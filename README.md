@@ -1,6 +1,10 @@
 # nan
 
-nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. Its bootstrap compiler, written in Rust and targeting Linux on x86_64, is temporary: nan will compile itself and build NanOS, an operating system for AI, from bootloader to user interface.
+nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. It will compile itself and build NanOS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
+
+## Specification
+
+The language is specified in [docs/spec](docs/spec/00-charter.md), starting with its charter; [the primer](docs/spec/39-primer.md) is the short introduction.
 
 ## Installation
 

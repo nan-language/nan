@@ -2,11 +2,11 @@
 
 ## Project
 
-nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. Its bootstrap compiler, written in Rust and targeting Linux on x86_64, is temporary: nan will compile itself and build NanOS, an operating system for AI, from bootloader to user interface.
+nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. It will compile itself and build NanOS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
 
 ## Architecture
 
-`bootstrap/nan` is the bootstrap compiler, a Rust binary named `nan`. It generates machine code with Cranelift, whose ELF objects the system `cc` links into Linux x86_64 executables. Everything Linux-specific (linking, program entry, calls into the system) stays in one target module.
+`bootstrap/nan` is the bootstrap compiler, a Rust binary named `nan` that implements the language specified in `docs/spec`. It generates machine code with Cranelift: the system `cc` links Linux x86_64 executables, and the compiler's own image writer builds UEFI and bare-metal images. Everything Linux-specific (linking, program entry, calls into the system) stays in one target module.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 
@@ -16,6 +16,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | --- | --- |
 | `bootstrap/` | The bootstrap compiler, one Cargo workspace crate per directory |
 | `bootstrap/nan/src/` | Source of the `nan` binary; a module's unit tests live in `<module>/tests.rs` beside it |
+| `docs/spec/` | The nan 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
 | `.config/` | nextest configuration |
 | `.agents/skills/` | Agent skills; `.claude/skills` links here |
@@ -88,6 +89,8 @@ Every document except ADRs is listed here. Read one only when the task needs it.
 
 | Document | Covers |
 | --- | --- |
+| `docs/spec/00-charter.md` | The nan 1.0 specification: its guarantees, glossary and the map of every chapter in `docs/spec/` |
+| `docs/spec/39-primer.md` | The primer: what to read before writing or reviewing nan code |
 
 ## ADR
 

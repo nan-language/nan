@@ -1,0 +1,822 @@
+# Text, rendering and Encode
+
+This chapter defines the text types, their lengths and slicing, `text::utf8`, `text::Interner`, `Render` and render budgets, `text::Writer`, the `text::fmt` template intrinsic, the `Encode` derive with its encoders, decoders and keys, decoding rules, schema hashes, and the formats `mem::wire` and `text::json`.
+
+## Text types
+
+**Text** is UTF-8 character data: a value of `Str`, `text::String` or `text::Fixed[N]`. Every text value holds well-formed UTF-8: shortest-form sequences of 1 to 4 bytes encoding scalar values, with no surrogate and nothing above U+10FFFF. No safe operation produces text that is not well-formed.
+
+- `char` is the [scalar](04-types.md#scalars) holding one Unicode scalar value.
+- `Str` is a core [view](05-properties.md#views) of the bytes of a text. A text literal or text run is a `Str` with static storage ([text literals](01-lexical.md#text-literals)); every other `Str` is a projection of a value owning text.
+- `text::String` is owned, growable text: a [growable container](12-memory.md#growth) whose capacity grows as that of `mem::Bytes` does.
+- `text::Fixed[N]` is owned text of at most `N` bytes stored inline, which never allocates. `of`, `push` and `append` require that the result fit, and their `try_` forms fail with `mem::OutOfMemory.Exhausted` there, leaving the value unchanged. `room` is `N` minus the byte length.
+- `text::String`, `text::Fixed[N]` and `text::Interner` are [base types](05-properties.md#structural-properties) with these properties:
+
+| Type | linear | view | Copy | Send | Inert | AnyBits |
+| --- | --- | --- | --- | --- | --- | --- |
+| `text::String` | no | no | no | yes | yes | no |
+| `text::Fixed[N]` | no | no | yes | yes | yes | no |
+| `text::Interner` | no | no | no | yes | no | no |
+
+- `text::String` and `text::Fixed[N]` implement `Eq`, `Ord` and `Hash` exactly as `Str` does on their bytes ([equality, ordering, hashing and defaults](08-generics-interfaces.md#equality-ordering-hashing-and-defaults)). `text::Fixed[N]` implements `Default`, the empty text.
+- Each read method of `Str` in this chapter also exists on `text::String` and `text::Fixed[N]` with the same head, and behaves as the same call on `as_str()`.
+- `for c in s` over a text iterates through `cursor`, whose `core::CharCursor` yields the chars in order ([iteration](07-ownership.md#iteration)).
+- `to_ascii_lowercase` and `to_ascii_uppercase` map each ASCII letter to its other case and return every other char unchanged.
+- `find(needle)` is `Some` of the byte index where `needle` first occurs, 0 for an empty `needle`, or `None`.
+
+```nan-api
+// module: core
+
+pub fn char.utf8_len(self) -> usize limits pure, notrap, terminates
+    example 'é'.utf8_len() == 2
+
+pub fn char.is_ascii(self) -> bool limits pure, notrap, terminates
+    ensures result == (self <= '\x7F')
+
+pub fn char.is_ascii_digit(self) -> bool limits pure, notrap, terminates
+    ensures result == (self >= '0' and self <= '9')
+
+pub fn char.is_ascii_alphabetic(self) -> bool limits pure, notrap, terminates
+    ensures result == ((self >= 'A' and self <= 'Z') or (self >= 'a' and self <= 'z'))
+
+pub fn char.is_ascii_whitespace(self) -> bool limits pure, notrap, terminates
+    ensures result == (self == ' ' or self == '\t' or self == '\n' or self == '\x0C' or self == '\r')
+
+pub fn char.to_ascii_lowercase(self) -> char limits pure, notrap, terminates
+    example 'Q'.to_ascii_lowercase() == 'q'
+
+pub fn char.to_ascii_uppercase(self) -> char limits pure, notrap, terminates
+
+pub proj fn Str.as_bytes(self) -> Slice[u8] limits pure, notrap, terminates
+
+pub proj fn Str.cursor(self) -> CharCursor limits pure, notrap, terminates
+
+pub fn Str.is_empty(self) -> bool limits pure, notrap, terminates
+    ensures result == (self.byte_len() == 0)
+
+pub fn Str.starts_with(self, prefix: Str) -> bool limits pure, notrap, terminates
+
+pub fn Str.ends_with(self, suffix: Str) -> bool limits pure, notrap, terminates
+
+pub fn Str.find(self, needle: Str) -> Option[usize] limits pure, notrap, terminates
+    example "port=80".find("=") == Some(4)
+
+pub open view struct CharCursor {
+} CharCursor
+
+impl CharCursor: Cursor[char]
+
+pub fn CharCursor.next(mut self) -> Option[char] limits pure, notrap, terminates
+```
+
+```nan-api
+// module: text
+
+pub open struct String {
+} String
+
+pub fn String.empty(alloc: mem::Alloc) -> String
+
+pub fn String.of(text: Str, alloc: mem::Alloc) -> String
+
+pub fn String.try_of(text: Str, alloc: mem::Alloc) -> String fails mem::OutOfMemory
+
+pub fn String.try_from_utf8(bytes: Slice[u8], alloc: mem::Alloc) -> String fails utf8::Utf8Error
+
+pub proj fn String.as_str(self) -> Str
+
+pub fn String.push(mut self, c: char)
+
+pub fn String.try_push(mut self, c: char) fails mem::OutOfMemory
+
+pub fn String.append(mut self, text: Str)
+
+pub fn String.try_append(mut self, text: Str) fails mem::OutOfMemory
+
+pub fn String.clear(mut self)
+
+pub fn String.into_bytes(take self) -> mem::Bytes
+
+pub open struct Fixed[N: usize where N > 0] {
+} Fixed
+
+pub fn Fixed.empty() -> Fixed[N] limits pure, notrap, terminates
+
+pub fn Fixed.of(text: Str) -> Fixed[N] limits notrap
+    requires text.byte_len() <= N
+
+pub fn Fixed.try_of(text: Str) -> Fixed[N] fails mem::OutOfMemory limits notrap
+
+pub proj fn Fixed.as_str(self) -> Str
+
+pub fn Fixed.room(self) -> usize limits pure, notrap, terminates
+    example Fixed[8].of("abc").room() == 5
+
+pub fn Fixed.push(mut self, c: char) limits notrap
+    requires c.utf8_len() <= self.room()
+
+pub fn Fixed.try_push(mut self, c: char) fails mem::OutOfMemory limits notrap
+
+pub fn Fixed.append(mut self, text: Str) limits notrap
+    requires text.byte_len() <= self.room()
+
+pub fn Fixed.try_append(mut self, text: Str) fails mem::OutOfMemory limits notrap
+
+pub fn Fixed.clear(mut self)
+```
+
+- `push` appends a char's UTF-8 bytes; `clear` empties the value and keeps its storage; `into_bytes` returns the text's bytes without copying them.
+
+```nan
+pub fn initials(name: Str, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    var at_start = true
+    for c in name {
+        if c == ' ' {
+            at_start = true
+        } else if at_start {
+            mut out.push(c.to_ascii_uppercase())
+            at_start = false
+        }
+    }
+    return out
+} initials
+
+test initials_of_two_words for initials {
+    let world = testing::world()
+    let short = initials("ada lovelace", alloc: world.alloc)
+    expect short.as_str() == "AL"
+} initials_of_two_words
+```
+
+## Lengths and slicing
+
+```nan-api
+// module: core
+
+pub fn Str.byte_len(self) -> usize limits pure, notrap, terminates
+    example "café".byte_len() == 5
+
+pub fn Str.char_count(self) -> usize limits pure, notrap, terminates
+    example "café".char_count() == 4
+
+pub fn Str.is_char_boundary(self, i: usize) -> bool limits pure, notrap, terminates
+    example not "café".is_char_boundary(4)
+
+pub proj fn Str.slice_bytes(self, start: usize, end: usize) -> Option[Str] limits pure, notrap, terminates
+    example "café".slice_bytes(0, end: 3) == Some("caf")
+    example "café".slice_bytes(0, end: 4) == None
+```
+
+- `byte_len` is the number of bytes; `char_count` the number of chars.
+- `is_char_boundary(i)` is true exactly when `i` is 0, `byte_len()`, or the index of the first byte of a char.
+- `slice_bytes(start, end: e)` is `Some` of the view of bytes `start` up to but excluding `e` when `start <= e`, `e <= byte_len()` and both are char boundaries, and `None` otherwise.
+- Text types have no `at`, `at_mut` or `len`. An index expression `s[i]` on a text value is an error (`text.integer-index`), reported in place of `own.not-indexable`, whose exact fix writes `s.as_bytes()[i]`. A call `s.len()` on a text value is an error (`text.bare-len`), reported in place of `name.unknown`, whose exact fix writes `s.byte_len()`.
+
+```nan
+pub fn has_key(line: Str, key: Str) -> bool
+    example has_key("port=80", key: "port")
+    example not has_key("café=1", key: "caf")
+{
+    let Some(at) = line.find("=") else {
+        return false
+    }
+    let Some(head) = line.slice_bytes(0, end: at) else {
+        return false
+    }
+    return head == key
+} has_key
+```
+
+```nan
+pub fn first_byte(name: Str) -> u8 {
+    return name[0] // error: text.integer-index
+} first_byte
+```
+
+```nan
+pub fn is_short(name: Str) -> bool {
+    return name.len() < 8 // error: text.bare-len
+} is_short
+```
+
+## UTF-8
+
+`text::utf8` converts between bytes and text.
+
+```nan-api
+// module: text::utf8
+
+pub closed enum Utf8Error derives Eq, Render {
+    Invalid(at: usize)
+    OutOfMemory(mem::OutOfMemory) from
+} Utf8Error
+
+pub fn valid_prefix(bytes: Slice[u8]) -> usize limits pure, notrap, terminates
+    example valid_prefix(b"ok\xFF") == 2
+
+pub fn is_valid(bytes: Slice[u8]) -> bool limits pure, notrap, terminates
+    ensures result == (valid_prefix(bytes) == bytes.len())
+    example not is_valid(b"\xC3")
+
+pub fn char_at(bytes: Slice[u8], at: usize) -> Option[char] limits pure, notrap, terminates
+    example char_at(b"\xC3\xA9", at: 0) == Some('é')
+
+pub fn write_char(c: char, mut out: SliceMut[u8]) -> usize limits pure, notrap, terminates
+    requires out.len() >= c.utf8_len()
+```
+
+- `valid_prefix` is the byte length of the longest prefix of `bytes` that is well-formed UTF-8.
+- `char_at(bytes, at: i)` is `Some(c)` when a well-formed encoding of `c` starts at byte `i`, and `None` otherwise.
+- `write_char` writes the UTF-8 bytes of `c` at the start of `out` and returns their count.
+- `text::String.try_from_utf8(bytes, alloc)` copies `bytes` into a new `text::String` when they are well-formed. Otherwise it fails with `Utf8Error.Invalid(at: n)`, where `n` is `valid_prefix(bytes)`. Exhausted memory fails with `Utf8Error.OutOfMemory`.
+
+```nan
+pub closed enum LabelError derives Eq, Render {
+    Utf8(text::utf8::Utf8Error) from
+    Empty
+} LabelError
+
+pub fn label_of(bytes: Slice[u8], alloc: mem::Alloc) -> text::String fails LabelError {
+    let label = try text::String.try_from_utf8(bytes, alloc)
+    if label.is_empty() {
+        fail LabelError.Empty
+    }
+    return label
+} label_of
+```
+
+## Interning
+
+`text::Interner` maps texts to `text::Symbol` values: interning equal texts gives equal symbols, and each symbol resolves to its text. It has [interior mutability](12-memory.md#interior-mutability), so `intern` takes it by read and a `Str` from `resolve` stays valid across later interning.
+
+```nan-api
+// module: text
+
+pub closed struct Symbol derives Copy, Eq, Ord, Hash, Render {
+    pub index: u32
+} Symbol
+
+pub open struct Interner {
+} Interner
+
+pub fn Interner.empty(alloc: mem::Alloc) -> Interner
+
+pub fn Interner.intern(self, text: Str) -> Symbol
+
+pub fn Interner.try_intern(self, text: Str) -> Symbol fails mem::OutOfMemory
+
+pub fn Interner.lookup(self, text: Str) -> Option[Symbol]
+
+pub proj fn Interner.resolve(self, symbol: Symbol) -> Str
+
+pub fn Interner.len(self) -> usize
+```
+
+- The n-th distinct text interned gets index n − 1, and `len` is their count. Interning a text already present returns its symbol and allocates nothing.
+- `intern` traps when memory is exhausted or every `u32` index is used (`trap.exhausted`); `try_intern` fails with `mem::OutOfMemory.Exhausted` instead.
+- `lookup` returns the symbol of an interned text, or `None`, without allocating.
+- `resolve` returns the text of a symbol; an index at or past `len()` traps (`trap.bounds`).
+
+```nan
+pub fn same_symbol(names: text::Interner, name: Str, other: Str) -> bool {
+    let a = names.intern(name)
+    let b = names.intern(other)
+    return a == b
+} same_symbol
+```
+
+## Render
+
+`Render` is the core interface writing a value as text. A **render budget** is the number of bytes a rendering may occupy, fixed by the operation that starts it, such as a [writer](#writers). A rendering starts with a new `core::Renderer` passed to one call of `render`; only std operations create renderers.
+
+```nan-api
+// module: core
+
+pub interface Render {
+    fn render(self, mut out: Renderer) limits pure, terminates
+} Render
+
+pub open view struct Renderer {
+} Renderer
+
+pub fn Renderer.write(mut self, text: Str) limits pure, notrap, terminates
+
+pub fn Renderer.write_char(mut self, c: char) limits pure, notrap, terminates
+
+pub fn Renderer.remaining(self) -> usize limits pure, notrap, terminates
+
+pub fn Renderer.is_elided(self) -> bool limits pure, notrap, terminates
+```
+
+The full rendering R is the concatenation, in call order, of every text and char written to one renderer. With render budget B:
+
+- When R holds at most B bytes, the output is R.
+- Otherwise the output is P followed by D, where D is `...` cut to its first `min(3, B)` bytes and P is the longest prefix of R ending at a char boundary with at most B − |D| bytes. The rendering is then elided.
+- `remaining()` is B minus the bytes written so far, or 0 when that is negative. `is_elided()` is true once more than B bytes have been written.
+
+Core and std types render as follows:
+
+| Type | Rendering |
+| --- | --- |
+| integers | decimal digits, with `-` before a negative value: `-42` |
+| `f32`, `f64` | `NaN`, `inf`, `-inf`, or a finite decimal form |
+| `bool` | `true`, `false` |
+| `char`, `Str`, `text::String`, `text::Fixed[N]` | their characters |
+| `Unit` | `Unit` |
+| `Option[T]`, `Result[T, E]` | `None`, `Some(v)`, `Ok(v)`, `Err(e)` |
+| `Array[T, N]`, `Slice[T]`, `SliceMut[T]`, `mem::List[T]`, `mem::Bounded[T, N]`, `mem::Set[T]` | `[1, 2]`: the elements, separated by `, `, in brackets |
+| `mem::Map[K, V]`, `mem::HashMap[K, V]` | `{k: v, k: v}`, in iteration order |
+| `mem::Bytes` | `b"`, each byte, then `"`: bytes `0x20` to `0x7E` as themselves, except `"` and `\` written `\"` and `\\`; `\n`, `\r`, `\t` and `\0` for their bytes; uppercase `\xHH` for the rest |
+| `mem::Box[T]`, `mem::Shared[T]` | the rendering of the contents |
+
+- A finite float renders as `-` when its sign bit is set, then the shortest digits d1…dk and exponent e for which d1.d2…dk × 10^e rounds to its magnitude m in its own type by roundTiesToEven, choosing the nearest to m, then an even last digit. For m 0 or in [10^-5, 10^16) the digits are positional with at least one each side of `.` (`0.1`, `100.0`, `-0.0`); otherwise they are d1, `.`, d2…dk or `0`, `e`, then e with `-` when negative (`1.5e-7`, `2.0e16`).
+- The generic types of the table implement `Render` when their type arguments do. Other core and std types implement it only as their declarations state; `Untrusted[T]` renders as [Untrusted data](15-untrusted.md#opacity) defines.
+
+### Derived Render
+
+`derives Render` writes `render` from the type's structure; [derives](08-generics-interfaces.md#derives) checks it against the constituent types and fixes the instantiations it applies to.
+
+- A struct renders as its name, `(`, then each field as `name: value` in declaration order separated by `, `, then `)`: `Header(kind: Kind.Ack, seq: 7)`. A struct without fields renders as `Name()`.
+- An enum value renders as `Name.Variant`, followed by `(value)` for a `V(T)` payload or by `(label: value, ...)` for labelled payloads in declaration order. The variants of `Option` and `Result` render without `Name.`.
+- Generic arguments do not appear. Private fields render like public ones.
+
+```nan
+pub closed enum Kind derives Copy, Eq, Render {
+    Data
+    Ack
+} Kind
+
+pub closed struct Header derives Copy, Eq, Render {
+    pub kind: Kind
+    pub seq: u32
+} Header
+
+pub fn header_line(header: Header, mut out: text::String) {
+    mut out.write(text::fmt("{header}", header), budget: 64)
+} header_line
+
+test header_line_shows_fields for header_line {
+    let world = testing::world()
+    var out = text::String.empty(world.alloc)
+    header_line(Header(kind: Kind.Ack, seq: 7), mut out)
+    expect out.as_str() == "Header(kind: Kind.Ack, seq: 7)"
+} header_line_shows_fields
+```
+
+```nan
+pub closed struct Celsius derives Copy {
+    pub tenths: u32
+} Celsius
+
+impl Celsius: Render
+
+pub fn Celsius.render(self, mut out: core::Renderer) {
+    text::fmt("{whole}.{tenth} C", whole: self.tenths / 10, tenth: self.tenths % 10).render(mut out)
+} Celsius.render
+```
+
+## Writers
+
+`text::Writer` is the interface of text destinations that start renderings.
+
+```nan-api
+// module: text
+
+pub interface Writer {
+    fn write(mut self, value: Dyn[Render], budget: usize)
+    fn try_write(mut self, value: Dyn[Render], budget: usize) fails mem::OutOfMemory
+} Writer
+
+impl String: Writer
+
+impl Fixed: Writer
+```
+
+- `write` appends the output of `value.render` with render budget `budget`.
+- `text::String.write` calls `value.render` twice, first to measure the output, then to write it into memory drawn for exactly that output. It traps when that memory is exhausted (`trap.exhausted`); `try_write` fails with `mem::OutOfMemory.Exhausted` there, leaving the receiver unchanged.
+- On `text::Fixed[N]` the render budget is the smaller of `budget` and `room()`; neither method traps or fails.
+
+```nan
+pub fn clipped(line: Str, mut out: text::String) {
+    mut out.write(text::fmt("{line}", line), budget: 8)
+} clipped
+
+test clipping_marks_elision for clipped {
+    let world = testing::world()
+    var out = text::String.empty(world.alloc)
+    clipped("a long line", mut out)
+    expect out.as_str() == "a lon..."
+} clipping_marks_elision
+```
+
+## Templates
+
+`text::fmt` is the one template intrinsic. A call `text::fmt("template", label: value, ...)` is a [call expression](06-statements-expressions.md#calls) whose first argument is the template and whose later arguments fill its holes.
+
+- The template is one `TEXT` literal; anything else, a text run included, is an error (`text.template-not-literal`).
+- In the template's value, `{`, an identifier that is not a [hard keyword](01-lexical.md#keywords), and `}` form a hole named by that identifier, and `{{` and `}}` stand for `{` and `}`. Any other `{` or `}` is an error (`text.template-malformed`).
+- The template carries no label. Each later argument carries a hole's name as its label, or is punned as [arguments and labels](06-statements-expressions.md#arguments-and-labels) states; any other form is an error (`expr.argument-label`).
+- A hole naming no argument is an error (`text.hole-unbound`). An argument named by no hole is an error (`text.argument-unused`). A label given to two arguments is an error (`text.argument-duplicate`). A hole may appear several times.
+- Each argument is an unmarked read argument (`mode.mismatch`) without an expected type, whose type implements `Render` or is `Dyn[Render]`; another type is an error (`generic.unsatisfied-bound`).
+- The call is a `Dyn[Render]` of a value holding the template and a read access to each argument, which lasts until the end of its statement. Evaluating it is pure, notrap and terminating.
+- `text::fmt` appears only as the callee of such a call, and the call only as an argument or receiver of another call; anything else is an error (`text.template-position`).
+- Rendering the call writes the template's text between holes and each hole's argument through its `Render`, in template order, to the same renderer.
+
+```nan
+pub fn describe(mut out: text::String, seq: u32, total: u32) {
+    mut out.write(text::fmt("frame {seq} of {total}, {{ok}}", seq, total), budget: 64)
+} describe
+
+test describe_counts for describe {
+    let world = testing::world()
+    var out = text::String.empty(world.alloc)
+    describe(mut out, seq: 3, total: 9)
+    expect out.as_str() == "frame 3 of 9, {ok}"
+} describe_counts
+```
+
+```nan
+pub fn describe(mut out: text::String, seq: u32) {
+    mut out.write(text::fmt("frame {seq} of {total}", seq), budget: 64) // error: text.hole-unbound
+} describe
+```
+
+```nan
+pub fn describe(mut out: text::String, seq: u32, total: u32) {
+    mut out.write(text::fmt("frame {seq}", seq, total), budget: 64) // error: text.argument-unused
+} describe
+```
+
+```nan
+pub fn describe(seq: u32) {
+    discard text::fmt("frame {seq}", seq) // error: text.template-position
+} describe
+```
+
+## Encode
+
+`Encode` is the core interface converting values to and from structured data. A **key** is the name identifying a field, variant or labelled payload in encoded data. A **decoder** is the function `T.decode` that `derives Encode` writes.
+
+```nan-api
+// module: core
+
+pub interface Encode {
+    fn encode[E: Encoder](self, mut e: E) limits terminates
+    fn decode[D: Decoder](mut d: D, alloc: mem::Alloc) -> Self fails DecodeError limits terminates
+} Encode
+```
+
+### Requirements
+
+- A written impl line naming `Encode` outside std is an error (`encode.manual-impl`).
+- `derives Encode` is checked in this order, and only the first failing check is reported, on the type's first line:
+  1. On a [capability type](05-properties.md#capability-types) it is `prop.capability-derive`.
+  2. On a type declared `view` it is an error (`encode.view`).
+  3. On a type declared `linear` it is an error (`encode.linear`).
+  4. On a type that is not [Inert](05-properties.md#inert), its type parameters counted as Inert, it is an error (`encode.not-inert`).
+- When none of these checks fails, [derives](08-generics-interfaces.md#derives) checks the derive against the constituent types and fixes the instantiations it applies to.
+- The allocator stored by a growable container is never encoded. Decoding gives `alloc` to every container, box and shared value it rebuilds.
+
+```nan
+pub closed struct Reading derives Copy, Eq, Encode {
+    pub sensor: u16
+    pub level: i32
+} Reading
+```
+
+```nan
+pub closed struct Glossary derives Encode { // error: encode.not-inert
+    pub words: text::Interner
+} Glossary
+```
+
+```nan
+pub closed linear struct Ticket derives Encode { // error: encode.linear
+    pub number: u32
+} Ticket
+```
+
+### Encoders and decoders
+
+An encoded value has one of these kinds, which `core::Encoder` writes and `core::Decoder` reads:
+
+| Kind | Encoder | Decoder |
+| --- | --- | --- |
+| bool | `write_bool` | `read_bool` |
+| unsigned | `write_unsigned` | `read_unsigned` |
+| signed | `write_signed` | `read_signed` |
+| float | `write_float` | `read_float` |
+| char | `write_char` | `read_char` |
+| text, bytes | `write_text`, `write_bytes` | `begin_text` or `begin_bytes`, then `read_chunk` |
+| sequence, map | `begin_sequence` or `begin_map`, the elements (a map's as key then value), `end` | `begin_sequence` or `begin_map`, `next_follows` before each element, `end` |
+| record | `begin_record`, then `write_key` and a value per field, `end` | `begin_record`, then `next_follows`, `read_key` and a value or `skip` per field, `end` |
+| variant | `begin_variant`, the payload when it has one, `end` | `read_variant`, `payload_follows`, the payload when present, `end` |
+
+```nan-api
+// module: core
+
+pub interface Encoder {
+    fn write_bool(mut self, value: bool) limits terminates
+    fn write_unsigned(mut self, value: u64) limits terminates
+    fn write_signed(mut self, value: i64) limits terminates
+    fn write_float(mut self, value: f64) limits terminates
+    fn write_char(mut self, value: char) limits terminates
+    fn write_text(mut self, value: Str) limits terminates
+    fn write_bytes(mut self, value: Slice[u8]) limits terminates
+    fn begin_sequence(mut self, count: usize) limits terminates
+    fn begin_map(mut self, count: usize) limits terminates
+    fn begin_record(mut self, count: usize) limits terminates
+    fn write_key(mut self, key: Str) limits terminates
+    fn begin_variant(mut self, key: Str, payload: bool) limits terminates
+    fn end(mut self) limits terminates
+} Encoder
+
+pub interface Decoder {
+    fn read_bool(mut self) -> bool fails DecodeError limits terminates
+    fn read_unsigned(mut self) -> u64 fails DecodeError limits terminates
+    fn read_signed(mut self) -> i64 fails DecodeError limits terminates
+    fn read_float(mut self) -> f64 fails DecodeError limits terminates
+    fn read_char(mut self) -> char fails DecodeError limits terminates
+    fn begin_text(mut self) -> usize fails DecodeError limits terminates
+    fn begin_bytes(mut self) -> usize fails DecodeError limits terminates
+    fn read_chunk(mut self, mut out: SliceMut[u8]) fails DecodeError limits terminates
+    fn begin_sequence(mut self) fails DecodeError limits terminates
+    fn begin_map(mut self) fails DecodeError limits terminates
+    fn begin_record(mut self) fails DecodeError limits terminates
+    fn next_follows(mut self) -> bool fails DecodeError limits terminates
+    fn read_key(mut self, keys: Slice[Str]) -> Option[usize] fails DecodeError limits terminates
+    fn read_variant(mut self, keys: Slice[Str]) -> Option[usize] fails DecodeError limits terminates
+    fn payload_follows(mut self) -> bool fails DecodeError limits terminates
+    fn skip(mut self) fails DecodeError limits terminates
+    fn end(mut self) fails DecodeError limits terminates
+} Decoder
+
+pub open enum DecodeError derives Copy, Eq, Hash, Render {
+    Truncated
+    Malformed
+    Trailing
+    TooDeep
+    UnknownKey
+    DuplicateKey
+    MissingField
+    UnknownVariant
+    OutOfRange
+    InvalidText
+    Invalid
+    OutOfMemory
+} DecodeError
+```
+
+- `begin_text` and `begin_bytes` return the value's byte length n. Each `read_chunk(out)` then fills `out` with the next bytes of the value; the value is read once the chunks total n, and a chunk reaching past n fails with `Malformed`. `read_key` and `read_variant` read the next key and return its index in `keys`, or `None`. `skip` passes over the next value whatever its kind.
+- The implementing functions of a std impl line of `core::Decoder` fail with `Malformed` when the input at a call does not encode a value of the kind the call reads or the calls depart from the order of the kind table; with `Truncated` on input ending inside a value, and on a count or byte length exceeding the bytes left, before allocating for it; with `TooDeep` on nesting deeper than 128 sequences, maps, records and variants; and with `OutOfMemory` on exhausted memory.
+
+### Derived encode and decode
+
+`derives Encode` writes `encode` and `decode`.
+
+- A struct encodes as a record of all its fields, private ones included, written in ascending byte order of their keys.
+- An enum value encodes as a variant with its key. A unit variant has no payload, a `V(T)` variant has its value as payload, and a variant with labelled payloads has a record of them as payload.
+- A struct decodes in these steps:
+  1. Each field present is read with `read_key` and decoded with `alloc`, as [Decoding rules](#decoding-rules) state for unknown, repeated and missing keys.
+  2. Each field `where` predicate in declaration order, then each `invariant`, is evaluated; a false one fails with `Invalid`.
+  3. The value is constructed.
+- An enum decodes the variant `read_variant` names; a payload present or absent against the variant's form fails with `Malformed`. A labelled payload decodes as the fields of a closed struct do.
+
+### Decoders as validators
+
+A decoder is a validator of data arriving [Untrusted](15-untrusted.md#untrusted-values), classified and granted as [validator classes](15-untrusted.md#validator-classes) and [validate grants](15-untrusted.md#validate-grants) state. It re-checks every variant key, [niche](04-types.md#niches) and predicate and fails with a `core::DecodeError` on every invalid input: its own code holds no trap site, and it draws memory only through `try_` forms, failing with `OutOfMemory` when one fails.
+
+### Std encodings
+
+| Type | Encoding |
+| --- | --- |
+| `u8` to `u64`, `usize` | unsigned |
+| `i8` to `i64`, `isize` | signed |
+| `f64`, `f32` | float; an `f32` is widened, and decodes as `f32.nearest` of the value read |
+| `bool` | bool |
+| `char` | char; a value that is not a scalar value fails with `Invalid` |
+| `Unit` | a record without fields |
+| `Array[T, N]` | a sequence of N elements; another count fails with `Malformed` |
+| `Option[T]`, `Result[T, E]` | a variant: `None`, `Some` with a `T`, `Ok` with a `T`, `Err` with an `E` |
+| `text::String` | text |
+| `text::Fixed[N]` | text; more than N bytes fails with `OutOfRange` |
+| `mem::Bytes` | bytes |
+| `mem::List[T]`, `mem::Set[T]`, `mem::Bounded[T, N]` | a sequence in iteration order; more than N elements fails with `OutOfRange` |
+| `mem::Map[K, V]` | a map in iteration order |
+| `mem::Box[T]`, `mem::Shared[T]` | the contents, decoded into a new box or shared value |
+| `mem::Id[T]` | as the `u32` of its index |
+
+- Decoding an integer outside its type fails with `OutOfRange`, and text that is not well-formed UTF-8 with `InvalidText`.
+- Decoding a `mem::Set[T]` or `mem::Map[K, V]` fails with `DuplicateKey` when an element or key equals the previous one, and with `Malformed` when it is less by `Ord`.
+- No other core or std type implements `Encode`.
+
+## Keys
+
+Keys compare by bytes.
+
+- A [tombstone](29-identity-versioning.md#tombstones) `retired T.old => T.new preserves`, with `T` deriving `Encode`, makes `old` an alias of the key of the field or variant that `T.new` reaches, directly or through further such tombstones: decoders accept `old` wherever they accept that key, and encoders write only that key. Only fields and variants have aliases.
+
+```nan
+pub closed struct Probe derives Eq, Encode {
+    pub seq: u32
+    pub hops: u8
+} Probe
+
+retired Probe.ttl => Probe.hops preserves
+
+pub fn load_probe(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Probe fails core::DecodeError {
+    return try mem::wire::Codec[Probe].decode(raw, alloc)
+} load_probe
+
+test probe_reads_old_key for load_probe {
+    let world = testing::world()
+    let current = attempt load_probe(Untrusted.of(b"\x02\x04hops\x01\x03\x03seq\x01\x05"), alloc: world.alloc)
+    let legacy = attempt load_probe(Untrusted.of(b"\x02\x03seq\x01\x05\x03ttl\x01\x03"), alloc: world.alloc)
+    expect current == Ok(Probe(seq: 5, hops: 3))
+    expect legacy == current
+} probe_reads_old_key
+```
+
+## Decoding rules
+
+A struct or enum declared `open` decodes as open; every other type, and every labelled payload, decodes as closed.
+
+- A record key that is neither a field's key nor an alias fails a closed type with `UnknownKey`. An open type skips the field and discards it.
+- A field given twice, by its key or its aliases, fails with `DuplicateKey`.
+- A missing field of an open type whose field type implements `Default` takes that default. Any other missing field fails with `MissingField`.
+- An unknown variant key fails closed and open types alike with `UnknownVariant`.
+- Each format frames a record field by its key, and `mem::wire` also by its byte length. This framing is the format space reserved for keeping skipped fields, which no language 1 decoder keeps.
+
+```nan
+pub open struct Config derives Eq, Encode {
+    pub retries: u8
+    pub verbose: bool
+} Config
+
+pub fn load_config(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Config fails core::DecodeError {
+    return try mem::wire::Codec[Config].decode(raw, alloc)
+} load_config
+
+test config_tolerates_new_fields for load_config {
+    let world = testing::world()
+    let loaded = attempt load_config(Untrusted.of(b"\x02\x04mode\x01\x07\x07retries\x01\x03"), alloc: world.alloc)
+    expect loaded == Ok(Config(retries: 3, verbose: false))
+} config_tolerates_new_fields
+```
+
+## Schema hashes
+
+The **schema hash** of a type implementing `Encode` is the [hash](29-identity-versioning.md#hash-values) of the `mem::wire` encoding of the root node of its schema tree, the description of its encoded structure. A node encodes as a variant keyed by its name, with a record of its fields as payload when it has fields:
+
+| Node | Fields | Made for |
+| --- | --- | --- |
+| `Bool`, `Char`, `Text`, `Bytes` | none | `bool`, `char`, `text::String`, `mem::Bytes` |
+| `Unsigned`, `Signed`, `Float` | `width: u8`, in bits, 64 for `usize` and `isize` | integers and floats |
+| `BoundedText` | `capacity: u64` | `text::Fixed[N]` |
+| `Sequence` | `element`, a node; `length: Option[u64]`; `capacity: Option[u64]`; `unique: bool` | `Array` (length), `mem::Bounded` (capacity), `mem::Set` (unique), `mem::List` |
+| `Map` | `key`, `value`: nodes | `mem::Map` |
+| `Record` | `open: bool`; `fields`, a sequence of records with `key: Str`, `aliases`, a sequence of texts in byte order, `defaulted: bool` and `value`, a node | structs, labelled payloads, `Unit` |
+| `Variant` | `open: bool`; `variants`, a sequence of records with `key: Str`, `aliases` and `payload: Option` of a node | enums, `Option`, `Result` |
+| `Back` | `depth: u64` | recursion |
+
+- `Record` fields and `Variant` variants appear in ascending byte order of keys. `defaulted` is true when the field takes a default when missing. `mem::Box[T]` and `mem::Shared[T]` give the node of `T`; `mem::Id[T]` gives `Unsigned` of width 32.
+- Where a node would be made for a struct or enum instantiation inside a node made for the same instantiation, a `Back` node is made instead. Its `depth` is the number of `Record` and `Variant` nodes on the path from it up to the nearest such enclosing node, that node included.
+
+## Wire format
+
+`mem::wire` is the canonical binary format. `Codec.encode` writes exactly one byte sequence for each value, and `Codec.decode` rejects every sequence `Codec.encode` never writes, except unknown, aliased and missing fields where the [decoding rules](#decoding-rules) accept them, and float values for `f32`.
+
+```nan-api
+// module: mem::wire
+
+pub open struct Codec[T: Encode] {
+} Codec
+
+pub fn Codec.encode(value: T, mut out: mem::Bytes)
+
+pub fn Codec.try_encode(value: T, mut out: mem::Bytes) fails mem::OutOfMemory
+
+pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+```
+
+- `encode` appends to `out` and traps when memory is exhausted (`trap.exhausted`); `try_encode` fails with `mem::OutOfMemory.Exhausted` and leaves `out` unchanged.
+- `decode` reads exactly one value; bytes left after it fail with `Trailing`.
+
+A **uvar** is an unsigned integer in LEB128: 7 bits per byte, least significant group first, the high bit set on every byte but the last. A uvar is minimal: its last byte is not 0 unless it is the only byte. A uvar that is not minimal or whose value exceeds 2^64 − 1 fails with `Malformed`.
+
+| Kind | Bytes |
+| --- | --- |
+| bool | `0x00` or `0x01`; another byte fails with `Malformed` |
+| unsigned | the value as a uvar |
+| signed | the uvar of `(n << 1) ^ (n >> 63)` on the 64-bit two's complement pattern of n, the right shift arithmetic |
+| float | the 8 bytes of the `f64` bit pattern, little-endian |
+| char | the scalar value as a uvar |
+| text, bytes | the byte length as a uvar, then the bytes |
+| sequence | the count as a uvar, then each element |
+| map | the count as a uvar, then each key followed by its value |
+| record | the field count as a uvar, then per field its key as text, the byte length of its value as a uvar, and the value, fields in strictly ascending byte order of keys |
+| variant | the key as text, then `0x00` without payload, or `0x01`, the payload's byte length as a uvar and the payload; another byte fails with `Malformed` |
+
+- A record whose keys are not in ascending order, or a field value or variant payload not filling exactly its stated length, fails with `Malformed`; a repeated key fails with `DuplicateKey`.
+
+```nan
+pub closed enum Signal derives Eq, Encode {
+    Idle
+    Level(u16)
+} Signal
+
+pub fn load_signal(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Signal fails core::DecodeError {
+    return try mem::wire::Codec[Signal].decode(raw, alloc)
+} load_signal
+
+test signal_bytes for load_signal {
+    let world = testing::world()
+    let idle = attempt load_signal(Untrusted.of(b"\x04Idle\x00"), alloc: world.alloc)
+    let level = attempt load_signal(Untrusted.of(b"\x05Level\x01\x02\xAC\x02"), alloc: world.alloc)
+    let trailing = attempt load_signal(Untrusted.of(b"\x04Idle\x00\x00"), alloc: world.alloc)
+    expect idle == Ok(Signal.Idle)
+    expect level == Ok(Signal.Level(300))
+    expect trailing == Err(core::DecodeError.Trailing)
+} signal_bytes
+```
+
+## JSON
+
+`text::json` encodes values as JSON text (RFC 8259) and decodes JSON bytes.
+
+```nan-api
+// module: text::json
+
+pub open struct Codec[T: Encode] {
+} Codec
+
+pub fn Codec.encode(value: T, mut out: text::String)
+
+pub fn Codec.try_encode(value: T, mut out: text::String) fails mem::OutOfMemory
+
+pub fn Codec.decode(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> T fails core::DecodeError
+```
+
+`encode` and `try_encode` behave as in [Wire format](#wire-format). `decode` reads exactly one JSON value; bytes other than whitespace left after it fail with `Trailing`. `encode` writes no whitespace and maps kinds to JSON as follows:
+
+| Kind | JSON |
+| --- | --- |
+| bool | `true`, `false` |
+| unsigned, signed | an integer in decimal, `-` before a negative value |
+| float | the number as [Render](#render) writes it; `NaN`, `inf` and `-inf` as JSON strings |
+| char, text | a JSON string |
+| bytes | a JSON string of the bytes in base64 with padding (RFC 4648, section 4) |
+| sequence | an array |
+| map | an array of 2-element arrays, key then value |
+| record | an object, members in ascending byte order of keys |
+| variant | without payload the key as a JSON string, otherwise an object whose one member maps the key to the payload |
+
+- JSON strings escape `"` as `\"`, `\` as `\\`, U+000A as `\n`, U+000D as `\r`, U+0009 as `\t`, U+0008 as `\b`, U+000C as `\f`, and other characters below U+0020 as `\u` with 4 lowercase hexadecimal digits; every other character is written as itself.
+- `decode` accepts the whitespace and escapes RFC 8259 allows and object members in any order. Input that is not well-formed UTF-8, or an escape naming a lone surrogate, fails with `InvalidText`; other input outside the RFC 8259 grammar, `null` included, fails with `Malformed`.
+- An unsigned or signed value is an integer without fraction or exponent (`-0` is 0), an unsigned one outside `u64` or a signed one outside `i64` failing with `OutOfRange`; a float any number, rounded to `f64` by roundTiesToEven, or one of the three JSON strings; a char a JSON string of exactly one char; bytes base64 exactly as `encode` writes it; a map entry an array of exactly 2 elements; a variant with payload an object of exactly 1 member. Other input for these kinds fails with `Malformed`.
+
+```nan
+pub closed struct Probe derives Eq, Encode {
+    pub seq: u32
+    pub hops: u8
+} Probe
+
+pub fn probe_json(probe: Probe, mut out: text::String) {
+    text::json::Codec[Probe].encode(probe, mut out)
+} probe_json
+
+pub fn load_probe_json(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Probe fails core::DecodeError {
+    return try text::json::Codec[Probe].decode(raw, alloc)
+} load_probe_json
+
+test probe_json_is_canonical for probe_json {
+    let world = testing::world()
+    var out = text::String.empty(world.alloc)
+    probe_json(Probe(seq: 5, hops: 3), mut out)
+    expect out.as_str() == "{\"hops\":3,\"seq\":5}"
+} probe_json_is_canonical
+
+test probe_json_accepts_spacing for load_probe_json {
+    let world = testing::world()
+    let loaded = attempt load_probe_json(Untrusted.of(b"{ \"seq\": 5, \"hops\": 3 }"), alloc: world.alloc)
+    expect loaded == Ok(Probe(seq: 5, hops: 3))
+} probe_json_accepts_spacing
+```
+
+## Diagnostics
+
+| Code | Class | Rule |
+| --- | --- | --- |
+| `encode.linear` | error | [Requirements](#requirements) |
+| `encode.manual-impl` | error | [Requirements](#requirements) |
+| `encode.not-inert` | error | [Requirements](#requirements) |
+| `encode.view` | error | [Requirements](#requirements) |
+| `text.argument-duplicate` | error | [Templates](#templates) |
+| `text.argument-unused` | error | [Templates](#templates) |
+| `text.bare-len` | error | [Lengths and slicing](#lengths-and-slicing) |
+| `text.hole-unbound` | error | [Templates](#templates) |
+| `text.integer-index` | error | [Lengths and slicing](#lengths-and-slicing) |
+| `text.template-malformed` | error | [Templates](#templates) |
+| `text.template-not-literal` | error | [Templates](#templates) |
+| `text.template-position` | error | [Templates](#templates) |

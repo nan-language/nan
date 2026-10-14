@@ -163,7 +163,7 @@ The harness runs `nan check` on every `nan` block; then, unless the block is mar
 - `// incomplete: family.code`: `nan check` reports exactly one diagnostic, of class incompleteness, with that code, on that line; for a gate code, `nan check` reports none and `nan verify` reports exactly that one. Every test passes and every image builds.
 - `// traps: trap.kind`: no run reports a diagnostic, every image builds, and exactly one test fails, through a trap of that kind whose [trap report](11-errors-domains.md#trap-reports) names that line as the trapping operation.
 
-With each marker comment and the space before it removed, `nan fmt` rewrites no file of a `nan` block, except that it inserts a blank line after the summary line the harness prepends.
+With each marker comment and the space before it removed, `nan fmt` rewrites no file of a `nan` block, except that it inserts a blank line after the summary line the harness prepends and, in a block marked `item.clause-order`, moves clause lines into their [canonical order](35-format.md#canonical-order).
 
 A `nan-api` block starts with `// module: <alias or alias::module>`, and that std module declares each item of the block with exactly its text, the block omitting only bodies and members consumers cannot see.
 

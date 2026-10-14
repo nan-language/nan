@@ -82,7 +82,7 @@ Exactly one space separates two tokens on a line, except that no space stands:
 
 - after `(` and `[`, and before `)`, `]`, `,` and `:`;
 - on either side of `.`, `::`, `..<` and `..=`, and of the `-` inside a [target](27-program-model.md#targets) name such as `x86_64-host`;
-- after a unary `-` or `~`;
+- after a unary `~`, and after a unary `-` that no `-` follows;
 - before a `(` or `[` that follows an identifier, `self`, `fn`, `dbg`, `)` or `]`, except the `(` opening the parameters of a test, which follows its target after one space.
 
 ### Blank lines

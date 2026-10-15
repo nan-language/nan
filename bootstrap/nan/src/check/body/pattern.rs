@@ -5,12 +5,15 @@ use super::Body;
 use crate::check::Member;
 use crate::check::db::ItemId;
 use crate::check::resolve::Named;
-use crate::check::sig::{Payload, SigKind, VariantSig, int_literal};
-use crate::check::tir::{LocalKind, TArm, TPattern, TPatternKind, ValueSpace};
+use crate::check::sig::{Payload, SigKind, VariantSig};
+use crate::check::tir::{
+    Compared, Lit, LocalId, LocalKind, TArm, TKind, TPattern, TPatternKind, ValueSpace, ValueTest,
+};
 use crate::check::ty::{Scalar, Subst, Ty};
+use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
+use crate::interp::{ConstValue, Val};
 use crate::syntax::ast::{self, ItemKind, LiteralKind, PatternKind, RangeKind, Tok, TypeModifier};
-use crate::syntax::literal::text_value;
 
 /// A pattern as exhaustiveness reads it.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,8 +25,6 @@ enum Pat {
     /// A constructor: a variant's index, or 0 for a struct, layout or `Unit`, with its fields in
     /// declaration order.
     Ctor(usize, Vec<Pat>),
-    /// A value no other pattern is known to equal.
-    Opaque,
 }
 
 /// The constructors of a type, as exhaustiveness counts them.
@@ -56,6 +57,7 @@ impl Body<'_, '_> {
     ) -> Vec<TPattern> {
         let mut typed = Vec::new();
         let mut first: Option<Vec<(String, Ty)>> = None;
+        let mut first_locals: Vec<LocalId> = Vec::new();
         let mut mismatched = false;
         for pattern in patterns {
             let start = self.locals.len();
@@ -64,16 +66,35 @@ impl Body<'_, '_> {
                 None => Vec::new(),
             };
             typed.push(self.top_pattern(pattern, ty, LocalKind::Pattern));
+            let declared: Vec<LocalId> = (start..self.locals.len())
+                .map(|index| LocalId(index as u32))
+                .collect();
             let mut bound: Vec<(String, Ty)> = self.locals[start..]
                 .iter()
                 .map(|local| (local.name.clone(), local.ty.clone()))
                 .collect();
             bound.sort_by(|left, right| left.0.cmp(&right.0));
             match &first {
-                None => first = Some(bound),
+                None => {
+                    first = Some(bound);
+                    first_locals = declared;
+                }
                 Some(expected) => {
                     mismatched |= *expected != bound;
                     *self.scopes.last_mut().expect("the arm's scope") = hidden;
+                    for later in declared {
+                        let name = &self.local(later).name;
+                        if let Some(earlier) = first_locals
+                            .iter()
+                            .find(|earlier| self.local(**earlier).name == *name)
+                        {
+                            self.usage
+                                .alternatives
+                                .entry(*earlier)
+                                .or_default()
+                                .push(later);
+                        }
+                    }
                 }
             }
         }
@@ -94,9 +115,9 @@ impl Body<'_, '_> {
         match &pattern.kind {
             PatternKind::Wildcard => typed(TPatternKind::Wildcard),
             PatternKind::Literal { literal, range } => {
-                let low = self.literal_value(token, literal, ty);
+                let low = self.pattern_literal(token, literal, ty);
                 match range {
-                    None => typed(low.map_or(TPatternKind::Failed, TPatternKind::Value)),
+                    None => typed(low.map_or(TPatternKind::Failed, equal)),
                     Some((range_kind, bound)) => {
                         self.range_pattern(token, ty, low, *range_kind, bound)
                     }
@@ -134,15 +155,14 @@ impl Body<'_, '_> {
         }
     }
 
-    /// The value a literal pattern matches, the literal typed by the scrutinee's type.
-    fn literal_value(
+    /// The value a literal pattern matches and the literal, typed by the scrutinee's type.
+    fn pattern_literal(
         &mut self,
         token: Tok,
         literal: &ast::PatternLiteral,
         ty: &Ty,
-    ) -> Option<ValueSpace> {
+    ) -> Option<(ValueSpace, Compared)> {
         let written = literal.literal();
-        let text = self.text(written.tokens[0]).to_owned();
         if written.kind == LiteralKind::Float {
             self.report(token, Code::ExprFloatPattern);
             return None;
@@ -156,29 +176,18 @@ impl Body<'_, '_> {
             self.report_mismatch(token, ty, &typed.ty);
             return None;
         }
-        Some(match written.kind {
-            LiteralKind::Int => {
-                let value = int_literal(&text)?;
-                let value = if negative { -value } else { value };
-                ValueSpace::Ints(value, value)
-            }
-            LiteralKind::Char => {
-                let value = text_value(&format!("\"{}\"", &text[1..text.len() - 1]));
-                let c = value.chars().next()? as i128;
-                ValueSpace::Ints(c, c)
-            }
-            LiteralKind::Byte => {
-                let value = byte_value(&text[1..]);
-                ValueSpace::Ints(value, value)
-            }
-            LiteralKind::True => ValueSpace::Bool(true),
-            LiteralKind::False => ValueSpace::Bool(false),
-            LiteralKind::Text | LiteralKind::TextRun => {
-                ValueSpace::Bytes(text_value(&text).into_bytes())
-            }
-            LiteralKind::Bytes => ValueSpace::Bytes(bytes_value(&text[1..])),
-            LiteralKind::Float => return None,
-        })
+        let TKind::Literal(value) = typed.kind else {
+            return None;
+        };
+        let space = match &value {
+            Lit::Int(value) => ValueSpace::Ints(*value, *value),
+            Lit::Char(c) => ValueSpace::Ints(i128::from(u32::from(*c)), i128::from(u32::from(*c))),
+            Lit::Bool(value) => ValueSpace::Bool(*value),
+            Lit::Text(text) => ValueSpace::Bytes(text.clone().into_bytes()),
+            Lit::Bytes(bytes) => ValueSpace::Bytes(bytes.clone()),
+            Lit::Float(_) => return None,
+        };
+        Some((space, Compared::Literal(value)))
     }
 
     /// A range pattern: both bounds of the scrutinee's integer or char type, matching some value.
@@ -186,12 +195,12 @@ impl Body<'_, '_> {
         &mut self,
         token: Tok,
         ty: &Ty,
-        low: Option<ValueSpace>,
+        low: Option<(ValueSpace, Compared)>,
         kind: RangeKind,
         bound: &ast::RangeBound,
     ) -> TPattern {
         let high = match bound {
-            ast::RangeBound::Literal(literal) => self.literal_value(token, literal, ty),
+            ast::RangeBound::Literal(literal) => self.pattern_literal(token, literal, ty),
             ast::RangeBound::Path(path) => self.constant_value(token, path, ty),
         };
         let failed = TPattern {
@@ -208,16 +217,13 @@ impl Body<'_, '_> {
             self.report(token, Code::PatternRangeKind);
             return failed;
         }
-        let (Some(low), Some(high)) = (low, high) else {
+        let (Some((low_space, low)), Some((high_space, high))) = (low, high) else {
             return failed;
         };
-        let space = match (low, high) {
+        let exclusive = kind == RangeKind::Exclusive;
+        let space = match (low_space, high_space) {
             (ValueSpace::Ints(low, _), ValueSpace::Ints(high, _)) => {
-                let high = if kind == RangeKind::Exclusive {
-                    high - 1
-                } else {
-                    high
-                };
+                let high = if exclusive { high - 1 } else { high };
                 if low > high {
                     self.report(token, Code::PatternEmptyRange);
                     return failed;
@@ -229,12 +235,18 @@ impl Body<'_, '_> {
         TPattern {
             token,
             ty: ty.clone(),
-            kind: TPatternKind::Value(space),
+            kind: TPatternKind::Value(space, ValueTest::Range(low, high, exclusive)),
         }
     }
 
-    /// The value of a constant written as a pattern or range bound: a path naming a const item.
-    fn constant_value(&mut self, token: Tok, path: &ast::Path, ty: &Ty) -> Option<ValueSpace> {
+    /// The value of a constant written as a pattern or range bound, a path naming a const item,
+    /// and the const.
+    fn constant_value(
+        &mut self,
+        token: Tok,
+        path: &ast::Path,
+        ty: &Ty,
+    ) -> Option<(ValueSpace, Compared)> {
         if let [name] = &path.segments[..]
             && self.lookup_local(&name.text).is_some()
         {
@@ -252,10 +264,10 @@ impl Body<'_, '_> {
             self.report(token, Code::PatternPathKind);
             return None;
         };
-        let ItemKind::Const(constant) = &self.ck.db.ast(item).kind else {
+        if !matches!(self.ck.db.ast(item).kind, ItemKind::Const(_)) {
             self.report(token, Code::PatternPathKind);
             return None;
-        };
+        }
         if !self.ck.db.visible(self.module, item) {
             self.report(token, Code::NamePrivate);
         }
@@ -280,11 +292,11 @@ impl Body<'_, '_> {
             self.report_mismatch(token, ty, const_ty);
             return None;
         }
-        Some(
-            self.ck
-                .const_space(item, &constant.value)
-                .unwrap_or(ValueSpace::Unknown),
-        )
+        let space = self
+            .ck
+            .const_value(item)
+            .map_or(ValueSpace::Unknown, |value| value_space(&value));
+        Some((space, Compared::Const(item)))
     }
 
     /// A variant, struct, layout, constant or `Unit` pattern.
@@ -318,7 +330,7 @@ impl Body<'_, '_> {
             return TPattern {
                 token,
                 ty: ty.clone(),
-                kind: TPatternKind::Value(ValueSpace::Unit),
+                kind: TPatternKind::Fields(None, Vec::new()),
             };
         }
         let named = match self.ck.db.resolve(self.module, path) {
@@ -336,7 +348,7 @@ impl Body<'_, '_> {
                     return TPattern {
                         token,
                         ty: ty.clone(),
-                        kind: value.map_or(TPatternKind::Failed, TPatternKind::Value),
+                        kind: value.map_or(TPatternKind::Failed, equal),
                     };
                 }
                 ItemKind::Struct(_) | ItemKind::Layout(_) if fields.is_some() => (item, None),
@@ -497,6 +509,17 @@ impl Body<'_, '_> {
                 }
                 if variant.is_none() {
                     self.name_member(label.token, Member::Field(item, name.clone()));
+                    let wildcard = matches!(field.pattern.kind, PatternKind::Wildcard);
+                    if !wildcard {
+                        self.ck.record_read(item, name);
+                    }
+                    let label = FieldLabel {
+                        item: self.item,
+                        first: field.token,
+                        last: field.pattern.token,
+                        simple: wildcard,
+                    };
+                    self.ck.record_label(item, name, label);
                 }
                 seen.push(name.clone());
                 let typed = self.pattern(&field.pattern, field_ty, kind);
@@ -542,13 +565,15 @@ impl Body<'_, '_> {
         }
     }
 
-    /// Whether a pattern is refutable: some value of its type does not match it.
-    pub fn refutable(&self, pattern: &TPattern) -> bool {
-        self.useful(
-            &[vec![self.pat(pattern)]],
+    /// Whether a pattern is refutable: some value of its type does not match it; unknown when
+    /// it names a const without a value.
+    pub fn refutable(&self, pattern: &TPattern) -> Option<bool> {
+        let pat = self.pat(pattern)?;
+        Some(self.useful(
+            &[vec![pat]],
             &[Pat::Wild],
             std::slice::from_ref(&pattern.ty),
-        )
+        ))
     }
 
     /// The disjointness and exhaustiveness of a match's arms, and the reachability of `match
@@ -578,11 +603,14 @@ impl Body<'_, '_> {
             {
                 return;
             }
-            let pats: Vec<Pat> = arm
+            let Some(pats) = arm
                 .patterns
                 .iter()
                 .map(|pattern| self.pat(pattern))
-                .collect();
+                .collect::<Option<Vec<Pat>>>()
+            else {
+                return;
+            };
             if first {
                 let reachable = pats
                     .iter()
@@ -750,21 +778,24 @@ impl Body<'_, '_> {
         useful
     }
 
-    fn pat(&self, pattern: &TPattern) -> Pat {
-        match &pattern.kind {
+    /// A pattern as exhaustiveness reads it; none when it names a const without a value.
+    fn pat(&self, pattern: &TPattern) -> Option<Pat> {
+        Some(match &pattern.kind {
             TPatternKind::Wildcard | TPatternKind::Binding(_) | TPatternKind::Failed => Pat::Wild,
-            TPatternKind::Value(space) => match space {
+            TPatternKind::Value(space, _) => match space {
                 ValueSpace::Ints(low, high) => Pat::Ints(*low, *high),
                 ValueSpace::Bool(value) => Pat::Bool(*value),
-                ValueSpace::Unit => Pat::Ctor(0, Vec::new()),
                 ValueSpace::Bytes(bytes) => Pat::Bytes(bytes.clone()),
-                ValueSpace::Unknown => Pat::Opaque,
+                ValueSpace::Unknown => return None,
             },
             TPatternKind::Fields(variant, fields) => Pat::Ctor(
                 variant.unwrap_or(0),
-                fields.iter().map(|(_, field)| self.pat(field)).collect(),
+                fields
+                    .iter()
+                    .map(|(_, field)| self.pat(field))
+                    .collect::<Option<_>>()?,
             ),
-        }
+        })
     }
 
     /// The constructors of a type.
@@ -856,10 +887,6 @@ impl Body<'_, '_> {
                     Pat::Bytes(other) => other == bytes,
                     _ => false,
                 });
-                self.useful(&rows, rest, rest_types)
-            }
-            Pat::Opaque => {
-                let rows = self.rows_with(matrix, |pat| matches!(pat, Pat::Wild));
                 self.useful(&rows, rest, rest_types)
             }
             Pat::Wild => match self.shape(ty) {
@@ -983,46 +1010,29 @@ impl Body<'_, '_> {
     }
 }
 
-impl crate::check::Checker<'_> {
-    /// The value of a const whose initializer is a literal, as patterns match it.
-    pub fn const_space(&self, item: ItemId, value: &ast::Expr) -> Option<ValueSpace> {
-        let data = self.db.item(item);
-        let literal_space = |literal: &ast::Literal, negative: bool| -> Option<ValueSpace> {
-            let text = data.text(literal.tokens[0]);
-            Some(match literal.kind {
-                LiteralKind::Int => {
-                    let value = int_literal(text)?;
-                    let value = if negative { -value } else { value };
-                    ValueSpace::Ints(value, value)
-                }
-                LiteralKind::True => ValueSpace::Bool(true),
-                LiteralKind::False => ValueSpace::Bool(false),
-                LiteralKind::Char => {
-                    let value = text_value(&format!("\"{}\"", &text[1..text.len() - 1]));
-                    let c = value.chars().next()? as i128;
-                    ValueSpace::Ints(c, c)
-                }
-                LiteralKind::Byte => {
-                    let value = byte_value(&text[1..]);
-                    ValueSpace::Ints(value, value)
-                }
-                LiteralKind::Text => ValueSpace::Bytes(text_value(text).into_bytes()),
-                LiteralKind::Bytes => ValueSpace::Bytes(bytes_value(&text[1..])),
-                _ => return None,
-            })
-        };
-        match &value.kind {
-            ast::ExprKind::Literal(literal) => literal_space(literal, false),
-            ast::ExprKind::Unary {
-                op: ast::UnaryOp::Neg,
-                operand,
-            } => match &operand.kind {
-                ast::ExprKind::Literal(literal) => literal_space(literal, true),
-                _ => None,
-            },
-            _ => None,
+/// The values a constant pattern matches: those equal to its const's value.
+fn value_space(value: &ConstValue) -> ValueSpace {
+    match &value.value {
+        Val::Int(value) => ValueSpace::Ints(*value, *value),
+        Val::Char(c) => {
+            let c = i128::from(u32::from(*c));
+            ValueSpace::Ints(c, c)
         }
+        Val::Bool(value) => ValueSpace::Bool(*value),
+        Val::View(view) => ValueSpace::Bytes(
+            value
+                .elements(view)
+                .iter()
+                .map(|byte| byte.int() as u8)
+                .collect(),
+        ),
+        _ => ValueSpace::Unknown,
     }
+}
+
+/// The pattern matching a value equal to a literal or const.
+fn equal((space, compared): (ValueSpace, Compared)) -> TPatternKind {
+    TPatternKind::Value(space, ValueTest::Eq(compared))
 }
 
 fn is_screaming(name: &str) -> bool {
@@ -1031,16 +1041,4 @@ fn is_screaming(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
-/// The value of a byte literal's quoted contents.
-fn byte_value(quoted: &str) -> i128 {
-    let value = text_value(&format!("\"{}\"", &quoted[1..quoted.len() - 1]));
-    value.chars().next().map_or(0, |c| c as i128)
-}
-
-/// The bytes of a byte-string literal's quoted contents.
-fn bytes_value(quoted: &str) -> Vec<u8> {
-    let value = text_value(&format!("\"{}\"", &quoted[1..quoted.len() - 1]));
-    value.chars().map(|c| c as u32 as u8).collect()
 }

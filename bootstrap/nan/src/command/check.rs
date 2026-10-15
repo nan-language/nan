@@ -241,7 +241,7 @@ const PENDING: [Code; 4] = [
 ];
 
 /// The codes not reported when their construct holds a token closing appends.
-const OPEN_CONSTRUCTS: [Code; 17] = [
+const OPEN_CONSTRUCTS: [Code; 18] = [
     Code::ClosureCaptureMode,
     Code::ClosureCaptureUnused,
     Code::ExprArgumentCount,
@@ -259,6 +259,7 @@ const OPEN_CONSTRUCTS: [Code; 17] = [
     Code::ThresholdUnusedWaiver,
     Code::TypeMissingField,
     Code::TypePayloadShape,
+    Code::UnusedLocal,
 ];
 
 /// `nan check --prefix`: the error at the prefix's first dead token, the diagnostics of the
@@ -314,12 +315,15 @@ fn prefixed(
             .line
             .is_some_and(|line| appended_lines.contains(&line))
             || OPEN_CONSTRUCTS.contains(&diagnostic.code)
-                && diagnostic.span.is_some_and(|(start, end)| {
-                    closed
-                        .pieces
-                        .iter()
-                        .any(|piece| piece.span.0 < end && piece.span.1 > start)
-                });
+                && diagnostic
+                    .judged
+                    .or(diagnostic.span)
+                    .is_some_and(|(start, end)| {
+                        closed
+                            .pieces
+                            .iter()
+                            .any(|piece| piece.span.0 < end && piece.span.1 > start)
+                    });
         if held {
             continue;
         }

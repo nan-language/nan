@@ -82,6 +82,59 @@ impl Checker<'_> {
         }
     }
 
+    /// The bits of an integer layout: each field's place in the representation, or each tag's
+    /// value; none for a bytes layout.
+    pub fn layout_shape(&self, item: ItemId) -> Option<LayoutShape> {
+        let ItemKind::Layout(layout) = &self.db.ast(item).kind else {
+            return None;
+        };
+        if matches!(layout.repr, LayoutRepr::Bytes { .. }) {
+            return None;
+        }
+        let data = self.db.item(item);
+        let value = |token: Tok| int_literal(data.text(token)).unwrap_or(0) as u32;
+        if let Some(tags) = &layout.tags {
+            return Some(LayoutShape::Tags(
+                tags.iter().map(|tag| u64::from(value(tag.value))).collect(),
+            ));
+        }
+        let types: Vec<Ty> = match &self.sig(item).kind {
+            SigKind::Layout { fields, .. } => fields.iter().map(|field| field.ty.clone()).collect(),
+            _ => Vec::new(),
+        };
+        let fields = layout
+            .fields
+            .iter()
+            .zip(&types)
+            .map(|(field, ty)| match &field.kind {
+                LayoutFieldKind::Bit { low, high: None } => LayoutBits {
+                    low: value(*low),
+                    width: 1,
+                    kind: BitsKind::Bool,
+                },
+                LayoutFieldKind::Bit {
+                    low,
+                    high: Some(high),
+                } => LayoutBits {
+                    low: value(*low),
+                    width: value(*high) - value(*low) + 1,
+                    kind: BitsKind::Ranged,
+                },
+                LayoutFieldKind::Typed { at, .. } => LayoutBits {
+                    low: value(*at),
+                    width: self.field_width(ty, false).unwrap_or(0) as u32,
+                    kind: BitsKind::Typed,
+                },
+                LayoutFieldKind::Rest => LayoutBits {
+                    low: 0,
+                    width: 0,
+                    kind: BitsKind::Rest,
+                },
+            })
+            .collect();
+        Some(LayoutShape::Fields(fields))
+    }
+
     /// The rules of a layout item: its representation, literals, byte order, tags and fields.
     pub fn check_layout(&self, item: ItemId) {
         let ItemKind::Layout(layout) = &self.db.ast(item).kind else {
@@ -594,4 +647,31 @@ fn suffixed(text: &str) -> bool {
 /// Whether a layout field is a ranged `bit i..=j`.
 fn field_ranged(kind: &LayoutFieldKind) -> bool {
     matches!(kind, LayoutFieldKind::Bit { high: Some(_), .. })
+}
+
+/// The bits of an integer layout.
+pub enum LayoutShape {
+    /// Its fields in declaration order.
+    Fields(Vec<LayoutBits>),
+    /// Its tags' values, in declaration order.
+    Tags(Vec<u64>),
+}
+
+/// Where a field of an integer layout lies: its lowest bit and its width, both 0 for `rest`.
+pub struct LayoutBits {
+    pub low: u32,
+    pub width: u32,
+    pub kind: BitsKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BitsKind {
+    /// `bit i`, a `bool`.
+    Bool,
+    /// `bit i..=j`.
+    Ranged,
+    /// `T at i`, an unsigned integer or integer layout.
+    Typed,
+    /// `rest`, the bits no other field covers.
+    Rest,
 }

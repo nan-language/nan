@@ -6,8 +6,6 @@ use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId};
 use crate::diagnostic::{Code, Fix, Offer};
 use crate::syntax::ast::Tok;
-use crate::syntax::grammar::Punct;
-use crate::syntax::token::TokenKind;
 use crate::workspace::Authority;
 
 /// The authorities a manifest grant names that a dependency's grant must be relayed for.
@@ -146,19 +144,7 @@ impl Checker<'_> {
             }
         }
         for dep in &manifest.deps {
-            let Some(Some(target)) = data.deps.get(&dep.alias) else {
-                continue;
-            };
-            let relayed = |authority: &Authority| {
-                manifest
-                    .allows
-                    .iter()
-                    .any(|allow| allow.authority == *authority && allow.names.contains(&dep.alias))
-            };
-            let missing: Vec<&Authority> = RELAYED
-                .iter()
-                .filter(|authority| self.grants_any(*target, authority) && !relayed(authority))
-                .collect();
+            let missing = self.ungranted(package, &dep.alias);
             if !missing.is_empty() {
                 let fix = missing
                     .iter()
@@ -173,6 +159,29 @@ impl Checker<'_> {
                 self.check_denied(module, to);
             }
         }
+    }
+
+    /// The authorities granted to the package a `dep` alias of a package names that the
+    /// package's manifest does not grant the alias.
+    pub fn ungranted(&self, package: PackageId, alias: &str) -> Vec<&'static Authority> {
+        let Some(Some(target)) = self.db.package(package).deps.get(alias) else {
+            return Vec::new();
+        };
+        let relayed = |authority: &Authority| {
+            self.db
+                .package(package)
+                .source
+                .manifest
+                .iter()
+                .flat_map(|manifest| &manifest.allows)
+                .any(|allow| {
+                    allow.authority == *authority && allow.names.iter().any(|name| name == alias)
+                })
+        };
+        RELAYED
+            .iter()
+            .filter(|authority| self.grants_any(*target, authority) && !relayed(authority))
+            .collect()
     }
 
     /// Whether a package's manifest grants an authority to any name.
@@ -194,15 +203,9 @@ impl Checker<'_> {
             let syntax = &data.file.syntax;
             let span = &syntax.items[data.index];
             let mut reported = None;
-            for index in span.first..span.end {
-                let starts_path = syntax.tokens[index].kind == TokenKind::Ident
-                    && syntax.text(index) == denied
-                    && syntax.tokens.get(index + 1).map(|token| token.kind)
-                        == Some(TokenKind::Punct(Punct::ColonColon))
-                    && (index == 0
-                        || syntax.tokens[index - 1].kind != TokenKind::Punct(Punct::ColonColon));
+            for index in syntax.path_starts(span.first..span.end) {
                 let line = syntax.tokens[index].line;
-                if starts_path && reported != Some(line) {
+                if syntax.text(index) == denied && reported != Some(line) {
                     self.report_line(item, line, Code::AuthorityDeniedDependency);
                     reported = Some(line);
                 }

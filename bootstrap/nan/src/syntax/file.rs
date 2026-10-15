@@ -83,6 +83,16 @@ impl SourceFile {
         (0..before).rev().find(|&at| !self.comment[at])
     }
 
+    /// The identifiers among the tokens `range` that start a path of two or more segments.
+    pub fn path_starts(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = usize> + '_ {
+        let separator = TokenKind::Punct(Punct::ColonColon);
+        range.filter(move |&index| {
+            self.tokens[index].kind == TokenKind::Ident
+                && self.tokens.get(index + 1).map(|token| token.kind) == Some(separator)
+                && (index == 0 || self.tokens[index - 1].kind != separator)
+        })
+    }
+
     /// The token after the longest text that `rule` derives from `start`.
     pub fn longest(&self, rule: Rule, start: usize) -> Option<usize> {
         let mut state = State::new(rule);

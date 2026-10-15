@@ -149,11 +149,12 @@ fn folds_to_core(name: &str, scalars_only: bool) -> bool {
 impl Checker<'_> {
     pub fn check_package(&self, package: PackageId) {
         self.check_manifest(package);
+        self.check_program(package);
         self.check_contributors(package);
         for &module in &self.db.package(package).modules {
             self.check_module_names(module);
             for &item in &self.db.module(module).items {
-                self.check_item(item);
+                self.judge_alone(item);
             }
         }
         self.check_package_whole(package);
@@ -207,6 +208,8 @@ impl Checker<'_> {
     pub(super) fn check_item(&self, item: ItemId) {
         let sig = self.sig(item);
         self.report_problems(item, &sig.problems);
+        self.check_docs(item);
+        self.check_test_only(item);
         self.check_interface_names(item);
         self.check_value_types(item);
         let ast = &self.db.ast(item).clone();
@@ -277,6 +280,13 @@ impl Checker<'_> {
                 self.check_type_item(item);
                 self.check_derived_collisions(item);
                 self.check_decoder_derive(item);
+                let generated = structure
+                    .derives
+                    .iter()
+                    .any(|entry| entry.text == "Generate");
+                if generated && self.derive_problem(item, "Generate").is_none() {
+                    self.check_generated(item);
+                }
                 self.check_type_name(item, &structure.name);
                 self.check_generic_names(item, &structure.generics);
                 for field in structure.fields() {
@@ -363,12 +373,23 @@ impl Checker<'_> {
                 self.check_contribution(item, contribution);
                 self.check_case(item, &contribution.name, Case::Snake);
             }
-            ItemKind::Test(test) => self.check_case(item, &test.name, Case::Snake),
+            ItemKind::Test(test) => {
+                if test.disputed {
+                    self.report(item, ast.token, Code::TodoDisputed);
+                }
+                self.check_case(item, &test.name, Case::Snake);
+                self.check_test_reach(item, test);
+            }
+            ItemKind::Retired(_) => self.check_tombstone(item),
             ItemKind::Impl(_) if self.check_impl(item) => {
                 self.check_capability_impl(item);
                 self.check_decoder_impl(item);
+                self.check_component_impl(item);
             }
             _ => {}
+        }
+        if let Some(generics) = generic_params(ast) {
+            self.where_conditions(item, generics);
         }
         if let Some(body) = self.check_bodies(item) {
             let body = std::rc::Rc::new(body);
@@ -378,10 +399,42 @@ impl Checker<'_> {
             if matches!(ast.kind, ItemKind::Fn(_) | ItemKind::Const(_)) {
                 self.check_float_use(item, &body);
             }
+            self.bodies.borrow_mut().insert(item, body.clone());
             if ast.kind.is_fn_with_body() {
-                self.bodies.borrow_mut().insert(item, body.clone());
                 self.check_limits(item, &body);
             }
+            if let ItemKind::Fn(function) = &ast.kind {
+                self.check_decreases(item, function);
+            }
+            if let ItemKind::Test(test) = &ast.kind {
+                self.check_property_test(item, test, &body);
+            }
+        }
+        if self.is_entry(item) {
+            self.check_entry_head(item);
+        }
+    }
+
+    /// The decreases clauses of a function: one is needed when it belongs to a cycle, and every
+    /// other is unneeded, its fix deleting it.
+    fn check_decreases(&self, item: ItemId, function: &ast::FnItem) {
+        let clauses = function
+            .clauses
+            .iter()
+            .filter_map(|clause| match &clause.kind {
+                ast::ClauseKind::Decreases(measure) => Some((clause.token, measure.last)),
+                _ => None,
+            });
+        let needed = usize::from(self.in_cycle(item));
+        for (first, last) in clauses.skip(needed) {
+            let fix = self.fix_deleting_lines(item, first, last);
+            self.report_fixed(
+                item,
+                (first, last),
+                Code::ContractDecreasesUnneeded,
+                vec![fix],
+                Offer::Each,
+            );
         }
     }
 
@@ -743,4 +796,15 @@ fn label_name(label: &ast::TypeExpr) -> Option<ast::Name> {
         }
         _ => None,
     }
+}
+
+/// The generic parameters an item declares.
+pub(super) fn generic_params(item: &ast::Item) -> Option<&[ast::GenericParam]> {
+    Some(match &item.kind {
+        ItemKind::Fn(function) => &function.head.generics,
+        ItemKind::Struct(structure) => &structure.generics,
+        ItemKind::Enum(enumeration) => &enumeration.generics,
+        ItemKind::Interface(interface) => &interface.generics,
+        _ => return None,
+    })
 }

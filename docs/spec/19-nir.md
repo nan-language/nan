@@ -160,7 +160,7 @@ A **span** is the source range a part of a unit comes from: its file path prefix
 
 - A `let` binding of a Copy type, a part or a wrapped part ([projection results](07-ownership.md#projection-results)), a read or `mut` parameter, and a name a pattern binds by `load` or reference are values.
 - Every other binding, and each `take` parameter, is a slot, created before its initialiser's code and stored by `init`; entry stores each `take` parameter into its slot.
-- A non-Copy temporary used without being consumed lives in a slot released at its statement's end, temporaries in reverse order of creation.
+- A non-Copy temporary used without being consumed lives in a slot of the scope its statement runs in, released at its statement's end, temporaries in reverse order of creation; one created in a branch is released at the branch's end, and those of a `while` condition, a guard or the right operand of `and` or `or` once its value is computed.
 - A place used as a value becomes `load` when Copy and `move` otherwise. An assignment is `init` where its place holds no value and `assign` where it holds one, under a `branch` on the guard deciding which.
 
 ### Scope exits
@@ -209,9 +209,9 @@ At each point where [predicate obligations](04-types.md#obligations) place one, 
 | `todo "intent"` | the `todo` terminator |
 | `await when`, quantifiers | `when`, `all`, `any` |
 
-- A Copy scrutinee that is not a place, and a part or wrapped part, is the root of its parts. Arms are tested in source order, an `else` arm last, the final arm without a test. A pattern is tested depth-first, left to right: a variant by `is` then its payload patterns, a literal or constant by `eq`, a range by `ge` then `le`, or `lt` for `..<`, `or` alternatives in order; bindings and `_` test nothing.
+- A Copy scrutinee that is not a place, and a part or wrapped part, is the root of its parts. Arms are tested in source order, an `else` arm last, the final arm without a test. A pattern is tested depth-first, left to right: a variant by `is` then its payload patterns, a literal or constant by `eq`, a range by `ge` then `le`, or `lt` for `..<`, `or` alternatives in order; bindings and `_` test nothing. A const in a pattern is compared through its `constant`.
 - After its tests, a pattern binds its names in written order: a Copy part by `load`, a non-Copy part of an owned scrutinee by `move` into a slot, any other part by `ref`, or `ref mut` in the `mut` form of `for`; the `take` form of `for` binds into slots. An arm with several alternatives creates its slots before the match's first test, and each alternative passes its other bindings to the arm's block as parameters, in the first alternative's order.
-- A `match first` guard follows its pattern's tests, with each name the pattern moves bound by `ref`; the moves follow a `true` guard.
+- A `match first` guard follows its pattern's tests, with each name the pattern moves bound by `ref`; the moves follow a `true` guard. When an arm's alternatives bind names, each alternative tests the guard before passing its bindings.
 - `let P = e else { B }` elaborates as a match with one arm and B.
 - A use of a `preserves` tombstone elaborates as its rewrite ([tombstones](29-identity-versioning.md#tombstones)).
 

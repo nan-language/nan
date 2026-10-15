@@ -9,8 +9,10 @@ use super::Checker;
 use super::db::{ItemId, TypeKey};
 use super::props::Property;
 use super::sig::{FnSig, GenericDef, SigKind, param_arg};
-use super::ty::{Arg, Args, Bound, Param, Scalar, Subst, Ty, no_args};
+use super::ty::{Arg, Args, Bound, Const, Param, Scalar, Subst, Ty, no_args};
 use crate::diagnostic::Code;
+use crate::interp::{End, Interpreter, Val};
+use crate::nir::Role;
 use crate::syntax::ast::{ItemKind, Tok};
 
 /// How a type implements an interface, with the interface's arguments for it.
@@ -742,6 +744,9 @@ impl Checker<'_> {
                 return;
             }
         }
+        if generics.iter().any(|def| def.constant.is_some()) {
+            self.instantiated(item, token, *target, args.clone());
+        }
     }
 }
 
@@ -775,5 +780,75 @@ impl super::db::Db<'_> {
                 | "HashMapIntoCursor"
                 | "SetIntoCursor"
         )
+    }
+}
+
+impl Checker<'_> {
+    /// Records an instantiation of an item with const parameters that an item's code writes,
+    /// whose `where` conditions are judged once the items are elaborated.
+    pub fn instantiated(&self, holder: ItemId, token: Tok, target: ItemId, args: Args) {
+        if self.muted.get() == 0 && !self.db.is_std(holder) {
+            self.instantiations
+                .borrow_mut()
+                .push((holder, token, target, args));
+        }
+    }
+
+    /// Reports each instantiation whose arguments break a `where` condition of a const
+    /// parameter: by const evaluation when every argument is a value, and otherwise unless the
+    /// prover proves it from the `where` conditions in scope (`generic.where-unmet`).
+    pub fn check_wheres(&self) {
+        let mut judged: Vec<(ItemId, Tok)> = Vec::new();
+        let instantiations = self.instantiations.borrow().clone();
+        for (holder, token, target, args) in instantiations {
+            if judged.contains(&(holder, token)) || self.rejected(holder) {
+                continue;
+            }
+            judged.push((holder, token));
+            let Some(unit) = self.unit(target) else {
+                continue;
+            };
+            let conditions: Vec<u32> = unit
+                .functions
+                .iter()
+                .filter(|function| function.role == Role::Where)
+                .map(|function| function.index)
+                .collect();
+            if conditions.is_empty() {
+                continue;
+            }
+            let generics = self.sig(target).generics.clone();
+            let consts: Vec<(Scalar, &Arg)> = generics
+                .iter()
+                .zip(args.iter())
+                .filter_map(|(def, arg)| def.constant.map(|scalar| (scalar, arg)))
+                .collect();
+            let values: Option<Vec<Val>> = consts
+                .iter()
+                .map(|(_, arg)| match arg {
+                    Arg::Const(Const::Int(value)) => Some(Val::Int(*value)),
+                    Arg::Const(Const::Bool(value)) => Some(Val::Bool(*value)),
+                    _ => None,
+                })
+                .collect();
+            let met = match values {
+                Some(values) => conditions.iter().all(|index| {
+                    matches!(
+                        Interpreter::new(self).run(
+                            target,
+                            Role::Where,
+                            *index,
+                            values.clone(),
+                            &args
+                        ),
+                        End::Value(Val::Bool(true))
+                    )
+                }),
+                None => self.wheres_entailed(holder, target, &unit, &conditions, &args, &consts),
+            };
+            if !met {
+                self.report(holder, token, Code::GenericWhereUnmet);
+            }
+        }
     }
 }

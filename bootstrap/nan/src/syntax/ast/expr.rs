@@ -232,6 +232,7 @@ impl Lower<'_> {
             token: tokens[0],
             last: self.last(node),
             kind: ExprKind::Quantifier {
+                all: self.text(tokens[0]) == "all",
                 name: self.name(tokens[1]),
                 range: Box::new(self.expr(exprs[0])),
                 body: Box::new(self.expr(exprs[1])),

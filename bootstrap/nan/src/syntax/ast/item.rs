@@ -491,12 +491,26 @@ impl<'a> Lower<'a> {
                 length: self.has_word(node, "length"),
                 reason: self.text_of(self.tokens_of(node, TokenKind::Text)[0]),
             },
-            _ => match self.nodes(node).first().copied() {
-                Some(marked) => self.clause(marked).kind,
-                None => ClauseKind::Missing,
-            },
+            _ => {
+                return match self.nodes(node).first().copied() {
+                    Some(marked) => Clause {
+                        token,
+                        disputed: true,
+                        ..self.clause(marked)
+                    },
+                    None => Clause {
+                        token,
+                        disputed: false,
+                        kind: ClauseKind::Missing,
+                    },
+                };
+            }
         };
-        Clause { token, kind }
+        Clause {
+            token,
+            disputed: false,
+            kind,
+        }
     }
 
     fn derives(&self, node: NodeId) -> (Vec<Name>, Option<Tok>) {
@@ -821,8 +835,12 @@ impl<'a> Lower<'a> {
             .copied()
             .find(|token| self.kind(*token) == TokenKind::Punct(Punct::LBrace))
             .expect("a test body opens");
+        let target = self.find(node, Rule::TestTarget).expect("a test target");
         TestItem {
+            disputed: self.text(tokens[0]) == "todo",
             name: self.name(self.idents(node)[0]),
+            target: self.path(self.find(target, Rule::Path).expect("a target path")),
+            member: self.idents(target).first().map(|token| self.name(*token)),
             params: self
                 .find(node, Rule::TestParams)
                 .map(|params| self.params(self.find(params, Rule::ParamList))),

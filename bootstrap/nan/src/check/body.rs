@@ -6,13 +6,19 @@ mod expr;
 mod pattern;
 mod retired;
 
+use std::rc::Rc;
+
 use super::Checker;
 use super::db::{ItemId, ModuleId};
 use super::decl::fold;
 use super::resolve::PathError;
 use super::sig::{FnSig, GenericDef, Problems, SigKind};
-use super::tir::{Local, LocalId, LocalKind, TBlock, TBody, TExpr, TKind, TStmt, TStmtKind};
+use super::tir::{
+    ClauseRole, Local, LocalId, LocalKind, TBlock, TBody, TClause, TExample, TExpr, TKind,
+    TPatternKind, TStmt, TStmtKind,
+};
 use super::ty::{Param, Scalar, Ty};
+use super::unused::{Binding, Usage};
 use crate::diagnostic::{Code, Fix, Offer};
 use crate::syntax::ast::{self, ItemKind, Mode, Tok};
 
@@ -198,6 +204,10 @@ pub struct Body<'c, 'a> {
     pub scope_bodies: Vec<u32>,
     /// The first and last tokens of the expression in statement position being typed.
     pub statement: Option<(Tok, Tok)>,
+    pub clauses: Vec<TClause>,
+    pub examples: Vec<TExample>,
+    /// What typing records of the use of the body's bindings.
+    pub usage: Usage,
 }
 
 impl Drop for Body<'_, '_> {
@@ -232,6 +242,9 @@ impl<'c, 'a> Body<'c, 'a> {
             bound_names: Vec::new(),
             scope_bodies: Vec::new(),
             statement: None,
+            clauses: Vec::new(),
+            examples: Vec::new(),
+            usage: Usage::default(),
         }
     }
 
@@ -478,11 +491,30 @@ impl<'c, 'a> Body<'c, 'a> {
         &self.locals[id.0 as usize]
     }
 
-    /// The typed form, once typing ends.
+    /// The binding outside closures a local stands for.
+    pub fn binding(&self, mut local: LocalId) -> LocalId {
+        while let Some(outer) = self.local(local).captured {
+            local = outer;
+        }
+        local
+    }
+
+    /// Records that an expression uses a local.
+    pub fn note_use(&mut self, local: LocalId) {
+        let binding = self.binding(local);
+        self.usage.used.insert(binding);
+    }
+
+    /// The typed form, once typing ends and its unused bindings are reported.
     pub fn finish(mut self, root: Option<TExpr>) -> TBody {
+        let roots: Vec<&TExpr> = root.iter().collect();
+        self.ck
+            .check_unused_locals(self.item, &self.locals, &self.usage, &roots);
         TBody {
             locals: std::mem::take(&mut self.locals),
             params: std::mem::take(&mut self.params),
+            clauses: std::mem::take(&mut self.clauses),
+            examples: std::mem::take(&mut self.examples),
             root,
         }
     }
@@ -585,6 +617,17 @@ impl<'c, 'a> Body<'c, 'a> {
                 let local_ty = declared.unwrap_or_else(|| typed.ty.clone());
                 let diverges = typed.ty.is_never();
                 let local = self.declare(name, local_ty, LocalKind::Var);
+                if matches!(&typed.kind, TKind::Call(call) | TKind::Index(call) if call.proj) {
+                    self.usage.parts.insert(local);
+                }
+                self.usage.bindings.insert(
+                    local,
+                    Binding {
+                        statement: stmt.token,
+                        value: (value.token, value.last),
+                        unit: matches!(typed.ty, Ty::Unit | Ty::Never),
+                    },
+                );
                 (
                     TStmtKind::Var {
                         local,
@@ -764,8 +807,20 @@ impl<'c, 'a> Body<'c, 'a> {
             block_typed
         });
         let typed_pattern = self.top_pattern(pattern, &scrutinee, LocalKind::Pattern);
-        if !typed.ty.has_error() && !scrutinee.has_error() {
-            let refutable = self.refutable(&typed_pattern);
+        if let (TPatternKind::Binding(local), None) = (&typed_pattern.kind, otherwise_block) {
+            self.usage.bindings.insert(
+                *local,
+                Binding {
+                    statement: stmt.token,
+                    value: (value.token, value.last),
+                    unit: matches!(typed.ty, Ty::Unit | Ty::Never),
+                },
+            );
+        }
+        if !typed.ty.has_error()
+            && !scrutinee.has_error()
+            && let Some(refutable) = self.refutable(&typed_pattern)
+        {
             if refutable && otherwise.is_none() {
                 self.report(pattern.token, Code::PatternRefutable);
             } else if let (false, Some(block)) = (refutable, otherwise_block) {
@@ -806,14 +861,23 @@ impl<'c, 'a> Body<'c, 'a> {
         op_token: Tok,
         value: &ast::Expr,
     ) -> (TStmtKind, bool) {
-        let target_typed = self.place(target);
+        let target_typed = self.place(target, op == ast::AssignOp::Set);
+        if let Some(root) = target_typed.as_ref().and_then(root_local) {
+            let binding = self.binding(root);
+            self.usage.assigned.insert(binding);
+            let writes_part = matches!(self.local(root).kind, LocalKind::Element(Mode::Mut))
+                || self.usage.parts.contains(&binding);
+            if op != ast::AssignOp::Set || writes_part {
+                self.note_use(root);
+            }
+        }
         let Some(target_typed) = target_typed else {
             self.report(target.token, Code::StmtAssignTarget);
             let value = self.skim(value);
             return (
                 TStmtKind::Assign {
                     target: TExpr::failed(target.token),
-                    compound: false,
+                    op: None,
                     value,
                 },
                 false,
@@ -839,7 +903,7 @@ impl<'c, 'a> Body<'c, 'a> {
         (
             TStmtKind::Assign {
                 target: target_typed,
-                compound: op != ast::AssignOp::Set,
+                op: op.binary(),
                 value: value_typed,
             },
             diverges,
@@ -957,8 +1021,10 @@ impl Checker<'_> {
             }
             ItemKind::Interface(interface) => {
                 if let SigKind::Interface { methods } = &sig.kind {
-                    for (method, method_sig) in interface.methods.iter().zip(methods) {
-                        self.method_body(item, method, &method_sig.sig);
+                    for (index, (method, method_sig)) in
+                        interface.methods.iter().zip(methods).enumerate()
+                    {
+                        self.method_body(item, index, method, &method_sig.sig);
                     }
                 }
                 None
@@ -1024,12 +1090,16 @@ impl Checker<'_> {
         program && self.names_entry(item)
     }
 
-    fn method_body(&self, item: ItemId, method: &ast::Method, sig: &FnSig) {
+    fn method_body(&self, item: ItemId, index: usize, method: &ast::Method, sig: &FnSig) {
         let mut body = Body::new(self, item, sig.generics.clone());
         body.push_frame(Body::function_frame(sig.result.clone(), sig.fails.clone()));
         body.declare_params(&method.head.params, sig);
         body.clauses(&method.clauses, sig);
         let Some(block) = &method.body else {
+            let typed = body.finish(None);
+            self.method_bodies
+                .borrow_mut()
+                .insert((item, index), Rc::new(typed));
             return;
         };
         let typed = body.result_block(block, &sig.result);
@@ -1043,6 +1113,9 @@ impl Checker<'_> {
         }));
         self.check_flow(item, &typed, method.proj);
         self.check_float_use(item, &typed);
+        self.method_bodies
+            .borrow_mut()
+            .insert((item, index), Rc::new(typed));
     }
 
     fn test_body(&self, item: ItemId, test: &ast::TestItem) -> TBody {
@@ -1074,14 +1147,11 @@ impl Checker<'_> {
         body.push_frame(Body::function_frame(Ty::Scalar(Scalar::Bool), None));
         body.cx.contract = true;
         body.cx.quantifiers = true;
+        let mut field_locals = Vec::new();
         for field in fields {
-            let name = ast::Name {
-                text: field.name.clone(),
-                token: field.token,
-            };
             let id = LocalId(body.locals.len() as u32);
             body.locals.push(Local {
-                name: name.text,
+                name: field.name.clone(),
                 ty: field.ty.clone(),
                 kind: LocalKind::Let,
                 token: field.token,
@@ -1089,16 +1159,61 @@ impl Checker<'_> {
                 closure: 0,
             });
             body.scopes[0].push(id);
+            field_locals.push((id, field.name.clone()));
         }
+        let mut conditions = Vec::new();
         for member in &structure.members {
             let predicate = match member {
                 ast::StructMember::Field(field) => field.where_clause.as_ref(),
                 ast::StructMember::Invariant(predicate) => Some(predicate),
             };
             if let Some(predicate) = predicate {
-                body.check(predicate, &Ty::Scalar(Scalar::Bool));
+                conditions.push(body.check(predicate, &Ty::Scalar(Scalar::Bool)));
             }
         }
+        let roots: Vec<&TExpr> = conditions.iter().collect();
+        self.check_unused_locals(item, &body.locals, &body.usage, &roots);
+        let typed = super::elaborate::TypedPredicates {
+            body: body.finish(None),
+            fields: field_locals,
+            conditions,
+        };
+        self.typed_predicates
+            .borrow_mut()
+            .insert(item, Rc::new(typed));
+    }
+
+    /// The `where` conditions of an item's const parameters: bool contract terms over the const
+    /// parameters.
+    pub fn where_conditions(&self, item: ItemId, generics: &[ast::GenericParam]) {
+        if generics.iter().all(|param| param.where_clause.is_none()) {
+            return;
+        }
+        let defs = self.sig(item).generics.clone();
+        let mut body = Body::new(self, item, defs.clone());
+        body.push_frame(Body::function_frame(Ty::Scalar(Scalar::Bool), None));
+        body.cx.contract = true;
+        body.cx.quantifiers = true;
+        let params: Vec<_> = defs
+            .iter()
+            .filter_map(|def| def.constant.map(|scalar| (def.param, scalar)))
+            .collect();
+        let mut conditions = Vec::new();
+        for param in generics {
+            if let Some(condition) = &param.where_clause {
+                let line = self.db.item(item).line(condition.token);
+                let typed = self
+                    .db
+                    .on_line(line, || body.check(condition, &Ty::Scalar(Scalar::Bool)));
+                conditions.push(typed);
+            }
+        }
+        let typed = super::elaborate::TypedWheres {
+            body: body.finish(None),
+            params,
+            conditions,
+        };
+        self.typed_wheres.borrow_mut().insert(item, Rc::new(typed));
     }
 }
 
@@ -1143,21 +1258,31 @@ impl Body<'_, '_> {
     }
 
     fn clause(&mut self, clause: &ast::Clause, sig: &FnSig) {
+        if clause.disputed {
+            self.report(clause.token, Code::TodoDisputed);
+        }
+        if let ast::ClauseKind::Missing = clause.kind {
+            self.report(clause.token, Code::TodoMissingSpec);
+        }
         let saved = self.cx;
-        match &clause.kind {
+        let typed = match &clause.kind {
             ast::ClauseKind::Requires(term) => {
                 self.cx.contract = true;
                 self.cx.requires = true;
                 self.cx.quantifiers = true;
-                self.check(term, &Ty::Scalar(Scalar::Bool));
+                Some((
+                    ClauseRole::Requires,
+                    self.check(term, &Ty::Scalar(Scalar::Bool)),
+                ))
             }
             ast::ClauseKind::Ensures(term) => {
                 self.cx.contract = true;
                 self.cx.ensures = true;
                 self.cx.quantifiers = true;
                 self.result = Some(sig.result.clone());
-                self.check(term, &Ty::Scalar(Scalar::Bool));
+                let typed = self.check(term, &Ty::Scalar(Scalar::Bool));
                 self.result = None;
+                Some((ClauseRole::Ensures, typed))
             }
             ast::ClauseKind::Decreases(term) => {
                 self.cx.contract = true;
@@ -1169,11 +1294,26 @@ impl Body<'_, '_> {
                 if !unsigned && !typed.ty.has_error() {
                     self.report_mismatch(term.token, &Ty::Scalar(Scalar::U64), &typed.ty);
                 }
+                Some((ClauseRole::Decreases, typed))
             }
             ast::ClauseKind::Example(example) => {
-                self.example(example);
+                let body = self.example(example);
+                self.examples.push(TExample {
+                    token: clause.token,
+                    disputed: clause.disputed,
+                    body,
+                });
+                None
             }
-            ast::ClauseKind::Missing | ast::ClauseKind::Waive { .. } => {}
+            ast::ClauseKind::Missing | ast::ClauseKind::Waive { .. } => None,
+        };
+        if let Some((role, expr)) = typed {
+            self.clauses.push(TClause {
+                token: clause.token,
+                role,
+                disputed: clause.disputed,
+                expr,
+            });
         }
         self.cx = saved;
     }
@@ -1204,7 +1344,7 @@ impl Body<'_, '_> {
         });
         self.push_scope();
         let typed_pattern = self.top_pattern(pattern, &element, LocalKind::Element(mode));
-        if !element.has_error() && self.refutable(&typed_pattern) {
+        if !element.has_error() && self.refutable(&typed_pattern) == Some(true) {
             self.report(pattern.token, Code::PatternRefutable);
         }
         let (invariants, block) = self.loop_body_in(body);
@@ -1444,13 +1584,15 @@ impl Body<'_, '_> {
         }
     }
 
-    /// An example: checked as the returned expression of a private parameterless function of the
-    /// item's module.
-    fn example(&mut self, example: &ast::Expr) {
+    /// An example, typed as the returned expression of a function without parameters.
+    fn example(&mut self, example: &ast::Expr) -> TBody {
         let mut body = Body::new(self.ck, self.item, Vec::new());
         body.push_frame(Body::function_frame(Ty::Scalar(Scalar::Bool), None));
         body.cx.example = true;
-        body.check(example, &Ty::Scalar(Scalar::Bool));
+        let typed = body.check(example, &Ty::Scalar(Scalar::Bool));
+        self.ck
+            .check_unused_locals(self.item, &body.locals, &body.usage, &[&typed]);
+        body.finish(Some(typed))
     }
 }
 
@@ -1468,6 +1610,16 @@ fn substituted(head: &FnSig, subst: &super::ty::Subst) -> FnSig {
         result: subst.ty(&head.result),
         fails: head.fails.as_ref().map(|ty| subst.ty(ty)),
         ..head.clone()
+    }
+}
+
+/// The local at the root of a place.
+fn root_local(place: &TExpr) -> Option<LocalId> {
+    match &place.kind {
+        TKind::Local(local) => Some(*local),
+        TKind::Field { base, .. } => root_local(base),
+        TKind::Index(call) => root_local(&call.args.first()?.expr),
+        _ => None,
     }
 }
 

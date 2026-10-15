@@ -26,7 +26,7 @@ target/debug/nan check
 target/debug/nan fmt
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. The bootstrap implements the checking, reading and editing commands of the [toolchain](docs/spec/33-toolchain.md): `check`, `fix`, `fmt`, `holes`, `show`, `read`, `find`, `context`, `explain`, `expand`, `edit` and `primer`. Contract proofs, tests and builds are not implemented yet.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. The bootstrap implements the checking, reading and editing commands of the [toolchain](docs/spec/33-toolchain.md): `check`, `fix`, `fmt`, `holes`, `show`, `read`, `find`, `context`, `explain`, `expand`, `edit` and `primer`, with contract proofs. Tests and builds are not implemented yet.
 
 ## Commands
 

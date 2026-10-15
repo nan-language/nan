@@ -3,8 +3,8 @@
 //! limits read bodies in this form.
 
 use super::db::ItemId;
-use super::ty::{Bound, FnTy, LimitSet, Ty};
-use crate::syntax::ast::{FailureMarker, Mode, Tok};
+use super::ty::{Args, Bound, FnTy, LimitSet, Ty};
+use crate::syntax::ast::{BinaryOp, FailureMarker, Mode, Tok, UnaryOp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub u32);
@@ -83,7 +83,7 @@ pub enum Callee {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
     /// A named conversion or bit conversion.
-    Conversion,
+    Conversion(crate::nir::Builtin),
     /// `Dyn[I].view`, `Dyn[I].view_mut` and `mem::Box[Dyn[I]].from_box`.
     DynView,
     /// `text::fmt`.
@@ -105,6 +105,9 @@ pub struct TArg {
 pub struct Call {
     pub token: Tok,
     pub callee: Callee,
+    /// The callee's generic arguments: those of the type or interface it is a member of, then
+    /// its own.
+    pub type_args: Args,
     /// The arguments, the receiver first for a method call.
     pub args: Vec<TArg>,
     /// The function type of the head called, instantiated.
@@ -112,6 +115,8 @@ pub struct Call {
     /// Whether the callee is a projection, and so its result a part, wrapped part or view value.
     pub proj: bool,
     pub failure: Option<(FailureMarker, Tok)>,
+    /// Whether the call is marked `await`.
+    pub awaited: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +152,7 @@ impl TExpr {
                     visit(&arg.expr);
                 }
             }
-            TKind::Construct(values) => {
+            TKind::Construct { values, .. } => {
                 for (_, value) in values {
                     visit(value);
                 }
@@ -178,7 +183,7 @@ impl TExpr {
                 }
             }
             TKind::Closure(closure) => visit(&closure.body),
-            TKind::When { accesses, body } => {
+            TKind::When { accesses, body, .. } => {
                 for (_, cown, _) in accesses {
                     visit(cown);
                 }
@@ -194,15 +199,15 @@ impl TExpr {
                 visit(body);
             }
             TKind::Failed
-            | TKind::Literal
+            | TKind::Literal(_)
             | TKind::Unit
             | TKind::Result
             | TKind::Register { .. }
-            | TKind::ConstParam
+            | TKind::ConstParam(_)
             | TKind::Local(_)
             | TKind::Value(_)
-            | TKind::FnValue(_)
-            | TKind::Todo
+            | TKind::FnValue { .. }
+            | TKind::Todo(_)
             | TKind::Break(_)
             | TKind::Continue(_) => {}
         }
@@ -270,11 +275,23 @@ impl TStmt {
     }
 }
 
+/// The value a literal denotes; a number takes the type of its expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lit {
+    Int(i128),
+    /// A float's bits, as wide as its type.
+    Float(u64),
+    Bool(bool),
+    Char(char),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 #[derive(Clone, Debug)]
 pub enum TKind {
     /// A construct that failed a rule; nothing depends on it.
     Failed,
-    Literal,
+    Literal(Lit),
     Unit,
     /// `result` in an ensures clause.
     Result,
@@ -286,12 +303,15 @@ pub enum TKind {
         index: usize,
     },
     /// A const generic parameter.
-    ConstParam,
+    ConstParam(super::ty::Param),
     Local(LocalId),
     /// A const, registry or contribution, which names a value and never a place.
     Value(ItemId),
-    /// A function item used as a value.
-    FnValue(ItemId),
+    /// A function item used as a value, with its generic arguments.
+    FnValue {
+        item: ItemId,
+        type_args: Args,
+    },
     Field {
         base: Box<TExpr>,
         name: String,
@@ -299,12 +319,19 @@ pub enum TKind {
     Call(Box<Call>),
     /// `x[i]`, a call of `at` or `at_mut`.
     Index(Box<Call>),
-    /// A construction of a struct, layout or variant, with its values in the order written.
-    Construct(Vec<(String, TExpr)>),
+    /// A construction of a struct, layout or variant (by its index), with its values in the
+    /// order written; a single payload's value is unlabelled.
+    Construct {
+        variant: Option<usize>,
+        values: Vec<(String, TExpr)>,
+    },
     Unary {
+        op: UnaryOp,
         operand: Box<TExpr>,
     },
+    /// A binary operator, a range included.
     Binary {
+        op: BinaryOp,
         left: Box<TExpr>,
         right: Box<TExpr>,
     },
@@ -320,18 +347,24 @@ pub enum TKind {
         arms: Vec<TArm>,
     },
     Closure(Box<TClosure>),
+    /// `await when`, or `await when attempt` yielding a `Result`.
     When {
+        attempt: bool,
         accesses: Vec<(Mode, TExpr, LocalId)>,
         body: Box<TExpr>,
     },
     Trusted(Box<TExpr>),
-    Todo,
+    /// `todo` with its intent.
+    Todo(String),
     Dbg(Box<TExpr>),
     Return(Option<Box<TExpr>>),
     Break(usize),
     Continue(usize),
     Fail(Box<TExpr>),
+    /// `all` or `any`, binding `local` to each value of the range.
     Quantifier {
+        all: bool,
+        local: LocalId,
         range: Box<TExpr>,
         body: Box<TExpr>,
     },
@@ -358,7 +391,6 @@ pub enum ValueSpace {
     /// An inclusive interval of integers or char scalar values.
     Ints(i128, i128),
     Bool(bool),
-    Unit,
     /// Text or bytes, which no finite set of values covers.
     Bytes(Vec<u8>),
     /// A value the checker does not know, as a failed constant's.
@@ -370,10 +402,26 @@ pub enum TPatternKind {
     Wildcard,
     Binding(LocalId),
     /// A literal, constant or range: it matches without moving or copying.
-    Value(ValueSpace),
-    /// A struct, layout or variant pattern: the variant's index, and each field's pattern.
+    Value(ValueSpace, ValueTest),
+    /// A struct, layout, variant or `Unit` pattern: the variant's index, and each field's
+    /// pattern.
     Fields(Option<usize>, Vec<(String, TPattern)>),
     Failed,
+}
+
+/// How a literal, constant or range pattern tests a value: equal to one, or at least a low bound
+/// and at most a high one, or below it when the range excludes it.
+#[derive(Clone, Debug)]
+pub enum ValueTest {
+    Eq(Compared),
+    Range(Compared, Compared, bool),
+}
+
+/// A value a pattern compares with.
+#[derive(Clone, Debug)]
+pub enum Compared {
+    Literal(Lit),
+    Const(ItemId),
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +432,8 @@ pub struct TClosure {
     pub ty: FnTy,
     pub body: TExpr,
     pub index: u32,
+    /// The loops of the enclosing code it lies in, which loops in it number after.
+    pub loops: usize,
     /// For the task closure of a lexical spawn, the body closure of its scope.
     pub lent: Option<u32>,
     /// The limits the function type it is written for demands.
@@ -446,11 +496,36 @@ pub enum TStmtKind {
     Expect(TExpr),
     Assume(TExpr),
     Expr(TExpr),
+    /// `target = value`, or `target op= value` with the operator a compound assignment applies.
     Assign {
         target: TExpr,
-        compound: bool,
+        op: Option<BinaryOp>,
         value: TExpr,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClauseRole {
+    Requires,
+    Ensures,
+    Decreases,
+}
+
+/// A requires, ensures or decreases clause in typed form, a contract term over the parameters.
+#[derive(Clone, Debug)]
+pub struct TClause {
+    pub token: Tok,
+    pub role: ClauseRole,
+    pub disputed: bool,
+    pub expr: TExpr,
+}
+
+/// An example clause, typed as the body of a function without parameters.
+#[derive(Clone, Debug)]
+pub struct TExample {
+    pub token: Tok,
+    pub disputed: bool,
+    pub body: TBody,
 }
 
 /// A body in typed form.
@@ -459,6 +534,9 @@ pub struct TBody {
     pub locals: Vec<Local>,
     /// The parameters of the function or test, in order.
     pub params: Vec<LocalId>,
+    /// The requires, ensures and decreases clauses, in clause order.
+    pub clauses: Vec<TClause>,
+    pub examples: Vec<TExample>,
     pub root: Option<TExpr>,
 }
 

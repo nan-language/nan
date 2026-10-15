@@ -222,6 +222,12 @@ impl Checker<'_> {
         })
     }
 
+    /// Whether code of `holder` unfolds calls to a transparent function: every field, item and
+    /// member its body names is visible to it.
+    pub fn unfolds(&self, function: ItemId, holder: ItemId) -> bool {
+        self.transparent_seen(function, Some(self.db.module_of(holder)))
+    }
+
     /// Whether a transparent function's body is seen: from the module `viewer`, when every
     /// field, item and member it names is visible there; and otherwise in its interface form, when
     /// the function is not generic, no member of a generic type, and its body names only fields,
@@ -300,7 +306,7 @@ impl Checker<'_> {
     /// Visits the items and fields an expression names.
     fn visit_names(&self, expr: &TExpr, visit: &mut dyn FnMut(Names)) {
         match &expr.kind {
-            TKind::Value(item) | TKind::FnValue(item) => visit(Names::Item(*item)),
+            TKind::Value(item) | TKind::FnValue { item, .. } => visit(Names::Item(*item)),
             TKind::Call(call) | TKind::Index(call) => {
                 if let Callee::Function { item, .. } = &call.callee {
                     visit(Names::Item(*item));
@@ -311,7 +317,7 @@ impl Checker<'_> {
                     visit(Names::Field(*owner, name.clone()));
                 }
             }
-            TKind::Construct(values) => {
+            TKind::Construct { values, .. } => {
                 if let Ty::Item(owner, _) = &expr.ty {
                     visit(Names::Item(*owner));
                     for (name, _) in values {

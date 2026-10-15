@@ -10,7 +10,7 @@ use super::reading::{Api, digest_lines};
 use super::{Checker, check_targets, checkers, ty};
 use crate::scope::Scope;
 use crate::syntax::ast::{ItemKind, Tok};
-use crate::syntax::grammar::{Punct, Rule};
+use crate::syntax::grammar::Rule;
 use crate::syntax::token::TokenKind;
 use crate::workspace::{Target, Workspace};
 
@@ -66,7 +66,10 @@ impl Checker<'_> {
     fn closure(&self, item: ItemId) -> Vec<ItemId> {
         let db = &self.db;
         self.package.set(Some(db.package_of(item)));
-        db.about(Some(item), || self.check_item(item));
+        db.about(Some(item), || {
+            self.check_item(item);
+            self.check_elaborated(item);
+        });
         let mut read = db.read_by(item);
         if let Some(body) = self.typed_body(item) {
             let mut types = Vec::new();
@@ -188,13 +191,8 @@ impl Checker<'_> {
         };
         let syntax = &data.file.syntax;
         let span = &syntax.items[data.index];
-        let separator = TokenKind::Punct(Punct::ColonColon);
-        let aliases: HashSet<&str> = (span.first..span.end)
-            .filter(|&index| {
-                syntax.tokens[index].kind == TokenKind::Ident
-                    && syntax.tokens.get(index + 1).map(|token| token.kind) == Some(separator)
-                    && (index == 0 || syntax.tokens[index - 1].kind != separator)
-            })
+        let aliases: HashSet<&str> = syntax
+            .path_starts(span.first..span.end)
             .map(|index| syntax.text(index))
             .collect();
         let manifest = &package.source.files[0].syntax;

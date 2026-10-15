@@ -17,7 +17,7 @@ A **move** transfers a non-Copy value to a new owner. A value moves when it init
 The **end of scope** of an owner is where the values it still holds are released:
 
 - for a binding, the exit of the block declaring it; for a parameter, the exit of its function;
-- for a temporary, the end of its statement, which for a `for` statement is the exit of the loop;
+- for a temporary, the end of its statement, which for a `for` statement is the exit of the loop; for one the value of a branch of an `if` or `match` creates, the end of that branch; and for one a `while` condition, a guard or the right operand of `and` or `or` creates, the end of its evaluation;
 - for the value a place held before an assignment, that assignment, after the new value is evaluated;
 - for a `take` capture of a closure that is not a task closure, the return of the call the closure is passed to.
 
@@ -255,7 +255,7 @@ At a call of a projection:
 - A view value is owned and moved like any value, and every value it moves into derives from it.
 - A part is **writable** when it is the result of a mut projection, a payload of a wrapped part that a mut projection returns, or a field of a writable part, except a part that the `next` of a [read cursor](#iteration) yields or that `core::Cursor.next` yields through a bound or `Dyn[I]`. Every other part is **read-only**. Assigning a read-only part or a field of one, or accessing either by `mut`, is an error (`own.read-only-view`).
 - A view value that the `next` of a read cursor yields, or that `core::Cursor.next` yields through a bound or `Dyn[I]`, is read-only, and so is every value derived from it: accessing one by `mut` is an error (`own.read-only-view`).
-- A non-Copy result of a projection whose receiver is a temporary, and every value derived from it, is used only within that temporary's statement; binding one to a name whose scope extends past that statement is an error (`own.temporary-source`).
+- A non-Copy result of a projection whose receiver is a temporary, and every value derived from it, is used only before that temporary's end of scope; binding one to a name whose scope extends past it, or yielding one as the value of the branch that creates the temporary, is an error (`own.temporary-source`).
 
 A function without `proj` may implement a `proj` interface method when its result type is droppable; otherwise the implementing function is an error (`interface.head-mismatch`, [conformance](08-generics-interfaces.md#conformance)). Called through its own type, its result is owned. Called through the interface, a bound or `Dyn[I]`, its result has the form the interface method's head fixes, and the caller releases it when it is no longer live.
 
@@ -310,6 +310,22 @@ pub closed struct Frame {
 pub fn first_seq(alloc: mem::Alloc) -> u32 {
     let head = mem::List[Frame].empty(alloc).at(0) // error: own.temporary-source
     return head.seq
+} first_seq
+```
+
+```nan
+pub closed struct Frame {
+    pub seq: u32
+    pub payload: mem::List[u8]
+} Frame
+
+pub fn seq_of(frame: Frame) -> u32 = frame.seq
+
+pub fn first_seq(empty: bool, alloc: mem::Alloc, frames: mem::List[Frame]) -> u32 {
+    return seq_of(match empty {
+        true => mem::List[Frame].empty(alloc).at(0) // error: own.temporary-source
+        false => frames.at(0)
+    })
 } first_seq
 ```
 

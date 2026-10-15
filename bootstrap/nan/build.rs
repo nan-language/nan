@@ -109,7 +109,7 @@ fn main() {
     }
     files.sort();
     let mut list = Vec::new();
-    encoding::uvar(&mut list, files.len() as u64);
+    encoding::uvar(&mut list, files.len() as u128);
     for file in &files {
         encoding::bytes(&mut list, file.as_bytes());
         encoding::bytes(

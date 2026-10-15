@@ -1,7 +1,7 @@
 //! The references of an item or member across the workspace: its declaration and the labels,
 //! paths, member names and doc references writing its name, which renaming rewrites.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 use super::db::{ItemId, ModuleId, TypeKey};
@@ -15,6 +15,9 @@ use crate::syntax::grammar::{Punct, Rule};
 use crate::syntax::token::TokenKind;
 use crate::syntax::tree::{Child, NodeId, Tree};
 use crate::workspace::File;
+
+/// The methods a `for` statement calls on what it iterates and on the cursor it obtains.
+const CURSOR_METHODS: [&str; 4] = ["cursor", "cursor_mut", "into_cursor", "next"];
 
 /// What an edit renames: an item, or a field, variant or interface method by its owner and name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,24 +148,27 @@ impl Checker<'_> {
         }
     }
 
+    /// An item with the module its paths are read in.
+    fn holder(&self, item: ItemId) -> Holder<'_> {
+        let data = self.db.item(item);
+        Holder {
+            item: Some(item),
+            file: data.file,
+            tree: data.syntax().items[data.index]
+                .tree
+                .as_ref()
+                .expect("a checked item has a tree"),
+            module: data.module,
+        }
+    }
+
     /// The parsed items of the workspace's packages, with the module their paths are read in.
     fn holders(&self) -> Vec<Holder<'_>> {
         let db = &self.db;
         let mut holders: Vec<Holder> = (0..db.items.len())
             .map(|index| ItemId(index as u32))
             .filter(|item| !db.is_std(*item))
-            .map(|item| {
-                let data = db.item(item);
-                Holder {
-                    item: Some(item),
-                    file: data.file,
-                    tree: data.syntax().items[data.index]
-                        .tree
-                        .as_ref()
-                        .expect("a checked item has a tree"),
-                    module: data.module,
-                }
-            })
+            .map(|item| self.holder(item))
             .collect();
         for package in db.packages.iter().filter(|package| !package.std) {
             let (Some(root), Some(file)) = (package.root, package.source.files.first()) else {
@@ -183,6 +189,63 @@ impl Checker<'_> {
             );
         }
         holders
+    }
+
+    /// The functions of the workspace named after a type, by their member names.
+    pub fn member_functions(&self) -> HashMap<&str, Vec<ItemId>> {
+        let mut functions: HashMap<&str, Vec<ItemId>> = HashMap::new();
+        for members in self.db.members.values() {
+            for (name, named) in members {
+                functions
+                    .entry(name.as_str())
+                    .or_default()
+                    .extend(named.iter().filter(|function| !self.db.is_std(**function)));
+            }
+        }
+        functions
+    }
+
+    /// The items an item names: those its paths name, its test target aside; the functions
+    /// `functions` lists under each member name it writes after `.` and each cursor method its
+    /// `for` statements call; the type a function is named after; and the functions
+    /// implementing the interface of an impl line.
+    pub fn names(&self, item: ItemId, functions: &HashMap<&str, Vec<ItemId>>) -> BTreeSet<ItemId> {
+        let holder = self.holder(item);
+        let written = holder.written();
+        let mut named: BTreeSet<ItemId> = written
+            .paths
+            .iter()
+            .filter_map(|path| match self.db.resolve(holder.module, path) {
+                Ok(Named::Item(named)) => Some(named),
+                _ => None,
+            })
+            .collect();
+        let cursors = CURSOR_METHODS.iter().filter(|_| written.iterates).copied();
+        for member in written.members.iter().map(String::as_str).chain(cursors) {
+            named.extend(functions.get(member).into_iter().flatten());
+        }
+        if let Some(TypeKey::Item(owner)) = self.db.owners.get(&item) {
+            named.insert(*owner);
+        }
+        if let SigKind::Impl {
+            interface: Some(bound),
+            ..
+        } = &self.sig(item).kind
+            && let SigKind::Interface { methods } = &self.sig(bound.interface).kind
+        {
+            named.extend(
+                methods
+                    .iter()
+                    .filter_map(|method| self.implementing_function(item, &method.name)),
+            );
+        }
+        named
+    }
+
+    /// The paths of an item that may name an item, outside labels, bindings, a tombstone's old
+    /// form and a test's target.
+    pub fn written_paths(&self, item: ItemId) -> Vec<ast::Path> {
+        self.holder(item).written().paths
     }
 
     /// The declared names of an item, and the labels of its functions, naming a target.
@@ -475,7 +538,7 @@ impl Checker<'_> {
         let package = db.package_of(*item);
         let to = db.module_named(package, module)?;
         let target = db.module(to);
-        let (dir, _) = target.first_file.as_deref()?.rsplit_once('/')?;
+        let (dir, _) = target.files.first()?.path.rsplit_once('/')?;
         let summary = format!("{dir}/{}.nan", target.name);
         let mut moved: Vec<ItemId> = vec![*item];
         for &other in &db.module(from).items {
@@ -727,13 +790,12 @@ impl Holder<'_> {
         };
         let mut found = Vec::new();
         for token in first..=last {
-            let token = &syntax.tokens[token as usize];
-            if token.kind != TokenKind::Doc {
+            if syntax.tokens[token as usize].kind != TokenKind::Doc {
                 continue;
             }
-            let text = &syntax.source[token.start as usize..token.end as usize];
-            for (offset, reference) in references(text) {
-                let at = token.start + offset as u32;
+            let (start, text) = super::docs::line_text(syntax, token as usize);
+            for (offset, reference) in super::docs::references(text) {
+                let at = start + offset as u32;
                 let (path, member) = match reference.rsplit_once('.') {
                     Some((path, member)) => (path, Some(member)),
                     None => (reference, None),
@@ -780,6 +842,18 @@ impl Holder<'_> {
     /// The paths of the item that may name an item, each with the member a test target names
     /// through it: not a label, a binding or a tombstone's old form.
     fn paths(&self) -> Vec<(ast::Path, Option<ast::Name>)> {
+        let written = self.written();
+        let mut found: Vec<(ast::Path, Option<ast::Name>)> =
+            written.paths.into_iter().map(|path| (path, None)).collect();
+        if let Some((path, member)) = written.target {
+            found.push((path.clone(), None));
+            found.push((path, member));
+        }
+        found
+    }
+
+    /// What the item writes that may name an item or member.
+    fn written(&self) -> Written {
         let tree = self.tree;
         let syntax = self.syntax();
         let bound = bindings(syntax, tree);
@@ -794,7 +868,12 @@ impl Holder<'_> {
                 .map(name)
                 .collect(),
         };
-        let mut found = Vec::new();
+        let mut written = Written {
+            paths: Vec::new(),
+            members: Vec::new(),
+            target: None,
+            iterates: false,
+        };
         let mut pending = vec![tree.root()];
         while let Some(node) = pending.pop() {
             let children: Vec<NodeId> = tree.child_nodes(node).collect();
@@ -802,31 +881,53 @@ impl Holder<'_> {
                 Rule::Arg | Rule::FieldPattern | Rule::PayloadField if children.len() == 2 => {
                     pending.push(children[1]);
                 }
-                Rule::RetiredOld => {}
+                Rule::RetiredOld | Rule::ItemLabel => {}
                 Rule::TestTarget => {
                     let member = tree
                         .child_tokens(node)
                         .filter(|token| syntax.tokens[*token as usize].kind == TokenKind::Ident)
                         .last()
                         .map(name);
-                    if let Some(path_node) = tree.find(node, Rule::Path) {
-                        found.push((path(path_node), None));
-                        found.push((path(path_node), member));
-                    }
+                    written.target = tree.find(node, Rule::Path).map(|node| (path(node), member));
                 }
                 Rule::Path => {
-                    let written = path(node);
-                    let local = written.segments.len() == 1
-                        && bound.of.contains_key(&written.segments[0].token);
-                    if !written.segments.is_empty() && !local {
-                        found.push((written, None));
+                    let found = path(node);
+                    let local = found.segments.len() == 1
+                        && bound.of.contains_key(&found.segments[0].token);
+                    if !found.segments.is_empty() && !local {
+                        written.paths.push(found);
                     }
                 }
-                _ => pending.extend(children),
+                rule => {
+                    written.iterates |= rule == Rule::ForStmt;
+                    let tokens: Vec<u32> = tree.child_tokens(node).collect();
+                    for pair in tokens.windows(2) {
+                        let kind = |token: u32| syntax.tokens[token as usize].kind;
+                        if kind(pair[0]) == TokenKind::Punct(Punct::Dot)
+                            && kind(pair[1]) == TokenKind::Ident
+                        {
+                            written
+                                .members
+                                .push(syntax.text(pair[1] as usize).to_owned());
+                        }
+                    }
+                    pending.extend(children);
+                }
             }
         }
-        found
+        written
     }
+}
+
+/// What an item writes that may name an item or member: its paths outside labels, bindings, a
+/// tombstone's old form and a test's target; the member names it writes after `.` outside
+/// labels; its test target's path with the member it names through it; and whether a `for`
+/// statement iterates.
+struct Written {
+    paths: Vec<ast::Path>,
+    members: Vec<String>,
+    target: Option<(ast::Path, Option<ast::Name>)>,
+    iterates: bool,
 }
 
 /// A doc reference: its path, the bytes of the whole path and of its last segment, and the
@@ -836,32 +937,4 @@ struct DocReference {
     whole: (u32, u32),
     last: (u32, u32),
     member: Option<(u32, String)>,
-}
-
-/// The doc references of a doc comment's text outside its code spans, with their offsets: the
-/// text between a `[` and the next `]` holding no space.
-fn references(text: &[u8]) -> Vec<(usize, &str)> {
-    let mut found = Vec::new();
-    let mut in_code = false;
-    let mut open = None;
-    for (at, byte) in text.iter().enumerate() {
-        match byte {
-            b'`' => {
-                in_code = !in_code;
-                open = None;
-            }
-            b'[' if !in_code => open = Some(at + 1),
-            b']' if !in_code => {
-                if let Some(start) = open.take()
-                    && let Ok(reference) = std::str::from_utf8(&text[start..at])
-                    && !reference.is_empty()
-                    && !reference.contains(' ')
-                {
-                    found.push((start, reference));
-                }
-            }
-            _ => {}
-        }
-    }
-    found
 }

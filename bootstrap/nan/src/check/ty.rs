@@ -144,7 +144,6 @@ pub enum Const {
     Int(i128),
     Bool(bool),
     Param(Param),
-    Item(ItemId),
     Error,
 }
 

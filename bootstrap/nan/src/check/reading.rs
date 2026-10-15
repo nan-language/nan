@@ -11,6 +11,8 @@ use super::identity::Hashes;
 use super::{
     Checker, check_targets, checked, checked_packages, checkers, decl, targets, ty, unchecked,
 };
+use crate::nir::{Builtin, Callable, Callee, CheckKind, Op, UnaryOp, Unit};
+use crate::prover::{Obligated, Obligation, Status, Unproved};
 use crate::scope::Scope;
 use crate::syntax::ast::{ItemKind, Tok};
 use crate::workspace::{Target, Workspace};
@@ -366,6 +368,17 @@ pub struct Explained {
     /// Each fact with the file and line raising it, by line.
     pub facts: Vec<(&'static str, String, u32)>,
     pub methods: Vec<String>,
+    pub obligations: Vec<Explanation>,
+}
+
+/// An obligation of an explained function: its file and line, its kind, its status or, without
+/// a trap kind, its outcome, and the labelled values of a refuted one's counterexample.
+pub struct Explanation {
+    pub path: String,
+    pub line: u32,
+    pub kind: String,
+    pub status: String,
+    pub counterexample: Vec<String>,
 }
 
 /// What `nan explain` prints of the function whose head lies in a scope, under each target its
@@ -417,13 +430,87 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
             .collect();
         methods.sort();
         methods.dedup();
+        let target = checker.db.target;
+        let obligations = checked(workspace, &std, target).explanations(item);
         return Some(Explained {
             digests: digest_lines(&checkers, checker, item),
             facts,
             methods,
+            obligations,
         });
     }
     None
+}
+
+impl Checker<'_> {
+    /// The obligations of a function, in site order, each as `nan explain` prints it.
+    fn explanations(&self, item: ItemId) -> Vec<Explanation> {
+        let Some(unit) = self.unit(item) else {
+            return Vec::new();
+        };
+        let data = self.db.item(item);
+        self.obligations(item)
+            .iter()
+            .map(|site| {
+                let trap_kind = !site.role.is_contract()
+                    && site.obligation != Obligation::Check(CheckKind::Decreases);
+                let (status, counterexample) = match (&site.unproved, trap_kind) {
+                    (_, true) => (status_word(site.status).to_owned(), Vec::new()),
+                    (None, false) => ("proved".to_owned(), Vec::new()),
+                    (Some(Unproved::Refuted(values)), false) => {
+                        ("refuted".to_owned(), values.clone())
+                    }
+                    (Some(Unproved::Unknown(_)), false) => ("unknown".to_owned(), Vec::new()),
+                };
+                Explanation {
+                    path: data.file.path.clone(),
+                    line: data.line(site.span.first),
+                    kind: obligation_kind(&unit, site),
+                    status,
+                    counterexample,
+                }
+            })
+            .collect()
+    }
+}
+
+fn status_word(status: Status) -> &'static str {
+    match status {
+        Status::Proven => "proven",
+        Status::Assumed => "assumed",
+        Status::Checked => "checked",
+        Status::Open => "open",
+    }
+}
+
+/// An obligation's kind as `nan explain` names it: its row's name with `-` for spaces, or for
+/// an arithmetic, shift, division or conversion obligation the operation's word.
+fn obligation_kind(unit: &Unit, site: &Obligated) -> String {
+    if site.role.is_contract() {
+        return "well-definedness".to_owned();
+    }
+    let operation = || {
+        let function = unit.function(site.role, site.index)?;
+        let block = function.block(site.block);
+        Some(match &block.insts.get(site.position)?.op {
+            Op::Binary(op, ..) => op.word(),
+            Op::Unary(UnaryOp::Neg, _) => "neg",
+            Op::Call(call) => match &call.callee {
+                Callee::Fn(fn_ref) => match &fn_ref.callable {
+                    Callable::Builtin(Builtin::Conversion(conversion, _)) => conversion.word(),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        })
+    };
+    match site.obligation {
+        Obligation::Check(CheckKind::Invariant) => "loop-invariant".to_owned(),
+        Obligation::Check(kind) => kind.word().to_owned(),
+        Obligation::Bounds => "index-bound".to_owned(),
+        _ => operation().unwrap_or("layout-field").to_owned(),
+    }
 }
 
 /// The items the derives of the struct or enum whose head lies in a scope write; none when the

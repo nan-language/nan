@@ -6,14 +6,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use datatest_stable::Utf8Path;
-use nan::Code;
 
 datatest_stable::harness! {
     { test = chapter, root = "../../docs/spec", pattern = r"^\d\d-[a-z-]+\.md$" },
 }
 
-/// Codes this implementation reports for only some of the constructs their rules cover.
-const PARTIAL: &[&str] = &["contract.ill-defined", "registry.platform-entry"];
+/// The test-run codes, which `nan test` gives as a failing test's cause.
+const TEST_RUN: &[&str] = &[
+    "test.emulator-unavailable",
+    "test.escaped-failure",
+    "test.stalled",
+    "test.target-not-run",
+    "test.timeout",
+];
+
+/// The codes only a final build reports.
+const FINAL_BUILD: &[&str] = &["limit.stack-exceeded", "limit.stack-unbounded"];
+
+/// The families of the gate codes, which only the release gate reports.
+const GATE: &[&str] = &["api.", "seal.", "trust."];
+
+/// Whether check time reports a code.
+fn checked(code: &str) -> bool {
+    !TEST_RUN.contains(&code)
+        && !FINAL_BUILD.contains(&code)
+        && !GATE.iter().any(|family| code.starts_with(family))
+}
 
 const SUMMARY: &str = "//! Specification example.";
 
@@ -183,11 +201,9 @@ fn diagnostics(output: &str) -> Vec<(String, String, String)> {
 
 fn run(example: &Example, dir: &Path) -> Result<(), String> {
     let marker = example.marker();
-    let reported = marker.as_ref().filter(|marker| {
-        marker.class != "traps"
-            && Code::from_name(&marker.code).is_some()
-            && !PARTIAL.contains(&marker.code.as_str())
-    });
+    let reported = marker
+        .as_ref()
+        .filter(|marker| marker.class != "traps" && checked(&marker.code));
     let expected: Vec<(String, String, String)> = reported
         .map(|marker| {
             (

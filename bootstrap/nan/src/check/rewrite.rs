@@ -184,6 +184,34 @@ impl Checker<'_> {
         self.fix_bytes(item, start, end, "")
     }
 
+    /// The fix deleting an item's lines, its doc comment's included, with the blank line after
+    /// them, or before them at the end of the file.
+    pub fn fix_deleting_item(&self, item: ItemId) -> Fix {
+        let data = self.db.item(item);
+        let syntax = data.syntax();
+        let lines = syntax.item_lines(&syntax.items[data.index]);
+        let start = |line: u32| {
+            syntax
+                .lines
+                .get(line as usize - 1)
+                .map_or(syntax.source.len() as u32, |line| line.start)
+        };
+        let blank = |line: u32| {
+            line >= 1
+                && syntax
+                    .lines
+                    .get(line as usize - 1)
+                    .is_some_and(|line| line.start == line.end)
+        };
+        let (mut first, mut last) = (*lines.start(), *lines.end());
+        if blank(last + 1) {
+            last += 1;
+        } else if blank(first - 1) {
+            first -= 1;
+        }
+        self.fix_bytes(item, start(first), start(last + 1), "")
+    }
+
     /// The fix adding a name to a package's `allow` directive for an authority, writing the
     /// directive before the manifest's closing line when it has none.
     pub fn fix_granting(

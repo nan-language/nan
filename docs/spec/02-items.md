@@ -508,7 +508,7 @@ const_assert_item = "assert" expr NL ;
 - A const without a type is an error (`item.const-untyped`).
 - A const whose type is not [Inert](05-properties.md#inert), or is [linear](05-properties.md#linear-types), is an error (`item.const-type`).
 - A const's initializer has the const's type, and a const assert's condition has type `bool`. Each is checked as the body of a function whose result type is the const's type and whose head states `limits pure, terminates` ([limits](10-effects-digests.md#limits)), exempt from `prop.view-result`; [const evaluation](21-interpreter.md#const-evaluation) restricts the views of its value.
-- An expression **reaches** each const, [contribution](25-registries.md#contributions) and function it names, and whatever their initializers, values and bodies reach in turn. A const or contribution whose initializer or value reaches itself is an error (`item.const-cycle`), reported once for each set of consts and contributions that reach one another, at the member whose canonical path sorts first in byte order.
+- The [const evaluation](21-interpreter.md#const-evaluation) of a const or [contribution](25-registries.md#contributions) **needs** the value of each const and contribution that its run reads, or that checking reads in an item whose unit the run executes, and whatever their evaluations need in turn. A const or contribution whose evaluation needs its own value is an error (`item.const-cycle`), reported once for each set of consts and contributions that need one another's values, at the member whose canonical path sorts first in byte order.
 - The interpreter computes each const and checks each const assert by [const evaluation](21-interpreter.md#const-evaluation), which reports an evaluation that traps (`const.trapped`) and a condition that is false (`const.assert-false`).
 - A const names a value, never a [place](07-ownership.md#places). Each use yields the computed value as a call result would, so a use passes to a `mut` or `take` parameter unmarked.
 
@@ -528,6 +528,17 @@ pub const RETRIES = 3 // error: item.const-untyped
 
 ```nan
 pub const SPAN: u32 = SPAN + 1 // error: item.const-cycle
+```
+
+```nan
+pub const LIMIT: u32 = capped(100) // error: item.const-cycle
+
+fn capped(value: u32) -> u32 {
+    return match value {
+        LIMIT => value
+        else => 0
+    }
+} capped
 ```
 
 ## Reserved forms

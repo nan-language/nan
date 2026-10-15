@@ -1,15 +1,83 @@
-//! Uses of retired forms: a use naming nothing whose canonical path a tombstone's old form has
-//! forwards to the tombstone's rewrite when it preserves behaviour, and is otherwise reported as
-//! moved.
+//! Retired forms: the rewrite of a tombstone with an old head, typed as that head's body, and the
+//! uses naming nothing whose canonical path a tombstone's old form has, which forward to the
+//! tombstone's rewrite when it preserves behaviour and are otherwise reported as moved.
 
-use super::Body;
 use super::call::Markers;
+use super::{Body, Clauses, Tail};
+use crate::check::Checker;
 use crate::check::conform::{Candidate, type_key};
 use crate::check::db::ItemId;
 use crate::check::tir::TExpr;
 use crate::check::ty::Ty;
-use crate::diagnostic::{Code, Fix, Offer};
-use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredItem, RetiredNew, Tok};
+use crate::diagnostic::{Class, Code, Fix, Offer};
+use crate::syntax::ast::{self, ExprKind, FailureMarker, ItemKind, RetiredItem, RetiredNew, Tok};
+
+impl Checker<'_> {
+    /// A tombstone's rewrite typed as the one statement of a function of its module having its
+    /// old head: `return` and the rewrite, or the rewrite alone without a result, preceded by the
+    /// `try` and `await` its outermost call needs; none when it does not check so.
+    pub fn typed_rewrite(
+        &self,
+        tombstone: ItemId,
+        head: &ast::Head,
+        rewrite: &ast::Expr,
+    ) -> Option<TExpr> {
+        let sig = self.fn_sig(tombstone)?;
+        let (mode, inner) = match &rewrite.kind {
+            ExprKind::Marked {
+                failure: None,
+                awaited: None,
+                mode: Some(mode),
+                inner,
+            } => (Some(*mode), &**inner),
+            _ => (None, rewrite),
+        };
+        let typed = |failure: Option<(FailureMarker, Tok)>, awaited: Option<Tok>| {
+            self.withheld(|| {
+                let mut body = Body::new(self, tombstone, sig.generics.clone());
+                body.push_frame(Body::function_frame(sig.result.clone(), sig.fails.clone()));
+                body.declare_params(&head.params, &sig);
+                let markers = Markers {
+                    failure,
+                    awaited,
+                    mode,
+                    ..Markers::default()
+                };
+                let typed = match inner.kind {
+                    ExprKind::Call { .. } => body.call(inner, Some(&sig.result), Some(markers)),
+                    _ => body.expr(rewrite, Some(&sig.result)),
+                };
+                if sig.result != Ty::Unit {
+                    body.expect(&typed, &sig.result, rewrite.token);
+                } else if !matches!(typed.ty, Ty::Unit | Ty::Never | Ty::Error) {
+                    body.unused_result(&Tail {
+                        token: rewrite.token,
+                        last: rewrite.last,
+                        ty: typed.ty.clone(),
+                    });
+                }
+                let frame = body.frames[0].clone();
+                let clauses = Clauses::of(head, false);
+                body.check_effects(rewrite.token, &frame, &sig.fn_ty(), &clauses, false);
+                typed
+            })
+        };
+        let start = self.db.item(tombstone).syntax().tokens[rewrite.token as usize].start;
+        let (_, unmarked) = typed(None, None);
+        let needs = |code: Code| {
+            unmarked.iter().any(|diagnostic| {
+                diagnostic.code == code && diagnostic.span.is_some_and(|(at, _)| at == start)
+            })
+        };
+        let failure = needs(Code::ErrorUnhandled).then_some((FailureMarker::Try, rewrite.token));
+        let awaited = needs(Code::EffectAwaitMissing).then_some(rewrite.token);
+        let (typed, found) = typed(failure, awaited);
+        let checks = !found
+            .iter()
+            .any(|diagnostic| diagnostic.code.class() == Class::Error);
+        checks.then_some(typed)
+    }
+}
 
 impl Body<'_, '_> {
     /// The tombstone whose old form is the member `name` of a type.

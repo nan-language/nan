@@ -58,7 +58,7 @@ pub fn largest(values: Slice[u32]) -> u32 limits notrap {
 
 ### Relevance
 
-After [canonicalisation](#canonicalisation), the negated goal is relevant, and so is each premise that shares a symbol or an application with a relevant premise. The procedure and the [canonical encoding](#determinism) use the relevant premises alone.
+After [canonicalisation](#canonicalisation), the negated goal is relevant, and so is each premise that shares a symbol or an application with a relevant premise; when the negated goal holds no symbol or application, as when an [entailment](#entailment) asks for `false`, every premise is relevant. The procedure and the [canonical encoding](#determinism) use the relevant premises alone.
 
 ## Callee knowledge
 

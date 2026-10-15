@@ -13,8 +13,10 @@ use crate::check::props::Property;
 use crate::check::resolve::Named;
 use crate::check::sig::{FnSig, ParamSig, Payload, SigKind};
 use crate::check::tir::{Builtin, Call, Callee, LocalKind, TArg, TExpr, TKind};
-use crate::check::ty::{Arg, Const, FnTy, Param, Scalar, Subst, Ty};
+use crate::check::ty::{Arg, Args, Const, FnTy, Param, Scalar, Subst, Ty, no_args};
+use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
+use crate::nir::{self, BitConversion, BitsOwner, Conversion};
 use crate::syntax::ast::{
     self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok, TypeModifier,
 };
@@ -183,6 +185,16 @@ impl Body<'_, '_> {
         else {
             return self.expr(expr, expected);
         };
+        if self.cx.example {
+            let marker = match (failure, awaited) {
+                (Some((FailureMarker::Try, token)), _) => Some(*token),
+                (_, Some(token)) => Some(*token),
+                _ => None,
+            };
+            if let Some(token) = marker {
+                self.report(token, Code::ExampleForm);
+            }
+        }
         if let ExprKind::When { .. } = inner.kind {
             if let Some(marker @ (FailureMarker::Try, _)) = failure {
                 self.unneeded_failure_marker(*marker);
@@ -314,6 +326,7 @@ impl Body<'_, '_> {
                     && generic_args.is_none()
                     && let Some(local) = self.lookup_local(&path.segments[0].text)
                 {
+                    self.note_use(local);
                     let value = TExpr {
                         token: callee.token,
                         ty: self.local(local).ty.clone(),
@@ -643,10 +656,12 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::MintRoot),
+                type_args: no_args(),
                 args: Vec::new(),
                 head: plain_head(ty),
                 proj: false,
                 failure: None,
+                awaited: false,
             })),
         }
     }
@@ -1352,7 +1367,7 @@ impl Body<'_, '_> {
                     let hint = (!callable.infer.open(&pattern)).then_some(&pattern);
                     let typed = self.operand(value, hint);
                     if let (Ty::Fn(found), Ty::Fn(wanted)) = (&typed.ty, &pattern) {
-                        if let TKind::FnValue(function) = typed.kind
+                        if let TKind::FnValue { item: function, .. } = typed.kind
                             && wanted.kind == FnKind::Task
                         {
                             self.ck.check_stack_bound(function, &found.limits);
@@ -1469,6 +1484,7 @@ impl Body<'_, '_> {
         {
             self.frames.last_mut().expect("a frame").raise(failure);
         }
+        let type_args = type_args(&callable.callee, &head, &subst);
         let callee = callable.callee;
         TExpr {
             token,
@@ -1476,10 +1492,12 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee,
+                type_args,
                 args: typed_args,
                 head: instantiated,
                 proj: head.is_proj(),
                 failure: markers.failure,
+                awaited: markers.awaited.is_some(),
             })),
         }
     }
@@ -1554,6 +1572,11 @@ impl Body<'_, '_> {
                     {
                         self.report(token, Code::DomainUnavailable);
                     }
+                    "host::Runner.run" => {
+                        if let Some(code) = self.ck.runner_problem(&callable.head, subst) {
+                            self.report(token, code);
+                        }
+                    }
                     "core::Untrusted.inspect" if !self.inspecting() => {
                         self.report(token, Code::UntrustedInspectOutsideValidator);
                     }
@@ -1616,13 +1639,10 @@ impl Body<'_, '_> {
     /// The body closure whose parameter a spawn's receiver is, when the spawn is lexical: written
     /// in that closure or in closures nested in it that are not task closures.
     fn lexical_scope(&self, receiver: &TExpr) -> Option<u32> {
-        let TKind::Local(mut local) = receiver.kind else {
+        let TKind::Local(local) = receiver.kind else {
             return None;
         };
-        while let Some(outer) = self.local(local).captured {
-            local = outer;
-        }
-        let declared = self.local(local);
+        let declared = self.local(self.binding(local));
         let scope = declared.closure;
         if !matches!(declared.kind, LocalKind::Param(_)) || !self.scope_bodies.contains(&scope) {
             return None;
@@ -1740,7 +1760,8 @@ impl Body<'_, '_> {
         self.ck.is_validator(self.item) && !self.cx.requires
     }
 
-    /// The bounds of the generic parameters a call fixes: each argument satisfies them.
+    /// The bounds of the generic parameters a call fixes: each argument satisfies them; the
+    /// `where` conditions of its const parameters are judged once elaborated.
     fn check_call_bounds(&self, token: Tok, callable: &Callable, head: &FnSig) {
         for def in &head.generics {
             if let Some(Arg::Ty(arg)) = callable.infer.subst.get(def.param)
@@ -1749,6 +1770,23 @@ impl Body<'_, '_> {
                 self.report(token, code);
                 return;
             }
+        }
+        if let Callee::Function { item } = &callable.callee
+            && head.generics.iter().any(|def| def.constant.is_some())
+        {
+            let args: Args = head
+                .generics
+                .iter()
+                .map(|def| {
+                    callable
+                        .infer
+                        .subst
+                        .get(def.param)
+                        .cloned()
+                        .unwrap_or_else(|| crate::check::sig::param_arg(def))
+                })
+                .collect();
+            self.ck.instantiated(self.item, token, *item, args);
         }
     }
 
@@ -2064,6 +2102,13 @@ impl Body<'_, '_> {
                 };
                 if variant.is_none() {
                     self.name_member(label.token, Member::Field(item, name.clone()));
+                    let label = FieldLabel {
+                        item: self.item,
+                        first: arg.token,
+                        last: arg.value.last,
+                        simple: place_or_literal(&arg.value),
+                    };
+                    self.ck.record_label(item, name, label);
                 }
                 if named.contains(name) {
                     self.report(arg.token, Code::TypeDuplicateLabel);
@@ -2128,7 +2173,7 @@ impl Body<'_, '_> {
         TExpr {
             token,
             ty,
-            kind: TKind::Construct(values),
+            kind: TKind::Construct { variant, values },
         }
     }
 
@@ -2136,7 +2181,7 @@ impl Body<'_, '_> {
     /// resolution finds on the type of `x`.
     pub fn index(&mut self, token: Tok, base: &ast::Expr, index: &ast::Expr, write: bool) -> TExpr {
         let base_typed = if write {
-            match self.place(base) {
+            match self.place(base, false) {
                 Some(place) => place,
                 None => self.expr(base, None),
             }
@@ -2175,12 +2220,14 @@ impl Body<'_, '_> {
         let index_typed = self.check(index, &index_ty);
         let head = subst.fn_ty(&callable.head.fn_ty());
         let result = head.result.clone();
+        let type_args = type_args(&callable.callee, &callable.head, &subst);
         TExpr {
             token,
             ty: result,
             kind: TKind::Index(Box::new(Call {
                 token,
                 callee: callable.callee,
+                type_args,
                 args: vec![
                     TArg {
                         expr: base_typed,
@@ -2194,6 +2241,7 @@ impl Body<'_, '_> {
                 head,
                 proj: true,
                 failure: None,
+                awaited: false,
             })),
         }
     }
@@ -2298,7 +2346,12 @@ impl Body<'_, '_> {
                 (result, typed)
             }
         };
-        builtin_call(token, Builtin::Conversion, source, result)
+        let builtin = match (Conversion::named(name), BitConversion::named(name)) {
+            (Some(conversion), _) => nir::Builtin::Conversion(conversion, target),
+            (None, Some(bits)) => nir::Builtin::Bits(bits, BitsOwner::Scalar(target)),
+            (None, None) => unreachable!("a conversion's name"),
+        };
+        builtin_call(token, Builtin::Conversion(builtin), source, result)
     }
 
     /// `L.from_bits(bits)` and `L.checked_from_bits(bits)` of a layout.
@@ -2318,9 +2371,17 @@ impl Body<'_, '_> {
             self.skim_args(args);
             return TExpr::failed(token);
         };
+        let owner = match layout {
+            Ty::Item(item, _) => BitsOwner::Layout(*item),
+            _ => return TExpr::failed(token),
+        };
+        let builtin = |name: &str| {
+            let conversion = BitConversion::named(name).expect("a bit conversion's name");
+            Builtin::Conversion(nir::Builtin::Bits(conversion, owner))
+        };
         if name == "to_bits" {
             let source = self.check(&arg.value, layout);
-            return builtin_call(token, Builtin::Conversion, source, bits);
+            return builtin_call(token, builtin(name), source, bits);
         }
         let source = self.check(&arg.value, &bits);
         if name == "from_bits" && !self.ck.has(layout, Property::AnyBits) {
@@ -2336,7 +2397,7 @@ impl Body<'_, '_> {
         } else {
             self.ck.option_ty(layout.clone())
         };
-        builtin_call(token, Builtin::Conversion, source, result)
+        builtin_call(token, builtin(name), source, result)
     }
 
     /// The bits type of a scalar or layout.
@@ -2393,7 +2454,13 @@ impl Body<'_, '_> {
             );
             return TExpr::failed(token);
         }
-        builtin_call(token, Builtin::Conversion, receiver, bits)
+        let owner = match &receiver.ty {
+            Ty::Scalar(scalar) => BitsOwner::Scalar(*scalar),
+            Ty::Item(item, _) => BitsOwner::Layout(*item),
+            _ => return TExpr::failed(token),
+        };
+        let builtin = nir::Builtin::Bits(BitConversion::To, owner);
+        builtin_call(token, Builtin::Conversion(builtin), receiver, bits)
     }
 
     /// `Dyn[I].view(x)` and `Dyn[I].view_mut(mut x)`.
@@ -2466,10 +2533,12 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::DynView),
+                type_args: no_args(),
                 args: vec![TArg { expr: typed, mode }],
                 head: plain_head(ty),
                 proj: true,
                 failure: None,
+                awaited: false,
             })),
         }
     }
@@ -2509,6 +2578,7 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::DynView),
+                type_args: no_args(),
                 args: vec![TArg {
                     expr: typed,
                     mode: Mode::Take,
@@ -2516,6 +2586,7 @@ impl Body<'_, '_> {
                 head: plain_head(boxed.clone()),
                 proj: false,
                 failure: None,
+                awaited: false,
             })),
         }
     }
@@ -2602,10 +2673,12 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::Template),
+                type_args: no_args(),
                 args: typed_args,
                 head: plain_head(ty),
                 proj: false,
                 failure: None,
+                awaited: false,
             })),
         }
     }
@@ -2701,6 +2774,7 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::DmaAccess),
+                type_args: no_args(),
                 args: vec![TArg {
                     expr: receiver,
                     mode: Mode::Mut,
@@ -2708,13 +2782,45 @@ impl Body<'_, '_> {
                 head: plain_head(result),
                 proj: false,
                 failure: markers.failure,
+                awaited: markers.awaited.is_some(),
             })),
         }
     }
 }
 
+/// Whether an expression is a place or a literal, whose value names no effect.
+fn place_or_literal(expr: &ast::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) | ExprKind::SelfValue | ExprKind::Path { args: None, .. } => true,
+        ExprKind::Field { base: inner, .. } | ExprKind::Paren(inner) => place_or_literal(inner),
+        ExprKind::Unary {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => matches!(operand.kind, ExprKind::Literal(_)),
+        _ => false,
+    }
+}
+
 /// Whether a typed expression is a place: a local, and a path of fields and indexes from one.
 /// The head of a toolchain operation: a plain function that neither fails nor waits.
+/// The generic arguments of a call: for an interface method, `Self` and the interface's
+/// arguments before the method's own; otherwise those of the head's generic parameters.
+fn type_args(callee: &Callee, head: &FnSig, subst: &Subst) -> Args {
+    let own = head.generics.iter().map(|def| match def.constant {
+        Some(_) => subst.arg(&Arg::Const(Const::Param(def.param))),
+        None => Arg::Ty(subst.ty(&Ty::Param(def.param))),
+    });
+    match callee {
+        Callee::Method {
+            interface, self_ty, ..
+        } => std::iter::once(Arg::Ty(self_ty.clone()))
+            .chain(interface.args.iter().cloned())
+            .chain(own)
+            .collect(),
+        _ => own.collect(),
+    }
+}
+
 fn plain_head(result: Ty) -> FnTy {
     FnTy {
         kind: FnKind::Plain,
@@ -2736,6 +2842,7 @@ fn builtin_call(token: Tok, builtin: Builtin, source: TExpr, result: Ty) -> TExp
         kind: TKind::Call(Box::new(Call {
             token,
             callee: Callee::Builtin(builtin),
+            type_args: no_args(),
             args: vec![TArg {
                 expr: source,
                 mode: Mode::Read,
@@ -2743,6 +2850,7 @@ fn builtin_call(token: Tok, builtin: Builtin, source: TExpr, result: Ty) -> TExp
             head,
             proj: false,
             failure: None,
+            awaited: false,
         })),
     }
 }

@@ -79,7 +79,7 @@ fn api_records_show_what_consumers_see() {
     ]);
     assert_eq!(
         run_in(&scratch.0, "show app --api").output,
-        "ok show app --api: records 1\napi app::clamp_level app/app.nan:4\n    /// Clamps a level.\n    pub fn clamp_level(level: u32) -> u32 limits notrap\n        ensures result <= 100 [checked]\n    digest: effects none | authority none | may-trap yes | terminates\nok show app --api: records 1\n"
+        "ok show app --api: records 1\napi app::clamp_level app/app.nan:4\n    /// Clamps a level.\n    pub fn clamp_level(level: u32) -> u32 limits notrap\n        ensures result <= 100 [proven]\n    digest: effects none | authority none | may-trap no | terminates\nok show app --api: records 1\n"
     );
 }
 
@@ -106,4 +106,20 @@ fn derived_items_expand_and_functions_explain_their_facts() {
         "{explained}"
     );
     assert!(explained.contains("\nradius "));
+}
+
+#[test]
+fn obligations_explain_their_status_or_outcome() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Ratios.\n\npub fn ratio(divisor: u32) -> u32\n    requires 100 / divisor > 0\n{\n    return 100 / divisor\n} ratio\n",
+        ),
+    ]);
+    let explained = run_in(&scratch.0, "explain app::ratio").output;
+    assert!(
+        explained.contains("\nobligation app/app.nan:6 div checked\n        return 100 / divisor\nobligation app/app.nan:4 requires checked\n        requires 100 / divisor > 0\nobligation app/app.nan:4 well-definedness refuted\n        requires 100 / divisor > 0\n    divisor: 0\n"),
+        "{explained}"
+    );
 }

@@ -249,6 +249,8 @@ pub enum ClauseKind {
 #[derive(Clone, Debug)]
 pub struct Clause {
     pub token: Tok,
+    /// Whether `todo TEXT` precedes the clause it marks.
+    pub disputed: bool,
     pub kind: ClauseKind,
 }
 
@@ -446,7 +448,12 @@ pub struct ContributeItem {
 
 #[derive(Clone, Debug)]
 pub struct TestItem {
+    /// Whether `todo TEXT` precedes the test, which disputes it.
+    pub disputed: bool,
     pub name: Name,
+    /// The test target: a path, and the member it names through it.
+    pub target: Path,
+    pub member: Option<Name>,
     pub params: Option<Vec<Param>>,
     pub body: Block,
 }
@@ -815,7 +822,9 @@ pub enum ExprKind {
     },
     Todo(Text),
     Dbg(Box<Expr>),
+    /// `all` or `any`, binding `name` to each value of `range`.
     Quantifier {
+        all: bool,
         name: Name,
         range: Box<Expr>,
         body: Box<Expr>,

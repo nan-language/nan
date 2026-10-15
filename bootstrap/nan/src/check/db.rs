@@ -38,7 +38,7 @@ pub struct PackageData<'a> {
     pub deps: HashMap<String, Option<PackageId>>,
 }
 
-pub struct ModuleData {
+pub struct ModuleData<'a> {
     pub package: PackageId,
     pub name: String,
     pub root: bool,
@@ -48,8 +48,8 @@ pub struct ModuleData {
     pub names: HashMap<String, Vec<ItemId>>,
     /// Whether one of its files holds an item the parse abandoned.
     pub abandoned: bool,
-    /// The path of its first source file, where diagnostics about it are reported.
-    pub first_file: Option<String>,
+    /// Its source files of the variant the target selects, in byte order of path.
+    pub files: Vec<&'a File>,
 }
 
 pub struct ItemData<'a> {
@@ -82,7 +82,7 @@ impl ItemData<'_> {
 pub struct Db<'a> {
     pub target: Target,
     pub packages: Vec<PackageData<'a>>,
-    pub modules: Vec<ModuleData>,
+    pub modules: Vec<ModuleData<'a>>,
     pub items: Vec<ItemData<'a>>,
     /// The package each std alias names.
     pub std: HashMap<&'static str, PackageId>,
@@ -216,7 +216,7 @@ impl<'a> Db<'a> {
                 items: Vec::new(),
                 names: HashMap::new(),
                 abandoned: false,
-                first_file: None,
+                files: Vec::new(),
             };
             for file in &package.files {
                 let in_module = file.module == Some(index)
@@ -227,7 +227,7 @@ impl<'a> Db<'a> {
                 if !in_module {
                     continue;
                 }
-                data.first_file.get_or_insert_with(|| file.path.clone());
+                data.files.push(file);
                 for (item_index, item) in file.syntax.items.iter().enumerate() {
                     if item.abandoned {
                         data.abandoned |= item.tree.is_some();
@@ -377,7 +377,7 @@ impl<'a> Db<'a> {
             .unwrap_or_default()
     }
 
-    pub fn module(&self, id: ModuleId) -> &ModuleData {
+    pub fn module(&self, id: ModuleId) -> &ModuleData<'a> {
         &self.modules[id.0 as usize]
     }
 

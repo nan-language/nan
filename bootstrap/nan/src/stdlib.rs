@@ -1,6 +1,7 @@
 //! The std packages this implementation checks against: the declarations of the specification's
-//! `nan-api` blocks, the items it states in prose or tables, written in `declarations.nan`, and
-//! the item families it declares once for one type and states for others.
+//! `nan-api` blocks, the items it states in prose or tables, written in `declarations.nan` (which
+//! restates an item of the blocks with the contract the prose gives it), and the item families it
+//! declares once for one type and states for others.
 
 include!(concat!(env!("OUT_DIR"), "/std_api.rs"));
 
@@ -89,21 +90,37 @@ pub fn modules() -> Vec<(String, String)> {
         .iter()
         .map(|(module, text)| ((*module).to_owned(), (*text).to_owned()))
         .collect();
-    let mut current: Option<usize> = None;
+    let mut supplements: Vec<(usize, String)> = Vec::new();
     for line in SUPPLEMENT.lines() {
         if let Some(module) = line.strip_prefix("// module: ") {
-            current = Some(match modules.iter().position(|(name, _)| name == module) {
+            let index = match modules.iter().position(|(name, _)| name == module) {
                 Some(index) => index,
                 None => {
                     modules.push((module.to_owned(), String::new()));
                     modules.len() - 1
                 }
-            });
+            };
+            supplements.push((index, String::new()));
             continue;
         }
-        let index = current.expect("the supplement starts with a module line");
-        modules[index].1.push_str(line);
-        modules[index].1.push('\n');
+        let (_, text) = supplements
+            .last_mut()
+            .expect("the supplement starts with a module line");
+        text.push_str(line);
+        text.push('\n');
+    }
+    for (index, supplement) in supplements {
+        for chunk in chunks(&supplement) {
+            let text = &mut modules[index].1;
+            let head = chunk.lines().next().unwrap_or_default();
+            let restated = chunks(text)
+                .into_iter()
+                .find(|known| !head.is_empty() && known.lines().next() == Some(head));
+            match restated {
+                Some(known) => *text = text.replacen(&known, &chunk, 1),
+                None => text.push_str(&chunk),
+            }
+        }
     }
     for family in &FAMILIES {
         let (_, text) = modules

@@ -261,6 +261,24 @@ generic_arg = type_expr | "-"? INT | "true" | "false" ;
 - Two instantiations are the same type exactly when they instantiate the same item with pairwise equal arguments: equal types, and const arguments that are equal values or the same const parameter.
 
 ```nan
+pub const WIDTH: usize = 2 * 2
+
+pub fn same(values: Array[u8, WIDTH]) -> Array[u8, 4] {
+    return values
+} same
+
+pub fn doubled(values: Array[u8, WIDTH]) -> Array[u8, 8] {
+    return values // error: type.mismatch
+} doubled
+```
+
+```nan
+pub const DEPTH: u32 = 4
+
+pub fn layered(values: Array[u8, DEPTH]) -> u8 = 0 // error: type.mismatch
+```
+
+```nan
 pub closed struct Window[N: usize where N > 0] {
     pub samples: Array[u32, N]
 } Window

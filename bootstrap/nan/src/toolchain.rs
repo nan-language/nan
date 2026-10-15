@@ -12,7 +12,7 @@ pub const LANGUAGES: [u64; 1] = [1];
 /// source tree hash.
 pub fn hash(language: u64) -> Hash {
     let mut version = Vec::new();
-    uvar(&mut version, language);
+    uvar(&mut version, u128::from(language));
     let mut tree = Vec::new();
     bytes(&mut tree, &SOURCE_TREE);
     let mut record = Vec::new();

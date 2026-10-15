@@ -99,6 +99,7 @@ A **run report** describes how an interpreter run ended, in the lines of a [trap
 **Const evaluation** is the interpreter run that computes a value at check time from a **const context**. The const contexts are exactly the initializer of a [const item](02-items.md#constants), the condition of a const assert, the value of a [contribution](25-registries.md#contributions), and the `where` condition of a [const parameter](08-generics-interfaces.md#generic-parameters) whose arguments are all values. Its run function is the `body` [function](19-nir.md#functions) of the const, const assert or contribution, without inputs, or the `where` function with the arguments as inputs.
 
 - A `constant` instruction yields the value of the named const's or contribution's own const evaluation. A const or contribution whose const evaluation ends without a value has no value.
+- Checking reads the value of each const that a const argument ([instantiation](08-generics-interfaces.md#instantiation)) or a constant pattern ([patterns](04-types.md#patterns)) names.
 - A const's value, with the data it refers to, becomes read-only data of every image holding the const. A `hw::Ptr` in it keeps the address the run gave it, without provenance.
 - A const or contribution whose value refers to an [extent](#interpreter-memory) other than literal data and the data of consts and contributions is an error (`const.view-not-static`).
 - A const assert whose condition yields `false` is an error (`const.assert-false`).

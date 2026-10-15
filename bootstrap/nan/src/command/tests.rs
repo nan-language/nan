@@ -124,7 +124,7 @@ fn a_scope_naming_nothing_is_unknown() {
 fn fmt_writes_through_the_journal_and_names_each_file() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),
-        ("app/app.nan", "//! Root.\nconst  MAX: u32 = 1\n"),
+        ("app/app.nan", "//! Root.\npub const  MAX: u32 = 1\n"),
     ]);
     let run = run_in(&scratch.0, "fmt");
     assert_eq!(
@@ -136,7 +136,7 @@ fn fmt_writes_through_the_journal_and_names_each_file() {
     );
     assert_eq!(
         fs::read_to_string(scratch.0.join("app/app.nan")).expect("read the file"),
-        "//! Root.\n\nconst MAX: u32 = 1\n"
+        "//! Root.\n\npub const MAX: u32 = 1\n"
     );
     assert!(!scratch.0.join(".nan/journal").exists());
 }

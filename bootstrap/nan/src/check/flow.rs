@@ -342,16 +342,6 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
     }
 
-    /// Records that the body names an item.
-    fn refer(&self, item: ItemId) {
-        self.ck
-            .refs
-            .borrow_mut()
-            .entry(self.item)
-            .or_default()
-            .insert(item);
-    }
-
     // Reports.
 
     fn report(&mut self, token: Tok, code: Code) {
@@ -823,11 +813,9 @@ impl<'c, 'a> Flow<'c, 'a> {
                 }
                 self.read(&value, expr.token);
             }
-            TStmtKind::Assign {
-                target,
-                compound,
-                value,
-            } => self.assign(stmt.token, target, *compound, value),
+            TStmtKind::Assign { target, op, value } => {
+                self.assign(stmt.token, target, op.is_some(), value)
+            }
         }
         Value::default()
     }
@@ -1025,6 +1013,16 @@ impl<'c, 'a> Flow<'c, 'a> {
             })
     }
 
+    /// A branch's value, as its `if` or `match` yields it; one derived from a temporary the
+    /// branch creates, which ends with the branch, is an error at `token`.
+    fn branch_value(&mut self, mut value: Value, token: Tok, ty: &Ty) -> Value {
+        if value.temporary && !self.is_copy(ty) {
+            self.report(token, Code::OwnTemporarySource);
+            value.temporary = false;
+        }
+        value
+    }
+
     // Bindings and patterns.
 
     /// A `let` or `var` binding of a value to a pattern.
@@ -1063,7 +1061,7 @@ impl<'c, 'a> Flow<'c, 'a> {
     /// Matches a part of a scrutinee, `owned` when the scrutinee owns its value.
     fn match_part(&mut self, pattern: &TPattern, part: &Value, owned: bool) {
         match &pattern.kind {
-            TPatternKind::Failed | TPatternKind::Value(_) => {}
+            TPatternKind::Failed | TPatternKind::Value(..) => {}
             TPatternKind::Wildcard => {
                 if owned
                     && self.is_linear(&pattern.ty)
@@ -1282,7 +1280,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 }
             }
             TKind::Index(call) | TKind::Call(call) => self.call(call, expr.token),
-            TKind::Construct(values) => self.construct(expr, values),
+            TKind::Construct { values, .. } => self.construct(expr, values),
             TKind::Unary { operand, .. } => {
                 let value = self.expr(operand);
                 self.read(&value, operand.token);
@@ -1303,11 +1301,13 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let found = self.expr(condition);
                 self.read(&found, condition.token);
                 let entry = self.state.clone();
-                let mut value = self.block(then);
+                let value = self.block(then);
+                let mut value = self.branch_value(value, tail_token(then, expr.token), &expr.ty);
                 let after_then = self.state.take();
                 self.state = entry;
                 if let Some(otherwise) = otherwise {
                     let other = self.expr(otherwise);
+                    let other = self.branch_value(other, value_token(otherwise), &expr.ty);
                     value.holds.extend(other.holds);
                     value.roots.extend(other.roots);
                 }
@@ -1315,9 +1315,9 @@ impl<'c, 'a> Flow<'c, 'a> {
                 value
             }
             TKind::Block(block) => self.block(block),
-            TKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms),
+            TKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, &expr.ty),
             TKind::Closure(closure) => self.closure(expr.token, closure),
-            TKind::When { accesses, body } => {
+            TKind::When { accesses, body, .. } => {
                 self.suspend(expr.token);
                 for (_, cown, local) in accesses {
                     let value = self.expr(cown);
@@ -1373,16 +1373,14 @@ impl<'c, 'a> Flow<'c, 'a> {
                 self.failed = true;
                 Value::default()
             }
-            TKind::Value(item) | TKind::FnValue(item) => {
-                self.refer(*item);
-                Value::default()
-            }
-            TKind::Literal
+            TKind::Value(_)
+            | TKind::FnValue { .. }
+            | TKind::Literal(_)
             | TKind::Unit
             | TKind::Result
-            | TKind::ConstParam
+            | TKind::ConstParam(_)
             | TKind::Register { .. }
-            | TKind::Todo => Value::default(),
+            | TKind::Todo(_) => Value::default(),
         }
     }
 
@@ -1412,7 +1410,7 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
     }
 
-    fn match_expr(&mut self, scrutinee: &TExpr, arms: &[super::tir::TArm]) -> Value {
+    fn match_expr(&mut self, scrutinee: &TExpr, arms: &[super::tir::TArm], ty: &Ty) -> Value {
         let found = self.expr(scrutinee);
         let owned = (found.form.is_none() || found.form == Some(Form::View))
             && found.place.as_ref().is_none_or(|path| self.owns(path.root));
@@ -1439,6 +1437,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 self.read(&condition, guard.token);
             }
             let yielded = self.expr(&arm.body);
+            let yielded = self.branch_value(yielded, value_token(&arm.body), ty);
             value.holds.extend(yielded.holds);
             value.roots.extend(yielded.roots);
             self.pop_scope(arm.body.token);
@@ -1481,9 +1480,6 @@ impl<'c, 'a> Flow<'c, 'a> {
     /// A call: its receiver and arguments evaluate in order, then their accesses become active
     /// together, then the call's result derives from its receiver when it is a projection.
     fn call(&mut self, call: &Call, token: Tok) -> Value {
-        if let Callee::Function { item, .. } = &call.callee {
-            self.refer(*item);
-        }
         let mut values = Vec::new();
         for arg in &call.args {
             let value = self.expr(&arg.expr);
@@ -1785,4 +1781,20 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
         value
     }
+}
+
+/// The token of the expression yielding an expression's value: a block's last statement's.
+fn value_token(expr: &TExpr) -> Tok {
+    match &expr.kind {
+        TKind::Block(block) => tail_token(block, expr.token),
+        _ => expr.token,
+    }
+}
+
+/// The token of the statement yielding a block's value, or `token` for an empty block.
+fn tail_token(block: &TBlock, token: Tok) -> Tok {
+    block.stmts.last().map_or(token, |stmt| match &stmt.kind {
+        TStmtKind::Expr(value) => value_token(value),
+        _ => stmt.token,
+    })
 }

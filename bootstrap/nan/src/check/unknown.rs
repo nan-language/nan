@@ -70,25 +70,10 @@ impl Checker<'_> {
         candidates: Vec<String>,
         stub: Option<String>,
     ) {
-        let written = self.written(item, first, last);
-        let mut near: Vec<(usize, String)> = candidates
-            .into_iter()
-            .filter(|candidate| *candidate != written)
-            .filter_map(|candidate| {
-                let distance = distance(&written, &candidate);
-                let longer = fold_path(&written)
-                    .chars()
-                    .count()
-                    .max(fold_path(&candidate).chars().count());
-                (distance <= longer.div_ceil(3)).then_some((distance, candidate))
-            })
-            .collect();
-        near.sort();
-        near.dedup();
-        near.truncate(LISTED);
+        let near = near(&self.written(item, first, last), candidates);
         let because = near
             .iter()
-            .map(|(_, candidate)| Reason {
+            .map(|candidate| Reason {
                 role: Role::Note,
                 subject: candidate.clone(),
                 at: None,
@@ -109,7 +94,7 @@ impl Checker<'_> {
                 .collect()
         } else {
             near.iter()
-                .map(|(_, candidate)| self.fix_replacing(item, first, last, candidate))
+                .map(|candidate| self.fix_replacing(item, first, last, candidate))
                 .collect()
         };
         self.report_diagnostic(
@@ -227,6 +212,27 @@ impl Checker<'_> {
         }
         found
     }
+}
+
+/// The candidates near a written name, closest first: those within a third of the length of the
+/// longer folded form, at most as many as a diagnostic lists.
+pub fn near(written: &str, candidates: Vec<String>) -> Vec<String> {
+    let mut near: Vec<(usize, String)> = candidates
+        .into_iter()
+        .filter(|candidate| candidate != written)
+        .filter_map(|candidate| {
+            let distance = distance(written, &candidate);
+            let longer = fold_path(written)
+                .chars()
+                .count()
+                .max(fold_path(&candidate).chars().count());
+            (distance <= longer.div_ceil(3)).then_some((distance, candidate))
+        })
+        .collect();
+    near.sort();
+    near.dedup();
+    near.truncate(LISTED);
+    near.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
 /// The folded form of a path: its segments' folded forms joined by `::`.

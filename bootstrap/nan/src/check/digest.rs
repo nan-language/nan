@@ -133,7 +133,7 @@ pub enum Brought {
 /// The std operations whose owning chapters state their facts, by the canonical path of the
 /// type they are members of or their own: pointers, register windows, DMA and privileged
 /// intrinsics.
-fn stated(path: &str) -> Option<Digest> {
+pub fn stated(path: &str) -> Option<Digest> {
     let (owner, member) = path.rsplit_once('.').unwrap_or((path, ""));
     let mut digest = Digest::none();
     match owner {
@@ -201,7 +201,7 @@ impl Checker<'_> {
         }
         let wait = head.as_ref().is_some_and(|head| head.wait);
         digest.wait = wait;
-        let cyclic = self.reaches(item, item, &mut Vec::new());
+        let cyclic = self.in_cycle(item);
         digest.terminates &= !wait && (!cyclic || self.has_decreases(item));
         self.digests.borrow_mut().computing.pop();
         let digest = Rc::new(digest);
@@ -215,6 +215,16 @@ impl Checker<'_> {
         let mut digest = Digest::none();
         digest.terminates = self.has_decreases(item);
         digest
+    }
+
+    /// Whether two functions belong to one cycle: each reaches the other through dependencies.
+    pub fn same_cycle(&self, first: ItemId, second: ItemId) -> bool {
+        self.reaches(first, second, &mut Vec::new()) && self.reaches(second, first, &mut Vec::new())
+    }
+
+    /// Whether a function belongs to a cycle: it reaches itself through its dependencies.
+    pub fn in_cycle(&self, item: ItemId) -> bool {
+        self.reaches(item, item, &mut Vec::new())
     }
 
     /// Whether a function reaches `target` through its dependencies: the functions it calls
@@ -320,7 +330,7 @@ impl Checker<'_> {
                     continue;
                 };
                 let facts = match &arg.expr.kind {
-                    TKind::FnValue(function) => (*self.digest(*function)).clone(),
+                    TKind::FnValue { item: function, .. } => (*self.digest(*function)).clone(),
                     TKind::Local(local)
                         if !matches!(body.local(*local).kind, LocalKind::Param(_))
                             && matches!(&arg.expr.ty, Ty::Fn(_)) =>
@@ -451,7 +461,7 @@ fn collect_dependencies(expr: &TExpr, found: &mut Vec<ItemId>) {
                 found.push(*item);
             }
         }
-        TKind::FnValue(item) => found.push(*item),
+        TKind::FnValue { item, .. } => found.push(*item),
         _ => {}
     }
     expr.each_child(&mut |child| collect_dependencies(child, found));
@@ -536,7 +546,7 @@ impl Walk<'_, '_, '_> {
                 }
                 TStmtKind::Assign {
                     target,
-                    compound: true,
+                    op: Some(_),
                     ..
                 } => self.float(stmt.token, &target.ty),
                 TStmtKind::Expect(_) | TStmtKind::Assume(_) => continue,
@@ -629,7 +639,7 @@ impl Walk<'_, '_, '_> {
                 }
             }
             Callee::Builtin(builtin) => {
-                if *builtin == Builtin::Conversion {
+                if let Builtin::Conversion(_) = builtin {
                     let source = call.args.first().map(|arg| &arg.expr.ty);
                     let floats = source
                         .into_iter()
@@ -669,7 +679,7 @@ impl Walk<'_, '_, '_> {
                 facts.wait = closure.ty.wait;
                 facts
             }
-            TKind::FnValue(function) => {
+            TKind::FnValue { item: function, .. } => {
                 let facts = (*self.ck.digest(*function)).clone();
                 self.site(token, facts, Brought::Call(Some(*function)));
                 return;
@@ -696,26 +706,13 @@ impl Walk<'_, '_, '_> {
 }
 
 impl Checker<'_> {
-    /// The typed body of a function item: the one its check produced, or one typed without
-    /// reporting.
+    /// The typed body of a function item with a body.
     pub fn typed_body(&self, item: ItemId) -> Option<Rc<TBody>> {
         self.db.note(item);
-        if let Some(body) = self.bodies.borrow().get(&item) {
-            return Some(body.clone());
-        }
         if !self.db.ast(item).kind.is_fn_with_body() {
             return None;
         }
-        self.muted.set(self.muted.get() + 1);
-        let body = self
-            .db
-            .about(Some(item), || self.check_bodies(item))
-            .map(Rc::new);
-        self.muted.set(self.muted.get() - 1);
-        if let Some(body) = &body {
-            self.bodies.borrow_mut().insert(item, body.clone());
-        }
-        body
+        self.typed(item)
     }
 
     /// The functions of primitive capabilities a function calls, directly or through the

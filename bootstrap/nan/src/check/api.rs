@@ -6,7 +6,10 @@ use super::Checker;
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::props::{Property, Props};
 use super::sig::SigKind;
+use super::tir::ClauseRole;
+use crate::nir::Role;
 use crate::output;
+use crate::prover::Status;
 use crate::syntax::ast::{ItemKind, TypeModifier, Visibility};
 
 impl Checker<'_> {
@@ -69,7 +72,8 @@ impl Checker<'_> {
                 (first..data.head_line()).map(|line| output::printable(syntax.line_text(line))),
             );
         }
-        lines.extend(statused(self.interface_text(item, viewer)));
+        let statuses = self.ensures_statuses(item);
+        lines.extend(statused(self.interface_text(item, viewer), &statuses));
         let mut impls: Vec<ItemId> = (0..self.db.items.len())
             .map(|index| ItemId(index as u32))
             .filter(|&other| {
@@ -142,8 +146,37 @@ impl Checker<'_> {
         }
     }
 
-    /// A function's digest as its digest line writes it after `digest: `, every function taken
-    /// to hold a trap site.
+    /// The status of each ensures clause of a function with a body, in clause order: the first
+    /// of open, assumed, checked and proven among those of its obligations.
+    fn ensures_statuses(&self, item: ItemId) -> Vec<&'static str> {
+        let Some(body) = self
+            .typed(item)
+            .filter(|_| self.db.ast(item).kind.is_fn_with_body())
+        else {
+            return Vec::new();
+        };
+        let obligations = self.obligations(item);
+        body.clauses
+            .iter()
+            .filter(|clause| clause.role == ClauseRole::Ensures)
+            .enumerate()
+            .map(|(index, clause)| {
+                let statuses: Vec<Status> = obligations
+                    .iter()
+                    .filter(|site| site.role == Role::Body && site.clause == Some(index as u32))
+                    .map(|site| site.status)
+                    .collect();
+                match () {
+                    _ if clause.disputed || statuses.contains(&Status::Open) => "open",
+                    _ if statuses.contains(&Status::Assumed) => "assumed",
+                    _ if statuses.contains(&Status::Checked) => "checked",
+                    _ => "proven",
+                }
+            })
+            .collect()
+    }
+
+    /// A function's digest as its digest line writes it after `digest: `.
     pub fn digest_text(&self, item: ItemId) -> String {
         let digest = self.digest(item);
         let effects: Vec<&str> = [
@@ -178,8 +211,9 @@ impl Checker<'_> {
         } else {
             "may-not-terminate"
         };
+        let may_trap = if self.may_trap(item) { "yes" } else { "no" };
         format!(
-            "effects {} | authority {} | may-trap yes | {terminates}",
+            "effects {} | authority {} | may-trap {may_trap} | {terminates}",
             or_none(&effects, " "),
             or_none(&authority, " ")
         )
@@ -194,10 +228,11 @@ fn or_none(entries: &[&str], separator: &str) -> String {
     }
 }
 
-/// Interface text lines with each ensures clause followed by its status: `open` for a disputed
-/// clause, and otherwise `checked`, no obligation being discharged.
-fn statused(mut lines: Vec<String>) -> Vec<String> {
+/// Interface text lines with each ensures clause followed by its status, `checked` for a clause
+/// of a function without a body.
+fn statused(mut lines: Vec<String>, statuses: &[&str]) -> Vec<String> {
     let depth = |line: &str| line.len() - line.trim_start().len();
+    let mut clause = 0;
     let mut at = 0;
     while at < lines.len() {
         let text = lines[at].trim_start();
@@ -210,7 +245,13 @@ fn statused(mut lines: Vec<String>) -> Vec<String> {
             {
                 end += 1;
             }
-            lines[end].push_str(if disputed { " [open]" } else { " [checked]" });
+            let status = match (statuses.get(clause), disputed) {
+                (Some(status), _) => status,
+                (None, true) => "open",
+                (None, false) => "checked",
+            };
+            lines[end].push_str(&format!(" [{status}]"));
+            clause += 1;
             at = end;
         }
         at += 1;

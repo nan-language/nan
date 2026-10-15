@@ -7,14 +7,19 @@ use super::call::Intrinsic;
 use super::{Body, Clauses, Frame, Written};
 use crate::check::db::ItemId;
 use crate::check::resolve::Named;
-use crate::check::sig::{Problems, SigKind, int_literal, limit_problems, limit_set};
-use crate::check::tir::{LocalId, LocalKind, TArm, TCapture, TClosure, TExpr, TKind, TStmtKind};
+use crate::check::sig::{
+    Problems, SigKind, int_literal, limit_problems, limit_set, literal_suffix,
+};
+use crate::check::tir::{
+    Lit, LocalId, LocalKind, TArm, TCapture, TClosure, TExpr, TKind, TStmtKind,
+};
 use crate::check::ty::{Arg, FnParam, FnTy, Scalar, Ty};
 use crate::check::{Checker, Member};
 use crate::diagnostic::{Code, Fix};
 use crate::syntax::ast::{
     self, BinaryOp, ExprKind, FnKind, ItemKind, LiteralKind, Mode, Tok, UnaryOp,
 };
+use crate::syntax::literal::text_value;
 use crate::workspace::{Authority, Target};
 
 impl Checker<'_> {
@@ -162,7 +167,7 @@ pub fn needs_expected(expr: &ast::Expr, text: &dyn Fn(Tok) -> String) -> bool {
     match &expr.kind {
         ExprKind::Literal(literal) => {
             matches!(literal.kind, LiteralKind::Int | LiteralKind::Float)
-                && !has_suffix(&text(literal.tokens[0]))
+                && literal_suffix(&text(literal.tokens[0])).is_none()
         }
         ExprKind::Unary {
             op: UnaryOp::Neg | UnaryOp::BitNot,
@@ -175,21 +180,6 @@ pub fn needs_expected(expr: &ast::Expr, text: &dyn Fn(Tok) -> String) -> bool {
         }
         _ => false,
     }
-}
-
-/// The scalar a number literal's suffix names.
-fn suffix(text: &str) -> Option<Scalar> {
-    let body = text.trim_start_matches("0x").trim_start_matches("0b");
-    let at = body.find(['u', 'i', 'f'])?;
-    Scalar::from_name(&body[at..])
-}
-
-fn has_suffix(text: &str) -> bool {
-    let is_hex = text.starts_with("0x");
-    if is_hex {
-        return text.contains('u') || text.contains('i');
-    }
-    suffix(text).is_some()
 }
 
 impl Body<'_, '_> {
@@ -315,7 +305,7 @@ impl Body<'_, '_> {
                         TExpr {
                             token,
                             ty: ty.clone(),
-                            kind: TKind::Todo,
+                            kind: TKind::Todo(reason.value.clone()),
                         }
                     }
                     None => {
@@ -325,6 +315,7 @@ impl Body<'_, '_> {
                 }
             }
             ExprKind::Dbg(inner) => {
+                self.report(token, Code::TestDbg);
                 let typed = self.expr(inner, expected);
                 TExpr {
                     token,
@@ -332,7 +323,12 @@ impl Body<'_, '_> {
                     kind: TKind::Dbg(Box::new(typed)),
                 }
             }
-            ExprKind::Quantifier { name, range, body } => self.quantifier(token, name, range, body),
+            ExprKind::Quantifier {
+                all,
+                name,
+                range,
+                body,
+            } => self.quantifier(token, *all, name, range, body),
             ExprKind::Field { base, name } => self.field_expr(token, base, name, expected),
             ExprKind::Call { .. } => self.call(expr, expected, None),
             ExprKind::Index { base, index } => self.index(token, base, index, false),
@@ -388,11 +384,7 @@ impl Body<'_, '_> {
         let ty = match literal.kind {
             LiteralKind::Int | LiteralKind::Float => {
                 let is_int = literal.kind == LiteralKind::Int;
-                let suffix_ty = if has_suffix(&text) {
-                    suffix(&text)
-                } else {
-                    None
-                };
+                let suffix_ty = literal_suffix(&text);
                 let ty = match (suffix_ty, expected) {
                     (Some(scalar), _) => Ty::Scalar(scalar),
                     (None, Some(Ty::Error)) | (None, Some(Ty::Never)) => {
@@ -460,15 +452,64 @@ impl Body<'_, '_> {
             LiteralKind::Byte => Ty::Scalar(Scalar::U8),
             LiteralKind::True | LiteralKind::False => Ty::Scalar(Scalar::Bool),
         };
+        let value = self.literal_value(literal, &ty, negative);
         TExpr {
             token,
             ty,
-            kind: TKind::Literal,
+            kind: TKind::Literal(value),
+        }
+    }
+
+    /// The value a literal of a valid type denotes.
+    fn literal_value(&self, literal: &ast::Literal, ty: &Ty, negative: bool) -> Lit {
+        let text = self.text(literal.tokens[0]);
+        let quoted = |text: &str| text_value(&format!("\"{}\"", &text[1..text.len() - 1]));
+        match literal.kind {
+            LiteralKind::Int => {
+                let value = int_literal(text).unwrap_or_default();
+                Lit::Int(if negative { -value } else { value })
+            }
+            LiteralKind::Float => {
+                let digits: String = text
+                    .trim_end_matches("f32")
+                    .trim_end_matches("f64")
+                    .chars()
+                    .filter(|c| *c != '_')
+                    .collect();
+                let digits = if negative {
+                    format!("-{digits}")
+                } else {
+                    digits
+                };
+                Lit::Float(match ty {
+                    Ty::Scalar(Scalar::F32) => {
+                        u64::from(digits.parse::<f32>().unwrap_or_default().to_bits())
+                    }
+                    _ => digits.parse::<f64>().unwrap_or_default().to_bits(),
+                })
+            }
+            LiteralKind::Text => Lit::Text(text_value(text)),
+            LiteralKind::TextRun => {
+                let lines: Vec<String> = literal
+                    .tokens
+                    .iter()
+                    .map(|token| text_value(&format!("\"{}\"", &self.text(*token)[2..])))
+                    .collect();
+                Lit::Text(lines.join("\n"))
+            }
+            LiteralKind::Bytes => Lit::Bytes(quoted(&text[1..]).chars().map(|c| c as u8).collect()),
+            LiteralKind::Char => Lit::Char(quoted(text).chars().next().unwrap_or_default()),
+            LiteralKind::Byte => {
+                Lit::Int(quoted(&text[1..]).chars().next().map_or(0, |c| c as i128))
+            }
+            LiteralKind::True => Lit::Bool(true),
+            LiteralKind::False => Lit::Bool(false),
         }
     }
 
     /// A use of a local, a `take` parameter appearing in an ensures clause only inside `old`.
     fn local_expr(&mut self, token: Tok, local: LocalId) -> TExpr {
+        self.note_use(local);
         let taken = matches!(self.local(local).kind, LocalKind::Param(Mode::Take));
         if taken && self.cx.ensures && !self.cx.old {
             self.report(token, Code::ContractTakenParameter);
@@ -511,7 +552,7 @@ impl Body<'_, '_> {
                     Some(scalar) => TExpr {
                         token,
                         ty: Ty::Scalar(scalar),
-                        kind: TKind::ConstParam,
+                        kind: TKind::ConstParam(def.param),
                     },
                     None => {
                         self.report(token, Code::NameUnknown);
@@ -624,10 +665,18 @@ impl Body<'_, '_> {
                 return TExpr::failed(token);
             }
         }
+        let type_args = function
+            .generics
+            .iter()
+            .map(|def| match def.constant {
+                Some(_) => subst.arg(&Arg::Const(crate::check::ty::Const::Param(def.param))),
+                None => Arg::Ty(subst.ty(&Ty::Param(def.param))),
+            })
+            .collect();
         TExpr {
             token,
             ty: Ty::Fn(Rc::new(subst.fn_ty(&ty))),
-            kind: TKind::FnValue(item),
+            kind: TKind::FnValue { item, type_args },
         }
     }
 
@@ -656,7 +705,10 @@ impl Body<'_, '_> {
         TExpr {
             token,
             ty,
-            kind: TKind::Construct(Vec::new()),
+            kind: TKind::Construct {
+                variant: Some(variant),
+                values: Vec::new(),
+            },
         }
     }
 
@@ -728,11 +780,12 @@ impl Body<'_, '_> {
             };
         }
         let typed_base = self.expr(base, None);
-        self.field_of(token, typed_base, name)
+        self.field_of(token, typed_base, name, true)
     }
 
-    /// A field of a value: of its struct or layout, where visible.
-    pub fn field_of(&mut self, token: Tok, base: TExpr, name: &ast::Name) -> TExpr {
+    /// A field of a value: of its struct or layout, where visible; `read` unless the field is
+    /// the target of `=`.
+    pub fn field_of(&mut self, token: Tok, base: TExpr, name: &ast::Name, read: bool) -> TExpr {
         let ty = match &base.ty {
             Ty::Error => return TExpr::failed(token),
             Ty::Item(item, args) => {
@@ -748,6 +801,9 @@ impl Body<'_, '_> {
                 match found {
                     Some(field) => {
                         self.name_member(name.token, Member::Field(*item, name.text.clone()));
+                        if read {
+                            self.ck.record_read(*item, &name.text);
+                        }
                         if !self
                             .ck
                             .db
@@ -926,7 +982,10 @@ impl Body<'_, '_> {
                         return TExpr {
                             token,
                             ty,
-                            kind: TKind::Construct(Vec::new()),
+                            kind: TKind::Construct {
+                                variant: Some(variant),
+                                values: Vec::new(),
+                            },
                         };
                     }
                 }
@@ -934,7 +993,10 @@ impl Body<'_, '_> {
                     return TExpr {
                         token,
                         ty: ty.clone(),
-                        kind: TKind::Construct(Vec::new()),
+                        kind: TKind::Construct {
+                            variant: tags.iter().position(|tag| *tag == name.text),
+                            values: Vec::new(),
+                        },
                     };
                 }
                 _ => {}
@@ -993,6 +1055,7 @@ impl Body<'_, '_> {
                 token,
                 ty: Ty::Scalar(Scalar::Bool),
                 kind: TKind::Unary {
+                    op,
                     operand: Box::new(typed),
                 },
             };
@@ -1045,6 +1108,7 @@ impl Body<'_, '_> {
             token,
             ty: result,
             kind: TKind::Unary {
+                op,
                 operand: Box::new(typed),
             },
         }
@@ -1066,13 +1130,14 @@ impl Body<'_, '_> {
                 token,
                 ty: Ty::Scalar(Scalar::Bool),
                 kind: TKind::Binary {
+                    op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
             };
         }
         if op.is_range() {
-            return self.range(token, left, right, expected);
+            return self.range(token, op, left, right, expected);
         }
         let item = self.item;
         let ck = self.ck;
@@ -1186,6 +1251,7 @@ impl Body<'_, '_> {
                             token,
                             ty: Ty::Error,
                             kind: TKind::Binary {
+                                op,
                                 left: Box::new(left),
                                 right: Box::new(right),
                             },
@@ -1227,6 +1293,7 @@ impl Body<'_, '_> {
             token,
             ty: result,
             kind: TKind::Binary {
+                op,
                 left: Box::new(left),
                 right: Box::new(right),
             },
@@ -1237,6 +1304,7 @@ impl Body<'_, '_> {
     fn range(
         &mut self,
         token: Tok,
+        op: BinaryOp,
         low: &ast::Expr,
         high: &ast::Expr,
         expected: Option<&Ty>,
@@ -1282,6 +1350,7 @@ impl Body<'_, '_> {
             token,
             ty,
             kind: TKind::Binary {
+                op,
                 left: Box::new(low_typed),
                 right: Box::new(high_typed),
             },
@@ -1604,8 +1673,9 @@ impl Body<'_, '_> {
             (ast::ClosureBody::Block(_), None) => Ty::Unit,
         };
         for capture in &closure.captures {
-            if self.lookup_local(&capture.name.text).is_none() {
-                self.report(capture.name.token, Code::NameUnknown);
+            match self.lookup_local(&capture.name.text) {
+                Some(local) => self.note_use(local),
+                None => self.report(capture.name.token, Code::NameUnknown),
             }
         }
         let loops = self.loops.len();
@@ -1744,6 +1814,7 @@ impl Body<'_, '_> {
                 ty: closure_ty,
                 body,
                 index,
+                loops,
                 lent: match written {
                     Written::Lent(scope) => Some(scope),
                     _ => None,
@@ -1897,6 +1968,7 @@ impl Body<'_, '_> {
     fn quantifier(
         &mut self,
         token: Tok,
+        all: bool,
         name: &ast::Name,
         range: &ast::Expr,
         body: &ast::Expr,
@@ -1919,13 +1991,15 @@ impl Body<'_, '_> {
             self.report(range.token, Code::ContractIllDefined);
         }
         self.push_scope();
-        self.declare(name, element, LocalKind::Quantified);
+        let local = self.declare(name, element, LocalKind::Quantified);
         let body_typed = self.check(body, &Ty::Scalar(Scalar::Bool));
         self.pop_scope();
         TExpr {
             token,
             ty: Ty::Scalar(Scalar::Bool),
             kind: TKind::Quantifier {
+                all,
+                local,
                 range: Box::new(range_typed),
                 body: Box::new(body_typed),
             },
@@ -2005,6 +2079,9 @@ impl Body<'_, '_> {
     }
 
     fn fail(&mut self, token: Tok, value: &ast::Expr) -> TExpr {
+        if self.cx.example {
+            self.report(token, Code::ExampleForm);
+        }
         let failure = self.frame().failure.clone();
         let test = self.frame().test;
         let typed = match (&failure, test) {
@@ -2072,7 +2149,7 @@ impl Body<'_, '_> {
                 None,
             );
             for field in &access.fields {
-                place = self.field_of(access.root.token, place, field);
+                place = self.field_of(access.root.token, place, field, true);
             }
             let value_ty = if self.ck.is_std(&place.ty, "task::Cown") {
                 place.ty.type_arg(0).cloned().unwrap_or(Ty::Error)
@@ -2131,14 +2208,16 @@ impl Body<'_, '_> {
             token,
             ty,
             kind: TKind::When {
+                attempt: attempt.is_some(),
                 accesses: accesses_typed,
                 body: Box::new(body_typed),
             },
         }
     }
 
-    /// An assignment target: a place, a local and a path of fields and indexes from it.
-    pub fn place(&mut self, target: &ast::Expr) -> Option<TExpr> {
+    /// An assignment target: a place, a local and a path of fields and indexes from it, the
+    /// target of `=` when `assigned`.
+    pub fn place(&mut self, target: &ast::Expr, assigned: bool) -> Option<TExpr> {
         match &target.kind {
             ExprKind::Path { path, args: None } if path.segments.len() == 1 => {
                 let local = self.lookup_local(&path.segments[0].text);
@@ -2160,8 +2239,8 @@ impl Body<'_, '_> {
                     self.expr(target, None);
                     return None;
                 }
-                let base = self.place(base)?;
-                Some(self.field_of(target.token, base, name))
+                let base = self.place(base, false)?;
+                Some(self.field_of(target.token, base, name, !assigned))
             }
             ExprKind::Index { base, index } => {
                 let typed = self.index(target.token, base, index, true);
@@ -2217,7 +2296,6 @@ impl Checker<'_> {
                         crate::check::ty::Const::Int(value) => value.to_string(),
                         crate::check::ty::Const::Bool(value) => value.to_string(),
                         crate::check::ty::Const::Param(param) => self.param_name(*param),
-                        crate::check::ty::Const::Item(item) => self.item_written(*item, from),
                         crate::check::ty::Const::Error => "_".to_owned(),
                     },
                 })

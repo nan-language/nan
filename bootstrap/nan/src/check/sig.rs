@@ -8,6 +8,7 @@ use super::db::{ItemId, ModuleId, TypeKey};
 use super::resolve::Named;
 use super::ty::{Arg, Args, Bound, Const, FnParam, FnTy, LimitSet, Param, Scalar, Ty};
 use crate::diagnostic::Code;
+use crate::interp::Val;
 use crate::syntax::ast::{
     self, FnKind, FnModifier, GenericArg, ItemKind, LimitKind, Mode, Tok, TypeKind, Visibility,
 };
@@ -19,11 +20,13 @@ pub struct Problem {
     pub token: Tok,
 }
 
-/// What resolving a signature finds: its diagnostics, and the instantiations, `Dyn` and function
-/// types it writes, checked once every signature is known.
+/// What resolving a signature finds: its diagnostics, the type mismatches with their expected
+/// and found texts, and the instantiations, `Dyn` and function types it writes, checked once
+/// every signature is known.
 #[derive(Clone, Debug, Default)]
 pub struct Problems {
     pub found: Vec<Problem>,
+    pub mismatches: Vec<(Tok, String, String)>,
     pub instantiations: Vec<(Ty, Tok)>,
 }
 
@@ -866,12 +869,42 @@ impl Checker<'_> {
         problems: &mut Problems,
     ) -> Arg {
         match (arg, param.constant) {
-            (GenericArg::Int { negative, token }, Some(_)) => {
-                let value = int_literal(self.db.item(ctx.item).text(*token)).unwrap_or(0);
-                Arg::Const(Const::Int(if *negative { -value } else { value }))
+            (GenericArg::Int { negative, token }, Some(scalar)) => {
+                let text = self.db.item(ctx.item).text(*token);
+                let written = literal_suffix(text);
+                if !scalar.is_integer() || written.is_some_and(|written| written != scalar) {
+                    let found = written.map_or("an integer type", Scalar::name);
+                    problems
+                        .mismatches
+                        .push((*token, scalar.name().to_owned(), found.to_owned()));
+                    return Arg::Const(Const::Error);
+                }
+                let value = int_literal(text).unwrap_or(0);
+                let value = if *negative { -value } else { value };
+                let (low, high) = scalar.range();
+                if value < low || value > high {
+                    problems.push(Problem {
+                        code: Code::TypeLiteralRange,
+                        token: *token,
+                    });
+                    return Arg::Const(Const::Error);
+                }
+                Arg::Const(Const::Int(value))
             }
-            (GenericArg::Bool { value, .. }, Some(_)) => Arg::Const(Const::Bool(*value)),
-            (GenericArg::Type(ty), Some(_)) => Arg::Const(self.const_arg(ctx, ty, problems)),
+            (GenericArg::Bool { value, token }, Some(scalar)) => {
+                if scalar != Scalar::Bool {
+                    problems.mismatches.push((
+                        *token,
+                        scalar.name().to_owned(),
+                        Scalar::Bool.name().to_owned(),
+                    ));
+                    return Arg::Const(Const::Error);
+                }
+                Arg::Const(Const::Bool(*value))
+            }
+            (GenericArg::Type(ty), Some(scalar)) => {
+                Arg::Const(self.const_arg(ctx, ty, scalar, problems))
+            }
             (GenericArg::Type(ty), None) => Arg::Ty(self.type_expr(ctx, ty, problems)),
             (GenericArg::Int { token, .. } | GenericArg::Bool { token, .. }, None) => {
                 problems.push(Problem {
@@ -883,8 +916,15 @@ impl Checker<'_> {
         }
     }
 
-    /// A const argument written as a type expression: a const item or a const parameter.
-    fn const_arg(&self, ctx: TypeCtx, ty: &ast::TypeExpr, problems: &mut Problems) -> Const {
+    /// A const argument of type `scalar` written as a type expression: a const item's value or a
+    /// const parameter.
+    fn const_arg(
+        &self,
+        ctx: TypeCtx,
+        ty: &ast::TypeExpr,
+        scalar: Scalar,
+        problems: &mut Problems,
+    ) -> Const {
         let TypeKind::Path { path, args: None } = &ty.kind else {
             problems.push(Problem {
                 code: Code::GenericArgumentKind,
@@ -898,18 +938,39 @@ impl Checker<'_> {
                 .iter()
                 .find(|def| def.name == path.segments[0].text)
         {
-            if def.constant.is_some() {
-                return Const::Param(def.param);
+            let Some(written) = def.constant else {
+                problems.push(Problem {
+                    code: Code::GenericArgumentKind,
+                    token: ty.token,
+                });
+                return Const::Error;
+            };
+            if written != scalar {
+                let found = written.name().to_owned();
+                problems
+                    .mismatches
+                    .push((ty.token, scalar.name().to_owned(), found));
+                return Const::Error;
             }
-            problems.push(Problem {
-                code: Code::GenericArgumentKind,
-                token: ty.token,
-            });
-            return Const::Error;
+            return Const::Param(def.param);
         }
         match self.db.resolve(ctx.module, path) {
             Ok(Named::Item(item)) if matches!(self.db.ast(item).kind, ItemKind::Const(_)) => {
-                Const::Item(item)
+                if let SigKind::Const { ty: written } = &self.sig(item).kind
+                    && *written != Ty::Scalar(scalar)
+                    && !written.has_error()
+                {
+                    let found = self.show(written, ctx.module);
+                    problems
+                        .mismatches
+                        .push((ty.token, scalar.name().to_owned(), found));
+                    return Const::Error;
+                }
+                match self.const_value(item).map(|value| value.value.clone()) {
+                    Some(Val::Int(value)) => Const::Int(value),
+                    Some(Val::Bool(value)) => Const::Bool(value),
+                    _ => Const::Error,
+                }
             }
             Ok(_) => {
                 problems.push(Problem {
@@ -1229,6 +1290,16 @@ pub fn int_literal(text: &str) -> Option<i128> {
         .find(|c: char| !c.is_digit(radix))
         .unwrap_or(digits.len());
     i128::from_str_radix(&digits[..end], radix).ok()
+}
+
+/// The scalar a number literal's suffix names, if it has one.
+pub fn literal_suffix(text: &str) -> Option<Scalar> {
+    let (body, markers): (&str, &[char]) = match text.strip_prefix("0x") {
+        Some(hex) => (hex, &['u', 'i']),
+        None => (text.trim_start_matches("0b"), &['u', 'i', 'f']),
+    };
+    let at = body.find(markers)?;
+    Scalar::from_name(&body[at..])
 }
 
 /// The smallest unsigned integer type holding `width` bits.

@@ -8,15 +8,15 @@ use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{self, ItemKind, Visibility};
-use crate::syntax::grammar::Punct;
-use crate::syntax::token::TokenKind;
 
 impl Checker<'_> {
     /// The rules over a package once each of its items is checked.
     pub fn check_package_whole(&self, package: PackageId) {
         self.check_module_cycles(package);
         self.check_variants(package);
-        self.check_const_cycles(package);
+        self.check_summaries(package);
+        self.check_variant_docs(package);
+        self.check_unused(package);
     }
 
     /// Each set of two or more modules depending on one another, reported once on the first
@@ -78,13 +78,8 @@ impl Checker<'_> {
         let data = self.db.item(item);
         let syntax = &data.file.syntax;
         let span = &syntax.items[data.index];
-        let separator = TokenKind::Punct(Punct::ColonColon);
-        (span.first..span.end)
-            .filter(|&index| {
-                syntax.tokens[index].kind == TokenKind::Ident
-                    && syntax.tokens.get(index + 1).map(|token| token.kind) == Some(separator)
-                    && (index == 0 || syntax.tokens[index - 1].kind != separator)
-            })
+        syntax
+            .path_starts(span.first..span.end)
             .filter_map(|index| {
                 let module = self.db.module_named(package, syntax.text(index))?;
                 Some((module, syntax.tokens[index].line))
@@ -141,55 +136,11 @@ impl Checker<'_> {
             }
         }
     }
-
-    /// Each set of consts and contributions whose initializers or values reach one another,
-    /// directly or through the functions they call, reported once at its member whose canonical
-    /// path sorts first.
-    fn check_const_cycles(&self, package: PackageId) {
-        let refs = self.refs.borrow();
-        let reaches = |from: ItemId| {
-            let mut seen = BTreeSet::new();
-            let mut pending = vec![from];
-            while let Some(current) = pending.pop() {
-                for next in refs.get(&current).into_iter().flatten() {
-                    if seen.insert(*next) {
-                        pending.push(*next);
-                    }
-                }
-            }
-            seen
-        };
-        let valued = |item: ItemId| {
-            matches!(
-                self.db.ast(item).kind,
-                ItemKind::Const(_) | ItemKind::Contribute(_)
-            )
-        };
-        let mut reported: BTreeSet<ItemId> = BTreeSet::new();
-        for &module in &self.db.package(package).modules {
-            for &item in &self.db.module(module).items {
-                if !valued(item) || reported.contains(&item) || !reaches(item).contains(&item) {
-                    continue;
-                }
-                let cycle: Vec<ItemId> = reaches(item)
-                    .into_iter()
-                    .filter(|other| valued(*other) && reaches(*other).contains(&item))
-                    .collect();
-                reported.extend(cycle.iter().copied());
-                if let Some(first) = cycle
-                    .iter()
-                    .min_by_key(|member| self.db.canonical(**member))
-                {
-                    self.report(*first, self.db.ast(*first).token, Code::ItemConstCycle);
-                }
-            }
-        }
-    }
 }
 
 /// The identity under which a variant directory exports an item: a `pub` or `pkg` item's name,
 /// an impl line's target and interface, or a tombstone's old form.
-fn exported_identity(item: &ast::Item) -> Option<String> {
+pub fn exported_identity(item: &ast::Item) -> Option<String> {
     let text = |path: &ast::Path| path.written();
     match &item.kind {
         ItemKind::Impl(implementation) => Some(format!(

@@ -222,6 +222,19 @@ impl Checker<'_> {
             && self.is_std(from, "task::Cancelled")
     }
 
+    /// The name of the from variant failure conversion chooses for a failure of type `from` into
+    /// the failure type `to`.
+    pub fn conversion_variant(&self, from: &Ty, to: &Ty) -> Option<String> {
+        let Ty::Item(item, _) = to else {
+            return None;
+        };
+        let index = self.chosen_from_variant(*item, to, from)?;
+        match &self.sig(*item).kind {
+            SigKind::Enum { variants } => Some(variants[index].name.clone()),
+            _ => None,
+        }
+    }
+
     /// The from variant of the enum `to` that from resolution chooses for a failure of type
     /// `from`: the one concrete candidate, else the one candidate.
     pub fn chosen_from_variant(&self, item: ItemId, to: &Ty, from: &Ty) -> Option<usize> {

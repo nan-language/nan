@@ -200,6 +200,22 @@ pub fn explain(
                     fields: vec![method],
                     lines: Vec::new(),
                 }));
+                for obligation in explained.obligations {
+                    let (_, file) = workspace
+                        .file(&obligation.path)
+                        .expect("items lie in workspace files");
+                    let mut lines = vec![output::printable(file.syntax.line_text(obligation.line))];
+                    lines.extend(obligation.counterexample);
+                    records.push(Record {
+                        word: "obligation".to_owned(),
+                        fields: vec![
+                            format!("{}:{}", obligation.path, obligation.line),
+                            obligation.kind,
+                            obligation.status,
+                        ],
+                        lines,
+                    });
+                }
             }
             let writer = scope.package(workspace).and_then(|package| package.name());
             if let [pack] = &check::contexts(workspace, &scope, None)[..] {

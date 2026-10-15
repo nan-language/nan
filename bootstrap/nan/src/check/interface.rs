@@ -27,6 +27,15 @@ pub fn openness(visibility: Visibility) -> u8 {
     }
 }
 
+/// The narrower of two visibilities.
+pub fn narrower(left: Visibility, right: Visibility) -> Visibility {
+    if openness(left) < openness(right) {
+        left
+    } else {
+        right
+    }
+}
+
 impl Checker<'_> {
     /// The rules of an impl line in order; a line failing where it lies or coherence is otherwise
     /// not checked.

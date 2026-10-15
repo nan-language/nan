@@ -56,13 +56,28 @@ codes! {
     ClosureProjectionValue = "closure.projection-value",
     ClosureSecondClass = "closure.second-class",
     ClosureShortEffect = "closure.short-effect",
+    ComponentNotComponent = "component.not-component",
+    ComponentStateGeneric = "component.state-generic",
+    ComponentStateNotEncode = "component.state-not-encode",
+    ComponentStateNotInert = "component.state-not-inert",
+    ComponentUnavailable = "component.unavailable",
+    ConstAssertFalse = "const.assert-false",
+    ConstStepsExhausted = "const.steps-exhausted",
+    ConstTrapped = "const.trapped",
+    ConstTrustedViolation = "const.trusted-violation",
+    ConstUninterpretable = "const.uninterpretable",
+    ConstViewNotStatic = "const.view-not-static",
     ContractAssumeUntrusted = "contract.assume-untrusted",
+    ContractDecreasesUnneeded = "contract.decreases-unneeded",
+    ContractDecreasesUnproven = "contract.decreases-unproven",
     ContractEmptyReason = "contract.empty-reason",
     ContractIllDefined = "contract.ill-defined",
+    ContractImplRequires = "contract.impl-requires",
     ContractImpureCondition = "contract.impure-condition",
     ContractOldForm = "contract.old-form",
     ContractQuantifierOutside = "contract.quantifier-outside",
     ContractTakenParameter = "contract.taken-parameter",
+    ContractVacuous = "contract.vacuous",
     DeferAbandonHead = "defer.abandon-head",
     DeferDeferredPlaceMoved = "defer.deferred-place-moved",
     DeferFails = "defer.fails",
@@ -75,9 +90,14 @@ codes! {
     DeriveDuplicate = "derive.duplicate",
     DeriveEnumDefault = "derive.enum-default",
     DeriveUnknown = "derive.unknown",
+    DocCodeBlock = "doc.code-block",
+    DocDigestClaim = "doc.digest-claim",
     DocMisplaced = "doc.misplaced",
     DocModuleFileMissing = "doc.module-file-missing",
+    DocPrivateReference = "doc.private-reference",
     DocSummaryMissing = "doc.summary-missing",
+    DocUnresolvedReference = "doc.unresolved-reference",
+    DocVariantMismatch = "doc.variant-mismatch",
     DomainUnavailable = "domain.unavailable",
     EditCheckFailed = "edit.check-failed",
     EditIdentityChanged = "edit.identity-changed",
@@ -96,6 +116,9 @@ codes! {
     EncodeManualImpl = "encode.manual-impl",
     EncodeNotInert = "encode.not-inert",
     EncodeView = "encode.view",
+    ExampleFailed = "example.failed",
+    ExampleForm = "example.form",
+    ExampleTrapped = "example.trapped",
     ErrorCancelUnmapped = "error.cancel-unmapped",
     ErrorFailureType = "error.failure-type",
     ErrorFromAmbiguous = "error.from-ambiguous",
@@ -129,6 +152,7 @@ codes! {
     GenericUninferred = "generic.uninferred",
     GenericUnsatisfiedBound = "generic.unsatisfied-bound",
     GenericWhereMisplaced = "generic.where-misplaced",
+    GenericWhereUnmet = "generic.where-unmet",
     HwAtomicType = "hw.atomic-type",
     HwDmaCompletion = "hw.dma-completion",
     HwDmaOperand = "hw.dma-operand",
@@ -217,6 +241,7 @@ codes! {
     LimitDuplicate = "limit.duplicate",
     LimitImpure = "limit.impure",
     LimitMayNotTerminate = "limit.may-not-terminate",
+    LimitMayTrap = "limit.may-trap",
     LimitRedundant = "limit.redundant",
     LimitStackSize = "limit.stack-size",
     ManifestAnyNotAlone = "manifest.any-not-alone",
@@ -279,8 +304,11 @@ codes! {
     PatternPathKind = "pattern.path-kind",
     PatternRangeKind = "pattern.range-kind",
     PatternRefutable = "pattern.refutable",
+    PredicateDefaultUnproven = "predicate.default-unproven",
     PredicateExposedField = "predicate.exposed-field",
     PredicateOutsideWrite = "predicate.outside-write",
+    ProofRefuted = "proof.refuted",
+    ProofUnknown = "proof.unknown",
     PropCapabilityDerive = "prop.capability-derive",
     PropCopyIneligible = "prop.copy-ineligible",
     PropLinearArgument = "prop.linear-argument",
@@ -305,6 +333,8 @@ codes! {
     RegisterStride = "register.stride",
     RegisterType = "register.type",
     RegisterWindowType = "register.window-type",
+    RegistryDuplicateKey = "registry.duplicate-key",
+    RegistryDuplicateUnique = "registry.duplicate-unique",
     RegistryEntryType = "registry.entry-type",
     RegistryGrantNotAlias = "registry.grant-not-alias",
     RegistryKeyType = "registry.key-type",
@@ -315,7 +345,10 @@ codes! {
     RegistryUniqueRepeated = "registry.unique-repeated",
     RegistryUniqueType = "registry.unique-type",
     RegistryUnknownField = "registry.unknown-field",
+    RetiredBadRewrite = "retired.bad-rewrite",
+    RetiredFormTaken = "retired.form-taken",
     RetiredForwardedUse = "retired.forwarded-use",
+    RetiredRewriteHidden = "retired.rewrite-hidden",
     StmtAssignTarget = "stmt.assign-target",
     StmtDiscardUnit = "stmt.discard-unit",
     StmtElseNotDiverging = "stmt.else-not-diverging",
@@ -335,6 +368,10 @@ codes! {
     SyntaxMismatchedDelimiter = "syntax.mismatched-delimiter",
     SyntaxUnclosedDelimiter = "syntax.unclosed-delimiter",
     SyntaxUnexpectedToken = "syntax.unexpected-token",
+    TargetDepProgram = "target.dep-program",
+    TargetDependencyUncovered = "target.dependency-uncovered",
+    TargetEntryHead = "target.entry-head",
+    TargetProgramTargets = "target.program-targets",
     TaskCaptureNotSend = "task.capture-not-send",
     TaskLendLocal = "task.lend-local",
     TaskLendOutsideScope = "task.lend-outside-scope",
@@ -345,7 +382,11 @@ codes! {
     TaskWhenNotCown = "task.when-not-cown",
     TaskWhenTake = "task.when-take",
     TaskWhenWait = "task.when-wait",
+    TestDbg = "test.dbg",
     TestGenerateType = "test.generate-type",
+    TestGeneratorGap = "test.generator-gap",
+    TestTargetUnreachable = "test.target-unreachable",
+    TestTestOnlyItem = "test.test-only-item",
     TextArgumentDuplicate = "text.argument-duplicate",
     TextArgumentUnused = "text.argument-unused",
     TextBareLen = "text.bare-len",
@@ -358,8 +399,10 @@ codes! {
     ThresholdEmptyReason = "threshold.empty-reason",
     ThresholdLength = "threshold.length",
     ThresholdUnusedWaiver = "threshold.unused-waiver",
+    TodoDisputed = "todo.disputed",
     TodoEmptyReason = "todo.empty-reason",
     TodoHole = "todo.hole",
+    TodoMissingSpec = "todo.missing-spec",
     TodoUntyped = "todo.untyped",
     ToolNoWorkspace = "tool.no-workspace",
     ToolUnknownScope = "tool.unknown-scope",
@@ -390,7 +433,11 @@ codes! {
     UntrustedValidatorInterface = "untrusted.validator-interface",
     UntrustedValidatorNoInput = "untrusted.validator-no-input",
     UntrustedWrappedAlias = "untrusted.wrapped-alias",
+    UnusedDependency = "unused.dependency",
+    UnusedField = "unused.field",
     UnusedGrant = "unused.grant",
+    UnusedItem = "unused.item",
+    UnusedLocal = "unused.local",
 }
 
 impl Code {
@@ -398,10 +445,18 @@ impl Code {
         match self {
             Code::InternalInvariant => Class::Internal,
             Code::RetiredForwardedUse
+            | Code::TestDbg
+            | Code::TestGeneratorGap
             | Code::ThresholdDepth
             | Code::ThresholdLength
+            | Code::TodoDisputed
             | Code::TodoHole
-            | Code::UnusedGrant => Class::Incompleteness,
+            | Code::TodoMissingSpec
+            | Code::UnusedDependency
+            | Code::UnusedField
+            | Code::UnusedGrant
+            | Code::UnusedItem
+            | Code::UnusedLocal => Class::Incompleteness,
             _ => Class::Error,
         }
     }
@@ -513,6 +568,8 @@ pub struct Diagnostic {
     pub because: Vec<Reason>,
     /// The bytes of the reported construct in its file.
     pub span: Option<(u32, u32)>,
+    /// The bytes of the construct its rule judges, when wider than the reported construct.
+    pub judged: Option<(u32, u32)>,
     /// For a syntax failure, the first byte of the token at which the parse failed.
     pub failing: Option<u32>,
     /// The fixes its rule names, or once re-checked, those it offers.
@@ -531,6 +588,7 @@ impl Diagnostic {
             found: None,
             because: Vec::new(),
             span: None,
+            judged: None,
             failing: None,
             fixes: Vec::new(),
             offer: Offer::Each,

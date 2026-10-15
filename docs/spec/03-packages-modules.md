@@ -291,14 +291,14 @@ pub fn stack_reserve() -> usize {
 } stack_reserve
 
 // file: probe/platform@bare/platform.nan
-//! Stack defaults on bare machines.
+//! Stack defaults per machine.
 
 pkg fn default_stack() -> usize {
     return 16_384
 } default_stack
 
 // file: probe/platform@host/platform.nan
-//! Stack defaults on the host.
+//! Stack defaults per machine.
 
 pkg fn default_stack() -> usize {
     return 65_536
@@ -322,7 +322,7 @@ pub fn stack_reserve() -> usize {
 } stack_reserve
 
 // file: probe/platform@bare/platform.nan
-//! Stack defaults on bare machines.
+//! Stack defaults per machine.
 
 pkg fn default_stack() -> usize {
     return 16_384
@@ -333,7 +333,7 @@ pkg fn has_firmware() -> bool { // error: module.variant-mismatch
 } has_firmware
 
 // file: probe/platform@host/platform.nan
-//! Stack defaults on the host.
+//! Stack defaults per machine.
 
 pkg fn default_stack() -> usize {
     return 65_536

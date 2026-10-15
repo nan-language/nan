@@ -438,6 +438,17 @@ pub fn is_unit(ratio: f64) -> bool {
 - The checker decides disjointness and exhaustiveness exactly over the values of the type: integers and `char` as sets of intervals, `bool` and `Unit` by value, enums by variant and payload, structs field by field, text and byte strings by value, which no finite set of literals covers, and a constant pattern by its const's value. A wildcard or binding matches every value, and only a wildcard, a binding or `else` matches the values of any other type.
 
 ```nan
+const SPLIT: u8 = 2 * 64
+
+pub fn half(level: u8) -> u8 {
+    return match level {
+        0..=SPLIT => 0
+        SPLIT..=255 => 1 // error: expr.overlapping-arms
+    }
+} half
+```
+
+```nan
 pub fn bucket(size: u32) -> u8 {
     return match size {
         0..<512 => 0

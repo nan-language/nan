@@ -4,7 +4,7 @@ Tasks in order, one agent each. Chapter numbers refer to `docs/spec/`; milestone
 
 ## 1. Front end foundation
 
-Implement the syntax layer of the bootstrap compiler: workspace, package and module loading (03), the lexer and parser of the grammar (41), `nan fmt` (35) and the diagnostic output contract (33, 34). Add a conformance harness that runs every nan example of the specification against its marker comments, and a CI pipeline running format, lint and tests.
+Implement the syntax layer of the bootstrap compiler: workspace, package and module loading (03), the lexer and parser of the grammar (41), `nan fmt` (35) and the diagnostic output contract (33, 34). Add a conformance harness that runs every NaN example of the specification against its marker comments, and a CI pipeline running format, lint and tests.
 
 ## 2. Semantic checker
 
@@ -16,7 +16,7 @@ Complete `nan check`: elaboration to NIR (19), the reference interpreter (21), c
 
 ## 4. Standard library
 
-Write the std packages in nan (28), every pub item with its contracts and examples, checked by `nan check`.
+Write the std packages in NaN (28), every pub item with its contracts and examples, checked by `nan check`.
 
 ## 5. Host code generation and runtime
 
@@ -34,9 +34,9 @@ Implement `nan verify` with the ledger, seals, API snapshots, doc binding and `n
 
 Add the `x86_64-uefi` and `x86_64-bare` targets: compiler stubs, the image writer, registries as data, the QEMU runner, the hw and boot std packages and both platform packages (23 to 25, 27). Then write the M4 scenario: a UEFI loader and an SMP kernel with preemption, a UART reader task woken by a signal and a virtio driver. Done when M4 passes.
 
-## 9. Front end in nan
+## 9. Front end in NaN
 
-Write the nan front end in nan: `nan check` with the prover and the interpreter, printing exactly what the bootstrap prints (38). Done when M5 passes.
+Write the NaN front end in NaN: `nan check` with the prover and the interpreter, printing exactly what the bootstrap prints (38). Done when M5 passes.
 
 ## 10. Freeze language 1
 
@@ -44,4 +44,4 @@ Take the measurements of the freeze (38), count the primer tiers with three toke
 
 ## 11. Self-hosting
 
-Make the nan toolchain build itself: write the code generator in nan over NIR (instruction selection, register allocation, x86-64 encoder, ELF and PE32+ writers, code without floating point for machine targets) and port the remaining commands. Then check the first self-built toolchain against the frozen bootstrap by diverse double-compiling and stage comparison (ADR 0002).
+Make the NaN toolchain build itself: write the code generator in NaN over NIR (instruction selection, register allocation, x86-64 encoder, ELF and PE32+ writers, code without floating point for machine targets) and port the remaining commands. Then check the first self-built toolchain against the frozen bootstrap by diverse double-compiling and stage comparison (ADR 0002).

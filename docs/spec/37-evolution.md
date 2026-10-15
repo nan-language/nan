@@ -4,13 +4,13 @@ This chapter defines language versions and the `language` directive, what a vers
 
 ## Language versions
 
-A **language version** is a positive integer naming one fixed definition of nan. This specification defines version 1, called language 1.
+A **language version** is a positive integer naming one fixed definition of NaN. This specification defines version 1, called language 1.
 
 The `language` [directive](03-packages-modules.md#manifest) states the version of its package. Every source file of the package is checked, formatted, proved and elaborated under exactly that version; no file, item, command option or environment variable states another.
 
 - The version is the value of the directive's `INT`. An `INT` that is not written in decimal, or that carries a literal suffix, is an error (`language.version-form`); the exact fix writes its value in decimal without a suffix, and the package is checked under that value.
 - A version the toolchain does not implement is an error (`language.unsupported`), reported on the directive. No command then checks, formats or builds any other file of the package.
-- An implementation of nan 1.0 implements exactly version 1.
+- An implementation of NaN 1.0 implements exactly version 1.
 
 ```nan
 // file: wire/package.nan

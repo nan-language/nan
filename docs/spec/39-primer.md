@@ -4,7 +4,7 @@ This chapter defines the primer tiers, their measurement and what `nan primer` p
 
 ## Primer tiers
 
-The **primer** is the priced text that teaches nan to an agent that has never seen it. It has three tiers:
+The **primer** is the priced text that teaches NaN to an agent that has never seen it. It has three tiers:
 
 - The core: what an agent writes correctly without a diagnostic. At most 8,000 tokens.
 - Six topics, each at most 3,000 tokens: low-level, concurrency, kernel, packages and trust, contracts, components.
@@ -16,13 +16,13 @@ A tier's size is the largest of the token counts that the three tokenizers named
 
 ## Core
 
-nan is a systems language without a garbage collector, a mandatory runtime or undefined behaviour in safe code. A line's meaning and acceptance depend only on its [closure set](00-charter.md#guarantees): its enclosing item, what the items and types it names expose, its module's grants, its package's targets, the aliases it uses and the core vocabulary. `nan context` prints that set, and `nan check --prefix` checks an unfinished file up to its first dead token.
+NaN is a systems language without a garbage collector, a mandatory runtime or undefined behaviour in safe code. A line's meaning and acceptance depend only on its [closure set](00-charter.md#guarantees): its enclosing item, what the items and types it names expose, its module's grants, its package's targets, the aliases it uses and the core vocabulary. `nan context` prints that set, and `nan check --prefix` checks an unfinished file up to its first dead token.
 
 ### Differences from mainstream languages
 
 `&&`, `||`, `!` and `?` are errors (`syntax.foreign`) whose exact fixes write `and`, `or`, `not` and `try`. The [false friends](40-false-friends.md) that matter most:
 
-| Mainstream habit | nan |
+| Mainstream habit | NaN |
 | --- | --- |
 | `throw`, `catch`, `f(x)?` | `fail E.V`, `attempt f(x)` (a `Result`), `try f(x)` |
 | `&x`, `&mut x`, `*p` | modes written at the call: read by default, `mut x`, `take x` |
@@ -467,7 +467,7 @@ pub validator fn decode(raw: Untrusted[Slice[u8]]) -> Header fails HeaderError
 - [Contracts](18-contracts.md#clauses): `requires P` is checked at each call that does not prove it; `ensures Q` may use `result` and `old(e)` and holds at each return, not when the call fails; `example E` is a `bool` expression the interpreter runs at check time, and it is part of the interface.
 - A run-time check is removed only by a proof; tests never remove checks. Tools show each obligation's [status](18-contracts.md#statuses): proven, checked, assumed or open.
 - `todo "intent"` is an expression of any type that traps when reached (`trap.todo`); in the clause region it marks a missing specification. `nan holes` lists every `todo` with its expected type.
-- `test name for target { ... } name` is a [test](22-testing.md#test-items) that counts only if its target runs. Its body may `await` and may pass any failure out with `try`; an escaping failure fails the test. Parameters of types implementing `Generate`, never views, make it a [property test](22-testing.md#property-tests): inputs are generated from types, predicates and the target's `requires`, boundary values included, and a failure shrinks to nan literals.
+- `test name for target { ... } name` is a [test](22-testing.md#test-items) that counts only if its target runs. Its body may `await` and may pass any failure out with `try`; an escaping failure fails the test. Parameters of types implementing `Generate`, never views, make it a [property test](22-testing.md#property-tests): inputs are generated from types, predicates and the target's `requires`, boundary values included, and a failure shrinks to NaN literals.
 - `testing::world()` returns a `host::World` of simulated capabilities, with an empty file system, a loopback network and a virtual clock. `testing` items and `sim` constructors are legal only in tests and examples. `dbg(e)` writes to the test trace and is incompleteness.
 
 ```nan
@@ -861,7 +861,7 @@ pub fn all_below(values: Slice[u8], limit: u8) -> bool
 
 - An example is one `bool` expression without `await`; a function that only mutates its receiver is shown by tests.
 - Property-test inputs are built constructively from types, predicates and the target's `requires`, with boundary values (0, minimum, maximum, empty, full, each limit and its neighbours) and never by rejection. A `requires` the generator cannot build from is a generator gap, which is incompleteness. A test needing a slice takes a `mem::List` or an `Array` and views it.
-- A failing property shrinks to nan literals and comes with an exact edit adding a regression test. `derives Generate` writes a type's generator.
+- A failing property shrinks to NaN literals and comes with an exact edit adding a regression test. `derives Generate` writes a type's generator.
 - `testing::world()` provides simulated capabilities: its file system starts empty and tests write files through it, its network reaches only the test's own listeners, and its clock is virtual. No code detects that it runs under test.
 - A failing `expect a == b` prints both sides; `testing::same(a, b)` compares structurally, Untrusted contents included. A failure escaping a test body is reported with its variant.
 - `nan test --affected` runs the tests whose dependencies changed. A test targeting a dependency's item is a [reliance test](22-testing.md#reliance-tests), which `nan dep sync` runs before accepting a release. uefi and bare tests also run under QEMU.

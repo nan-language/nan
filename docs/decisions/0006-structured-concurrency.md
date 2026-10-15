@@ -4,9 +4,9 @@ Status: accepted
 
 ## Context
 
-nan has no garbage collector and no references: values are reached through access modes and projections held by liveness ([0004](0004-value-semantics-without-references.md)), and waiting is the one effect code writes ([0005](0005-only-waiting-is-written.md)). On the host, reads and writes go through io_uring; in the kernel, through DMA. In both, the kernel or a device writes into a task's memory while the task waits.
+NaN has no garbage collector and no references: values are reached through access modes and projections held by liveness ([0004](0004-value-semantics-without-references.md)), and waiting is the one effect code writes ([0005](0005-only-waiting-is-written.md)). On the host, reads and writes go through io_uring; in the kernel, through DMA. In both, the kernel or a device writes into a task's memory while the task waits.
 
-The bugs concurrency usually brings are invisible from the window an agent reads: a task that outlives the data it uses, a lock order that deadlocks two functions apart, a cancelled read whose buffer the device still fills, a data race. An agent also cannot debug a failure that happens one run in a hundred. NanOS services must be updatable while they run, which needs a moment when a service holds no half-finished work.
+The bugs concurrency usually brings are invisible from the window an agent reads: a task that outlives the data it uses, a lock order that deadlocks two functions apart, a cancelled read whose buffer the device still fills, a data race. An agent also cannot debug a failure that happens one run in a hundred. NaN OS services must be updatable while they run, which needs a moment when a service holds no half-finished work.
 
 The concurrency model therefore has to make these bugs impossible by construction, judged inside one item, and make concurrent tests reproducible.
 
@@ -25,7 +25,7 @@ Rejected alternatives:
 
 - **Unstructured spawn:** a detached task can outlive every value it uses and fail with nobody told.
 - **Lending through a `Scope` passed as a parameter:** the callee could lend its own locals, which end before the scope does.
-- **Stackless futures:** they need pinning and self-referential types that nan lacks, and they forbid views across suspension.
+- **Stackless futures:** they need pinning and self-referential types that NaN lacks, and they forbid views across suspension.
 - **Locks in safe code:** their deadlocks depend on the order of acquisitions in distant functions.
 - **Cancellation by dropping frames, or owned buffers for every operation:** the first frees memory a device still writes; the second gives up views in I/O.
 - **A component item kind:** an interface and an impl line express it, with no new item kind for the parser, the formatter and the merge driver.
@@ -39,4 +39,4 @@ Rejected alternatives:
 - Cancellation takes as long as the slowest acknowledgement. A driver that writes its own completion operation stops the device and polls it until it acknowledges before returning the buffer.
 - Every task needs a stack: 64 KiB guard-paged on the host, a static bound in kernel contexts. Host switching relies on Cranelift's `stack_switch`, which the Cranelift spike must confirm before M2.
 - Replay reproduces the interleavings safe code can observe, not orders that trusted atomics may observe beyond sequential consistency, nor device and interrupt timing.
-- Before NanOS, components run only under `host::Runner`. A handler needing I/O delegates it to a keyed task, and a resource leaves the Env through an `Option` field and returns inside a message.
+- Before NaN OS, components run only under `host::Runner`. A handler needing I/O delegates it to a keyed task, and a resource leaves the Env through an `Option` field and returns inside a message.

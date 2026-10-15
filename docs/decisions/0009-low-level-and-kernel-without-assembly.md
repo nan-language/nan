@@ -4,9 +4,9 @@ Status: accepted
 
 ## Context
 
-NanOS is written in nan from the bootloader up: UEFI firmware calls, page tables, descriptor tables, interrupt entry, device registers and DMA rings. This code needs operations no type system can check, and in mainstream systems languages it is written with an undifferentiated `unsafe` and inline assembly strings. Neither states what it relies on, neither is visible to analysis, and agents invent instructions and register constraints inside assembly text that nothing checks. Kernel state usually lives in mutable globals, and the rules of interrupt context (never sleep, never allocate, hold the right lock with interrupts masked) are conventions that a reader of one window cannot verify.
+NaN OS is written in NaN from the bootloader up: UEFI firmware calls, page tables, descriptor tables, interrupt entry, device registers and DMA rings. This code needs operations no type system can check, and in mainstream systems languages it is written with an undifferentiated `unsafe` and inline assembly strings. Neither states what it relies on, neither is visible to analysis, and agents invent instructions and register constraints inside assembly text that nothing checks. Kernel state usually lives in mutable globals, and the rules of interrupt context (never sleep, never allocate, hold the right lock with interrupts masked) are conventions that a reader of one window cannot verify.
 
-nan has no ambient authority ([0008](0008-authority-as-values.md)), and the bootstrap generates code with Cranelift, which cannot be relied on to keep memory-mapped accesses in order or to leave floating-point state untouched. The trusted base must be small, listed and typed, and kernel rules must be compiler errors.
+NaN has no ambient authority ([0008](0008-authority-as-values.md)), and the bootstrap generates code with Cranelift, which cannot be relied on to keep memory-mapped accesses in order or to leave floating-point state untouched. The trusted base must be small, listed and typed, and kernel rules must be compiler errors.
 
 ## Decision
 
@@ -21,7 +21,7 @@ nan has no ambient authority ([0008](0008-authority-as-values.md)), and the boot
 Rejected alternatives:
 
 - **`unsafe`:** it unlocks everything at once, states no premise and leaves its obligations invisible.
-- **Inline assembly:** a second, unchecked language inside nan, opaque to digests, contracts and authority checks.
+- **Inline assembly:** a second, unchecked language inside NaN, opaque to digests, contracts and authority checks.
 - **Unions:** reinterpretation forges tags and predicates; trusted byte views cover the rare need.
 - **Mutable statics:** they are ambient, unsynchronised and cannot be replaced in tests.
 - **Masking interrupts as exclusion:** it excludes only the local CPU.

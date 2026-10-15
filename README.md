@@ -1,6 +1,6 @@
-# nan
+# NaN
 
-nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. It will compile itself and build NanOS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It will compile itself and build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
 
 ## Specification
 
@@ -19,7 +19,7 @@ The first command installs the Rust toolchain pinned in `rust-toolchain.toml`. T
 
 ## Usage
 
-Build the compiler with `cargo build`, then run it from a directory of nan packages:
+Build the compiler with `cargo build`, then run it from a directory of NaN packages:
 
 ```bash
 target/debug/nan check

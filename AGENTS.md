@@ -2,7 +2,7 @@
 
 ## Project
 
-nan is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled nan artefacts can reuse each other. It will compile itself and build NanOS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It will compile itself and build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, then stays frozen and serves only to verify the self-hosted compiler.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `bootstrap/` | The bootstrap compiler, one Cargo workspace crate per directory |
 | `bootstrap/nan/src/` | Source of the `nan` binary; a module's unit tests live in `<module>/tests.rs` beside it |
 | `bootstrap/nan/tests/` | The conformance harness |
-| `docs/spec/` | The nan 1.0 language specification, one chapter per file |
+| `docs/spec/` | The NaN 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
 | `.config/` | nextest configuration |
 | `.github/` | The CI workflow |
@@ -94,8 +94,8 @@ Every document except ADRs is listed here. Read one only when the task needs it.
 
 | Document | Covers |
 | --- | --- |
-| `docs/spec/00-charter.md` | The nan 1.0 specification: its guarantees, glossary and the map of every chapter in `docs/spec/` |
-| `docs/spec/39-primer.md` | The primer: what to read before writing or reviewing nan code |
+| `docs/spec/00-charter.md` | The NaN 1.0 specification: its guarantees, glossary and the map of every chapter in `docs/spec/` |
+| `docs/spec/39-primer.md` | The primer: what to read before writing or reviewing NaN code |
 
 ## ADR
 

@@ -4,9 +4,9 @@ Status: superseded by 0002
 
 ## Context
 
-nan is a language for agentic coding that will compile itself and build NanOS, an operating system for AI, on x86_64. Until then, a bootstrap compiler written in an existing language compiles nan for Linux on x86_64; it is discarded once nan compiles itself, and nothing it depends on may shape the language.
+NaN is a language for agentic coding that will compile itself and build NaN OS, an operating system for AI, on x86_64. Until then, a bootstrap compiler written in an existing language compiles NaN for Linux on x86_64; it is discarded once NaN compiles itself, and nothing it depends on may shape the language.
 
-The bootstrap compiler generates machine code through an existing code-generation library: a hand-written backend would be discarded with it, and the lasting backend will be written in nan.
+The bootstrap compiler generates machine code through an existing code-generation library: a hand-written backend would be discarded with it, and the lasting backend will be written in NaN.
 
 Tools must be mature and widely adopted, and checks must be fast, runnable for one scope and quiet enough for agents to read.
 
@@ -24,11 +24,11 @@ Cranelift and `datatest-stable` enter the manifest with the first change that us
 
 ## Consequences
 
-- Rewriting the compiler in nan is a translation, not a port of Rust libraries; argument parsing, errors and serialisation are written by hand.
-- Cranelift needs no system dependency but optimises less than LLVM, so programs built by the bootstrap compiler are slower. Performance belongs to the nan-written backend.
-- Cranelift's API changes between releases. The compiler follows one long-term support line at a time (security fixes for 24 months, until about August 2028 for 0.135) and keeps every Cranelift call in one backend unit, so each upgrade, and the switch to the nan backend, replaces that unit. Cranelift fixes are published as Wasmtime security advisories, not under Cranelift's crate names.
+- Rewriting the compiler in NaN is a translation, not a port of Rust libraries; argument parsing, errors and serialisation are written by hand.
+- Cranelift needs no system dependency but optimises less than LLVM, so programs built by the bootstrap compiler are slower. Performance belongs to the NaN-written backend.
+- Cranelift's API changes between releases. The compiler follows one long-term support line at a time (security fixes for 24 months, until about August 2028 for 0.135) and keeps every Cranelift call in one backend unit, so each upgrade, and the switch to the NaN backend, replaces that unit. Cranelift fixes are published as Wasmtime security advisories, not under Cranelift's crate names.
 - Cranelift adds about 30 crates; a clean build takes about 30 seconds, an incremental one under a second.
 - Programs built during the bootstrap depend on glibc. Linking without it (an own entry point and system-call stubs, linked with `ld -static -nostdlib`) works with the same tools and is left to the decision on the program runtime.
 - Fixed target settings make output identical on every machine, which comparing the stages of a self-hosting compiler requires, at the cost of newer CPU extensions until the baseline is raised deliberately.
 - cargo-nextest is installed separately, at a pinned version that `.config/nextest.toml` enforces. It does not run doctests, so behaviour is tested in unit and end-to-end tests, not in doc comments.
-- The end-to-end tests belong to the language, not to the Rust compiler, so any nan compiler, including the self-hosted one, can be checked against them.
+- The end-to-end tests belong to the language, not to the Rust compiler, so any NaN compiler, including the self-hosted one, can be checked against them.

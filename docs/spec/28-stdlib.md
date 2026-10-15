@@ -29,7 +29,7 @@ A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `t
 Std ships with the toolchain:
 
 - A toolchain carries exactly one release of each std package, and the [toolchain hash](36-builds.md#toolchain-hash) covers their sources. No `dep` directive and no line of a [lock](29-identity-versioning.md#lock) names a std package.
-- In every other respect a std package is a package: written in nan, with an [artefact](30-artefacts.md#artefacts) holding its interfaces, digests, ledger and seals, and recorded in the [requires-sets](29-identity-versioning.md#requires-sets) of the packages using its items.
+- In every other respect a std package is a package: written in NaN, with an [artefact](30-artefacts.md#artefacts) holding its interfaces, digests, ledger and seals, and recorded in the [requires-sets](29-identity-versioning.md#requires-sets) of the packages using its items.
 - Std passes `nan verify`: it holds no incompleteness, and each of its trust escapes, its package items granting `device` or `priv` included, carries a current [seal](31-trust.md#seals). An implementation whose std fails `nan verify` does not conform.
 
 ```nan

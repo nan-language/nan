@@ -6,9 +6,9 @@ Status: accepted
 
 This record supersedes [0001](0001-stack.md). Its tools stand; three of its premises do not.
 
-- Language 1 freezes only once a UEFI loader and an SMP kernel run ([milestones](../spec/38-self-hosting.md#milestones)), and kernel work cannot wait for a compiler written in nan. The bootstrap therefore builds `x86_64-uefi` (PE32+) and `x86_64-bare` (freestanding ELF64) images as well as Linux programs ([descriptors](../spec/27-program-model.md#descriptors)). No C toolchain or libc exists for those images to link against.
+- Language 1 freezes only once a UEFI loader and an SMP kernel run ([milestones](../spec/38-self-hosting.md#milestones)), and kernel work cannot wait for a compiler written in NaN. The bootstrap therefore builds `x86_64-uefi` (PE32+) and `x86_64-bare` (freestanding ELF64) images as well as Linux programs ([descriptors](../spec/27-program-model.md#descriptors)). No C toolchain or libc exists for those images to link against.
 - The language defines stackful tasks, completion I/O and acknowledged cancellation ([suspension, I/O and cleanup](../spec/17-suspension-io.md)). Host programs need a runtime that completes I/O into buffers a task lent and acknowledges every cancellation before the buffer's owner continues.
-- A bootstrap discarded once nan compiles itself leaves no independent compiler to check the self-hosted one against. Diverse double-compiling needs a second implementation of the whole language, from another code base in another language.
+- A bootstrap discarded once NaN compiles itself leaves no independent compiler to check the self-hosted one against. Diverse double-compiling needs a second implementation of the whole language, from another code base in another language.
 
 ## Decision
 
@@ -26,7 +26,7 @@ These decisions are new:
 - **Image writer.** Cranelift emits freestanding objects for `x86_64-uefi` and `x86_64-bare`, each function in its calling convention (`win64` for code that firmware calls or that calls firmware). The compiler's own image writer lays out those objects and applies their relocations into a PE32+ image or a static ELF64 image entered by the PVH boot protocol ([images](../spec/27-program-model.md#images)). It links only objects the compiler produced: registries become sorted read-only data in codegen, and no foreign object enters a machine image.
 - **QEMU.** Tests and `nan run` of machine-target programs boot their image under `qemu-system-x86_64` on a `q35` machine with 4 processors, through OVMF for UEFI and PVH for bare images. The serial port carries the output, and a write to the exit port ends the run with its status ([emulator runs](../spec/22-testing.md#emulator-runs)).
 - **Host runtime.** Every task runs on its own guard-paged stack, 64 KiB unless its limits say otherwise, switched by Cranelift's stack switching. Each executor thread owns one io_uring instance through which every waiting primitive performs its operation; cancelling submits `IORING_OP_ASYNC_CANCEL`, and the operation's own completion is the acknowledgement ([host I/O backend](../spec/27-program-model.md#host-io-backend)). Host images link `libc.so.6` alone.
-- **Lifetime.** The bootstrap implements all of language 1: every rule on every target, every command, the prover and the interpreter ([bootstrap](../spec/38-self-hosting.md#bootstrap)). Language 1 freezes on it, and the bootstrap freezes with it: it never implements a later language version. Once the nan toolchain builds itself, the bootstrap checks that first self-built toolchain by diverse double-compiling and [stage comparison](../spec/36-builds.md#stage-comparison). Each later toolchain is built by its checked predecessor, so the chain of trust starts at an independent compiler without the bootstrap following the language.
+- **Lifetime.** The bootstrap implements all of language 1: every rule on every target, every command, the prover and the interpreter ([bootstrap](../spec/38-self-hosting.md#bootstrap)). Language 1 freezes on it, and the bootstrap freezes with it: it never implements a later language version. Once the NaN toolchain builds itself, the bootstrap checks that first self-built toolchain by diverse double-compiling and [stage comparison](../spec/36-builds.md#stage-comparison). Each later toolchain is built by its checked predecessor, so the chain of trust starts at an independent compiler without the bootstrap following the language.
 
 Rejected alternatives:
 
@@ -38,11 +38,11 @@ Rejected alternatives:
 - **Discarding the bootstrap:** every later compiler would rest on a chain of binaries leading back to one nobody can rebuild. Rust took that path, and independent verification of rustc later needed an outside reimplementation, mrustc, which lags behind the language.
 - **Keeping the bootstrap for a subset:** double-compiling would then cover only that subset, and the self-hosted toolchain could not use the rest of the language.
 - **Keeping the bootstrap in step with every language version:** it doubles the cost of every change and keeps Rust in the language's evolution, while checking the first self-built toolchain and chaining from it gives the same assurance.
-- **Writing the nan backend before kernel work:** NanOS would wait behind the hardest toolchain project.
+- **Writing the NaN backend before kernel work:** NaN OS would wait behind the hardest toolchain project.
 
 ## Consequences
 
-- Language changes after the freeze land only in the nan toolchain. The conformance tests and end-to-end tests belong to the language, so both implementations answer to the same tests of language 1.
+- Language changes after the freeze land only in the NaN toolchain. The conformance tests and end-to-end tests belong to the language, so both implementations answer to the same tests of language 1.
 - Repeating the double-compiling check needs a Linux host and the frozen Rust toolchain of the bootstrap.
 - The design relies on Cranelift 0.135 for stack switching on x86_64, reported frame sizes (which the [stack limits](../spec/10-effects-digests.md#stack-limits) check reads), the `win64` convention, freestanding objects, and code that never stores below the stack pointer on machine targets. Each Cranelift upgrade must keep them.
 - Cranelift promises neither the ordering of volatile device accesses nor code free of SSE registers. Device, port and privileged operations are byte-function stubs that act as compiler barriers, and every seam saves the full extended CPU state ([floating point](../spec/24-kernel.md#floating-point)).

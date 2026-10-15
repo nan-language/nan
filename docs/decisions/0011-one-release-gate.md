@@ -23,7 +23,7 @@ Alternatives rejected:
 - **Named policies or profiles** such as dev, release and kernel: a third axis beside targets and commands, and a meaning of "passes" that depends on configuration. Target environments restrict what is valid; the gate restricts what is released.
 - **More statuses** (tested, sealed, attested): only the difference between a premise and a reviewed judgement changes behaviour.
 - **Seals bound to the item text alone**: a callee whose contract weakens would leave the seal standing on a premise that no longer holds.
-- **Signed seals**: they need keys and principal identities that only NanOS provides.
+- **Signed seals**: they need keys and principal identities that only NaN OS provides.
 - **Review in pull requests with no seals**: nothing machine-checked ties the review to the code, so it lapses silently.
 - **A separate store of specifications with its own accept command**: it duplicates the API snapshot and seals.
 - **Hashing whole tests**: any refactor of a test would read as a weakening, which teaches agents to seal by reflex.

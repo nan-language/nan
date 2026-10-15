@@ -4,7 +4,7 @@ Status: accepted
 
 ## Context
 
-nan builds a kernel, drivers and a compiler, so it needs in-place mutation, address-stable memory and no undefined behaviour in safe code, without a garbage collector or a mandatory runtime.
+NaN builds a kernel, drivers and a compiler, so it needs in-place mutation, address-stable memory and no undefined behaviour in safe code, without a garbage collector or a mandatory runtime.
 
 Rust reaches this with references and lifetimes. Lifetime variables enter heads and tie items together, and borrow errors name regions and code outside the window. That breaks closure ([0003](0003-agent-first-guarantees.md)) and makes such errors hard to repair from a window. An agent reading one line must also see whether a call reads, changes or consumes each argument.
 

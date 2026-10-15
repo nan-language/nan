@@ -1,6 +1,6 @@
 # Kernel execution model
 
-This chapter defines how nan code runs as a kernel on `x86_64-uefi` and `x86_64-bare`: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state and the kernel lowering of waiting; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
+This chapter defines how NaN code runs as a kernel on `x86_64-uefi` and `x86_64-bare`: the anchor and the entry contexts that reach it; interrupt fns with their contexts, frames, exits, implied limits, binding and stacks, and the landing fns that receive user-origin exceptions and syscalls; interrupt state and `hw::without_irqs`; signals; spin locks and installed devices; thread context, thread switching, preemption, per-CPU state and the kernel lowering of waiting; physical memory; firmware services; floating point and extended state; kernel halts; and the properties of the kernel types.
 
 ## Anchor
 

@@ -179,7 +179,7 @@ An enum is **packed** when exactly one of its variants has a payload that is not
 
 ### ABI
 
-The **ABI** of a final closure is every choice of representation and calling that this chapter leaves open: the layouts of structs, enums that are not packed, views, boxes, function values, closures, `Dyn` values and task frames; field order, padding and tag values; the niche representing each unit variant of a packed enum; how nan functions pass arguments, results and failures; the encoding of an image's line tables and frame records; the binding of symbols, every symbol name the specification does not fix, and the objects lowering produces. The ABI is unspecified.
+The **ABI** of a final closure is every choice of representation and calling that this chapter leaves open: the layouts of structs, enums that are not packed, views, boxes, function values, closures, `Dyn` values and task frames; field order, padding and tag values; the niche representing each unit variant of a packed enum; how NaN functions pass arguments, results and failures; the encoding of an image's line tables and frame records; the binding of symbols, every symbol name the specification does not fix, and the objects lowering produces. The ABI is unspecified.
 
 Between code of different final closures, the only defined representations are the fixed layouts and the conventions of [foreign fns](23-low-level.md#foreign-functions) and function types with a [convention clause](23-low-level.md#calling-conventions).
 

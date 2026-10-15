@@ -4,7 +4,7 @@ Status: accepted
 
 ## Context
 
-NanOS runs code written by agents, and agents act on data that others control: network payloads, files, model output, arguments passed by another agent. Any of it may carry instructions meant to steer the program. The system needs least authority, and a guarantee that outside data cannot reach a decision without passing through code someone reviewed.
+NaN OS runs code written by agents, and agents act on data that others control: network payloads, files, model output, arguments passed by another agent. Any of it may carry instructions meant to steer the program. The system needs least authority, and a guarantee that outside data cannot reach a decision without passing through code someone reviewed.
 
 Mainstream languages give every function ambient authority: a global file system, clock, randomness, allocator and environment. Least authority then cannot be enforced, a window does not show what a function can touch, and tests cannot replace the world without mocking inside the code. Some authority is not a value at all, though: touching device memory, executing privileged instructions, running trusted code, opening untrusted data. Systems code also fills shared tables (interrupt vectors, drivers, system calls) that many packages extend, and that parallel agents would otherwise all edit in one place.
 
@@ -33,5 +33,5 @@ Rejected alternatives:
 - Heads carry capability parameters. Copy handles keep that cheap, but every operation through one checks its generation at run time.
 - Parsing code is explicit and confined to validators, which tools list; declassifying validators need a seal by an author other than theirs.
 - A driver granted `device` can still misprogram DMA until an IOMMU is modelled; sealing and listing the grant is the protection until then.
-- Registry tables are fixed at the final build: a duplicate key can appear only when two packages meet in one closure, and tables filled at load time wait for NanOS.
-- The word `ipc` and the path `sys::infer` are reserved for IPC and inference capabilities, whose data is already listed as Untrusted. NanOS principals and capability-scoped tool queries wait for NanOS.
+- Registry tables are fixed at the final build: a duplicate key can appear only when two packages meet in one closure, and tables filled at load time wait for NaN OS.
+- The word `ipc` and the path `sys::infer` are reserved for IPC and inference capabilities, whose data is already listed as Untrusted. NaN OS principals and capability-scoped tool queries wait for NaN OS.

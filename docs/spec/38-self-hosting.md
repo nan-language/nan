@@ -1,6 +1,6 @@
 # Self-hosting and milestones
 
-This chapter defines the bootstrap and the nan front end, the milestones on which language 1 freezes, and the measurements the freeze requires.
+This chapter defines the bootstrap and the NaN front end, the milestones on which language 1 freezes, and the measurements the freeze requires.
 
 ## Bootstrap
 
@@ -12,16 +12,16 @@ The **bootstrap** is the [implementation](00-charter.md#conformance) written in 
 - On `x86_64-host`, the bootstrap's `stack_switch` [support routine](27-program-model.md#runtime-support) switches task stacks with Cranelift's stack switching.
 - Cranelift is the backend whose reported frame sizes the [stack limits](10-effects-digests.md#stack-limits) check reads.
 
-### Nan front end
+### NaN front end
 
-The **nan front end** is a program written in nan that implements `nan check`: lexing, parsing, every checking rule, elaboration to NIR, the prover and the interpreter. It targets `x86_64-host`, is built by the bootstrap and implements no other command.
+The **NaN front end** is a program written in NaN that implements `nan check`: lexing, parsing, every checking rule, elaboration to NIR, the prover and the interpreter. It targets `x86_64-host`, is built by the bootstrap and implements no other command.
 
-- For every workspace and scope, the nan front end prints, byte for byte, the output of the bootstrap's `nan check`.
+- For every workspace and scope, the NaN front end prints, byte for byte, the output of the bootstrap's `nan check`.
 - For every item and target it checks, it produces NIR whose [canonical encoding](19-nir.md#encoding) is identical to the bootstrap's when both carry the same [advisories](37-evolution.md#prover-monotonicity).
 
 ## Milestones
 
-A **milestone** is one of M1 to M6, each a set of checks run on the bootstrap. Language 1 **freezes**, becoming the fixed definition of nan that version 1 names ([language versions](37-evolution.md#language-versions)), when all six milestones pass on one build of the bootstrap and every [measurement](#measurements) with a bound meets it on that build.
+A **milestone** is one of M1 to M6, each a set of checks run on the bootstrap. Language 1 **freezes**, becoming the fixed definition of NaN that version 1 names ([language versions](37-evolution.md#language-versions)), when all six milestones pass on one build of the bootstrap and every [measurement](#measurements) with a bound meets it on that build.
 
 A **kernel conformance test** is one whose `nan` block, or for a `text` block the nearest earlier `nan` block of its section, has a package declaring `x86_64-uefi` or `x86_64-bare`; the others are **host conformance tests**. A conformance test passes when every run of the [harness](00-charter.md#marker-comments) gives what its marker comments state.
 
@@ -33,7 +33,7 @@ A **scenario** is a workspace written for a milestone with the behaviour the mil
 | M2: host programs | Every host conformance test passes, except the `nan verify` runs and the `text` blocks holding commands. In a scenario, the body of `sys::Domain.run` traps while a task of its domain has a `sys::net::Conn.read` in flight; the test asserts that `run` returns `Err` ([settlement](11-errors-domains.md#settlement)), then connects again and completes a read. |
 | M3: proof and packages | Every host conformance test passes. Each obligation of the host conformance tests and the M2 scenario has the same outcome with and without the [proof cache](20-prover.md#proof-cache). In a scenario of 2 packages, one naming the other by a store name of the [local store](29-identity-versioning.md#local-store), `nan publish --local` publishes 2 releases of the dependency, then `nan dep sync` locks the second. `nan merge` of a file holding an enum with 2 versions of it, each adding a distinct variant, reports no conflict ([order-free members](33-toolchain.md#order-free-members)). |
 | M4: kernel | Every kernel conformance test passes. An `x86_64-uefi` loader reads the image file of the M4 kernel from its boot volume through [firmware services](24-kernel.md#firmware-services) and copies each loadable segment to its physical address, zero-filled to its size in memory. An `x86_64-bare` kernel installs its [anchor](24-kernel.md#anchor), whose scheduler runs on every processor of the [emulator](27-program-model.md#descriptors); a task that never awaits is [preempted](24-kernel.md#preemption) and another task runs; a reader task is woken by a [signal](24-kernel.md#signals) that the 16550 UART's interrupt fn posts on receiving, in loopback mode, a byte the kernel wrote; and a driver of a virtio entropy device keeps its virtqueue in `hw::DmaShared` memory ([DMA](23-low-level.md#dma)) and receives bytes through it. |
-| M5: self-check | The nan front end meets every requirement of [nan front end](#nan-front-end) on its own workspace, on every [std package](28-stdlib.md#std-layers) and on the `nan` block of every conformance test, and reports no diagnostic on its own workspace. |
+| M5: self-check | The NaN front end meets every requirement of [NaN front end](#nan-front-end) on its own workspace, on every [std package](28-stdlib.md#std-layers) and on the `nan` block of every conformance test, and reports no diagnostic on its own workspace. |
 | M6: component | In a scenario, a [component](26-components.md#components) runs on `host::Runner`, its Env holding a `sys::net::Listener` in an `Option` field. A handler moves the listener out with [`Option.extract`](28-stdlib.md#option-and-result-members) into a [keyed task](26-components.md#keyed-tasks), which accepts a connection, owns it while reading it until the peer closes it, and posts each read's byte count through its outbox. The runner's body connects, writes bytes, closes and sleeps for 1 ms; the test asserts that `run` returns a state counting every byte written. |
 
 ## Measurements

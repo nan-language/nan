@@ -1,10 +1,10 @@
 # False friends
 
-A **false friend** is a nan form spelt like a form of C, Rust, Go, Python or TypeScript but meaning something else, or a mainstream form that nan rejects. This chapter lists the false friends shared by several of these languages, then those of each language. Each row gives the mainstream form, what nan does with that spelling or writes for that intent, and the section owning the rule, which alone defines it. Exact fixes for `syntax.foreign` come from the [idiom table](34-diagnostics.md#idiom-table).
+A **false friend** is a NaN form spelt like a form of C, Rust, Go, Python or TypeScript but meaning something else, or a mainstream form that NaN rejects. This chapter lists the false friends shared by several of these languages, then those of each language. Each row gives the mainstream form, what NaN does with that spelling or writes for that intent, and the section owning the rule, which alone defines it. Exact fixes for `syntax.foreign` come from the [idiom table](34-diagnostics.md#idiom-table).
 
 ## Common forms
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | `&&`, `\|\|`, `!` | `and`, `or`, `not`; the foreign spellings are `syntax.foreign` | [Logical operators](06-statements-expressions.md#logical-operators) |
 | `;` ending a statement | A statement ends with its logical line; `;` is `syntax.foreign` | [Statements](06-statements-expressions.md#statements) |
@@ -65,7 +65,7 @@ pub fn unit_span(start: u32) -> Span {
 
 ## C
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | `char`, `'a'` as small integers | `char` holds a Unicode scalar value; a byte is a `u8`, written `b'a'` | [Scalars](04-types.md#scalars), [Text literals](01-lexical.md#text-literals) |
 | NUL-terminated strings | `Str` is a UTF-8 view carrying its length; `b"..."` adds no NUL | [Text types](13-text-encode.md#text-types) |
@@ -110,7 +110,7 @@ pub fn is_newline(byte: u8) -> bool {
 
 ## Rust
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | `let mut x` | `var x` (`syntax.foreign`); a `let` binding is never assigned or accessed by `mut` (`mode.immutable-binding`) | [Modes](07-ownership.md#modes) |
 | `f(x)?` | `try f(x)` (`syntax.foreign`); failures convert only through `from` variants | [Failure conversion](11-errors-domains.md#failure-conversion) |
@@ -177,7 +177,7 @@ pub fn doubled(value: u32) -> u32 {
 
 ## Go
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | `x := e` | `let x = e` or `var x = e` (`syntax.foreign`) | [Bindings](06-statements-expressions.md#bindings) |
 | `var x int` holding a zero value | Every binding is initialised at its definition | [Bindings](06-statements-expressions.md#bindings) |
@@ -215,7 +215,7 @@ pub fn doubled_count(count: u32) -> u32 {
 
 ## Python
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | Blocks by indentation | Braces delimit blocks; indentation means nothing beyond column 0 | [Indentation and whitespace](01-lexical.md#indentation-and-whitespace) |
 | `#` comments, docstrings | `//`; `///` before the documented item; `#` is `lex.unexpected-character` | [Comments](01-lexical.md#comments) |
@@ -254,7 +254,7 @@ pub fn last_reading(readings: Slice[u32]) -> u32 {
 
 ## TypeScript
 
-| Form | In nan | Rule |
+| Form | In NaN | Rule |
 | --- | --- | --- |
 | `let` reassignable, `const` binding | `var` and `let`; `const` declares a check-time item | [Bindings](06-statements-expressions.md#bindings), [Constants](02-items.md#constants) |
 | `===`, coercing `==` | `==` (`syntax.foreign` for `===`) compares two operands of one type through `Eq`, or by IEEE 754 for floats | [Equality, ordering, hashing and defaults](08-generics-interfaces.md#equality-ordering-hashing-and-defaults), [Float comparison](08-generics-interfaces.md#float-comparison) |

@@ -4,7 +4,7 @@ This chapter defines the terms agent and toolchain, the reading conventions, the
 
 ## Terms
 
-An **agent** is a human or model that reads and writes nan source through the toolchain from partial views, such as a window of lines or a command's output, with no memory between sessions.
+An **agent** is a human or model that reads and writes NaN source through the toolchain from partial views, such as a window of lines or a command's output, with no memory between sessions.
 
 The **toolchain** is the `nan` command and everything it runs. The components that rules name as subjects include the checker, which decides validity and reports diagnostics, the prover, the interpreter, the query engine, `nan fmt`, the merge driver, lowering, and the runtime, which is exactly the [support routines](27-program-model.md#runtime-support) an image holds.
 
@@ -29,7 +29,7 @@ Each diagnostic code belongs to one family, whose owning chapter lists the code 
 
 ### Notation
 
-- Code font marks nan text, file names, commands and diagnostic codes. Terms are plain text, bold where defined and linked to that definition at their first use in a section.
+- Code font marks NaN text, file names, commands and diagnostic codes. Terms are plain text, bold where defined and linked to that definition at their first use in a section.
 - Core vocabulary names appear without a path; every other std item appears with its alias path, as `mem::Box`, and a member as `Type.member`, as `mem::Alloc.split`.
 - Fenced blocks are tagged `nan` for source, `nan-api` for std declarations, `ebnf` for grammar, and `text` for commands with their output, for other exact text a sentence names, and for diagrams.
 
@@ -108,7 +108,7 @@ Exactly these rules relate several items instead of deciding one line, and the c
 
 ## Systems guarantees
 
-nan has no garbage collector, no mandatory runtime and no undefined behaviour in safe code:
+NaN has no garbage collector, no mandatory runtime and no undefined behaviour in safe code:
 
 - Memory returns to its [store](12-memory.md#stores) at [end of scope](07-ownership.md#ownership) or through the store's own operations; no collector traces or scans memory.
 - An image holds only the [support routines](27-program-model.md#runtime-support) that its code and stubs call, no item is initialised at run time, and no item holds mutable state ([authority](14-authority.md#authority)).
@@ -123,7 +123,7 @@ Trusted code, an `assume`, a foreign fn and a `device` or `priv` grant are [trus
 
 ## Scope
 
-This specification, nan 1.0, defines language 1, which a manifest selects with `language 1` ([Evolution and governance](37-evolution.md#language-versions)). It fixes every rule deciding whether source is valid and what it means, and every output it states exactly, from diagnostic codes to hashes and file formats.
+This specification, NaN 1.0, defines language 1, which a manifest selects with `language 1` ([Evolution and governance](37-evolution.md#language-versions)). It fixes every rule deciding whether source is valid and what it means, and every output it states exactly, from diagnostic codes to hashes and file formats.
 
 Meaning never varies with target or environment, and varies with implementation only through the choices a rule leaves to it ([normative wording](#normative-wording)): targets and environments only restrict which programs are valid ([descriptors](27-program-model.md#descriptors)), and the release gate only restricts which are released.
 
@@ -217,7 +217,7 @@ Each term links to its home, whose definition governs.
 | [agent](#terms) | Human or model using the toolchain from partial views. |
 | [alias](03-packages-modules.md#aliases) | Name a package gives a dependency or std package. |
 | [allocator](12-memory.md#allocators) | `mem::Alloc`, the capability to allocate. |
-| [ambient authority](14-authority.md#authority) | Authority without a capability; nan has none. |
+| [ambient authority](14-authority.md#authority) | Authority without a capability; NaN has none. |
 | [anchor](24-kernel.md#anchor) | The one value per kernel reached without being passed. |
 | [AnyBits](05-properties.md#anybits) | Of a type whose every bit pattern is valid. |
 | [API snapshot](31-trust.md#api-snapshots) | Machine-written interface and accepted spec of a module. |
@@ -434,7 +434,7 @@ Each term links to its home, whose definition governs.
 | [predicate](04-types.md#predicates) | `where` or `invariant` condition. |
 | [prefix viability](#guarantees) | Written text fixes all meaning: the first dead token is defined, and every prefix before it closes with typed holes and closers into a file the grammar derives. |
 | [premise](23-low-level.md#trusted-code) | What trusted code relies on. |
-| [primer](39-primer.md#primer-tiers) | Priced text teaching nan. |
+| [primer](39-primer.md#primer-tiers) | Priced text teaching NaN. |
 | [primitive capability](05-properties.md#capability-types) | Base type that its owning chapter declares a capability. |
 | [principal](31-trust.md#seals) | Identity a seal names. |
 | [privileged intrinsic](23-low-level.md#privileged-intrinsics) | Privileged `hw::Ring0` operation. |

@@ -38,7 +38,7 @@ The **because-chain** is the ordered list of reasons that lead from the root cau
 | `command` | It has no line; the subject is the command that makes the change the rule requires. |
 | `note` | It has no line; the subject is a value the owning rule names, such as a path, hash, release, advisory number or prover outcome. |
 
-- The subject is nan text (a name, place, path, type or operation), a code, a command line or a value, as its role states.
+- The subject is NaN text (a name, place, path, type or operation), a code, a command line or a value, as its role states.
 - The owning rule of a code states the reasons of its diagnostics; a rule stating none gives an empty chain.
 - Reasons appear in the order the owning rule gives, and otherwise in order of path, then line, reasons without a line last.
 

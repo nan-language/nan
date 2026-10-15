@@ -4,7 +4,7 @@ This chapter defines authority and the absence of ambient authority, capabilitie
 
 ## Authority
 
-**Authority** is the power to act outside a function's own values: I/O, time, randomness, allocation, devices and privileged machine state. **Ambient authority** is authority reachable without a capability value; nan has none.
+**Authority** is the power to act outside a function's own values: I/O, time, randomness, allocation, devices and privileged machine state. **Ambient authority** is authority reachable without a capability value; NaN has none.
 
 - Code acts outside its own values only through [capabilities](#capabilities) it holds as parameters, captures or values reached from them. A [manifest grant](#manifest-grants) confers no capability; it permits the operations its authority covers.
 - No item holds mutable state: a [const item](02-items.md#constants) is immutable and Inert, so it holds no capability, and every other value an item holds, such as a registry entry, is const data. The one value reachable without being passed is the [kernel anchor](24-kernel.md#anchor), reached only from entry contexts.

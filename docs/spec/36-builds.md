@@ -28,11 +28,11 @@ The next example computes a checksum table at check time.
 ```nan
 const CRC_POLYNOMIAL: u32 = 0xEDB8_8320
 
-pub const CRC_TABLE: Array[u32, 256] = crc_table()
+pub const CRC_TABLE: Array[u32, 256] = build_crc_table()
 
 const assert CRC_TABLE[1] == 0x7707_3096
 
-fn crc_table() -> Array[u32, 256] {
+fn build_crc_table() -> Array[u32, 256] {
     var table = Array[u32, 256].filled(0)
     for index in 0..<256usize {
         var entry = u32.fit(index)
@@ -46,7 +46,7 @@ fn crc_table() -> Array[u32, 256] {
         table[index] = entry
     }
     return table
-} crc_table
+} build_crc_table
 ```
 
 ## Network and fetching

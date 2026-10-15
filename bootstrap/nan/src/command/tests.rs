@@ -1,13 +1,14 @@
 use super::*;
 use crate::workspace::tests::Scratch;
 
-const MANIFEST: &str = "//! A package.\n\npackage app {\n    language 1\n    targets any\n} app\n";
+pub(super) const MANIFEST: &str =
+    "//! A package.\n\npackage app {\n    language 1\n    targets any\n} app\n";
 
 fn args(line: &str) -> Vec<String> {
     line.split(' ').map(str::to_owned).collect()
 }
 
-fn run_in(dir: &Path, line: &str) -> Run {
+pub(super) fn run_in(dir: &Path, line: &str) -> Run {
     run(&args(line), dir)
 }
 
@@ -76,7 +77,7 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
     let scratch = Scratch::new(&[("app/package.nan", MANIFEST)]);
     for line in [
         "frobnicate",
-        "check --radius",
+        "check --affected",
         "check a b",
         "check --budget 99",
         "check --skip",
@@ -123,7 +124,7 @@ fn a_scope_naming_nothing_is_unknown() {
 fn fmt_writes_through_the_journal_and_names_each_file() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),
-        ("app/app.nan", "//! Root.\nconst  X: u32 = 1\n"),
+        ("app/app.nan", "//! Root.\nconst  MAX: u32 = 1\n"),
     ]);
     let run = run_in(&scratch.0, "fmt");
     assert_eq!(
@@ -135,7 +136,7 @@ fn fmt_writes_through_the_journal_and_names_each_file() {
     );
     assert_eq!(
         fs::read_to_string(scratch.0.join("app/app.nan")).expect("read the file"),
-        "//! Root.\n\nconst X: u32 = 1\n"
+        "//! Root.\n\nconst MAX: u32 = 1\n"
     );
     assert!(!scratch.0.join(".nan/journal").exists());
 }

@@ -355,7 +355,7 @@ pub closed struct Counter {
 
 pub fn count_twice(counter: task::Cown[Counter], exec: task::Executor) fails task::Cancelled uses wait {
     try await task::scope(exec, body: fn(s: task::Scope) {
-        for _ in 0..<2 {
+        for _ in 0..<2u32 {
             discard s.spawn(fn() fails task::Cancelled uses wait {
                 await when mut counter {
                     counter.hits += 1

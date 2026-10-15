@@ -1,7 +1,9 @@
 //! `nan fmt`: the canonical format of source files.
 
+pub mod bindings;
 mod item;
-mod punning;
+pub mod normal;
+pub mod punning;
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;

@@ -1,12 +1,16 @@
 //! The `nan` command line: reading it, running the command it names, and printing the result.
 
+mod check;
+mod edit;
+mod read;
+
 use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use crate::diagnostic::{Class, Code, Diagnostic};
-use crate::format;
+use crate::diagnostic::{Code, Diagnostic};
+use crate::fix;
 use crate::journal;
 use crate::output::{self, Format, Output, Record, Verdict};
 use crate::scope::Scope;
@@ -22,14 +26,138 @@ pub struct Run {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Name {
     Check,
+    Fix,
     Fmt,
+    Find,
+    Holes,
+    Show,
+    Read,
+    Context,
+    Explain,
+    Expand,
+    EditReplace,
+    EditRename,
+    EditMove,
+    Primer,
 }
 
 impl Name {
-    fn word(self) -> &'static str {
+    /// The command named by the words a command line starts with, and how many it takes.
+    fn read(args: &[String]) -> Option<(Name, usize)> {
+        if args.first()? == "edit" {
+            let name = match args.get(1)?.as_str() {
+                "replace" => Name::EditReplace,
+                "rename" => Name::EditRename,
+                "move" => Name::EditMove,
+                _ => return None,
+            };
+            return Some((name, 2));
+        }
+        let name = match args.first()?.as_str() {
+            "check" => Name::Check,
+            "fix" => Name::Fix,
+            "fmt" => Name::Fmt,
+            "find" => Name::Find,
+            "holes" => Name::Holes,
+            "show" => Name::Show,
+            "read" => Name::Read,
+            "context" => Name::Context,
+            "explain" => Name::Explain,
+            "expand" => Name::Expand,
+            "primer" => Name::Primer,
+            _ => return None,
+        };
+        Some((name, 1))
+    }
+
+    /// The command's name words.
+    fn words(self) -> &'static str {
         match self {
             Name::Check => "check",
+            Name::Fix => "fix",
             Name::Fmt => "fmt",
+            Name::Find => "find",
+            Name::Holes => "holes",
+            Name::Show => "show",
+            Name::Read => "read",
+            Name::Context => "context",
+            Name::Explain => "explain",
+            Name::Expand => "expand",
+            Name::EditReplace => "edit replace",
+            Name::EditRename => "edit rename",
+            Name::EditMove => "edit move",
+            Name::Primer => "primer",
+        }
+    }
+
+    /// The flags the command accepts, and its options taking a value.
+    fn options(self) -> (&'static [&'static str], &'static [&'static str]) {
+        match self {
+            Name::Check => (&["--radius"], &["--prefix", "--agent"]),
+            Name::Fmt
+            | Name::Holes
+            | Name::Read
+            | Name::Context
+            | Name::Explain
+            | Name::Expand
+            | Name::EditRename
+            | Name::EditMove
+            | Name::Primer => (&[], &[]),
+            Name::EditReplace => (&[], &["--expect", "--from"]),
+            Name::Show => (&["--api"], &[]),
+            Name::Find => (&["--contributors"], &[]),
+            Name::Fix => (&["--propagate"], &[]),
+        }
+    }
+
+    /// The most operands the command takes.
+    fn operands(self) -> usize {
+        match self {
+            Name::Find | Name::EditRename | Name::EditMove => 2,
+            _ => 1,
+        }
+    }
+
+    /// Whether its first operand is a scope, which may be omitted.
+    fn scoped(self) -> bool {
+        !matches!(
+            self,
+            Name::Find
+                | Name::Show
+                | Name::Read
+                | Name::Context
+                | Name::Explain
+                | Name::Expand
+                | Name::EditReplace
+                | Name::EditRename
+                | Name::EditMove
+                | Name::Primer
+        )
+    }
+
+    /// Whether the command writes source or machine files.
+    fn writes(self) -> bool {
+        matches!(
+            self,
+            Name::Fix | Name::Fmt | Name::EditReplace | Name::EditRename | Name::EditMove
+        )
+    }
+
+    /// The names of the counts its summary gives.
+    fn counts(self) -> &'static [&'static str] {
+        match self {
+            Name::Check | Name::Fix => &["errors", "incomplete"],
+            Name::Fmt | Name::EditReplace | Name::EditRename | Name::EditMove => {
+                &["files", "errors", "incomplete"]
+            }
+            Name::Find
+            | Name::Holes
+            | Name::Show
+            | Name::Read
+            | Name::Explain
+            | Name::Expand
+            | Name::Primer => &["records"],
+            Name::Context => &["entries", "radius"],
         }
     }
 }
@@ -37,17 +165,49 @@ impl Name {
 /// A command line this implementation runs.
 struct Invocation<'a> {
     name: Name,
-    scope: Option<&'a str>,
+    /// The arguments after the name words.
     args: &'a [String],
+    operands: Vec<&'a str>,
+    flags: Vec<&'a str>,
+    values: Vec<(&'a str, &'a str)>,
     format: Format,
 }
 
 impl Invocation<'_> {
-    /// The command line without `nan`, an omitted scope written after the name, without `--skip`
-    /// unless `skip` keeps it.
+    /// The scope operand, when the command takes one first.
+    fn scope(&self) -> Option<&str> {
+        self.operands
+            .first()
+            .copied()
+            .filter(|_| self.name.scoped())
+    }
+
+    fn flag(&self, flag: &str) -> bool {
+        self.flags.contains(&flag)
+    }
+
+    /// The value given to an option.
+    fn value(&self, option: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(given, _)| *given == option)
+            .map(|(_, value)| *value)
+    }
+
+    /// The names of the counts its summary gives: prefix checking's own, or the command's.
+    fn counts(&self) -> &'static [&'static str] {
+        if self.value("--prefix").is_some() {
+            &["dead", "pending", "holes"]
+        } else {
+            self.name.counts()
+        }
+    }
+
+    /// The command line without `nan`, an omitted scope written after the name words, without
+    /// `--skip` unless `skip` keeps it.
     fn command(&self, scope: &str, skip: bool) -> String {
-        let mut words = vec![self.name.word().to_owned()];
-        if self.scope.is_none() {
+        let mut words = vec![self.name.words().to_owned()];
+        if self.name.scoped() && self.scope().is_none() && self.value("--prefix").is_none() {
             words.push(output::argument(scope));
         }
         let mut args = self.args.iter();
@@ -59,6 +219,22 @@ impl Invocation<'_> {
             words.push(output::argument(arg));
         }
         words.join(" ")
+    }
+
+    /// The output of a command that reported a `tool` error and did nothing else.
+    fn tool_error(&self, code: Code, scope: &str) -> Output {
+        let summary = self
+            .counts()
+            .iter()
+            .map(|count| (*count, usize::from(matches!(*count, "errors" | "records"))))
+            .collect();
+        Output {
+            command: self.command(scope, true),
+            elision: self.command(scope, false),
+            verdict: Verdict::Invalid,
+            summary,
+            records: vec![unlocated(code, Vec::new())],
+        }
     }
 }
 
@@ -91,7 +267,7 @@ pub fn run(args: &[String], current: &Path) -> Run {
 
 /// The output of a command whose implementation failed, after writing its reproducer.
 fn internal_error(invocation: &Invocation, args: &[String], trace: &Trace) -> Output {
-    let scope = trace.scope.as_deref().or(invocation.scope).unwrap_or(".");
+    let scope = trace.scope.as_deref().or(invocation.scope()).unwrap_or(".");
     let reproducer = trace
         .root
         .as_deref()
@@ -140,42 +316,50 @@ fn reproducer(root: &Path, args: &[String], read: &[String]) -> io::Result<Strin
 
 /// Reads the command line, or `None` when it is outside every synopsis this implementation runs.
 fn read(args: &[String]) -> Option<Invocation<'_>> {
-    let (name, rest) = args.split_first()?;
-    let name = match name.as_str() {
-        "check" => Name::Check,
-        "fmt" => Name::Fmt,
-        _ => return None,
+    let (name, taken) = Name::read(args)?;
+    let rest = &args[taken..];
+    let (flags, valued) = name.options();
+    let mut invocation = Invocation {
+        name,
+        args: rest,
+        operands: Vec::new(),
+        flags: Vec::new(),
+        values: Vec::new(),
+        format: Format {
+            json: false,
+            budget: None,
+            skip: 0,
+        },
     };
-    let mut format = Format {
-        json: false,
-        budget: None,
-        skip: 0,
-    };
-    let mut scope = None;
     let mut index = 0;
     while index < rest.len() {
         let arg = rest[index].as_str();
         match arg {
-            "--json" => format.json = true,
+            "--json" => invocation.format.json = true,
             "--budget" => {
                 index += 1;
-                format.budget = Some(number(rest.get(index)?).filter(|budget| *budget >= 100)?);
+                let budget = number(rest.get(index)?).filter(|budget| *budget >= 100)?;
+                invocation.format.budget = Some(budget);
             }
             "--skip" => {
                 index += 1;
-                format.skip = number(rest.get(index)?)?;
+                invocation.format.skip = number(rest.get(index)?)?;
             }
-            _ if arg.starts_with("--") || scope.is_some() => return None,
-            _ => scope = Some(arg),
+            _ if flags.contains(&arg) && !invocation.flag(arg) => invocation.flags.push(arg),
+            _ if valued.contains(&arg)
+                && invocation.values.iter().all(|(option, _)| *option != arg) =>
+            {
+                index += 1;
+                invocation.values.push((arg, rest.get(index)?.as_str()));
+            }
+            _ if arg.starts_with("--") || invocation.operands.len() == name.operands() => {
+                return None;
+            }
+            _ => invocation.operands.push(arg),
         }
         index += 1;
     }
-    Some(Invocation {
-        name,
-        scope,
-        args: rest,
-        format,
-    })
+    Some(invocation)
 }
 
 fn number(arg: &str) -> Option<usize> {
@@ -189,16 +373,15 @@ fn number(arg: &str) -> Option<usize> {
 fn usage(args: &[String]) -> Run {
     let command: Vec<String> = args.iter().map(|arg| output::argument(arg)).collect();
     let command = command.join(" ");
-    let summary = match args.first().map(String::as_str) {
-        Some("check") => vec![("errors", 1), ("incomplete", 0)],
-        Some("fmt") => vec![("files", 0), ("errors", 1), ("incomplete", 0)],
-        _ => vec![("records", 1)],
-    };
+    let counts = Name::read(args).map_or(&["records"][..], |(name, _)| name.counts());
     let output = Output {
         command: command.clone(),
         elision: command,
         verdict: Verdict::Invalid,
-        summary,
+        summary: counts
+            .iter()
+            .map(|count| (*count, usize::from(matches!(*count, "errors" | "records"))))
+            .collect(),
         records: vec![unlocated(Code::ToolUsage, Vec::new())],
     };
     Run {
@@ -212,101 +395,57 @@ fn usage(args: &[String]) -> Run {
 }
 
 fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Output> {
-    let tool_error = |code: Code, scope: &str| Output {
-        command: invocation.command(scope, true),
-        elision: invocation.command(scope, false),
-        verdict: Verdict::Invalid,
-        summary: summary(invocation.name, 0, 1, 0),
-        records: vec![unlocated(code, Vec::new())],
-    };
     let root = workspace::root(current);
     if !workspace::holds_package(&root)? {
-        return Ok(tool_error(Code::ToolNoWorkspace, "."));
+        return Ok(invocation.tool_error(Code::ToolNoWorkspace, "."));
     }
     trace.root = Some(root.clone());
-    let _lock = journal::Lock::acquire(&root, invocation.name == Name::Fmt)?;
+    let _lock = journal::Lock::acquire(&root, invocation.name.writes())?;
     let workspace = Workspace::load(root, &mut trace.read)?;
-    let Some((scope, written)) = Scope::resolve(&workspace, current, invocation.scope) else {
-        return Ok(tool_error(
-            Code::ToolUnknownScope,
-            invocation.scope.unwrap_or("."),
-        ));
-    };
-    trace.scope = Some(written.clone());
-    let diagnostics = diagnostics(&workspace, &scope);
-    let mut records: Vec<Record> = diagnostics
-        .iter()
-        .map(|diagnostic| record(&workspace, &scope, diagnostic))
-        .collect();
-    let errors = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code.class() == Class::Error)
-        .count();
-    let incomplete = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code.class() == Class::Incompleteness)
-        .count();
-    let mut files = 0;
-    if invocation.name == Name::Fmt {
-        let written = format::workspace(&workspace, &scope);
-        journal::write(&workspace.root, &written)?;
-        files = written.len();
-        records.extend(written.iter().map(|(path, _)| Record {
-            word: "wrote".to_owned(),
-            fields: vec![path.clone()],
-            lines: Vec::new(),
-        }));
-    }
-    Ok(Output {
-        command: invocation.command(&written, true),
-        elision: invocation.command(&written, false),
-        verdict: if errors > 0 {
-            Verdict::Failed
-        } else {
-            Verdict::Ok
-        },
-        summary: summary(invocation.name, files, errors, incomplete),
-        records,
-    })
-}
-
-fn summary(
-    name: Name,
-    files: usize,
-    errors: usize,
-    incomplete: usize,
-) -> Vec<(&'static str, usize)> {
-    match name {
-        Name::Check => vec![("errors", errors), ("incomplete", incomplete)],
-        Name::Fmt => vec![
-            ("files", files),
-            ("errors", errors),
-            ("incomplete", incomplete),
-        ],
+    match invocation.name {
+        Name::Check | Name::Fix | Name::Fmt => check::run(invocation, &workspace, current, trace),
+        Name::Holes => read::holes(invocation, &workspace, current, trace),
+        Name::Find => read::find(invocation, &workspace, current),
+        Name::Show | Name::Read => read::show(invocation, &workspace, current, trace),
+        Name::Context => read::context(invocation, &workspace, current, trace),
+        Name::Explain => read::explain(invocation, &workspace, current, trace),
+        Name::Expand => read::expand(invocation, &workspace, current, trace),
+        Name::EditReplace => edit::replace(invocation, &workspace, current, trace),
+        Name::EditRename => edit::rename(invocation, &workspace, current, trace),
+        Name::EditMove => edit::move_item(invocation, &workspace, current, trace),
+        Name::Primer => Ok(read::primer(invocation)),
     }
 }
 
-/// The diagnostics reported on lines of the scope, by path, line and code, each once.
-fn diagnostics(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
-    let mut found: Vec<Diagnostic> = workspace.diagnostics().collect();
-    for (_, file) in workspace.files() {
-        found.extend(file.syntax.diagnostics.iter().map(|diagnostic| Diagnostic {
-            expected: diagnostic.expected.clone(),
-            found: diagnostic.found.clone(),
-            ..Diagnostic::at(diagnostic.code, &file.path, diagnostic.line)
-        }));
+/// A canonical path as records write it for the scope's package `writer`: without the package
+/// name when it lies in another module of that package.
+fn written_for(path: &str, writer: Option<&str>) -> String {
+    let rest = writer.and_then(|package| path.strip_prefix(package)?.strip_prefix("::"));
+    match rest {
+        Some(rest)
+            if rest
+                .find("::")
+                .is_some_and(|at| !rest[..at].contains(['.', '['])) =>
+        {
+            rest.to_owned()
+        }
+        _ => path.to_owned(),
     }
-    found.retain(|diagnostic| {
-        diagnostic
-            .path
-            .as_deref()
-            .is_none_or(|path| scope.holds(workspace, path, diagnostic.line))
-    });
-    found.sort_by(|left, right| {
-        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
-    });
-    found.dedup();
-    found
+}
+
+/// The item holding a line of a workspace file as records write it for the scope's package: by
+/// the canonical path `known` when the checker gave one, else by the path its syntax gives.
+fn item_written(
+    workspace: &Workspace,
+    writer: Option<&str>,
+    path: &str,
+    line: u32,
+    known: Option<&str>,
+) -> String {
+    known
+        .map(str::to_owned)
+        .or_else(|| workspace.item_at(path, line).map(|item| item.canonical()))
+        .map_or_else(|| "-".to_owned(), |item| written_for(&item, writer))
 }
 
 /// The record of a diagnostic without location or item.
@@ -326,15 +465,12 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
         _ => "-".to_owned(),
     };
     let writer = scope.package(workspace).and_then(|package| package.name());
-    let item = diagnostic
-        .path
-        .as_deref()
-        .zip(diagnostic.line)
-        .and_then(|(path, line)| workspace.item_at(path, line))
-        .map_or_else(
-            || "-".to_owned(),
-            |path| writer.map_or_else(|| path.canonical(), |package| path.written_for(package)),
-        );
+    let item = match (&diagnostic.path, diagnostic.line) {
+        (Some(path), Some(line)) => {
+            item_written(workspace, writer, path, line, diagnostic.item.as_deref())
+        }
+        _ => "-".to_owned(),
+    };
     let mut lines = Vec::new();
     if let (Some(path), Some(line)) = (&diagnostic.path, diagnostic.line) {
         let (_, file) = workspace
@@ -346,20 +482,48 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
         diagnostic
             .expected
             .iter()
-            .map(|expected| format!("expected: {expected}")),
+            .map(|expected| format!("expected: {}", output::printable(expected.as_bytes()))),
     );
     lines.extend(
         diagnostic
             .found
             .iter()
-            .map(|found| format!("found: {found}")),
+            .map(|found| format!("found: {}", output::printable(found.as_bytes()))),
     );
-    lines.extend(
-        diagnostic
-            .because
-            .iter()
-            .map(|reason| format!("because {} - - {}", reason.role.word(), reason.subject)),
-    );
+    for reason in &diagnostic.because {
+        let Some((path, line)) = &reason.at else {
+            lines.push(format!(
+                "because {} - - {}",
+                reason.role.word(),
+                reason.subject
+            ));
+            continue;
+        };
+        let item = item_written(workspace, writer, path, *line, None);
+        lines.push(format!(
+            "because {} {path}:{line} {item} {}",
+            reason.role.word(),
+            reason.subject
+        ));
+        let (_, file) = workspace
+            .file(path)
+            .expect("reasons lie in workspace files");
+        lines.push(output::printable(file.syntax.line_text(*line)));
+    }
+    for (number, fix) in diagnostic.fixes.iter().enumerate() {
+        for edit in fix::edits(workspace, fix) {
+            lines.push(format!("fix {} {}", number + 1, edit.path));
+            let changed = |sign: char, line: &String| {
+                if line.is_empty() {
+                    sign.to_string()
+                } else {
+                    format!("{sign} {}", output::printable(line.as_bytes()))
+                }
+            };
+            lines.extend(edit.old.iter().map(|line| changed('-', line)));
+            lines.extend(edit.new.iter().map(|line| changed('+', line)));
+        }
+    }
     Record {
         word: diagnostic.code.class().word().to_owned(),
         fields: vec![diagnostic.code.name().to_owned(), location, item],

@@ -8,7 +8,7 @@ nan is a programming language made for agentic coding: performant, fast and safe
 
 `bootstrap/nan` is the bootstrap compiler, a Rust binary named `nan` that implements the language specified in `docs/spec`. It generates machine code with Cranelift: the system `cc` links Linux x86_64 executables, and the compiler's own image writer builds UEFI and bare-metal images. Everything Linux-specific (linking, program entry, calls into the system) stays in one target module.
 
-Its parser runs on tables that `build.rs` generates from the `ebnf` blocks of `docs/spec/41-grammar.md`, so the grammar changes only in the specification. The conformance harness runs every `nan` example of the specification against its marker comments.
+Its parser runs on tables that `build.rs` generates from the `ebnf` blocks of `docs/spec/41-grammar.md`, so the grammar changes only in the specification. Its checker computes every fact as a query over one item and one target, recording what each query reads; context packs come from those records. The conformance harness runs every `nan` example of the specification against its marker comments and checks each item's context pack against what checking it reads.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 

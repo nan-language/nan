@@ -42,6 +42,49 @@ pub struct Manifest {
     pub targets_line: Option<u32>,
     /// Whether the package's language version is one this implementation implements.
     pub supported: bool,
+    /// The name the `entry` directive gives, and its line.
+    pub entry: Option<(String, u32)>,
+    pub deps: Vec<Dep>,
+    pub allows: Vec<Allow>,
+    /// The module pairs of `deny a -> b` directives, and their lines.
+    pub denies: Vec<(String, String, u32)>,
+}
+
+pub struct Dep {
+    pub alias: String,
+    /// The workspace directory a relative source names, or the store name.
+    pub source: Option<String>,
+    pub path: bool,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Authority {
+    Device,
+    Priv,
+    Trusted,
+    Validate,
+    /// The registry path of a `contribute` grant, as written.
+    Contribute(String),
+}
+
+impl Authority {
+    /// The authority as an `allow` directive writes it.
+    pub fn written(&self) -> String {
+        match self {
+            Authority::Device => "device".to_owned(),
+            Authority::Priv => "priv".to_owned(),
+            Authority::Trusted => "trusted".to_owned(),
+            Authority::Validate => "validate".to_owned(),
+            Authority::Contribute(registry) => format!("contribute {registry}"),
+        }
+    }
+}
+
+pub struct Allow {
+    pub authority: Authority,
+    pub names: Vec<String>,
+    pub line: u32,
 }
 
 /// The manifest's directives, read from its tree.
@@ -144,6 +187,10 @@ impl Reader<'_> {
             targets: Vec::new(),
             targets_line: None,
             supported: true,
+            entry: None,
+            deps: Vec::new(),
+            allows: Vec::new(),
+            denies: Vec::new(),
         };
         let (mut language, mut entry) = (false, false);
         let mut dep_aliases: Vec<String> = Vec::new();
@@ -211,7 +258,9 @@ impl Reader<'_> {
                 Rule::EntryDirective => {
                     if std::mem::replace(&mut entry, true) {
                         self.report(line, Code::ManifestDuplicate);
+                        continue;
                     }
+                    manifest.entry = Some((self.idents(node).swap_remove(1), line));
                 }
                 Rule::DepDirective => {
                     let alias = self.idents(node).swap_remove(1);
@@ -235,6 +284,12 @@ impl Reader<'_> {
                     if repeated {
                         self.report(line, Code::ManifestDuplicate);
                     }
+                    manifest.deps.push(Dep {
+                        alias: alias.clone(),
+                        source: resolved.clone(),
+                        path: matches!(source_kind(&source), Some(Source::Path)),
+                        line,
+                    });
                     dep_aliases.push(alias);
                     dep_sources.extend(resolved);
                 }
@@ -246,6 +301,18 @@ impl Reader<'_> {
                     if authorities.contains(&authority) || has_repeat(&names) {
                         self.report(line, Code::ManifestDuplicate);
                     }
+                    let granted = match authority.as_str() {
+                        "device" => Authority::Device,
+                        "priv" => Authority::Priv,
+                        "trusted" => Authority::Trusted,
+                        "validate" => Authority::Validate,
+                        _ => Authority::Contribute(authority["contribute".len()..].to_owned()),
+                    };
+                    manifest.allows.push(Allow {
+                        authority: granted,
+                        names,
+                        line,
+                    });
                     authorities.push(authority);
                 }
                 Rule::DenyDirective => {
@@ -257,6 +324,7 @@ impl Reader<'_> {
                     if denials.contains(&pair) {
                         self.report(line, Code::ManifestDuplicate);
                     }
+                    manifest.denies.push((pair.0.clone(), pair.1.clone(), line));
                     denials.push(pair);
                 }
                 rule => unreachable!("{} is no directive", rule.name()),

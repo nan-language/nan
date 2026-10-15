@@ -21,7 +21,7 @@ impl Class {
 macro_rules! codes {
     ($($variant:ident = $name:literal,)*) => {
         /// The diagnostic codes this implementation reports.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Code {
             $($variant,)*
         }
@@ -44,21 +44,126 @@ macro_rules! codes {
 }
 
 codes! {
+    AuthorityCapabilityImpl = "authority.capability-impl",
+    AuthorityDeniedDependency = "authority.denied-dependency",
+    AuthorityDependencyUngranted = "authority.dependency-ungranted",
+    AuthorityUngranted = "authority.ungranted",
+    AuthorityUnknownName = "authority.unknown-name",
     BuildSymbolicLink = "build.symbolic-link",
+    ClosureCaptureDuplicate = "closure.capture-duplicate",
+    ClosureCaptureMode = "closure.capture-mode",
+    ClosureCaptureUnused = "closure.capture-unused",
+    ClosureProjectionValue = "closure.projection-value",
+    ClosureSecondClass = "closure.second-class",
+    ClosureShortEffect = "closure.short-effect",
+    ContractAssumeUntrusted = "contract.assume-untrusted",
+    ContractEmptyReason = "contract.empty-reason",
+    ContractIllDefined = "contract.ill-defined",
+    ContractImpureCondition = "contract.impure-condition",
+    ContractOldForm = "contract.old-form",
+    ContractQuantifierOutside = "contract.quantifier-outside",
+    ContractTakenParameter = "contract.taken-parameter",
+    DeferAbandonHead = "defer.abandon-head",
+    DeferDeferredPlaceMoved = "defer.deferred-place-moved",
+    DeferFails = "defer.fails",
+    DeferHasResult = "defer.has-result",
+    DeferNotCall = "defer.not-call",
+    DeferOperandForm = "defer.operand-form",
+    DeferUndeferUnmatched = "defer.undefer-unmatched",
+    DeferWaits = "defer.waits",
+    DeriveConstituentMissing = "derive.constituent-missing",
+    DeriveDuplicate = "derive.duplicate",
+    DeriveEnumDefault = "derive.enum-default",
+    DeriveUnknown = "derive.unknown",
     DocMisplaced = "doc.misplaced",
     DocModuleFileMissing = "doc.module-file-missing",
     DocSummaryMissing = "doc.summary-missing",
+    DomainUnavailable = "domain.unavailable",
+    EditCheckFailed = "edit.check-failed",
+    EditIdentityChanged = "edit.identity-changed",
+    EditMoveInvalid = "edit.move-invalid",
+    EditNotOneItem = "edit.not-one-item",
+    EditStale = "edit.stale",
+    EffectAwaitMissing = "effect.await-missing",
+    EffectAwaitUnneeded = "effect.await-unneeded",
+    EffectFitFails = "effect.fit-fails",
+    EffectFitHead = "effect.fit-head",
+    EffectFitKind = "effect.fit-kind",
+    EffectFitWait = "effect.fit-wait",
+    EffectForeignWait = "effect.foreign-wait",
     EffectUsesUnknown = "effect.uses-unknown",
+    EncodeLinear = "encode.linear",
+    EncodeManualImpl = "encode.manual-impl",
+    EncodeNotInert = "encode.not-inert",
+    EncodeView = "encode.view",
+    ErrorCancelUnmapped = "error.cancel-unmapped",
+    ErrorFailureType = "error.failure-type",
+    ErrorFromAmbiguous = "error.from-ambiguous",
+    ErrorFromDuplicate = "error.from-duplicate",
+    ErrorFromShape = "error.from-shape",
+    ErrorMarkerUnneeded = "error.marker-unneeded",
+    ErrorUnconvertible = "error.unconvertible",
+    ErrorUnhandled = "error.unhandled",
+    ExprArgumentCount = "expr.argument-count",
+    ExprArgumentLabel = "expr.argument-label",
+    ExprBranchForm = "expr.branch-form",
     ExprChainedComparison = "expr.chained-comparison",
+    ExprFieldCall = "expr.field-call",
+    ExprFloatPattern = "expr.float-pattern",
+    ExprGuardOutsideFirst = "expr.guard-outside-first",
     ExprMarkerOrder = "expr.marker-order",
+    ExprMarkerTarget = "expr.marker-target",
+    ExprMethodValue = "expr.method-value",
+    ExprMisplacedJump = "expr.misplaced-jump",
+    ExprMissingElse = "expr.missing-else",
+    ExprNonExhaustive = "expr.non-exhaustive",
+    ExprOrBindings = "expr.or-bindings",
+    ExprOverlappingArms = "expr.overlapping-arms",
     ExprParentheses = "expr.parentheses",
+    ExprRangeType = "expr.range-type",
+    ExprUnreachableArm = "expr.unreachable-arm",
+    GenericArgumentKind = "generic.argument-kind",
+    GenericArity = "generic.arity",
+    GenericConstType = "generic.const-type",
+    GenericParameterUnused = "generic.parameter-unused",
+    GenericUninferred = "generic.uninferred",
+    GenericUnsatisfiedBound = "generic.unsatisfied-bound",
+    GenericWhereMisplaced = "generic.where-misplaced",
+    HwAtomicType = "hw.atomic-type",
+    HwDmaCompletion = "hw.dma-completion",
+    HwDmaOperand = "hw.dma-operand",
+    HwLandingCalled = "hw.landing-called",
+    HwLandingSignature = "hw.landing-signature",
+    HwLayoutUnfixed = "hw.layout-unfixed",
+    HwMintRootMisplaced = "hw.mint-root-misplaced",
+    InterfaceAmbiguousMethod = "interface.ambiguous-method",
+    InterfaceDuplicateImpl = "interface.duplicate-impl",
+    InterfaceDynViewMode = "interface.dyn-view-mode",
+    InterfaceHeadMismatch = "interface.head-mismatch",
+    InterfaceImplMisplaced = "interface.impl-misplaced",
+    InterfaceImplParameters = "interface.impl-parameters",
+    InterfaceImplTarget = "interface.impl-target",
+    InterfaceImplVisibility = "interface.impl-visibility",
+    InterfaceMethodClause = "interface.method-clause",
+    InterfaceMethodCollision = "interface.method-collision",
+    InterfaceMissingMethod = "interface.missing-method",
+    InterfaceNotDynUsable = "interface.not-dyn-usable",
+    InterfaceNotImplemented = "interface.not-implemented",
+    InterfaceNotInterface = "interface.not-interface",
+    InterfaceUnqualifiedCall = "interface.unqualified-call",
     InternalInvariant = "internal.invariant",
     ItemBodyOpener = "item.body-opener",
     ItemClauseOrder = "item.clause-order",
+    ItemConstCycle = "item.const-cycle",
+    ItemConstType = "item.const-type",
     ItemConstUntyped = "item.const-untyped",
+    ItemDuplicate = "item.duplicate",
+    ItemFailsMissing = "item.fails-missing",
+    ItemFailsUnneeded = "item.fails-unneeded",
     ItemForeignForm = "item.foreign-form",
     ItemIndented = "item.indented",
     ItemLabelMismatch = "item.label-mismatch",
+    ItemMethodMisplaced = "item.method-misplaced",
     ItemMissingBody = "item.missing-body",
     ItemModifierConflict = "item.modifier-conflict",
     ItemModifierMisplaced = "item.modifier-misplaced",
@@ -72,8 +177,25 @@ codes! {
     ItemTransparentLimits = "item.transparent-limits",
     ItemUnitResult = "item.unit-result",
     ItemVisibilityNotAllowed = "item.visibility-not-allowed",
+    ItemWaitMissing = "item.wait-missing",
+    ItemWaitUnneeded = "item.wait-unneeded",
+    KernelAnchorOutsideEntry = "kernel.anchor-outside-entry",
+    KernelFloatUse = "kernel.float-use",
+    KernelIrqCall = "kernel.irq-call",
+    KernelIrqHead = "kernel.irq-head",
+    KernelIrqLimit = "kernel.irq-limit",
+    KernelIrqWait = "kernel.irq-wait",
     LanguageUnsupported = "language.unsupported",
     LanguageVersionForm = "language.version-form",
+    LayoutEndianness = "layout.endianness",
+    LayoutFieldForm = "layout.field-form",
+    LayoutFieldType = "layout.field-type",
+    LayoutLiteral = "layout.literal",
+    LayoutOutOfRange = "layout.out-of-range",
+    LayoutOverlap = "layout.overlap",
+    LayoutRepr = "layout.repr",
+    LayoutTagValue = "layout.tag-value",
+    LayoutUncovered = "layout.uncovered",
     LexCarriageReturn = "lex.carriage-return",
     LexCharLiteralSize = "lex.char-literal-size",
     LexEscapeOutOfRange = "lex.escape-out-of-range",
@@ -91,6 +213,12 @@ codes! {
     LexUnexpectedCharacter = "lex.unexpected-character",
     LexUnknownEscape = "lex.unknown-escape",
     LexUnterminatedLiteral = "lex.unterminated-literal",
+    LimitAllocates = "limit.allocates",
+    LimitDuplicate = "limit.duplicate",
+    LimitImpure = "limit.impure",
+    LimitMayNotTerminate = "limit.may-not-terminate",
+    LimitRedundant = "limit.redundant",
+    LimitStackSize = "limit.stack-size",
     ManifestAnyNotAlone = "manifest.any-not-alone",
     ManifestBadSource = "manifest.bad-source",
     ManifestDenySelf = "manifest.deny-self",
@@ -100,26 +228,180 @@ codes! {
     ManifestMissingDirective = "manifest.missing-directive",
     ManifestReservedTarget = "manifest.reserved-target",
     ManifestUnknownTarget = "manifest.unknown-target",
+    ModeCopyTaken = "mode.copy-taken",
+    ModeImmutableBinding = "mode.immutable-binding",
+    ModeMismatch = "mode.mismatch",
+    ModeUnmarked = "mode.unmarked",
+    ModuleCycle = "module.cycle",
+    ModuleVariantMismatch = "module.variant-mismatch",
     ModuleVariantMissing = "module.variant-missing",
     ModuleVariantMixed = "module.variant-mixed",
     ModuleVariantOverlap = "module.variant-overlap",
     ModuleVariantUnmatched = "module.variant-unmatched",
+    NameCase = "name.case",
+    NameClash = "name.clash",
+    NameColonForMember = "name.colon-for-member",
+    NameCoreRedefined = "name.core-redefined",
     NameDotForPath = "name.dot-for-path",
+    NameMoved = "name.moved",
+    NamePrefixMismatch = "name.prefix-mismatch",
+    NamePrivate = "name.private",
+    NamePrivateInInterface = "name.private-in-interface",
+    NameRedundantPath = "name.redundant-path",
+    NameReserved = "name.reserved",
+    NameUnknown = "name.unknown",
+    NumConversionUndefined = "num.conversion-undefined",
+    NumConversionValue = "num.conversion-value",
+    NumFromBitsNotAnybits = "num.from-bits-not-anybits",
+    NumSameTypeConversion = "num.same-type-conversion",
+    NumSignedDivision = "num.signed-division",
+    NumSignedShiftRight = "num.signed-shift-right",
+    NumUnsignedNegation = "num.unsigned-negation",
+    NumWidenApplies = "num.widen-applies",
+    NumWidenLossy = "num.widen-lossy",
+    OwnConflict = "own.conflict",
+    OwnLinearDropped = "own.linear-dropped",
+    OwnMoveNotOwned = "own.move-not-owned",
+    OwnNotIndexable = "own.not-indexable",
+    OwnNotIterable = "own.not-iterable",
+    OwnProjReceiver = "own.proj-receiver",
+    OwnProjSource = "own.proj-source",
+    OwnReadOnlyView = "own.read-only-view",
+    OwnTemporarySource = "own.temporary-source",
+    OwnUseAfterMove = "own.use-after-move",
+    OwnViewEscape = "own.view-escape",
+    OwnWrappedPartUse = "own.wrapped-part-use",
+    PatternConstKind = "pattern.const-kind",
+    PatternDuplicateBinding = "pattern.duplicate-binding",
+    PatternEmptyRange = "pattern.empty-range",
+    PatternOpenEnumNoElse = "pattern.open-enum-no-else",
+    PatternOpenStruct = "pattern.open-struct",
+    PatternPathKind = "pattern.path-kind",
+    PatternRangeKind = "pattern.range-kind",
+    PatternRefutable = "pattern.refutable",
+    PredicateExposedField = "predicate.exposed-field",
+    PredicateOutsideWrite = "predicate.outside-write",
+    PropCapabilityDerive = "prop.capability-derive",
+    PropCopyIneligible = "prop.copy-ineligible",
+    PropLinearArgument = "prop.linear-argument",
+    PropLinearUndeclared = "prop.linear-undeclared",
+    PropPromiseNotOpen = "prop.promise-not-open",
+    PropPromiseUnmet = "prop.promise-unmet",
+    PropPropertyImpl = "prop.property-impl",
+    PropTokenArgument = "prop.token-argument",
+    PropTokenWait = "prop.token-wait",
+    PropViewArgument = "prop.view-argument",
+    PropViewResult = "prop.view-result",
+    PropViewUndeclared = "prop.view-undeclared",
+    RegisterArrayAccess = "register.array-access",
     RegisterBankReserved = "register.bank-reserved",
+    RegisterLiteral = "register.literal",
+    RegisterMisaligned = "register.misaligned",
+    RegisterNotReadable = "register.not-readable",
+    RegisterNotWritable = "register.not-writable",
+    RegisterOperand = "register.operand",
+    RegisterOverlap = "register.overlap",
+    RegisterPortWidth = "register.port-width",
+    RegisterStride = "register.stride",
+    RegisterType = "register.type",
+    RegisterWindowType = "register.window-type",
+    RegistryEntryType = "registry.entry-type",
+    RegistryGrantNotAlias = "registry.grant-not-alias",
+    RegistryKeyType = "registry.key-type",
+    RegistryNotRegistry = "registry.not-registry",
+    RegistryPlatformEntry = "registry.platform-entry",
+    RegistryPlatformTarget = "registry.platform-target",
+    RegistryUngranted = "registry.ungranted",
+    RegistryUniqueRepeated = "registry.unique-repeated",
+    RegistryUniqueType = "registry.unique-type",
+    RegistryUnknownField = "registry.unknown-field",
+    RetiredForwardedUse = "retired.forwarded-use",
+    StmtAssignTarget = "stmt.assign-target",
+    StmtDiscardUnit = "stmt.discard-unit",
+    StmtElseNotDiverging = "stmt.else-not-diverging",
+    StmtIrrefutableElse = "stmt.irrefutable-else",
+    StmtMissingReturn = "stmt.missing-return",
+    StmtNoLoop = "stmt.no-loop",
+    StmtReturnValue = "stmt.return-value",
+    StmtShadowing = "stmt.shadowing",
+    StmtUnknownLabel = "stmt.unknown-label",
+    StmtUnreachable = "stmt.unreachable",
+    StmtUnusedLabel = "stmt.unused-label",
+    StmtUnusedResult = "stmt.unused-result",
+    StmtWildcardBinding = "stmt.wildcard-binding",
+    SuspendStackMissing = "suspend.stack-missing",
+    SuspendTokenAcrossAwait = "suspend.token-across-await",
     SyntaxForeign = "syntax.foreign",
     SyntaxMismatchedDelimiter = "syntax.mismatched-delimiter",
     SyntaxUnclosedDelimiter = "syntax.unclosed-delimiter",
     SyntaxUnexpectedToken = "syntax.unexpected-token",
+    TaskCaptureNotSend = "task.capture-not-send",
+    TaskLendLocal = "task.lend-local",
+    TaskLendOutsideScope = "task.lend-outside-scope",
+    TaskTaskFnCall = "task.task-fn-call",
+    TaskUnscopedFailure = "task.unscoped-failure",
+    TaskWhenDuplicate = "task.when-duplicate",
+    TaskWhenEscape = "task.when-escape",
+    TaskWhenNotCown = "task.when-not-cown",
     TaskWhenTake = "task.when-take",
+    TaskWhenWait = "task.when-wait",
+    TestGenerateType = "test.generate-type",
+    TextArgumentDuplicate = "text.argument-duplicate",
+    TextArgumentUnused = "text.argument-unused",
+    TextBareLen = "text.bare-len",
+    TextHoleUnbound = "text.hole-unbound",
+    TextIntegerIndex = "text.integer-index",
+    TextTemplateMalformed = "text.template-malformed",
+    TextTemplateNotLiteral = "text.template-not-literal",
+    TextTemplatePosition = "text.template-position",
+    ThresholdDepth = "threshold.depth",
+    ThresholdEmptyReason = "threshold.empty-reason",
+    ThresholdLength = "threshold.length",
+    ThresholdUnusedWaiver = "threshold.unused-waiver",
+    TodoEmptyReason = "todo.empty-reason",
+    TodoHole = "todo.hole",
+    TodoUntyped = "todo.untyped",
     ToolNoWorkspace = "tool.no-workspace",
     ToolUnknownScope = "tool.unknown-scope",
     ToolUsage = "tool.usage",
+    TrustedBlockValue = "trusted.block-value",
+    TrustedConventionTarget = "trusted.convention-target",
+    TrustedConventionUnknown = "trusted.convention-unknown",
+    TrustedEmptyPremise = "trusted.empty-premise",
+    TrustedForeignSignature = "trusted.foreign-signature",
+    TrustedNested = "trusted.nested",
+    TrustedPrimitiveOutside = "trusted.primitive-outside",
+    TypeClosedHiddenField = "type.closed-hidden-field",
+    TypeDuplicateLabel = "type.duplicate-label",
+    TypeDuplicateMember = "type.duplicate-member",
+    TypeHiddenField = "type.hidden-field",
+    TypeLiteralRange = "type.literal-range",
+    TypeLiteralUntyped = "type.literal-untyped",
+    TypeMismatch = "type.mismatch",
+    TypeMissingField = "type.missing-field",
+    TypeNotAType = "type.not-a-type",
+    TypeOpenConstruction = "type.open-construction",
+    TypePayloadShape = "type.payload-shape",
+    TypeQualifiedCoreVariant = "type.qualified-core-variant",
+    TypeRecursive = "type.recursive",
+    TypeUnlabelledField = "type.unlabelled-field",
+    TypeUnlabelledPayload = "type.unlabelled-payload",
+    UntrustedInspectOutsideValidator = "untrusted.inspect-outside-validator",
+    UntrustedValidatorInterface = "untrusted.validator-interface",
+    UntrustedValidatorNoInput = "untrusted.validator-no-input",
+    UntrustedWrappedAlias = "untrusted.wrapped-alias",
+    UnusedGrant = "unused.grant",
 }
 
 impl Code {
     pub fn class(self) -> Class {
         match self {
             Code::InternalInvariant => Class::Internal,
+            Code::RetiredForwardedUse
+            | Code::ThresholdDepth
+            | Code::ThresholdLength
+            | Code::TodoHole
+            | Code::UnusedGrant => Class::Incompleteness,
             _ => Class::Error,
         }
     }
@@ -128,6 +410,24 @@ impl Code {
 /// The role of a reason in a because-chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
+    /// Its line binds or creates the subject.
+    Bound,
+    /// Its line starts a hold freezing the subject.
+    Frozen,
+    /// Its line starts a hold holding the subject.
+    Held,
+    /// Its line moves the subject.
+    Moved,
+    /// Its line uses the subject, keeping a hold or a value live.
+    Used,
+    /// Its line accesses the subject, written with its mode.
+    Accessed,
+    /// Its line calls the subject, through which a fact reaches the reported line.
+    Called,
+    /// Its line is the site of a fact; the subject is the operation.
+    Raised,
+    /// The command making the change the owning rule requires, on no line.
+    Command,
     /// A value the owning rule names, on no line.
     Note,
 }
@@ -135,6 +435,15 @@ pub enum Role {
 impl Role {
     pub fn word(self) -> &'static str {
         match self {
+            Role::Bound => "bound",
+            Role::Frozen => "frozen",
+            Role::Held => "held",
+            Role::Moved => "moved",
+            Role::Used => "used",
+            Role::Accessed => "accessed",
+            Role::Called => "called",
+            Role::Raised => "raised",
+            Role::Command => "command",
             Role::Note => "note",
         }
     }
@@ -144,6 +453,8 @@ impl Role {
 pub struct Reason {
     pub role: Role,
     pub subject: String,
+    /// The workspace file and line the reason lies on, when it lies in source.
+    pub at: Option<(String, u32)>,
 }
 
 impl Reason {
@@ -151,8 +462,42 @@ impl Reason {
         Reason {
             role: Role::Note,
             subject: subject.to_owned(),
+            at: None,
         }
     }
+}
+
+/// A replacement of the bytes `start..end` of a source file, an empty run inserting the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+}
+
+/// An exact fix: replacements in the workspace's source files, by path, none overlapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fix(pub Vec<(String, Replacement)>);
+
+impl Fix {
+    /// The fix making this one's replacements and another's.
+    pub fn and(mut self, other: Fix) -> Fix {
+        self.0.extend(other.0);
+        self
+    }
+}
+
+/// Which of the fixes a rule names a diagnostic offers, among those passing the in-memory
+/// re-check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Offer {
+    /// Each.
+    #[default]
+    Each,
+    /// The first, the others being its alternatives.
+    First,
+    /// The one, when exactly one passes.
+    Unique,
 }
 
 /// One reported root cause. The quote and the item are derived from the location when printed.
@@ -161,9 +506,18 @@ pub struct Diagnostic {
     pub code: Code,
     pub path: Option<String>,
     pub line: Option<u32>,
+    /// The canonical path of the item it is reported on, when the checker reports it.
+    pub item: Option<String>,
     pub expected: Option<String>,
     pub found: Option<String>,
     pub because: Vec<Reason>,
+    /// The bytes of the reported construct in its file.
+    pub span: Option<(u32, u32)>,
+    /// For a syntax failure, the first byte of the token at which the parse failed.
+    pub failing: Option<u32>,
+    /// The fixes its rule names, or once re-checked, those it offers.
+    pub fixes: Vec<Fix>,
+    pub offer: Offer,
 }
 
 impl Diagnostic {
@@ -172,9 +526,14 @@ impl Diagnostic {
             code,
             path: None,
             line: None,
+            item: None,
             expected: None,
             found: None,
             because: Vec::new(),
+            span: None,
+            failing: None,
+            fixes: Vec::new(),
+            offer: Offer::Each,
         }
     }
 

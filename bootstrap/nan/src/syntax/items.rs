@@ -4,7 +4,7 @@ use super::file::{FileDiagnostic, SourceFile};
 use super::grammar::{Keyword, Punct, Rule};
 use super::token::TokenKind;
 use super::tree::{Child, NodeId, Tree};
-use crate::diagnostic::Code;
+use crate::diagnostic::{Code, Replacement};
 
 /// A view of one item's tree over its file.
 #[derive(Clone, Copy)]
@@ -65,6 +65,50 @@ impl<'a> Item<'a> {
             .collect()
     }
 
+    /// The bytes from a token's start to the next token's on its line, or to its own end.
+    fn with_space_after(&self, token: u32) -> (u32, u32) {
+        let at = &self.file.tokens[token as usize];
+        let next = &self.file.tokens[self.file.next(token as usize + 1)];
+        let end = if next.line == at.line && !next.kind.is_virtual() {
+            next.start
+        } else {
+            at.end
+        };
+        (at.start, end)
+    }
+
+    /// The bytes from the end of the token before `first` to the end of `last`.
+    fn with_space_before(&self, first: u32, last: u32) -> (u32, u32) {
+        let before = self
+            .file
+            .previous(first as usize)
+            .map_or(self.file.tokens[first as usize].start, |before| {
+                self.file.tokens[before].end
+            });
+        (before, self.file.tokens[last as usize].end)
+    }
+
+    /// A diagnostic on the tokens `first..=last`, with the fix replacing the bytes `range` with
+    /// `text`.
+    fn fixed(
+        &self,
+        (first, last): (u32, u32),
+        code: Code,
+        (start, end): (u32, u32),
+        text: &str,
+    ) -> FileDiagnostic {
+        let at = &self.file.tokens[first as usize];
+        FileDiagnostic {
+            span: Some((at.start, self.file.tokens[last as usize].end)),
+            fixes: vec![vec![Replacement {
+                start,
+                end,
+                text: text.to_owned(),
+            }]],
+            ..FileDiagnostic::new(at.line, code)
+        }
+    }
+
     /// The name the item's head declares, as the head spells it.
     pub fn name(&self) -> Option<String> {
         let (rule, node) = self.kind()?;
@@ -93,6 +137,35 @@ impl<'a> Item<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether a byte of the item lies in its declaration rather than in a body: for a function,
+    /// before the `{` or `=` opening its body; for a test, never; for other kinds, always.
+    pub fn declares(&self, position: u32) -> bool {
+        match self.kind() {
+            Some((Rule::FnItem, node)) => {
+                let opener = self.tree.find(node, Rule::FnEnd).and_then(|end| {
+                    self.tree.child_tokens(end).find(|&token| {
+                        matches!(
+                            self.kind_of(token),
+                            TokenKind::Punct(Punct::LBrace | Punct::Eq)
+                        )
+                    })
+                });
+                opener.is_none_or(|opener| position < self.file.tokens[opener as usize].start)
+            }
+            Some((Rule::TestItem, _)) => false,
+            _ => true,
+        }
+    }
+
+    /// The last token of a function item's head.
+    pub fn head_end(&self) -> Option<u32> {
+        let (rule, node) = self.kind()?;
+        if rule != Rule::FnItem {
+            return None;
+        }
+        Some(self.tree.span(self.tree.find(node, Rule::FnHead)?)?.1)
     }
 
     /// The line of the item's first token after its doc comment.
@@ -131,14 +204,8 @@ pub fn clause_group(tree: &Tree, clause: NodeId) -> u8 {
 /// Checks the rules of item shape that the parse leaves to the parsed item.
 pub fn check(item: Item) -> Vec<FileDiagnostic> {
     let mut found = Vec::new();
-    let mut report = |line: u32, code: Code| {
-        found.push(FileDiagnostic {
-            line,
-            code,
-            expected: None,
-            found: None,
-        })
-    };
+    let mut fixed = Vec::new();
+    let mut report = |line: u32, code: Code| found.push(FileDiagnostic::new(line, code));
     let Some((kind, node)) = item.kind() else {
         return found;
     };
@@ -155,7 +222,8 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
             | Rule::PackageItem
     );
     if let Some(token) = visibility.filter(|_| no_visibility) {
-        report(item.line(token), Code::ItemVisibilityNotAllowed);
+        let deleted = item.with_space_after(token);
+        fixed.push(item.fixed((token, token), Code::ItemVisibilityNotAllowed, deleted, ""));
     }
 
     let fn_end = (kind == Rule::FnItem)
@@ -166,7 +234,7 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
         matches!(child, Child::Token(token) if item.kind_of(token) == TokenKind::Punct(Punct::Eq))
     });
     let mut type_modifiers: Vec<(String, u32)> = Vec::new();
-    let mut fn_modifier = false;
+    let mut fn_modifier: Option<String> = None;
     for (rule, token) in item.modifiers() {
         let word = item.text(token).to_owned();
         match rule {
@@ -175,10 +243,13 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
             }
             Rule::TypeModifier => {
                 let openness = |word: &str| word == "closed" || word == "open";
-                let conflict = type_modifiers
+                if type_modifiers.iter().any(|(other, _)| *other == word) {
+                    let deleted = item.with_space_after(token);
+                    fixed.push(item.fixed((token, token), Code::ItemModifierConflict, deleted, ""));
+                } else if type_modifiers
                     .iter()
-                    .any(|(other, _)| *other == word || (openness(other) && openness(&word)));
-                if conflict {
+                    .any(|(other, _)| openness(other) && openness(&word))
+                {
                     report(item.line(token), Code::ItemModifierConflict);
                 }
                 type_modifiers.push((word, token));
@@ -192,8 +263,14 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
             Rule::FnModifier if transparent && word != "proj" => {
                 report(item.line(token), Code::ItemModifierMisplaced)
             }
-            Rule::FnModifier if fn_modifier => report(item.line(token), Code::ItemModifierConflict),
-            Rule::FnModifier => fn_modifier = true,
+            Rule::FnModifier if fn_modifier == Some(word.clone()) => {
+                let deleted = item.with_space_after(token);
+                fixed.push(item.fixed((token, token), Code::ItemModifierConflict, deleted, ""));
+            }
+            Rule::FnModifier if fn_modifier.is_some() => {
+                report(item.line(token), Code::ItemModifierConflict)
+            }
+            Rule::FnModifier => fn_modifier = Some(word),
             _ => {}
         }
     }
@@ -208,23 +285,26 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
                 item.head_line().expect("a parsed item has a head"),
                 Code::ItemOpennessMissing,
             ),
-            (false, Some((_, token))) => report(item.line(*token), Code::ItemOpennessNotPub),
+            (false, Some((_, token))) => {
+                let deleted = item.with_space_after(*token);
+                fixed.push(item.fixed((*token, *token), Code::ItemOpennessNotPub, deleted, ""));
+            }
             _ => {}
         }
     }
 
     match kind {
-        Rule::FnItem => check_fn(item, node, &mut report),
+        Rule::FnItem => check_fn(item, node, &mut report, &mut fixed),
         Rule::InterfaceItem => {
             for member in tree
                 .child_nodes(node)
                 .filter(|member| tree.rule(*member) == Rule::InterfaceMember)
             {
-                check_head(item, member, true, &mut report);
+                check_head(item, member, true, &mut report, &mut fixed);
                 let method_end = tree.find(member, Rule::MethodEnd);
                 if let Some(region) = method_end.and_then(|end| tree.find(end, Rule::ClauseRegion))
                 {
-                    check_clause_order(item, region, &mut report);
+                    check_clause_order(item, region, &mut fixed);
                 }
                 let body = method_end.and_then(|end| tree.find(end, Rule::MethodBody));
                 let name = tree
@@ -237,11 +317,26 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
                     if label.is_none_or(|label| item.text(label) != item.text(name)) {
                         let closer = tree
                             .child_tokens(body)
-                            .find(|token| item.kind_of(*token) == TokenKind::Punct(Punct::RBrace));
-                        report(
-                            item.line(closer.expect("a body closes")),
-                            Code::ItemLabelMismatch,
-                        );
+                            .find(|token| item.kind_of(*token) == TokenKind::Punct(Punct::RBrace))
+                            .expect("a body closes");
+                        let name = item.text(name);
+                        fixed.push(match label {
+                            Some(label) => {
+                                let at = &item.file.tokens[label as usize];
+                                let written = (at.start, at.end);
+                                item.fixed((label, label), Code::ItemLabelMismatch, written, name)
+                            }
+                            None => {
+                                let end = item.file.tokens[closer as usize].end;
+                                let written = format!(" {name}");
+                                item.fixed(
+                                    (closer, closer),
+                                    Code::ItemLabelMismatch,
+                                    (end, end),
+                                    &written,
+                                )
+                            }
+                        });
                     }
                 }
             }
@@ -271,15 +366,23 @@ pub fn check(item: Item) -> Vec<FileDiagnostic> {
     if let (Some(label), Some(name)) = (label, item.name())
         && item.tokens_text(label) != name
     {
-        report(
-            item.line(tree.span(label).expect("a label holds tokens").0),
-            Code::ItemLabelMismatch,
+        let (first, last) = tree.span(label).expect("a label holds tokens");
+        let written = (
+            item.file.tokens[first as usize].start,
+            item.file.tokens[last as usize].end,
         );
+        fixed.push(item.fixed((first, last), Code::ItemLabelMismatch, written, &name));
     }
+    found.extend(fixed);
     found
 }
 
-fn check_fn(item: Item, node: NodeId, report: &mut dyn FnMut(u32, Code)) {
+fn check_fn(
+    item: Item,
+    node: NodeId,
+    report: &mut dyn FnMut(u32, Code),
+    fixed: &mut Vec<FileDiagnostic>,
+) {
     let tree = item.tree;
     let Some(head) = tree.find(node, Rule::FnHead) else {
         return;
@@ -287,7 +390,7 @@ fn check_fn(item: Item, node: NodeId, report: &mut dyn FnMut(u32, Code)) {
     let Some(end) = tree.find(node, Rule::FnEnd) else {
         return;
     };
-    check_head(item, head, false, report);
+    check_head(item, head, false, report, fixed);
     let foreign = item
         .modifiers()
         .iter()
@@ -311,18 +414,23 @@ fn check_fn(item: Item, node: NodeId, report: &mut dyn FnMut(u32, Code)) {
         report(first_line, Code::ItemForeignForm);
     }
     if let Some(limits) = tree.find(head, Rule::LimitsClause).filter(|_| transparent) {
-        report(
-            item.line(tree.span(limits).expect("limits hold tokens").0),
-            Code::ItemTransparentLimits,
-        );
+        let (first, last) = tree.span(limits).expect("limits hold tokens");
+        let deleted = item.with_space_before(first, last);
+        fixed.push(item.fixed((first, last), Code::ItemTransparentLimits, deleted, ""));
     }
     if let Some(region) = region {
-        check_clause_order(item, region, report);
+        check_clause_order(item, region, fixed);
     }
 }
 
 /// Checks a function head or interface method head: its result and its `self` parameters.
-fn check_head(item: Item, head: NodeId, method: bool, report: &mut dyn FnMut(u32, Code)) {
+fn check_head(
+    item: Item,
+    head: NodeId,
+    method: bool,
+    report: &mut dyn FnMut(u32, Code),
+    fixed: &mut Vec<FileDiagnostic>,
+) {
     let tree = item.tree;
     if let Some(result) = tree.find(head, Rule::FnResult) {
         let unit = tree.find(result, Rule::TypeExpr).is_some_and(|ty| {
@@ -334,10 +442,9 @@ fn check_head(item: Item, head: NodeId, method: bool, report: &mut dyn FnMut(u32
             children.next().is_none() && item.tokens_text(path) == "Unit"
         });
         if unit {
-            report(
-                item.line(tree.span(result).expect("a result holds tokens").0),
-                Code::ItemUnitResult,
-            );
+            let (first, last) = tree.span(result).expect("a result holds tokens");
+            let deleted = item.with_space_before(first, last);
+            fixed.push(item.fixed((first, last), Code::ItemUnitResult, deleted, ""));
         }
     }
     let type_member = method
@@ -366,20 +473,51 @@ fn report_self(item: Item, param: NodeId, report: &mut dyn FnMut(u32, Code)) {
     }
 }
 
-/// Reports each clause line that follows a line of a later group.
-fn check_clause_order(item: Item, region: NodeId, report: &mut dyn FnMut(u32, Code)) {
+/// Reports each clause line that follows a line of a later group, with the fix moving it to just
+/// before the first line of a later group.
+fn check_clause_order(item: Item, region: NodeId, fixed: &mut Vec<FileDiagnostic>) {
     let tree = item.tree;
+    let lines: Vec<(u8, u32, u32)> = tree
+        .child_nodes(region)
+        .filter_map(|line| {
+            let clause = tree.child_nodes(line).next()?;
+            let (first, last) = tree.span(clause)?;
+            Some((clause_group(tree, clause), first, last))
+        })
+        .collect();
+    let physical = |token: u32| &item.file.lines[item.line(token) as usize - 1];
     let mut latest = 0;
-    for line in tree.child_nodes(region) {
-        let Some(clause) = tree.child_nodes(line).next() else {
-            continue;
-        };
-        let group = clause_group(tree, clause);
+    for &(group, first, last) in &lines {
         if group < latest {
-            report(
-                item.line(tree.span(clause).expect("a clause holds tokens").0),
-                Code::ItemClauseOrder,
-            );
+            let later = lines
+                .iter()
+                .find(|(other, _, _)| *other > group)
+                .expect("a later group precedes the line");
+            let start = physical(first).start;
+            let end = item
+                .file
+                .lines
+                .get(item.line(last) as usize)
+                .map_or(item.file.source.len() as u32, |next| next.start);
+            let moved = String::from_utf8_lossy(&item.file.source[start as usize..end as usize]);
+            let target = physical(later.1).start;
+            let at = &item.file.tokens[first as usize];
+            fixed.push(FileDiagnostic {
+                span: Some((at.start, item.file.tokens[last as usize].end)),
+                fixes: vec![vec![
+                    Replacement {
+                        start: target,
+                        end: target,
+                        text: moved.into_owned(),
+                    },
+                    Replacement {
+                        start,
+                        end,
+                        text: String::new(),
+                    },
+                ]],
+                ..FileDiagnostic::new(at.line, Code::ItemClauseOrder)
+            });
         }
         latest = latest.max(group);
     }

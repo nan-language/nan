@@ -86,6 +86,11 @@ fn units(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
+/// The size of records in units, as their text prints them.
+pub fn units_of(records: &[Record]) -> usize {
+    units(records.iter().map(|record| record.text().len()).sum())
+}
+
 impl Output {
     fn verdict_text(&self) -> String {
         let counts: Vec<String> = self

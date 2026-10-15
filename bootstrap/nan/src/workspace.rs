@@ -8,11 +8,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use manifest::{Manifest, Target};
+pub use manifest::{Authority, Manifest, Target};
 pub use modules::Module;
 
 use crate::diagnostic::{Code, Diagnostic, Reason};
-use crate::syntax::file::{SourceFile, parse};
+use crate::syntax::file::{SourceFile, parse, parse_declarations};
 use crate::syntax::grammar::Rule;
 use crate::syntax::items::Item;
 
@@ -23,6 +23,8 @@ pub struct Workspace {
     pub stray: Vec<String>,
     /// The package and file indexes of each file, by path.
     paths: HashMap<String, (usize, usize)>,
+    /// The package directories and files the walk found.
+    layout: Vec<Found>,
 }
 
 pub struct Package {
@@ -80,6 +82,7 @@ fn is_manifest(path: &Path) -> bool {
 }
 
 /// The files of one package directory found by the walk.
+#[derive(Clone)]
 struct Found {
     dir: String,
     sources: Vec<String>,
@@ -89,12 +92,43 @@ struct Found {
 impl Workspace {
     /// Loads the workspace at `root`, recording in `read` each file it reads.
     pub fn load(root: PathBuf, read: &mut Vec<String>) -> io::Result<Workspace> {
-        let mut found = Vec::new();
+        let mut layout = Vec::new();
         let mut stray = Vec::new();
-        walk(&root, "", None, &mut found, &mut stray)?;
-        let packages: Vec<Package> = found
-            .into_iter()
-            .map(|found| Package::load(&root, found, read))
+        walk(&root, "", None, &mut layout, &mut stray)?;
+        let mut source = |path: &str| {
+            read.push(path.to_owned());
+            fs::read(root.join(path))
+        };
+        Workspace::build(root.clone(), layout, stray, &mut source)
+    }
+
+    /// The workspace with the files of `changed` holding their new sources, read from memory.
+    pub fn with_sources(&self, changed: &HashMap<String, Vec<u8>>) -> Workspace {
+        let mut source = |path: &str| {
+            Ok(changed.get(path).cloned().unwrap_or_else(|| {
+                let (_, file) = self.file(path).expect("a fix changes workspace files");
+                file.syntax.source.clone()
+            }))
+        };
+        Workspace::build(
+            self.root.clone(),
+            self.layout.clone(),
+            self.stray.clone(),
+            &mut source,
+        )
+        .expect("sources in memory read without failing")
+    }
+
+    fn build(
+        root: PathBuf,
+        layout: Vec<Found>,
+        stray: Vec<String>,
+        source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Workspace> {
+        let packages: Vec<Package> = layout
+            .iter()
+            .cloned()
+            .map(|found| Package::load(found, source))
             .collect::<io::Result<_>>()?;
         let paths = packages
             .iter()
@@ -112,6 +146,7 @@ impl Workspace {
             packages,
             stray,
             paths,
+            layout,
         })
     }
 
@@ -176,16 +211,6 @@ impl ItemPath {
         .cloned()
         .collect::<Vec<_>>()
         .join("::")
-    }
-
-    /// The path as tool output writes it for `package`: a module's items without the package
-    /// name, every other path canonical.
-    pub fn written_for(&self, package: &str) -> String {
-        match (&self.module, &self.name) {
-            (Some(module), Some(name)) if self.package == package => format!("{module}::{name}"),
-            (Some(module), None) if self.package == package => module.clone(),
-            _ => self.canonical(),
-        }
     }
 }
 
@@ -342,12 +367,11 @@ impl Package {
         Some(path)
     }
 
-    fn load(root: &Path, mut found: Found, read: &mut Vec<String>) -> io::Result<Package> {
+    fn load(
+        mut found: Found,
+        source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Package> {
         found.sources.sort();
-        let mut source = |path: &str| {
-            read.push(path.to_owned());
-            fs::read(root.join(path))
-        };
         let manifest_path = format!("{}/package.nan", found.dir);
         let syntax = parse(source(&manifest_path)?);
         let mut diagnostics = Vec::new();
@@ -378,25 +402,7 @@ impl Package {
                 });
             }
         }
-        let mut types = vec![HashSet::new(); modules.len()];
-        for file in &files {
-            let Some(module) = file.module else { continue };
-            for tree in file
-                .syntax
-                .items
-                .iter()
-                .filter_map(|item| item.tree.as_ref())
-            {
-                let item = Item {
-                    file: &file.syntax,
-                    tree,
-                };
-                let is_type = item.kind().is_some_and(|(rule, _)| {
-                    matches!(rule, Rule::StructItem | Rule::EnumItem | Rule::LayoutItem)
-                });
-                types[module].extend(item.name().filter(|_| is_type));
-            }
-        }
+        let types = type_names(&files, modules.len());
         let mut package = Package {
             dir: found.dir,
             manifest,
@@ -415,6 +421,41 @@ impl Package {
             package.diagnostics.extend(found);
         }
         Ok(package)
+    }
+
+    /// A std package from the declarations of its modules, given as paths and sources relative to
+    /// a package directory named like the package.
+    pub fn declared(name: &str, sources: Vec<(String, Vec<u8>)>) -> Package {
+        let paths: Vec<String> = sources.iter().map(|(path, _)| path.clone()).collect();
+        let (modules, assigned) = modules::assign(name, Some(name), &paths);
+        let files: Vec<File> = sources
+            .into_iter()
+            .zip(assigned)
+            .map(|((path, source), module)| File {
+                path,
+                module: Some(module),
+                syntax: parse_declarations(source),
+            })
+            .collect();
+        let types = type_names(&files, modules.len());
+        Package {
+            dir: name.to_owned(),
+            manifest: Some(Manifest {
+                name: name.to_owned(),
+                line: 1,
+                targets: vec![Target::Any],
+                targets_line: None,
+                supported: true,
+                entry: None,
+                deps: Vec::new(),
+                allows: Vec::new(),
+                denies: Vec::new(),
+            }),
+            files,
+            modules,
+            types,
+            diagnostics: Vec::new(),
+        }
     }
 
     /// Reports every `package` item outside `package.nan`, and every item of `package.nan` but
@@ -448,6 +489,30 @@ impl Package {
             }
         }
     }
+}
+
+/// The names of the structs, enums and layouts each module of `files` declares.
+fn type_names(files: &[File], modules: usize) -> Vec<HashSet<String>> {
+    let mut types = vec![HashSet::new(); modules];
+    for file in files {
+        let Some(module) = file.module else { continue };
+        for tree in file
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| item.tree.as_ref())
+        {
+            let item = Item {
+                file: &file.syntax,
+                tree,
+            };
+            let is_type = item.kind().is_some_and(|(rule, _)| {
+                matches!(rule, Rule::StructItem | Rule::EnumItem | Rule::LayoutItem)
+            });
+            types[module].extend(item.name().filter(|_| is_type));
+        }
+    }
+    types
 }
 
 #[cfg(test)]

@@ -10,9 +10,9 @@ use crate::diagnostic::Code;
 
 #[derive(Clone, Debug)]
 pub struct Frame {
-    seq: SeqId,
-    elem: usize,
-    count: usize,
+    pub(super) seq: SeqId,
+    pub(super) elem: usize,
+    pub(super) count: usize,
     pub rule: Option<Rule>,
     /// The index of the first token the frame read.
     pub start: usize,

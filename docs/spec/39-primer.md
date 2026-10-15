@@ -567,7 +567,7 @@ pub fn poll_byte(mut regs: hw::Mmio[UartRegs]) -> Option[u8] {
     return Some(mut regs.read(UartRegs.data))
 } poll_byte
 
-pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> hw::PageTableRoot {
+pub fn activate(take root: hw::PageTableRoot, cpu: hw::Ring0) -> Option[hw::PageTableRoot] {
     return trusted "root maps the running kernel image and the current stack" { cpu.write_cr3(take root) }
 } activate
 ```

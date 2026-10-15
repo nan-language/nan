@@ -56,6 +56,23 @@ pub fn write(root: &Path, files: &[(String, Vec<u8>)]) -> io::Result<()> {
     fs::remove_file(path)
 }
 
+/// Replaces one file outside the source and machine files, which a command holding the shared
+/// lock writes, by renaming a new file of this process into place.
+pub fn replace_alone(root: &Path, path: &str, content: &[u8]) -> io::Result<()> {
+    let target = root.join(path);
+    let directory = target.parent().expect("a file lies in a directory");
+    fs::create_dir_all(directory)?;
+    let name = target
+        .file_name()
+        .expect("a file has a name")
+        .to_string_lossy()
+        .into_owned();
+    let new = directory.join(format!(".{name}.{}.new", std::process::id()));
+    write_synced(&new, content)?;
+    fs::rename(&new, &target)?;
+    sync_directory(directory)
+}
+
 fn write_synced(path: &Path, content: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(content)?;

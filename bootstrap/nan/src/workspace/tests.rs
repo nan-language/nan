@@ -383,12 +383,7 @@ fn items_have_canonical_paths() {
         Some("app::units::Scale.half")
     );
     assert_eq!(
-        at("app/units/units.nan", 4)
-            .map(|_| workspace
-                .item_at("app/units/units.nan", 4)
-                .expect("an item")
-                .written_for("app"))
-            .as_deref(),
-        Some("units::Scale")
+        at("app/units/units.nan", 4).as_deref(),
+        Some("app::units::Scale")
     );
 }

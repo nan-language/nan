@@ -1,8 +1,8 @@
 //! Line-local lexing of a source file into tokens, virtual tokens and lexical diagnostics.
 
-use super::grammar::{Foreign, Keyword, Punct, REJECTED};
+use super::grammar::{Foreign, Keyword, Punct, REJECTED, REJECTED_SPACE};
 use super::token::{Token, TokenKind};
-use crate::diagnostic::Code;
+use crate::diagnostic::{Code, Replacement};
 
 /// A physical line: its byte range without the LF, the offset of its plain comment, and whether it
 /// holds a lexical diagnostic.
@@ -14,10 +14,13 @@ pub struct Line {
     pub lexical_error: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexDiagnostic {
     pub line: u32,
     pub code: Code,
+    /// The bytes of the offending character or token.
+    pub span: (u32, u32),
+    pub fix: Option<Vec<Replacement>>,
 }
 
 pub struct Lexed {
@@ -80,7 +83,31 @@ pub fn lex(source: &[u8]) -> Lexed {
             last = Some(token);
         }
         if let Some((offset, code)) = scan.error {
-            lexed.diagnostics.push(LexDiagnostic { line: number, code });
+            let line = &source[start..end];
+            let width = if code == Code::LexTrailingWhitespace {
+                line.len() - offset
+            } else {
+                line[offset..]
+                    .utf8_chunks()
+                    .next()
+                    .and_then(|chunk| chunk.valid().chars().next())
+                    .map_or(1, char::len_utf8)
+            };
+            lexed.diagnostics.push(LexDiagnostic {
+                line: number,
+                code,
+                span: (at(offset), at(offset + width.min(line.len() - offset))),
+                fix: line_fix(line, offset, code).map(|replacements| {
+                    replacements
+                        .into_iter()
+                        .map(|(from, to, text)| Replacement {
+                            start: at(from),
+                            end: at(to),
+                            text,
+                        })
+                        .collect()
+                }),
+            });
             let position = at(offset);
             lexed.tokens.push(Token {
                 kind: TokenKind::LexError,
@@ -237,12 +264,147 @@ fn lex_line(bytes: &[u8], last_unterminated: bool) -> LineScan {
     }
 }
 
-fn is_rejected(c: char) -> bool {
+/// The exact fix of a line's lexical error at byte `at`, as replacements of byte ranges of the
+/// line.
+fn line_fix(bytes: &[u8], at: usize, code: Code) -> Option<Vec<(usize, usize, String)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let literals = literals(text);
+    let held = |offset: usize| literals[offset];
+    let fix = match code {
+        Code::LexCarriageReturn => text
+            .match_indices('\r')
+            .map(|(offset, _)| (offset, offset + 1, String::new()))
+            .collect(),
+        Code::LexTab => {
+            let indentation = text.len() - text.trim_start_matches([' ', '\t']).len();
+            text.match_indices('\t')
+                .map(|(offset, _)| {
+                    let replacement = if offset < indentation {
+                        "    "
+                    } else if held(offset).is_some() {
+                        "\\t"
+                    } else {
+                        " "
+                    };
+                    (offset, offset + 1, replacement.to_owned())
+                })
+                .collect()
+        }
+        Code::LexTrailingWhitespace => {
+            let kept = text.trim_end_matches(' ').len();
+            if held(text.len() - 1) == Some(Literal::TextLine) {
+                vec![(text.len() - 1, text.len(), "\\x20".to_owned())]
+            } else {
+                vec![(kept, text.len(), String::new())]
+            }
+        }
+        Code::LexMissingFinalNewline => vec![(text.len(), text.len(), "\n".to_owned())],
+        Code::LexRejectedCodePoint => {
+            let c = text[at..].chars().next()?;
+            let replacement = match held(at) {
+                Some(Literal::Text | Literal::Char | Literal::TextLine) => {
+                    format!("\\u{{{:X}}}", u32::from(c))
+                }
+                Some(Literal::Bytes | Literal::Byte) if c.is_ascii() => {
+                    format!("\\x{:02X}", u32::from(c))
+                }
+                Some(_) => return None,
+                None if in_ranges(c, &REJECTED_SPACE) => " ".to_owned(),
+                None => String::new(),
+            };
+            vec![(at, at + c.len_utf8(), replacement)]
+        }
+        Code::LexNotAtLineStart
+            if text[at..].starts_with("///") || text[at..].starts_with("//!") =>
+        {
+            vec![(at, at + 3, "//".to_owned())]
+        }
+        Code::LexLiteralSuffix => {
+            let rest = &text.as_bytes()[at..];
+            let mut length = 0;
+            while let Some(&byte) = rest.get(length) {
+                let fraction = byte == b'.' && rest.get(length + 1).is_some_and(u8::is_ascii_digit);
+                if !(byte.is_ascii_alphanumeric() || byte == b'_' || fraction) {
+                    break;
+                }
+                length += 1;
+            }
+            let run = &text[at..at + length];
+            let suffix = dec_int(run).filter(|rest| matches!(*rest, "f32" | "f64"))?;
+            let before = at + run.len() - suffix.len();
+            vec![(before, before, ".0".to_owned())]
+        }
+        Code::LexEscapeOutOfRange => {
+            let digits = text[at..].strip_prefix("\\x")?.get(..2)?;
+            vec![(
+                at,
+                at + 4,
+                format!("\\u{{{}}}", digits.to_ascii_uppercase()),
+            )]
+        }
+        Code::LexUnknownEscape if held(at).is_some_and(Literal::holds_bytes) => {
+            let rest = text[at..].strip_prefix("\\u{")?;
+            let digits = &rest[..rest.find('}')?];
+            let value = u32::from_str_radix(digits, 16)
+                .ok()
+                .filter(|value| *value < 0x80)?;
+            vec![(at, at + 4 + digits.len(), format!("\\x{value:02X}"))]
+        }
+        _ => return None,
+    };
+    Some(fix)
+}
+
+/// The literal holding each byte of a line, read as the scanner reads literals, past the
+/// characters it rejects; none in code and comments.
+fn literals(text: &str) -> Vec<Option<Literal>> {
+    let mut held = vec![None; text.len() + 1];
+    let bytes = text.as_bytes();
+    let first = text.len() - text.trim_start_matches(' ').len();
+    if text[first..].starts_with("\\\\") {
+        held[first..].fill(Some(Literal::TextLine));
+        return held;
+    }
+    let mut at = 0;
+    while at < bytes.len() {
+        let (literal, contents) = match (bytes[at], bytes.get(at + 1)) {
+            (b'/', Some(b'/')) => break,
+            (b'"', _) => (Literal::Text, at + 1),
+            (b'\'', _) => (Literal::Char, at + 1),
+            (b'b', Some(b'"')) => (Literal::Bytes, at + 2),
+            (b'b', Some(b'\'')) => (Literal::Byte, at + 2),
+            (byte, _) if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                    at += 1;
+                }
+                continue;
+            }
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        let quote = bytes[contents - 1];
+        let mut end = contents;
+        while end < bytes.len() && bytes[end] != quote {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
+        }
+        let end = (end + 1).min(bytes.len());
+        held[at..end].fill(Some(literal));
+        at = end;
+    }
+    held
+}
+
+fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
     let value = c as u32;
-    !(0x20..0x7F).contains(&value)
-        && REJECTED
-            .iter()
-            .any(|&(low, high)| (low..=high).contains(&value))
+    ranges
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&value))
+}
+
+fn is_rejected(c: char) -> bool {
+    !(0x20..0x7F).contains(&(c as u32)) && in_ranges(c, &REJECTED)
 }
 
 fn rejected_code(c: char) -> Option<Code> {

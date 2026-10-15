@@ -13,7 +13,7 @@ datatest_stable::harness! {
 }
 
 /// Codes this implementation reports for only some of the constructs their rules cover.
-const PARTIAL: &[&str] = &["name.dot-for-path"];
+const PARTIAL: &[&str] = &["contract.ill-defined", "registry.platform-entry"];
 
 const SUMMARY: &str = "//! Specification example.";
 
@@ -209,6 +209,10 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
         return Err(format!(
             "nan check exits with {code:?} and reports\n{output}expected {expected:?}"
         ));
+    }
+    let gaps = nan::context_gaps(dir).map_err(|error| error.to_string())?;
+    if !gaps.is_empty() {
+        return Err(format!("context packs lack facts:\n{}", gaps.join("\n")));
     }
 
     example

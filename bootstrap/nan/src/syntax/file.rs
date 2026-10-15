@@ -8,7 +8,7 @@ use super::lexer::{Line, lex};
 use super::parser::{self, Discard, Failure, Fed, Lookahead, State};
 use super::token::{Token, TokenKind};
 use super::tree::{Builder, Tree};
-use crate::diagnostic::Code;
+use crate::diagnostic::{Code, Offer, Replacement};
 
 /// A diagnostic of a file, before its path is known.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +17,28 @@ pub struct FileDiagnostic {
     pub code: Code,
     pub expected: Option<String>,
     pub found: Option<String>,
+    /// The bytes of the reported construct, when narrower than its line.
+    pub span: Option<(u32, u32)>,
+    /// For a syntax failure, the first byte of the token at which the parse failed.
+    pub failing: Option<u32>,
+    /// The fixes its rule names, each as replacements in this file.
+    pub fixes: Vec<Vec<Replacement>>,
+    pub offer: Offer,
+}
+
+impl FileDiagnostic {
+    pub fn new(line: u32, code: Code) -> FileDiagnostic {
+        FileDiagnostic {
+            line,
+            code,
+            expected: None,
+            found: None,
+            span: None,
+            failing: None,
+            fixes: Vec::new(),
+            offer: Offer::Each,
+        }
+    }
 }
 
 /// An item of a file, or a run of tokens between items that starts none.
@@ -61,6 +83,25 @@ impl SourceFile {
         (0..before).rev().find(|&at| !self.comment[at])
     }
 
+    /// The token after the longest text that `rule` derives from `start`.
+    pub fn longest(&self, rule: Rule, start: usize) -> Option<usize> {
+        let mut state = State::new(rule);
+        let mut at = start;
+        loop {
+            let next = (at + 1 < self.tokens.len()).then(|| &self.tokens[self.next(at + 1)]);
+            let lookahead = Lookahead {
+                token: &self.tokens[at],
+                next,
+                at,
+            };
+            match state.feed(lookahead, &self.source, &mut Discard) {
+                Ok(Fed::Consumed) => at = self.next(at + 1),
+                Ok(Fed::Done) => return (at != start).then_some(at),
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// The physical lines of an item, from its first token's to its last token's.
     pub fn item_lines(&self, item: &ItemSyntax) -> std::ops::RangeInclusive<u32> {
         self.tokens[item.first].line..=self.tokens[item.end - 1].line
@@ -84,8 +125,19 @@ impl SourceFile {
 }
 
 pub fn parse(source: Vec<u8>) -> SourceFile {
+    parse_as(source, false)
+}
+
+/// Parses std declarations as the specification publishes them: a function may end at its head
+/// line or clause region, without a body.
+pub fn parse_declarations(source: Vec<u8>) -> SourceFile {
+    parse_as(source, true)
+}
+
+fn parse_as(source: Vec<u8>, declarations: bool) -> SourceFile {
     let lexed = lex(&source);
     let mut parser = Parser {
+        declarations,
         file: SourceFile {
             source,
             comment: vec![false; lexed.tokens.len()],
@@ -109,13 +161,17 @@ pub fn parse(source: Vec<u8>) -> SourceFile {
     let lines = &file.lines;
     file.diagnostics
         .retain(|diagnostic| !lines[diagnostic.line as usize - 1].lexical_error);
-    file.diagnostics
-        .extend(lexed.diagnostics.iter().map(|diagnostic| FileDiagnostic {
-            line: diagnostic.line,
-            code: diagnostic.code,
-            expected: None,
-            found: None,
-        }));
+    file.diagnostics.extend(
+        lexed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| FileDiagnostic {
+                span: Some(diagnostic.span),
+                failing: Some(diagnostic.span.0),
+                fixes: diagnostic.fix.into_iter().collect(),
+                ..FileDiagnostic::new(diagnostic.line, diagnostic.code)
+            }),
+    );
     file
 }
 
@@ -128,6 +184,7 @@ enum DocRun {
 }
 
 struct Parser {
+    declarations: bool,
     file: SourceFile,
 }
 
@@ -154,11 +211,26 @@ impl Parser {
     }
 
     fn report(&mut self, line: u32, code: Code) {
+        self.file.diagnostics.push(FileDiagnostic::new(line, code));
+    }
+
+    /// Reports a syntax failure at the token `failing` on the tokens `first..=last`, with the
+    /// fixes its rule names.
+    fn report_fixed(
+        &mut self,
+        failing: usize,
+        (first, last): (usize, usize),
+        code: Code,
+        fixes: Vec<Vec<Replacement>>,
+        offer: Offer,
+    ) {
+        let (first, last) = (self.file.tokens[first], self.file.tokens[last]);
         self.file.diagnostics.push(FileDiagnostic {
-            line,
-            code,
-            expected: None,
-            found: None,
+            span: Some((first.start, last.end.max(first.start))),
+            failing: Some(self.file.tokens[failing].start),
+            fixes,
+            offer,
+            ..FileDiagnostic::new(first.line, code)
         });
     }
 
@@ -250,6 +322,21 @@ impl Parser {
                     });
                     return at;
                 }
+                Err(Failure::Token { at, .. })
+                    if self.declarations && state.innermost_rule() == Some(Rule::FnEnd) =>
+                {
+                    let end = match self.previous(at) {
+                        Some(previous) if self.kind(previous) == TokenKind::Col0 => previous,
+                        _ => at,
+                    };
+                    self.file.items.push(ItemSyntax {
+                        first,
+                        end,
+                        tree: Some(builder.finish()),
+                        abandoned: false,
+                    });
+                    return end;
+                }
                 Err(failure) => {
                     let failed_at = match failure {
                         Failure::Token { at, expected } => {
@@ -258,7 +345,9 @@ impl Parser {
                             at
                         }
                         Failure::Rejected { code, start } => {
-                            self.report(self.file.tokens[start].line, code);
+                            let (fixes, offer) = self.file.rejected(&state, code, start, at);
+                            let last = self.previous(at).unwrap_or(start).max(start);
+                            self.report_fixed(start, (start, last), code, fixes, offer);
                             at
                         }
                         Failure::MultipleLines { at } => {
@@ -407,15 +496,30 @@ impl Parser {
         if token.kind == TokenKind::LexError {
             return;
         }
-        if let Some((code, line)) = self.item_rule(item, failed, at) {
-            self.report(line, code);
+        if let Some(diagnostic) = self.item_rule(item, failed, at) {
+            self.file.diagnostics.push(diagnostic);
             return;
         }
         let previous = self.previous(at);
         let at_column_zero = token.kind == TokenKind::Col0
             || previous.is_some_and(|previous| self.kind(previous) == TokenKind::Col0);
         if at_column_zero {
-            self.report(token.line, Code::ItemStrayColumnZero);
+            let (col0, first) = match token.kind {
+                TokenKind::Col0 => (at, self.next(at + 1)),
+                _ => (previous.expect("a column-0 token follows its COL0"), at),
+            };
+            let fixes = item
+                .filter(|&item| {
+                    let parse = if col0 == at {
+                        before.clone()
+                    } else {
+                        self.replay(item, col0)
+                    };
+                    parse.accepts(&[self.file.tokens[first]], &self.file.source)
+                })
+                .map(|item| vec![vec![self.file.reindented(item, first)]])
+                .unwrap_or_default();
+            self.report_fixed(at, (at, at), Code::ItemStrayColumnZero, fixes, Offer::Each);
             return;
         }
         let first_on_line =
@@ -428,7 +532,8 @@ impl Parser {
             && !token.kind.is_virtual()
             && before.accepts(&[col0, token], &self.file.source)
         {
-            self.report(token.line, Code::ItemIndented);
+            let fix = vec![self.file.unindented(at)];
+            self.report_fixed(at, (at, at), Code::ItemIndented, vec![fix], Offer::Each);
             return;
         }
         let written = token.written();
@@ -438,38 +543,68 @@ impl Parser {
             expected: &expected,
             at,
         });
-        let (code, expected_text, found) = if let Some(Idiom::Rewrite { expected, found }) = idiom {
-            (Code::SyntaxForeign, expected, Some(found))
-        } else if idiom.is_some() || matches!(token.kind, TokenKind::Foreign(_)) {
-            (
-                Code::SyntaxForeign,
-                Some(written_set(&expected)),
-                Some(written),
-            )
-        } else if let Some(closers) = self.unclosed(at) {
-            (Code::SyntaxUnclosedDelimiter, Some(closers), Some(written))
-        } else if let Some(closer) = self.mismatched(at) {
-            (Code::SyntaxMismatchedDelimiter, Some(closer), Some(written))
-        } else {
-            (
-                Code::SyntaxUnexpectedToken,
-                Some(written_set(&expected)),
-                Some(written),
-            )
-        };
-        self.file.diagnostics.push(FileDiagnostic {
-            line: token.line,
-            code,
-            expected: expected_text,
+        if let Some(Idiom::Rewrite {
+            expected,
             found,
+            span,
+            fixes,
+        }) = idiom
+        {
+            self.file.diagnostics.push(FileDiagnostic {
+                expected,
+                found: Some(found),
+                span: Some(span),
+                failing: Some(token.start),
+                fixes: fixes.into_iter().map(|fix| vec![fix]).collect(),
+                offer: Offer::First,
+                ..FileDiagnostic::new(token.line, Code::SyntaxForeign)
+            });
+            return;
+        }
+        let (code, expected_text, fix) =
+            if idiom.is_some() || matches!(token.kind, TokenKind::Foreign(_)) {
+                (Code::SyntaxForeign, written_set(&expected), None)
+            } else if let Some(closers) = self.unclosed(at) {
+                let written: Vec<String> = closers
+                    .iter()
+                    .map(|closer| format!("\"{}\"", closer.spelling()))
+                    .collect();
+                let fix = self.file.closed(at, &closers);
+                (Code::SyntaxUnclosedDelimiter, written.join(" "), fix)
+            } else if let Some(closer) = self.mismatched(at) {
+                let written = format!("\"{}\"", closer.spelling());
+                let fix = Some(self.file.rematched(at, closer));
+                (Code::SyntaxMismatchedDelimiter, written, fix)
+            } else {
+                (Code::SyntaxUnexpectedToken, written_set(&expected), None)
+            };
+        self.file.diagnostics.push(FileDiagnostic {
+            expected: Some(expected_text),
+            found: Some(written),
+            span: Some((token.start, token.end)),
+            failing: Some(token.start),
+            fixes: fix.into_iter().map(|fix| vec![fix]).collect(),
+            ..FileDiagnostic::new(token.line, code)
         });
     }
 
-    /// The code a rule of an item kind names for a syntax failure, and the line it is reported on.
-    fn item_rule(&self, item: Option<usize>, failed: &State, at: usize) -> Option<(Code, u32)> {
+    /// The diagnostic a rule of an item kind names for a syntax failure, on its line, with the
+    /// rule's fix.
+    fn item_rule(&self, item: Option<usize>, failed: &State, at: usize) -> Option<FileDiagnostic> {
         let item = item?;
         let token = self.file.tokens[at];
         let line = token.line;
+        let diagnostic = |code: Code, line: u32, fix: Option<Vec<Replacement>>| FileDiagnostic {
+            span: Some((token.start, token.end)),
+            failing: Some(token.start),
+            fixes: fix.into_iter().collect(),
+            ..FileDiagnostic::new(line, code)
+        };
+        let opener = if token.kind == TokenKind::Col0 {
+            self.next(at + 1)
+        } else {
+            at
+        };
         let next_kind = self.kind(self.next(at + 1));
         let opener_at_zero =
             token.kind == TokenKind::Col0 && next_kind == TokenKind::Punct(Punct::LBrace);
@@ -491,19 +626,30 @@ impl Parser {
             || (rule == Some(Rule::MethodBody)
                 && atom == Some(Atom::Term(Term::Class(Class::Ident))));
         if label && after_closer {
-            return Some((Code::ItemLabelMismatch, line));
+            let fix = self
+                .file
+                .declared_name(item, failed)
+                .and_then(|name| self.file.relabelled(at, &name))
+                .map(|fix| vec![fix]);
+            return Some(diagnostic(Code::ItemLabelMismatch, line, fix));
         }
         if rule.is_some_and(|rule| clause_rules.contains(&rule)) && is_opener {
-            return Some((Code::ItemBodyOpener, line));
+            let fix = self.file.opener_below(opener);
+            return Some(diagnostic(Code::ItemBodyOpener, line, Some(fix)));
         }
         if rule == Some(Rule::InterfaceItem) && is_opener {
-            return Some((Code::ItemBodyOpener, line));
+            return Some(diagnostic(Code::ItemBodyOpener, line, None));
         }
         if rule == Some(Rule::FnEnd) {
             let after_head = atom == Some(Atom::Rule(Rule::ClauseRegion));
             let after_clauses = atom == Some(Atom::Term(Term::Class(Class::Col0)));
-            if (after_head && opener_at_zero) || (after_clauses && is_opener) {
-                return Some((Code::ItemBodyOpener, line));
+            if after_head && opener_at_zero {
+                let fix = self.file.opener_to_head(opener);
+                return Some(diagnostic(Code::ItemBodyOpener, line, fix));
+            }
+            if after_clauses && is_opener {
+                let fix = vec![self.file.unindented(opener)];
+                return Some(diagnostic(Code::ItemBodyOpener, line, Some(fix)));
             }
             if after_head || after_clauses || atom == Some(Atom::Term(Term::Punct(Punct::LBrace))) {
                 let foreign = self.item_has_keyword(item, Keyword::Foreign);
@@ -512,7 +658,7 @@ impl Parser {
                 } else {
                     Code::ItemMissingBody
                 };
-                return Some((code, self.head_line(item)));
+                return Some(diagnostic(code, self.head_line(item), None));
             }
         }
         let body = failed
@@ -550,8 +696,14 @@ impl Parser {
         let opener_ends_head = self
             .previous(opener)
             .is_some_and(|previous| self.kind(previous) != TokenKind::Col0);
-        (failing_statement == first_statement && opener_ends_head && starts_clause)
-            .then(|| (Code::ItemBodyOpener, self.file.tokens[first_statement].line))
+        (failing_statement == first_statement && opener_ends_head && starts_clause).then(|| {
+            let fix = self.file.opener_below(opener);
+            diagnostic(
+                Code::ItemBodyOpener,
+                self.file.tokens[first_statement].line,
+                Some(fix),
+            )
+        })
     }
 
     fn item_has_keyword(&self, item: usize, keyword: Keyword) -> bool {
@@ -600,7 +752,9 @@ impl Parser {
         open
     }
 
-    fn unclosed(&self, at: usize) -> Option<String> {
+    /// The closers of the delimiters still open at an `NL` or `EOF`, innermost first, from the
+    /// outermost `(` or `[`.
+    fn unclosed(&self, at: usize) -> Option<Vec<Punct>> {
         if !matches!(self.kind(at), TokenKind::Nl | TokenKind::Eof) {
             return None;
         }
@@ -608,15 +762,17 @@ impl Parser {
         let outermost = open
             .iter()
             .position(|punct| matches!(punct, Punct::LParen | Punct::LBracket))?;
-        let closers: Vec<String> = open[outermost..]
-            .iter()
-            .rev()
-            .map(|punct| format!("\"{}\"", closes(*punct).spelling()))
-            .collect();
-        Some(closers.join(" "))
+        Some(
+            open[outermost..]
+                .iter()
+                .rev()
+                .map(|punct| closes(*punct))
+                .collect(),
+        )
     }
 
-    fn mismatched(&self, at: usize) -> Option<String> {
+    /// The closer a closing token stands in place of.
+    fn mismatched(&self, at: usize) -> Option<Punct> {
         let TokenKind::Punct(closer @ (Punct::RParen | Punct::RBracket | Punct::RBrace)) =
             self.kind(at)
         else {
@@ -628,7 +784,7 @@ impl Parser {
         let innermost = *self.open_delimiters(at).last()?;
         let delimiter =
             matches!(innermost, Punct::LParen | Punct::LBracket) && closes(innermost) != closer;
-        (!at_column_zero && delimiter).then(|| format!("\"{}\"", closes(innermost).spelling()))
+        (!at_column_zero && delimiter).then(|| closes(innermost))
     }
 }
 

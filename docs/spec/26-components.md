@@ -114,7 +114,7 @@ pub closed struct Env {
     pub log: sys::Log
 } Env
 
-pub closed struct Peak[T: Ord and Copy and Send and Encode] derives Encode {
+pub closed struct Peak[T: Ord and Copy and Send] {
     pub highest: Option[T]
 } Peak
 

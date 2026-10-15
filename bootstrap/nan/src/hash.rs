@@ -19,6 +19,48 @@ impl Hash {
     pub fn full(&self) -> String {
         checksummed_base32(&self.0)
     }
+
+    /// The checksummed base32 of the tag and the first 9 bytes of the digest, 18 characters.
+    pub fn short(&self) -> String {
+        checksummed_base32(&self.0[..10])
+    }
+}
+
+/// The bytes a hash's short or full form writes: 18 or 55 characters of the alphabet with zero
+/// padding bits and a correct checksum, over the tag `0x01`; none for any other text.
+pub fn parse_form(text: &str) -> Option<Vec<u8>> {
+    let length = match text.len() {
+        18 => 10,
+        55 => 33,
+        _ => return None,
+    };
+    let digits: Vec<u32> = text
+        .bytes()
+        .map(|byte| {
+            ALPHABET
+                .iter()
+                .position(|letter| *letter == byte)
+                .map(|at| at as u32)
+        })
+        .collect::<Option<_>>()?;
+    let (data, _) = digits.split_at(digits.len() - 2);
+    let mut bytes = Vec::with_capacity(length);
+    let mut bits = 0u32;
+    let mut held = 0;
+    for digit in data {
+        bits = (bits << 5) | digit;
+        held += 5;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+        }
+    }
+    let padding_zero = bits & ((1 << held) - 1) == 0;
+    (bytes.len() == length
+        && padding_zero
+        && bytes[0] == BLAKE3
+        && checksummed_base32(&bytes) == text)
+        .then_some(bytes)
 }
 
 /// The base32 of `bytes`, most significant bit first and the last character padded with zero

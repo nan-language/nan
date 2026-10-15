@@ -545,7 +545,7 @@ pub layout Sector: bytes 512 le {
 
 pub fn read_sector(take buf: Untrusted[hw::Dma[Sector]], done: mem::Shared[hw::Signal[u32]]) -> task::Completion[Untrusted[hw::Dma[Sector]], u32, task::Cancelled] fails task::Cancelled uses wait {
     let outcome = attempt await done.contents().wait()
-    return task::Completion(buf: take buf, outcome: outcome)
+    return task::Completion(buf: take buf, outcome: take outcome)
 } read_sector
 ```
 
@@ -567,7 +567,7 @@ pub layout Sector: bytes 512 le {
 
 pub fn read_sector(take buf: hw::Dma[Sector], done: mem::Shared[hw::Signal[u32]]) -> task::Completion[hw::Dma[Sector], u32, task::Cancelled] fails task::Cancelled uses wait { // error: hw.dma-completion
     let outcome = attempt await done.contents().wait()
-    return task::Completion(buf: take buf, outcome: outcome)
+    return task::Completion(buf: take buf, outcome: take outcome)
 } read_sector
 ```
 

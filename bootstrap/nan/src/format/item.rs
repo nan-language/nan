@@ -5,7 +5,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use super::{group_number, opener_spaced, punning};
+use super::{bindings, group_number, opener_spaced, punning};
 use crate::syntax::file::{ItemSyntax, SourceFile};
 use crate::syntax::grammar::{Keyword, Punct, Rule};
 use crate::syntax::items::clause_group;
@@ -13,19 +13,20 @@ use crate::syntax::token::TokenKind;
 use crate::syntax::tree::{Child, NodeId, Tree};
 
 /// A token of the formatted item.
-struct Tok {
+#[derive(Clone)]
+pub(super) struct Tok {
     /// Its source token; none for a trailing comma the format adds.
-    source: Option<u32>,
-    kind: TokenKind,
-    text: String,
+    pub(super) source: Option<u32>,
+    pub(super) kind: TokenKind,
+    pub(super) text: String,
     /// Whether the source breaks the line before it.
-    newline: bool,
+    pub(super) newline: bool,
     /// Whether it is the last token of its line in the source, comments aside.
     ends_line: bool,
     /// Comment lines before it, their openers spaced.
-    comments: Vec<String>,
+    pub(super) comments: Vec<String>,
     /// The comment ending its line.
-    trailing: Option<String>,
+    pub(super) trailing: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,7 +38,7 @@ enum ListKind {
 }
 
 /// A breakable list.
-struct List {
+pub(super) struct List {
     kind: ListKind,
     opener: u32,
     closer: u32,
@@ -54,8 +55,8 @@ struct Sorted {
 
 /// What the item's tree fixes about the format of its tokens.
 #[derive(Default)]
-struct Facts {
-    lists: Vec<List>,
+pub(super) struct Facts {
+    pub(super) lists: Vec<List>,
     /// For each token of a comma-separated list that lies on one line, the outermost such list
     /// holding it, numbered.
     one_line: HashMap<u32, usize>,
@@ -76,8 +77,9 @@ struct Facts {
 pub fn lines(file: &SourceFile, item: &ItemSyntax) -> Vec<String> {
     let tree = item.tree.as_ref().expect("a parsed item has a tree");
     let facts = Facts::collect(file, tree);
-    let mut toks = tokens(file, item, &facts, &punning::punned(file, tree));
-    let roles = trailing_commas(&mut toks, &facts);
+    let punned = punning::punning(file, tree, &bindings::bindings(file, tree)).labels;
+    let mut toks = tokens(file, item, &facts, &punned);
+    let roles = trailing_commas(&mut toks, &facts, false);
     Layout {
         toks: &toks,
         facts: &facts,
@@ -87,7 +89,7 @@ pub fn lines(file: &SourceFile, item: &ItemSyntax) -> Vec<String> {
 }
 
 impl Facts {
-    fn collect(file: &SourceFile, tree: &Tree) -> Facts {
+    pub(super) fn collect(file: &SourceFile, tree: &Tree) -> Facts {
         let mut facts = Facts::default();
         let mut one_line = Vec::new();
         let kind = |token: u32| file.tokens[token as usize].kind;
@@ -428,7 +430,12 @@ fn joined(file: &SourceFile, tree: &Tree, node: NodeId) -> String {
 }
 
 /// The item's tokens in canonical order, without punned labels, each with its comments.
-fn tokens(file: &SourceFile, item: &ItemSyntax, facts: &Facts, punned: &HashSet<u32>) -> Vec<Tok> {
+pub(super) fn tokens(
+    file: &SourceFile,
+    item: &ItemSyntax,
+    facts: &Facts,
+    punned: &HashSet<u32>,
+) -> Vec<Tok> {
     let mut order: Vec<u32> = (item.first..item.end)
         .filter(|&token| !file.comment[token] && file.tokens[token].kind != TokenKind::Col0)
         .map(|token| token as u32)
@@ -544,14 +551,38 @@ enum Role {
 }
 
 /// The roles of the tokens in lists, and whether each breakable list is broken.
-struct Roles {
+pub(super) struct Roles {
     roles: Vec<Option<Role>>,
     broken: Vec<bool>,
 }
 
-/// Decides which breakable lists are broken, gives a broken list its trailing comma and takes a
-/// flat list's away.
-fn trailing_commas(toks: &mut Vec<Tok>, facts: &Facts) -> Roles {
+impl Roles {
+    /// The roles of tokens whose lists are all flat, which need none.
+    pub(super) fn flat(tokens: usize, lists: usize) -> Roles {
+        Roles {
+            roles: vec![None; tokens],
+            broken: vec![false; lists],
+        }
+    }
+
+    /// The roles of the tokens kept.
+    pub(super) fn kept(&self, kept: &[bool]) -> Roles {
+        Roles {
+            roles: self
+                .roles
+                .iter()
+                .zip(kept)
+                .filter(|(_, kept)| **kept)
+                .map(|(role, _)| *role)
+                .collect(),
+            broken: self.broken.clone(),
+        }
+    }
+}
+
+/// Decides which breakable lists are broken, every one when `flat` is false, gives a broken list
+/// its trailing comma and takes a flat list's away.
+pub(super) fn trailing_commas(toks: &mut Vec<Tok>, facts: &Facts, flat: bool) -> Roles {
     let positions = |toks: &[Tok]| -> HashMap<u32, usize> {
         toks.iter()
             .enumerate()
@@ -577,10 +608,12 @@ fn trailing_commas(toks: &mut Vec<Tok>, facts: &Facts) -> Roles {
         let commented = toks[opener].trailing.is_some()
             || commented_before[closer] > commented_before[opener + 1]
             || !toks[closer].comments.is_empty();
-        broken[list] = match facts_list.kind {
-            ListKind::Params => facts_list.ends.len() > 4 || commented,
-            _ => toks[opener].ends_line || commas.iter().any(|comma| toks[*comma].ends_line),
-        } && !facts_list.ends.is_empty();
+        broken[list] = !flat
+            && match facts_list.kind {
+                ListKind::Params => facts_list.ends.len() > 4 || commented,
+                _ => toks[opener].ends_line || commas.iter().any(|comma| toks[*comma].ends_line),
+            }
+            && !facts_list.ends.is_empty();
         match (
             broken[list],
             commas.iter().find(|comma| **comma + 1 == closer),
@@ -628,10 +661,10 @@ fn trailing_commas(toks: &mut Vec<Tok>, facts: &Facts) -> Roles {
     Roles { roles, broken }
 }
 
-struct Layout<'a> {
-    toks: &'a [Tok],
-    facts: &'a Facts,
-    roles: &'a Roles,
+pub(super) struct Layout<'a> {
+    pub(super) toks: &'a [Tok],
+    pub(super) facts: &'a Facts,
+    pub(super) roles: &'a Roles,
 }
 
 /// An opening delimiter the layout is inside.
@@ -727,7 +760,7 @@ impl Layout<'_> {
         true
     }
 
-    fn render(&self) -> Vec<String> {
+    pub(super) fn render(&self) -> Vec<String> {
         let toks = self.toks;
         let mut lines: Vec<Vec<usize>> = Vec::new();
         for at in (0..toks.len()).filter(|at| toks[*at].kind != TokenKind::Nl) {

@@ -210,9 +210,9 @@ pub fn lead_byte(text: Slice[u8]) -> u8 fails ParseError {
     return text[0]
 } lead_byte
 
-pub fn first_or_zero(text: Slice[u8]) -> u8 {
+pub fn first_byte(text: Slice[u8]) -> u8 fails ParseError {
     return lead_byte(text) // error: error.unhandled
-} first_or_zero
+} first_byte
 ```
 
 ## Cancellation

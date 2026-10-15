@@ -700,7 +700,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     let exec = world.exec
     let counter = task::Cown.of(Counter(hits: 0), alloc: world.alloc)
     try await task::scope(exec, body: fn(s: task::Scope) {
-        for _ in 0..<2 {
+        for _ in 0..<2u32 {
             discard s.spawn(fn() fails task::Cancelled uses wait {
                 await when mut counter {
                     counter.hits += 1

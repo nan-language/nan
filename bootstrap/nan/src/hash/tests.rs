@@ -81,3 +81,20 @@ fn checksummed_base32_pads_the_last_character_and_appends_ten_digest_bits() {
         "afsdpm5mhbdfcm7726"
     );
 }
+
+#[test]
+fn hash_forms_read_back_and_reject_damage() {
+    let hash = Hash::of(b"item\n");
+    let (short, full) = (hash.short(), hash.full());
+    assert_eq!((short.len(), full.len()), (18, 55));
+    assert_eq!(parse_form(&short).as_deref(), Some(&hash.0[..10]));
+    assert_eq!(parse_form(&full).as_deref(), Some(&hash.0[..]));
+    let mut damaged = short.clone().into_bytes();
+    damaged[5] = if damaged[5] == b'a' { b'b' } else { b'a' };
+    assert_eq!(
+        parse_form(std::str::from_utf8(&damaged).expect("ASCII")),
+        None
+    );
+    assert_eq!(parse_form(&short[..17]), None);
+    assert_eq!(parse_form(&checksummed_base32(&[2; 10])), None);
+}

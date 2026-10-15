@@ -1,18 +1,21 @@
 //! The idiom table: foreign spellings that make a syntax failure `syntax.foreign`, with the text
-//! each matches and the rewrite it reports.
+//! each matches and the rewrites that fix it.
 
 use super::file::SourceFile;
 use super::grammar::{ANALYSIS, Atom, Foreign, Keyword, Punct, Rule, TermSet};
-use super::parser::{Discard, Fed, Lookahead, State};
+use super::parser::State;
 use super::token::TokenKind;
+use crate::diagnostic::Replacement;
 
 /// How the first matching entry reports the failure.
 pub enum Idiom {
     /// Expected is the entry's first rewrite, absent for a rewrite stated in words; found is the
-    /// matched text.
+    /// matched text, whose bytes are `span`. Each fix is an alternative rewrite, in order.
     Rewrite {
         expected: Option<String>,
         found: String,
+        span: (u32, u32),
+        fixes: Vec<Replacement>,
     },
     /// An entry without rewrite: expected and found are those of `syntax.unexpected-token`.
     Unrewritable,
@@ -44,14 +47,14 @@ impl Matched {
     }
 }
 
-/// A rewrite column of the table, up to its first alternative.
+/// A rewrite column of the table.
 enum Rewrite {
     /// "none".
     Absent,
-    /// A rewrite the table states in words.
-    Words,
-    /// A rewrite in which each `{placeholder}` stands for the text it matched.
-    Template(&'static str),
+    /// A rewrite the table states in words, as the replacement it makes.
+    Words(fn(&Failed, &Matched) -> Replacement),
+    /// Alternatives in order, in each of which a `{placeholder}` stands for the text it matched.
+    Templates(&'static [&'static str]),
 }
 
 /// How an entry's foreign form matches a failure.
@@ -60,40 +63,49 @@ type Matcher = fn(&Failed) -> Option<Matched>;
 /// The idiom table of language 1, in table order.
 #[rustfmt::skip]
 const TABLE: &[(Matcher, Rewrite)] = &[
-    (|failed| failed.between(Foreign::AmpAmp), Rewrite::Template("{a} and {b}")),
-    (|failed| failed.between(Foreign::PipePipe), Rewrite::Template("{a} or {b}")),
-    (|failed| failed.empty_closure(), Rewrite::Template("fn() => {e}")),
+    (|failed| failed.between(Foreign::AmpAmp), Rewrite::Templates(&["{a} and {b}"])),
+    (|failed| failed.between(Foreign::PipePipe), Rewrite::Templates(&["{a} or {b}"])),
+    (|failed| failed.empty_closure(), Rewrite::Templates(&["fn() => {e}"])),
     (|failed| failed.bar_closure(), Rewrite::Absent),
-    (|failed| failed.assert_macro(), Rewrite::Template("expect {e}")),
-    (|failed| failed.assert_pair("assert_eq"), Rewrite::Template("expect {a} == {b}")),
-    (|failed| failed.assert_pair("assert_ne"), Rewrite::Template("expect {a} != {b}")),
-    (|failed| failed.todo_macro(true), Rewrite::Template("todo {t}")),
-    (|failed| failed.todo_macro(false), Rewrite::Template("todo {t}")),
+    (|failed| failed.assert_macro(), Rewrite::Templates(&["expect {e}"])),
+    (|failed| failed.assert_pair("assert_eq"), Rewrite::Templates(&["expect {a} == {b}"])),
+    (|failed| failed.assert_pair("assert_ne"), Rewrite::Templates(&["expect {a} != {b}"])),
+    (|failed| failed.todo_macro(true), Rewrite::Templates(&["todo {t}"])),
+    (|failed| failed.todo_macro(false), Rewrite::Templates(&["todo {t}"])),
     (|failed| failed.macro_name(), Rewrite::Absent),
-    (|failed| failed.bang_operand(), Rewrite::Template("not {e}")),
-    (|failed| failed.tripled(Punct::EqEq), Rewrite::Template("{a} == {b}")),
-    (|failed| failed.tripled(Punct::NotEq), Rewrite::Template("{a} != {b}")),
-    (|failed| failed.question_call(), Rewrite::Template("try {c}")),
+    (|failed| failed.bang_operand(), Rewrite::Templates(&["not {e}", "(not {e})", "~{e}"])),
+    (|failed| failed.tripled(Punct::EqEq), Rewrite::Templates(&["{a} == {b}"])),
+    (|failed| failed.tripled(Punct::NotEq), Rewrite::Templates(&["{a} != {b}"])),
+    (|failed| failed.question_call(), Rewrite::Templates(&["try {c}"])),
     (|failed| failed.alone(Foreign::Question), Rewrite::Absent),
-    (|failed| failed.semicolon(true), Rewrite::Words),
-    (|failed| failed.semicolon(false), Rewrite::Words),
-    (|failed| failed.between(Foreign::DotDot), Rewrite::Template("{a}..<{b}")),
+    (|failed| failed.semicolon(true), Rewrite::Words(|failed, matched| failed.semicolon_deleted(matched))),
+    (|failed| failed.semicolon(false), Rewrite::Words(|failed, matched| failed.semicolon_broken(matched))),
+    (|failed| failed.between(Foreign::DotDot), Rewrite::Templates(&["{a}..<{b}"])),
     (|failed| failed.alone(Foreign::DotDot), Rewrite::Absent),
-    (|failed| failed.let_mut(), Rewrite::Template("var {x}")),
-    (|failed| failed.walrus(), Rewrite::Template("let {x} = {e}")),
-    (|failed| failed.cast(), Rewrite::Template("{T}.widen({e})")),
-    (|failed| failed.reference(true), Rewrite::Template("mut {e}")),
-    (|failed| failed.reference(false), Rewrite::Template("{e}")),
-    (|failed| failed.self_reference(true), Rewrite::Template("mut self")),
-    (|failed| failed.self_reference(false), Rewrite::Template("self")),
-    (|failed| failed.typed_reference(true), Rewrite::Template("mut {x}: {T}")),
-    (|failed| failed.typed_reference(false), Rewrite::Template("{x}: {T}")),
+    (|failed| failed.let_mut(), Rewrite::Templates(&["var {x}"])),
+    (|failed| failed.walrus(), Rewrite::Templates(&["let {x} = {e}", "var {x} = {e}"])),
+    (
+        |failed| failed.cast(),
+        Rewrite::Templates(&[
+            "{T}.widen({e})",
+            "{T}.truncate({e})",
+            "{T}.saturate({e})",
+            "{T}.nearest({e})",
+            "{e}",
+        ]),
+    ),
+    (|failed| failed.reference(true), Rewrite::Templates(&["mut {e}"])),
+    (|failed| failed.reference(false), Rewrite::Templates(&["{e}"])),
+    (|failed| failed.self_reference(true), Rewrite::Templates(&["mut self"])),
+    (|failed| failed.self_reference(false), Rewrite::Templates(&["self"])),
+    (|failed| failed.typed_reference(true), Rewrite::Templates(&["mut {x}: {T}"])),
+    (|failed| failed.typed_reference(false), Rewrite::Templates(&["{x}: {T}"])),
     (|failed| failed.dereference(), Rewrite::Absent),
-    (|failed| failed.dot_await(), Rewrite::Template("{m}await {c}")),
-    (|failed| failed.increment(), Rewrite::Template("{p} += 1")),
-    (|failed| failed.decrement(), Rewrite::Template("{p} -= 1")),
-    (|failed| failed.arrow_member(), Rewrite::Template("{p}.{x}")),
-    (|failed| failed.unit_result(), Rewrite::Words),
+    (|failed| failed.dot_await(), Rewrite::Templates(&["{m}await {c}"])),
+    (|failed| failed.increment(), Rewrite::Templates(&["{p} += 1"])),
+    (|failed| failed.decrement(), Rewrite::Templates(&["{p} -= 1"])),
+    (|failed| failed.arrow_member(), Rewrite::Templates(&["{p}.{x}"])),
+    (|failed| failed.unit_result(), Rewrite::Words(|failed, matched| failed.unit_result_deleted(matched))),
 ];
 
 /// The first entry of the idiom table matching the failure, as it reports it.
@@ -101,21 +113,36 @@ pub fn foreign(failed: &Failed) -> Option<Idiom> {
     let (matched, rewrite) = TABLE
         .iter()
         .find_map(|(matches, rewrite)| matches(failed).map(|matched| (matched, rewrite)))?;
-    let expected = match rewrite {
+    let span = (
+        failed.file.tokens[matched.first].start,
+        failed.file.tokens[matched.last].end,
+    );
+    let fixes = match rewrite {
         Rewrite::Absent => return Some(Idiom::Unrewritable),
-        Rewrite::Words => None,
-        Rewrite::Template(template) => Some(
-            matched
-                .holes
-                .iter()
-                .fold(template.to_string(), |text, (hole, value)| {
-                    text.replace(&format!("{{{hole}}}"), value)
-                }),
-        ),
+        Rewrite::Words(replacement) => vec![replacement(failed, &matched)],
+        Rewrite::Templates(templates) => templates
+            .iter()
+            .map(|template| Replacement {
+                start: span.0,
+                end: span.1,
+                text: matched
+                    .holes
+                    .iter()
+                    .fold(template.to_string(), |text, (hole, value)| {
+                        text.replace(&format!("{{{hole}}}"), value)
+                    }),
+            })
+            .collect(),
+    };
+    let expected = match rewrite {
+        Rewrite::Templates(_) => fixes.first().map(|fix| fix.text.clone()),
+        _ => None,
     };
     Some(Idiom::Rewrite {
         expected,
         found: failed.text(matched.first, matched.last),
+        span,
+        fixes,
     })
 }
 
@@ -209,24 +236,8 @@ impl Failed<'_> {
         Some((first, self.text(first, self.previous(self.at)?)))
     }
 
-    /// The token after the longest text that `rule` derives from `start`.
     fn longest(&self, rule: Rule, start: usize) -> Option<usize> {
-        let mut state = State::new(rule);
-        let mut at = start;
-        loop {
-            let next =
-                (at + 1 < self.file.tokens.len()).then(|| &self.file.tokens[self.next(at + 1)]);
-            let lookahead = Lookahead {
-                token: &self.file.tokens[at],
-                next,
-                at,
-            };
-            match state.feed(lookahead, &self.file.source, &mut Discard) {
-                Ok(Fed::Consumed) => at = self.next(at + 1),
-                Ok(Fed::Done) => return (at != start).then_some(at),
-                Err(_) => return None,
-            }
-        }
+        self.file.longest(rule, start)
     }
 
     /// The longest text that `rule` derives from `start`, as its last token and text.
@@ -665,6 +676,51 @@ impl Failed<'_> {
             last: name,
             holes: vec![("p", p), ("x", self.file.text(name).to_owned())],
         })
+    }
+
+    /// The run of spaces ending at `end` on its line, as its first byte.
+    fn spaces_before(&self, end: u32) -> u32 {
+        let source = &self.file.source;
+        let mut start = end;
+        while start > 0 && source[start as usize - 1] == b' ' {
+            start -= 1;
+        }
+        start
+    }
+
+    /// The rewrite of a `;` ending its logical line: it and the spaces before it deleted.
+    fn semicolon_deleted(&self, matched: &Matched) -> Replacement {
+        let token = &self.file.tokens[matched.first];
+        Replacement {
+            start: self.spaces_before(token.start),
+            end: token.end,
+            text: String::new(),
+        }
+    }
+
+    /// The rewrite of a `;` followed by more of its logical line: it and the spaces after it
+    /// replaced by a line break and the indentation of its line.
+    fn semicolon_broken(&self, matched: &Matched) -> Replacement {
+        let token = &self.file.tokens[matched.first];
+        let line = &self.file.lines[token.line as usize - 1];
+        let indentation = self.file.source[line.start as usize..]
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        Replacement {
+            start: token.start,
+            end: self.file.tokens[self.after()].start,
+            text: format!("\n{}", " ".repeat(indentation)),
+        }
+    }
+
+    /// The rewrite of `-> ()`: the matched text and the space before it deleted.
+    fn unit_result_deleted(&self, matched: &Matched) -> Replacement {
+        Replacement {
+            start: self.spaces_before(self.file.tokens[matched.first].start),
+            end: self.file.tokens[matched.last].end,
+            text: String::new(),
+        }
     }
 
     /// `-> ()` where a function's result type is expected.

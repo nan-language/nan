@@ -70,6 +70,8 @@ pub(super) struct Facts {
     clause_heads: HashMap<u32, u32>,
     /// The `{` opening a body after a clause region, and the first token of its head.
     body_heads: HashMap<u32, u32>,
+    /// The `example` opening each example clause, which a following `(` does not call.
+    example_words: HashSet<u32>,
     sorted: Vec<Sorted>,
 }
 
@@ -214,14 +216,15 @@ impl Facts {
             }
             match rule {
                 Rule::FnEnd => {
-                    let opener = tokens.iter().copied().find(punct(Punct::LBrace));
-                    if let (Some(region), Some(head), Some(opener)) =
-                        (tree.find(node, Rule::ClauseRegion), head, opener)
+                    if let (Some(region), Some(head)) = (tree.find(node, Rule::ClauseRegion), head)
                     {
                         facts.clauses(tree, region, head);
-                        facts.body_heads.insert(opener, head);
+                        if let Some(opener) = tokens.iter().copied().find(punct(Punct::LBrace)) {
+                            facts.body_heads.insert(opener, head);
+                        }
                     }
                 }
+                Rule::ExampleClause => facts.example_words.extend(tokens.first()),
                 Rule::InterfaceMember => {
                     let member_head = tokens.iter().copied().find(|token| {
                         matches!(
@@ -754,7 +757,10 @@ impl Layout<'_> {
                 | TokenKind::Keyword(Keyword::SelfValue | Keyword::Fn | Keyword::Dbg)
                 | TokenKind::Punct(Punct::RParen | Punct::RBracket)
         );
-        if matches!(b.kind, TokenKind::Punct(Punct::LParen | Punct::LBracket)) && calls {
+        if matches!(b.kind, TokenKind::Punct(Punct::LParen | Punct::LBracket))
+            && calls
+            && !self.source_in(left, &self.facts.example_words)
+        {
             return self.source_in(right, &self.facts.test_opener);
         }
         true

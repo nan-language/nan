@@ -308,7 +308,7 @@ pub fn Registers.last_written_at[E: AnyBits, N: usize](self, register: hw::Regis
 
 ### Simulation boundary
 
-- Items of `testing`, `sys::sim` and `hw::sim` are named only in test items and example clauses; anywhere else a path to one is an error (`test.test-only-item`).
+- Items of `testing`, `sys::sim` and `hw::sim` are named only in test items, example clauses and the items of those modules; anywhere else a path to one is an error (`test.test-only-item`).
 - No item, intrinsic or capability operation reveals whether code runs in a test. Code under test is checked and compiled as in a build, keeping every [run-time check](18-contracts.md#run-time-checks), and differs only through the capabilities it receives and the scheduler's choices.
 
 ```nan

@@ -1,5 +1,5 @@
 use super::*;
-use crate::syntax::file::parse;
+use crate::syntax::file::{parse, parse_std};
 
 fn format(source: &str) -> String {
     String::from_utf8(source_file(&parse(source.as_bytes().to_vec()), None)).expect("UTF-8 output")
@@ -93,6 +93,16 @@ fn labels_naming_a_binding_in_scope_are_punned_in_calls() {
     check(
         "//! P.\n\nfn f(items: Slice[u32], x: u32) -> u32 {\n    for item in items {\n        g(x, item: item)\n    }\n    g(x, item: item)\n    if x > 0 {\n        let y = 1\n        g(x, y: y)\n    }\n    g(x, y: y)\n    return match x {\n        Some(inner) => g(x, inner: inner)\n        else => g(x, inner: inner)\n    }\n} f\n",
         "//! P.\n\nfn f(items: Slice[u32], x: u32) -> u32 {\n    for item in items {\n        g(x, item)\n    }\n    g(x, item: item)\n    if x > 0 {\n        let y = 1\n        g(x, y)\n    }\n    g(x, y: y)\n    return match x {\n        Some(inner) => g(x, inner)\n        else => g(x, inner: inner)\n    }\n} f\n",
+    );
+}
+
+#[test]
+fn clause_lines_of_a_body_less_std_function_take_the_depth_of_its_clauses() {
+    let source = "//! S.\n\npub fn u32.f(self) -> u32 limits pure\n    example (~0u32).f() == 1\n    example(1u32).f() == 1\n";
+    let formatted = source_file(&parse_std(source.as_bytes().to_vec()), None);
+    assert_eq!(
+        String::from_utf8(formatted).expect("UTF-8 output"),
+        "//! S.\n\npub fn u32.f(self) -> u32 limits pure\n    example (~0u32).f() == 1\n    example (1u32).f() == 1\n",
     );
 }
 

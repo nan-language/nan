@@ -172,16 +172,16 @@ fn example_runs_dispatch_calls_through_dyn_views() {
 }
 
 #[test]
-fn a_run_reaching_a_std_operation_the_interpreter_lacks_is_not_judged() {
+fn a_generic_function_passes_its_values_to_the_function_values_it_calls() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),
         (
             "app/app.nan",
-            "//! Text.\n\npub fn is_text(data: Slice[u8]) -> bool\n    example is_text(b\"abc\")\n{\n    return text::utf8::is_valid(data)\n} is_text\n",
+            "//! Checks.\n\npub fn holds[T: Any](value: T, check: fn(value: T) -> bool) -> bool\n    example holds(3u8, check: fn(value: u8) => value == 4)\n{\n    return check(value)\n} holds\n",
         ),
     ]);
     assert_eq!(
         run_in(&scratch.0, "check").output,
-        "ok check .: errors 0, incomplete 0\nok check .: errors 0, incomplete 0\n"
+        "failed check .: errors 1, incomplete 0\nerror example.failed app/app.nan:4 app::holds\n        example holds(3u8, check: fn(value: u8) => value == 4)\nfailed check .: errors 1, incomplete 0\n"
     );
 }

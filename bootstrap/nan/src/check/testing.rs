@@ -69,7 +69,7 @@ impl Checker<'_> {
             let mut reach: BTreeSet<ItemId> = BTreeSet::from([item]);
             let mut pending: Vec<ItemId> = self.names(item, &functions).into_iter().collect();
             while let Some(next) = pending.pop() {
-                if !reach.insert(next) || self.db.is_std(next) {
+                if !reach.insert(next) || self.db.is_carried(next) {
                     continue;
                 }
                 pending.extend(self.names(next, &functions));
@@ -95,9 +95,13 @@ impl Checker<'_> {
         }
     }
 
-    /// Each path of an item other than a test naming an item of `testing`, `sys::sim` or
-    /// `hw::sim`, outside its example clauses.
+    /// Each path of an item other than a test or an item of those modules naming an item of
+    /// `testing`, `sys::sim` or `hw::sim`, outside its example clauses.
     pub fn check_test_only(&self, item: ItemId) {
+        let own_module = self.db.module_path(self.db.module_of(item));
+        if self.db.is_std(item) && TEST_ONLY.contains(&own_module.as_str()) {
+            return;
+        }
         let ast = self.db.ast(item);
         let clauses = match &ast.kind {
             ItemKind::Test(_) => return,

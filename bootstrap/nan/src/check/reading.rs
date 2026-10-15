@@ -44,7 +44,7 @@ pub fn declared(workspace: &Workspace, name: &str) -> Vec<Declared> {
     let wanted = decl::fold(name);
     let mut found: Vec<Declared> = Vec::new();
     for target in targets(workspace) {
-        let checker = unchecked(workspace, &std, target);
+        let checker = unchecked(workspace, std, target);
         let db = &checker.db;
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
@@ -56,7 +56,7 @@ pub fn declared(workspace: &Workspace, name: &str) -> Vec<Declared> {
                     file: data.file.path.clone(),
                     line,
                     text: crate::output::printable(data.file.syntax.line_text(line)),
-                    workspace: !db.is_std(item),
+                    workspace: !db.is_carried(item),
                 };
                 if !found.iter().any(|other| {
                     (&other.file, other.line, &other.path) == (&entry.file, entry.line, &entry.path)
@@ -100,7 +100,7 @@ pub fn contributed(workspace: &Workspace, root: usize, registry: &str) -> Option
     let mut found: Vec<Contributed> = Vec::new();
     let mut named = false;
     for target in check_targets(&workspace.packages[root]) {
-        let checker = unchecked(workspace, &std, target);
+        let checker = unchecked(workspace, std, target);
         let Some((_, package)) = checked_packages(&checker, workspace, target)
             .into_iter()
             .find(|(index, _)| *index == root)
@@ -142,7 +142,7 @@ pub fn holes(workspace: &Workspace) -> Vec<Listed> {
     let std = crate::stdlib::packages();
     let mut listed: Vec<Listed> = Vec::new();
     for target in targets(workspace) {
-        let checker = checked(workspace, &std, target);
+        let checker = checked(workspace, std, target);
         for hole in checker.holes.borrow().iter() {
             let data = checker.db.item(hole.item);
             let module = data.module;
@@ -206,12 +206,12 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
     let mut shown: Vec<Shown> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for target in targets(workspace) {
-        let checker = unchecked(workspace, &std, target);
+        let checker = unchecked(workspace, std, target);
         let db = &checker.db;
         let mut found: Vec<(&crate::workspace::File, usize, Option<ItemId>, PackageId)> =
             Vec::new();
         for (index, package) in db.packages.iter().enumerate() {
-            if !package.std {
+            if !package.carried {
                 let package = PackageId(index as u32);
                 let manifest = &db.package(package).source.files[0];
                 let item = manifest
@@ -224,7 +224,7 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
         }
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
-            if !db.is_std(item) {
+            if !db.is_carried(item) {
                 let data = db.item(item);
                 found.push((data.file, data.index, Some(item), db.package_of(item)));
             }
@@ -281,7 +281,7 @@ pub struct Api {
 /// target its package declares, in byte order, each followed by its target when there are several.
 pub fn api(workspace: &Workspace, scope: &Scope) -> Vec<Api> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, &std);
+    let checkers = checkers(workspace, std);
     let mut found: Vec<Api> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for (_, checker) in &checkers {
@@ -290,7 +290,9 @@ pub fn api(workspace: &Workspace, scope: &Scope) -> Vec<Api> {
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let data = db.item(item);
-            if db.is_std(item) || !scope.holds(workspace, &data.file.path, Some(data.head_line())) {
+            if db.is_carried(item)
+                || !scope.holds(workspace, &data.file.path, Some(data.head_line()))
+            {
                 continue;
             }
             items.push(item);
@@ -385,14 +387,15 @@ pub struct Explanation {
 /// package declares; none for another item.
 pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, &std);
+    let checkers = checkers(workspace, std);
     for (_, checker) in &checkers {
         let db = &checker.db;
         let item = (0..db.items.len())
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_std(*item) && scope.holds(workspace, &data.file.path, Some(data.head_line()))
+                !db.is_carried(*item)
+                    && scope.holds(workspace, &data.file.path, Some(data.head_line()))
             });
         let Some(item) = item else {
             continue;
@@ -431,7 +434,7 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
         methods.sort();
         methods.dedup();
         let target = checker.db.target;
-        let obligations = checked(workspace, &std, target).explanations(item);
+        let obligations = checked(workspace, std, target).explanations(item);
         return Some(Explained {
             digests: digest_lines(&checkers, checker, item),
             facts,
@@ -518,13 +521,14 @@ fn obligation_kind(unit: &Unit, site: &Obligated) -> String {
 pub fn expanded(workspace: &Workspace, scope: &Scope) -> Option<Vec<DerivedItem>> {
     let std = crate::stdlib::packages();
     for target in targets(workspace) {
-        let checker = unchecked(workspace, &std, target);
+        let checker = unchecked(workspace, std, target);
         let db = &checker.db;
         let item = (0..db.items.len())
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_std(*item) && scope.holds(workspace, &data.file.path, Some(data.head_line()))
+                !db.is_carried(*item)
+                    && scope.holds(workspace, &data.file.path, Some(data.head_line()))
             });
         let Some(item) = item else {
             continue;

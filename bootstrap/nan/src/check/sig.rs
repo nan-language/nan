@@ -644,7 +644,7 @@ impl Checker<'_> {
     }
 
     /// Adds to a member function's inherited parameters the bounds of each impl line it implements
-    /// a method of.
+    /// a method of, and counts as droppable each parameter droppable for such a line.
     fn add_impl_bounds(&self, function: ItemId, inherited: &mut [GenericDef]) {
         for line in self.implemented_lines(function) {
             for (def, line_def) in inherited.iter_mut().zip(&self.sig(line).generics) {
@@ -652,6 +652,12 @@ impl Checker<'_> {
                     if !def.bounds.contains(bound) {
                         def.bounds.push(bound.clone());
                     }
+                }
+            }
+            for (def, droppable) in inherited.iter_mut().zip(self.droppable_for_line(line)) {
+                if droppable {
+                    def.bounds
+                        .retain(|bound| self.db.canonical(bound.interface) != "core::Any");
                 }
             }
         }

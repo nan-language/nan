@@ -259,7 +259,7 @@ Rules on the parts of a head:
 Rules on bodies:
 
 - A function with the `foreign` modifier is a [foreign fn](23-low-level.md#foreign-functions): its head ends with a convention clause, and it has no clause region and no body. A foreign fn with a clause region or a body or without a convention clause, and a convention clause on any other function, are errors (`item.foreign-form`).
-- Every other function has a body; one without is an error (`item.missing-body`).
+- A function of a std package may have no body: its item then ends at its head line or after its clause region, and it is a [supplied operation](28-stdlib.md#supplied-operations). Every other function has a body; one without is an error (`item.missing-body`).
 - When the function has no clause region, the `{` opening its body block is the last token of the last physical line of the head; otherwise it is the first token at column 0 after the last clause. A `{` at column 0 after a head without a clause region, a `{` ending a clause line, a `{` after a clause region that is not at column 0, and a clause line after the `{` that ends the head line are errors (`item.body-opener`); the exact fix moves the `{`.
 
 `fails` and `uses wait` are written exactly when the body needs them. These rules read the body outside the bodies of the [closures](07-ownership.md#closures) it holds, and judge each call whether or not it carries its markers.
@@ -324,7 +324,7 @@ pub fn pause(clock: sys::Clock) fails task::Cancelled { // error: item.wait-miss
 
 A function named `Type.name` is a member of `Type`. A **method** is one whose first parameter is `self`; an **associated function** is one without a `self` parameter. Methods are called receiver-first and associated functions as `Type.name(...)`, as [calls](06-statements-expressions.md#calls) define.
 
-- `Type` is written as a [path](03-packages-modules.md#paths) from the function's module, without generic arguments. It names a struct, enum or layout declared in the function's module, or the target of an [impl line](08-generics-interfaces.md#impl-lines) of the function's module whose interface declares `name`. Any other function named `Type.name` is an error (`item.method-misplaced`).
+- `Type` is written as a [path](03-packages-modules.md#paths) from the function's module, without generic arguments. It names a struct, enum or layout declared in the function's module, a [scalar](04-types.md#scalars) or `Unit` when the function's module is the root module of `core`, or the target of an [impl line](08-generics-interfaces.md#impl-lines) of the function's module whose interface declares `name`. Any other function named `Type.name` is an error (`item.method-misplaced`).
 - `self` is written `self`, `mut self` or `take self`, without a type. It is legal only as the first parameter of a function named `Type.name`, of an [interface method](08-generics-interfaces.md#interfaces) or of the old head of a [tombstone](29-identity-versioning.md#tombstones); anywhere else, closures and tests included, it is an error (`item.self-misplaced`).
 - The type of `self` is `Type` applied to its own generic parameters. Those parameters and their bounds are in scope in the head, clause region and body of every function named `Type.name`, which may add generic parameters of its own after its name.
 

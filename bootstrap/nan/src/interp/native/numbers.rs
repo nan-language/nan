@@ -11,7 +11,7 @@ use crate::check::sig::SigKind;
 use crate::check::ty::{Scalar, Ty};
 use crate::nir::{BitConversion, BitsOwner, Builtin, Conversion, Span};
 
-/// The members core declares for a scalar type.
+/// The members core declares for a scalar type without a body.
 pub fn scalar_member(
     interp: &mut Interpreter,
     scalar: Scalar,
@@ -19,112 +19,57 @@ pub fn scalar_member(
     args: &[Val],
     at: (ItemId, Span),
 ) -> Exec<Flow> {
-    let option_item = interp.ty_item("core", "Option");
-    let option = || option_item;
-    let value = || interp.deref(&args[0]);
-    let other = || args.get(1).map(|other| interp.deref(other));
     if scalar.is_float() {
         return float_member(interp, member, args).map(Flow::Return);
     }
-    let (op, form) = match member.split_once('_') {
-        Some((form, op))
-            if matches!(form, "wrapping" | "saturating" | "checked" | "overflowing") =>
-        {
-            (op, form)
-        }
-        _ => (member, ""),
-    };
-    let a = value().int();
-    let result = |exact: i128| -> Val {
-        match form {
-            "wrapping" => Val::Int(wrap(exact, scalar)),
-            "saturating" => {
-                let (low, high) = scalar.range();
-                Val::Int(exact.clamp(low, high))
-            }
-            "checked" => match fits(exact, scalar) {
-                true => Val::some(option(), Val::Int(exact)),
-                false => Val::none(option()),
-            },
-            _ => {
-                let overflowing = interp.ty_item("core", "Overflowing");
-                Val::Struct(
-                    overflowing,
-                    Rc::new(vec![
-                        Val::Int(wrap(exact, scalar)),
-                        Val::Bool(!fits(exact, scalar)),
-                    ]),
-                )
-            }
-        }
-    };
-    let value = match (op, form) {
-        ("add" | "sub" | "mul", form) if !form.is_empty() => {
-            let b = other().expect("an operand").int();
-            let exact = match op {
-                "add" => a + b,
-                "sub" => a - b,
-                _ => a * b,
-            };
-            result(exact)
-        }
-        ("neg", form) if !form.is_empty() => result(-a),
-        ("shl", "wrapping" | "checked") => {
-            let amount = other().expect("an amount").int();
-            if amount >= i128::from(scalar.bits()) {
-                match form {
-                    "checked" => Val::none(option()),
-                    _ => return Err(interp.trap("trap.shift", at)),
+    let a = interp.deref(&args[0]).int();
+    let b = || interp.deref(&args[1]).int();
+    let value = match member {
+        "wrapping_add" => Val::Int(wrap(a + b(), scalar)),
+        "wrapping_sub" => Val::Int(wrap(a - b(), scalar)),
+        "wrapping_mul" => Val::Int(wrap(a * b(), scalar)),
+        "wrapping_shl" | "checked_shl" | "shr_arith" => {
+            let amount = b();
+            let fits_width = amount < i128::from(scalar.bits());
+            match member {
+                "checked_shl" => {
+                    let option = interp.ty_item("core", "Option");
+                    let shifted = a << amount.min(127);
+                    match fits_width && fits(shifted, scalar) {
+                        true => Val::some(option, Val::Int(shifted)),
+                        false => Val::none(option),
+                    }
                 }
-            } else {
-                result(a << amount)
+                _ if !fits_width => return Err(interp.trap("trap.shift", at)),
+                "wrapping_shl" => Val::Int(wrap(a << amount, scalar)),
+                _ => Val::Int(a >> amount),
             }
         }
-        ("shr_arith", _) => {
-            let amount = other().expect("an amount").int();
-            if amount >= i128::from(scalar.bits()) {
-                return Err(interp.trap("trap.shift", at));
-            }
-            Val::Int(a >> amount)
-        }
-        ("div_trunc" | "rem_trunc" | "div_floor" | "mod_floor", _) => {
-            let b = other().expect("a divisor").int();
-            if b == 0 {
+        "div_trunc" | "rem_trunc" => {
+            let divisor = b();
+            if divisor == 0 {
                 return Err(interp.trap("trap.division-by-zero", at));
             }
-            let truncated = a / b;
-            let floored = match a % b != 0 && (a < 0) != (b < 0) {
-                true => truncated - 1,
-                false => truncated,
-            };
-            match op {
-                "div_trunc" | "div_floor" => {
-                    let quotient = if op == "div_trunc" {
-                        truncated
-                    } else {
-                        floored
-                    };
-                    if !fits(quotient, scalar) {
-                        return Err(interp.trap("trap.overflow", at));
-                    }
-                    Val::Int(quotient)
+            let quotient = a / divisor;
+            match member {
+                "div_trunc" if !fits(quotient, scalar) => {
+                    return Err(interp.trap("trap.overflow", at));
                 }
-                "rem_trunc" => Val::Int(a - b * truncated),
-                _ => Val::Int(a - b * floored),
+                "div_trunc" => Val::Int(quotient),
+                _ => Val::Int(a - divisor * quotient),
             }
         }
-        ("count_ones", _) => Val::Int(i128::from(bits_of(a, scalar).count_ones())),
-        ("leading_zeros", _) => {
+        "count_ones" => Val::Int(i128::from(bits_of(a, scalar).count_ones())),
+        "leading_zeros" => {
             let bits = bits_of(a, scalar);
             Val::Int(i128::from(bits.leading_zeros()) - i128::from(64 - scalar.bits()))
         }
-        ("trailing_zeros", _) => {
+        "trailing_zeros" => {
             let bits = bits_of(a, scalar);
             Val::Int(i128::from(bits.trailing_zeros().min(scalar.bits())))
         }
-        ("wide_mul", _) => {
-            let b = other().expect("an operand").int();
-            let product = a * b;
+        "wide_mul" => {
+            let product = a * b();
             let wide = interp.ty_item("core", "WideProduct");
             let low = product.rem_euclid(1i128 << 64);
             let high = (product - low) >> 64;
@@ -135,12 +80,10 @@ pub fn scalar_member(
     Ok(Flow::Return(value))
 }
 
-/// The members core declares for a float type.
+/// The members core declares for a float type without a body.
 fn float_member(interp: &Interpreter, member: &str, args: &[Val]) -> Exec<Val> {
     let values: Vec<Val> = args.iter().map(|arg| interp.deref(arg)).collect();
     Ok(match (member, &values[..]) {
-        ("abs", [Val::F32(a)]) => Val::F32(a.abs()),
-        ("abs", [Val::F64(a)]) => Val::F64(a.abs()),
         ("sqrt", [Val::F32(a)]) => canonical(Val::F32(a.sqrt())),
         ("sqrt", [Val::F64(a)]) => canonical(Val::F64(a.sqrt())),
         ("fused_mul_add", [Val::F32(a), Val::F32(b), Val::F32(c)]) => {
@@ -148,12 +91,6 @@ fn float_member(interp: &Interpreter, member: &str, args: &[Val]) -> Exec<Val> {
         }
         ("fused_mul_add", [Val::F64(a), Val::F64(b), Val::F64(c)]) => {
             canonical(Val::F64(a.mul_add(*b, *c)))
-        }
-        ("is_nan", [Val::F32(a)]) => Val::Bool(a.is_nan()),
-        ("is_nan", [Val::F64(a)]) => Val::Bool(a.is_nan()),
-        ("total_cmp", [left, right]) => {
-            let ordering = interp.ty_item("core", "Ordering");
-            super::ordering_value(ordering, interp.order(left, right))
         }
         _ => return Err(End::Missing),
     })
@@ -303,7 +240,7 @@ fn nearest(value: &Val, target: Scalar) -> Val {
 }
 
 /// The bit pattern of a scalar value.
-fn scalar_bits(value: &Val, scalar: Scalar) -> u64 {
+pub(super) fn scalar_bits(value: &Val, scalar: Scalar) -> u64 {
     match value {
         Val::F32(value) => u64::from(value.to_bits()),
         Val::F64(value) => value.to_bits(),
@@ -315,7 +252,7 @@ fn scalar_bits(value: &Val, scalar: Scalar) -> u64 {
 }
 
 /// The value of a scalar type with a bit pattern, none for a niche.
-fn from_bits(bits: u64, scalar: Scalar) -> Option<Val> {
+pub(super) fn from_bits(bits: u64, scalar: Scalar) -> Option<Val> {
     Some(match scalar {
         Scalar::F32 => Val::F32(f32::from_bits(bits as u32)),
         Scalar::F64 => Val::F64(f64::from_bits(bits)),
@@ -360,7 +297,7 @@ pub fn layout_bits(interp: &Interpreter, layout: ItemId, value: &Val) -> u64 {
 }
 
 /// The value of an integer layout with a bits value, none for a niche.
-fn layout_value(interp: &Interpreter, layout: ItemId, bits: u64) -> Option<Val> {
+pub(super) fn layout_value(interp: &Interpreter, layout: ItemId, bits: u64) -> Option<Val> {
     match interp.ck.layout_shape(layout).expect("an integer layout") {
         LayoutShape::Tags(values) => {
             let index = values.iter().position(|value| *value == bits)?;

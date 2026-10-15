@@ -220,7 +220,8 @@ impl<'b, 'c> Builder<'b, 'c> {
     }
 
     /// A struct the judged module may construct, from its fields, or an enum value, its
-    /// variant from its tag and its payload from its payload fields.
+    /// variant from its tag and its payload from its payload fields; none for a struct that is a
+    /// base type, whose representation no field shows.
     fn composite(
         &self,
         term: Option<TermId>,
@@ -233,6 +234,7 @@ impl<'b, 'c> Builder<'b, 'c> {
             term.and_then(|term| self.state.terms.lookup(&Term::Field(term, name.to_owned())))
         };
         match &sig.kind {
+            SigKind::Struct { .. } if self.ck.is_base_type(item) => None,
             SigKind::Struct { fields } => {
                 if !fields.iter().all(|field| {
                     self.ck

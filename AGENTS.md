@@ -8,7 +8,7 @@ NaN is a programming language made for agentic coding: performant, fast and safe
 
 `bootstrap/nan` is the bootstrap compiler, a Rust binary named `nan` that implements the language specified in `docs/spec`. It generates machine code with Cranelift: the system `cc` links Linux x86_64 executables, and the compiler's own image writer builds UEFI and bare-metal images. Everything Linux-specific (linking, program entry, calls into the system) stays in one target module.
 
-Its parser runs on tables that `build.rs` generates from the `ebnf` blocks of `docs/spec/41-grammar.md`, so the grammar changes only in the specification. Its checker computes every fact as a query over one item and one target, recording what each query reads; context packs come from those records. Once every package is checked, each item without errors elaborates to NIR, which the reference interpreter runs for examples and refutations and over which the prover decides each obligation; the rules needing them run then. Checking runs a const's evaluation when it first reads the const's value. The conformance harness runs every `nan` example of the specification against its marker comments and checks each item's context pack against what checking it reads.
+Its parser runs on tables that `build.rs` generates from the `ebnf` blocks of `docs/spec/41-grammar.md`, so the grammar changes only in the specification. Its checker computes every fact as a query over one item and one target, recording what each query reads; context packs come from those records. Once every package is checked, each item without errors elaborates to NIR, which the reference interpreter runs for examples and refutations and over which the prover decides each obligation; the rules needing them run then. Checking runs a const's evaluation when it first reads the const's value. The std packages are NaN sources that `build.rs` embeds in the binary; a std function without a body is a supplied operation, whose facts the checker derives and which the interpreter runs natively. The conformance harness runs every `nan` example of the specification against its marker comments, checks each item's context pack against what checking it reads, and checks that std declares each `nan-api` item of the specification exactly.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 
@@ -19,6 +19,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `bootstrap/` | The bootstrap compiler, one Cargo workspace crate per directory |
 | `bootstrap/nan/src/` | Source of the `nan` binary; a module's unit tests live in `<module>/tests.rs` beside it |
 | `bootstrap/nan/tests/` | The conformance harness |
+| `std/` | The std packages, one directory per package |
 | `docs/spec/` | The NaN 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
 | `.config/` | nextest configuration |
@@ -38,6 +39,7 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `cargo clippy -q --workspace --all-targets -- -D warnings` | Lint; any warning fails |
 | `cargo nextest run --cargo-quiet -p nan -E 'test(/^<module>::/)'` | Run the tests of one module, given by its path in the crate (`a::b`) |
 | `cargo nextest run --cargo-quiet -p nan --test conformance -E 'test(/<chapter>/)'` | Run the conformance tests of one specification chapter, given by its file name (`01-lexical`) |
+| `../target/debug/nan check <package>` | Check one std package, from `std/`, with the compiler built last |
 
 Design each command for who runs it: agent-facing commands run without interaction, accept a scope where one applies and print only what an agent needs. Agent-facing commands are listed here, human-facing ones in README.md, shared ones in both.
 

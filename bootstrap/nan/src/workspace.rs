@@ -7,12 +7,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub use manifest::{Authority, Manifest, Target};
 pub use modules::Module;
 
 use crate::diagnostic::{Code, Diagnostic, Reason};
-use crate::syntax::file::{SourceFile, parse, parse_declarations};
+use crate::syntax::ast;
+use crate::syntax::file::{SourceFile, parse, parse_std};
 use crate::syntax::grammar::Rule;
 use crate::syntax::items::Item;
 
@@ -45,6 +47,33 @@ pub struct File {
     /// The index of the file's module, none for `package.nan`.
     pub module: Option<usize>,
     pub syntax: SourceFile,
+    /// Its items lowered, by index, once a check has read them; none for an item without one.
+    lowered: OnceLock<Vec<Option<ast::Item>>>,
+}
+
+impl File {
+    fn new(path: String, module: Option<usize>, syntax: SourceFile) -> File {
+        File {
+            path,
+            module,
+            syntax,
+            lowered: OnceLock::new(),
+        }
+    }
+
+    /// Its items lowered, by index: none for an abandoned item or one that lowers to nothing.
+    pub fn lowered(&self) -> &[Option<ast::Item>] {
+        self.lowered.get_or_init(|| {
+            self.syntax
+                .items
+                .iter()
+                .map(|item| {
+                    let tree = item.tree.as_ref().filter(|_| !item.abandoned)?;
+                    ast::lower(&self.syntax, tree)
+                })
+                .collect()
+        })
+    }
 }
 
 /// The workspace root of a command run in `current`: the parent of the outermost directory at or
@@ -117,6 +146,43 @@ impl Workspace {
             &mut source,
         )
         .expect("sources in memory read without failing")
+    }
+
+    /// The workspace of in-memory files, each given by its path relative to `root`: each file
+    /// belongs to the package of the nearest directory at or above it holding a `package.nan`.
+    pub fn of_files(root: PathBuf, files: &[(&str, &[u8])]) -> Workspace {
+        let mut layout: Vec<Found> = files
+            .iter()
+            .filter_map(|(path, _)| path.strip_suffix("/package.nan"))
+            .map(|dir| Found {
+                dir: dir.to_owned(),
+                sources: Vec::new(),
+                links: Vec::new(),
+            })
+            .collect();
+        let mut stray = Vec::new();
+        for (path, _) in files {
+            let holder = layout
+                .iter_mut()
+                .filter(|found| path.starts_with(&format!("{}/", found.dir)))
+                .max_by_key(|found| found.dir.len());
+            match holder {
+                Some(found) if *path != format!("{}/package.nan", found.dir) => {
+                    found.sources.push((*path).to_owned());
+                }
+                Some(_) => {}
+                None => stray.push((*path).to_owned()),
+            }
+        }
+        let mut source = |path: &str| -> io::Result<Vec<u8>> {
+            let (_, bytes) = files
+                .iter()
+                .find(|(known, _)| *known == path)
+                .expect("a file of the workspace");
+            Ok(bytes.to_vec())
+        };
+        Workspace::build(root, layout, stray, &mut source)
+            .expect("in-memory files read without failing")
     }
 
     fn build(
@@ -376,11 +442,7 @@ impl Package {
         let syntax = parse(source(&manifest_path)?);
         let mut diagnostics = Vec::new();
         let manifest = Manifest::read(&syntax, &manifest_path, &mut diagnostics);
-        let mut files = vec![File {
-            path: manifest_path.clone(),
-            module: None,
-            syntax,
-        }];
+        let mut files = vec![File::new(manifest_path.clone(), None, syntax)];
         if let Some(manifest) = &manifest {
             for link in &found.links {
                 diagnostics.push(Diagnostic {
@@ -392,14 +454,18 @@ impl Package {
         let package_name = manifest.as_ref().map(|manifest| manifest.name.clone());
         let (modules, assigned) =
             modules::assign(&found.dir, package_name.as_deref(), &found.sources);
+        let std = package_name
+            .as_deref()
+            .is_some_and(|name| crate::stdlib::PACKAGES.contains(&name));
         if manifest.as_ref().is_none_or(|manifest| manifest.supported) {
             for (path, module) in found.sources.iter().zip(assigned) {
-                let syntax = parse(source(path)?);
-                files.push(File {
-                    path: path.clone(),
-                    module: Some(module),
-                    syntax,
-                });
+                let source = source(path)?;
+                let syntax = if std {
+                    parse_std(source)
+                } else {
+                    parse(source)
+                };
+                files.push(File::new(path.clone(), Some(module), syntax));
             }
         }
         let types = type_names(&files, modules.len());
@@ -421,41 +487,6 @@ impl Package {
             package.diagnostics.extend(found);
         }
         Ok(package)
-    }
-
-    /// A std package from the declarations of its modules, given as paths and sources relative to
-    /// a package directory named like the package.
-    pub fn declared(name: &str, sources: Vec<(String, Vec<u8>)>) -> Package {
-        let paths: Vec<String> = sources.iter().map(|(path, _)| path.clone()).collect();
-        let (modules, assigned) = modules::assign(name, Some(name), &paths);
-        let files: Vec<File> = sources
-            .into_iter()
-            .zip(assigned)
-            .map(|((path, source), module)| File {
-                path,
-                module: Some(module),
-                syntax: parse_declarations(source),
-            })
-            .collect();
-        let types = type_names(&files, modules.len());
-        Package {
-            dir: name.to_owned(),
-            manifest: Some(Manifest {
-                name: name.to_owned(),
-                line: 1,
-                targets: vec![Target::Any],
-                targets_line: None,
-                supported: true,
-                entry: None,
-                deps: Vec::new(),
-                allows: Vec::new(),
-                denies: Vec::new(),
-            }),
-            files,
-            modules,
-            types,
-            diagnostics: Vec::new(),
-        }
     }
 
     /// Reports every `package` item outside `package.nan`, and every item of `package.nan` but

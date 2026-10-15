@@ -10,8 +10,9 @@ use crate::diagnostic::Code;
 use crate::syntax::ast::{FnKind, FnModifier, Mode};
 
 /// The core types whose type parameters accept views and hold their arguments as they are.
-const VIEW_CONTAINERS: [&str; 6] = [
+const VIEW_CONTAINERS: [&str; 7] = [
     "core::Array",
+    "core::ArrayCursor",
     "core::Option",
     "core::Result",
     "core::Untrusted",
@@ -90,6 +91,7 @@ impl Checker<'_> {
                     "core::Option",
                     "core::Result",
                     "core::Array",
+                    "core::ArrayCursor",
                     "core::Untrusted",
                 ]
                 .iter()

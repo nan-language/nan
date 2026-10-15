@@ -1,0 +1,483 @@
+//! The sys capabilities, revocation and domains.
+
+pub open struct Domain {
+} Domain
+
+pub fn Domain.run[T: Send, E: Send](take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub open struct Trap derives Send {
+} Trap
+
+impl Trap: Render
+
+pub fn Trap.render(self, mut out: core::Renderer)
+
+pub fn Trap.kind(self) -> TrapKind
+
+pub closed enum TrapKind derives Copy, Eq, Render {
+    Bounds
+    Overflow
+    DivisionByZero
+    Shift
+    Conversion
+    StaleHandle
+    Exhausted
+    Predicate
+    Requires
+    Ensures
+    Expect
+    Todo
+    StackOverflow
+    DuplicateAccess
+    Poisoned
+} TrapKind
+
+pub open struct Fs {
+} Fs
+
+pub fn Fs.subdir(self, path: Str) -> Fs fails fs::FsError
+    example match attempt testing::world().fs.subdir("logs/..") {
+        Err(fs::FsError.InvalidPath) => true
+        else => false
+    }
+
+pub fn Fs.read_only(self) -> Fs fails Revoked
+
+pub fn Fs.open(self, path: Str) -> fs::File fails fs::FsError uses wait
+
+pub fn Fs.create(self, path: Str) -> fs::File fails fs::FsError uses wait
+
+pub fn Fs.read_all(self, path: Str, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails fs::FsError uses wait
+
+pub fn Fs.write_all(self, path: Str, data: Slice[u8]) fails fs::FsError uses wait
+
+pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
+
+pub open struct Net {
+} Net
+
+pub fn Net.only_host(self, host: Str) -> Net fails Revoked
+
+pub fn Net.listen(self, port: u16) -> net::Listener fails net::NetError uses wait
+
+pub fn Net.connect(self, host: Str, port: u16) -> net::Conn fails net::NetError uses wait
+
+pub open struct Clock {
+} Clock
+
+pub fn Clock.elapsed_ms(self) -> u64 fails Revoked
+    example attempt testing::world().clock.elapsed_ms() == Ok(0)
+
+pub fn Clock.sleep(self, ms: u64) fails task::Cancelled uses wait
+
+pub open struct Random {
+} Random
+
+pub fn Random.fill(self, mut buf: SliceMut[u8]) fails Revoked
+
+pub fn Random.next_u64(self) -> u64 fails Revoked {
+    var bytes = Array[u8, 8].filled(0)
+    try self.fill(mut bytes.view_mut())
+    return bytes.view().u64_le(0)
+} Random.next_u64
+
+pub open struct Log {
+} Log
+
+pub fn Log.info[T: Render](self, message: Str, value: T)
+
+pub fn Log.warn[T: Render](self, message: Str, value: T)
+
+pub fn Log.error[T: Render](self, message: Str, value: T)
+
+pub open struct Stdio {
+} Stdio
+
+pub fn Stdio.read_in(self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails StdioError uses wait
+    ensures result <= buf.byte_len()
+
+pub fn Stdio.write_out(self, data: Slice[u8]) fails StdioError uses wait
+
+pub fn Stdio.write_err(self, data: Slice[u8]) fails StdioError uses wait
+
+pub open enum StdioError derives Render {
+    Closed
+    Revoked(Revoked) from
+    Cancelled(task::Cancelled) from
+} StdioError
+
+pub closed enum Revoked derives Copy, Eq, Hash, Render {
+    Stale
+} Revoked
+
+pub interface Capability {
+} Capability
+
+impl Fs: Capability
+
+impl Net: Capability
+
+impl Clock: Capability
+
+impl Random: Capability
+
+impl Log: Capability
+
+impl Stdio: Capability
+
+impl mem::Alloc: Capability
+
+impl task::Executor: Capability
+
+pub fn revocable[C: Capability and Copy](cap: C) -> Revoker[C] fails Revoked
+
+pub open linear struct Revoker[C: Capability and Copy] {
+} Revoker
+
+pub fn Revoker.capability(self) -> C
+
+pub fn Revoker.revoke(take self)
+
+pub interface Component[Env: Send, M: Send] {
+    fn start(mut env: Env) -> Self
+    fn on(mut self, take message: M, mut env: Env, mut cx: Cx[M])
+} Component
+
+pub open view struct Cx[M: Send] {
+} Cx
+
+pub fn Cx.send(mut self, take message: M)
+
+pub fn Cx.after(mut self, ms: u64, take send: M)
+
+pub fn Cx.spawn(mut self, key: u64, take run: task fn(out: Outbox[M]) fails task::Cancelled uses wait)
+
+pub fn Cx.cancel(mut self, key: u64)
+
+pub open struct Outbox[M: Send] {
+} Outbox
+
+pub fn Outbox.post(self, take message: M) fails task::SendError uses wait
+
+struct Probe derives Encode {
+    handled: u64
+} Probe
+
+struct ProbeEnv {
+    clock: Clock
+} ProbeEnv
+
+enum ProbeMessage {
+    Count
+    Echo
+    Delay
+    Spawn(u64)
+    Stop
+} ProbeMessage
+
+impl Probe: Component[ProbeEnv, ProbeMessage]
+
+fn Probe.start(mut env: ProbeEnv) -> Probe = Probe(handled: 0)
+
+fn Probe.on(mut self, take message: ProbeMessage, mut env: ProbeEnv, mut cx: Cx[ProbeMessage]) {
+    match message {
+        ProbeMessage.Count => {
+            self.handled += 1
+        }
+        ProbeMessage.Echo => mut cx.send(ProbeMessage.Count)
+        ProbeMessage.Delay => mut cx.after(ms: 10, send: ProbeMessage.Count)
+        ProbeMessage.Spawn(ms) => {
+            let clock = env.clock
+            mut cx.spawn(key: 1, run: fn(out: Outbox[ProbeMessage]) fails task::Cancelled uses wait {
+                try await clock.sleep(ms)
+                discard attempt await out.post(ProbeMessage.Count)
+            })
+        }
+        ProbeMessage.Stop => mut cx.cancel(key: 1)
+    }
+} Probe.on
+
+test trap_stays_inside_its_domain for Domain.run {
+    let world = testing::world()
+    let divisor: u32 = 0
+    let outcome = try await Domain.run(fn() -> u32 {
+        return 10 / divisor
+    }, exec: world.exec, alloc: world.alloc)
+    expect outcome.is_err()
+} trap_stays_inside_its_domain
+
+test trap_renders_its_report for Trap.render {
+    let world = testing::world()
+    let divisor: u32 = 0
+    let outcome = try await Domain.run(fn() -> u32 {
+        return 10 / divisor
+    }, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        return
+    }
+    var report = text::String.empty(world.alloc)
+    mut report.write(text::fmt("{trap}", trap), budget: 1_024)
+    expect report.starts_with("trap.division-by-zero at ")
+} trap_renders_its_report
+
+test trap_names_its_kind for Trap.kind {
+    let world = testing::world()
+    let divisor: u32 = 0
+    let outcome = try await Domain.run(fn() -> u32 {
+        return 10 / divisor
+    }, exec: world.exec, alloc: world.alloc)
+    let Err(trap) = outcome else {
+        return
+    }
+    let kind = trap.kind()
+    expect kind == TrapKind.DivisionByZero
+} trap_names_its_kind
+
+test read_only_fs_refuses_writes for Fs.read_only {
+    let world = testing::world()
+    let reader = try world.fs.read_only()
+    let outcome = attempt await reader.write_all("note", data: b"x")
+    let denied = match outcome {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
+    expect denied
+} read_only_fs_refuses_writes
+
+test open_of_a_missing_file_fails for Fs.open {
+    let world = testing::world()
+    let outcome = attempt await world.fs.open("missing")
+    let missing = match outcome {
+        Err(fs::FsError.NotFound) => true
+        else => false
+    }
+    expect missing
+} open_of_a_missing_file_fails
+
+test create_truncates_an_existing_file for Fs.create {
+    let world = testing::world()
+    try await world.fs.write_all("note", data: b"hello")
+    let file = try await world.fs.create("note")
+    let len = try await file.byte_len()
+    expect len == 0
+} create_truncates_an_existing_file
+
+test read_all_returns_the_written_bytes for Fs.read_all {
+    let world = testing::world()
+    try await world.fs.write_all("note", data: b"hello")
+    let saved = try await world.fs.read_all("note", alloc: world.alloc)
+    expect testing::same(saved.view(), expected: Untrusted.of(b"hello"))
+} read_all_returns_the_written_bytes
+
+test write_all_replaces_contents_below_new_directories for Fs.write_all {
+    let world = testing::world()
+    try await world.fs.write_all("notes/day", data: b"first")
+    try await world.fs.write_all("notes/day", data: b"next")
+    let saved = try await world.fs.read_all("notes/day", alloc: world.alloc)
+    expect testing::same(saved.view(), expected: Untrusted.of(b"next"))
+} write_all_replaces_contents_below_new_directories
+
+test removed_file_cannot_be_opened for Fs.remove {
+    let world = testing::world()
+    try await world.fs.write_all("note", data: b"x")
+    try await world.fs.remove("note")
+    let outcome = attempt await world.fs.open("note")
+    let missing = match outcome {
+        Err(fs::FsError.NotFound) => true
+        else => false
+    }
+    expect missing
+} removed_file_cannot_be_opened
+
+test narrowed_net_cannot_listen for Net.only_host {
+    let world = testing::world()
+    let narrow = try world.net.only_host("localhost")
+    let outcome = attempt await narrow.listen(4_100)
+    let denied = match outcome {
+        Err(net::NetError.Denied) => true
+        else => false
+    }
+    expect denied
+} narrowed_net_cannot_listen
+
+test taken_port_cannot_be_listened_on for Net.listen {
+    let world = testing::world()
+    let held = try await world.net.listen(4_100)
+    let outcome = attempt await world.net.listen(4_100)
+    discard held
+    let taken = match outcome {
+        Err(net::NetError.AddressInUse) => true
+        else => false
+    }
+    expect taken
+} taken_port_cannot_be_listened_on
+
+test connect_without_a_listener_is_refused for Net.connect {
+    let world = testing::world()
+    let outcome = attempt await world.net.connect("localhost", port: 4_100)
+    var refused = false
+    match outcome {
+        Ok(conn) => take conn.abandon()
+        Err(failure) => {
+            refused = match failure {
+                net::NetError.Refused => true
+                else => false
+            }
+        }
+    }
+    expect refused
+} connect_without_a_listener_is_refused
+
+test sleep_lets_time_pass for Clock.sleep {
+    let world = testing::world()
+    let start = try world.clock.elapsed_ms()
+    try await world.clock.sleep(25)
+    let finish = try world.clock.elapsed_ms()
+    expect finish - start >= 25
+} sleep_lets_time_pass
+
+test revoked_random_cannot_fill for Random.fill {
+    let world = testing::world()
+    let revoker = try revocable(world.random)
+    let random = revoker.capability()
+    take revoker.revoke()
+    var bytes = Array[u8, 4].filled(0)
+    let outcome = attempt random.fill(mut bytes.view_mut())
+    expect outcome == Err(Revoked.Stale)
+} revoked_random_cannot_fill
+
+test next_u64_reads_eight_bytes_low_first for Random.next_u64 {
+    var bytes = Array[u8, 8].filled(0)
+    try sim::random(3).fill(mut bytes.view_mut())
+    let value = try sim::random(3).next_u64()
+    expect value == bytes.view().u64_le(0)
+} next_u64_reads_eight_bytes_low_first
+
+test info_records_a_value for Log.info {
+    let world = testing::world()
+    world.log.info("answer", value: 42u32)
+} info_records_a_value
+
+test revoked_log_drops_records_quietly for Log.warn {
+    let world = testing::world()
+    let revoker = try revocable(world.log)
+    let log = revoker.capability()
+    take revoker.revoke()
+    log.warn("dropped", value: 1u32)
+} revoked_log_drops_records_quietly
+
+test error_records_a_failure for Log.error {
+    let world = testing::world()
+    world.log.error("failed", value: Revoked.Stale)
+} error_records_a_failure
+
+test empty_input_ends_at_once for Stdio.read_in {
+    let world = testing::world()
+    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    let count = try await world.stdio.read_in(mut buf.view_mut())
+    expect count == 0
+} empty_input_ends_at_once
+
+test revoked_stdio_cannot_write for Stdio.write_out {
+    let world = testing::world()
+    let revoker = try revocable(world.stdio)
+    let stdio = revoker.capability()
+    take revoker.revoke()
+    let outcome = attempt await stdio.write_out(b"lost")
+    let revoked = match outcome {
+        Err(StdioError.Revoked(_)) => true
+        else => false
+    }
+    expect revoked
+} revoked_stdio_cannot_write
+
+test write_err_writes_the_data for Stdio.write_err {
+    let world = testing::world()
+    try await world.stdio.write_err(b"warning\n")
+} write_err_writes_the_data
+
+test revocable_copy_goes_stale for revocable {
+    let world = testing::world()
+    let revoker = try revocable(world.clock)
+    let clock = revoker.capability()
+    take revoker.revoke()
+    let outcome = attempt clock.elapsed_ms()
+    expect outcome == Err(Revoked.Stale)
+} revocable_copy_goes_stale
+
+test capability_acts_until_revoked for Revoker.capability {
+    let world = testing::world()
+    let revoker = try revocable(world.clock)
+    let outcome = attempt revoker.capability().elapsed_ms()
+    take revoker.revoke()
+    expect outcome.is_ok()
+} capability_acts_until_revoked
+
+test revoke_reaches_derived_capabilities for Revoker.revoke {
+    let world = testing::world()
+    let revoker = try revocable(world.fs)
+    defer take revoker.revoke()
+    let reports = try revoker.capability().subdir("reports")
+    undefer revoker
+    take revoker.revoke()
+    let outcome = attempt await reports.write_all("day", data: b"x")
+    let revoked = match outcome {
+        Err(fs::FsError.Revoked(_)) => true
+        else => false
+    }
+    expect revoked
+} revoke_reaches_derived_capabilities
+
+test sent_message_is_handled for Cx.send {
+    let world = testing::world()
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.Echo)
+        try await inbox.post(ProbeMessage.Count)
+    })
+    expect last.handled == 2
+} sent_message_is_handled
+
+test delayed_message_waits_for_its_delay for Cx.after {
+    let world = testing::world()
+    let clock = world.clock
+    let hurried = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.Delay)
+    })
+    let patient = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.Delay)
+        try await clock.sleep(50)
+    })
+    expect hurried.handled == 0
+    expect patient.handled == 1
+} delayed_message_waits_for_its_delay
+
+test keyed_task_posts_to_the_component for Cx.spawn {
+    let world = testing::world()
+    let clock = world.clock
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.Spawn(0))
+        try await clock.sleep(50)
+    })
+    expect last.handled == 1
+} keyed_task_posts_to_the_component
+
+test cancelled_keyed_task_posts_nothing for Cx.cancel {
+    let world = testing::world()
+    let clock = world.clock
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        try await inbox.post(ProbeMessage.Spawn(1_000))
+        try await inbox.post(ProbeMessage.Stop)
+        try await clock.sleep(2_000)
+    })
+    expect last.handled == 0
+} cancelled_keyed_task_posts_nothing
+
+test posted_messages_are_all_handled for Outbox.post {
+    let world = testing::world()
+    let last = try await host::Runner[Probe].run(ProbeEnv(clock: world.clock), exec: world.exec, alloc: world.alloc, body: fn(inbox: Outbox[ProbeMessage]) fails task::SendError uses wait {
+        for _ in 0..<3u32 {
+            try await inbox.post(ProbeMessage.Count)
+        }
+    })
+    expect last.handled == 3
+} posted_messages_are_all_handled

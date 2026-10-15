@@ -120,6 +120,20 @@ pub fn final_history(take gauge: Gauge, level: u32) -> mem::List[u32] {
 ```
 
 ```nan
+pub closed struct Frame {
+    pub bytes: Array[u8, 4]
+} Frame
+
+pub fn Frame.clear(mut self) {
+    mut self.bytes.view_mut().fill(0)
+} Frame.clear
+
+pub fn clear_first(mut frames: mem::List[Frame]) {
+    mut frames.at_mut(0).clear()
+} clear_first
+```
+
+```nan
 pub closed struct Gauge {
     pub level: u32
 } Gauge
@@ -641,7 +655,7 @@ pub proj fn SliceMut.cursor_mut(mut self) -> SliceCursorMut[T] limits pure, notr
 - `SliceCursor[T]` yields the elements of the array or slice it was made from, in index order, as parts. It is a **read cursor**: the parts its `next` yields are read-only ([projection results](#projection-results)). Each std cursor type that its owning chapter declares a read cursor is one too.
 - `SliceCursorMut[T]` yields the same elements as writable parts.
 - `ArrayCursor[T, N]` owns the elements of the array it was made from and yields them, owned, in index order; releasing it releases the elements not yet yielded. Its impl line covers droppable `T` only ([impl lines](08-generics-interfaces.md#impl-lines)).
-- These are [base types](05-properties.md#structural-properties). `SliceCursor[T]` and `SliceCursorMut[T]` are views, never linear, Copy or AnyBits, and Send and Inert exactly when `T` is. `ArrayCursor[T, N]` is linear, Send and Inert exactly when `T` is, and never a view, Copy or AnyBits.
+- These are [base types](05-properties.md#structural-properties). `SliceCursor[T]` and `SliceCursorMut[T]` are views, never linear, Copy or AnyBits, and Send and Inert exactly when `T` is. `ArrayCursor[T, N]` is linear, a view, Send and Inert exactly when `T` is, and never Copy or AnyBits.
 - `core::Range[T]` is a cursor type for integer T and `char` ([ranges](09-numbers.md#ranges)).
 
 A `for` statement ([conditionals and loops](06-statements-expressions.md#conditionals-and-loops)) obtains its cursor from its iterated expression. A mode marker at the start of the iterated expression selects the form of the loop, and `e` is the rest of the expression:

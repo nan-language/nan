@@ -30,7 +30,11 @@ pub enum TypeKey {
 pub struct PackageData<'a> {
     pub source: &'a Package,
     pub name: String,
+    /// Whether it is a std package.
     pub std: bool,
+    /// Whether it is a std package the toolchain carries, which no check reports on, rather than
+    /// one of the workspace.
+    pub carried: bool,
     /// Its modules, by their index in the package.
     pub modules: Vec<ModuleId>,
     pub root: Option<ModuleId>,
@@ -57,7 +61,7 @@ pub struct ItemData<'a> {
     pub file: &'a File,
     /// Its index among the items of its file.
     pub index: usize,
-    pub ast: ast::Item,
+    pub ast: &'a ast::Item,
 }
 
 impl ItemData<'_> {
@@ -134,16 +138,26 @@ impl<'a> Db<'a> {
             retired: HashMap::new(),
             reads: RefCell::new(None),
         };
+        let in_workspace = |name: Option<&str>| {
+            workspace
+                .packages
+                .iter()
+                .any(|package| package.name() == name)
+        };
         let sources = workspace
             .packages
             .iter()
             .map(|package| (package, false))
-            .chain(std.iter().map(|package| (package, true)));
-        for (package, is_std) in sources {
+            .chain(
+                std.iter()
+                    .filter(|package| !in_workspace(package.name()))
+                    .map(|package| (package, true)),
+            );
+        for (package, carried) in sources {
             if package.manifest.is_none() {
                 continue;
             }
-            db.add_package(package, is_std);
+            db.add_package(package, carried);
         }
         for (index, package) in db.packages.iter().enumerate() {
             if package.std {
@@ -183,12 +197,13 @@ impl<'a> Db<'a> {
         db
     }
 
-    fn add_package(&mut self, package: &'a Package, is_std: bool) {
+    fn add_package(&mut self, package: &'a Package, carried: bool) {
         let id = PackageId(self.packages.len() as u32);
         let name = package
             .name()
             .expect("a package with a manifest")
             .to_owned();
+        let std = crate::stdlib::PACKAGES.contains(&name.as_str());
         let mut modules = Vec::new();
         let mut root = None;
         for (index, module) in package.modules.iter().enumerate() {
@@ -228,17 +243,17 @@ impl<'a> Db<'a> {
                     continue;
                 }
                 data.files.push(file);
+                let lowered = file.lowered();
                 for (item_index, item) in file.syntax.items.iter().enumerate() {
                     if item.abandoned {
                         data.abandoned |= item.tree.is_some();
                         continue;
                     }
-                    let Some(tree) = &item.tree else { continue };
-                    let Some(lowered) = ast::lower(&file.syntax, tree) else {
+                    let Some(lowered) = &lowered[item_index] else {
                         continue;
                     };
                     let item_id = ItemId(self.items.len() as u32);
-                    if let Some(name) = lowered.name().filter(|_| !is_member(&lowered)) {
+                    if let Some(name) = lowered.name().filter(|_| !is_member(lowered)) {
                         data.names.entry(name).or_default().push(item_id);
                     }
                     data.items.push(item_id);
@@ -256,7 +271,8 @@ impl<'a> Db<'a> {
         self.packages.push(PackageData {
             source: package,
             name,
-            std: is_std,
+            std,
+            carried,
             modules,
             root,
             deps: HashMap::new(),
@@ -270,7 +286,7 @@ impl<'a> Db<'a> {
 
     /// An item's syntax read for its name and kind alone, which the names of its module show.
     pub fn declaration(&self, id: ItemId) -> &ast::Item {
-        &self.items[id.0 as usize].ast
+        self.items[id.0 as usize].ast
     }
 
     /// The item of this database parsed from the same item of the same file as another
@@ -397,8 +413,13 @@ impl<'a> Db<'a> {
         self.package(self.package_of(item)).std
     }
 
+    /// Whether an item belongs to a std package the toolchain carries.
+    pub fn is_carried(&self, item: ItemId) -> bool {
+        self.package(self.package_of(item)).carried
+    }
+
     pub fn ast(&self, item: ItemId) -> &ast::Item {
-        &self.item(item).ast
+        self.item(item).ast
     }
 
     /// The first item of a module declaring `name`, functions named after a type excepted.

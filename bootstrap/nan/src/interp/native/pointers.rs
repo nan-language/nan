@@ -2,7 +2,9 @@
 //! checked against the Ptr rules in their order.
 
 use super::super::memory::layout;
-use super::super::value::{Loc, Provenance, Ptr, Val};
+use std::rc::Rc;
+
+use super::super::value::{Loc, Provenance, Ptr, Val, wrap};
 use super::super::{End, Exec, Flow, Interpreter};
 use crate::check::db::ItemId;
 use crate::check::ty::{Arg, Ty};
@@ -72,30 +74,104 @@ pub fn member(
             }
             Val::Ptr(Ptr { address, ..ptr })
         }
-        "read" => {
-            let ptr = pointer(interp, &args[0]);
-            let loc = match access(interp, &ptr, size, align, false, at) {
-                Ok(loc) => loc,
+        "cast" => Val::Ptr(pointer(interp, &args[0])),
+        "read" | "atomic_load" => match load(interp, &args[0], size, align, at) {
+            Ok(value) => value,
+            Err(end) => return Some(Err(end)),
+        },
+        "write" | "atomic_store" => match store(interp, &args[0], args[1].clone(), size, align, at)
+        {
+            Ok(()) => Val::Unit,
+            Err(end) => return Some(Err(end)),
+        },
+        "atomic_swap" | "atomic_compare_swap" | "atomic_wrapping_add" => {
+            let previous = match load(interp, &args[0], size, align, at) {
+                Ok(value) => value,
                 Err(end) => return Some(Err(end)),
             };
-            let value = interp.memory.get(&loc).clone();
-            if value == Val::Absent {
-                return Some(Err(violation(interp, "initialisation", at)));
+            let (stored, result) = match member {
+                "atomic_swap" => (Some(args[1].clone()), previous),
+                "atomic_wrapping_add" => {
+                    let scalar = element.scalar().expect("an integer pointee");
+                    let sum = wrap(previous.int() + interp.deref(&args[1]).int(), scalar);
+                    (Some(Val::Int(sum)), previous)
+                }
+                _ => {
+                    let result = interp.ty_item("core", "Result");
+                    match interp.equal(&previous, &args[1]) {
+                        true => (
+                            Some(args[2].clone()),
+                            Val::Variant(result, 0, Rc::new(vec![previous])),
+                        ),
+                        false => (None, Val::Variant(result, 1, Rc::new(vec![previous]))),
+                    }
+                }
+            };
+            if let Some(stored) = stored
+                && let Err(end) = store(interp, &args[0], stored, size, align, at)
+            {
+                return Some(Err(end));
             }
-            value
+            result
         }
-        "write" => {
-            let ptr = pointer(interp, &args[0]);
-            let loc = match access(interp, &ptr, size, align, true, at) {
-                Ok(loc) => loc,
-                Err(end) => return Some(Err(end)),
+        "copy" => {
+            let (from, to) = (pointer(interp, &args[0]), pointer(interp, &args[1]));
+            let at_element = |ptr: &Ptr, index: u64| {
+                Val::Ptr(Ptr {
+                    address: ptr.address + index * size,
+                    ..ptr.clone()
+                })
             };
-            interp.memory.set(&loc, args[1].clone());
+            let mut copied = Vec::new();
+            for index in 0..args[2].int() as u64 {
+                match load(interp, &at_element(&from, index), size, align, at) {
+                    Ok(value) => copied.push(value),
+                    Err(end) => return Some(Err(end)),
+                }
+            }
+            for (index, value) in copied.into_iter().enumerate() {
+                let target = at_element(&to, index as u64);
+                if let Err(end) = store(interp, &target, value, size, align, at) {
+                    return Some(Err(end));
+                }
+            }
             Val::Unit
         }
         _ => return None,
     };
     Some(Ok(Flow::Return(value)))
+}
+
+/// The value a pointer reads, after the Ptr checks and the initialisation rule.
+fn load(
+    interp: &Interpreter,
+    pointer_value: &Val,
+    size: u64,
+    align: u64,
+    at: (ItemId, Span),
+) -> Exec<Val> {
+    let ptr = pointer(interp, pointer_value);
+    let loc = access(interp, &ptr, size, align, false, at)?;
+    let value = interp.memory.get(&loc).clone();
+    if value == Val::Absent {
+        return Err(violation(interp, "initialisation", at));
+    }
+    Ok(value)
+}
+
+/// Writes a value through a pointer, after the Ptr checks.
+fn store(
+    interp: &mut Interpreter,
+    pointer_value: &Val,
+    value: Val,
+    size: u64,
+    align: u64,
+    at: (ItemId, Span),
+) -> Exec<()> {
+    let ptr = pointer(interp, pointer_value);
+    let loc = access(interp, &ptr, size, align, true, at)?;
+    interp.memory.set(&loc, value);
+    Ok(())
 }
 
 fn pointer(interp: &Interpreter, value: &Val) -> Ptr {

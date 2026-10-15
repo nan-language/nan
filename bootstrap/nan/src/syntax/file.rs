@@ -138,16 +138,16 @@ pub fn parse(source: Vec<u8>) -> SourceFile {
     parse_as(source, false)
 }
 
-/// Parses std declarations as the specification publishes them: a function may end at its head
-/// line or clause region, without a body.
-pub fn parse_declarations(source: Vec<u8>) -> SourceFile {
+/// Parses a source file of a std package, where a function may end at its head line or clause
+/// region, without a body.
+pub fn parse_std(source: Vec<u8>) -> SourceFile {
     parse_as(source, true)
 }
 
-fn parse_as(source: Vec<u8>, declarations: bool) -> SourceFile {
+fn parse_as(source: Vec<u8>, std: bool) -> SourceFile {
     let lexed = lex(&source);
     let mut parser = Parser {
-        declarations,
+        std,
         file: SourceFile {
             source,
             comment: vec![false; lexed.tokens.len()],
@@ -194,7 +194,7 @@ enum DocRun {
 }
 
 struct Parser {
-    declarations: bool,
+    std: bool,
     file: SourceFile,
 }
 
@@ -333,7 +333,7 @@ impl Parser {
                     return at;
                 }
                 Err(Failure::Token { at, .. })
-                    if self.declarations && state.innermost_rule() == Some(Rule::FnEnd) =>
+                    if self.std && state.innermost_rule() == Some(Rule::FnEnd) =>
                 {
                     let end = match self.previous(at) {
                         Some(previous) if self.kind(previous) == TokenKind::Col0 => previous,

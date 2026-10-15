@@ -159,13 +159,22 @@ impl Elab<'_, '_> {
                     .map(|ty| Arg::Ty(ty.clone()))
                     .collect(),
             },
+            tir::Callee::Builtin(tir::Builtin::Template) => FnRef {
+                callable: Callable::Builtin(Builtin::Intrinsic("text::fmt")),
+                args: call
+                    .args
+                    .iter()
+                    .map(|arg| Arg::Ty(arg.expr.ty.clone()))
+                    .collect(),
+            },
             tir::Callee::Builtin(builtin) => FnRef {
                 callable: Callable::Builtin(match builtin {
                     tir::Builtin::Conversion(builtin) => *builtin,
-                    tir::Builtin::Template => Builtin::Intrinsic("text::fmt"),
                     tir::Builtin::DmaAccess => Builtin::Intrinsic("hw::Dma.access"),
                     tir::Builtin::MintRoot => Builtin::Intrinsic("hw::mint_root"),
-                    tir::Builtin::DynView => unreachable!("a Dyn view has its own reference"),
+                    tir::Builtin::DynView | tir::Builtin::Template => {
+                        unreachable!("a Dyn view or template has its own reference")
+                    }
                 }),
                 args: Args::from(Vec::new()),
             },

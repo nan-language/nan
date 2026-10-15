@@ -1,0 +1,317 @@
+//! Task scopes, joins, deadlines, races, cowns, channels and executors.
+
+pub open struct Cancelled derives Send {
+} Cancelled
+
+impl Cancelled: Render
+
+pub fn Cancelled.render(self, mut out: core::Renderer) {
+    mut out.write("cancelled")
+} Cancelled.render
+
+pub open view struct Scope {
+} Scope
+
+pub fn scope[E](exec: Executor, body: fn(s: Scope) fails E uses wait) fails E uses wait
+
+pub fn Scope.cancel(self)
+
+pub fn Scope.is_cancelled(self) -> bool
+
+pub open struct Join[T: Any and Send, E: Send] {
+} Join
+
+pub fn Scope.spawn[T: Any and Send, E: Send](self, take child: task fn() -> T fails E uses wait) -> Join[T, E]
+
+pub fn Join.join(take self) -> T fails E uses wait
+
+pub fn within[T, E](clock: sys::Clock, ms: u64, body: fn() -> T fails E uses wait) -> Option[T] fails E uses wait
+
+pub fn race[T: Send, E: Send](exec: Executor, take left: task fn() -> T fails E uses wait, take right: task fn() -> T fails E uses wait) -> T fails E uses wait
+
+pub open struct Cown[T: Send] {
+} Cown
+
+pub fn Cown.of(take value: T, alloc: mem::Alloc) -> Cown[T]
+
+pub fn Cown.try_of(take value: T, alloc: mem::Alloc) -> Cown[T] fails mem::OutOfMemory
+
+pub fn Cown.share(self) -> Cown[T]
+
+pub open struct Poisoned derives Send {
+} Poisoned
+
+impl Poisoned: Render
+
+pub fn Poisoned.render(self, mut out: core::Renderer) {
+    mut out.write("poisoned")
+} Poisoned.render
+
+pub closed struct Channel[T: Any and Send] {
+    pub sender: Sender[T]
+    pub receiver: Receiver[T]
+} Channel
+
+pub fn Channel.bounded(capacity: usize, alloc: mem::Alloc) -> Channel[T]
+    requires capacity > 0
+
+pub fn Channel.try_bounded(capacity: usize, alloc: mem::Alloc) -> Channel[T] fails mem::OutOfMemory
+    requires capacity > 0
+
+pub open struct Sender[T: Any and Send] {
+} Sender
+
+pub fn Sender.split(self) -> Sender[T]
+
+pub fn Sender.send(self, take value: T) fails SendError uses wait
+
+pub open struct Receiver[T: Any and Send] {
+} Receiver
+
+pub fn Receiver.receive(mut self) -> Option[T] fails Cancelled uses wait
+
+pub fn Receiver.drain(take self, visit: fn(take value: T)) fails Cancelled uses wait
+
+pub closed enum SendError derives Render {
+    Closed
+    Cancelled(Cancelled) from
+} SendError
+
+pub open struct Executor {
+} Executor
+
+pub closed struct Completion[B: Any, T: Any, E] {
+    pub buf: B
+    pub outcome: Result[T, E]
+} Completion
+
+test cancelled_renders_its_name for Cancelled.render {
+    let world = testing::world()
+    let clock = world.clock
+    var out = text::String.empty(world.alloc)
+    discard try await within(clock, ms: 1, body: fn[mut out]() fails Cancelled uses wait {
+        let Err(cancelled) = attempt await clock.sleep(10) else {
+            return
+        }
+        mut out.write(text::fmt("{cancelled}", cancelled), budget: 16)
+    })
+    expect out.as_str() == "cancelled"
+} cancelled_renders_its_name
+
+test scope_waits_for_every_child for scope {
+    let world = testing::world()
+    let hits = Cown.of(0u32, alloc: world.alloc)
+    try await scope(world.exec, body: fn(s: Scope) {
+        for _ in 0..<3u32 {
+            discard s.spawn(fn() fails Cancelled uses wait {
+                await when mut hits {
+                    hits += 1
+                }
+            })
+        }
+    })
+    let total = await when hits => hits
+    expect total == 3
+} scope_waits_for_every_child
+
+test cancel_ends_the_scope_without_failure for Scope.cancel {
+    let world = testing::world()
+    let clock = world.clock
+    try await scope(world.exec, body: fn(s: Scope) {
+        discard s.spawn(fn() fails Cancelled uses wait {
+            loop {
+                try await clock.sleep(10)
+            }
+        })
+        s.cancel()
+    })
+} cancel_ends_the_scope_without_failure
+
+test is_cancelled_follows_cancel for Scope.is_cancelled {
+    let world = testing::world()
+    var before = true
+    var after = false
+    try await scope(world.exec, body: fn[mut before, mut after](s: Scope) {
+        before = s.is_cancelled()
+        s.cancel()
+        after = s.is_cancelled()
+    })
+    expect not before
+    expect after
+} is_cancelled_follows_cancel
+
+test spawned_child_runs_beside_the_body for Scope.spawn {
+    let world = testing::world()
+    var received: Option[u32] = None
+    try await scope(world.exec, body: fn[mut received](s: Scope) fails SendError uses wait {
+        let channel = Channel[u32].bounded(1, alloc: world.alloc)
+        let sender = channel.sender
+        var receiver = channel.receiver
+        discard s.spawn(fn[take sender]() fails SendError uses wait {
+            try await sender.send(7)
+        })
+        received = try await mut receiver.receive()
+    })
+    expect received == Some(7)
+} spawned_child_runs_beside_the_body
+
+test join_yields_the_child_result for Join.join {
+    let world = testing::world()
+    var product: u32 = 0
+    try await scope(world.exec, body: fn[mut product](s: Scope) fails Cancelled uses wait {
+        let job = s.spawn(fn() -> u32 {
+            return 6 * 7
+        })
+        product = try await take job.join()
+    })
+    expect product == 42
+} join_yields_the_child_result
+
+test deadline_cancels_only_a_late_body for within {
+    let world = testing::world()
+    let clock = world.clock
+    let late = try await within(clock, ms: 10, body: fn() -> u32 fails Cancelled uses wait {
+        try await clock.sleep(1_000)
+        return 1
+    })
+    let early = try await within(clock, ms: 1_000, body: fn() -> u32 fails Cancelled uses wait {
+        try await clock.sleep(10)
+        return 2
+    })
+    expect late == None
+    expect early == Some(2)
+} deadline_cancels_only_a_late_body
+
+test earlier_end_decides_the_race for race {
+    let world = testing::world()
+    let clock = world.clock
+    let winner = try await race(world.exec, left: fn() -> u32 fails Cancelled uses wait {
+        try await clock.sleep(1_000)
+        return 1
+    }, right: fn() -> u32 fails Cancelled uses wait {
+        try await clock.sleep(10)
+        return 2
+    })
+    expect winner == 2
+} earlier_end_decides_the_race
+
+test cown_holds_its_value for Cown.of {
+    let world = testing::world()
+    let cell = Cown.of(7u32, alloc: world.alloc)
+    let value = await when cell => cell
+    expect value == 7
+} cown_holds_its_value
+
+test exhausted_alloc_fails_the_cown for Cown.try_of {
+    let world = testing::world()
+    let budget = world.alloc.split(0)
+    let outcome = attempt Cown.try_of(7u32, alloc: budget.alloc())
+    take budget.close()
+    expect outcome.is_err()
+} exhausted_alloc_fails_the_cown
+
+test shared_handles_reach_one_value for Cown.share {
+    let world = testing::world()
+    let cell = Cown.of(1u32, alloc: world.alloc)
+    let other = cell.share()
+    await when mut other {
+        other += 1
+    }
+    let value = await when cell => cell
+    expect value == 2
+} shared_handles_reach_one_value
+
+test poisoned_renders_its_name for Poisoned.render {
+    let world = testing::world()
+    let level = Cown.of(8u32, alloc: world.alloc)
+    let held = level.share()
+    let divisor: u32 = 0
+    discard try await sys::Domain.run(fn[take held]() fails Cancelled uses wait {
+        await when mut held {
+            held = held / divisor
+        }
+    }, exec: world.exec, alloc: world.alloc)
+    let outcome: Result[u32, Poisoned] = attempt await when level => level
+    let Err(poisoned) = outcome else {
+        return
+    }
+    var out = text::String.empty(world.alloc)
+    mut out.write(text::fmt("{poisoned}", poisoned), budget: 16)
+    expect out.as_str() == "poisoned"
+} poisoned_renders_its_name
+
+test bounded_channel_keeps_send_order for Channel.bounded {
+    let world = testing::world()
+    let channel = Channel[u32].bounded(2, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    try await sender.send(1)
+    try await sender.send(2)
+    let older = try await mut receiver.receive()
+    let newer = try await mut receiver.receive()
+    expect older == Some(1)
+    expect newer == Some(2)
+} bounded_channel_keeps_send_order
+
+test exhausted_alloc_fails_the_channel for Channel.try_bounded {
+    let world = testing::world()
+    let budget = world.alloc.split(0)
+    let outcome = attempt Channel[u32].try_bounded(4, alloc: budget.alloc())
+    take budget.close()
+    expect outcome.is_err()
+} exhausted_alloc_fails_the_channel
+
+test split_sender_feeds_the_same_receiver for Sender.split {
+    let world = testing::world()
+    let channel = Channel[u32].bounded(2, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    let other = sender.split()
+    try await other.send(5)
+    try await sender.send(6)
+    let older = try await mut receiver.receive()
+    let newer = try await mut receiver.receive()
+    expect older == Some(5)
+    expect newer == Some(6)
+} split_sender_feeds_the_same_receiver
+
+test send_without_a_receiver_fails_closed for Sender.send {
+    let world = testing::world()
+    let channel = Channel[u32].bounded(1, alloc: world.alloc)
+    let sender = channel.sender
+    discard channel.receiver
+    let outcome = attempt await sender.send(5)
+    let closed = match outcome {
+        Err(SendError.Closed) => true
+        else => false
+    }
+    expect closed
+} send_without_a_receiver_fails_closed
+
+test receive_ends_once_every_sender_is_released for Receiver.receive {
+    let world = testing::world()
+    let channel = Channel[u32].bounded(1, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    try await sender.send(3)
+    discard sender
+    let value = try await mut receiver.receive()
+    let end = try await mut receiver.receive()
+    expect value == Some(3)
+    expect end == None
+} receive_ends_once_every_sender_is_released
+
+test drain_visits_values_oldest_first for Receiver.drain {
+    let world = testing::world()
+    let channel = Channel[u32].bounded(2, alloc: world.alloc)
+    let sender = channel.sender
+    let receiver = channel.receiver
+    try await sender.send(1)
+    try await sender.send(2)
+    discard sender
+    var digits: u32 = 0
+    try await take receiver.drain(visit: fn[mut digits](take value: u32) {
+        digits = digits * 10 + value
+    })
+    expect digits == 12
+} drain_visits_values_oldest_first

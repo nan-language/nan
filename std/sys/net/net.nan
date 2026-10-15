@@ -1,0 +1,121 @@
+//! Listeners, connections and their errors.
+
+pub open struct Listener {
+} Listener
+
+pub fn Listener.accept(mut self) -> Conn fails NetError uses wait
+
+pub open linear struct Conn {
+} Conn
+
+pub fn Conn.read(mut self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails NetError uses wait
+    ensures result <= buf.byte_len()
+
+pub fn Conn.write(mut self, data: Slice[u8]) -> usize fails NetError uses wait
+    ensures result <= data.len()
+    ensures data.is_empty() or result >= 1
+
+pub fn Conn.close(take self) fails NetError uses wait
+
+pub fn Conn.abandon(take self)
+
+pub open enum NetError derives Render {
+    Refused
+    Reset
+    Unreachable
+    AddressInUse
+    Denied
+    Revoked(sys::Revoked) from
+    Cancelled(task::Cancelled) from
+} NetError
+
+test accept_takes_a_loopback_connection for Listener.accept {
+    let world = testing::world()
+    let loopback = world.net
+    var listener = try await loopback.listen(4_100)
+    try await task::scope(world.exec, body: fn[mut listener](s: task::Scope) fails NetError uses wait {
+        discard s.spawn(fn() fails NetError uses wait {
+            let client = try await loopback.connect("localhost", port: 4_100)
+            take client.abandon()
+        })
+        let server = try await mut listener.accept()
+        take server.abandon()
+    })
+} accept_takes_a_loopback_connection
+
+test read_receives_the_peer_bytes for Conn.read {
+    let world = testing::world()
+    let loopback = world.net
+    let clock = world.clock
+    var listener = try await loopback.listen(4_100)
+    var count: usize = 0
+    try await task::scope(world.exec, body: fn[mut listener, mut count](s: task::Scope) fails NetError uses wait {
+        discard s.spawn(fn() fails NetError uses wait {
+            var client = try await loopback.connect("localhost", port: 4_100)
+            defer take client.abandon()
+            discard try await mut client.write(b"x")
+            try await clock.sleep(100)
+        })
+        var server = try await mut listener.accept()
+        defer take server.abandon()
+        var buf = Untrusted.of(Array[u8, 4].filled(0))
+        count = try await mut server.read(mut buf.view_mut())
+    })
+    expect count == 1
+} read_receives_the_peer_bytes
+
+test write_sends_part_of_the_data for Conn.write {
+    let world = testing::world()
+    let loopback = world.net
+    var listener = try await loopback.listen(4_100)
+    var sent: usize = 0
+    try await task::scope(world.exec, body: fn[mut listener, mut sent](s: task::Scope) fails NetError uses wait {
+        let client = s.spawn(fn() -> usize fails NetError uses wait {
+            var conn = try await loopback.connect("localhost", port: 4_100)
+            defer take conn.abandon()
+            return try await mut conn.write(b"ping")
+        })
+        let server = try await mut listener.accept()
+        defer take server.abandon()
+        sent = try await take client.join()
+    })
+    expect sent >= 1
+} write_sends_part_of_the_data
+
+test close_shuts_the_connection_down for Conn.close {
+    let world = testing::world()
+    let loopback = world.net
+    var listener = try await loopback.listen(4_100)
+    try await task::scope(world.exec, body: fn[mut listener](s: task::Scope) fails NetError uses wait {
+        let client = s.spawn(fn() fails NetError uses wait {
+            let conn = try await loopback.connect("localhost", port: 4_100)
+            try await take conn.close()
+        })
+        let server = try await mut listener.accept()
+        defer take server.abandon()
+        try await take client.join()
+    })
+} close_shuts_the_connection_down
+
+test abandon_resets_the_peer for Conn.abandon {
+    let world = testing::world()
+    let loopback = world.net
+    var listener = try await loopback.listen(4_100)
+    var reset = false
+    try await task::scope(world.exec, body: fn[mut listener, mut reset](s: task::Scope) fails NetError uses wait {
+        let client = s.spawn(fn() fails NetError uses wait {
+            let conn = try await loopback.connect("localhost", port: 4_100)
+            take conn.abandon()
+        })
+        var server = try await mut listener.accept()
+        defer take server.abandon()
+        try await take client.join()
+        var buf = Untrusted.of(Array[u8, 4].filled(0))
+        let outcome = attempt await mut server.read(mut buf.view_mut())
+        reset = match outcome {
+            Err(NetError.Reset) => true
+            else => false
+        }
+    })
+    expect reset
+} abandon_resets_the_peer

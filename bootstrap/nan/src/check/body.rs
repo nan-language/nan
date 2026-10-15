@@ -213,6 +213,7 @@ pub struct Body<'c, 'a> {
 impl Drop for Body<'_, '_> {
     fn drop(&mut self) {
         self.ck.scope.borrow_mut().clear();
+        self.ck.within.set(None);
     }
 }
 
@@ -223,6 +224,7 @@ impl<'c, 'a> Body<'c, 'a> {
             .find(|def| def.param.is_self())
             .map(|def| def.param);
         *ck.scope.borrow_mut() = generics.clone();
+        ck.within.set(Some(item));
         Body {
             ck,
             item,
@@ -421,7 +423,8 @@ impl<'c, 'a> Body<'c, 'a> {
                 && super::decl::declared_name(ast)
                     .is_some_and(|declared| fold(&declared.text) == folded)
         });
-        let clashes_scalar = Scalar::ALL.iter().any(|scalar| scalar.name() == folded);
+        let clashes_scalar = self.ck.db.package_of(self.item) != self.ck.db.core()
+            && Scalar::ALL.iter().any(|scalar| scalar.name() == folded);
         if clashes_scalar {
             self.report(name.token, Code::NameCoreRedefined);
         } else if clashes_local || clashes_value {

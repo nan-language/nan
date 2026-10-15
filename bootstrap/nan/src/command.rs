@@ -499,15 +499,19 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
             ));
             continue;
         };
-        let item = item_written(workspace, writer, path, *line, None);
+        let home = match workspace.file(path) {
+            Some(_) => workspace,
+            None => crate::stdlib::workspace(),
+        };
+        let item = item_written(home, writer, path, *line, None);
         lines.push(format!(
             "because {} {path}:{line} {item} {}",
             reason.role.word(),
             reason.subject
         ));
-        let (_, file) = workspace
+        let (_, file) = home
             .file(path)
-            .expect("reasons lie in workspace files");
+            .expect("reasons lie in workspace or std files");
         lines.push(output::printable(file.syntax.line_text(*line)));
     }
     for (number, fix) in diagnostic.fixes.iter().enumerate() {

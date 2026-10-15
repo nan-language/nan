@@ -130,28 +130,6 @@ pub enum Brought {
     Charged,
 }
 
-/// The std operations whose owning chapters state their facts, by the canonical path of the
-/// type they are members of or their own: pointers, register windows, DMA and privileged
-/// intrinsics.
-pub fn stated(path: &str) -> Option<Digest> {
-    let (owner, member) = path.rsplit_once('.').unwrap_or((path, ""));
-    let mut digest = Digest::none();
-    match owner {
-        "hw::Ptr" => {
-            digest.sync =
-                matches!(member, "read" | "write" | "copy") || member.starts_with("atomic_")
-        }
-        "hw::fence" => digest.sync = true,
-        "hw::UserAddr" if member == "copy_in" => digest.sync = true,
-        "hw::Mmio" | "hw::Ports" | "hw::Dma" | "hw::DmaShared" | "hw::dma_fence" => {
-            digest.device = true
-        }
-        "hw::Ring0" => digest.privileged = true,
-        _ => return None,
-    }
-    Some(digest)
-}
-
 /// The digests computed in one check, by item.
 #[derive(Default)]
 pub struct Digests {
@@ -161,7 +139,8 @@ pub struct Digests {
 }
 
 impl Checker<'_> {
-    /// The digest of a function item: computed from its body, or its declared digest without one.
+    /// The digest of a function item: computed from its body, supplied for a std function
+    /// without one, and otherwise declared.
     pub fn digest(&self, item: ItemId) -> Rc<Digest> {
         self.db.note(item);
         if let Some(digest) = self.digests.borrow().done.get(&item) {
@@ -182,14 +161,9 @@ impl Checker<'_> {
             return Rc::new(self.cycle_digest(item));
         }
         let Some(body) = self.typed_body(item) else {
-            let digest = match self
-                .db
-                .is_std(item)
-                .then(|| stated(&self.db.canonical(item)))
-                .flatten()
-            {
-                Some(stated) => Rc::new(stated),
-                None => declared(),
+            let digest = match self.db.is_std(item) {
+                true => Rc::new(self.supplied(item)),
+                false => declared(),
             };
             self.digests.borrow_mut().done.insert(item, digest.clone());
             return digest;
@@ -255,12 +229,23 @@ impl Checker<'_> {
     /// whose body is walked when it is one; a closure's code is charged to the call it is
     /// supplied to.
     pub fn sites(&self, item: ItemId, body: &TBody, closure: Option<&TClosure>) -> Vec<Site> {
+        self.walk(item, body, closure).sites
+    }
+
+    /// The walk of a body's own code, or of a closure's.
+    fn walk<'c>(
+        &self,
+        item: ItemId,
+        body: &'c TBody,
+        closure: Option<&TClosure>,
+    ) -> Walk<'_, 'c, '_> {
         let mut walk = Walk {
             ck: self,
             item,
             body,
             closure: closure.map_or(0, |closure| closure.index),
             sites: Vec::new(),
+            expects: Vec::new(),
         };
         match closure {
             Some(closure) => walk.expr(&closure.body),
@@ -270,7 +255,20 @@ impl Checker<'_> {
                 }
             }
         }
-        walk.sites
+        walk
+    }
+
+    /// Reports each `expect` of a body, its closures' included, whose condition is not pure.
+    pub fn check_expect_purity(&self, item: ItemId, body: &TBody) {
+        let mut pending = vec![None];
+        while let Some(closure) = pending.pop() {
+            for (token, sites) in self.walk(item, body, closure).expects {
+                if sites.iter().any(|site| !site.facts.pure()) {
+                    self.report(item, token, Code::ContractImpureCondition);
+                }
+            }
+            pending.extend(closures_of(body, closure).into_iter().map(Some));
+        }
     }
 
     /// The sites of a body's whole text: its own code and that of each closure it holds.
@@ -483,6 +481,8 @@ struct Walk<'w, 'c, 'a> {
     /// The closure whose code is walked, 0 for the item's own body.
     closure: u32,
     sites: Vec<Site>,
+    /// The sites of each `expect` condition, by the condition's first token.
+    expects: Vec<(Tok, Vec<Site>)>,
 }
 
 impl Walk<'_, '_, '_> {
@@ -549,7 +549,20 @@ impl Walk<'_, '_, '_> {
                     op: Some(_),
                     ..
                 } => self.float(stmt.token, &target.ty),
-                TStmtKind::Expect(_) | TStmtKind::Assume(_) => continue,
+                TStmtKind::Expect(condition) => {
+                    let mut condition_walk = Walk {
+                        ck: self.ck,
+                        item: self.item,
+                        body: self.body,
+                        closure: self.closure,
+                        sites: Vec::new(),
+                        expects: Vec::new(),
+                    };
+                    condition_walk.expr(condition);
+                    self.expects.push((condition.token, condition_walk.sites));
+                    continue;
+                }
+                TStmtKind::Assume(_) => continue,
                 _ => {}
             }
             match &stmt.kind {
@@ -605,7 +618,9 @@ impl Walk<'_, '_, '_> {
             Callee::Function { item, .. } => {
                 let mut facts = (*self.ck.digest(*item)).clone();
                 if self.ck.db.is_std(*item) && self.ck.is_primitive_capability_member(*item) {
-                    facts.capabilities = Some(BTreeSet::from([self.ck.owner_item(*item)]));
+                    let mut capabilities = facts.capabilities.clone().unwrap_or_default();
+                    capabilities.insert(self.ck.owner_item(*item));
+                    facts.capabilities = Some(capabilities);
                 }
                 if self.ck.is_validator(*item) {
                     let mut validators = facts.validators.clone().unwrap_or_default();

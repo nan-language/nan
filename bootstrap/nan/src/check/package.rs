@@ -20,8 +20,12 @@ impl Checker<'_> {
     }
 
     /// Each set of two or more modules depending on one another, reported once on the first
-    /// path from the set's first module, by name, to another module of the set.
+    /// path from the set's first module, by name, to another module of the set; std's module
+    /// graphs may hold cycles.
     fn check_module_cycles(&self, package: PackageId) {
+        if self.db.package(package).std {
+            return;
+        }
         let modules = &self.db.package(package).modules;
         let mut edges: BTreeMap<ModuleId, Vec<(ModuleId, ItemId, u32)>> = BTreeMap::new();
         for &module in modules {

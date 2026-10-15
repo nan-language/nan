@@ -212,9 +212,11 @@ impl Checker<'_> {
 
     /// Whether an implementing function's head matches its method's, `Self` and the interface's
     /// parameters substituted: its modifier, own generic parameters, parameters, result, failure
-    /// type and waiting.
+    /// type and waiting. The result's droppability is judged under the function's own bounds.
     fn head_matches(&self, written: &FnSig, wanted: &FnSig) -> bool {
+        let saved = self.scope.replace(written.generics.clone());
         let droppable_result = !self.has(&written.result, super::props::Property::Linear);
+        *self.scope.borrow_mut() = saved;
         let modifier = written.modifier == wanted.modifier
             || (wanted.is_proj() && written.modifier.is_none() && droppable_result);
         let own = written.own_generics();

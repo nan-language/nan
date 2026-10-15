@@ -87,7 +87,7 @@ const BASE_TYPES: &[(&str, Facts)] = &[
     ("core::Str", [No, Yes, No, Yes, Yes, No]),
     ("core::SliceCursor", VIEW_SEND_INERT_AS),
     ("core::SliceCursorMut", VIEW_SEND_INERT_AS),
-    ("core::ArrayCursor", [First, No, No, First, First, No]),
+    ("core::ArrayCursor", [First, First, No, First, First, No]),
     ("core::CharCursor", [No, Yes, No, Yes, Yes, No]),
     ("core::atomic::AtomicU8", AFFINE_SEND),
     ("core::atomic::AtomicU16", AFFINE_SEND),
@@ -205,7 +205,7 @@ const PRIMITIVE_CAPABILITIES: [&str; 26] = [
 ];
 
 /// The base types with interior mutability, by canonical path.
-const INTERIOR: [&str; 14] = [
+pub const INTERIOR: [&str; 14] = [
     "task::Cown",
     "core::atomic::AtomicU8",
     "core::atomic::AtomicU16",
@@ -587,6 +587,7 @@ impl Checker<'_> {
                         && matches!(
                             self.db.canonical(param.owner).as_str(),
                             "core::Array"
+                                | "core::ArrayCursor"
                                 | "core::Option"
                                 | "core::Result"
                                 | "core::Untrusted"

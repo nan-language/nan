@@ -216,7 +216,9 @@ impl Checker<'_> {
         match &ast.kind {
             ItemKind::Fn(function) => {
                 self.check_case(item, &function.label.name, Case::Snake);
-                if function.label.owner.is_none() && folds_to_core(&function.label.name.text, true)
+                if function.label.owner.is_none()
+                    && !self.in_core(item)
+                    && folds_to_core(&function.label.name.text, true)
                 {
                     self.report(item, function.label.name.token, Code::NameCoreRedefined);
                 }
@@ -361,7 +363,7 @@ impl Checker<'_> {
                     self.report(item, constant.name.token, Code::ItemConstType);
                 }
                 self.check_case(item, &constant.name, Case::Screaming);
-                if folds_to_core(&constant.name.text, true) {
+                if !self.in_core(item) && folds_to_core(&constant.name.text, true) {
                     self.report(item, constant.name.token, Code::NameCoreRedefined);
                 }
             }
@@ -403,6 +405,7 @@ impl Checker<'_> {
             if ast.kind.is_fn_with_body() {
                 self.check_limits(item, &body);
             }
+            self.check_expect_purity(item, &body);
             if let ItemKind::Fn(function) = &ast.kind {
                 self.check_decreases(item, function);
             }
@@ -438,10 +441,15 @@ impl Checker<'_> {
         }
     }
 
-    /// A type's name: PascalCase, and no core vocabulary name.
+    /// Whether an item belongs to `core`, which declares the core vocabulary.
+    fn in_core(&self, item: ItemId) -> bool {
+        self.db.package_of(item) == self.db.core()
+    }
+
+    /// A type's name: PascalCase, and outside core no core vocabulary name.
     fn check_type_name(&self, item: ItemId, name: &ast::Name) {
         self.check_case(item, name, Case::Pascal);
-        if folds_to_core(&name.text, false) {
+        if !self.in_core(item) && folds_to_core(&name.text, false) {
             self.report(item, name.token, Code::NameCoreRedefined);
         }
     }
@@ -471,7 +479,7 @@ impl Checker<'_> {
                 _ => {}
             }
             self.check_case(item, &param.name, Case::Pascal);
-            if folds_to_core(&param.name.text, false) {
+            if !self.in_core(item) && folds_to_core(&param.name.text, false) {
                 self.report(item, param.name.token, Code::NameCoreRedefined);
             }
             let folded = fold(&param.name.text);
@@ -594,8 +602,9 @@ impl Checker<'_> {
         }
     }
 
-    /// A function named `Type.name`: `Type` is declared in its module, or an impl line of its
-    /// module targets it with an interface declaring `name`.
+    /// A function named `Type.name`: `Type` is declared in its module, the scalars and `Unit` in
+    /// the root module of core, or an impl line of its module targets it with an interface
+    /// declaring `name`.
     fn check_method_placement(&self, item: ItemId, owner: &ast::Path) {
         let module = self.db.module_of(item);
         let key = match self.db.resolve(module, owner) {
@@ -607,8 +616,13 @@ impl Checker<'_> {
             }
             Ok(_) => self.db.owner_key(module, owner),
         };
-        let declared =
-            matches!(key, Some(TypeKey::Item(target)) if self.db.module_of(target) == module);
+        let declared = match key {
+            Some(TypeKey::Item(target)) => self.db.module_of(target) == module,
+            Some(TypeKey::Scalar(_) | TypeKey::Unit) => {
+                self.db.package(self.db.core()).root == Some(module)
+            }
+            None => false,
+        };
         let implemented = !self.implemented_lines(item).is_empty();
         if !declared && !implemented {
             self.report(item, self.db.ast(item).token, Code::ItemMethodMisplaced);

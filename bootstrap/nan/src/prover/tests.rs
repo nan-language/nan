@@ -14,7 +14,7 @@ fn statuses(files: &[(&str, &str)], item: &str) -> Vec<(u32, Status)> {
     let scratch = Scratch::new(&all);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    let checker = checked(&workspace, &std, Target::Any);
+    let checker = checked(&workspace, std, Target::Any);
     let id = (0..checker.db.items.len())
         .map(|index| crate::check::db::ItemId(index as u32))
         .find(|id| !checker.db.is_std(*id) && checker.db.canonical(*id) == item)
@@ -91,5 +91,23 @@ fn a_when_body_flows_into_the_code_around_it() {
     assert_eq!(
         statuses(&files, "example::early"),
         vec![(38, Status::Checked), (40, Status::Checked)]
+    );
+}
+
+#[test]
+fn a_disequality_excludes_the_value_its_term_is_fixed_at() {
+    let source = "//! Bytes.\n\npub fn head(bytes: Slice[u8]) -> u8 limits notrap {\n    if bytes.len() == 0 {\n        return 0\n    }\n    return bytes[0]\n} head\n";
+    let statuses = statuses(&[("example/example.nan", source)], "example::head");
+    assert_eq!(statuses, vec![(7, Status::Proven)]);
+}
+
+#[test]
+fn where_conditions_of_const_parameters_are_facts_in_their_items_and_members() {
+    let source = "//! Rings.\n\npub fn wrap[N: usize where N > 0](slots: Array[u8, N], index: usize) -> usize {\n    return index % N\n} wrap\n\npub closed struct Ring[N: usize where N > 0] {\n    pub slots: Array[u8, N]\n} Ring\n\npub fn Ring.wrap(self, index: usize) -> usize {\n    return index % N\n} Ring.wrap\n";
+    let files = [("example/example.nan", source)];
+    assert_eq!(statuses(&files, "example::wrap"), vec![(4, Status::Proven)]);
+    assert_eq!(
+        statuses(&files, "example::Ring.wrap"),
+        vec![(12, Status::Proven)]
     );
 }

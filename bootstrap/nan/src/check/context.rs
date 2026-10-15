@@ -35,7 +35,7 @@ pub struct Context {
 /// item, or of its line `line`.
 pub fn contexts(workspace: &Workspace, scope: &Scope, line: Option<u32>) -> Vec<Context> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, &std);
+    let checkers = checkers(workspace, std);
     let mut packs: Vec<Context> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for (target, checker) in &checkers {
@@ -46,7 +46,7 @@ pub fn contexts(workspace: &Workspace, scope: &Scope, line: Option<u32>) -> Vec<
             let data = db.item(item);
             let first =
                 check_targets(db.package(db.package_of(item)).source).first() == Some(target);
-            if db.is_std(item)
+            if db.is_carried(item)
                 || !first
                 || !scope.holds(workspace, &data.file.path, Some(data.head_line()))
                 || !listed.insert((data.file.path.clone(), data.head_line()))
@@ -308,7 +308,7 @@ pub struct Green {
 /// and of those in the closure sets of `lines`, each once, by path.
 pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u32)]) -> Vec<Green> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, &std);
+    let checkers = checkers(workspace, std);
     let mut found: Vec<Green> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for (_, checker) in &checkers {
@@ -318,7 +318,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let data = db.item(item);
-            if db.is_std(item) {
+            if db.is_carried(item) {
                 continue;
             }
             if scope.is_some_and(|scope| {
@@ -339,7 +339,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
                     checker
                         .line_closure(item, *line)
                         .into_iter()
-                        .filter(|read| !db.is_std(*read)),
+                        .filter(|read| !db.is_carried(*read)),
                 );
             }
         }
@@ -373,7 +373,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
 /// of the type or interface showing it.
 pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, &std);
+    let checkers = checkers(workspace, std);
     let mut gaps = Vec::new();
     for (target, checker) in &checkers {
         let db = &checker.db;
@@ -382,7 +382,7 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
             let item = ItemId(index as u32);
             let first =
                 check_targets(db.package(db.package_of(item)).source).first() == Some(target);
-            if db.is_std(item) || !first {
+            if db.is_carried(item) || !first {
                 continue;
             }
             let pack = checker.context(&checkers, item, None);

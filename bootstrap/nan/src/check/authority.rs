@@ -215,10 +215,11 @@ impl Checker<'_> {
 
     /// An impl line naming `sys::Capability`, which only std writes.
     pub fn check_capability_impl(&self, item: ItemId) {
-        if let super::sig::SigKind::Impl {
-            interface: Some(bound),
-            ..
-        } = &self.sig(item).kind
+        if !self.db.is_std(item)
+            && let super::sig::SigKind::Impl {
+                interface: Some(bound),
+                ..
+            } = &self.sig(item).kind
             && self.db.canonical(bound.interface) == "sys::Capability"
         {
             self.report(item, self.db.ast(item).token, Code::AuthorityCapabilityImpl);

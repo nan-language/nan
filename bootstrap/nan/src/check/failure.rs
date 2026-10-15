@@ -2,7 +2,7 @@
 //! parameter's use as a failure type implies, and failure conversion.
 
 use super::Checker;
-use super::db::ItemId;
+use super::db::{ItemId, TypeKey};
 use super::props::Property;
 use super::sig::{FnSig, Payload, SigKind};
 use super::ty::{FnTy, Param, Subst, Ty};
@@ -63,10 +63,11 @@ impl Checker<'_> {
         })
     }
 
-    /// The bounds a generic parameter's uses as a failure type in its item imply: a failure type
-    /// in a `fails` clause or as the payload of a from variant, and a cancellable one as the
-    /// failure type of a head or function type stating `uses wait`, or of a head with a parameter
-    /// whose function type does.
+    /// The bounds a generic parameter's uses as a failure type in its item, or in the heads of the
+    /// functions named after its type in the type's module, imply: a failure type in a `fails`
+    /// clause or as the payload of a from variant, and a cancellable one as the failure type of a
+    /// head or function type stating `uses wait`, or of a head with a parameter whose function
+    /// type does.
     pub fn implied(&self, param: Param) -> Implied {
         let named = |ty: &Option<Ty>| *ty == Some(Ty::Param(param));
         let sig = self.sig(param.owner);
@@ -100,15 +101,30 @@ impl Checker<'_> {
                 }
             });
         }
-        if let Some(head) = head
-            && named(&head.fails)
-        {
-            implied.failure = true;
-            implied.cancellable |= head.wait
-                || head
-                    .params
-                    .iter()
-                    .any(|candidate| matches!(&candidate.ty, Ty::Fn(fn_ty) if fn_ty.wait));
+        let members: Vec<ItemId> = match &sig.kind {
+            SigKind::Struct { .. } | SigKind::Enum { .. } => self
+                .db
+                .members
+                .get(&TypeKey::Item(param.owner))
+                .into_iter()
+                .flat_map(|members| members.values().flatten().copied())
+                .filter(|function| self.db.module_of(*function) == self.db.module_of(param.owner))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let member_heads: Vec<FnSig> = members
+            .iter()
+            .filter_map(|function| self.fn_sig(*function))
+            .collect();
+        for head in head.into_iter().chain(&member_heads) {
+            if named(&head.fails) {
+                implied.failure = true;
+                implied.cancellable |= head.wait
+                    || head
+                        .params
+                        .iter()
+                        .any(|candidate| matches!(&candidate.ty, Ty::Fn(fn_ty) if fn_ty.wait));
+            }
         }
         if let SigKind::Enum { variants } = &sig.kind && variants.iter().any(|variant| {
             variant.from

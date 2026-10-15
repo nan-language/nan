@@ -237,20 +237,31 @@ impl Checker<'_> {
     }
 
     /// Whether an impl line applies to an instantiation as far as droppable parameters go: a
-    /// parameter its target bounds by `Any` that the line lists without `Any` takes droppable
-    /// arguments only.
+    /// parameter droppable for the line takes droppable arguments only.
     fn impl_droppable(&self, line: ItemId, ty: &Ty) -> bool {
+        self.droppable_for_line(line)
+            .into_iter()
+            .zip(ty.args())
+            .all(|(droppable, arg)| match arg {
+                Arg::Ty(arg) if droppable => !self.has(arg, Property::Linear),
+                _ => true,
+            })
+    }
+
+    /// For each generic parameter of an impl line's target, whether it is droppable for the
+    /// line: its target bounds it by `Any` and the line lists it without `Any`, or the line is a
+    /// std impl line its owning chapter restricts to droppable instantiations.
+    pub fn droppable_for_line(&self, line: ItemId) -> Vec<bool> {
         let ItemKind::Impl(implementation) = &self.db.ast(line).kind else {
-            return true;
+            return Vec::new();
         };
-        let target_bounds = type_key(ty)
-            .map(|key| self.type_generics(key))
-            .unwrap_or_default();
-        let any = |bounds: &[Bound]| {
-            bounds
-                .iter()
-                .any(|bound| self.core_interface(bound.interface).as_deref() == Some("Any"))
+        let SigKind::Impl {
+            target: Some(key), ..
+        } = self.sig(line).kind
+        else {
+            return Vec::new();
         };
+        let target_bounds = self.type_generics(key);
         let listed: Vec<bool> = match &implementation.params {
             Some(params) => params
                 .iter()
@@ -264,16 +275,19 @@ impl Checker<'_> {
             None if self.db.is_std(line) && self.db.canonical_line_droppable(line) => {
                 vec![false; target_bounds.len()]
             }
-            None => return true,
+            None => vec![true; target_bounds.len()],
         };
         target_bounds
             .iter()
             .zip(listed)
-            .zip(ty.args())
-            .all(|((def, listed_any), arg)| match arg {
-                Arg::Ty(arg) if any(&def.bounds) && !listed_any => !self.has(arg, Property::Linear),
-                _ => true,
+            .map(|(def, listed_any)| {
+                !listed_any
+                    && def
+                        .bounds
+                        .iter()
+                        .any(|bound| self.core_interface(bound.interface).as_deref() == Some("Any"))
             })
+            .collect()
     }
 
     /// The conformances the owning chapters declare for scalars, `Unit` and std types.
@@ -342,7 +356,9 @@ impl Checker<'_> {
                         "mem::List" | "mem::Set" | "mem::Bounded" | "mem::Map" | "mem::HashMap",
                         "Eq" | "Hash" | "Render" | "Encode" | "Generate",
                     ) => all_args(interface),
-                    ("mem::Bytes", "Eq" | "Hash" | "Render" | "Encode" | "Generate") => true,
+                    ("mem::Bytes", "Eq" | "Ord" | "Hash" | "Render" | "Encode" | "Generate") => {
+                        true
+                    }
                     ("mem::Box" | "mem::Shared", "Render" | "Encode") => all_args(interface),
                     ("mem::Box", "Generate") => all_args(interface),
                     ("mem::Id", "Eq" | "Ord" | "Hash" | "Encode" | "Generate") => true,
@@ -583,64 +599,81 @@ impl Checker<'_> {
         })
     }
 
-    /// Whether a std member that exists only for some instantiations exists for `ty`.
+    /// Whether a std member that exists only for some instantiations exists for `ty`. Typing a
+    /// member of the same type that exists only for some instantiations, its receiver's type
+    /// admits the members whose receivers include all of its own.
     fn member_exists(&self, function: ItemId, ty: &Ty) -> bool {
         if !self.db.is_std(function) {
             return true;
         }
-        let path = self.db.canonical(function);
-        let element = ty.type_arg(0);
-        let copy = || element.is_some_and(|element| self.has(element, Property::Copy));
-        let bytes = || element == Some(&Ty::Scalar(Scalar::U8));
-        let byte_contents = || {
-            element.is_some_and(|inner| match inner {
-                Ty::Item(item, args) => match self.db.canonical(*item).as_str() {
-                    "core::Slice" | "core::SliceMut" | "core::Array" => {
-                        args.first() == Some(&Arg::Ty(Ty::Scalar(Scalar::U8)))
-                    }
-                    "mem::Bytes" => true,
-                    _ => false,
-                },
-                _ => false,
-            })
+        let Some(receivers) = self.receivers(function) else {
+            return true;
         };
-        let named = |names: &[&str]| {
+        if let (Some(Ty::Param(param)), Some(within)) = (ty.type_arg(0), self.within.get())
+            && self.db.owners.get(&within) == Some(&TypeKey::Item(param.owner))
+        {
+            return self
+                .receivers(within)
+                .is_some_and(|own| receivers.include(own));
+        }
+        let element = ty.type_arg(0);
+        let named = |names: &[&str], bytes_only: bool| {
             element.is_some_and(|inner| match inner {
                 Ty::Item(item, args) => {
                     let path = self.db.canonical(*item);
                     names.contains(&path.as_str())
-                        && (path != "core::SliceMut" && path != "core::Array"
+                        && (!bytes_only
+                            || path == "mem::Bytes"
                             || args.first() == Some(&Arg::Ty(Ty::Scalar(Scalar::U8))))
                 }
                 _ => false,
             })
         };
-        let (owner, member) = path.rsplit_once('.').unwrap_or((&path, ""));
-        match (owner, member) {
-            ("core::Array", "filled") | ("core::SliceMut", "fill" | "copy_from") => copy(),
-            ("core::Option", "value_or") => copy(),
-            ("core::Slice" | "core::SliceMut", member)
-                if member.ends_with("_le") || member.ends_with("_be") =>
-            {
-                bytes()
+        match receivers {
+            Receivers::Copy => element.is_some_and(|element| self.has(element, Property::Copy)),
+            Receivers::Bytes => element == Some(&Ty::Scalar(Scalar::U8)),
+            Receivers::ByteContents => named(
+                &["core::Slice", "core::SliceMut", "core::Array", "mem::Bytes"],
+                true,
+            ),
+            Receivers::WritableByteContents => {
+                named(&["core::SliceMut", "core::Array", "mem::Bytes"], true)
             }
-            ("core::Untrusted", "byte_len" | "view" | "prefix" | "split_at" | "copy_prefix")
-            | ("core::Untrusted", "try_copy_prefix") => byte_contents(),
-            ("core::Untrusted", "view_mut") => named(&["core::SliceMut", "core::Array", "mem::Bytes"]),
-            ("core::Untrusted", "append" | "try_append") => named(&["mem::Bytes"]),
-            ("core::Untrusted", "into_cleared") => {
-                named(&["core::Array", "mem::Bytes"])
-                    || element.is_some_and(|inner| {
-                        matches!(inner, Ty::Item(item, _) if self.db.canonical(*item) == "hw::Dma")
-                    })
+            Receivers::OwnedBytes => named(&["mem::Bytes"], true),
+            Receivers::Clearable => {
+                named(&["core::Array", "mem::Bytes"], true) || named(&["hw::Dma"], false)
             }
-            ("core::Range", "next") => element.is_some_and(|element| {
+            Receivers::Stepped => element.is_some_and(|element| {
                 element
                     .scalar()
                     .is_some_and(|scalar| scalar.is_integer() || scalar == Scalar::Char)
             }),
-            _ => true,
         }
+    }
+
+    /// The receivers of a std member that exists only for some instantiations.
+    fn receivers(&self, function: ItemId) -> Option<Receivers> {
+        let path = self.db.canonical(function);
+        let (owner, member) = path.rsplit_once('.').unwrap_or((&path, ""));
+        Some(match (owner, member) {
+            ("core::Array", "filled")
+            | ("core::SliceMut", "fill" | "copy_from")
+            | ("core::Option", "value_or") => Receivers::Copy,
+            ("core::Slice" | "core::SliceMut", member)
+                if member.ends_with("_le") || member.ends_with("_be") =>
+            {
+                Receivers::Bytes
+            }
+            (
+                "core::Untrusted",
+                "byte_len" | "view" | "prefix" | "split_at" | "copy_prefix" | "try_copy_prefix",
+            ) => Receivers::ByteContents,
+            ("core::Untrusted", "view_mut") => Receivers::WritableByteContents,
+            ("core::Untrusted", "append" | "try_append") => Receivers::OwnedBytes,
+            ("core::Untrusted", "into_cleared") => Receivers::Clearable,
+            ("core::Range", "next") => Receivers::Stepped,
+            _ => return None,
+        })
     }
 
     /// The type a struct or enum's item is, applied to its own parameters, for a type key.
@@ -850,5 +883,32 @@ impl Checker<'_> {
                 self.report(holder, token, Code::GenericWhereUnmet);
             }
         }
+    }
+}
+
+/// The receivers a std member existing only for some instantiations admits, by its receiver's
+/// type argument.
+#[derive(Clone, Copy, PartialEq)]
+enum Receivers {
+    Copy,
+    Bytes,
+    ByteContents,
+    WritableByteContents,
+    OwnedBytes,
+    Clearable,
+    Stepped,
+}
+
+impl Receivers {
+    /// Whether these receivers include all of `inner`'s.
+    fn include(self, inner: Receivers) -> bool {
+        self == inner
+            || matches!(
+                (self, inner),
+                (
+                    Receivers::ByteContents,
+                    Receivers::WritableByteContents | Receivers::OwnedBytes
+                ) | (Receivers::WritableByteContents, Receivers::OwnedBytes)
+            )
     }
 }

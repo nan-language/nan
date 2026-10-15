@@ -1,6 +1,6 @@
 # 0021. NIR, interpreter and prover after checking
 
-Status: accepted
+Status: accepted; its natives for std superseded by 0022
 
 ## Context
 

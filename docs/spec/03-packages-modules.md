@@ -201,7 +201,7 @@ A **module** is a directory of source files inside a package, whose items share 
 - Two plain module directories named alike after folding are an error ([`name.clash`](#naming-conventions)).
 - The root module is declared by the `package` item, and every other module or variant directory at the first line of its first source file in byte order of path, where diagnostics about it are reported. A diagnostic about a source file's name is reported on its first line.
 
-Module A **depends on** module B when an item of A names an item or member of B by a path. Under each declared target the module graph is acyclic. Each maximal set of two or more modules that each depend on every other, directly or through modules of the set, is one error (`module.cycle`). Its diagnostic lists the set's modules and is reported on the first such path, in byte order of file path and then position, from the set's first module in byte order of name to another module of the set.
+Module A **depends on** module B when an item of A names an item or member of B by a path. Under each declared target the module graph of a package outside [std](28-stdlib.md#std-layers) is acyclic. Each maximal set of two or more modules that each depend on every other, directly or through modules of the set, is one error (`module.cycle`). Its diagnostic lists the set's modules and is reported on the first such path, in byte order of file path and then position, from the set's first module in byte order of name to another module of the set.
 
 ```nan
 // file: geo/package.nan

@@ -146,7 +146,7 @@ pub fn pick(take primary: Option[Lease], take backup: Lease) -> Lease {
 
 ## Views
 
-A **view** is a value referring into memory it does not own. The view types are exactly `Slice[T]`, `SliceMut[T]`, `Str`, `Dyn[I]`, state tokens, structs and enums declared with the `view` [modifier](02-items.md#modifiers), the instantiations of `Array`, `Option`, `Result` and `Untrusted` with a view type argument, the base types their owning chapters declare views, and type parameters as [view arguments](#view-arguments) state.
+A **view** is a value referring into memory it does not own. The view types are exactly `Slice[T]`, `SliceMut[T]`, `Str`, `Dyn[I]`, state tokens, structs and enums declared with the `view` [modifier](02-items.md#modifiers), the instantiations of `Array`, `core::ArrayCursor`, `Option`, `Result` and `Untrusted` with a view type argument, the base types their owning chapters declare views, and type parameters as [view arguments](#view-arguments) state.
 
 - A struct or enum not declared `view` with a constituent type that is a view is an error (`prop.view-undeclared`), reported at the first such field or variant in source order, whose exact fix inserts `view`.
 - `view` may be declared on any struct or enum, with or without `linear`.
@@ -193,7 +193,7 @@ pub fn default_name() -> Str { // error: prop.view-result
 
 ### View arguments
 
-- A type parameter accepts view type arguments exactly when it is `Self` or a parameter of an interface, a parameter of a struct or enum declared `view`, or a parameter of `Array`, `Option`, `Result`, `Untrusted`, `Slice` or `SliceMut`, and no bound of it names `Copy`, `Send` or `AnyBits`. A view type argument for any other type parameter is an error (`prop.view-argument`), except `Dyn[I]` as the argument of `mem::Box`, which forms `mem::Box[Dyn[I]]` ([dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch)).
+- A type parameter accepts view type arguments exactly when it is `Self` or a parameter of an interface, a parameter of a struct or enum declared `view`, or a parameter of `Array`, `core::ArrayCursor`, `Option`, `Result`, `Untrusted`, `Slice` or `SliceMut`, and no bound of it names `Copy`, `Send` or `AnyBits`. A view type argument for any other type parameter is an error (`prop.view-argument`), except `Dyn[I]` as the argument of `mem::Box`, which forms `mem::Box[Dyn[I]]` ([dynamic dispatch](08-generics-interfaces.md#dynamic-dispatch)).
 - Inside its item, a type parameter that accepts view arguments is a view; every other type parameter is not.
 
 ```nan
@@ -233,7 +233,7 @@ pub fn fill(out: SliceMut[u8], value: u8) {
 A **state token** is a struct declared `view` with no fields. It stands for a machine state that holds while its holder runs, such as `hw::IrqsDisabled` for maskable interrupts being disabled ([interrupt state](24-kernel.md#interrupt-state)).
 
 - A function head, closure or function type with `uses wait` and a parameter whose type is or contains a state token is an error (`prop.token-wait`).
-- A type that is or contains a state token is an error (`prop.token-argument`) as a type argument for a parameter that accepts [view arguments](#view-arguments), other than a parameter of `Array`, `Option`, `Result`, `Untrusted`, `Slice` or `SliceMut`, and as the target of an impl line.
+- A type that is or contains a state token is an error (`prop.token-argument`) as a type argument for a parameter that accepts [view arguments](#view-arguments), other than a parameter of `Array`, `core::ArrayCursor`, `Option`, `Result`, `Untrusted`, `Slice` or `SliceMut`, and as the target of an impl line.
 - A state token live at a suspension point is an error that [views across suspension points](17-suspension-io.md#views-across-suspension-points) defines.
 
 ```nan

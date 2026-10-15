@@ -1,0 +1,152 @@
+//! Conversion between bytes and text.
+
+pub closed enum Utf8Error derives Eq, Render {
+    Invalid(at: usize)
+    OutOfMemory(mem::OutOfMemory) from
+} Utf8Error
+
+pub fn valid_prefix(bytes: Slice[u8]) -> usize limits pure, notrap, terminates
+    ensures result <= bytes.len()
+    example valid_prefix(b"ok\xFF") == 2
+    example valid_prefix(b"\xC3\xA9") == 2
+{
+    var next: usize = 0
+    for at in 0..<bytes.len() {
+        if at == next {
+            let Some(c) = char_at(bytes, at) else {
+                return at
+            }
+            next = at.saturating_add(c.utf8_len())
+        }
+    }
+    return bytes.len()
+} valid_prefix
+
+pub fn is_valid(bytes: Slice[u8]) -> bool limits pure, notrap, terminates
+    ensures result == (valid_prefix(bytes) == bytes.len())
+    example not is_valid(b"\xC3")
+{
+    return valid_prefix(bytes) == bytes.len()
+} is_valid
+
+pub fn char_at(bytes: Slice[u8], at: usize) -> Option[char] limits pure, notrap, terminates
+    example char_at(b"\xC3\xA9", at: 0) == Some('é')
+    example char_at(b"\xC3\xA9", at: 1) == None
+    example char_at(b"\xED\xA0\x80", at: 0) == None
+{
+    let Some(parts) = bytes.split_at(at) else {
+        return None
+    }
+    let rest = parts.tail
+    if rest.len() == 0 {
+        return None
+    }
+    let lead = u32.widen(rest[0])
+    if lead < 0x80 {
+        return char.checked_from_bits(lead)
+    }
+    if lead < 0xC2 or lead > 0xF4 {
+        return None
+    }
+    if lead < 0xE0 {
+        if rest.len() < 2 {
+            return None
+        }
+        if not is_continuation(rest[1]) {
+            return None
+        }
+        return char.checked_from_bits(((lead & 0x1F) << 6) | low_bits(rest[1]))
+    }
+    if lead < 0xF0 {
+        if rest.len() < 3 {
+            return None
+        }
+        if not is_continuation(rest[1]) or not is_continuation(rest[2]) {
+            return None
+        }
+        let value = ((lead & 0x0F) << 12) | (low_bits(rest[1]) << 6) | low_bits(rest[2])
+        if value < 0x800 {
+            return None
+        }
+        return char.checked_from_bits(value)
+    }
+    if rest.len() < 4 {
+        return None
+    }
+    if not is_continuation(rest[1]) or not is_continuation(rest[2]) {
+        return None
+    }
+    if not is_continuation(rest[3]) {
+        return None
+    }
+    let high = ((lead & 0x07) << 18) | (low_bits(rest[1]) << 12)
+    let value = high | (low_bits(rest[2]) << 6) | low_bits(rest[3])
+    if value < 0x1_0000 {
+        return None
+    }
+    return char.checked_from_bits(value)
+} char_at
+
+fn is_continuation(byte: u8) -> bool limits pure, notrap, terminates {
+    return (byte & 0xC0) == 0x80
+} is_continuation
+
+fn low_bits(byte: u8) -> u32 limits pure, notrap, terminates {
+    return u32.widen(byte & 0x3F)
+} low_bits
+
+pub fn write_char(c: char, mut out: SliceMut[u8]) -> usize limits pure, notrap, terminates
+    requires out.len() >= c.utf8_len()
+    ensures result == c.utf8_len()
+{
+    let encoded = encoding(c)
+    let count = c.utf8_len()
+    let Some(source) = encoded.view().prefix(count) else {
+        return count
+    }
+    let Some(head) = mut out.prefix_mut(count) else {
+        return count
+    }
+    var target = head
+    mut target.copy_from(source)
+    return count
+} write_char
+
+fn encoding(c: char) -> Array[u8, 4] limits pure, notrap, terminates {
+    var bytes = Array[u8, 4].filled(0)
+    let value = c.to_bits()
+    match c.utf8_len() {
+        1 => {
+            bytes[0] = u8.truncate(value)
+        }
+        2 => {
+            bytes[0] = 0xC0 | u8.truncate(value >> 6)
+            bytes[1] = continuation(value)
+        }
+        3 => {
+            bytes[0] = 0xE0 | u8.truncate(value >> 12)
+            bytes[1] = continuation(value >> 6)
+            bytes[2] = continuation(value)
+        }
+        else => {
+            bytes[0] = 0xF0 | u8.truncate(value >> 18)
+            bytes[1] = continuation(value >> 12)
+            bytes[2] = continuation(value >> 6)
+            bytes[3] = continuation(value)
+        }
+    }
+    return bytes
+} encoding
+
+fn continuation(bits: u32) -> u8 limits pure, notrap, terminates {
+    return 0x80 | u8.truncate(bits & 0x3F)
+} continuation
+
+test write_char_encodes_two_bytes for write_char {
+    var bytes = Array[u8, 4].filled(0)
+    var view = mut bytes.view_mut()
+    let count = write_char('é', out: mut view)
+    expect count == 2
+    expect bytes[0] == 0xC3
+    expect bytes[1] == 0xA9
+} write_char_encodes_two_bytes

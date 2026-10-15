@@ -413,6 +413,17 @@ test advance_counts_up for Ticker.advance {
 } advance_counts_up
 ```
 
+```nan
+pub fn reading(clock: sys::Clock) -> u64 fails sys::Revoked {
+    return try clock.elapsed_ms()
+} reading
+
+test reading_starts_at_zero for reading {
+    let world = testing::world()
+    expect (attempt reading(world.clock)) == Ok(0) // error: contract.impure-condition
+} reading_starts_at_zero
+```
+
 ## Assume
 
 `assume P because "why"` makes P a fact without proof or check.

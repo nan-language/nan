@@ -12,7 +12,7 @@ use crate::check::db::ItemId;
 use crate::check::props::Property;
 use crate::check::resolve::Named;
 use crate::check::sig::{FnSig, ParamSig, Payload, SigKind};
-use crate::check::tir::{Builtin, Call, Callee, LocalKind, TArg, TExpr, TKind};
+use crate::check::tir::{Builtin, Call, Callee, Lit, LocalKind, TArg, TExpr, TKind};
 use crate::check::ty::{Arg, Args, Const, FnTy, Param, Scalar, Subst, Ty, no_args};
 use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
@@ -153,6 +153,9 @@ pub struct Markers {
     pub mode: Option<(Mode, Tok)>,
     /// Whether a call further out of a projection chain takes `mut self` of this call's result.
     pub chain_mut: bool,
+    /// Whether the mode marks the root of the projection chain that is the receiver, which it
+    /// covers, rather than the receiver.
+    pub chained: bool,
     /// The last token of the receiver a method call passes for `self`.
     pub receiver: Option<Tok>,
     /// The first and last tokens of the call they mark, its markers aside.
@@ -601,7 +604,8 @@ impl Body<'_, '_> {
         };
         let db = &self.ck.db;
         let package = db.module(self.module).package;
-        if db.module_named(package, &alias.text).is_some() {
+        let own = db.std.get(alias.text.as_str()) == Some(&package);
+        if !own && db.module_named(package, &alias.text).is_some() {
             return None;
         }
         let aliased = db.alias(package, &alias.text)?;
@@ -1185,13 +1189,10 @@ impl Body<'_, '_> {
             self.skim_args(args);
             return TExpr::failed(token);
         }
-        let receiver_marker = if matches!(&receiver.kind, TKind::Call(call) if call.proj) {
-            None
-        } else {
-            markers.mode
-        };
+        let projected = matches!(&receiver.kind, TKind::Call(call) if call.proj);
         let markers = Markers {
-            mode: receiver_marker,
+            mode: markers.mode.filter(|_| !projected),
+            chained: projected && markers.mode.is_some(),
             ..markers
         };
         self.apply(token, callable, Some(receiver), args, expected, markers)
@@ -1327,14 +1328,16 @@ impl Body<'_, '_> {
                     &receiver.ty,
                 );
             }
-            self.check_mode(
-                (receiver.token, markers.receiver.unwrap_or(receiver.token)),
-                &receiver,
-                param.mode,
-                markers.mode,
-                markers.chain_mut,
-                true,
-            );
+            if !markers.chained {
+                self.check_mode(
+                    (receiver.token, markers.receiver.unwrap_or(receiver.token)),
+                    &receiver,
+                    param.mode,
+                    markers.mode,
+                    markers.chain_mut,
+                    true,
+                );
+            }
             typed_args.push(TArg {
                 expr: receiver,
                 mode: param.mode,
@@ -1947,10 +1950,16 @@ impl Body<'_, '_> {
         self.report_fixed(construct, code, vec![fix]);
     }
 
-    /// Whether a typed expression is a part: the result of a projection call, or a field of one.
+    /// Whether a typed expression is a part: the result of a projection call whose result type,
+    /// its type parameters counted as no view, is neither a view nor an `Option` or `Result`, or
+    /// a field of one.
     fn is_part(&self, expr: &TExpr) -> bool {
         match &expr.kind {
-            TKind::Call(call) => call.proj,
+            TKind::Call(call) => {
+                let result = &call.head.result;
+                let wrapped = matches!(result, Ty::Item(item, _) if self.wraps(*item));
+                call.proj && !wrapped && !self.ck.counts_as_view(result)
+            }
             TKind::Index(_) => true,
             TKind::Field { base, .. } => self.is_part(base),
             _ => false,
@@ -2597,13 +2606,13 @@ impl Body<'_, '_> {
             self.report(token, Code::ExprArgumentCount);
             return TExpr::failed(token);
         };
-        let holes = match &template.value.kind {
+        let (text, holes) = match &template.value.kind {
             ExprKind::Literal(literal)
                 if literal.kind == ast::LiteralKind::Text && template.label.is_none() =>
             {
                 let value = crate::syntax::literal::text_value(self.text(literal.tokens[0]));
                 match template_holes(&value) {
-                    Some(holes) => holes,
+                    Some(holes) => (value, holes),
                     None => {
                         self.report(template.token, Code::TextTemplateMalformed);
                         return TExpr::failed(token);
@@ -2616,7 +2625,15 @@ impl Body<'_, '_> {
             }
         };
         let mut names: Vec<String> = Vec::new();
-        let mut typed_args = Vec::new();
+        let text_arg = |token: Tok, text: String, str_ty: Ty| TArg {
+            expr: TExpr {
+                token,
+                ty: str_ty,
+                kind: TKind::Literal(Lit::Text(text)),
+            },
+            mode: Mode::Read,
+        };
+        let mut typed_args = vec![text_arg(template.token, text, self.ck.str_ty())];
         let render = self.ck.db.core_item("Render");
         for arg in rest {
             let name = match arg.label_name() {
@@ -2641,7 +2658,8 @@ impl Body<'_, '_> {
             if !holes.contains(&name) {
                 self.report(arg.token, Code::TextArgumentUnused);
             }
-            names.push(name);
+            names.push(name.clone());
+            typed_args.push(text_arg(arg.token, name, self.ck.str_ty()));
             let (marker, value) = self.marked_value(&arg.value);
             if let Some((_, marker)) = marker {
                 self.report(marker, Code::ModeMismatch);

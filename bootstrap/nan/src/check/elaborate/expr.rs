@@ -836,6 +836,12 @@ impl Elab<'_, '_> {
                 }
                 other => Some(other),
             },
+            (Out::Operand(operand), Mode::Mut) => {
+                let slot = self.slot_holding(operand, &expr.ty, expr.token);
+                self.temps.push(slot);
+                self.scopes[self.temp_scope].slots.push(slot);
+                Some(Operand::Place(Mode::Mut, Place::of(slot)))
+            }
             (Out::Operand(operand), _) => Some(operand),
             (Out::Place(place), Mode::Read) => Some(self.read_operand(place, &expr.ty, span)),
             (Out::Place(place), Mode::Mut) => Some(Operand::Place(Mode::Mut, place)),

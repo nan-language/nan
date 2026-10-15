@@ -1,10 +1,21 @@
-//! The std operations the interpreter supplies: named and bit conversions, the members of
-//! scalars, ranges, slices, cursors, `Option`, `Untrusted` and texts, the std containers, the
-//! testing world, the conformances of scalars and the methods derives write.
+//! The std operations the interpreter supplies, its supplied operations and intrinsics: named
+//! and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted`
+//! and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the
+//! capabilities of the testing world, channels, rendering, and the conformances the toolchain
+//! supplies and the methods derives write.
 
+mod atomics;
+mod codecs;
+mod collections;
+mod hardware;
+mod hashing;
 mod numbers;
 mod pointers;
+mod render;
+mod sims;
 mod stores;
+mod tasks;
+mod text;
 
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -29,11 +40,14 @@ pub fn call(
     site: Site,
 ) -> Exec<Flow> {
     let path = interp.ck.db.canonical(item);
+    let (owner, member) = path.rsplit_once('.').unwrap_or((path.as_str(), ""));
+    if let Some(flow) = hardware::member(interp, owner, member, type_args, &args, at, site) {
+        return flow;
+    }
     let stated = crate::check::stated(&path);
     if stated.is_some_and(|facts| facts.device || facts.privileged) {
         return Err(interp.uninterpretable(at));
     }
-    let (owner, member) = path.rsplit_once('.').unwrap_or((path.as_str(), ""));
     if let Some(scalar) = owner.strip_prefix("core::").and_then(Scalar::from_name) {
         return numbers::scalar_member(interp, scalar, member, &args, at);
     }
@@ -42,32 +56,42 @@ pub fn call(
     {
         return flow;
     }
-    if let Some(flow) = stores::member(interp, owner, member, type_args, &args, at) {
+    if let Some(flow) = stores::member(interp, owner, member, type_args, &args, at, site) {
+        return flow;
+    }
+    if let Some(flow) = collections::member(interp, owner, member, type_args, &args, at, site) {
+        return flow;
+    }
+    if let Some(flow) = text::member(interp, owner, member, type_args, &args, at, site) {
+        return flow;
+    }
+    if let Some(flow) = sims::member(interp, owner, member, type_args, &args) {
+        return flow;
+    }
+    if let Some(flow) = codecs::member(interp, owner, member, type_args, &args, at, site) {
+        return flow;
+    }
+    if let Some(flow) = tasks::member(interp, owner, member, type_args, &args, at) {
+        return flow;
+    }
+    if let Some(flow) = owner
+        .strip_prefix("core::atomic::")
+        .and_then(|name| atomics::member(interp, name, member, &args))
+    {
+        return flow;
+    }
+    if let Some(flow) = (owner == "core::Renderer")
+        .then(|| render::renderer(interp, member, &args))
+        .flatten()
+    {
         return flow;
     }
     let option_item = interp.ty_item("core", "Option");
     let option = || option_item;
     let value = match (owner, member) {
         ("core::Range", "next") => range_next(interp, &args[0]),
-        ("core::Range", "contains") => {
-            let range = interp.deref(&args[0]);
-            let fields = range.fields();
-            let value = args[1].int();
-            let (low, high, inclusive) = (fields[0].int(), fields[1].int(), fields[2].bool());
-            Val::Bool(low <= value && (value < high || (inclusive && value <= high)))
-        }
-        ("core::Range", "is_empty") => {
-            let range = interp.deref(&args[0]);
-            let fields = range.fields();
-            let (low, high, inclusive) = (fields[0].int(), fields[1].int(), fields[2].bool());
-            Val::Bool(high < low || (!inclusive && high <= low))
-        }
-        ("core::Slice" | "core::SliceMut" | "mem::List" | "mem::Bytes", "len")
-        | ("core::Str", "byte_len") => Val::Int(interp.view(&args[0]).len as i128),
-        (
-            "core::Slice" | "core::SliceMut" | "core::Array" | "mem::List" | "mem::Bytes",
-            "at" | "at_mut",
-        ) => {
+        ("core::Slice" | "core::SliceMut", "len") => Val::Int(interp.view(&args[0]).len as i128),
+        ("core::Slice" | "core::SliceMut" | "core::Array", "at" | "at_mut") => {
             let view = interp.view(&args[0]);
             let index = args[1].int();
             if index < 0 || index as usize >= view.len {
@@ -75,16 +99,43 @@ pub fn call(
             }
             Val::Ref(view.array.with((view.start + index as usize) as u32))
         }
-        (
-            "core::Slice" | "core::SliceMut" | "core::Array" | "core::Str" | "mem::List"
-            | "mem::Bytes",
-            "cursor" | "cursor_mut",
-        ) => {
-            let cursor = interp.ty_item("core", "SliceCursor");
+        ("core::Slice" | "core::SliceMut" | "core::Array", "cursor" | "cursor_mut") => {
+            let name = match member {
+                "cursor" => "SliceCursor",
+                _ => "SliceCursorMut",
+            };
+            let cursor = interp.ty_item("core", name);
             Val::Struct(cursor, Rc::new(vec![Val::View(interp.view(&args[0]))]))
         }
         ("core::SliceCursor" | "core::SliceCursorMut", "next") => slice_next(interp, &args[0]),
-        ("core::Array" | "mem::List" | "mem::Bytes", "view" | "view_mut")
+        ("core::Str", "cursor") => {
+            let cursor = interp.ty_item("core", "CharCursor");
+            Val::Struct(cursor, Rc::new(vec![Val::View(interp.view(&args[0]))]))
+        }
+        ("core::CharCursor", "next") => char_next(interp, &args[0]),
+        ("core::Array", "into_cursor") => {
+            let cursor = interp.ty_item("core", "ArrayCursor");
+            Val::Struct(cursor, Rc::new(vec![interp.deref(&args[0]), Val::Int(0)]))
+        }
+        ("core::ArrayCursor", "next") => array_next(interp, &args[0]),
+        ("core::SliceMut", "fill") => {
+            let view = interp.view(&args[0]);
+            for index in 0..view.len {
+                let element = view.array.with((view.start + index) as u32);
+                interp.memory.set(&element, args[1].clone());
+            }
+            Val::Unit
+        }
+        ("core::SliceMut", "copy_from") => {
+            let view = interp.view(&args[0]);
+            let source = interp.view(&args[1]);
+            for (index, value) in interp.view_values(&source).into_iter().enumerate() {
+                let element = view.array.with((view.start + index) as u32);
+                interp.memory.set(&element, value);
+            }
+            Val::Unit
+        }
+        ("core::Array", "view" | "view_mut")
         | ("core::SliceMut", "view")
         | ("core::Str", "as_bytes") => Val::View(interp.view(&args[0])),
         ("core::Slice" | "core::SliceMut", "prefix" | "prefix_mut") => {
@@ -142,7 +193,6 @@ pub fn call(
             }
             Val::Unit
         }
-        ("core::Str", "is_empty") => Val::Bool(interp.view(&args[0]).len == 0),
         ("core::Str", "slice_bytes") => {
             let view = interp.view(&args[0]);
             let bytes = interp.bytes(&args[0]);
@@ -161,52 +211,29 @@ pub fn call(
                 false => Val::none(option()),
             }
         }
-        ("core::Str", "starts_with" | "ends_with" | "find") => {
-            let text = interp.bytes(&args[0]);
-            let needle = interp.bytes(&args[1]);
-            match member {
-                "starts_with" => Val::Bool(text.starts_with(&needle)),
-                "ends_with" => Val::Bool(text.ends_with(&needle)),
-                _ => {
-                    let found = (needle.len() <= text.len())
-                        .then(|| {
-                            (0..=text.len() - needle.len())
-                                .find(|start| text[*start..].starts_with(&needle))
-                        })
-                        .flatten();
-                    match found {
-                        Some(start) => Val::some(option(), Val::Int(start as i128)),
-                        None => Val::none(option()),
-                    }
-                }
-            }
-        }
         ("core::Option", "value_or") => match interp.deref(&args[0]) {
             Val::Variant(_, 0, payload) => payload[0].clone(),
             _ => args[1].clone(),
         },
-        ("core::Option" | "core::Result", "is_some" | "is_ok") => {
-            Val::Bool(matches!(interp.deref(&args[0]), Val::Variant(_, 0, _)))
+        ("core::Option", "extract") => {
+            let Val::Ref(place) = &args[0] else {
+                panic!("an option passed by mut");
+            };
+            let held = interp.memory.get(place).clone();
+            interp.memory.set(place, Val::none(option()));
+            held
         }
-        ("core::Option" | "core::Result", "is_none" | "is_err") => {
-            Val::Bool(matches!(interp.deref(&args[0]), Val::Variant(_, 1, _)))
-        }
-        ("core::TotalF64" | "core::TotalF32", "eq" | "cmp") => {
+        ("core::TotalF64" | "core::TotalF32", "cmp") => {
             let (left, right) = (interp.deref(&args[0]), interp.deref(&args[1]));
-            let (left, right) = (&left.fields()[0], &right.fields()[0]);
-            let order = interp.order(left, right);
-            match member {
-                "eq" => Val::Bool(order == Ordering::Equal),
-                _ => ordering_value(interp.ty_item("core", "Ordering"), order),
-            }
+            let order = interp.order(&left.fields()[0], &right.fields()[0]);
+            ordering_value(interp.ty_item("core", "Ordering"), order)
         }
         ("core::Untrusted", "of") => {
             let untrusted = interp.ty_item("core", "Untrusted");
             Val::Struct(untrusted, Rc::new(vec![args[0].clone()]))
         }
-        ("core::Untrusted", "inspect" | "into_cleared") => {
-            interp.deref(&args[0]).fields()[0].clone()
-        }
+        ("core::Untrusted", "inspect") => interp.deref(&args[0]).fields()[0].clone(),
+        ("core::Untrusted", "into_cleared") => cleared(interp, &interp.deref(&args[0]).fields()[0]),
         ("core::Untrusted", "byte_len") => {
             let inner = interp.deref(&args[0]).fields()[0].clone();
             Val::Int(interp.view(&inner).len as i128)
@@ -215,6 +242,35 @@ pub fn call(
             let inner = interp.deref(&args[0]).fields()[0].clone();
             let untrusted = interp.ty_item("core", "Untrusted");
             Val::Struct(untrusted, Rc::new(vec![Val::View(interp.view(&inner))]))
+        }
+        ("core::Untrusted", "append" | "try_append") => {
+            let Val::Ref(place) = &args[0] else {
+                panic!("an Untrusted value passed by mut");
+            };
+            let bytes = interp.deref(&args[1]).fields()[0].clone();
+            let view = interp.view(&bytes);
+            let values = interp.view_values(&view);
+            let byte = Ty::Scalar(Scalar::U8);
+            if stores::append(interp, &place.with(0), &values, &byte).is_none() {
+                return stores::exhausted(interp, member == "try_append", at);
+            }
+            Val::Unit
+        }
+        ("core::Untrusted", "copy_prefix" | "try_copy_prefix") => {
+            let inner = interp.deref(&args[0]).fields()[0].clone();
+            let view = interp.view(&inner);
+            let count = args[1].int() as usize;
+            if count > view.len {
+                return Err(interp.trap("trap.requires", at));
+            }
+            let values = interp.view_values(&View { len: count, ..view });
+            let cell = stores::cell_of(interp, &args[2]);
+            let byte = Ty::Scalar(Scalar::U8);
+            let Some(bytes) = stores::holding(interp, "mem::Bytes", values, cell, &byte) else {
+                return stores::exhausted(interp, member == "try_copy_prefix", at);
+            };
+            let untrusted = interp.ty_item("core", "Untrusted");
+            Val::Struct(untrusted, Rc::new(vec![bytes]))
         }
         ("core::Untrusted", "prefix" | "split_at") => {
             let inner = interp.deref(&args[0]).fields()[0].clone();
@@ -247,10 +303,26 @@ pub fn call(
             };
             Val::Array(Rc::new(vec![args[0].clone(); count]))
         }
-        ("testing::world", "") => interp.world(),
+        ("testing::same", "") => Val::Bool(interp.equal(&args[0], &args[1])),
         _ => return Err(End::Missing),
     };
     Ok(Flow::Return(value))
+}
+
+/// Contents with every byte set to 0: the elements of an array, or the storage of a byte list.
+fn cleared(interp: &mut Interpreter, contents: &Val) -> Val {
+    match contents {
+        Val::Array(elements) => Val::Array(Rc::new(vec![Val::Int(0); elements.len()])),
+        Val::Struct(..) => {
+            let storage = stores::storage(interp, contents);
+            let len = interp.memory.get(&storage).fields().len();
+            interp
+                .memory
+                .set(&storage, Val::Array(Rc::new(vec![Val::Int(0); len])));
+            contents.clone()
+        }
+        other => other.clone(),
+    }
 }
 
 /// The width in bytes and byte order, most significant first when `true`, of an integer reader
@@ -319,6 +391,58 @@ fn range_next(interp: &mut Interpreter, cursor: &Val) -> Val {
     Val::some(option, element(low))
 }
 
+/// The `next` of a char cursor: the char its bytes start with, then the bytes past it.
+fn char_next(interp: &mut Interpreter, cursor: &Val) -> Val {
+    let Val::Ref(loc) = cursor else {
+        panic!("a cursor passed by mut");
+    };
+    let state = interp.memory.get(loc).clone();
+    let Val::Struct(item, fields) = &state else {
+        panic!("a char cursor value");
+    };
+    let Val::View(view) = &fields[0] else {
+        panic!("a char cursor's view");
+    };
+    let option = interp.ck.db.core_item("Option").expect("core::Option");
+    let bytes: Vec<u8> = interp
+        .view_values(view)
+        .iter()
+        .take(4)
+        .map(|byte| byte.int() as u8)
+        .collect();
+    let Some(c) = String::from_utf8_lossy(&bytes).chars().next() else {
+        return Val::none(option);
+    };
+    let rest = View {
+        array: view.array.clone(),
+        start: view.start + c.len_utf8(),
+        len: view.len - c.len_utf8(),
+    };
+    interp
+        .memory
+        .set(loc, Val::Struct(*item, Rc::new(vec![Val::View(rest)])));
+    Val::some(option, Val::Char(c))
+}
+
+/// The `next` of an array cursor: the element at its position, which then moves past it.
+fn array_next(interp: &mut Interpreter, cursor: &Val) -> Val {
+    let Val::Ref(loc) = cursor else {
+        panic!("a cursor passed by mut");
+    };
+    let state = interp.memory.get(loc).clone();
+    let Val::Struct(item, fields) = &state else {
+        panic!("an array cursor value");
+    };
+    let option = interp.ck.db.core_item("Option").expect("core::Option");
+    let position = fields[1].int() as usize;
+    let Some(element) = fields[0].fields().get(position).cloned() else {
+        return Val::none(option);
+    };
+    let next = vec![fields[0].clone(), Val::Int(position as i128 + 1)];
+    interp.memory.set(loc, Val::Struct(*item, Rc::new(next)));
+    Val::some(option, element)
+}
+
 /// The `next` of a slice cursor: a reference to its first element, then the rest.
 fn slice_next(interp: &mut Interpreter, cursor: &Val) -> Val {
     let Val::Ref(loc) = cursor else {
@@ -349,30 +473,78 @@ fn slice_next(interp: &mut Interpreter, cursor: &Val) -> Val {
 
 /// A method of an interface a type implements through a conformance the toolchain supplies;
 /// a run reaching one the interpreter does not supply ends missing.
-pub fn conformance(interp: &mut Interpreter, ty: &Ty, method: &str, args: Vec<Val>) -> Exec<Flow> {
+pub fn conformance(
+    interp: &mut Interpreter,
+    ty: &Ty,
+    method: &str,
+    type_args: &[Arg],
+    args: Vec<Val>,
+    at: (ItemId, Span),
+    site: Site,
+) -> Exec<Flow> {
+    match method {
+        "render" => render::builtin(interp, ty, &args, at, site)?,
+        "hash" => {
+            let hasher = type_args.get(1).and_then(Arg::ty);
+            hashing::builtin(interp, ty, hasher, &args, at, site)?;
+        }
+        _ => {}
+    }
     let values: Vec<Val> = args.iter().map(|arg| interp.deref(arg)).collect();
     let value = match method {
+        "render" | "hash" => Val::Unit,
         "eq" => Val::Bool(interp.equal(&values[0], &values[1])),
         "cmp" => {
             let ordering = interp.ty_item("core", "Ordering");
             ordering_value(ordering, interp.order(&values[0], &values[1]))
         }
-        "default" => default_of(ty),
+        "default" => default_of(interp, ty, at, site)?,
         _ => return Err(End::Missing),
     };
     Ok(Flow::Return(value))
 }
 
-/// The default of a scalar type.
-fn default_of(ty: &Ty) -> Val {
-    match ty {
+/// The default of a type whose `Default` the toolchain supplies: 0 or its like for a scalar,
+/// the empty text for a fixed text, and the default of each element for an array.
+fn default_of(interp: &mut Interpreter, ty: &Ty, at: (ItemId, Span), site: Site) -> Exec<Val> {
+    Ok(match ty {
         Ty::Scalar(Scalar::Bool) => Val::Bool(false),
         Ty::Scalar(Scalar::Char) => Val::Char('\0'),
         Ty::Scalar(Scalar::F32) => Val::F32(0.0),
         Ty::Scalar(Scalar::F64) => Val::F64(0.0),
         Ty::Scalar(_) => Val::Int(0),
+        Ty::Item(item, args) => {
+            let count = match args.get(1) {
+                Some(Arg::Const(crate::check::ty::Const::Int(count))) => *count as usize,
+                _ => 0,
+            };
+            match interp.ck.db.canonical(*item).as_str() {
+                "text::Fixed" => {
+                    let bound = match args.first() {
+                        Some(Arg::Const(crate::check::ty::Const::Int(bound))) => *bound as usize,
+                        _ => 0,
+                    };
+                    let bytes = Val::Array(Rc::new(vec![Val::Int(0); bound]));
+                    Val::Struct(*item, Rc::new(vec![bytes, Val::Int(0)]))
+                }
+                "core::Array" => {
+                    let element = args.first().and_then(Arg::ty).cloned().unwrap_or(Ty::Unit);
+                    let value = collections::conformance(
+                        interp,
+                        "Default",
+                        "default",
+                        &element,
+                        Vec::new(),
+                        at,
+                        site,
+                    )?;
+                    Val::Array(Rc::new(vec![value; count]))
+                }
+                _ => return Err(End::Missing),
+            }
+        }
         _ => Val::Unit,
-    }
+    })
 }
 
 pub fn ordering_value(item: ItemId, order: Ordering) -> Val {
@@ -385,17 +557,25 @@ pub fn ordering_value(item: ItemId, order: Ordering) -> Val {
 }
 
 /// A method a derive writes for a type: equality and order over its fields or variants in
-/// declaration order, and the default of a struct of scalars; a run reaching another ends
-/// missing.
+/// declaration order, its rendering and hash, and the default of a struct; a run reaching
+/// another ends missing.
 pub fn derived(
     interp: &mut Interpreter,
     owner: ItemId,
     type_args: &[Arg],
     method: &str,
     args: Vec<Val>,
+    at: (ItemId, Span),
+    site: Site,
 ) -> Exec<Flow> {
+    match method {
+        "render" => render::derived(interp, owner, type_args, &args, at, site)?,
+        "hash" => hashing::derived(interp, owner, type_args, &args, at, site)?,
+        _ => {}
+    }
     let values: Vec<Val> = args.iter().map(|arg| interp.deref(arg)).collect();
     let value = match method {
+        "render" | "hash" => Val::Unit,
         "eq" => Val::Bool(interp.equal(&values[0], &values[1])),
         "cmp" => {
             let ordering = interp.ty_item("core", "Ordering");
@@ -411,10 +591,15 @@ pub fn derived(
             let mut values = Vec::new();
             for field in fields {
                 let ty = subst.ty(&field.ty);
-                match ty {
-                    Ty::Scalar(_) => values.push(default_of(&ty)),
-                    _ => return Err(End::Missing),
-                }
+                values.push(collections::conformance(
+                    interp,
+                    "Default",
+                    "default",
+                    &ty,
+                    Vec::new(),
+                    at,
+                    site,
+                )?);
             }
             Val::Struct(owner, Rc::new(values))
         }
@@ -423,20 +608,23 @@ pub fn derived(
     Ok(Flow::Return(value))
 }
 
-/// An intrinsic the toolchain supplies: a `Dyn` view. A run reaching `text::fmt` ends missing,
-/// and the others bring a fact that makes them uninterpretable.
+/// An intrinsic the toolchain supplies: a `Dyn` view or a template, and the rendering of a
+/// template; the others bring a fact that makes them uninterpretable.
 pub fn intrinsic(
     interp: &mut Interpreter,
     path: &str,
     type_args: &[Arg],
     args: Vec<Val>,
     at: (ItemId, Span),
+    site: Site,
 ) -> Exec<Flow> {
+    if let Some(flow) = render::intrinsic(interp, path, type_args, args.clone(), at, site) {
+        return flow;
+    }
     match path {
         "Dyn.view" => dyn_view(interp, type_args, &args[0])
             .map(Flow::Return)
             .ok_or(End::Missing),
-        "text::fmt" => Err(End::Missing),
         _ => Err(interp.uninterpretable(at)),
     }
 }
@@ -464,14 +652,10 @@ fn dyn_view(interp: &Interpreter, type_args: &[Arg], value: &Val) -> Option<Val>
     })))
 }
 
-/// Releases the memory a value's std containers own.
+/// Releases what a value owns: the memory of the std containers, stores, boxes and shared
+/// values it holds.
 pub fn release(interp: &mut Interpreter, value: &Val) {
-    if let Val::Struct(item, _) = value {
-        let path = interp.ck.db.canonical(*item);
-        if matches!(path.as_str(), "mem::List" | "mem::Bytes" | "mem::Pool") {
-            stores::release(interp, value);
-        }
-    }
+    stores::release(interp, value);
 }
 
 impl Interpreter<'_, '_> {
@@ -532,27 +716,6 @@ impl Interpreter<'_, '_> {
             .collect()
     }
 
-    /// The world `testing::world()` returns: its allocator names a new root cell, and each
-    /// other capability is a value of its type.
-    fn world(&mut self) -> Val {
-        let world = self.ty_item("host", "World");
-        let SigKind::Struct { fields } = &self.ck.sig(world).kind else {
-            panic!("host::World is a struct");
-        };
-        let fields = fields.clone();
-        let alloc = self.ty_item("mem", "Alloc");
-        let cell = self.budgets.root(stores::WORLD_LIMIT);
-        let values = fields
-            .iter()
-            .map(|field| match &field.ty {
-                Ty::Item(item, _) if *item == alloc => stores::allocator(self, cell),
-                Ty::Item(item, _) => Val::Struct(*item, Rc::new(Vec::new())),
-                _ => Val::Unit,
-            })
-            .collect();
-        Val::Struct(world, Rc::new(values))
-    }
-
     /// A std type item, by its module and name.
     pub fn ty_item(&self, module: &str, name: &str) -> ItemId {
         self.ck
@@ -591,7 +754,8 @@ impl Interpreter<'_, '_> {
     }
 
     /// Structural order: scalars by value, enum values by variant then payload, structs and
-    /// arrays part by part in order.
+    /// arrays part by part in order, the std types the interpreter models by their compared
+    /// parts.
     pub(super) fn order(&self, left: &Val, right: &Val) -> Ordering {
         match (self.deref(left), self.deref(right)) {
             (Val::F32(a), Val::F32(b)) => a.total_cmp(&b),
@@ -603,11 +767,35 @@ impl Interpreter<'_, '_> {
             (Val::Variant(_, a, payload_a), Val::Variant(_, b, payload_b)) => a
                 .cmp(&b)
                 .then_with(|| self.order_all(&payload_a, &payload_b)),
-            (Val::Struct(_, a), Val::Struct(_, b)) | (Val::Array(a), Val::Array(b)) => {
-                self.order_all(&a, &b)
+            (a @ Val::Struct(..), b @ Val::Struct(..)) => {
+                self.order_all(&self.compared(&a), &self.compared(&b))
             }
+            (Val::Array(a), Val::Array(b)) => self.order_all(&a, &b),
             (Val::Unit, Val::Unit) => Ordering::Equal,
             (a, b) => a.int().cmp(&b.int()),
+        }
+    }
+
+    /// The parts structural order compares of a struct: a collection's elements, a fixed
+    /// text's bytes, a box's or shared value's contents, the memory a store or once map holds,
+    /// a capability's table entry, and the fields of any other struct.
+    fn compared(&self, value: &Val) -> Vec<Val> {
+        let Val::Struct(item, fields) = value else {
+            panic!("a struct value");
+        };
+        let identity = |loc: &Loc| vec![Val::Int(i128::from(loc.extent))];
+        match self.ck.db.canonical(*item).as_str() {
+            "mem::List" | "mem::Bytes" | "mem::Map" | "mem::HashMap" | "mem::Set"
+            | "text::String" => self.deref(&fields[0]).fields().to_vec(),
+            "text::Fixed" => fields[0].fields()[..fields[1].int() as usize].to_vec(),
+            "mem::Box" | "mem::Shared" => vec![self.deref(&fields[0])],
+            "mem::Pool" | "mem::Arena" | "mem::OnceMap" | "text::Interner" | "sys::Fs"
+            | "sys::Net" | "sys::Clock" | "sys::Random" | "sys::Log" | "sys::Stdio"
+            | "task::Executor" => match &fields[0] {
+                Val::Ref(loc) => identity(loc),
+                other => vec![other.clone()],
+            },
+            _ => fields.to_vec(),
         }
     }
 
@@ -621,3 +809,6 @@ impl Interpreter<'_, '_> {
         left.len().cmp(&right.len())
     }
 }
+
+#[cfg(test)]
+mod tests;

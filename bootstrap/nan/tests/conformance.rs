@@ -1,5 +1,5 @@
 //! The conformance harness: runs each `nan` example of a specification chapter against its marker
-//! comments, one test per chapter.
+//! comments and finds each item of its `nan-api` blocks in the std sources, one test per chapter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,9 @@ fn checked(code: &str) -> bool {
 }
 
 const SUMMARY: &str = "//! Specification example.";
+
+/// The std sources, relative to the crate.
+const STD: &str = "../../std";
 
 const MANIFEST: &str = "//! Specification example.
 
@@ -262,12 +265,127 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The items of a declaration text, each the lines from a column-0 head to before the next,
+/// without trailing blank lines.
+fn chunks(lines: &[&str]) -> Vec<Vec<String>> {
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    for line in lines {
+        let starts = !line.is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('}')
+            && !line.starts_with("//");
+        if starts {
+            chunks.push(Vec::new());
+        }
+        if let Some(chunk) = chunks.last_mut() {
+            chunk.push((*line).to_owned());
+        }
+    }
+    for chunk in &mut chunks {
+        while chunk.last().is_some_and(|line| line.is_empty()) {
+            chunk.pop();
+        }
+    }
+    chunks
+}
+
+/// The items the source files of a std module declare.
+fn std_items(module: &str) -> std::io::Result<Vec<Vec<String>>> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(STD)
+        .join(module.replace("::", "/"));
+    let mut items = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "nan") {
+            let text = fs::read_to_string(path)?;
+            items.extend(chunks(&text.lines().collect::<Vec<_>>()));
+        }
+    }
+    Ok(items)
+}
+
+/// Whether a std item declares a `nan-api` block's item with exactly its text: the same head and
+/// members, the std item adding only a body, clauses and private fields.
+fn declares(declared: &[String], published: &[String]) -> bool {
+    let head = &published[0];
+    if declared[0] != *head && declared[0] != format!("{head} {{") {
+        return false;
+    }
+    let function = head.contains("fn ");
+    let text: &[String] = match declared.iter().position(|line| line == "{") {
+        Some(opener) if function => &declared[..opener],
+        _ if function && declared[0] != *head => &declared[..1],
+        _ => declared,
+    };
+    let mut lines = published.iter().peekable();
+    for (index, line) in text.iter().enumerate() {
+        let matches = lines.peek().is_some_and(|next| {
+            *next == line || (index == 0 && line.strip_suffix(" {") == Some(next.as_str()))
+        });
+        if matches {
+            lines.next();
+            continue;
+        }
+        let extra = match function {
+            true => line.starts_with("    "),
+            false => {
+                line.starts_with("    ")
+                    && !line.starts_with("    pub ")
+                    && !line.starts_with("    pkg ")
+            }
+        };
+        if !extra {
+            return false;
+        }
+    }
+    lines.next().is_none()
+}
+
+/// The items of each `nan-api` block of a chapter that their std module does not declare with
+/// exactly their text, by the line of the block.
+fn api_failures(text: &str) -> std::io::Result<Vec<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut failures = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index] != "```nan-api" {
+            index += 1;
+            continue;
+        }
+        let module = lines[index + 1]
+            .strip_prefix("// module: ")
+            .expect("a block names its module");
+        let start = index + 2;
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|line| *line == "```")
+                .expect("a block ends");
+        let declared = std_items(module)?;
+        for published in chunks(&lines[start..end]) {
+            if !declared.iter().any(|item| declares(item, &published)) {
+                failures.push(format!(
+                    "{}: {module} lacks\n{}",
+                    index + 1,
+                    published.join("\n")
+                ));
+            }
+        }
+        index = end + 1;
+    }
+    Ok(failures)
+}
+
 fn chapter(path: &Utf8Path, text: String) -> datatest_stable::Result<()> {
     let chapter = path.file_stem().expect("a chapter file");
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("conformance")
         .join(chapter);
-    let mut failures = Vec::new();
+    let mut failures: Vec<String> = api_failures(&text)?
+        .into_iter()
+        .map(|failure| format!("{path}:{failure}"))
+        .collect();
     for example in examples(&text) {
         let dir = root.join(example.line.to_string());
         match run(&example, &dir) {

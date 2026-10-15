@@ -14,7 +14,7 @@ mod tests;
 use std::rc::Rc;
 
 use crate::check::Checker;
-use crate::check::db::ItemId;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::param_arg;
 use crate::check::tir::ClauseRole;
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
@@ -71,7 +71,7 @@ impl Checker<'_> {
             return done.clone();
         }
         let sites = self.db.about(Some(item), || match self.unit(item) {
-            Some(unit) if !self.db.is_std(item) => self.decide_unit(item, &unit),
+            Some(unit) if !self.db.is_carried(item) => self.decide_unit(item, &unit),
             _ => Vec::new(),
         });
         let sites = Rc::new(sites);
@@ -313,16 +313,6 @@ impl Checker<'_> {
             .iter()
             .map(|(scalar, arg)| constant(&mut terms, *scalar, arg))
             .collect();
-        let own_args: Vec<Arg> = self.sig(holder).generics.iter().map(param_arg).collect();
-        let own_params: Vec<TermId> = self
-            .sig(holder)
-            .generics
-            .iter()
-            .filter_map(|def| {
-                def.constant
-                    .map(|scalar| constant(&mut terms, scalar, &param_arg(def)))
-            })
-            .collect();
         let mut walk = Walk::new(
             self,
             holder,
@@ -333,24 +323,7 @@ impl Checker<'_> {
             Vec::new(),
             Vec::new(),
         );
-        let premises: Vec<TermId> = self
-            .unit(holder)
-            .iter()
-            .flat_map(|own| {
-                own.functions
-                    .iter()
-                    .filter(|function| function.role == Role::Where)
-            })
-            .filter_map(|function| {
-                walk.returned(
-                    holder,
-                    Role::Where,
-                    function.index,
-                    &own_args,
-                    own_params.clone(),
-                )
-            })
-            .collect();
+        let premises = self.where_facts(holder, &mut walk);
         let goals: Vec<TermId> = conditions
             .iter()
             .filter_map(|index| walk.returned(target, Role::Where, *index, args, params.clone()))
@@ -358,6 +331,47 @@ impl Checker<'_> {
         goals
             .into_iter()
             .all(|goal| self.entails(&mut terms, package, &premises, goal))
+    }
+
+    /// The facts the `where` conditions of the const parameters in scope in an item give: those
+    /// of its own and of the type it is a member of.
+    fn where_facts(&self, item: ItemId, walk: &mut Walk) -> Vec<TermId> {
+        let mut holders = vec![item];
+        if let Some(TypeKey::Item(owner)) = self.db.owners.get(&item) {
+            holders.push(*owner);
+        }
+        let mut facts = Vec::new();
+        for holder in holders {
+            let Some(unit) = self.unit(holder) else {
+                continue;
+            };
+            let generics = self.sig(holder).generics.clone();
+            let args: Vec<Arg> = generics.iter().map(param_arg).collect();
+            let params: Vec<TermId> = generics
+                .iter()
+                .filter_map(|def| {
+                    def.constant.map(|scalar| {
+                        let constant = term::Op::Constant(crate::nir::Constant::Param(def.param));
+                        walk.terms
+                            .intern(Term::App(constant, Vec::new()), Ty::Scalar(scalar))
+                    })
+                })
+                .collect();
+            for function in unit
+                .functions
+                .iter()
+                .filter(|function| function.role == Role::Where)
+            {
+                facts.extend(walk.returned(
+                    holder,
+                    Role::Where,
+                    function.index,
+                    &args,
+                    params.clone(),
+                ));
+            }
+        }
+        facts
     }
 
     /// Whether premises entail a goal: the procedure proves the query of the premises and goal.
@@ -470,53 +484,56 @@ impl Checker<'_> {
             Vec::new(),
             Vec::new(),
         );
-        walk.opaquely(|walk| match function.role {
-            Role::Body
-            | Role::Default
-            | Role::Entry
-            | Role::Requires
-            | Role::Old
-            | Role::Decreases => {
-                let boundary = self.is_boundary(item);
-                for (term, param) in params.iter().zip(&item_params) {
-                    walk.predicate_facts(*term, &subst.ty(&param.ty), boundary, &mut facts);
-                }
-                if function.role != Role::Entry {
-                    for requires in self.entry_requires(item) {
-                        let Callable::Item {
-                            item: holder,
-                            index,
-                            ..
-                        } = requires.callable
-                        else {
-                            continue;
-                        };
-                        if function.role == Role::Requires
-                            && holder == item
-                            && index >= function.index
-                        {
-                            continue;
-                        }
-                        let args = subst.args(&requires.args);
-                        if let Some(fact) =
-                            walk.returned(holder, Role::Requires, index, &args, params.clone())
-                        {
-                            facts.push(fact);
+        walk.opaquely(|walk| {
+            facts.extend(self.where_facts(item, walk));
+            match function.role {
+                Role::Body
+                | Role::Default
+                | Role::Entry
+                | Role::Requires
+                | Role::Old
+                | Role::Decreases => {
+                    let boundary = self.is_boundary(item);
+                    for (term, param) in params.iter().zip(&item_params) {
+                        walk.predicate_facts(*term, &subst.ty(&param.ty), boundary, &mut facts);
+                    }
+                    if function.role != Role::Entry {
+                        for requires in self.entry_requires(item) {
+                            let Callable::Item {
+                                item: holder,
+                                index,
+                                ..
+                            } = requires.callable
+                            else {
+                                continue;
+                            };
+                            if function.role == Role::Requires
+                                && holder == item
+                                && index >= function.index
+                            {
+                                continue;
+                            }
+                            let args = subst.args(&requires.args);
+                            if let Some(fact) =
+                                walk.returned(holder, Role::Requires, index, &args, params.clone())
+                            {
+                                facts.push(fact);
+                            }
                         }
                     }
                 }
-            }
-            Role::Ensures => {
-                let ensures = self.ensures_premises(item, function, walk, &mut params, &subst);
-                facts.extend(ensures);
-            }
-            Role::Closure => {
-                for (term, param) in params.iter().zip(&function.params) {
-                    let ty = subst.ty(function.ty(param.value).ty());
-                    walk.predicate_facts(*term, &ty, false, &mut facts);
+                Role::Ensures => {
+                    let ensures = self.ensures_premises(item, function, walk, &mut params, &subst);
+                    facts.extend(ensures);
                 }
+                Role::Closure => {
+                    for (term, param) in params.iter().zip(&function.params) {
+                        let ty = subst.ty(function.ty(param.value).ty());
+                        walk.predicate_facts(*term, &ty, false, &mut facts);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         });
         walk.restart(
             params,

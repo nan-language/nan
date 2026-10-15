@@ -29,8 +29,9 @@ enum Source {
 impl Checker<'_> {
     /// Whether a function's digest has may-trap: its own code holds a trap site, or a function
     /// it calls directly, a declared digest it calls through, or a function argument it
-    /// supplies has may-trap; the members of a cycle share it. A function without a unit has
-    /// its declared digest's.
+    /// supplies has may-trap; the members of a cycle share it. A std function without a body
+    /// has its supplied digest's; any other function without a body or a unit has its declared
+    /// digest's.
     pub fn may_trap(&self, item: ItemId) -> bool {
         self.db.note(item);
         if let Some(known) = self.may_traps.borrow().get(&item) {
@@ -43,12 +44,13 @@ impl Checker<'_> {
         let members = self.cycle_of(item);
         let mut traps = false;
         for member in &members {
-            if self.db.is_std(*member)
-                && super::digest::stated(&self.db.canonical(*member)).is_some()
-            {
+            let bodiless = matches!(&self.db.ast(*member).kind,
+                ItemKind::Fn(function) if matches!(function.body, ast::FnBody::None));
+            if bodiless && self.db.is_std(*member) {
+                traps |= self.supplied_traps(*member);
                 continue;
             }
-            let Some(unit) = self.unit(*member).filter(|_| !self.db.is_std(*member)) else {
+            let Some(unit) = self.unit(*member).filter(|_| !bodiless) else {
                 traps |= self.fn_sig(*member).is_none_or(|sig| !sig.limits.notrap);
                 continue;
             };

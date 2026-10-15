@@ -45,7 +45,7 @@ impl Checker<'_> {
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_std(*item)
+                !db.is_carried(*item)
                     && data.file.path == path
                     && data
                         .syntax()
@@ -167,10 +167,10 @@ impl Checker<'_> {
         let db = &self.db;
         let mut holders: Vec<Holder> = (0..db.items.len())
             .map(|index| ItemId(index as u32))
-            .filter(|item| !db.is_std(*item))
+            .filter(|item| !db.is_carried(*item))
             .map(|item| self.holder(item))
             .collect();
-        for package in db.packages.iter().filter(|package| !package.std) {
+        for package in db.packages.iter().filter(|package| !package.carried) {
             let (Some(root), Some(file)) = (package.root, package.source.files.first()) else {
                 continue;
             };
@@ -196,10 +196,11 @@ impl Checker<'_> {
         let mut functions: HashMap<&str, Vec<ItemId>> = HashMap::new();
         for members in self.db.members.values() {
             for (name, named) in members {
-                functions
-                    .entry(name.as_str())
-                    .or_default()
-                    .extend(named.iter().filter(|function| !self.db.is_std(**function)));
+                functions.entry(name.as_str()).or_default().extend(
+                    named
+                        .iter()
+                        .filter(|function| !self.db.is_carried(**function)),
+                );
             }
         }
         functions
@@ -424,7 +425,7 @@ impl Checker<'_> {
         };
         let declares = |name: &ast::Name| name.token == token;
         let target = match &data.ast.kind {
-            _ if super::decl::declared_name(&data.ast).is_some_and(declares) => {
+            _ if super::decl::declared_name(data.ast).is_some_and(declares) => {
                 Some(Target::Item(item))
             }
             ItemKind::Struct(structure) => structure

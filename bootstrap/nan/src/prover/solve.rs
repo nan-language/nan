@@ -346,7 +346,7 @@ impl<'a, 'c> Solver<'a, 'c> {
     }
 
     /// Rule 3: each asserted atom narrows its terms' intervals from the others', each
-    /// disequality excludes a bound once its other terms are single, and each `mul`
+    /// disequality excludes a bound of one term once its other terms are single, and each `mul`
     /// application lies within its operands' products.
     fn intervals(&mut self, state: &mut State) -> Step<bool> {
         let mut changed = false;
@@ -376,8 +376,10 @@ impl<'a, 'c> Solver<'a, 'c> {
             let open: Vec<usize> = (0..linear.terms.len())
                 .filter(|index| state.class(linear.terms[*index].1).single().is_none())
                 .collect();
-            let [index] = open[..] else {
-                continue;
+            let index = match open[..] {
+                [index] => index,
+                [] if !linear.terms.is_empty() => 0,
+                _ => continue,
             };
             let (others, _) = state.sum(&linear, Some(index));
             let (coefficient, term) = linear.terms[index];

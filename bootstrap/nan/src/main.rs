@@ -5,8 +5,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let current = std::env::current_dir().expect("the current directory");
     let run = nan::run(&args, &current);
-    std::io::stdout()
-        .write_all(run.output.as_bytes())
-        .expect("standard output");
+    let written = std::io::stdout().write_all(run.output.as_bytes());
+    if let Err(error) = written
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("standard output: {error}");
+    }
     std::process::exit(run.status);
 }

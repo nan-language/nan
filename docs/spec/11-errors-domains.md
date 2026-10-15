@@ -238,6 +238,7 @@ impl Cancelled: Render
 
 - A generic type parameter named as a failure type in its item, in a `fails` clause or as the payload of a from variant, carries the **implied failure bound**: its argument is a failure type or `Never`.
 - A generic type parameter that is a failure type required to be cancellable in its item, by [cancellation](#cancellation), carries the **implied cancellable bound**: its argument is a cancellable type. Inside the item, `task::Cancelled` converts to it by case 3 of [failure conversion](#failure-conversion).
+- A parameter of a struct or enum also carries the bounds that its uses in the heads of the functions named after its type in the type's module imply.
 - An argument outside an implied bound fails that bound (`generic.unsatisfied-bound`).
 - Where [failure polymorphism](10-effects-digests.md#failure-polymorphism) would fix a parameter carrying the implied cancellable bound as `Never`, it is fixed as `task::Cancelled`.
 

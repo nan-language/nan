@@ -1,6 +1,6 @@
 # Standard library 1.0
 
-This chapter defines std: its packages, modules and layers, the index of every pub std item with the section defining it, the std items no other chapter defines (array and slice members, Option and Result members, ordered lookup), the contracts and evidence pub std items carry, the authority each std package reaches, the platform packages, the controlled vocabulary and naming conventions of std names, and the reserved std names.
+This chapter defines std: its packages, modules and layers, the index of every pub std item with the section defining it, the std items no other chapter defines (array and slice members, Option and Result members, ordered lookup), the supplied operations, the contracts and evidence pub std items carry, the authority each std package reaches, the platform packages, the controlled vocabulary and naming conventions of std names, and the reserved std names.
 
 ## Std layers
 
@@ -23,7 +23,7 @@ This chapter defines std: its packages, modules and layers, the index of every p
 
 A **layer** is a position in this order, lowest first: `core`, `mem`, `text`, `task`, `sys`, `hw`, `boot`, `host`, `testing`, the platform packages.
 
-- A std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
+- Outside test items and example clauses, a std item names and calls only items of its own and lower layers, except these references to [base types](05-properties.md#structural-properties) of higher layers and their members: `core` names `mem::Alloc`, `mem::Bytes`, `mem::OutOfMemory` and `hw::Dma[T]` in `Encode`, `Generate` and the [content-blind operations](15-untrusted.md#content-blind-operations); `mem` names `hw::Region` in `over`; `task` names `sys::Clock` in `task::within`; and the type of `hw::mint_root` is a root grant of `boot` or `host`.
 - The checker checks std one layer at a time, lowest first, having read the heads of the base types these exceptions name.
 
 Std ships with the toolchain:
@@ -261,14 +261,23 @@ test finds_port_by_name for port_of {
 } finds_port_by_name
 ```
 
+## Supplied operations
+
+A **supplied operation** is a std function without a body, whose item ends at its head line or after its clause region ([heads](02-items.md#heads)). The toolchain implements it as its head, its clauses and the section defining it state, and the [prover](20-prover.md#callee-knowledge) takes its requires and ensures without proving them. The section defining it states its facts ([digests](10-effects-digests.md#digests)), which are exactly these:
+
+- wait when its head states `uses wait`, and terminates otherwise; float use when a parameter or its result has a float type; and the device, priv and sync facts that its section states for pointers, register windows, DMA and privileged intrinsics.
+- Unless its head demands `pure`: sync when it is a member of a type with [interior mutability](12-memory.md#interior-mutability), or is `mem::Shared.share` or `mem::Shared.make_mut`, which change a count; and, in its capabilities set, the primitive capabilities among its parameters' types.
+- Unless its head demands `pure` or `noalloc`, alloc when it draws memory: when its name starts with `try_`, when the type it is a member of has a member of its name prefixed with `try_`, or when its section states that it draws memory, but never for the members of `text::Fixed` and `mem::Bounded`, which store their contents inline.
+- Unless its head demands `notrap`, may-trap when it draws memory and its name does not start with `try_`, or when its section names a trap it raises.
+
 ## Std evidence
 
 Pub std items carry the contracts and evidence that consumers rely on:
 
 - Apart from stack overflow (`trap.stack-overflow`), a pub std function traps only on conditions its requires state or the section defining it names as traps.
 - Each contract term of a pub std item names only items and members a consumer sees, so no part of it is [opaque](18-contracts.md#opacity) to a consumer.
-- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)).
-- Each fact that the section defining a std item states as its requires or ensures is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
+- Every pub std function carries an `example` clause or is the target of a test of its std package ([test items](22-testing.md#test-items)), except the functions that no test or example on `x86_64-host` can call: the members of `boot::Machine`, `boot::Kernel`, `boot::Services`, `hw::Ring0`, `hw::Region`, `hw::PhysFrame[S]`, `hw::PageTableRoot`, `hw::IrqContext`, `hw::TrapFrame[V]`, `hw::SpinGuard[T]` and `hw::SavedContext`, whose values only machine targets give, and the functions with a parameter of one of these types; `hw::Mmio.map`, `hw::Ports.map` and `hw::Idt.of_vectors`, which need the devices and vector seams of a machine target; `hw::Anchor.with`, which only interrupt and landing functions call; and `Untrusted.inspect`, which only validators call.
+- Each fact that the section defining a std item states as its requires or ensures, and that a contract term over the item's parameters and result can state, is a `requires` or `ensures` clause of that item, which `nan show <path> --api` prints.
 
 ## Std authority
 

@@ -34,7 +34,8 @@ mod rewrite;
 mod runs;
 mod shape;
 pub(crate) mod sig;
-mod testing;
+mod supplied;
+pub(crate) mod testing;
 mod threshold;
 pub(crate) mod tir;
 mod tombstone;
@@ -50,12 +51,12 @@ use std::rc::Rc;
 
 pub use context::{Context, Green, context_gaps, contexts, greens};
 use db::{Db, ItemId, ModuleId, PackageId};
-pub use digest::stated;
 pub use edits::{identity, moved, renamed};
 pub use elaborate::EnsuresClause;
 pub use reading::{api, contributed, declared, expanded, explained, holes, shown};
 pub use references::Relocated;
 use sig::{GenericDef, Sig};
+pub use supplied::stated;
 pub use traps::closure_demands_notrap;
 
 use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Reason, Role};
@@ -76,6 +77,8 @@ pub struct Checker<'a> {
     muted: Cell<u32>,
     /// The generic parameters of the body being checked, with the bounds that hold in it.
     scope: RefCell<Vec<GenericDef>>,
+    /// The item whose body or clauses are being typed.
+    within: Cell<Option<ItemId>>,
     /// The properties of struct and enum definitions, by whether a consumer sees them; none while
     /// one is being decided.
     definitions: RefCell<HashMap<(ItemId, bool), Option<props::Props>>>,
@@ -162,6 +165,7 @@ impl<'a> Checker<'a> {
             impls: RefCell::new(None),
             muted: Cell::new(0),
             scope: RefCell::new(Vec::new()),
+            within: Cell::new(None),
             definitions: RefCell::new(HashMap::new()),
             bodies: RefCell::new(HashMap::new()),
             digests: RefCell::new(digest::Digests::default()),
@@ -193,7 +197,7 @@ impl<'a> Checker<'a> {
         self.package.get()
     }
 
-    /// Reports a diagnostic on a line of an item's file; std's items report nothing.
+    /// Reports a diagnostic on a line of an item's file; the carried std's items report nothing.
     pub fn report_line(&self, item: ItemId, line: u32, code: Code) {
         self.report_diagnostic(item, Diagnostic::at(code, "", line));
     }
@@ -305,9 +309,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A diagnostic located on an item's file and item; none for std's items and in probes.
+    /// A diagnostic located on an item's file and item; none for the carried std's items and in
+    /// probes.
     fn on_item(&self, item: ItemId, mut diagnostic: Diagnostic) -> Option<Diagnostic> {
-        if self.db.is_std(item) || self.muted.get() > 0 {
+        if self.db.is_carried(item) || self.muted.get() > 0 {
             return None;
         }
         diagnostic.path = Some(self.db.item(item).file.path.clone());
@@ -598,7 +603,7 @@ pub fn diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut unused: Vec<(Diagnostic, usize)> = Vec::new();
     let mut checking: HashMap<String, usize> = HashMap::new();
     for target in targets(workspace) {
-        let checker = checked(workspace, &std, target);
+        let checker = checked(workspace, std, target);
         for (_, package) in checked_packages(&checker, workspace, target) {
             let data = checker.db.package(package);
             let modules = data.modules.iter().map(|module| checker.db.module(*module));

@@ -115,6 +115,8 @@ The facts below are the requires and ensures of these operations, available to t
 - `copy_prefix` and `try_copy_prefix` require `count <= self.byte_len()`. They copy the first `count` bytes into a new `mem::Bytes` drawn from `alloc`, so the result's `byte_len` is `count`, exhaustion behaving as for `append` and `try_append`.
 - `into_cleared` sets every byte of the contents to 0 and returns them; a `mem::Bytes` keeps its length.
 
+In the clauses of a content-blind operation, its receiver has each content-blind operation whose receivers include all of its own.
+
 ```nan
 pub fn joined(head: Untrusted[Slice[u8]], tail: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
     var message = head.copy_prefix(head.byte_len(), alloc)

@@ -15,7 +15,7 @@ use crate::workspace::Workspace;
 pub fn identity(workspace: &Workspace, path: &str, line: u32) -> Option<String> {
     let std = crate::stdlib::packages();
     let (source, _) = workspace.file(path)?;
-    let checker = unchecked(workspace, &std, *check_targets(source).first()?);
+    let checker = unchecked(workspace, std, *check_targets(source).first()?);
     let db = &checker.db;
     let item = (0..db.items.len())
         .map(|index| ItemId(index as u32))
@@ -50,7 +50,7 @@ pub fn renamed(
     let mut tombstone = None;
     let mut found = false;
     for target in targets(workspace) {
-        let checker = checked(workspace, &std, target);
+        let checker = checked(workspace, std, target);
         let Some(target) = checker.target_at(path, lines) else {
             continue;
         };
@@ -123,7 +123,7 @@ pub fn moved(
 ) -> Option<Result<Move, ()>> {
     let std = crate::stdlib::packages();
     let (source, _) = workspace.file(path)?;
-    let checker = checked(workspace, &std, *check_targets(source).first()?);
+    let checker = checked(workspace, std, *check_targets(source).first()?);
     let target = checker.target_at(path, lines)?;
     Some(checker.moving(&target, module).ok_or(()))
 }

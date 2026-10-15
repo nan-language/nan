@@ -8,14 +8,15 @@ mod memory;
 mod native;
 mod value;
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub use value::{FnVal, Loc, Val, View};
 
 use crate::check::Checker;
-use crate::check::db::ItemId;
-use crate::check::sig::{Payload as PayloadSig, SigKind};
-use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
+use crate::check::db::{ItemId, TypeKey};
+use crate::check::sig::{Payload as PayloadSig, SigKind, param_arg};
+use crate::check::ty::{Arg, Const, Param, Scalar, Subst, Ty};
 use crate::nir::{
     BinaryOp, BlockId, Builtin, Call, Callable, Callee, CheckKind, Constant, FnRef, Function, Inst,
     Jump, Literal, NTy, Op, Operand, Payload, Place, Role, Span, Terminator, UnaryOp, Unit,
@@ -247,34 +248,56 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         args: &[Val],
         type_args: &[Arg],
     ) -> bool {
-        let Some(unit) = self.ck.unit(item) else {
+        if self.ck.unit(item).is_none() {
             return false;
-        };
-        let consts: Vec<Val> = self
-            .ck
-            .sig(item)
-            .generics
+        }
+        let generics = self.ck.sig(item).generics.clone();
+        let values: HashMap<Param, Val> = generics
             .iter()
             .zip(type_args)
-            .filter_map(|(def, arg)| match (def.constant, arg) {
-                (Some(_), Arg::Const(Const::Int(value))) => Some(Val::Int(*value)),
-                (Some(_), Arg::Const(Const::Bool(value))) => Some(Val::Bool(*value)),
+            .filter_map(|(def, arg)| match arg {
+                Arg::Const(Const::Int(value)) => Some((def.param, Val::Int(*value))),
+                Arg::Const(Const::Bool(value)) => Some((def.param, Val::Bool(*value))),
                 _ => None,
             })
             .collect();
-        for condition in unit
-            .functions
-            .iter()
-            .filter(|other| other.role == Role::Where)
-        {
-            if !self.holds(
-                item,
-                Role::Where,
-                condition.index,
-                consts.clone(),
-                type_args,
-            ) {
-                return false;
+        let owner = match self.ck.db.owners.get(&item) {
+            Some(TypeKey::Item(owner)) => Some(*owner),
+            _ => None,
+        };
+        for holder in std::iter::once(item).chain(owner) {
+            let Some(unit) = self.ck.unit(holder) else {
+                continue;
+            };
+            let holder_generics = self.ck.sig(holder).generics.clone();
+            let consts: Vec<Val> = holder_generics
+                .iter()
+                .filter(|def| def.constant.is_some())
+                .filter_map(|def| values.get(&def.param).cloned())
+                .collect();
+            let holder_args: Vec<Arg> = holder_generics
+                .iter()
+                .map(|def| {
+                    generics
+                        .iter()
+                        .position(|own| own.param == def.param)
+                        .map_or_else(|| param_arg(def), |at| type_args[at].clone())
+                })
+                .collect();
+            for condition in unit
+                .functions
+                .iter()
+                .filter(|other| other.role == Role::Where)
+            {
+                if !self.holds(
+                    holder,
+                    Role::Where,
+                    condition.index,
+                    consts.clone(),
+                    &holder_args,
+                ) {
+                    return false;
+                }
             }
         }
         let boundary = self.ck.is_boundary(item);
@@ -419,6 +442,10 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         };
         let nir = frame.function(&unit);
         for (param, arg) in nir.params.iter().zip(args) {
+            let arg = match (nir.ty(param.value).is_reference(), arg) {
+                (false, reference @ Val::Ref(_)) => self.deref(&reference),
+                (_, arg) => arg,
+            };
             frame.values[param.value.0 as usize] = Some(arg);
         }
         let flow = self.blocks(&mut frame, BlockId(0));
@@ -1294,6 +1321,30 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         }
     }
 
+    /// An implementing function's reference with its own generic parameters given the type
+    /// arguments a call through a bound gave the method's.
+    fn with_own_args(&self, implementation: FnRef, own: &[Arg]) -> FnRef {
+        let Callable::Item { item, .. } = implementation.callable else {
+            return implementation;
+        };
+        let mut own = own.iter();
+        let args = self
+            .ck
+            .sig(item)
+            .generics
+            .iter()
+            .zip(implementation.args.iter())
+            .map(|(def, arg)| match def.param.owner == item {
+                true => own.next().cloned().unwrap_or_else(|| arg.clone()),
+                false => arg.clone(),
+            })
+            .collect();
+        FnRef {
+            args,
+            ..implementation
+        }
+    }
+
     fn call_function(
         &mut self,
         fn_ref: &FnRef,
@@ -1337,16 +1388,17 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                     Some(implementation)
                         if !matches!(implementation.callable, Callable::Method { .. }) =>
                     {
+                        let implementation = self.with_own_args(implementation, &fn_ref.args[1..]);
                         self.call_function(&implementation, args, at, site)
                     }
-                    _ => native::conformance(self, &self_ty, &name, args),
+                    _ => native::conformance(self, &self_ty, &name, &fn_ref.args, args, at, site),
                 }
             }
             Callable::Derived { owner, method } => {
-                native::derived(self, *owner, &fn_ref.args, method, args)
+                native::derived(self, *owner, &fn_ref.args, method, args, at, site)
             }
             Callable::Builtin(Builtin::Intrinsic(path)) => {
-                native::intrinsic(self, path, &fn_ref.args, args, at)
+                native::intrinsic(self, path, &fn_ref.args, args, at, site)
             }
             Callable::Builtin(builtin) => native::builtin(self, *builtin, args, at, site),
         }

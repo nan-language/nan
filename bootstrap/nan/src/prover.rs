@@ -13,21 +13,28 @@ mod tests;
 
 use std::rc::Rc;
 
+use crate::cache::Cache;
 use crate::check::Checker;
 use crate::check::db::{ItemId, TypeKey};
 use crate::check::sig::param_arg;
 use crate::check::tir::ClauseRole;
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
 use crate::diagnostic::{Code, Reason};
+use crate::hash::Hash;
 use crate::interp::{Input, Interpreter, Site as RunSite};
 use crate::nir::{BlockId, Callable, CheckKind, Function, Literal, Role, Span, Unit};
 use crate::syntax::ast::{self, ItemKind, Mode};
+use crate::toolchain;
 use canon::Origin;
 use query::{Query, Site, Walk};
 use solve::{Decision, Solver};
 use term::{Term, TermId, Terms};
 
 pub use query::Obligation;
+
+/// The results the proof cache holds: a proved query, and one whose fuel ran out.
+const PROVED: u8 = 0;
+const EXHAUSTED: u8 = 1;
 
 /// How an obligation holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,9 +395,59 @@ impl Checker<'_> {
             .collect();
         let canonical = canon::canonical(self, terms, package, &premises, goal);
         matches!(
-            Solver::new(self, package).decide(canonical),
+            self.decided(&mut Solver::new(self, package), canonical),
             Decision::Proved
         )
+    }
+
+    /// The procedure's decision of a canonical query, read from the proof cache when it holds
+    /// the query's result and recorded there when the query is proved or the fuel runs out. While
+    /// the prover is compared with the cache, the procedure decides every query, and a held result
+    /// that differs is recorded as a mismatch.
+    fn decided(&self, solver: &mut Solver, query: canon::Query) -> Decision {
+        let cache = self
+            .proof_cache
+            .get_or_init(|| Cache::open().ok().and_then(Result::ok))
+            .as_ref();
+        let package = self.db.package(solver.package);
+        let language = package
+            .source
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.language)
+            .and_then(|(version, _)| u64::try_from(version).ok())
+            .unwrap_or(toolchain::LANGUAGES[0]);
+        let mut key = b"proof\n".to_vec();
+        key.extend_from_slice(&toolchain::hash(language).0);
+        key.extend_from_slice(&query.hash.0);
+        let key = Hash::of(&key);
+        let held = cache
+            .and_then(|cache| cache.entry(&key).ok())
+            .and_then(Result::ok)
+            .flatten();
+        let comparing = self.compared.borrow().is_some();
+        if !comparing {
+            match held.as_deref() {
+                Some([PROVED]) => return Decision::Proved,
+                Some([EXHAUSTED]) => return Decision::Exhausted,
+                _ => {}
+            }
+        }
+        let hash = query.hash;
+        let decision = solver.decide(query);
+        let result = match decision {
+            Decision::Proved => Some(PROVED),
+            Decision::Exhausted => Some(EXHAUSTED),
+            Decision::Open(..) => None,
+        };
+        if let Some(mismatches) = self.compared.borrow_mut().as_mut() {
+            if held.is_some_and(|held| result.is_none_or(|result| held != [result])) {
+                mismatches.push(hash);
+            }
+        } else if let (Some(cache), Some(result), None) = (cache, result, held) {
+            drop(cache.put(&key, &[result]));
+        }
+        decision
     }
 
     /// The default of a type as a term: a scalar's zero, `false` or the `char` of value 0, the
@@ -719,7 +776,7 @@ impl Checker<'_> {
                         canon::canonical(self, terms, package, &query.premises, query.goal);
                     let origins = canonical.origins.clone();
                     let mut solver = Solver::new(self, package);
-                    match solver.decide(canonical) {
+                    match self.decided(&mut solver, canonical) {
                         Decision::Proved => {
                             let assumed = origins.iter().any(|origin| match origin {
                                 Origin::Assume => true,

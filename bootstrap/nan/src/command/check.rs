@@ -41,14 +41,9 @@ pub fn run(
         return Ok(invocation.tool_error(Code::ToolUnknownScope, invocation.scope().unwrap_or(".")));
     };
     trace.scope = Some(written.clone());
-    let agent = invocation.value("--agent").unwrap_or("default");
-    let agent_named = !agent.is_empty()
-        && agent
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-    if !agent_named {
+    let Some(agent) = agent(invocation) else {
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    }
+    };
     let mut wrote = BTreeMap::new();
     let fixed = match invocation.name {
         Name::Fix => fixed(invocation, workspace, current),
@@ -115,25 +110,27 @@ pub fn run(
     })
 }
 
+/// The agent `--agent` names, `default` without one; none for a name that is not one.
+pub(super) fn agent<'i>(invocation: &'i Invocation) -> Option<&'i str> {
+    let agent = invocation.value("--agent").unwrap_or("default");
+    let named = !agent.is_empty()
+        && agent
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    named.then_some(agent)
+}
+
 /// An entry of a last-green record: an item's location, interface hash and api lines.
-struct Entry {
+pub(super) struct Entry {
     location: String,
     interface: String,
     api: Vec<String>,
 }
 
-/// Keeps an agent's last-green record: after a check reporting no error, replaces the entries of
-/// the items of its scope; after one reporting errors, returns a `changed` record per item of the
-/// closure sets of the lines holding one whose interface hash differs from its entry.
-fn last_green(
-    workspace: &Workspace,
-    scope: &Scope,
-    agent: &str,
-    errors: &[(String, u32)],
-) -> io::Result<Vec<Record>> {
-    let path = format!(".nan/green/{agent}");
+/// The entries of an agent's last-green record, by item.
+pub(super) fn green_entries(workspace: &Workspace, agent: &str) -> BTreeMap<String, Entry> {
     let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
-    if let Ok(text) = std::fs::read_to_string(workspace.root.join(&path)) {
+    if let Ok(text) = std::fs::read_to_string(workspace.root.join(format!(".nan/green/{agent}"))) {
         let mut current: Option<String> = None;
         for line in text.lines() {
             if let Some(api) = line.strip_prefix("    ")
@@ -160,27 +157,55 @@ fn last_green(
             current = Some(item.to_owned());
         }
     }
-    let interface = |green: &check::Green| {
-        green
-            .interface
-            .map_or_else(|| "-".to_owned(), |hash| hash.full())
-    };
+    entries
+}
+
+fn green_interface(green: &check::Green) -> String {
+    green
+        .interface
+        .map_or_else(|| "-".to_owned(), |hash| hash.full())
+}
+
+/// A `changed` record per item whose interface hash differs from its last-green entry, merging
+/// its entry's api lines with its current ones; an item without an entry has none.
+pub(super) fn changed(
+    entries: &BTreeMap<String, Entry>,
+    greens: &[check::Green],
+    writer: Option<&str>,
+) -> Vec<Record> {
+    greens
+        .iter()
+        .filter_map(|green| {
+            let entry = entries.get(&green.path)?;
+            (entry.interface != green_interface(green)).then(|| Record {
+                word: "changed".to_owned(),
+                fields: vec![
+                    written_for(&green.path, writer),
+                    format!("{}:{}", green.file, green.line),
+                ],
+                lines: crate::diff::merged(&entry.api, &green.api),
+            })
+        })
+        .collect()
+}
+
+/// Keeps an agent's last-green record: after a check reporting no error, replaces the entries of
+/// the items of its scope; after one reporting errors, returns a `changed` record per item of the
+/// closure sets of the lines holding one whose interface hash differs from its entry.
+fn last_green(
+    workspace: &Workspace,
+    scope: &Scope,
+    agent: &str,
+    errors: &[(String, u32)],
+) -> io::Result<Vec<Record>> {
+    let mut entries = green_entries(workspace, agent);
     if !errors.is_empty() {
         let writer = scope.package(workspace).and_then(|package| package.name());
-        return Ok(check::greens(workspace, None, errors)
-            .iter()
-            .filter_map(|green| {
-                let entry = entries.get(&green.path)?;
-                (entry.interface != interface(green)).then(|| Record {
-                    word: "changed".to_owned(),
-                    fields: vec![
-                        written_for(&green.path, writer),
-                        format!("{}:{}", green.file, green.line),
-                    ],
-                    lines: crate::diff::merged(&entry.api, &green.api),
-                })
-            })
-            .collect());
+        return Ok(changed(
+            &entries,
+            &check::greens(workspace, None, errors),
+            writer,
+        ));
     }
     entries.retain(|_, entry| {
         let (file, line) = entry.location.rsplit_once(':').unwrap_or_default();
@@ -191,7 +216,7 @@ fn last_green(
             green.path.clone(),
             Entry {
                 location: format!("{}:{}", green.file, green.line),
-                interface: interface(&green),
+                interface: green_interface(&green),
                 api: green.api,
             },
         );
@@ -206,6 +231,7 @@ fn last_green(
             text.push_str(&format!("    {line}\n"));
         }
     }
+    let path = format!(".nan/green/{agent}");
     journal::replace_alone(&workspace.root, &path, text.as_bytes())?;
     Ok(Vec::new())
 }

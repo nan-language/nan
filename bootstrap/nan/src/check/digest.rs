@@ -183,6 +183,56 @@ impl Checker<'_> {
         digest
     }
 
+    /// The digest of a body, closure or default function of an item's unit: the item's own for
+    /// its body; for a closure or a default body, the join of its own code's sites, waiting as
+    /// its head states.
+    pub fn function_digest(&self, item: ItemId, role: crate::nir::Role, index: u32) -> Digest {
+        let own = |body: &TBody, closure: Option<&TClosure>, wait: bool| {
+            let mut digest = Digest::none();
+            for site in self.sites(item, body, closure) {
+                digest.join(&site.facts);
+            }
+            digest.wait = wait;
+            digest.terminates &= !wait;
+            digest
+        };
+        match role {
+            crate::nir::Role::Closure => {
+                let Some(body) = self.typed(item) else {
+                    return Digest::none();
+                };
+                let mut closures = Vec::new();
+                if let Some(root) = &body.root {
+                    nested_closures(root, &mut closures);
+                }
+                match closures.into_iter().find(|closure| closure.index == index) {
+                    Some(closure) => own(&body, Some(closure), closure.ty.wait),
+                    None => Digest::none(),
+                }
+            }
+            crate::nir::Role::Default => {
+                let SigKind::Interface { methods } = &self.sig(item).kind else {
+                    return Digest::none();
+                };
+                let Some(method) = methods
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, method)| method.default)
+                    .nth(index as usize)
+                    .map(|(position, _)| position)
+                else {
+                    return Digest::none();
+                };
+                let body = self.method_bodies.borrow().get(&(item, method)).cloned();
+                match body {
+                    Some(body) => own(&body, None, methods[method].sig.wait),
+                    None => Digest::none(),
+                }
+            }
+            _ => (*self.digest(item)).clone(),
+        }
+    }
+
     /// The facts a function reaching itself is taken to hold while its digest is computed: no
     /// fact, the others of its cycle joining theirs.
     fn cycle_digest(&self, item: ItemId) -> Digest {
@@ -465,6 +515,16 @@ fn collect_dependencies(expr: &TExpr, found: &mut Vec<ItemId>) {
     expr.each_child(&mut |child| collect_dependencies(child, found));
 }
 
+/// The closures an expression holds at any depth, those inside closures included.
+fn nested_closures<'b>(expr: &'b TExpr, found: &mut Vec<&'b TClosure>) {
+    if let TKind::Closure(closure) = &expr.kind {
+        found.push(closure);
+        nested_closures(&closure.body, found);
+        return;
+    }
+    expr.each_child(&mut |child| nested_closures(child, found));
+}
+
 fn collect_closures<'b>(expr: &'b TExpr, found: &mut Vec<&'b TClosure>) {
     if let TKind::Closure(closure) = &expr.kind {
         found.push(closure);
@@ -724,7 +784,8 @@ impl Checker<'_> {
     /// The typed body of a function item with a body.
     pub fn typed_body(&self, item: ItemId) -> Option<Rc<TBody>> {
         self.db.note(item);
-        if !self.db.ast(item).kind.is_fn_with_body() {
+        let kind = &self.db.ast(item).kind;
+        if !kind.is_fn_with_body() && !matches!(kind, ItemKind::Retired(_)) {
             return None;
         }
         self.typed(item)

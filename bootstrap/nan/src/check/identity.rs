@@ -8,7 +8,9 @@ use super::resolve::{Named, is_core_vocabulary};
 use super::sig::SigKind;
 use super::tir::{Callee, TExpr, TKind, TPattern, TPatternKind, TStmtKind};
 use super::ty::Ty;
-use crate::format::normal::{Forms, Known, Reach, forms, interface_text};
+use crate::format::normal::{
+    Forms, Known, Numbering, Reach, flat_text, forms, interface_text, normalised_fragment,
+};
 use crate::hash::Hash;
 use crate::syntax::ast::{self, ItemKind, Visibility};
 
@@ -30,8 +32,38 @@ impl Hashes {
 }
 
 impl Checker<'_> {
+    /// An item's hashes, a const's interface hash from the value its evaluation gives.
     pub fn hashes(&self, item: ItemId) -> Hashes {
-        Hashes::of(self.forms(item))
+        let mut forms = self.forms(item);
+        if forms.interface.is_none()
+            && let ItemKind::Const(_) = &self.db.ast(item).kind
+        {
+            forms.interface = self.const_interface(item, &forms.normalised);
+        }
+        Hashes::of(forms)
+    }
+
+    /// The interface form of a const: its head, `=` and the lowercase hexadecimal of its value's
+    /// canonical encoding, once per declared concrete target or once for `any`.
+    fn const_interface(&self, item: ItemId, normalised: &str) -> Option<String> {
+        let SigKind::Const { ty } = &self.sig(item).kind else {
+            return None;
+        };
+        let value = self.const_value(item)?;
+        let names = super::units::ItemNames::new(self, item);
+        let encoder = crate::nir::encode::Encoder { names: &names };
+        let encoded = self.value_bytes(ty, &value, &encoder);
+        let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+        let head = normalised.trim_end().split_once(" = ")?.0;
+        let package = self.db.package(self.db.package_of(item));
+        let targets = package.source.manifest.as_ref().map_or(1, |manifest| {
+            match manifest.targets.contains(&crate::workspace::Target::Any) {
+                true => 1,
+                false => manifest.targets.len().max(1),
+            }
+        });
+        let values = vec![hex; targets].join(" ");
+        Some(format!("{head} = {values}\n"))
     }
 
     /// The hashes of a package's `package` item, whose paths read as its root module's.
@@ -73,6 +105,30 @@ impl Checker<'_> {
             &data.file.syntax,
             &data.file.syntax.items[data.index],
             &self.known(item, &resolve, viewer),
+        )
+    }
+
+    /// The tokens `first..=last` of an item as its normalised form writes them, on one line,
+    /// with its bindings numbered as `numbering` states.
+    pub fn fragment(&self, item: ItemId, range: (u32, u32), numbering: Numbering) -> String {
+        let data = self.db.item(item);
+        let resolve = |segments: &[&str]| self.canonically(data.module, segments);
+        normalised_fragment(
+            &data.file.syntax,
+            &data.file.syntax.items[data.index],
+            &self.known(item, &resolve, None),
+            range,
+            numbering,
+        )
+    }
+
+    /// The flat text of the tokens `first..=last` of an item.
+    pub fn flat(&self, item: ItemId, range: (u32, u32)) -> String {
+        let data = self.db.item(item);
+        flat_text(
+            &data.file.syntax,
+            &data.file.syntax.items[data.index],
+            range,
         )
     }
 
@@ -232,7 +288,7 @@ impl Checker<'_> {
     /// field, item and member it names is visible there; and otherwise in its interface form, when
     /// the function is not generic, no member of a generic type, and its body names only fields,
     /// items and members visible wherever the function is.
-    fn transparent_seen(&self, item: ItemId, viewer: Option<ModuleId>) -> bool {
+    pub(super) fn transparent_seen(&self, item: ItemId, viewer: Option<ModuleId>) -> bool {
         let ast = self.db.ast(item);
         let ItemKind::Fn(function) = &ast.kind else {
             return false;

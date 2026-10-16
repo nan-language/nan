@@ -44,12 +44,23 @@ macro_rules! codes {
 }
 
 codes! {
+    ApiStale = "api.stale",
+    ApiWeakeningPending = "api.weakening-pending",
+    ArtefactMalformed = "artefact.malformed",
+    ArtefactRecheckFailed = "artefact.recheck-failed",
+    ArtefactReservedSection = "artefact.reserved-section",
+    ArtefactRootMismatch = "artefact.root-mismatch",
+    ArtefactSymbolCollision = "artefact.symbol-collision",
+    ArtefactVersionUnsupported = "artefact.version-unsupported",
     AuthorityCapabilityImpl = "authority.capability-impl",
     AuthorityDeniedDependency = "authority.denied-dependency",
     AuthorityDependencyUngranted = "authority.dependency-ungranted",
     AuthorityUngranted = "authority.ungranted",
     AuthorityUnknownName = "authority.unknown-name",
+    AuthorityWideningUnapproved = "authority.widening-unapproved",
     BuildCacheExposed = "build.cache-exposed",
+    BuildImageUnreadable = "build.image-unreadable",
+    BuildStageMismatch = "build.stage-mismatch",
     BuildSymbolicLink = "build.symbolic-link",
     ClosureCaptureDuplicate = "closure.capture-duplicate",
     ClosureCaptureMode = "closure.capture-mode",
@@ -87,6 +98,12 @@ codes! {
     DeferOperandForm = "defer.operand-form",
     DeferUndeferUnmatched = "defer.undefer-unmatched",
     DeferWaits = "defer.waits",
+    DepCycle = "dep.cycle",
+    DepEpochUnapproved = "dep.epoch-unapproved",
+    DepLockStale = "dep.lock-stale",
+    DepReleaseMissing = "dep.release-missing",
+    DepSplitPackage = "dep.split-package",
+    DepUnresolved = "dep.unresolved",
     DeriveConstituentMissing = "derive.constituent-missing",
     DeriveDuplicate = "derive.duplicate",
     DeriveEnumDefault = "derive.enum-default",
@@ -96,6 +113,7 @@ codes! {
     DocMisplaced = "doc.misplaced",
     DocModuleFileMissing = "doc.module-file-missing",
     DocPrivateReference = "doc.private-reference",
+    DocStale = "doc.stale",
     DocSummaryMissing = "doc.summary-missing",
     DocUnresolvedReference = "doc.unresolved-reference",
     DocVariantMismatch = "doc.variant-mismatch",
@@ -117,9 +135,6 @@ codes! {
     EncodeManualImpl = "encode.manual-impl",
     EncodeNotInert = "encode.not-inert",
     EncodeView = "encode.view",
-    ExampleFailed = "example.failed",
-    ExampleForm = "example.form",
-    ExampleTrapped = "example.trapped",
     ErrorCancelUnmapped = "error.cancel-unmapped",
     ErrorFailureType = "error.failure-type",
     ErrorFromAmbiguous = "error.from-ambiguous",
@@ -128,6 +143,9 @@ codes! {
     ErrorMarkerUnneeded = "error.marker-unneeded",
     ErrorUnconvertible = "error.unconvertible",
     ErrorUnhandled = "error.unhandled",
+    ExampleFailed = "example.failed",
+    ExampleForm = "example.form",
+    ExampleTrapped = "example.trapped",
     ExprArgumentCount = "expr.argument-count",
     ExprArgumentLabel = "expr.argument-label",
     ExprBranchForm = "expr.branch-form",
@@ -146,6 +164,9 @@ codes! {
     ExprParentheses = "expr.parentheses",
     ExprRangeType = "expr.range-type",
     ExprUnreachableArm = "expr.unreachable-arm",
+    FormatMachineInvalid = "format.machine-invalid",
+    FormatMachineVersion = "format.machine-version",
+    FormatReservedField = "format.reserved-field",
     GenericArgumentKind = "generic.argument-kind",
     GenericArity = "generic.arity",
     GenericConstType = "generic.const-type",
@@ -210,6 +231,8 @@ codes! {
     KernelIrqHead = "kernel.irq-head",
     KernelIrqLimit = "kernel.irq-limit",
     KernelIrqWait = "kernel.irq-wait",
+    LanguageDowngrade = "language.downgrade",
+    LanguageNewerDependency = "language.newer-dependency",
     LanguageUnsupported = "language.unsupported",
     LanguageVersionForm = "language.version-form",
     LayoutEndianness = "layout.endianness",
@@ -256,6 +279,9 @@ codes! {
     ManifestMissingDirective = "manifest.missing-directive",
     ManifestReservedTarget = "manifest.reserved-target",
     ManifestUnknownTarget = "manifest.unknown-target",
+    MergeConflict = "merge.conflict",
+    MergeSemanticConflict = "merge.semantic-conflict",
+    MergeUnresolved = "merge.unresolved",
     ModeCopyTaken = "mode.copy-taken",
     ModeImmutableBinding = "mode.immutable-binding",
     ModeMismatch = "mode.mismatch",
@@ -272,12 +298,15 @@ codes! {
     NameCoreRedefined = "name.core-redefined",
     NameDotForPath = "name.dot-for-path",
     NameMoved = "name.moved",
+    NameNewerRelease = "name.newer-release",
     NamePrefixMismatch = "name.prefix-mismatch",
     NamePrivate = "name.private",
     NamePrivateInInterface = "name.private-in-interface",
     NameRedundantPath = "name.redundant-path",
     NameReserved = "name.reserved",
     NameUnknown = "name.unknown",
+    NirMalformed = "nir.malformed",
+    NirVersionUnsupported = "nir.version-unsupported",
     NumConversionUndefined = "num.conversion-undefined",
     NumConversionValue = "num.conversion-value",
     NumFromBitsNotAnybits = "num.from-bits-not-anybits",
@@ -348,10 +377,16 @@ codes! {
     RegistryUniqueRepeated = "registry.unique-repeated",
     RegistryUniqueType = "registry.unique-type",
     RegistryUnknownField = "registry.unknown-field",
+    RetiredAmbiguousUse = "retired.ambiguous-use",
     RetiredBadRewrite = "retired.bad-rewrite",
+    RetiredForeignPath = "retired.foreign-path",
     RetiredFormTaken = "retired.form-taken",
     RetiredForwardedUse = "retired.forwarded-use",
+    RetiredNotPreserved = "retired.not-preserved",
     RetiredRewriteHidden = "retired.rewrite-hidden",
+    SealBadPrincipal = "seal.bad-principal",
+    SealSameAuthor = "seal.same-author",
+    SealUnneeded = "seal.unneeded",
     StmtAssignTarget = "stmt.assign-target",
     StmtDiscardUnit = "stmt.discard-unit",
     StmtElseNotDiverging = "stmt.else-not-diverging",
@@ -417,6 +452,7 @@ codes! {
     ToolNoWorkspace = "tool.no-workspace",
     ToolUnknownScope = "tool.unknown-scope",
     ToolUsage = "tool.usage",
+    TrustUnsealed = "trust.unsealed",
     TrustedBlockValue = "trusted.block-value",
     TrustedConventionTarget = "trusted.convention-target",
     TrustedConventionUnknown = "trusted.convention-unknown",
@@ -448,13 +484,22 @@ codes! {
     UnusedGrant = "unused.grant",
     UnusedItem = "unused.item",
     UnusedLocal = "unused.local",
+    UnusedTombstone = "unused.tombstone",
+    VersionBreakingTarget = "version.breaking-target",
+    VersionParentMissing = "version.parent-missing",
+    VersionPathDependency = "version.path-dependency",
+    VersionStoreNameTaken = "version.store-name-taken",
 }
 
 impl Code {
     pub fn class(self) -> Class {
         match self {
             Code::InternalInvariant => Class::Internal,
-            Code::RetiredForwardedUse
+            Code::ApiStale
+            | Code::ApiWeakeningPending
+            | Code::DocStale
+            | Code::RetiredForwardedUse
+            | Code::SealSameAuthor
             | Code::TestDbg
             | Code::TestGeneratorGap
             | Code::ThresholdDepth
@@ -462,11 +507,13 @@ impl Code {
             | Code::TodoDisputed
             | Code::TodoHole
             | Code::TodoMissingSpec
+            | Code::TrustUnsealed
             | Code::UnusedDependency
             | Code::UnusedField
             | Code::UnusedGrant
             | Code::UnusedItem
-            | Code::UnusedLocal => Class::Incompleteness,
+            | Code::UnusedLocal
+            | Code::UnusedTombstone => Class::Incompleteness,
             _ => Class::Error,
         }
     }

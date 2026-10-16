@@ -71,17 +71,7 @@ pub fn run(
             }
         }
     }
-    let writer = scope.package(workspace).and_then(|package| package.name());
-    records.extend(report.failures.iter().map(|failure| Record {
-        word: "fail".to_owned(),
-        fields: vec![
-            written_for(&failure.item, writer),
-            format!("{}:{}", failure.path, failure.line),
-            failure.target.name().to_owned(),
-            failure.cause.clone(),
-        ],
-        lines: failure.lines.clone(),
-    }));
+    records.extend(fail_records(workspace, &scope, &report));
     Ok(output(
         invocation,
         &written,
@@ -89,6 +79,25 @@ pub fn run(
         (errors, incomplete),
         &report,
     ))
+}
+
+/// A `fail` record per failing test of a report.
+pub fn fail_records(workspace: &Workspace, scope: &Scope, report: &Report) -> Vec<Record> {
+    let writer = scope.package(workspace).and_then(|package| package.name());
+    report
+        .failures
+        .iter()
+        .map(|failure| Record {
+            word: "fail".to_owned(),
+            fields: vec![
+                written_for(&failure.item, writer),
+                format!("{}:{}", failure.path, failure.line),
+                failure.target.name().to_owned(),
+                failure.cause.clone(),
+            ],
+            lines: failure.lines.clone(),
+        })
+        .collect()
 }
 
 /// The output of a test command: its records, its counts of errors and incompleteness, and what

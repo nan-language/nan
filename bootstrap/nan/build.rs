@@ -8,6 +8,7 @@ use std::{env, fs};
 
 // The crate formats these shared modules; formatting them from here would look for their tests
 // beside the build script.
+#[allow(dead_code, reason = "the crate shares this module and uses the forms the build does not")]
 #[path = "src/encoding.rs"]
 #[rustfmt::skip]
 mod encoding;

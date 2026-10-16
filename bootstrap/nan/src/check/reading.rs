@@ -9,7 +9,7 @@ use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::expand::DerivedItem;
 use super::identity::Hashes;
 use super::{
-    Checker, check_targets, checked, checked_packages, checkers, decl, targets, ty, unchecked,
+    Checker, check_targets, checked_closures, checked_packages, checkers, decl, ty, unchecked,
 };
 use crate::nir::{Builtin, Callable, Callee, CheckKind, Op, UnaryOp, Unit};
 use crate::prover::{Obligated, Obligation, Status, Unproved};
@@ -43,8 +43,7 @@ pub fn declared(workspace: &Workspace, name: &str) -> Vec<Declared> {
     let std = crate::stdlib::packages();
     let wanted = decl::fold(name);
     let mut found: Vec<Declared> = Vec::new();
-    for target in targets(workspace) {
-        let checker = unchecked(workspace, std, target);
+    for (_, checker) in checkers(workspace, std) {
         let db = &checker.db;
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
@@ -56,7 +55,7 @@ pub fn declared(workspace: &Workspace, name: &str) -> Vec<Declared> {
                     file: data.file.path.clone(),
                     line,
                     text: crate::output::printable(data.file.syntax.line_text(line)),
-                    workspace: !db.is_carried(item),
+                    workspace: db.is_reported(item),
                 };
                 if !found.iter().any(|other| {
                     (&other.file, other.line, &other.path) == (&entry.file, entry.line, &entry.path)
@@ -99,9 +98,10 @@ pub fn contributed(workspace: &Workspace, root: usize, registry: &str) -> Option
     let std = crate::stdlib::packages();
     let mut found: Vec<Contributed> = Vec::new();
     let mut named = false;
+    let closure = workspace.closure_of(&workspace.packages[root])?;
     for target in check_targets(&workspace.packages[root]) {
-        let checker = unchecked(workspace, std, target);
-        let Some((_, package)) = checked_packages(&checker, workspace, target)
+        let checker = unchecked(workspace, closure, std, target);
+        let Some((_, package)) = checked_packages(&checker)
             .into_iter()
             .find(|(index, _)| *index == root)
         else {
@@ -141,8 +141,7 @@ pub fn contributed(workspace: &Workspace, root: usize, registry: &str) -> Option
 pub fn holes(workspace: &Workspace) -> Vec<Listed> {
     let std = crate::stdlib::packages();
     let mut listed: Vec<Listed> = Vec::new();
-    for target in targets(workspace) {
-        let checker = checked(workspace, std, target);
+    for (_, checker) in checked_closures(workspace, std) {
         for hole in checker.holes.borrow().iter() {
             let data = checker.db.item(hole.item);
             let module = data.module;
@@ -205,13 +204,12 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
     let std = crate::stdlib::packages();
     let mut shown: Vec<Shown> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
-    for target in targets(workspace) {
-        let checker = unchecked(workspace, std, target);
+    for (_, checker) in checkers(workspace, std) {
         let db = &checker.db;
         let mut found: Vec<(&crate::workspace::File, usize, Option<ItemId>, PackageId)> =
             Vec::new();
         for (index, package) in db.packages.iter().enumerate() {
-            if !package.carried {
+            if !package.carried && !package.quiet {
                 let package = PackageId(index as u32);
                 let manifest = &db.package(package).source.files[0];
                 let item = manifest
@@ -224,7 +222,7 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
         }
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
-            if !db.is_carried(item) {
+            if db.is_reported(item) {
                 let data = db.item(item);
                 found.push((data.file, data.index, Some(item), db.package_of(item)));
             }
@@ -290,7 +288,7 @@ pub fn api(workspace: &Workspace, scope: &Scope) -> Vec<Api> {
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let data = db.item(item);
-            if db.is_carried(item)
+            if !db.is_reported(item)
                 || !scope.holds(workspace, &data.file.path, Some(data.head_line()))
             {
                 continue;
@@ -387,14 +385,14 @@ pub struct Explanation {
 /// package declares; none for another item.
 pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
     let std = crate::stdlib::packages();
-    let checkers = checkers(workspace, std);
+    let checkers = checked_closures(workspace, std);
     for (_, checker) in &checkers {
         let db = &checker.db;
         let item = (0..db.items.len())
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_carried(*item)
+                db.is_reported(*item)
                     && scope.holds(workspace, &data.file.path, Some(data.head_line()))
             });
         let Some(item) = item else {
@@ -433,8 +431,7 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
             .collect();
         methods.sort();
         methods.dedup();
-        let target = checker.db.target;
-        let obligations = checked(workspace, std, target).explanations(item);
+        let obligations = checker.explanations(item);
         return Some(Explained {
             digests: digest_lines(&checkers, checker, item),
             facts,
@@ -443,6 +440,37 @@ pub fn explained(workspace: &Workspace, scope: &Scope) -> Option<Explained> {
         });
     }
     None
+}
+
+/// The ledger entries of a scope, by path and line: of a package, its ledger; of the lines of an
+/// item, the item's.
+pub fn ledgered(workspace: &Workspace, scope: &Scope) -> Vec<super::ledger::Entry> {
+    let std = crate::stdlib::packages();
+    for (_, checker) in checkers(workspace, std) {
+        let db = &checker.db;
+        if let Scope::Package(index) = scope {
+            let package = &workspace.packages[*index];
+            let id = db
+                .packages
+                .iter()
+                .position(|data| std::ptr::eq(data.source, package) && !data.quiet);
+            if let Some(id) = id {
+                return checker.package_ledger(PackageId(id as u32));
+            }
+            continue;
+        }
+        let item = (0..db.items.len())
+            .map(|index| ItemId(index as u32))
+            .find(|item| {
+                let data = db.item(*item);
+                db.is_reported(*item)
+                    && scope.holds(workspace, &data.file.path, Some(data.head_line()))
+            });
+        if let Some(item) = item {
+            return checker.ledger(item);
+        }
+    }
+    Vec::new()
 }
 
 impl Checker<'_> {
@@ -520,14 +548,13 @@ fn obligation_kind(unit: &Unit, site: &Obligated) -> String {
 /// scope names no struct or enum.
 pub fn expanded(workspace: &Workspace, scope: &Scope) -> Option<Vec<DerivedItem>> {
     let std = crate::stdlib::packages();
-    for target in targets(workspace) {
-        let checker = unchecked(workspace, std, target);
+    for (_, checker) in checkers(workspace, std) {
         let db = &checker.db;
         let item = (0..db.items.len())
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_carried(*item)
+                db.is_reported(*item)
                     && scope.holds(workspace, &data.file.path, Some(data.head_line()))
             });
         let Some(item) = item else {

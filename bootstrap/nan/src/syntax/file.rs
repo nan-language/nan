@@ -160,6 +160,11 @@ fn parse_as(source: Vec<u8>, std: bool) -> SourceFile {
     };
     parser.run();
     let mut file = parser.file;
+    let blocks = conflict_blocks(&file);
+    for item in &mut file.items {
+        let line = file.tokens[item.first].line;
+        item.abandoned |= blocks.iter().any(|block| block.lines().contains(&line));
+    }
     let checked: Vec<FileDiagnostic> = file
         .items
         .iter()
@@ -182,7 +187,71 @@ fn parse_as(source: Vec<u8>, std: bool) -> SourceFile {
                 ..FileDiagnostic::new(diagnostic.line, diagnostic.code)
             }),
     );
+    file.diagnostics.retain(|diagnostic| {
+        !blocks
+            .iter()
+            .any(|block| block.lines().contains(&diagnostic.line))
+    });
+    for block in &blocks {
+        file.diagnostics.push(FileDiagnostic {
+            fixes: vec![block.keeping(&file, true), block.keeping(&file, false)],
+            ..FileDiagnostic::new(block.first, Code::MergeUnresolved)
+        });
+    }
     file
+}
+
+/// A conflict block, by the numbers of its `<<<<<<< ours`, `=======` and `>>>>>>> theirs` lines.
+struct ConflictBlock {
+    first: u32,
+    middle: u32,
+    last: u32,
+}
+
+impl ConflictBlock {
+    fn lines(&self) -> std::ops::RangeInclusive<u32> {
+        self.first..=self.last
+    }
+
+    /// The replacement of the block by ours' text or theirs'.
+    fn keeping(&self, file: &SourceFile, ours: bool) -> Vec<Replacement> {
+        let start = |line: u32| {
+            file.lines
+                .get(line as usize - 1)
+                .map_or(file.source.len() as u32, |line| line.start)
+        };
+        let (from, to) = if ours {
+            (self.first + 1, self.middle)
+        } else {
+            (self.middle + 1, self.last)
+        };
+        vec![Replacement {
+            start: start(self.first),
+            end: start(self.last + 1),
+            text: String::from_utf8_lossy(&file.source[start(from) as usize..start(to) as usize])
+                .into_owned(),
+        }]
+    }
+}
+
+/// The conflict blocks of a file, each marker line at column 0.
+fn conflict_blocks(file: &SourceFile) -> Vec<ConflictBlock> {
+    let mut blocks = Vec::new();
+    let mut lines = (1..=file.lines.len() as u32).map(|line| (line, file.line_text(line)));
+    while let Some((first, _)) = lines.find(|(_, text)| *text == b"<<<<<<< ours") {
+        let Some((middle, _)) = lines.find(|(_, text)| *text == b"=======") else {
+            break;
+        };
+        let Some((last, _)) = lines.find(|(_, text)| *text == b">>>>>>> theirs") else {
+            break;
+        };
+        blocks.push(ConflictBlock {
+            first,
+            middle,
+            last,
+        });
+    }
+    blocks
 }
 
 /// How a run of doc comment lines stands in the parse.

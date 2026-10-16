@@ -40,13 +40,28 @@ const COMPLETE: &[u8] = b"complete\n";
 
 /// Writes files, given by path relative to `root`, through the journal.
 pub fn write(root: &Path, files: &[(String, Vec<u8>)]) -> io::Result<()> {
-    if files.is_empty() {
+    let changes: Vec<(String, Option<Vec<u8>>)> = files
+        .iter()
+        .map(|(path, content)| (path.clone(), Some(content.clone())))
+        .collect();
+    apply(root, &changes)
+}
+
+/// Writes or deletes files, given by path relative to `root` with their new content or none,
+/// through the journal.
+pub fn apply(root: &Path, changes: &[(String, Option<Vec<u8>>)]) -> io::Result<()> {
+    if changes.is_empty() {
         return Ok(());
     }
     let mut journal = Vec::new();
-    for (path, content) in files {
-        journal.extend(format!("write {} {path}\n", content.len()).bytes());
-        journal.extend(content);
+    for (path, content) in changes {
+        match content {
+            Some(content) => {
+                journal.extend(format!("write {} {path}\n", content.len()).bytes());
+                journal.extend(content);
+            }
+            None => journal.extend(format!("delete {path}\n").bytes()),
+        }
     }
     journal.extend(COMPLETE);
     let path = journal_path(root);
@@ -97,18 +112,27 @@ fn recover(root: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
-/// Replaces each file a complete journal records by renaming a new file into place, and returns
-/// once the replacements are on disk.
+/// Replaces each file a complete journal records by renaming a new file into place, deletes each
+/// file it records deleted, and returns once the changes are on disk.
 fn replace(root: &Path, journal: &[u8]) -> io::Result<()> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "the journal is malformed");
     let mut rest = &journal[..journal.len() - COMPLETE.len()];
     let mut renames = Vec::new();
+    let mut deletions = Vec::new();
+    let mut directories = BTreeSet::new();
     while !rest.is_empty() {
         let header_end = rest
             .iter()
             .position(|byte| *byte == b'\n')
             .ok_or_else(invalid)?;
         let header = std::str::from_utf8(&rest[..header_end]).map_err(|_| invalid())?;
+        if let Some(path) = header.strip_prefix("delete ") {
+            let target = root.join(path);
+            directories.insert(target.parent().ok_or_else(invalid)?.to_owned());
+            deletions.push(target);
+            rest = &rest[header_end + 1..];
+            continue;
+        }
         let (length, path) = header
             .strip_prefix("write ")
             .and_then(|header| header.split_once(' '))
@@ -124,14 +148,20 @@ fn replace(root: &Path, journal: &[u8]) -> io::Result<()> {
             .to_string_lossy()
             .into_owned();
         let new = target.with_file_name(format!(".{name}.new"));
+        fs::create_dir_all(target.parent().ok_or_else(invalid)?)?;
         write_synced(&new, content)?;
         renames.push((new, target));
         rest = &rest[header_end + 1 + length..];
     }
-    let mut directories = BTreeSet::new();
     for (new, target) in renames {
         fs::rename(&new, &target)?;
         directories.insert(target.parent().ok_or_else(invalid)?.to_owned());
+    }
+    for target in deletions {
+        match fs::remove_file(&target) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
     }
     directories
         .iter()

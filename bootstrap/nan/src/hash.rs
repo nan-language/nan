@@ -2,7 +2,7 @@
 //! forms. The build script includes this file, so it depends on nothing but `core`.
 
 /// A hash: the algorithm tag, then the 32-byte digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash(pub [u8; 33]);
 
 const BLAKE3: u8 = 0x01;

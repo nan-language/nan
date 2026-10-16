@@ -46,7 +46,7 @@ pub fn contexts(workspace: &Workspace, scope: &Scope, line: Option<u32>) -> Vec<
             let data = db.item(item);
             let first =
                 check_targets(db.package(db.package_of(item)).source).first() == Some(target);
-            if db.is_carried(item)
+            if !db.is_reported(item)
                 || !first
                 || !scope.holds(workspace, &data.file.path, Some(data.head_line()))
                 || !listed.insert((data.file.path.clone(), data.head_line()))
@@ -318,7 +318,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let data = db.item(item);
-            if db.is_carried(item) {
+            if !db.is_reported(item) {
                 continue;
             }
             if scope.is_some_and(|scope| {
@@ -339,7 +339,7 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
                     checker
                         .line_closure(item, *line)
                         .into_iter()
-                        .filter(|read| !db.is_carried(*read)),
+                        .filter(|read| db.is_reported(*read)),
                 );
             }
         }
@@ -382,7 +382,7 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
             let item = ItemId(index as u32);
             let first =
                 check_targets(db.package(db.package_of(item)).source).first() == Some(target);
-            if db.is_carried(item) || !first {
+            if !db.is_reported(item) || !first {
                 continue;
             }
             let pack = checker.context(&checkers, item, None);

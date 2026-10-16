@@ -523,7 +523,7 @@ A token is **accepted** when the parse of the tokens before it continues with it
 
 A **pending clause** is a `fails` clause, `uses wait` clause or from variant that the exact fix of an `item.fails-missing`, `item.wait-missing`, `error.cancel-unmapped` or `error.unconvertible` diagnostic adds. In a prefix, such a diagnostic with an exact fix is not reported, and closing adds its pending clauses as the fix does. Pending clauses are lower bounds: text after the prefix never removes one.
 
-The prefix up to line 2 of this file closes with two closers:
+The prefix up to line 3 of this file closes with two closers:
 
 ```nan
 pub fn clamp_level(level: u32, ceiling: u32) -> u32 {
@@ -535,11 +535,11 @@ pub fn clamp_level(level: u32, ceiling: u32) -> u32 {
 ```
 
 ```text
-$ nan check --prefix example/example.nan:2
-ok check --prefix example/example.nan:2: dead 0, pending 0, holes 0
+$ nan check --prefix example/example.nan:3
+ok check --prefix example/example.nan:3: dead 0, pending 0, holes 0
 close }
 close } clamp_level
-ok check --prefix example/example.nan:2: dead 0, pending 0, holes 0
+ok check --prefix example/example.nan:3: dead 0, pending 0, holes 0
 ```
 
 ## Grammar publication

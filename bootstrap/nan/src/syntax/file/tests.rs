@@ -246,3 +246,21 @@ fn every_file_starts_with_a_described_summary() {
 fn a_line_with_a_lexical_diagnostic_reports_nothing_else() {
     assert_eq!(codes("fn f() {\n    return )\t\n} f\n"), [(3, "lex.tab")]);
 }
+
+#[test]
+fn a_conflict_block_is_reported_once_with_fixes_keeping_either_side() {
+    let body = "<<<<<<< ours\nfn f() -> u32 = 2\n=======\nfn f() -> u32 = 3\n>>>>>>> theirs\n";
+    assert_eq!(codes(body), [(2, "merge.unresolved")]);
+    let file = parse(format!("//! Summary.\n{body}").into_bytes());
+    let kept: Vec<&str> = file.diagnostics[0]
+        .fixes
+        .iter()
+        .map(|fix| fix[0].text.as_str())
+        .collect();
+    assert_eq!(kept, ["fn f() -> u32 = 2\n", "fn f() -> u32 = 3\n"]);
+    assert!(
+        file.items
+            .iter()
+            .all(|item| item.abandoned || item.tree.is_none())
+    );
+}

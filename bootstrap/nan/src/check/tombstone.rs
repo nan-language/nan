@@ -2,15 +2,19 @@
 //! old forms that live items, members and the tombstones of other modules take.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::Checker;
-use super::db::{ItemId, ModuleId, TypeKey};
+use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::interface::{narrower, openness};
 use super::resolve::Named;
 use super::sig::SigKind;
 use super::tir::{Callee, TExpr, TKind};
 use super::ty::Ty;
+use crate::cache::Cache;
 use crate::diagnostic::Code;
+use crate::release;
+use crate::store::Store;
 use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredItem, RetiredNew, Visibility};
 
 impl Checker<'_> {
@@ -65,17 +69,112 @@ impl Checker<'_> {
         let ItemKind::Retired(retired) = &ast.kind else {
             return;
         };
+        let package = self.db.package_of(item);
+        let foreign = retired.path.segments.len() > 1
+            && retired.path.segments.first().is_some_and(|first| {
+                self.db.module_named(package, &first.text).is_none()
+                    && self
+                        .db
+                        .alias(package, &first.text)
+                        .is_some_and(|aliased| aliased != package)
+            });
         let rewrite = match &retired.new {
+            _ if foreign => Some(Code::RetiredForeignPath),
             RetiredNew::Rewrite { expr, .. } => self.rewrite_problem(item, retired, expr),
             RetiredNew::Manual => None,
         };
-        let code = rewrite.or_else(|| {
-            self.form_taken(item, retired)
-                .then_some(Code::RetiredFormTaken)
-        });
+        let code = rewrite
+            .or_else(|| {
+                (!self.db.in_history(item) && self.form_taken(item, retired))
+                    .then_some(Code::RetiredFormTaken)
+            })
+            .or_else(|| {
+                self.unused_tombstone(item, retired)
+                    .then_some(Code::UnusedTombstone)
+            });
         if let Some(code) = code {
             self.report(item, ast.token, code);
         }
+    }
+
+    /// Whether a tombstone retires a member of a type deriving `Encode`, whose key it keeps.
+    pub fn keeps_encode_key(&self, module: ModuleId, retired: &RetiredItem) -> bool {
+        if retired.member.is_none() {
+            return false;
+        }
+        let Ok(Named::Item(owner)) = self.db.resolve(module, &retired.path) else {
+            return false;
+        };
+        let derives = match &self.db.ast(owner).kind {
+            ItemKind::Struct(structure) => &structure.derives,
+            ItemKind::Enum(enumeration) => &enumeration.derives,
+            _ => return false,
+        };
+        derives.iter().any(|name| name.text == "Encode")
+    }
+
+    /// Whether a tombstone in source retires nothing the release its package's history head
+    /// names exports: no item or member consumers see has its old form's canonical path, a
+    /// function with the old head's parameter modes and types for an old head. A tombstone
+    /// keeping an `Encode` key is never unused.
+    fn unused_tombstone(&self, item: ItemId, retired: &RetiredItem) -> bool {
+        let module = self.db.module_of(item);
+        if self.db.in_history(item) || self.keeps_encode_key(module, retired) {
+            return false;
+        }
+        let Some(form) = self.db.old_form(module, retired) else {
+            return false;
+        };
+        let Some(exported) = self.head_exports(self.db.package_of(item)) else {
+            return false;
+        };
+        if let Some(entry) = exported.get(&form) {
+            let data = self.db.item(item);
+            let line =
+                String::from_utf8_lossy(data.syntax().line_text(data.head_line())).into_owned();
+            let old = line
+                .strip_prefix("retired ")
+                .and_then(|rest| rest.split_once(" => "));
+            return match (&retired.head, old, entry.text.first()) {
+                (Some(_), Some((head, _)), Some(text)) => params(head) != params(text),
+                _ => false,
+            };
+        }
+        let Some((owner, member)) = form.rsplit_once('.') else {
+            return true;
+        };
+        let members = exported
+            .get(owner)
+            .map(|entry| &entry.text[1..])
+            .unwrap_or_default();
+        !members.iter().any(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let line = line.strip_prefix("fn ").unwrap_or(line);
+            let name = line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default();
+            name == member
+        })
+    }
+
+    /// The exported items of the release a package's history head names, from the local store.
+    fn head_exports(&self, package: PackageId) -> Option<Rc<super::Exported>> {
+        if let Some(known) = self.head_exports.borrow().get(&package) {
+            return known.clone();
+        }
+        let head = self.db.package(package).source.machine.history()?.head?;
+        let exported = Cache::open()
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|cache| Store::new(cache.store()).entries().ok()?.ok())
+            .and_then(|entries| entries.into_iter().find(|entry| entry.root() == head))
+            .map(|entry| Rc::new(release::exported(&entry.artefact)));
+        self.head_exports
+            .borrow_mut()
+            .insert(package, exported.clone());
+        exported
     }
 
     /// The rule a tombstone's rewrite breaks: its form, a name resolving to nothing live, and
@@ -100,6 +199,7 @@ impl Checker<'_> {
                     .head_rewrite_form(rewrite)
                     .then(|| self.typed_rewrite(item, head, rewrite))
                     .flatten()
+                    .and_then(|body| body.root)
                 else {
                     return Some(Code::RetiredBadRewrite);
                 };
@@ -133,7 +233,7 @@ impl Checker<'_> {
 
     /// Whether the rewrite of a tombstone with an old head is a call or a path whose only markers
     /// are `mut` and `take`.
-    fn head_rewrite_form(&self, rewrite: &ast::Expr) -> bool {
+    pub fn head_rewrite_form(&self, rewrite: &ast::Expr) -> bool {
         let inner = match &rewrite.kind {
             ExprKind::Marked {
                 failure: None,
@@ -256,8 +356,72 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether a live item or member, or a tombstone of another module with the same identity
-    /// that comes first by file path and line, takes a tombstone's old form.
+    /// Reports a live item, and each member of it, whose canonical path is the old form that a
+    /// tombstone of its package's history keeps, a function only when it has that tombstone's
+    /// old parameter modes and types.
+    pub fn check_history_forms(&self, item: ItemId) {
+        let ast = self.db.ast(item);
+        if ast.name().is_none() || matches!(ast.kind, ItemKind::Retired(_) | ItemKind::Impl(_)) {
+            return;
+        }
+        let package = self.db.package_of(item);
+        let kept = |form: &str| -> Vec<ItemId> {
+            self.db
+                .retired
+                .get(form)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&tombstone| {
+                    self.db.in_history(tombstone) && self.db.package_of(tombstone) == package
+                })
+                .collect()
+        };
+        let path = self.db.canonical(item);
+        let modes_and_types = |function: ItemId| {
+            self.fn_sig(function).map(|sig| {
+                sig.params
+                    .iter()
+                    .map(|param| (param.mode, param.ty.clone()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let taken = kept(&path).into_iter().any(|tombstone| {
+            let ItemKind::Retired(retired) = &self.db.ast(tombstone).kind else {
+                return false;
+            };
+            retired.head.is_none()
+                || !matches!(ast.kind, ItemKind::Fn(_))
+                || modes_and_types(item) == modes_and_types(tombstone)
+        });
+        if taken {
+            self.report(item, ast.token, Code::RetiredFormTaken);
+        }
+        let members: Vec<&ast::Name> = match &ast.kind {
+            ItemKind::Struct(structure) => structure.fields().map(|field| &field.name).collect(),
+            ItemKind::Enum(enumeration) => enumeration
+                .variants
+                .iter()
+                .map(|variant| &variant.name)
+                .collect(),
+            ItemKind::Interface(interface) => interface
+                .methods
+                .iter()
+                .map(|method| &method.name)
+                .collect(),
+            ItemKind::Layout(layout) => layout.fields.iter().map(|field| &field.name).collect(),
+            _ => Vec::new(),
+        };
+        for member in members {
+            if !kept(&format!("{path}.{}", member.text)).is_empty() {
+                self.report(item, member.token, Code::RetiredFormTaken);
+            }
+        }
+    }
+
+    /// Whether a live item or member, a tombstone of the history with the same identity, or a
+    /// tombstone of another module with the same identity that comes first by file path and line,
+    /// takes a tombstone's old form.
     fn form_taken(&self, item: ItemId, retired: &RetiredItem) -> bool {
         let module = self.db.module_of(item);
         let Some(form) = self.db.old_form(module, retired) else {
@@ -322,9 +486,10 @@ impl Checker<'_> {
                 .into_iter()
                 .flatten()
                 .any(|&other| {
-                    self.db.module_of(other) != module
+                    let earlier = self.db.in_history(other)
+                        || (self.db.module_of(other) != module && position(other) < position(item));
+                    earlier
                         && !self.db.is_std(other)
-                        && position(other) < position(item)
                         && match &self.db.ast(other).kind {
                             ItemKind::Retired(earlier) => {
                                 earlier.head.is_some() == own.is_some()
@@ -353,4 +518,55 @@ fn replacement(expr: &TExpr) -> Option<ItemId> {
         TKind::Value(item) | TKind::FnValue { item, .. } => Some(*item),
         _ => None,
     }
+}
+
+/// The modes and types of the parameters a head's text writes, without their names.
+fn params(head: &str) -> Vec<String> {
+    let Some(open) = head.find('(') else {
+        return Vec::new();
+    };
+    let mut depth = 0;
+    let mut close = head.len();
+    for (at, c) in head[open..].char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + at;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    let mut depth = 0;
+    let mut start = open + 1;
+    for (at, c) in head[open + 1..close].char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                found.push(head[start..open + 1 + at].to_owned());
+                start = open + 2 + at;
+            }
+            _ => {}
+        }
+    }
+    found.push(head[start..close].to_owned());
+    found
+        .iter()
+        .map(|param| {
+            let param = param.trim();
+            match param.split_once(':') {
+                Some((named, ty)) => match named.trim().split_once(' ') {
+                    Some((mode, _)) => format!("{mode} {}", ty.trim()),
+                    None => ty.trim().to_owned(),
+                },
+                None => param.to_owned(),
+            }
+        })
+        .filter(|param| !param.is_empty())
+        .collect()
 }

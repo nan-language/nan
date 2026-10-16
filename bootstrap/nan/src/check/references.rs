@@ -45,7 +45,7 @@ impl Checker<'_> {
             .map(|index| ItemId(index as u32))
             .find(|item| {
                 let data = db.item(*item);
-                !db.is_carried(*item)
+                db.is_reported(*item)
                     && data.file.path == path
                     && data
                         .syntax()
@@ -167,10 +167,14 @@ impl Checker<'_> {
         let db = &self.db;
         let mut holders: Vec<Holder> = (0..db.items.len())
             .map(|index| ItemId(index as u32))
-            .filter(|item| !db.is_carried(*item))
+            .filter(|item| db.is_reported(*item))
             .map(|item| self.holder(item))
             .collect();
-        for package in db.packages.iter().filter(|package| !package.carried) {
+        for package in db
+            .packages
+            .iter()
+            .filter(|package| !package.carried && !package.quiet)
+        {
             let (Some(root), Some(file)) = (package.root, package.source.files.first()) else {
                 continue;
             };
@@ -199,7 +203,7 @@ impl Checker<'_> {
                 functions.entry(name.as_str()).or_default().extend(
                     named
                         .iter()
-                        .filter(|function| !self.db.is_carried(**function)),
+                        .filter(|function| self.db.is_reported(**function)),
                 );
             }
         }

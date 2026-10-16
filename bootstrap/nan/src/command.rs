@@ -1,10 +1,18 @@
 //! The `nan` command line: reading it, running the command it names, and printing the result.
 
+mod api;
 mod build;
 mod check;
+mod dep;
+mod diff;
 mod edit;
+mod merge;
+mod publish;
 mod read;
+mod seal;
 mod test;
+mod upgrade;
+mod verify;
 
 use std::fs;
 use std::io;
@@ -54,18 +62,34 @@ enum Name {
     Build,
     Run,
     Test,
+    ApiUpdate,
+    DepAdd,
+    DepSync,
+    DepApprove,
+    Verify,
+    Publish,
+    Merge,
+    Upgrade,
+    Diff,
+    Seal,
 }
 
 impl Name {
     /// The command named by the words a command line starts with, and how many it takes.
     fn read(args: &[String]) -> Option<(Name, usize)> {
-        if args.first()? == "edit" {
-            let name = match args.get(1)?.as_str() {
-                "replace" => Name::EditReplace,
-                "rename" => Name::EditRename,
-                "move" => Name::EditMove,
-                _ => return None,
-            };
+        let second = args.get(1).map(String::as_str);
+        let pair = match (args.first()?.as_str(), second) {
+            ("edit", Some("replace")) => Some(Name::EditReplace),
+            ("edit", Some("rename")) => Some(Name::EditRename),
+            ("edit", Some("move")) => Some(Name::EditMove),
+            ("api", Some("update")) => Some(Name::ApiUpdate),
+            ("dep", Some("add")) => Some(Name::DepAdd),
+            ("dep", Some("sync")) => Some(Name::DepSync),
+            ("dep", Some("approve")) => Some(Name::DepApprove),
+            ("edit" | "api" | "dep", _) => return None,
+            _ => None,
+        };
+        if let Some(name) = pair {
             return Some((name, 2));
         }
         let name = match args.first()?.as_str() {
@@ -83,6 +107,12 @@ impl Name {
             "build" => Name::Build,
             "run" => Name::Run,
             "test" => Name::Test,
+            "verify" => Name::Verify,
+            "publish" => Name::Publish,
+            "merge" => Name::Merge,
+            "upgrade" => Name::Upgrade,
+            "diff" => Name::Diff,
+            "seal" => Name::Seal,
             _ => return None,
         };
         Some((name, 1))
@@ -108,6 +138,16 @@ impl Name {
             Name::Build => "build",
             Name::Run => "run",
             Name::Test => "test",
+            Name::ApiUpdate => "api update",
+            Name::DepAdd => "dep add",
+            Name::DepSync => "dep sync",
+            Name::DepApprove => "dep approve",
+            Name::Verify => "verify",
+            Name::Publish => "publish",
+            Name::Merge => "merge",
+            Name::Upgrade => "upgrade",
+            Name::Diff => "diff",
+            Name::Seal => "seal",
         }
     }
 
@@ -131,13 +171,32 @@ impl Name {
             Name::Find => (&["--contributors"], &[]),
             Name::Fix => (&["--propagate"], &[]),
             Name::Test => (&["--affected"], &["--replay"]),
+            Name::ApiUpdate | Name::DepAdd | Name::DepSync | Name::DepApprove | Name::Verify => {
+                (&[], &[])
+            }
+            Name::Publish => (&[], &["--local", "--name"]),
+            Name::Merge => (&[], &["--path"]),
+            Name::Upgrade => (&[], &["--language"]),
+            Name::Diff => (&["--green"], &["--path", "--agent"]),
+            Name::Seal => (&[], &["--as"]),
+        }
+    }
+
+    /// The option taking every argument after it up to the next option.
+    fn listing(self) -> Option<&'static str> {
+        match self {
+            Name::ApiUpdate => Some("--confirm-docs"),
+            Name::Publish => Some("--breaking"),
+            _ => None,
         }
     }
 
     /// The most operands the command takes.
     fn operands(self) -> usize {
         match self {
-            Name::Find | Name::EditRename | Name::EditMove => 2,
+            Name::Find | Name::EditRename | Name::EditMove | Name::DepAdd => 2,
+            Name::Merge => 3,
+            Name::Diff => 2,
             _ => 1,
         }
     }
@@ -165,6 +224,11 @@ impl Name {
                 | Name::EditRename
                 | Name::EditMove
                 | Name::Primer
+                | Name::DepAdd
+                | Name::Publish
+                | Name::Merge
+                | Name::Diff
+                | Name::Seal
         )
     }
 
@@ -180,6 +244,15 @@ impl Name {
                 | Name::Build
                 | Name::Run
                 | Name::Test
+                | Name::ApiUpdate
+                | Name::DepAdd
+                | Name::DepSync
+                | Name::DepApprove
+                | Name::Verify
+                | Name::Publish
+                | Name::Merge
+                | Name::Upgrade
+                | Name::Seal
         )
     }
 
@@ -187,21 +260,30 @@ impl Name {
     fn counts(self) -> &'static [&'static str] {
         match self {
             Name::Check | Name::Fix => &["errors", "incomplete"],
-            Name::Test => &["errors", "incomplete", "tests", "failed"],
+            Name::Test | Name::Verify => &["errors", "incomplete", "tests", "failed"],
             Name::Fmt
             | Name::EditReplace
             | Name::EditRename
             | Name::EditMove
             | Name::Build
-            | Name::Run => &["files", "errors", "incomplete"],
+            | Name::Run
+            | Name::ApiUpdate
+            | Name::DepAdd
+            | Name::DepSync
+            | Name::DepApprove
+            | Name::Publish
+            | Name::Upgrade
+            | Name::Seal => &["files", "errors", "incomplete"],
             Name::Find
             | Name::Holes
             | Name::Show
             | Name::Read
             | Name::Explain
             | Name::Expand
-            | Name::Primer => &["records"],
+            | Name::Primer
+            | Name::Diff => &["records"],
             Name::Context => &["entries", "radius"],
+            Name::Merge => &["files", "conflicts", "errors"],
         }
     }
 }
@@ -238,6 +320,15 @@ impl Invocation<'_> {
             .iter()
             .find(|(given, _)| *given == option)
             .map(|(_, value)| *value)
+    }
+
+    /// The values a listing option was given, in order.
+    fn listed(&self, option: &str) -> Vec<&str> {
+        self.values
+            .iter()
+            .filter(|(given, _)| *given == option)
+            .map(|(_, value)| *value)
+            .collect()
     }
 
     /// The names of the counts its summary gives: prefix checking's own, or the command's.
@@ -409,6 +500,19 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
                 invocation.format.skip = number(rest.get(index)?)?;
             }
             _ if flags.contains(&arg) && !invocation.flag(arg) => invocation.flags.push(arg),
+            _ if name.listing() == Some(arg) && invocation.listed(arg).is_empty() => {
+                let listed: Vec<&String> = rest[index + 1..]
+                    .iter()
+                    .take_while(|value| !value.starts_with("--"))
+                    .collect();
+                if listed.is_empty() {
+                    return None;
+                }
+                index += listed.len();
+                invocation
+                    .values
+                    .extend(listed.into_iter().map(|value| (arg, value.as_str())));
+            }
             _ if valued.contains(&arg)
                 && invocation.values.iter().all(|(option, _)| *option != arg) =>
             {
@@ -463,6 +567,15 @@ fn usage(args: &[String]) -> Run {
 }
 
 fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Outcome> {
+    if invocation.name == Name::Merge {
+        return merge::run(invocation, current, trace).map(Outcome::Output);
+    }
+    if invocation.name == Name::Diff
+        && invocation.value("--path").is_none()
+        && !invocation.flag("--green")
+    {
+        return diff::workspaces(invocation, current, trace).map(Outcome::Output);
+    }
     let root = workspace::root(current);
     if !workspace::holds_package(&root)? {
         return Ok(Outcome::Output(
@@ -486,6 +599,19 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
         Name::EditRename => edit::rename(invocation, &workspace, current, trace),
         Name::EditMove => edit::move_item(invocation, &workspace, current, trace),
         Name::Primer => Ok(read::primer(invocation)),
+        Name::ApiUpdate => api::update(invocation, &workspace, current, trace),
+        Name::DepAdd => dep::add(invocation, &workspace, current, trace),
+        Name::DepSync => dep::sync(invocation, &workspace, current, trace),
+        Name::DepApprove => dep::approve(invocation, &workspace, current, trace),
+        Name::Verify => verify::run(invocation, &workspace, current, trace),
+        Name::Publish => publish::run(invocation, &workspace, current, trace),
+        Name::Merge => unreachable!("merge runs outside a workspace"),
+        Name::Upgrade if invocation.value("--language").is_some() => {
+            upgrade::language(invocation, &workspace, current, trace)
+        }
+        Name::Upgrade => dep::upgrade(invocation, &workspace, current, trace),
+        Name::Diff => diff::run(invocation, &workspace, current, trace),
+        Name::Seal => seal::run(invocation, &workspace, current, trace),
     };
     output.map(Outcome::Output)
 }
@@ -546,10 +672,10 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
     };
     let mut lines = Vec::new();
     if let (Some(path), Some(line)) = (&diagnostic.path, diagnostic.line) {
-        let (_, file) = workspace
-            .file(path)
+        let text = workspace
+            .line_text(path, line)
             .expect("diagnostics lie in workspace files");
-        lines.push(output::printable(file.syntax.line_text(line)));
+        lines.push(output::printable(text));
     }
     lines.extend(
         diagnostic

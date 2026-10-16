@@ -11,6 +11,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId};
 use crate::check::sig::SigKind;
 use crate::check::ty::{Scalar, Ty};
+use crate::hash::Hash;
 use crate::nir::{BinaryOp, UnaryOp};
 use crate::syntax::ast::TypeModifier;
 
@@ -759,6 +760,8 @@ pub struct Query {
     pub terms: Terms,
     pub clauses: Vec<Clause>,
     pub origins: Vec<Origin>,
+    /// The obligation hash: the hash of the concatenated encodings of its clauses.
+    pub hash: Hash,
 }
 
 /// Canonicalises a query: premises in order, then the range premises of their terms, then the
@@ -812,10 +815,15 @@ pub fn canonical(
         })
         .collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let encoding: Vec<u8> = sorted
+        .iter()
+        .flat_map(|(encoded, ..)| encoded.clone())
+        .collect();
     Query {
         terms: store,
         clauses: sorted.iter().map(|(_, clause, _)| clause.clone()).collect(),
         origins: sorted.iter().map(|(_, _, origin)| *origin).collect(),
+        hash: Hash::of(&encoding),
     }
 }
 

@@ -35,8 +35,9 @@ pub enum Fault {
 pub type Elaborated<T> = Result<T, Fault>;
 
 impl Checker<'_> {
-    /// The NIR unit of an item the checker accepts; none for a rejected item, a package, a
-    /// tombstone, or an item whose elaboration faulted, which reports an internal error.
+    /// The NIR unit of an item the checker accepts, a tombstone's holding its forwarding function;
+    /// none for a rejected item, a package, a tombstone without one, or an item whose elaboration
+    /// faulted, which reports an internal error.
     pub fn unit(&self, item: ItemId) -> Option<Rc<Unit>> {
         self.db.note(item);
         if let Some(unit) = self.units.borrow().get(&item) {
@@ -111,7 +112,14 @@ impl Checker<'_> {
                 self.closure_functions(&mut unit, &body)?;
                 self.statement_functions(&mut unit, &body)?;
             }
-            ItemKind::Package | ItemKind::Retired(_) => return Ok(None),
+            ItemKind::Retired(_) => {
+                let (Some(sig), Some(body)) = (self.fn_sig(item), self.typed(item)) else {
+                    return Ok(None);
+                };
+                unit.number_conditions(&body);
+                self.function_unit(&mut unit, &sig, &body, true, Role::Body)?;
+            }
+            ItemKind::Package => return Ok(None),
             _ => {}
         }
         self.where_functions(&mut unit)?;
@@ -938,7 +946,7 @@ impl UnitDraft {
     }
 
     /// The premise index of a trusted block or expression, by its first token, numbered in
-    /// order of first request.
+    /// order of first request until the unit is finished.
     fn premise(&mut self, token: Tok) -> u32 {
         match self.premises.iter().position(|known| *known == token) {
             Some(index) => index as u32,
@@ -953,12 +961,30 @@ impl UnitDraft {
         self.functions.push(function);
     }
 
+    /// The unit, its premises renumbered in source order.
     fn finish(mut self) -> Unit {
         self.functions
             .sort_by_key(|function| (function.role, function.index));
+        let mut premises = self.premises.clone();
+        premises.sort();
+        let renumbered: Vec<u32> = self
+            .premises
+            .iter()
+            .map(|token| premises.binary_search(token).expect("a premise") as u32)
+            .collect();
+        for function in &mut self.functions {
+            for block in &mut function.blocks {
+                for inst in &mut block.insts {
+                    if let Some(premise) = &mut inst.trusted {
+                        *premise = renumbered[*premise as usize];
+                    }
+                }
+            }
+        }
         Unit {
             item: self.item,
             functions: self.functions,
+            premises,
         }
     }
 }

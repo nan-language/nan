@@ -42,6 +42,8 @@ pub struct Manifest {
     pub targets_line: Option<u32>,
     /// Whether the package's language version is one this implementation implements.
     pub supported: bool,
+    /// The language version the `language` directive states, and its line.
+    pub language: Option<(u128, u32)>,
     /// The name the `entry` directive gives, and its line.
     pub entry: Option<(String, u32)>,
     pub deps: Vec<Dep>,
@@ -54,6 +56,8 @@ pub struct Dep {
     pub alias: String,
     /// The workspace directory a relative source names, or the store name.
     pub source: Option<String>,
+    /// The source as the directive writes it.
+    pub written: String,
     pub path: bool,
     pub line: u32,
 }
@@ -187,6 +191,7 @@ impl Reader<'_> {
             targets: Vec::new(),
             targets_line: None,
             supported: true,
+            language: None,
             entry: None,
             deps: Vec::new(),
             allows: Vec::new(),
@@ -218,6 +223,7 @@ impl Reader<'_> {
                     let text = self.text(version);
                     let decimal = text.chars().all(|c| c.is_ascii_digit() || c == '_');
                     manifest.supported = int_value(text) == Some(1);
+                    manifest.language = int_value(text).map(|version| (version, line));
                     if !decimal {
                         self.report(line, Code::LanguageVersionForm);
                     }
@@ -287,6 +293,7 @@ impl Reader<'_> {
                     manifest.deps.push(Dep {
                         alias: alias.clone(),
                         source: resolved.clone(),
+                        written: source.clone(),
                         path: matches!(source_kind(&source), Some(Source::Path)),
                         line,
                     });
@@ -371,7 +378,7 @@ fn source_kind(source: &str) -> Option<Source> {
 }
 
 /// The workspace path a relative source names from the package directory, `.` and `..` resolved.
-fn resolve(package_dir: &str, source: &str) -> String {
+pub fn resolve(package_dir: &str, source: &str) -> String {
     let mut parts: Vec<&str> = package_dir.split('/').collect();
     for segment in source.split('/') {
         match segment {
@@ -399,4 +406,29 @@ fn int_value(text: &str) -> Option<u128> {
         .find(|c: char| !c.is_digit(radix))
         .unwrap_or(digits.len());
     u128::from_str_radix(&digits[..end], radix).ok()
+}
+
+/// The relative path source naming the directory `to` from the directory `from`, both relative
+/// to the workspace root.
+pub fn relative(from: &str, to: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|part| !part.is_empty()).collect();
+    let to: Vec<&str> = to.split('/').filter(|part| !part.is_empty()).collect();
+    let shared = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - shared];
+    parts.extend(&to[shared..]);
+    match parts.first() {
+        Some(&"..") => parts.join("/"),
+        _ => {
+            let mut written = String::from(".");
+            for part in parts {
+                written.push('/');
+                written.push_str(part);
+            }
+            written
+        }
+    }
 }

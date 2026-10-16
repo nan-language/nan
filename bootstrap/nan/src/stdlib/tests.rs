@@ -47,7 +47,12 @@ const HOST_UNCALLABLE: [&str; 5] = [
 #[test]
 fn every_pub_std_function_has_an_example_or_a_test() {
     let workspace = std_workspace();
-    let checker = crate::check::checked(&workspace, &[], crate::workspace::Target::Any);
+    let checker = crate::check::checked(
+        &workspace,
+        &workspace.closures[0],
+        &[],
+        crate::workspace::Target::Any,
+    );
     let db = &checker.db;
     let items = (0..db.items.len()).map(|index| ItemId(index as u32));
     let tested: Vec<ItemId> = items
@@ -94,7 +99,12 @@ fn every_pub_std_function_has_an_example_or_a_test() {
 #[test]
 fn every_std_example_runs_to_true() {
     let workspace = std_workspace();
-    let checker = crate::check::checked(&workspace, &[], crate::workspace::Target::Any);
+    let checker = crate::check::checked(
+        &workspace,
+        &workspace.closures[0],
+        &[],
+        crate::workspace::Target::Any,
+    );
     let mut failing = Vec::new();
     for item in (0..checker.db.items.len()).map(|index| ItemId(index as u32)) {
         let Some(body) = checker.typed(item) else {

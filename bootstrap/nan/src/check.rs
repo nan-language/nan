@@ -3,8 +3,11 @@
 //! over one item under one target, memoized for the run.
 
 mod api;
+mod approval;
+mod author;
 mod authority;
 mod body;
+mod changes;
 mod component;
 mod conform;
 mod context;
@@ -17,23 +20,33 @@ mod elaborate;
 mod expand;
 mod failure;
 mod flow;
+mod gate;
 pub(crate) mod generation;
 mod head;
 mod identity;
 mod interface;
 mod kernel;
+pub(crate) mod ledger;
 pub(crate) mod lowlevel;
 mod package;
+mod preserved;
 mod program;
 pub(crate) mod props;
+mod published;
 mod reading;
 mod references;
 mod registry;
+pub(crate) mod requires;
 mod resolve;
 mod rewrite;
+pub(crate) mod root;
 mod runs;
+pub(crate) mod schema;
+pub(crate) mod seal;
 mod shape;
 pub(crate) mod sig;
+pub(crate) mod snapshot;
+pub(crate) mod spec;
 mod supplied;
 pub(crate) mod testing;
 mod threshold;
@@ -41,28 +54,39 @@ pub(crate) mod tir;
 mod tombstone;
 mod traps;
 pub(crate) mod ty;
+mod units;
 mod unknown;
 mod untrusted;
 mod unused;
 
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+pub use approval::approvals;
+pub use changes::{Change, changes, semantic_conflicts};
 pub use context::{Context, Green, context_gaps, contexts, greens};
 use db::{Db, ItemId, ModuleId, PackageId};
 pub use edits::{identity, moved, renamed};
 pub use elaborate::EnsuresClause;
-pub use reading::{api, contributed, declared, expanded, explained, holes, shown};
+pub use gate::gate;
+pub use preserved::not_preserved;
+pub use published::summaries as publish_summaries;
+pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
 pub use references::Relocated;
+pub use root::package_files as package_sources;
 use sig::{GenericDef, Sig};
+pub use snapshot::{Snapshots, Unsealed};
 pub use supplied::stated;
 pub use traps::closure_demands_notrap;
 
+use crate::cache::Cache;
 use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Reason, Role};
+use crate::hash::Hash;
+use crate::machine::api::Entry as ApiEntry;
 use crate::scope::Scope;
 use crate::syntax::ast::{self, Tok};
-use crate::workspace::{Authority, Package, Target, Workspace};
+use crate::workspace::{Authority, Closure, Package, Target, Workspace};
 
 pub struct Checker<'a> {
     pub db: Db<'a>,
@@ -127,12 +151,26 @@ pub struct Checker<'a> {
     /// The diagnostics of unused code found under the target, reported once found under every
     /// target checking their file.
     unused: RefCell<Vec<Diagnostic>>,
+    /// The diagnostics found on the items of quiet packages, which no command reports.
+    quiet: RefCell<Vec<Diagnostic>>,
     /// The fields of structs the bodies checked read.
     fields_read: RefCell<HashSet<(ItemId, String)>>,
     /// The `label: value` of each construction and struct pattern the bodies checked write, by
     /// the struct and the field it names.
     field_labels: RefCell<HashMap<(ItemId, String), Vec<unused::FieldLabel>>>,
+    /// The proof cache of the running user, opened at the first query decided; none without a
+    /// usable one.
+    pub(crate) proof_cache: OnceCell<Option<Cache>>,
+    /// The exported items of the release each package's history head names, once read from the
+    /// local store; none for a head the store does not hold.
+    head_exports: RefCell<HashMap<PackageId, Option<Rc<Exported>>>>,
+    /// While the prover is compared with the proof cache, the obligation hashes whose held
+    /// result differs from the procedure's.
+    pub(crate) compared: RefCell<Option<Vec<Hash>>>,
 }
+
+/// The exported items of a release, by canonical path.
+type Exported = BTreeMap<String, ApiEntry>;
 
 /// A member a name written in a body names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,8 +226,12 @@ impl<'a> Checker<'a> {
             may_traps: RefCell::new(HashMap::new()),
             instantiations: RefCell::new(Vec::new()),
             unused: RefCell::new(Vec::new()),
+            quiet: RefCell::new(Vec::new()),
             fields_read: RefCell::new(HashSet::new()),
             field_labels: RefCell::new(HashMap::new()),
+            proof_cache: OnceCell::new(),
+            head_exports: RefCell::new(HashMap::new()),
+            compared: RefCell::new(None),
         }
     }
 
@@ -308,14 +350,19 @@ impl<'a> Checker<'a> {
 
     fn report_diagnostic(&self, item: ItemId, diagnostic: Diagnostic) {
         if let Some(diagnostic) = self.on_item(item, diagnostic) {
-            self.found.borrow_mut().push(diagnostic);
+            match self.db.is_reported(item) {
+                true => self.found.borrow_mut().push(diagnostic),
+                false => self.quiet.borrow_mut().push(diagnostic),
+            }
         }
     }
 
     /// Records a diagnostic of unused code on an item, reported once found under every target
     /// checking its file.
     fn report_unused(&self, item: ItemId, diagnostic: Diagnostic) {
-        if let Some(diagnostic) = self.on_item(item, diagnostic) {
+        if let Some(diagnostic) = self.on_item(item, diagnostic)
+            && self.db.is_reported(item)
+        {
             self.unused.borrow_mut().push(diagnostic);
         }
     }
@@ -464,6 +511,7 @@ impl Checker<'_> {
     pub(crate) fn judge_alone(&self, item: ItemId) {
         if self.judged.borrow_mut().insert(item) {
             let reported = self.found.borrow().len();
+            let quieted = self.quiet.borrow().len();
             let (muted, package) = (self.muted.replace(0), self.package.get());
             self.package.set(Some(self.db.package_of(item)));
             self.db.about(Some(item), || self.check_item(item));
@@ -475,13 +523,17 @@ impl Checker<'_> {
                 .syntax
                 .item_lines(&data.file.syntax.items[data.index]);
             let error = |line: u32| lines.contains(&line);
-            let failed = self.found.borrow()[reported..].iter().any(|diagnostic| {
+            let on_item = |diagnostic: &Diagnostic| {
                 diagnostic.code.class() == crate::diagnostic::Class::Error
                     && diagnostic.path.as_deref() == Some(data.file.path.as_str())
                     && diagnostic.line.is_some_and(error)
-            }) || data.file.syntax.diagnostics.iter().any(|diagnostic| {
-                diagnostic.code.class() == crate::diagnostic::Class::Error && error(diagnostic.line)
-            });
+            };
+            let failed = self.found.borrow()[reported..].iter().any(on_item)
+                || self.quiet.borrow()[quieted..].iter().any(on_item)
+                || data.file.syntax.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code.class() == crate::diagnostic::Class::Error
+                        && error(diagnostic.line)
+                });
             if failed {
                 self.rejections.borrow_mut().insert(item);
             }
@@ -494,8 +546,10 @@ impl Checker<'_> {
         self.judged_all.set(true);
         let mut errors: HashSet<(String, u32)> = HashSet::new();
         let found = self.found.borrow();
+        let quiet = self.quiet.borrow();
         let reported = found
             .iter()
+            .chain(quiet.iter())
             .chain(workspace.diagnostics().collect::<Vec<_>>().iter())
             .filter(|diagnostic| diagnostic.code.class() == crate::diagnostic::Class::Error)
             .filter_map(|diagnostic| Some((diagnostic.path.clone()?, diagnostic.line?)))
@@ -536,73 +590,125 @@ fn check_targets(package: &Package) -> Vec<Target> {
     manifest.targets.clone()
 }
 
-/// The targets the workspace's packages are checked under, in order.
-pub fn targets(workspace: &Workspace) -> Vec<Target> {
-    let mut targets: Vec<Target> = workspace.packages.iter().flat_map(check_targets).collect();
+/// The packages a checker checks under its target: the workspace packages its closure checks
+/// that declare the target, by workspace index, with their ids in its database.
+fn checked_packages(checker: &Checker) -> Vec<(usize, PackageId)> {
+    let target = checker.db.target;
+    checker
+        .db
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, data)| {
+            !data.carried && !data.quiet && check_targets(data.source).contains(&target)
+        })
+        .filter_map(|(id, data)| match data.member? {
+            crate::workspace::Member::Source(index) => Some((index, PackageId(id as u32))),
+            crate::workspace::Member::Release(_) => None,
+        })
+        .collect()
+}
+
+/// The targets the packages a closure checks are checked under, in order.
+fn closure_targets(workspace: &Workspace, closure: &Closure) -> Vec<Target> {
+    let mut targets: Vec<Target> = closure
+        .checked
+        .iter()
+        .flat_map(|index| check_targets(&workspace.packages[*index]))
+        .collect();
     targets.sort();
     targets.dedup();
     targets
 }
 
-/// The workspace's packages checked under a target, with their ids in its database.
-fn checked_packages<'w>(
-    checker: &Checker<'w>,
-    workspace: &'w Workspace,
+/// The checker of a closure under a target, once it has checked each package the closure checks
+/// under it.
+pub fn checked<'a>(
+    workspace: &'a Workspace,
+    closure: &Closure,
+    std: &'a [Package],
     target: Target,
-) -> Vec<(usize, PackageId)> {
-    workspace
-        .packages
-        .iter()
-        .enumerate()
-        .filter(|(_, package)| check_targets(package).contains(&target))
-        .filter_map(|(index, package)| {
-            let id = checker
-                .db
-                .packages
-                .iter()
-                .position(|data| std::ptr::eq(data.source, package))?;
-            Some((index, PackageId(id as u32)))
-        })
-        .collect()
-}
-
-/// The checker of a workspace under a target, once it has checked each package checked under
-/// it.
-pub fn checked<'a>(workspace: &'a Workspace, std: &'a [Package], target: Target) -> Checker<'a> {
-    let mut db = Db::build(workspace, std, target);
-    db.link();
-    let checker = Checker::new(db);
-    for (_, package) in checked_packages(&checker, workspace, target) {
-        checker.package.set(Some(package));
-        checker.check_package(package);
-    }
-    checker.fix_misnamed();
-    checker.reject_items(workspace);
-    for (_, package) in checked_packages(&checker, workspace, target) {
-        for &module in &checker.db.package(package).modules {
-            for &item in &checker.db.module(module).items {
-                checker.check_elaborated(item);
-            }
-        }
-        checker.check_tables(package);
-    }
-    checker.check_wheres();
-    checker.check_const_cycles();
+) -> Checker<'a> {
+    let checker = unchecked(workspace, closure, std, target);
+    checker.check_all(workspace);
     checker
 }
 
-/// The checker of a workspace under a target before it checks anything.
-pub fn unchecked<'a>(workspace: &'a Workspace, std: &'a [Package], target: Target) -> Checker<'a> {
-    let mut db = Db::build(workspace, std, target);
+impl Checker<'_> {
+    /// Checks each package the checker checks, then the rules relating its items.
+    fn check_all(&self, workspace: &Workspace) {
+        for (_, package) in checked_packages(self) {
+            self.package.set(Some(package));
+            self.check_package(package);
+        }
+        self.fix_misnamed();
+        self.reject_items(workspace);
+        for (_, package) in checked_packages(self) {
+            for &module in &self.db.package(package).modules {
+                for &item in &self.db.module(module).items {
+                    self.check_elaborated(item);
+                }
+            }
+            self.check_tables(package);
+            self.check_approvals(workspace, package);
+        }
+        self.check_wheres();
+        self.check_const_cycles();
+    }
+}
+
+/// The checker of a closure under a target before it checks anything.
+pub fn unchecked<'a>(
+    workspace: &'a Workspace,
+    closure: &Closure,
+    std: &'a [Package],
+    target: Target,
+) -> Checker<'a> {
+    let mut db = Db::build(workspace, closure, std, target);
     db.link();
     Checker::new(db)
 }
 
-/// An unchecked checker of the workspace under each target its packages are checked for.
+/// The obligation hashes, under each target the workspace's packages are checked for, whose
+/// result the proof cache holds and the procedure does not give.
+pub fn proof_cache_mismatches(workspace: &Workspace) -> Vec<String> {
+    let std = crate::stdlib::packages();
+    let mut mismatches = Vec::new();
+    for (_, checker) in checkers(workspace, std) {
+        *checker.compared.borrow_mut() = Some(Vec::new());
+        checker.check_all(workspace);
+        let found = checker.compared.borrow_mut().take().unwrap_or_default();
+        mismatches.extend(found.iter().map(Hash::full));
+    }
+    mismatches
+}
+
+/// A checked checker of each closure under each target its packages are checked for.
+fn checked_closures<'a>(
+    workspace: &'a Workspace,
+    std: &'a [Package],
+) -> Vec<(Target, Checker<'a>)> {
+    workspace
+        .closures
+        .iter()
+        .flat_map(|closure| {
+            closure_targets(workspace, closure)
+                .into_iter()
+                .map(move |target| (target, checked(workspace, closure, std, target)))
+        })
+        .collect()
+}
+
+/// An unchecked checker of each closure under each target its packages are checked for.
 fn checkers<'a>(workspace: &'a Workspace, std: &'a [Package]) -> Vec<(Target, Checker<'a>)> {
-    targets(workspace)
-        .into_iter()
-        .map(|target| (target, unchecked(workspace, std, target)))
+    workspace
+        .closures
+        .iter()
+        .flat_map(|closure| {
+            closure_targets(workspace, closure)
+                .into_iter()
+                .map(move |target| (target, unchecked(workspace, closure, std, target)))
+        })
         .collect()
 }
 
@@ -613,9 +719,14 @@ pub fn diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut found = Vec::new();
     let mut unused: Vec<(Diagnostic, usize)> = Vec::new();
     let mut checking: HashMap<String, usize> = HashMap::new();
-    for target in targets(workspace) {
-        let checker = checked(workspace, std, target);
-        for (_, package) in checked_packages(&checker, workspace, target) {
+    let runs = workspace.closures.iter().flat_map(|closure| {
+        closure_targets(workspace, closure)
+            .into_iter()
+            .map(move |target| (closure, target))
+    });
+    for (closure, target) in runs {
+        let checker = checked(workspace, closure, std, target);
+        for (_, package) in checked_packages(&checker) {
             let data = checker.db.package(package);
             let modules = data.modules.iter().map(|module| checker.db.module(*module));
             let files = modules
@@ -650,5 +761,134 @@ pub fn diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
             })
             .map(|(diagnostic, _)| diagnostic),
     );
+    found
+}
+
+/// Unchecked checkers of a workspace package's closure under each target it is checked for.
+fn package_checkers<'a>(
+    workspace: &'a Workspace,
+    std: &'a [Package],
+    package: &Package,
+) -> Vec<(Target, Checker<'a>)> {
+    let Some(closure) = workspace.closure_of(package) else {
+        return Vec::new();
+    };
+    check_targets(package)
+        .into_iter()
+        .map(|target| (target, unchecked(workspace, closure, std, target)))
+        .collect()
+}
+
+/// The API snapshots `nan api update` computes for a workspace package, confirming the public
+/// docs of the items `confirmed` names by canonical path.
+pub fn package_snapshots(
+    workspace: &Workspace,
+    package: &Package,
+    confirmed: &[String],
+) -> Snapshots {
+    let std = crate::stdlib::packages();
+    let checkers = package_checkers(workspace, std, package);
+    let views: Vec<(Target, &Checker)> =
+        checkers.iter().map(|(target, ck)| (*target, ck)).collect();
+    let name = package.name().unwrap_or_default();
+    let items = snapshot::Items::of(&views, name);
+    snapshot::snapshots(&items, package, confirmed)
+}
+
+/// The seal `principal` writes on a package's item at `path`, in a VCS workspace meeting the
+/// author rule, or why `nan seal` writes nothing.
+pub fn sealed(
+    workspace: &Workspace,
+    package: &Package,
+    path: &str,
+    principal: &str,
+) -> Result<snapshot::Sealed, snapshot::Unsealed> {
+    let std = crate::stdlib::packages();
+    let checkers = package_checkers(workspace, std, package);
+    let views: Vec<(Target, &Checker)> =
+        checkers.iter().map(|(target, ck)| (*target, ck)).collect();
+    let name = package.name().unwrap_or_default();
+    let items = snapshot::Items::of(&views, name);
+    let sealed = snapshot::sealed(&items, package, path, principal)?;
+    let shared = author::History::open(workspace).and_then(|history| {
+        history.would_share(name, path, &sealed.seal, sealed.accepted.as_ref())
+    });
+    match shared {
+        Some(author) => Err(snapshot::Unsealed::SameAuthor(author)),
+        None => Ok(sealed),
+    }
+}
+
+/// Whether the workspace item of a canonical path has public docs.
+pub fn has_public_docs(workspace: &Workspace, path: &str) -> bool {
+    let std = crate::stdlib::packages();
+    checkers(workspace, std).iter().any(|(_, checker)| {
+        (0..checker.db.items.len())
+            .map(|index| ItemId(index as u32))
+            .filter(|item| checker.db.is_reported(*item))
+            .any(|item| {
+                checker.canonical_path(item).as_deref() == Some(path)
+                    && checker.consumers_see(item)
+                    && !checker.public_docs(item).is_empty()
+            })
+    })
+}
+
+/// The errors checking a closure finds under each target its packages are checked for: on the
+/// packages it checks, and on each of its other members, checked whole.
+pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnostic> {
+    let std = crate::stdlib::packages();
+    let mut found = Vec::new();
+    for target in closure_targets(workspace, closure) {
+        let checker = checked(workspace, closure, std, target);
+        let quiet: Vec<PackageId> = (0..checker.db.packages.len())
+            .map(|index| PackageId(index as u32))
+            .filter(|package| checker.db.package(*package).quiet)
+            .collect();
+        for package in quiet {
+            checker.check_whole(workspace, package);
+        }
+        found.extend(
+            checker
+                .found
+                .into_inner()
+                .into_iter()
+                .chain(checker.quiet.into_inner())
+                .filter(|diagnostic| diagnostic.code.class() == crate::diagnostic::Class::Error),
+        );
+    }
+    found
+}
+
+/// The tombstones of a workspace package that keep an `Encode` key: those retiring a field or
+/// variant of a type deriving `Encode`, by file and first line.
+pub fn encode_key_tombstones(workspace: &Workspace, package: &Package) -> Vec<(String, u32)> {
+    let std = crate::stdlib::packages();
+    let Some(closure) = workspace.closure_of(package) else {
+        return Vec::new();
+    };
+    let Some(target) = check_targets(package).into_iter().next() else {
+        return Vec::new();
+    };
+    let checker = unchecked(workspace, closure, std, target);
+    let Some(id) = checker.package_named(package.name().unwrap_or_default()) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for &module in &checker.db.package(id).modules {
+        for &item in &checker.db.module(module).items {
+            let ast::ItemKind::Retired(retired) = &checker.db.ast(item).kind else {
+                continue;
+            };
+            if checker.keeps_encode_key(module, retired) {
+                let data = checker.db.item(item);
+                let first = *data
+                    .syntax()
+                    .item_lines(&data.syntax().items[data.index])
+                    .start();
+                found.push((data.file.path.clone(), first));
+            }
+        }
+    }
     found
 }

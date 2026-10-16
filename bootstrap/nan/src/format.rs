@@ -33,6 +33,11 @@ pub fn workspace(workspace: &Workspace, scope: &Scope) -> Vec<(String, Vec<u8>)>
     written
 }
 
+/// The canonical format of one item of a file, its lines joined by LF.
+pub fn item_text(file: &SourceFile, item: &crate::syntax::file::ItemSyntax) -> String {
+    item::lines(file, item).join("\n")
+}
+
 /// A run of a file's lines between items, or an item.
 enum Part {
     /// An item to format, by index.

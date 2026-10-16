@@ -437,7 +437,7 @@ impl Checker<'_> {
     }
 
     /// The workspace packages a package depends on, directly or through others, itself excluded.
-    fn dependency_closure(&self, package: PackageId) -> Vec<PackageId> {
+    pub(super) fn dependency_closure(&self, package: PackageId) -> Vec<PackageId> {
         let mut closure = vec![package];
         let mut next = 0;
         while let Some(&current) = closure.get(next) {

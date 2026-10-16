@@ -1,5 +1,6 @@
 //! The bootstrap implementation of nan language 1.
 
+mod artefact;
 mod cache;
 mod check;
 mod command;
@@ -13,14 +14,20 @@ mod hash;
 mod interp;
 mod journal;
 mod lower;
+mod machine;
+mod merge;
 mod nir;
 mod output;
 mod prover;
+mod release;
+mod resolution;
 mod scope;
 mod stdlib;
+mod store;
 mod syntax;
 mod test_runs;
 mod toolchain;
+mod vcs;
 mod workspace;
 
 pub use command::{Launch, Run, run};
@@ -31,4 +38,11 @@ pub use diagnostic::Code;
 pub fn context_gaps(root: &std::path::Path) -> std::io::Result<Vec<String>> {
     let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
     Ok(check::context_gaps(&workspace))
+}
+
+/// The obligation hashes of the workspace at `root` whose result the proof cache holds and the
+/// prover's procedure does not give, for the harnesses.
+pub fn proof_cache_mismatches(root: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
+    Ok(check::proof_cache_mismatches(&workspace))
 }

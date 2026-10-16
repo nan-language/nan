@@ -121,7 +121,7 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
     let entry = entry_glue(&mut lowering, tests);
     super::host::test_seam(&mut lowering, entry);
     lowering.drain();
-    lowering.finish()
+    lowering.finish(None)
 }
 
 impl Lowering<'_, '_> {

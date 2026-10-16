@@ -403,7 +403,7 @@ fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
         .any(|&(low, high)| (low..=high).contains(&value))
 }
 
-fn is_rejected(c: char) -> bool {
+pub(crate) fn is_rejected(c: char) -> bool {
     !(0x20..0x7F).contains(&(c as u32)) && in_ranges(c, &REJECTED)
 }
 

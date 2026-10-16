@@ -14,7 +14,7 @@ fn statuses(files: &[(&str, &str)], item: &str) -> Vec<(u32, Status)> {
     let scratch = Scratch::new(&all);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    let checker = checked(&workspace, std, Target::Any);
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::Any);
     let id = (0..checker.db.items.len())
         .map(|index| crate::check::db::ItemId(index as u32))
         .find(|id| !checker.db.is_std(*id) && checker.db.canonical(*id) == item)

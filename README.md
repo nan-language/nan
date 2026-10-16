@@ -28,7 +28,11 @@ target/debug/nan run
 target/debug/nan test
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of an `x86_64-host` program under `.nan/images/x86_64-host/`, and `nan run` builds and runs it. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names. The bootstrap implements the checking, reading and editing commands of the [toolchain](docs/spec/33-toolchain.md): `check`, `fix`, `fmt`, `holes`, `show`, `read`, `find`, `context`, `explain`, `expand`, `edit` and `primer`, with contract proofs, and `build`, `run` and `test` for `x86_64-host`. Machine targets are not implemented yet.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of an `x86_64-host` program under `.nan/images/x86_64-host/`, and `nan run` builds and runs it. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names.
+
+Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
+
+The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, except stage comparison (`nan build --compare-with`). Machine targets are not implemented yet.
 
 ## Commands
 
@@ -41,4 +45,4 @@ target/debug/nan test
 | `cargo nextest run -p nan -E 'test(/^<module>::/)'` | Run the tests of one module, given by its path in the crate (`a::b`) |
 | `cargo nextest run -p nan --test conformance -E 'test(/<chapter>/)'` | Run the conformance tests of one specification chapter, given by its file name (`01-lexical`) |
 | `cargo nextest run -p nan --test programs -E 'test(/<program>/)'` | Build and run one program of `bootstrap/nan/tests/programs`, given by its directory name |
-| `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run `nan test` in the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |
+| `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |

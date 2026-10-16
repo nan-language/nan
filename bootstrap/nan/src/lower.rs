@@ -208,6 +208,8 @@ pub struct Program {
     pub roots: Vec<PackageId>,
     /// The package names of the final closure with the prefix their symbols carry.
     pub prefixes: HashMap<String, String>,
+    /// The content of the image's `.nan` section.
+    pub section: Vec<u8>,
 }
 
 pub struct Lowering<'c, 'a> {
@@ -276,7 +278,7 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
     let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
     host::entry_seam(&mut lowering, program);
     lowering.drain();
-    lowering.finish()
+    lowering.finish(Some(&program.section))
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
@@ -641,12 +643,21 @@ impl<'c, 'a> Lowering<'c, 'a> {
         self.layouts.of(self.ck, ty)
     }
 
-    fn finish(mut self) -> Lowered {
+    /// The object of the lowering, holding a `.nan` section with `section` when given.
+    fn finish(mut self, section: Option<&[u8]>) -> Lowered {
         lines::emit(&mut self);
         runtime::tasks::emit_entry_stacks(&mut self);
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
-        let product = self.module.finish();
+        let mut product = self.module.finish();
+        if let Some(section) = section {
+            let id = product.object.add_section(
+                Vec::new(),
+                b".nan".to_vec(),
+                cranelift_object::object::SectionKind::Other,
+            );
+            product.object.append_section_data(id, section, 1);
+        }
         Lowered {
             object: product.emit().expect("an object file"),
             frames,

@@ -23,9 +23,11 @@ fn show_hashes_change_with_what_each_covers() {
         .collect();
     assert_eq!(headers[1], "module app");
     assert!(headers[2].starts_with("item app::STEP app/app.nan:3 "));
-    assert!(
-        headers[2].ends_with(" -"),
-        "a const has no interface hash yet"
+    let interface = headers[2].rsplit(' ').next().expect("an interface hash");
+    assert_eq!(
+        interface.len(),
+        18,
+        "a const's interface hash comes from its value"
     );
     let (item, interface) = hashes(&scratch, "app::Gauge.reset");
     assert_eq!((item.len(), interface.len()), (18, 18));

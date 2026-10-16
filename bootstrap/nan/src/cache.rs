@@ -1,12 +1,13 @@
-//! The user directory and its build cache: cache records, each a file later runs replace whole,
-//! holding its contents followed by their BLAKE3-256 digest.
+//! The user directory and its build cache: cache entries, each a file never rewritten, and cache
+//! records, each a file later runs replace whole; both hold their contents followed by their
+//! BLAKE3-256 digest.
 
 use std::fs::{self, DirBuilder, Metadata, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use crate::hash::blake3;
+use crate::hash::{Hash, blake3};
 
 /// The build cache of the running user; without a directory when the user database gives the
 /// user no home directory, so that no record is found and none is kept.
@@ -14,6 +15,27 @@ pub struct Cache {
     dir: Option<PathBuf>,
     home: PathBuf,
     uid: u32,
+}
+
+/// The local store's directory in the user directory, once checked, and how to check its files.
+pub struct StoreDir {
+    pub dir: Option<PathBuf>,
+    pub home: PathBuf,
+    pub uid: u32,
+}
+
+impl StoreDir {
+    /// Whether a file or directory of the store is exposed: its path as `~/.nan/...` when it is.
+    pub fn exposed(&self, path: &Path) -> io::Result<Option<Exposed>> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if exposed(&metadata, self.uid) => {
+                Ok(Some(Exposed(shown(&self.home, path))))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// A part of the user directory that a symbolic link could redirect or another user could
@@ -52,6 +74,33 @@ impl Cache {
             home,
             uid,
         }))
+    }
+
+    /// The local store of the user directory.
+    pub fn store(&self) -> StoreDir {
+        StoreDir {
+            dir: self
+                .dir
+                .as_ref()
+                .and_then(|cache| cache.parent())
+                .map(|user| user.join("store")),
+            home: self.home.clone(),
+            uid: self.uid,
+        }
+    }
+
+    /// The contents of a cache entry, none when it is missing or its digest does not match.
+    pub fn entry(&self, key: &Hash) -> io::Result<Result<Option<Vec<u8>>, Exposed>> {
+        self.record(&format!("entry-{}", key.full()))
+    }
+
+    /// Writes a cache entry under its key unless one is there.
+    pub fn put(&self, key: &Hash, contents: &[u8]) -> io::Result<()> {
+        let name = format!("entry-{}", key.full());
+        match &self.dir {
+            Some(dir) if !dir.join(&name).exists() => self.replace(&name, contents),
+            _ => Ok(()),
+        }
     }
 
     /// The contents of a cache record, none when it is missing or its digest does not match.

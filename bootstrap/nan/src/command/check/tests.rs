@@ -84,6 +84,7 @@ fn unused_code_is_reported_where_no_target_uses_it_with_its_fixes() {
             "//! Rings.\n\npub const CAPACITY: usize = 64\n",
         ),
     ]);
+    run_in(&scratch.0, "dep sync probe");
     let run = run_in(&scratch.0, "check");
     assert!(
         run.output
@@ -183,5 +184,49 @@ fn a_generic_function_passes_its_values_to_the_function_values_it_calls() {
     assert_eq!(
         run_in(&scratch.0, "check").output,
         "failed check .: errors 1, incomplete 0\nerror example.failed app/app.nan:4 app::holds\n        example holds(3u8, check: fn(value: u8) => value == 4)\nfailed check .: errors 1, incomplete 0\n"
+    );
+}
+
+#[test]
+fn a_doc_bound_to_an_older_interface_hash_is_stale_until_confirmed() {
+    let source = "//! Frames.\n\n/// Frames a window of `slots` slots holds, at 8 frames per slot.\npub fn window_frames(slots: u32) -> u32 {\n    return slots.saturating_mul(8)\n} window_frames\n";
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", source)]);
+    run_in(&scratch.0, "api update");
+    let widened = source
+        .replace("(slots: u32)", "(slots: u32, per_slot: u32)")
+        .replace("saturating_mul(8)", "saturating_mul(per_slot)");
+    fs::write(scratch.0.join("app/app.nan"), widened).expect("the widened source");
+    let run = run_in(&scratch.0, "check");
+    assert!(
+        run.output
+            .contains("\nincomplete doc.stale app/app.nan:3 app::window_frames\n"),
+        "{}",
+        run.output
+    );
+    run_in(&scratch.0, "api update --confirm-docs app::window_frames");
+    let run = run_in(&scratch.0, "check");
+    assert!(
+        run.output
+            .starts_with("ok check .: errors 0, incomplete 0\n"),
+        "{}",
+        run.output
+    );
+}
+
+#[test]
+fn a_tombstone_retiring_a_path_of_another_package_is_foreign() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Totals.\n\npub fn total() -> u32 = 1\n\nretired core::sum => total preserves\n",
+        ),
+    ]);
+    let run = run_in(&scratch.0, "check");
+    assert!(
+        run.output
+            .contains("\nerror retired.foreign-path app/app.nan:5 "),
+        "{}",
+        run.output
     );
 }

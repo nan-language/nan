@@ -9,7 +9,8 @@ use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::interface::{narrower, openness};
 use super::resolve::{Named, PathError};
 use super::sig::SigKind;
-use crate::diagnostic::{Code, Diagnostic, Fix, Replacement};
+use crate::diagnostic::{Code, Diagnostic, Fix, Reason, Replacement};
+use crate::machine::api::DocKey;
 use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredNew, Visibility};
 use crate::syntax::file::SourceFile;
 use crate::syntax::grammar::{Keyword, Punct, Rule};
@@ -332,6 +333,105 @@ type Problem = (Code, Vec<Fix>);
 type HeldDocs<'f> = (&'f str, u32, BTreeMap<String, String>);
 
 impl Checker<'_> {
+    /// The public docs of an item consumers see, in source order: its own, keyed empty, and
+    /// those of the members entering its interface form, keyed by name, an invariant line by its
+    /// position among those; each with its doc text and first line.
+    /// Reports an item whose public docs its module's API snapshot binds, with the same doc
+    /// text, to another hash than its current interface hash, once, on the first such doc,
+    /// listing each and the command confirming them.
+    pub fn check_doc_binding(&self, item: ItemId) {
+        let docs = self.public_docs(item);
+        if docs.is_empty() {
+            return;
+        }
+        let data = self.db.item(item);
+        let package = self.db.package(self.db.package_of(item)).source;
+        let Some(path) = self.canonical_path(item) else {
+            return;
+        };
+        let Some(entry) = package
+            .machine
+            .snapshot(&self.db.module(data.module).name)
+            .and_then(|snapshot| snapshot.entry(&path))
+        else {
+            return;
+        };
+        let hashes = self.hashes(item);
+        let interface = hashes.interface.unwrap_or(hashes.item);
+        let stale: Vec<&(DocKey, String, u32)> = docs
+            .iter()
+            .filter(|(key, text, _)| {
+                entry
+                    .docs
+                    .iter()
+                    .any(|doc| doc.key == *key && doc.text == *text && doc.bound != interface)
+            })
+            .collect();
+        let Some((_, _, line)) = stale.first() else {
+            return;
+        };
+        let mut because: Vec<Reason> = stale
+            .iter()
+            .map(|(key, _, _)| {
+                Reason::note(&match key {
+                    DocKey::Own => "doc".to_owned(),
+                    DocKey::Member(name) => format!("doc {name}"),
+                    DocKey::Invariant(position) => format!("doc invariant {position}"),
+                })
+            })
+            .collect();
+        because.push(Reason::note(&format!(
+            "nan api update --confirm-docs {path}"
+        )));
+        self.report_diagnostic(
+            item,
+            Diagnostic {
+                because,
+                ..Diagnostic::at(Code::DocStale, "", *line)
+            },
+        );
+    }
+
+    pub fn public_docs(&self, item: ItemId) -> Vec<(DocKey, String, u32)> {
+        let data = self.db.item(item);
+        let syntax = data.syntax();
+        let Some(tree) = &syntax.items[data.index].tree else {
+            return Vec::new();
+        };
+        let interface: Vec<String> = self
+            .interface_text(item, None)
+            .iter()
+            .map(|line| line.trim().to_owned())
+            .collect();
+        let mut invariants = 0;
+        let mut docs = Vec::new();
+        for doc in doc_comments(syntax, tree, data.ast.visibility) {
+            let invariant = doc.member.starts_with("invariant ");
+            let key = if doc.member.is_empty() {
+                DocKey::Own
+            } else if invariant {
+                if !interface.contains(&doc.member) {
+                    continue;
+                }
+                invariants += 1;
+                DocKey::Invariant(invariants)
+            } else {
+                DocKey::Member(doc.member.clone())
+            };
+            if doc.visibility != Visibility::Pub {
+                continue;
+            }
+            let texts: Vec<&str> = doc
+                .lines
+                .iter()
+                .map(|&token| line_text(syntax, token).1)
+                .collect();
+            let line = syntax.tokens[doc.lines[0]].line;
+            docs.push((key, texts.join("\n"), line));
+        }
+        docs
+    }
+
     /// The rules of an item's doc comments and those of its members.
     pub fn check_docs(&self, item: ItemId) {
         let data = self.db.item(item);

@@ -2,26 +2,27 @@
 //! uses naming nothing whose canonical path a tombstone's old form has, which forward to the
 //! tombstone's rewrite when it preserves behaviour and are otherwise reported as moved.
 
-use super::call::Markers;
+use super::call::{Callable, Markers};
 use super::{Body, Clauses, Tail};
 use crate::check::Checker;
 use crate::check::conform::{Candidate, type_key};
 use crate::check::db::ItemId;
-use crate::check::tir::TExpr;
+use crate::check::resolve::Named;
+use crate::check::tir::{TBody, TExpr};
 use crate::check::ty::Ty;
 use crate::diagnostic::{Class, Code, Fix, Offer};
 use crate::syntax::ast::{self, ExprKind, FailureMarker, ItemKind, RetiredItem, RetiredNew, Tok};
 
 impl Checker<'_> {
-    /// A tombstone's rewrite typed as the one statement of a function of its module having its
-    /// old head: `return` and the rewrite, or the rewrite alone without a result, preceded by the
-    /// `try` and `await` its outermost call needs; none when it does not check so.
+    /// The forwarding function of a tombstone with an old head: a function of its module having
+    /// that head, whose body is the rewrite preceded by the `try` and `await` its outermost call
+    /// needs; none when it does not check so.
     pub fn typed_rewrite(
         &self,
         tombstone: ItemId,
         head: &ast::Head,
         rewrite: &ast::Expr,
-    ) -> Option<TExpr> {
+    ) -> Option<TBody> {
         let sig = self.fn_sig(tombstone)?;
         let (mode, inner) = match &rewrite.kind {
             ExprKind::Marked {
@@ -59,7 +60,7 @@ impl Checker<'_> {
                 let frame = body.frames[0].clone();
                 let clauses = Clauses::of(head, false);
                 body.check_effects(rewrite.token, &frame, &sig.fn_ty(), &clauses, false);
-                typed
+                body.finish(Some(typed))
             })
         };
         let start = self.db.item(tombstone).syntax().tokens[rewrite.token as usize].start;
@@ -142,7 +143,8 @@ impl Body<'_, '_> {
     fn forwarded_fix(
         &self,
         tombstone: ItemId,
-        receiver: &TExpr,
+        receiver: Option<&TExpr>,
+        start: Tok,
         args: &[ast::Arg],
         markers: &Markers,
     ) -> Option<Fix> {
@@ -152,11 +154,14 @@ impl Body<'_, '_> {
         };
         let head = retired.head.as_ref()?;
         let data = self.ck.db.item(self.item);
-        let start = markers.mode.map_or(receiver.token, |(_, marker)| marker);
         let last = markers.last?;
-        let receiver_text = self
-            .ck
-            .written(self.item, receiver.token, markers.receiver?);
+        let receiver_text = match receiver {
+            Some(receiver) => Some(
+                self.ck
+                    .written(self.item, receiver.token, markers.receiver?),
+            ),
+            None => None,
+        };
         let mut given: Vec<(String, &ast::Expr)> = Vec::new();
         let mut unnamed = head
             .params
@@ -183,10 +188,12 @@ impl Body<'_, '_> {
         let source = tombstone_data.syntax();
         let mut occurrences: Vec<(Tok, Tok, String, Option<usize>)> = Vec::new();
         let mut calls: Vec<Tok> = Vec::new();
+        let mut unreceived = false;
         expr.visit(&mut |inner| match &inner.kind {
-            ExprKind::SelfValue => {
-                occurrences.push((inner.token, inner.last, receiver_text.clone(), None));
-            }
+            ExprKind::SelfValue => match &receiver_text {
+                Some(text) => occurrences.push((inner.token, inner.last, text.clone(), None)),
+                None => unreceived = true,
+            },
             ExprKind::Path { path, args: None } if path.segments.len() == 1 => {
                 let name = &path.segments[0].text;
                 match given.iter().position(|(param, _)| param == name) {
@@ -215,6 +222,9 @@ impl Body<'_, '_> {
             ExprKind::Call { .. } => calls.push(inner.last),
             _ => {}
         });
+        if unreceived {
+            return None;
+        }
         let mut order = Vec::new();
         for (index, (_, value)) in given.iter().enumerate() {
             let simple = matches!(
@@ -284,8 +294,8 @@ impl Body<'_, '_> {
         expected: Option<&Ty>,
         markers: Markers,
     ) -> TExpr {
-        let fix = self.forwarded_fix(tombstone, &receiver, args, &markers);
         let start = markers.mode.map_or(receiver.token, |(_, marker)| marker);
+        let fix = self.forwarded_fix(tombstone, Some(&receiver), start, args, &markers);
         let construct = (start, markers.last.unwrap_or(name.token));
         let renamed = self.report_retired(construct, tombstone, fix);
         if self.ck.fn_sig(tombstone).is_some() {
@@ -309,5 +319,49 @@ impl Body<'_, '_> {
                 TExpr::failed(token)
             }
         }
+    }
+    /// A call whose path names nothing and would have the canonical path a tombstone's old form
+    /// has: checked against the old head, or as a call of the function a path rewrite names.
+    pub fn retired_call(
+        &mut self,
+        token: Tok,
+        callee: &ast::Expr,
+        tombstone: ItemId,
+        args: &[ast::Arg],
+        expected: Option<&Ty>,
+        markers: Markers,
+    ) -> TExpr {
+        let fix = self.forwarded_fix(tombstone, None, callee.token, args, &markers);
+        let construct = (callee.token, markers.last.unwrap_or(callee.last));
+        self.report_retired(construct, tombstone, fix);
+        let function = match self.ck.fn_sig(tombstone) {
+            Some(head) => Some((tombstone, head)),
+            None => match &self.retired(tombstone).new {
+                RetiredNew::Rewrite {
+                    expr:
+                        ast::Expr {
+                            kind: ExprKind::Path { path, args: None },
+                            ..
+                        },
+                    preserves: true,
+                } => match self.ck.db.resolve(self.ck.db.module_of(tombstone), path) {
+                    Ok(Named::Item(item)) => self.ck.fn_sig(item).map(|head| (item, head)),
+                    _ => None,
+                },
+                _ => None,
+            },
+        };
+        let Some((item, head)) = function else {
+            self.skim_args(args);
+            return TExpr::failed(token);
+        };
+        self.apply(
+            token,
+            Callable::function(item, head),
+            None,
+            args,
+            expected,
+            markers,
+        )
     }
 }

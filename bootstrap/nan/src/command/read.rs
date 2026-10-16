@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::{Invocation, Name, Trace, item_written, written_for};
 use crate::check;
+use crate::check::ledger::Kind;
 use crate::diagnostic::Code;
 use crate::output::{self, Output, Record, Verdict};
 use crate::scope::Scope;
@@ -158,8 +159,8 @@ pub fn context(
 
 /// `nan explain <item or package>`: of a function, its digest lines as `digest:` records, a `fact`
 /// record per line raising a digest fact and a `method` record per capability method it
-/// reaches; of an item, its `radius`; of a package, its items' ledger records, of which this
-/// toolchain records none.
+/// reaches; of an item, its `ledger` records and its `radius`; of a package, its items' ledger
+/// records.
 pub fn explain(
     invocation: &Invocation,
     workspace: &Workspace,
@@ -176,7 +177,7 @@ pub fn explain(
     trace.scope = Some(written.clone());
     let mut records = Vec::new();
     match scope {
-        Scope::Package(_) => {}
+        Scope::Package(_) => records.extend(ledger_records(workspace, &scope)),
         Scope::Lines(..) => {
             if let Some(explained) = check::explained(workspace, &scope) {
                 for digest in explained.digests {
@@ -217,6 +218,7 @@ pub fn explain(
                     });
                 }
             }
+            records.extend(ledger_records(workspace, &scope));
             let writer = scope.package(workspace).and_then(|package| package.name());
             if let [pack] = &check::contexts(workspace, &scope, None)[..] {
                 records.push(Record {
@@ -231,6 +233,34 @@ pub fn explain(
         _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
     }
     Ok(listed_output(invocation, &written, records))
+}
+
+/// A `ledger` record per ledger entry of a scope, holding its premise, condition, reason or
+/// text, its kind followed by `escape` for a trust escape.
+fn ledger_records(workspace: &Workspace, scope: &Scope) -> Vec<Record> {
+    check::ledgered(workspace, scope)
+        .into_iter()
+        .map(|entry| {
+            let mut fields = vec![entry.kind.word().to_owned()];
+            if entry.escape {
+                fields.push("escape".to_owned());
+            }
+            fields.push(format!("{}:{}", entry.path, entry.line));
+            let lines = match entry.kind {
+                Kind::Trusted | Kind::Assume | Kind::Todo => entry.texts,
+                Kind::Waiver => entry.texts.into_iter().skip(1).collect(),
+                _ => Vec::new(),
+            };
+            Record {
+                word: "ledger".to_owned(),
+                fields,
+                lines: lines
+                    .iter()
+                    .map(|line| output::printable(line.as_bytes()))
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 /// `nan expand <type>`: an `item` record located `derived` per item the type's derives write,

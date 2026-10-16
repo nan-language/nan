@@ -70,6 +70,26 @@ impl Checker<'_> {
         traps
     }
 
+    /// Whether a body, closure or default function of an item's unit has may-trap: the item's
+    /// own fact for its body, and otherwise whether its own code holds a trap site or reaches a
+    /// function that has may-trap.
+    pub fn function_may_trap(&self, item: ItemId, role: Role, index: u32) -> bool {
+        if role == Role::Body {
+            return self.may_trap(item);
+        }
+        let Some(unit) = self.unit(item) else {
+            return false;
+        };
+        self.trap_sources(item, &unit, role, index)
+            .into_iter()
+            .any(|source| match source {
+                Source::Own(..) | Source::Declared(_) => true,
+                Source::Callee(callee, _, entry) => {
+                    (entry && self.entry_traps(callee)) || self.may_trap(callee)
+                }
+            })
+    }
+
     /// Whether a function's checking entry keeps a check.
     fn entry_traps(&self, item: ItemId) -> bool {
         self.obligations(item)

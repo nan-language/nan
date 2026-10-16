@@ -170,7 +170,7 @@ impl Checker<'_> {
 
     /// Whether a type, one of its type arguments at any depth, or a constituent of a struct or
     /// enum it instantiates satisfies `test`.
-    fn any_part(&self, ty: &Ty, test: &dyn Fn(&Ty) -> bool) -> bool {
+    pub(super) fn any_part(&self, ty: &Ty, test: &dyn Fn(&Ty) -> bool) -> bool {
         let mut seen = Vec::new();
         self.any_part_from(ty, test, &mut seen)
     }

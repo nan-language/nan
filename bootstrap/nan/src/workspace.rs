@@ -1,5 +1,7 @@
 //! The workspace a command runs in: its packages, their manifests, modules and source files.
 
+mod closure;
+mod machine;
 mod manifest;
 mod modules;
 
@@ -9,7 +11,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub use manifest::{Authority, Manifest, Target};
+pub use closure::{Closure, Member, Release, Store as ReleaseStore, holds_sources};
+pub use machine::Machine;
+pub use manifest::{
+    Authority, Manifest, Target, relative as relative_source, resolve as resolve_source,
+};
 pub use modules::Module;
 
 use crate::diagnostic::{Code, Diagnostic, Reason};
@@ -21,6 +27,15 @@ use crate::syntax::items::Item;
 pub struct Workspace {
     pub root: PathBuf,
     pub packages: Vec<Package>,
+    /// The releases of the local store that the packages' locks read.
+    pub releases: Vec<Release>,
+    /// The store entries confirming that path sources' current states are the releases their
+    /// locks name.
+    confirmed: Vec<crate::store::Entry>,
+    /// The dependency closures the packages share, each checking some of them.
+    pub closures: Vec<Closure>,
+    /// The diagnostics of reading the locks.
+    locked: Vec<Diagnostic>,
     /// Source files that no package holds.
     pub stray: Vec<String>,
     /// The package and file indexes of each file, by path.
@@ -36,6 +51,9 @@ pub struct Package {
     /// `package.nan` first, then the source files in byte order of path.
     pub files: Vec<File>,
     pub modules: Vec<Module>,
+    pub machine: Machine,
+    /// The tombstones of a valid history, one file per module holding some.
+    pub history: Vec<File>,
     /// The names of the structs, enums and layouts each module declares, by module index.
     types: Vec<HashSet<String>>,
     pub diagnostics: Vec<Diagnostic>,
@@ -47,6 +65,9 @@ pub struct File {
     /// The index of the file's module, none for `package.nan`.
     pub module: Option<usize>,
     pub syntax: SourceFile,
+    /// Whether it holds a module's history tombstones: the history with every other line blank,
+    /// so that each tombstone keeps its line.
+    pub history: bool,
     /// Its items lowered, by index, once a check has read them; none for an item without one.
     lowered: OnceLock<Vec<Option<ast::Item>>>,
 }
@@ -57,6 +78,7 @@ impl File {
             path,
             module,
             syntax,
+            history: false,
             lowered: OnceLock::new(),
         }
     }
@@ -116,6 +138,8 @@ struct Found {
     dir: String,
     sources: Vec<String>,
     links: Vec<String>,
+    /// Its machine files.
+    machine: Vec<String>,
 }
 
 impl Workspace {
@@ -128,29 +152,100 @@ impl Workspace {
             read.push(path.to_owned());
             fs::read(root.join(path))
         };
-        Workspace::build(root.clone(), layout, stray, &mut source)
+        Workspace::build(
+            root.clone(),
+            layout,
+            stray,
+            &mut source,
+            &mut UserStore::default(),
+        )
     }
 
     /// The workspace with the files of `changed` holding their new sources, read from memory.
     pub fn with_sources(&self, changed: &HashMap<String, Vec<u8>>) -> Workspace {
         let mut source = |path: &str| {
             Ok(changed.get(path).cloned().unwrap_or_else(|| {
-                let (_, file) = self.file(path).expect("a fix changes workspace files");
-                file.syntax.source.clone()
+                self.bytes(path)
+                    .expect("a change reads workspace files")
+                    .to_vec()
+            }))
+        };
+        let mut releases = HeldReleases(&self.releases, &self.confirmed);
+        Workspace::build(
+            self.root.clone(),
+            self.layout_with(changed),
+            self.stray.clone(),
+            &mut source,
+            &mut releases,
+        )
+        .expect("sources in memory read without failing")
+    }
+
+    /// The layout with the files of `changed` the workspace does not hold added to their
+    /// packages, source or machine.
+    fn layout_with(&self, changed: &HashMap<String, Vec<u8>>) -> Vec<Found> {
+        let mut layout = self.layout.clone();
+        for path in changed.keys() {
+            let Some(found) = layout
+                .iter_mut()
+                .filter(|found| path.starts_with(&format!("{}/", found.dir)))
+                .max_by_key(|found| found.dir.len())
+            else {
+                continue;
+            };
+            let held = match path.starts_with(&format!("{}/.nan/", found.dir)) {
+                true => &mut found.machine,
+                false => &mut found.sources,
+            };
+            if !held.contains(path) && path.ends_with(".nan") {
+                held.push(path.clone());
+            }
+        }
+        layout
+    }
+
+    /// The workspace with the files of `changed`, source or machine, holding their new contents,
+    /// its locks reading releases through `store`.
+    pub fn rebuilt(
+        &self,
+        changed: &HashMap<String, Vec<u8>>,
+        store: &mut dyn closure::Store,
+    ) -> io::Result<Workspace> {
+        let layout = self.layout_with(changed);
+        let mut source = |path: &str| {
+            Ok(changed.get(path).cloned().unwrap_or_else(|| {
+                self.bytes(path)
+                    .expect("a change reads workspace files")
+                    .to_vec()
             }))
         };
         Workspace::build(
             self.root.clone(),
-            self.layout.clone(),
+            layout,
             self.stray.clone(),
             &mut source,
+            store,
         )
-        .expect("sources in memory read without failing")
     }
 
     /// The workspace of in-memory files, each given by its path relative to `root`: each file
     /// belongs to the package of the nearest directory at or above it holding a `package.nan`.
     pub fn of_files(root: PathBuf, files: &[(&str, &[u8])]) -> Workspace {
+        Workspace::from_files(root, files, &mut HeldReleases(&[], &[]))
+            .expect("in-memory files read without failing")
+    }
+
+    /// The workspace of in-memory files as `of_files` places them, its locks reading releases
+    /// from the local store.
+    pub fn of_stored_files(root: PathBuf, files: &[(&str, &[u8])]) -> io::Result<Workspace> {
+        Workspace::from_files(root, files, &mut UserStore::default())
+    }
+
+    fn from_files(
+        root: PathBuf,
+        files: &[(&str, &[u8])],
+        store: &mut dyn closure::Store,
+    ) -> io::Result<Workspace> {
         let mut layout: Vec<Found> = files
             .iter()
             .filter_map(|(path, _)| path.strip_suffix("/package.nan"))
@@ -158,6 +253,7 @@ impl Workspace {
                 dir: dir.to_owned(),
                 sources: Vec::new(),
                 links: Vec::new(),
+                machine: Vec::new(),
             })
             .collect();
         let mut stray = Vec::new();
@@ -167,6 +263,9 @@ impl Workspace {
                 .filter(|found| path.starts_with(&format!("{}/", found.dir)))
                 .max_by_key(|found| found.dir.len());
             match holder {
+                Some(found) if path.starts_with(&format!("{}/.nan/", found.dir)) => {
+                    found.machine.push((*path).to_owned());
+                }
                 Some(found) if *path != format!("{}/package.nan", found.dir) => {
                     found.sources.push((*path).to_owned());
                 }
@@ -181,8 +280,7 @@ impl Workspace {
                 .expect("a file of the workspace");
             Ok(bytes.to_vec())
         };
-        Workspace::build(root, layout, stray, &mut source)
-            .expect("in-memory files read without failing")
+        Workspace::build(root, layout, stray, &mut source, store)
     }
 
     fn build(
@@ -190,12 +288,14 @@ impl Workspace {
         layout: Vec<Found>,
         stray: Vec<String>,
         source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+        store: &mut dyn closure::Store,
     ) -> io::Result<Workspace> {
         let packages: Vec<Package> = layout
             .iter()
             .cloned()
             .map(|found| Package::load(found, source))
             .collect::<io::Result<_>>()?;
+        let read = closure::closures(&packages, store)?;
         let paths = packages
             .iter()
             .enumerate()
@@ -210,23 +310,48 @@ impl Workspace {
         Ok(Workspace {
             root,
             packages,
+            releases: read.releases,
+            confirmed: read.confirmed,
+            closures: read.closures,
+            locked: read.found,
             stray,
             paths,
             layout,
         })
     }
 
-    /// The loading diagnostics: a stray file's, and every package's.
+    /// The package of a closure's member.
+    pub fn member(&self, member: Member) -> &Package {
+        match member {
+            Member::Source(index) => &self.packages[index],
+            Member::Release(index) => &self.releases[index].package,
+        }
+    }
+
+    /// The closure checking a workspace package.
+    pub fn closure_of(&self, package: &Package) -> Option<&Closure> {
+        let index = self
+            .packages
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, package))?;
+        self.closures
+            .iter()
+            .find(|closure| closure.checked.contains(&index))
+    }
+
+    /// The loading diagnostics: a stray file's, every package's and those of their locks.
     pub fn diagnostics(&self) -> impl Iterator<Item = Diagnostic> + '_ {
         let stray = self
             .stray
             .iter()
             .map(|path| Diagnostic::at(Code::ManifestMissing, path, 1));
-        stray.chain(
-            self.packages
-                .iter()
-                .flat_map(|package| package.diagnostics.iter().cloned()),
-        )
+        stray
+            .chain(
+                self.packages
+                    .iter()
+                    .flat_map(|package| package.diagnostics.iter().cloned()),
+            )
+            .chain(self.locked.iter().cloned())
     }
 
     pub fn files(&self) -> impl Iterator<Item = (&Package, &File)> {
@@ -241,6 +366,39 @@ impl Workspace {
         Some((package, &package.files[file]))
     }
 
+    /// The bytes of a source or machine file of the workspace, by path.
+    pub fn bytes(&self, path: &str) -> Option<&[u8]> {
+        if let Some((_, file)) = self.file(path) {
+            return Some(&file.syntax.source);
+        }
+        self.packages
+            .iter()
+            .find_map(|package| package.machine.bytes(path))
+    }
+
+    /// The text of a line of a source or machine file of the workspace, without its line end.
+    pub fn line_text(&self, path: &str, line: u32) -> Option<&[u8]> {
+        if let Some((_, file)) = self.file(path) {
+            return Some(file.syntax.line_text(line));
+        }
+        let bytes = self.bytes(path)?;
+        bytes.split(|byte| *byte == b'\n').nth(line as usize - 1)
+    }
+
+    /// The file and head line of the item with a canonical path.
+    pub fn item_location(&self, canonical: &str) -> Option<(String, u32)> {
+        self.files().find_map(|(_, file)| {
+            file.syntax.items.iter().find_map(|item| {
+                let line = file
+                    .syntax
+                    .item_lines(item)
+                    .find(|line| !file.syntax.line_text(*line).starts_with(b"//"))?;
+                let path = self.item_at(&file.path, line)?.canonical();
+                (path == canonical).then(|| (file.path.clone(), line))
+            })
+        })
+    }
+
     /// The path of the item holding a line of a file, if that item has one this implementation
     /// computes.
     pub fn item_at(&self, path: &str, line: u32) -> Option<ItemPath> {
@@ -253,6 +411,72 @@ impl Workspace {
                 tree: item.tree.as_ref()?,
             },
         )
+    }
+}
+
+/// The alias, source as written and whether it is a path, of each `dep` directive of a package
+/// whose source is valid.
+pub fn manifest_deps(package: &Package) -> Vec<(String, String, bool)> {
+    package
+        .manifest
+        .iter()
+        .flat_map(|manifest| &manifest.deps)
+        .filter(|dep| dep.source.is_some())
+        .map(|dep| (dep.alias.clone(), dep.written.clone(), dep.path))
+        .collect()
+}
+
+/// The `dep` directives of a manifest file read as the manifest of the package directory `dir`.
+pub fn read_deps(file: &SourceFile, dir: &str) -> Vec<(String, String, bool)> {
+    let path = format!("{dir}/package.nan");
+    Manifest::read(file, &path, &mut Vec::new())
+        .map(|manifest| {
+            manifest
+                .deps
+                .into_iter()
+                .filter(|dep| dep.source.is_some())
+                .map(|dep| (dep.alias, dep.written, dep.path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The local store of the user directory, opened when a lock first needs a release.
+#[derive(Default)]
+struct UserStore {
+    opened: Option<(crate::store::Store, Vec<(u64, crate::hash::Hash)>)>,
+}
+
+impl closure::Store for UserStore {
+    fn entry(&mut self, root: &crate::hash::Hash) -> io::Result<Option<crate::store::Entry>> {
+        if self.opened.is_none() {
+            let Ok(cache) = crate::cache::Cache::open()? else {
+                return Ok(None);
+            };
+            let store = crate::store::Store::new(cache.store());
+            let Ok(index) = store.index()? else {
+                return Ok(None);
+            };
+            self.opened = Some((store, index));
+        }
+        let (store, index) = self.opened.as_ref().expect("an opened store");
+        let Some((number, _)) = index.iter().find(|(_, held)| held == root) else {
+            return Ok(None);
+        };
+        Ok(store.read(*number, root)?.ok().flatten())
+    }
+}
+
+/// The releases a workspace already read, read again for a changed workspace.
+struct HeldReleases<'a>(&'a [Release], &'a [crate::store::Entry]);
+
+impl closure::Store for HeldReleases<'_> {
+    fn entry(&mut self, root: &crate::hash::Hash) -> io::Result<Option<crate::store::Entry>> {
+        let release = self.0.iter().find(|release| release.root == *root);
+        Ok(release
+            .map(|release| &release.entry)
+            .or_else(|| self.1.iter().find(|entry| entry.root() == *root))
+            .cloned())
     }
 }
 
@@ -295,6 +519,7 @@ fn walk(
             dir: dir.to_owned(),
             sources: Vec::new(),
             links: Vec::new(),
+            machine: Vec::new(),
         });
         Some(found.len() - 1)
     } else {
@@ -319,6 +544,7 @@ fn walk(
             }
             if in_package == ".nan" {
                 links_in_machine_dir(root, &path, in_package, &mut found[index].links)?;
+                machine_files(root, &path, &mut found[index].machine)?;
             }
         }
         if name.starts_with('.') || metadata.is_symlink() {
@@ -332,6 +558,79 @@ fn walk(
             match package {
                 Some(index) => found[index].sources.push(path),
                 None => stray.push(path),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The files of a valid history's tombstones: per module holding some, the history with every
+/// line but that module's tombstones blank.
+fn history_files(machine: &Machine, modules: &[Module]) -> Vec<File> {
+    let Some(loaded) = machine
+        .history
+        .as_ref()
+        .filter(|loaded| loaded.valid().is_some())
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&loaded.bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<(usize, Vec<&str>)> = Vec::new();
+    let mut module = None;
+    for (number, line) in lines.iter().enumerate() {
+        if let Some(name) = line.strip_prefix("module ") {
+            module = modules.iter().position(|known| known.name == name);
+            continue;
+        }
+        let Some(index) = module.filter(|_| line.starts_with("retired ")) else {
+            continue;
+        };
+        if kept.last().is_none_or(|(last, _)| *last != index) {
+            kept.push((index, vec![""; lines.len()]));
+        }
+        if let Some((_, file)) = kept.last_mut() {
+            file[number] = line;
+        }
+    }
+    kept.into_iter()
+        .map(|(index, file)| {
+            let mut text = file.join("\n");
+            text.push('\n');
+            File {
+                history: true,
+                ..File::new(loaded.path.clone(), Some(index), parse(text.into_bytes()))
+            }
+        })
+        .collect()
+}
+
+/// The machine files a package's `.nan` directory holds as regular files: its lock, its history
+/// and its API snapshots.
+fn machine_files(root: &Path, path: &str, machine: &mut Vec<String>) -> io::Result<()> {
+    let is_file =
+        |path: &str| fs::symlink_metadata(root.join(path)).is_ok_and(|metadata| metadata.is_file());
+    let is_dir =
+        |path: &str| fs::symlink_metadata(root.join(path)).is_ok_and(|metadata| metadata.is_dir());
+    if !is_dir(path) {
+        return Ok(());
+    }
+    for name in ["lock.nan", "history.nan"] {
+        let file = format!("{path}/{name}");
+        if is_file(&file) {
+            machine.push(file);
+        }
+    }
+    let api = format!("{path}/api");
+    if is_dir(&api) {
+        let mut names: Vec<String> = fs::read_dir(root.join(&api))?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<_>>()?;
+        names.sort();
+        for name in names.into_iter().filter(|name| name.ends_with(".nan")) {
+            let file = format!("{api}/{name}");
+            if is_file(&file) {
+                machine.push(file);
             }
         }
     }
@@ -467,11 +766,16 @@ impl Package {
             }
         }
         let types = type_names(&files, modules.len());
+        let machine = Machine::load(&found.dir, &found.machine, source)?;
+        diagnostics.extend(machine.diagnostics());
+        let history = history_files(&machine, &modules);
         let mut package = Package {
             dir: found.dir,
             manifest,
             files,
             modules,
+            machine,
+            history,
             types,
             diagnostics,
         };
@@ -485,6 +789,43 @@ impl Package {
             package.diagnostics.extend(found);
         }
         Ok(package)
+    }
+
+    /// A release's package, loaded from its store entry's files into a directory.
+    fn from_entry(entry: &crate::store::Entry, dir: &str) -> io::Result<Package> {
+        let files: Vec<(String, &[u8])> = entry
+            .sources
+            .iter()
+            .map(|(path, content)| (format!("{dir}/{path}"), content.as_slice()))
+            .collect();
+        let manifest = format!("{dir}/package.nan");
+        let machine_prefix = format!("{dir}/.nan/");
+        let found = Found {
+            dir: dir.to_owned(),
+            sources: files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .filter(|path| {
+                    *path != manifest
+                        && !path.starts_with(&machine_prefix)
+                        && path.ends_with(".nan")
+                })
+                .collect(),
+            links: Vec::new(),
+            machine: files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .filter(|path| path.starts_with(&machine_prefix))
+                .collect(),
+        };
+        let mut source = |path: &str| -> io::Result<Vec<u8>> {
+            files
+                .iter()
+                .find(|(known, _)| known == path)
+                .map(|(_, content)| content.to_vec())
+                .ok_or_else(|| io::Error::other("a release's file"))
+        };
+        Package::load(found, &mut source)
     }
 
     /// Reports every `package` item outside `package.nan`, and every item of `package.nan` but

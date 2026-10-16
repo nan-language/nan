@@ -109,6 +109,100 @@ pub fn interface_text(file: &SourceFile, item: &ItemSyntax, known: &Known) -> Ve
     .render()
 }
 
+/// Which bindings a fragment's normalised text numbers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Numbering {
+    /// Those it introduces, in order of introduction; every other binding keeps its name.
+    Introduced,
+    /// Every binding it names, in order of first occurrence in it.
+    Named,
+}
+
+/// The tokens `first..=last` of a parsed item on one line, written as its normalised form
+/// writes them: paths canonical, literals canonical, order-free members sorted, and bindings
+/// numbered as `numbering` states.
+pub fn normalised_fragment(
+    file: &SourceFile,
+    item: &ItemSyntax,
+    known: &Known,
+    (first, last): (u32, u32),
+    numbering: Numbering,
+) -> String {
+    let tree = item.tree.as_ref().expect("a parsed item has a tree");
+    let facts = Facts::collect(file, tree);
+    let bindings = bindings(file, tree);
+    let punning = punning(file, tree, &bindings);
+    let mut toks = uncommented(tokens(file, item, &facts, &punning.labels));
+    for tok in &mut toks {
+        tok.newline = false;
+    }
+    trailing_commas(&mut toks, &facts, true);
+    let normal = Normal {
+        file,
+        tree,
+        facts: &facts,
+        bindings: &bindings,
+    };
+    let renamed = normal.substitute(&mut toks, known, &punning);
+    for run in normal.runs() {
+        normal.sort(&mut toks, &run);
+    }
+    let within = |token: u32| (first..=last).contains(&token);
+    toks.retain(|tok| tok.source.is_some_and(within));
+    let mut numbers: HashMap<u32, usize> = HashMap::new();
+    for tok in &mut toks {
+        let Some(&binding) = tok.source.and_then(|source| renamed.get(&source)) else {
+            continue;
+        };
+        let at = tok
+            .text
+            .rfind('$')
+            .expect("a renamed binding is written `$`");
+        if numbering == Numbering::Introduced && !within(binding) {
+            tok.text.replace_range(at..=at, file.text(binding as usize));
+            continue;
+        }
+        let next = numbers.len() + 1;
+        let number = *numbers.entry(binding).or_insert(next);
+        tok.text.replace_range(at..=at, &format!("${number}"));
+    }
+    normal.render(&toks).join(" ").trim_start().to_owned()
+}
+
+/// The flat text of the tokens `first..=last` of a parsed item: on one line, without comments,
+/// each breakable list flat and each text run written as the normalised form writes it.
+pub fn flat_text(file: &SourceFile, item: &ItemSyntax, (first, last): (u32, u32)) -> String {
+    let tree = item.tree.as_ref().expect("a parsed item has a tree");
+    let facts = Facts::collect(file, tree);
+    let punned = punning(file, tree, &bindings(file, tree)).labels;
+    let mut toks = uncommented(tokens(file, item, &facts, &punned));
+    for tok in &mut toks {
+        tok.newline = false;
+    }
+    trailing_commas(&mut toks, &facts, true);
+    toks.retain(|tok| {
+        tok.source
+            .is_some_and(|source| (first..=last).contains(&source))
+    });
+    for tok in &mut toks {
+        if matches!(tok.kind, TokenKind::Text | TokenKind::TextLine)
+            && let Some(text) = literal(tok.kind, &tok.text)
+        {
+            tok.text = text;
+        }
+    }
+    merge_runs(&mut toks);
+    Layout {
+        toks: &toks,
+        facts: &facts,
+        roles: &Roles::flat(toks.len(), facts.lists.len()),
+    }
+    .render()
+    .join(" ")
+    .trim_start()
+    .to_owned()
+}
+
 /// The tokens without their comments and doc comments.
 fn uncommented(toks: Vec<Tok>) -> Vec<Tok> {
     toks.into_iter()

@@ -175,6 +175,20 @@ pub struct Callable {
     receiver_first: bool,
 }
 
+impl Callable {
+    /// A function called by its path.
+    pub fn function(item: ItemId, head: FnSig) -> Callable {
+        let params: Vec<Param> = head.generics.iter().map(|def| def.param).collect();
+        Callable {
+            callee: Callee::Function { item },
+            head,
+            infer: Infer::new(params),
+            from_expected: false,
+            receiver_first: false,
+        }
+    }
+}
+
 impl Body<'_, '_> {
     /// An expression with markers before it: they apply to the call that ends the postfix
     /// expression, or precede `when`.
@@ -344,6 +358,13 @@ impl Body<'_, '_> {
                 let named = match self.ck.db.resolve(self.module, path) {
                     Ok(named) => named,
                     Err(error) if error.code == Some(Code::NameUnknown) => {
+                        if generic_args.is_none()
+                            && let Some(form) = self.ck.db.spelled(self.module, path)
+                            && let Some(tombstone) = self.tombstone(&form)
+                        {
+                            return self
+                                .retired_call(token, callee, tombstone, args, expected, markers);
+                        }
                         let stub = match &path.segments[..] {
                             [name] if generic_args.is_none() => {
                                 self.stub(&name.text, None, args, expected, markers)
@@ -382,15 +403,7 @@ impl Body<'_, '_> {
                                     self.skim_args(args);
                                     return TExpr::failed(token);
                                 }
-                                let params: Vec<Param> =
-                                    head.generics.iter().map(|def| def.param).collect();
-                                let callable = Callable {
-                                    callee: Callee::Function { item },
-                                    head,
-                                    infer: Infer::new(params),
-                                    from_expected: false,
-                                    receiver_first: false,
-                                };
+                                let callable = Callable::function(item, head);
                                 self.apply(token, callable, None, args, expected, markers)
                             }
                             ItemKind::Struct(_) | ItemKind::Layout(_) => {

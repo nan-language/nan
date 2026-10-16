@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use super::ty::Scalar;
 use crate::syntax::ast;
 use crate::syntax::file::SourceFile;
-use crate::workspace::{File, Package, Target, Workspace};
+use crate::workspace::{Closure, File, Member, Package, Target, Workspace};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackageId(pub u32);
@@ -35,6 +35,11 @@ pub struct PackageData<'a> {
     /// Whether it is a std package the toolchain carries, which no check reports on, rather than
     /// one of the workspace.
     pub carried: bool,
+    /// Whether it is checked without being reported on: a release of the local store, or a
+    /// workspace package another closure checks.
+    pub quiet: bool,
+    /// The closure member it is; none for a carried std package.
+    pub member: Option<Member>,
     /// Its modules, by their index in the package.
     pub modules: Vec<ModuleId>,
     pub root: Option<ModuleId>,
@@ -125,8 +130,14 @@ fn selects(selector: &str, target: Target) -> bool {
 }
 
 impl<'a> Db<'a> {
-    /// The database of the workspace's packages and std under `target`.
-    pub fn build(workspace: &'a Workspace, std: &'a [Package], target: Target) -> Db<'a> {
+    /// The database of a closure's packages and std under `target`: the workspace packages it
+    /// checks, its other members quiet, and each std package no member is named like, carried.
+    pub fn build(
+        workspace: &'a Workspace,
+        closure: &Closure,
+        std: &'a [Package],
+        target: Target,
+    ) -> Db<'a> {
         let mut db = Db {
             target,
             packages: Vec::new(),
@@ -138,26 +149,24 @@ impl<'a> Db<'a> {
             retired: HashMap::new(),
             reads: RefCell::new(None),
         };
-        let in_workspace = |name: Option<&str>| {
-            workspace
-                .packages
-                .iter()
-                .any(|package| package.name() == name)
-        };
-        let sources = workspace
-            .packages
-            .iter()
-            .map(|package| (package, false))
-            .chain(
-                std.iter()
-                    .filter(|package| !in_workspace(package.name()))
-                    .map(|package| (package, true)),
-            );
-        for (package, carried) in sources {
+        let mut members: Vec<Member> = closure.members.values().copied().collect();
+        members.sort();
+        for member in &members {
+            let package = workspace.member(*member);
             if package.manifest.is_none() {
                 continue;
             }
-            db.add_package(package, carried);
+            let quiet = !matches!(member, Member::Source(index) if closure.checked.contains(index));
+            db.add_package(package, Some(*member), quiet);
+        }
+        for package in std {
+            if package.manifest.is_some()
+                && !closure
+                    .members
+                    .contains_key(package.name().unwrap_or_default())
+            {
+                db.add_package(package, None, false);
+            }
         }
         for (index, package) in db.packages.iter().enumerate() {
             let alias = crate::stdlib::PACKAGES
@@ -176,11 +185,13 @@ impl<'a> Db<'a> {
                     .deps
                     .iter()
                     .map(|dep| {
-                        let dir = dep.source.as_deref().filter(|_| dep.path);
-                        let found = dir.and_then(|dir| {
+                        let named = package
+                            .member
+                            .and_then(|member| closure.aliases.get(&(member, dep.alias.clone())));
+                        let found = named.and_then(|named| {
                             db.packages
                                 .iter()
-                                .position(|candidate| !candidate.std && candidate.source.dir == dir)
+                                .position(|candidate| candidate.member == Some(*named))
                         });
                         (
                             dep.alias.clone(),
@@ -196,7 +207,9 @@ impl<'a> Db<'a> {
         db
     }
 
-    fn add_package(&mut self, package: &'a Package, carried: bool) {
+    /// Adds a package: a closure's member, or a carried std package without one.
+    fn add_package(&mut self, package: &'a Package, member: Option<Member>, quiet: bool) {
+        let carried = member.is_none();
         let id = PackageId(self.packages.len() as u32);
         let name = package
             .name()
@@ -238,10 +251,15 @@ impl<'a> Db<'a> {
                         .path
                         .rsplit_once('/')
                         .is_some_and(|(dir, _)| selected.contains(&dir));
-                if !in_module {
-                    continue;
+                if in_module {
+                    data.files.push(file);
                 }
-                data.files.push(file);
+            }
+            let history = package
+                .history
+                .iter()
+                .filter(|file| file.module == Some(index));
+            for file in data.files.clone().into_iter().chain(history) {
                 let lowered = file.lowered();
                 for (item_index, item) in file.syntax.items.iter().enumerate() {
                     if item.abandoned {
@@ -272,6 +290,8 @@ impl<'a> Db<'a> {
             name,
             std,
             carried,
+            quiet,
+            member,
             modules,
             root,
             deps: HashMap::new(),
@@ -400,6 +420,11 @@ impl<'a> Db<'a> {
         &self.packages[id.0 as usize]
     }
 
+    /// Whether an item is a tombstone of its package's history.
+    pub fn in_history(&self, item: ItemId) -> bool {
+        self.items[item.0 as usize].file.history
+    }
+
     pub fn module_of(&self, item: ItemId) -> ModuleId {
         self.item(item).module
     }
@@ -415,6 +440,12 @@ impl<'a> Db<'a> {
     /// Whether an item belongs to a std package the toolchain carries.
     pub fn is_carried(&self, item: ItemId) -> bool {
         self.package(self.package_of(item)).carried
+    }
+
+    /// Whether an item belongs to a package the check reports on: neither carried nor quiet.
+    pub fn is_reported(&self, item: ItemId) -> bool {
+        let package = self.package(self.package_of(item));
+        !package.carried && !package.quiet
     }
 
     pub fn ast(&self, item: ItemId) -> &ast::Item {

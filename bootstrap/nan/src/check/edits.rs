@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 
 use super::db::ItemId;
 use super::references::{Move, Target};
-use super::{check_targets, checked, targets, unchecked};
+use super::{check_targets, checked, checked_closures, unchecked};
 use crate::diagnostic::{Fix, Replacement};
 use crate::syntax::ast::ItemKind;
 use crate::workspace::Workspace;
@@ -15,7 +15,8 @@ use crate::workspace::Workspace;
 pub fn identity(workspace: &Workspace, path: &str, line: u32) -> Option<String> {
     let std = crate::stdlib::packages();
     let (source, _) = workspace.file(path)?;
-    let checker = unchecked(workspace, std, *check_targets(source).first()?);
+    let closure = workspace.closure_of(source)?;
+    let checker = unchecked(workspace, closure, std, *check_targets(source).first()?);
     let db = &checker.db;
     let item = (0..db.items.len())
         .map(|index| ItemId(index as u32))
@@ -49,8 +50,7 @@ pub fn renamed(
     let mut spans = std::collections::BTreeSet::new();
     let mut tombstone = None;
     let mut found = false;
-    for target in targets(workspace) {
-        let checker = checked(workspace, std, target);
+    for (_, checker) in checked_closures(workspace, std) {
         let Some(target) = checker.target_at(path, lines) else {
             continue;
         };
@@ -123,7 +123,8 @@ pub fn moved(
 ) -> Option<Result<Move, ()>> {
     let std = crate::stdlib::packages();
     let (source, _) = workspace.file(path)?;
-    let checker = checked(workspace, std, *check_targets(source).first()?);
+    let closure = workspace.closure_of(source)?;
+    let checker = checked(workspace, closure, std, *check_targets(source).first()?);
     let target = checker.target_at(path, lines)?;
     Some(checker.moving(&target, module).ok_or(()))
 }

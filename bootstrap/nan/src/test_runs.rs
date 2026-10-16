@@ -65,6 +65,9 @@ pub enum Runs {
     Affected,
     /// The one run a replay token names.
     Replay(Token),
+    /// Every run of each reliance test, and of each test whose reach holds an item of one of
+    /// these packages.
+    Reaching(Vec<String>),
 }
 
 /// The run a replay token names: its run target, its test's canonical path, its index and seed.
@@ -95,19 +98,22 @@ impl Token {
     /// The location of the head of the test the token names, when it is a test of the workspace
     /// and the token names one of its run targets.
     pub fn location(&self, workspace: &Workspace) -> Option<String> {
-        let checker = check::unchecked(workspace, crate::stdlib::packages(), Target::Host);
-        let item = (0..checker.db.items.len())
-            .map(|index| ItemId(index as u32))
-            .find(|item| {
-                let data = checker.db.item(*item);
-                matches!(data.ast.kind, ItemKind::Test(_))
-                    && workspace.file(&data.file.path).is_some()
-                    && checker.db.canonical(*item) == self.test
-            })?;
-        let data = checker.db.item(item);
-        run_targets(&checker, checker.db.package_of(item))
-            .contains(&self.target)
-            .then(|| format!("{}:{}", data.file.path, data.line(data.ast.token)))
+        workspace.closures.iter().find_map(|closure| {
+            let checker =
+                check::unchecked(workspace, closure, crate::stdlib::packages(), Target::Host);
+            let item = (0..checker.db.items.len())
+                .map(|index| ItemId(index as u32))
+                .find(|item| {
+                    let data = checker.db.item(*item);
+                    matches!(data.ast.kind, ItemKind::Test(_))
+                        && checker.db.is_reported(*item)
+                        && checker.db.canonical(*item) == self.test
+                })?;
+            let data = checker.db.item(item);
+            run_targets(&checker, checker.db.package_of(item))
+                .contains(&self.target)
+                .then(|| format!("{}:{}", data.file.path, data.line(data.ast.token)))
+        })
     }
 }
 
@@ -132,62 +138,11 @@ pub fn run(
         return Ok(Ok(report));
     }
     let std = crate::stdlib::packages();
-    let checker = check::checked(workspace, std, Target::Host);
-    let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
-    for selected in select(&checker, workspace, scope) {
-        let package = checker.db.package_of(selected.item);
-        by_package.entry(package.0).or_default().push(selected);
-    }
-    let mut planned = Vec::new();
-    for (package, tests) in by_package {
-        let package = PackageId(package);
-        for target in run_targets(&checker, package) {
-            let kept = match runs {
-                Runs::All => tests.clone(),
-                Runs::Affected => {
-                    let mut affected = Vec::new();
-                    for test in &tests {
-                        let record =
-                            match cache.record(&record_name(&checker, test.item, target))? {
-                                Ok(record) => record,
-                                Err(exposed) => return Ok(Err(exposed)),
-                            };
-                        if record != Some(pass_record(&checker, test.item, target)) {
-                            affected.push(test.clone());
-                        }
-                    }
-                    affected
-                }
-                Runs::Replay(token) if token.target == target => tests.clone(),
-                Runs::Replay(_) => Vec::new(),
-            };
-            planned.push((package, target, kept));
-        }
-    }
-    for (package, target, tests) in planned {
-        report.tests += tests.len();
-        match target {
-            Target::Host => {
-                run_host(
-                    &checker,
-                    workspace,
-                    package,
-                    &tests,
-                    (runs, cache),
-                    &mut report,
-                )?;
-            }
-            _ => {
-                for test in &tests {
-                    report.failures.push(failure(
-                        &checker,
-                        test.item,
-                        target,
-                        "test.emulator-unavailable",
-                        Vec::new(),
-                    ));
-                }
-            }
+    for closure in &workspace.closures {
+        let checker = check::checked(workspace, closure, std, Target::Host);
+        match run_closure(&checker, workspace, scope, runs, cache, &mut report)? {
+            Ok(()) => {}
+            Err(exposed) => return Ok(Err(exposed)),
         }
     }
     report.failures.sort_by(|left, right| {
@@ -198,6 +153,88 @@ pub fn run(
         ))
     });
     Ok(Ok(report))
+}
+
+/// Runs the tests a scope selects among the packages a checker's closure checks.
+fn run_closure(
+    checker: &Checker,
+    workspace: &Workspace,
+    scope: &Scope,
+    runs: &Runs,
+    cache: &Cache,
+    report: &mut Report,
+) -> io::Result<Result<(), Exposed>> {
+    let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
+    for selected in select(checker, workspace, scope) {
+        let package = checker.db.package_of(selected.item);
+        by_package.entry(package.0).or_default().push(selected);
+    }
+    let mut planned = Vec::new();
+    for (package, tests) in by_package {
+        let package = PackageId(package);
+        for target in run_targets(checker, package) {
+            let kept = match runs {
+                Runs::All => tests.clone(),
+                Runs::Affected => {
+                    let mut affected = Vec::new();
+                    for test in &tests {
+                        let record =
+                            match cache.record(&record_name(checker, test.item, target))? {
+                                Ok(record) => record,
+                                Err(exposed) => return Ok(Err(exposed)),
+                            };
+                        if record != Some(pass_record(checker, test.item, target)) {
+                            affected.push(test.clone());
+                        }
+                    }
+                    affected
+                }
+                Runs::Replay(token) if token.target == target => tests.clone(),
+                Runs::Replay(_) => Vec::new(),
+                Runs::Reaching(packages) => tests
+                    .iter()
+                    .filter(|test| {
+                        let foreign = |item: ItemId| checker.db.package_of(item) != package;
+                        let reliance = match &checker.db.ast(test.item).kind {
+                            ItemKind::Test(item) => matches!(
+                                checker.test_target(test.item, item),
+                                Some(testing::Target::Function(target) | testing::Target::Derived(target))
+                                    if foreign(target)
+                            ),
+                            _ => false,
+                        };
+                        reliance
+                            || checker.test_reach(test.item).into_iter().any(|item| {
+                                let name = &checker.db.package(checker.db.package_of(item)).name;
+                                packages.contains(name)
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            planned.push((package, target, kept));
+        }
+    }
+    for (package, target, tests) in planned {
+        report.tests += tests.len();
+        match target {
+            Target::Host => {
+                run_host(checker, workspace, package, &tests, (runs, cache), report)?;
+            }
+            _ => {
+                for test in &tests {
+                    report.failures.push(failure(
+                        checker,
+                        test.item,
+                        target,
+                        "test.emulator-unavailable",
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// The name of the cache record of a test's passes on a run target.
@@ -244,7 +281,7 @@ fn select(checker: &Checker, workspace: &Workspace, scope: &Scope) -> Vec<Select
         let ItemKind::Test(test) = &data.ast.kind else {
             continue;
         };
-        if test.disputed || workspace.file(&data.file.path).is_none() {
+        if test.disputed || !checker.db.is_reported(item) {
             continue;
         }
         let property = test.params.is_some();
@@ -341,7 +378,7 @@ fn run_host(
         let path = checker.db.canonical(test.item);
         let indexed: Vec<(u64, u64)> = match runs {
             Runs::Replay(token) => vec![(token.index, token.seed)],
-            Runs::All | Runs::Affected => {
+            Runs::All | Runs::Affected | Runs::Reaching(_) => {
                 let hash = checker.hashes(test.item).item;
                 let count = if test.property { CASES } else { SCHEDULES };
                 (0..count)
@@ -408,7 +445,9 @@ fn build(
                 })
                 .collect(),
             roots: vec![package],
-            prefixes: crate::final_build::prefixes(checker),
+            prefixes: crate::final_build::prefixes(&crate::final_build::artefacts(
+                workspace, checker, package,
+            )),
         },
     );
     let name = &checker.db.package(package).name;

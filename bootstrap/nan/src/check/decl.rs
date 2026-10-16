@@ -209,9 +209,11 @@ impl Checker<'_> {
         let sig = self.sig(item);
         self.report_problems(item, &sig.problems);
         self.check_docs(item);
+        self.check_doc_binding(item);
         self.check_test_only(item);
         self.check_interface_names(item);
         self.check_value_types(item);
+        self.check_history_forms(item);
         let ast = &self.db.ast(item).clone();
         match &ast.kind {
             ItemKind::Fn(function) => {

@@ -996,6 +996,11 @@ impl Checker<'_> {
                 Some(self.function_body(item, function, fn_sig))
             }
             ItemKind::Test(test) => Some(self.test_body(item, test)),
+            ItemKind::Retired(ast::RetiredItem {
+                head: Some(head),
+                new: ast::RetiredNew::Rewrite { expr, .. },
+                ..
+            }) if self.head_rewrite_form(expr) => self.typed_rewrite(item, head, expr),
             ItemKind::Const(constant) => {
                 let SigKind::Const { ty } = &sig.kind else {
                     return None;

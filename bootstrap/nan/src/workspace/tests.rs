@@ -39,9 +39,11 @@ fn load(files: &[(&str, &str)]) -> (Scratch, Workspace) {
     (scratch, workspace)
 }
 
+/// The diagnostics of reading a workspace but those of its locks.
 fn codes(workspace: &Workspace) -> Vec<(String, u32, &'static str)> {
     workspace
         .diagnostics()
+        .filter(|diagnostic| !diagnostic.code.name().starts_with("dep."))
         .map(|diagnostic| {
             (
                 diagnostic.path.unwrap_or_default(),
@@ -386,4 +388,25 @@ fn items_have_canonical_paths() {
         at("app/units/units.nan", 4).as_deref(),
         Some("app::units::Scale")
     );
+}
+
+#[test]
+fn two_sources_of_one_package_name_split_it() {
+    let units = "//! Units.\n\npackage units {\n    language 1\n    targets any\n} units\n";
+    let (_scratch, workspace) = load(&[
+        ("units/package.nan", units),
+        ("copy/package.nan", units),
+        (
+            "app/package.nan",
+            &manifest(
+                "    language 1\n    targets any\n    dep a \"../units\"\n    dep b \"../copy\"\n    dep c \"./../units\"\n",
+            ),
+        ),
+    ]);
+    let split: Vec<u32> = workspace
+        .diagnostics()
+        .filter(|diagnostic| diagnostic.code.name() == "dep.split-package")
+        .filter_map(|diagnostic| diagnostic.line)
+        .collect();
+    assert_eq!(split, [7]);
 }

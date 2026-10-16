@@ -2,6 +2,7 @@
 //! interpreter read. A unit holds the NIR functions of one item; each function numbers its blocks
 //! and values as elaboration orders them, and keeps the type of every value.
 
+pub mod encode;
 #[cfg(test)]
 mod text;
 
@@ -557,6 +558,8 @@ pub struct Unit {
     pub item: ItemId,
     /// Its functions by role, in the role table's order, then by index.
     pub functions: Vec<Function>,
+    /// The first token of each trusted block or expression, by premise index, in source order.
+    pub premises: Vec<Tok>,
 }
 
 impl Unit {

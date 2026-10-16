@@ -1,7 +1,9 @@
 //! The conformance harness: runs each `nan` example of a specification chapter against its marker
-//! comments, builds its `x86_64-host` programs and compares what one writes with the text its
-//! section gives, and finds each item of its `nan-api` blocks in the std sources, one test per
-//! chapter.
+//! comments after locking and snapshotting each of its packages, `nan verify` included for a gate
+//! code, compares a host example's obligation outcomes with the proof cache's, builds its
+//! `x86_64-host` programs and compares what one writes with the text its section gives, runs the
+//! commands of the `text` blocks of its section, and finds each item of its `nan-api` blocks in
+//! the std sources, one test per chapter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,13 +57,15 @@ struct Marker {
     line: usize,
 }
 
-/// A `nan` block: the line of the specification it starts on, its files, and what running its
-/// program writes when its section gives it.
+/// A `nan` block: the line of the specification it starts on, its files, what running its
+/// program writes when its section gives it, and the commands of its section's `text` blocks with
+/// their exact outputs.
 struct Example {
     line: usize,
     files: Vec<(String, Vec<String>)>,
     prepended: bool,
     written: Option<Written>,
+    commands: Vec<(String, String)>,
 }
 
 /// What a program writes when run, and the status it exits with.
@@ -125,9 +129,51 @@ impl Example {
         })
     }
 
-    /// Writes the files into `dir`, without their marker comments when `unmarked`.
+    /// The package directories of the block, each after the packages its path sources name.
+    fn packages(&self) -> Vec<String> {
+        let mut deps: Vec<(String, Vec<String>)> = Vec::new();
+        if self.prepended {
+            deps.push(("example".to_owned(), Vec::new()));
+        }
+        for (path, lines) in &self.files {
+            let Some(package) = path.strip_suffix("/package.nan") else {
+                continue;
+            };
+            let named = lines
+                .iter()
+                .filter_map(|line| {
+                    let source = line.trim().strip_prefix("dep ")?.split_once(" \"../")?.1;
+                    Some(source.split('"').next()?.to_owned())
+                })
+                .collect();
+            deps.push((package.to_owned(), named));
+        }
+        let mut ordered: Vec<String> = Vec::new();
+        while ordered.len() < deps.len() {
+            let before = ordered.len();
+            for (package, named) in &deps {
+                let ready = named.iter().all(|dep| {
+                    ordered.contains(dep) || !deps.iter().any(|(known, _)| known == dep)
+                });
+                if !ordered.contains(package) && ready {
+                    ordered.push(package.clone());
+                }
+            }
+            if ordered.len() == before {
+                for (package, _) in &deps {
+                    if !ordered.contains(package) {
+                        ordered.push(package.clone());
+                    }
+                }
+            }
+        }
+        ordered
+    }
+
+    /// Writes the files into `dir`, without their marker comments when `unmarked`; the marked
+    /// files into a new directory, the unmarked ones over them, keeping the machine files.
     fn write(&self, dir: &Path, unmarked: bool) -> std::io::Result<()> {
-        if dir.exists() {
+        if dir.exists() && !unmarked {
             fs::remove_dir_all(dir)?;
         }
         if self.prepended {
@@ -177,6 +223,24 @@ fn program_output(lines: &[&str], index: usize) -> Option<Written> {
     Some(Written { text, status })
 }
 
+/// The commands of a `text` block starting after line `index`, each the text after `$ ` with the
+/// lines up to the next command.
+fn commands(lines: &[&str], index: usize) -> Vec<(String, String)> {
+    let mut commands: Vec<(String, String)> = Vec::new();
+    for line in lines[index + 1..].iter().take_while(|line| **line != "```") {
+        match line.strip_prefix("$ ") {
+            Some(command) => commands.push((command.to_owned(), String::new())),
+            None => {
+                if let Some((_, output)) = commands.last_mut() {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+        }
+    }
+    commands
+}
+
 /// The `nan` blocks of a chapter, each placed in its workspace as the charter states.
 fn examples(text: &str) -> Vec<Example> {
     let lines: Vec<&str> = text.lines().collect();
@@ -189,10 +253,12 @@ fn examples(text: &str) -> Vec<Example> {
         }
         if lines[index] == "```text"
             && same_section
-            && let Some(written) = program_output(&lines, index)
             && let Some(example) = examples.last_mut()
         {
-            example.written = Some(written);
+            if let Some(written) = program_output(&lines, index) {
+                example.written = Some(written);
+            }
+            example.commands.extend(commands(&lines, index));
         }
         if lines[index] != "```nan" {
             index += 1;
@@ -233,6 +299,7 @@ fn examples(text: &str) -> Vec<Example> {
             files,
             prepended,
             written: None,
+            commands: Vec::new(),
         });
         same_section = true;
         index = end + 1;
@@ -294,6 +361,11 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
     example
         .write(dir, false)
         .map_err(|error| error.to_string())?;
+    for package in example.packages() {
+        for command in [&["dep", "sync"][..], &["api", "update"]] {
+            nan(&dir.join(&package), command)?;
+        }
+    }
     let (output, code) = nan(dir, &["check"])?;
     if diagnostics(&output) != expected || code != status {
         return Err(format!(
@@ -304,6 +376,15 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
     if !gaps.is_empty() {
         return Err(format!("context packs lack facts:\n{}", gaps.join("\n")));
     }
+    if !example.kernel() {
+        let mismatches = nan::proof_cache_mismatches(dir).map_err(|error| error.to_string())?;
+        if !mismatches.is_empty() {
+            return Err(format!(
+                "the proof cache holds results the prover does not give for:\n{}",
+                mismatches.join("\n")
+            ));
+        }
+    }
     if status == Some(0) {
         if !example.kernel() {
             test(marker.as_ref(), &expected, dir)?;
@@ -313,6 +394,27 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
             .is_some_and(|marker| TEST_RUN.contains(&marker.code.as_str()));
         if !test_run {
             build(example, marker.as_ref(), &expected, dir)?;
+        }
+    }
+    if let Some(marker) = marker
+        .as_ref()
+        .filter(|marker| GATE.iter().any(|family| marker.code.starts_with(family)))
+    {
+        let gated = vec![(
+            marker.class.to_owned(),
+            marker.code.clone(),
+            format!("{}:{}", marker.path, marker.line),
+        )];
+        let (output, _) = nan(dir, &["verify"])?;
+        if diagnostics(&output) != gated {
+            return Err(format!("nan verify reports\n{output}expected {gated:?}"));
+        }
+    }
+    for (command, expected) in &example.commands {
+        let args: Vec<&str> = command.split(' ').skip(1).collect();
+        let (output, _) = nan(dir, &args)?;
+        if output != *expected {
+            return Err(format!("$ {command} writes\n{output}expected\n{expected}"));
         }
     }
 

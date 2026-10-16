@@ -454,9 +454,7 @@ impl Package {
         let package_name = manifest.as_ref().map(|manifest| manifest.name.clone());
         let (modules, assigned) =
             modules::assign(&found.dir, package_name.as_deref(), &found.sources);
-        let std = package_name
-            .as_deref()
-            .is_some_and(|name| crate::stdlib::PACKAGES.contains(&name));
+        let std = package_name.as_deref().is_some_and(crate::stdlib::is_std);
         if manifest.as_ref().is_none_or(|manifest| manifest.supported) {
             for (path, module) in found.sources.iter().zip(assigned) {
                 let source = source(path)?;

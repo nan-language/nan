@@ -53,7 +53,7 @@ impl Elab<'_, '_> {
         scrutinee: &TExpr,
         arms: &[TArm],
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let Some(matched) = self.scrutinee(scrutinee)? else {
             return Ok(Out::Never);
         };
@@ -278,6 +278,7 @@ impl Elab<'_, '_> {
                 let ty = self.body.local(name.local).ty.clone();
                 let slot = self.binding_slot(name.local, &ty, span);
                 self.move_bound(name, slot, span);
+                self.hold(slot);
             }
         }
         Ok(())
@@ -427,6 +428,7 @@ impl Elab<'_, '_> {
                 let ty = self.body.local(name.local).ty.clone();
                 let slot = self.binding_slot(name.local, &ty, span);
                 self.move_bound(name, slot, span);
+                self.hold(slot);
             } else {
                 let value = self.binding_value(name, span)?;
                 self.held.insert(name.local, Held::Value(value));
@@ -529,7 +531,7 @@ impl Elab<'_, '_> {
         mode: Mode,
         cursor: &Ty,
     ) -> Elaborated<Option<Operand>> {
-        let span = Self::span(iterated.token);
+        let span = Self::spanning(iterated);
         if mode == Mode::Read && iterated.ty == *cursor {
             return self.arg(iterated, Mode::Take);
         }
@@ -634,6 +636,7 @@ impl Elab<'_, '_> {
             let slot = self.binding_slot(local, element, span);
             let value = self.take_place(matched.place, element, span);
             self.emit(Op::Init(Place::of(slot), value), span);
+            self.hold(slot);
             return Ok(());
         }
         self.bind(pattern, &matched, span)

@@ -262,6 +262,14 @@ impl Body<'_, '_> {
     /// Types an expression; `jump` when it stands where `return`, `break`, `continue` and `fail`
     /// may: as a whole expression statement or a match arm's expression body.
     pub fn expr_jump(&mut self, expr: &ast::Expr, expected: Option<&Ty>, jump: bool) -> TExpr {
+        let typed = self.expr_kind(expr, expected, jump);
+        TExpr {
+            last: expr.last,
+            ..typed
+        }
+    }
+
+    fn expr_kind(&mut self, expr: &ast::Expr, expected: Option<&Ty>, jump: bool) -> TExpr {
         let token = expr.token;
         match &expr.kind {
             ExprKind::Literal(literal) => self.literal(token, literal, expected, false),
@@ -304,6 +312,7 @@ impl Body<'_, '_> {
                         self.record_hole(token, ty);
                         TExpr {
                             token,
+                            last: token,
                             ty: ty.clone(),
                             kind: TKind::Todo(reason.value.clone()),
                         }
@@ -319,6 +328,7 @@ impl Body<'_, '_> {
                 let typed = self.expr(inner, expected);
                 TExpr {
                     token,
+                    last: token,
                     ty: typed.ty.clone(),
                     kind: TKind::Dbg(Box::new(typed)),
                 }
@@ -355,6 +365,7 @@ impl Body<'_, '_> {
                 let index = self.jump_target(token, label.as_ref(), true);
                 TExpr {
                     token,
+                    last: token,
                     ty: Ty::Never,
                     kind: index.map_or(TKind::Failed, TKind::Break),
                 }
@@ -363,6 +374,7 @@ impl Body<'_, '_> {
                 let index = self.jump_target(token, label.as_ref(), false);
                 TExpr {
                     token,
+                    last: token,
                     ty: Ty::Never,
                     kind: index.map_or(TKind::Failed, TKind::Continue),
                 }
@@ -455,6 +467,7 @@ impl Body<'_, '_> {
         let value = self.literal_value(literal, &ty, negative);
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Literal(value),
         }
@@ -516,6 +529,7 @@ impl Body<'_, '_> {
         }
         TExpr {
             token,
+            last: token,
             ty: self.local(local).ty.clone(),
             kind: TKind::Local(local),
         }
@@ -540,6 +554,7 @@ impl Body<'_, '_> {
                 }
                 return TExpr {
                     token,
+                    last: token,
                     ty: result,
                     kind: TKind::Result,
                 };
@@ -551,6 +566,7 @@ impl Body<'_, '_> {
                 return match def.constant {
                     Some(scalar) => TExpr {
                         token,
+                        last: token,
                         ty: Ty::Scalar(scalar),
                         kind: TKind::ConstParam(def.param),
                     },
@@ -582,6 +598,7 @@ impl Body<'_, '_> {
         match named {
             Named::Unit if args.is_none() => TExpr {
                 token,
+                last: token,
                 ty: Ty::Unit,
                 kind: TKind::Unit,
             },
@@ -624,6 +641,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Value(item),
         }
@@ -675,6 +693,7 @@ impl Body<'_, '_> {
             .collect();
         TExpr {
             token,
+            last: token,
             ty: Ty::Fn(Rc::new(subst.fn_ty(&ty))),
             kind: TKind::FnValue { item, type_args },
         }
@@ -704,6 +723,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Construct {
                 variant: Some(variant),
@@ -838,6 +858,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Field {
                 base: Box::new(base),
@@ -932,6 +953,7 @@ impl Body<'_, '_> {
                     };
                     return TExpr {
                         token,
+                        last: token,
                         ty,
                         kind: TKind::Register {
                             block: *item,
@@ -981,6 +1003,7 @@ impl Body<'_, '_> {
                         }
                         return TExpr {
                             token,
+                            last: token,
                             ty,
                             kind: TKind::Construct {
                                 variant: Some(variant),
@@ -992,6 +1015,7 @@ impl Body<'_, '_> {
                 SigKind::Layout { tags, .. } if tags.contains(&name.text) => {
                     return TExpr {
                         token,
+                        last: token,
                         ty: ty.clone(),
                         kind: TKind::Construct {
                             variant: tags.iter().position(|tag| *tag == name.text),
@@ -1053,6 +1077,7 @@ impl Body<'_, '_> {
             let typed = self.check(operand, &Ty::Scalar(Scalar::Bool));
             return TExpr {
                 token,
+                last: token,
                 ty: Ty::Scalar(Scalar::Bool),
                 kind: TKind::Unary {
                     op,
@@ -1106,6 +1131,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty: result,
             kind: TKind::Unary {
                 op,
@@ -1128,6 +1154,7 @@ impl Body<'_, '_> {
             let right = self.check(right, &Ty::Scalar(Scalar::Bool));
             return TExpr {
                 token,
+                last: token,
                 ty: Ty::Scalar(Scalar::Bool),
                 kind: TKind::Binary {
                     op,
@@ -1249,6 +1276,7 @@ impl Body<'_, '_> {
                         let right = right_check(self, Some(&ty));
                         return TExpr {
                             token,
+                            last: token,
                             ty: Ty::Error,
                             kind: TKind::Binary {
                                 op,
@@ -1291,6 +1319,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty: result,
             kind: TKind::Binary {
                 op,
@@ -1348,6 +1377,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Binary {
                 op,
@@ -1375,6 +1405,7 @@ impl Body<'_, '_> {
                         (
                             Some(Box::new(TExpr {
                                 token: block.token,
+                                last: block.end,
                                 ty: if diverges { Ty::Never } else { Ty::Unit },
                                 kind: TKind::Block(typed),
                             })),
@@ -1391,6 +1422,7 @@ impl Body<'_, '_> {
                 let diverges = then_diverges && otherwise.is_some() && otherwise_diverges;
                 TExpr {
                     token,
+                    last: token,
                     ty: if diverges { Ty::Never } else { Ty::Unit },
                     kind: TKind::If {
                         condition: Box::new(condition),
@@ -1452,6 +1484,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::If {
                 condition: Box::new(condition),
@@ -1482,6 +1515,7 @@ impl Body<'_, '_> {
             };
             return TExpr {
                 token: block.token,
+                last: block.end,
                 ty,
                 kind: TKind::Block(crate::check::tir::TBlock {
                     end: block.end,
@@ -1498,6 +1532,7 @@ impl Body<'_, '_> {
         }
         TExpr {
             token: block.token,
+            last: block.end,
             ty: if diverges { Ty::Never } else { Ty::Error },
             kind: TKind::Block(typed),
         }
@@ -1566,6 +1601,7 @@ impl Body<'_, '_> {
                     }
                     TExpr {
                         token: block.token,
+                        last: block.end,
                         ty: if diverges { Ty::Never } else { Ty::Unit },
                         kind: TKind::Block(typed),
                     }
@@ -1619,6 +1655,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Match {
                 scrutinee: Box::new(scrutinee_typed),
@@ -1715,6 +1752,7 @@ impl Body<'_, '_> {
                 (
                     TExpr {
                         token: block.token,
+                        last: block.end,
                         ty: Ty::Unit,
                         kind: TKind::Block(typed),
                     },
@@ -1806,6 +1844,7 @@ impl Body<'_, '_> {
         }
         TExpr {
             token,
+            last: token,
             ty: Ty::Fn(Rc::new(closure_ty.clone())),
             kind: TKind::Closure(Box::new(TClosure {
                 task,
@@ -1952,6 +1991,7 @@ impl Body<'_, '_> {
                 let (typed, diverges) = self.block(block);
                 TExpr {
                     token: block.token,
+                    last: block.end,
                     ty: if diverges { Ty::Never } else { Ty::Unit },
                     kind: TKind::Block(typed),
                 }
@@ -1960,6 +2000,7 @@ impl Body<'_, '_> {
         self.cx = saved;
         TExpr {
             token,
+            last: token,
             ty: typed.ty.clone(),
             kind: TKind::Trusted(Box::new(typed)),
         }
@@ -1996,6 +2037,7 @@ impl Body<'_, '_> {
         self.pop_scope();
         TExpr {
             token,
+            last: token,
             ty: Ty::Scalar(Scalar::Bool),
             kind: TKind::Quantifier {
                 all,
@@ -2037,6 +2079,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty: Ty::Never,
             kind: TKind::Return(typed),
         }
@@ -2106,6 +2149,7 @@ impl Body<'_, '_> {
         self.frames.last_mut().expect("a frame").raise(&raised);
         TExpr {
             token,
+            last: token,
             ty: Ty::Never,
             kind: TKind::Fail(Box::new(typed)),
         }
@@ -2185,6 +2229,7 @@ impl Body<'_, '_> {
                 let (typed, diverges) = self.block(block);
                 TExpr {
                     token: block.token,
+                    last: block.end,
                     ty: if diverges { Ty::Never } else { Ty::Unit },
                     kind: TKind::Block(typed),
                 }
@@ -2206,6 +2251,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::When {
                 attempt: attempt.is_some(),
@@ -2224,6 +2270,7 @@ impl Body<'_, '_> {
                 match local {
                     Some(local) => Some(TExpr {
                         token: target.token,
+                        last: target.last,
                         ty: self.local(local).ty.clone(),
                         kind: TKind::Local(local),
                     }),

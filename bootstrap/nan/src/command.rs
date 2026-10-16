@@ -1,5 +1,6 @@
 //! The `nan` command line: reading it, running the command it names, and printing the result.
 
+mod build;
 mod check;
 mod edit;
 mod read;
@@ -17,10 +18,20 @@ use crate::scope::Scope;
 use crate::toolchain;
 use crate::workspace::{self, Workspace};
 
-/// What a run printed and the status it ends with.
+pub use build::Launch;
+
+/// What a run printed and the status it ends with, or for `nan run` of a built program, the
+/// image to start in its place.
 pub struct Run {
     pub output: String,
     pub status: i32,
+    pub launch: Option<Launch>,
+}
+
+/// What a command ends with: its output, or the image `nan run` starts.
+enum Outcome {
+    Output(Output),
+    Launch(Launch),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +50,8 @@ enum Name {
     EditRename,
     EditMove,
     Primer,
+    Build,
+    Run,
 }
 
 impl Name {
@@ -65,6 +78,8 @@ impl Name {
             "explain" => Name::Explain,
             "expand" => Name::Expand,
             "primer" => Name::Primer,
+            "build" => Name::Build,
+            "run" => Name::Run,
             _ => return None,
         };
         Some((name, 1))
@@ -87,6 +102,8 @@ impl Name {
             Name::EditRename => "edit rename",
             Name::EditMove => "edit move",
             Name::Primer => "primer",
+            Name::Build => "build",
+            Name::Run => "run",
         }
     }
 
@@ -102,7 +119,9 @@ impl Name {
             | Name::Expand
             | Name::EditRename
             | Name::EditMove
-            | Name::Primer => (&[], &[]),
+            | Name::Primer
+            | Name::Build
+            | Name::Run => (&[], &[]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
             Name::Show => (&["--api"], &[]),
             Name::Find => (&["--contributors"], &[]),
@@ -139,7 +158,13 @@ impl Name {
     fn writes(self) -> bool {
         matches!(
             self,
-            Name::Fix | Name::Fmt | Name::EditReplace | Name::EditRename | Name::EditMove
+            Name::Fix
+                | Name::Fmt
+                | Name::EditReplace
+                | Name::EditRename
+                | Name::EditMove
+                | Name::Build
+                | Name::Run
         )
     }
 
@@ -147,9 +172,12 @@ impl Name {
     fn counts(self) -> &'static [&'static str] {
         match self {
             Name::Check | Name::Fix => &["errors", "incomplete"],
-            Name::Fmt | Name::EditReplace | Name::EditRename | Name::EditMove => {
-                &["files", "errors", "incomplete"]
-            }
+            Name::Fmt
+            | Name::EditReplace
+            | Name::EditRename
+            | Name::EditMove
+            | Name::Build
+            | Name::Run => &["files", "errors", "incomplete"],
             Name::Find
             | Name::Holes
             | Name::Show
@@ -168,6 +196,8 @@ struct Invocation<'a> {
     /// The arguments after the name words.
     args: &'a [String],
     operands: Vec<&'a str>,
+    /// The arguments after `--`, which `nan run` passes to the program.
+    passed: &'a [String],
     flags: Vec<&'a str>,
     values: Vec<(&'a str, &'a str)>,
     format: Format,
@@ -256,12 +286,20 @@ pub fn run(args: &[String], current: &Path) -> Run {
         execute(&invocation, current, &mut trace)
     }));
     let output = match outcome {
-        Ok(Ok(output)) => output,
+        Ok(Ok(Outcome::Output(output))) => output,
+        Ok(Ok(Outcome::Launch(launch))) => {
+            return Run {
+                output: String::new(),
+                status: 0,
+                launch: Some(launch),
+            };
+        }
         Ok(Err(_)) | Err(_) => internal_error(&invocation, args, &trace),
     };
     Run {
         output: output.render(&invocation.format),
         status: output.verdict.status(),
+        launch: None,
     }
 }
 
@@ -323,6 +361,7 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
         name,
         args: rest,
         operands: Vec::new(),
+        passed: &[],
         flags: Vec::new(),
         values: Vec::new(),
         format: Format {
@@ -335,6 +374,10 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
     while index < rest.len() {
         let arg = rest[index].as_str();
         match arg {
+            "--" if name == Name::Run => {
+                invocation.passed = &rest[index + 1..];
+                break;
+            }
             "--json" => invocation.format.json = true,
             "--budget" => {
                 index += 1;
@@ -391,18 +434,22 @@ fn usage(args: &[String]) -> Run {
             skip: 0,
         }),
         status: Verdict::Invalid.status(),
+        launch: None,
     }
 }
 
-fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Output> {
+fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Outcome> {
     let root = workspace::root(current);
     if !workspace::holds_package(&root)? {
-        return Ok(invocation.tool_error(Code::ToolNoWorkspace, "."));
+        return Ok(Outcome::Output(
+            invocation.tool_error(Code::ToolNoWorkspace, "."),
+        ));
     }
     trace.root = Some(root.clone());
     let _lock = journal::Lock::acquire(&root, invocation.name.writes())?;
     let workspace = Workspace::load(root, &mut trace.read)?;
-    match invocation.name {
+    let output = match invocation.name {
+        Name::Build | Name::Run => return build::run(invocation, &workspace, current, trace),
         Name::Check | Name::Fix | Name::Fmt => check::run(invocation, &workspace, current, trace),
         Name::Holes => read::holes(invocation, &workspace, current, trace),
         Name::Find => read::find(invocation, &workspace, current),
@@ -414,7 +461,8 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
         Name::EditRename => edit::rename(invocation, &workspace, current, trace),
         Name::EditMove => edit::move_item(invocation, &workspace, current, trace),
         Name::Primer => Ok(read::primer(invocation)),
-    }
+    };
+    output.map(Outcome::Output)
 }
 
 /// A canonical path as records write it for the scope's package `writer`: without the package
@@ -490,6 +538,14 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
             .iter()
             .map(|found| format!("found: {}", output::printable(found.as_bytes()))),
     );
+    if let Some((origin, quoted)) = &diagnostic.envelope {
+        lines.push(format!("envelope {origin} {}", quoted.len()));
+        lines.extend(
+            quoted
+                .iter()
+                .map(|line| format!("| {}", output::printable(line.as_bytes()))),
+        );
+    }
     for reason in &diagnostic.because {
         let Some((path, line)) = &reason.at else {
             lines.push(format!(

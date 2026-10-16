@@ -11,11 +11,11 @@ use super::super::{End, Exec, Flow, Interpreter, Site};
 use super::collections::{conformance, ordering};
 use super::render::float_text;
 use super::stores::{boxed, cell_of, counted, entries, exhausted, holding, place};
-use crate::check::db::{ItemId, TypeKey};
+use crate::check::db::ItemId;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, Const, Scalar, Subst, Ty};
 use crate::nir::Span;
-use crate::syntax::ast::{ExprKind, ItemKind, RetiredNew, TypeModifier};
+use crate::syntax::ast::TypeModifier;
 
 /// The nesting of sequences, maps, records and variants past which decoding fails.
 const MAX_DEPTH: usize = 128;
@@ -656,7 +656,7 @@ impl Decoding<'_, '_, '_, '_> {
         let sig = self.interp.ck.sig(item);
         let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
         let open = self.interp.ck.db.ast(item).has_modifier(TypeModifier::Open);
-        let aliases = aliases(self.interp, item);
+        let aliases = self.interp.ck.key_aliases(item);
         match &sig.kind {
             SigKind::Struct { fields } => {
                 let named: Vec<(String, Ty)> = fields
@@ -810,51 +810,6 @@ impl Decoding<'_, '_, '_, '_> {
             None => fail("OutOfMemory"),
         }
     }
-}
-
-/// The aliases tombstones give the keys of a type's fields and variants: each old key, by the
-/// key its rewrite reaches through further tombstones.
-fn aliases(interp: &Interpreter, item: ItemId) -> HashMap<Vec<u8>, Vec<u8>> {
-    let prefix = format!("{}.", interp.ck.db.type_path(TypeKey::Item(item)));
-    let renamed: HashMap<String, String> = interp
-        .ck
-        .db
-        .retired
-        .iter()
-        .filter_map(|(form, tombstones)| {
-            let old = form.strip_prefix(&prefix)?;
-            let ItemKind::Retired(retired) = &interp.ck.db.ast(*tombstones.first()?).kind else {
-                return None;
-            };
-            let RetiredNew::Rewrite {
-                expr,
-                preserves: true,
-            } = &retired.new
-            else {
-                return None;
-            };
-            let new = match &expr.kind {
-                ExprKind::Field { name, .. } => name.text.clone(),
-                ExprKind::Path { path, .. } => path.segments.last()?.text.clone(),
-                _ => return None,
-            };
-            Some((old.to_owned(), new))
-        })
-        .collect();
-    renamed
-        .keys()
-        .map(|old| {
-            let mut current = old.clone();
-            let mut steps = 0;
-            while let Some(next) = renamed.get(&current)
-                && steps <= renamed.len()
-            {
-                current = next.clone();
-                steps += 1;
-            }
-            (old.clone().into_bytes(), current.into_bytes())
-        })
-        .collect()
 }
 
 /// A position in the input with the bytes before it read.

@@ -1,6 +1,8 @@
 //! Tombstones: the forms their rewrites take, what a rewrite names beside its replacement, and the
 //! old forms that live items, members and the tombstones of other modules take.
 
+use std::collections::HashMap;
+
 use super::Checker;
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::interface::{narrower, openness};
@@ -12,6 +14,50 @@ use crate::diagnostic::Code;
 use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredItem, RetiredNew, Visibility};
 
 impl Checker<'_> {
+    /// The aliases tombstones give the keys of a type's fields and variants: each old key, by
+    /// the key its rewrite reaches through further tombstones.
+    pub fn key_aliases(&self, item: ItemId) -> HashMap<Vec<u8>, Vec<u8>> {
+        let prefix = format!("{}.", self.db.type_path(TypeKey::Item(item)));
+        let renamed: HashMap<String, String> = self
+            .db
+            .retired
+            .iter()
+            .filter_map(|(form, tombstones)| {
+                let old = form.strip_prefix(&prefix)?;
+                let ItemKind::Retired(retired) = &self.db.ast(*tombstones.first()?).kind else {
+                    return None;
+                };
+                let RetiredNew::Rewrite {
+                    expr,
+                    preserves: true,
+                } = &retired.new
+                else {
+                    return None;
+                };
+                let new = match &expr.kind {
+                    ExprKind::Field { name, .. } => name.text.clone(),
+                    ExprKind::Path { path, .. } => path.segments.last()?.text.clone(),
+                    _ => return None,
+                };
+                Some((old.to_owned(), new))
+            })
+            .collect();
+        renamed
+            .keys()
+            .map(|old| {
+                let mut current = old.clone();
+                let mut steps = 0;
+                while let Some(next) = renamed.get(&current)
+                    && steps <= renamed.len()
+                {
+                    current = next.clone();
+                    steps += 1;
+                }
+                (old.clone().into_bytes(), current.into_bytes())
+            })
+            .collect()
+    }
+
     /// The rules of a tombstone, the first it breaks reported on it: the form of its rewrite and
     /// what the rewrite names, then whether its old form is taken.
     pub fn check_tombstone(&self, item: ItemId) {

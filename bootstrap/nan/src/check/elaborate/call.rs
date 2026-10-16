@@ -21,7 +21,7 @@ struct Requires {
 }
 
 impl Elab<'_, '_> {
-    pub fn call(&mut self, call: &tir::Call, ty: &Ty) -> Elaborated<Out> {
+    pub fn call(&mut self, call: &tir::Call, ty: &Ty, span: Span) -> Elaborated<Out> {
         let function_value = match &call.callee {
             tir::Callee::Value(value) => match self.operand(value)? {
                 Some(Operand::Value(value)) => Some(value),
@@ -41,7 +41,7 @@ impl Elab<'_, '_> {
                 None => return Ok(Out::Never),
             }
         }
-        self.finish_call(call, function_value, args, ty)
+        self.finish_call(call, function_value, args, ty, span)
     }
 
     /// A call whose callee and arguments are evaluated: its checks, then the call.
@@ -51,8 +51,8 @@ impl Elab<'_, '_> {
         function_value: Option<crate::nir::Value>,
         mut args: Vec<Operand>,
         ty: &Ty,
+        span: Span,
     ) -> Elaborated<Out> {
-        let span = Self::span(call.token);
         let callee = match (&call.callee, function_value) {
             (_, Some(value)) => Callee::Value(value),
             (

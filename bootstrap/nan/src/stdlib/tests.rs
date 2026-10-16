@@ -3,7 +3,7 @@ use crate::check::db::{ItemId, TypeKey};
 use crate::check::ty::Ty;
 use crate::interp::{End, Interpreter, Val};
 use crate::nir::Role;
-use crate::syntax::ast::{ClauseKind, ItemKind, Visibility};
+use crate::syntax::ast::{ClauseKind, FnModifier, ItemKind, Visibility};
 
 /// The std packages as the workspace checked.
 fn std_workspace() -> Workspace {
@@ -82,7 +82,8 @@ fn every_pub_std_function_has_an_example_or_a_test() {
                         .iter()
                         .any(|param| matches!(&param.ty, Ty::Item(ty, _) if machine(*ty)))
                 });
-            let callable = !machine_value && !HOST_UNCALLABLE.contains(&path.as_str());
+            let landing = matches!(function.modifier, Some((FnModifier::Landing, _)));
+            let callable = !machine_value && !landing && !HOST_UNCALLABLE.contains(&path.as_str());
             ast.visibility == Visibility::Pub && callable && !example && !tested.contains(item)
         })
         .map(|item| db.canonical(item))

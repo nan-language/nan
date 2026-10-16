@@ -40,6 +40,14 @@ impl Elab<'_, '_> {
         Span::at(token)
     }
 
+    /// The span of a typed expression, from its first token to its last.
+    pub fn spanning(expr: &TExpr) -> Span {
+        Span {
+            first: expr.token,
+            last: expr.last,
+        }
+    }
+
     /// The place a local names.
     pub fn local_place(&mut self, local: LocalId) -> Elaborated<Place> {
         if let Some((value, field)) = self.fields.get(&local) {
@@ -90,7 +98,7 @@ impl Elab<'_, '_> {
     pub fn operand(&mut self, expr: &TExpr) -> Elaborated<Option<Operand>> {
         Ok(match self.expr(expr)? {
             Out::Operand(operand) => Some(operand),
-            Out::Place(place) => Some(self.take_place(place, &expr.ty, Self::span(expr.token))),
+            Out::Place(place) => Some(self.take_place(place, &expr.ty, Self::spanning(expr))),
             Out::Never => None,
         })
     }
@@ -138,7 +146,7 @@ impl Elab<'_, '_> {
         if !self.b.open() {
             return Ok(Out::Never);
         }
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         Ok(match &expr.kind {
             TKind::Failed => return Err(Fault::Failed),
             TKind::Literal(lit) => Out::Operand(Operand::Literal(literal(lit, &expr.ty)?)),
@@ -199,7 +207,9 @@ impl Elab<'_, '_> {
                 Some(place) => Out::Place(place.step(name)),
                 None => Out::Never,
             },
-            TKind::Call(call) | TKind::Index(call) => self.call(call, &expr.ty)?,
+            TKind::Call(call) | TKind::Index(call) => {
+                self.call(call, &expr.ty, Self::spanning(expr))?
+            }
             TKind::Construct { variant, values } => self.construct(expr, *variant, values)?,
             TKind::Unary { op, operand } => self.unary(expr, *op, operand)?,
             TKind::Binary { op, left, right } => self.binary(expr, *op, left, right)?,
@@ -286,7 +296,7 @@ impl Elab<'_, '_> {
         variant: Option<usize>,
         values: &[(String, TExpr)],
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let mut operands: Vec<(String, Operand)> = Vec::new();
         for (name, value) in values {
             let Some(operand) = self.arg(value, Mode::Take)? else {
@@ -359,7 +369,7 @@ impl Elab<'_, '_> {
     }
 
     fn unary(&mut self, expr: &TExpr, op: ast::UnaryOp, operand: &TExpr) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let Some(value) = self.operand(operand)? else {
             return Ok(Out::Never);
         };
@@ -385,7 +395,7 @@ impl Elab<'_, '_> {
         left: &TExpr,
         right: &TExpr,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         match op {
             ast::BinaryOp::And | ast::BinaryOp::Or => {
                 return self.logical(op == ast::BinaryOp::And, left, right, span);
@@ -602,7 +612,7 @@ impl Elab<'_, '_> {
         then: &TBlock,
         otherwise: Option<&TExpr>,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let Some(test) = self.operand(condition)? else {
             return Ok(Out::Never);
         };
@@ -654,7 +664,7 @@ impl Elab<'_, '_> {
         accesses: &[(Mode, TExpr, LocalId)],
         body: &TExpr,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let mut operands = Vec::new();
         for (mode, cown, _) in accesses {
             let Some(place) = self.place(cown)? else {
@@ -717,7 +727,7 @@ impl Elab<'_, '_> {
         range: &TExpr,
         body: &TExpr,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let TKind::Binary {
             op,
             left: low,
@@ -770,7 +780,7 @@ impl Elab<'_, '_> {
         method: &str,
         args: Vec<Operand>,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let operand_ty = expr.ty.clone();
         let Some(interface) = self.ck.db.std_item("core", interface) else {
             return Err(Fault::Unsupported(format!(
@@ -795,7 +805,7 @@ impl Elab<'_, '_> {
         expr: &TExpr,
         closure: &crate::check::tir::TClosure,
     ) -> Elaborated<Out> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         let mut operands = Vec::new();
         for capture in super::closure_captures(closure) {
             let ty = self.body.local(capture.outer).ty.clone();
@@ -824,7 +834,7 @@ impl Elab<'_, '_> {
 
     /// The operand an argument passes for a parameter in a mode.
     pub fn arg(&mut self, expr: &TExpr, mode: Mode) -> Elaborated<Option<Operand>> {
-        let span = Self::span(expr.token);
+        let span = Self::spanning(expr);
         Ok(match (self.expr(expr)?, mode) {
             (Out::Never, _) => None,
             (Out::Operand(operand), Mode::Read) => match operand {

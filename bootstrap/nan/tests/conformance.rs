@@ -1,5 +1,7 @@
 //! The conformance harness: runs each `nan` example of a specification chapter against its marker
-//! comments and finds each item of its `nan-api` blocks in the std sources, one test per chapter.
+//! comments, builds its `x86_64-host` programs and compares what one writes with the text its
+//! section gives, and finds each item of its `nan-api` blocks in the std sources, one test per
+//! chapter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,14 +55,37 @@ struct Marker {
     line: usize,
 }
 
-/// A `nan` block: the line of the specification it starts on, and its files.
+/// A `nan` block: the line of the specification it starts on, its files, and what running its
+/// program writes when its section gives it.
 struct Example {
     line: usize,
     files: Vec<(String, Vec<String>)>,
     prepended: bool,
+    written: Option<Written>,
+}
+
+/// What a program writes when run, and the status it exits with.
+struct Written {
+    text: String,
+    status: i32,
 }
 
 impl Example {
+    /// The names of the packages of the block that are `x86_64-host` programs.
+    fn host_programs(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|(path, lines)| {
+                path.ends_with("/package.nan")
+                    && lines.iter().any(|line| line.trim() == "entry main")
+                    && lines
+                        .iter()
+                        .any(|line| line.trim() == "targets x86_64-host")
+            })
+            .filter_map(|(path, _)| path.split_once('/').map(|(package, _)| package.to_owned()))
+            .collect()
+    }
+
     fn marker(&self) -> Option<Marker> {
         let markers = [
             (" // error: ", "error"),
@@ -119,12 +144,43 @@ fn unmark(line: &str) -> &str {
         .unwrap_or(line)
 }
 
+/// The text a `text` block starting after line `index` gives as what a program writes, when the
+/// sentence before it says so: the block's text and the exit status the sentence states.
+fn program_output(lines: &[&str], index: usize) -> Option<Written> {
+    let sentence = lines[..index].iter().rev().find(|line| !line.is_empty())?;
+    if !sentence.starts_with("Running this program writes") {
+        return None;
+    }
+    let status = sentence
+        .split_once("exits with status ")
+        .and_then(|(_, rest)| rest.trim_end_matches(':').parse().ok())
+        .unwrap_or(0);
+    let end = index + 1 + lines[index + 1..].iter().position(|line| *line == "```")?;
+    let mut text = String::new();
+    for line in &lines[index + 1..end] {
+        text.push_str(line);
+        text.push('\n');
+    }
+    Some(Written { text, status })
+}
+
 /// The `nan` blocks of a chapter, each placed in its workspace as the charter states.
 fn examples(text: &str) -> Vec<Example> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut examples = Vec::new();
+    let mut examples: Vec<Example> = Vec::new();
+    let mut same_section = false;
     let mut index = 0;
     while index < lines.len() {
+        if lines[index].starts_with('#') {
+            same_section = false;
+        }
+        if lines[index] == "```text"
+            && same_section
+            && let Some(written) = program_output(&lines, index)
+            && let Some(example) = examples.last_mut()
+        {
+            example.written = Some(written);
+        }
         if lines[index] != "```nan" {
             index += 1;
             continue;
@@ -163,7 +219,9 @@ fn examples(text: &str) -> Vec<Example> {
             line: start + 1,
             files,
             prepended,
+            written: None,
         });
+        same_section = true;
         index = end + 1;
     }
     examples
@@ -233,6 +291,9 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
     if !gaps.is_empty() {
         return Err(format!("context packs lack facts:\n{}", gaps.join("\n")));
     }
+    if status == Some(0) {
+        build(example, marker.as_ref(), &expected, dir)?;
+    }
 
     example
         .write(dir, true)
@@ -259,6 +320,54 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
             return Err(format!(
                 "nan fmt rewrites {path}:\n{output}{}",
                 written.join("\n")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Builds each `x86_64-host` program of an example: every image builds, reporting what check
+/// time reports and the one diagnostic a final-build marker states, and a program whose
+/// section gives what it writes writes exactly that and exits with the status stated.
+fn build(
+    example: &Example,
+    marker: Option<&Marker>,
+    checked: &[(String, String, String)],
+    dir: &Path,
+) -> Result<(), String> {
+    for program in example.host_programs() {
+        let mut expected = checked.to_vec();
+        let final_marker = marker.filter(|marker| FINAL_BUILD.contains(&marker.code.as_str()));
+        if let Some(marker) = final_marker {
+            expected.push((
+                marker.class.to_owned(),
+                marker.code.clone(),
+                format!("{}:{}", marker.path, marker.line),
+            ));
+        }
+        let (output, code) = nan(dir, &["build", &program])?;
+        let status = i32::from(final_marker.is_some());
+        if diagnostics(&output) != expected || code != Some(status) {
+            return Err(format!(
+                "nan build {program} exits with {code:?} and reports\n{output}expected {expected:?}"
+            ));
+        }
+        let Some(written) = example.written.as_ref().filter(|_| final_marker.is_none()) else {
+            continue;
+        };
+        let image = dir.join(".nan/images/x86_64-host").join(&program);
+        let run = Command::new(&image)
+            .current_dir(dir)
+            .output()
+            .map_err(|error| error.to_string())?;
+        let mut text = String::from_utf8_lossy(&run.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&run.stderr));
+        if text != written.text || run.status.code() != Some(written.status) {
+            return Err(format!(
+                "{program} exits with {:?} and writes\n{text}expected status {} and\n{}",
+                run.status.code(),
+                written.status,
+                written.text
             ));
         }
     }

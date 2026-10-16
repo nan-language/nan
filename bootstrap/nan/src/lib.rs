@@ -5,11 +5,13 @@ mod command;
 mod diagnostic;
 mod diff;
 mod encoding;
+mod final_build;
 mod fix;
 mod format;
 mod hash;
 mod interp;
 mod journal;
+mod lower;
 mod nir;
 mod output;
 mod prover;
@@ -19,7 +21,7 @@ mod syntax;
 mod toolchain;
 mod workspace;
 
-pub use command::{Run, run};
+pub use command::{Launch, Run, run};
 pub use diagnostic::Code;
 
 /// The facts checking each item of the workspace rooted at `root` reads that its context pack

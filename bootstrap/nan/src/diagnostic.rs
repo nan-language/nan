@@ -243,7 +243,9 @@ codes! {
     LimitMayNotTerminate = "limit.may-not-terminate",
     LimitMayTrap = "limit.may-trap",
     LimitRedundant = "limit.redundant",
+    LimitStackExceeded = "limit.stack-exceeded",
     LimitStackSize = "limit.stack-size",
+    LimitStackUnbounded = "limit.stack-unbounded",
     ManifestAnyNotAlone = "manifest.any-not-alone",
     ManifestBadSource = "manifest.bad-source",
     ManifestDenySelf = "manifest.deny-self",
@@ -371,6 +373,8 @@ codes! {
     TargetDepProgram = "target.dep-program",
     TargetDependencyUncovered = "target.dependency-uncovered",
     TargetEntryHead = "target.entry-head",
+    TargetEntryMissing = "target.entry-missing",
+    TargetLinkFailed = "target.link-failed",
     TargetProgramTargets = "target.program-targets",
     TaskCaptureNotSend = "task.capture-not-send",
     TaskLendLocal = "task.lend-local",
@@ -575,6 +579,8 @@ pub struct Diagnostic {
     /// The fixes its rule names, or once re-checked, those it offers.
     pub fixes: Vec<Fix>,
     pub offer: Offer,
+    /// The output of an external program it quotes: the program's name and the lines.
+    pub envelope: Option<(String, Vec<String>)>,
 }
 
 impl Diagnostic {
@@ -592,6 +598,7 @@ impl Diagnostic {
             failing: None,
             fixes: Vec::new(),
             offer: Offer::Each,
+            envelope: None,
         }
     }
 

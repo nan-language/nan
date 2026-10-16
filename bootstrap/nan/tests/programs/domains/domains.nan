@@ -1,0 +1,200 @@
+//! Each scenario logs how its domain ended.
+
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+fn share(total: u32, items: u32) -> u32 {
+    return total / items
+} share
+
+fn spin(seed: u64) -> u64 {
+    var value = seed
+    while value != 1 {
+        value = value.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 2
+    }
+    return value
+} spin
+
+fn busy(rounds: u64) -> u64 {
+    var count: u64 = 0
+    var left = rounds
+    while left > 0 {
+        count = count.wrapping_add(left)
+        left -= 1
+    }
+    return count
+} busy
+
+fn depth(level: u64) -> u64 {
+    if level == 0 {
+        return 0
+    }
+    return depth(level + 1) + 1
+} depth
+
+fn fill(seed: u8) -> u64 limits stack 2_000_000 {
+    var block = Array[u8, 100_000].filled(seed)
+    block[99_999] = 3
+    var total: u64 = 0
+    for value in block {
+        total += u64.widen(value)
+    }
+    return total
+} fill
+
+fn divide_level(gauge: task::Cown[Gauge], divisor: u32) fails task::Cancelled uses wait {
+    await when mut gauge {
+        gauge.level = gauge.level / divisor
+    }
+} divide_level
+
+fn contain(items: u32, world: host::World) fails task::Cancelled uses wait {
+    let outcome = try await sys::Domain.run(fn() -> u32 {
+        return share(10, items: items)
+    }, exec: world.exec, alloc: world.alloc)
+    match outcome {
+        Ok(value) => world.log.info("ok", value: value)
+        Err(trap) => {
+            world.log.info("kind", value: trap.kind())
+            world.log.info("trap", value: trap)
+        }
+    }
+} contain
+
+fn stops(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let clock = world.clock
+    let outcome = try await sys::Domain.run(fn() fails task::Cancelled uses wait {
+        try await task::scope(exec, body: fn(s: task::Scope) {
+            discard s.spawn(fn() -> u64 {
+                return spin(3)
+            })
+            discard s.spawn(fn() -> u32 fails task::Cancelled uses wait {
+                try await clock.sleep(400)
+                return 1
+            })
+            discard s.spawn(fn() -> u32 fails task::Cancelled uses wait {
+                discard try await task::within(clock, ms: 300, body: fn() -> u32 fails task::Cancelled uses wait {
+                    try await clock.sleep(5_000)
+                    return 2
+                })
+                return 3
+            })
+            discard busy(20_000_000)
+            discard share(10, items: 0)
+        })
+    }, exec: world.exec, alloc: world.alloc)
+    match outcome {
+        Ok(_) => world.log.info("stops returned", value: true)
+        Err(trap) => world.log.info("stops kind", value: trap.kind())
+    }
+} stops
+
+fn poisons(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let gauge = task::Cown.of(Gauge(level: 8), alloc)
+    let held = gauge.share()
+    let channel = task::Channel[u32].bounded(1, alloc: alloc)
+    var receiver = channel.receiver
+    let sender = channel.sender
+    let clock = world.clock
+    let outcome = try await sys::Domain.run(fn[take held, take sender]() fails task::Cancelled uses wait {
+        try await task::scope(exec, body: fn[take held, take sender](s: task::Scope) fails task::Cancelled uses wait {
+            let producer = sender.split()
+            discard s.spawn(fn[take producer]() fails task::Cancelled uses wait {
+                discard attempt await producer.send(1)
+                discard attempt await producer.send(2)
+            })
+            try await clock.sleep(20)
+            try await divide_level(held, divisor: 0)
+        })
+    }, exec, alloc)
+    let trapped = match outcome {
+        Ok(_) => false
+        Err(_) => true
+    }
+    world.log.info("poison trapped", value: trapped)
+    let level = attempt await when gauge => gauge.level
+    let poisoned = match level {
+        Ok(_) => false
+        Err(_) => true
+    }
+    world.log.info("poisoned", value: poisoned)
+    let oldest = try await mut receiver.receive()
+    world.log.info("oldest", value: oldest)
+} poisons
+
+fn overflows(world: host::World) fails task::Cancelled uses wait {
+    let outcome = try await sys::Domain.run(fn() -> u64 {
+        return depth(1)
+    }, exec: world.exec, alloc: world.alloc)
+    match outcome {
+        Ok(value) => world.log.info("depth", value: value)
+        Err(trap) => world.log.info("overflow kind", value: trap.kind())
+    }
+} overflows
+
+fn wide(world: host::World) fails task::Cancelled uses wait {
+    let outcome = try await sys::Domain.run(fn() -> u64 limits stack 3_000_000 {
+        return fill(1)
+    }, exec: world.exec, alloc: world.alloc)
+    match outcome {
+        Ok(value) => world.log.info("filled", value: value)
+        Err(trap) => world.log.info("fill kind", value: trap.kind())
+    }
+} wide
+
+fn revoked(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let clock = world.clock
+    let Ok(revoker) = attempt sys::revocable(clock) else {
+        return
+    }
+    let derived = revoker.capability()
+    let winner = try await task::race(exec, left: fn() -> Option[u32] fails task::Cancelled uses wait {
+        return try await task::within(derived, ms: 10_000, body: fn() -> u32 fails task::Cancelled uses wait {
+            try await clock.sleep(5_000)
+            return 1
+        })
+    }, right: fn[take revoker]() -> Option[u32] fails task::Cancelled uses wait {
+        discard attempt await clock.sleep(100)
+        take revoker.revoke()
+        try await clock.sleep(1_000)
+        return Some(9)
+    })
+    world.log.info("winner", value: winner)
+} revoked
+
+fn stores(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let arena = mem::Arena[u64].empty(alloc)
+    let names = mem::OnceMap[u32, u64].empty(seed: 7, alloc: alloc)
+    try await task::scope(exec, body: fn(s: task::Scope) {
+        for worker in 0..<8u64 {
+            discard s.spawn(fn() {
+                for step in 0..<5_000u64 {
+                    discard arena.push(worker * 1_000_000 + step)
+                    discard names.insert(u32.truncate(step % 1_000), value: worker)
+                }
+            })
+        }
+    })
+    world.log.info("arena", value: arena.len())
+    world.log.info("names", value: names.len())
+} stores
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    try await contain(2, world: world)
+    try await contain(0, world: world)
+    try await stops(world)
+    try await poisons(world)
+    try await overflows(world)
+    try await wide(world)
+    try await revoked(world)
+    try await stores(world)
+    try await world.clock.sleep(500)
+    world.log.info("after", value: 7u32)
+} main

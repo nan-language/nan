@@ -1,0 +1,335 @@
+//! Each scenario logs what settlement, or a domain's end, left behind.
+
+fn ratio(total: u32, items: u32) -> u32 {
+    return total / items
+} ratio
+
+fn sum(values: mem::List[u64]) -> u64 {
+    var total: u64 = 0
+    for value in values {
+        total += value
+    }
+    return total
+} sum
+
+fn trapped[T](outcome: Result[T, sys::Trap]) -> bool {
+    return match outcome {
+        Ok(_) => false
+        Err(_) => true
+    }
+} trapped
+
+fn relisten(world: host::World, zero: u32) fails sys::net::NetError uses wait {
+    let net = world.net
+    let outcome = try await sys::Domain.run(fn() fails sys::net::NetError uses wait {
+        var listener = try await net.listen(4_301)
+        discard ratio(1, items: zero)
+        let conn = try await mut listener.accept()
+        take conn.abandon()
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("listener trapped", value: trapped(outcome))
+    discard try await net.listen(4_301)
+    world.log.info("relistened", value: true)
+} relisten
+
+fn peer_reset(world: host::World, zero: u32) fails sys::net::NetError uses wait {
+    let net = world.net
+    var listener = try await net.listen(4_302)
+    let client = try await net.connect("localhost", port: 4_302)
+    defer take client.abandon()
+    var server = try await mut listener.accept()
+    defer take server.abandon()
+    undefer client
+    let outcome = try await sys::Domain.run(fn[take client]() {
+        discard ratio(1, items: zero)
+        take client.abandon()
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("conn trapped", value: trapped(outcome))
+    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    let read = attempt await mut server.read(mut buf.view_mut())
+    let reset = match read {
+        Err(sys::net::NetError.Reset) => true
+        else => false
+    }
+    world.log.info("peer reset", value: reset)
+} peer_reset
+
+fn senders_end(world: host::World, zero: u32) fails task::Cancelled uses wait {
+    let channel = task::Channel[u32].bounded(4, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    let outcome = try await sys::Domain.run(fn[take sender]() fails task::Cancelled uses wait {
+        discard attempt await sender.send(5)
+        discard ratio(1, items: zero)
+        discard attempt await sender.send(6)
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("sender trapped", value: trapped(outcome))
+    let oldest = try await mut receiver.receive()
+    let later = try await mut receiver.receive()
+    world.log.info("oldest", value: oldest)
+    world.log.info("later", value: later)
+} senders_end
+
+fn receiver_ends(world: host::World, zero: u32) fails task::Cancelled uses wait {
+    let channel = task::Channel[u32].bounded(1, alloc: world.alloc)
+    let sender = channel.sender
+    let receiver = channel.receiver
+    let outcome = try await sys::Domain.run(fn[take receiver]() fails task::Cancelled uses wait {
+        discard ratio(1, items: zero)
+        try await take receiver.drain(visit: fn(take value: u32) {
+        })
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("receiver trapped", value: trapped(outcome))
+    let sent = attempt await sender.send(1)
+    let closed = match sent {
+        Err(task::SendError.Closed) => true
+        else => false
+    }
+    world.log.info("send closed", value: closed)
+} receiver_ends
+
+fn lists_outlive(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let channel = task::Channel[mem::List[u64]].bounded(8, alloc: alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    let outcome = try await sys::Domain.run(fn[take sender]() fails task::Cancelled uses wait {
+        for round in 0..<4u32 {
+            var built = mem::List[u64].empty(alloc)
+            for index in 0..<1_000u32 {
+                mut built.push(u64.widen(index + round))
+            }
+            discard attempt await sender.send(take built)
+        }
+    }, exec: world.exec, alloc: alloc)
+    world.log.info("sent trapped", value: trapped(outcome))
+    var noise = mem::List[u64].empty(alloc)
+    for index in 0..<20_000u32 {
+        mut noise.push(u64.widen(index))
+    }
+    var total: u64 = 0
+    loop {
+        let next = try await mut receiver.receive()
+        let Some(list) = next else {
+            break
+        }
+        for value in list {
+            total += value
+        }
+    }
+    world.log.info("received total", value: total)
+} lists_outlive
+
+fn cown_grows(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let store = task::Cown.of(mem::List[u64].empty(alloc), alloc)
+    let held = store.share()
+    let outcome = try await sys::Domain.run(fn[take held]() fails task::Cancelled uses wait {
+        await when mut held {
+            for index in 0..<5_000u32 {
+                mut held.push(u64.widen(index))
+            }
+        }
+    }, exec: world.exec, alloc: alloc)
+    world.log.info("grew trapped", value: trapped(outcome))
+    var noise = mem::List[u64].empty(alloc)
+    for index in 0..<20_000u32 {
+        mut noise.push(u64.widen(index))
+    }
+    let total = await when store => sum(store)
+    world.log.info("cown total", value: total)
+} cown_grows
+
+fn run_and_drop(alloc: mem::Alloc, world: host::World, zero: u32) -> bool fails task::Cancelled uses wait {
+    let outcome = try await sys::Domain.run(fn() {
+        var built = mem::List[u64].empty(alloc)
+        for index in 0..<10_000u32 {
+            mut built.push(u64.widen(index))
+        }
+        discard ratio(1, items: zero)
+    }, exec: world.exec, alloc: alloc)
+    return trapped(outcome)
+} run_and_drop
+
+fn charge_returns(world: host::World, zero: u32) fails task::Cancelled uses wait {
+    let budget = world.alloc.split(10_000_000)
+    defer take budget.close()
+    let alloc = budget.alloc()
+    let before = budget.charged()
+    let dropped = try await run_and_drop(alloc, world: world, zero: zero)
+    let between = budget.charged()
+    let kept = try await run_and_drop(alloc, world: world, zero: 1)
+    let after = budget.charged()
+    world.log.info("dropped trapped", value: dropped)
+    world.log.info("kept trapped", value: kept)
+    world.log.info("charge before", value: before)
+    world.log.info("charge between", value: between)
+    world.log.info("charge after", value: after)
+} charge_returns
+
+fn revoked_out(world: host::World, zero: u32) fails task::Cancelled uses wait {
+    let channel = task::Channel[sys::Fs].bounded(1, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    let fs = world.fs
+    let outcome = try await sys::Domain.run(fn[take sender]() fails task::Cancelled uses wait {
+        let made = attempt sys::revocable(fs)
+        match made {
+            Ok(revoker) => {
+                discard attempt await sender.send(revoker.capability())
+                discard ratio(1, items: zero)
+                take revoker.revoke()
+            }
+            Err(_) => {}
+        }
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("revoker trapped", value: trapped(outcome))
+    let got = try await mut receiver.receive()
+    let Some(copy) = got else {
+        return
+    }
+    let read = attempt await copy.read_all("settlement.nan", alloc: world.alloc)
+    let stale = match read {
+        Err(sys::fs::FsError.Revoked(_)) => true
+        else => false
+    }
+    world.log.info("copy stale", value: stale)
+} revoked_out
+
+fn budget_out(world: host::World, zero: u32) fails task::Cancelled uses wait {
+    let channel = task::Channel[mem::Alloc].bounded(1, alloc: world.alloc)
+    let sender = channel.sender
+    var receiver = channel.receiver
+    let parent = world.alloc
+    let outcome = try await sys::Domain.run(fn[take sender]() fails task::Cancelled uses wait {
+        let budget = parent.split(1_000_000)
+        discard attempt await sender.send(budget.alloc())
+        discard ratio(1, items: zero)
+        take budget.close()
+    }, exec: world.exec, alloc: world.alloc)
+    world.log.info("budget trapped", value: trapped(outcome))
+    let got = try await mut receiver.receive()
+    let Some(drawn) = got else {
+        return
+    }
+    var list = mem::List[u64].empty(drawn)
+    let pushed = attempt mut list.try_push(1)
+    let exhausted = match pushed {
+        Err(_) => true
+        Ok(_) => false
+    }
+    world.log.info("budget closed", value: exhausted)
+} budget_out
+
+fn results_outlive(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let outcome = try await sys::Domain.run(fn() -> task::Cown[mem::List[u64]] {
+        var built = mem::List[u64].empty(alloc)
+        for index in 0..<3_000u32 {
+            mut built.push(u64.widen(index))
+        }
+        return task::Cown.of(take built, alloc)
+    }, exec: world.exec, alloc: alloc)
+    let Ok(store) = outcome else {
+        return
+    }
+    var noise = mem::List[u64].empty(alloc)
+    for index in 0..<20_000u32 {
+        mut noise.push(u64.widen(index))
+    }
+    let total = await when store => sum(store)
+    world.log.info("result total", value: total)
+} results_outlive
+
+fn receiver_outlives(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let outcome = try await sys::Domain.run(fn() -> task::Receiver[mem::List[u64]] fails task::Cancelled uses wait {
+        let channel = task::Channel[mem::List[u64]].bounded(4, alloc: alloc)
+        let sender = channel.sender
+        for round in 0..<3u32 {
+            var built = mem::List[u64].empty(alloc)
+            for index in 0..<2_000u32 {
+                mut built.push(u64.widen(index * round))
+            }
+            discard attempt await sender.send(take built)
+        }
+        return channel.receiver
+    }, exec: world.exec, alloc: alloc)
+    let Ok(receiver) = outcome else {
+        return
+    }
+    var noise = mem::List[u64].empty(alloc)
+    for index in 0..<20_000u32 {
+        mut noise.push(u64.widen(index))
+    }
+    var total: u64 = 0
+    try await take receiver.drain(visit: fn[mut total](take list: mem::List[u64]) {
+        total += sum(list)
+    })
+    world.log.info("buffered total", value: total)
+} receiver_outlives
+
+fn shared_outlives(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let outcome = try await sys::Domain.run(fn() -> mem::Shared[mem::List[u64]] {
+        var built = mem::List[u64].empty(alloc)
+        for index in 0..<4_000u32 {
+            mut built.push(u64.widen(index))
+        }
+        return mem::Shared.of(take built, alloc)
+    }, exec: world.exec, alloc: alloc)
+    let Ok(shared) = outcome else {
+        return
+    }
+    var noise = mem::List[u64].empty(alloc)
+    for index in 0..<20_000u32 {
+        mut noise.push(u64.widen(index))
+    }
+    world.log.info("shared total", value: sum(shared.contents()))
+} shared_outlives
+
+fn read_in_flight(world: host::World, zero: u32) fails sys::net::NetError uses wait {
+    let net = world.net
+    let clock = world.clock
+    var listener = try await net.listen(4_304)
+    let exec = world.exec
+    let outcome = try await sys::Domain.run(fn() fails sys::net::NetError uses wait {
+        try await task::scope(exec, body: fn(s: task::Scope) fails sys::net::NetError uses wait {
+            discard s.spawn(fn() fails sys::net::NetError uses wait {
+                var conn = try await net.connect("localhost", port: 4_304)
+                defer take conn.abandon()
+                var buf = Untrusted.of(Array[u8, 4].filled(0))
+                discard try await mut conn.read(mut buf.view_mut())
+            })
+            try await clock.sleep(50)
+            discard ratio(1, items: zero)
+        })
+    }, exec: exec, alloc: world.alloc)
+    world.log.info("read trapped", value: trapped(outcome))
+    var stale = try await mut listener.accept()
+    defer take stale.abandon()
+    var client = try await net.connect("localhost", port: 4_304)
+    defer take client.abandon()
+    var second = try await mut listener.accept()
+    defer take second.abandon()
+    discard try await mut second.write(b"ok")
+    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    let count = try await mut client.read(mut buf.view_mut())
+    world.log.info("read again", value: count)
+} read_in_flight
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    discard attempt await relisten(world, zero: 0)
+    discard attempt await peer_reset(world, zero: 0)
+    try await senders_end(world, zero: 0)
+    try await receiver_ends(world, zero: 0)
+    try await lists_outlive(world)
+    try await cown_grows(world)
+    try await charge_returns(world, zero: 0)
+    try await revoked_out(world, zero: 0)
+    try await budget_out(world, zero: 0)
+    try await results_outlive(world)
+    try await receiver_outlives(world)
+    try await shared_outlives(world)
+    discard attempt await read_in_flight(world, zero: 0)
+} main

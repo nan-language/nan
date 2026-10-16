@@ -202,6 +202,9 @@ pub struct Body<'c, 'a> {
     pub bound_names: Vec<String>,
     /// The closures that are the body closures of `task::scope` calls.
     pub scope_bodies: Vec<u32>,
+    /// The lexical spawns whose `task::scope` call is still being typed: its body closure, the
+    /// child's failure type and the spawn's token.
+    pub lexical_spawns: Vec<(u32, Ty, Tok)>,
     /// The first and last tokens of the expression in statement position being typed.
     pub statement: Option<(Tok, Tok)>,
     pub clauses: Vec<TClause>,
@@ -243,6 +246,7 @@ impl<'c, 'a> Body<'c, 'a> {
             closed: std::cell::Cell::new(false),
             bound_names: Vec::new(),
             scope_bodies: Vec::new(),
+            lexical_spawns: Vec::new(),
             statement: None,
             clauses: Vec::new(),
             examples: Vec::new(),
@@ -1046,6 +1050,7 @@ impl Checker<'_> {
                 let typed = body.result_block(block, &sig.result);
                 Some(TExpr {
                     token: block.token,
+                    last: block.end,
                     ty: Ty::Unit,
                     kind: TKind::Block(typed),
                 })
@@ -1111,6 +1116,7 @@ impl Checker<'_> {
         body.check_effects(method.token, &frame, &sig.fn_ty(), &clauses, true);
         let typed = body.finish(Some(TExpr {
             token: block.token,
+            last: block.end,
             ty: Ty::Unit,
             kind: TKind::Block(typed),
         }));
@@ -1136,6 +1142,7 @@ impl Checker<'_> {
         let (typed, _) = body.block(&test.body);
         body.finish(Some(TExpr {
             token: test.body.token,
+            last: test.body.end,
             ty: Ty::Unit,
             kind: TKind::Block(typed),
         }))

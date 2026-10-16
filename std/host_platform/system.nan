@@ -1,0 +1,96 @@
+//! The clock, the random source and log records of the host.
+
+/// A time as seconds and nanoseconds.
+layout Timespec: bytes 16 le {
+    seconds: i64 at 0
+    nanoseconds: i64 at 8
+} Timespec
+
+foreign fn clock_gettime(clock: i32, time: hw::Ptr[Timespec]) -> i32 convention "sysv"
+
+foreign fn getrandom(buffer: hw::Ptr[u8], len: usize, flags: u32) -> isize convention "sysv"
+
+foreign fn write(fd: i32, buffer: hw::Ptr[u8], count: usize) -> isize convention "sysv"
+
+/// The milliseconds of the monotonic clock.
+pkg fn now_ms() -> u64 {
+    var time = Timespec(seconds: 0, nanoseconds: 0)
+    discard clock_gettime(1, time: hw::Ptr.of_mut(mut time))
+    return u64.fit(time.seconds) * 1_000 + u64.fit(time.nanoseconds) / 1_000_000
+} now_ms
+
+pkg fn sleep(ms: u64) fails task::Cancelled uses wait {
+    var time = Timespec(seconds: i64.fit(ms / 1_000), nanoseconds: i64.fit(ms % 1_000 * 1_000_000))
+    let address = u64.widen(hw::Ptr.of_mut(mut time).addr())
+    discard try await submit(operation(OP_TIMEOUT, fd: -1, address, len: 1, offset: 0))
+} sleep
+
+pkg fn random_fill(mut buf: SliceMut[u8]) {
+    var done: usize = 0
+    while done < buf.len() {
+        let Some(parts) = mut buf.split_at_mut(done) else {
+            return
+        }
+        var rest = parts.tail
+        let count = getrandom(hw::Ptr.of_view_mut(mut rest), len: rest.len(), flags: 0)
+        if count > 0 {
+            done += usize.fit(count)
+        }
+    }
+} random_fill
+
+/// Writes every byte of a buffer's prefix to standard error.
+fn write_err(bytes: Slice[u8]) {
+    var done: usize = 0
+    while done < bytes.len() {
+        let Some(parts) = bytes.split_at(done) else {
+            return
+        }
+        let count = write(2, buffer: hw::Ptr.of_view(parts.tail), count: parts.tail.len())
+        if count <= 0 {
+            return
+        }
+        done += usize.fit(count)
+    }
+} write_err
+
+/// Writes one log record to standard error: the level, `: `, the message, a space and the
+/// rendering, each line feed written as `\n`, then a line feed.
+pkg fn log_line(level: Str, message: Str, rendering: Str) {
+    var line = Array[u8, 4_096].filled(0)
+    var len: usize = 0
+    len = append_escaped(mut line, at: len, text: level.as_bytes())
+    len = append_escaped(mut line, at: len, text: b": ")
+    len = append_escaped(mut line, at: len, text: message.as_bytes())
+    len = append_escaped(mut line, at: len, text: b" ")
+    len = append_escaped(mut line, at: len, text: rendering.as_bytes())
+    let Some(written) = line.view().prefix(len) else {
+        return
+    }
+    write_err(written)
+    write_err(b"\n")
+} log_line
+
+/// Appends a text to a line from `at`, each line feed as `\n`, flushing a full line; returns
+/// the line's new length.
+fn append_escaped(mut line: Array[u8, 4_096], at: usize, text: Slice[u8]) -> usize {
+    var len = at
+    for byte in text {
+        if len + 2 > 4_096 {
+            let Some(full) = line.view().prefix(len) else {
+                return len
+            }
+            write_err(full)
+            len = 0
+        }
+        if byte == b'\n' {
+            line[len] = b'\\'
+            line[len + 1] = b'n'
+            len += 2
+        } else {
+            line[len] = byte
+            len += 1
+        }
+    }
+    return len
+} append_escaped

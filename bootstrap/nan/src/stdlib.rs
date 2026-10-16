@@ -8,10 +8,18 @@ use std::sync::OnceLock;
 
 use crate::workspace::{Package, Workspace};
 
-/// The std packages in layer order.
+/// The std packages that std aliases name, in layer order.
 pub const PACKAGES: [&str; 9] = [
     "core", "mem", "text", "task", "sys", "hw", "boot", "host", "testing",
 ];
+
+/// The platform packages, which no alias names.
+pub const PLATFORMS: [&str; 1] = ["host_platform"];
+
+/// Whether a package name is a std package's.
+pub fn is_std(name: &str) -> bool {
+    PACKAGES.contains(&name) || PLATFORMS.contains(&name)
+}
 
 /// The std packages, loaded once per run.
 pub fn packages() -> &'static [Package] {

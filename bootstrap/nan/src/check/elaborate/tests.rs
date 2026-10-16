@@ -70,7 +70,7 @@ fn alternatives_move_into_the_slot_their_arm_creates_before_the_first_test() {
     );
     assert_eq!(
         unit_text(&source, "example::size_of"),
-        "unit example::size_of\n\nfn body (take %0: example::Label) -> u32\n^0:\n    %1 = slot label: example::Label\n    init %1, %0\n    %2 = slot token: example::Token\n    %3 = is %1, example::Label.Short\n    branch %3, ^1, ^4\n^1:\n    %4 = move %1.Short\n    init %2, %4\n    jump ^2\n^2:\n    %5 = load %2.size\n    release %2\n    jump ^3(%5)\n^3(%6: u32):\n    release %1\n    return %6\n^4:\n    %7 = is %1, example::Label.Long\n    branch %7, ^5, ^6\n^5:\n    %8 = move %1.Long\n    init %2, %8\n    jump ^2\n^6:\n    jump ^3(0u32)\n"
+        "unit example::size_of\n\nfn body (take %0: example::Label) -> u32\n^0:\n    %1 = slot label: example::Label\n    init %1, %0\n    %2 = slot token: example::Token\n    %3 = is %1, example::Label.Short\n    branch %3, ^1, ^4\n^1:\n    %4 = move %1.Short\n    init %2, %4\n    jump ^2\n^2:\n    %5 = load %2.size\n    release %2\n    jump ^3(%5)\n^3(%6: u32):\n    return %6\n^4:\n    %7 = is %1, example::Label.Long\n    branch %7, ^5, ^6\n^5:\n    %8 = move %1.Long\n    init %2, %8\n    jump ^2\n^6:\n    release %1\n    jump ^3(0u32)\n"
     );
 }
 
@@ -81,7 +81,7 @@ fn a_guard_reads_by_reference_what_its_pattern_moves_after_it() {
     );
     assert_eq!(
         unit_text(&source, "example::weight"),
-        "unit example::weight\n\nfn body (take %0: example::Pair) -> u32\n^0:\n    %1 = slot pair: example::Pair\n    init %1, %0\n    %2 = load %1.kind\n    %3 = ge %2, 0u32\n    branch %3, ^1, ^5\n^1:\n    %4 = constant example::LIMIT\n    %5 = lt %2, %4\n    branch %5, ^2, ^5\n^2:\n    %6 = ref %1.token\n    %7 = load %6.size\n    %8 = gt %7, 0u32\n    branch %8, ^3, ^5\n^3:\n    %9 = slot token: example::Token\n    %10 = move %1.token\n    init %9, %10\n    %11 = load %9.size\n    release %9\n    jump ^4(%11)\n^4(%12: u32):\n    release %1\n    return %12\n^5:\n    %13 = constant example::LIMIT\n    jump ^4(%13)\n"
+        "unit example::weight\n\nfn body (take %0: example::Pair) -> u32\n^0:\n    %1 = slot pair: example::Pair\n    init %1, %0\n    %2 = load %1.kind\n    %3 = ge %2, 0u32\n    branch %3, ^1, ^5\n^1:\n    %4 = constant example::LIMIT\n    %5 = lt %2, %4\n    branch %5, ^2, ^5\n^2:\n    %6 = ref %1.token\n    %7 = load %6.size\n    %8 = gt %7, 0u32\n    branch %8, ^3, ^5\n^3:\n    %9 = slot token: example::Token\n    %10 = move %1.token\n    init %9, %10\n    %11 = load %9.size\n    release %9\n    jump ^4(%11)\n^4(%12: u32):\n    return %12\n^5:\n    %13 = constant example::LIMIT\n    release %1.token\n    jump ^4(%13)\n"
     );
 }
 
@@ -117,7 +117,7 @@ fn an_exit_releases_the_temporaries_of_the_statements_it_leaves() {
     );
     assert_eq!(
         unit_text(&source, "example::early"),
-        "unit example::early\n\nfn body (read %0: bool) -> u32\n^0:\n    %1 = call example::make(3u32)\n    %2 = variant example::Label.Short(%1)\n    %3 = slot example::Label\n    init %3, %2\n    %4 = is %3, example::Label.Short\n    branch %4, ^1, ^5\n^1:\n    %5 = slot token: example::Token\n    %6 = move %3.Short\n    init %5, %6\n    branch %0, ^2, ^3\n^2:\n    %7 = load %5.size\n    %8 = call example::make(%7)\n    %9 = slot example::Token\n    init %9, %8\n    %10 = load %9.size\n    release %9\n    release %5\n    release %3\n    return %10\n^3:\n    release %5\n    jump ^4\n^4:\n    release %3\n    return 0u32\n^5:\n    jump ^4\n"
+        "unit example::early\n\nfn body (read %0: bool) -> u32\n^0:\n    %1 = call example::make(3u32)\n    %2 = variant example::Label.Short(%1)\n    %3 = slot example::Label\n    init %3, %2\n    %4 = is %3, example::Label.Short\n    branch %4, ^1, ^5\n^1:\n    %5 = slot token: example::Token\n    %6 = move %3.Short\n    init %5, %6\n    branch %0, ^2, ^3\n^2:\n    %7 = load %5.size\n    %8 = call example::make(%7)\n    %9 = slot example::Token\n    init %9, %8\n    %10 = load %9.size\n    release %9\n    release %5\n    return %10\n^3:\n    release %5\n    jump ^4\n^4:\n    return 0u32\n^5:\n    release %3\n    jump ^4\n"
     );
 }
 
@@ -241,4 +241,16 @@ impl crate::nir::Names for UnitNames<'_, '_> {
             _ => "_".to_owned(),
         }
     }
+}
+
+#[test]
+fn a_failing_initialiser_releases_only_the_bindings_before_it() {
+    let text = unit_text(
+        "pub closed enum Fault {\n    Bad\n} Fault\n\npub fn made() -> mem::Bytes fails Fault {\n    fail Fault.Bad\n} made\n\npub fn both() -> usize fails Fault {\n    let one = try made()\n    let two = try made()\n    return one.len() + two.len()\n} both\n",
+        "example::both",
+    );
+    assert_eq!(
+        text,
+        "unit example::both\n\nfn body () -> usize fails example::Fault\n^0:\n    %0 = slot one: mem::Bytes\n    call example::made() ok ^1 fail ^4\n^1(%1: mem::Bytes):\n    init %0, %1\n    %2 = slot two: mem::Bytes\n    call example::made() ok ^2 fail ^3\n^2(%3: mem::Bytes):\n    init %2, %3\n    %4 = call mem::Bytes.len(read %0)\n    %5 = call mem::Bytes.len(read %2)\n    %6 = add %4, %5\n    release %2\n    release %0\n    return %6\n^3(%7: example::Fault):\n    release %0\n    fail %7\n^4(%8: example::Fault):\n    fail %8\n"
+    );
 }

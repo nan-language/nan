@@ -11,8 +11,9 @@ use crate::workspace::Target;
 
 impl Checker<'_> {
     /// The rules of a package's `targets`, `entry` and `dep` directives: a program declares one
-    /// concrete target, and each dependency in the workspace covers every target the package
-    /// declares and is no program, unless its `dep` directive lacks a grant its package needs.
+    /// concrete target and an entry function `main` of its root module, and each dependency in
+    /// the workspace covers every target the package declares and is no program, unless its
+    /// `dep` directive lacks a grant its package needs.
     pub fn check_program(&self, package: PackageId) {
         let data = self.db.package(package);
         let Some(manifest) = &data.source.manifest else {
@@ -25,6 +26,18 @@ impl Checker<'_> {
             && !concrete
         {
             self.report_file(path, *line, Code::TargetProgramTargets);
+        }
+        if let Some((name, line)) = &manifest.entry
+            && let Some(module) = data.root
+            && !self.db.module(module).abandoned
+        {
+            let main = self
+                .db
+                .lookup(module, "main")
+                .is_some_and(|item| matches!(self.db.ast(item).kind, ItemKind::Fn(_)));
+            if name != "main" || !main {
+                self.report_file(path, *line, Code::TargetEntryMissing);
+            }
         }
         for dep in &manifest.deps {
             let Some(Some(dependency)) = data.deps.get(&dep.alias) else {

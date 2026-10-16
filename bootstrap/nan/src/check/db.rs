@@ -160,11 +160,10 @@ impl<'a> Db<'a> {
             db.add_package(package, carried);
         }
         for (index, package) in db.packages.iter().enumerate() {
-            if package.std {
-                let alias = crate::stdlib::PACKAGES
-                    .iter()
-                    .find(|alias| **alias == package.name)
-                    .expect("a std package is named like its alias");
+            let alias = crate::stdlib::PACKAGES
+                .iter()
+                .find(|alias| **alias == package.name);
+            if let Some(alias) = alias.filter(|_| package.std) {
                 db.std.insert(alias, PackageId(index as u32));
             }
         }
@@ -203,7 +202,7 @@ impl<'a> Db<'a> {
             .name()
             .expect("a package with a manifest")
             .to_owned();
-        let std = crate::stdlib::PACKAGES.contains(&name.as_str());
+        let std = crate::stdlib::is_std(&name);
         let mut modules = Vec::new();
         let mut root = None;
         for (index, module) in package.modules.iter().enumerate() {

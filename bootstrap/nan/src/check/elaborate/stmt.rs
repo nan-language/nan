@@ -5,13 +5,15 @@ use std::collections::BTreeSet;
 
 use super::expr::Out;
 use super::{Deferred, Elab, Elaborated, Exit, Fault, Held, Leave, Loop, Scope};
+use crate::check::db::ItemId;
+use crate::check::sig::{Payload, SigKind};
 use crate::check::tir::{
     LocalId, LocalKind, TBlock, TClosure, TExpr, TKind, TPattern, TPatternKind, TStmt, TStmtKind,
 };
-use crate::check::ty::{Scalar, Ty};
+use crate::check::ty::{Args, Scalar, Subst, Ty};
 use crate::nir::{
     BlockId, Callable, CheckKind, FnRef, Jump, Literal, NTy, Op, Operand, Place, Role, Span,
-    Terminator, Value,
+    Terminator, Value, is_variant_step,
 };
 use crate::syntax::ast::{self, Mode, Tok};
 
@@ -29,7 +31,7 @@ impl Elab<'_, '_> {
         if self.b.open() {
             let value = match out {
                 Out::Operand(operand) => Some(operand),
-                Out::Place(place) => Some(self.take_place(place, &root.ty, Self::span(root.token))),
+                Out::Place(place) => Some(self.take_place(place, &root.ty, Self::spanning(root))),
                 Out::Never => None,
             };
             let end = match &root.kind {
@@ -82,6 +84,7 @@ impl Elab<'_, '_> {
                 let slot = self.binding_slot(*local, &ty, span);
                 if let Some(operand) = self.arg(value, Mode::Take)? {
                     self.emit(Op::Init(Place::of(slot), operand), span);
+                    self.hold(slot);
                 }
             }
             TStmtKind::Discard(value) => {
@@ -190,12 +193,17 @@ impl Elab<'_, '_> {
         }
     }
 
-    /// A slot for a binding of the current scope, created before its initialiser's code.
+    /// A slot for a binding of the current scope, created before its initialiser's code; the
+    /// scope releases it once `hold` records that it holds a value.
     pub fn binding_slot(&mut self, local: LocalId, ty: &Ty, span: Span) -> Value {
         let slot = self.named_slot(local, ty, span);
         self.held.insert(local, Held::Slot(slot));
-        self.scopes.last_mut().expect("a scope").slots.push(slot);
         slot
+    }
+
+    /// Records that a slot of the current scope holds a value, which the scope's exits release.
+    pub fn hold(&mut self, slot: Value) {
+        self.scopes.last_mut().expect("a scope").slots.push(slot);
     }
 
     /// A slot named after a binding.
@@ -238,6 +246,7 @@ impl Elab<'_, '_> {
             let slot = self.binding_slot(local, &ty, span);
             if let Some(operand) = self.arg(value, Mode::Take)? {
                 self.emit(Op::Init(Place::of(slot), operand), span);
+                self.hold(slot);
             }
             return Ok(());
         }
@@ -249,7 +258,7 @@ impl Elab<'_, '_> {
 
     /// The value a `let` binding of a value takes: a Copy value, or a projection's reference.
     fn bound_value(&mut self, value: &TExpr) -> Elaborated<Option<Value>> {
-        let span = Self::span(value.token);
+        let span = Self::spanning(value);
         Ok(match self.expr(value)? {
             Out::Never => None,
             Out::Operand(Operand::Value(bound)) => Some(bound),
@@ -280,7 +289,10 @@ impl Elab<'_, '_> {
         op: Option<ast::BinaryOp>,
         value: &TExpr,
     ) -> Elaborated<()> {
-        let span = Self::span(token);
+        let span = Span {
+            first: token,
+            last: value.last,
+        };
         let Some(pending) = self.target_operands(target)? else {
             return Ok(());
         };
@@ -328,6 +340,7 @@ impl Elab<'_, '_> {
                 }
                 Some(Target::Indexed {
                     call,
+                    span: Self::spanning(target),
                     args,
                     steps: Vec::new(),
                 })
@@ -336,11 +349,17 @@ impl Elab<'_, '_> {
                 Some(Target::Place(place)) => Some(Target::Place(place.step(name))),
                 Some(Target::Indexed {
                     call,
+                    span,
                     args,
                     mut steps,
                 }) => {
                     steps.push(name.clone());
-                    Some(Target::Indexed { call, args, steps })
+                    Some(Target::Indexed {
+                        call,
+                        span,
+                        args,
+                        steps,
+                    })
                 }
                 None => None,
             },
@@ -352,18 +371,21 @@ impl Elab<'_, '_> {
     fn reach_target(&mut self, target: Target) -> Elaborated<Option<Place>> {
         match target {
             Target::Place(place) => Ok(Some(place)),
-            Target::Indexed { call, args, steps } => {
-                match self.finish_call(call, None, args, &call.head.result)? {
-                    Out::Place(mut place) => {
-                        place.steps.extend(steps);
-                        Ok(Some(place))
-                    }
-                    Out::Never => Ok(None),
-                    Out::Operand(_) => Err(Fault::Unsupported(
-                        "an indexed target without place".to_owned(),
-                    )),
+            Target::Indexed {
+                call,
+                span,
+                args,
+                steps,
+            } => match self.finish_call(call, None, args, &call.head.result, span)? {
+                Out::Place(mut place) => {
+                    place.steps.extend(steps);
+                    Ok(Some(place))
                 }
-            }
+                Out::Never => Ok(None),
+                Out::Operand(_) => Err(Fault::Unsupported(
+                    "an indexed target without place".to_owned(),
+                )),
+            },
         }
     }
 
@@ -434,11 +456,11 @@ impl Elab<'_, '_> {
             NTy::Owned(cursor.clone()),
             span,
         );
-        self.scopes.last_mut().expect("a scope").slots.push(slot);
         let Some(obtained) = self.cursor(iterated, mode, cursor)? else {
             return Ok(());
         };
         self.emit(Op::Init(Place::of(slot), obtained), span);
+        self.hold(slot);
         let header = self.b.block();
         let exit = self.b.block();
         self.b.jump(header, Vec::new(), span);
@@ -556,14 +578,84 @@ impl Elab<'_, '_> {
         Ok(())
     }
 
-    /// Releases a slot unless it holds nothing or a Copy or view value.
+    /// The type of the value at a place of struct fields.
+    fn place_ty(&self, place: &Place) -> Ty {
+        place
+            .steps
+            .iter()
+            .fold(self.b.ty(place.root).ty().clone(), |ty, step| {
+                self.ck.field_type(&ty, step).expect("a struct field")
+            })
+    }
+
+    /// Releases a slot unless it holds nothing or a Copy or view value; of a slot with parts
+    /// moved out, only the parts left.
     fn release_slot(&mut self, slot: Value, span: Span) {
-        let place = Place::of(slot);
         let ty = self.b.ty(slot).ty().clone();
-        if self.moved.contains(&place) || self.ck.nir_copy(&ty) || self.ck.nir_view(&ty) {
+        self.release_left(Place::of(slot), &ty, span);
+    }
+
+    /// Releases what a place still holds unless that is nothing or a Copy or view value: of a
+    /// struct or variant payload with parts moved out, the parts left.
+    fn release_left(&mut self, place: Place, ty: &Ty, span: Span) {
+        if self.moved.iter().any(|moved| is_prefix(moved, &place))
+            || self.ck.nir_copy(ty)
+            || self.ck.nir_view(ty)
+        {
             return;
         }
-        self.emit(Op::Release(place), span);
+        let moved = self
+            .moved
+            .iter()
+            .find(|moved| is_prefix(&place, moved))
+            .cloned();
+        let parts = match (moved, ty) {
+            (Some(moved), Ty::Item(item, args)) => self.parts(&place, &moved, *item, args),
+            _ => None,
+        };
+        match parts {
+            Some(parts) => {
+                for (part, part_ty) in parts {
+                    self.release_left(part, &part_ty, span);
+                }
+            }
+            None => self.emit(Op::Release(place), span),
+        }
+    }
+
+    /// The parts of a struct value at a place, or of the payload of the variant a moved part
+    /// lies in, with their types.
+    fn parts(
+        &self,
+        place: &Place,
+        moved: &Place,
+        item: ItemId,
+        args: &Args,
+    ) -> Option<Vec<(Place, Ty)>> {
+        let sig = self.ck.sig(item);
+        let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
+        match &sig.kind {
+            SigKind::Struct { fields } => Some(
+                fields
+                    .iter()
+                    .map(|field| (place.step(&field.name), subst.ty(&field.ty)))
+                    .collect(),
+            ),
+            SigKind::Enum { variants } => {
+                let step = &moved.steps[place.steps.len()];
+                let variant = variants.iter().find(|variant| variant.name == *step)?;
+                let payload = place.step(step);
+                Some(match &variant.payload {
+                    Payload::None => Vec::new(),
+                    Payload::Single(ty) => vec![(payload, subst.ty(ty))],
+                    Payload::Labelled(fields) => fields
+                        .iter()
+                        .map(|(name, ty)| (payload.step(name), subst.ty(ty)))
+                        .collect(),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// `return e`: its value, the exit of every scope, then the function's return exit.
@@ -820,8 +912,9 @@ impl Elab<'_, '_> {
         })
     }
 
-    /// Joins branches: each releases the slots another moved whole, then jumps to the join,
-    /// passing its value when the branches yield one.
+    /// Joins branches: each releases what it still holds of the parts of slots another moved,
+    /// of the whole value of a variant payload part, then jumps to the join, passing its value
+    /// when the branches yield one.
     pub fn join(&mut self, arms: Vec<ArmEnd>, ty: &Ty, span: Span) -> Elaborated<Out> {
         let live: Vec<ArmEnd> = arms.into_iter().filter(|arm| arm.block.is_some()).collect();
         if live.is_empty() {
@@ -832,16 +925,26 @@ impl Elab<'_, '_> {
         for arm in &live {
             union.extend(arm.moved.iter().cloned());
         }
+        let released: BTreeSet<Place> = union
+            .iter()
+            .filter(|place| {
+                self.b.is_slot(place.root)
+                    && live
+                        .iter()
+                        .any(|arm| !arm.moved.iter().any(|moved| is_prefix(moved, place)))
+            })
+            .map(before_variant)
+            .collect();
         let join = self.b.block();
         let yields = !matches!(ty, Ty::Unit | Ty::Never);
         let param = yields.then(|| self.b.block_param(join, NTy::Owned(ty.clone())));
         for arm in live {
             self.b.at(arm.block.expect("a live branch"));
             self.moved = arm.moved.clone();
-            for place in union.difference(&arm.moved) {
-                if place.steps.is_empty() && self.b.is_slot(place.root) {
-                    self.emit(Op::Release(place.clone()), span);
-                }
+            for place in &released {
+                let place_ty = self.place_ty(place);
+                self.release_left(place.clone(), &place_ty, span);
+                self.moved.insert(place.clone());
             }
             let args = match (yields, arm.value) {
                 (true, Some(value)) => vec![value],
@@ -850,6 +953,7 @@ impl Elab<'_, '_> {
             self.b.jump(join, args, span);
         }
         self.moved = union;
+        self.moved.extend(released);
         self.b.at(join);
         Ok(match param {
             Some(param) => Out::Operand(Operand::Value(param)),
@@ -863,6 +967,7 @@ enum Target<'t> {
     Place(Place),
     Indexed {
         call: &'t crate::check::tir::Call,
+        span: Span,
         args: Vec<Operand>,
         steps: Vec<String>,
     },
@@ -871,6 +976,15 @@ enum Target<'t> {
 /// Whether `prefix` is a place `place` lies within.
 pub fn is_prefix(prefix: &Place, place: &Place) -> bool {
     prefix.root == place.root && place.steps.starts_with(&prefix.steps)
+}
+
+/// A place up to its first variant step: the enum value holding a payload part.
+fn before_variant(place: &Place) -> Place {
+    let kept = place.steps.iter().take_while(|step| !is_variant_step(step));
+    Place {
+        root: place.root,
+        steps: kept.cloned().collect(),
+    }
 }
 
 /// Whether an expression is a part or wrapped part: a projection's result or a path of fields

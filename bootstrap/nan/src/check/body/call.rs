@@ -213,6 +213,7 @@ impl Body<'_, '_> {
             let typed = self.expr(inner, expected);
             return TExpr {
                 token: expr.token,
+                last: expr.last,
                 ..typed
             };
         }
@@ -225,6 +226,7 @@ impl Body<'_, '_> {
         let typed = self.call(inner, expected, Some(markers));
         TExpr {
             token: expr.token,
+            last: expr.last,
             ..typed
         }
     }
@@ -243,6 +245,7 @@ impl Body<'_, '_> {
         }
         TExpr {
             token,
+            last: token,
             ty: typed.ty.clone(),
             kind: TKind::Old(Box::new(typed)),
         }
@@ -332,6 +335,7 @@ impl Body<'_, '_> {
                     self.note_use(local);
                     let value = TExpr {
                         token: callee.token,
+                        last: callee.last,
                         ty: self.local(local).ty.clone(),
                         kind: TKind::Local(local),
                     };
@@ -656,6 +660,7 @@ impl Body<'_, '_> {
         let ty = grant.map_or(Ty::Error, |grant| Ty::item(grant, Vec::new()));
         TExpr {
             token,
+            last: token,
             ty: ty.clone(),
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -1420,6 +1425,7 @@ impl Body<'_, '_> {
         self.check_callee(token, &callable);
         self.check_volatile(token, &callable, &typed_args);
         self.check_spawn(token, &callable, &typed_args);
+        self.check_lexical_spawns(&callable, &typed_args);
         let subst = callable.infer.subst.clone();
         let instantiated = subst.fn_ty(&head.fn_ty());
         let failure = instantiated.fails.clone().filter(|ty| *ty != Ty::Never);
@@ -1491,6 +1497,7 @@ impl Body<'_, '_> {
         let callee = callable.callee;
         TExpr {
             token,
+            last: token,
             ty: result,
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -1661,8 +1668,9 @@ impl Body<'_, '_> {
     }
 
     /// The failure type of a spawned child: at a lexical spawn it converts to the failure type of
-    /// its scope's body closure, elsewhere it is `task::Cancelled`.
-    fn check_spawn(&self, token: Tok, callable: &Callable, args: &[TArg]) {
+    /// its scope's `task::scope` call, checked once that call is typed; elsewhere it is
+    /// `task::Cancelled`.
+    fn check_spawn(&mut self, token: Tok, callable: &Callable, args: &[TArg]) {
         let Callee::Function { item, .. } = &callable.callee else {
             return;
         };
@@ -1680,19 +1688,8 @@ impl Body<'_, '_> {
         let scope = args
             .first()
             .and_then(|receiver| self.lexical_scope(&receiver.expr));
-        match scope.and_then(|scope| self.frames.iter().find(|frame| frame.closure == scope)) {
-            Some(frame) => {
-                if let Some(scope_failure) = &frame.failure
-                    && !self.ck.converts(failure, scope_failure)
-                {
-                    let fixes = self
-                        .ck
-                        .variant_added_fix(failure, scope_failure)
-                        .into_iter()
-                        .collect();
-                    self.report_fixed((token, token), Code::ErrorUnconvertible, fixes);
-                }
-            }
+        match scope {
+            Some(scope) => self.lexical_spawns.push((scope, failure.clone(), token)),
             None => {
                 if !failure.has_error()
                     && !failure.is_never()
@@ -1700,6 +1697,42 @@ impl Body<'_, '_> {
                 {
                     self.report(token, Code::TaskUnscopedFailure);
                 }
+            }
+        }
+    }
+
+    /// At a `task::scope` call whose body is a closure, the lexical spawns on that closure: each
+    /// child failure type converts to the call's failure type.
+    fn check_lexical_spawns(&mut self, callable: &Callable, args: &[TArg]) {
+        let Callee::Function { item, .. } = &callable.callee else {
+            return;
+        };
+        if !self.ck.db.is_std(*item) || self.ck.db.canonical(*item) != "task::scope" {
+            return;
+        }
+        let Some(TKind::Closure(body)) = args.get(1).map(|arg| &arg.expr.kind) else {
+            return;
+        };
+        let Some(Arg::Ty(scope_failure)) = callable
+            .head
+            .own_generics()
+            .first()
+            .and_then(|def| callable.infer.subst.get(def.param))
+        else {
+            return;
+        };
+        let (spawns, others) = std::mem::take(&mut self.lexical_spawns)
+            .into_iter()
+            .partition(|(scope, ..)| *scope == body.index);
+        self.lexical_spawns = others;
+        for (_, failure, token) in spawns {
+            if !self.ck.converts(&failure, scope_failure) {
+                let fixes = self
+                    .ck
+                    .variant_added_fix(&failure, scope_failure)
+                    .into_iter()
+                    .collect();
+                self.report_fixed((token, token), Code::ErrorUnconvertible, fixes);
             }
         }
     }
@@ -2181,6 +2214,7 @@ impl Body<'_, '_> {
         }
         TExpr {
             token,
+            last: token,
             ty,
             kind: TKind::Construct { variant, values },
         }
@@ -2232,6 +2266,7 @@ impl Body<'_, '_> {
         let type_args = type_args(&callable.callee, &callable.head, &subst);
         TExpr {
             token,
+            last: token,
             ty: result,
             kind: TKind::Index(Box::new(Call {
                 token,
@@ -2538,6 +2573,7 @@ impl Body<'_, '_> {
         let ty = Ty::Dyn(Rc::new(bound));
         TExpr {
             token,
+            last: token,
             ty: ty.clone(),
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -2583,6 +2619,7 @@ impl Body<'_, '_> {
         );
         TExpr {
             token,
+            last: token,
             ty: boxed.clone(),
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -2628,6 +2665,7 @@ impl Body<'_, '_> {
         let text_arg = |token: Tok, text: String, str_ty: Ty| TArg {
             expr: TExpr {
                 token,
+                last: token,
                 ty: str_ty,
                 kind: TKind::Literal(Lit::Text(text)),
             },
@@ -2687,6 +2725,7 @@ impl Body<'_, '_> {
         };
         TExpr {
             token,
+            last: token,
             ty: ty.clone(),
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -2788,6 +2827,7 @@ impl Body<'_, '_> {
         let result = if write { Ty::Unit } else { element };
         TExpr {
             token,
+            last: token,
             ty: result.clone(),
             kind: TKind::Call(Box::new(Call {
                 token,
@@ -2856,6 +2896,7 @@ fn builtin_call(token: Tok, builtin: Builtin, source: TExpr, result: Ty) -> TExp
     let head = plain_head(result.clone());
     TExpr {
         token,
+        last: token,
         ty: result,
         kind: TKind::Call(Box::new(Call {
             token,

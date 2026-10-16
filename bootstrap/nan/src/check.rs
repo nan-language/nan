@@ -25,7 +25,7 @@ mod kernel;
 pub(crate) mod lowlevel;
 mod package;
 mod program;
-mod props;
+pub(crate) mod props;
 mod reading;
 mod references;
 mod registry;
@@ -265,6 +265,17 @@ impl<'a> Checker<'a> {
             span: Some((tokens[first as usize].start, tokens[last as usize].end)),
             ..Diagnostic::at(code, "", data.line(first))
         }
+    }
+
+    /// A diagnostic a final build reports on the construct of an item's tokens `first..=last`;
+    /// none on the carried std's items.
+    pub fn diagnostic_on(
+        &self,
+        item: ItemId,
+        construct: (Tok, Tok),
+        code: Code,
+    ) -> Option<Diagnostic> {
+        self.on_item(item, self.on(item, construct, code))
     }
 
     /// A reason lying on the line of one of an item's tokens.

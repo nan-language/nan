@@ -122,6 +122,8 @@ pub struct Call {
 #[derive(Clone, Debug)]
 pub struct TExpr {
     pub token: Tok,
+    /// The expression's last token.
+    pub last: Tok,
     pub ty: Ty,
     pub kind: TKind,
 }
@@ -130,6 +132,7 @@ impl TExpr {
     pub fn failed(token: Tok) -> TExpr {
         TExpr {
             token,
+            last: token,
             ty: Ty::Error,
             kind: TKind::Failed,
         }

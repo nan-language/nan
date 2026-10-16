@@ -835,12 +835,22 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         index: usize,
         order: bool,
     ) -> bool {
-        let (left, right) = (self.import(left), self.import(right));
-        let (left, right) = (&left.fields()[index], &right.fields()[index]);
-        match order {
-            true => self.order(left, right) == std::cmp::Ordering::Equal,
-            false => self.equal(left, right),
+        if order {
+            return self.field_order(left, right, index) == std::cmp::Ordering::Equal;
         }
+        let (left, right) = (self.import(left), self.import(right));
+        self.equal(&left.fields()[index], &right.fields()[index])
+    }
+
+    /// The order of two const struct values by the field at `index`.
+    pub fn field_order(
+        &mut self,
+        left: &ConstValue,
+        right: &ConstValue,
+        index: usize,
+    ) -> std::cmp::Ordering {
+        let (left, right) = (self.import(left), self.import(right));
+        self.order(&left.fields()[index], &right.fields()[index])
     }
 
     /// A run's value as a const's: the data it views copied out of the run's memory, or none

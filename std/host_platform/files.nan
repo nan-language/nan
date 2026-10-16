@@ -1,0 +1,180 @@
+//! The file operations of `sys::Fs` and `sys::fs::File` over the descriptor of a directory.
+
+/// How `openat2` resolves a path: its open flags, its mode and its resolution flags.
+layout OpenHow: bytes 24 le {
+    flags: u64 at 0
+    mode: u64 at 8
+    resolve: u64 at 16
+} OpenHow
+
+/// The open flags of a file read from, written to after truncation, or created.
+const READ_ONLY: u64 = 0x8_0000
+
+const WRITE_CREATE: u64 = 0x8_0241
+
+/// Resolution staying beneath the directory and following no magic links.
+const BENEATH: u64 = 0x0A
+
+/// The longest path the platform functions join, in bytes, its NUL excluded.
+const PATH_LIMIT: usize = 4_095
+
+/// `prefix`, `/` when it is not empty, `path` and a NUL, in a buffer; false when it is too long.
+fn joined(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
+    let head = prefix.as_bytes()
+    let tail = path.as_bytes()
+    var separator: usize = 0
+    if head.len() > 0 {
+        separator = 1
+    }
+    if head.len() + separator + tail.len() > PATH_LIMIT {
+        return false
+    }
+    var at: usize = 0
+    for byte in head {
+        buffer[at] = byte
+        at += 1
+    }
+    if separator == 1 {
+        buffer[at] = b'/'
+        at += 1
+    }
+    for byte in tail {
+        buffer[at] = byte
+        at += 1
+    }
+    buffer[at] = 0
+    return true
+} joined
+
+/// The failure of a negative error number of a file operation.
+fn failure(error: i32) -> sys::fs::FsError {
+    return match -error {
+        2 => sys::fs::FsError.NotFound
+        28 or 122 => sys::fs::FsError.NoSpace
+        else => sys::fs::FsError.Denied
+    }
+} failure
+
+/// Opens a path beneath a directory with `flags`, creating its missing directories first when
+/// `create` holds: the new descriptor.
+fn open_beneath(dir: i32, prefix: Str, path: Str, flags: u64) -> i32 fails sys::fs::FsError uses wait {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    if flags == WRITE_CREATE {
+        try await make_parents(dir, path: buffer)
+    }
+    var how = OpenHow(flags: flags, mode: 0x1A4, resolve: BENEATH)
+    let path_address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
+    let how_address = u64.widen(hw::Ptr.of_mut(mut how).addr())
+    let result = try await submit(operation(OP_OPENAT2, fd: dir, address: path_address, len: 24, offset: how_address))
+    if result < 0 {
+        fail failure(result)
+    }
+    return result
+} open_beneath
+
+/// Creates each missing directory of a joined path's parent.
+fn make_parents(dir: i32, path: Array[u8, 4_096]) fails sys::fs::FsError uses wait {
+    var partial = Array[u8, 4_096].filled(0)
+    var at: usize = 0
+    while path[at] != 0 {
+        if path[at] == b'/' {
+            let address = u64.widen(hw::Ptr.of_view(partial.view()).addr())
+            let result = try await submit(operation(OP_MKDIRAT, fd: dir, address, len: 0x1ED, offset: 0))
+            if result < 0 and result != -EEXIST {
+                fail failure(result)
+            }
+        }
+        partial[at] = path[at]
+        at += 1
+    }
+} make_parents
+
+pkg fn fs_open(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError uses wait {
+    return try await open_beneath(dir, prefix, path, flags: READ_ONLY)
+} fs_open
+
+pkg fn fs_create(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError uses wait {
+    return try await open_beneath(dir, prefix, path, flags: WRITE_CREATE)
+} fs_create
+
+pkg fn fs_read_all(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError uses wait {
+    let fd = try await open_beneath(dir, prefix, path, flags: READ_ONLY)
+    defer release(fd)
+    var contents = mem::Bytes.empty(alloc)
+    var chunk = Array[u8, 4_096].filled(0)
+    loop {
+        let address = u64.widen(hw::Ptr.of_view_mut(mut chunk.view_mut()).addr())
+        let count = try await read_at(fd, address, len: 4_096)
+        if count < 0 {
+            fail failure(count)
+        }
+        if count == 0 {
+            return contents
+        }
+        let Some(filled) = chunk.view().prefix(usize.fit(count)) else {
+            return contents
+        }
+        mut contents.append(filled)
+    }
+} fs_read_all
+
+pkg fn fs_write_all(dir: i32, prefix: Str, path: Str, data: Slice[u8]) fails sys::fs::FsError uses wait {
+    let fd = try await open_beneath(dir, prefix, path, flags: WRITE_CREATE)
+    defer release(fd)
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        let count = try await write_some(fd, data: parts.tail)
+        if count <= 0 {
+            fail failure(count)
+        }
+        done += usize.fit(count)
+    }
+} fs_write_all
+
+pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError uses wait {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
+    let result = try await submit(operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0))
+    if result < 0 {
+        fail failure(result)
+    }
+} fs_remove
+
+pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError uses wait {
+    let count = try await read_at(fd, address, len)
+    if count < 0 {
+        fail failure(count)
+    }
+    return usize.fit(count)
+} file_read
+
+pkg fn file_write(fd: i32, data: Slice[u8]) -> usize fails sys::fs::FsError uses wait {
+    let count = try await write_some(fd, data)
+    if count < 0 {
+        fail failure(count)
+    }
+    return usize.fit(count)
+} file_write
+
+pkg fn file_byte_len(fd: i32) -> u64 fails sys::fs::FsError uses wait {
+    var status = Array[u8, 256].filled(0)
+    let empty = Array[u8, 1].filled(0)
+    let path_address = u64.widen(hw::Ptr.of_view(empty.view()).addr())
+    let status_address = u64.widen(hw::Ptr.of_view_mut(mut status.view_mut()).addr())
+    var request = operation(OP_STATX, fd, address: path_address, len: 0x200, offset: status_address)
+    request.op_flags = 0x1000
+    let result = try await submit(request)
+    if result < 0 {
+        fail failure(result)
+    }
+    return status.view().u64_le(40)
+} file_byte_len

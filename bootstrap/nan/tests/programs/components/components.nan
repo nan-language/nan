@@ -1,0 +1,126 @@
+//! Each scenario logs what the component kept.
+
+pub closed struct Log {
+    pub log: sys::Log
+} Log
+
+pub closed enum Note {
+    Add(u32)
+    Echo(u32)
+} Note
+
+pub closed struct Seen derives Encode {
+    pub total: u64
+} Seen
+
+impl Seen: sys::Component[Log, Note]
+
+pub fn Seen.start(mut env: Log) -> Seen = Seen(total: 0)
+
+pub fn Seen.on(mut self, take message: Note, mut env: Log, mut cx: sys::Cx[Note]) {
+    match message {
+        Note.Add(value) => {
+            self.total += u64.widen(value)
+        }
+        Note.Echo(value) => {
+            mut cx.after(ms: 300, send: Note.Add(value + 2))
+        }
+    }
+} Seen.on
+
+pub closed struct Pool {
+    pub alloc: mem::Alloc
+} Pool
+
+pub closed enum Batch {
+    Values(mem::List[u64])
+} Batch
+
+pub closed struct Kept derives Encode {
+    pub lists: mem::List[mem::List[u64]]
+} Kept
+
+impl Kept: sys::Component[Pool, Batch]
+
+pub fn Kept.start(mut env: Pool) -> Kept = Kept(lists: mem::List[mem::List[u64]].empty(env.alloc))
+
+pub fn Kept.on(mut self, take message: Batch, mut env: Pool, mut cx: sys::Cx[Batch]) {
+    match message {
+        Batch.Values(list) => {
+            mut self.lists.push(take list)
+        }
+    }
+} Kept.on
+
+fn share(total: u32, items: u32) -> u32 {
+    return total / items
+} share
+
+fn sum_all(lists: mem::List[mem::List[u64]]) -> u64 {
+    var sum: u64 = 0
+    for list in lists {
+        for value in list {
+            sum += value
+        }
+    }
+    return sum
+} sum_all
+
+fn trapping_body(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let log = world.log
+    let pause = world.clock
+    let channel = task::Channel[sys::Outbox[Note]].bounded(1, alloc: alloc)
+    var receiver = channel.receiver
+    let sender = channel.sender
+    let outcome = try await sys::Domain.run(fn[take sender]() fails task::Cancelled uses wait {
+        discard attempt await host::Runner[Seen].run(Log(log: log), exec, alloc, body: fn[take sender](inbox: sys::Outbox[Note]) fails task::Cancelled uses wait {
+            discard attempt await sender.send(inbox)
+            discard attempt await inbox.post(Note.Echo(1))
+            try await pause.sleep(20)
+            discard share(1, items: 0)
+        })
+    }, exec, alloc)
+    let trapped = match outcome {
+        Ok(_) => false
+        Err(_) => true
+    }
+    world.log.info("runner trapped", value: trapped)
+    let Some(outbox) = try await mut receiver.receive() else {
+        return
+    }
+    let posted = attempt await outbox.post(Note.Add(5))
+    let refused = match posted {
+        Ok(_) => false
+        Err(_) => true
+    }
+    world.log.info("post refused", value: refused)
+    try await pause.sleep(500)
+} trapping_body
+
+fn nested_posts(world: host::World) fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let kept = try await host::Runner[Kept].run(Pool(alloc: alloc), exec, alloc, body: fn(inbox: sys::Outbox[Batch]) fails task::Cancelled uses wait {
+        discard try await sys::Domain.run(fn() fails task::Cancelled uses wait {
+            for round in 0..<3u32 {
+                var built = mem::List[u64].empty(alloc)
+                for index in 0..<1_000u32 {
+                    mut built.push(u64.widen(index + round))
+                }
+                discard attempt await inbox.post(Batch.Values(take built))
+            }
+        }, exec, alloc)
+        var noise = mem::List[u64].empty(alloc)
+        for index in 0..<20_000u32 {
+            mut noise.push(u64.widen(index))
+        }
+    })
+    world.log.info("kept total", value: sum_all(kept.lists))
+} nested_posts
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    try await trapping_body(world)
+    try await nested_posts(world)
+} main

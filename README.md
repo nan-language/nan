@@ -24,9 +24,10 @@ Build the compiler with `cargo build`, then run it from a directory of NaN packa
 ```bash
 target/debug/nan check
 target/debug/nan fmt
+target/debug/nan run
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. The bootstrap implements the checking, reading and editing commands of the [toolchain](docs/spec/33-toolchain.md): `check`, `fix`, `fmt`, `holes`, `show`, `read`, `find`, `context`, `explain`, `expand`, `edit` and `primer`, with contract proofs. Tests and builds are not implemented yet.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of an `x86_64-host` program under `.nan/images/x86_64-host/`, and `nan run` builds and runs it. The bootstrap implements the checking, reading and editing commands of the [toolchain](docs/spec/33-toolchain.md): `check`, `fix`, `fmt`, `holes`, `show`, `read`, `find`, `context`, `explain`, `expand`, `edit` and `primer`, with contract proofs, and `build` and `run` for `x86_64-host`. Tests and machine-target builds are not implemented yet.
 
 ## Commands
 
@@ -38,3 +39,4 @@ target/debug/nan fmt
 | `cargo nextest run` | Run all tests |
 | `cargo nextest run -p nan -E 'test(/^<module>::/)'` | Run the tests of one module, given by its path in the crate (`a::b`) |
 | `cargo nextest run -p nan --test conformance -E 'test(/<chapter>/)'` | Run the conformance tests of one specification chapter, given by its file name (`01-lexical`) |
+| `cargo nextest run -p nan --test programs -E 'test(/<program>/)'` | Build and run one program of `bootstrap/nan/tests/programs`, given by its directory name |

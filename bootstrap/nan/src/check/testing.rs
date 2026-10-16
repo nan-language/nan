@@ -8,7 +8,7 @@ use super::db::{ItemId, TypeKey};
 use super::resolve::Named;
 use super::sig::SigKind;
 use crate::diagnostic::{Code, Offer};
-use crate::syntax::ast::{ClauseKind, ItemKind, TestItem};
+use crate::syntax::ast::{ClauseKind, ItemKind, Mode, TestItem};
 
 /// The std modules whose items only tests and examples name.
 const TEST_ONLY: [&str; 3] = ["testing", "sys::sim", "hw::sim"];
@@ -57,14 +57,72 @@ impl Checker<'_> {
         derived.then_some(Target::Derived(ty))
     }
 
-    /// A test's target lies in its reach: the test and, for each item of the reach, the items it
-    /// names, the impl lines of each type and the contributions to each registry it names, its
-    /// `for` clause naming nothing.
+    /// A test's head: its target names a function item or a method a derive writes, and no
+    /// parameter is `mut`.
+    pub fn check_test_head(&self, item: ItemId, test: &TestItem) {
+        if self.test_target(item, test).is_none() && self.names_other(item, test) {
+            self.report(item, test.target.token(), Code::TestTargetKind);
+        }
+        for param in test.params.iter().flatten() {
+            if param.mode == Mode::Mut {
+                self.report(item, param.token, Code::TestParameterForm);
+            }
+        }
+    }
+
+    /// Whether a test's target names something other than a function or derived method: an item
+    /// of another kind, or a field of its owner.
+    fn names_other(&self, item: ItemId, test: &TestItem) -> bool {
+        let module = self.db.module_of(item);
+        let Some(member) = &test.member else {
+            return matches!(self.db.resolve(module, &test.target), Ok(Named::Item(_)));
+        };
+        let Some(TypeKey::Item(owner)) = self.db.owner_key(module, &test.target) else {
+            return false;
+        };
+        matches!(&self.sig(owner).kind, SigKind::Struct { fields }
+            if fields.iter().any(|field| field.name == member.text))
+    }
+
+    /// An impl line naming `Generate` outside std is an error; gives whether it is one.
+    pub fn check_generate_impl(&self, item: ItemId) -> bool {
+        if self.db.is_std(item) {
+            return false;
+        }
+        let SigKind::Impl {
+            interface: Some(bound),
+            ..
+        } = &self.sig(item).kind
+        else {
+            return false;
+        };
+        let manual = self.db.core_item("Generate") == Some(bound.interface);
+        if manual {
+            self.report(item, self.db.ast(item).token, Code::TestGenerateManualImpl);
+        }
+        manual
+    }
+
+    /// A test's target lies in its reach.
     pub fn check_test_reach(&self, item: ItemId, test: &TestItem) {
         let Some(target) = self.test_target(item, test) else {
             return;
         };
-        let reached = self.db.about(None, || {
+        let reach = self.test_reach(item);
+        let reached = match target {
+            Target::Function(function) => reach.contains(&function),
+            Target::Derived(ty) => reach.contains(&ty),
+        };
+        if !reached {
+            self.report(item, self.db.ast(item).token, Code::TestTargetUnreachable);
+        }
+    }
+
+    /// A test's reach: the test and, for each item of the reach, the items it names, the impl
+    /// lines of each type and the contributions to each registry it names, its `for` clause
+    /// naming nothing; an item of a carried package adds only itself.
+    pub fn test_reach(&self, item: ItemId) -> BTreeSet<ItemId> {
+        self.db.about(None, || {
             let functions = self.member_functions();
             let mut reach: BTreeSet<ItemId> = BTreeSet::from([item]);
             let mut pending: Vec<ItemId> = self.names(item, &functions).into_iter().collect();
@@ -85,14 +143,8 @@ impl Checker<'_> {
                     _ => {}
                 }
             }
-            match target {
-                Target::Function(function) => reach.contains(&function),
-                Target::Derived(ty) => reach.contains(&ty),
-            }
-        });
-        if !reached {
-            self.report(item, self.db.ast(item).token, Code::TestTargetUnreachable);
-        }
+            reach
+        })
     }
 
     /// Each path of an item other than a test or an item of those modules naming an item of

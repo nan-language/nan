@@ -516,7 +516,7 @@ impl Body<'_, '_, '_, '_> {
             big: false,
         };
         for (name, operand) in fields {
-            let (held, nty) = self.operand(operand);
+            let (held, nty) = self.owned_operand(operand);
             let location = self.field_step(target.clone(), name);
             self.write_location(&location, held, &nty);
         }
@@ -524,7 +524,7 @@ impl Body<'_, '_, '_, '_> {
     }
 
     /// An enum value of a variant with its payload's operands; a wrapped part stores the address
-    /// of each non-Copy payload.
+    /// of each payload that is a part, which a place operand gives.
     pub fn variant(&mut self, ty: &Ty, variant: &str, payload: &Payload, wrapped: bool) -> Held {
         let operands: Vec<&Operand> = match payload {
             Payload::None => Vec::new(),
@@ -533,7 +533,17 @@ impl Body<'_, '_, '_, '_> {
         };
         let held: Vec<Held> = operands
             .into_iter()
-            .map(|operand| self.operand(operand).0)
+            .map(|operand| match operand {
+                Operand::Place(_, place) if wrapped => {
+                    let part_ty = self.place_type(place);
+                    match self.lo.is_part(&part_ty) {
+                        true => Held::Address(self.place_address(place)),
+                        false => self.operand(operand).0,
+                    }
+                }
+                _ if wrapped => self.operand(operand).0,
+                _ => self.owned_operand(operand).0,
+            })
             .collect();
         self.lo.variant_value(self.fx, ty, variant, &held, wrapped)
     }
@@ -666,8 +676,15 @@ impl Body<'_, '_, '_, '_> {
         !nty.is_reference() && self.lo.wraps(nty.ty()) && self.wrapped_flag(value)
     }
 
-    /// The operand passed as a read argument: a wrapped part becomes an owned value whose
-    /// payloads are copies of the parts it points at, which the callee only reads.
+    /// An operand as an owned value, as `plain` gives a wrapped part.
+    pub fn owned_operand(&mut self, operand: &Operand) -> (Held, NTy) {
+        let (held, nty) = self.operand(operand);
+        let value = self.operand_value(operand);
+        (self.plain(held, value, nty.ty()), nty)
+    }
+
+    /// A value as an owned one: a wrapped part becomes a value whose payloads are copies of the
+    /// parts it points at, as a read argument, which the callee only reads, or a Copy value.
     pub fn plain(&mut self, held: Held, value: Option<Value>, ty: &Ty) -> Held {
         if !value.is_some_and(|value| self.is_wrapped(value)) {
             return held;

@@ -1,6 +1,7 @@
 //! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`,
-//! `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, files, listeners and
-//! connections, revocation, and the submission of io_uring operations.
+//! `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image
+//! through the sims, files, listeners and connections, revocation, and the submission of
+//! io_uring operations.
 //!
 //! Each operation checks its capability's entry first. An `Fs` entry's state is its directory's
 //! descriptor, the address and length of its path prefix, and whether it is read-only; a `Net`
@@ -19,6 +20,7 @@ use super::super::runtime::{Routine, holdings};
 use super::super::transfer;
 use super::Supply;
 use super::render;
+use super::sims;
 use crate::check::ty::Ty;
 
 /// The words of an entry's state.
@@ -73,7 +75,7 @@ fn checked(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, capability: Value) -
 
 /// Fails with a failure value of the operation's failure type: the variant of that name, or
 /// for a stale handle `Revoked.Stale` itself or the `Revoked` variant holding it.
-fn fail_with(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, variant: &str) {
+pub fn fail_with(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, variant: &str) {
     let fails = supply.abi.fails.clone().expect("a failing operation");
     let value = if variant == "Revoked" {
         let revoked = lo.std_ty("sys", "Revoked", Vec::new());
@@ -113,7 +115,7 @@ fn after(
 }
 
 /// A view held in memory: its address and length.
-fn view(fx: &mut Fx, held: Held) -> (Value, Value) {
+pub fn view(fx: &mut Fx, held: Held) -> (Value, Value) {
     let address = held.address();
     (fx.load(PTR, address, 0), fx.load(PTR, address, 8))
 }
@@ -215,6 +217,16 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         fx.when(invalid, |fx| fail_with(lo, fx, supply, "InvalidPath"));
     }
     let directory = Held::Scalar(directory);
+    if lo.seeded() && !matches!(member, "subdir" | "read_only") {
+        match member {
+            "open" | "create" => sims::fs::open(lo, fx, supply, record, member == "create"),
+            "read_all" => sims::fs::read_all(lo, fx, supply, record),
+            "write_all" => sims::fs::write_all(lo, fx, supply, record),
+            "remove" => sims::fs::remove(lo, fx, supply, record),
+            member => panic!("no lowering of sys::Fs.{member}"),
+        }
+        return;
+    }
     match member {
         "subdir" | "read_only" => {
             let handle = fx.load(PTR, capability, 0);
@@ -259,7 +271,8 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let called = lo.platform_call(fx, name, &[directory, prefix, supply.param(1)]);
             after(lo, fx, supply, &called, |lo, fx, fd| {
                 let handle = fx.load(PTR, capability, 0);
-                ret_resource(lo, fx, supply, handle, fd.scalar());
+                let fd = fx.b.ins().sextend(PTR, fd.scalar());
+                ret_resource(lo, fx, supply, handle, fd);
             });
         }
         "read_all" => {
@@ -283,11 +296,16 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 }
 
 /// Returns a file, listener or connection: the entry it was opened through and the holding of
-/// a descriptor, which settlement closes, or abandons for a connection.
-fn ret_resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, handle: Value, descriptor: Value) {
+/// a descriptor or sim, which settlement closes, or abandons for a connection.
+pub fn ret_resource(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    handle: Value,
+    descriptor: Value,
+) {
     let sret = supply.sret.expect("a resource's address");
     fx.store(handle, sret, 0);
-    let descriptor = fx.b.ins().sextend(PTR, descriptor);
     let linear = lo.ck.is_std(&supply.abi.result, "sys::net::Conn");
     let kind = if linear {
         holdings::kind::ABANDON
@@ -334,10 +352,15 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "listen" => {
             fx.when(restricted, |fx| fail_with(lo, fx, supply, "Denied"));
+            if lo.seeded() {
+                sims::net::listen(lo, fx, supply, record);
+                return;
+            }
             let called = lo.platform_call(fx, "net_listen", &[supply.param(1)]);
             after(lo, fx, supply, &called, |lo, fx, fd| {
                 let handle = fx.load(PTR, capability, 0);
-                ret_resource(lo, fx, supply, handle, fd.scalar());
+                let fd = fx.b.ins().sextend(PTR, fd.scalar());
+                ret_resource(lo, fx, supply, handle, fd);
             });
         }
         "connect" => {
@@ -348,10 +371,15 @@ fn net(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 let other = fx.b.ins().bxor_imm_s(same, 1);
                 fx.when(other, |fx| fail_with(lo, fx, supply, "Denied"));
             });
+            if lo.seeded() {
+                sims::net::connect(lo, fx, supply, record);
+                return;
+            }
             let called = lo.platform_call(fx, "net_connect", &[host, supply.param(2)]);
             after(lo, fx, supply, &called, |lo, fx, fd| {
                 let handle = fx.load(PTR, capability, 0);
-                ret_resource(lo, fx, supply, handle, fd.scalar());
+                let fd = fx.b.ins().sextend(PTR, fd.scalar());
+                ret_resource(lo, fx, supply, handle, fd);
             });
         }
         member => panic!("no lowering of sys::Net.{member}"),
@@ -367,12 +395,16 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "elapsed_ms" => {
             fx.when(stale, |fx| fail_with(lo, fx, supply, "Revoked"));
             let minted = fx.load(PTR, record, entry::STATE);
-            let called = lo.platform_call(fx, "now_ms", &[]);
-            let elapsed = fx.b.ins().isub(called.result.scalar(), minted);
+            let now = lo.now_ms(fx);
+            let elapsed = fx.b.ins().isub(now, minted);
             supply.ret(lo, fx, Held::Scalar(elapsed));
         }
         "sleep" => {
             fx.when(stale, |fx| supply.done(lo, fx));
+            if lo.seeded() {
+                sims::sleep(lo, fx, supply, supply.param(1).scalar());
+                return;
+            }
             let called = lo.platform_call(fx, "sleep", &[supply.param(1)]);
             after(lo, fx, supply, &called, |lo, fx, _| supply.done(lo, fx));
         }
@@ -382,8 +414,13 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    checked(lo, fx, supply, capability);
-    lo.platform_call(fx, "random_fill", &[supply.param(1)]);
+    let record = checked(lo, fx, supply, capability);
+    match lo.seeded() {
+        true => sims::random_fill(lo, fx, record, supply.param(1)),
+        false => {
+            lo.platform_call(fx, "random_fill", &[supply.param(1)]);
+        }
+    }
     supply.done(lo, fx);
 }
 
@@ -395,6 +432,10 @@ fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let value_ty = supply.type_arg(0);
     let level = supply.member().to_owned();
     fx.when(live, |fx| {
+        if lo.seeded() {
+            sims::log_line(lo, fx, &level, supply.param(1), &value_ty, supply.param(2));
+            return;
+        }
         let (buffer, len) = render::render_value(lo, fx, &value_ty, supply.param(2), LOG_BUDGET);
         let rendering = new_view(fx, buffer, len);
         let level = lo.view_literal(fx, level.as_bytes());
@@ -405,7 +446,14 @@ fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 fn stdio(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
-    checked(lo, fx, supply, capability);
+    let record = checked(lo, fx, supply, capability);
+    if lo.seeded() {
+        match supply.member() {
+            "read_in" => sims::stdio_read(lo, fx, supply, record),
+            _ => sims::stdio_write(lo, fx, supply),
+        }
+        return;
+    }
     let called = match supply.member() {
         "read_in" => {
             let (start, len) = view(fx, supply.param(1));
@@ -430,7 +478,16 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let member = supply.member();
     let descriptor = Held::Scalar(descriptor(fx, address));
     if member == "abandon" {
-        lo.platform_call(fx, "conn_abandon", &[descriptor]);
+        match lo.seeded() {
+            true => {
+                let holding = fx.offset(address, 8);
+                let payload = holdings::payload(fx, holding);
+                sims::abandon(lo, fx, payload);
+            }
+            false => {
+                lo.platform_call(fx, "conn_abandon", &[descriptor]);
+            }
+        }
         let holding = fx.load(PTR, address, 8);
         lo.call_routine(fx, Routine::Unhold, &[holding]);
         supply.done(lo, fx);
@@ -440,6 +497,24 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         checked(lo, fx, supply, address);
     }
     let owner = supply.path.rsplit_once('.').map_or("", |(owner, _)| owner);
+    if lo.seeded() {
+        match (owner, member) {
+            ("sys::fs::File", "read") => sims::fs::read(lo, fx, supply),
+            ("sys::fs::File", "write") => sims::fs::write(lo, fx, supply),
+            ("sys::fs::File", "byte_len") => sims::fs::byte_len(lo, fx, supply),
+            ("sys::net::Listener", "accept") => sims::net::accept(lo, fx, supply),
+            ("sys::net::Conn", "read") => sims::net::read(lo, fx, supply),
+            ("sys::net::Conn", "write") => sims::net::write(lo, fx, supply),
+            ("sys::net::Conn", "close") => {
+                sims::net::close(lo, fx, supply);
+                let holding = fx.load(PTR, address, 8);
+                lo.call_routine(fx, Routine::Unhold, &[holding]);
+                supply.done(lo, fx);
+            }
+            (owner, member) => panic!("no lowering of {owner}.{member}"),
+        }
+        return;
+    }
     let called = match (owner, member) {
         ("sys::fs::File", "read") | ("sys::net::Conn", "read") => {
             let (start, len) = view(fx, supply.param(1));
@@ -464,7 +539,8 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let called = lo.platform_call(fx, "listener_accept", &[descriptor]);
             after(lo, fx, supply, &called, |lo, fx, fd| {
                 let handle = fx.load(PTR, address, 0);
-                ret_resource(lo, fx, supply, handle, fd.scalar());
+                let fd = fx.b.ins().sextend(PTR, fd.scalar());
+                ret_resource(lo, fx, supply, handle, fd);
             });
             return;
         }
@@ -485,8 +561,17 @@ fn resource(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, _ty: &Ty, address: Value) -> bool {
     match path {
         "sys::fs::File" | "sys::net::Listener" => {
-            let descriptor = descriptor(fx, address);
-            lo.platform_call(fx, "release", &[Held::Scalar(descriptor)]);
+            match lo.seeded() {
+                true => {
+                    let holding = fx.offset(address, 8);
+                    let payload = holdings::payload(fx, holding);
+                    sims::release(lo, fx, payload);
+                }
+                false => {
+                    let descriptor = descriptor(fx, address);
+                    lo.platform_call(fx, "release", &[Held::Scalar(descriptor)]);
+                }
+            }
             let holding = fx.load(PTR, address, 8);
             lo.call_routine(fx, Routine::Unhold, &[holding]);
             true

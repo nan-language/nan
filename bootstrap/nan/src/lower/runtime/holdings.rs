@@ -12,6 +12,7 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use super::super::Lowering;
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
+use super::super::supplied::sims;
 use super::super::supplied::tasks::channels;
 use super::super::transfer;
 use super::{Routine, state, tasks};
@@ -169,6 +170,13 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
         for (wanted, platform) in [(kind::CLOSE, "release"), (kind::ABANDON, "conn_abandon")] {
             let this = is(fx, wanted);
             fx.when(this, |fx| {
+                if lo.seeded() {
+                    match wanted {
+                        kind::CLOSE => sims::release(lo, fx, payload),
+                        _ => sims::abandon(lo, fx, payload),
+                    }
+                    return;
+                }
                 let descriptor = fx.b.ins().ireduce(types::I32, payload);
                 lo.platform_call(fx, platform, &[Held::Scalar(descriptor)]);
             });

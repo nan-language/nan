@@ -630,6 +630,7 @@ impl Checker<'_> {
                 "default" => "default",
                 "render" => "render",
                 "write" => "write",
+                "generate" => "generate",
                 _ => return None,
             };
             return Some(FnRef {
@@ -638,6 +639,42 @@ impl Checker<'_> {
             });
         }
         Some(through_bound)
+    }
+
+    /// The implementation of a method for a call giving the method `args`: those of `Self` and
+    /// the interface, then the method's own. An implementing function receives the own ones for
+    /// its own generic parameters, a derived method after its owner's, and a call through a bound
+    /// or a supplied conformance all of them.
+    pub fn with_call_args(&self, implementation: FnRef, interface: ItemId, args: &[Arg]) -> FnRef {
+        let interface_args = (self.sig(interface).generics.iter())
+            .filter(|def| !def.param.is_self())
+            .count();
+        let own = args.get(1 + interface_args..).unwrap_or_default();
+        let args: Args = match implementation.callable {
+            Callable::Method { .. } => args.into(),
+            Callable::Derived { .. } => implementation.args.iter().chain(own).cloned().collect(),
+            Callable::Item {
+                item,
+                role: Role::Body,
+                ..
+            } => {
+                let mut own = own.iter();
+                self.sig(item)
+                    .generics
+                    .iter()
+                    .zip(implementation.args.iter())
+                    .map(|(def, arg)| match def.param.owner == item {
+                        true => own.next().cloned().unwrap_or_else(|| arg.clone()),
+                        false => arg.clone(),
+                    })
+                    .collect()
+            }
+            Callable::Item { .. } | Callable::Builtin(_) => return implementation,
+        };
+        FnRef {
+            args,
+            ..implementation
+        }
     }
 
     /// Whether a function is a foreign fn.
@@ -1044,6 +1081,8 @@ pub struct Elab<'e, 'a> {
     /// The temporaries of the statement being elaborated still holding values on the path being
     /// elaborated, released at its end.
     pub temps: Vec<Value>,
+    /// The wrapped parts projection calls give, which own nothing.
+    pub wrapped: HashSet<Value>,
     /// The `await when` body being elaborated.
     pub when: Option<WhenBody>,
     /// The scope whose slots the temporaries of the statement being elaborated are.
@@ -1084,6 +1123,7 @@ impl<'e, 'a> Elab<'e, 'a> {
             const_params: HashMap::new(),
             trusted: None,
             temps: Vec::new(),
+            wrapped: HashSet::new(),
             temp_scope: 0,
             when: None,
         }

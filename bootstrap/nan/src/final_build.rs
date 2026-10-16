@@ -59,19 +59,13 @@ pub fn build(workspace: &Workspace, program: usize) -> io::Result<Build> {
         .find(|package| package.name == PLATFORM)
         .and_then(|package| checker.db.lookup(package.root?, LANDING))
         .expect("the host platform's entry landing fn");
-    let prefixes = checker
-        .db
-        .packages
-        .iter()
-        .map(|package| (package.name.clone(), prefix(&package.name)))
-        .collect::<HashMap<_, _>>();
     let lowered = lower::lower(
         &checker,
         &lower::Program {
             entry,
             landing,
             roots: vec![root],
-            prefixes,
+            prefixes: prefixes(&checker),
         },
     );
     diagnostics.extend(lower::stack::judge(
@@ -140,6 +134,16 @@ fn closure(checker: &check::Checker, root: PackageId) -> Vec<PackageId> {
     found
 }
 
+/// The prefix the symbols of each package of the checker's closure carry, by package name.
+pub fn prefixes(checker: &check::Checker) -> HashMap<String, String> {
+    checker
+        .db
+        .packages
+        .iter()
+        .map(|package| (package.name.clone(), prefix(&package.name)))
+        .collect()
+}
+
 /// The prefix a package's symbols carry: until packages have code roots, the first 12
 /// characters of the checksummed base32 of its name's hash.
 fn prefix(name: &str) -> String {
@@ -149,7 +153,7 @@ fn prefix(name: &str) -> String {
 
 /// Links an object into a position-independent executable at `image` with the `cc` of the
 /// `PATH`, replacing any earlier image at once; `cc`'s output when it fails.
-fn link(object: &[u8], image: &std::path::Path) -> Result<(), String> {
+pub fn link(object: &[u8], image: &std::path::Path) -> Result<(), String> {
     let directory = image.parent().expect("an image lies in a directory");
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let name = image

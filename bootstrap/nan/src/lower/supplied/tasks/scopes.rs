@@ -12,9 +12,8 @@ use cranelift_module::FuncId;
 use super::super::super::body::{Body, Held};
 use super::super::super::call::adapt_value;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::host::{self, kind, operation};
 use super::super::super::runtime::regions::{self, region};
-use super::super::super::runtime::tasks::{self, flag, task};
+use super::super::super::runtime::tasks::{self, flag, kind, operation, task};
 use super::super::super::runtime::{Routine, report, tables};
 use super::super::super::{Glue, Lowering};
 use super::super::Supply;
@@ -521,7 +520,7 @@ fn spawn_child(
         Some(end),
         done,
     );
-    lo.call_routine(fx, Routine::Wake, &[record]);
+    tasks::spawned(lo, fx, record);
     record
 }
 
@@ -782,21 +781,15 @@ fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     supply.ret(lo, fx, held);
 }
 
-/// Submits a deadline's timeout of `ms` milliseconds on the monotonic clock, whose expiry
-/// cancels its region, first among the deadlines the running task armed.
+/// Arms a deadline's timer of `ms` milliseconds, whose expiry cancels its region, first among
+/// the deadlines the running task armed.
 fn arm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value, ms: Value) {
     let current = tasks::current_task(lo, fx);
     let armed = fx.load(PTR, current, task::DEADLINES);
     fx.store(armed, timer, operation::LINK);
     fx.store(timer, current, task::DEADLINES);
-    let thousand = fx.ptr(1_000);
-    let seconds = fx.b.ins().udiv(ms, thousand);
-    let rest = fx.b.ins().urem(ms, thousand);
-    let nanoseconds = fx.b.ins().imul_imm_s(rest, 1_000_000);
     let spec = fx.offset(timer, operation::SIZE);
-    fx.store(seconds, spec, 0);
-    fx.store(nanoseconds, spec, 8);
-    host::submit_timeout(lo, fx, timer, spec);
+    lo.arm_timer(fx, timer, ms, spec);
 }
 
 /// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it
@@ -806,8 +799,8 @@ fn disarm_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value) {
     let waiter = fx.offset(timer, operation::WAITER);
     fx.b.ins()
         .atomic_store(MemFlagsData::trusted(), current, waiter);
-    host::cancel_operation(lo, fx, timer);
-    host::wait_delivered(lo, fx, timer);
+    lo.cancel_operation(fx, timer);
+    tasks::wait_delivered(lo, fx, timer);
     let current = tasks::current_task(lo, fx);
     let armed = fx.load(PTR, timer, operation::LINK);
     fx.store(armed, current, task::DEADLINES);
@@ -850,7 +843,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         tasks.push(started);
     }
     for started in &tasks {
-        lo.call_routine(fx, Routine::Wake, &[*started]);
+        tasks::spawned(lo, fx, *started);
     }
     wait_children(lo, fx, record, region::LIVE);
     let decided = fx.load(PTR, record, race::DECIDED);

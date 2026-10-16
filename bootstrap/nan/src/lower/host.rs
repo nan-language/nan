@@ -24,7 +24,7 @@ use cranelift_module::{Linkage, Module};
 use super::abi::Returned;
 use super::fx::{Fx, PTR};
 use super::runtime::regions::region;
-use super::runtime::tasks::{self, task};
+use super::runtime::tasks::{self, kind, operation, task};
 use super::runtime::{Routine, memory, state, tables};
 use super::{CALL_CONV, Instance, Lowering, Program, lines};
 use crate::nir::Role;
@@ -90,9 +90,15 @@ pub mod thread {
 /// The most locks a thread holds at once that a trap of its task releases.
 const HELD_LOCKS: u64 = 8;
 
-/// The signal asking a thread to stop the task it runs, and the signal of a fault.
+/// The signal asking a thread to stop the task it runs, the signal of a fault, and that of an
+/// exceeded processor time limit.
 pub const SIGURG: i32 = 23;
 const SIGSEGV: i32 = 11;
+const SIGXCPU: i32 = 24;
+
+/// The resource limit of processor time, and the seconds a test run may use.
+const RLIMIT_CPU: i64 = 0;
+const CPU_SECONDS: u64 = 10;
 
 /// The `sigaction` flags of the runtime's handlers: given a `siginfo_t` and a context, run on
 /// the thread's signal stack, and restarting interrupted system calls.
@@ -116,46 +122,6 @@ mod context {
 
 /// The size of each thread's signal stack and of its stack for stack overflow reports.
 const SIGNAL_STACK: u64 = 65_536;
-
-/// The offsets of an operation record's fields.
-pub mod operation {
-    pub const TASK: u64 = 0;
-    pub const RESULT: u64 = 8;
-    /// Zero in flight, `COMPLETED` once its completion arrived, then `DELIVERED` once its waiter
-    /// has been woken, after which the thread delivering it no longer reads the record.
-    pub const DONE: u64 = 16;
-    pub const THREAD: u64 = 24;
-    /// Zero, `REQUESTED` once its cancellation is asked, `SUBMITTED` once submitted.
-    pub const CANCEL: u64 = 32;
-    pub const KIND: u64 = 40;
-    pub const NEXT: u64 = 48;
-    pub const PREVIOUS: u64 = 56;
-    /// For a deadline, the task to wake once it completes, and the next deadline its task
-    /// armed.
-    pub const WAITER: u64 = 64;
-    pub const LINK: u64 = 72;
-    pub const SIZE: u64 = 80;
-    pub const COMPLETED: i64 = 1;
-    pub const DELIVERED: i64 = 2;
-    pub const REQUESTED: i64 = 1;
-    pub const SUBMITTED: i64 = 2;
-}
-
-/// The kinds of operations.
-pub mod kind {
-    /// A task waits on it.
-    pub const WAIT: i64 = 0;
-    /// It reads the next termination request.
-    pub const SIGNAL: i64 = 1;
-    /// A deadline, whose expiry cancels the region its `TASK` field names.
-    pub const DEADLINE: i64 = 2;
-    /// A component's delayed message, whose expiry lets the messages due into the intake of
-    /// the runner its `TASK` field names.
-    pub const AFTER: i64 = 3;
-}
-
-/// The error number of an expired timeout, negated.
-const EXPIRED: i64 = -62;
 
 /// The termination request signals and the length of a `signalfd_siginfo`.
 const SIGNALS: [i64; 3] = [1, 2, 15];
@@ -222,6 +188,100 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         lo.call_routine(fx, Routine::Schedule, &[]);
         fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
     });
+}
+
+/// Defines the entry seam `main` of a test image: reads the test's number, the run's index and
+/// seed, its replay token and, for a rerun, its forced draws from the arguments, then starts the
+/// entry task, which runs `entry`.
+pub fn test_seam(lo: &mut Lowering, entry: cranelift_module::FuncId) {
+    let mut signature = Signature::new(CALL_CONV);
+    signature.params.push(AbiParam::new(types::I32));
+    signature.params.push(AbiParam::new(PTR));
+    signature.params.push(AbiParam::new(PTR));
+    signature.returns.push(AbiParam::new(types::I32));
+    let id = lo
+        .module
+        .declare_function("main", Linkage::Export, &signature)
+        .expect("the test entry seam");
+    lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
+        let params = fx.entry();
+        let failed = lo.call_routine(fx, Routine::Init, &[])[0];
+        let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+        fx.when(unavailable, |fx| unavailable_exit(lo, fx));
+        let argv = params[1];
+        let argument = |fx: &mut Fx, index: u64| fx.load(PTR, argv, 8 * index);
+        let mut run = [fx.ptr(0); 3];
+        for (field, index) in run.iter_mut().zip(1..) {
+            let text = argument(fx, index);
+            *field = decimal(fx, text);
+        }
+        let token = argument(fx, 4);
+        let len = lo.call_libc(fx, "strlen", &[token], &[PTR])[0];
+        let count = fx.b.ins().uextend(PTR, params[0]);
+        let rerun = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, count, 5);
+        let none = fx.ptr(0);
+        let first = fx.b.ins().iadd_imm_s(argv, 8 * 5);
+        let forced = fx.b.ins().select(rerun, first, none);
+        let left = fx.b.ins().iadd_imm_s(count, -5);
+        let left = fx.b.ins().select(rerun, left, none);
+        super::test_image::arguments(lo, fx, run, (token, len), (forced, left));
+        let state_address = lo.state(fx);
+        let process = fx.load(PTR, state_address, state::PROCESS);
+        let root = fx.load(PTR, state_address, state::ROOT);
+        let glue = lo.func_ref(fx, entry);
+        let glue = fx.b.ins().func_addr(PTR, glue);
+        let zero = fx.ptr(0);
+        let stack = fx.ptr(tasks::STACK);
+        let record = lo.call_routine(
+            fx,
+            Routine::Spawn,
+            &[glue, zero, zero, zero, stack, zero, process, root],
+        )[0];
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+        fx.when(missing, |fx| unavailable_exit(lo, fx));
+        fx.store(record, state_address, state::ENTRY_TASK);
+        lo.call_routine(fx, Routine::Wake, &[record]);
+        lo.call_routine(fx, Routine::Schedule, &[]);
+        fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+    });
+}
+
+/// The unsigned decimal number a NUL-terminated text writes.
+fn decimal(fx: &mut Fx, text: Value) -> Value {
+    let zero = fx.ptr(0);
+    fx.repeat(&[text, zero], |fx, state| {
+        let (at, value) = (state[0], state[1]);
+        let byte = fx.load(types::I8, at, 0);
+        let byte = fx.b.ins().uextend(PTR, byte);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, byte, 0);
+        let digit = fx.b.ins().iadd_imm_s(byte, -i64::from(b'0'));
+        let shifted = fx.b.ins().imul_imm_s(value, 10);
+        let grown = fx.b.ins().iadd(shifted, digit);
+        let value = fx.b.ins().select(more, grown, value);
+        let next = fx.b.ins().iadd_imm_s(at, 1);
+        (more, vec![next, value])
+    })[1]
+}
+
+/// Writes a byte range to a descriptor, whole unless the descriptor refuses.
+pub fn write_all(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
+    let fd = fx.int(types::I32, fd);
+    fx.repeat(&[text, len], |fx, state| {
+        let (at, left) = (state[0], state[1]);
+        let written = lo.call_libc(fx, "write", &[fd, at, left], &[PTR])[0];
+        let progressed = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, written, 0);
+        let next_at = fx.b.ins().iadd(at, written);
+        let next_left = fx.b.ins().isub(left, written);
+        let zero = fx.ptr(0);
+        let next_left = fx.b.ins().select(progressed, next_left, zero);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next_left, 0);
+        (more, vec![next_at, next_left])
+    });
+}
+
+/// Writes a byte range to standard output.
+pub fn write_out(lo: &mut Lowering, fx: &mut Fx, text: Value, len: Value) {
+    write_all(lo, fx, 1, text, len);
 }
 
 /// Writes that the runtime is unavailable and returns status 71 from the seam.
@@ -356,6 +416,11 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         }
         Routine::Preempt => preempt(lo, fx, params[2]),
         Routine::Overflow => overflow(lo, fx, params[1], params[2]),
+        Routine::CpuLimit => {
+            let status = fx.int(types::I32, i64::from(super::test_image::TIMED_OUT));
+            lo.call_libc(fx, "_exit", &[status], &[]);
+            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+        }
         _ => unreachable!("a host routine"),
     }
 }
@@ -632,6 +697,10 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
     let root = fx.load(PTR, state_address, state::ROOT);
     fx.store(one, root, region::ID);
     fx.store(one, state_address, state::REGIONS);
+    if lo.seeded() {
+        init_seeded(lo, fx);
+        return;
+    }
     let count = processors(lo, fx);
     fx.store(count, state_address, state::THREAD_COUNT);
     let eight = fx.ptr(8);
@@ -688,6 +757,44 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
             fx.b.ins().return_(&[one]);
         });
     });
+    let zero = fx.ptr(0);
+    fx.b.ins().return_(&[zero]);
+}
+
+/// The seeded scheduler's part of `Init`: the calling thread is the one executor thread, without
+/// a ring; a fault reports a stack overflow, and the run ends with status `TIMED_OUT` once it has
+/// used 10 seconds of processor time.
+fn init_seeded(lo: &mut Lowering, fx: &mut Fx) {
+    let state_address = lo.state(fx);
+    let one = fx.ptr(1);
+    fx.store(one, state_address, state::THREAD_COUNT);
+    let eight = fx.ptr(8);
+    let threads = lo.call_libc(fx, "calloc", &[one, eight], &[PTR])[0];
+    unavailable_unless(fx, threads);
+    fx.store(threads, state_address, state::THREADS);
+    let size = fx.ptr(thread::SIZE);
+    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    unavailable_unless(fx, record);
+    fx.store(record, threads, 0);
+    let slot = lo.thread_slot(fx);
+    fx.store(record, slot, 0);
+    let refused = thread_signals(lo, fx, record);
+    fx.when(refused, |fx| {
+        let one = fx.ptr(1);
+        fx.b.ins().return_(&[one]);
+    });
+    install_handler(lo, fx, SIGSEGV, Routine::Overflow, false);
+    install_handler(lo, fx, SIGXCPU, Routine::CpuLimit, false);
+    let limit = fx.slot(16, 8);
+    let soft = fx.ptr(CPU_SECONDS);
+    let hard = fx.ptr(CPU_SECONDS + 2);
+    fx.store(soft, limit, 0);
+    fx.store(hard, limit, 8);
+    let cpu = fx.int(types::I32, RLIMIT_CPU);
+    lo.call_libc(fx, "setrlimit", &[cpu, limit], &[types::I32]);
+    let ignore = fx.ptr(1);
+    let pipe = fx.int(types::I32, SIGPIPE);
+    lo.call_libc(fx, "signal", &[pipe, ignore], &[PTR]);
     let zero = fx.ptr(0);
     fx.b.ins().return_(&[zero]);
 }
@@ -1033,56 +1140,7 @@ fn complete(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
     let kind = fx.load(PTR, op, operation::KIND);
     let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::SIGNAL);
     fx.when(signal, |fx| termination(lo, fx, op, result));
-    let wait = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::WAIT);
-    fx.when(wait, |fx| {
-        fx.store(result, op, operation::RESULT);
-        let waiting = fx.load(PTR, op, operation::TASK);
-        set_done(fx, op, operation::COMPLETED);
-        tasks::wake(lo, fx, waiting);
-        set_done(fx, op, operation::DELIVERED);
-    });
-    let deadline = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::DEADLINE);
-    fx.when(deadline, |fx| {
-        set_done(fx, op, operation::COMPLETED);
-        let expired = fx.b.ins().icmp_imm_s(IntCC::Equal, result, EXPIRED);
-        fx.when(expired, |fx| {
-            let region_record = fx.load(PTR, op, operation::TASK);
-            lo.call_routine(fx, Routine::Cancel, &[region_record]);
-        });
-        let waiter = fx.offset(op, operation::WAITER);
-        let waiter = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), waiter);
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
-        fx.when(present, |fx| tasks::wake(lo, fx, waiter));
-        set_done(fx, op, operation::DELIVERED);
-    });
-    let after = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::AFTER);
-    fx.when(after, |fx| {
-        super::supplied::tasks::components::timer_completed(lo, fx, op);
-    });
-}
-
-/// Stores how far an operation's completion has been delivered.
-fn set_done(fx: &mut Fx, op: Value, done: i64) {
-    let word = fx.offset(op, operation::DONE);
-    let done = fx.ptr(done as u64);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), done, word);
-}
-
-/// Waits until an operation's completion has been delivered, the running task parking while it
-/// has not arrived.
-pub fn wait_delivered(lo: &mut Lowering, fx: &mut Fx, op: Value) {
-    let word = fx.offset(op, operation::DONE);
-    fx.repeat(&[], |fx, _| {
-        let done = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), word);
-        let pending = fx.b.ins().icmp_imm_s(IntCC::Equal, done, 0);
-        fx.when(pending, |fx| {
-            lo.call_routine(fx, Routine::Park, &[]);
-        });
-        let delivered =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::Equal, done, operation::DELIVERED);
-        (fx.b.ins().bxor_imm_s(delivered, 1), Vec::new())
-    });
+    tasks::deliver(lo, fx, op, result);
 }
 
 /// Submits a deadline's timeout of the relative time at `spec` on the running thread's ring.

@@ -1,0 +1,44 @@
+//! A domain whose body traps while one of its tasks waits on a read.
+
+/// The share of a total each of `items` gets.
+fn share(total: u32, items: u32) -> u32 {
+    return total / items
+} share
+
+/// Runs a domain spawning a task that connects to `port` and reads from the connection, while
+/// the domain's body sleeps for 50 ms and then shares 100 among `items`; gives what the domain
+/// returns.
+pub fn read_in_domain(world: host::World, port: u16, items: u32) -> Result[Unit, sys::Trap] fails sys::net::NetError uses wait {
+    let net = world.net
+    let clock = world.clock
+    let exec = world.exec
+    return try await sys::Domain.run(fn() fails sys::net::NetError uses wait {
+        try await task::scope(exec, body: fn(s: task::Scope) fails sys::net::NetError uses wait {
+            discard s.spawn(fn() fails sys::net::NetError uses wait {
+                var conn = try await net.connect("localhost", port)
+                defer take conn.abandon()
+                var buf = Untrusted.of(Array[u8, 4].filled(0))
+                discard try await mut conn.read(mut buf.view_mut())
+            })
+            try await clock.sleep(50)
+            discard share(100, items)
+        })
+    }, exec: exec, alloc: world.alloc)
+} read_in_domain
+
+test a_trap_settles_a_read_in_flight for read_in_domain {
+    let world = testing::world()
+    var listener = try await world.net.listen(4_304)
+    let outcome = try await read_in_domain(world, port: 4_304, items: 0)
+    expect outcome.is_err()
+    var stale = try await mut listener.accept()
+    defer take stale.abandon()
+    var client = try await world.net.connect("localhost", port: 4_304)
+    defer take client.abandon()
+    var server = try await mut listener.accept()
+    defer take server.abandon()
+    discard try await mut server.write(b"ok")
+    var buf = Untrusted.of(Array[u8, 4].filled(0))
+    let count = try await mut client.read(mut buf.view_mut())
+    expect count == 2
+} a_trap_settles_a_read_in_flight

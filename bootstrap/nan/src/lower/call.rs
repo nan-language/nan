@@ -53,12 +53,18 @@ impl Body<'_, '_, '_, '_> {
         position: usize,
         targets: Option<(BlockId, BlockId)>,
     ) -> Option<Held> {
+        if call.awaited {
+            super::runtime::seeded::scheduling_point(self.lo, self.fx);
+        }
         let target = match &call.callee {
             Callee::Fn(fn_ref) => {
                 let fn_ref = FnRef {
                     callable: fn_ref.callable.clone(),
                     args: self.subst.args(&fn_ref.args),
                 };
+                if let Some(slot) = self.lo.called_target(&fn_ref.callable) {
+                    self.lo.mark_ran(self.fx, slot);
+                }
                 if let Callable::Builtin(builtin) = &fn_ref.callable {
                     let held = supplied::builtin(
                         self,
@@ -530,9 +536,24 @@ impl Body<'_, '_, '_, '_> {
 impl Lowering<'_, '_> {
     /// The instance a function reference calls: a NIR function, a supplied std function, a
     /// derived method or a supplied conformance, a method through a bound resolved to its
-    /// implementation.
-    pub fn callable_instance(&mut self, fn_ref: &FnRef, _as_value: bool) -> Instance {
+    /// implementation; as a value, a function with a checking entry is called through it.
+    pub fn callable_instance(&mut self, fn_ref: &FnRef, as_value: bool) -> Instance {
         match &fn_ref.callable {
+            Callable::Item {
+                item,
+                role: Role::Body,
+                index: 0,
+            } if as_value && self.entry_role(*item) == Role::Entry => {
+                let entry = FnRef {
+                    callable: Callable::Item {
+                        item: *item,
+                        role: Role::Entry,
+                        index: 0,
+                    },
+                    args: fn_ref.args.clone(),
+                };
+                self.callable_instance(&entry, false)
+            }
             Callable::Item { item, role, index } => {
                 let has_function = self
                     .ck
@@ -586,7 +607,9 @@ impl Lowering<'_, '_> {
                     Some(implementation)
                         if !matches!(implementation.callable, Callable::Method { .. }) =>
                     {
-                        let implementation = self.with_own_args(implementation, &fn_ref.args[1..]);
+                        let implementation =
+                            self.ck
+                                .with_call_args(implementation, *interface, &fn_ref.args);
                         self.callable_instance(&implementation, false)
                     }
                     _ => Instance::Conformance {
@@ -597,30 +620,6 @@ impl Lowering<'_, '_> {
                 }
             }
             Callable::Builtin(builtin) => panic!("a function value of the builtin {builtin:?}"),
-        }
-    }
-
-    /// An implementing function's reference with its own generic parameters given the type
-    /// arguments a call through a bound gave the method's.
-    fn with_own_args(&self, implementation: FnRef, own: &[Arg]) -> FnRef {
-        let Callable::Item { item, .. } = implementation.callable else {
-            return implementation;
-        };
-        let mut own = own.iter();
-        let args = self
-            .ck
-            .sig(item)
-            .generics
-            .iter()
-            .zip(implementation.args.iter())
-            .map(|(def, arg)| match def.param.owner == item {
-                true => own.next().cloned().unwrap_or_else(|| arg.clone()),
-                false => arg.clone(),
-            })
-            .collect();
-        FnRef {
-            args,
-            ..implementation
         }
     }
 
@@ -978,6 +977,7 @@ pub fn adapt_value(lo: &mut Lowering, fx: &mut Fx, held: Held, nty: &NTy, wanted
             Held::Address(slot)
         }
         (Held::Address(address), Repr::Scalar(_)) => lo.held_at(fx, nty.ty(), address),
+        (Held::Empty, Repr::Address) => Held::Address(fx.slot(1, 1)),
         (_, Repr::Empty) => Held::Empty,
         (held, _) => held,
     }

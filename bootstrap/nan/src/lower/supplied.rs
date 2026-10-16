@@ -4,11 +4,14 @@
 
 pub mod codecs;
 pub mod floats;
+pub mod generate;
 pub mod mem;
 pub mod numbers;
 pub mod pointers;
 pub mod render;
+pub mod same;
 pub mod sequences;
+pub mod sims;
 pub mod sys;
 pub mod tasks;
 pub mod text;
@@ -180,10 +183,13 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         params,
     };
     let lowered = numbers::lower(lo, fx, &supply)
+        || generate::lower(lo, fx, &supply)
         || sequences::lower(lo, fx, &supply)
         || pointers::lower(lo, fx, &supply)
         || mem::lower(lo, fx, &supply)
         || render::lower(lo, fx, &supply)
+        || (lo.seeded() && sims::lower(lo, fx, &supply))
+        || same::lower(lo, fx, &supply)
         || sys::lower(lo, fx, &supply)
         || tasks::lower(lo, fx, &supply)
         || text::lower(lo, fx, &supply)

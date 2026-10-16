@@ -171,7 +171,7 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         lo,
         elided,
         &[PTR],
-        |_, fx| vec![elided_end(fx, value, room)],
+        |_, fx| vec![elided_end(fx, value, budget, room)],
         |_, _| vec![written],
     )[0];
     let output = fx.b.ins().iadd(end, marker);
@@ -188,7 +188,7 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
     let data = fx.load(PTR, address, vector::DATA);
     let target = fx.b.ins().iadd(data, len);
-    let keep = render::new_renderer(fx, target, end);
+    let keep = render::window_renderer(fx, target, budget, (zero, end));
     render::render_dyn(fx, value, keep);
     let marked = fx.b.ins().icmp_imm_s(IntCC::NotEqual, marker, 0);
     fx.when(marked, |fx| {
@@ -200,16 +200,16 @@ fn string_write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(needed, address, vector::LEN);
 }
 
-/// The length of the longest prefix of an elided rendering of a `Dyn[Render]` value that ends
-/// at a char boundary within `room` bytes, read from the bytes the rendering holds around
-/// `room`.
-fn elided_end(fx: &mut Fx, value: Value, room: Value) -> Value {
+/// The length of the longest prefix of the elided rendering of a `Dyn[Render]` value within
+/// `budget` that ends at a char boundary within `room` bytes, read from the bytes the rendering
+/// holds around `room`.
+fn elided_end(fx: &mut Fx, value: Value, budget: Value, room: Value) -> Value {
     let three = fx.ptr(3);
     let back = fx.b.ins().umin(room, three);
     let skip = fx.b.ins().isub(room, back);
     let window = fx.slot(4, 1);
     let four = fx.ptr(4);
-    let renderer = render::window_renderer(fx, window, four, skip);
+    let renderer = render::window_renderer(fx, window, budget, (skip, four));
     render::render_dyn(fx, value, renderer);
     fx.repeat(&[room], |fx, state| {
         let end = state[0];

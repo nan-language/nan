@@ -34,6 +34,14 @@ pub fn parse_form(text: &str) -> Option<Vec<u8>> {
         55 => 33,
         _ => return None,
     };
+    read_checksummed_base32(text, length).filter(|bytes| bytes[0] == BLAKE3)
+}
+
+/// The `length` bytes whose checksummed base32 is `text`, if any.
+pub fn read_checksummed_base32(text: &str, length: usize) -> Option<Vec<u8>> {
+    if text.len() != (length * 8).div_ceil(5) + 2 {
+        return None;
+    }
     let digits: Vec<u32> = text
         .bytes()
         .map(|byte| {
@@ -56,11 +64,7 @@ pub fn parse_form(text: &str) -> Option<Vec<u8>> {
         }
     }
     let padding_zero = bits & ((1 << held) - 1) == 0;
-    (bytes.len() == length
-        && padding_zero
-        && bytes[0] == BLAKE3
-        && checksummed_base32(&bytes) == text)
-        .then_some(bytes)
+    (bytes.len() == length && padding_zero && checksummed_base32(&bytes) == text).then_some(bytes)
 }
 
 /// The base32 of `bytes`, most significant bit first and the last character padded with zero

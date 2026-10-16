@@ -81,6 +81,8 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
         "check a b",
         "check --budget 99",
         "check --skip",
+        "test app --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
+        "test --affected --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
     ] {
         let run = run_in(&scratch.0, line);
         assert_eq!(run.status, 2, "{line}");
@@ -169,4 +171,85 @@ fn an_internal_error_writes_a_reproducer() {
         fs::read_to_string(reproducer.join("app/package.nan")).expect("read the copy"),
         MANIFEST
     );
+}
+
+const HALVES: &str = "//! Root.\n\npub fn half(value: u32) -> u32 {\n    return value / 2\n} half\n\ntest halves for half {\n    expect half(4) == 2\n} halves\n";
+
+#[test]
+fn affected_tests_are_those_without_a_pass_of_their_reach() {
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", HALVES)]);
+    let verdict = |line: &str| {
+        let run = run_in(&scratch.0, line);
+        run.output
+            .lines()
+            .next()
+            .expect("a verdict line")
+            .to_owned()
+    };
+    assert_eq!(
+        verdict("test"),
+        "ok test .: errors 0, incomplete 0, tests 1, failed 0"
+    );
+    let unchanged = "ok test . --affected: errors 0, incomplete 0, tests 0, failed 0";
+    assert_eq!(verdict("test --affected"), unchanged);
+    fs::write(
+        scratch.0.join("app/app.nan"),
+        HALVES.replace("/ 2", "/ 2 + 0"),
+    )
+    .expect("an edit");
+    let changed = "ok test . --affected: errors 0, incomplete 0, tests 1, failed 0";
+    assert_eq!(verdict("test --affected"), changed);
+}
+
+#[test]
+fn a_replay_token_reruns_its_run() {
+    let failing = HALVES.replace("half(4) == 2", "half(5) == 3");
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &failing)]);
+    let output = run_in(&scratch.0, "test").output;
+    let token = output
+        .lines()
+        .find_map(|line| line.strip_prefix("    replay "))
+        .expect("a replay token");
+    let replayed = run_in(&scratch.0, &format!("test --replay {token}"));
+    let verdict =
+        format!("failed test --replay {token}: errors 0, incomplete 0, tests 1, failed 1\n");
+    assert!(replayed.output.starts_with(&verdict), "{}", replayed.output);
+    assert!(
+        replayed
+            .output
+            .contains("\nfail app::halves app/app.nan:7 x86_64-host trap.expect\n")
+    );
+    for wrong in [
+        token.replacen("sc/", "hb/", 1),
+        token.replacen("/0/", "/00/", 1),
+        token.replacen("halves", "thirds", 1),
+        token.replacen("x86_64-host", "x86_64-uefi", 1),
+        format!("{token}a"),
+    ] {
+        let run = run_in(&scratch.0, &format!("test --replay {wrong}"));
+        assert!(
+            run.output.contains("\nerror test.replay-token - -\n"),
+            "{wrong}: {}",
+            run.output
+        );
+    }
+}
+
+#[test]
+fn a_test_head_names_a_function_and_takes_generated_values() {
+    let tests = "\npub const LIMIT: u32 = 4\n\ntest limit for LIMIT {\n    expect LIMIT == 4\n} limit\n\ntest any_half for half (mut value: u32) {\n    expect half(value) <= value\n} any_half\n\ntest view_half for half (values: Slice[u32]) {\n    expect half(values.len().truncate()) <= 4\n} view_half\n\nstruct Pair derives Copy {\n    left: u64\n} Pair\n\nimpl Pair: Generate\n";
+    let source = format!("{HALVES}{tests}");
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &source)]);
+    let output = run_in(&scratch.0, "check").output;
+    for record in [
+        "error test.target-kind app/app.nan:13 app::limit",
+        "error test.parameter-form app/app.nan:17 app::any_half",
+        "error test.parameter-type app/app.nan:21 app::view_half",
+        "error test.generate-manual-impl app/app.nan:29 app::impl[app::Pair: core::Generate]",
+    ] {
+        assert!(
+            output.contains(&format!("\n{record}\n")),
+            "{record}: {output}"
+        );
+    }
 }

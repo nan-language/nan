@@ -8,11 +8,11 @@ use cranelift_codegen::ir::{
 use cranelift_module::FuncId;
 
 use super::super::fx::{Fx, PTR};
-use super::super::host::{self, operation};
+use super::super::host;
 use super::super::supplied::tasks::cowns;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::WAITING;
-use super::tasks::{self, domain, run, task};
+use super::tasks::{self, domain, operation, run, task};
 use super::{Routine, holdings, memory, state, tables};
 
 /// The offsets of a wait record's fields: the glue withdrawing the wait, given the record and
@@ -171,10 +171,10 @@ fn claim_operation(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
 /// Cancels an operation and waits until its completion has been delivered, handling the
 /// completions on the running thread's ring meanwhile.
 fn settle_operation(lo: &mut Lowering, fx: &mut Fx, op: Value) {
-    host::cancel_operation(lo, fx, op);
+    lo.cancel_operation(fx, op);
     let word = fx.offset(op, operation::DONE);
     fx.repeat(&[], |fx, _| {
-        host::reap(lo, fx, None);
+        lo.reap(fx);
         let done = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), word);
         let pending =
             fx.b.ins()

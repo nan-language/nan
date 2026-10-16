@@ -4,6 +4,7 @@ mod build;
 mod check;
 mod edit;
 mod read;
+mod test;
 
 use std::fs;
 use std::io;
@@ -52,6 +53,7 @@ enum Name {
     Primer,
     Build,
     Run,
+    Test,
 }
 
 impl Name {
@@ -80,6 +82,7 @@ impl Name {
             "primer" => Name::Primer,
             "build" => Name::Build,
             "run" => Name::Run,
+            "test" => Name::Test,
             _ => return None,
         };
         Some((name, 1))
@@ -104,6 +107,7 @@ impl Name {
             Name::Primer => "primer",
             Name::Build => "build",
             Name::Run => "run",
+            Name::Test => "test",
         }
     }
 
@@ -126,6 +130,7 @@ impl Name {
             Name::Show => (&["--api"], &[]),
             Name::Find => (&["--contributors"], &[]),
             Name::Fix => (&["--propagate"], &[]),
+            Name::Test => (&["--affected"], &["--replay"]),
         }
     }
 
@@ -165,6 +170,7 @@ impl Name {
                 | Name::EditMove
                 | Name::Build
                 | Name::Run
+                | Name::Test
         )
     }
 
@@ -172,6 +178,7 @@ impl Name {
     fn counts(self) -> &'static [&'static str] {
         match self {
             Name::Check | Name::Fix => &["errors", "incomplete"],
+            Name::Test => &["errors", "incomplete", "tests", "failed"],
             Name::Fmt
             | Name::EditReplace
             | Name::EditRename
@@ -237,7 +244,10 @@ impl Invocation<'_> {
     /// `--skip` unless `skip` keeps it.
     fn command(&self, scope: &str, skip: bool) -> String {
         let mut words = vec![self.name.words().to_owned()];
-        if self.name.scoped() && self.scope().is_none() && self.value("--prefix").is_none() {
+        let scopeless = ["--prefix", "--replay"]
+            .iter()
+            .any(|option| self.value(option).is_some());
+        if self.name.scoped() && self.scope().is_none() && !scopeless {
             words.push(output::argument(scope));
         }
         let mut args = self.args.iter();
@@ -451,6 +461,7 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
     let output = match invocation.name {
         Name::Build | Name::Run => return build::run(invocation, &workspace, current, trace),
         Name::Check | Name::Fix | Name::Fmt => check::run(invocation, &workspace, current, trace),
+        Name::Test => test::run(invocation, &workspace, current, trace),
         Name::Holes => read::holes(invocation, &workspace, current, trace),
         Name::Find => read::find(invocation, &workspace, current),
         Name::Show | Name::Read => read::show(invocation, &workspace, current, trace),
@@ -570,20 +581,7 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
             .expect("reasons lie in workspace or std files");
         lines.push(output::printable(file.syntax.line_text(*line)));
     }
-    for (number, fix) in diagnostic.fixes.iter().enumerate() {
-        for edit in fix::edits(workspace, fix) {
-            lines.push(format!("fix {} {}", number + 1, edit.path));
-            let changed = |sign: char, line: &String| {
-                if line.is_empty() {
-                    sign.to_string()
-                } else {
-                    format!("{sign} {}", output::printable(line.as_bytes()))
-                }
-            };
-            lines.extend(edit.old.iter().map(|line| changed('-', line)));
-            lines.extend(edit.new.iter().map(|line| changed('+', line)));
-        }
-    }
+    lines.extend(fix::shown(workspace, &diagnostic.fixes));
     Record {
         word: diagnostic.code.class().word().to_owned(),
         fields: vec![diagnostic.code.name().to_owned(), location, item],

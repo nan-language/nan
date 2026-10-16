@@ -46,10 +46,10 @@ impl Lowering<'_, '_> {
         Ty::item(*item, args)
     }
 
-    /// Whether a payload of a wrapped part is a part, held by address: neither Copy nor a view,
-    /// whose values a projection builds.
+    /// Whether a payload of a wrapped part is a part, held by address: not a view, whose values
+    /// a projection builds.
     pub fn is_part(&self, payload: &Ty) -> bool {
-        !self.ck.nir_copy(payload) && !self.ck.nir_view(payload)
+        !self.ck.nir_view(payload)
     }
 
     /// The value of a layout's tag, or the index of an enum's variant held in a register.

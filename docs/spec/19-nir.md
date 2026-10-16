@@ -96,6 +96,7 @@ The instructions, with their results and behaviour, are:
 - `assume o`: nothing; o is a [fact](18-contracts.md#assume).
 - `all`, `any`: `all lo ..< hi R` runs region R for each integer of the range upward until R yields `false`, and is `true` when none does; `any` stops at `true`; `..=` includes hi.
 - `when`: `when (o, ...) R` acquires the cowns whose handles its `read` and `mut` operands name, trapping as `await when` does ([cowns](16-concurrency.md#cowns)), then yields R's value, R receiving a `ref` or `ref mut` to each cown's value; `when attempt` yields `Err(task::Poisoned)` instead of `trap.poisoned`, and `Ok` of R's value.
+- `dbg o`: o, once a test run has written the line of its `dbg` ([debug output](22-testing.md#debug-output)).
 
 `init`, `assign`, `release`, `check` and `assume` have no result, nor does a call or `when` of type `Unit`. A call of a callee whose head states `fails` is always a terminator.
 
@@ -207,6 +208,7 @@ At each point where [predicate obligations](04-types.md#obligations) place one, 
 | `expect P` | P's code, then `check expect` |
 | `assume P because "why"` | a call of its `assume` function, then `assume` of the result |
 | `todo "intent"` | the `todo` terminator |
+| `dbg(e)` | e as a `take` operand, then `dbg` |
 | `await when`, quantifiers | `when`, `all`, `any` |
 
 - A Copy scrutinee that is not a place, and a part or wrapped part, is the root of its parts. Arms are tested in source order, an `else` arm last, the final arm without a test. A pattern is tested depth-first, left to right: a variant by `is` then its payload patterns, a literal or constant by `eq`, a range by `ge` then `le`, or `lt` for `..<`, `or` alternatives in order; bindings and `_` test nothing. A const in a pattern is compared through its `constant`.
@@ -383,7 +385,8 @@ operation = 'slot' ( IDENT ":" )? nir_type
     | 'check' check_kind "," operand
     | "assume" operand
     | ( 'all' | 'any' ) operand ( "..<" | "..=" ) operand region
-    | "when" "attempt"? "(" operands ")" region ;
+    | "when" "attempt"? "(" operands ")" region
+    | "dbg" operand ;
 binary_word = 'add' | 'sub' | 'mul' | 'div' | 'rem' | 'shl' | 'shr' | 'band' | 'bor' | 'bxor' | 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge' ;
 check_kind = "requires" | "ensures" | 'predicate' | "expect" | "invariant" | "decreases" ;
 call = 'call' "await"? callee "(" operands? ")" ;

@@ -25,8 +25,8 @@ pub struct Scrutinee {
 }
 
 impl Elab<'_, '_> {
-    /// The scrutinee of a match or `let`: a place, a Copy value or part as its own root, or a
-    /// temporary in a slot.
+    /// The scrutinee of a match or `let`: a place, a Copy value, part or wrapped part as its own
+    /// root, or a temporary in a slot.
     pub fn scrutinee(&mut self, value: &TExpr) -> Elaborated<Option<Scrutinee>> {
         Ok(match self.expr(value)? {
             Out::Never => None,
@@ -35,7 +35,7 @@ impl Elab<'_, '_> {
                 Some(Scrutinee { place, owned })
             }
             Out::Operand(operand) => {
-                let owned = !self.ck.nir_copy(&value.ty);
+                let owned = !self.ck.nir_copy(&value.ty) && !super::stmt::is_part(value);
                 let place = match operand {
                     Operand::Value(root) if !owned => Place::of(root),
                     Operand::Value(root) if self.b.ty(root).is_reference() => Place::of(root),

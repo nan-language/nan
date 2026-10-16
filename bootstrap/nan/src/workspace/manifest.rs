@@ -26,7 +26,7 @@ impl Target {
         }
     }
 
-    fn from_name(name: &str) -> Option<Target> {
+    pub fn from_name(name: &str) -> Option<Target> {
         [Target::Host, Target::Uefi, Target::Bare, Target::Any]
             .into_iter()
             .find(|target| target.name() == name)

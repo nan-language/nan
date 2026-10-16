@@ -23,6 +23,7 @@ mod runtime;
 pub mod stack;
 mod supplied;
 mod symbols;
+pub mod test_image;
 mod transfer;
 mod trap;
 mod types;
@@ -143,6 +144,10 @@ pub enum Glue {
     WithdrawRun,
     /// Withdraws a stopped poster's entry from a runner's intake.
     WithdrawPost,
+    /// Withdraws a waiting operation from the sim waiter slot its record names.
+    SimWithdraw,
+    /// Compares two values of a type structurally, for `testing::same`.
+    Same(Ty),
     /// Moves a value of a type into another domain's reach.
     Transfer(Ty),
     /// Moves the captures of a task closure, the closure function's instance, into another
@@ -168,6 +173,7 @@ impl Glue {
                 | Glue::WithdrawWhen
                 | Glue::WithdrawRun
                 | Glue::WithdrawPost
+                | Glue::SimWithdraw
         )
     }
 }
@@ -230,6 +236,9 @@ pub struct Lowering<'c, 'a> {
     pub entry_table: Option<DataId>,
     frames: Vec<Frame>,
     pub demands: Vec<Demand>,
+    /// For a test image, what its tests' runs need, and the sim table once declared.
+    test: Option<test_image::Runtime>,
+    sims: Option<DataId>,
 }
 
 /// A function declared and not yet defined.
@@ -264,42 +273,54 @@ fn isa() -> OwnedTargetIsa {
 
 /// Lowers the reach of a program's final build.
 pub fn lower(ck: &Checker, program: &Program) -> Lowered {
-    let isa = isa();
-    let builder = ObjectBuilder::new(
-        isa.clone(),
-        "nan",
-        cranelift_module::default_libcall_names(),
-    )
-    .expect("an object builder");
-    let mut lowering = Lowering {
-        ck,
-        module: ObjectModule::new(builder),
-        layouts: Layouts::new(),
-        isa,
-        prefixes: program.prefixes.clone(),
-        roots: program.roots.clone(),
-        instances: HashMap::new(),
-        routines: HashMap::new(),
-        queue: Vec::new(),
-        releases: HashMap::new(),
-        transfers: HashMap::new(),
-        glues: HashMap::new(),
-        glue: 0,
-        state_id: None,
-        thread_id: None,
-        data: data::Data::default(),
-        lines: lines::Lines::default(),
-        entry_stacks: Vec::new(),
-        entry_table: None,
-        frames: Vec::new(),
-        demands: Vec::new(),
-    };
+    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
     host::entry_seam(&mut lowering, program);
     lowering.drain();
     lowering.finish()
 }
 
 impl<'c, 'a> Lowering<'c, 'a> {
+    /// A lowering into a new object, of a test image when `test` is given.
+    fn new(
+        ck: &'c Checker<'a>,
+        prefixes: HashMap<String, String>,
+        roots: Vec<PackageId>,
+        test: Option<test_image::Runtime>,
+    ) -> Self {
+        let isa = isa();
+        let builder = ObjectBuilder::new(
+            isa.clone(),
+            "nan",
+            cranelift_module::default_libcall_names(),
+        )
+        .expect("an object builder");
+        Lowering {
+            ck,
+            module: ObjectModule::new(builder),
+            layouts: Layouts::new(),
+            isa,
+            prefixes,
+            roots,
+            instances: HashMap::new(),
+            routines: HashMap::new(),
+            queue: Vec::new(),
+            releases: HashMap::new(),
+            transfers: HashMap::new(),
+            glues: HashMap::new(),
+            glue: 0,
+            state_id: None,
+            thread_id: None,
+            data: data::Data::default(),
+            lines: lines::Lines::default(),
+            entry_stacks: Vec::new(),
+            entry_table: None,
+            frames: Vec::new(),
+            demands: Vec::new(),
+            test,
+            sims: None,
+        }
+    }
+
     /// The function lowering an instance, declared now and lowered later when new.
     pub fn instance(&mut self, instance: Instance) -> FuncId {
         if let Some(id) = self.instances.get(&instance) {
@@ -323,7 +344,12 @@ impl<'c, 'a> Lowering<'c, 'a> {
                 Pending::Instance(instance, id) => {
                     let abi = self.abi(&instance);
                     let flags = self.frame_flags(&instance);
+                    let ran = self.target_slot(&instance);
                     self.define(id, abi.signature(), flags, |lo, fx| {
+                        if let Some(slot) = ran {
+                            let data = lo.ran_data();
+                            fx.mark = Some((lo.data_ref(fx, data), slot));
+                        }
                         lo.lower_instance(fx, &instance, &abi)
                     });
                     self.describe_frame(&instance, &abi, id);

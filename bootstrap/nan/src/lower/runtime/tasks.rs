@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use super::super::fx::{Fx, PTR};
-use super::super::host::{self, operation, thread};
+use super::super::host::{self, thread};
 use super::super::{CALL_CONV, Lowering};
 use super::regions::origin;
 use super::{Routine, state};
@@ -81,7 +81,9 @@ pub mod task {
     pub const WAIT: u64 = 256;
     /// The next task of the abandoned domain being settled.
     pub const SETTLE: u64 = 264;
-    pub const SIZE: u64 = 272;
+    /// On the seeded scheduler, the order in which it last became ready.
+    pub const ORDER: u64 = 272;
+    pub const SIZE: u64 = 280;
 }
 
 /// The bits of a task record's flags.
@@ -127,6 +129,55 @@ pub mod domain {
     pub const SIZE: u64 = 80;
 }
 
+/// The offsets of an operation record's fields: what a task waits on at a cancellation point,
+/// or a timer, which a completion, the virtual clock or a sim reaches.
+pub mod operation {
+    pub const TASK: u64 = 0;
+    pub const RESULT: u64 = 8;
+    /// Zero in flight, `COMPLETED` once its completion arrived, then `DELIVERED` once its waiter
+    /// has been woken, after which the thread delivering it no longer reads the record.
+    pub const DONE: u64 = 16;
+    pub const THREAD: u64 = 24;
+    /// Zero, `REQUESTED` once its cancellation is asked, `SUBMITTED` once submitted.
+    pub const CANCEL: u64 = 32;
+    pub const KIND: u64 = 40;
+    /// Its links among its thread's operations in flight; on the seeded scheduler, among the
+    /// virtual clock's timers or in the queue of the sim it waits in.
+    pub const NEXT: u64 = 48;
+    pub const PREVIOUS: u64 = 56;
+    /// For a deadline, the task to wake once it completes, and the next deadline its task
+    /// armed; for a wait in a sim, the sim's record.
+    pub const WAITER: u64 = 64;
+    pub const LINK: u64 = 72;
+    /// On the seeded scheduler, when a timer is due and the order in which it was armed, and
+    /// for a wait in a sim, the glue withdrawing it from the sim, given the record.
+    pub const DUE: u64 = 80;
+    pub const ORDER: u64 = 88;
+    pub const WITHDRAW: u64 = 96;
+    pub const SIZE: u64 = 104;
+    pub const COMPLETED: i64 = 1;
+    pub const DELIVERED: i64 = 2;
+    pub const REQUESTED: i64 = 1;
+    pub const SUBMITTED: i64 = 2;
+}
+
+/// The kinds of operations.
+pub mod kind {
+    /// A task waits on it.
+    pub const WAIT: i64 = 0;
+    /// It reads the next termination request.
+    pub const SIGNAL: i64 = 1;
+    /// A deadline, whose expiry cancels the region its `TASK` field names.
+    pub const DEADLINE: i64 = 2;
+    /// A component's delayed message, whose expiry lets the messages due into the intake of
+    /// the runner its `TASK` field names.
+    pub const AFTER: i64 = 3;
+}
+
+/// The error numbers of an expired timeout and of a cancelled operation, negated.
+pub const EXPIRED: i64 = -62;
+pub const CANCELED: i64 = -125;
+
 /// The offsets of a trap record's fields.
 pub mod trap_record {
     pub const KIND: u64 = 0;
@@ -142,9 +193,6 @@ pub const GUARD: u64 = 4_096;
 /// functions that its calls of support routines run, whose use past the stub call bound the
 /// usable size does not count.
 const ROUTINE_RESERVE: u64 = 32_768;
-
-/// The error number of a cancelled io_uring operation, negated.
-const CANCELED: i64 = -125;
 
 /// The bit of a task's `IO` word set while a cancellation reads the record of the operation
 /// the task waits on, which the task keeps until the bit clears.
@@ -521,8 +569,18 @@ pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     });
 }
 
+/// Makes a task just spawned ready; the spawn is a scheduling point of the running task.
+pub fn spawned(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    lo.call_routine(fx, Routine::Wake, &[record]);
+    super::seeded::scheduling_point(lo, fx);
+}
+
 /// Appends a ready task to the run queue, waking an idle executor thread.
 pub fn push_ready(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    if lo.seeded() {
+        super::seeded::push_ready(lo, fx, record);
+        return;
+    }
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::QUEUE_LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -568,13 +626,17 @@ pub fn pop_ready(lo: &mut Lowering, fx: &mut Fx) -> Value {
 }
 
 /// The scheduler of an executor thread: runs ready tasks, handling the completions on its ring
-/// between them, and waits for a completion when no task is ready. Never returns.
+/// between them, and waits for a completion when no task is ready; the seeded scheduler
+/// chooses each task it runs and advances its virtual clock instead of waiting. Never returns.
 fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let header = fx.block();
     fx.b.ins().jump(header, &[]);
     fx.b.switch_to_block(header);
-    let record = pop_ready(lo, fx);
+    let record = match lo.seeded() {
+        true => super::seeded::pick(lo, fx),
+        false => pop_ready(lo, fx),
+    };
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
     fx.choose_in(
         lo,
@@ -582,11 +644,14 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
         &[],
         |lo, fx| {
             run_task(lo, fx, record);
-            host::reap(lo, fx, None);
+            lo.reap(fx);
             Vec::new()
         },
         |lo, fx| {
-            host::idle(lo, fx);
+            match lo.seeded() {
+                true => super::seeded::idle(lo, fx),
+                false => host::idle(lo, fx),
+            }
             Vec::new()
         },
     );
@@ -755,7 +820,7 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
     let cancelled = origin(fx, region);
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
     fx.when(cancelled, |fx| host::cancel_operation(lo, fx, op));
-    host::wait_delivered(lo, fx, op);
+    wait_delivered(lo, fx, op);
     fx.repeat(&[], |fx, _| {
         let seen =
             fx.b.ins()
@@ -772,4 +837,113 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
     let failed = fx.b.ins().band(refused, cancelled);
     fx.b.ins().return_(&[failed, result]);
+}
+
+/// Delivers an operation's completion with its result, by its kind: a waiting task wakes, a
+/// deadline that expired cancels its region and wakes the task disarming it, and a component's
+/// delayed messages that are due enter its intake.
+pub fn deliver(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
+    let kind = fx.load(PTR, op, operation::KIND);
+    let wait = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::WAIT);
+    fx.when(wait, |fx| {
+        fx.store(result, op, operation::RESULT);
+        let waiting = fx.load(PTR, op, operation::TASK);
+        set_done(fx, op, operation::COMPLETED);
+        wake(lo, fx, waiting);
+        set_done(fx, op, operation::DELIVERED);
+    });
+    let deadline = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::DEADLINE);
+    fx.when(deadline, |fx| {
+        set_done(fx, op, operation::COMPLETED);
+        let expired = fx.b.ins().icmp_imm_s(IntCC::Equal, result, EXPIRED);
+        fx.when(expired, |fx| {
+            let region_record = fx.load(PTR, op, operation::TASK);
+            lo.call_routine(fx, Routine::Cancel, &[region_record]);
+        });
+        let waiter = fx.offset(op, operation::WAITER);
+        let waiter = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), waiter);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+        fx.when(present, |fx| wake(lo, fx, waiter));
+        set_done(fx, op, operation::DELIVERED);
+    });
+    let after = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::AFTER);
+    fx.when(after, |fx| {
+        super::super::supplied::tasks::components::timer_completed(lo, fx, op);
+    });
+}
+
+/// Stores how far an operation's completion has been delivered.
+fn set_done(fx: &mut Fx, op: Value, done: i64) {
+    let word = fx.offset(op, operation::DONE);
+    let done = fx.ptr(done as u64);
+    fx.b.ins().atomic_store(MemFlagsData::trusted(), done, word);
+}
+
+/// Waits until an operation's completion has been delivered, the running task parking while it
+/// has not arrived; on the seeded scheduler a completion queued is delivered at once.
+pub fn wait_delivered(lo: &mut Lowering, fx: &mut Fx, op: Value) {
+    let word = fx.offset(op, operation::DONE);
+    fx.repeat(&[], |fx, _| {
+        let done = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), word);
+        let pending = fx.b.ins().icmp_imm_s(IntCC::Equal, done, 0);
+        fx.when(pending, |fx| {
+            lo.call_routine(fx, Routine::Park, &[]);
+        });
+        if lo.seeded() {
+            let queued =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, done, operation::COMPLETED);
+            fx.when(queued, |fx| super::seeded::reap(lo, fx));
+        }
+        let delivered =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, done, operation::DELIVERED);
+        (fx.b.ins().bxor_imm_s(delivered, 1), Vec::new())
+    });
+}
+
+impl Lowering<'_, '_> {
+    /// Arms a timer that expires `ms` milliseconds from now: a timeout of the relative time it
+    /// writes at `spec` on the running thread's ring, or on the seeded scheduler a pending
+    /// deadline of the virtual clock.
+    pub fn arm_timer(&mut self, fx: &mut Fx, op: Value, ms: Value, spec: Value) {
+        if self.seeded() {
+            super::seeded::arm(self, fx, op, ms);
+            return;
+        }
+        let thousand = fx.ptr(1_000);
+        let seconds = fx.b.ins().udiv(ms, thousand);
+        let rest = fx.b.ins().urem(ms, thousand);
+        let nanoseconds = fx.b.ins().imul_imm_s(rest, 1_000_000);
+        fx.store(seconds, spec, 0);
+        fx.store(nanoseconds, spec, 8);
+        host::submit_timeout(self, fx, op, spec);
+    }
+
+    /// Asks once for the cancellation of an operation whose record stays valid during the
+    /// call; on the seeded scheduler one in flight completes cancelled at once.
+    pub fn cancel_operation(&mut self, fx: &mut Fx, op: Value) {
+        match self.seeded() {
+            true => super::seeded::cancel(self, fx, op),
+            false => host::cancel_operation(self, fx, op),
+        }
+    }
+
+    /// Delivers the completions that have arrived: those on the running thread's ring, or
+    /// those the seeded scheduler queued.
+    pub fn reap(&mut self, fx: &mut Fx) {
+        match self.seeded() {
+            true => super::seeded::reap(self, fx),
+            false => host::reap(self, fx, None),
+        }
+    }
+
+    /// The milliseconds of the clock that delays count: the monotonic clock, or on the seeded
+    /// scheduler the virtual clock.
+    pub fn now_ms(&mut self, fx: &mut Fx) -> Value {
+        match self.seeded() {
+            true => super::seeded::now(self, fx),
+            false => self.platform_call(fx, "now_ms", &[]).result.scalar(),
+        }
+    }
 }

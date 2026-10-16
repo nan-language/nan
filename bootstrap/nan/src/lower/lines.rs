@@ -58,18 +58,11 @@ impl Lines {
         if let Some(known) = self.known.get(&(item, line)) {
             return *known;
         }
-        let package = ck.db.package(ck.db.package_of(item));
-        let relative = data
-            .file
-            .path
-            .strip_prefix(&package.source.dir)
-            .map(|rest| rest.trim_start_matches('/'))
-            .unwrap_or(&data.file.path);
         let text = String::from_utf8_lossy(data.file.syntax.line_text(line))
             .trim_start()
             .to_owned();
         self.locations.push(Location {
-            path: format!("{}/{relative}", package.name),
+            path: path(ck, item),
             line,
             item: ck
                 .canonical_path(item)
@@ -99,6 +92,18 @@ impl Lines {
                 .expect("the line tables")
         })
     }
+}
+
+/// The path of an item's file as reports write it: its package's name, then the path within
+/// the package's source directory.
+pub fn path(ck: &Checker, item: ItemId) -> String {
+    let file = &ck.db.item(item).file.path;
+    let package = ck.db.package(ck.db.package_of(item));
+    let relative = file
+        .strip_prefix(&package.source.dir)
+        .map(|rest| rest.trim_start_matches('/'))
+        .unwrap_or(file);
+    format!("{}/{relative}", package.name)
 }
 
 /// Defines the line tables from every function lowered.

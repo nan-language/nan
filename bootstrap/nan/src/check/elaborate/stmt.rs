@@ -79,6 +79,11 @@ impl Elab<'_, '_> {
                 value,
                 otherwise,
             } => self.let_stmt(stmt.token, pattern, value, otherwise.as_ref())?,
+            TStmtKind::Var { local, value } if self.views(*local, value) => {
+                if let Some(bound) = self.bound_value(value)? {
+                    self.held.insert(*local, Held::Value(bound));
+                }
+            }
             TStmtKind::Var { local, value } => {
                 let ty = self.body.local(*local).ty.clone();
                 let slot = self.binding_slot(*local, &ty, span);
@@ -91,7 +96,8 @@ impl Elab<'_, '_> {
                 if let Some(operand) = self.operand(value)?
                     && !self.ck.nir_copy(&value.ty)
                     && !self.ck.nir_view(&value.ty)
-                    && let Operand::Value(_) = operand
+                    && let Operand::Value(discarded) = operand
+                    && !self.wrapped.contains(&discarded)
                 {
                     let slot = self.slot_holding(operand, &value.ty, stmt.token);
                     self.emit(Op::Release(Place::of(slot)), span);
@@ -178,19 +184,17 @@ impl Elab<'_, '_> {
         Ok(elaborated)
     }
 
-    /// Releases the temporaries created since the first `from` of the statement, in reverse
-    /// order of creation, unless moved.
+    /// Releases what the temporaries created since the first `from` of the statement still
+    /// hold, in reverse order of creation; past this point no place within them counts as moved.
     pub fn release_temps(&mut self, from: usize, token: Tok) {
         let temps = self.temps.split_off(from);
         self.scopes[self.temp_scope]
             .slots
             .retain(|slot| !temps.contains(slot));
-        for temp in temps.into_iter().rev() {
-            let place = Place::of(temp);
-            if !self.moved.contains(&place) {
-                self.emit(Op::Release(place), Self::span(token));
-            }
+        for temp in temps.iter().rev() {
+            self.release_slot(*temp, Self::span(token));
         }
+        self.moved.retain(|place| !temps.contains(&place.root));
     }
 
     /// A slot for a binding of the current scope, created before its initialiser's code; the
@@ -222,7 +226,20 @@ impl Elab<'_, '_> {
     /// Whether a `let` binding is a value: Copy, or bound to a part or wrapped part.
     fn binds_value(&self, local: LocalId, value: &TExpr) -> bool {
         let ty = &self.body.local(local).ty;
-        self.ck.nir_copy(ty) || is_part(value)
+        self.ck.nir_copy(ty) || is_part(value) || self.view_binding(value)
+    }
+
+    /// Whether a `var` binding is a view binding, naming what its initialiser names: a part or
+    /// view binding that is not Copy.
+    fn views(&self, local: LocalId, value: &TExpr) -> bool {
+        let ty = &self.body.local(local).ty;
+        !self.ck.nir_copy(ty) && (is_part(value) || self.view_binding(value))
+    }
+
+    /// Whether an expression names a view binding: a local bound to a reference.
+    fn view_binding(&self, value: &TExpr) -> bool {
+        matches!(&value.kind, TKind::Local(local)
+            if matches!(self.held.get(local), Some(Held::Value(bound)) if self.b.ty(*bound).is_reference()))
     }
 
     fn let_stmt(
@@ -547,13 +564,16 @@ impl Elab<'_, '_> {
         Ok(operands)
     }
 
-    /// Closes the innermost scope at its end: its deferred calls, then its slots' releases.
+    /// Closes the innermost scope at its end: its deferred calls, then its slots' releases; the
+    /// places of its slots no longer count as moved, as no later code reaches them.
     pub fn close_scope(&mut self, end: Tok) -> Elaborated<()> {
         let depth = self.scopes.len() - 1;
         if self.b.open() {
             self.leave_scopes(depth, end)?;
         }
-        self.scopes.pop();
+        let scope = self.scopes.pop().expect("the scope closed");
+        self.moved
+            .retain(|place| !scope.slots.contains(&place.root));
         Ok(())
     }
 
@@ -989,7 +1009,7 @@ fn before_variant(place: &Place) -> Place {
 
 /// Whether an expression is a part or wrapped part: a projection's result or a path of fields
 /// from one.
-fn is_part(expr: &TExpr) -> bool {
+pub fn is_part(expr: &TExpr) -> bool {
     match &expr.kind {
         TKind::Index(_) => true,
         TKind::Call(call) => call.proj,

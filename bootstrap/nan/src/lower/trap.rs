@@ -1,5 +1,6 @@
 //! Trap sites: the call of the trap routine that each failing check and partial operation
-//! makes, with its kind and the operands its report shows.
+//! makes, with its kind and the operands its report shows; and the lines `dbg` writes to the
+//! test trace, which show their operand as reports do.
 //!
 //! An operand record is 40 bytes: the address and length of the operand's source text, the
 //! bits of a scalar value or the address of another, how the report writes the bits, as
@@ -12,7 +13,7 @@ use super::Lowering;
 use super::body::{Body, Held};
 use super::fx::{Fx, PTR};
 use super::runtime::Routine;
-use super::runtime::report::values;
+use super::runtime::report::{REPORT, Report, values};
 use crate::check::db::ItemId;
 use crate::check::ty::{Scalar, Subst, Ty};
 use crate::nir::{
@@ -212,6 +213,44 @@ impl Shown {
             writer: Some(values::writer(lo, ty)),
         }
     }
+
+    /// Appends the value to a report.
+    fn write(&self, lo: &mut Lowering, fx: &mut Fx, report: Report) {
+        match self.writer {
+            Some(writer) => {
+                let writer = lo.func_ref(fx, writer);
+                fx.b.ins().call(writer, &[report.out, self.bits]);
+            }
+            None => {
+                let how = fx.ptr(self.written as u64);
+                lo.call_routine(fx, Routine::ReportScalar, &[report.out, self.bits, how]);
+            }
+        }
+    }
+}
+
+/// Writes the line of the `dbg` being lowered to the test trace: its path and line, the source
+/// text of its operand, ` = ` and the operand's value.
+pub fn dbg_line(body: &mut Body, held: Held, nty: &NTy) {
+    let span = body.current;
+    let text = {
+        let source = Source::of(&body.lo.ck.db.item(body.item).file.syntax, span);
+        let last = source.tokens.len().saturating_sub(2);
+        source.text(2, last).unwrap_or_default()
+    };
+    let line = body.lo.ck.db.item(body.item).line(span.first);
+    let path = super::lines::path(body.lo.ck, body.item);
+    let shown = shown(body, held, nty);
+    let out = body.fx.slot(8 + REPORT, 8);
+    let zero = body.fx.ptr(0);
+    body.fx.store(zero, out, 0);
+    let report = Report { out };
+    report.text(body.fx, body.lo, &format!("{path}:{line} {text} = "));
+    shown.write(body.lo, body.fx, report);
+    report.text(body.fx, body.lo, "\n");
+    let bytes = body.fx.b.ins().iadd_imm_s(out, 8);
+    let len = body.fx.load(PTR, out, 0);
+    super::supplied::sims::trace(body.lo, body.fx, &[(bytes, len)]);
 }
 
 /// The source text and shown value of each operand a report shows.

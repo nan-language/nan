@@ -1,5 +1,6 @@
 //! The bootstrap implementation of nan language 1.
 
+mod cache;
 mod check;
 mod command;
 mod diagnostic;
@@ -18,6 +19,7 @@ mod prover;
 mod scope;
 mod stdlib;
 mod syntax;
+mod test_runs;
 mod toolchain;
 mod workspace;
 

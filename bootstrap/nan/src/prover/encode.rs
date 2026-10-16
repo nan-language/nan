@@ -12,16 +12,16 @@ use crate::encoding::bytes;
 use crate::nir::{BinaryOp, Builtin, Callable, Constant, FnRef, Literal as Value, UnaryOp};
 
 /// The opcodes of the query forms, after those of NIR's instructions and terminators.
-const ITE: u64 = 49;
-const QUOTIENT: u64 = 50;
-const REMAINDER: u64 = 51;
-const TAG: u64 = 52;
-const FRESH: u64 = 53;
-const SKOLEM: u64 = 54;
-const BOUND: u64 = 55;
+const ITE: u64 = 50;
+const QUOTIENT: u64 = 51;
+const REMAINDER: u64 = 52;
+const TAG: u64 = 53;
+const FRESH: u64 = 54;
+const SKOLEM: u64 = 55;
+const BOUND: u64 = 56;
 /// The connectives a term may hold as an operand, which no instruction names.
-const AND: u64 = 56;
-const OR: u64 = 57;
+const AND: u64 = 57;
+const OR: u64 = 58;
 
 /// The encodings of a store's terms, each computed once.
 #[derive(Clone, Default)]

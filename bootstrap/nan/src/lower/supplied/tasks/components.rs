@@ -21,10 +21,9 @@ use cranelift_module::FuncId;
 use super::super::super::body::Held;
 use super::super::super::call::Invoked;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::host::{self, operation};
 use super::super::super::runtime::regions::{WAITING, region};
 use super::super::super::runtime::tables::{self, entry as cap_entry};
-use super::super::super::runtime::tasks::{self, task};
+use super::super::super::runtime::tasks::{self, kind, operation, task};
 use super::super::super::runtime::{Routine, fetch_add, report, settle};
 use super::super::super::{Glue, Instance, Lowering};
 use super::super::Supply;
@@ -296,7 +295,7 @@ fn start_component(
     let done = fx.b.ins().func_addr(PTR, done);
     fx.store(done, component, task::DONE);
     fx.store(component, record, runner::COMPONENT);
-    lo.call_routine(fx, Routine::Wake, &[component]);
+    tasks::spawned(lo, fx, component);
 }
 
 /// The component task: removes the intake's messages one at a time, oldest first, passing each
@@ -451,7 +450,7 @@ fn withdraw_run(lo: &mut Lowering) -> FuncId {
                 present,
                 &[PTR],
                 |lo, fx| {
-                    host::cancel_operation(lo, fx, op);
+                    lo.cancel_operation(fx, op);
                     vec![fx.load(PTR, op, timer::NEXT)]
                 },
                 |_, fx| vec![fx.ptr(0)],
@@ -460,7 +459,7 @@ fn withdraw_run(lo: &mut Lowering) -> FuncId {
         });
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         fx.repeat(&[], |fx, _| {
-            host::reap(lo, fx, None);
+            lo.reap(fx);
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let timers = fx.load(PTR, record, runner::TIMER_COUNT);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
@@ -537,7 +536,7 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value, message: &Ty) {
             present,
             &[PTR],
             |lo, fx| {
-                host::cancel_operation(lo, fx, op);
+                lo.cancel_operation(fx, op);
                 vec![fx.load(PTR, op, timer::NEXT)]
             },
             |_, fx| vec![fx.ptr(0)],
@@ -710,17 +709,11 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let op = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, op, 0);
     fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
-    let after_kind = fx.ptr(host::kind::AFTER as u64);
+    let after_kind = fx.ptr(kind::AFTER as u64);
     fx.store(after_kind, op, operation::KIND);
     fx.store(record, op, operation::TASK);
-    let thousand = fx.ptr(1_000);
-    let seconds = fx.b.ins().udiv(ms, thousand);
-    let rest = fx.b.ins().urem(ms, thousand);
-    let nanoseconds = fx.b.ins().imul_imm_s(rest, 1_000_000);
     let spec = fx.offset(op, timer::SPEC);
-    fx.store(seconds, spec, 0);
-    fx.store(nanoseconds, spec, 8);
-    let now = lo.platform_call(fx, "now_ms", &[]).result.scalar();
+    let now = lo.now_ms(fx);
     let (deadline, overflow) = fx.b.ins().uadd_overflow(now, ms);
     let latest = fx.int(PTR, -1);
     let deadline = fx.b.ins().select(overflow, latest, deadline);
@@ -755,7 +748,7 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let count = fx.load(PTR, record, runner::TIMER_COUNT);
             let count = fx.b.ins().iadd_imm_s(count, 1);
             fx.store(count, record, runner::TIMER_COUNT);
-            host::submit_timeout(lo, fx, op, spec);
+            lo.arm_timer(fx, op, ms, spec);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             Vec::new()
         },
@@ -811,7 +804,7 @@ fn insert_delayed(fx: &mut Fx, record: Value, node: Value, deadline: Value) {
 pub fn timer_completed(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     let record = fx.load(PTR, op, operation::TASK);
     let lock = fx.offset(record, runner::LOCK);
-    let now = lo.platform_call(fx, "now_ms", &[]).result.scalar();
+    let now = lo.now_ms(fx);
     lo.call_routine(fx, Routine::Lock, &[lock]);
     fx.repeat(&[], |fx, _| {
         let first = fx.load(PTR, record, runner::DELAYED);
@@ -910,7 +903,7 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let live = fx.b.ins().iadd_imm_s(live, 1);
     fx.store(live, record, runner::LIVE_KEYED);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    lo.call_routine(fx, Routine::Wake, &[started]);
+    tasks::spawned(lo, fx, started);
     supply.done(lo, fx);
 }
 

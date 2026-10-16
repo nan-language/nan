@@ -71,6 +71,19 @@ struct Written {
 }
 
 impl Example {
+    /// Whether the block is a kernel conformance test: a package of it declares `x86_64-uefi`
+    /// or `x86_64-bare`. Its tests need the emulator, which the harness does not start.
+    fn kernel(&self) -> bool {
+        self.files.iter().any(|(path, lines)| {
+            path.ends_with("/package.nan")
+                && lines.iter().any(|line| {
+                    let line = line.trim();
+                    line.starts_with("targets ")
+                        && (line.contains("x86_64-uefi") || line.contains("x86_64-bare"))
+                })
+        })
+    }
+
     /// The names of the packages of the block that are `x86_64-host` programs.
     fn host_programs(&self) -> Vec<String> {
         self.files
@@ -292,7 +305,15 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
         return Err(format!("context packs lack facts:\n{}", gaps.join("\n")));
     }
     if status == Some(0) {
-        build(example, marker.as_ref(), &expected, dir)?;
+        if !example.kernel() {
+            test(marker.as_ref(), &expected, dir)?;
+        }
+        let test_run = marker
+            .as_ref()
+            .is_some_and(|marker| TEST_RUN.contains(&marker.code.as_str()));
+        if !test_run {
+            build(example, marker.as_ref(), &expected, dir)?;
+        }
     }
 
     example
@@ -322,6 +343,60 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
                 written.join("\n")
             ));
         }
+    }
+    Ok(())
+}
+
+/// The cause, location and first held line of each `fail` record of an output.
+fn failures(output: &str) -> Vec<(String, String, String)> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields[0] != "fail" || fields.len() != 5 {
+            continue;
+        }
+        let first = lines
+            .get(index + 1)
+            .and_then(|next| next.strip_prefix("    "))
+            .unwrap_or_default();
+        found.push((fields[4].to_owned(), fields[2].to_owned(), first.to_owned()));
+    }
+    found
+}
+
+/// Runs the tests of an example: `nan test` reports what check time reports, and every test
+/// passes but the one a test-run code or trap marker names, which fails with that cause, its
+/// head on the marked line for a test-run code, its trap report naming that line for a trap.
+fn test(
+    marker: Option<&Marker>,
+    checked: &[(String, String, String)],
+    dir: &Path,
+) -> Result<(), String> {
+    let (output, code) = nan(dir, &["test"])?;
+    let failing =
+        marker.filter(|marker| marker.class == "traps" || TEST_RUN.contains(&marker.code.as_str()));
+    let failures = failures(&output);
+    let expected = match failing {
+        Some(marker) => {
+            let location = format!("{}:{}", marker.path, marker.line);
+            failures.len() == 1 && {
+                let (cause, at, first) = &failures[0];
+                *cause == marker.code
+                    && match marker.class {
+                        "traps" => first.starts_with(&format!("{cause} at {location} ")),
+                        _ => *at == location,
+                    }
+            }
+        }
+        None => failures.is_empty(),
+    };
+    let status = Some(i32::from(failing.is_some()));
+    if diagnostics(&output) != checked || !expected || code != status {
+        return Err(format!(
+            "nan test exits with {code:?} and reports\n{output}expected {checked:?} and {:?}",
+            failing.map(|marker| &marker.code)
+        ));
     }
     Ok(())
 }

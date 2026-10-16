@@ -256,6 +256,7 @@ impl Writer<'_> {
                 format!("check {}, {}", kind.word(), self.operand(operand))
             }
             Op::Assume(operand) => format!("assume {}", self.operand(operand)),
+            Op::Dbg(operand) => format!("dbg {}", self.operand(operand)),
             Op::Quantifier {
                 all,
                 low,

@@ -2,9 +2,9 @@
 //! `Render`, `text::fmt` templates, and `Dyn` views.
 //!
 //! A renderer is the address of its state: the buffer kept bytes go to (zero while measuring),
-//! the render budget, the bytes the full rendering holds so far, the bytes kept, and the
-//! position in the full rendering where keeping starts. A rendering keeps at most the budget's
-//! bytes; finishing it elides what passed the budget.
+//! the render budget, the bytes the full rendering holds so far, the bytes kept, the position
+//! in the full rendering where keeping starts, and the most bytes kept, at most the budget.
+//! Finishing a rendering elides what passed the budget.
 //!
 //! A `Dyn[I]` value is the address of the value and of its method table: the release of the
 //! value's type, its size and alignment, then each of `I`'s methods.
@@ -31,18 +31,24 @@ mod renderer {
     pub const WRITTEN: u64 = 16;
     pub const KEPT: u64 = 24;
     pub const SKIP: u64 = 32;
-    pub const SIZE: u64 = 40;
+    pub const LIMIT: u64 = 40;
+    pub const SIZE: u64 = 48;
 }
 
 /// A renderer value over a new state, keeping bytes in `buffer` (zero to measure).
 pub fn new_renderer(fx: &mut Fx, buffer: Value, budget: Value) -> Value {
     let zero = fx.ptr(0);
-    window_renderer(fx, buffer, budget, zero)
+    window_renderer(fx, buffer, budget, (zero, budget))
 }
 
-/// A renderer value over a new state keeping the bytes of the full rendering from position
-/// `skip` on, at most `budget` of them, in `buffer`.
-pub fn window_renderer(fx: &mut Fx, buffer: Value, budget: Value, skip: Value) -> Value {
+/// A renderer value over a new state with a budget, keeping in `buffer` at most `limit` bytes
+/// of the full rendering from position `skip` on.
+pub fn window_renderer(
+    fx: &mut Fx,
+    buffer: Value,
+    budget: Value,
+    (skip, limit): (Value, Value),
+) -> Value {
     let state = fx.slot(renderer::SIZE, 8);
     fx.store(buffer, state, renderer::BUFFER);
     fx.store(budget, state, renderer::BUDGET);
@@ -50,6 +56,7 @@ pub fn window_renderer(fx: &mut Fx, buffer: Value, budget: Value, skip: Value) -
     fx.store(zero, state, renderer::WRITTEN);
     fx.store(zero, state, renderer::KEPT);
     fx.store(skip, state, renderer::SKIP);
+    fx.store(limit, state, renderer::LIMIT);
     let value = fx.slot(8, 8);
     fx.store(state, value, 0);
     value
@@ -131,12 +138,12 @@ pub fn render_value(
     (buffer, len)
 }
 
-/// Appends bytes to a rendering: the bytes within its budget from its skip position on are
+/// Appends bytes to a rendering: the bytes within its limit from its skip position on are
 /// kept, all are counted.
 pub fn append(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, text: Value, len: Value) {
     let state = fx.load(PTR, renderer_value, 0);
     let buffer = fx.load(PTR, state, renderer::BUFFER);
-    let budget = fx.load(PTR, state, renderer::BUDGET);
+    let limit = fx.load(PTR, state, renderer::LIMIT);
     let written = fx.load(PTR, state, renderer::WRITTEN);
     let kept = fx.load(PTR, state, renderer::KEPT);
     let skip = fx.load(PTR, state, renderer::SKIP);
@@ -149,10 +156,10 @@ pub fn append(lo: &mut Lowering, fx: &mut Fx, renderer_value: Value, text: Value
     let dropped = fx.b.ins().umin(dropped, len);
     let text = fx.b.ins().iadd(text, dropped);
     let len = fx.b.ins().isub(len, dropped);
-    let room = fx.b.ins().isub(budget, kept);
+    let room = fx.b.ins().isub(limit, kept);
     let fits = fx.b.ins().icmp(IntCC::UnsignedLessThan, len, room);
     let count = fx.b.ins().select(fits, len, room);
-    let has_room = fx.b.ins().icmp(IntCC::UnsignedLessThan, kept, budget);
+    let has_room = fx.b.ins().icmp(IntCC::UnsignedLessThan, kept, limit);
     let keeping = fx.b.ins().icmp_imm_s(IntCC::NotEqual, buffer, 0);
     let copying = fx.b.ins().band(has_room, keeping);
     fx.when(copying, |fx| {

@@ -17,7 +17,7 @@ mod elaborate;
 mod expand;
 mod failure;
 mod flow;
-mod generation;
+pub(crate) mod generation;
 mod head;
 mod identity;
 mod interface;

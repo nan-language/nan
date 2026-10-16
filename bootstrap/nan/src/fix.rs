@@ -150,8 +150,29 @@ fn overlaps((start, end): (u32, u32), (from, to): (u32, u32)) -> bool {
 }
 
 /// The workspace once a fix is made.
-fn fixed(workspace: &Workspace, fix: &Fix) -> Workspace {
+pub fn fixed(workspace: &Workspace, fix: &Fix) -> Workspace {
     workspace.with_sources(&apply(workspace, &[fix]))
+}
+
+/// The lines a record holds for its fixes: per fix and edit, `fix <number> <path>`, then the old
+/// lines each prefixed `- ` and the new ones `+ `.
+pub fn shown(workspace: &Workspace, fixes: &[Fix]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (number, fix) in fixes.iter().enumerate() {
+        for edit in edits(workspace, fix) {
+            lines.push(format!("fix {} {}", number + 1, edit.path));
+            let changed = |sign: char, line: &String| {
+                if line.is_empty() {
+                    sign.to_string()
+                } else {
+                    format!("{sign} {}", crate::output::printable(line.as_bytes()))
+                }
+            };
+            lines.extend(edit.old.iter().map(|line| changed('-', line)));
+            lines.extend(edit.new.iter().map(|line| changed('+', line)));
+        }
+    }
+    lines
 }
 
 /// Keeps in each diagnostic the fixes it offers among those its rule names, each re-checked over

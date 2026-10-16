@@ -79,70 +79,11 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
     let cell = fx.load(PTR, supply.param(2).address(), 0);
     let caller_domain = tasks::current_domain(lo, fx);
-    let size = fx.ptr(trap_record::BYTES + report::REPORT);
-    let align = fx.ptr(8);
-    let trap = lo.call_routine(fx, Routine::AllocIn, &[cell, size, align, caller_domain])[0];
-    let one = fx.ptr(1);
-    let record_size = fx.ptr(domain::SIZE);
-    let record = lo.call_libc(fx, "calloc", &[one, record_size], &[PTR])[0];
-    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
-    let no_trap = fx.b.ins().icmp_imm_s(IntCC::Equal, trap, 0);
-    let missing = fx.b.ins().bor(missing, no_trap);
-    fx.when(missing, |fx| {
-        report::raise_kind(lo, fx, "trap.exhausted");
-    });
-    fx.store(trap, record, domain::TRAP);
-    fx.store(caller_domain, record, domain::PARENT);
-    let current = tasks::current_task(lo, fx);
-    fx.store(current, record, domain::WAITER);
-    let parent_lock = fx.offset(caller_domain, domain::LOCK);
-    lo.call_routine(fx, Routine::Lock, &[parent_lock]);
-    let siblings = fx.load(PTR, caller_domain, domain::CHILDREN);
-    fx.store(siblings, record, domain::SIBLING);
-    fx.store(record, caller_domain, domain::CHILDREN);
-    lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
-    let region = fx.load(PTR, current, task::REGION);
-    let none = fx.ptr(0);
-    lo.transfer(
-        fx,
-        &Ty::Fn(body_ty.clone().into()),
-        supply.param(0).address(),
-        none,
+    let Nested {
         record,
-    );
-    let done = domain_done(lo);
-    let first = super::scopes::start_task(
-        lo,
-        fx,
-        &body_ty,
-        supply.param(0).address(),
-        cell,
-        record,
-        region,
-        record,
-        None,
-        done,
-    );
-    lo.call_routine(fx, Routine::Wake, &[first]);
-    let lock = fx.offset(record, domain::LOCK);
-    fx.repeat(&[], |fx, _| {
-        lo.call_routine(fx, Routine::Lock, &[lock]);
-        let flags = fx.load(PTR, first, task::FLAGS);
-        let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
-        let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
-        let abandoned = fx.load(PTR, record, domain::ABANDONED);
-        let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
-        let over = fx.b.ins().bor(ended, abandoned);
-        let waiting = fx.b.ins().bxor_imm_s(over, 1);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
-        fx.when(waiting, |fx| {
-            lo.call_routine(fx, Routine::Park, &[]);
-        });
-        (waiting, Vec::new())
-    });
-    lo.call_routine(fx, Routine::Lock, &[parent_lock]);
-    unlink_child(fx, caller_domain, record);
-    lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
+        first,
+        trap,
+    } = run_nested(lo, fx, &body_ty, supply.param(0).address(), cell, true);
     let option = supply.abi.result.clone();
     let layout = lo.layout(&option);
     let slot = supply
@@ -185,14 +126,101 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             Vec::new()
         },
     );
-    holdings::pass_all(lo, fx, record, caller_domain);
-    memory::free_chunks(lo, fx, record);
-    lo.call_libc(fx, "free", &[first], &[]);
-    lo.call_libc(fx, "free", &[record], &[]);
+    end_nested(lo, fx, record, first, caller_domain);
     let failed = fx.b.ins().bxor_imm_s(returned, 1);
     fx.when(failed, |fx| supply.fail(fx));
     let held = lo.held_at(fx, &option, slot);
     supply.ret(lo, fx, held);
+}
+
+/// A domain `run_nested` ran: its record, its first task and its trap record.
+pub struct Nested {
+    pub record: Value,
+    pub first: Value,
+    pub trap: Value,
+}
+
+/// Runs the `task fn` value of a type held at `function` as the first task of a new domain
+/// nested in the running task's, its stack and trap record drawn through a cell, and waits
+/// until that task ends or a trap abandons the domain; the spawn is a scheduling point when
+/// `point` holds.
+pub fn run_nested(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    body_ty: &crate::check::ty::FnTy,
+    function: Value,
+    cell: Value,
+    point: bool,
+) -> Nested {
+    let caller_domain = tasks::current_domain(lo, fx);
+    let size = fx.ptr(trap_record::BYTES + report::REPORT);
+    let align = fx.ptr(8);
+    let trap = lo.call_routine(fx, Routine::AllocIn, &[cell, size, align, caller_domain])[0];
+    let one = fx.ptr(1);
+    let record_size = fx.ptr(domain::SIZE);
+    let record = lo.call_libc(fx, "calloc", &[one, record_size], &[PTR])[0];
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    let no_trap = fx.b.ins().icmp_imm_s(IntCC::Equal, trap, 0);
+    let missing = fx.b.ins().bor(missing, no_trap);
+    fx.when(missing, |fx| {
+        report::raise_kind(lo, fx, "trap.exhausted");
+    });
+    fx.store(trap, record, domain::TRAP);
+    fx.store(caller_domain, record, domain::PARENT);
+    let current = tasks::current_task(lo, fx);
+    fx.store(current, record, domain::WAITER);
+    let parent_lock = fx.offset(caller_domain, domain::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[parent_lock]);
+    let siblings = fx.load(PTR, caller_domain, domain::CHILDREN);
+    fx.store(siblings, record, domain::SIBLING);
+    fx.store(record, caller_domain, domain::CHILDREN);
+    lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
+    let region = fx.load(PTR, current, task::REGION);
+    let none = fx.ptr(0);
+    lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record);
+    let done = domain_done(lo);
+    let first = super::scopes::start_task(
+        lo, fx, body_ty, function, cell, record, region, record, None, done,
+    );
+    match point {
+        true => tasks::spawned(lo, fx, first),
+        false => {
+            lo.call_routine(fx, Routine::Wake, &[first]);
+        }
+    }
+    let lock = fx.offset(record, domain::LOCK);
+    fx.repeat(&[], |fx, _| {
+        lo.call_routine(fx, Routine::Lock, &[lock]);
+        let flags = fx.load(PTR, first, task::FLAGS);
+        let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
+        let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
+        let abandoned = fx.load(PTR, record, domain::ABANDONED);
+        let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
+        let over = fx.b.ins().bor(ended, abandoned);
+        let waiting = fx.b.ins().bxor_imm_s(over, 1);
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
+        fx.when(waiting, |fx| {
+            lo.call_routine(fx, Routine::Park, &[]);
+        });
+        (waiting, Vec::new())
+    });
+    lo.call_routine(fx, Routine::Lock, &[parent_lock]);
+    unlink_child(fx, caller_domain, record);
+    lo.call_routine(fx, Routine::Unlock, &[parent_lock]);
+    Nested {
+        record,
+        first,
+        trap,
+    }
+}
+
+/// Ends a domain whose first task ended: the holdings it still owns pass to `parent`, its other
+/// chunks are freed, and its records with them.
+pub fn end_nested(lo: &mut Lowering, fx: &mut Fx, record: Value, first: Value, parent: Value) {
+    holdings::pass_all(lo, fx, record, parent);
+    memory::free_chunks(lo, fx, record);
+    lo.call_libc(fx, "free", &[first], &[]);
+    lo.call_libc(fx, "free", &[record], &[]);
 }
 
 /// Takes a domain out of the list of the domains nested in its parent; the caller holds the

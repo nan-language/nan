@@ -104,6 +104,9 @@ impl Elab<'_, '_> {
         let result_ty = self.result_nty(call);
         let reference = result_ty.is_reference();
         let value = self.emit_value(Op::Call(nir_call), result_ty, span);
+        if call.proj && self.wraps(&call.head.result) {
+            self.wrapped.insert(value);
+        }
         Ok(match reference {
             true => Out::Place(Place::of(value)),
             false => Out::Operand(Operand::Value(value)),
@@ -114,9 +117,7 @@ impl Elab<'_, '_> {
     /// projection takes its receiver by `mut`.
     fn result_nty(&self, call: &tir::Call) -> NTy {
         let result = call.head.result.clone();
-        let wraps =
-            self.ck.is_std(&result, "core::Option") || self.ck.is_std(&result, "core::Result");
-        if !call.proj || self.ck.nir_view(&result) || wraps {
+        if !call.proj || self.ck.nir_view(&result) || self.wraps(&result) {
             return NTy::Owned(result);
         }
         let writable = call
@@ -128,6 +129,11 @@ impl Elab<'_, '_> {
             true => NTy::RefMut(result),
             false => NTy::Ref(result),
         }
+    }
+
+    /// Whether a type is an `Option` or `Result`, which a projection returns as a wrapped part.
+    fn wraps(&self, ty: &Ty) -> bool {
+        self.ck.is_std(ty, "core::Option") || self.ck.is_std(ty, "core::Result")
     }
 
     /// The function a call names.
@@ -149,7 +155,12 @@ impl Elab<'_, '_> {
                         },
                         args: call.type_args.clone(),
                     },
-                    _ => self.implementation(self_ty, interface.interface, &name)?,
+                    _ => {
+                        let implementation =
+                            self.implementation(self_ty, interface.interface, &name)?;
+                        self.ck
+                            .with_call_args(implementation, interface.interface, &call.type_args)
+                    }
                 }
             }
             tir::Callee::Builtin(tir::Builtin::DynView) => FnRef {

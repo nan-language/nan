@@ -113,11 +113,11 @@ impl Elab<'_, '_> {
         })
     }
 
-    /// A place holding a value: the value itself when Copy or a view, else a temporary of the
-    /// statement being elaborated.
+    /// A place holding a value: the value itself when Copy, a view or a wrapped part, else a
+    /// temporary of the statement being elaborated.
     pub fn temporary(&mut self, operand: Operand, ty: &Ty, token: Tok) -> Place {
         if let Operand::Value(value) = &operand
-            && (self.ck.nir_copy(ty) || self.ck.nir_view(ty))
+            && (self.ck.nir_copy(ty) || self.ck.nir_view(ty) || self.wrapped.contains(value))
         {
             return Place::of(*value);
         }
@@ -237,7 +237,13 @@ impl Elab<'_, '_> {
                 self.end(Terminator::Todo(intent.clone()), span);
                 Out::Never
             }
-            TKind::Dbg(inner) => self.expr(inner)?,
+            TKind::Dbg(inner) => {
+                let Some(operand) = self.arg(inner, Mode::Take)? else {
+                    return Ok(Out::Never);
+                };
+                let ty = NTy::Owned(expr.ty.clone());
+                Out::Operand(Operand::Value(self.emit_value(Op::Dbg(operand), ty, span)))
+            }
             TKind::Return(value) => {
                 self.return_expr(value.as_deref(), expr.token)?;
                 Out::Never

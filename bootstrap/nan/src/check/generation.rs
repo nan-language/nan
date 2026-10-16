@@ -416,91 +416,109 @@ fn called(expr: &Expr) -> Option<(&Expr, &str)> {
     args.is_empty().then_some((&**base, name.text.as_str()))
 }
 
-/// Whether constructive conjuncts have a solution: their difference bounds, each `b + c` kept
-/// within the type of `b`, without a negative cycle, and each `a != c` leaving `a` a value.
-fn satisfiable(conjuncts: &[Constructive]) -> bool {
-    let mut nodes: HashMap<&str, (usize, (i128, i128))> = HashMap::new();
-    for conjunct in conjuncts {
-        for (path, bounds) in std::iter::once(&conjunct.left).chain(&conjunct.right) {
-            let next = nodes.len() + 1;
-            nodes.entry(path).or_insert((next, *bounds));
-        }
-    }
-    let mut edges: Vec<(usize, usize, i128)> = Vec::new();
-    for (node, (low, high)) in nodes.values() {
-        edges.push((0, *node, *high));
-        edges.push((*node, 0, -low));
-    }
-    for conjunct in conjuncts {
-        let Some(offset) = conjunct.offset else {
-            continue;
-        };
-        let left = nodes[conjunct.left.0.as_str()].0;
-        let right = match &conjunct.right {
-            Some((path, (low, high))) => {
-                let right = nodes[path.as_str()].0;
-                edges.push((0, right, high - offset));
-                edges.push((right, 0, offset - low));
-                right
-            }
-            None => 0,
-        };
-        match conjunct.op {
-            BinaryOp::Lt => edges.push((right, left, offset - 1)),
-            BinaryOp::Le => edges.push((right, left, offset)),
-            BinaryOp::Eq => {
-                edges.push((right, left, offset));
-                edges.push((left, right, -offset));
-            }
-            BinaryOp::Ge => edges.push((left, right, -offset)),
-            BinaryOp::Gt => edges.push((left, right, -offset - 1)),
-            _ => {}
-        }
-    }
-    let mut distance = vec![0i128; nodes.len() + 1];
-    let mut settled = false;
-    for _ in 0..=nodes.len() {
-        settled = true;
-        for (from, to, weight) in &edges {
-            if distance[*from] + weight < distance[*to] {
-                distance[*to] = distance[*from] + weight;
-                settled = false;
-            }
-        }
-        if settled {
-            break;
-        }
-    }
-    if !settled {
-        return false;
-    }
-    nodes.iter().all(|(path, (_, (low, high)))| {
-        let mut bounds = (*low, *high);
-        let mut excluded = BTreeSet::new();
-        for conjunct in conjuncts
+/// The constraints of a generation as difference bounds over its drawn integers, numbered from 1
+/// with node 0 standing for zero: each drawn integer's path and type bounds; edges `(from, to,
+/// weight)`, each bounding `x[to] - x[from]` by `weight`, each `b + c` kept within the type of
+/// `b`; and the values each `a != c` excludes from `a`.
+pub struct Constraints {
+    pub drawn: Vec<(String, (i128, i128))>,
+    pub edges: Vec<(usize, usize, i128)>,
+    pub excluded: Vec<(usize, i128)>,
+}
+
+impl Constraints {
+    fn of(conjuncts: &[Constructive]) -> Constraints {
+        let mut drawn: Vec<(String, (i128, i128))> = Vec::new();
+        let mut node = |path: &str, bounds: (i128, i128)| match drawn
             .iter()
-            .filter(|conjunct| conjunct.left.0 == *path && conjunct.right.is_none())
+            .position(|(known, _)| known == path)
         {
-            let Some(value) = conjunct.offset else {
+            Some(index) => index + 1,
+            None => {
+                drawn.push((path.to_owned(), bounds));
+                drawn.len()
+            }
+        };
+        let mut edges: Vec<(usize, usize, i128)> = Vec::new();
+        let mut excluded = Vec::new();
+        for conjunct in conjuncts {
+            let left = node(&conjunct.left.0, conjunct.left.1);
+            let Some(offset) = conjunct.offset else {
+                if let Some((path, bounds)) = &conjunct.right {
+                    node(path, *bounds);
+                }
                 continue;
             };
-            match conjunct.op {
-                BinaryOp::Lt => bounds.1 = bounds.1.min(value - 1),
-                BinaryOp::Le => bounds.1 = bounds.1.min(value),
-                BinaryOp::Eq => bounds = (bounds.0.max(value), bounds.1.min(value)),
-                BinaryOp::Ge => bounds.0 = bounds.0.max(value),
-                BinaryOp::Gt => bounds.0 = bounds.0.max(value + 1),
-                _ => {
-                    excluded.insert(value);
+            let right = match &conjunct.right {
+                Some((path, (low, high))) => {
+                    let right = node(path, (*low, *high));
+                    edges.push((0, right, high - offset));
+                    edges.push((right, 0, offset - low));
+                    right
                 }
+                None => 0,
+            };
+            match conjunct.op {
+                BinaryOp::Lt => edges.push((right, left, offset - 1)),
+                BinaryOp::Le => edges.push((right, left, offset)),
+                BinaryOp::Eq => {
+                    edges.push((right, left, offset));
+                    edges.push((left, right, -offset));
+                }
+                BinaryOp::Ge => edges.push((left, right, -offset)),
+                BinaryOp::Gt => edges.push((left, right, -offset - 1)),
+                _ => excluded.push((left, offset)),
             }
         }
-        let excluded = excluded
-            .iter()
-            .filter(|value| (bounds.0..=bounds.1).contains(*value))
-            .count() as i128;
-        bounds.1 - bounds.0 + 1 > excluded
-    })
+        for (index, (_, (low, high))) in drawn.iter().enumerate() {
+            edges.push((0, index + 1, *high));
+            edges.push((index + 1, 0, -low));
+        }
+        Constraints {
+            drawn,
+            edges,
+            excluded,
+        }
+    }
+
+    /// The shortest distances from node 0 to each node over `edges`, reversed when `inward`;
+    /// none when a negative cycle leaves them unbounded.
+    fn distances(&self, inward: bool) -> Option<Vec<i128>> {
+        let mut distance = vec![i128::MAX / 4; self.drawn.len() + 1];
+        distance[0] = 0;
+        for _ in 0..=self.drawn.len() {
+            let mut settled = true;
+            for (from, to, weight) in &self.edges {
+                let (from, to) = if inward { (*to, *from) } else { (*from, *to) };
+                if distance[from] + weight < distance[to] {
+                    distance[to] = distance[from] + weight;
+                    settled = false;
+                }
+            }
+            if settled {
+                return Some(distance);
+            }
+        }
+        None
+    }
+
+    /// Whether the constraints have a solution: their difference bounds have no negative cycle,
+    /// and each `a != c` leaves `a` a value within its bounds.
+    fn satisfiable(&self) -> bool {
+        let (Some(upper), Some(lower)) = (self.distances(false), self.distances(true)) else {
+            return false;
+        };
+        (1..=self.drawn.len()).all(|node| {
+            let (low, high) = (-lower[node], upper[node]);
+            let excluded: BTreeSet<i128> = self
+                .excluded
+                .iter()
+                .filter(|(excluding, value)| *excluding == node && (low..=high).contains(value))
+                .map(|(_, value)| *value)
+                .collect();
+            high - low + 1 > excluded.len() as i128
+        })
+    }
 }
 
 /// Whether a target's parameter types, its generic parameters fixed, are a test's.
@@ -542,17 +560,46 @@ impl Checker<'_> {
         }
     }
 
-    /// The generator gaps of a property test, reported on its head: a conjunct of its target's
-    /// requires that is not constructive, when the target takes the test's parameter types, and
-    /// constructive conjuncts of its generation no values satisfy.
+    /// The parameters of a property test, whose types must implement `Generate`, and its
+    /// generator gaps, reported on its head.
     pub fn check_property_test(&self, item: ItemId, test: &TestItem, body: &TBody) {
-        if test.params.is_none() {
+        let Some(types) = self.param_types(body).filter(|_| test.params.is_some()) else {
             return;
+        };
+        let generate = self.db.core_item("Generate");
+        let mut generated = true;
+        for (param, ty) in test.params.iter().flatten().zip(&types) {
+            if !generate.is_some_and(|generate| self.implements(ty, generate)) {
+                self.report(item, param.token, Code::TestParameterType);
+                generated = false;
+            }
         }
-        let params: Vec<&Ty> = body.params.iter().map(|id| &body.local(*id).ty).collect();
-        if params.iter().any(|ty| ty.has_error()) {
-            return;
+        if generated && self.property_conjuncts(item, test, body).is_none() {
+            self.report(item, self.db.ast(item).token, Code::TestGeneratorGap);
         }
+    }
+
+    /// The types of a test's parameters, none when one failed.
+    fn param_types(&self, body: &TBody) -> Option<Vec<Ty>> {
+        let params: Vec<Ty> = body
+            .params
+            .iter()
+            .map(|id| body.local(*id).ty.clone())
+            .collect();
+        (!params.iter().any(Ty::has_error)).then_some(params)
+    }
+
+    /// The conjuncts of a property test's generation: those of its target's requires when the
+    /// target takes the test's parameter types, then the constructive conjuncts of the
+    /// predicates of the structs it generates; none for a gap: a conjunct of the requires that
+    /// is not constructive, or conjuncts no values satisfy.
+    fn property_conjuncts(
+        &self,
+        item: ItemId,
+        test: &TestItem,
+        body: &TBody,
+    ) -> Option<Vec<Constructive>> {
+        let params = self.param_types(body)?;
         let mut constructive = Vec::new();
         if let Some(Target::Function(target)) = self.test_target(item, test)
             && let Some(sig) = self.fn_sig(target)
@@ -582,17 +629,11 @@ impl Checker<'_> {
                     .zip(&params)
                     .enumerate()
                     .map(|(index, (param, ty))| {
-                        (param.name.clone(), (format!("#{index}"), (*ty).clone()))
+                        (param.name.clone(), (format!("#{index}"), ty.clone()))
                     })
                     .collect();
                 let mut reader = Reader::new(self, target, values, HashMap::new());
-                match reader.read(&requires) {
-                    Some(conjuncts) => constructive.extend(conjuncts),
-                    None => {
-                        self.report(item, self.db.ast(item).token, Code::TestGeneratorGap);
-                        return;
-                    }
-                }
+                constructive.extend(reader.read(&requires)?);
             }
         }
         for (index, ty) in params.iter().enumerate() {
@@ -603,9 +644,72 @@ impl Checker<'_> {
                 &mut constructive,
             );
         }
-        if !satisfiable(&constructive) {
-            self.report(item, self.db.ast(item).token, Code::TestGeneratorGap);
+        Constraints::of(&constructive)
+            .satisfiable()
+            .then_some(constructive)
+    }
+
+    /// The constraints a property test's generation narrows its draws by at the positions its
+    /// parameters reach through fields, paths starting `#i` for parameter `i`; none when it has a
+    /// gap or a struct it generates does.
+    pub fn generation(&self, item: ItemId) -> Option<Constraints> {
+        let ItemKind::Test(test) = &self.db.ast(item).kind else {
+            return None;
+        };
+        let body = self.typed(item)?;
+        let conjuncts = self.property_conjuncts(item, test, &body)?;
+        let params = self.param_types(&body)?;
+        if params
+            .iter()
+            .any(|ty| self.generates_gap(ty, &mut Vec::new()))
+        {
+            return None;
         }
+        let fixed = |path: &str| !path.contains('<');
+        let fixed: Vec<Constructive> = conjuncts
+            .into_iter()
+            .filter(|conjunct| {
+                fixed(&conjunct.left.0) && conjunct.right.iter().all(|(path, _)| fixed(path))
+            })
+            .collect();
+        Some(Constraints::of(&fixed))
+    }
+
+    /// The constraints of the predicates of a struct type a derived generator builds, paths
+    /// naming its fields; none when no conjunct of them is constructive.
+    pub fn struct_generation(&self, ty: &Ty) -> Option<Constraints> {
+        let Ty::Item(item, _) = ty else {
+            return None;
+        };
+        let conjuncts = self.struct_constraints(*item, ty, "")?;
+        (!conjuncts.is_empty()).then(|| Constraints::of(&conjuncts))
+    }
+
+    /// Whether a struct deriving `Generate` that a value of a type generates, through its fields
+    /// and type arguments, has a generator gap.
+    fn generates_gap(&self, ty: &Ty, open: &mut Vec<ItemId>) -> bool {
+        let Ty::Item(item, args) = ty else {
+            return false;
+        };
+        if open.contains(item) {
+            return false;
+        }
+        open.push(*item);
+        let mut gap = args
+            .iter()
+            .filter_map(Arg::ty)
+            .any(|arg| self.generates_gap(arg, open));
+        let generate = self.db.core_item("Generate");
+        let derived = generate.is_some_and(|generate| self.derives(*item, generate));
+        if derived && let SigKind::Struct { fields } = &self.sig(*item).kind {
+            gap |= self.struct_constraints(*item, ty, "").is_none();
+            gap |= fields.iter().any(|field| {
+                self.field_type(ty, &field.name)
+                    .is_some_and(|field_ty| self.generates_gap(&field_ty, open))
+            });
+        }
+        open.pop();
+        gap
     }
 
     /// The constructive conjuncts of the predicates of the structs a value of a type generates

@@ -5,12 +5,14 @@
 //!
 //! `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability
 //! tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes
-//! trap reports and abandons domains; `settle` settles abandoned domains.
+//! trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the
+//! seeded scheduler of test images.
 
 pub mod holdings;
 pub mod memory;
 pub mod regions;
 pub mod report;
+pub mod seeded;
 pub mod settle;
 pub mod tables;
 pub mod tasks;
@@ -83,6 +85,9 @@ pub enum Routine {
     Preempt,
     /// `(signal, info, context)`: the handler of a fault, which reports a stack overflow.
     Overflow,
+    /// `(signal, info, context)`: the handler of an exceeded processor time limit, which ends a
+    /// test run.
+    CpuLimit,
     /// `() -> Never`: traps with `trap.stack-overflow`, run on a thread's trap stack.
     OverflowRaise,
     /// `(task) -> Never`: stops the running task, which a stop signal interrupted.
@@ -131,6 +136,12 @@ pub enum Routine {
     /// `() -> thread`: the record of the executor thread running the caller, which a call
     /// reads anew after each suspension as a task may resume on another thread.
     Thread,
+    /// `()`: a scheduling point of the running task on the seeded scheduler.
+    Yield,
+    /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
+    Stream,
+    /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
+    Draw,
 }
 
 impl Routine {
@@ -164,6 +175,7 @@ impl Routine {
             Routine::Settle => "_NSsettle_domain",
             Routine::Preempt => "_NStrap_preempt",
             Routine::Overflow => "_NStrap_overflow",
+            Routine::CpuLimit => "_NSreplay_cpu_limit",
             Routine::OverflowRaise => "_NStrap_overflow_raise",
             Routine::Stop => "_NSstack_switch_stop",
             Routine::ReportText => "_NStrap_text",
@@ -184,6 +196,9 @@ impl Routine {
             Routine::Lock => "_NSstack_switch_lock",
             Routine::Unlock => "_NSstack_switch_unlock",
             Routine::Thread => "_NSstack_switch_thread",
+            Routine::Yield => "_NSreplay_yield",
+            Routine::Stream => "_NSreplay_stream",
+            Routine::Draw => "_NSreplay_draw",
         }
     }
 
@@ -227,13 +242,15 @@ impl Routine {
             | Routine::Unlock
             | Routine::Settle
             | Routine::Stop => (&[P], &[]),
-            Routine::Preempt | Routine::Overflow => (&[types::I32, P, P], &[]),
+            Routine::Preempt | Routine::Overflow | Routine::CpuLimit => (&[types::I32, P, P], &[]),
             Routine::OverflowRaise => (&[], &[]),
             Routine::TrapRaise | Routine::ReportText => (&[P, P, P, P], &[]),
             Routine::ReportScalar => (&[P, P, P], &[]),
             Routine::WriteErr => (&[P, P], &[]),
             Routine::Spawn => (&[P, P, P, P, P, P, P, P], &[P]),
-            Routine::Park | Routine::Schedule => (&[], &[]),
+            Routine::Park | Routine::Schedule | Routine::Yield => (&[], &[]),
+            Routine::Stream => (&[P, P, P], &[P]),
+            Routine::Draw => (&[P, P, P, P], &[P]),
             Routine::Origin | Routine::Init | Routine::Thread => (&[], &[P]),
             Routine::IoSubmit => (&[P], &[types::I8, types::I32]),
         }
@@ -292,6 +309,18 @@ pub mod state {
     pub const REGIONS: u64 = 168;
     /// The construct that termination requests cancel, whose region is the entry task.
     pub const ROOT: u64 = 176;
+    /// On the seeded scheduler: the run's seed, the index of the scheduling stream's next
+    /// value, the virtual clock's milliseconds and its first timer, the last order a task or
+    /// timer took, whether a scheduling point found two ready tasks, and the first and last
+    /// of the completions not yet delivered.
+    pub const SEED: u64 = 184;
+    pub const PICKS: u64 = 192;
+    pub const NOW: u64 = 200;
+    pub const TIMERS: u64 = 208;
+    pub const ORDER: u64 = 216;
+    pub const CONTENDED: u64 = 224;
+    pub const COMPLETIONS: u64 = 232;
+    pub const COMPLETIONS_TAIL: u64 = 240;
     pub const SIZE: u64 = 256;
 }
 
@@ -484,12 +513,15 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Stop => tasks::define(lo, fx, routine),
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
+        Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
+        Routine::Draw => super::supplied::generate::define_draw(lo, fx),
         Routine::Init
         | Routine::Exit
         | Routine::Lock
         | Routine::Unlock
         | Routine::Preempt
-        | Routine::Overflow => super::host::define(lo, fx, routine),
+        | Routine::Overflow
+        | Routine::CpuLimit => super::host::define(lo, fx, routine),
     }
 }
 

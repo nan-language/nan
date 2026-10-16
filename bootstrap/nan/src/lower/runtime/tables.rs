@@ -35,7 +35,7 @@ pub mod entry {
 /// The links of a deadline's timer in its clock entry's deadlines and the clock's handle, after
 /// its timeout's time.
 pub mod deadline {
-    use super::super::super::host::operation;
+    use super::super::tasks::operation;
     pub const NEXT: u64 = operation::SIZE + 16;
     pub const PREVIOUS: u64 = operation::SIZE + 24;
     pub const CLOCK: u64 = operation::SIZE + 32;
@@ -241,7 +241,7 @@ fn expire_deadlines(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         fx.repeat(&[first], |fx, state| {
             let timer = state[0];
             let next = fx.load(PTR, timer, deadline::NEXT);
-            let region = fx.load(PTR, timer, super::super::host::operation::TASK);
+            let region = fx.load(PTR, timer, super::tasks::operation::TASK);
             lo.call_routine(fx, Routine::Cancel, &[region]);
             let detached = fx.int(PTR, deadline::DETACHED);
             fx.store(detached, timer, deadline::PREVIOUS);
@@ -451,6 +451,14 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         let at = lo.layouts.field(lo.ck, &world_ty, None, field).offset;
         fx.store(*handle, world, at);
     }
+    grant_memory(lo, fx, world, cell);
+    fx.b.ins().return_(&[]);
+}
+
+/// Writes a `host::World`'s allocator, naming a root cell, and its empty arguments and
+/// environment, which store through it.
+pub fn grant_memory(lo: &mut Lowering, fx: &mut Fx, world: Value, cell: Value) {
+    let world_ty = lo.std_ty("host", "World", Vec::new());
     let alloc = lo.layouts.field(lo.ck, &world_ty, None, "alloc").offset;
     fx.store(cell, world, alloc);
     for field in ["args", "environment"] {
@@ -463,7 +471,16 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         }
         fx.store(cell, world, at + 24);
     }
-    fx.b.ins().return_(&[]);
+}
+
+/// A new live entry of a kind, by handle.
+pub fn mint(lo: &mut Lowering, fx: &mut Fx, kind: Value) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let handle = new_entry(lo, fx, kind);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    handle
 }
 
 impl Lowering<'_, '_> {

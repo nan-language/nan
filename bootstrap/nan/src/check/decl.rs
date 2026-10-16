@@ -380,10 +380,11 @@ impl Checker<'_> {
                     self.report(item, ast.token, Code::TodoDisputed);
                 }
                 self.check_case(item, &test.name, Case::Snake);
+                self.check_test_head(item, test);
                 self.check_test_reach(item, test);
             }
             ItemKind::Retired(_) => self.check_tombstone(item),
-            ItemKind::Impl(_) if self.check_impl(item) => {
+            ItemKind::Impl(_) if !self.check_generate_impl(item) && self.check_impl(item) => {
                 self.check_capability_impl(item);
                 self.check_decoder_impl(item);
                 self.check_component_impl(item);

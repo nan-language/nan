@@ -686,6 +686,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                 }
                 None
             }
+            Op::Dbg(operand) => Some(self.operand(frame, operand, at)?),
             Op::Assume(operand) => {
                 if !self.operand(frame, operand, at)?.bool() {
                     return Err(End::Violation(self.report("assume violation", at)));
@@ -1331,30 +1332,6 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         }
     }
 
-    /// An implementing function's reference with its own generic parameters given the type
-    /// arguments a call through a bound gave the method's.
-    fn with_own_args(&self, implementation: FnRef, own: &[Arg]) -> FnRef {
-        let Callable::Item { item, .. } = implementation.callable else {
-            return implementation;
-        };
-        let mut own = own.iter();
-        let args = self
-            .ck
-            .sig(item)
-            .generics
-            .iter()
-            .zip(implementation.args.iter())
-            .map(|(def, arg)| match def.param.owner == item {
-                true => own.next().cloned().unwrap_or_else(|| arg.clone()),
-                false => arg.clone(),
-            })
-            .collect();
-        FnRef {
-            args,
-            ..implementation
-        }
-    }
-
     fn call_function(
         &mut self,
         fn_ref: &FnRef,
@@ -1398,7 +1375,9 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                     Some(implementation)
                         if !matches!(implementation.callable, Callable::Method { .. }) =>
                     {
-                        let implementation = self.with_own_args(implementation, &fn_ref.args[1..]);
+                        let implementation =
+                            self.ck
+                                .with_call_args(implementation, *interface, &fn_ref.args);
                         self.call_function(&implementation, args, at, site)
                     }
                     _ => native::conformance(self, &self_ty, &name, &fn_ref.args, args, at, site),

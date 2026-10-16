@@ -169,6 +169,15 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         &self.unit.functions[self.function]
     }
 
+    /// Whether the function is the body of a test item, from which failures escape.
+    fn test_body(&self) -> bool {
+        self.function().role == Role::Body
+            && matches!(
+                self.lo.ck.db.ast(self.item).kind,
+                crate::syntax::ast::ItemKind::Test(_)
+            )
+    }
+
     /// Computes the types, slots, wrapped parts and regions of the function, and creates its
     /// blocks.
     fn prepare(&mut self) {
@@ -231,6 +240,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                                     .iter()
                                     .any(|operand| self.operand_is_reference(operand, &wrapped))
                         }
+                        Op::Dbg(Operand::Value(value)) => wrapped[value.0 as usize],
                         _ => false,
                     };
                     if marks && !wrapped[result.0 as usize] {
@@ -403,6 +413,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
             let entry = self.blocks[0];
             self.fx.b.switch_to_block(entry);
             self.fx.b.append_block_params_for_function_params(entry);
+            self.fx.mark_ran();
             self.fx.b.block_params(entry).to_vec()
         };
         let mut incoming = params.into_iter();
@@ -610,6 +621,13 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 None
             }
             Op::Assume(_) => None,
+            Op::Dbg(operand) => {
+                let (held, nty) = self.operand(operand);
+                if self.lo.seeded() {
+                    trap::dbg_line(self, held, &nty);
+                }
+                Some(held)
+            }
             Op::Quantifier {
                 all,
                 low,
@@ -623,6 +641,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 region,
             } => {
                 let result = inst.result;
+                super::runtime::seeded::scheduling_point(self.lo, self.fx);
                 Some(self.when(*attempt, accesses, region, result))
             }
         };
@@ -673,14 +692,23 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 self.fx.b.ins().return_(&[]);
             }
             Terminator::Return(operand) => {
-                let held = operand.as_ref().map(|operand| self.operand(operand));
+                let wraps = self.wraps_result().is_some();
+                let held = operand.as_ref().map(|operand| match wraps {
+                    true => self.operand(operand),
+                    false => self.owned_operand(operand),
+                });
                 self.ret(held);
             }
             Terminator::Fail(operand) => {
                 let (held, nty) = self.operand(operand);
-                let failure = self.failure.expect("a failing function");
                 let ty = nty.ty().clone();
-                self.write_value(failure, held, &ty);
+                match self.test_body() {
+                    true => super::test_image::escape(self.lo, self.fx, held, &ty),
+                    false => {
+                        let failure = self.failure.expect("a failing function");
+                        self.write_value(failure, held, &ty);
+                    }
+                }
                 let failed = self.fx.int(types::I8, 1);
                 let mut returns = vec![failed];
                 if let Returned::Scalar(ty) = self.abi.returned {
@@ -716,7 +744,10 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         let params = &unit.functions[self.function].blocks[jump.block.0 as usize].params;
         let mut args = Vec::new();
         for (param, operand) in params.iter().zip(&jump.args) {
-            let (held, nty) = self.operand(operand);
+            let (held, nty) = match self.is_wrapped(*param) {
+                true => self.operand(operand),
+                false => self.owned_operand(operand),
+            };
             let wanted = self.value_repr(*param);
             args.extend(self.adapt(held, &nty, wanted).values());
         }
@@ -900,7 +931,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         block: BlockId,
         position: usize,
     ) {
-        let (held, nty) = self.operand(operand);
+        let (held, nty) = self.owned_operand(operand);
         let nty = &nty;
         let location = self.locate_place(place);
         if let super::place::Location::Bits { .. } = &location {

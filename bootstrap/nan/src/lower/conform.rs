@@ -27,9 +27,8 @@ impl Lowering<'_, '_> {
     /// The head of a derived method for its owner applied to `args`, and whether it is a
     /// projection.
     pub fn derived_head(&mut self, owner: ItemId, method: &str, args: &Args) -> (FnTy, bool) {
-        let ty = Ty::Item(owner, args.clone());
-        let fn_ty = self.conformance_head(&ty, method, &Args::from(Vec::new()));
-        (fn_ty, false)
+        let (ty, own) = derived_parts(self, owner, args);
+        (self.conformance_head(&ty, method, &own), false)
     }
 
     /// The head of an interface method a type implements through a conformance, with the
@@ -40,8 +39,8 @@ impl Lowering<'_, '_> {
         if !own.is_empty()
             && let SigKind::Interface { methods } = &self.ck.sig(interface).kind
         {
-            let generics = &methods[0].sig.generics;
-            let subst = crate::check::ty::Subst::of(generics.iter().map(|def| def.param), own);
+            let generics = methods[0].sig.generics.iter().map(|def| def.param);
+            let subst = crate::check::ty::Subst::of(generics.filter(|param| !param.is_self()), own);
             fn_ty = subst.fn_ty(&fn_ty);
         }
         fn_ty
@@ -108,6 +107,7 @@ fn method_interface(method: &str) -> &'static str {
         "default" => "Default",
         "render" => "Render",
         "write" => "Encode",
+        "generate" => "Generate",
         other => panic!("the conformance method {other}"),
     }
 }
@@ -121,17 +121,30 @@ pub fn derived(
     method: &str,
     args: &Args,
 ) {
-    let ty = Ty::Item(owner, args.clone());
+    let (ty, _) = derived_parts(lo, owner, args);
     match method {
         "render" => super::supplied::render::define_render(lo, fx, abi, &ty),
+        "generate" => super::supplied::generate::derived(lo, fx, abi, &ty),
         _ => composite(lo, fx, abi, &ty, method),
     }
+}
+
+/// The type a derived method is of and the method's own type arguments, from the arguments of
+/// its instance: its owner's, then its own.
+fn derived_parts(lo: &Lowering, owner: ItemId, args: &Args) -> (Ty, Args) {
+    let count = lo.ck.sig(owner).generics.len().min(args.len());
+    let (type_args, own) = args.split_at(count);
+    (Ty::Item(owner, type_args.into()), own.into())
 }
 
 /// Defines a conformance the toolchain supplies.
 pub fn supplied(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty, method: &str) {
     if method == "render" {
         super::supplied::render::define_render(lo, fx, abi, ty);
+        return;
+    }
+    if method == "generate" {
+        super::supplied::generate::conformance(lo, fx, abi, ty);
         return;
     }
     if let Ty::Scalar(_) | Ty::Unit = ty {

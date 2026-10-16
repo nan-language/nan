@@ -362,6 +362,7 @@ impl Renumber<'_> {
                 open: *open,
             },
             Op::Assume(operand) => Op::Assume(self.operand(operand)),
+            Op::Dbg(operand) => Op::Dbg(self.operand(operand)),
             Op::Quantifier {
                 all,
                 low,

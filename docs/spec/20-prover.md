@@ -15,7 +15,7 @@ The [prover](#procedure) decides each [obligation site](19-nir.md#obligations) s
 The query is the weakest precondition of the obligation over the function's control-flow graph with every back edge removed, a back edge being an edge to a block that dominates its source. Walking the blocks so that each follows its predecessors, the prover gives a term to each value and operand, and to the content of each place at each point:
 
 - A function parameter is a symbol. The place that a `ref` or `ref mut` parameter designates has its own symbol as content at entry. A place within a place whose content is t has the field of t.
-- An operand `read P`, `mut P` or `take P`, and `load P` and `move P`, have the content of P. `constant C` has C's value when C has an integer, `bool` or `char` type.
+- An operand `read P`, `mut P` or `take P`, and `load P` and `move P`, have the content of P. `dbg o` has the term of o. `constant C` has C's value when C has an integer, `bool` or `char` type.
 - An instruction or call of an interpreted form of the [decidable fragment](#decidable-fragment) has that form's term, and any other call the term that [callee knowledge](#callee-knowledge) gives. A `when` is a fresh symbol. Every other instruction with a result is the application of its opcode to its operand terms.
 - `init P, o` and `assign P, o` give P the term of o, and a place containing P its former content with P's field replaced. A guard slot's content is the literal boolean last stored there on the path.
 - A call returning `ref T` or `ref mut T` designates a place whose content is the call's term. `ref P` and `ref mut P` designate P.

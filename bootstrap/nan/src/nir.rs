@@ -427,6 +427,8 @@ pub enum Op {
         accesses: Vec<Operand>,
         region: Region,
     },
+    /// Its operand, once a test run has written the `dbg` line showing it.
+    Dbg(Operand),
 }
 
 #[derive(Clone, Debug, PartialEq)]

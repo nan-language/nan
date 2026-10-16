@@ -8,7 +8,7 @@ use cranelift_codegen::ir::{
 use super::super::Lowering;
 use super::super::body::Held;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::{Routine, state};
+use super::super::runtime::{Routine, seeded, state};
 use super::Supply;
 use crate::check::ty::{Scalar, Ty};
 
@@ -114,7 +114,8 @@ fn pointer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 }
 
 /// The atomic operation `member` on the value of register type `ty` at an address, its
-/// operands from the operation's second parameter on.
+/// operands from the operation's second parameter on; a scheduling point of the seeded
+/// scheduler.
 fn atomic_op(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -124,6 +125,7 @@ fn atomic_op(
     ty: Type,
     element: &Ty,
 ) -> Held {
+    seeded::scheduling_point(lo, fx);
     let flags = MemFlagsData::trusted();
     let operand = |index: usize| supply.param(index).scalar();
     match member {

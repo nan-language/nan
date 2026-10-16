@@ -33,19 +33,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     match routine {
         Routine::WriteErr => {
             let params = fx.entry();
-            let (text, len) = (params[0], params[1]);
-            let two = fx.int(types::I32, 2);
-            fx.repeat(&[text, len], |fx, state| {
-                let (at, left) = (state[0], state[1]);
-                let written = lo.call_libc(fx, "write", &[two, at, left], &[PTR])[0];
-                let progressed = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, written, 0);
-                let next_at = fx.b.ins().iadd(at, written);
-                let next_left = fx.b.ins().isub(left, written);
-                let zero = fx.ptr(0);
-                let next_left = fx.b.ins().select(progressed, next_left, zero);
-                let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next_left, 0);
-                (more, vec![next_at, next_left])
-            });
+            super::super::host::write_all(lo, fx, 2, params[0], params[1]);
             fx.b.ins().return_(&[]);
         }
         Routine::TrapRaise => raise(lo, fx),
@@ -526,16 +514,17 @@ fn location_record(fx: &mut Fx, locations: Value, number: Value) -> Value {
 }
 
 /// `TrapRaise(kind, operands, count, caller)`: writes the report of a trap of the running task,
-/// the location numbered `caller` its first caller line when not 0, and ends the process domain
-/// with status 70.
+/// the location numbered `caller` its first caller line when not 0, and its replay token in a
+/// test image, and ends the process domain with status 70.
 fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (kind, operands, count, caller) = (params[0], params[1], params[2], params[3]);
     let frames = fx.slot(FRAMES * 16, 8);
     let frame_pointer = fx.b.ins().get_frame_pointer(PTR);
     let zero = fx.ptr(0);
-    let walked = fx.repeat(&[frame_pointer, zero, zero], |fx, state| {
-        let (frame, at, beyond) = (state[0], state[1], state[2]);
+    let walked = fx.repeat(&[frame_pointer, zero, zero, zero, zero], |fx, state| {
+        let (frame, at, beyond, beyond_known, any_shown) =
+            (state[0], state[1], state[2], state[3], state[4]);
         let address = fx.load(PTR, frame, 8);
         let (location, hidden) = lookup(lo, fx, address);
         let room =
@@ -554,18 +543,34 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
         let counted = fx.b.ins().band(shown, full);
         let counted = fx.b.ins().uextend(PTR, counted);
         let beyond = fx.b.ins().iadd(beyond, counted);
+        let counted_known = fx.b.ins().band(known, full);
+        let counted_known = fx.b.ins().uextend(PTR, counted_known);
+        let beyond_known = fx.b.ins().iadd(beyond_known, counted_known);
+        let shown_word = fx.b.ins().uextend(PTR, shown);
+        let any_shown = fx.b.ins().bor(any_shown, shown_word);
         let stored = fx.b.ins().uextend(PTR, room);
         let at = fx.b.ins().iadd(at, stored);
         let caller = fx.load(PTR, frame, 0);
         let has_caller = fx.b.ins().icmp_imm_s(IntCC::NotEqual, caller, 0);
         let more = fx.b.ins().band(known, has_caller);
-        (more, vec![caller, at, beyond])
+        (more, vec![caller, at, beyond, beyond_known, any_shown])
     });
-    let (walked, beyond) = (walked[1], walked[2]);
+    let (beyond_shown, beyond_known) = (walked[2], walked[3]);
+    let (walked, any_shown) = (walked[1], walked[4]);
     let frame_at = |fx: &mut Fx, index: Value| {
         let offset = fx.b.ins().imul_imm_s(index, 16);
         fx.b.ins().iadd(frames, offset)
     };
+    let all_std = fx.b.ins().icmp_imm_s(IntCC::Equal, any_shown, 0);
+    let beyond = fx.b.ins().select(all_std, beyond_known, beyond_shown);
+    fx.when(all_std, |fx| {
+        let zero = fx.ptr(0);
+        fx.each(zero, walked, |fx, index| {
+            let slot = frame_at(fx, index);
+            let zero = fx.ptr(0);
+            fx.store(zero, slot, 8);
+        });
+    });
     let first_visible = fx.repeat(&[zero], |fx, state| {
         let index = state[0];
         let slot = frame_at(fx, index);
@@ -673,7 +678,8 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     });
     let callers = fx.b.use_var(callers);
     let written = fx.b.use_var(lines);
-    let left = fx.ptr(LINES);
+    let replayed = lo.seeded();
+    let left = fx.ptr(LINES - u64::from(replayed));
     let left = fx.b.ins().isub(left, written);
     let elided = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, callers, left);
     let fewer = fx.b.ins().iadd_imm_s(left, -1);
@@ -698,6 +704,12 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
         report.decimal(fx, lo, left_out);
         report.text(fx, lo, " more frames\n");
     });
+    if replayed {
+        let (token, len) = super::super::test_image::token(lo, fx);
+        report.text(fx, lo, "    replay ");
+        report.bytes(fx, lo, token, len);
+        report.text(fx, lo, "\n");
+    }
     let task = tasks::current_task(lo, fx);
     let domain = tasks::current_domain(lo, fx);
     let state_address = lo.state(fx);

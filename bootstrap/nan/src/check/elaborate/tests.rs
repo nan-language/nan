@@ -244,6 +244,18 @@ impl crate::nir::Names for UnitNames<'_, '_> {
 }
 
 #[test]
+fn a_temporary_releases_only_what_its_pattern_leaves() {
+    let text = unit_text(
+        "pub fn made(alloc: mem::Alloc) -> Option[mem::Bytes] = Some(mem::Bytes.empty(alloc))\n\npub fn length(alloc: mem::Alloc, wanted: bool) -> usize {\n    var total: usize = 0\n    if wanted {\n        let Some(bytes) = made(alloc) else {\n            return 0\n        }\n        total = bytes.len()\n    }\n    return total\n} length\n",
+        "example::length",
+    );
+    assert_eq!(
+        text,
+        "unit example::length\n\nfn body (read %0: mem::Alloc, read %1: bool) -> usize\n^0:\n    %2 = slot total: usize\n    init %2, 0usize\n    branch %1, ^1, ^3\n^1:\n    %3 = call example::made(%0)\n    %4 = slot Option[mem::Bytes]\n    init %4, %3\n    %5 = is %4, Option.Some\n    branch %5, ^2, ^4\n^2:\n    %6 = slot bytes: mem::Bytes\n    %7 = move %4.Some\n    init %6, %7\n    %8 = call mem::Bytes.len(read %6)\n    assign %2, %8\n    release %6\n    jump ^3\n^3:\n    %9 = load %2\n    return %9\n^4:\n    release %4\n    return 0usize\n"
+    );
+}
+
+#[test]
 fn a_failing_initialiser_releases_only_the_bindings_before_it() {
     let text = unit_text(
         "pub closed enum Fault {\n    Bad\n} Fault\n\npub fn made() -> mem::Bytes fails Fault {\n    fail Fault.Bad\n} made\n\npub fn both() -> usize fails Fault {\n    let one = try made()\n    let two = try made()\n    return one.len() + two.len()\n} both\n",

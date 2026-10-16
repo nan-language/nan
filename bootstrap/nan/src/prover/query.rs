@@ -953,6 +953,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                 );
                 None
             }
+            NirOp::Dbg(operand) => Some(self.operand(operand, contents)),
             NirOp::Assume(operand) => {
                 let fact = self.operand(operand, contents);
                 self.fact(block, position, fact, Origin::Assume);

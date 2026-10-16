@@ -9,7 +9,7 @@ use super::layout::Shape;
 use super::{CALL_CONV, Instance, Lowering};
 use crate::check::ty::{FnTy, Subst, Ty};
 use crate::nir::{NTy, Role};
-use crate::syntax::ast::Mode;
+use crate::syntax::ast::{ItemKind, Mode};
 
 /// How a value is held: a scalar in a register, an address, or nothing for an empty type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +41,8 @@ pub struct Abi {
     /// The failure type, when the function may fail.
     pub fails: Option<Ty>,
     /// Whether the function receives a failure address and returns whether it failed: those
-    /// that may fail, and every function value, whichever its type, as a function that cannot
-    /// fail fits a type that may.
+    /// that may fail, a test's body, from which failures of any type escape, and every function
+    /// value, whichever its type, as a function that cannot fail fits a type that may.
     pub flagged: bool,
 }
 
@@ -189,12 +189,13 @@ impl Lowering<'_, '_> {
                     && self.is_projection(*item, *role, *index);
                 let (result, returned) = self.result_form(&subst.ty(&function.result), projection);
                 let fails = failure(&function.fails.as_ref().map(|ty| subst.ty(ty)));
+                let test = matches!(self.ck.db.ast(*item).kind, ItemKind::Test(_));
                 Abi {
                     env: false,
                     params,
                     result,
                     returned,
-                    flagged: fails.is_some(),
+                    flagged: fails.is_some() || (test && *role == Role::Body),
                     fails,
                 }
             }

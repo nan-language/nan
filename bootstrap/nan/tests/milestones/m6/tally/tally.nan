@@ -1,0 +1,84 @@
+//! A component whose keyed task reads a connection to the listener its Env holds.
+
+/// The key of the task reading the connection.
+const READER: u64 = 1
+
+pub closed struct Env {
+    pub listener: Option[sys::net::Listener]
+} Env
+
+pub closed enum Message {
+    Listen
+    Read(u64)
+} Message
+
+pub closed struct Tally derives Encode {
+    pub bytes: u64
+} Tally
+
+impl Tally: sys::Component[Env, Message]
+
+pub fn Tally.start(mut env: Env) -> Tally = Tally(bytes: 0)
+
+pub fn Tally.on(mut self, take message: Message, mut env: Env, mut cx: sys::Cx[Message]) {
+    match message {
+        Message.Listen => {
+            let Some(listener) = mut env.listener.extract() else {
+                return
+            }
+            mut cx.spawn(key: READER, run: fn[take listener](out: sys::Outbox[Message]) fails task::Cancelled uses wait {
+                let Ok(conn) = attempt await mut listener.accept() else {
+                    return
+                }
+                var reading = conn
+                defer take reading.abandon()
+                var buf = Untrusted.of(Array[u8, 16].filled(0))
+                loop {
+                    let Ok(count) = attempt await mut reading.read(mut buf.view_mut()) else {
+                        return
+                    }
+                    if count == 0 {
+                        return
+                    }
+                    let Ok(_) = attempt await out.post(Message.Read(u64.widen(count))) else {
+                        return
+                    }
+                }
+            })
+        }
+        Message.Read(count) => {
+            self.bytes += count
+        }
+    }
+} Tally.on
+
+/// A failure of a tally: of the network, of posting to the component, or its cancellation.
+pub closed enum TallyError {
+    Net(sys::net::NetError) from
+    Send(task::SendError) from
+    Cancelled(task::Cancelled) from
+} TallyError
+
+/// Runs a tally of the bytes its keyed task reads from a connection to `port`, through which
+/// the runner's body writes `data` before closing it.
+pub fn tally(world: host::World, port: u16, data: Slice[u8]) -> Tally fails TallyError uses wait {
+    let listener = try await world.net.listen(port)
+    let net = world.net
+    let pause = world.clock
+    let env = Env(listener: Some(take listener))
+    return try await host::Runner[Tally].run(take env, exec: world.exec, alloc: world.alloc, body: fn(inbox: sys::Outbox[Message]) fails TallyError uses wait {
+        try await inbox.post(Message.Listen)
+        var conn = try await net.connect("localhost", port)
+        defer take conn.abandon()
+        discard try await mut conn.write(data)
+        undefer conn
+        try await take conn.close()
+        try await pause.sleep(1)
+    })
+} tally
+
+test tally_counts_every_byte_written for tally {
+    let world = testing::world()
+    let counted = try await tally(world, port: 4_400, data: b"twelve bytes")
+    expect counted.bytes == 12
+} tally_counts_every_byte_written

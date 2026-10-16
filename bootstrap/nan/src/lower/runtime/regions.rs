@@ -105,9 +105,7 @@ fn cancel_claimed(lo: &mut Lowering, fx: &mut Fx, record: Value, op: Value, targ
     fx.when(held, |fx| {
         let region = fx.load(PTR, record, task::REGION);
         let reached = within(fx, region, target);
-        fx.when(reached, |fx| {
-            super::super::host::cancel_operation(lo, fx, op)
-        });
+        fx.when(reached, |fx| lo.cancel_operation(fx, op));
         fx.b.ins().atomic_store(MemFlagsData::trusted(), op, word);
     });
 }

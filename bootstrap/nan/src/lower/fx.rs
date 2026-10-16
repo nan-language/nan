@@ -20,6 +20,9 @@ pub struct Fx<'f> {
     pub sites: Vec<(ir::Inst, Site)>,
     /// The addresses of the function's own function-typed parameters, with their positions.
     pub fn_params: HashMap<Value, usize>,
+    /// In a test image, the bytes recording which targets ran and the slot of the target this
+    /// function's calls run, which its entry marks.
+    pub mark: Option<(ir::GlobalValue, u32)>,
 }
 
 /// Flags of an access to memory lowered code owns: aligned and never trapping.
@@ -52,16 +55,28 @@ impl<'f> Fx<'f> {
             b,
             sites: Vec::new(),
             fn_params: HashMap::new(),
+            mark: None,
         }
     }
 
-    /// Starts the function: its entry block holding its parameters, current and sealed.
+    /// Starts the function: its entry block holding its parameters, current and sealed, which
+    /// marks the target the function's calls run.
     pub fn entry(&mut self) -> Vec<Value> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
         self.b.switch_to_block(entry);
         self.b.seal_block(entry);
+        self.mark_ran();
         self.b.block_params(entry).to_vec()
+    }
+
+    /// Marks, at the function's entry, the target its calls run.
+    pub fn mark_ran(&mut self) {
+        if let Some((ran, slot)) = self.mark.take() {
+            let base = self.b.ins().symbol_value(PTR, ran);
+            let one = self.int(types::I8, 1);
+            self.store(one, base, u64::from(slot));
+        }
     }
 
     pub fn int(&mut self, ty: Type, value: i64) -> Value {

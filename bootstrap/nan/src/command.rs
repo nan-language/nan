@@ -142,6 +142,15 @@ impl Name {
         }
     }
 
+    /// The option of its form taking no scope and no other option of its own.
+    fn alone(self) -> Option<&'static str> {
+        match self {
+            Name::Check => Some("--prefix"),
+            Name::Test => Some("--replay"),
+            _ => None,
+        }
+    }
+
     /// Whether its first operand is a scope, which may be omitted.
     fn scoped(self) -> bool {
         !matches!(
@@ -244,10 +253,11 @@ impl Invocation<'_> {
     /// `--skip` unless `skip` keeps it.
     fn command(&self, scope: &str, skip: bool) -> String {
         let mut words = vec![self.name.words().to_owned()];
-        let scopeless = ["--prefix", "--replay"]
-            .iter()
-            .any(|option| self.value(option).is_some());
-        if self.name.scoped() && self.scope().is_none() && !scopeless {
+        let alone = self
+            .name
+            .alone()
+            .is_some_and(|option| self.value(option).is_some());
+        if self.name.scoped() && self.scope().is_none() && !alone {
             words.push(output::argument(scope));
         }
         let mut args = self.args.iter();
@@ -412,7 +422,11 @@ fn read(args: &[String]) -> Option<Invocation<'_>> {
         }
         index += 1;
     }
-    Some(invocation)
+    let alone = name
+        .alone()
+        .is_some_and(|option| invocation.value(option).is_some());
+    let others = invocation.operands.len() + invocation.flags.len() + invocation.values.len();
+    (!alone || others == 1).then_some(invocation)
 }
 
 fn number(arg: &str) -> Option<usize> {

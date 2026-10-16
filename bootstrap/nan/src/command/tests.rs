@@ -83,6 +83,9 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
         "check --skip",
         "test app --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
         "test --affected --replay sc/x86_64-host/app::halves/0/aaaaaaaaaaaaaaa",
+        "check app --prefix app/app.nan",
+        "check --prefix app/app.nan --radius",
+        "check --prefix app/app.nan --agent other",
     ] {
         let run = run_in(&scratch.0, line);
         assert_eq!(run.status, 2, "{line}");

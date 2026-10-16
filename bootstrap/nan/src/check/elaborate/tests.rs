@@ -243,6 +243,20 @@ impl crate::nir::Names for UnitNames<'_, '_> {
     }
 }
 
+const SCALED: &str = "pub interface Scaled[U: Copy] {\n    fn unit(self, base: U) -> u64\n    fn times[T: Copy](self, base: U, tag: T) -> u64 {\n        return self.unit(base)\n    } times\n    fn checked[T: Copy](self, count: u64, tag: T) -> u64\n        requires count > 0\n} Scaled\n\npub closed struct Meter derives Copy {\n    pub size: u64\n} Meter\n\nimpl Meter: Scaled[u8]\n\npub fn Meter.unit(self, base: u8) -> u64 = self.size\n\npub fn Meter.checked[T: Copy](self, count: u64, tag: T) -> u64 = self.size\n\npub fn total(meter: Meter) -> u64 {\n    return meter.times(1, tag: true)\n} total\n\npub fn bounded[S: Scaled[u8]](scaled: S) -> u64 {\n    return scaled.checked(1, tag: 5u16)\n} bounded\n";
+
+#[test]
+fn a_method_call_gives_the_method_its_own_type_arguments() {
+    assert_eq!(
+        unit_text(SCALED, "example::total"),
+        "unit example::total\n\nfn body (read %0: example::Meter) -> u64\n^0:\n    %1 = call example::Scaled default 0[u8, example::Meter, bool](%0, 1u8, true)\n    return %1\n"
+    );
+    assert_eq!(
+        unit_text(SCALED, "example::bounded"),
+        "unit example::bounded\n\nfn body (read %0: ref S) -> u64\n^0:\n    %1 = call example::Scaled requires 0[u8, S, u16](read %0, 1u64, 5u16)\n    check requires, %1\n    %2 = call example::Scaled.checked[S, u8, u16](read %0, 1u64, 5u16)\n    return %2\n"
+    );
+}
+
 #[test]
 fn a_temporary_releases_only_what_its_pattern_leaves() {
     let text = unit_text(

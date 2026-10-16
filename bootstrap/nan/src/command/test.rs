@@ -22,9 +22,6 @@ pub fn run(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let (located, runs) = match invocation.value("--replay") {
-        Some(_) if invocation.scope().is_some() || invocation.flag("--affected") => {
-            return Ok(invocation.tool_error(Code::ToolUsage, "."));
-        }
         Some(text) => {
             let named =
                 Token::read(text).and_then(|token| Some((token.location(workspace)?, token)));

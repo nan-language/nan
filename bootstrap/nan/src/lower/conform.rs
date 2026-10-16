@@ -11,7 +11,6 @@ use super::call::{Invoked, adapt_value};
 use super::fx::{Fx, PTR};
 use super::layout::Shape;
 use crate::check::db::ItemId;
-use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Args, FnTy, Ty};
 use crate::nir::{Callable, FnRef, NTy};
 
@@ -35,15 +34,7 @@ impl Lowering<'_, '_> {
     /// method's own type arguments.
     pub fn conformance_head(&mut self, ty: &Ty, method: &str, own: &Args) -> FnTy {
         let interface = self.core_interface(method_interface(method));
-        let (mut fn_ty, _) = self.method_head(ty, interface, &Args::from(Vec::new()), 0);
-        if !own.is_empty()
-            && let SigKind::Interface { methods } = &self.ck.sig(interface).kind
-        {
-            let generics = methods[0].sig.generics.iter().map(|def| def.param);
-            let subst = crate::check::ty::Subst::of(generics.filter(|param| !param.is_self()), own);
-            fn_ty = subst.fn_ty(&fn_ty);
-        }
-        fn_ty
+        self.method_head(ty, interface, own, 0).0
     }
 
     /// Calls method `method` of a core interface on a value of a concrete type, with `own`

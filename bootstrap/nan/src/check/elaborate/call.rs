@@ -375,21 +375,24 @@ impl Elab<'_, '_> {
                     ..
                 },
                 _,
-            ) => (
-                interface.interface,
-                *method,
-                self.ck
-                    .interface_args(interface.interface, self_ty, &interface.args),
-            ),
+            ) => {
+                let args = self
+                    .ck
+                    .interface_args(interface.interface, self_ty, &interface.args);
+                let own = call.type_args.get(args.len()..).unwrap_or_default();
+                let args = args.iter().chain(own).cloned().collect();
+                (interface.interface, *method, args)
+            }
             (_, Callable::Item { item, .. }) => {
                 let implemented = self.ck.implemented_method(*item)?;
                 let generics = &self.ck.sig(*item).generics;
                 let subst = Subst::of(generics.iter().map(|def| def.param), &callee.args);
-                (
-                    implemented.interface,
-                    implemented.method,
-                    subst.args(&implemented.args),
-                )
+                let own = (generics.iter().zip(callee.args.iter()))
+                    .filter(|(def, _)| def.param.owner == *item)
+                    .map(|(_, arg)| arg.clone());
+                let interface_args = subst.args(&implemented.args);
+                let args = interface_args.iter().cloned().chain(own).collect();
+                (implemented.interface, implemented.method, args)
             }
             _ => return None,
         };

@@ -273,7 +273,7 @@ impl Lowering<'_, '_> {
 
     /// The substitution an item's generic parameters receive from an instance's arguments.
     pub fn subst(&self, item: crate::check::db::ItemId, args: &[crate::check::ty::Arg]) -> Subst {
-        Subst::of(self.ck.sig(item).generics.iter().map(|def| def.param), args)
+        self.ck.unit_subst(item, args)
     }
 
     /// Whether a function of an item's unit returns as a projection does.

@@ -161,13 +161,12 @@ impl<'w, 'a> Walk<'w, 'a> {
         params: Vec<TermId>,
         entry: Vec<(TermId, Origin)>,
     ) -> Walk<'w, 'a> {
-        let generics = ck.sig(unit.item).generics.clone();
         let blocks = unit.functions[function].blocks.len();
         let mut walk = Walk {
             ck,
             holder,
             terms,
-            subst: Subst::of(generics.iter().map(|def| def.param), type_args),
+            subst: ck.unit_subst(unit.item, type_args),
             entry: Vec::new(),
             values: vec![None; unit.functions[function].types.len()],
             referents: HashMap::new(),

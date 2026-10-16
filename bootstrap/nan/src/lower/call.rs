@@ -697,8 +697,8 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The head of an interface method with `Self` and the interface's arguments given, and
-    /// whether it is a projection.
+    /// The head of an interface method with `Self`, then the interface's arguments and any of
+    /// the method's own given, and whether it is a projection.
     pub fn method_head(
         &mut self,
         self_ty: &Ty,
@@ -711,7 +711,11 @@ impl Lowering<'_, '_> {
             panic!("a method of no interface");
         };
         let method = &methods[method as usize];
-        let mut subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
+        let params = (sig.generics.iter())
+            .filter(|def| !def.param.is_self())
+            .chain(method.sig.own_generics())
+            .map(|def| def.param);
+        let mut subst = Subst::of(params, args);
         subst.insert(
             crate::check::ty::Param {
                 owner: interface,
@@ -722,6 +726,8 @@ impl Lowering<'_, '_> {
         (subst.fn_ty(&method.sig.fn_ty()), method.sig.is_proj())
     }
 
+    /// The head of an interface's default body numbered `index`, given the interface's
+    /// arguments, `Self`, then the method's own.
     fn default_head(&mut self, interface: ItemId, index: u32, args: &Args) -> (FnTy, bool) {
         let sig = self.ck.sig(interface);
         let SigKind::Interface { methods } = &sig.kind else {
@@ -734,12 +740,18 @@ impl Lowering<'_, '_> {
             .nth(index as usize)
             .map(|(position, _)| position)
             .expect("a defaulted method");
+        let count = (sig.generics.iter())
+            .filter(|def| !def.param.is_self())
+            .count();
         let self_ty = args
-            .first()
+            .get(count)
             .and_then(Arg::ty)
             .cloned()
             .expect("a Self type");
-        let rest: Args = args[1..].iter().cloned().collect();
+        let rest: Args = (args.iter().enumerate())
+            .filter(|(at, _)| *at != count)
+            .map(|(_, arg)| arg.clone())
+            .collect();
         self.method_head(&self_ty, interface, &rest, position as u32)
     }
 

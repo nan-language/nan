@@ -302,11 +302,10 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         }
         let boundary = self.ck.is_boundary(item);
         for (param, arg) in function.params.iter().zip(args) {
-            let ty = Subst::of(
-                self.ck.sig(item).generics.iter().map(|def| def.param),
-                type_args,
-            )
-            .ty(function.ty(param.value).ty());
+            let ty = self
+                .ck
+                .unit_subst(item, type_args)
+                .ty(function.ty(param.value).ty());
             let value = self.deref(arg);
             if !self.predicates_hold(item, boundary, &value, &ty) {
                 return false;
@@ -343,11 +342,7 @@ impl<'c, 'a> Interpreter<'c, 'a> {
                     _ => arg.clone(),
                 })
                 .collect();
-            let type_args = Subst::of(
-                self.ck.sig(item).generics.iter().map(|def| def.param),
-                type_args,
-            )
-            .args(&requires.args);
+            let type_args = self.ck.unit_subst(item, type_args).args(&requires.args);
             if !self.holds(holder, Role::Requires, index, passed, &type_args) {
                 return false;
             }
@@ -432,11 +427,10 @@ impl<'c, 'a> Interpreter<'c, 'a> {
         type_args: &[Arg],
     ) -> Exec<Flow> {
         let item = unit.item;
-        let generics = self.ck.sig(item).generics.clone();
         let mut frame = Frame {
             function,
             values: vec![None; unit.functions[function].types.len()],
-            subst: Subst::of(generics.iter().map(|def| def.param), type_args),
+            subst: self.ck.unit_subst(item, type_args),
             slots: Vec::new(),
             unit: unit.clone(),
         };

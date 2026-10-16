@@ -19,7 +19,7 @@ use super::db::{ItemId, TypeKey};
 use super::props::Property;
 use super::sig::{FnSig, SigKind};
 use super::tir::{ClauseRole, LocalId, LocalKind, TBody, TClosure, TExpr, TKind, TStmtKind};
-use super::ty::{Arg, Args, Const, Param as GenericParam, Scalar, Ty};
+use super::ty::{Arg, Args, Const, Param as GenericParam, Scalar, Subst, Ty};
 use crate::nir::{
     Callable, ClosureHead, FnRef, Function, NTy, Op, Operand, Param, Place, Role, Span, Unit, Value,
 };
@@ -608,8 +608,11 @@ impl Checker<'_> {
                     .collect();
                 return Some(FnRef::item(function, args));
             }
-            let args = std::iter::once(Arg::Ty(ty.clone()))
-                .chain(bound.args.iter().map(|arg| subst.arg(arg)))
+            let args = bound
+                .args
+                .iter()
+                .map(|arg| subst.arg(arg))
+                .chain(std::iter::once(Arg::Ty(ty.clone())))
                 .collect();
             return Some(FnRef {
                 callable: Callable::Item {
@@ -643,8 +646,8 @@ impl Checker<'_> {
 
     /// The implementation of a method for a call giving the method `args`: those of `Self` and
     /// the interface, then the method's own. An implementing function receives the own ones for
-    /// its own generic parameters, a derived method after its owner's, and a call through a bound
-    /// or a supplied conformance all of them.
+    /// its own generic parameters, a derived method or default body after the others, and a call
+    /// through a bound or a supplied conformance all of them.
     pub fn with_call_args(&self, implementation: FnRef, interface: ItemId, args: &[Arg]) -> FnRef {
         let interface_args = (self.sig(interface).generics.iter())
             .filter(|def| !def.param.is_self())
@@ -652,7 +655,11 @@ impl Checker<'_> {
         let own = args.get(1 + interface_args..).unwrap_or_default();
         let args: Args = match implementation.callable {
             Callable::Method { .. } => args.into(),
-            Callable::Derived { .. } => implementation.args.iter().chain(own).cloned().collect(),
+            Callable::Derived { .. }
+            | Callable::Item {
+                role: Role::Default,
+                ..
+            } => implementation.args.iter().chain(own).cloned().collect(),
             Callable::Item {
                 item,
                 role: Role::Body,
@@ -675,6 +682,24 @@ impl Checker<'_> {
             args,
             ..implementation
         }
+    }
+
+    /// The substitution of the generic parameters of an item's unit from the type arguments of a
+    /// reference to one of its functions, in the item's order. A reference into an interface's
+    /// unit then gives the referenced method's own, which stand for the own parameters of every
+    /// method by position, as each function of the unit belongs to one method.
+    pub fn unit_subst(&self, item: ItemId, args: &[Arg]) -> Subst {
+        let sig = self.sig(item);
+        let mut subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
+        if let SigKind::Interface { methods } = &sig.kind {
+            let own = args.get(sig.generics.len()..).unwrap_or_default();
+            for method in methods {
+                for (def, arg) in method.sig.own_generics().iter().zip(own) {
+                    subst.insert(def.param, arg.clone());
+                }
+            }
+        }
+        subst
     }
 
     /// Whether a function is a foreign fn.

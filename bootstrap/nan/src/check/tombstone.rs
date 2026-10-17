@@ -11,10 +11,8 @@ use super::resolve::Named;
 use super::sig::SigKind;
 use super::tir::{Callee, TExpr, TKind};
 use super::ty::Ty;
-use crate::cache::Cache;
 use crate::diagnostic::Code;
 use crate::release;
-use crate::store::Store;
 use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredItem, RetiredNew, Visibility};
 
 impl Checker<'_> {
@@ -143,20 +141,9 @@ impl Checker<'_> {
         let Some((owner, member)) = form.rsplit_once('.') else {
             return true;
         };
-        let members = exported
+        !exported
             .get(owner)
-            .map(|entry| &entry.text[1..])
-            .unwrap_or_default();
-        !members.iter().any(|line| {
-            let line = line.trim();
-            let line = line.strip_prefix("pub ").unwrap_or(line);
-            let line = line.strip_prefix("fn ").unwrap_or(line);
-            let name = line
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or_default();
-            name == member
-        })
+            .is_some_and(|entry| entry.declares(member))
     }
 
     /// The exported items of the release a package's history head names, from the local store.
@@ -165,11 +152,9 @@ impl Checker<'_> {
             return known.clone();
         }
         let head = self.db.package(package).source.machine.history()?.head?;
-        let exported = Cache::open()
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|cache| Store::new(cache.store()).entries().ok()?.ok())
-            .and_then(|entries| entries.into_iter().find(|entry| entry.root() == head))
+        let exported = self
+            .store_entries()
+            .and_then(|entries| entries.iter().find(|entry| entry.root() == head))
             .map(|entry| Rc::new(release::exported(&entry.artefact)));
         self.head_exports
             .borrow_mut()
@@ -504,7 +489,7 @@ impl Checker<'_> {
 
 /// What an expression's outermost call or path names: the function it calls, the interface of
 /// the method it calls, the type it constructs, or the item it names.
-fn replacement(expr: &TExpr) -> Option<ItemId> {
+pub(super) fn replacement(expr: &TExpr) -> Option<ItemId> {
     match &expr.kind {
         TKind::Call(call) => match &call.callee {
             Callee::Function { item } => Some(*item),

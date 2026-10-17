@@ -77,6 +77,7 @@ pub fn judged(workspace: &Workspace, packages: &[usize]) -> io::Result<(Vec<Diag
                         Ok(ran) => {
                             report.tests += ran.tests;
                             report.failures.extend(ran.failures);
+                            diagnostics.extend(ran.diagnostics);
                         }
                         Err(exposed) => diagnostics.push(Diagnostic {
                             path: Some(exposed.0),

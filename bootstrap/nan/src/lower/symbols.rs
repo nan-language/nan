@@ -3,6 +3,7 @@
 //! role and the instantiation key; generated glue is named apart under `_NX`.
 
 use super::{Instance, Lowering};
+use crate::check::Checker;
 use crate::check::db::ItemId;
 use crate::check::ty::{Arg, Args, Const, FnTy, Ty};
 use crate::hash::{Hash, checksummed_base32};
@@ -23,6 +24,27 @@ pub fn name(lo: &mut Lowering, instance: &Instance) -> String {
             format!("_NX{}_{}", glue_word(other), lo.glue)
         }
     }
+}
+
+/// An instance as a diagnostic names it: its item's canonical path with its generic arguments,
+/// then the role and index of a NIR function other than a body.
+pub fn entity(ck: &Checker, instance: &Instance) -> String {
+    let (item, role, index, args) = match instance {
+        Instance::Nir {
+            item,
+            role,
+            index,
+            args,
+        } => (*item, *role, *index, args),
+        Instance::Supplied { item, args } => (*item, Role::Body, 0, args),
+        other => return glue_word(other).to_owned(),
+    };
+    let module = ck.db.module_of(item);
+    let mut text = format!("{}{}", ck.db.canonical(item), ck.show_args(args, module));
+    if role != Role::Body {
+        text.push_str(&format!(" {} {index}", role_word(role)));
+    }
+    text
 }
 
 fn glue_word(instance: &Instance) -> &'static str {

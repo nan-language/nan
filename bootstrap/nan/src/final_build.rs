@@ -2,16 +2,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::artefact;
 use crate::check;
 use crate::check::db::PackageId;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, Reason};
 use crate::encoding::{bytes, list};
 use crate::hash::checksummed_base32;
 use crate::lower;
-use crate::workspace::{Member, Target, Workspace};
+use crate::workspace::{Member, Package, Target, Workspace};
 
 /// The platform package of `x86_64-host` and its entry landing fn.
 const PLATFORM: &str = "host_platform";
@@ -23,8 +23,14 @@ pub struct Build {
     pub image: Option<String>,
 }
 
-/// Performs the final build of the program at index `program` of the workspace.
-pub fn build(workspace: &Workspace, program: usize) -> io::Result<Build> {
+/// Performs the final build of the program at index `program` of the workspace, comparing its
+/// code roots with those of the image at the path `compared` gives, written as it gives, when
+/// given.
+pub fn build(
+    workspace: &Workspace,
+    program: usize,
+    compared: Option<(&Path, &str)>,
+) -> io::Result<Build> {
     let source = &workspace.packages[program];
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
@@ -68,6 +74,15 @@ pub fn build(workspace: &Workspace, program: usize) -> io::Result<Build> {
         .and_then(|package| checker.db.lookup(package.root?, LANDING))
         .expect("the host platform's entry landing fn");
     let artefacts = artefacts(workspace, &checker, root);
+    if let Some((image, written)) = compared {
+        diagnostics.extend(crate::stage::compare(&checker, &artefacts, image, written));
+        if errors(&diagnostics) {
+            return Ok(Build {
+                diagnostics,
+                image: None,
+            });
+        }
+    }
     let lowered = lower::lower(
         &checker,
         &lower::Program {
@@ -78,6 +93,7 @@ pub fn build(workspace: &Workspace, program: usize) -> io::Result<Build> {
             section: section(&artefacts),
         },
     );
+    diagnostics.extend(collisions(source, &lowered));
     diagnostics.extend(lower::stack::judge(
         &checker,
         &lowered.frames,
@@ -109,6 +125,23 @@ pub fn build(workspace: &Workspace, program: usize) -> io::Result<Build> {
         diagnostics,
         image: Some(image),
     })
+}
+
+/// The symbol collisions of a lowering for the image of a final-link root or tested package,
+/// each reported on its `package` line, quoting both entities.
+pub fn collisions(package: &Package, lowered: &lower::Lowered) -> Vec<Diagnostic> {
+    let line = package
+        .manifest
+        .as_ref()
+        .map_or(1, |manifest| manifest.line);
+    lowered
+        .collisions
+        .iter()
+        .map(|(first, second)| Diagnostic {
+            because: vec![Reason::note(first), Reason::note(second)],
+            ..Diagnostic::at(Code::ArtefactSymbolCollision, &package.files[0].path, line)
+        })
+        .collect()
 }
 
 fn errors(diagnostics: &[Diagnostic]) -> bool {

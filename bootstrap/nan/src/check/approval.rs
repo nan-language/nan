@@ -60,7 +60,7 @@ impl Checker<'_> {
 
     /// What a final-link root's final closure needs its lock to approve; nothing for a package
     /// that is no program.
-    pub fn needed(&self, workspace: &Workspace, root: PackageId) -> Needed {
+    pub fn needed(&self, root: PackageId) -> Needed {
         let mut needed = Needed {
             pairs: BTreeSet::new(),
             epochs: BTreeSet::new(),
@@ -85,7 +85,7 @@ impl Checker<'_> {
                 needed.pairs.insert((data.name.clone(), entry));
             }
             if let Some(Member::Release(index)) = data.member
-                && let Some(summary) = &workspace.releases[index].entry.summary
+                && let Some(summary) = &self.db.workspace.releases[index].entry.summary
             {
                 for (path, _, epoch) in &summary.items {
                     if *epoch > 0 {
@@ -99,14 +99,14 @@ impl Checker<'_> {
 
     /// The rules of a final-link root's approvals: each needed pair of its closure summary and
     /// each needed epoch pair its lock does not approve, listed on its `package` line.
-    pub fn check_approvals(&self, workspace: &Workspace, root: PackageId) {
+    pub fn check_approvals(&self, root: PackageId) {
         let data = self.db.package(root);
         let (Some(lock), Some(manifest)) =
             (data.source.machine.lock(), data.source.manifest.as_ref())
         else {
             return;
         };
-        let needed = self.needed(workspace, root);
+        let needed = self.needed(root);
         let path = format!("{}/package.nan", data.source.dir);
         let unapproved: Vec<String> = needed
             .pairs
@@ -164,7 +164,7 @@ pub fn approvals(
         else {
             continue;
         };
-        let needed = checker.needed(workspace, root);
+        let needed = checker.needed(root);
         pairs.extend(needed.pairs);
         epochs.extend(needed.epochs);
     }

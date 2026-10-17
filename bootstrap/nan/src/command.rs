@@ -164,8 +164,8 @@ impl Name {
             | Name::EditRename
             | Name::EditMove
             | Name::Primer
-            | Name::Build
             | Name::Run => (&[], &[]),
+            Name::Build => (&[], &["--compare-with"]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
             Name::Show => (&["--api"], &[]),
             Name::Find => (&["--contributors"], &[]),

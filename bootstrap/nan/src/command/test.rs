@@ -71,6 +71,13 @@ pub fn run(
             }
         }
     }
+    errors += report.diagnostics.len();
+    records.extend(
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| record(workspace, &scope, diagnostic)),
+    );
     records.extend(fail_records(workspace, &scope, &report));
     Ok(output(
         invocation,

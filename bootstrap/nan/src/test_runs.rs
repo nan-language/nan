@@ -12,6 +12,7 @@ use std::{fs, io};
 use crate::cache::{Cache, Exposed};
 use crate::check::db::{ItemId, PackageId};
 use crate::check::{self, Checker, testing};
+use crate::diagnostic::Diagnostic;
 use crate::encoding::{bytes, uvar};
 use crate::hash::{Hash, blake3, checksummed_base32, read_checksummed_base32};
 use crate::lower::test_image::{self, Target as Targeted};
@@ -42,11 +43,13 @@ pub struct Failure {
     pub lines: Vec<String>,
 }
 
-/// What the runs of a scope's tests found: how many tests ran on a run target, and the failures.
+/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, and
+/// what building their test images reports.
 #[derive(Default)]
 pub struct Report {
     pub tests: usize,
     pub failures: Vec<Failure>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// A test selected to run: its item, its target and whether it is a property test.
@@ -125,10 +128,7 @@ pub fn run(
     runs: &Runs,
     cache: &Cache,
 ) -> io::Result<Result<Report, Exposed>> {
-    let mut report = Report {
-        tests: 0,
-        failures: Vec::new(),
-    };
+    let mut report = Report::default();
     if !workspace.files().any(|(_, file)| {
         file.lowered()
             .iter()
@@ -373,7 +373,13 @@ fn run_host(
     if tests.is_empty() {
         return Ok(());
     }
-    let image = build(checker, workspace, package, tests)?;
+    let image = match build(checker, workspace, package, tests)? {
+        Ok(image) => image,
+        Err(collisions) => {
+            report.diagnostics.extend(collisions);
+            return Ok(());
+        }
+    };
     for (number, test) in tests.iter().enumerate() {
         let path = checker.db.canonical(test.item);
         let indexed: Vec<(u64, u64)> = match runs {
@@ -427,13 +433,14 @@ fn run_host(
     fs::remove_file(&image)
 }
 
-/// Lowers and links the test image of a package's tests, under `.nan/tests/`.
+/// Lowers and links the test image of a package's tests, under `.nan/tests/`; or the symbol
+/// collisions of its lowering.
 fn build(
     checker: &Checker,
     workspace: &Workspace,
     package: PackageId,
     tests: &[Selected],
-) -> io::Result<std::path::PathBuf> {
+) -> io::Result<Result<std::path::PathBuf, Vec<Diagnostic>>> {
     let lowered = test_image::lower(
         checker,
         &test_image::Tests {
@@ -450,14 +457,18 @@ fn build(
             )),
         },
     );
-    let name = &checker.db.package(package).name;
+    let data = checker.db.package(package);
+    let collisions = crate::final_build::collisions(data.source, &lowered);
+    if !collisions.is_empty() {
+        return Ok(Err(collisions));
+    }
     let image = workspace
         .root
         .join(".nan/tests")
         .join(Target::Host.name())
-        .join(name);
+        .join(&data.name);
     crate::final_build::link(&lowered.object, &image).map_err(io::Error::other)?;
-    Ok(image)
+    Ok(Ok(image))
 }
 
 /// The seed of a run: the first 8 bytes, little-endian, of the BLAKE3-256 hash of the test's

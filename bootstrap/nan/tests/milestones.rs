@@ -1,11 +1,11 @@
 //! The milestone harness: in a copy of each scenario workspace of `tests/milestones`, runs the
 //! commands its milestone states, then `nan verify`, which must accept the workspace after
 //! running its tests; for M2, the obligation outcomes are also compared with the proof cache's.
+//! Its runs of `nan` use the harnesses' home directory and a local store of their own, which each
+//! scenario starts empty.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::UNIX_EPOCH;
 
 /// Copies a directory tree into another, made anew.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -28,21 +28,26 @@ fn copied(milestone: &str) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/milestones")
         .join(milestone);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("milestones")
-        .join(milestone);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let root = tmp.join("milestones").join(milestone);
     copy_tree(&source, &root).expect("a copy of the scenario");
+    let store = tmp.join("stores").join(milestone);
+    match fs::remove_dir_all(&store) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            panic!("the scenario's local store not emptied: {error}")
+        }
+        _ => {}
+    }
+    fs::create_dir_all(tmp.join("home")).expect("the harnesses' home directory");
+    fs::create_dir_all(tmp.join("stores")).expect("the directory of local stores");
+    nan::use_home(tmp.join("home"), Some(store));
     root
 }
 
 /// Runs `nan` in a directory and gives its output, asserting that its verdict is `ok`.
 fn ok(dir: &Path, args: &[&str]) -> String {
-    let run = Command::new(env!("CARGO_BIN_EXE_nan"))
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("a run of nan");
-    let output = String::from_utf8_lossy(&run.stdout).into_owned();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let output = nan::run(&args, dir).output;
     assert!(
         output.starts_with("ok "),
         "nan {} reports\n{output}",
@@ -92,21 +97,15 @@ fn published(output: &str) -> String {
 #[test]
 fn m3() {
     let root = copied("m3");
-    // The store name is this build's own, so that no release another build published under it
-    // competes in resolution.
-    let built = fs::metadata(env!("CARGO_BIN_EXE_nan"))
-        .and_then(|metadata| metadata.modified())
-        .expect("the binary's modification time");
-    let built = built.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let name = format!("nan-milestones/m3/gauge-{:x}", built.as_nanos());
-    let manifest = root.join("panel/package.nan");
-    let text = fs::read_to_string(&manifest).expect("the panel manifest");
-    let text = text.replace("\"nan-milestones/m3/gauge\"", &format!("\"{name}\""));
-    fs::write(&manifest, text).expect("the panel manifest written");
-
     let first = published(&ok(
         &root,
-        &["publish", "--local", "gauge", "--name", &name],
+        &[
+            "publish",
+            "--local",
+            "gauge",
+            "--name",
+            "nan-milestones/m3/gauge",
+        ],
     ));
     let source = root.join("gauge/gauge.nan");
     let text = fs::read_to_string(&source).expect("the gauge source");

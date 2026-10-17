@@ -55,8 +55,9 @@ impl Elab<'_, '_> {
         }
         match self.held.get(&local) {
             Some(Held::Value(value) | Held::Slot(value)) => Ok(Place::of(*value)),
-            None => Err(Fault::Unsupported(format!(
-                "the binding {} has no value in {:?}",
+            Some(Held::Place(place)) => Ok(place.clone()),
+            Some(Held::Literal(_)) | None => Err(Fault::Unsupported(format!(
+                "the binding {} has no place in {:?}",
                 self.body.local(local).name,
                 self.role
             ))),
@@ -167,7 +168,10 @@ impl Elab<'_, '_> {
                     ));
                 }
             },
-            TKind::Local(local) => Out::Place(self.local_place(*local)?),
+            TKind::Local(local) => match self.held.get(local) {
+                Some(Held::Literal(literal)) => Out::Operand(Operand::Literal(literal.clone())),
+                _ => Out::Place(self.local_place(*local)?),
+            },
             TKind::Value(item) => {
                 let value = self.emit_value(
                     Op::Constant(Constant::Item(*item)),
@@ -814,6 +818,10 @@ impl Elab<'_, '_> {
         let span = Self::spanning(expr);
         let mut operands = Vec::new();
         for capture in super::closure_captures(closure) {
+            if let Some(Held::Literal(literal)) = self.held.get(&capture.outer) {
+                operands.push(Operand::Literal(literal.clone()));
+                continue;
+            }
             let ty = self.body.local(capture.outer).ty.clone();
             let place = self.local_place(capture.outer)?;
             let operand = match capture.mode {
@@ -829,7 +837,7 @@ impl Elab<'_, '_> {
         self.closure_predicate_checks(closure, span)?;
         let value = self.emit_value(
             Op::Closure {
-                index: closure.index - 1,
+                index: self.closure_base + closure.index - 1,
                 captures: operands,
             },
             NTy::Owned(expr.ty.clone()),

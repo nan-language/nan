@@ -248,6 +248,29 @@ pub fn is_idle(counter: Counter) -> bool {
 } is_idle
 ```
 
+```nan
+pub closed struct Step {
+    pub by: u64
+} Step
+
+pub closed struct Counter {
+    pub hits: u64
+} Counter
+
+pub fn Counter.add(mut self, step: Step) {
+    self.hits = self.hits.saturating_add(step.by)
+} Counter.add
+
+retired Counter.add(mut self, step: u32) => mut self.add(Step(by: u64.widen(step))) preserves
+
+retired Counter.add(mut self, step: u16) => mut self.add(Step(by: u64.widen(step))) preserves
+
+pub fn tally(mut counter: Counter) {
+    mut counter.add(Step(by: 5))
+    mut counter.add(1) // error: retired.ambiguous-use
+} tally
+```
+
 ### History
 
 The **history** of a package is its [machine file](35-format.md#machine-files) `.nan/history.nan`, recording its store name, its [history head](#publishing) and every tombstone [publishing](#publishing) moved out of source; tombstones keeping an `Encode` [key](13-text-encode.md#keys) stay in source while their type derives `Encode`. A release's [code root](30-artefacts.md#code-roots) holds the history's tombstones, never its history head or store name. History tombstones forward, match and take old forms exactly as tombstones in source do.

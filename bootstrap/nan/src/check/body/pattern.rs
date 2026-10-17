@@ -3,7 +3,7 @@
 
 use super::Body;
 use crate::check::Member;
-use crate::check::db::ItemId;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::resolve::Named;
 use crate::check::sig::{Payload, SigKind, VariantSig};
 use crate::check::tir::{
@@ -253,7 +253,7 @@ impl Body<'_, '_> {
             self.report(token, Code::PatternPathKind);
             return None;
         }
-        let named = match self.ck.db.resolve(self.module, path) {
+        let named = match self.ck.resolve_use(self.item, self.module, path) {
             Ok(named) => named,
             Err(error) => {
                 self.report_path(error);
@@ -333,7 +333,7 @@ impl Body<'_, '_> {
                 kind: TPatternKind::Fields(None, Vec::new()),
             };
         }
-        let named = match self.ck.db.resolve(self.module, path) {
+        let named = match self.ck.resolve_use(self.item, self.module, path) {
             Ok(named) => named,
             Err(error) => {
                 self.report_path(error);
@@ -363,22 +363,33 @@ impl Body<'_, '_> {
                     return failed(self, fields);
                 }
                 match &self.ck.sig(item).kind {
-                    SigKind::Enum { variants } => match variants
-                        .iter()
-                        .position(|variant| variant.name == member.text)
-                    {
-                        Some(variant) => {
-                            self.name_member(
-                                member.token,
-                                Member::Variant(item, member.text.clone()),
-                            );
-                            (item, Some(variant))
-                        }
-                        None => {
+                    SigKind::Enum { variants } => {
+                        let position =
+                            |name: &str| variants.iter().position(|variant| variant.name == name);
+                        let renaming = match position(&member.text) {
+                            Some(_) => None,
+                            None => self.ck.member_renaming(
+                                TypeKey::Item(item),
+                                &member.text,
+                                self.module,
+                            ),
+                        };
+                        let member = match renaming {
+                            Some(tombstone) => {
+                                match self.ck.forward_member(self.item, member, tombstone) {
+                                    Some(renamed) => renamed,
+                                    None => return failed(self, fields),
+                                }
+                            }
+                            None => member.clone(),
+                        };
+                        let Some(variant) = position(&member.text) else {
                             self.report(member.token, Code::NameUnknown);
                             return failed(self, fields);
-                        }
-                    },
+                        };
+                        self.name_member(member.token, Member::Variant(item, member.text.clone()));
+                        (item, Some(variant))
+                    }
                     SigKind::Layout { tags, .. }
                         if tags.contains(&member.text) && fields.is_none() =>
                     {
@@ -496,9 +507,8 @@ impl Body<'_, '_> {
                     complete = false;
                     continue;
                 };
-                let Some((name, field_ty)) = declared.iter().find(|(name, _)| *name == label.text)
-                else {
-                    self.report(label.token, Code::NameUnknown);
+                let owner = variant.is_none().then_some(item);
+                let Some((name, field_ty)) = self.labelled_field(owner, label, &declared) else {
                     self.pattern(&field.pattern, &Ty::Error, kind);
                     complete = false;
                     continue;

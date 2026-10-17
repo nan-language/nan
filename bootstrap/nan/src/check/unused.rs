@@ -33,6 +33,7 @@ const READING: [&str; 5] = ["Eq", "Ord", "Hash", "Render", "Encode"];
 
 /// A `let` or `var` statement binding one name without `else`: its first token, its
 /// initializer's first and last tokens, and whether the initializer has type `Unit` or `Never`.
+#[derive(Clone)]
 pub struct Binding {
     pub statement: Tok,
     pub value: (Tok, Tok),
@@ -43,7 +44,7 @@ pub struct Binding {
 /// binding one name, the bindings expressions use and those statements assign, by the binding
 /// outside closures, the `var` bindings of parts, assigning which writes the part, and the
 /// bindings of the later alternatives of an arm by those of its first that they stand for.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Usage {
     pub bindings: HashMap<LocalId, Binding>,
     pub used: HashSet<LocalId>,

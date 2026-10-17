@@ -6,8 +6,12 @@ use super::*;
 pub(crate) struct Scratch(pub PathBuf);
 
 impl Scratch {
+    /// A directory holding `files`; the process's runs use a home directory of their own.
     pub(crate) fn new(files: &[(&str, &str)]) -> Scratch {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let home = std::env::temp_dir().join("nan-test-home");
+        fs::create_dir_all(&home).expect("create the home directory");
+        crate::cache::use_home(home, None);
         let name = format!(
             "nan-test-{}-{}",
             std::process::id(),

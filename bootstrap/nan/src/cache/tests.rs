@@ -8,6 +8,7 @@ fn a_record_reads_back_until_damaged_or_exposed() {
     let scratch = Scratch::new(&[("cache/other", "")]);
     let cache = Cache {
         dir: Some(scratch.0.join("cache")),
+        store: None,
         home: scratch.0.clone(),
         uid: running_user().expect("a user id"),
     };

@@ -192,14 +192,16 @@ pub fn run(
             &unpreserved,
         ));
     }
+    let compatible = check::compatible(&moved_workspace, index, &parent_exported, &exported);
     let classes = release::classes(
         &parent_exported,
         &exported,
         &epochs,
         &release::forwards(&built.artefact),
+        &compatible,
     );
     let class = release::release_class(&classes, parent.is_some());
-    let encode = encode_class(&parent_exported, &exported, parent.is_some());
+    let encode = check::encode_class(&moved_workspace, index, parent);
     let (functions, authority) = check::publish_summaries(&moved_workspace, closure, moved_package);
     let summary = Summary {
         class,
@@ -290,39 +292,6 @@ fn canonical(workspace: &Workspace, named: &str) -> String {
             .map_or_else(|| named.to_owned(), |item| item.canonical()),
         _ => named.to_owned(),
     }
-}
-
-/// The encode class of a release: identical when no exported type deriving `Encode` changes its
-/// interface, additive when such types are only added, breaking otherwise.
-fn encode_class(
-    parent: &BTreeMap<String, crate::machine::api::Entry>,
-    release: &BTreeMap<String, crate::machine::api::Entry>,
-    parented: bool,
-) -> Class {
-    if !parented {
-        return Class::Additive;
-    }
-    let encodes = |entry: &crate::machine::api::Entry| {
-        entry
-            .text
-            .first()
-            .is_some_and(|head| head.contains("derives") && head.contains("Encode"))
-    };
-    let mut class = Class::Identical;
-    for (path, entry) in release.iter().filter(|(_, entry)| encodes(entry)) {
-        class = class.max(match parent.get(path).filter(|old| encodes(old)) {
-            None => Class::Additive,
-            Some(old) if old.interface == entry.interface => Class::Identical,
-            Some(_) => Class::Breaking,
-        });
-    }
-    if parent
-        .iter()
-        .any(|(path, entry)| encodes(entry) && !release.get(path).is_some_and(encodes))
-    {
-        class = Class::Breaking;
-    }
-    class
 }
 
 /// The tombstones publishing moves out of a package's source: its source files without them, by
@@ -429,3 +398,6 @@ fn output(
         records,
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -144,7 +144,7 @@ Elaboration producing NIR that is not well formed is an internal error ([diagnos
 A **span** is the source range a part of a unit comes from: its file path prefixed by its package's name, its first line, the byte offset in that line of its first character, its last line and the byte offset in that line after its last character. Every function, function parameter, instruction and terminator has one; those of function parameters and slots carry their names.
 
 - A function, and its entry code, has its item's, clause's, line's or closure's span; other code that of the construct it elaborates, and exit code that of the statement making the exit or of the last line of the block it ends.
-- A copied deferred call has its `defer`'s span, derived code its `derives` entry's, and a requires, ensures or invariant check, with the call computing its condition, its clause's or line's, or the call's for a std callee.
+- A copied deferred call has its `defer`'s span, the code of a forwarded use, the functions of its rewrite's closures included, the use's, derived code its `derives` entry's, and a requires, ensures or invariant check, with the call computing its condition, its clause's or line's, or the call's for a std callee.
 - Trap reports and diagnostics use a span's first line.
 
 ## Elaboration

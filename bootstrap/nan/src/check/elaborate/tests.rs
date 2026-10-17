@@ -280,3 +280,12 @@ fn a_failing_initialiser_releases_only_the_bindings_before_it() {
         "unit example::both\n\nfn body () -> usize fails example::Fault\n^0:\n    %0 = slot one: mem::Bytes\n    call example::made() ok ^1 fail ^4\n^1(%1: mem::Bytes):\n    init %0, %1\n    %2 = slot two: mem::Bytes\n    call example::made() ok ^2 fail ^3\n^2(%3: mem::Bytes):\n    init %2, %3\n    %4 = call mem::Bytes.len(read %0)\n    %5 = call mem::Bytes.len(read %2)\n    %6 = add %4, %5\n    release %2\n    release %0\n    return %6\n^3(%7: example::Fault):\n    release %0\n    fail %7\n^4(%8: example::Fault):\n    fail %8\n"
     );
 }
+
+#[test]
+fn a_forwarded_call_elaborates_as_its_rewrite_over_its_arguments() {
+    let source = "pub closed struct Counter {\n    pub hits: u64\n} Counter\n\npub fn Counter.add(mut self, step: u64) {\n    self.hits = self.hits.saturating_add(step)\n} Counter.add\n\nretired Counter.bump(mut self, step: u32) => mut self.add(u64.widen(step)) preserves\n\npub fn tally(mut counter: Counter, step: u32) {\n    mut counter.bump(step)\n} tally\n";
+    assert_eq!(
+        unit_text(source, "example::tally"),
+        "unit example::tally\n\nfn body (mut %0: ref mut example::Counter, read %1: u32)\n^0:\n    %2 = call u64.widen(%1)\n    call example::Counter.add(mut %0, %2)\n    return\n"
+    );
+}

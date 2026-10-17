@@ -32,7 +32,7 @@ target/debug/nan test
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 
-The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, except stage comparison (`nan build --compare-with`). Machine targets are not implemented yet.
+The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`. Machine targets are not implemented yet.
 
 ## Commands
 

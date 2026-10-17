@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use super::entail::{self, Weakened};
 use super::snapshot::Items;
 use super::spec::keeps;
 use super::{Checker, package_checkers};
@@ -291,45 +292,79 @@ impl<'w> History<'w> {
                 .filter(|commit| self.parents.contains_key(commit))
                 .map(Change::Commit),
         );
-        let mut found = Vec::new();
+        let accepted_at = |change: &Change, path: &str| {
+            self.recorded(change)
+                .entries
+                .get(path)
+                .map(|entry| entry.accepted.clone())
+                .unwrap_or_default()
+        };
+        let mut judged: Vec<(Change, String, Accepted, Vec<Accepted>)> = Vec::new();
         for path in items.by_path.keys() {
             for change in &changes {
-                let Some(accepted) = self
-                    .recorded(change)
-                    .entries
-                    .get(path)
-                    .map(|entry| entry.accepted.clone())
-                    .filter(|accepted| !accepted.is_empty())
-                else {
-                    continue;
-                };
+                let accepted = accepted_at(change, path);
                 let parents = self.parents(change);
-                let kept = parents.is_empty()
-                    || parents.iter().any(|parent| {
-                        let before = self
-                            .recorded(parent)
-                            .entries
-                            .get(path)
-                            .map(|entry| entry.accepted.clone())
-                            .unwrap_or_default();
-                        keeps(&accepted, &before)
-                    });
-                if kept || self.accepted_by_seal(change, name, path, &accepted) {
-                    continue;
+                let earlier: Vec<Accepted> = parents
+                    .iter()
+                    .map(|parent| accepted_at(parent, path))
+                    .collect();
+                let kept = accepted.is_empty()
+                    || parents.is_empty()
+                    || earlier.iter().any(|before| keeps(&accepted, before));
+                if !kept {
+                    judged.push((change.clone(), path.clone(), accepted, earlier));
                 }
-                let Some((file, line)) = location(items, package, path) else {
-                    continue;
-                };
-                let named = match change {
-                    Change::Uncommitted => "uncommitted".to_owned(),
-                    Change::Commit(name) => name.clone(),
-                };
-                found.push(Diagnostic {
-                    because: vec![Reason::note(&format!("change {named}"))],
-                    item: Some(path.clone()),
-                    ..Diagnostic::at(Code::ApiWeakeningPending, &file, line)
-                });
             }
+        }
+        let weakened: Vec<Weakened> = judged
+            .iter()
+            .flat_map(|(_, path, accepted, earlier)| {
+                let first = items.first(path);
+                earlier.iter().filter_map(move |before| {
+                    let first = first?;
+                    Some(Weakened {
+                        ck: first.ck,
+                        item: first.item,
+                        accepted: before.clone(),
+                        later: Some(accepted.clone()),
+                    })
+                })
+            })
+            .collect();
+        let index = self
+            .current
+            .packages
+            .iter()
+            .position(|held| std::ptr::eq(held, package));
+        let mut left = match index {
+            Some(index) if !weakened.is_empty() => entail::left(self.current, index, &weakened),
+            _ => Vec::new(),
+        }
+        .into_iter();
+        let mut found = Vec::new();
+        for (change, path, accepted, earlier) in judged {
+            let entailed = match items.first(&path) {
+                Some(_) => {
+                    let left: Vec<Vec<String>> = left.by_ref().take(earlier.len()).collect();
+                    left.iter().any(Vec::is_empty)
+                }
+                None => false,
+            };
+            if entailed || self.accepted_by_seal(&change, name, &path, &accepted) {
+                continue;
+            }
+            let Some((file, line)) = location(items, package, &path) else {
+                continue;
+            };
+            let named = match &change {
+                Change::Uncommitted => "uncommitted".to_owned(),
+                Change::Commit(name) => name.clone(),
+            };
+            found.push(Diagnostic {
+                because: vec![Reason::note(&format!("change {named}"))],
+                item: Some(path.clone()),
+                ..Diagnostic::at(Code::ApiWeakeningPending, &file, line)
+            });
         }
         found
     }

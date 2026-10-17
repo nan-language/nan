@@ -1,6 +1,6 @@
 # 0028. The author rule reads git
 
-Status: accepted
+Status: superseded by 0032
 
 ## Context
 

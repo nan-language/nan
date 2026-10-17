@@ -1,9 +1,10 @@
 //! The conformance harness: runs each `nan` example of a specification chapter against its marker
-//! comments after locking and snapshotting each of its packages, `nan verify` included for a gate
-//! code, compares a host example's obligation outcomes with the proof cache's, builds its
-//! `x86_64-host` programs and compares what one writes with the text its section gives, runs the
-//! commands of the `text` blocks of its section, and finds each item of its `nan-api` blocks in
-//! the std sources, one test per chapter.
+//! comments after locking, snapshotting and publishing each of its packages into a local store
+//! holding nothing else, `nan verify` included for a gate code, compares a host example's
+//! obligation outcomes with the proof cache's, builds its `x86_64-host` programs and compares what
+//! one writes with the text its section gives, runs the commands of the `text` blocks of its
+//! section, and finds each item of its `nan-api` blocks in the std sources, one test per chapter,
+//! whose runs of `nan` use the harnesses' home directory and a local store of their own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,7 +130,7 @@ impl Example {
         })
     }
 
-    /// The package directories of the block, each after the packages its path sources name.
+    /// The package directories of the block, each after the packages its sources name.
     fn packages(&self) -> Vec<String> {
         let mut deps: Vec<(String, Vec<String>)> = Vec::new();
         if self.prepended {
@@ -141,9 +142,10 @@ impl Example {
             };
             let named = lines
                 .iter()
-                .filter_map(|line| {
-                    let source = line.trim().strip_prefix("dep ")?.split_once(" \"../")?.1;
-                    Some(source.split('"').next()?.to_owned())
+                .filter_map(|line| source(line))
+                .map(|source| match source.strip_prefix("../") {
+                    Some(dir) => dir.to_owned(),
+                    None => named_package(&source).to_owned(),
                 })
                 .collect();
             deps.push((package.to_owned(), named));
@@ -168,6 +170,21 @@ impl Example {
             }
         }
         ordered
+    }
+
+    /// The store names that the `dep` directives of the block write for a package directory,
+    /// in byte order.
+    fn store_names(&self, package: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .files
+            .iter()
+            .filter(|(path, _)| path.ends_with("/package.nan"))
+            .flat_map(|(_, lines)| lines.iter().filter_map(|line| source(line)))
+            .filter(|source| !source.starts_with('.') && named_package(source) == package)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Writes the files into `dir`, without their marker comments when `unmarked`; the marked
@@ -307,15 +324,29 @@ fn examples(text: &str) -> Vec<Example> {
     examples
 }
 
+/// The source of a `dep` directive's line.
+fn source(line: &str) -> Option<String> {
+    let source = line.trim().strip_prefix("dep ")?.split_once(" \"")?.1;
+    Some(source.split('"').next()?.to_owned())
+}
+
+/// The package directory a store name names: its last segment.
+fn named_package(store_name: &str) -> &str {
+    store_name.rsplit('/').next().unwrap_or(store_name)
+}
+
 /// Runs `nan` with `args` at `dir`, returning its output and exit status.
 fn nan(dir: &Path, args: &[&str]) -> Result<(String, Option<i32>), String> {
-    let output = Command::new(env!("CARGO_BIN_EXE_nan"))
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|error| error.to_string())?;
-    let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-    Ok((stdout, output.status.code()))
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let run = nan::run(&args, dir);
+    match run.launch {
+        Some(launch) => Err(format!(
+            "nan {} launches {}",
+            args.join(" "),
+            launch.image.display()
+        )),
+        None => Ok((run.output, Some(run.status))),
+    }
 }
 
 /// The class word, code and location of each diagnostic record of an output.
@@ -364,6 +395,9 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
     for package in example.packages() {
         for command in [&["dep", "sync"][..], &["api", "update"]] {
             nan(&dir.join(&package), command)?;
+        }
+        for name in example.store_names(&package) {
+            nan(dir, &["publish", "--local", &package, "--name", &name])?;
         }
     }
     let (output, code) = nan(dir, &["check"])?;
@@ -665,14 +699,21 @@ fn api_failures(text: &str) -> std::io::Result<Vec<String>> {
 
 fn chapter(path: &Utf8Path, text: String) -> datatest_stable::Result<()> {
     let chapter = path.file_stem().expect("a chapter file");
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("conformance")
-        .join(chapter);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let root = tmp.join("conformance").join(chapter);
+    let store = tmp.join("stores").join(chapter);
+    fs::create_dir_all(tmp.join("home"))?;
+    fs::create_dir_all(tmp.join("stores"))?;
+    nan::use_home(tmp.join("home"), Some(store.clone()));
     let mut failures: Vec<String> = api_failures(&text)?
         .into_iter()
         .map(|failure| format!("{path}:{failure}"))
         .collect();
     for example in examples(&text) {
+        match fs::remove_dir_all(&store) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
         let dir = root.join(example.line.to_string());
         match run(&example, &dir) {
             Ok(()) => fs::remove_dir_all(&dir)?,

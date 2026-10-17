@@ -60,9 +60,10 @@ const SYNONYMS: [(&str, &[&str]); 41] = [
 const LISTED: usize = 5;
 
 impl Checker<'_> {
-    /// Reports an unknown name written over the tokens `(first, last)` of an item: the
-    /// candidates near it among `candidates` listed as notes and offered as exact fixes, or, when
-    /// none is near, `stub` inserted after the item.
+    /// Reports an unknown name written over the tokens `(first, last)` of an item: a path that a
+    /// newer release of its alias's source names as such, otherwise with the candidates near it
+    /// among `candidates` listed as notes and offered as exact fixes, or, when none is near,
+    /// `stub` inserted after the item.
     pub fn report_unknown(
         &self,
         item: ItemId,
@@ -70,7 +71,11 @@ impl Checker<'_> {
         candidates: Vec<String>,
         stub: Option<String>,
     ) {
-        let near = near(&self.written(item, first, last), candidates);
+        let written = self.written(item, first, last);
+        if self.report_newer_release(item, (first, last), &written) {
+            return;
+        }
+        let near = near(&written, candidates);
         let because = near
             .iter()
             .map(|candidate| Reason {

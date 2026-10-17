@@ -3,7 +3,7 @@
 //! releases it locks to the local store. `nan upgrade` also forwards the package's uses of
 //! retired forms.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
 use crate::cache::{Cache, Exposed};
@@ -415,9 +415,12 @@ impl Resolver<'_> {
             let scope = Scope::Package(self.package);
             let changed = self.changed(&lock);
             match test_runs::run(&workspace, &scope, &Runs::Reaching(changed), self.cache)? {
-                Ok(report) => failures.extend(report.failures.iter().map(|failure| {
-                    Diagnostic::at(Code::DepUnresolved, &failure.path, failure.line)
-                })),
+                Ok(report) => {
+                    failures.extend(report.failures.iter().map(|failure| {
+                        Diagnostic::at(Code::DepUnresolved, &failure.path, failure.line)
+                    }));
+                    failures.extend(report.diagnostics);
+                }
                 Err(exposed) => failures.push(Diagnostic {
                     path: Some(exposed.0),
                     ..Diagnostic::new(Code::BuildCacheExposed)
@@ -560,13 +563,20 @@ impl Resolver<'_> {
             .into_iter()
             .filter(|name| old.get(name) != new.get(name))
             .map(|name| {
-                let artefact = |root: Option<&Hash>| {
+                let entry = |root: Option<&Hash>| {
                     root.and_then(|root| self.entries.iter().find(|entry| entry.root() == *root))
-                        .map(|entry| (entry.artefact.clone(), entry.summary.clone()))
                 };
+                let artefact = |root: Option<&Hash>| {
+                    entry(root).map(|entry| (entry.artefact.clone(), entry.summary.clone()))
+                };
+                let published = entry(new.get(name))
+                    .filter(|entry| entry.parent.as_ref() == old.get(name))
+                    .and_then(|entry| entry.summary.as_ref())
+                    .map(|summary| summary.class);
                 let (parent, release) = (artefact(old.get(name)), artefact(new.get(name)));
-                let class = match (&parent, &release) {
-                    (Some((parent, old_summary)), Some((release, new_summary))) => {
+                let class = match (published, &parent, &release) {
+                    (Some(class), _, _) => class,
+                    (None, Some((parent, old_summary)), Some((release, new_summary))) => {
                         let epochs = |path: &str| {
                             (
                                 release::epoch(old_summary.as_ref(), path),
@@ -578,6 +588,7 @@ impl Resolver<'_> {
                             &release::exported(release),
                             &epochs,
                             &release::forwards(release),
+                            &BTreeSet::new(),
                         );
                         release::release_class(&classes, true)
                     }

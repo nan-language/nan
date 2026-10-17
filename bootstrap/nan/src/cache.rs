@@ -6,13 +6,27 @@ use std::fs::{self, DirBuilder, Metadata, OpenOptions};
 use std::io::{self, ErrorKind, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::hash::{Hash, blake3};
 
-/// The build cache of the running user; without a directory when the user database gives the
-/// user no home directory, so that no record is found and none is kept.
+/// The home directory this process uses in place of the one the user database gives, and the
+/// directory of its local store in place of the user directory's `store`, once a harness gives
+/// them.
+static HOME: OnceLock<(PathBuf, Option<PathBuf>)> = OnceLock::new();
+
+/// Makes this process use `home` as the running user's home directory and, when given, `store`
+/// as the directory of its local store, unless an earlier call gave them.
+pub fn use_home(home: PathBuf, store: Option<PathBuf>) {
+    let _ = HOME.set((home, store));
+}
+
+/// The build cache of the running user, with the directory of its local store; without a
+/// directory when the user database gives the user no home directory, so that no record is found
+/// and none is kept.
 pub struct Cache {
     dir: Option<PathBuf>,
+    store: Option<PathBuf>,
     home: PathBuf,
     uid: u32,
 }
@@ -47,16 +61,22 @@ impl Cache {
     /// and creating each that is missing.
     pub fn open() -> io::Result<Result<Cache, Exposed>> {
         let uid = running_user()?;
-        let Some(home) = home(uid)? else {
+        let (home, store) = match HOME.get() {
+            Some((home, store)) => (Some(home.clone()), store.clone()),
+            None => (home(uid)?, None),
+        };
+        let Some(home) = home else {
             return Ok(Ok(Cache {
                 dir: None,
+                store: None,
                 home: PathBuf::new(),
                 uid,
             }));
         };
         let user = home.join(".nan");
+        let store = store.unwrap_or_else(|| user.join("store"));
         let mut missing = Vec::new();
-        for dir in [user.clone(), user.join("cache"), user.join("store")] {
+        for dir in [user.clone(), user.join("cache"), store.clone()] {
             match fs::symlink_metadata(&dir) {
                 Ok(metadata) if exposed(&metadata, uid) => {
                     return Ok(Err(Exposed(shown(&home, &dir))));
@@ -67,10 +87,19 @@ impl Cache {
             }
         }
         for dir in missing {
-            DirBuilder::new().mode(0o700).create(dir)?;
+            match DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if exposed(&fs::symlink_metadata(&dir)?, uid) {
+                        return Ok(Err(Exposed(shown(&home, &dir))));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(Ok(Cache {
             dir: Some(user.join("cache")),
+            store: Some(store),
             home,
             uid,
         }))
@@ -79,11 +108,7 @@ impl Cache {
     /// The local store of the user directory.
     pub fn store(&self) -> StoreDir {
         StoreDir {
-            dir: self
-                .dir
-                .as_ref()
-                .and_then(|cache| cache.parent())
-                .map(|user| user.join("store")),
+            dir: self.store.clone(),
             home: self.home.clone(),
             uid: self.uid,
         }

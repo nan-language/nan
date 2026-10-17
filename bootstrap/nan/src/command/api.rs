@@ -134,3 +134,6 @@ pub fn update(
         records,
     })
 }
+
+#[cfg(test)]
+mod tests;

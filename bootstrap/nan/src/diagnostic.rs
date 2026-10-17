@@ -522,6 +522,8 @@ impl Code {
 /// The role of a reason in a because-chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
+    /// Its line declares the subject the reported construct is checked against.
+    Declared,
     /// Its line binds or creates the subject.
     Bound,
     /// Its line starts a hold freezing the subject.
@@ -547,6 +549,7 @@ pub enum Role {
 impl Role {
     pub fn word(self) -> &'static str {
         match self {
+            Role::Declared => "declared",
             Role::Bound => "bound",
             Role::Frozen => "frozen",
             Role::Held => "held",

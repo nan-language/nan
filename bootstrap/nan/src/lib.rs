@@ -22,6 +22,7 @@ mod prover;
 mod release;
 mod resolution;
 mod scope;
+mod stage;
 mod stdlib;
 mod store;
 mod syntax;
@@ -30,6 +31,7 @@ mod toolchain;
 mod vcs;
 mod workspace;
 
+pub use cache::use_home;
 pub use command::{Launch, Run, run};
 pub use diagnostic::Code;
 

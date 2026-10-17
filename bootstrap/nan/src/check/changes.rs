@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::db::ItemId;
+use super::entail::{self, Weakened};
 use super::{Checker, checked_closures};
 use crate::diagnostic::{Code, Diagnostic, Reason};
 use crate::hash::Hash;
@@ -279,9 +280,9 @@ fn rewritten(form: &str, renames: &BTreeMap<String, String>) -> String {
 
 /// The items changed between two states of a workspace, with `file` only those of that file,
 /// in byte order of canonical path.
-pub fn changes(old: &Workspace, new: &Workspace, file: Option<&str>) -> Vec<Change> {
+pub fn changes(old: &Workspace, new_workspace: &Workspace, file: Option<&str>) -> Vec<Change> {
     let before = State::of(old, file);
-    let after = State::of(new, file);
+    let after = State::of(new_workspace, file);
     let renames: BTreeMap<String, String> = after
         .renames
         .iter()
@@ -338,7 +339,22 @@ pub fn changes(old: &Workspace, new: &Workspace, file: Option<&str>) -> Vec<Chan
                     continue;
                 }
                 let checker = &after.checkers[index];
-                let weakening = !checker.weakened(item, &old.spec, &new.spec).is_empty();
+                let source = checker.db.package(checker.db.package_of(item)).source;
+                let package = new_workspace
+                    .packages
+                    .iter()
+                    .position(|package| std::ptr::eq(package, source));
+                let weakened = Weakened {
+                    ck: checker,
+                    item,
+                    accepted: old.spec.clone(),
+                    later: None,
+                };
+                let weakening = package.is_some_and(|package| {
+                    !entail::left(new_workspace, package, &[weakened])
+                        .remove(0)
+                        .is_empty()
+                });
                 let widening = new.summary.iter().any(|entry| !old.summary.contains(entry));
                 Change {
                     path,

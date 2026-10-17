@@ -393,7 +393,7 @@ impl Elab<'_, '_> {
                 span,
                 args,
                 steps,
-            } => match self.finish_call(call, None, args, &call.head.result, span)? {
+            } => match self.finish_call(call, None, args, &call.head.result, span, None)? {
                 Out::Place(mut place) => {
                     place.steps.extend(steps);
                     Ok(Some(place))
@@ -808,23 +808,28 @@ impl Elab<'_, '_> {
 
     /// A failure converted into the function's failure type when its type differs.
     pub fn converted(&mut self, failure: Operand, ty: &Ty, token: Tok) -> Elaborated<Operand> {
-        let Some(target) = self.failure_ty.clone() else {
-            return Ok(failure);
-        };
-        if *ty == target {
-            return Ok(failure);
+        Ok(match self.failure_ty.clone() {
+            Some(target) => self.converted_to(failure, ty, &target, Self::span(token)),
+            None => failure,
+        })
+    }
+
+    /// A failure of type `from` converted into `to`.
+    pub fn converted_to(&mut self, failure: Operand, from: &Ty, to: &Ty, span: Span) -> Operand {
+        if from == to {
+            return failure;
         }
-        let via = self.ck.conversion_variant(ty, &target);
+        let via = self.ck.conversion_variant(from, to);
         let value = self.emit_value(
             Op::Convert {
                 value: failure,
-                to: target.clone(),
+                to: to.clone(),
                 via,
             },
-            NTy::Owned(target),
-            Self::span(token),
+            NTy::Owned(to.clone()),
+            span,
         );
-        Ok(Operand::Value(value))
+        Operand::Value(value)
     }
 
     /// The failure exit: deferred calls and releases of every scope, the exit's predicate

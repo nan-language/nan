@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::db::{ItemId, PackageId};
 use super::requires::Entry as Required;
 use super::sig::SigKind;
-use super::snapshot::{Items, snapshots};
+use super::snapshot::Items;
 use super::{Checker, check_targets, unchecked};
 use crate::artefact::{self, AttestedSeal, Parts};
 use crate::cache::Cache;
@@ -112,7 +112,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
             let checker = unchecked(workspace, closure, std, target);
             checker.db.record();
             if let Some(id) = checker.package_named(&name) {
-                checker.check_whole(workspace, id);
+                checker.check_whole(id);
             }
             (target, checker)
         })
@@ -120,7 +120,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
     let views: Vec<(Target, &Checker)> =
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let items = Items::of(&views, &name);
-    let computed = snapshots(&items, package, &[]);
+    let computed = super::computed_snapshots(workspace, package, &items, &[]);
     let interface: Vec<(String, String)> = computed
         .modules
         .iter()
@@ -320,11 +320,11 @@ pub fn package_files(package: &Package) -> Vec<(String, Vec<u8>)> {
 
 impl Checker<'_> {
     /// Checks a package of the checker's closure, quiet or not, and the rules relating its items.
-    pub(super) fn check_whole(&self, workspace: &Workspace, package: PackageId) {
+    pub(super) fn check_whole(&self, package: PackageId) {
         self.package.set(Some(package));
         self.check_package(package);
         self.fix_misnamed();
-        self.reject_items(workspace);
+        self.reject_items();
         for &module in &self.db.package(package).modules {
             for &item in &self.db.module(module).items {
                 self.check_elaborated(item);

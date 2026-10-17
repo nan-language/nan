@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, TypeKey};
-use super::resolve::Named;
+use super::resolve::{Named, PathError};
 use super::ty::{Arg, Args, Bound, Const, FnParam, FnTy, LimitSet, Param, Scalar, Ty};
 use crate::diagnostic::Code;
 use crate::interp::Val;
@@ -28,6 +28,9 @@ pub struct Problems {
     pub found: Vec<Problem>,
     pub mismatches: Vec<(Tok, String, String)>,
     pub instantiations: Vec<(Ty, Tok)>,
+    /// The paths naming nothing that match the old form of a tombstone without an old head, by
+    /// their first and last tokens, with the tombstone.
+    pub renamed: Vec<((Tok, Tok), ItemId)>,
 }
 
 impl Problems {
@@ -797,6 +800,30 @@ impl Checker<'_> {
         defs.split_off(start)
     }
 
+    /// What a path written in `module` names, forwarding a path that names nothing through a
+    /// tombstone without an old head, which `problems` records.
+    fn resolve_forwarded(
+        &self,
+        module: ModuleId,
+        path: &ast::Path,
+        problems: &mut Problems,
+    ) -> Result<Named, PathError> {
+        match self.db.resolve(module, path) {
+            Err(error) if error.code == Some(Code::NameUnknown) => {
+                let Some(tombstone) = self.renamed_path(module, path) else {
+                    return Err(error);
+                };
+                let last = path.segments[path.segments.len() - 1].token;
+                problems.renamed.push(((path.token(), last), tombstone));
+                self.forwarding(tombstone).ok_or(PathError {
+                    code: None,
+                    token: error.token,
+                })
+            }
+            resolved => resolved,
+        }
+    }
+
     /// The interface a bound names, with its arguments.
     pub fn bound(
         &self,
@@ -805,7 +832,7 @@ impl Checker<'_> {
         problems: &mut Problems,
     ) -> Option<Bound> {
         let token = bound.path.token();
-        let named = match self.db.resolve(ctx.module, &bound.path) {
+        let named = match self.resolve_forwarded(ctx.module, &bound.path, problems) {
             Ok(named) => named,
             Err(error) => {
                 if let Some(code) = error.code {
@@ -960,7 +987,7 @@ impl Checker<'_> {
             }
             return Const::Param(def.param);
         }
-        match self.db.resolve(ctx.module, path) {
+        match self.resolve_forwarded(ctx.module, path, problems) {
             Ok(Named::Item(item)) if matches!(self.db.ast(item).kind, ItemKind::Const(_)) => {
                 if let SigKind::Const { ty: written } = &self.sig(item).kind
                     && *written != Ty::Scalar(scalar)
@@ -1025,7 +1052,7 @@ impl Checker<'_> {
                         return Ty::Param(def.param);
                     }
                 }
-                let named = match self.db.resolve(ctx.module, path) {
+                let named = match self.resolve_forwarded(ctx.module, path, problems) {
                     Ok(named) => named,
                     Err(error) => {
                         if let Some(code) = error.code {

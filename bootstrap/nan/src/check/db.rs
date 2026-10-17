@@ -89,6 +89,7 @@ impl ItemData<'_> {
 }
 
 pub struct Db<'a> {
+    pub workspace: &'a Workspace,
     pub target: Target,
     pub packages: Vec<PackageData<'a>>,
     pub modules: Vec<ModuleData<'a>>,
@@ -139,6 +140,7 @@ impl<'a> Db<'a> {
         target: Target,
     ) -> Db<'a> {
         let mut db = Db {
+            workspace,
             target,
             packages: Vec::new(),
             modules: Vec::new(),
@@ -529,8 +531,13 @@ impl<'a> Db<'a> {
         }
     }
 
-    /// The canonical path of a named item.
+    /// The canonical path of a named item, or of a tombstone's old form.
     pub fn canonical(&self, item: ItemId) -> String {
+        if let ast::ItemKind::Retired(retired) = &self.ast(item).kind {
+            return self
+                .old_form(self.items[item.0 as usize].module, retired)
+                .unwrap_or_default();
+        }
         let name = self.declaration(item).name().unwrap_or_default();
         match self.owners.get(&item) {
             Some(key) => {

@@ -35,9 +35,8 @@ pub enum Fault {
 pub type Elaborated<T> = Result<T, Fault>;
 
 impl Checker<'_> {
-    /// The NIR unit of an item the checker accepts, a tombstone's holding its forwarding function;
-    /// none for a rejected item, a package, a tombstone without one, or an item whose elaboration
-    /// faulted, which reports an internal error.
+    /// The NIR unit of an item the checker accepts; none for a rejected item, a package, a
+    /// tombstone, or an item whose elaboration faulted, which reports an internal error.
     pub fn unit(&self, item: ItemId) -> Option<Rc<Unit>> {
         self.db.note(item);
         if let Some(unit) = self.units.borrow().get(&item) {
@@ -109,17 +108,10 @@ impl Checker<'_> {
                 let span = Span::at(self.db.ast(item).token);
                 let function = elab.finish(Ty::Unit, None, false, None, span);
                 unit.add(function);
-                self.closure_functions(&mut unit, &body)?;
+                self.closure_functions(&mut unit, &body, None)?;
                 self.statement_functions(&mut unit, &body)?;
             }
-            ItemKind::Retired(_) => {
-                let (Some(sig), Some(body)) = (self.fn_sig(item), self.typed(item)) else {
-                    return Ok(None);
-                };
-                unit.number_conditions(&body);
-                self.function_unit(&mut unit, &sig, &body, true, Role::Body)?;
-            }
-            ItemKind::Package => return Ok(None),
+            ItemKind::Retired(_) | ItemKind::Package => return Ok(None),
             _ => {}
         }
         self.where_functions(&mut unit)?;
@@ -205,7 +197,7 @@ impl Checker<'_> {
                 let entry = Elab::entry_function(self, unit, body, sig, span)?;
                 unit.add(entry);
             }
-            self.closure_functions(unit, body)?;
+            self.closure_functions(unit, body, None)?;
         }
         self.contract_functions(unit, sig, body, &olds)?;
         self.statement_functions(unit, body)
@@ -219,19 +211,27 @@ impl Checker<'_> {
         elab.function_root_value(root)?;
         let function = elab.finish(root.ty.clone(), None, false, None, span);
         unit.add(function);
-        self.closure_functions(unit, body)?;
+        self.closure_functions(unit, body, None)?;
         self.statement_functions(unit, body)
     }
 
     /// The closure functions of a body, each taking its captures, then its own parameters.
-    fn closure_functions(&self, unit: &mut UnitDraft, body: &Rc<TBody>) -> Elaborated<()> {
+    fn closure_functions(
+        &self,
+        unit: &mut UnitDraft,
+        body: &Rc<TBody>,
+        inlined: Option<&Inlined>,
+    ) -> Elaborated<()> {
         let mut closures: Vec<&TClosure> = Vec::new();
         if let Some(root) = &body.root {
             collect_closures(root, &mut closures);
         }
         closures.sort_by_key(|closure| closure.index);
+        let base = inlined.map_or(0, |inlined| inlined.base);
         for closure in closures {
             let mut elab = Elab::new(self, unit, body, Role::Closure);
+            elab.closure_base = base;
+            let mark = elab.b.mark();
             for capture in closure_captures(closure) {
                 let local = body.local(capture.local);
                 let value = elab.b.value(elab.param_ty(capture.mode, &local.ty));
@@ -258,15 +258,23 @@ impl Checker<'_> {
                 task: closure.task,
                 limits: closure.ty.limits,
             };
-            let function = elab.finish(
+            let (mut result, mut fails, mut span) = (
                 closure.ty.result.clone(),
                 fails,
-                closure.ty.wait,
-                Some(head),
                 Span::at(closure.body.token),
             );
+            if let Some(inlined) = inlined {
+                elab.b.since(&mark, inlined.span, &inlined.subst);
+                for param in &mut elab.params {
+                    param.span = inlined.span;
+                }
+                result = inlined.subst.ty(&result);
+                fails = fails.map(|fails| inlined.subst.ty(&fails));
+                span = inlined.span;
+            }
+            let function = elab.finish(result, fails, closure.ty.wait, Some(head), span);
             unit.add(Function {
-                index: closure.index - 1,
+                index: base + closure.index - 1,
                 ..function
             });
         }
@@ -343,7 +351,7 @@ impl Checker<'_> {
             elab.function_root_value(root)?;
             let function = elab.finish(root.ty.clone(), None, false, None, Span::at(example.token));
             unit.add(Function { index, ..function });
-            self.closure_functions(unit, &Rc::new(example.body.clone()))?;
+            self.closure_functions(unit, &Rc::new(example.body.clone()), None)?;
         }
         Ok(())
     }
@@ -885,6 +893,9 @@ pub struct UnitDraft {
     pub item: ItemId,
     functions: Vec<Function>,
     counts: HashMap<Role, u32>,
+    /// The closure functions of the item's typed body, once a rewrite inlined into it needs
+    /// functions for its own closures after them, and how many those take so far.
+    inlined_closures: Option<(u32, u32)>,
     /// The index of each invariant line and assume statement, by its condition's first token.
     conditions: HashMap<(Role, Tok), u32>,
     /// The first token of each trusted block or expression, by premise index.
@@ -897,9 +908,35 @@ impl UnitDraft {
             item,
             functions: Vec::new(),
             counts: HashMap::new(),
+            inlined_closures: None,
             conditions: HashMap::new(),
             premises: Vec::new(),
         }
+    }
+
+    /// The index of the first of `count` closure functions of a rewrite inlined into `body`, the
+    /// item's typed body: after those of its own closures and of the rewrites inlined earlier.
+    pub fn inline_closures(&mut self, body: &TBody, count: u32) -> u32 {
+        let (own, inlined) = self.inlined_closures.get_or_insert_with(|| {
+            let mut closures: Vec<&TClosure> = Vec::new();
+            let clauses = body.clauses.iter().map(|clause| &clause.expr);
+            let examples = body
+                .examples
+                .iter()
+                .filter_map(|example| example.body.root.as_ref());
+            for expr in body.root.iter().chain(clauses).chain(examples) {
+                collect_closures(expr, &mut closures);
+            }
+            let own = closures
+                .iter()
+                .map(|closure| closure.index)
+                .max()
+                .unwrap_or(0);
+            (own, 0)
+        });
+        let base = *own + *inlined;
+        *inlined += count;
+        base
     }
 
     /// The number of functions of a role so far.
@@ -989,14 +1026,27 @@ impl UnitDraft {
     }
 }
 
+/// A rewrite inlined at a call: the index the unit's functions of its closures start at, the
+/// span of the call, and the arguments of its tombstone's generic parameters.
+pub struct Inlined {
+    pub base: u32,
+    pub span: Span,
+    pub subst: Subst,
+}
+
 /// How a local of the typed body is held in the function being elaborated.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Held {
     /// A value: a Copy or view binding, a parameter received by value or reference, or a name a
     /// pattern binds by `load` or reference.
     Value(Value),
     /// A slot holding the binding.
     Slot(Value),
+    /// A place of the code a rewrite is inlined into: a parameter of the rewrite whose argument
+    /// passes it by read or `mut`.
+    Place(Place),
+    /// A literal: a parameter of an inlined rewrite whose argument is one.
+    Literal(crate::nir::Literal),
 }
 
 /// The ensures clauses a function checks at each return: its own, by index from `first`, with
@@ -1138,6 +1188,11 @@ pub struct Elab<'e, 'a> {
     pub when: Option<WhenBody>,
     /// The scope whose slots the temporaries of the statement being elaborated are.
     pub temp_scope: usize,
+    /// The tombstones whose rewrites the code being elaborated is inlined from, outermost first.
+    pub forwarding: Vec<ItemId>,
+    /// The index the unit's functions of the typed body's closures start at: 0 but for an
+    /// inlined rewrite's closures.
+    pub closure_base: u32,
 }
 
 impl<'e, 'a> Elab<'e, 'a> {
@@ -1177,6 +1232,8 @@ impl<'e, 'a> Elab<'e, 'a> {
             wrapped: HashSet::new(),
             temp_scope: 0,
             when: None,
+            forwarding: Vec::new(),
+            closure_base: 0,
         }
     }
 

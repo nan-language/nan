@@ -30,6 +30,22 @@ pub struct Entry {
     pub seals: Vec<Seal>,
 }
 
+impl Entry {
+    /// Whether its interface text declares a member named `member`: a field, variant or method.
+    pub fn declares(&self, member: &str) -> bool {
+        self.text.iter().skip(1).any(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let line = line.strip_prefix("fn ").unwrap_or(line);
+            let name = line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or_default();
+            name == member
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocKey {
     Own,

@@ -1,7 +1,7 @@
 //! Releases compared: the exported items of a release from its code root's interface, and each
 //! item's class relative to the release's parent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::artefact::{self, read_bytes, read_uvar};
 use crate::hash::Hash;
@@ -85,6 +85,16 @@ fn part(code_root: &[u8], wanted: u128) -> Option<&[u8]> {
         rest = after;
     }
     None
+}
+
+/// The package name the manifest of a code root declares.
+pub fn package_name(code_root: &[u8]) -> Option<String> {
+    let (manifest, _) = read_bytes(part(code_root, 2)?)?;
+    let manifest = String::from_utf8_lossy(manifest);
+    let line = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("package "))?;
+    Some(line.split(' ').next()?.to_owned())
 }
 
 /// The elements of a list of texts.
@@ -190,15 +200,16 @@ pub fn replaces(old: &Entry, new: &Entry, old_path: &str, new_path: &str) -> boo
 }
 
 /// The class of each exported item of a release relative to its parent's, by canonical path,
-/// removed items included: identical when its interface hash, epoch and digests are unchanged,
-/// additive when it is new, when only its digests change without gaining a fact, or when it is
-/// removed while a `preserves` tombstone forwards it to a replacement that keeps its interface,
-/// and breaking otherwise.
+/// removed items included: identical when its interface hash, epoch and digests are unchanged;
+/// additive when it is new, when its interface changes only as `compatible` holds it and its
+/// digests gain no fact, or when it is removed while a `preserves` tombstone forwards it to a
+/// replacement that keeps its interface; breaking otherwise.
 pub fn classes(
     parent: &BTreeMap<String, Entry>,
     release: &BTreeMap<String, Entry>,
     epochs: &dyn Fn(&str) -> (u64, u64),
     forwards: &BTreeMap<String, Forward>,
+    compatible: &BTreeSet<String>,
 ) -> BTreeMap<String, Class> {
     let mut classes = BTreeMap::new();
     for (path, entry) in release {
@@ -206,9 +217,10 @@ pub fn classes(
             None => Class::Additive,
             Some(old) => {
                 let (old_epoch, new_epoch) = epochs(path);
-                if old.interface != entry.interface || old_epoch != new_epoch {
+                let changed = old.interface != entry.interface;
+                if old_epoch != new_epoch || (changed && !compatible.contains(path)) {
                     Class::Breaking
-                } else if old.digests == entry.digests {
+                } else if !changed && old.digests == entry.digests {
                     Class::Identical
                 } else {
                     let widened = entry.digests.iter().any(|(target, digest)| {

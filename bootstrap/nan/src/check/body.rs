@@ -19,7 +19,7 @@ use super::tir::{
 };
 use super::ty::{Param, Scalar, Ty};
 use super::unused::{Binding, Usage};
-use crate::diagnostic::{Code, Fix, Offer};
+use crate::diagnostic::{Code, Diagnostic, Fix, Offer};
 use crate::syntax::ast::{self, ItemKind, Mode, Tok};
 
 /// The function, closure or other body whose `return`, `fail` and `try` statements act on.
@@ -211,12 +211,15 @@ pub struct Body<'c, 'a> {
     pub examples: Vec<TExample>,
     /// What typing records of the use of the body's bindings.
     pub usage: Usage,
+    /// The generic scope and the item being typed that the body replaced in the checker.
+    enclosing: (Vec<GenericDef>, Option<ItemId>),
 }
 
 impl Drop for Body<'_, '_> {
     fn drop(&mut self) {
-        self.ck.scope.borrow_mut().clear();
-        self.ck.within.set(None);
+        let (scope, within) = std::mem::take(&mut self.enclosing);
+        *self.ck.scope.borrow_mut() = scope;
+        self.ck.within.set(within);
     }
 }
 
@@ -226,8 +229,10 @@ impl<'c, 'a> Body<'c, 'a> {
             .iter()
             .find(|def| def.param.is_self())
             .map(|def| def.param);
-        *ck.scope.borrow_mut() = generics.clone();
-        ck.within.set(Some(item));
+        let enclosing = (
+            ck.scope.replace(generics.clone()),
+            ck.within.replace(Some(item)),
+        );
         Body {
             ck,
             item,
@@ -251,11 +256,40 @@ impl<'c, 'a> Body<'c, 'a> {
             clauses: Vec::new(),
             examples: Vec::new(),
             usage: Usage::default(),
+            enclosing,
         }
     }
 
     pub fn report(&self, token: Tok, code: Code) {
         self.ck.report(self.item, token, code);
+    }
+
+    /// Types something only to judge it: returns what typing it gives and the diagnostics it
+    /// finds on the body's item, leaving the body as it was.
+    pub fn probe<T>(&mut self, typing: impl FnOnce(&mut Self) -> T) -> (T, Vec<Diagnostic>) {
+        let saved = (
+            self.locals.clone(),
+            self.scopes.clone(),
+            self.frames.clone(),
+            self.closures,
+            self.minted,
+            self.scope_bodies.clone(),
+            self.lexical_spawns.clone(),
+            self.usage.clone(),
+        );
+        let ck = self.ck;
+        let probed = ck.heard(self.item, || typing(self));
+        (
+            self.locals,
+            self.scopes,
+            self.frames,
+            self.closures,
+            self.minted,
+            self.scope_bodies,
+            self.lexical_spawns,
+            self.usage,
+        ) = saved;
+        probed
     }
 
     /// Records the member a name of the body names.

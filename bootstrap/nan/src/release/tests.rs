@@ -22,7 +22,10 @@ fn a_removed_item_is_additive_only_while_a_preserves_tombstone_forwards_it() {
         let forwards = forward
             .map(|forward| BTreeMap::from([("app::percent".to_owned(), forward)]))
             .unwrap_or_default();
-        release_class(&classes(&parent, release, &epochs, &forwards), true)
+        release_class(
+            &classes(&parent, release, &epochs, &forwards, &Default::default()),
+            true,
+        )
     };
     let path = || Some(Forward::Path("app::ratio".to_owned()));
     assert_eq!(class(&renamed, None), Class::Breaking);

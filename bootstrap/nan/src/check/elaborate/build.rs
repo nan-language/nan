@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::check::ty::Subst;
 use crate::nir::{
     Block, BlockId, Call, Callee, Inst, Jump, NTy, Op, Operand, Payload, Place, Region, Span,
     Terminator, Value,
@@ -13,6 +14,14 @@ struct Draft {
     params: Vec<Value>,
     insts: Vec<Inst>,
     term: Option<(Terminator, Span)>,
+}
+
+/// Where the code built so far ends: its blocks, its values, and the instructions of its current
+/// block.
+pub struct Mark {
+    blocks: usize,
+    values: usize,
+    current: Option<(BlockId, usize)>,
 }
 
 pub struct Builder {
@@ -82,6 +91,50 @@ impl Builder {
 
     pub fn at(&mut self, block: BlockId) {
         self.current = Some(block);
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            blocks: self.blocks.len(),
+            values: self.types.len(),
+            current: self
+                .current
+                .map(|block| (block, self.blocks[block.0 as usize].insts.len())),
+        }
+    }
+
+    /// Gives the instructions and terminators built since `mark` the span `span`, and replaces
+    /// generic parameters by `subst` in the types of the values they make and of what they name.
+    pub fn since(&mut self, mark: &Mark, span: Span, subst: &Subst) {
+        let substituted = !subst.0.is_empty();
+        if substituted {
+            for ty in &mut self.types[mark.values..] {
+                *ty = match ty {
+                    NTy::Owned(ty) => NTy::Owned(subst.ty(ty)),
+                    NTy::Ref(ty) => NTy::Ref(subst.ty(ty)),
+                    NTy::RefMut(ty) => NTy::RefMut(subst.ty(ty)),
+                };
+            }
+        }
+        for (index, draft) in self.blocks.iter_mut().enumerate() {
+            let first = match mark.current {
+                Some((block, built)) if block.0 as usize == index => built,
+                _ if index >= mark.blocks => 0,
+                _ => continue,
+            };
+            for inst in &mut draft.insts[first..] {
+                inst.span = span;
+                if substituted {
+                    substitute_op(&mut inst.op, subst);
+                }
+            }
+            if let Some((term, term_span)) = &mut draft.term {
+                *term_span = span;
+                if substituted && let Terminator::Call { call, .. } = term {
+                    substitute_call(call, subst);
+                }
+            }
+        }
     }
 
     /// Emits an instruction into the current block, with a result of `result`'s type.
@@ -420,5 +473,25 @@ impl Renumber<'_> {
             Terminator::Unreachable => Terminator::Unreachable,
             Terminator::Yield(operand) => Terminator::Yield(self.operand(operand)),
         }
+    }
+}
+
+/// Replaces generic parameters by `subst` in the types an instruction names.
+fn substitute_op(op: &mut Op, subst: &Subst) {
+    match op {
+        Op::Slot { ty, .. }
+        | Op::Construct { ty, .. }
+        | Op::Variant { ty, .. }
+        | Op::Is { ty, .. }
+        | Op::Convert { to: ty, .. } => *ty = subst.ty(ty),
+        Op::FnRef(fn_ref) => fn_ref.args = subst.args(&fn_ref.args),
+        Op::Call(call) => substitute_call(call, subst),
+        _ => {}
+    }
+}
+
+fn substitute_call(call: &mut Call, subst: &Subst) {
+    if let Callee::Fn(fn_ref) = &mut call.callee {
+        fn_ref.args = subst.args(&fn_ref.args);
     }
 }

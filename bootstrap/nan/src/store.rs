@@ -366,8 +366,8 @@ impl Store {
         Ok(Ok(found))
     }
 
-    /// The entry of a publication index, none when its file does not decode or its checksum
-    /// does not match.
+    /// The entry of a publication index, read from its file named with `root`; none when the
+    /// file does not decode or its checksum does not match.
     pub fn read(&self, index: u64, root: &Hash) -> io::Result<Result<Option<Entry>, Exposed>> {
         let Some(dir) = &self.dir.dir else {
             return Ok(Ok(None));
@@ -381,7 +381,7 @@ impl Store {
             .split_last_chunk::<32>()
             .filter(|(contents, digest)| blake3(contents) == **digest)
             .and_then(|(contents, _)| Entry::decoded(contents))
-            .filter(|entry| entry.index == index && entry.root() == *root);
+            .filter(|entry| entry.index == index);
         Ok(Ok(entry))
     }
 

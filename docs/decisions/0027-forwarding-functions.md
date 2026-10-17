@@ -1,6 +1,6 @@
 # 0027. Forwarding functions
 
-Status: accepted
+Status: superseded by 0030
 
 ## Context
 

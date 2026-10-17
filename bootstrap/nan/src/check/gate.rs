@@ -1,7 +1,7 @@
 //! The gate codes of the release gate: API snapshots that are not current, pending weakenings,
 //! and trust escapes without a current seal.
 
-use super::snapshot::{Items, differing, snapshots};
+use super::snapshot::{Items, differing};
 use super::{Checker, check_targets, unchecked};
 use crate::diagnostic::{Code, Diagnostic, Reason};
 use crate::workspace::{Package, Target, Workspace};
@@ -20,7 +20,7 @@ pub fn gate(workspace: &Workspace, package: &Package) -> Vec<Diagnostic> {
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let name = package.name().unwrap_or_default();
     let items = Items::of(&views, name);
-    let computed = snapshots(&items, package, &[]);
+    let computed = super::computed_snapshots(workspace, package, &items, &[]);
     let mut found = Vec::new();
     let summary = |module: &str| -> (String, u32) {
         package

@@ -8,7 +8,7 @@ use crate::diagnostic::{Class, Code};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
-use crate::workspace::Workspace;
+use crate::workspace::{Target, Workspace};
 
 /// An image `nan run` starts once it has built it: its path and its arguments.
 pub struct Launch {
@@ -31,15 +31,27 @@ pub fn run(
     trace.scope = Some(written.clone());
     let programs = programs(workspace, &scope);
     let single = matches!(scope, Scope::Package(_) | Scope::Workspace) && programs.len() == 1;
-    if programs.is_empty() || (invocation.name == Name::Run && !single) {
+    let compared = invocation.value("--compare-with");
+    let host = programs.iter().all(|program| {
+        let manifest = workspace.packages[*program].manifest.as_ref();
+        manifest.is_some_and(|manifest| manifest.targets.contains(&Target::Host))
+    });
+    let unusable = programs.is_empty()
+        || (invocation.name == Name::Run && !single)
+        || (compared.is_some() && (!single || !host));
+    if unusable {
         return Ok(Outcome::Output(
             invocation.tool_error(Code::ToolUsage, &written),
         ));
     }
+    let compared = compared.map(|image| (current.join(image), image));
     let mut diagnostics = Vec::new();
     let mut images = Vec::new();
     for program in &programs {
-        let build = final_build::build(workspace, *program)?;
+        let compared = compared
+            .as_ref()
+            .map(|(path, image)| (path.as_path(), *image));
+        let build = final_build::build(workspace, *program, compared)?;
         diagnostics.extend(build.diagnostics);
         images.extend(build.image);
     }
@@ -113,3 +125,6 @@ fn programs(workspace: &Workspace, scope: &Scope) -> Vec<usize> {
     };
     held.into_iter().filter(program).collect()
 }
+
+#[cfg(test)]
+mod tests;

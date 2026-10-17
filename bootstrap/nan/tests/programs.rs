@@ -1,6 +1,7 @@
 //! The program harness: builds each program of `tests/programs` for `x86_64-host`, runs its
 //! image and compares what it writes, standard output then standard error, with the program's
-//! `expected` file, whose first line states the exit status.
+//! `expected` file, whose first line states the exit status. Its builds use the harnesses' home
+//! directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,19 +31,16 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     let source = path.parent().expect("a program directory");
     let name = source.file_name().expect("a program name");
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("programs")
-        .join(name);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let root = tmp.join("programs").join(name);
     copy_dir(source.as_std_path(), &root.join(name))?;
-    let build = Command::new(env!("CARGO_BIN_EXE_nan"))
-        .args(["build", name])
-        .current_dir(&root)
-        .output()?;
-    if !build.status.success() {
-        let output = String::from_utf8_lossy(&build.stdout);
+    fs::create_dir_all(tmp.join("home"))?;
+    nan::use_home(tmp.join("home"), None);
+    let build = nan::run(&["build".to_owned(), name.to_owned()], &root);
+    if build.status != 0 {
         return Err(format!(
-            "nan build {name} exits with {:?} and reports\n{output}",
-            build.status.code()
+            "nan build {name} exits with {} and reports\n{}",
+            build.status, build.output
         )
         .into());
     }

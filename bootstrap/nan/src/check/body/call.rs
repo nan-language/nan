@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use super::expr::TypeTarget;
+use super::retired::Use;
 use super::{Body, Written};
 use crate::check::Member;
 use crate::check::conform::{Candidate, type_key};
@@ -38,6 +39,7 @@ pub fn is_conversion(name: &str) -> bool {
 
 /// The inference of a call's generic arguments: each parameter fixed by the first part matching
 /// it.
+#[derive(Clone)]
 pub struct Infer {
     pub params: Vec<Param>,
     pub subst: Subst,
@@ -164,6 +166,7 @@ pub struct Markers {
 }
 
 /// A head being called with what is known of its generic arguments.
+#[derive(Clone)]
 pub struct Callable {
     callee: Callee,
     head: FnSig,
@@ -280,9 +283,13 @@ impl Body<'_, '_> {
                 if path.segments.len() == 1 && self.lookup_local(&path.segments[0].text).is_some() {
                     return false;
                 }
-                match self.ck.db.resolve(self.module, path) {
-                    Ok(Named::Variant(..)) => true,
-                    Ok(Named::Item(item)) => matches!(
+                let named = self.ck.db.resolve(self.module, path).ok().or_else(|| {
+                    let tombstone = self.ck.renamed_path(self.module, path)?;
+                    self.ck.forwarding(tombstone)
+                });
+                match named {
+                    Some(Named::Variant(..)) => true,
+                    Some(Named::Item(item)) => matches!(
                         self.ck.db.ast(item).kind,
                         ItemKind::Struct(_) | ItemKind::Layout(_)
                     ),
@@ -317,6 +324,12 @@ impl Body<'_, '_> {
             start: Some(expr.token),
             last: Some(expr.last),
             ..markers.unwrap_or_default()
+        };
+        let call = Use {
+            token,
+            args,
+            expected,
+            markers,
         };
         match &callee.kind {
             ExprKind::Path {
@@ -357,13 +370,25 @@ impl Body<'_, '_> {
                 }
                 let named = match self.ck.db.resolve(self.module, path) {
                     Ok(named) => named,
-                    Err(error) if error.code == Some(Code::NameUnknown) => {
+                    Err(error) if error.code == Some(Code::NameUnknown) => 'unknown: {
                         if generic_args.is_none()
                             && let Some(form) = self.ck.db.spelled(self.module, path)
-                            && let Some(tombstone) = self.tombstone(&form)
                         {
-                            return self
-                                .retired_call(token, callee, tombstone, args, expected, markers);
+                            let matched = self.matched(&form, None, None, call, Body::retired_head);
+                            if let [tombstone] = matched[..]
+                                && self.ck.renaming(&form, self.module) == Some(tombstone)
+                            {
+                                match self.ck.forward_path(self.item, self.module, path) {
+                                    Some(named) => break 'unknown named,
+                                    None => {
+                                        self.skim_args(args);
+                                        return TExpr::failed(token);
+                                    }
+                                }
+                            }
+                            if !matched.is_empty() {
+                                return self.retired_call(callee, &matched, call);
+                            }
                         }
                         let stub = match &path.segments[..] {
                             [name] if generic_args.is_none() => {
@@ -404,6 +429,20 @@ impl Body<'_, '_> {
                                     return TExpr::failed(token);
                                 }
                                 let callable = Callable::function(item, head);
+                                if generic_args.is_none()
+                                    && let Some(form) = self.ck.canonical_path(item)
+                                {
+                                    let matched = self.matched(
+                                        &form,
+                                        Some(&callable),
+                                        None,
+                                        call,
+                                        Body::retired_head,
+                                    );
+                                    if !matched.is_empty() {
+                                        return self.retired_call(callee, &matched, call);
+                                    }
+                                }
                                 self.apply(token, callable, None, args, expected, markers)
                             }
                             ItemKind::Struct(_) | ItemKind::Layout(_) => {
@@ -787,7 +826,7 @@ impl Body<'_, '_> {
     /// `T.name(...)`, `I.name(...)` or `module.name(...)`: a construction, an associated function
     /// or method called through its type, a qualified interface call, or a built-in member.
     #[allow(clippy::too_many_arguments)]
-    fn member_call(
+    pub fn member_call(
         &mut self,
         token: Tok,
         target: TypeTarget,
@@ -870,6 +909,23 @@ impl Body<'_, '_> {
             return self.layout_bits(token, &ty, name, args, markers);
         }
         let candidates = self.ck.method_candidates(&ty, &name.text);
+        let call = Use {
+            token,
+            args,
+            expected,
+            markers,
+        };
+        if candidates.is_empty()
+            && let Some(form) = self.member_form(&ty, &name.text)
+        {
+            let matched = self.matched(&form, None, None, call, |body, tombstone| {
+                let candidate = body.retired_candidate(tombstone, &ty);
+                body.member_callable(candidate, &ty, written_args)
+            });
+            if !matched.is_empty() {
+                return self.retired_member(ty, base, name, written_args, &matched, call);
+            }
+        }
         let requalified = |interfaces: Vec<ItemId>| -> Vec<Fix> {
             interfaces
                 .into_iter()
@@ -883,7 +939,13 @@ impl Body<'_, '_> {
         let candidate = match candidates.len() {
             0 => {
                 let interfaces = self.unqualified(&ty, &name.text);
-                if interfaces.is_empty() {
+                let construct = (base.token, name.token);
+                let written = self.ck.written(self.item, base.token, name.token);
+                if interfaces.is_empty()
+                    && self.ck.report_newer_release(self.item, construct, &written)
+                {
+                    self.skim_args(args);
+                } else if interfaces.is_empty() {
                     let stub = self.member_stub(&ty, name, None, args, expected, markers);
                     self.unknown_member(name, &ty, stub);
                 } else {
@@ -914,12 +976,34 @@ impl Body<'_, '_> {
             }
         };
         self.name_candidate(name.token, &candidate, &name.text);
-        let Some(mut callable) = self.callable(candidate, &ty) else {
+        let Some(callable) = self.member_callable(candidate, &ty, written_args) else {
             self.skim_args(args);
             return TExpr::failed(token);
         };
+        if let Some(form) = self.member_form(&ty, &name.text) {
+            let matched = self.matched(&form, Some(&callable), None, call, |body, tombstone| {
+                let candidate = body.retired_candidate(tombstone, &ty);
+                body.member_callable(candidate, &ty, written_args)
+            });
+            if !matched.is_empty() {
+                return self.retired_member(ty, base, name, written_args, &matched, call);
+            }
+        }
+        self.apply(token, callable, None, args, expected, markers)
+    }
+
+    /// The callable a candidate stands for in a call naming it through its type, the receiver
+    /// passed first; `written_args` when the type path writes the type's arguments, which are
+    /// otherwise inferred.
+    pub fn member_callable(
+        &mut self,
+        candidate: Candidate,
+        ty: &Ty,
+        written_args: bool,
+    ) -> Option<Callable> {
+        let mut callable = self.callable(candidate, ty)?;
         callable.receiver_first = true;
-        if !written_args && let Some(key) = type_key(&ty) {
+        if !written_args && let Some(key) = type_key(ty) {
             let type_params: Vec<Param> = self
                 .ck
                 .type_generics(key)
@@ -932,7 +1016,7 @@ impl Body<'_, '_> {
             }
             callable.from_expected = true;
         }
-        self.apply(token, callable, None, args, expected, markers)
+        Some(callable)
     }
 
     /// The callable a method resolution candidate stands for, its type's arguments substituted.
@@ -1146,11 +1230,25 @@ impl Body<'_, '_> {
             return self.apply_dma(token, receiver, callable, args, markers);
         }
         let candidates = self.ck.method_candidates(&receiver.ty, &name.text);
+        let form = self.member_form(&receiver.ty, &name.text);
+        let call = Use {
+            token,
+            args,
+            expected,
+            markers,
+        };
         let candidate = match candidates.len() {
             0 => {
-                if let Some(tombstone) = self.member_tombstone(&receiver.ty, &name.text) {
-                    return self
-                        .retired_method(token, receiver, name, tombstone, args, expected, markers);
+                if let Some(form) = &form {
+                    let ty = receiver.ty.clone();
+                    let matched =
+                        self.matched(form, None, Some(&receiver), call, |body, tombstone| {
+                            let candidate = body.retired_candidate(tombstone, &ty);
+                            body.callable(candidate, &ty)
+                        });
+                    if !matched.is_empty() {
+                        return self.retired_method(receiver, name, &matched, call);
+                    }
                 }
                 let field = match &receiver.ty {
                     Ty::Item(item, _) => match &self.ck.sig(*item).kind {
@@ -1213,6 +1311,18 @@ impl Body<'_, '_> {
             chained: projected && markers.mode.is_some(),
             ..markers
         };
+        if let Some(form) = &form {
+            let call = Use { markers, ..call };
+            let ty = receiver.ty.clone();
+            let live = Some(&callable);
+            let matched = self.matched(form, live, Some(&receiver), call, |body, tombstone| {
+                let candidate = body.retired_candidate(tombstone, &ty);
+                body.callable(candidate, &ty)
+            });
+            if !matched.is_empty() {
+                return self.retired_method(receiver, name, &matched, call);
+            }
+        }
         self.apply(token, callable, Some(receiver), args, expected, markers)
     }
 
@@ -2149,8 +2259,8 @@ impl Body<'_, '_> {
                     failed = true;
                     continue;
                 };
-                let Some((name, ty)) = fields.iter().find(|(name, _)| *name == label.text) else {
-                    self.report(label.token, Code::NameUnknown);
+                let owner = variant.is_none().then_some(item);
+                let Some((name, ty)) = self.labelled_field(owner, label, &fields) else {
                     self.skim(&arg.value);
                     failed = true;
                     continue;

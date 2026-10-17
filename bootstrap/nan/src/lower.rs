@@ -198,6 +198,8 @@ pub struct Lowered {
     /// for the stack limits check.
     pub frames: Vec<Frame>,
     pub demands: Vec<Demand>,
+    /// The two entities of each pair lowered with one host symbol name, as diagnostics name them.
+    pub collisions: Vec<(String, String)>,
 }
 
 /// What a final build lowers: the program's entry function and its target's entry landing fn,
@@ -220,6 +222,10 @@ pub struct Lowering<'c, 'a> {
     prefixes: HashMap<String, String>,
     roots: Vec<PackageId>,
     instances: HashMap<Instance, FuncId>,
+    /// The instance each host symbol name names.
+    named: HashMap<String, Instance>,
+    /// The distinct instances lowered with one host symbol name.
+    collisions: Vec<(Instance, Instance)>,
     routines: HashMap<runtime::Routine, FuncId>,
     /// The instances and routines declared and not yet defined.
     queue: Vec<Pending>,
@@ -304,6 +310,8 @@ impl<'c, 'a> Lowering<'c, 'a> {
             prefixes,
             roots,
             instances: HashMap::new(),
+            named: HashMap::new(),
+            collisions: Vec::new(),
             routines: HashMap::new(),
             queue: Vec::new(),
             releases: HashMap::new(),
@@ -329,7 +337,17 @@ impl<'c, 'a> Lowering<'c, 'a> {
             return *id;
         }
         let abi = self.abi(&instance);
-        let name = symbols::name(self, &instance);
+        let mut name = symbols::name(self, &instance);
+        match self.named.get(&name) {
+            Some(named) => {
+                self.collisions.push((named.clone(), instance.clone()));
+                self.glue += 1;
+                name = format!("_NXcollision_{}", self.glue);
+            }
+            None => {
+                self.named.insert(name.clone(), instance.clone());
+            }
+        }
         let id = self
             .module
             .declare_function(&name, Linkage::Local, &abi.signature())
@@ -649,6 +667,15 @@ impl<'c, 'a> Lowering<'c, 'a> {
         runtime::tasks::emit_entry_stacks(&mut self);
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
+        let collisions = std::mem::take(&mut self.collisions)
+            .iter()
+            .map(|(first, second)| {
+                (
+                    symbols::entity(self.ck, first),
+                    symbols::entity(self.ck, second),
+                )
+            })
+            .collect();
         let mut product = self.module.finish();
         if let Some(section) = section {
             let id = product.object.add_section(
@@ -662,9 +689,13 @@ impl<'c, 'a> Lowering<'c, 'a> {
             object: product.emit().expect("an object file"),
             frames,
             demands,
+            collisions,
         }
     }
 }
 
 /// The calling convention of every lowered function.
 pub const CALL_CONV: CallConv = CallConv::SystemV;
+
+#[cfg(test)]
+mod tests;

@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use super::call::Intrinsic;
 use super::{Body, Clauses, Frame, Written};
-use crate::check::db::ItemId;
+use crate::check::conform::type_key;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::resolve::Named;
 use crate::check::sig::{
     Problems, SigKind, int_literal, limit_problems, limit_set, literal_suffix,
@@ -588,7 +589,7 @@ impl Body<'_, '_> {
             }
             None => {}
         }
-        let named = match self.ck.db.resolve(self.module, path) {
+        let named = match self.ck.resolve_use(self.item, self.module, path) {
             Ok(named) => named,
             Err(error) => {
                 self.report_path(error);
@@ -838,6 +839,15 @@ impl Body<'_, '_> {
                         subst.ty(&field.ty)
                     }
                     None => {
+                        if let Some(tombstone) =
+                            self.ck
+                                .member_renaming(TypeKey::Item(*item), &name.text, self.module)
+                        {
+                            return match self.ck.forward_member(self.item, name, tombstone) {
+                                Some(renamed) => self.field_of(token, base, &renamed, read),
+                                None => TExpr::failed(token),
+                            };
+                        }
                         if self.ck.method_candidates(&base.ty, &name.text).is_empty() {
                             self.unknown_member(name, &base.ty, None);
                         } else {
@@ -890,7 +900,7 @@ impl Body<'_, '_> {
                 return Some(TypeTarget::Type(Ty::Param(param)));
             }
         }
-        let named = match self.ck.db.resolve(self.module, path) {
+        let named = match self.ck.resolve_use(self.item, self.module, path) {
             Ok(named) => named,
             Err(_) => return None,
         };
@@ -1051,7 +1061,21 @@ impl Body<'_, '_> {
                 None => TExpr::failed(token),
             },
             None => {
-                self.report(name.token, Code::NameUnknown);
+                if let Some(tombstone) = type_key(ty)
+                    .and_then(|key| self.ck.member_renaming(key, &name.text, self.module))
+                {
+                    return match self.ck.forward_member(self.item, name, tombstone) {
+                        Some(renamed) => self.member_value(token, ty, &renamed, expected),
+                        None => TExpr::failed(token),
+                    };
+                }
+                let written = self.ck.written(self.item, token, name.token);
+                if !self
+                    .ck
+                    .report_newer_release(self.item, (token, name.token), &written)
+                {
+                    self.report(name.token, Code::NameUnknown);
+                }
                 TExpr::failed(token)
             }
         }
@@ -2329,26 +2353,30 @@ impl Checker<'_> {
         }
     }
 
+    /// Generic arguments as diagnostics write them after what they apply to, from a module:
+    /// nothing without any.
+    pub fn show_args(&self, args: &[Arg], from: crate::check::db::ModuleId) -> String {
+        if args.is_empty() {
+            return String::new();
+        }
+        let written: Vec<String> = args
+            .iter()
+            .map(|arg| match arg {
+                Arg::Ty(ty) => self.show(ty, from),
+                Arg::Const(constant) => match constant {
+                    crate::check::ty::Const::Int(value) => value.to_string(),
+                    crate::check::ty::Const::Bool(value) => value.to_string(),
+                    crate::check::ty::Const::Param(param) => self.param_name(*param),
+                    crate::check::ty::Const::Error => "_".to_owned(),
+                },
+            })
+            .collect();
+        format!("[{}]", written.join(", "))
+    }
+
     /// A type as diagnostics write it, from a module.
     pub fn show(&self, ty: &Ty, from: crate::check::db::ModuleId) -> String {
-        let args = |args: &[Arg]| -> String {
-            if args.is_empty() {
-                return String::new();
-            }
-            let written: Vec<String> = args
-                .iter()
-                .map(|arg| match arg {
-                    Arg::Ty(ty) => self.show(ty, from),
-                    Arg::Const(constant) => match constant {
-                        crate::check::ty::Const::Int(value) => value.to_string(),
-                        crate::check::ty::Const::Bool(value) => value.to_string(),
-                        crate::check::ty::Const::Param(param) => self.param_name(*param),
-                        crate::check::ty::Const::Error => "_".to_owned(),
-                    },
-                })
-                .collect();
-            format!("[{}]", written.join(", "))
-        };
+        let args = |args: &[Arg]| self.show_args(args, from);
         match ty {
             Ty::Scalar(scalar) => scalar.name().to_owned(),
             Ty::Unit => "Unit".to_owned(),

@@ -57,6 +57,84 @@ pub struct Variant {
 }
 
 impl Node {
+    /// Whether this tree, a type's new one, accepts an old one: nodes of one kind whose parts
+    /// accept the old parts, a record matching each old field by key or alias, keeping one only
+    /// when open and defaulting each new one, and a variant node matching each old variant.
+    pub fn accepts(&self, old: &Node) -> bool {
+        match (self, old) {
+            (Node::Unsigned(new), Node::Unsigned(old))
+            | (Node::Signed(new), Node::Signed(old))
+            | (Node::Float(new), Node::Float(old))
+            | (Node::Back(new), Node::Back(old)) => new == old,
+            (Node::BoundedText(new), Node::BoundedText(old)) => new >= old,
+            (
+                Node::Sequence {
+                    element,
+                    length,
+                    capacity,
+                    unique,
+                },
+                Node::Sequence {
+                    element: old_element,
+                    length: old_length,
+                    capacity: old_capacity,
+                    unique: old_unique,
+                },
+            ) => {
+                element.accepts(old_element)
+                    && length == old_length
+                    && capacity
+                        .is_none_or(|capacity| old_capacity.is_some_and(|old| capacity >= old))
+                    && (!unique || *old_unique)
+            }
+            (
+                Node::Map { key, value },
+                Node::Map {
+                    key: old_key,
+                    value: old_value,
+                },
+            ) => key.accepts(old_key) && value.accepts(old_value),
+            (
+                Node::Record { open, fields },
+                Node::Record {
+                    fields: old_fields, ..
+                },
+            ) => {
+                let matching = |field: &Field, key: &str| {
+                    field.key == key || field.aliases.iter().any(|alias| alias == key)
+                };
+                let kept = old_fields.iter().all(|old| {
+                    match fields.iter().find(|field| matching(field, &old.key)) {
+                        Some(field) => field.value.accepts(&old.value),
+                        None => *open,
+                    }
+                });
+                let defaulted = fields.iter().all(|field| {
+                    field.defaulted || old_fields.iter().any(|old| matching(field, &old.key))
+                });
+                kept && defaulted
+            }
+            (
+                Node::Variant { variants, .. },
+                Node::Variant {
+                    variants: old_variants,
+                    ..
+                },
+            ) => old_variants.iter().all(|old| {
+                variants.iter().any(|variant| {
+                    let matched = variant.key == old.key || variant.aliases.contains(&old.key);
+                    matched
+                        && match (&variant.payload, &old.payload) {
+                            (None, None) => true,
+                            (Some(new), Some(old)) => new.accepts(old),
+                            _ => false,
+                        }
+                })
+            }),
+            (new, old) => std::mem::discriminant(new) == std::mem::discriminant(old),
+        }
+    }
+
     /// The node's `mem::wire` encoding: a variant keyed by its name, with a record of its fields
     /// as payload when it has fields.
     pub fn wire(&self) -> Vec<u8> {

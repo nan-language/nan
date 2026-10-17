@@ -8,6 +8,7 @@ mod author;
 mod authority;
 mod body;
 mod changes;
+mod compatible;
 mod component;
 mod conform;
 mod context;
@@ -17,6 +18,7 @@ mod digest;
 mod docs;
 mod edits;
 mod elaborate;
+mod entail;
 mod expand;
 mod failure;
 mod flow;
@@ -28,6 +30,7 @@ mod interface;
 mod kernel;
 pub(crate) mod ledger;
 pub(crate) mod lowlevel;
+mod newer;
 mod package;
 mod preserved;
 mod program;
@@ -48,6 +51,7 @@ pub(crate) mod sig;
 pub(crate) mod snapshot;
 pub(crate) mod spec;
 mod supplied;
+mod synthetic;
 pub(crate) mod testing;
 mod threshold;
 pub(crate) mod tir;
@@ -65,6 +69,7 @@ use std::rc::Rc;
 
 pub use approval::approvals;
 pub use changes::{Change, changes, semantic_conflicts};
+pub use compatible::{compatible, encode_class};
 pub use context::{Context, Green, context_gaps, contexts, greens};
 use db::{Db, ItemId, ModuleId, PackageId};
 pub use edits::{identity, moved, renamed};
@@ -99,6 +104,8 @@ pub struct Checker<'a> {
     impls: RefCell<Option<conform::ImplIndex>>,
     /// While positive, typing reports nothing: a probe of what a construct is.
     muted: Cell<u32>,
+    /// While a probe of an item's typing listens, that item and the diagnostics found on it.
+    heard: RefCell<Option<(ItemId, Vec<Diagnostic>)>>,
     /// The generic parameters of the body being checked, with the bounds that hold in it.
     scope: RefCell<Vec<GenericDef>>,
     /// The item whose body or clauses are being typed.
@@ -137,6 +144,8 @@ pub struct Checker<'a> {
     const_values: RefCell<HashMap<ItemId, Option<Rc<crate::interp::ConstValue>>>>,
     /// The consts and contributions being evaluated, innermost last.
     evaluating: RefCell<Vec<ItemId>>,
+    /// The tombstones whose replacements are being found, innermost last.
+    replacing: RefCell<Vec<ItemId>>,
     /// The consts and contributions whose values each evaluation needs, by the one evaluated.
     needs: RefCell<std::collections::BTreeMap<ItemId, std::collections::BTreeSet<ItemId>>>,
     /// The consts and contributions whose evaluation needs their own values.
@@ -161,6 +170,8 @@ pub struct Checker<'a> {
     /// The proof cache of the running user, opened at the first query decided; none without a
     /// usable one.
     pub(crate) proof_cache: OnceCell<Option<Cache>>,
+    /// The entries of the local store of the running user, once read; none without a usable one.
+    store_entries: OnceCell<Option<Vec<crate::store::Entry>>>,
     /// The exported items of the release each package's history head names, once read from the
     /// local store; none for a head the store does not hold.
     head_exports: RefCell<HashMap<PackageId, Option<Rc<Exported>>>>,
@@ -202,6 +213,7 @@ impl<'a> Checker<'a> {
             package: Cell::new(None),
             impls: RefCell::new(None),
             muted: Cell::new(0),
+            heard: RefCell::new(None),
             scope: RefCell::new(Vec::new()),
             within: Cell::new(None),
             definitions: RefCell::new(HashMap::new()),
@@ -220,6 +232,7 @@ impl<'a> Checker<'a> {
             units: RefCell::new(HashMap::new()),
             const_values: RefCell::new(HashMap::new()),
             evaluating: RefCell::new(Vec::new()),
+            replacing: RefCell::new(Vec::new()),
             needs: RefCell::new(std::collections::BTreeMap::new()),
             cyclic: RefCell::new(HashSet::new()),
             obligations: RefCell::new(HashMap::new()),
@@ -230,6 +243,7 @@ impl<'a> Checker<'a> {
             fields_read: RefCell::new(HashSet::new()),
             field_labels: RefCell::new(HashMap::new()),
             proof_cache: OnceCell::new(),
+            store_entries: OnceCell::new(),
             head_exports: RefCell::new(HashMap::new()),
             compared: RefCell::new(None),
         }
@@ -330,6 +344,27 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Runs a muted probe of an item's typing, returning its result and the diagnostics it finds
+    /// on that item.
+    fn heard<T>(&self, item: ItemId, probe: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
+        let outer = self.heard.replace(Some((item, Vec::new())));
+        self.muted.set(self.muted.get() + 1);
+        let result = probe();
+        self.muted.set(self.muted.get() - 1);
+        let heard = self.heard.replace(outer).map(|(_, heard)| heard);
+        (result, heard.unwrap_or_default())
+    }
+
+    /// The entries of the local store of the running user; none without a usable one.
+    fn store_entries(&self) -> Option<&[crate::store::Entry]> {
+        self.store_entries
+            .get_or_init(|| {
+                let cache = Cache::open().ok()?.ok()?;
+                crate::store::Store::new(cache.store()).entries().ok()?.ok()
+            })
+            .as_deref()
+    }
+
     /// Runs a probe whose diagnostics are withheld, returning its result and those diagnostics.
     fn withheld<T>(&self, probe: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
         let before = self.found.borrow().len();
@@ -368,9 +403,17 @@ impl<'a> Checker<'a> {
     }
 
     /// A diagnostic located on an item's file and item; none for the carried std's items and in
-    /// probes.
+    /// probes, which hear those on the item they listen to.
     fn on_item(&self, item: ItemId, mut diagnostic: Diagnostic) -> Option<Diagnostic> {
-        if self.db.is_carried(item) || self.muted.get() > 0 {
+        if self.db.is_carried(item) {
+            return None;
+        }
+        if self.muted.get() > 0 {
+            if let Some((listening, heard)) = &mut *self.heard.borrow_mut()
+                && *listening == item
+            {
+                heard.push(diagnostic);
+            }
             return None;
         }
         diagnostic.path = Some(self.db.item(item).file.path.clone());
@@ -394,6 +437,9 @@ impl<'a> Checker<'a> {
         }
         for (ty, token) in &problems.instantiations {
             self.check_instantiation(item, ty, *token);
+        }
+        for (construct, tombstone) in &problems.renamed {
+            self.report_renamed_path(item, *construct, *tombstone);
         }
     }
 
@@ -542,7 +588,8 @@ impl Checker<'_> {
 
     /// Records the items holding a line that an error is reported on, whose functions have no
     /// unit.
-    fn reject_items(&self, workspace: &Workspace) {
+    fn reject_items(&self) {
+        let workspace = self.db.workspace;
         self.judged_all.set(true);
         let mut errors: HashSet<(String, u32)> = HashSet::new();
         let found = self.found.borrow();
@@ -630,19 +677,19 @@ pub fn checked<'a>(
     target: Target,
 ) -> Checker<'a> {
     let checker = unchecked(workspace, closure, std, target);
-    checker.check_all(workspace);
+    checker.check_all();
     checker
 }
 
 impl Checker<'_> {
     /// Checks each package the checker checks, then the rules relating its items.
-    fn check_all(&self, workspace: &Workspace) {
+    fn check_all(&self) {
         for (_, package) in checked_packages(self) {
             self.package.set(Some(package));
             self.check_package(package);
         }
         self.fix_misnamed();
-        self.reject_items(workspace);
+        self.reject_items();
         for (_, package) in checked_packages(self) {
             for &module in &self.db.package(package).modules {
                 for &item in &self.db.module(module).items {
@@ -650,7 +697,7 @@ impl Checker<'_> {
                 }
             }
             self.check_tables(package);
-            self.check_approvals(workspace, package);
+            self.check_approvals(package);
         }
         self.check_wheres();
         self.check_const_cycles();
@@ -676,7 +723,7 @@ pub fn proof_cache_mismatches(workspace: &Workspace) -> Vec<String> {
     let mut mismatches = Vec::new();
     for (_, checker) in checkers(workspace, std) {
         *checker.compared.borrow_mut() = Some(Vec::new());
-        checker.check_all(workspace);
+        checker.check_all();
         let found = checker.compared.borrow_mut().take().unwrap_or_default();
         mismatches.extend(found.iter().map(Hash::full));
     }
@@ -792,7 +839,26 @@ pub fn package_snapshots(
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let name = package.name().unwrap_or_default();
     let items = snapshot::Items::of(&views, name);
-    snapshot::snapshots(&items, package, confirmed)
+    computed_snapshots(workspace, package, &items, confirmed)
+}
+
+/// The snapshots `nan api update` computes for a package of a workspace, from its items across
+/// the checkers of its targets, its pending weakenings judged by entailment.
+fn computed_snapshots(
+    workspace: &Workspace,
+    package: &Package,
+    items: &snapshot::Items,
+    confirmed: &[String],
+) -> Snapshots {
+    let mut computed = snapshot::snapshots(items, package, confirmed);
+    if let Some(index) = workspace
+        .packages
+        .iter()
+        .position(|held| std::ptr::eq(held, package))
+    {
+        entail::refine(workspace, index, items, &mut computed);
+    }
+    computed
 }
 
 /// The seal `principal` writes on a package's item at `path`, in a VCS workspace meeting the
@@ -809,7 +875,8 @@ pub fn sealed(
         checkers.iter().map(|(target, ck)| (*target, ck)).collect();
     let name = package.name().unwrap_or_default();
     let items = snapshot::Items::of(&views, name);
-    let sealed = snapshot::sealed(&items, package, path, principal)?;
+    let computed = computed_snapshots(workspace, package, &items, &[]);
+    let sealed = snapshot::sealed(&items, package, computed, path, principal)?;
     let shared = author::History::open(workspace).and_then(|history| {
         history.would_share(name, path, &sealed.seal, sealed.accepted.as_ref())
     });
@@ -846,7 +913,7 @@ pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnosti
             .filter(|package| checker.db.package(*package).quiet)
             .collect();
         for package in quiet {
-            checker.check_whole(workspace, package);
+            checker.check_whole(package);
         }
         found.extend(
             checker

@@ -1,17 +1,34 @@
 //! Elaborating calls: the callee and arguments, the predicate, requires and decreases checks a
 //! call carries, failing calls with `try` and `attempt`, and checking entries.
 
+use std::collections::HashMap;
+
 use super::expr::Out;
-use super::{Elab, Elaborated, Fault};
+use super::{Elab, Elaborated, Fault, Held};
 use crate::check::db::ItemId;
 use crate::check::sig::{FnSig, SigKind};
-use crate::check::tir::{self, ClauseRole, TBody, TClosure};
+use crate::check::tir::{self, ClauseRole, TBody, TClosure, TKind};
 use crate::check::ty::{Arg, Args, Scalar, Subst, Ty};
 use crate::nir::{
     Builtin, Call, Callable, Callee, CheckKind, FnRef, Function, NTy, Op, Operand, Payload, Place,
     Role, Span, Terminator,
 };
-use crate::syntax::ast::{FailureMarker, ItemKind, Mode};
+use crate::syntax::ast::{FailureMarker, ItemKind, Mode, Tok};
+
+/// What elaborating a rewrite gives: its outermost call with the callee value and arguments
+/// evaluated, none when one diverges; or its value.
+enum Rewritten<'c> {
+    Call(Option<Evaluated<'c>>),
+    Value(Out),
+}
+
+/// A call with its callee value, for a call through a function value, and its arguments
+/// evaluated.
+struct Evaluated<'c> {
+    call: &'c tir::Call,
+    function_value: Option<crate::nir::Value>,
+    args: Vec<Operand>,
+}
 
 /// The requires clauses a call meets: the unit whose functions compute them, their indexes
 /// there, and whether each is disputed.
@@ -41,10 +58,190 @@ impl Elab<'_, '_> {
                 None => return Ok(Out::Never),
             }
         }
-        self.finish_call(call, function_value, args, ty, span)
+        if let tir::Callee::Function { item } = &call.callee
+            && matches!(self.ck.db.ast(*item).kind, ItemKind::Retired(_))
+        {
+            return self.forwarded(call, *item, args, ty, span);
+        }
+        self.finish_call(call, function_value, args, ty, span, None)
     }
 
-    /// A call whose callee and arguments are evaluated: its checks, then the call.
+    /// A call forwarded through a tombstone's old head: its arguments, `args`, in the old head's
+    /// parameters, then the tombstone's rewrite over them, the call's markers on the rewrite's
+    /// outermost call, all with the call's span.
+    fn forwarded(
+        &mut self,
+        call: &tir::Call,
+        tombstone: ItemId,
+        args: Vec<Operand>,
+        ty: &Ty,
+        span: Span,
+    ) -> Elaborated<Out> {
+        if self.forwarding.contains(&tombstone) {
+            return Err(Fault::Unsupported(
+                "a cycle of forwarded rewrites".to_owned(),
+            ));
+        }
+        let (Some(sig), Some(body)) = (self.ck.fn_sig(tombstone), self.ck.typed(tombstone)) else {
+            return Err(Fault::Failed);
+        };
+        let Some(rewrite) = &body.root else {
+            return Err(Fault::Failed);
+        };
+        let subst = Subst::of(sig.generics.iter().map(|def| def.param), &call.type_args);
+        let mark = self.b.mark();
+        let mut held = HashMap::new();
+        for ((local, param), arg) in body.params.iter().zip(&call.head.params).zip(args) {
+            let binding = match arg {
+                Operand::Literal(literal) => Held::Literal(literal),
+                Operand::Place(Mode::Take, place) => {
+                    let ty = NTy::Owned(param.ty.clone());
+                    let value = self.emit_value(Op::Move(place), ty, span);
+                    self.taken_binding(value, &param.ty, call.token)
+                }
+                Operand::Place(_, place) => Held::Place(place),
+                Operand::Value(value) if param.mode == Mode::Take => {
+                    self.taken_binding(value, &param.ty, call.token)
+                }
+                Operand::Value(value) => Held::Value(value),
+            };
+            held.insert(*local, binding);
+        }
+        let mut closures: Vec<&TClosure> = Vec::new();
+        super::collect_closures(rewrite, &mut closures);
+        let count = closures
+            .iter()
+            .map(|closure| closure.index)
+            .max()
+            .unwrap_or(0);
+        let base = self.unit.inline_closures(self.body, count);
+        let (parts, nested) = {
+            let builder = std::mem::replace(&mut self.b, super::Builder::new());
+            let mut nested = Elab::new(self.ck, &mut *self.unit, body.as_ref(), self.role);
+            nested.b = builder;
+            nested.held = held;
+            nested.trusted = self.trusted;
+            nested.closure_base = base;
+            nested.forwarding = self.forwarding.clone();
+            nested.forwarding.push(tombstone);
+            let parts = match &rewrite.kind {
+                TKind::Call(inner) => nested.callee_and_args(inner).map(Rewritten::Call),
+                _ => nested.expr(rewrite).map(Rewritten::Value),
+            };
+            let held = nested.scopes.swap_remove(0).slots;
+            (
+                parts,
+                (nested.b, nested.temps, held, nested.moved, nested.wrapped),
+            )
+        };
+        let (builder, temps, slots, moved, wrapped) = nested;
+        self.b = builder;
+        self.temps.extend(temps);
+        self.scopes[self.temp_scope].slots.extend(slots);
+        self.moved.extend(moved);
+        self.wrapped.extend(wrapped);
+        if count > 0 {
+            let inlined = super::Inlined {
+                base,
+                span,
+                subst: subst.clone(),
+            };
+            self.ck
+                .closure_functions(&mut *self.unit, &body, Some(&inlined))?;
+        }
+        let out = match parts? {
+            Rewritten::Call(None) | Rewritten::Value(Out::Never) => Out::Never,
+            Rewritten::Call(Some(Evaluated {
+                call: inner,
+                function_value,
+                args,
+            })) => {
+                let mut outer = inner.clone();
+                outer.token = call.token;
+                outer.failure = call.failure;
+                outer.awaited = call.awaited;
+                outer.type_args = subst.args(&inner.type_args);
+                outer.head = subst.fn_ty(&inner.head);
+                if let tir::Callee::Method {
+                    interface, self_ty, ..
+                } = &mut outer.callee
+                {
+                    interface.args = subst.args(&interface.args);
+                    *self_ty = subst.ty(self_ty);
+                }
+                if call.failure.is_none() && outer.head.fails.is_some() {
+                    return Err(Fault::Unsupported(
+                        "a forwarded rewrite failing where its use does not".to_owned(),
+                    ));
+                }
+                let through = call.head.fails.as_ref();
+                self.finish_call(&outer, function_value, args, ty, span, through)?
+            }
+            Rewritten::Value(value) => match call.failure {
+                Some((FailureMarker::Attempt, _)) => {
+                    let value = match value {
+                        Out::Place(place) => self.take_place(place, &call.head.result, span),
+                        Out::Operand(operand) => operand,
+                        Out::Never => unreachable!("a value"),
+                    };
+                    let wrapped = self.emit_value(
+                        Op::Variant {
+                            ty: ty.clone(),
+                            variant: "Ok".to_owned(),
+                            payload: Payload::Single(value),
+                        },
+                        NTy::Owned(ty.clone()),
+                        span,
+                    );
+                    Out::Operand(Operand::Value(wrapped))
+                }
+                _ => value,
+            },
+        };
+        self.b.since(&mark, span, &subst);
+        Ok(out)
+    }
+
+    /// The binding of a `take` parameter of an inlined rewrite to the value its argument moves:
+    /// the value when Copy, else a temporary of the statement holding it.
+    fn taken_binding(&mut self, value: crate::nir::Value, ty: &Ty, token: Tok) -> Held {
+        let place = self.temporary(Operand::Value(value), ty, token);
+        match place.root == value {
+            true => Held::Value(value),
+            false => Held::Slot(place.root),
+        }
+    }
+
+    /// The callee value and the arguments of a call, evaluated; none when one diverges.
+    fn callee_and_args<'c>(&mut self, call: &'c tir::Call) -> Elaborated<Option<Evaluated<'c>>> {
+        let function_value = match &call.callee {
+            tir::Callee::Value(value) => match self.operand(value)? {
+                Some(Operand::Value(value)) => Some(value),
+                Some(_) => {
+                    return Err(Fault::Unsupported(
+                        "a function value that is no value".to_owned(),
+                    ));
+                }
+                None => return Ok(None),
+            },
+            _ => None,
+        };
+        let mut args = Vec::new();
+        for arg in &call.args {
+            match self.arg(&arg.expr, arg.mode)? {
+                Some(operand) => args.push(operand),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(Evaluated {
+            call,
+            function_value,
+            args,
+        }))
+    }
+
+    /// A call whose callee and arguments are evaluated: its checks, then the call, its failure
+    /// converted first to `through` when given.
     pub fn finish_call(
         &mut self,
         call: &tir::Call,
@@ -52,6 +249,7 @@ impl Elab<'_, '_> {
         mut args: Vec<Operand>,
         ty: &Ty,
         span: Span,
+        through: Option<&Ty>,
     ) -> Elaborated<Out> {
         let callee = match (&call.callee, function_value) {
             (_, Some(value)) => Callee::Value(value),
@@ -90,7 +288,7 @@ impl Elab<'_, '_> {
             args,
         };
         if call.head.fails.is_some() {
-            return self.failing_call(call, nir_call, ty, span);
+            return self.failing_call(call, nir_call, ty, span, through);
         }
         if call.head.result == Ty::Never {
             self.emit(Op::Call(nir_call), span);
@@ -438,13 +636,15 @@ impl Elab<'_, '_> {
         nir_call: Call,
         ty: &Ty,
         span: crate::nir::Span,
+        through: Option<&Ty>,
     ) -> Elaborated<Out> {
         let ok = self.b.block();
         let fail = self.b.block();
         let value_ty = call.head.result.clone();
-        let failure_ty = call.head.fails.clone().unwrap_or(Ty::Never);
+        let raised = call.head.fails.clone().unwrap_or(Ty::Never);
         let result = self.b.block_param(ok, self.result_nty(call));
-        let failure = self.b.block_param(fail, NTy::Owned(failure_ty.clone()));
+        let failure = self.b.block_param(fail, NTy::Owned(raised.clone()));
+        let failure_ty = through.cloned().unwrap_or_else(|| raised.clone());
         self.end(
             Terminator::Call {
                 call: nir_call,
@@ -470,11 +670,13 @@ impl Elab<'_, '_> {
                 );
                 self.b.jump(join, vec![Operand::Value(wrapped)], span);
                 self.b.at(fail);
+                let failure =
+                    self.converted_to(Operand::Value(failure), &raised, &failure_ty, span);
                 let wrapped = self.emit_value(
                     Op::Variant {
                         ty: ty.clone(),
                         variant: "Err".to_owned(),
-                        payload: Payload::Single(Operand::Value(failure)),
+                        payload: Payload::Single(failure),
                     },
                     NTy::Owned(ty.clone()),
                     span,
@@ -487,11 +689,12 @@ impl Elab<'_, '_> {
             _ => {
                 let moved = self.moved.clone();
                 self.b.at(fail);
-                if failure_ty == Ty::Never {
+                if raised == Ty::Never {
                     self.end(Terminator::Unreachable, span);
                 } else {
-                    let converted =
-                        self.converted(Operand::Value(failure), &failure_ty, call.token)?;
+                    let failure =
+                        self.converted_to(Operand::Value(failure), &raised, &failure_ty, span);
+                    let converted = self.converted(failure, &failure_ty, call.token)?;
                     self.exit_fail(converted, call.token)?;
                 }
                 self.moved = moved;
@@ -511,6 +714,9 @@ impl Elab<'_, '_> {
     /// captures.
     pub fn closure_predicate_checks(&mut self, closure: &TClosure, span: Span) -> Elaborated<()> {
         for capture in super::closure_captures(closure) {
+            if matches!(self.held.get(&capture.outer), Some(Held::Literal(_))) {
+                continue;
+            }
             let ty = self.body.local(capture.outer).ty.clone();
             let place = self.local_place(capture.outer)?;
             self.predicate_checks(place, &ty, span)?;

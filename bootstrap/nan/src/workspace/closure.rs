@@ -184,17 +184,24 @@ impl Reader<'_> {
         };
         let mut lines: HashMap<&str, Member> = HashMap::new();
         for line in &lock.deps {
+            let reaching = manifest
+                .deps
+                .iter()
+                .filter(|dep| dep.written == line.source)
+                .map(|dep| dep.line)
+                .next()
+                .unwrap_or(manifest.line);
+            let held = self.store.entry(&line.root)?;
+            let mismatched = held.as_ref().is_some_and(|entry| entry.root() != line.root);
+            if mismatched {
+                self.report(Code::ArtefactRootMismatch, package, reaching);
+            }
             let missing = |reader: &mut Reader| {
-                let reaching = manifest
-                    .deps
-                    .iter()
-                    .filter(|dep| dep.written == line.source)
-                    .map(|dep| dep.line)
-                    .next()
-                    .unwrap_or(manifest.line);
-                reader.report(Code::DepReleaseMissing, package, reaching);
+                if !mismatched {
+                    reader.report(Code::DepReleaseMissing, package, reaching);
+                }
             };
-            let entry = self.store.entry(&line.root)?;
+            let entry = held.filter(|_| !mismatched);
             let member = if line.source.starts_with('.') {
                 let dir = resolve(&package.dir, &line.source);
                 let source = self.at(&dir).filter(|at| {

@@ -148,6 +148,24 @@ pub struct Snapshots {
     pub recorded: Vec<Recorded>,
 }
 
+impl Snapshots {
+    /// The entry of an item, by canonical path.
+    pub fn entry(&self, path: &str) -> Option<&Entry> {
+        self.modules
+            .iter()
+            .filter_map(|(_, snapshot)| snapshot.as_ref())
+            .find_map(|snapshot| snapshot.entry(path))
+    }
+
+    pub fn entry_mut(&mut self, path: &str) -> Option<&mut Entry> {
+        self.modules
+            .iter_mut()
+            .filter_map(|(_, snapshot)| snapshot.as_mut())
+            .flat_map(|snapshot| snapshot.entries.iter_mut())
+            .find(|entry| entry.path == path)
+    }
+}
+
 /// The snapshots `nan api update` computes for a package from its source, its snapshots and,
 /// for each item of `confirmed`, the bound hashes of its public docs set to its interface hash.
 pub fn snapshots(items: &Items, source: &Package, confirmed: &[String]) -> Snapshots {
@@ -242,11 +260,13 @@ pub struct Sealed {
     pub accepted: Option<Accepted>,
 }
 
-/// The snapshot of the module recording the item at `path` once `principal` seals it: the seal
-/// replaces an earlier one of the principal and accepts the item's pending weakening.
+/// The snapshot of the module recording the item at `path` once `principal` seals it, from the
+/// snapshots `nan api update` computes: the seal replaces an earlier one of the principal and
+/// accepts the item's pending weakening.
 pub fn sealed(
     items: &Items,
     source: &Package,
+    computed: Snapshots,
     path: &str,
     principal: &str,
 ) -> Result<Sealed, Unsealed> {
@@ -264,7 +284,6 @@ pub fn sealed(
             .clone(),
         None => return Err(Unsealed::Unneeded),
     };
-    let computed = snapshots(items, source, &[]);
     let current = computed
         .modules
         .into_iter()

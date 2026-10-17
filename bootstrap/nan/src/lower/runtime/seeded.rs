@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, 
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
-use super::super::host::thread;
+use super::tasks::thread;
 use super::tasks::{self, CANCELED, EXPIRED, operation, run, task};
 use super::{Routine, state};
 

@@ -22,9 +22,8 @@ const SIZE: u64 = LOCK + 8;
 
 /// A new empty header drawing through an allocator handle.
 pub fn header(lo: &mut Lowering, fx: &mut Fx, alloc: Value) -> Value {
-    let one = fx.ptr(1);
     let size = fx.ptr(SIZE);
-    let header = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let header = lo.record_alloc(fx, size);
     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, header, 0);
     fx.when(failed, |fx| {
         super::super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
@@ -105,7 +104,7 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, header: Value, element: &Ty) {
             lo.call_routine(fx, Routine::Free, &[base]);
         });
     });
-    lo.call_libc(fx, "free", &[header], &[]);
+    lo.record_free(fx, header);
 }
 
 /// Moves every element and the segments into another domain's reach.

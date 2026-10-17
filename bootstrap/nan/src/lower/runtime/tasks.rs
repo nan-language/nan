@@ -15,10 +15,11 @@ use cranelift_codegen::ir::{
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use super::super::fx::{Fx, PTR};
-use super::super::host::{self, thread};
+use super::super::host;
+use super::super::machine::Stub;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::origin;
-use super::{Routine, state};
+use super::{Routine, state, system};
 
 /// The offsets of a task record's fields.
 pub mod task {
@@ -83,7 +84,32 @@ pub mod task {
     pub const SETTLE: u64 = 264;
     /// On the seeded scheduler, the order in which it last became ready.
     pub const ORDER: u64 = 272;
-    pub const SIZE: u64 = 280;
+    /// On a kernel, nonzero while an interrupt that preempted the task waits to return into it.
+    pub const PREEMPTED: u64 = 280;
+    pub const SIZE: u64 = 288;
+}
+
+/// The offsets of an executor thread record's fields: the scheduler's saved context, the task
+/// it runs, its index and the locks it holds; on `x86_64-host` also its ring, whether it waits
+/// idle in its ring, the operations in flight on it, whether another thread asked to cancel one,
+/// its POSIX thread and the top of the stack its stack overflow reports run on; on a kernel the
+/// flags from before its outermost held lock disabled interrupts.
+pub mod thread {
+    pub const CONTEXT: u64 = 0;
+    pub const CURRENT: u64 = 24;
+    pub const RING: u64 = 32;
+    pub const INDEX: u64 = 40;
+    pub const IDLE: u64 = 48;
+    pub const OPERATIONS: u64 = 56;
+    pub const REQUESTS: u64 = 64;
+    /// The number of locks the thread holds, then up to `HELD_LOCKS` of them in the order it
+    /// took them.
+    pub const LOCKS: u64 = 72;
+    pub const PTHREAD: u64 = 80;
+    pub const TRAP_STACK: u64 = 88;
+    pub const HELD: u64 = 96;
+    pub const SAVED_IF: u64 = HELD + 8 * super::super::locks::HELD_LOCKS;
+    pub const SIZE: u64 = SAVED_IF + 8;
 }
 
 /// The bits of a task record's flags.
@@ -240,6 +266,15 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     }
 }
 
+/// Sets what the running task waits on at a cancellation point: `regions::WAITING` for a plain
+/// wait, zero once it no longer waits.
+pub fn waiting_on(lo: &mut Lowering, fx: &mut Fx, what: i64) {
+    let current = current_task(lo, fx);
+    let word = fx.offset(current, task::IO);
+    let what = fx.ptr(what as u64);
+    fx.b.ins().atomic_store(MemFlagsData::trusted(), what, word);
+}
+
 /// The task the running executor thread runs, zero outside a task.
 pub fn current_task(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let thread = lo.thread(fx);
@@ -387,8 +422,7 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     let (cell, domain, region) = (params[5], params[6], params[7]);
     let usable = own_stack(lo, fx, code, params[4]);
     let size = fx.b.ins().iadd_imm_s(extra, task::SIZE as i64);
-    let one = fx.ptr(1);
-    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let record = lo.record_alloc(fx, size);
     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     fx.when(failed, |fx| {
         super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -402,18 +436,18 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
         lo,
         mapped,
         &[PTR],
-        |lo, fx| vec![host::map_stack(lo, fx, length)],
+        |lo, fx| vec![system::map_stack(lo, fx, length)],
         |lo, fx| {
             let align = fx.ptr(super::memory::CHUNK);
             let drawn = lo.call_routine(fx, Routine::AllocIn, &[cell, length, align, domain])[0];
             let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, drawn, 0);
-            fx.when(present, |fx| host::protect_guard(lo, fx, drawn, false));
+            fx.when(present, |fx| system::protect_guard(lo, fx, drawn, false));
             vec![drawn]
         },
     )[0];
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, stack, 0);
     fx.when(missing, |fx| {
-        lo.call_libc(fx, "free", &[record], &[]);
+        lo.record_free(fx, record);
         let zero = fx.ptr(0);
         fx.b.ins().return_(&[zero]);
     });
@@ -504,6 +538,27 @@ fn switch_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
     fx.b.ins().stack_switch(context, scheduler, record);
+}
+
+/// Switches the running kernel task, which an interrupt preempted, away from its CPU: it becomes
+/// ready again once its registers are saved, and resumes through the seam that preempted it. A
+/// task interrupted while it switches away for another reason, parking or ending, stays as it is.
+pub fn yield_preempted(lo: &mut Lowering, fx: &mut Fx) {
+    let record = current_task(lo, fx);
+    let word = fx.offset(record, task::STATE);
+    let running = fx.int(types::I32, run::RUNNING);
+    let notified = fx.int(types::I32, run::NOTIFIED);
+    let seen =
+        fx.b.ins()
+            .atomic_cas(MemFlagsData::trusted(), word, running, notified);
+    let was_running = fx.b.ins().icmp(IntCC::Equal, seen, running);
+    let was_notified = fx.b.ins().icmp(IntCC::Equal, seen, notified);
+    let yields = fx.b.ins().bor(was_running, was_notified);
+    fx.when(yields, |fx| {
+        let one = fx.ptr(1);
+        fx.store(one, record, task::PREEMPTED);
+        switch_out(lo, fx, record);
+    });
 }
 
 /// Suspends the running task until a wake, unless one came since it last ran.
@@ -602,7 +657,7 @@ pub fn push_ready(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     );
     fx.store(record, state_address, state::READY_TAIL);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    host::wake_idle(lo, fx);
+    system::wake_idle(lo, fx);
 }
 
 /// Takes the first ready task, zero when none.
@@ -633,6 +688,9 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     let header = fx.block();
     fx.b.ins().jump(header, &[]);
     fx.b.switch_to_block(header);
+    if lo.kernel() {
+        lo.call_stub(fx, Stub::Cli, &[]);
+    }
     let record = match lo.seeded() {
         true => super::seeded::pick(lo, fx),
         false => pop_ready(lo, fx),
@@ -650,7 +708,7 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
         |lo, fx| {
             match lo.seeded() {
                 true => super::seeded::idle(lo, fx),
-                false => host::idle(lo, fx),
+                false => system::idle(lo, fx),
             }
             Vec::new()
         },
@@ -695,6 +753,26 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     fx.store(thread, record, task::THREAD);
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
+    if lo.kernel() {
+        // A preempted task resumes through the seam that preempted it, whose return restores its
+        // interrupt flag; every other task runs with maskable interrupts enabled.
+        let preempted = fx.load(PTR, record, task::PREEMPTED);
+        let resumed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, preempted, 0);
+        fx.choose_in(
+            lo,
+            resumed,
+            &[],
+            |_, fx| {
+                let zero = fx.ptr(0);
+                fx.store(zero, record, task::PREEMPTED);
+                Vec::new()
+            },
+            |lo, fx| {
+                lo.call_stub(fx, Stub::Sti, &[]);
+                Vec::new()
+            },
+        );
+    }
     fx.b.ins().stack_switch(scheduler, context, record);
     let thread = lo.thread(fx);
     let zero = fx.ptr(0);
@@ -721,7 +799,12 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             Vec::new()
         },
         |lo, fx| {
+            // A task switching away notified was woken after it parked, or was preempted.
             let parking = fx.b.ins().icmp_imm_s(IntCC::Equal, state_now, run::PARKING);
+            let notified =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, state_now, run::NOTIFIED);
+            let parking = fx.b.ins().bor(parking, notified);
             fx.when(parking, |fx| {
                 let parking = fx.int(types::I32, run::PARKING);
                 let parked = fx.int(types::I32, run::PARKED);
@@ -782,11 +865,11 @@ pub fn release_stack(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         &[],
         |lo, fx| {
             let length = fx.load(PTR, record, task::STACK_SIZE);
-            host::unmap(lo, fx, stack, length);
+            system::unmap_stack(lo, fx, stack, length);
             Vec::new()
         },
         |lo, fx| {
-            host::protect_guard(lo, fx, stack, true);
+            system::protect_guard(lo, fx, stack, true);
             lo.call_routine(fx, Routine::Free, &[stack]);
             Vec::new()
         },
@@ -827,7 +910,7 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
                 .atomic_cas(MemFlagsData::trusted(), word, op, zero);
         let claimed = fx.b.ins().icmp(IntCC::NotEqual, seen, op);
         fx.when(claimed, |fx| {
-            lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
+            lo.relax(fx);
         });
         (claimed, Vec::new())
     });
@@ -923,18 +1006,24 @@ impl Lowering<'_, '_> {
     /// Asks once for the cancellation of an operation whose record stays valid during the
     /// call; on the seeded scheduler one in flight completes cancelled at once.
     pub fn cancel_operation(&mut self, fx: &mut Fx, op: Value) {
-        match self.seeded() {
-            true => super::seeded::cancel(self, fx, op),
-            false => host::cancel_operation(self, fx, op),
+        if self.seeded() {
+            super::seeded::cancel(self, fx, op);
+        } else if self.kernel() {
+            // A kernel task waits only on plain waits, which cancellation wakes, never on an
+            // operation.
+            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+        } else {
+            host::cancel_operation(self, fx, op);
         }
     }
 
     /// Delivers the completions that have arrived: those on the running thread's ring, or
-    /// those the seeded scheduler queued.
+    /// those the seeded scheduler queued; a kernel's waits end by wakes alone.
     pub fn reap(&mut self, fx: &mut Fx) {
-        match self.seeded() {
-            true => super::seeded::reap(self, fx),
-            false => host::reap(self, fx, None),
+        if self.seeded() {
+            super::seeded::reap(self, fx);
+        } else if !self.kernel() {
+            host::reap(self, fx, None);
         }
     }
 

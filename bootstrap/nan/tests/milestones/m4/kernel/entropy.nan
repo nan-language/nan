@@ -1,0 +1,296 @@
+//! A driver of the virtio entropy device, receiving bytes through a DMA-shared virtqueue.
+
+/// The virtio vendor id, and the transitional and modern device ids of the entropy device.
+const VIRTIO_VENDOR: u32 = 0x1AF4
+
+const RNG_TRANSITIONAL: u32 = 0x1005
+
+const RNG_MODERN: u32 = 0x1044
+
+/// The PCI configuration offsets the driver reads: the ids, the command and status word, the
+/// first base address register and the capability list's head; the status bit announcing that
+/// list, and the command bits enabling memory decoding and bus mastering.
+const PCI_IDS: u32 = 0x00
+
+const PCI_COMMAND: u32 = 0x04
+
+const PCI_BARS: u32 = 0x10
+
+const PCI_CAPABILITIES: u32 = 0x34
+
+const HAS_CAPABILITIES: u32 = 0x10_0000
+
+const MEMORY_AND_MASTER: u32 = 0x6
+
+/// The vendor-specific capability id, and the virtio configuration kinds the driver uses.
+const VENDOR_CAPABILITY: u32 = 0x09
+
+const COMMON_KIND: u32 = 1
+
+const NOTIFY_KIND: u32 = 2
+
+/// The device status bits a driver sets as it initialises the device, and the feature bit, in
+/// the second feature word, of virtio 1.
+const ACKNOWLEDGE: u8 = 1
+
+const DRIVER: u8 = 2
+
+const DRIVER_OK: u8 = 4
+
+const FEATURES_OK: u8 = 8
+
+const VERSION_1: u32 = 1
+
+/// The entries of the driver's virtqueue, the flag of a descriptor the device writes, and the
+/// polls of the used ring before the driver gives up.
+const QUEUE_SIZE: u16 = 4
+
+const DEVICE_WRITES: u16 = 2
+
+const USED_POLLS: u32 = 50_000_000
+
+/// The bytes each request asks for.
+const SAMPLE_BYTES: u32 = 16
+
+/// PCI configuration mechanism #1.
+registers PciConfig {
+    address: u32 at 0x0 write
+    data: u32 at 0x4 read write
+} PciConfig
+
+/// The virtio common configuration.
+registers Common {
+    device_feature_select: u32 at 0x0 read write
+    device_feature: u32 at 0x4 read
+    driver_feature_select: u32 at 0x8 read write
+    driver_feature: u32 at 0xC read write
+    status: u8 at 0x14 read write
+    queue_select: u16 at 0x16 read write
+    queue_size: u16 at 0x18 read write
+    queue_enable: u16 at 0x1C read write
+    queue_notify_off: u16 at 0x1E read
+    queue_desc_low: u32 at 0x20 read write
+    queue_desc_high: u32 at 0x24 read write
+    queue_driver_low: u32 at 0x28 read write
+    queue_driver_high: u32 at 0x2C read write
+    queue_device_low: u32 at 0x30 read write
+    queue_device_high: u32 at 0x34 read write
+} Common
+
+/// A queue's notification register.
+registers Notify {
+    queue: u16 at 0x0 write
+} Notify
+
+layout Descriptor: bytes 16 le {
+    address: u64 at 0
+    length: u32 at 8
+    flags: u16 at 12
+    next: u16 at 14
+} Descriptor
+
+layout UsedEntry: bytes 8 le {
+    id: u32 at 0
+    length: u32 at 4
+} UsedEntry
+
+/// The virtqueue and the bytes its one request receives: the descriptor table, the driver area
+/// and the device area at the alignments virtio requires of them, then the receive buffer.
+layout Queue: bytes 160 le {
+    descriptors: Array[Descriptor, 4] at 0
+    avail_flags: u16 at 64
+    avail_index: u16 at 66
+    avail_ring: Array[u16, 4] at 68
+    avail_pad: Array[u8, 4] at 76
+    used_flags: u16 at 80
+    used_index: u16 at 82
+    used_ring: Array[UsedEntry, 4] at 84
+    used_pad: Array[u8, 12] at 116
+    data: Array[u8, 16] at 128
+    data_pad: Array[u8, 16] at 144
+} Queue
+
+/// The offsets of the driver and device areas and of the receive buffer in a `Queue`.
+const DRIVER_AREA: u64 = 64
+
+const DEVICE_AREA: u64 = 80
+
+const BUFFER: u64 = 128
+
+pub closed enum EntropyError derives Render {
+    NoDevice
+    NoCapability
+    Unsupported
+    Misaligned
+    NoResponse
+} EntropyError
+
+/// Where the device's configuration structures lie: its common configuration, and its
+/// notification registers with the multiplier of each queue's offset among them.
+struct Device {
+    common: u64
+    notify: u64
+    multiplier: u32
+} Device
+
+/// Asks the entropy device for bytes and reports how many it gave, or why it gave none.
+fn sample_entropy(console: hw::IrqShared[Console], alloc: mem::Alloc) {
+    let outcome = attempt receive(alloc)
+    match outcome {
+        Ok(count) => say_number(console, before: "virtio-rng: received ", value: u64.widen(count), after: " bytes\n")
+        Err(error) => {
+            say(console, text: "virtio-rng: failed\n")
+            discard error
+        }
+    }
+} sample_entropy
+
+/// Finds the device, sets up its virtqueue in DMA-shared memory, makes one request and gives the
+/// number of bytes the device wrote.
+fn receive(alloc: mem::Alloc) -> u32 fails EntropyError {
+    var config = trusted "the board's PCI configuration mechanism #1 lies at ports 0xCF8 to 0xCFF and nothing else maps them" { hw::Ports[PciConfig].map(0xCF8) }
+    let found = attempt locate(mut config)
+    take config.unmap()
+    let device = match found {
+        Ok(device) => device
+        Err(error) => fail error
+    }
+    let heap = mem::Heap.of(alloc)
+    var queue = hw::DmaShared.of(heap.boxed(Queue.from_bits(Array[u8, 160].filled(0))))
+    let outcome = attempt exchange(device, mut queue)
+    discard take queue.into_box()
+    return match outcome {
+        Ok(count) => count
+        Err(error) => fail error
+    }
+} receive
+
+/// The configuration structures of the first entropy device on PCI bus 0, with its memory
+/// decoding and bus mastering enabled.
+fn locate(mut config: hw::Ports[PciConfig]) -> Device fails EntropyError {
+    for slot in 0u32..<32 {
+        let ids = read_config(mut config, slot, offset: PCI_IDS)
+        let vendor = ids & 0xFFFF
+        let product = ids >> 16
+        if vendor == VIRTIO_VENDOR and (product == RNG_TRANSITIONAL or product == RNG_MODERN) {
+            let command = read_config(mut config, slot, offset: PCI_COMMAND)
+            write_config(mut config, slot, offset: PCI_COMMAND, value: (command & 0xFFFF) | MEMORY_AND_MASTER)
+            return try structures(mut config, slot, status: command)
+        }
+    }
+    fail EntropyError.NoDevice
+} locate
+
+/// The common and notification structures a device's vendor-specific capabilities name.
+fn structures(mut config: hw::Ports[PciConfig], slot: u32, status: u32) -> Device fails EntropyError {
+    if (status & HAS_CAPABILITIES) == 0 {
+        fail EntropyError.NoCapability
+    }
+    var common: u64 = 0
+    var notify: u64 = 0
+    var multiplier: u32 = 0
+    var at = read_config(mut config, slot, offset: PCI_CAPABILITIES) & 0xFC
+    for _ in 0u32..<48 {
+        if at == 0 {
+            break
+        }
+        let head = read_config(mut config, slot, offset: at)
+        let kind = (head >> 24) & 0xFF
+        if (head & 0xFF) == VENDOR_CAPABILITY and (kind == COMMON_KIND or kind == NOTIFY_KIND) {
+            let bar = read_config(mut config, slot, offset: at + 4) & 0xFF
+            let offset = read_config(mut config, slot, offset: at + 8)
+            let base = bar_base(mut config, slot, bar)
+            if kind == COMMON_KIND {
+                common = base + u64.widen(offset)
+            } else {
+                notify = base + u64.widen(offset)
+                multiplier = read_config(mut config, slot, offset: at + 16)
+            }
+        }
+        at = (head >> 8) & 0xFC
+    }
+    if common == 0 or notify == 0 {
+        fail EntropyError.NoCapability
+    }
+    return Device(common: common, notify: notify, multiplier: multiplier)
+} structures
+
+/// The memory address a device's base address register `bar` holds, both words of a 64-bit one.
+fn bar_base(mut config: hw::Ports[PciConfig], slot: u32, bar: u32) -> u64 {
+    let low = read_config(mut config, slot, offset: PCI_BARS + 4 * bar)
+    let base = u64.widen(low & 0xFFFF_FFF0)
+    if ((low >> 1) & 0x3) != 2 {
+        return base
+    }
+    let high = read_config(mut config, slot, offset: PCI_BARS + 4 * bar + 4)
+    return base | (u64.widen(high) << 32)
+} bar_base
+
+fn read_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32) -> u32 {
+    mut config.write(PciConfig.address, value: 0x8000_0000 | (slot << 11) | (offset & 0xFC))
+    return mut config.read(PciConfig.data)
+} read_config
+
+fn write_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32, value: u32) {
+    mut config.write(PciConfig.address, value: 0x8000_0000 | (slot << 11) | (offset & 0xFC))
+    mut config.write(PciConfig.data, value)
+} write_config
+
+/// Initialises the device with its virtqueue in `queue`, makes one request for
+/// `SAMPLE_BYTES` bytes into the queue's receive buffer, and gives the number it wrote.
+fn exchange(device: Device, mut queue: hw::DmaShared[Queue]) -> u32 fails EntropyError {
+    let bus = queue.bus_addr().value
+    if bus % 16 != 0 {
+        fail EntropyError.Misaligned
+    }
+    var common = trusted "the device's common configuration lies at device.common, uncached in the entry root, and nothing else maps it" { hw::Mmio[Common].map(device.common) }
+    defer take common.unmap()
+    try start(mut common, bus)
+    let notify_off = mut common.read(Common.queue_notify_off)
+    mut queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(address: bus + BUFFER, length: SAMPLE_BYTES, flags: DEVICE_WRITES, next: 0))
+    mut queue.write_release_at(Queue.avail_ring, index: 0, value: 0)
+    mut queue.write_release(Queue.avail_index, value: 1)
+    let doorbell = device.notify + u64.widen(notify_off) * u64.widen(device.multiplier)
+    var notify = trusted "the device's notification registers lie at doorbell, uncached in the entry root, and nothing else maps them" { hw::Mmio[Notify].map(doorbell) }
+    mut notify.write(Notify.queue, value: 0)
+    take notify.unmap()
+    for _ in 0..<USED_POLLS {
+        if mut queue.read_acquire(Queue.used_index) != 0 {
+            let used = mut queue.read_acquire_at(Queue.used_ring, index: 0)
+            return used.length
+        }
+    }
+    fail EntropyError.NoResponse
+} exchange
+
+/// Resets the device, negotiates virtio 1 alone, and sets up queue 0 of `QUEUE_SIZE` entries in
+/// the queue whose bus address is `bus`, leaving the device running.
+fn start(mut common: hw::Mmio[Common], bus: u64) fails EntropyError {
+    mut common.write(Common.status, value: 0)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER)
+    mut common.write(Common.device_feature_select, value: 1)
+    if (mut common.read(Common.device_feature) & VERSION_1) == 0 {
+        fail EntropyError.Unsupported
+    }
+    mut common.write(Common.driver_feature_select, value: 0)
+    mut common.write(Common.driver_feature, value: 0)
+    mut common.write(Common.driver_feature_select, value: 1)
+    mut common.write(Common.driver_feature, value: VERSION_1)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK)
+    if (mut common.read(Common.status) & FEATURES_OK) == 0 {
+        fail EntropyError.Unsupported
+    }
+    mut common.write(Common.queue_select, value: 0)
+    if mut common.read(Common.queue_size) < QUEUE_SIZE {
+        fail EntropyError.Unsupported
+    }
+    mut common.write(Common.queue_size, value: QUEUE_SIZE)
+    mut common.write(Common.queue_desc_low, value: u32.truncate(bus))
+    mut common.write(Common.queue_desc_high, value: u32.truncate(bus >> 32))
+    mut common.write(Common.queue_driver_low, value: u32.truncate(bus + DRIVER_AREA))
+    mut common.write(Common.queue_driver_high, value: u32.truncate((bus + DRIVER_AREA) >> 32))
+    mut common.write(Common.queue_device_low, value: u32.truncate(bus + DEVICE_AREA))
+    mut common.write(Common.queue_device_high, value: u32.truncate((bus + DEVICE_AREA) >> 32))
+    mut common.write(Common.queue_enable, value: 1)
+    mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+} start

@@ -1,8 +1,9 @@
 //! Final builds: checking a program's final closure, lowering its reach and linking its image.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::artefact;
 use crate::check;
@@ -13,8 +14,7 @@ use crate::hash::checksummed_base32;
 use crate::lower;
 use crate::workspace::{Member, Package, Target, Workspace};
 
-/// The platform package of `x86_64-host` and its entry landing fn.
-const PLATFORM: &str = "host_platform";
+/// The entry landing fn each platform package holds.
 const LANDING: &str = "enter";
 
 /// What a final build reports and the image it writes, relative to the workspace root.
@@ -41,7 +41,8 @@ pub fn build(
             image: None,
         });
     };
-    let checker = check::checked(workspace, checked, std, Target::Host);
+    let target = source.program_target();
+    let checker = check::checked(workspace, checked, std, target);
     let root = package_id(&checker, source);
     let closure = closure(&checker, root);
     diagnostics.retain(|diagnostic| {
@@ -70,9 +71,9 @@ pub fn build(
         .db
         .packages
         .iter()
-        .find(|package| package.name == PLATFORM)
+        .find(|package| Some(package.name.as_str()) == target.platform_package())
         .and_then(|package| checker.db.lookup(package.root?, LANDING))
-        .expect("the host platform's entry landing fn");
+        .expect("the platform package's entry landing fn");
     let artefacts = artefacts(workspace, &checker, root);
     if let Some((image, written)) = compared {
         diagnostics.extend(crate::stage::compare(&checker, &artefacts, image, written));
@@ -83,16 +84,17 @@ pub fn build(
             });
         }
     }
-    let lowered = lower::lower(
-        &checker,
-        &lower::Program {
-            entry,
-            landing,
-            roots: vec![root],
-            prefixes: prefixes(&artefacts),
-            section: section(&artefacts),
-        },
-    );
+    let program = lower::Program {
+        entry,
+        landing,
+        roots: vec![root],
+        prefixes: prefixes(&artefacts),
+        section: section(&artefacts),
+    };
+    let lowered = match target.is_machine() {
+        true => lower::lower_machine(&checker, &program),
+        false => lower::lower(&checker, &program),
+    };
     diagnostics.extend(collisions(source, &lowered));
     diagnostics.extend(lower::stack::judge(
         &checker,
@@ -105,9 +107,13 @@ pub fn build(
             image: None,
         });
     }
-    let image = format!(".nan/images/{}/{name}", Target::Host.name());
-    let target = workspace.root.join(&image);
-    if let Err(output) = link(&lowered.object, &target) {
+    let image = format!(
+        ".nan/images/{}/{name}{}",
+        target.name(),
+        target.image_suffix()
+    );
+    let written = workspace.root.join(&image);
+    if let Err(output) = write_image(target, &lowered.object, &written)? {
         let manifest = source.manifest.as_ref().expect("a program's manifest");
         let line = manifest
             .entry
@@ -125,6 +131,39 @@ pub fn build(
         diagnostics,
         image: Some(image),
     })
+}
+
+/// Writes the image of a lowered object at `image` through a staged file beside it, replacing any
+/// earlier image at once: on `x86_64-host` an executable the `cc` of the `PATH` links, giving
+/// `cc`'s output when it fails; on a machine target the image writer's, entered by the program
+/// entry seam.
+pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Result<(), String>> {
+    let directory = image.parent().expect("an image lies in a directory");
+    fs::create_dir_all(directory)?;
+    let name = image
+        .file_name()
+        .expect("an image has a name")
+        .to_string_lossy();
+    let staged =
+        |extension: &str| directory.join(format!(".{name}.{}.{extension}", std::process::id()));
+    let new = staged("new");
+    match target.is_machine() {
+        true => {
+            let bytes = crate::image::write(target, object, lower::machine::ENTRY);
+            fs::write(&new, bytes)?;
+        }
+        false => {
+            let staged_object = staged("o");
+            fs::write(&staged_object, object)?;
+            let linked = lower::host::link(&staged_object, &new);
+            fs::remove_file(&staged_object)?;
+            if let Err(output) = linked {
+                return Ok(Err(output));
+            }
+        }
+    }
+    fs::rename(&new, image)?;
+    Ok(Ok(()))
 }
 
 /// The symbol collisions of a lowering for the image of a final-link root or tested package,
@@ -243,25 +282,4 @@ fn section(artefacts: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         bytes(out, artefact)
     });
     out
-}
-
-/// Links an object into a position-independent executable at `image` with the `cc` of the
-/// `PATH`, replacing any earlier image at once; `cc`'s output when it fails.
-pub fn link(object: &[u8], image: &std::path::Path) -> Result<(), String> {
-    let directory = image.parent().expect("an image lies in a directory");
-    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-    let name = image
-        .file_name()
-        .expect("an image has a name")
-        .to_string_lossy()
-        .into_owned();
-    let staged = |extension: &str| -> PathBuf {
-        directory.join(format!(".{name}.{}.{extension}", std::process::id()))
-    };
-    let (object_path, new) = (staged("o"), staged("new"));
-    std::fs::write(&object_path, object).map_err(|error| error.to_string())?;
-    let linked = lower::host::link(&object_path, &new);
-    let _ = std::fs::remove_file(&object_path);
-    linked?;
-    std::fs::rename(&new, image).map_err(|error| error.to_string())
 }

@@ -529,6 +529,28 @@ pub fn sector_buffer(heap: mem::Heap) -> hw::Dma[Sector] {
 
 ```nan
 // file: kernel/package.nan
+//! A device's status word.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    allow device in kernel
+} kernel
+
+// file: kernel/kernel.nan
+//! Clears a device's status word.
+
+pub layout Status: bytes 4 le {
+    pending: u32 at 0
+} Status
+
+pub fn clear(mut status: hw::DmaShared[Status]) {
+    mut status.write_release(Status.pending) // error: hw.dma-operand
+} clear
+```
+
+```nan
+// file: kernel/package.nan
 //! A block device's sector reads.
 
 package kernel {

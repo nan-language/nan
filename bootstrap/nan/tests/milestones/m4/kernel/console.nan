@@ -1,0 +1,140 @@
+//! The console: the 16550 UART, its receive interrupt and output under its lock.
+
+/// The vector the UART's interrupt arrives on, and its line on the I/O APIC.
+const UART_VECTOR: u8 = 0x24
+
+const UART_LINE: u32 = 4
+
+/// The modem control lines raised, with the interrupt output enabled, and the same in loopback.
+const MODEM_ON: u8 = 0x0B
+
+const MODEM_LOOPBACK: u8 = 0x1B
+
+/// The receive interrupt's enable bit.
+const RECEIVE_INTERRUPT: u8 = 0x01
+
+/// The polls of the line status before a byte is written whatever it says.
+const TRANSMIT_POLLS: u32 = 100_000
+
+layout LineStatus: u8 {
+    data_ready: bit 0
+    transmit_empty: bit 5
+    reserved: rest
+} LineStatus
+
+registers Uart {
+    data: u8 at 0x0 read write
+    interrupts: u8 at 0x1 read write
+    modem: u8 at 0x4 read write
+    line_status: LineStatus at 0x5 read
+} Uart
+
+registers IoApic {
+    select: u32 at 0x0 write
+    window: u32 at 0x10 read write
+} IoApic
+
+/// The UART and the signal its interrupt fn posts each received byte to.
+linear struct Console {
+    port: hw::Ports[Uart]
+    received: mem::Shared[hw::Signal[u8]]
+} Console
+
+/// Routes the UART's interrupt line to `UART_VECTOR` on the boot CPU and installs the console on
+/// that vector.
+fn attach(take received: mem::Shared[hw::Signal[u8]]) -> hw::IrqShared[Console] {
+    var port = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    var ioapic = trusted "the board's I/O APIC lies at 0xFEC0_0000, which the entry root maps uncached, and nothing else maps it" { hw::Mmio[IoApic].map(0xFEC0_0000) }
+    mut ioapic.write(IoApic.select, value: 0x10 + 2 * UART_LINE)
+    mut ioapic.write(IoApic.window, value: u32.widen(UART_VECTOR))
+    mut ioapic.write(IoApic.select, value: 0x11 + 2 * UART_LINE)
+    mut ioapic.write(IoApic.window, value: 0)
+    take ioapic.unmap()
+    mut port.write(Uart.modem, value: MODEM_ON)
+    let console = Console(port: take port, received: take received)
+    return hw::IrqShared.install(take console, vector: UART_VECTOR, on_irq: Console.on_irq)
+} attach
+
+/// Unbinds the console and ends its UART window.
+fn detach(take console: hw::IrqShared[Console]) {
+    let Console(port: port, received: _) = take console.uninstall()
+    take port.unmap()
+} detach
+
+/// Takes a received byte, ends loopback and the receive interrupt, and posts the byte.
+interrupt fn Console.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let status = mut self.port.read(Uart.line_status)
+    if status.data_ready {
+        let byte = mut self.port.read(Uart.data)
+        mut self.port.write(Uart.interrupts, value: 0)
+        mut self.port.write(Uart.modem, value: MODEM_ON)
+        self.received.contents().post(irq.irqs_disabled(), value: byte)
+    }
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Console.on_irq
+
+/// Writes a byte once the transmitter is empty, or after `TRANSMIT_POLLS` polls.
+fn Console.put(mut self, byte: u8) limits notrap, terminates, noalloc {
+    for _ in 0..<TRANSMIT_POLLS {
+        let status = mut self.port.read(Uart.line_status)
+        if status.transmit_empty {
+            break
+        }
+    }
+    mut self.port.write(Uart.data, value: byte)
+} Console.put
+
+/// Puts the UART in loopback with its receive interrupt enabled and writes `byte`, which its
+/// receiver then takes.
+fn loop_back(console: hw::IrqShared[Console], byte: u8) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        console.with(t, body: fn(mut device: Console) limits notrap, terminates, noalloc {
+            mut device.port.write(Uart.modem, value: MODEM_LOOPBACK)
+            mut device.port.write(Uart.interrupts, value: RECEIVE_INTERRUPT)
+            mut device.put(byte)
+        })
+    })
+} loop_back
+
+/// Writes bytes to the device.
+fn Console.put_all(mut self, bytes: Slice[u8]) limits notrap, terminates, noalloc {
+    for byte in bytes {
+        mut self.put(byte)
+    }
+} Console.put_all
+
+/// Writes text to the console under one hold of its lock.
+fn say(console: hw::IrqShared[Console], text: Str) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        console.with(t, body: fn(mut device: Console) limits notrap, terminates, noalloc {
+            mut device.put_all(text.as_bytes())
+        })
+    })
+} say
+
+/// Writes text, a number in decimal and more text to the console under one hold of its lock,
+/// so another task's output never lands among them.
+fn say_number(console: hw::IrqShared[Console], before: Str, value: u64, after: Str) {
+    var digits = Array[u8, 20].filled(b'0')
+    var rest = value
+    var leading: usize = 19
+    for position in 0usize..<20 {
+        let at = 19 - position
+        digits[at] = b'0' + u8.truncate(rest % 10)
+        rest = rest / 10
+        if digits[at] != b'0' {
+            leading = at
+        }
+    }
+    let Some(parts) = digits.view().split_at(leading) else {
+        return
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        console.with(t, body: fn(mut device: Console) limits notrap, terminates, noalloc {
+            mut device.put_all(before.as_bytes())
+            mut device.put_all(parts.tail)
+            mut device.put_all(after.as_bytes())
+        })
+    })
+} say_number

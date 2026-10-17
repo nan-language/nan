@@ -95,6 +95,16 @@ impl Elab<'_, '_> {
         Operand::Place(Mode::Read, place)
     }
 
+    /// An expression read in place: a place is passed as itself, however small its type, and any
+    /// other expression as a read argument.
+    pub fn borrowed(&mut self, expr: &TExpr) -> Elaborated<Option<Operand>> {
+        Ok(match self.expr(expr)? {
+            Out::Place(place) if self.owned_root(&place) => Some(Operand::Value(place.root)),
+            Out::Place(place) => Some(Operand::Place(Mode::Read, place)),
+            out => self.argument(out, expr, Mode::Read),
+        })
+    }
+
     /// An expression as a value: places read, copied or moved.
     pub fn operand(&mut self, expr: &TExpr) -> Elaborated<Option<Operand>> {
         Ok(match self.expr(expr)? {
@@ -848,8 +858,14 @@ impl Elab<'_, '_> {
 
     /// The operand an argument passes for a parameter in a mode.
     pub fn arg(&mut self, expr: &TExpr, mode: Mode) -> Elaborated<Option<Operand>> {
+        let out = self.expr(expr)?;
+        Ok(self.argument(out, expr, mode))
+    }
+
+    /// The operand passing an elaborated argument expression in a mode.
+    fn argument(&mut self, out: Out, expr: &TExpr, mode: Mode) -> Option<Operand> {
         let span = Self::spanning(expr);
-        Ok(match (self.expr(expr)?, mode) {
+        match (out, mode) {
             (Out::Never, _) => None,
             (Out::Operand(operand), Mode::Read) => match operand {
                 Operand::Value(value)
@@ -877,7 +893,7 @@ impl Elab<'_, '_> {
                     Some(Operand::Place(Mode::Take, place))
                 }
             }
-        })
+        }
     }
 
     /// A call returning a value of `ty`.

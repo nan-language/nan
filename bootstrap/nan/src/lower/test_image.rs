@@ -1,7 +1,8 @@
-//! Test images: a package's tests lowered for their runs on `x86_64-host`, each run a process.
-//! The seam reads which test and run to perform and starts the entry task, which mints the run's
-//! simulated world, runs the test as the first task of a new test domain on the seeded
-//! scheduler, then writes the run's outcome as a frame on standard output and ends the process.
+//! Test images: a package's tests lowered for their runs on a run target, each run a process on
+//! `x86_64-host` and a boot of the emulator on a machine target. The seam reads which test and
+//! run to perform and starts the entry task, which mints the run's simulated world, runs the test
+//! as the first task of a new test domain on the seeded scheduler, then writes the run's outcome
+//! as a frame on standard output, or the serial port of a machine, and ends the run.
 //!
 //! A frame is its kind's byte, its payload's length as 4 bytes little-endian, then the payload.
 //! An outcome's payload is its code, whether the test's target ran and whether a scheduling
@@ -10,13 +11,16 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC, types,
+};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use super::body::Held;
 use super::fx::{Fx, PTR};
-use super::runtime::tasks::{domain, trap_record};
-use super::runtime::{Routine, state};
+use super::machine::Stub;
+use super::runtime::tasks::{self, domain, trap_record};
+use super::runtime::{Routine, state, system};
 use super::supplied::tasks::domains;
 use super::{CALL_CONV, Instance, Lowered, Lowering, lines};
 use crate::check::Checker;
@@ -48,6 +52,17 @@ pub enum Target {
 
 /// The exit status of a run that used more processor time than a test run may.
 pub const TIMED_OUT: i32 = 124;
+
+/// The texts naming a run before any forced draws: its test's number, its index and seed, and
+/// its replay token.
+const RUN_TEXTS: u64 = 4;
+
+/// The emulator configuration file holding the texts that name a machine run.
+pub const RUN_FILE: &str = "opt/nan/run";
+
+/// What a machine test image writes to the serial port before its frames, after the firmware's
+/// own output.
+pub const RUN_START: &[u8] = b"\0nan-run\0";
 
 /// The kinds of frames.
 pub mod frame {
@@ -119,9 +134,170 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
         Some(runtime),
     );
     let entry = entry_glue(&mut lowering, tests);
-    super::host::test_seam(&mut lowering, entry);
+    match lowering.machine() {
+        true => machine_seam(&mut lowering, entry),
+        false => super::host::test_seam(&mut lowering, entry),
+    }
     lowering.drain();
     lowering.finish(None)
+}
+
+/// Starts the run of a test image that `count` NUL-terminated texts name, their addresses at
+/// `texts`: the `RUN_TEXTS` naming the run, its test's number, its index and seed and its replay
+/// token, then for a rerun its forced draws. Sets up the runtime, then starts the entry task,
+/// which runs `entry`; ends with status 71 when the runtime cannot start.
+pub fn start_run(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    entry: cranelift_module::FuncId,
+    count: Value,
+    texts: Value,
+) {
+    let failed = lo.call_routine(fx, Routine::Init, &[])[0];
+    let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+    fx.when(unavailable, |fx| system::unavailable(lo, fx));
+    let text = |fx: &mut Fx, index: u64| fx.load(PTR, texts, 8 * index);
+    let mut run = [fx.ptr(0); 3];
+    for (field, index) in run.iter_mut().zip(0..) {
+        let text = text(fx, index);
+        *field = decimal(fx, text);
+    }
+    let token = text(fx, RUN_TEXTS - 1);
+    let len = text_len(fx, token);
+    let rerun =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, count, RUN_TEXTS as i64);
+    let none = fx.ptr(0);
+    let first = fx.b.ins().iadd_imm_s(texts, 8 * RUN_TEXTS as i64);
+    let forced = fx.b.ins().select(rerun, first, none);
+    let left = fx.b.ins().iadd_imm_s(count, -(RUN_TEXTS as i64));
+    let left = fx.b.ins().select(rerun, left, none);
+    arguments(lo, fx, run, (token, len), (forced, left));
+    let state_address = lo.state(fx);
+    let process = fx.load(PTR, state_address, state::PROCESS);
+    let root = fx.load(PTR, state_address, state::ROOT);
+    let glue = lo.func_ref(fx, entry);
+    let glue = fx.b.ins().func_addr(PTR, glue);
+    let zero = fx.ptr(0);
+    let stack = fx.ptr(tasks::STACK);
+    let record = lo.call_routine(
+        fx,
+        Routine::Spawn,
+        &[glue, zero, zero, zero, stack, zero, process, root],
+    )[0];
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    fx.when(missing, |fx| system::unavailable(lo, fx));
+    fx.store(record, state_address, state::ENTRY_TASK);
+    lo.call_routine(fx, Routine::Wake, &[record]);
+    lo.call_routine(fx, Routine::Schedule, &[]);
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// The length of a NUL-terminated text.
+fn text_len(fx: &mut Fx, text: Value) -> Value {
+    let zero = fx.ptr(0);
+    fx.repeat(&[zero], |fx, state| {
+        let at = fx.b.ins().iadd(text, state[0]);
+        let byte = fx.load(types::I8, at, 0);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, byte, 0);
+        let next = fx.b.ins().iadd_imm_s(state[0], 1);
+        let len = fx.b.ins().select(more, next, state[0]);
+        (more, vec![len])
+    })[0]
+}
+
+/// The unsigned decimal number a NUL-terminated text writes.
+fn decimal(fx: &mut Fx, text: Value) -> Value {
+    let zero = fx.ptr(0);
+    fx.repeat(&[text, zero], |fx, state| {
+        let (at, value) = (state[0], state[1]);
+        let byte = fx.load(types::I8, at, 0);
+        let byte = fx.b.ins().uextend(PTR, byte);
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, byte, 0);
+        let digit = fx.b.ins().iadd_imm_s(byte, -i64::from(b'0'));
+        let shifted = fx.b.ins().imul_imm_s(value, 10);
+        let grown = fx.b.ins().iadd(shifted, digit);
+        let value = fx.b.ins().select(more, grown, value);
+        let next = fx.b.ins().iadd_imm_s(at, 1);
+        (more, vec![next, value])
+    })[1]
+}
+
+/// The entry seam of a machine test image, whose boot glue ignores the platform's values,
+/// disables maskable interrupts, the firmware's included, and reads the texts naming its run,
+/// each NUL-terminated, from the emulator configuration file `RUN_FILE`.
+fn machine_seam(lo: &mut Lowering, entry: FuncId) {
+    let mut signature = Signature::new(CALL_CONV);
+    signature.params.push(AbiParam::new(PTR));
+    signature.params.push(AbiParam::new(PTR));
+    let boot = lo
+        .module
+        .declare_function("_NStest_boot", Linkage::Local, &signature)
+        .expect("the test boot glue");
+    lo.define(
+        boot,
+        signature,
+        lines::HIDDEN | lines::CRITICAL,
+        |lo, fx| {
+            fx.entry();
+            lo.call_stub(fx, Stub::Cli, &[]);
+            let start = lo.view_literal(fx, RUN_START).address();
+            let (text, len) = (fx.load(PTR, start, 0), fx.load(PTR, start, 8));
+            super::runtime::system::write_stream(lo, fx, 1, text, len);
+            let (bytes, len) = lo.fw_cfg_file(fx, RUN_FILE);
+            let (count, texts) = texts(lo, fx, bytes, len);
+            start_run(lo, fx, entry, count, texts);
+        },
+    );
+    lo.entry_seam(boot, super::machine::BOOT_STACK);
+}
+
+/// The NUL-terminated texts of a run file's bytes, which a NUL follows: their count and an array
+/// of their addresses, with `RUN_TEXTS` more entries addressing that last NUL, standing for texts
+/// the file lacks.
+fn texts(lo: &mut Lowering, fx: &mut Fx, bytes: Value, len: Value) -> (Value, Value) {
+    let zero = fx.ptr(0);
+    let count = fx.var(PTR, zero);
+    fx.each(zero, len, |fx, index| {
+        let at = fx.b.ins().iadd(bytes, index);
+        let byte = fx.load(types::I8, at, 0);
+        let ends = fx.b.ins().icmp_imm_s(IntCC::Equal, byte, 0);
+        let ends = fx.b.ins().uextend(PTR, ends);
+        let counted = fx.b.use_var(count);
+        let counted = fx.b.ins().iadd(counted, ends);
+        fx.b.def_var(count, counted);
+    });
+    let count = fx.b.use_var(count);
+    let slots = fx.b.ins().iadd_imm_s(count, RUN_TEXTS as i64);
+    let size = fx.b.ins().imul_imm_s(slots, 8);
+    let array = lo.record_alloc(fx, size);
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, array, 0);
+    fx.when(missing, |fx| system::unavailable(lo, fx));
+    let empty = fx.b.ins().iadd(bytes, len);
+    fx.each(zero, slots, |fx, index| {
+        let slot = fx.b.ins().imul_imm_s(index, 8);
+        let slot = fx.b.ins().iadd(array, slot);
+        fx.store(empty, slot, 0);
+    });
+    let start = fx.var(PTR, bytes);
+    let filled = fx.var(PTR, zero);
+    fx.each(zero, len, |fx, index| {
+        let at = fx.b.ins().iadd(bytes, index);
+        let byte = fx.load(types::I8, at, 0);
+        let ends = fx.b.ins().icmp_imm_s(IntCC::Equal, byte, 0);
+        fx.when(ends, |fx| {
+            let index = fx.b.use_var(filled);
+            let slot = fx.b.ins().imul_imm_s(index, 8);
+            let slot = fx.b.ins().iadd(array, slot);
+            let text = fx.b.use_var(start);
+            fx.store(text, slot, 0);
+            let index = fx.b.ins().iadd_imm_s(index, 1);
+            fx.b.def_var(filled, index);
+            let next = fx.b.ins().iadd_imm_s(at, 1);
+            fx.b.def_var(start, next);
+        });
+    });
+    (count, array)
 }
 
 impl Lowering<'_, '_> {
@@ -388,9 +564,9 @@ pub fn write_frame(lo: &mut Lowering, fx: &mut Fx, kind: u8, parts: &[(Value, Va
     let len = fx.b.ins().ireduce(types::I32, len);
     fx.b.ins().store(super::fx::unaligned(), len, header, 1);
     let five = fx.ptr(5);
-    super::host::write_out(lo, fx, header, five);
+    super::runtime::system::write_stream(lo, fx, 1, header, five);
     for (start, part) in parts {
-        super::host::write_out(lo, fx, *start, *part);
+        super::runtime::system::write_stream(lo, fx, 1, *start, *part);
     }
 }
 
@@ -519,8 +695,7 @@ pub fn escape(lo: &mut Lowering, fx: &mut Fx, held: Held, ty: &Ty) {
         append(lo, fx, start, size);
     }
     let size = fx.b.use_var(len);
-    let one = fx.ptr(1);
-    let copy = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let copy = lo.record_alloc(fx, size);
     lo.call_routine(fx, Routine::Copy, &[copy, text, size]);
     let at = lo.test_state(fx);
     fx.store(copy, at, test_state::ESCAPE);

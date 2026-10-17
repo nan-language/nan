@@ -93,7 +93,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let abandoned = fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0);
     fx.when(abandoned, |fx| {
         lo.call_routine(fx, Routine::Settle, &[record]);
-        lo.call_libc(fx, "free", &[record], &[]);
+        lo.record_free(fx, record);
         let value = fx.slot(8, 8);
         fx.store(trap, value, 0);
         let err = lo.variant_value(fx, &option, "Err", &[Held::Address(value)], false);
@@ -156,9 +156,8 @@ pub fn run_nested(
     let size = fx.ptr(trap_record::BYTES + report::REPORT);
     let align = fx.ptr(8);
     let trap = lo.call_routine(fx, Routine::AllocIn, &[cell, size, align, caller_domain])[0];
-    let one = fx.ptr(1);
     let record_size = fx.ptr(domain::SIZE);
-    let record = lo.call_libc(fx, "calloc", &[one, record_size], &[PTR])[0];
+    let record = lo.record_alloc(fx, record_size);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     let no_trap = fx.b.ins().icmp_imm_s(IntCC::Equal, trap, 0);
     let missing = fx.b.ins().bor(missing, no_trap);
@@ -219,8 +218,8 @@ pub fn run_nested(
 pub fn end_nested(lo: &mut Lowering, fx: &mut Fx, record: Value, first: Value, parent: Value) {
     holdings::pass_all(lo, fx, record, parent);
     memory::free_chunks(lo, fx, record);
-    lo.call_libc(fx, "free", &[first], &[]);
-    lo.call_libc(fx, "free", &[record], &[]);
+    lo.record_free(fx, first);
+    lo.record_free(fx, record);
 }
 
 /// Takes a domain out of the list of the domains nested in its parent; the caller holds the

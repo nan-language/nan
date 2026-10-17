@@ -31,6 +31,41 @@ impl Target {
             .into_iter()
             .find(|target| target.name() == name)
     }
+
+    /// Whether the target is a machine target, `x86_64-uefi` or `x86_64-bare`, whose image the
+    /// implementation's own writer builds.
+    pub fn is_machine(self) -> bool {
+        matches!(self, Target::Uefi | Target::Bare)
+    }
+
+    /// The platform package a concrete target's descriptor names; `any` names none.
+    pub fn platform_package(self) -> Option<&'static str> {
+        match self {
+            Target::Host => Some("host_platform"),
+            Target::Uefi => Some("uefi_platform"),
+            Target::Bare => Some("bare_platform"),
+            Target::Any => None,
+        }
+    }
+
+    /// The module and name of the root grant a concrete target's entry takes; `any` has none.
+    pub fn root_grant(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Target::Host => Some(("host", "World")),
+            Target::Uefi => Some(("boot", "Machine")),
+            Target::Bare => Some(("boot", "Kernel")),
+            Target::Any => None,
+        }
+    }
+
+    /// What an image of the target appends to its package's name.
+    pub fn image_suffix(self) -> &'static str {
+        match self {
+            Target::Uefi => ".efi",
+            Target::Bare => ".elf",
+            Target::Host | Target::Any => "",
+        }
+    }
 }
 
 pub struct Manifest {

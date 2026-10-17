@@ -681,6 +681,14 @@ impl Package {
             .map(|manifest| manifest.name.as_str())
     }
 
+    /// The target a program's image is built for: the one concrete target it declares.
+    pub fn program_target(&self) -> Target {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.targets.first().copied())
+            .unwrap_or(Target::Host)
+    }
+
     /// The canonical path of a module of the package, its name absent for the root module.
     pub fn module_path(&self, module: usize) -> Option<ItemPath> {
         let package = self.name()?.to_owned();

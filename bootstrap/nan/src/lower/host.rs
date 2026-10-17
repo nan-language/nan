@@ -3,10 +3,7 @@
 //! affinity set, each with its io_uring; termination requests read from a `signalfd`; the
 //! support routines' calls into the system; and linking the image with `cc`.
 //!
-//! A thread record holds the scheduler's saved context, the task it runs, its ring, its index,
-//! whether it waits idle in its ring, the operations in flight on its ring, and whether other
-//! threads have asked it to cancel some of them. An operation record is what a completion
-//! reaches: the task waiting on it, its result, how far its completion has been delivered, the
+//! An operation record is what a completion reaches: the task waiting on it, its result, how far its completion has been delivered, the
 //! thread whose ring holds it, how far its cancellation has gone, its kind and its links in its
 //! thread's list. Only the thread whose ring holds an operation lists it, delivers its
 //! completion and submits its cancellation, so an operation another thread asks to cancel is
@@ -23,9 +20,9 @@ use cranelift_module::{Linkage, Module};
 
 use super::abi::Returned;
 use super::fx::{Fx, PTR};
-use super::runtime::regions::region;
-use super::runtime::tasks::{self, kind, operation, task};
-use super::runtime::{Routine, memory, state, tables};
+use super::runtime::system::{self, unavailable_unless};
+use super::runtime::tasks::{self, kind, operation, task, thread};
+use super::runtime::{Routine, memory, state};
 use super::{CALL_CONV, Instance, Lowering, Program, lines};
 use crate::nir::Role;
 
@@ -66,30 +63,6 @@ mod ring {
     pub const SIZE: u64 = 80;
 }
 
-/// The offsets of an executor thread record's fields.
-pub mod thread {
-    /// The scheduler's saved context.
-    pub const CONTEXT: u64 = 0;
-    pub const CURRENT: u64 = 24;
-    pub const RING: u64 = 32;
-    pub const INDEX: u64 = 40;
-    pub const IDLE: u64 = 48;
-    /// The operations in flight on its ring, and whether another thread asked to cancel one.
-    pub const OPERATIONS: u64 = 56;
-    pub const REQUESTS: u64 = 64;
-    /// The number of locks the thread holds.
-    pub const LOCKS: u64 = 72;
-    /// Its POSIX thread, and the top of the stack its stack overflow reports run on.
-    pub const PTHREAD: u64 = 80;
-    pub const TRAP_STACK: u64 = 88;
-    /// The locks it holds, in the order it took them, up to `HELD_LOCKS` of them.
-    pub const HELD: u64 = 96;
-    pub const SIZE: u64 = HELD + 8 * super::HELD_LOCKS;
-}
-
-/// The most locks a thread holds at once that a trap of its task releases.
-const HELD_LOCKS: u64 = 8;
-
 /// The signal asking a thread to stop the task it runs, the signal of a fault, and that of an
 /// exceeded processor time limit.
 pub const SIGURG: i32 = 23;
@@ -128,9 +101,6 @@ const SIGNALS: [i64; 3] = [1, 2, 15];
 const SIGINFO: u64 = 128;
 const SIGPIPE: i64 = 13;
 
-/// The text written when the runtime cannot start.
-const UNAVAILABLE: &str = "nan: runtime unavailable\n";
-
 /// Defines the program entry seam `main` and the glue running the entry function as the first
 /// task.
 pub fn entry_seam(lo: &mut Lowering, program: &Program) {
@@ -153,7 +123,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         let params = fx.entry();
         let failed = lo.call_routine(fx, Routine::Init, &[])[0];
         let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-        fx.when(unavailable, |fx| unavailable_exit(lo, fx));
+        fx.when(unavailable, |fx| system::unavailable(lo, fx));
         let world_ty = lo.std_ty("host", "World", Vec::new());
         let layout = lo.layout(&world_ty);
         let world = fx.slot(layout.size, layout.align);
@@ -182,7 +152,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
             &[glue_address, zero, env, zero, stack, zero, process, root],
         )[0];
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
-        fx.when(missing, |fx| unavailable_exit(lo, fx));
+        fx.when(missing, |fx| system::unavailable(lo, fx));
         fx.store(record, state_address, state::ENTRY_TASK);
         lo.call_routine(fx, Routine::Wake, &[record]);
         lo.call_routine(fx, Routine::Schedule, &[]);
@@ -190,9 +160,8 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
     });
 }
 
-/// Defines the entry seam `main` of a test image: reads the test's number, the run's index and
-/// seed, its replay token and, for a rerun, its forced draws from the arguments, then starts the
-/// entry task, which runs `entry`.
+/// Defines the entry seam `main` of a test image, whose arguments after the program's name are
+/// the texts naming its run.
 pub fn test_seam(lo: &mut Lowering, entry: cranelift_module::FuncId) {
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(types::I32));
@@ -205,62 +174,11 @@ pub fn test_seam(lo: &mut Lowering, entry: cranelift_module::FuncId) {
         .expect("the test entry seam");
     lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
         let params = fx.entry();
-        let failed = lo.call_routine(fx, Routine::Init, &[])[0];
-        let unavailable = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
-        fx.when(unavailable, |fx| unavailable_exit(lo, fx));
-        let argv = params[1];
-        let argument = |fx: &mut Fx, index: u64| fx.load(PTR, argv, 8 * index);
-        let mut run = [fx.ptr(0); 3];
-        for (field, index) in run.iter_mut().zip(1..) {
-            let text = argument(fx, index);
-            *field = decimal(fx, text);
-        }
-        let token = argument(fx, 4);
-        let len = lo.call_libc(fx, "strlen", &[token], &[PTR])[0];
         let count = fx.b.ins().uextend(PTR, params[0]);
-        let rerun = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, count, 5);
-        let none = fx.ptr(0);
-        let first = fx.b.ins().iadd_imm_s(argv, 8 * 5);
-        let forced = fx.b.ins().select(rerun, first, none);
-        let left = fx.b.ins().iadd_imm_s(count, -5);
-        let left = fx.b.ins().select(rerun, left, none);
-        super::test_image::arguments(lo, fx, run, (token, len), (forced, left));
-        let state_address = lo.state(fx);
-        let process = fx.load(PTR, state_address, state::PROCESS);
-        let root = fx.load(PTR, state_address, state::ROOT);
-        let glue = lo.func_ref(fx, entry);
-        let glue = fx.b.ins().func_addr(PTR, glue);
-        let zero = fx.ptr(0);
-        let stack = fx.ptr(tasks::STACK);
-        let record = lo.call_routine(
-            fx,
-            Routine::Spawn,
-            &[glue, zero, zero, zero, stack, zero, process, root],
-        )[0];
-        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
-        fx.when(missing, |fx| unavailable_exit(lo, fx));
-        fx.store(record, state_address, state::ENTRY_TASK);
-        lo.call_routine(fx, Routine::Wake, &[record]);
-        lo.call_routine(fx, Routine::Schedule, &[]);
-        fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+        let count = fx.b.ins().iadd_imm_s(count, -1);
+        let texts = fx.b.ins().iadd_imm_s(params[1], 8);
+        super::test_image::start_run(lo, fx, entry, count, texts);
     });
-}
-
-/// The unsigned decimal number a NUL-terminated text writes.
-fn decimal(fx: &mut Fx, text: Value) -> Value {
-    let zero = fx.ptr(0);
-    fx.repeat(&[text, zero], |fx, state| {
-        let (at, value) = (state[0], state[1]);
-        let byte = fx.load(types::I8, at, 0);
-        let byte = fx.b.ins().uextend(PTR, byte);
-        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, byte, 0);
-        let digit = fx.b.ins().iadd_imm_s(byte, -i64::from(b'0'));
-        let shifted = fx.b.ins().imul_imm_s(value, 10);
-        let grown = fx.b.ins().iadd(shifted, digit);
-        let value = fx.b.ins().select(more, grown, value);
-        let next = fx.b.ins().iadd_imm_s(at, 1);
-        (more, vec![next, value])
-    })[1]
 }
 
 /// Writes a byte range to a descriptor, whole unless the descriptor refuses.
@@ -277,21 +195,6 @@ pub fn write_all(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Valu
         let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next_left, 0);
         (more, vec![next_at, next_left])
     });
-}
-
-/// Writes a byte range to standard output.
-pub fn write_out(lo: &mut Lowering, fx: &mut Fx, text: Value, len: Value) {
-    write_all(lo, fx, 1, text, len);
-}
-
-/// Writes that the runtime is unavailable and returns status 71 from the seam.
-fn unavailable_exit(lo: &mut Lowering, fx: &mut Fx) {
-    let text = lo.view_literal(fx, UNAVAILABLE.as_bytes()).address();
-    let start = fx.load(PTR, text, 0);
-    let len = fx.load(PTR, text, 8);
-    lo.call_routine(fx, Routine::WriteErr, &[start, len]);
-    let status = fx.int(types::I32, 71);
-    fx.b.ins().return_(&[status]);
 }
 
 /// The glue the entry task runs: calls the entry function with the root grant, then ends the
@@ -360,59 +263,23 @@ fn write_err_literal(lo: &mut Lowering, fx: &mut Fx, text: &str) {
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();
     match routine {
-        Routine::Init => init(lo, fx),
+        Routine::RecordAlloc => {
+            let one = fx.ptr(1);
+            let address = lo.call_libc(fx, "calloc", &[one, params[0]], &[PTR])[0];
+            fx.b.ins().return_(&[address]);
+        }
+        Routine::RecordFree => {
+            lo.call_libc(fx, "free", &[params[0]], &[]);
+            fx.b.ins().return_(&[]);
+        }
+        Routine::RecordResize => {
+            let address = lo.call_libc(fx, "realloc", &[params[0], params[1]], &[PTR])[0];
+            fx.b.ins().return_(&[address]);
+        }
         Routine::Exit => {
             let status = fx.b.ins().ireduce(types::I32, params[0]);
             lo.call_libc(fx, "_exit", &[status], &[]);
             fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
-        }
-        Routine::Lock => {
-            let lock = params[0];
-            fx.repeat(&[], |fx, _| {
-                let zero = fx.int(types::I32, 0);
-                let one = fx.int(types::I32, 1);
-                let seen =
-                    fx.b.ins()
-                        .atomic_cas(MemFlagsData::trusted(), lock, zero, one);
-                let busy = fx.b.ins().icmp_imm_s(IntCC::NotEqual, seen, 0);
-                fx.when(busy, |fx| {
-                    lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
-                });
-                (busy, Vec::new())
-            });
-            hold(lo, fx, lock);
-            fx.b.ins().return_(&[]);
-        }
-        Routine::Unlock => {
-            let lock = params[0];
-            let thread = lo.thread(fx);
-            let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
-            fx.when(inside, |fx| {
-                let held = fx.load(PTR, thread, thread::LOCKS);
-                let held = fx.b.ins().iadd_imm_s(held, -1);
-                fx.store(held, thread, thread::LOCKS);
-                let recorded =
-                    fx.b.ins()
-                        .icmp_imm_s(IntCC::UnsignedLessThan, held, HELD_LOCKS as i64);
-                fx.when(recorded, |fx| {
-                    let zero = fx.ptr(0);
-                    fx.each(zero, held, |fx, index| {
-                        let slot = fx.b.ins().imul_imm_s(index, 8);
-                        let slot = fx.b.ins().iadd(thread, slot);
-                        let taken = fx.load(PTR, slot, thread::HELD);
-                        let same = fx.b.ins().icmp(IntCC::Equal, taken, lock);
-                        fx.when(same, |fx| {
-                            let last = fx.b.ins().imul_imm_s(held, 8);
-                            let last = fx.b.ins().iadd(thread, last);
-                            let moved = fx.load(PTR, last, thread::HELD);
-                            fx.store(moved, slot, thread::HELD);
-                        });
-                    });
-                });
-            });
-            let zero = fx.int(types::I32, 0);
-            fx.b.ins().atomic_store(MemFlagsData::trusted(), zero, lock);
-            fx.b.ins().return_(&[]);
         }
         Routine::Preempt => preempt(lo, fx, params[2]),
         Routine::Overflow => overflow(lo, fx, params[1], params[2]),
@@ -423,42 +290,6 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         }
         _ => unreachable!("a host routine"),
     }
-}
-
-/// Records a lock the running thread took, outside any thread before the executor starts.
-fn hold(lo: &mut Lowering, fx: &mut Fx, lock: Value) {
-    let thread = lo.thread(fx);
-    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
-    fx.when(inside, |fx| {
-        let held = fx.load(PTR, thread, thread::LOCKS);
-        let recorded =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedLessThan, held, HELD_LOCKS as i64);
-        fx.when(recorded, |fx| {
-            let slot = fx.b.ins().imul_imm_s(held, 8);
-            let slot = fx.b.ins().iadd(thread, slot);
-            fx.store(lock, slot, thread::HELD);
-        });
-        let held = fx.b.ins().iadd_imm_s(held, 1);
-        fx.store(held, thread, thread::LOCKS);
-    });
-}
-
-/// Releases every lock the running thread holds, for its trapping task.
-pub fn release_locks(lo: &mut Lowering, fx: &mut Fx) {
-    let thread = lo.thread(fx);
-    let held = fx.load(PTR, thread, thread::LOCKS);
-    let most = fx.ptr(HELD_LOCKS);
-    let recorded = fx.b.ins().umin(held, most);
-    let zero = fx.ptr(0);
-    fx.each(zero, recorded, |fx, index| {
-        let slot = fx.b.ins().imul_imm_s(index, 8);
-        let slot = fx.b.ins().iadd(thread, slot);
-        let lock = fx.load(PTR, slot, thread::HELD);
-        let free = fx.int(types::I32, 0);
-        fx.b.ins().atomic_store(MemFlagsData::trusted(), free, lock);
-    });
-    fx.store(zero, thread, thread::LOCKS);
 }
 
 /// Records the running thread in its record and gives it a signal stack and a stack for stack
@@ -674,31 +505,13 @@ fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
     fx.b.ins().return_(&[]);
 }
 
-/// `Init()`: the cell, chunk and capability tables, the process domain, the construct that
-/// termination requests cancel, one executor thread per processor of the affinity set with its
-/// ring, the calling thread being the first, and the reading of termination requests; nonzero
-/// when the runtime cannot start.
-fn init(lo: &mut Lowering, fx: &mut Fx) {
+/// The executor threads of `Init`: one per processor of the affinity set with its ring, the
+/// calling thread being the first, and the reading of termination requests; returns 1 from
+/// `Init` when the system refuses one.
+pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
-    let one = fx.ptr(1);
-    let tables = [
-        (state::CELLS, memory::CELLS * memory::CELL_RECORD),
-        (state::CHUNK_MAP, memory::MAP_ROOTS * 8),
-        (state::ENTRIES, tables::ENTRIES * tables::ENTRY_RECORD),
-        (state::PROCESS, tasks::domain::SIZE),
-        (state::ROOT, region::SIZE),
-    ];
-    for (field, size) in tables {
-        let size = fx.ptr(size);
-        let address = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
-        unavailable_unless(fx, address);
-        fx.store(address, state_address, field);
-    }
-    let root = fx.load(PTR, state_address, state::ROOT);
-    fx.store(one, root, region::ID);
-    fx.store(one, state_address, state::REGIONS);
     if lo.seeded() {
-        init_seeded(lo, fx);
+        start_seeded(lo, fx);
         return;
     }
     let count = processors(lo, fx);
@@ -757,14 +570,12 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
             fx.b.ins().return_(&[one]);
         });
     });
-    let zero = fx.ptr(0);
-    fx.b.ins().return_(&[zero]);
 }
 
-/// The seeded scheduler's part of `Init`: the calling thread is the one executor thread, without
-/// a ring; a fault reports a stack overflow, and the run ends with status `TIMED_OUT` once it has
+/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
+/// thread, without a ring; a fault reports a stack overflow, and the run ends with status `TIMED_OUT` once it has
 /// used 10 seconds of processor time.
-fn init_seeded(lo: &mut Lowering, fx: &mut Fx) {
+fn start_seeded(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
     let one = fx.ptr(1);
     fx.store(one, state_address, state::THREAD_COUNT);
@@ -795,17 +606,6 @@ fn init_seeded(lo: &mut Lowering, fx: &mut Fx) {
     let ignore = fx.ptr(1);
     let pipe = fx.int(types::I32, SIGPIPE);
     lo.call_libc(fx, "signal", &[pipe, ignore], &[PTR]);
-    let zero = fx.ptr(0);
-    fx.b.ins().return_(&[zero]);
-}
-
-/// Returns 1 from `Init` when an address is zero.
-fn unavailable_unless(fx: &mut Fx, address: Value) {
-    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, address, 0);
-    fx.when(missing, |fx| {
-        let one = fx.ptr(1);
-        fx.b.ins().return_(&[one]);
-    });
 }
 
 /// The number of processors in the process's affinity set, at least 1.

@@ -52,9 +52,8 @@ fn pointer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let address = match supply.param(0) {
                 Held::Address(address) => address,
                 held => {
-                    let one = fx.ptr(1);
                     let size = fx.ptr(layout.size.max(1));
-                    let kept = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+                    let kept = lo.record_alloc(fx, size);
                     lo.store_held(fx, kept, held, &element);
                     kept
                 }

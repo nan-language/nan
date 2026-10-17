@@ -1,18 +1,20 @@
 //! The commands that perform final builds: `nan build` and `nan run`.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{Invocation, Name, Outcome, Trace, record};
 use crate::diagnostic::{Class, Code};
+use crate::emulator::{self, Writes};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::workspace::{Target, Workspace};
 
-/// An image `nan run` starts once it has built it: its path and its arguments.
+/// What `nan run` starts once it has built an image: the image on `x86_64-host`, the emulator
+/// booting it on a machine target, and its arguments.
 pub struct Launch {
-    pub image: std::path::PathBuf,
+    pub program: PathBuf,
     pub args: Vec<String>,
 }
 
@@ -68,10 +70,20 @@ pub fn run(
     let (errors, incomplete) = (count(Class::Error), count(Class::Incompleteness));
     if invocation.name == Name::Run && errors == 0 {
         let image = images.pop().expect("a built image");
-        return Ok(Outcome::Launch(Launch {
-            image: workspace.root.join(image),
-            args: invocation.passed.to_vec(),
-        }));
+        let path = workspace.root.join(&image);
+        let target = workspace.packages[programs[0]].program_target();
+        let launch = match target {
+            Target::Uefi => {
+                let files = volume_files(workspace, &path)?;
+                emulator::launch(target, &path, &files, Writes::Kept)?
+            }
+            Target::Bare => emulator::launch(target, &path, &[], Writes::Kept)?,
+            _ => Launch {
+                program: path,
+                args: invocation.passed.to_vec(),
+            },
+        };
+        return Ok(Outcome::Launch(launch));
     }
     images.sort();
     let mut records: Vec<Record> = diagnostics
@@ -99,6 +111,26 @@ pub fn run(
         records,
     };
     Ok(Outcome::Output(output))
+}
+
+/// The image files of the workspace's machine programs other than `image`, which the boot volume
+/// of an `x86_64-uefi` image holds under `nan run`.
+fn volume_files(workspace: &Workspace, image: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for target in [Target::Uefi, Target::Bare] {
+        let directory = workspace.root.join(".nan/images").join(target.name());
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_file() && path != image {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// The indexes of the programs a scope holds: every program of the workspace, or the program

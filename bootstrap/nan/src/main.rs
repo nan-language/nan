@@ -7,10 +7,10 @@ fn main() {
     let current = std::env::current_dir().expect("the current directory");
     let run = nan::run(&args, &current);
     if let Some(launch) = run.launch {
-        let error = std::process::Command::new(&launch.image)
+        let error = std::process::Command::new(&launch.program)
             .args(&launch.args)
             .exec();
-        panic!("starting {}: {error}", launch.image.display());
+        panic!("starting {}: {error}", launch.program.display());
     }
     let written = std::io::stdout().write_all(run.output.as_bytes());
     if let Err(error) = written

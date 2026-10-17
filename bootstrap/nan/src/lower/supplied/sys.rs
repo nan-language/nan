@@ -34,10 +34,11 @@ mod word {
 /// The render budget of a log record's value.
 const LOG_BUDGET: u64 = 1_024;
 
-/// `hw::mint_root()`: a new root grant.
+/// `hw::mint_root()`: a new root grant of the target, a `host::World`, `boot::Kernel` or
+/// `boot::Machine`.
 pub fn mint_root(body: &mut Body) -> Held {
-    let world = body.lo.std_ty("host", "World", Vec::new());
-    let layout = body.lo.layout(&world);
+    let grant = body.lo.root_grant();
+    let layout = body.lo.layout(&grant);
     let slot = body.fx.slot(layout.size, layout.align);
     body.lo.call_routine(body.fx, Routine::MintRoot, &[slot]);
     Held::Address(slot)
@@ -102,15 +103,7 @@ fn after(
     called: &Called,
     then: impl FnOnce(&mut Lowering, &mut Fx, Held),
 ) {
-    if let (Some(failed), Some(failure)) = (called.failed, called.failure) {
-        fx.when(failed, |fx| {
-            let fails = supply.abi.fails.clone().expect("a failing operation");
-            let target = supply.failure.expect("a failure address");
-            let layout = lo.layout(&fails);
-            lo.copy(fx, target, failure, layout.size, layout.align);
-            supply.fail(fx);
-        });
-    }
+    supply.forward_failure(lo, fx, called);
     then(lo, fx, called.result);
 }
 
@@ -130,9 +123,8 @@ fn new_view(fx: &mut Fx, start: Value, len: Value) -> Held {
 
 /// A copy of `len` bytes from `start` in runtime memory, as an entry's state keeps texts.
 fn kept_text(lo: &mut Lowering, fx: &mut Fx, start: Value, len: Value) -> Value {
-    let one = fx.ptr(1);
     let size = fx.b.ins().iadd_imm_s(len, 1);
-    let copy = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let copy = lo.record_alloc(fx, size);
     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
     fx.when(failed, |fx| {
         super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
@@ -241,9 +233,8 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 let has_prefix = fx.b.ins().icmp_imm_s(IntCC::NotEqual, prefix_len, 0);
                 let separator = fx.b.ins().uextend(PTR, has_prefix);
                 let joined = fx.b.ins().iadd(joined, separator);
-                let one = fx.ptr(1);
                 let size = fx.b.ins().iadd_imm_s(joined, 1);
-                let text = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+                let text = lo.record_alloc(fx, size);
                 lo.call_routine(fx, Routine::Copy, &[text, prefix_start, prefix_len]);
                 fx.when(has_prefix, |fx| {
                     let at = fx.b.ins().iadd(text, prefix_len);

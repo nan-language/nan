@@ -59,7 +59,7 @@ impl Lowering<'_, '_> {
                     let structural = matches!(
                         path.as_str(),
                         "core::Array" | "core::Untrusted" | "core::ArrayCursor"
-                    );
+                    ) || path.starts_with("core::atomic::");
                     if base && !structural && self.layout(ty).size > 0 {
                         panic!("no transfer of {path}");
                     }

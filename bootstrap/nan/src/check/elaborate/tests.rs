@@ -289,3 +289,33 @@ fn a_forwarded_call_elaborates_as_its_rewrite_over_its_arguments() {
         "unit example::tally\n\nfn body (mut %0: ref mut example::Counter, read %1: u32)\n^0:\n    %2 = call u64.widen(%1)\n    call example::Counter.add(mut %0, %2)\n    return\n"
     );
 }
+
+const SHELF: &str = "pub closed struct Gauge {\n    pub level: u32\n} Gauge\n\npub proj fn Gauge.level_of(self) -> u32 = self.level\n\npub closed struct Shelf {\n    pub books: mem::List[u32]\n    pub gauge: Gauge\n} Shelf\n\npub proj fn Shelf.gauge_of(self) -> Gauge = self.gauge\n\npub fn made(alloc: mem::Alloc) -> Shelf = Shelf(books: mem::List[u32].empty(alloc), gauge: Gauge(level: 3))\n\n";
+
+#[test]
+fn a_projection_reads_its_receiver_place_in_place() {
+    let source = format!("{SHELF}pub fn level(shelf: Shelf) -> u32 = shelf.gauge.level_of()\n");
+    assert_eq!(
+        unit_text(&source, "example::level"),
+        "unit example::level\n\nfn body (read %0: ref example::Shelf) -> u32\n^0:\n    %1 = call example::Gauge.level_of(read %0.gauge)\n    %2 = load %1\n    return %2\n"
+    );
+}
+
+#[test]
+fn a_projection_releases_its_temporary_receiver() {
+    let source =
+        format!("{SHELF}pub fn fresh(alloc: mem::Alloc) -> u32 = made(alloc).gauge_of().level\n");
+    assert_eq!(
+        unit_text(&source, "example::fresh"),
+        "unit example::fresh\n\nfn body (read %0: mem::Alloc) -> u32\n^0:\n    %1 = call example::made(%0)\n    %2 = slot example::Shelf\n    init %2, %1\n    %3 = call example::Shelf.gauge_of(read %2)\n    %4 = load %3.level\n    release %2\n    return %4\n"
+    );
+}
+
+#[test]
+fn a_call_failing_with_never_has_no_failure_path() {
+    let source = "pub fn checked[E](value: u32, body: fn(input: u32) -> u32 fails E) -> u32 fails E {\n    return try body(value)\n} checked\n\npub fn doubled(value: u32) -> u32 {\n    return checked(value, body: fn(input: u32) -> u32 {\n        return input * 2\n    })\n} doubled\n";
+    assert_eq!(
+        unit_text(source, "example::doubled"),
+        "unit example::doubled\n\nfn body (read %0: u32) -> u32\n^0:\n    %1 = closure 0()\n    %2 = call example::checked[Never](%0, %1)\n    return %2\n\nfn closure 0 (read %0: u32) -> u32\n^0:\n    %1 = mul %0, 2u32\n    return %1\n"
+    );
+}

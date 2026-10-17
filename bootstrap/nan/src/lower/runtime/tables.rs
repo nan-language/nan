@@ -92,9 +92,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let owns = fx.b.ins().band(owns, held);
                     fx.when(owns, |fx| {
                         let len = fx.load(PTR, record, entry::STATE + 16);
-                        let one = fx.ptr(1);
                         let size = fx.b.ins().iadd_imm_s(len, 1);
-                        let copy = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+                        let copy = lo.record_alloc(fx, size);
                         let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
                         fx.when(failed, |fx| {
                             super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -224,7 +223,7 @@ fn revoke(lo: &mut Lowering, fx: &mut Fx, handle: Value) {
                 let owns = owns_text(fx, record);
                 fx.when(owns, |fx| {
                     let text = fx.load(PTR, record, entry::STATE + 8);
-                    lo.call_libc(fx, "free", &[text], &[]);
+                    lo.record_free(fx, text);
                 });
                 free_entry(lo, fx, record, index);
             });
@@ -417,9 +416,13 @@ fn new_entry(lo: &mut Lowering, fx: &mut Fx, kind: Value) -> Value {
     fx.b.ins().bor(index, generation)
 }
 
-/// `MintRoot(world)`: the root cell and the entries of the root grant's capabilities, written
-/// into a `host::World` with empty arguments and environment.
+/// `MintRoot(grant)`: the root cell and the entries of the root grant's capabilities, written
+/// into a `host::World` with empty arguments and environment, or into a machine target's grant.
 fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
+    if lo.machine() {
+        mint_machine_root(lo, fx, world);
+        return;
+    }
     let world_ty = lo.std_ty("host", "World", Vec::new());
     let state_address = lo.state(fx);
     let limit = fx.int(PTR, -1);
@@ -452,6 +455,31 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         fx.store(*handle, world, at);
     }
     grant_memory(lo, fx, world, cell);
+    fx.b.ins().return_(&[]);
+}
+
+/// A machine target's root grant: a root cell without a limit, whose supply is the boot heap,
+/// and an executor drawing through it that records no clock; its regions and `hw::Ring0` are not
+/// yet taken.
+fn mint_machine_root(lo: &mut Lowering, fx: &mut Fx, grant: Value) {
+    let grant_ty = lo.root_grant();
+    let unlimited = fx.int(PTR, -1);
+    let cell = memory::new_cell(lo, fx, unlimited, unlimited);
+    let executor = fx.ptr(kind::EXECUTOR as u64);
+    let exec = new_entry(lo, fx, executor);
+    let record = entry_at(lo, fx, exec);
+    fx.store(cell, record, entry::STATE);
+    let zero = fx.ptr(0);
+    fx.store(zero, record, entry::STATE + 8);
+    for (field, value) in [("alloc", cell), ("exec", exec)] {
+        let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
+        fx.store(value, grant, at);
+    }
+    let untaken = fx.int(types::I8, 0);
+    for field in ["regions", "ring0"] {
+        let at = lo.layouts.field(lo.ck, &grant_ty, None, field).offset;
+        fx.store(untaken, grant, at);
+    }
     fx.b.ins().return_(&[]);
 }
 
@@ -498,8 +526,13 @@ impl Lowering<'_, '_> {
         self.invoke(fx, Invoked::Direct(id), &abi, args)
     }
 
-    /// The instance of the function of the host platform package named `name`.
+    /// The instance of the function of the host platform package named `name`, which only an
+    /// `x86_64-host` image holds.
     fn platform_instance(&mut self, name: &str) -> Instance {
+        assert!(
+            !self.machine(),
+            "the host platform function {name} in a machine image"
+        );
         let item = self
             .ck
             .db

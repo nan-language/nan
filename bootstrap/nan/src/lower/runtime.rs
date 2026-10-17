@@ -9,11 +9,13 @@
 //! seeded scheduler of test images.
 
 pub mod holdings;
+pub mod locks;
 pub mod memory;
 pub mod regions;
 pub mod report;
 pub mod seeded;
 pub mod settle;
+pub mod system;
 pub mod tables;
 pub mod tasks;
 
@@ -23,6 +25,7 @@ use cranelift_codegen::ir::{
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use super::fx::{Fx, PTR};
+use super::machine::Stub;
 use super::{CALL_CONV, Lowering};
 
 /// A support routine.
@@ -41,6 +44,13 @@ pub enum Routine {
     AllocIn,
     /// `(address)`: frees an allocation.
     Free,
+    /// `(size) -> address`: a zeroed runtime record of `size` bytes, zero on exhaustion.
+    RecordAlloc,
+    /// `(address)`: frees a runtime record.
+    RecordFree,
+    /// `(address, size) -> address`: a runtime record moved to `size` bytes, keeping its
+    /// leading bytes; zero on exhaustion, the record then unchanged.
+    RecordResize,
     /// `(cell, limit) -> cell`: a budget's new cell under an allocator's.
     Split,
     /// `(cell)`: closes a cell.
@@ -79,6 +89,8 @@ pub enum Routine {
     OutboxClaim,
     /// `(kind, operands, count, caller) -> Never`: traps the running task.
     TrapRaise,
+    /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
+    Reacquired,
     /// `(domain)`: settles an abandoned `sys::Domain` body.
     Settle,
     /// `(signal, info, context)`: the handler of the stop signal.
@@ -153,6 +165,9 @@ impl Routine {
             Routine::Alloc => "_NScap_table_alloc",
             Routine::AllocIn => "_NScap_table_alloc_in",
             Routine::Free => "_NScap_table_free",
+            Routine::RecordAlloc => "_NScap_table_record_alloc",
+            Routine::RecordFree => "_NScap_table_record_free",
+            Routine::RecordResize => "_NScap_table_record_resize",
             Routine::Split => "_NScap_table_split",
             Routine::Close => "_NScap_table_close",
             Routine::Charged => "_NScap_table_charged",
@@ -171,6 +186,7 @@ impl Routine {
             Routine::OutboxRetire => "_NScap_table_outbox_retire",
             Routine::OutboxClaim => "_NScap_table_outbox_claim",
             Routine::TrapRaise => "_NStrap_raise",
+            Routine::Reacquired => "_NStrap_reacquired",
             Routine::ReportScalar => "_NStrap_scalar",
             Routine::Settle => "_NSsettle_domain",
             Routine::Preempt => "_NStrap_preempt",
@@ -224,8 +240,11 @@ impl Routine {
             | Routine::TaskEnv
             | Routine::Check
             | Routine::OutboxClaim
-            | Routine::RegionOpen => (&[P], &[P]),
+            | Routine::RegionOpen
+            | Routine::RecordAlloc => (&[P], &[P]),
+            Routine::RecordResize => (&[P, P], &[P]),
             Routine::Free
+            | Routine::RecordFree
             | Routine::Close
             | Routine::TaskEnvFree
             | Routine::Unhold
@@ -241,6 +260,7 @@ impl Routine {
             | Routine::Lock
             | Routine::Unlock
             | Routine::Settle
+            | Routine::Reacquired
             | Routine::Stop => (&[P], &[]),
             Routine::Preempt | Routine::Overflow | Routine::CpuLimit => (&[types::I32, P, P], &[]),
             Routine::OverflowRaise => (&[], &[]),
@@ -321,7 +341,24 @@ pub mod state {
     pub const CONTENDED: u64 = 224;
     pub const COMPLETIONS: u64 = 232;
     pub const COMPLETIONS_TAIL: u64 = 240;
-    pub const SIZE: u64 = 256;
+    /// On a machine target: the two values the platform entered the image with, the
+    /// start-information address on `x86_64-bare` and the image handle and system table on
+    /// `x86_64-uefi`; the installed anchor's address, zero before one; the location record of
+    /// the `anchor` call that installed it; the number of CPUs that started their executor;
+    /// nonzero once a kernel halt begins; the number of CPUs it has stopped; and on
+    /// `x86_64-uefi`, once `exit_services` ends the firmware's boot services, the record of its
+    /// final memory map, the map's size and the size of each of its descriptors.
+    pub const PLATFORM: u64 = 248;
+    pub const PLATFORM_TABLE: u64 = 256;
+    pub const ANCHOR: u64 = 264;
+    pub const ANCHOR_CALL: u64 = 272;
+    pub const STARTED_CPUS: u64 = 280;
+    pub const HALTING: u64 = 288;
+    pub const STOPPED_CPUS: u64 = 296;
+    pub const MEMORY_MAP: u64 = 304;
+    pub const MAP_SIZE: u64 = 312;
+    pub const MAP_STRIDE: u64 = 320;
+    pub const SIZE: u64 = 384;
 }
 
 impl Lowering<'_, '_> {
@@ -373,7 +410,8 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The address of the thread-local word holding the running executor thread's record.
+    /// The address of the thread-local word holding the running executor thread's record, on
+    /// `x86_64-host`.
     pub fn thread_slot(&mut self, fx: &mut Fx) -> Value {
         let id = match self.thread_id {
             Some(id) => id,
@@ -396,18 +434,41 @@ impl Lowering<'_, '_> {
         fx.b.ins().tls_value(PTR, global)
     }
 
-    /// The record of the running executor thread, zero outside one.
-    pub fn thread(&mut self, fx: &mut Fx) -> Value {
-        self.call_routine(fx, Routine::Thread, &[])[0]
+    /// A zeroed runtime record of `size` bytes, zero on exhaustion.
+    pub fn record_alloc(&mut self, fx: &mut Fx, size: Value) -> Value {
+        self.call_routine(fx, Routine::RecordAlloc, &[size])[0]
     }
 
-    /// A C library function, by name.
+    /// Frees a runtime record.
+    pub fn record_free(&mut self, fx: &mut Fx, address: Value) {
+        self.call_routine(fx, Routine::RecordFree, &[address]);
+    }
+
+    /// A runtime record moved to `size` bytes, zero on exhaustion.
+    pub fn record_resize(&mut self, fx: &mut Fx, address: Value, size: Value) -> Value {
+        self.call_routine(fx, Routine::RecordResize, &[address, size])[0]
+    }
+
+    /// The record of the running executor thread, zero outside one: on a machine target the
+    /// running CPU's, which its record holds.
+    pub fn thread(&mut self, fx: &mut Fx) -> Value {
+        match self.machine() {
+            true => self.call_stub(fx, Stub::Thread, &[])[0],
+            false => self.call_routine(fx, Routine::Thread, &[])[0],
+        }
+    }
+
+    /// A C library function, by name, which only an `x86_64-host` image links.
     pub fn libc(
         &mut self,
         name: &str,
         params: &[cranelift_codegen::ir::Type],
         returns: &[cranelift_codegen::ir::Type],
     ) -> FuncId {
+        assert!(
+            !self.machine(),
+            "the C library function {name} in a machine image"
+        );
         let mut signature = Signature::new(CALL_CONV);
         signature
             .params
@@ -436,6 +497,16 @@ impl Lowering<'_, '_> {
         let reference = self.func_ref(fx, id);
         let call = fx.b.ins().call(reference, args);
         fx.b.inst_results(call).to_vec()
+    }
+
+    /// Relaxes the processor in a spin loop: on `x86_64-host` it yields the processor to the
+    /// system, on a machine target it hints the spin with `pause`.
+    pub fn relax(&mut self, fx: &mut Fx) {
+        if self.machine() {
+            self.call_stub(fx, Stub::Pause, &[]);
+        } else {
+            self.call_libc(fx, "sched_yield", &[], &[types::I32]);
+        }
     }
 
     /// Copies `size` bytes, inline when small.
@@ -497,6 +568,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::OutboxRetire
         | Routine::OutboxClaim => tables::define(lo, fx, routine),
         Routine::TrapRaise
+        | Routine::Reacquired
         | Routine::ReportScalar
         | Routine::ReportText
         | Routine::WriteErr
@@ -515,13 +587,15 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
         Routine::Draw => super::supplied::generate::define_draw(lo, fx),
+        Routine::Lock | Routine::Unlock => locks::define(lo, fx, routine),
         Routine::Init
         | Routine::Exit
-        | Routine::Lock
-        | Routine::Unlock
-        | Routine::Preempt
-        | Routine::Overflow
-        | Routine::CpuLimit => super::host::define(lo, fx, routine),
+        | Routine::RecordAlloc
+        | Routine::RecordFree
+        | Routine::RecordResize => system::define(lo, fx, routine),
+        Routine::Preempt | Routine::Overflow | Routine::CpuLimit => {
+            super::host::define(lo, fx, routine)
+        }
     }
 }
 

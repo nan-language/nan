@@ -41,9 +41,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let lock = fx.offset(state_address, state::LOCK);
     match routine {
         Routine::Hold => {
-            let one = fx.ptr(1);
             let size = fx.ptr(holding::SIZE);
-            let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let record = lo.record_alloc(fx, size);
             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
             fx.when(missing, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -60,7 +59,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             lo.call_routine(fx, Routine::Lock, &[lock]);
             unlink(fx, params[0]);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
-            lo.call_libc(fx, "free", &[params[0]], &[]);
+            lo.record_free(fx, params[0]);
             fx.b.ins().return_(&[]);
         }
         Routine::Rehome => {
@@ -194,7 +193,7 @@ pub fn release_all(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
             let this = is(fx, wanted);
             fx.when(this, |fx| channels::settle_end(lo, fx, payload, sender));
         }
-        lo.call_libc(fx, "free", &[record], &[]);
+        lo.record_free(fx, record);
     });
 }
 

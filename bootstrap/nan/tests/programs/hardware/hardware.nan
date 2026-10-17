@@ -1,0 +1,61 @@
+//! Each line shows what tasks on several executor threads did through a spin lock and a signal.
+
+/// The tasks counting under the spin lock, and the times each counts.
+const COUNTERS: u32 = 8
+
+const ROUNDS: u32 = 10_000
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let counter = mem::Shared.of(hw::SpinLock.of(0u64), alloc)
+    let mail = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let received = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    try await task::scope(world.exec, body: fn(s: task::Scope) {
+        for _ in 0..<COUNTERS {
+            let mine = counter.share()
+            discard s.spawn(fn[take mine]() {
+                for _ in 0..<ROUNDS {
+                    count(mine)
+                }
+            })
+        }
+        let inbox = mail.share()
+        let noted = received.share()
+        discard s.spawn(fn[take inbox, take noted]() fails task::Cancelled uses wait {
+            let value = try await inbox.contents().wait()
+            discard noted.contents().fetch_add(value)
+        })
+        post(mail, value: 3)
+    })
+    world.log.info("counted", value: total(counter))
+    world.log.info("received", value: received.contents().load())
+    post(mail, value: 5)
+    post(mail, value: 7)
+    let kept = try await mail.contents().wait()
+    world.log.info("kept", value: kept)
+    let unposted = hw::Signal[mem::Bytes].empty()
+    discard unposted
+} main
+
+/// Adds one to the count under its lock.
+fn count(lock: mem::Shared[hw::SpinLock[u64]]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        lock.contents().with(t, body: fn(mut value: u64) limits notrap, terminates, noalloc {
+            value = value.wrapping_add(1)
+        })
+    })
+} count
+
+/// The count under its lock.
+fn total(lock: mem::Shared[hw::SpinLock[u64]]) -> u64 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+        return lock.contents().with(t, body: fn(mut value: u64) => value)
+    })
+} total
+
+/// Posts a value to a signal, replacing the value it holds.
+fn post(mail: mem::Shared[hw::Signal[u64]], value: u64) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        mail.contents().post(t, value: value)
+    })
+} post

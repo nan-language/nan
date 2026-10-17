@@ -3,24 +3,27 @@
 //! allocations carved from the chunks a domain draws through one cell.
 //!
 //! A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A
-//! cell record is its limit, its charge, its parent's index plus one, its generation and whether
-//! it is open. Each drawn run of chunks has a record, found from the address of its first chunk
-//! through the chunk map: its cell handle, its domain, its live allocation count, the offset of
-//! its free bytes, its chunk count, its links in its domain's list and its address. A run
-//! passes to an enclosing domain when a value it holds leaves the domain owning it, and the
-//! runs a domain still owns are freed when it ends.
+//! cell record is its limit, its charge, its parent's index plus one, its generation, whether it
+//! is open and, for a chain whose root cell is over a region, the supply of the region's chunks,
+//! which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record,
+//! found from the address of its first chunk through the chunk map: its cell handle, its domain,
+//! its live allocation count, the offset of its free bytes, its chunk count, its links in its
+//! domain's list and its address. A run passes to an enclosing domain when a value it holds
+//! leaves the domain owning it, and the runs a domain still owns are freed when it ends.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
-use super::{Routine, state, tasks};
+use super::super::machine::Stub;
+use super::super::machine::heap;
+use super::{Routine, state, system, tasks};
 
 pub const CHUNK: u64 = 65_536;
 
 /// The cell table's capacity.
 pub const CELLS: u64 = 65_536;
-pub const CELL_RECORD: u64 = 32;
+pub const CELL_RECORD: u64 = 40;
 
 /// The chunk map: a table of 2^15 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
@@ -33,6 +36,15 @@ mod cell {
     pub const PARENT: u64 = 16;
     pub const GENERATION: u64 = 20;
     pub const OPEN: u64 = 24;
+    pub const SUPPLY: u64 = 32;
+}
+
+/// The offsets of a region's supply record: its first chunk's address, its chunk count, then its
+/// map of a bit per chunk.
+mod supply {
+    pub const BASE: u64 = 0;
+    pub const COUNT: u64 = 8;
+    pub const MAP: u64 = 16;
 }
 
 pub mod chunk {
@@ -56,9 +68,14 @@ mod pool {
     pub const SIZE: u64 = 24;
 }
 
-/// The byte routines of `mem_op`, over the C library's.
+/// The byte routines of `mem_op`: the C library's on `x86_64-host`; on a machine target, which
+/// has no C library, the copy and fill compiler stubs and a comparison loop.
 pub fn bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();
+    if lo.machine() {
+        machine_bytes(lo, fx, routine, &params);
+        return;
+    }
     match routine {
         Routine::Copy => {
             lo.call_libc(fx, "memmove", &params, &[PTR]);
@@ -72,6 +89,49 @@ pub fn bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         _ => {
             let order = lo.call_libc(fx, "memcmp", &params, &[types::I32]);
             fx.b.ins().return_(&order);
+        }
+    }
+}
+
+/// The byte routines of a machine target.
+fn machine_bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine, params: &[Value]) {
+    let flags = super::super::fx::unaligned();
+    let zero = fx.ptr(0);
+    match routine {
+        Routine::Copy => {
+            lo.call_stub(fx, Stub::Copy, params);
+            fx.b.ins().return_(&[]);
+        }
+        Routine::Fill => {
+            lo.call_stub(fx, Stub::Fill, params);
+            fx.b.ins().return_(&[]);
+        }
+        _ => {
+            let (left, right, len) = (params[0], params[1], params[2]);
+            let equal = fx.int(types::I32, 0);
+            let order = fx.repeat(&[zero, equal], |fx, state| {
+                let index = state[0];
+                let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
+                let order = fx.choose(
+                    inside,
+                    &[types::I32],
+                    |fx| {
+                        let a = fx.b.ins().iadd(left, index);
+                        let b = fx.b.ins().iadd(right, index);
+                        let a = fx.b.ins().load(types::I8, flags, a, 0);
+                        let b = fx.b.ins().load(types::I8, flags, b, 0);
+                        let a = fx.b.ins().uextend(types::I32, a);
+                        let b = fx.b.ins().uextend(types::I32, b);
+                        vec![fx.b.ins().isub(a, b)]
+                    },
+                    |fx| vec![fx.int(types::I32, 0)],
+                )[0];
+                let same = fx.b.ins().icmp_imm_s(IntCC::Equal, order, 0);
+                let more = fx.b.ins().band(inside, same);
+                let next = fx.b.ins().iadd_imm_s(index, 1);
+                (more, vec![next, order])
+            });
+            fx.b.ins().return_(&[order[1]]);
         }
     }
 }
@@ -134,8 +194,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         }
         Routine::TaskEnv => {
             let size = params[0];
-            let one = fx.ptr(1);
-            let address = lo.call_libc(fx, "calloc", &[size, one], &[PTR])[0];
+            let address = lo.record_alloc(fx, size);
             let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, address, 0);
             fx.when(failed, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted");
@@ -143,7 +202,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             fx.b.ins().return_(&[address]);
         }
         Routine::TaskEnvFree => {
-            lo.call_libc(fx, "free", &[params[0]], &[]);
+            lo.record_free(fx, params[0]);
             fx.b.ins().return_(&[]);
         }
         Routine::Lift => {
@@ -209,7 +268,50 @@ pub fn new_cell(lo: &mut Lowering, fx: &mut Fx, limit: Value, parent: Value) -> 
     fx.store(none, record, cell::GENERATION);
     let open = fx.int(types::I32, 1);
     fx.store(open, record, cell::OPEN);
+    let supply = fx.choose_in(
+        lo,
+        root,
+        &[PTR],
+        |_, fx| vec![fx.ptr(0)],
+        |lo, fx| {
+            let index = fx.b.ins().band_imm_s(parent, 0xFFFF_FFFF);
+            let parent_record = record_at(lo, fx, index);
+            vec![fx.load(PTR, parent_record, cell::SUPPLY)]
+        },
+    )[0];
+    fx.store(supply, record, cell::SUPPLY);
     count
+}
+
+/// Adds a root cell whose supply is the `count` chunks from `first` and whose limit is their
+/// size; gives its handle. The caller holds the lock.
+pub fn region_cell(lo: &mut Lowering, fx: &mut Fx, first: Value, count: Value) -> Value {
+    let limit = fx.b.ins().imul_imm_s(count, CHUNK as i64);
+    let root = fx.int(PTR, -1);
+    let handle = new_cell(lo, fx, limit, root);
+    let words = fx.b.ins().iadd_imm_s(count, 63);
+    let words = fx.b.ins().ushr_imm_s(words, 6);
+    let size = fx.b.ins().imul_imm_s(words, 8);
+    let size = fx.b.ins().iadd_imm_s(size, supply::MAP as i64);
+    let record = lo.record_alloc(fx, size);
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    fx.when(missing, |fx| {
+        super::report::raise_kind(lo, fx, "trap.exhausted")
+    });
+    fx.store(first, record, supply::BASE);
+    fx.store(count, record, supply::COUNT);
+    let cell = cell_record(lo, fx, handle);
+    fx.store(record, cell, cell::SUPPLY);
+    handle
+}
+
+/// A region's supply by its record.
+fn region_supply(fx: &mut Fx, record: Value) -> heap::ChunkSupply {
+    heap::ChunkSupply {
+        base: fx.load(PTR, record, supply::BASE),
+        count: fx.load(PTR, record, supply::COUNT),
+        map: fx.offset(record, supply::MAP),
+    }
 }
 
 /// Draws `count` chunks through a cell: charges every cell of its chain and maps them, or gives
@@ -222,7 +324,26 @@ fn draw(lo: &mut Lowering, fx: &mut Fx, handle: Value, count: Value) -> Value {
     let mapped = fx.choose(
         fits,
         &[PTR],
-        |fx| vec![super::super::host::map_chunks(lo, fx, count)],
+        |fx| {
+            let region = fx.load(PTR, first, cell::SUPPLY);
+            let platform = fx.b.ins().icmp_imm_s(IntCC::Equal, region, 0);
+            fx.choose_in(
+                lo,
+                platform,
+                &[PTR],
+                |lo, fx| vec![system::map_chunks(lo, fx, count)],
+                |lo, fx| {
+                    let supply = region_supply(fx, region);
+                    let base = heap::take_chunks(fx, supply, count);
+                    let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
+                    fx.when(taken, |fx| {
+                        let len = fx.b.ins().imul_imm_s(count, CHUNK as i64);
+                        heap::clear(lo, fx, base, len);
+                    });
+                    vec![base]
+                },
+            )
+        },
         |fx| vec![fx.ptr(0)],
     )[0];
     let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, mapped, 0);
@@ -368,9 +489,8 @@ fn new_chunk(lo: &mut Lowering, fx: &mut Fx, handle: Value, count: Value, domain
         drawn,
         &[PTR],
         |fx| {
-            let one = fx.ptr(1);
             let size = fx.ptr(chunk::SIZE);
-            let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let record = lo.record_alloc(fx, size);
             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
             fx.when(missing, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -406,9 +526,8 @@ fn map_leaf(lo: &mut Lowering, fx: &mut Fx, base: Value) -> Value {
         missing,
         &[PTR],
         |fx| {
-            let one = fx.ptr(1);
             let size = fx.ptr(MAP_LEAVES * 8);
-            let table = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let table = lo.record_alloc(fx, size);
             let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, table, 0);
             fx.when(failed, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -424,8 +543,12 @@ fn map_leaf(lo: &mut Lowering, fx: &mut Fx, base: Value) -> Value {
     fx.b.ins().iadd(table, leaf)
 }
 
-/// Carves a small allocation from the chunk a domain's pool for a cell holds, drawing a new
-/// chunk when it lacks room.
+/// The least alignment of an allocation carved from a chunk on a machine target, which suits
+/// devices reaching a DMA buffer of any type.
+const MIN_ALIGN: u64 = 16;
+
+/// Carves a small allocation from the chunk a domain's pool for a cell holds, on a machine
+/// target at least `MIN_ALIGN`-aligned, drawing a new chunk when it lacks room.
 fn carve(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -436,6 +559,13 @@ fn carve(
 ) -> Value {
     let pool = domain_pool(lo, fx, domain, handle);
     let current = fx.load(PTR, pool, pool::CHUNK);
+    let align = match lo.machine() {
+        true => {
+            let least = fx.ptr(MIN_ALIGN);
+            fx.b.ins().umax(align, least)
+        }
+        false => align,
+    };
     let start = |fx: &mut Fx, record: Value| {
         let used = fx.load(PTR, record, chunk::USED);
         let mask = fx.b.ins().iadd_imm_s(align, -1);
@@ -514,8 +644,7 @@ fn domain_pool(lo: &mut Lowering, fx: &mut Fx, domain: Value, handle: Value) -> 
         &[PTR],
         |fx| {
             let size = fx.ptr(pool::SIZE);
-            let one = fx.ptr(1);
-            let pool = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let pool = lo.record_alloc(fx, size);
             let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, pool, 0);
             fx.when(failed, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted")
@@ -547,7 +676,7 @@ fn release(lo: &mut Lowering, fx: &mut Fx, address: Value) {
 }
 
 /// Returns a run of chunks by its record: takes it out of its domain, uncharges its chain,
-/// unmaps it and drops its record. The caller holds the lock.
+/// returns it to its chain's supply and drops its record. The caller holds the lock.
 pub fn return_chunk(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     detach(fx, record);
     let handle = fx.load(PTR, record, chunk::CELL);
@@ -559,8 +688,23 @@ pub fn return_chunk(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let leaf = map_leaf(lo, fx, base);
     let zero = fx.ptr(0);
     fx.store(zero, leaf, 0);
-    super::super::host::unmap(lo, fx, base, bytes);
-    lo.call_libc(fx, "free", &[record], &[]);
+    let region = fx.load(PTR, cell, cell::SUPPLY);
+    let platform = fx.b.ins().icmp_imm_s(IntCC::Equal, region, 0);
+    fx.choose_in(
+        lo,
+        platform,
+        &[],
+        |lo, fx| {
+            system::unmap_chunks(lo, fx, base, count);
+            Vec::new()
+        },
+        |_, fx| {
+            let supply = region_supply(fx, region);
+            heap::give_chunks(fx, supply, base, count);
+            Vec::new()
+        },
+    );
+    lo.record_free(fx, record);
 }
 
 /// Takes a run of chunks out of its domain's list and out of the pool carving it.
@@ -690,7 +834,7 @@ pub fn free_chunks(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
             &[PTR],
             |lo, fx| {
                 let next = fx.load(PTR, pool, pool::NEXT);
-                lo.call_libc(fx, "free", &[pool], &[]);
+                lo.record_free(fx, pool);
                 vec![next]
             },
             |_, fx| vec![fx.ptr(0)],

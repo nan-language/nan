@@ -8,7 +8,7 @@ The language is specified in [docs/spec](docs/spec/00-charter.md), starting with
 
 ## Installation
 
-Requires [rustup](https://rustup.rs) and a C compiler available as `cc`. From the repository root:
+Requires [rustup](https://rustup.rs) and a C compiler available as `cc`; building and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU (`qemu-system-x86_64`) and OVMF. From the repository root:
 
 ```bash
 rustup toolchain install
@@ -28,11 +28,11 @@ target/debug/nan run
 target/debug/nan test
 ```
 
-`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of an `x86_64-host` program under `.nan/images/x86_64-host/`, and `nan run` builds and runs it. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names.
+`nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting an `x86_64-uefi` or `x86_64-bare` image under QEMU with its serial port on the terminal. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names.
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 
-The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`. Machine targets are not implemented yet.
+The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, `x86_64-uefi` and `x86_64-bare`.
 
 ## Commands
 

@@ -34,8 +34,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     match routine {
         Routine::RegionOpen => {
             let size = params[0];
-            let one = fx.ptr(1);
-            let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let record = lo.record_alloc(fx, size);
             let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
             fx.when(failed, |fx| {
                 super::report::raise_kind(lo, fx, "trap.exhausted")

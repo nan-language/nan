@@ -69,9 +69,8 @@ fn joined(lo: &mut Lowering, fx: &mut Fx, prefix: (Value, Value), path: Held) ->
     let separator = fx.b.ins().uextend(PTR, has_prefix);
     let len = fx.b.ins().iadd(prefix.1, separator);
     let len = fx.b.ins().iadd(len, path_len);
-    let one = fx.ptr(1);
     let size = fx.b.ins().iadd_imm_s(len, 1);
-    let text = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let text = lo.record_alloc(fx, size);
     super::exhausted_unless(lo, fx, text);
     lo.call_routine(fx, Routine::Copy, &[text, prefix.0, prefix.1]);
     fx.when(has_prefix, |fx| {
@@ -144,9 +143,8 @@ fn find_or_create(lo: &mut Lowering, fx: &mut Fx, system: Value, path: (Value, V
         missing,
         &[PTR],
         |lo, fx| {
-            let one = fx.ptr(1);
             let size = fx.ptr(file::SIZE);
-            let created = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let created = lo.record_alloc(fx, size);
             super::exhausted_unless(lo, fx, created);
             fx.store(path.0, created, file::PATH);
             fx.store(path.1, created, file::PATH_LEN);
@@ -156,7 +154,7 @@ fn find_or_create(lo: &mut Lowering, fx: &mut Fx, system: Value, path: (Value, V
             vec![created]
         },
         |lo, fx| {
-            lo.call_libc(fx, "free", &[path.0], &[]);
+            lo.record_free(fx, path.0);
             vec![found]
         },
     )[0]
@@ -212,7 +210,7 @@ pub fn open(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value, crea
         target
     } else {
         let (target, _) = find(lo, fx, system, path);
-        lo.call_libc(fx, "free", &[path.0], &[]);
+        lo.record_free(fx, path.0);
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);
         fx.when(missing, |fx| sys::fail_with(lo, fx, supply, "NotFound"));
         target
@@ -233,7 +231,7 @@ pub fn read_all(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) 
     let (system, prefix) = of_entry(lo, fx, record);
     let path = joined(lo, fx, prefix, supply.param(1));
     let (target, _) = find(lo, fx, system, path);
-    lo.call_libc(fx, "free", &[path.0], &[]);
+    lo.record_free(fx, path.0);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);
     fx.when(missing, |fx| sys::fail_with(lo, fx, supply, "NotFound"));
     let alloc = fx.load(PTR, supply.param(2).address(), 0);
@@ -274,7 +272,7 @@ pub fn remove(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, record: Value) {
     let (system, prefix) = of_entry(lo, fx, record);
     let path = joined(lo, fx, prefix, supply.param(1));
     let (target, link) = find(lo, fx, system, path);
-    lo.call_libc(fx, "free", &[path.0], &[]);
+    lo.record_free(fx, path.0);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, target, 0);
     fx.when(missing, |fx| sys::fail_with(lo, fx, supply, "NotFound"));
     let next = fx.load(PTR, target, file::NEXT);

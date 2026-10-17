@@ -158,11 +158,14 @@ impl Checker<'_> {
         let seams = match self.db.canonical(registry).as_str() {
             "hw::vectors" => vectors,
             "hw::preempt" => {
-                self.report(
-                    item,
-                    contribution.registry.token(),
-                    Code::RegistryPlatformEntry,
-                );
+                let package = &self.db.package(self.db.package_of(item)).name;
+                if !crate::stdlib::PLATFORMS.contains(&package.as_str()) {
+                    self.report(
+                        item,
+                        contribution.registry.token(),
+                        Code::RegistryPlatformEntry,
+                    );
+                }
                 vectors
             }
             "hw::syscall_entry" => self.db.target == Target::Bare,
@@ -243,14 +246,25 @@ impl Checker<'_> {
                 .iter()
                 .any(|alias| data.deps.get(alias) == Some(&Some(contributor)))
         };
+        let platform = self
+            .db
+            .packages
+            .iter()
+            .position(|package| Some(package.name.as_str()) == self.db.target.platform_package())
+            .map(|index| PackageId(index as u32))
+            .filter(|platform| *platform != root);
         let mut found = Vec::new();
-        for contributor in std::iter::once(root).chain(self.dependency_closure(root)) {
+        let contributors = std::iter::once(root)
+            .chain(self.dependency_closure(root))
+            .chain(platform);
+        for contributor in contributors {
             for &module in &self.db.package(contributor).modules {
                 for &item in &self.db.module(module).items {
                     let Some(registry) = self.contribution_registry(item) else {
                         continue;
                     };
                     let admitted = contributor == root
+                        || Some(contributor) == platform
                         || self.db.package_of(registry) == contributor
                         || grants.iter().any(|(granted, aliases)| {
                             *granted == registry && named(contributor, aliases)

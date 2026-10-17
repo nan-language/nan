@@ -551,9 +551,8 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
                         &[types::F64, types::I32],
                         |lo, fx| {
                             let len = fx.b.ins().isub(end, start);
-                            let one = fx.ptr(1);
                             let size = fx.b.ins().iadd_imm_s(len, 1);
-                            let text = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+                            let text = lo.record_alloc(fx, size);
                             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, text, 0);
                             fx.choose_in(
                                 lo,
@@ -567,7 +566,7 @@ pub fn read_float(lo: &mut Lowering, fx: &mut Fx, state: Value) -> (Value, Value
                                     let none = fx.ptr(0);
                                     let value =
                                         lo.call_libc(fx, "strtod", &[text, none], &[types::F64])[0];
-                                    lo.call_libc(fx, "free", &[text], &[]);
+                                    lo.record_free(fx, text);
                                     vec![value, code(fx, 0)]
                                 },
                             )
@@ -1043,7 +1042,7 @@ pub fn read_base64(lo: &mut Lowering, fx: &mut Fx, state: Value, target: Value) 
         |lo, fx| {
             let one = fx.ptr(1);
             let size = fx.b.ins().umax(len, one);
-            let text = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+            let text = lo.record_alloc(fx, size);
             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, text, 0);
             fx.choose_in(
                 lo,
@@ -1065,7 +1064,7 @@ pub fn read_base64(lo: &mut Lowering, fx: &mut Fx, state: Value, target: Value) 
                     let reference = lo.func_ref(fx, function);
                     let call = fx.b.ins().call(reference, &[text, len, target]);
                     let failed = fx.b.inst_results(call)[0];
-                    lo.call_libc(fx, "free", &[text], &[]);
+                    lo.record_free(fx, text);
                     vec![failed]
                 },
             )

@@ -2,9 +2,11 @@
 //! implements. Each std function is a lowered function of its own, written by the family of its
 //! owning type; builtins are lowered where they are called.
 
+pub mod boot;
 pub mod codecs;
 pub mod floats;
 pub mod generate;
+pub mod hw;
 pub mod mem;
 pub mod numbers;
 pub mod pointers;
@@ -21,6 +23,7 @@ use cranelift_codegen::ir::{InstBuilder, Value};
 use super::Lowering;
 use super::abi::{Abi, Repr, Returned};
 use super::body::{Body, Held};
+use super::call::Called;
 use super::fx::Fx;
 use crate::check::db::ItemId;
 use crate::check::ty::{Args, Ty};
@@ -114,6 +117,24 @@ impl Supply<'_> {
         self.fail(fx);
     }
 
+    /// Fails with the failure a called function gave when it failed, provided the operation
+    /// itself may fail: a function value always carries a failure flag, which stays clear when
+    /// the operation cannot fail.
+    pub fn forward_failure(&self, lo: &mut Lowering, fx: &mut Fx, called: &Called) {
+        if let (Some(failed), Some(source), Some(fails), Some(target)) = (
+            called.failed,
+            called.failure,
+            self.abi.fails.clone(),
+            self.failure,
+        ) {
+            fx.when(failed, |fx| {
+                let layout = lo.layout(&fails);
+                lo.copy(fx, target, source, layout.size, layout.align);
+                self.fail(fx);
+            });
+        }
+    }
+
     /// Fails with the failure value already written at the failure address.
     pub fn fail(&self, fx: &mut Fx) {
         let mut returns = vec![fx.int(cranelift_codegen::ir::types::I8, 1)];
@@ -190,6 +211,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         || render::lower(lo, fx, &supply)
         || (lo.seeded() && sims::lower(lo, fx, &supply))
         || same::lower(lo, fx, &supply)
+        || hw::lower(lo, fx, &supply)
+        || boot::lower(lo, fx, &supply)
         || sys::lower(lo, fx, &supply)
         || tasks::lower(lo, fx, &supply)
         || text::lower(lo, fx, &supply)
@@ -216,6 +239,7 @@ pub fn builtin(
         }
         Builtin::Intrinsic(path) => match path {
             "hw::mint_root" => sys::mint_root(body),
+            "hw::Dma.access" => hw::dma_access(body, args, operands),
             "text::fmt" => render::template(body, args, operands),
             "Dyn.view" => render::dyn_view(body, args, &operands[0]),
             other => panic!("the intrinsic {other} has no lowering on this target"),
@@ -229,6 +253,8 @@ pub fn base_needs_release(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool
         .or_else(|| sys::needs_release(path))
         .or_else(|| tasks::needs_release(path))
         .or_else(|| text::needs_release(path))
+        .or_else(|| hw::needs_release(lo, path, ty))
+        .or_else(|| boot::needs_release(path))
 }
 
 /// Whether moving a value of a std base type into another domain's reach does anything; none
@@ -238,6 +264,7 @@ pub fn base_transfers(lo: &mut Lowering, path: &str, ty: &Ty) -> Option<bool> {
         .or_else(|| sys::transfers(path))
         .or_else(|| tasks::transfers(path))
         .or_else(|| text::transfers(path))
+        .or_else(|| hw::transfers(lo, path, ty))
 }
 
 /// Moves a value of a std base type into another domain's reach; false for a type std declares
@@ -258,6 +285,7 @@ pub fn transfer_base(
         || sys::transfer(lo, fx, &path, address, owner)
         || tasks::transfer(lo, fx, &path, ty, address, lift, owner)
         || text::transfer(lo, fx, &path, address, lift)
+        || hw::transfer(lo, fx, &path, ty, address, lift, owner)
 }
 
 /// Releases a value of a std base type; false for a type std declares in full.
@@ -270,4 +298,5 @@ pub fn release_base(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value) -> 
         || sys::release(lo, fx, &path, ty, address)
         || tasks::release(lo, fx, &path, ty, address)
         || text::release(lo, fx, &path, address)
+        || hw::release(lo, fx, &path, ty, address)
 }

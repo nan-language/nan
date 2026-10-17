@@ -15,7 +15,7 @@
 //! keyed task's node holds its links, its task, key, outbox and region, whether its key was
 //! superseded and whether it has ended.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
 use super::super::super::body::Held;
@@ -388,7 +388,7 @@ fn component_done(lo: &mut Lowering) -> FuncId {
         fx.store(one, record, runner::ENDED);
         wake_waiter(lo, fx, record);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
-        lo.call_libc(fx, "free", &[component], &[]);
+        lo.record_free(fx, component);
         fx.b.ins().return_(&[]);
     })
 }
@@ -465,7 +465,7 @@ fn withdraw_run(lo: &mut Lowering) -> FuncId {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             let pending = fx.b.ins().icmp_imm_s(IntCC::NotEqual, timers, 0);
             fx.when(pending, |fx| {
-                lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
+                lo.relax(fx);
             });
             (pending, Vec::new())
         });
@@ -704,9 +704,8 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let immediate = fx.b.ins().icmp_imm_s(IntCC::Equal, ms, 0);
     fx.when(immediate, |fx| send_now(lo, fx, supply, record, held));
     let node = new_entry(lo, fx, record, &message, held);
-    let one = fx.ptr(1);
     let size = fx.ptr(timer::SIZE);
-    let op = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let op = lo.record_alloc(fx, size);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, op, 0);
     fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
     let after_kind = fx.ptr(kind::AFTER as u64);
@@ -731,7 +730,7 @@ fn after(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let at = fx.offset(node, entry::MESSAGE);
             lo.release(fx, &message, at);
             lo.call_routine(fx, Routine::Free, &[node]);
-            lo.call_libc(fx, "free", &[op], &[]);
+            lo.record_free(fx, op);
             Vec::new()
         },
         |lo, fx| {
@@ -850,7 +849,7 @@ pub fn timer_completed(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     fx.store(count, record, runner::TIMER_COUNT);
     wake_waiter(lo, fx, record);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    lo.call_libc(fx, "free", &[op], &[]);
+    lo.record_free(fx, op);
 }
 
 /// `mut cx.spawn(key: k, run: f)`: supersedes `k`, then starts a keyed task running `f` with a
@@ -867,9 +866,8 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let task_region = lo.call_routine(fx, Routine::RegionOpen, &[size])[0];
     let keyed_outbox = fx.ptr(1);
     let outbox = lo.call_routine(fx, Routine::OutboxMint, &[record, key, keyed_outbox])[0];
-    let one = fx.ptr(1);
     let node_size = fx.ptr(keyed::SIZE);
-    let node = lo.call_libc(fx, "calloc", &[one, node_size], &[PTR])[0];
+    let node = lo.record_alloc(fx, node_size);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, node, 0);
     fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
     fx.store(key, node, keyed::KEY);
@@ -1023,7 +1021,7 @@ fn free_node(lo: &mut Lowering, fx: &mut Fx, node: Value) {
     );
     let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
     fx.when(has_next, |fx| fx.store(previous, next, keyed::PREVIOUS));
-    lo.call_libc(fx, "free", &[node], &[]);
+    lo.record_free(fx, node);
 }
 
 /// What the executor thread does once a keyed task has ended: its region is freed, its node too
@@ -1043,13 +1041,13 @@ fn keyed_done(lo: &mut Lowering) -> FuncId {
         let live = fx.b.ins().iadd_imm_s(live, -1);
         fx.store(live, record, runner::LIVE_KEYED);
         let task_region = fx.load(PTR, node, keyed::REGION);
-        lo.call_libc(fx, "free", &[task_region], &[]);
+        lo.record_free(fx, task_region);
         let superseded = fx.load(PTR, node, keyed::SUPERSEDED);
         let superseded = fx.b.ins().icmp_imm_s(IntCC::NotEqual, superseded, 0);
         fx.when(superseded, |fx| free_node(lo, fx, node));
         wake_waiter(lo, fx, record);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
-        lo.call_libc(fx, "free", &[started], &[]);
+        lo.record_free(fx, started);
         fx.b.ins().return_(&[]);
     })
 }
@@ -1063,14 +1061,6 @@ fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     fx.when(last, |fx| {
         lo.call_routine(fx, Routine::Free, &[record]);
     });
-}
-
-/// Sets what the running task waits on at a cancellation point.
-fn waiting_on(lo: &mut Lowering, fx: &mut Fx, what: i64) {
-    let current = tasks::current_task(lo, fx);
-    let word = fx.offset(current, task::IO);
-    let what = fx.ptr(what as u64);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), what, word);
 }
 
 /// Fails a post with `SendError.Closed`.
@@ -1133,7 +1123,7 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let at = fx.offset(node, entry::MESSAGE);
     lo.store_held(fx, at, held, &message);
     append(lo, fx, record, node);
-    waiting_on(lo, fx, WAITING);
+    tasks::waiting_on(lo, fx, WAITING);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
     let withdraw = withdraw_post(lo);
     settle::enter_wait(lo, fx, withdraw, record, node);
@@ -1145,7 +1135,7 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         fx.when(taken, |fx| {
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             settle::leave_wait(lo, fx);
-            waiting_on(lo, fx, 0);
+            tasks::waiting_on(lo, fx, 0);
             unreference(lo, fx, record);
             supply.done(lo, fx);
         });
@@ -1158,7 +1148,7 @@ fn post(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.when(waiting, |fx| unlink(fx, record, node));
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             settle::leave_wait(lo, fx);
-            waiting_on(lo, fx, 0);
+            tasks::waiting_on(lo, fx, 0);
             unreference(lo, fx, record);
             lo.release(fx, &message, at);
             fx.when(cancelled, |fx| {

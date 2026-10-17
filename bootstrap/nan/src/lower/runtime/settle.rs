@@ -3,7 +3,7 @@
 //! domains hold is released and their memory is freed.
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
+    AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
 };
 use cranelift_module::FuncId;
 
@@ -82,7 +82,7 @@ fn settle(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
     each_stopped(fx, first, &mut |fx, record| poison_held(lo, fx, record));
     each_stopped(fx, first, &mut |fx, record| {
         tasks::release_stack(lo, fx, record);
-        lo.call_libc(fx, "free", &[record], &[]);
+        lo.record_free(fx, record);
     });
     end_nested(lo, fx, abandoned);
     end(lo, fx, abandoned);
@@ -125,7 +125,7 @@ fn cancel_operations(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             settle_operation(lo, fx, timer);
             tables::unlink_deadline(lo, fx, timer);
             let region = fx.load(PTR, timer, operation::TASK);
-            lo.call_libc(fx, "free", &[region], &[]);
+            lo.record_free(fx, region);
             let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
             (more, vec![next])
         });
@@ -162,7 +162,7 @@ fn claim_operation(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
             |fx| vec![claimed, fx.ptr(0)],
         );
         fx.when(result[0], |fx| {
-            lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
+            lo.relax(fx);
         });
         (result[0], vec![result[1]])
     })[0]
@@ -180,7 +180,7 @@ fn settle_operation(lo: &mut Lowering, fx: &mut Fx, op: Value) {
             fx.b.ins()
                 .icmp_imm_s(IntCC::NotEqual, done, operation::DELIVERED);
         fx.when(pending, |fx| {
-            lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
+            lo.relax(fx);
         });
         (pending, Vec::new())
     });
@@ -264,7 +264,7 @@ fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
         });
         let waiting = fx.b.use_var(pending);
         fx.when(waiting, |fx| {
-            lo.call_libc(fx, "sched_yield", &[], &[types::I32]);
+            lo.relax(fx);
         });
         (waiting, Vec::new())
     });
@@ -312,8 +312,14 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                 |lo, fx| {
                     let running = fx.b.ins().bxor_imm_s(is_stopped, 1);
                     fx.when(running, |fx| {
+                        // A machine image settles domains only in a test run, on its one
+                        // executor, which runs the settling task.
+                        if lo.machine() {
+                            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+                            return;
+                        }
                         let thread = fx.load(PTR, record, task::THREAD);
-                        let pthread = fx.load(PTR, thread, host::thread::PTHREAD);
+                        let pthread = fx.load(PTR, thread, tasks::thread::PTHREAD);
                         let signal = fx.int(types::I32, i64::from(host::SIGURG));
                         lo.call_libc(fx, "pthread_kill", &[pthread, signal], &[types::I32]);
                     });
@@ -428,7 +434,7 @@ fn end_nested(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
             let sibling = fx.load(PTR, innermost, domain::SIBLING);
             fx.store(sibling, outer, domain::CHILDREN);
             end(lo, fx, innermost);
-            lo.call_libc(fx, "free", &[innermost], &[]);
+            lo.record_free(fx, innermost);
         });
         (present, Vec::new())
     });

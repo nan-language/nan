@@ -324,6 +324,7 @@ impl Layouts {
     /// The layout the lowering gives a std base type, none for a type std declares in full.
     fn base(&mut self, ck: &Checker, path: &str, args: &[Arg]) -> Option<Layout> {
         let ty_arg = |index: usize| args.get(index).and_then(Arg::ty).cloned();
+        let word = Ty::Scalar(Scalar::Usize);
         let count = |index: usize| match args.get(index) {
             Some(Arg::Const(Const::Int(count))) => *count as u64,
             _ => 0,
@@ -414,6 +415,16 @@ impl Layouts {
                 },
                 niche: None,
             },
+            // A register value is its register's index in its block, which a volatile call reads.
+            "hw::Register" => Layout {
+                size: 8,
+                align: 8,
+                shape: Shape::Scalar {
+                    ty: types::I64,
+                    big: false,
+                },
+                niche: None,
+            },
             "mem::Box" => match ty_arg(0) {
                 Some(Ty::Dyn(_)) => pointers(2, Some(0)),
                 _ => pointers(1, Some(0)),
@@ -483,7 +494,91 @@ impl Layouts {
                     niche: None,
                 }
             }
-            "task::Poisoned" | "sys::Domain" | "host::Runner" => empty(),
+            "task::Poisoned" | "sys::Domain" | "host::Runner" | "hw::Anchor" | "hw::IrqContext" => {
+                empty()
+            }
+            // A machine root grant: the handles of its root allocator and executor, and whether
+            // its regions and its `hw::Ring0` were taken; `boot::Machine` carries them into the
+            // `boot::Kernel` its `exit_services` returns.
+            "boot::Kernel" | "boot::Machine" => self.record(
+                ck,
+                &[
+                    ("alloc".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("exec".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("regions".to_owned(), Ty::Scalar(Scalar::Bool)),
+                    ("ring0".to_owned(), Ty::Scalar(Scalar::Bool)),
+                ],
+            ),
+            // A physical frame, a page-table root owning one, and a user address are one
+            // address; an installed table's token holds the table's box.
+            "hw::PhysFrame" | "hw::PageTableRoot" | "hw::UserAddr" => {
+                self.record(ck, &[("address".to_owned(), Ty::Scalar(Scalar::U64))])
+            }
+            "hw::IdtInstalled" => pointers(1, Some(0)),
+            // An exception's trap frame: the address of the state its seam saved, and a page
+            // fault's faulting address.
+            "hw::TrapFrame" => self.record(
+                ck,
+                &[
+                    ("saved".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("fault".to_owned(), Ty::Scalar(Scalar::U64)),
+                ],
+            ),
+            // An interrupt descriptor table, as words.
+            "hw::Idt" => {
+                let words = super::machine::IDT_BYTES / 8;
+                let gates = Ty::item(
+                    ck.db.core_item("Array").expect("core::Array"),
+                    vec![
+                        Arg::Ty(Ty::Scalar(Scalar::U64)),
+                        Arg::Const(Const::Int(i128::from(words))),
+                    ],
+                );
+                self.record(ck, &[("gates".to_owned(), gates)])
+            }
+            // A region of physical memory: its base and its length in bytes.
+            "hw::Region" => self.record(
+                ck,
+                &[
+                    ("base".to_owned(), Ty::Scalar(Scalar::U64)),
+                    ("len".to_owned(), Ty::Scalar(Scalar::U64)),
+                ],
+            ),
+            // A register window and a simulated register block each hold one pointer: the sim
+            // block its window reaches, or on a machine target the mapped address or port.
+            "hw::Mmio" | "hw::Ports" | "hw::sim::Registers" => pointers(1, None),
+            // A DMA buffer holds its box, whose contents never move.
+            "hw::Dma" | "hw::DmaShared" => pointers(1, Some(0)),
+            // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
+            // that of its storage.
+            "hw::IrqShared" | "hw::PerCpu" => pointers(1, None),
+            // A spin lock is its lock word, then its value; a guard, which no code holds, its
+            // value.
+            "hw::SpinLock" => {
+                let value = ty_arg(0).expect("a wrapped type");
+                self.record(
+                    ck,
+                    &[("lock".to_owned(), word), ("value".to_owned(), value)],
+                )
+            }
+            "hw::SpinGuard" => {
+                let value = ty_arg(0).expect("a wrapped type");
+                self.record(ck, &[("value".to_owned(), value)])
+            }
+            // A one-slot mailbox: its lock word, whether it holds a value, the waiting task and
+            // the value.
+            "hw::Signal" => {
+                let value = ty_arg(0).expect("a signalled type");
+                self.record(
+                    ck,
+                    &[
+                        ("lock".to_owned(), word.clone()),
+                        ("stored".to_owned(), Ty::Scalar(Scalar::Bool)),
+                        ("waiter".to_owned(), word),
+                        ("value".to_owned(), value),
+                    ],
+                )
+            }
             _ => return None,
         })
     }

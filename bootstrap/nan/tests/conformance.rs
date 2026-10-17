@@ -1,10 +1,11 @@
 //! The conformance harness: runs each `nan` example of a specification chapter against its marker
 //! comments after locking, snapshotting and publishing each of its packages into a local store
 //! holding nothing else, `nan verify` included for a gate code, compares a host example's
-//! obligation outcomes with the proof cache's, builds its `x86_64-host` programs and compares what
-//! one writes with the text its section gives, runs the commands of the `text` blocks of its
-//! section, and finds each item of its `nan-api` blocks in the std sources, one test per chapter,
-//! whose runs of `nan` use the harnesses' home directory and a local store of their own.
+//! obligation outcomes with the proof cache's, builds its programs and compares what an
+//! `x86_64-host` one writes with the text its section gives, runs the commands of the `text`
+//! blocks of its section, and finds each item of its `nan-api` blocks in the std sources, one
+//! test per chapter, whose runs of `nan` use the harnesses' home directory and a local store of
+//! their own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,7 +78,7 @@ struct Written {
 
 impl Example {
     /// Whether the block is a kernel conformance test: a package of it declares `x86_64-uefi`
-    /// or `x86_64-bare`. Its tests need the emulator, which the harness does not start.
+    /// or `x86_64-bare`.
     fn kernel(&self) -> bool {
         self.files.iter().any(|(path, lines)| {
             path.ends_with("/package.nan")
@@ -89,18 +90,23 @@ impl Example {
         })
     }
 
-    /// The names of the packages of the block that are `x86_64-host` programs.
-    fn host_programs(&self) -> Vec<String> {
+    /// The programs of the block: each package declaring an entry and a concrete target, by name
+    /// and target.
+    fn programs(&self) -> Vec<(String, String)> {
         self.files
             .iter()
-            .filter(|(path, lines)| {
-                path.ends_with("/package.nan")
-                    && lines.iter().any(|line| line.trim() == "entry main")
-                    && lines
-                        .iter()
-                        .any(|line| line.trim() == "targets x86_64-host")
+            .filter(|(path, _)| path.ends_with("/package.nan"))
+            .filter_map(|(path, lines)| {
+                let entry = lines.iter().any(|line| line.trim() == "entry main");
+                let target = lines.iter().find_map(|line| {
+                    let target = line.trim().strip_prefix("targets ")?;
+                    ["x86_64-host", "x86_64-uefi", "x86_64-bare"]
+                        .into_iter()
+                        .find(|known| target.split(", ").any(|one| one == *known))
+                })?;
+                let package = path.split_once('/')?.0.to_owned();
+                entry.then_some((package, target.to_owned()))
             })
-            .filter_map(|(path, _)| path.split_once('/').map(|(package, _)| package.to_owned()))
             .collect()
     }
 
@@ -343,7 +349,7 @@ fn nan(dir: &Path, args: &[&str]) -> Result<(String, Option<i32>), String> {
         Some(launch) => Err(format!(
             "nan {} launches {}",
             args.join(" "),
-            launch.image.display()
+            launch.program.display()
         )),
         None => Ok((run.output, Some(run.status))),
     }
@@ -420,9 +426,7 @@ fn run(example: &Example, dir: &Path) -> Result<(), String> {
         }
     }
     if status == Some(0) {
-        if !example.kernel() {
-            test(marker.as_ref(), &expected, dir)?;
-        }
+        test(marker.as_ref(), &expected, dir)?;
         let test_run = marker
             .as_ref()
             .is_some_and(|marker| TEST_RUN.contains(&marker.code.as_str()));
@@ -537,16 +541,16 @@ fn test(
     Ok(())
 }
 
-/// Builds each `x86_64-host` program of an example: every image builds, reporting what check
-/// time reports and the one diagnostic a final-build marker states, and a program whose
-/// section gives what it writes writes exactly that and exits with the status stated.
+/// Builds each program of an example on its target: every image builds, reporting what check
+/// time reports and the one diagnostic a final-build marker states, and an `x86_64-host` program
+/// whose section gives what it writes writes exactly that and exits with the status stated.
 fn build(
     example: &Example,
     marker: Option<&Marker>,
     checked: &[(String, String, String)],
     dir: &Path,
 ) -> Result<(), String> {
-    for program in example.host_programs() {
+    for (program, target) in example.programs() {
         let mut expected = checked.to_vec();
         let final_marker = marker.filter(|marker| FINAL_BUILD.contains(&marker.code.as_str()));
         if let Some(marker) = final_marker {
@@ -563,7 +567,12 @@ fn build(
                 "nan build {program} exits with {code:?} and reports\n{output}expected {expected:?}"
             ));
         }
-        let Some(written) = example.written.as_ref().filter(|_| final_marker.is_none()) else {
+        let host = target == "x86_64-host";
+        let Some(written) = example
+            .written
+            .as_ref()
+            .filter(|_| host && final_marker.is_none())
+        else {
             continue;
         };
         let image = dir.join(".nan/images/x86_64-host").join(&program);

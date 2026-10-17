@@ -52,8 +52,14 @@ impl Elab<'_, '_> {
             _ => None,
         };
         let mut args = Vec::new();
-        for arg in &call.args {
-            match self.arg(&arg.expr, arg.mode)? {
+        for (index, arg) in call.args.iter().enumerate() {
+            // A projection's result is part of its receiver, so a receiver read from a place is
+            // passed as that place, never as a copy the part would point into.
+            let operand = match call.proj && index == 0 && arg.mode == Mode::Read {
+                true => self.borrowed(&arg.expr)?,
+                false => self.arg(&arg.expr, arg.mode)?,
+            };
+            match operand {
                 Some(operand) => args.push(operand),
                 None => return Ok(Out::Never),
             }
@@ -287,7 +293,14 @@ impl Elab<'_, '_> {
             callee,
             args,
         };
-        if call.head.fails.is_some() {
+        // A failure type of `Never` is uninhabited, so the call cannot fail and is lowered
+        // without a failure path, as its calling form carries none.
+        if call
+            .head
+            .fails
+            .as_ref()
+            .is_some_and(|fails| *fails != Ty::Never)
+        {
             return self.failing_call(call, nir_call, ty, span, through);
         }
         if call.head.result == Ty::Never {
@@ -376,10 +389,14 @@ impl Elab<'_, '_> {
                     .map(|arg| Arg::Ty(arg.expr.ty.clone()))
                     .collect(),
             },
+            tir::Callee::Builtin(tir::Builtin::DmaAccess) => FnRef {
+                callable: Callable::Builtin(Builtin::Intrinsic("hw::Dma.access")),
+                args: call.type_args.clone(),
+            },
             tir::Callee::Builtin(builtin) => FnRef {
                 callable: Callable::Builtin(match builtin {
                     tir::Builtin::Conversion(builtin) => *builtin,
-                    tir::Builtin::DmaAccess => Builtin::Intrinsic("hw::Dma.access"),
+                    tir::Builtin::DmaAccess => unreachable!("a DMA access has its own reference"),
                     tir::Builtin::MintRoot => Builtin::Intrinsic("hw::mint_root"),
                     tir::Builtin::DynView | tir::Builtin::Template => {
                         unreachable!("a Dyn view or template has its own reference")

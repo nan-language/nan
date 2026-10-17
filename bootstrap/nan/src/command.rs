@@ -30,14 +30,14 @@ use crate::workspace::{self, Workspace};
 pub use build::Launch;
 
 /// What a run printed and the status it ends with, or for `nan run` of a built program, the
-/// image to start in its place.
+/// program to start in its place: the image, or the emulator booting it.
 pub struct Run {
     pub output: String,
     pub status: i32,
     pub launch: Option<Launch>,
 }
 
-/// What a command ends with: its output, or the image `nan run` starts.
+/// What a command ends with: its output, or the program `nan run` starts.
 enum Outcome {
     Output(Output),
     Launch(Launch),

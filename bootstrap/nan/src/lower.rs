@@ -1,4 +1,4 @@
-//! Lowering: the translation of the NIR of a final closure to an `x86_64-host` object through
+//! Lowering: the translation of the NIR of a final closure to an object of its target through
 //! Cranelift, with the support routines, compiler stubs, read-only data and line tables the image
 //! needs. Every Cranelift call of the toolchain lies in this module and its submodules.
 //!
@@ -17,6 +17,7 @@ mod held;
 pub(crate) mod host;
 mod layout;
 mod lines;
+pub mod machine;
 mod place;
 mod release;
 mod runtime;
@@ -43,6 +44,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId, TypeKey};
 use crate::check::ty::{self as ty, Args, Ty};
 use crate::nir::{Role, Span};
+use crate::workspace::Target;
 pub use abi::Abi;
 use fx::Fx;
 use layout::Layouts;
@@ -106,6 +108,8 @@ pub enum Glue {
     RaceDone,
     /// What the executor thread does once a domain's first task has ended.
     DomainDone,
+    /// What the executor thread does once a kernel anchor's first task has ended.
+    AnchorDone,
     /// A runner's component task, for its state, Env and message types.
     Component(Ty, Ty, Ty),
     /// What the executor thread does once a component task has ended.
@@ -146,8 +150,13 @@ pub enum Glue {
     WithdrawPost,
     /// Withdraws a waiting operation from the sim waiter slot its record names.
     SimWithdraw,
+    /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
+    WithdrawSignal(Ty),
     /// Compares two values of a type structurally, for `testing::same`.
     Same(Ty),
+    /// Calls the interrupt fn of a device of a type behind an IRQ-safe lock, the interrupt fn
+    /// being of a function type, with the device's record.
+    IrqDevice(Ty, ty::FnTy),
     /// Moves a value of a type into another domain's reach.
     Transfer(Ty),
     /// Moves the captures of a task closure, the closure function's instance, into another
@@ -166,6 +175,7 @@ impl Glue {
                 | Glue::RaceEnd
                 | Glue::RaceDone
                 | Glue::DomainDone
+                | Glue::AnchorDone
                 | Glue::ComponentDone
                 | Glue::KeyedDone
                 | Glue::WithdrawSender
@@ -174,6 +184,7 @@ impl Glue {
                 | Glue::WithdrawRun
                 | Glue::WithdrawPost
                 | Glue::SimWithdraw
+                | Glue::WithdrawSignal(_)
         )
     }
 }
@@ -236,6 +247,12 @@ pub struct Lowering<'c, 'a> {
     glue: u32,
     state_id: Option<DataId>,
     thread_id: Option<DataId>,
+    /// A machine image's compiler stubs, its vector seam, the data objects it reserves by name,
+    /// and the sizes of its interrupt stacks once declared.
+    machine_stubs: HashMap<machine::Stub, FuncId>,
+    vector_seam: Option<FuncId>,
+    reserved: HashMap<&'static str, DataId>,
+    irq_stacks: Option<DataId>,
     pub data: data::Data,
     pub lines: lines::Lines,
     /// The task entries whose own `limits stack N` passes the default task stack, by the code a
@@ -255,17 +272,24 @@ enum Pending {
     Routine(runtime::Routine, FuncId),
 }
 
-/// The settings every image's code is generated with: the x86-64 base set with SSE2, frame
-/// pointers in every function, stack probes inline, stack switching, and the canonical NaN as
-/// the NaN every float operation returns.
-fn isa() -> OwnedTargetIsa {
+/// The settings an image's code is generated with: the x86-64 base set with SSE2, frame
+/// pointers in every function, stack switching, and the canonical NaN as the NaN every float
+/// operation returns. An `x86_64-host` image is position-independent and links against glibc
+/// with inline stack probes for its guard pages; a machine image loads at a fixed address and
+/// is not position-independent, so its code reaches its own functions and data directly, with no
+/// global offset table and no stack probes.
+fn isa(target: Target) -> OwnedTargetIsa {
     let mut flags = settings::builder();
+    let (triple, pic, probes) = match target {
+        Target::Host => ("x86_64-unknown-linux-gnu", "true", "true"),
+        _ => ("x86_64-unknown-none-elf", "false", "false"),
+    };
     for (name, value) in [
         ("opt_level", "speed"),
-        ("is_pic", "true"),
+        ("is_pic", pic),
         ("preserve_frame_pointers", "true"),
         ("stack_switch_model", "basic"),
-        ("enable_probestack", "true"),
+        ("enable_probestack", probes),
         ("probestack_strategy", "inline"),
         ("unwind_info", "false"),
         ("tls_model", "elf_gd"),
@@ -273,7 +297,7 @@ fn isa() -> OwnedTargetIsa {
     ] {
         flags.set(name, value).expect("a Cranelift setting");
     }
-    cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu")
+    cranelift_codegen::isa::lookup_by_name(triple)
         .expect("the x86-64 backend")
         .finish(settings::Flags::new(flags))
         .expect("the x86-64 settings")
@@ -287,6 +311,18 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
     lowering.finish(Some(&program.section))
 }
 
+/// Lowers the reach of an `x86_64-uefi` or `x86_64-bare` program's final build: the entry
+/// function and the target's entry landing fn behind the machine entry seam, into an object the
+/// image writer turns into an image.
+pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
+    let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
+    let boot = lowering.boot_glue(program);
+    let stack = lowering.boot_stack(program);
+    lowering.entry_seam(boot, stack);
+    lowering.drain();
+    lowering.finish(None)
+}
+
 impl<'c, 'a> Lowering<'c, 'a> {
     /// A lowering into a new object, of a test image when `test` is given.
     fn new(
@@ -295,7 +331,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         roots: Vec<PackageId>,
         test: Option<test_image::Runtime>,
     ) -> Self {
-        let isa = isa();
+        let isa = isa(ck.db.target);
         let builder = ObjectBuilder::new(
             isa.clone(),
             "nan",
@@ -320,6 +356,10 @@ impl<'c, 'a> Lowering<'c, 'a> {
             glue: 0,
             state_id: None,
             thread_id: None,
+            machine_stubs: HashMap::new(),
+            vector_seam: None,
+            reserved: HashMap::new(),
+            irq_stacks: None,
             data: data::Data::default(),
             lines: lines::Lines::default(),
             entry_stacks: Vec::new(),
@@ -329,6 +369,17 @@ impl<'c, 'a> Lowering<'c, 'a> {
             test,
             sims: None,
         }
+    }
+
+    /// Whether the image runs on a machine target, `x86_64-uefi` or `x86_64-bare`.
+    pub fn machine(&self) -> bool {
+        self.ck.db.target.is_machine()
+    }
+
+    /// Whether the image runs a kernel's executor, under interrupts: a machine image other than
+    /// a test image, whose runs keep interrupts disabled.
+    pub fn kernel(&self) -> bool {
+        self.machine() && !self.seeded()
     }
 
     /// The function lowering an instance, declared now and lowered later when new.
@@ -665,6 +716,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
     fn finish(mut self, section: Option<&[u8]>) -> Lowered {
         lines::emit(&mut self);
         runtime::tasks::emit_entry_stacks(&mut self);
+        self.finish_interrupts();
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
         let collisions = std::mem::take(&mut self.collisions)

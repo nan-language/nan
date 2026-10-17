@@ -33,7 +33,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     match routine {
         Routine::WriteErr => {
             let params = fx.entry();
-            super::super::host::write_all(lo, fx, 2, params[0], params[1]);
+            super::system::write_stream(lo, fx, 2, params[0], params[1]);
             fx.b.ins().return_(&[]);
         }
         Routine::TrapRaise => raise(lo, fx),
@@ -51,6 +51,10 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::OverflowRaise => {
             fx.entry();
             raise_kind(lo, fx, "trap.stack-overflow");
+        }
+        Routine::Reacquired => {
+            let params = fx.entry();
+            halt(lo, fx, "lock-reacquired", params[0], None);
         }
         _ => unreachable!("a report routine"),
     }
@@ -310,14 +314,17 @@ impl Report {
             fx.b.ins()
                 .icmp_imm_s(IntCC::Equal, how, Written::Char as i64);
         fx.when(character, |fx| self.char_literal(fx, lo, bits));
-        let single =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::Equal, how, Written::F32 as i64);
-        fx.when(single, |fx| self.float(fx, lo, bits, true));
-        let double =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::Equal, how, Written::F64 as i64);
-        fx.when(double, |fx| self.float(fx, lo, bits, false));
+        // The code of a machine target holds no float operation, so no float reaches a report.
+        if !lo.machine() {
+            let single =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, how, Written::F32 as i64);
+            fx.when(single, |fx| self.float(fx, lo, bits, true));
+            let double =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::Equal, how, Written::F64 as i64);
+            fx.when(double, |fx| self.float(fx, lo, bits, false));
+        }
         let hidden =
             fx.b.ins()
                 .icmp_imm_s(IntCC::Equal, how, Written::Hidden as i64);
@@ -337,6 +344,22 @@ impl Report {
         self.text(fx, lo, "\n");
     }
 
+    /// Writes where a location record lies: ` at ` its path and line, ` in ` its item, then its
+    /// source line, indented on a line of its own.
+    fn located(self, fx: &mut Fx, lo: &mut Lowering, location: Value) {
+        self.text(fx, lo, " at ");
+        self.location_text(fx, lo, location, 0);
+        self.text(fx, lo, ":");
+        let line = fx.load(types::I32, location, 24);
+        let line = fx.b.ins().uextend(PTR, line);
+        self.decimal(fx, lo, line);
+        self.text(fx, lo, " in ");
+        self.location_text(fx, lo, location, 8);
+        self.text(fx, lo, "\n    ");
+        self.location_text(fx, lo, location, 16);
+        self.text(fx, lo, "\n");
+    }
+
     /// Writes the text a location record holds at `field` (path, item or line).
     fn location_text(self, fx: &mut Fx, lo: &mut Lowering, location: Value, field: u64) {
         let tables = line_tables(lo, fx);
@@ -352,7 +375,7 @@ impl Report {
 
 /// The code point of the valid UTF-8 sequence whose first byte, `first`, is at `place`, and
 /// the sequence's length.
-fn decode_utf8(fx: &mut Fx, place: Value, first: Value) -> (Value, Value) {
+pub fn decode_utf8(fx: &mut Fx, place: Value, first: Value) -> (Value, Value) {
     let two =
         fx.b.ins()
             .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, first, 0xC0);
@@ -596,17 +619,7 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     report.bytes(fx, lo, kind_text, kind_len);
     let slot = frame_at(fx, first_visible);
     let location = fx.load(PTR, slot, 0);
-    report.text(fx, lo, " at ");
-    report.location_text(fx, lo, location, 0);
-    report.text(fx, lo, ":");
-    let line = fx.load(types::I32, location, 24);
-    let line = fx.b.ins().uextend(PTR, line);
-    report.decimal(fx, lo, line);
-    report.text(fx, lo, " in ");
-    report.location_text(fx, lo, location, 8);
-    report.text(fx, lo, "\n    ");
-    report.location_text(fx, lo, location, 16);
-    report.text(fx, lo, "\n");
+    report.located(fx, lo, location);
     let own = fx.b.ins().icmp_imm_s(IntCC::Equal, first_visible, 0);
     let shown = fx.b.ins().icmp_imm_s(IntCC::NotEqual, count, 0);
     let show = fx.b.ins().band(own, shown);
@@ -718,12 +731,77 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let nested = fx.b.ins().icmp(IntCC::NotEqual, domain, process);
     let contained = fx.b.ins().band(inside, nested);
     fx.when(contained, |fx| abandon(lo, fx, task, domain, kind, out));
-    let bytes = fx.b.ins().iadd_imm_s(out, 8);
-    let length = fx.load(PTR, out, 0);
+    end_with(lo, fx, report);
+}
+
+/// Ends the process, or halts a machine's kernel, with a report written: a kernel first stops its
+/// other CPUs, and on a machine target the serial port is programmed again, as code may have
+/// reprogrammed it.
+fn end_with(lo: &mut Lowering, fx: &mut Fx, report: Report) {
+    if lo.kernel() {
+        lo.stop_other_cpus(fx);
+    }
+    if lo.machine() {
+        lo.serial_init(fx);
+    }
+    let bytes = fx.b.ins().iadd_imm_s(report.out, 8);
+    let length = fx.load(PTR, report.out, 0);
     lo.call_routine(fx, Routine::WriteErr, &[bytes, length]);
     let status = fx.ptr(70);
     lo.call_routine(fx, Routine::Exit, &[status]);
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// The location record of the call of the running function, from its return address.
+pub fn caller_location(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    let frame = fx.b.ins().get_frame_pointer(PTR);
+    let address = fx.load(PTR, frame, 8);
+    location_at(lo, fx, address)
+}
+
+/// The location record of a code address, zero for an address no lowered function holds.
+pub fn location_at(lo: &mut Lowering, fx: &mut Fx, address: Value) -> Value {
+    lookup(lo, fx, address).0
+}
+
+/// Halts the kernel for a cause at a location record: writes the halt report, which has the
+/// form of a trap report with `halt` and the cause in place of the trap kind and, given an
+/// operand, its line, then ends the machine with status 70.
+pub fn halt(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    cause: &str,
+    location: Value,
+    operand: Option<(&str, Value)>,
+) {
+    let out = fx.slot(8 + REPORT, 8);
+    let zero = fx.ptr(0);
+    fx.store(zero, out, 0);
+    let report = Report { out };
+    report.text(fx, lo, "halt ");
+    report.text(fx, lo, cause);
+    let known = fx.b.ins().icmp_imm_s(IntCC::NotEqual, location, 0);
+    fx.choose_in(
+        lo,
+        known,
+        &[],
+        |lo, fx| {
+            report.located(fx, lo, location);
+            Vec::new()
+        },
+        |lo, fx| {
+            report.text(fx, lo, "\n");
+            Vec::new()
+        },
+    );
+    if let Some((name, value)) = operand {
+        report.text(fx, lo, "    ");
+        report.text(fx, lo, name);
+        report.text(fx, lo, " = ");
+        report.decimal(fx, lo, value);
+        report.text(fx, lo, "\n");
+    }
+    end_with(lo, fx, report);
 }
 
 /// Abandons the `sys::Domain` body domain of a trapping task: the first trap of the domain
@@ -751,7 +829,7 @@ fn abandon(lo: &mut Lowering, fx: &mut Fx, task: Value, domain: Value, kind: Val
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         lo.call_routine(fx, Routine::Wake, &[waiter]);
     });
-    super::super::host::release_locks(lo, fx);
+    super::locks::release_held(lo, fx);
     tasks::stop_running(lo, fx, task);
 }
 

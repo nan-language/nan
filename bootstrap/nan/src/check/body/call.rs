@@ -703,12 +703,12 @@ impl Body<'_, '_> {
         if !legal {
             self.report(token, Code::HwMintRootMisplaced);
         }
-        let grant = match self.ck.db.target {
-            Target::Host => self.ck.db.std_item("host", "World"),
-            Target::Uefi => self.ck.db.std_item("boot", "Machine"),
-            Target::Bare => self.ck.db.std_item("boot", "Kernel"),
-            Target::Any => None,
-        };
+        let grant = self
+            .ck
+            .db
+            .target
+            .root_grant()
+            .and_then(|(module, name)| self.ck.db.std_item(module, name));
         let ty = grant.map_or(Ty::Error, |grant| Ty::item(grant, Vec::new()));
         TExpr {
             token,
@@ -2882,20 +2882,21 @@ impl Body<'_, '_> {
         args: &[ast::Arg],
         markers: Markers,
     ) -> TExpr {
+        self.ck.require(self.item, token, Authority::Device);
         let layout = receiver.ty.type_arg(0).cloned().unwrap_or(Ty::Error);
         let Some(first) = args.first() else {
             self.report(token, Code::HwDmaOperand);
             return TExpr::failed(token);
         };
-        let field_ty = match (&first.value.kind, &layout) {
+        let field = match (&first.value.kind, &layout) {
             (ExprKind::Field { base, name: field }, Ty::Item(item, _)) => {
                 match self.type_target(base) {
                     Some(TypeTarget::Type(Ty::Item(written, _))) if written == *item => {
                         match &self.ck.sig(*item).kind {
                             SigKind::Layout { fields, .. } => fields
                                 .iter()
-                                .find(|candidate| candidate.name == field.text)
-                                .map(|field| field.ty.clone()),
+                                .position(|candidate| candidate.name == field.text)
+                                .map(|index| (index, fields[index].ty.clone())),
                             _ => None,
                         }
                     }
@@ -2904,7 +2905,7 @@ impl Body<'_, '_> {
             }
             _ => None,
         };
-        let Some(field_ty) = field_ty else {
+        let Some((field_index, field_ty)) = field else {
             self.report(first.token, Code::HwDmaOperand);
             return TExpr::failed(token);
         };
@@ -2923,20 +2924,30 @@ impl Body<'_, '_> {
             }
         };
         let write = name.starts_with("write");
+        let mut index_arg = None;
+        let mut value_arg = None;
         for arg in &args[1..] {
             let label = arg.label_name().map(|name| name.text.as_str());
             match label {
-                Some("index") => {
-                    self.check(&arg.value, &Ty::Scalar(Scalar::Usize));
+                Some("index") if indexed && index_arg.is_none() => {
+                    index_arg = Some(self.check(&arg.value, &Ty::Scalar(Scalar::Usize)));
                 }
-                Some("value") if write => {
-                    self.check(&arg.value, &element);
+                Some("value") if write && value_arg.is_none() => {
+                    value_arg = Some(self.check(&arg.value, &element));
+                }
+                Some("index" | "value") => {
+                    self.report(arg.token, Code::HwDmaOperand);
+                    return TExpr::failed(token);
                 }
                 _ => {
                     self.report(arg.token, Code::ExprArgumentLabel);
                     return TExpr::failed(token);
                 }
             }
+        }
+        if index_arg.is_some() != indexed || value_arg.is_some() != write {
+            self.report(token, Code::HwDmaOperand);
+            return TExpr::failed(token);
         }
         self.check_mode(
             (receiver.token, markers.receiver.unwrap_or(receiver.token)),
@@ -2946,8 +2957,28 @@ impl Body<'_, '_> {
             false,
             true,
         );
-        self.ck.require(self.item, token, Authority::Device);
         let result = if write { Ty::Unit } else { element };
+        // The access carries, as type arguments, its field's bytes layout, the field's index in
+        // it and whether the access writes and is indexed; its operands are the buffer, then the
+        // index of an indexed access, then the value of a write.
+        let type_args = Args::from(vec![
+            Arg::Ty(layout),
+            Arg::Const(Const::Int(field_index as i128)),
+            Arg::Const(Const::Bool(write)),
+            Arg::Const(Const::Bool(indexed)),
+        ]);
+        let mut call_args = vec![TArg {
+            expr: receiver,
+            mode: Mode::Mut,
+        }];
+        call_args.extend(index_arg.map(|expr| TArg {
+            expr,
+            mode: Mode::Read,
+        }));
+        call_args.extend(value_arg.map(|expr| TArg {
+            expr,
+            mode: Mode::Take,
+        }));
         TExpr {
             token,
             last: token,
@@ -2955,11 +2986,8 @@ impl Body<'_, '_> {
             kind: TKind::Call(Box::new(Call {
                 token,
                 callee: Callee::Builtin(Builtin::DmaAccess),
-                type_args: no_args(),
-                args: vec![TArg {
-                    expr: receiver,
-                    mode: Mode::Mut,
-                }],
+                type_args,
+                args: call_args,
                 head: plain_head(result),
                 proj: false,
                 failure: markers.failure,

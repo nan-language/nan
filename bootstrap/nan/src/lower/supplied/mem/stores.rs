@@ -15,7 +15,7 @@ use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::{Routine, holdings, report, tasks};
 use super::super::super::transfer;
-use super::super::Supply;
+use super::super::{Supply, hw};
 use super::maps::Entries;
 use super::segments;
 use super::vector::{self, Element};
@@ -70,6 +70,15 @@ fn handle(fx: &mut Fx, held: Held) -> Value {
     fx.load(PTR, held.address(), 0)
 }
 
+/// The cell a new store draws through: its allocator's, or a new root cell over the region its
+/// `over` takes.
+fn store_cell(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> Value {
+    match supply.member() {
+        "over" => hw::region_cell(lo, fx, supply.param(0)),
+        _ => handle(fx, supply.param(0)),
+    }
+}
+
 /// Returns a cell handle as an allocator or heap.
 fn ret_handle(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, cell: Value) {
     let sret = supply.sret.expect("a handle's address");
@@ -112,15 +121,15 @@ fn budget(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 fn heap(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
-        "of" | "alloc" => {
-            let cell = handle(fx, supply.param(0));
+        "of" | "alloc" | "over" => {
+            let cell = store_cell(lo, fx, supply);
             ret_handle(lo, fx, supply, cell);
         }
         "boxed" | "try_boxed" => {
             let cell = handle(fx, supply.param(0));
             boxed(lo, fx, supply, cell);
         }
-        member => panic!("mem::Heap.{member} has no lowering on x86_64-host"),
+        member => panic!("no lowering of mem::Heap.{member}"),
     }
 }
 
@@ -364,8 +373,8 @@ fn arena(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let element = supply.type_arg(0);
     let shape = Element::of(lo, &element);
     match supply.member() {
-        "empty" => {
-            let cell = handle(fx, supply.param(0));
+        "empty" | "over" => {
+            let cell = store_cell(lo, fx, supply);
             let header = segments::header(lo, fx, cell);
             let sret = supply.sret.expect("an arena's address");
             fx.store(header, sret, 0);
@@ -432,7 +441,7 @@ fn arena(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let cell = segments::alloc(fx, header);
             boxed(lo, fx, supply, cell);
         }
-        member => panic!("mem::Arena.{member} has no lowering on x86_64-host"),
+        member => panic!("no lowering of mem::Arena.{member}"),
     }
 }
 
@@ -504,9 +513,9 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let element = supply.type_arg(0);
     let (slot, value_at) = slot_shape(lo, &element);
     match supply.member() {
-        "empty" => {
+        "empty" | "over" => {
             let sret = supply.sret.expect("a pool's address");
-            let cell = handle(fx, supply.param(0));
+            let cell = store_cell(lo, fx, supply);
             vector::empty(fx, sret, cell, slot);
             let zero = fx.ptr(0);
             fx.store(zero, sret, POOL_COUNT);
@@ -639,7 +648,7 @@ fn pool(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let cell = fx.load(PTR, supply.param(0).address(), vector::ALLOC);
             boxed(lo, fx, supply, cell);
         }
-        member => panic!("mem::Pool.{member} has no lowering on x86_64-host"),
+        member => panic!("no lowering of mem::Pool.{member}"),
     }
 }
 

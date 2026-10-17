@@ -366,7 +366,7 @@ fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let previous = super::super::super::runtime::fetch_add(fx, refs, minus);
     let last = fx.b.ins().icmp_imm_s(IntCC::Equal, previous, 1);
     fx.when(last, |fx| {
-        lo.call_libc(fx, "free", &[record], &[]);
+        lo.record_free(fx, record);
     });
 }
 
@@ -616,25 +616,47 @@ fn child_done(lo: &mut Lowering) -> FuncId {
         }
         let reaped = fx.b.ins().band_imm_s(flags, flag::REAPED);
         let reaped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, reaped, 0);
-        fx.when(reaped, |fx| finish_child(lo, fx, record, scope_record));
+        fx.when(reaped, |fx| {
+            finish_child(lo, fx, record, scope_record, None)
+        });
         fx.b.ins().return_(&[]);
     })
 }
 
 /// Frees an ended child's record, releasing its result when it returned one, and drops its
-/// reference to its scope.
-fn finish_child(lo: &mut Lowering, fx: &mut Fx, record: Value, scope_record: Value) {
+/// reference to its scope. The result's type, when known, releases it by a direct call; the
+/// executor thread, which ends children of every type, releases it through the release the
+/// child's record holds.
+fn finish_child(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    record: Value,
+    scope_record: Value,
+    result_ty: Option<&Ty>,
+) {
     let outcome = fx.load(PTR, record, task::OUTCOME);
     let returned = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, 1);
-    let release = fx.load(PTR, record, task::RESULT_RELEASE);
-    let releases = fx.b.ins().icmp_imm_s(IntCC::NotEqual, release, 0);
-    let releases = fx.b.ins().band(returned, releases);
-    fx.when(releases, |fx| {
-        let result = fx.load(PTR, record, task::RESULT);
-        let signature = fx.b.import_signature(super::record_signature());
-        fx.b.ins().call_indirect(signature, release, &[result]);
-    });
-    lo.call_libc(fx, "free", &[record], &[]);
+    match result_ty {
+        Some(ty) => {
+            if lo.needs_release(ty) {
+                fx.when(returned, |fx| {
+                    let result = fx.load(PTR, record, task::RESULT);
+                    lo.release(fx, ty, result);
+                });
+            }
+        }
+        None => {
+            let release = fx.load(PTR, record, task::RESULT_RELEASE);
+            let releases = fx.b.ins().icmp_imm_s(IntCC::NotEqual, release, 0);
+            let releases = fx.b.ins().band(returned, releases);
+            fx.when(releases, |fx| {
+                let result = fx.load(PTR, record, task::RESULT);
+                let signature = fx.b.import_signature(super::record_signature());
+                fx.b.ins().call_indirect(signature, release, &[result]);
+            });
+        }
+    }
+    lo.record_free(fx, record);
     unreference(lo, fx, scope_record);
 }
 
@@ -672,7 +694,7 @@ fn join(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let held = lo.held_at(fx, &result_ty, result);
         lo.store_held(fx, slot, held, &result_ty);
     });
-    lo.call_libc(fx, "free", &[record], &[]);
+    lo.record_free(fx, record);
     unreference(lo, fx, scope_record);
     let failed = fx.b.ins().bxor_imm_s(child_returned, 1);
     fx.when(failed, |fx| {
@@ -684,7 +706,7 @@ fn join(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 }
 
 /// Releases a join handle: reaps its child, releasing its result once it has ended.
-pub fn release_join(lo: &mut Lowering, fx: &mut Fx, address: Value) {
+pub fn release_join(lo: &mut Lowering, fx: &mut Fx, address: Value, result: &Ty) {
     let record = fx.load(PTR, address, 0);
     let scope_record = fx.load(PTR, record, task::OWNER);
     let lock = fx.offset(scope_record, scope::LOCK);
@@ -696,7 +718,9 @@ pub fn release_join(lo: &mut Lowering, fx: &mut Fx, address: Value) {
     let flags = fx.b.ins().select(done, flags, reaped);
     fx.store(flags, record, task::FLAGS);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    fx.when(done, |fx| finish_child(lo, fx, record, scope_record));
+    fx.when(done, |fx| {
+        finish_child(lo, fx, record, scope_record, Some(result))
+    });
 }
 
 /// `task::within(clock, ms, body: b)`: runs `b` in a region that a deadline cancels; `None`
@@ -738,7 +762,7 @@ fn within(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         disarm_deadline(lo, fx, timer);
     });
     let id = fx.load(PTR, record, region::ID);
-    lo.call_libc(fx, "free", &[record], &[]);
+    lo.record_free(fx, record);
     let option = supply.abi.result.clone();
     let layout = lo.layout(&option);
     let slot = supply
@@ -875,9 +899,9 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         },
     );
     for started in &tasks {
-        lo.call_libc(fx, "free", &[*started], &[]);
+        lo.record_free(fx, *started);
     }
-    lo.call_libc(fx, "free", &[record], &[]);
+    lo.record_free(fx, record);
     let failed = fx.b.ins().bxor_imm_s(returned, 1);
     fx.when(failed, |fx| supply.fail(fx));
     let held = lo.held_at(fx, &result_ty, slot);

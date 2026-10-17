@@ -1,18 +1,20 @@
-//! Test runs: the tests a scope selects, the test image holding each package's tests for its
-//! run target, each run as a process of that image, the failure each failing test reports, and
-//! the pass record each passing test leaves in the build cache.
+//! Test runs: the tests a scope selects, the test image holding each package's tests for each
+//! run target, lowered by a checker of that target, each run as a process of that image or a boot
+//! of the emulator on it, the failure each failing test reports, and the pass record each
+//! passing test leaves in the build cache.
 
 mod outcome;
 mod setup;
 mod shrink;
 
 use std::collections::BTreeMap;
-use std::{fs, io};
+use std::io;
 
 use crate::cache::{Cache, Exposed};
 use crate::check::db::{ItemId, PackageId};
 use crate::check::{self, Checker, testing};
 use crate::diagnostic::Diagnostic;
+use crate::emulator;
 use crate::encoding::{bytes, uvar};
 use crate::hash::{Hash, blake3, checksummed_base32, read_checksummed_base32};
 use crate::lower::test_image::{self, Target as Targeted};
@@ -20,8 +22,8 @@ use crate::output;
 use crate::scope::Scope;
 use crate::syntax::ast::ItemKind;
 use crate::toolchain;
-use crate::workspace::{Target, Workspace};
-use outcome::{Ended, Run};
+use crate::workspace::{Closure, File, Package, Target, Workspace};
+use outcome::{Ended, Image, Run};
 
 /// The most runs of a test without parameters: schedules 0 to 63.
 const SCHEDULES: u64 = 64;
@@ -53,7 +55,6 @@ pub struct Report {
 }
 
 /// A test selected to run: its item, its target and whether it is a property test.
-#[derive(Clone)]
 struct Selected {
     item: ItemId,
     target: Targeted,
@@ -103,7 +104,7 @@ impl Token {
     pub fn location(&self, workspace: &Workspace) -> Option<String> {
         workspace.closures.iter().find_map(|closure| {
             let checker =
-                check::unchecked(workspace, closure, crate::stdlib::packages(), Target::Host);
+                check::unchecked(workspace, closure, crate::stdlib::packages(), self.target);
             let item = (0..checker.db.items.len())
                 .map(|index| ItemId(index as u32))
                 .find(|item| {
@@ -113,7 +114,7 @@ impl Token {
                         && checker.db.canonical(*item) == self.test
                 })?;
             let data = checker.db.item(item);
-            run_targets(&checker, checker.db.package_of(item))
+            run_targets(checker.db.package(checker.db.package_of(item)).source)
                 .contains(&self.target)
                 .then(|| format!("{}:{}", data.file.path, data.line(data.ast.token)))
         })
@@ -129,20 +130,15 @@ pub fn run(
     cache: &Cache,
 ) -> io::Result<Result<Report, Exposed>> {
     let mut report = Report::default();
-    if !workspace.files().any(|(_, file)| {
-        file.lowered()
-            .iter()
-            .flatten()
-            .any(|item| matches!(item.kind, ItemKind::Test(_)))
-    }) {
-        return Ok(Ok(report));
-    }
     let std = crate::stdlib::packages();
     for closure in &workspace.closures {
-        let checker = check::checked(workspace, closure, std, Target::Host);
-        match run_closure(&checker, workspace, scope, runs, cache, &mut report)? {
-            Ok(()) => {}
-            Err(exposed) => return Ok(Err(exposed)),
+        for target in scope_targets(workspace, closure, scope) {
+            let checker = check::checked(workspace, closure, std, target);
+            if let Err(exposed) =
+                run_target(&checker, workspace, scope, (runs, cache), &mut report)?
+            {
+                return Ok(Err(exposed));
+            }
         }
     }
     report.failures.sort_by(|left, right| {
@@ -155,99 +151,118 @@ pub fn run(
     Ok(Ok(report))
 }
 
-/// Runs the tests a scope selects among the packages a checker's closure checks.
-fn run_closure(
+/// The run targets of the packages a closure checks that hold a test a scope may select: one
+/// whose head the scope holds, or any for the lines of an item that is no test, which tests
+/// anywhere may target.
+fn scope_targets(workspace: &Workspace, closure: &Closure, scope: &Scope) -> Vec<Target> {
+    let targeted = match scope {
+        Scope::Lines(path, lines) => workspace
+            .file(path)
+            .is_some_and(|(_, file)| !test_heads(file).any(|line| lines.contains(&line))),
+        _ => false,
+    };
+    let selects = |package: &&Package| {
+        package.files.iter().any(|file| {
+            test_heads(file).any(|line| targeted || scope.holds(workspace, &file.path, Some(line)))
+        })
+    };
+    let mut targets: Vec<Target> = closure
+        .checked
+        .iter()
+        .map(|index| &workspace.packages[*index])
+        .filter(selects)
+        .flat_map(run_targets)
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// The lines of the heads of a file's tests.
+fn test_heads(file: &File) -> impl Iterator<Item = u32> {
+    file.lowered()
+        .iter()
+        .flatten()
+        .filter(|item| matches!(item.kind, ItemKind::Test(_)))
+        .map(|item| file.syntax.tokens[item.token as usize].line)
+}
+
+/// Runs the tests a scope selects on a checker's target, in the packages it is a run target of.
+fn run_target(
     checker: &Checker,
     workspace: &Workspace,
     scope: &Scope,
-    runs: &Runs,
-    cache: &Cache,
+    (runs, cache): (&Runs, &Cache),
     report: &mut Report,
 ) -> io::Result<Result<(), Exposed>> {
+    let target = checker.db.target;
     let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
     for selected in select(checker, workspace, scope) {
         let package = checker.db.package_of(selected.item);
-        by_package.entry(package.0).or_default().push(selected);
+        if run_targets(checker.db.package(package).source).contains(&target) {
+            by_package.entry(package.0).or_default().push(selected);
+        }
     }
     let mut planned = Vec::new();
     for (package, tests) in by_package {
         let package = PackageId(package);
-        for target in run_targets(checker, package) {
-            let kept = match runs {
-                Runs::All => tests.clone(),
-                Runs::Affected => {
-                    let mut affected = Vec::new();
-                    for test in &tests {
-                        let record =
-                            match cache.record(&record_name(checker, test.item, target))? {
-                                Ok(record) => record,
-                                Err(exposed) => return Ok(Err(exposed)),
-                            };
-                        if record != Some(pass_record(checker, test.item, target)) {
-                            affected.push(test.clone());
-                        }
+        let kept = match runs {
+            Runs::All => tests,
+            Runs::Affected => {
+                let mut affected = Vec::new();
+                for test in tests {
+                    let record = match cache.record(&record_name(checker, test.item))? {
+                        Ok(record) => record,
+                        Err(exposed) => return Ok(Err(exposed)),
+                    };
+                    if record != Some(pass_record(checker, test.item)) {
+                        affected.push(test);
                     }
-                    affected
                 }
-                Runs::Replay(token) if token.target == target => tests.clone(),
-                Runs::Replay(_) => Vec::new(),
-                Runs::Reaching(packages) => tests
-                    .iter()
-                    .filter(|test| {
-                        let foreign = |item: ItemId| checker.db.package_of(item) != package;
-                        let reliance = match &checker.db.ast(test.item).kind {
-                            ItemKind::Test(item) => matches!(
-                                checker.test_target(test.item, item),
-                                Some(testing::Target::Function(target) | testing::Target::Derived(target))
-                                    if foreign(target)
-                            ),
-                            _ => false,
-                        };
-                        reliance
-                            || checker.test_reach(test.item).into_iter().any(|item| {
-                                let name = &checker.db.package(checker.db.package_of(item)).name;
-                                packages.contains(name)
-                            })
-                    })
-                    .cloned()
-                    .collect(),
-            };
-            planned.push((package, target, kept));
-        }
+                affected
+            }
+            Runs::Replay(token) if token.target == target => tests,
+            Runs::Replay(_) => Vec::new(),
+            Runs::Reaching(packages) => tests
+                .into_iter()
+                .filter(|test| {
+                    let foreign = |item: ItemId| checker.db.package_of(item) != package;
+                    let reliance = match &checker.db.ast(test.item).kind {
+                        ItemKind::Test(item) => matches!(
+                            checker.test_target(test.item, item),
+                            Some(testing::Target::Function(target) | testing::Target::Derived(target))
+                                if foreign(target)
+                        ),
+                        _ => false,
+                    };
+                    reliance
+                        || checker.test_reach(test.item).into_iter().any(|item| {
+                            let name = &checker.db.package(checker.db.package_of(item)).name;
+                            packages.contains(name)
+                        })
+                })
+                .collect(),
+        };
+        planned.push((package, kept));
     }
-    for (package, target, tests) in planned {
+    for (package, tests) in planned {
         report.tests += tests.len();
-        match target {
-            Target::Host => {
-                run_host(checker, workspace, package, &tests, (runs, cache), report)?;
-            }
-            _ => {
-                for test in &tests {
-                    report.failures.push(failure(
-                        checker,
-                        test.item,
-                        target,
-                        "test.emulator-unavailable",
-                        Vec::new(),
-                    ));
-                }
-            }
-        }
+        run_package(checker, workspace, package, &tests, (runs, cache), report)?;
     }
     Ok(Ok(()))
 }
 
-/// The name of the cache record of a test's passes on a run target.
-fn record_name(checker: &Checker, test: ItemId, target: Target) -> String {
+/// The name of the cache record of a test's passes on a checker's target.
+fn record_name(checker: &Checker, test: ItemId) -> String {
     let mut key = Vec::new();
     bytes(&mut key, checker.db.canonical(test).as_bytes());
-    bytes(&mut key, target.name().as_bytes());
+    bytes(&mut key, checker.db.target.name().as_bytes());
     format!("pass-{}", Hash::of(&key).full())
 }
 
-/// The record of a test passing on a run target: the toolchain hash, the run target's name,
+/// The record of a test passing on a checker's target: the toolchain hash, the target's name,
 /// then the canonical path and item hash of each item of the test's reach, in path order.
-fn pass_record(checker: &Checker, test: ItemId, target: Target) -> Vec<u8> {
+fn pass_record(checker: &Checker, test: ItemId) -> Vec<u8> {
     let mut reach: Vec<(String, [u8; 33])> = checker
         .test_reach(test)
         .into_iter()
@@ -256,7 +271,7 @@ fn pass_record(checker: &Checker, test: ItemId, target: Target) -> Vec<u8> {
     reach.sort();
     let mut record = Vec::new();
     bytes(&mut record, &toolchain::hash(1).0);
-    bytes(&mut record, target.name().as_bytes());
+    bytes(&mut record, checker.db.target.name().as_bytes());
     uvar(&mut record, reach.len() as u128);
     for (path, hash) in reach {
         bytes(&mut record, path.as_bytes());
@@ -336,20 +351,14 @@ fn item_at(checker: &Checker, path: &str, line: u32) -> Option<ItemId> {
 }
 
 /// The run targets of a package: each target it declares, `any` standing for `x86_64-host`.
-fn run_targets(checker: &Checker, package: PackageId) -> Vec<Target> {
-    let declared = checker
-        .db
-        .package(package)
-        .source
+fn run_targets(package: &Package) -> Vec<Target> {
+    let mut targets: Vec<Target> = package
         .manifest
-        .as_ref()
-        .map(|manifest| manifest.targets.clone())
-        .unwrap_or_default();
-    let mut targets: Vec<Target> = declared
-        .into_iter()
+        .iter()
+        .flat_map(|manifest| &manifest.targets)
         .map(|target| match target {
             Target::Any => Target::Host,
-            other => other,
+            other => *other,
         })
         .collect();
     if targets.is_empty() {
@@ -360,9 +369,10 @@ fn run_targets(checker: &Checker, package: PackageId) -> Vec<Target> {
     targets
 }
 
-/// Runs a package's tests on `x86_64-host`, each run a process of the package's test image, and
-/// records in the cache each test whose every run passes, unless replaying.
-fn run_host(
+/// Runs a package's tests on a checker's target, each run a process of the package's test image
+/// or a boot of the emulator on it, and records in the cache each test whose every run passes,
+/// unless replaying; every run fails on a machine target whose emulator cannot start.
+fn run_package(
     checker: &Checker,
     workspace: &Workspace,
     package: PackageId,
@@ -371,6 +381,16 @@ fn run_host(
     report: &mut Report,
 ) -> io::Result<()> {
     if tests.is_empty() {
+        return Ok(());
+    }
+    let target = checker.db.target;
+    if target.is_machine() && !emulator::available(target) {
+        for test in tests {
+            let cause = "test.emulator-unavailable";
+            report
+                .failures
+                .push(failure(checker, test.item, cause, Vec::new()));
+        }
         return Ok(());
     }
     let image = match build(checker, workspace, package, tests)? {
@@ -388,13 +408,13 @@ fn run_host(
                 let hash = checker.hashes(test.item).item;
                 let count = if test.property { CASES } else { SCHEDULES };
                 (0..count)
-                    .map(|index| (index, seed(&hash, Target::Host, index)))
+                    .map(|index| (index, seed(&hash, target, index)))
                     .collect()
             }
         };
         let failures = report.failures.len();
         for (index, seed) in indexed {
-            let token = token(Target::Host, &path, index, seed);
+            let token = token(target, &path, index, seed);
             let run = outcome::run(&image, number, (index, seed), &token, None)?;
             let Some(cause) = cause(&run) else {
                 if !test.property && !run.contended {
@@ -422,25 +442,25 @@ fn run_host(
             held.extend(replay);
             report
                 .failures
-                .push(failure(checker, test.item, Target::Host, &cause, held));
+                .push(failure(checker, test.item, &cause, held));
             break;
         }
         if report.failures.len() == failures && !matches!(runs, Runs::Replay(_)) {
-            let name = record_name(checker, test.item, Target::Host);
-            cache.replace(&name, &pass_record(checker, test.item, Target::Host))?;
+            let name = record_name(checker, test.item);
+            cache.replace(&name, &pass_record(checker, test.item))?;
         }
     }
-    fs::remove_file(&image)
+    image.discard()
 }
 
-/// Lowers and links the test image of a package's tests, under `.nan/tests/`; or the symbol
-/// collisions of its lowering.
+/// Lowers and writes the test image of a package's tests for a checker's target, under
+/// `.nan/tests/`, readied for its runs; or the symbol collisions of its lowering.
 fn build(
     checker: &Checker,
     workspace: &Workspace,
     package: PackageId,
     tests: &[Selected],
-) -> io::Result<Result<std::path::PathBuf, Vec<Diagnostic>>> {
+) -> io::Result<Result<Image, Vec<Diagnostic>>> {
     let lowered = test_image::lower(
         checker,
         &test_image::Tests {
@@ -462,13 +482,14 @@ fn build(
     if !collisions.is_empty() {
         return Ok(Err(collisions));
     }
+    let target = checker.db.target;
     let image = workspace
         .root
         .join(".nan/tests")
-        .join(Target::Host.name())
-        .join(&data.name);
-    crate::final_build::link(&lowered.object, &image).map_err(io::Error::other)?;
-    Ok(Ok(image))
+        .join(target.name())
+        .join(format!("{}{}", data.name, target.image_suffix()));
+    crate::final_build::write_image(target, &lowered.object, &image)?.map_err(io::Error::other)?;
+    Ok(Ok(Image::new(target, image)?))
 }
 
 /// The seed of a run: the first 8 bytes, little-endian, of the BLAKE3-256 hash of the test's
@@ -583,20 +604,14 @@ fn record_lines(run: &Run, token: &str) -> Vec<String> {
     lines
 }
 
-/// The failure of a test on a run target, at its head.
-fn failure(
-    checker: &Checker,
-    item: ItemId,
-    target: Target,
-    cause: &str,
-    lines: Vec<String>,
-) -> Failure {
+/// The failure of a test on a checker's target, at its head.
+fn failure(checker: &Checker, item: ItemId, cause: &str, lines: Vec<String>) -> Failure {
     let data = checker.db.item(item);
     Failure {
         item: checker.db.canonical(item),
         path: data.file.path.clone(),
         line: data.line(data.ast.token),
-        target,
+        target: checker.db.target,
         cause: cause.to_owned(),
         lines,
     }

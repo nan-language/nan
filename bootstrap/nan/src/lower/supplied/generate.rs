@@ -728,15 +728,14 @@ fn struct_table(lo: &mut Lowering, ty: &Ty) -> Option<DataId> {
 pub fn push_frame(lo: &mut Lowering, fx: &mut Fx, record: Value, table_id: DataId) {
     let global = lo.data_ref(fx, table_id);
     let table_address = fx.b.ins().symbol_value(PTR, global);
-    let one = fx.ptr(1);
     let size = fx.ptr(frame::SIZE);
-    let pushed = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let pushed = lo.record_alloc(fx, size);
     super::sims::exhausted_unless(lo, fx, pushed);
     let drawn = fx.load(PTR, table_address, table::DRAWN);
     let nodes = fx.b.ins().iadd_imm_s(drawn, 1);
     for (field, width) in [(frame::VALUES, 32), (frame::UPPER, 16), (frame::LOWER, 16)] {
-        let width = fx.ptr(width);
-        let area = lo.call_libc(fx, "calloc", &[nodes, width], &[PTR])[0];
+        let size = fx.b.ins().imul_imm_s(nodes, width);
+        let area = lo.record_alloc(fx, size);
         super::sims::exhausted_unless(lo, fx, area);
         fx.store(area, pushed, field);
     }
@@ -1295,9 +1294,8 @@ pub fn case(
     alloc: Value,
     run: (Value, Value, Value),
 ) -> Vec<Value> {
-    let one = fx.ptr(1);
     let size = fx.ptr(choices::SIZE);
-    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let record = lo.record_alloc(fx, size);
     super::sims::exhausted_unless(lo, fx, record);
     let (case_index, forced, forced_count) = run;
     fx.store(case_index, record, choices::CASE);

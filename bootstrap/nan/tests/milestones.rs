@@ -1,11 +1,16 @@
 //! The milestone harness: in a copy of each scenario workspace of `tests/milestones`, runs the
 //! commands its milestone states, then `nan verify`, which must accept the workspace after
-//! running its tests; for M2, the obligation outcomes are also compared with the proof cache's.
+//! running its tests; for M2, the obligation outcomes are also compared with the proof cache's,
+//! and for M4 each program runs under its emulator until its serial output shows the behaviour.
 //! Its runs of `nan` use the harnesses' home directory and a local store of their own, which each
 //! scenario starts empty.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// Copies a directory tree into another, made anew.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -24,12 +29,20 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Copies a scenario into the harnesses' temporary directory, made anew, and gives its root.
 fn copied(milestone: &str) -> PathBuf {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    copied_into(milestone, &tmp.join("milestones"))
+}
+
+/// Copies a scenario into `directory`, made anew, and gives its root, starting the scenario's
+/// local store empty.
+fn copied_into(milestone: &str, directory: &Path) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/milestones")
         .join(milestone);
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let root = tmp.join("milestones").join(milestone);
+    let root = directory.join(milestone);
     copy_tree(&source, &root).expect("a copy of the scenario");
     let store = tmp.join("stores").join(milestone);
     match fs::remove_dir_all(&store) {
@@ -157,4 +170,104 @@ fn m3() {
 #[test]
 fn m6() {
     verified(&copied("m6"));
+}
+
+/// How long a machine program may run before its serial output shows its behaviour.
+const BEHAVIOUR_WAIT: Duration = Duration::from_secs(60);
+
+/// Runs a machine program of a scenario with `nan run` under its emulator until its serial
+/// output holds each line of `behaviour`, then ends the emulator by a termination request. The
+/// output must show no kernel halt or trap report.
+fn shows(root: &Path, program: &str, behaviour: &[&str]) {
+    let run = nan::run(&["run".to_owned(), program.to_owned()], root);
+    let Some(launch) = run.launch else {
+        panic!("nan run {program} reports\n{}", run.output);
+    };
+    let mut emulator = Command::new(&launch.program)
+        .args(&launch.args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the emulator started");
+    let serial = emulator.stdout.take().expect("the serial port's output");
+    let mut diagnostics = emulator.stderr.take().expect("the emulator's diagnostics");
+    let diagnosed = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        drop(diagnostics.read_to_end(&mut bytes));
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(serial).split(b'\n') {
+            let Ok(line) = line else {
+                break;
+            };
+            let line = String::from_utf8_lossy(&line)
+                .trim_end_matches('\r')
+                .to_owned();
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + BEHAVIOUR_WAIT;
+    let mut written = Vec::new();
+    let mut missing = behaviour.to_vec();
+    while !missing.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = received.recv_timeout(left) else {
+            break;
+        };
+        missing.retain(|wanted| *wanted != line);
+        written.push(line);
+    }
+    let terminated = Command::new("kill")
+        .args(["-TERM", &emulator.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !terminated {
+        drop(emulator.kill());
+    }
+    drop(emulator.wait());
+    let diagnostics = diagnosed.join().expect("the emulator's diagnostics");
+    let written = written.join("\n");
+    assert!(
+        missing.is_empty(),
+        "{program} writes no {missing:?} in\n{written}\nand the emulator reports\n{diagnostics}"
+    );
+    assert!(
+        !written
+            .lines()
+            .any(|line| line.starts_with("halt ") || line.starts_with("trap.")),
+        "{program} halts in\n{written}"
+    );
+}
+
+/// Builds a copy of the M4 scenario outside every git working tree, runs each program under its
+/// emulator until it shows its behaviour, then verifies the scenario.
+#[test]
+fn m4() {
+    let outside = std::env::temp_dir().join(format!("nan-milestones-{}", std::process::id()));
+    let root = copied_into("m4", &outside);
+    ok(&root, &["build"]);
+    shows(
+        &root,
+        "kernel",
+        &[
+            "kernel: running on 4 cpus",
+            "smp: tasks ran on every one of 4 cpus",
+            "preempt: 5 tasks that never await all ran",
+            "uart: reader woke on byte 78",
+            "virtio-rng: received 16 bytes",
+        ],
+    );
+    shows(
+        &root,
+        "loader",
+        &["loader: copied 3 loadable segments of kernel.elf to their physical addresses"],
+    );
+    verified(&root);
+    fs::remove_dir(outside).expect("the scenario's directory removed");
 }

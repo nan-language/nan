@@ -125,7 +125,13 @@ pub fn transfer(
 /// Releases a value of a task type at an address; false for a type std declares in full.
 pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, ty: &Ty, address: Value) -> bool {
     match path {
-        "task::Join" => scopes::release_join(lo, fx, address),
+        "task::Join" => {
+            let result = ty
+                .type_arg(0)
+                .cloned()
+                .expect("a join handle's result type");
+            scopes::release_join(lo, fx, address, &result);
+        }
         "task::Cown" => cowns::release(lo, fx, ty, address),
         "task::Sender" | "task::Receiver" => channels::release(lo, fx, path, ty, address),
         "sys::Trap" => domains::release_trap(lo, fx, address),

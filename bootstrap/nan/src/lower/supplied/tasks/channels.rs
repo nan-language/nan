@@ -7,7 +7,7 @@
 //! through the channel's allocator, and its reach. A sender or receiver is the holding of the
 //! record. A waiting sender is a node on its stack: its task and the next waiting sender.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use cranelift_module::FuncId;
 
@@ -85,7 +85,7 @@ fn bounded(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, buffer, 0);
     fx.when(failed, |fx| supply.exhausted(lo, fx, &[]));
     let size = fx.ptr(channel::SIZE);
-    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let record = lo.record_alloc(fx, size);
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     fx.when(missing, |fx| {
         super::super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
@@ -158,14 +158,6 @@ fn take_oldest(lo: &mut Lowering, fx: &mut Fx, record: Value, element: &Ty, targ
         let task = fx.load(PTR, sender, node::TASK);
         lo.call_routine(fx, Routine::Wake, &[task]);
     });
-}
-
-/// Sets what the running task waits on at a cancellation point.
-fn waiting_on(lo: &mut Lowering, fx: &mut Fx, what: i64) {
-    let current = tasks::current_task(lo, fx);
-    let word = fx.offset(current, tasks::task::IO);
-    let what = fx.ptr(what as u64);
-    fx.b.ins().atomic_store(MemFlagsData::trusted(), what, word);
 }
 
 /// Whether the running call is cancelled, with the origin a cancellation then holds.
@@ -261,7 +253,7 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
                 fx.store(head, waiter, node::NEXT);
                 fx.store(waiter, record, channel::WAITING_SENDERS);
                 if !linear {
-                    waiting_on(lo, fx, WAITING);
+                    tasks::waiting_on(lo, fx, WAITING);
                 }
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let withdraw = withdraw_sender(lo);
@@ -269,7 +261,7 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
                 lo.call_routine(fx, Routine::Park, &[]);
                 settle::leave_wait(lo, fx);
                 if !linear {
-                    waiting_on(lo, fx, 0);
+                    tasks::waiting_on(lo, fx, 0);
                     let (is, origin) = cancelled(lo, fx);
                     fx.when(is, |fx| {
                         lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -420,13 +412,13 @@ fn receive(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
             supply.ret(lo, fx, held);
         });
         fx.store(current, record, channel::WAITING_RECEIVER);
-        waiting_on(lo, fx, WAITING);
+        tasks::waiting_on(lo, fx, WAITING);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         let withdraw = withdraw_receiver(lo);
         settle::enter_wait(lo, fx, withdraw, record, current);
         lo.call_routine(fx, Routine::Park, &[]);
         settle::leave_wait(lo, fx);
-        waiting_on(lo, fx, 0);
+        tasks::waiting_on(lo, fx, 0);
         let (is, origin) = cancelled(lo, fx);
         fx.when(is, |fx| {
             lo.call_routine(fx, Routine::Lock, &[lock]);
@@ -507,7 +499,7 @@ fn drain(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
 fn free_channel(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let buffer = fx.load(PTR, record, channel::BUFFER);
     lo.call_routine(fx, Routine::Free, &[buffer]);
-    lo.call_libc(fx, "free", &[record], &[]);
+    lo.record_free(fx, record);
 }
 
 /// Releases a sender or a receiver: a receiver of droppable values releases those it buffers
@@ -628,7 +620,7 @@ pub fn transfer(
                 let bytes = shape.bytes(fx, len);
                 let one = fx.ptr(1);
                 let bytes = fx.b.ins().umax(bytes, one);
-                let copy = lo.call_libc(fx, "malloc", &[bytes], &[PTR])[0];
+                let copy = lo.record_alloc(fx, bytes);
                 let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
                 fx.when(missing, |fx| {
                     super::super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
@@ -654,7 +646,7 @@ pub fn transfer(
                 let at = shape.at(fx, copy, position);
                 lo.transfer(fx, &element, at, lift, keep);
             });
-            lo.call_libc(fx, "free", &[copy], &[]);
+            lo.record_free(fx, copy);
         }
     });
 }

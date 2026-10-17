@@ -24,6 +24,12 @@ impl Lowering<'_, '_> {
         Ty::item(item, args.into_iter().map(Arg::Ty).collect())
     }
 
+    /// The root grant of the target lowered for.
+    pub fn root_grant(&self) -> Ty {
+        let (module, name) = self.ck.db.target.root_grant().expect("a concrete target");
+        self.std_ty(module, name, Vec::new())
+    }
+
     pub fn slice_of(&self, element: Ty) -> Ty {
         self.std_ty("core", "Slice", vec![element])
     }

@@ -122,9 +122,8 @@ fn capability(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entry_kind: i64, 
 pub fn mint_world(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let world_ty = lo.std_ty("host", "World", Vec::new());
     let layout = lo.layout(&world_ty);
-    let one = fx.ptr(1);
     let size = fx.ptr(layout.size);
-    let world = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    let world = lo.record_alloc(fx, size);
     let limit = fx.int(PTR, -1);
     let parent = fx.int(PTR, -1);
     let cell = memory::new_cell(lo, fx, limit, parent);
@@ -184,9 +183,8 @@ fn sims_table(lo: &mut Lowering, fx: &mut Fx) -> Value {
 
 /// A new zeroed sim object of a kind and size in runtime memory: its index and record.
 pub fn new_object(lo: &mut Lowering, fx: &mut Fx, object_kind: i64, size: u64) -> (Value, Value) {
-    let one = fx.ptr(1);
     let bytes = fx.ptr(size);
-    let record = lo.call_libc(fx, "calloc", &[one, bytes], &[PTR])[0];
+    let record = lo.record_alloc(fx, bytes);
     exhausted_unless(lo, fx, record);
     let kind_value = fx.ptr(object_kind as u64);
     fx.store(kind_value, record, object::KIND);
@@ -202,7 +200,7 @@ pub fn new_object(lo: &mut Lowering, fx: &mut Fx, object_kind: i64, size: u64) -
         let grown = fx.b.ins().umax(doubled, least);
         let bytes = fx.b.ins().imul_imm_s(grown, 8);
         let records = fx.load(PTR, sims, table::RECORDS);
-        let moved = lo.call_libc(fx, "realloc", &[records, bytes], &[PTR])[0];
+        let moved = lo.record_resize(fx, records, bytes);
         exhausted_unless(lo, fx, moved);
         fx.store(moved, sims, table::RECORDS);
         fx.store(grown, sims, table::CAPACITY);

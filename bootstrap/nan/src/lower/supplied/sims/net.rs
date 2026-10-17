@@ -278,7 +278,7 @@ pub fn write(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let doubled = fx.b.ins().ishl_imm_s(capacity, 1);
         let grown = fx.b.ins().umax(doubled, needed);
         let data = fx.load(PTR, peer, endpoint::DATA);
-        let moved = lo.call_libc(fx, "realloc", &[data, grown], &[PTR])[0];
+        let moved = lo.record_resize(fx, data, grown);
         exhausted_unless(lo, fx, moved);
         fx.store(moved, peer, endpoint::DATA);
         fx.store(grown, peer, endpoint::CAPACITY);

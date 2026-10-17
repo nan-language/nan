@@ -1,11 +1,12 @@
 //! Read-only data: the bytes of text and byte-string literals, the values of consts and
-//! contributions laid out as their types are, and registry tables. An image writes no data at
-//! run time but the support routines'.
+//! contributions laid out as their types are, and registry tables; and the writable data of
+//! zeros a machine image reserves for its support routines. An image writes no data at run time
+//! but the support routines'.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use cranelift_codegen::ir::{InstBuilder, types};
+use cranelift_codegen::ir::{InstBuilder, Value, types};
 use cranelift_module::{DataDescription, DataId, Linkage, Module};
 
 use super::body::Held;
@@ -83,6 +84,37 @@ impl Lowering<'_, '_> {
             data,
         };
         self.define_data(kind, image, 8)
+    }
+
+    /// The writable data object of zeros a machine image reserves under a name, declared once.
+    pub fn reserved_data(&mut self, name: &'static str, size: u64, align: u64) -> DataId {
+        if let Some(id) = self.reserved.get(name) {
+            return *id;
+        }
+        let id = self
+            .module
+            .declare_data(name, Linkage::Local, true, false)
+            .unwrap_or_else(|error| panic!("declaring {name}: {error}"));
+        let mut description = DataDescription::new();
+        description.define_zeroinit(size as usize);
+        description.set_align(align);
+        self.module
+            .define_data(id, &description)
+            .unwrap_or_else(|error| panic!("defining {name}: {error}"));
+        self.reserved.insert(name, id);
+        id
+    }
+
+    /// The address of the writable data object of zeros a machine image reserves under a name.
+    pub fn reserved(&mut self, fx: &mut Fx, name: &'static str, size: u64, align: u64) -> Value {
+        let id = self.reserved_data(name, size, align);
+        self.data_address(fx, id)
+    }
+
+    /// The address of a data object of the image.
+    pub fn data_address(&mut self, fx: &mut Fx, id: DataId) -> Value {
+        let global = self.data_ref(fx, id);
+        fx.b.ins().symbol_value(PTR, global)
     }
 
     /// The data object holding bytes.
@@ -419,7 +451,7 @@ impl Lowering<'_, '_> {
 
     /// The values of a registry's admitted contributions in table order: by canonical path, each
     /// inserted before the first entry whose key is greater.
-    fn table_entries(&mut self, registry: ItemId) -> Vec<Rc<ConstValue>> {
+    pub(super) fn table_entries(&mut self, registry: ItemId) -> Vec<Rc<ConstValue>> {
         let ItemKind::Registry(declared) = &self.ck.db.ast(registry).kind else {
             panic!("a registry item");
         };

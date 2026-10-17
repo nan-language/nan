@@ -8,7 +8,7 @@ The language is specified in [docs/spec](docs/spec/00-charter.md), starting with
 
 ## Installation
 
-Requires [rustup](https://rustup.rs) and a C compiler available as `cc`; building and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU (`qemu-system-x86_64`) and OVMF. From the repository root:
+Requires [rustup](https://rustup.rs) and a C compiler available as `cc`; running and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU 10.2 or later (`qemu-system-x86_64`) and OVMF. From the repository root:
 
 ```bash
 rustup toolchain install

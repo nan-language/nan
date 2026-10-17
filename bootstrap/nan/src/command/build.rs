@@ -1,7 +1,9 @@
 //! The commands that perform final builds: `nan build` and `nan run`.
 
 use std::io;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use super::{Invocation, Name, Outcome, Trace, record};
 use crate::diagnostic::{Class, Code};
@@ -16,6 +18,21 @@ use crate::workspace::{Target, Workspace};
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// Whether the program is the emulator, whose end gives the run's status.
+    pub emulated: bool,
+}
+
+impl Launch {
+    /// Starts the program: the image replaces this process, so that termination requests reach
+    /// it and its status is the run's; the emulator runs as a child, and the status the run ends
+    /// with is given once it ends.
+    pub fn start(&self) -> i32 {
+        if self.emulated {
+            return emulator::run(self);
+        }
+        let error = Command::new(&self.program).args(&self.args).exec();
+        panic!("starting {}: {error}", self.program.display());
+    }
 }
 
 pub fn run(
@@ -72,6 +89,9 @@ pub fn run(
         let image = images.pop().expect("a built image");
         let path = workspace.root.join(&image);
         let target = workspace.packages[programs[0]].program_target();
+        if target.is_machine() && !emulator::available(target) {
+            return Ok(Outcome::Ended(emulator::OTHER_END));
+        }
         let launch = match target {
             Target::Uefi => {
                 let files = volume_files(workspace, &path)?;
@@ -81,6 +101,7 @@ pub fn run(
             _ => Launch {
                 program: path,
                 args: invocation.passed.to_vec(),
+                emulated: false,
             },
         };
         return Ok(Outcome::Launch(launch));

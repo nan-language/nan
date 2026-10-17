@@ -49,15 +49,7 @@ fn pointer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.member() {
         "of_addr" | "addr" | "cast" => supply.ret(lo, fx, supply.param(0)),
         "of" | "of_mut" => {
-            let address = match supply.param(0) {
-                Held::Address(address) => address,
-                held => {
-                    let size = fx.ptr(layout.size.max(1));
-                    let kept = lo.record_alloc(fx, size);
-                    lo.store_held(fx, kept, held, &element);
-                    kept
-                }
-            };
+            let address = supply.param(0).address();
             supply.ret(lo, fx, Held::Scalar(address));
         }
         "of_view" | "of_view_mut" => {

@@ -130,6 +130,12 @@ impl Checker<'_> {
         digest
     }
 
+    /// Whether a supplied operation takes its read argument as the place holding it, whatever
+    /// its type: `hw::Ptr.of`, whose pointer is to that place.
+    pub fn reads_in_place(&self, item: ItemId) -> bool {
+        self.db.is_std(item) && self.db.canonical(item) == "hw::Ptr.of"
+    }
+
     /// Whether a supplied operation has a trap site: unless its head demands `notrap`, when it
     /// draws memory other than through a `try_` form, or its owning chapter names a trap.
     pub fn supplied_traps(&self, item: ItemId) -> bool {

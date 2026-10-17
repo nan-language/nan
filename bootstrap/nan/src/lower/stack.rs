@@ -248,17 +248,21 @@ impl Judge<'_> {
     }
 
     /// The because-chain of a call path: a `called` reason per call, and for an unbounded path
-    /// a `raised` reason for its last call site, the unbounded one.
+    /// a `raised` reason for its last call site, the unbounded one. Calls of code lowering
+    /// writes itself, support routines and compiler stubs among them, have no reason.
     fn because(&self, ck: &Checker, path: &[(FuncId, usize)], unbounded: bool) -> Vec<Reason> {
         let mut because = Vec::new();
         for (step, (function, index)) in path.iter().enumerate() {
             let site = &self.frames[function].sites[*index];
-            let last = unbounded && step + 1 == path.len();
-            let (role, subject) = match (&site.kind, last) {
-                (Kind::Direct { callee, .. }, false) => (Role::Called, self.name(*callee)),
-                (Kind::Direct { callee, .. }, true) => (Role::Raised, self.name(*callee)),
-                (Kind::Param(_), _) => (Role::Raised, "function parameter".to_owned()),
-                (_, _) => (Role::Raised, "function value".to_owned()),
+            let role = match unbounded && step + 1 == path.len() {
+                true => Role::Raised,
+                false => Role::Called,
+            };
+            let subject = match &site.kind {
+                Kind::Direct { callee, .. } => self.name(*callee),
+                Kind::Param(_) => "function parameter".to_owned(),
+                Kind::Bounded(_) => "function value".to_owned(),
+                Kind::Stub => String::new(),
             };
             if subject.is_empty() {
                 continue;
@@ -311,3 +315,6 @@ fn diagnostic(ck: &Checker, at: At, code: Code, because: Vec<Reason>) -> Option<
     diagnostic.because = because;
     Some(diagnostic)
 }
+
+#[cfg(test)]
+mod tests;

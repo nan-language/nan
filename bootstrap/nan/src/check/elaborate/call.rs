@@ -51,11 +51,16 @@ impl Elab<'_, '_> {
             },
             _ => None,
         };
+        let in_place = match call.callee {
+            tir::Callee::Function { item } => call.proj || self.ck.reads_in_place(item),
+            _ => call.proj,
+        };
         let mut args = Vec::new();
         for (index, arg) in call.args.iter().enumerate() {
             // A projection's result is part of its receiver, so a receiver read from a place is
-            // passed as that place, never as a copy the part would point into.
-            let operand = match call.proj && index == 0 && arg.mode == Mode::Read {
+            // passed as that place, never as a copy the part would point into; so is an argument
+            // an operation makes a pointer to.
+            let operand = match in_place && index == 0 && arg.mode == Mode::Read {
                 true => self.borrowed(&arg.expr)?,
                 false => self.arg(&arg.expr, arg.mode)?,
             };

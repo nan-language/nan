@@ -1,5 +1,4 @@
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
@@ -7,10 +6,7 @@ fn main() {
     let current = std::env::current_dir().expect("the current directory");
     let run = nan::run(&args, &current);
     if let Some(launch) = run.launch {
-        let error = std::process::Command::new(&launch.program)
-            .args(&launch.args)
-            .exec();
-        panic!("starting {}: {error}", launch.program.display());
+        std::process::exit(launch.start());
     }
     let written = std::io::stdout().write_all(run.output.as_bytes());
     if let Err(error) = written

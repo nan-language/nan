@@ -36,8 +36,8 @@ pub struct Workspace {
     pub closures: Vec<Closure>,
     /// The diagnostics of reading the locks.
     locked: Vec<Diagnostic>,
-    /// Source files that no package holds.
-    pub stray: Vec<String>,
+    /// Source files that no package holds, with their contents.
+    stray: Vec<(String, Vec<u8>)>,
     /// The package and file indexes of each file, by path.
     paths: HashMap<String, (usize, usize)>,
     /// The package directories and files the walk found.
@@ -174,7 +174,7 @@ impl Workspace {
         Workspace::build(
             self.root.clone(),
             self.layout_with(changed),
-            self.stray.clone(),
+            self.stray_paths(),
             &mut source,
             &mut releases,
         )
@@ -222,7 +222,7 @@ impl Workspace {
         Workspace::build(
             self.root.clone(),
             layout,
-            self.stray.clone(),
+            self.stray_paths(),
             &mut source,
             store,
         )
@@ -296,6 +296,10 @@ impl Workspace {
             .map(|found| Package::load(found, source))
             .collect::<io::Result<_>>()?;
         let read = closure::closures(&packages, store)?;
+        let stray = stray
+            .into_iter()
+            .map(|path| source(&path).map(|bytes| (path, bytes)))
+            .collect::<io::Result<_>>()?;
         let paths = packages
             .iter()
             .enumerate()
@@ -339,12 +343,17 @@ impl Workspace {
             .find(|closure| closure.checked.contains(&index))
     }
 
+    /// The paths of the source files that no package holds.
+    fn stray_paths(&self) -> Vec<String> {
+        self.stray.iter().map(|(path, _)| path.clone()).collect()
+    }
+
     /// The loading diagnostics: a stray file's, every package's and those of their locks.
     pub fn diagnostics(&self) -> impl Iterator<Item = Diagnostic> + '_ {
         let stray = self
             .stray
             .iter()
-            .map(|path| Diagnostic::at(Code::ManifestMissing, path, 1));
+            .map(|(path, _)| Diagnostic::at(Code::ManifestMissing, path, 1));
         stray
             .chain(
                 self.packages
@@ -370,6 +379,9 @@ impl Workspace {
     pub fn bytes(&self, path: &str) -> Option<&[u8]> {
         if let Some((_, file)) = self.file(path) {
             return Some(&file.syntax.source);
+        }
+        if let Some((_, bytes)) = self.stray.iter().find(|(stray, _)| stray == path) {
+            return Some(bytes);
         }
         self.packages
             .iter()

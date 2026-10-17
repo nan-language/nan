@@ -126,6 +126,16 @@ fn a_scope_naming_nothing_is_unknown() {
 }
 
 #[test]
+fn a_stray_file_is_reported_on_its_first_line() {
+    let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("stray.nan", "//! Stray.\n")]);
+    let run = run_in(&scratch.0, "check");
+    assert_eq!(
+        run.output.lines().skip(1).take(2).collect::<Vec<_>>(),
+        ["error manifest.missing stray.nan:1 -", "    //! Stray."]
+    );
+}
+
+#[test]
 fn fmt_writes_through_the_journal_and_names_each_file() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),

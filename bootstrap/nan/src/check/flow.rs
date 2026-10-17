@@ -1279,7 +1279,13 @@ impl<'c, 'a> Flow<'c, 'a> {
                     ..base
                 }
             }
-            TKind::Index(call) | TKind::Call(call) => self.call(call, expr.token),
+            TKind::Index(call) | TKind::Call(call) => {
+                let value = self.call(call, expr.token);
+                if expr.ty.is_never() {
+                    self.state = None;
+                }
+                value
+            }
             TKind::Construct { values, .. } => self.construct(expr, values),
             TKind::Unary { operand, .. } => {
                 let value = self.expr(operand);

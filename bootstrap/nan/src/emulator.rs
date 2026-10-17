@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,9 @@ const OVMF: [&str; 4] = [
     "/usr/share/OVMF/OVMF_CODE_4M.fd",
     "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
 ];
+
+/// The status of a run under the emulator that ends other than by a write to the exit port.
+pub const OTHER_END: i32 = 70;
 
 /// The host processor time a bounded boot may use.
 const PROCESSOR_TIME: Duration = Duration::from_secs(10);
@@ -42,9 +45,11 @@ const SYSTEM_TIME: usize = 12;
 
 /// The emulator arguments common to every machine run: the machine, accelerated by KVM where the
 /// host offers it, processors, memory, entropy device, exit port, serial port on the standard
-/// streams and no display or reboot.
+/// streams, no display or reboot, and an end with the process that starts it.
 fn base_args() -> Vec<String> {
     [
+        "-run-with",
+        "exit-with-parent=on",
         "-machine",
         "q35",
         "-accel",
@@ -73,16 +78,31 @@ fn base_args() -> Vec<String> {
     .collect()
 }
 
-/// Whether the emulator of a machine target can start: the emulator program runs, and OVMF is
-/// present for `x86_64-uefi`.
+/// Whether the emulator of a machine target can start: the emulator program runs and can end
+/// with the process that starts it, and OVMF is present for `x86_64-uefi`.
 pub fn available(target: Target) -> bool {
     let runs = Command::new(QEMU)
-        .arg("--version")
-        .stdout(Stdio::null())
+        .args(["-run-with", "help"])
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("exit-with-parent"));
     runs && (target != Target::Uefi || firmware().is_some())
+}
+
+/// Boots the emulator as `launch` gives, with the standard streams of this process, and gives
+/// the status the run ends with once the emulator ends.
+pub fn run(launch: &Launch) -> i32 {
+    run_status(Command::new(&launch.program).args(&launch.args).status())
+}
+
+/// The status a run under the emulator ends with: v mod 128 when the machine wrote the byte v to
+/// the exit port, which ends the emulator with status (2v + 1) mod 256, and `OTHER_END` for any
+/// other end.
+fn run_status(ended: io::Result<ExitStatus>) -> i32 {
+    match ended.map(|status| status.code()) {
+        Ok(Some(code)) if code % 2 == 1 => (code - 1) / 2,
+        _ => OTHER_END,
+    }
 }
 
 /// The OVMF firmware present on the host.
@@ -130,6 +150,7 @@ pub fn launch(
     Ok(Launch {
         program: QEMU.into(),
         args,
+        emulated: true,
     })
 }
 
@@ -231,3 +252,6 @@ fn drain(mut stream: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
         bytes
     })
 }
+
+#[cfg(test)]
+mod tests;

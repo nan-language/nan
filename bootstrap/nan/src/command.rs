@@ -37,10 +37,12 @@ pub struct Run {
     pub launch: Option<Launch>,
 }
 
-/// What a command ends with: its output, or the program `nan run` starts.
+/// What a command ends with: its output, the program `nan run` starts, or the status `nan run`
+/// ends with when the emulator cannot start.
 enum Outcome {
     Output(Output),
     Launch(Launch),
+    Ended(i32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -403,6 +405,13 @@ pub fn run(args: &[String], current: &Path) -> Run {
                 output: String::new(),
                 status: 0,
                 launch: Some(launch),
+            };
+        }
+        Ok(Ok(Outcome::Ended(status))) => {
+            return Run {
+                output: String::new(),
+                status,
+                launch: None,
             };
         }
         Ok(Err(_)) | Err(_) => internal_error(&invocation, args, &trace),

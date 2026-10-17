@@ -585,6 +585,21 @@ pub closed linear struct Lease {
     pub slot: u32
 } Lease
 
+pub fn halt() -> Never {
+    loop {
+    }
+} halt
+
+pub fn hold_until_halt(take lease: Lease) -> Never {
+    halt()
+} hold_until_halt
+```
+
+```nan
+pub closed linear struct Lease {
+    pub slot: u32
+} Lease
+
 pub closed enum SlotError derives Eq, Render {
     Busy
 } SlotError

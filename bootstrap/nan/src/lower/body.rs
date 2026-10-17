@@ -496,6 +496,10 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 let ty = nty.ty().clone();
                 Held::Scalar(self.load_scalar(address, 0, &ty))
             }
+            (Held::Empty, Repr::Address) => {
+                let layout = self.lo.layout(nty.ty());
+                Held::Address(self.fx.slot(layout.size, layout.align))
+            }
             (_, Repr::Empty) => Held::Empty,
             (held, _) => held,
         }

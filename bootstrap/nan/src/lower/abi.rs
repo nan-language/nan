@@ -202,7 +202,12 @@ impl Lowering<'_, '_> {
             Instance::Supplied { item, args } => {
                 let sig = self.ck.fn_sig(*item).expect("a supplied function's head");
                 let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
-                self.head_abi(&sig.fn_ty(), &subst, sig.is_proj())
+                let mut abi = self.head_abi(&sig.fn_ty(), &subst, sig.is_proj());
+                if self.ck.reads_in_place(*item) {
+                    let read = abi.params[0].0.ty().clone();
+                    abi.params[0] = (NTy::Ref(read), Repr::Address);
+                }
+                abi
             }
             Instance::Derived {
                 owner,

@@ -46,3 +46,4 @@ The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.
 | `cargo nextest run -p nan --test conformance -E 'test(/<chapter>/)'` | Run the conformance tests of one specification chapter, given by its file name (`01-lexical`) |
 | `cargo nextest run -p nan --test programs -E 'test(/<program>/)'` | Build and run one program of `bootstrap/nan/tests/programs`, given by its directory name |
 | `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |
+| `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN front end of `toolchain/` with the bootstrap on one chapter, std package or the toolchain (`toolchain`) |

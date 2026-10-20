@@ -1,0 +1,2023 @@
+//! The grammar of language 1, built from `docs/spec/41-grammar.md`, and its LL(1) analysis.
+
+/// The grammar's tables: the choice each syntactic rule expands, each choice's alternatives and
+/// each alternative's elements, the code points the lexer rejects, and the LL(1) analysis.
+pkg struct Grammar {
+    /// The choice of each rule, by rule index.
+    rule_choices: mem::List[usize]
+    /// The alternatives of each choice, as sequence ids.
+    choices: mem::List[mem::List[usize]]
+    seqs: mem::List[SeqDef]
+    /// The ranges `REJECTED` matches, sorted.
+    rejected: mem::List[CodeRange]
+    /// The ranges `REJECTED_SPACE` matches, sorted.
+    rejected_space: mem::List[CodeRange]
+    analysis: Analysis
+} Grammar
+
+/// The code points from `low` to `high`, both included.
+struct CodeRange derives Copy, Eq, Ord {
+    low: u32
+    high: u32
+} CodeRange
+
+/// One alternative of a choice: elements in order, and the code it is rejected with, if any.
+struct SeqDef {
+    elems: mem::List[ElemDef]
+    rejection: Option[diagnostic::Code]
+} SeqDef
+
+struct ElemDef derives Copy, Eq {
+    atom: Atom
+    repeat: Repeat
+} ElemDef
+
+enum Atom derives Copy, Eq {
+    Rule(Rule)
+    /// A parenthesised group, by its choice id.
+    Group(usize)
+    Term(Term)
+} Atom
+
+enum Repeat derives Copy, Eq {
+    One
+    Opt
+    Star
+    Plus
+} Repeat
+
+/// A terminal of the syntactic grammar.
+enum Term derives Copy, Eq {
+    Keyword(Keyword)
+    Punct(Punct)
+    Context(ContextWord)
+    Class(Class)
+} Term
+
+const KEYWORDS: usize = 67
+
+const PUNCTS: usize = 42
+
+const FOREIGNS: usize = 7
+
+const CONTEXTS: usize = 52
+
+const CLASSES: usize = 13
+
+const TERMS: usize = KEYWORDS + PUNCTS + CONTEXTS + CLASSES
+
+const WORDS: usize = (TERMS + 63) / 64
+
+fn Rule.choice(self, grammar: Grammar) -> usize {
+    return grammar.rule_choices[self.index()]
+} Rule.choice
+
+fn Term.index(self) -> usize {
+    return match self {
+        Term.Keyword(keyword) => keyword.index()
+        Term.Punct(punct) => KEYWORDS + punct.index()
+        Term.Context(word) => KEYWORDS + PUNCTS + word.index()
+        Term.Class(class) => KEYWORDS + PUNCTS + CONTEXTS + class.index()
+    }
+} Term.index
+
+fn Term.from_index(index: usize) -> Term {
+    if index < KEYWORDS {
+        let Some(keyword) = Keyword.from_index(index) else {
+            expect false
+            return Term.Class(Class.Eof)
+        }
+        return Term.Keyword(keyword)
+    }
+    if index < KEYWORDS + PUNCTS {
+        let Some(punct) = Punct.from_index(index - KEYWORDS) else {
+            expect false
+            return Term.Class(Class.Eof)
+        }
+        return Term.Punct(punct)
+    }
+    if index < KEYWORDS + PUNCTS + CONTEXTS {
+        let Some(word) = ContextWord.from_index(index - KEYWORDS - PUNCTS) else {
+            expect false
+            return Term.Class(Class.Eof)
+        }
+        return Term.Context(word)
+    }
+    let Some(class) = Class.from_index(index - KEYWORDS - PUNCTS - CONTEXTS) else {
+        expect false
+        return Term.Class(Class.Eof)
+    }
+    return Term.Class(class)
+} Term.from_index
+
+/// The terminal as grammar notation writes it: `"fn"`, `'language'` or `IDENT`.
+fn Term.written(self, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    match self {
+        Term.Keyword(keyword) => {
+            mut written.push('"')
+            mut written.append(keyword.spelling())
+            mut written.push('"')
+        }
+        Term.Punct(punct) => {
+            mut written.push('"')
+            mut written.append(punct.spelling())
+            mut written.push('"')
+        }
+        Term.Context(word) => {
+            mut written.push('\'')
+            mut written.append(word.spelling())
+            mut written.push('\'')
+        }
+        Term.Class(class) => mut written.append(class.name())
+    }
+    return written
+} Term.written
+
+/// A set of terminals.
+struct TermSet derives Copy, Eq, Default {
+    words: Array[u64, WORDS]
+} TermSet
+
+fn TermSet.single(term: Term) -> TermSet {
+    var set = TermSet.default()
+    mut set.insert(term)
+    return set
+} TermSet.single
+
+fn TermSet.insert(mut self, term: Term) {
+    let index = term.index()
+    self.words[index / 64] |= 1u64 << u32.truncate(index % 64)
+} TermSet.insert
+
+fn TermSet.contains(self, term: Term) -> bool {
+    let index = term.index()
+    return (self.words[index / 64] & (1u64 << u32.truncate(index % 64))) != 0
+} TermSet.contains
+
+fn TermSet.union(mut self, other: TermSet) {
+    for index in 0..<WORDS {
+        self.words[index] |= other.words[index]
+    }
+} TermSet.union
+
+fn TermSet.is_superset(self, other: TermSet) -> bool {
+    for index in 0..<WORDS {
+        if (self.words[index] & other.words[index]) != other.words[index] {
+            return false
+        }
+    }
+    return true
+} TermSet.is_superset
+
+/// The terminals of the set, in index order.
+fn TermSet.terms(self, alloc: mem::Alloc) -> mem::List[Term] {
+    var held = mem::List[Term].empty(alloc)
+    for index in 0..<TERMS {
+        if (self.words[index / 64] & (1u64 << u32.truncate(index % 64))) != 0 {
+            mut held.push(Term.from_index(index))
+        }
+    }
+    return held
+} TermSet.terms
+
+/// What can start a symbol: terminals reached outside every rejected alternative (`ok`), terminals
+/// reached through a rejected alternative (`rejected`), and whether it derives no token.
+struct First derives Copy, Eq, Default {
+    ok: TermSet
+    rejected: TermSet
+    nullable: bool
+} First
+
+/// What can start each choice and each sequence of the grammar.
+struct Analysis {
+    choices: mem::List[First]
+    seqs: mem::List[First]
+} Analysis
+
+fn Analysis.empty(alloc: mem::Alloc) -> Analysis = Analysis(choices: mem::List[First].empty(alloc), seqs: mem::List[First].empty(alloc))
+
+fn Analysis.compute(grammar: Grammar, alloc: mem::Alloc) -> Analysis {
+    var analysis = Analysis.empty(alloc)
+    for _ in 0..<grammar.choices.len() {
+        mut analysis.choices.push(First.default())
+    }
+    for _ in 0..<grammar.seqs.len() {
+        mut analysis.seqs.push(First.default())
+    }
+    loop {
+        var changed = false
+        for id in 0..<grammar.seqs.len() {
+            let seq = grammar.seqs[id]
+            var reached = analysis.elems(seq.elems, grammar)
+            if seq.rejection.is_some() {
+                mut reached.rejected.union(reached.ok)
+                reached.ok = TermSet.default()
+            }
+            changed = changed or analysis.seqs[id] != reached
+            analysis.seqs[id] = reached
+        }
+        for id in 0..<grammar.choices.len() {
+            var reached = First.default()
+            for alt in grammar.choices[id] {
+                let alternative = analysis.seqs[alt]
+                mut reached.ok.union(alternative.ok)
+                mut reached.rejected.union(alternative.rejected)
+                reached.nullable = reached.nullable or alternative.nullable
+            }
+            changed = changed or analysis.choices[id] != reached
+            analysis.choices[id] = reached
+        }
+        if not changed {
+            return analysis
+        }
+    }
+} Analysis.compute
+
+fn Analysis.choice(self, choice: usize) -> First {
+    return self.choices[choice]
+} Analysis.choice
+
+fn Analysis.seq(self, seq: usize) -> First {
+    return self.seqs[seq]
+} Analysis.seq
+
+fn Analysis.atom(self, atom: Atom, grammar: Grammar) -> First {
+    return match atom {
+        Atom.Term(term) => First(ok: TermSet.single(term), rejected: TermSet.default(), nullable: false)
+        Atom.Rule(rule) => self.choices[rule.choice(grammar)]
+        Atom.Group(choice) => self.choices[choice]
+    }
+} Analysis.atom
+
+/// What can start a run of elements, through every element that may derive no token.
+fn Analysis.elems(self, elems: mem::List[ElemDef], grammar: Grammar) -> First {
+    var reached = First(ok: TermSet.default(), rejected: TermSet.default(), nullable: true)
+    for elem in elems {
+        let atom = self.atom(elem.atom, grammar)
+        mut reached.ok.union(atom.ok)
+        mut reached.rejected.union(atom.rejected)
+        let optional = match elem.repeat {
+            Repeat.Opt or Repeat.Star => true
+            Repeat.One or Repeat.Plus => false
+        }
+        if not (atom.nullable or optional) {
+            reached.nullable = false
+            break
+        }
+    }
+    return reached
+} Analysis.elems
+
+test choices_are_ll1_under_the_published_resolutions for Grammar.load {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    for alts in grammar.choices {
+        for left in 0..<alts.len() {
+            for right in (left + 1)..<alts.len() {
+                let left_first = grammar.analysis.seq(alts[left])
+                let right_first = grammar.analysis.seq(alts[right])
+                for term in left_first.ok.terms(alloc) {
+                    expect not right_first.ok.contains(term)
+                }
+                for term in left_first.rejected.terms(alloc) {
+                    expect not right_first.rejected.contains(term)
+                }
+            }
+        }
+    }
+} choices_are_ll1_under_the_published_resolutions
+
+test rejected_code_points_leave_printable_ascii_alone for Grammar.load {
+    let grammar = Grammar.load(testing::world().alloc)
+    for range in grammar.rejected {
+        expect range.high < 0x20 or range.low >= 0x7F
+    }
+} rejected_code_points_leave_printable_ascii_alone
+
+/// The hard keywords, in the order the grammar lists them.
+pkg enum Keyword derives Copy, Eq {
+    Underscore
+    And
+    Assert
+    Assume
+    Attempt
+    Await
+    Break
+    Const
+    Continue
+    Contribute
+    Dbg
+    Decreases
+    Defer
+    Derives
+    Discard
+    Else
+    Ensures
+    Enum
+    Expect
+    Fail
+    Fails
+    False
+    First
+    Fn
+    For
+    Foreign
+    If
+    Impl
+    In
+    Interface
+    Interrupt
+    Invariant
+    Landing
+    Layout
+    Let
+    Limits
+    Linear
+    Loop
+    Match
+    Mut
+    Not
+    Or
+    Package
+    Pkg
+    Proj
+    Pub
+    Registers
+    Registry
+    Requires
+    Retired
+    Return
+    SelfValue
+    Struct
+    Take
+    Test
+    Todo
+    True
+    Trusted
+    Try
+    Undefer
+    Uses
+    Validator
+    Var
+    Waive
+    When
+    Where
+    While
+} Keyword
+
+/// The keyword as source spells it.
+pkg proj fn Keyword.spelling(self) -> Str {
+    return match self {
+        Keyword.Underscore => "_"
+        Keyword.And => "and"
+        Keyword.Assert => "assert"
+        Keyword.Assume => "assume"
+        Keyword.Attempt => "attempt"
+        Keyword.Await => "await"
+        Keyword.Break => "break"
+        Keyword.Const => "const"
+        Keyword.Continue => "continue"
+        Keyword.Contribute => "contribute"
+        Keyword.Dbg => "dbg"
+        Keyword.Decreases => "decreases"
+        Keyword.Defer => "defer"
+        Keyword.Derives => "derives"
+        Keyword.Discard => "discard"
+        Keyword.Else => "else"
+        Keyword.Ensures => "ensures"
+        Keyword.Enum => "enum"
+        Keyword.Expect => "expect"
+        Keyword.Fail => "fail"
+        Keyword.Fails => "fails"
+        Keyword.False => "false"
+        Keyword.First => "first"
+        Keyword.Fn => "fn"
+        Keyword.For => "for"
+        Keyword.Foreign => "foreign"
+        Keyword.If => "if"
+        Keyword.Impl => "impl"
+        Keyword.In => "in"
+        Keyword.Interface => "interface"
+        Keyword.Interrupt => "interrupt"
+        Keyword.Invariant => "invariant"
+        Keyword.Landing => "landing"
+        Keyword.Layout => "layout"
+        Keyword.Let => "let"
+        Keyword.Limits => "limits"
+        Keyword.Linear => "linear"
+        Keyword.Loop => "loop"
+        Keyword.Match => "match"
+        Keyword.Mut => "mut"
+        Keyword.Not => "not"
+        Keyword.Or => "or"
+        Keyword.Package => "package"
+        Keyword.Pkg => "pkg"
+        Keyword.Proj => "proj"
+        Keyword.Pub => "pub"
+        Keyword.Registers => "registers"
+        Keyword.Registry => "registry"
+        Keyword.Requires => "requires"
+        Keyword.Retired => "retired"
+        Keyword.Return => "return"
+        Keyword.SelfValue => "self"
+        Keyword.Struct => "struct"
+        Keyword.Take => "take"
+        Keyword.Test => "test"
+        Keyword.Todo => "todo"
+        Keyword.True => "true"
+        Keyword.Trusted => "trusted"
+        Keyword.Try => "try"
+        Keyword.Undefer => "undefer"
+        Keyword.Uses => "uses"
+        Keyword.Validator => "validator"
+        Keyword.Var => "var"
+        Keyword.Waive => "waive"
+        Keyword.When => "when"
+        Keyword.Where => "where"
+        Keyword.While => "while"
+    }
+} Keyword.spelling
+
+/// The keyword spelt by the bytes, if any.
+pkg fn Keyword.from_spelling(text: Slice[u8]) -> Option[Keyword] {
+    return match text {
+        b"_" => Some(Keyword.Underscore)
+        b"and" => Some(Keyword.And)
+        b"assert" => Some(Keyword.Assert)
+        b"assume" => Some(Keyword.Assume)
+        b"attempt" => Some(Keyword.Attempt)
+        b"await" => Some(Keyword.Await)
+        b"break" => Some(Keyword.Break)
+        b"const" => Some(Keyword.Const)
+        b"continue" => Some(Keyword.Continue)
+        b"contribute" => Some(Keyword.Contribute)
+        b"dbg" => Some(Keyword.Dbg)
+        b"decreases" => Some(Keyword.Decreases)
+        b"defer" => Some(Keyword.Defer)
+        b"derives" => Some(Keyword.Derives)
+        b"discard" => Some(Keyword.Discard)
+        b"else" => Some(Keyword.Else)
+        b"ensures" => Some(Keyword.Ensures)
+        b"enum" => Some(Keyword.Enum)
+        b"expect" => Some(Keyword.Expect)
+        b"fail" => Some(Keyword.Fail)
+        b"fails" => Some(Keyword.Fails)
+        b"false" => Some(Keyword.False)
+        b"first" => Some(Keyword.First)
+        b"fn" => Some(Keyword.Fn)
+        b"for" => Some(Keyword.For)
+        b"foreign" => Some(Keyword.Foreign)
+        b"if" => Some(Keyword.If)
+        b"impl" => Some(Keyword.Impl)
+        b"in" => Some(Keyword.In)
+        b"interface" => Some(Keyword.Interface)
+        b"interrupt" => Some(Keyword.Interrupt)
+        b"invariant" => Some(Keyword.Invariant)
+        b"landing" => Some(Keyword.Landing)
+        b"layout" => Some(Keyword.Layout)
+        b"let" => Some(Keyword.Let)
+        b"limits" => Some(Keyword.Limits)
+        b"linear" => Some(Keyword.Linear)
+        b"loop" => Some(Keyword.Loop)
+        b"match" => Some(Keyword.Match)
+        b"mut" => Some(Keyword.Mut)
+        b"not" => Some(Keyword.Not)
+        b"or" => Some(Keyword.Or)
+        b"package" => Some(Keyword.Package)
+        b"pkg" => Some(Keyword.Pkg)
+        b"proj" => Some(Keyword.Proj)
+        b"pub" => Some(Keyword.Pub)
+        b"registers" => Some(Keyword.Registers)
+        b"registry" => Some(Keyword.Registry)
+        b"requires" => Some(Keyword.Requires)
+        b"retired" => Some(Keyword.Retired)
+        b"return" => Some(Keyword.Return)
+        b"self" => Some(Keyword.SelfValue)
+        b"struct" => Some(Keyword.Struct)
+        b"take" => Some(Keyword.Take)
+        b"test" => Some(Keyword.Test)
+        b"todo" => Some(Keyword.Todo)
+        b"true" => Some(Keyword.True)
+        b"trusted" => Some(Keyword.Trusted)
+        b"try" => Some(Keyword.Try)
+        b"undefer" => Some(Keyword.Undefer)
+        b"uses" => Some(Keyword.Uses)
+        b"validator" => Some(Keyword.Validator)
+        b"var" => Some(Keyword.Var)
+        b"waive" => Some(Keyword.Waive)
+        b"when" => Some(Keyword.When)
+        b"where" => Some(Keyword.Where)
+        b"while" => Some(Keyword.While)
+        else => None
+    }
+} Keyword.from_spelling
+
+/// The position of the keyword in the order the grammar lists them.
+fn Keyword.index(self) -> usize {
+    return match self {
+        Keyword.Underscore => 0
+        Keyword.And => 1
+        Keyword.Assert => 2
+        Keyword.Assume => 3
+        Keyword.Attempt => 4
+        Keyword.Await => 5
+        Keyword.Break => 6
+        Keyword.Const => 7
+        Keyword.Continue => 8
+        Keyword.Contribute => 9
+        Keyword.Dbg => 10
+        Keyword.Decreases => 11
+        Keyword.Defer => 12
+        Keyword.Derives => 13
+        Keyword.Discard => 14
+        Keyword.Else => 15
+        Keyword.Ensures => 16
+        Keyword.Enum => 17
+        Keyword.Expect => 18
+        Keyword.Fail => 19
+        Keyword.Fails => 20
+        Keyword.False => 21
+        Keyword.First => 22
+        Keyword.Fn => 23
+        Keyword.For => 24
+        Keyword.Foreign => 25
+        Keyword.If => 26
+        Keyword.Impl => 27
+        Keyword.In => 28
+        Keyword.Interface => 29
+        Keyword.Interrupt => 30
+        Keyword.Invariant => 31
+        Keyword.Landing => 32
+        Keyword.Layout => 33
+        Keyword.Let => 34
+        Keyword.Limits => 35
+        Keyword.Linear => 36
+        Keyword.Loop => 37
+        Keyword.Match => 38
+        Keyword.Mut => 39
+        Keyword.Not => 40
+        Keyword.Or => 41
+        Keyword.Package => 42
+        Keyword.Pkg => 43
+        Keyword.Proj => 44
+        Keyword.Pub => 45
+        Keyword.Registers => 46
+        Keyword.Registry => 47
+        Keyword.Requires => 48
+        Keyword.Retired => 49
+        Keyword.Return => 50
+        Keyword.SelfValue => 51
+        Keyword.Struct => 52
+        Keyword.Take => 53
+        Keyword.Test => 54
+        Keyword.Todo => 55
+        Keyword.True => 56
+        Keyword.Trusted => 57
+        Keyword.Try => 58
+        Keyword.Undefer => 59
+        Keyword.Uses => 60
+        Keyword.Validator => 61
+        Keyword.Var => 62
+        Keyword.Waive => 63
+        Keyword.When => 64
+        Keyword.Where => 65
+        Keyword.While => 66
+    }
+} Keyword.index
+
+fn Keyword.from_index(index: usize) -> Option[Keyword] {
+    return match index {
+        0 => Some(Keyword.Underscore)
+        1 => Some(Keyword.And)
+        2 => Some(Keyword.Assert)
+        3 => Some(Keyword.Assume)
+        4 => Some(Keyword.Attempt)
+        5 => Some(Keyword.Await)
+        6 => Some(Keyword.Break)
+        7 => Some(Keyword.Const)
+        8 => Some(Keyword.Continue)
+        9 => Some(Keyword.Contribute)
+        10 => Some(Keyword.Dbg)
+        11 => Some(Keyword.Decreases)
+        12 => Some(Keyword.Defer)
+        13 => Some(Keyword.Derives)
+        14 => Some(Keyword.Discard)
+        15 => Some(Keyword.Else)
+        16 => Some(Keyword.Ensures)
+        17 => Some(Keyword.Enum)
+        18 => Some(Keyword.Expect)
+        19 => Some(Keyword.Fail)
+        20 => Some(Keyword.Fails)
+        21 => Some(Keyword.False)
+        22 => Some(Keyword.First)
+        23 => Some(Keyword.Fn)
+        24 => Some(Keyword.For)
+        25 => Some(Keyword.Foreign)
+        26 => Some(Keyword.If)
+        27 => Some(Keyword.Impl)
+        28 => Some(Keyword.In)
+        29 => Some(Keyword.Interface)
+        30 => Some(Keyword.Interrupt)
+        31 => Some(Keyword.Invariant)
+        32 => Some(Keyword.Landing)
+        33 => Some(Keyword.Layout)
+        34 => Some(Keyword.Let)
+        35 => Some(Keyword.Limits)
+        36 => Some(Keyword.Linear)
+        37 => Some(Keyword.Loop)
+        38 => Some(Keyword.Match)
+        39 => Some(Keyword.Mut)
+        40 => Some(Keyword.Not)
+        41 => Some(Keyword.Or)
+        42 => Some(Keyword.Package)
+        43 => Some(Keyword.Pkg)
+        44 => Some(Keyword.Proj)
+        45 => Some(Keyword.Pub)
+        46 => Some(Keyword.Registers)
+        47 => Some(Keyword.Registry)
+        48 => Some(Keyword.Requires)
+        49 => Some(Keyword.Retired)
+        50 => Some(Keyword.Return)
+        51 => Some(Keyword.SelfValue)
+        52 => Some(Keyword.Struct)
+        53 => Some(Keyword.Take)
+        54 => Some(Keyword.Test)
+        55 => Some(Keyword.Todo)
+        56 => Some(Keyword.True)
+        57 => Some(Keyword.Trusted)
+        58 => Some(Keyword.Try)
+        59 => Some(Keyword.Undefer)
+        60 => Some(Keyword.Uses)
+        61 => Some(Keyword.Validator)
+        62 => Some(Keyword.Var)
+        63 => Some(Keyword.Waive)
+        64 => Some(Keyword.When)
+        65 => Some(Keyword.Where)
+        66 => Some(Keyword.While)
+        else => None
+    }
+} Keyword.from_index
+
+/// The punctuation and operator tokens, in the order the grammar lists them.
+pkg enum Punct derives Copy, Eq {
+    LParen
+    RParen
+    LBracket
+    RBracket
+    LBrace
+    RBrace
+    Comma
+    Colon
+    ColonColon
+    Dot
+    Arrow
+    FatArrow
+    Eq
+    PlusEq
+    MinusEq
+    StarEq
+    SlashEq
+    PercentEq
+    AmpEq
+    PipeEq
+    CaretEq
+    ShlEq
+    ShrEq
+    Plus
+    Minus
+    Star
+    Slash
+    Percent
+    Amp
+    Pipe
+    Caret
+    Tilde
+    Shl
+    Shr
+    EqEq
+    NotEq
+    Lt
+    Le
+    Gt
+    Ge
+    DotDotLt
+    DotDotEq
+} Punct
+
+/// The token as source spells it.
+pkg proj fn Punct.spelling(self) -> Str {
+    return match self {
+        Punct.LParen => "("
+        Punct.RParen => ")"
+        Punct.LBracket => "["
+        Punct.RBracket => "]"
+        Punct.LBrace => "{"
+        Punct.RBrace => "}"
+        Punct.Comma => ","
+        Punct.Colon => ":"
+        Punct.ColonColon => "::"
+        Punct.Dot => "."
+        Punct.Arrow => "->"
+        Punct.FatArrow => "=>"
+        Punct.Eq => "="
+        Punct.PlusEq => "+="
+        Punct.MinusEq => "-="
+        Punct.StarEq => "*="
+        Punct.SlashEq => "/="
+        Punct.PercentEq => "%="
+        Punct.AmpEq => "&="
+        Punct.PipeEq => "|="
+        Punct.CaretEq => "^="
+        Punct.ShlEq => "<<="
+        Punct.ShrEq => ">>="
+        Punct.Plus => "+"
+        Punct.Minus => "-"
+        Punct.Star => "*"
+        Punct.Slash => "/"
+        Punct.Percent => "%"
+        Punct.Amp => "&"
+        Punct.Pipe => "|"
+        Punct.Caret => "^"
+        Punct.Tilde => "~"
+        Punct.Shl => "<<"
+        Punct.Shr => ">>"
+        Punct.EqEq => "=="
+        Punct.NotEq => "!="
+        Punct.Lt => "<"
+        Punct.Le => "<="
+        Punct.Gt => ">"
+        Punct.Ge => ">="
+        Punct.DotDotLt => "..<"
+        Punct.DotDotEq => "..="
+    }
+} Punct.spelling
+
+/// The position of the token in the order the grammar lists them.
+fn Punct.index(self) -> usize {
+    return match self {
+        Punct.LParen => 0
+        Punct.RParen => 1
+        Punct.LBracket => 2
+        Punct.RBracket => 3
+        Punct.LBrace => 4
+        Punct.RBrace => 5
+        Punct.Comma => 6
+        Punct.Colon => 7
+        Punct.ColonColon => 8
+        Punct.Dot => 9
+        Punct.Arrow => 10
+        Punct.FatArrow => 11
+        Punct.Eq => 12
+        Punct.PlusEq => 13
+        Punct.MinusEq => 14
+        Punct.StarEq => 15
+        Punct.SlashEq => 16
+        Punct.PercentEq => 17
+        Punct.AmpEq => 18
+        Punct.PipeEq => 19
+        Punct.CaretEq => 20
+        Punct.ShlEq => 21
+        Punct.ShrEq => 22
+        Punct.Plus => 23
+        Punct.Minus => 24
+        Punct.Star => 25
+        Punct.Slash => 26
+        Punct.Percent => 27
+        Punct.Amp => 28
+        Punct.Pipe => 29
+        Punct.Caret => 30
+        Punct.Tilde => 31
+        Punct.Shl => 32
+        Punct.Shr => 33
+        Punct.EqEq => 34
+        Punct.NotEq => 35
+        Punct.Lt => 36
+        Punct.Le => 37
+        Punct.Gt => 38
+        Punct.Ge => 39
+        Punct.DotDotLt => 40
+        Punct.DotDotEq => 41
+    }
+} Punct.index
+
+fn Punct.from_index(index: usize) -> Option[Punct] {
+    return match index {
+        0 => Some(Punct.LParen)
+        1 => Some(Punct.RParen)
+        2 => Some(Punct.LBracket)
+        3 => Some(Punct.RBracket)
+        4 => Some(Punct.LBrace)
+        5 => Some(Punct.RBrace)
+        6 => Some(Punct.Comma)
+        7 => Some(Punct.Colon)
+        8 => Some(Punct.ColonColon)
+        9 => Some(Punct.Dot)
+        10 => Some(Punct.Arrow)
+        11 => Some(Punct.FatArrow)
+        12 => Some(Punct.Eq)
+        13 => Some(Punct.PlusEq)
+        14 => Some(Punct.MinusEq)
+        15 => Some(Punct.StarEq)
+        16 => Some(Punct.SlashEq)
+        17 => Some(Punct.PercentEq)
+        18 => Some(Punct.AmpEq)
+        19 => Some(Punct.PipeEq)
+        20 => Some(Punct.CaretEq)
+        21 => Some(Punct.ShlEq)
+        22 => Some(Punct.ShrEq)
+        23 => Some(Punct.Plus)
+        24 => Some(Punct.Minus)
+        25 => Some(Punct.Star)
+        26 => Some(Punct.Slash)
+        27 => Some(Punct.Percent)
+        28 => Some(Punct.Amp)
+        29 => Some(Punct.Pipe)
+        30 => Some(Punct.Caret)
+        31 => Some(Punct.Tilde)
+        32 => Some(Punct.Shl)
+        33 => Some(Punct.Shr)
+        34 => Some(Punct.EqEq)
+        35 => Some(Punct.NotEq)
+        36 => Some(Punct.Lt)
+        37 => Some(Punct.Le)
+        38 => Some(Punct.Gt)
+        39 => Some(Punct.Ge)
+        40 => Some(Punct.DotDotLt)
+        41 => Some(Punct.DotDotEq)
+        else => None
+    }
+} Punct.from_index
+
+/// The foreign spellings, which are tokens no syntactic rule accepts, in the order the grammar lists them.
+pkg enum Foreign derives Copy, Eq {
+    AmpAmp
+    PipePipe
+    Bang
+    Question
+    Semi
+    DotDot
+    MinusMinus
+} Foreign
+
+/// The token as source spells it.
+pkg proj fn Foreign.spelling(self) -> Str {
+    return match self {
+        Foreign.AmpAmp => "&&"
+        Foreign.PipePipe => "||"
+        Foreign.Bang => "!"
+        Foreign.Question => "?"
+        Foreign.Semi => ";"
+        Foreign.DotDot => ".."
+        Foreign.MinusMinus => "--"
+    }
+} Foreign.spelling
+
+/// The position of the spelling in the order the grammar lists them.
+fn Foreign.index(self) -> usize {
+    return match self {
+        Foreign.AmpAmp => 0
+        Foreign.PipePipe => 1
+        Foreign.Bang => 2
+        Foreign.Question => 3
+        Foreign.Semi => 4
+        Foreign.DotDot => 5
+        Foreign.MinusMinus => 6
+    }
+} Foreign.index
+
+fn Foreign.from_index(index: usize) -> Option[Foreign] {
+    return match index {
+        0 => Some(Foreign.AmpAmp)
+        1 => Some(Foreign.PipePipe)
+        2 => Some(Foreign.Bang)
+        3 => Some(Foreign.Question)
+        4 => Some(Foreign.Semi)
+        5 => Some(Foreign.DotDot)
+        6 => Some(Foreign.MinusMinus)
+        else => None
+    }
+} Foreign.from_index
+
+/// The context words syntactic rules name, in byte order.
+pkg enum ContextWord derives Copy, Eq {
+    All
+    Allow
+    Any
+    As
+    At
+    Bank
+    Be
+    Because
+    Bit
+    By
+    Bytes
+    Changes
+    Closed
+    Convention
+    Deny
+    Dep
+    Depth
+    Device
+    Entry
+    Example
+    Flexible
+    From
+    Ipc
+    Keyed
+    Language
+    Le
+    Length
+    Machine
+    Manual
+    Migrate
+    Noalloc
+    Notrap
+    Open
+    Preserves
+    Priv
+    Protocol
+    Pure
+    Read
+    Rest
+    Stable
+    Stack
+    Stride
+    Tags
+    Targets
+    Task
+    Terminates
+    Unique
+    Validate
+    View
+    Wait
+    Write
+    WriteOneClear
+} ContextWord
+
+/// The word as source spells it.
+pkg proj fn ContextWord.spelling(self) -> Str {
+    return match self {
+        ContextWord.All => "all"
+        ContextWord.Allow => "allow"
+        ContextWord.Any => "any"
+        ContextWord.As => "as"
+        ContextWord.At => "at"
+        ContextWord.Bank => "bank"
+        ContextWord.Be => "be"
+        ContextWord.Because => "because"
+        ContextWord.Bit => "bit"
+        ContextWord.By => "by"
+        ContextWord.Bytes => "bytes"
+        ContextWord.Changes => "changes"
+        ContextWord.Closed => "closed"
+        ContextWord.Convention => "convention"
+        ContextWord.Deny => "deny"
+        ContextWord.Dep => "dep"
+        ContextWord.Depth => "depth"
+        ContextWord.Device => "device"
+        ContextWord.Entry => "entry"
+        ContextWord.Example => "example"
+        ContextWord.Flexible => "flexible"
+        ContextWord.From => "from"
+        ContextWord.Ipc => "ipc"
+        ContextWord.Keyed => "keyed"
+        ContextWord.Language => "language"
+        ContextWord.Le => "le"
+        ContextWord.Length => "length"
+        ContextWord.Machine => "machine"
+        ContextWord.Manual => "manual"
+        ContextWord.Migrate => "migrate"
+        ContextWord.Noalloc => "noalloc"
+        ContextWord.Notrap => "notrap"
+        ContextWord.Open => "open"
+        ContextWord.Preserves => "preserves"
+        ContextWord.Priv => "priv"
+        ContextWord.Protocol => "protocol"
+        ContextWord.Pure => "pure"
+        ContextWord.Read => "read"
+        ContextWord.Rest => "rest"
+        ContextWord.Stable => "stable"
+        ContextWord.Stack => "stack"
+        ContextWord.Stride => "stride"
+        ContextWord.Tags => "tags"
+        ContextWord.Targets => "targets"
+        ContextWord.Task => "task"
+        ContextWord.Terminates => "terminates"
+        ContextWord.Unique => "unique"
+        ContextWord.Validate => "validate"
+        ContextWord.View => "view"
+        ContextWord.Wait => "wait"
+        ContextWord.Write => "write"
+        ContextWord.WriteOneClear => "write_one_clear"
+    }
+} ContextWord.spelling
+
+/// The context word spelt by the bytes, if any.
+pkg fn ContextWord.from_spelling(text: Slice[u8]) -> Option[ContextWord] {
+    return match text {
+        b"all" => Some(ContextWord.All)
+        b"allow" => Some(ContextWord.Allow)
+        b"any" => Some(ContextWord.Any)
+        b"as" => Some(ContextWord.As)
+        b"at" => Some(ContextWord.At)
+        b"bank" => Some(ContextWord.Bank)
+        b"be" => Some(ContextWord.Be)
+        b"because" => Some(ContextWord.Because)
+        b"bit" => Some(ContextWord.Bit)
+        b"by" => Some(ContextWord.By)
+        b"bytes" => Some(ContextWord.Bytes)
+        b"changes" => Some(ContextWord.Changes)
+        b"closed" => Some(ContextWord.Closed)
+        b"convention" => Some(ContextWord.Convention)
+        b"deny" => Some(ContextWord.Deny)
+        b"dep" => Some(ContextWord.Dep)
+        b"depth" => Some(ContextWord.Depth)
+        b"device" => Some(ContextWord.Device)
+        b"entry" => Some(ContextWord.Entry)
+        b"example" => Some(ContextWord.Example)
+        b"flexible" => Some(ContextWord.Flexible)
+        b"from" => Some(ContextWord.From)
+        b"ipc" => Some(ContextWord.Ipc)
+        b"keyed" => Some(ContextWord.Keyed)
+        b"language" => Some(ContextWord.Language)
+        b"le" => Some(ContextWord.Le)
+        b"length" => Some(ContextWord.Length)
+        b"machine" => Some(ContextWord.Machine)
+        b"manual" => Some(ContextWord.Manual)
+        b"migrate" => Some(ContextWord.Migrate)
+        b"noalloc" => Some(ContextWord.Noalloc)
+        b"notrap" => Some(ContextWord.Notrap)
+        b"open" => Some(ContextWord.Open)
+        b"preserves" => Some(ContextWord.Preserves)
+        b"priv" => Some(ContextWord.Priv)
+        b"protocol" => Some(ContextWord.Protocol)
+        b"pure" => Some(ContextWord.Pure)
+        b"read" => Some(ContextWord.Read)
+        b"rest" => Some(ContextWord.Rest)
+        b"stable" => Some(ContextWord.Stable)
+        b"stack" => Some(ContextWord.Stack)
+        b"stride" => Some(ContextWord.Stride)
+        b"tags" => Some(ContextWord.Tags)
+        b"targets" => Some(ContextWord.Targets)
+        b"task" => Some(ContextWord.Task)
+        b"terminates" => Some(ContextWord.Terminates)
+        b"unique" => Some(ContextWord.Unique)
+        b"validate" => Some(ContextWord.Validate)
+        b"view" => Some(ContextWord.View)
+        b"wait" => Some(ContextWord.Wait)
+        b"write" => Some(ContextWord.Write)
+        b"write_one_clear" => Some(ContextWord.WriteOneClear)
+        else => None
+    }
+} ContextWord.from_spelling
+
+/// The position of the word in byte order.
+fn ContextWord.index(self) -> usize {
+    return match self {
+        ContextWord.All => 0
+        ContextWord.Allow => 1
+        ContextWord.Any => 2
+        ContextWord.As => 3
+        ContextWord.At => 4
+        ContextWord.Bank => 5
+        ContextWord.Be => 6
+        ContextWord.Because => 7
+        ContextWord.Bit => 8
+        ContextWord.By => 9
+        ContextWord.Bytes => 10
+        ContextWord.Changes => 11
+        ContextWord.Closed => 12
+        ContextWord.Convention => 13
+        ContextWord.Deny => 14
+        ContextWord.Dep => 15
+        ContextWord.Depth => 16
+        ContextWord.Device => 17
+        ContextWord.Entry => 18
+        ContextWord.Example => 19
+        ContextWord.Flexible => 20
+        ContextWord.From => 21
+        ContextWord.Ipc => 22
+        ContextWord.Keyed => 23
+        ContextWord.Language => 24
+        ContextWord.Le => 25
+        ContextWord.Length => 26
+        ContextWord.Machine => 27
+        ContextWord.Manual => 28
+        ContextWord.Migrate => 29
+        ContextWord.Noalloc => 30
+        ContextWord.Notrap => 31
+        ContextWord.Open => 32
+        ContextWord.Preserves => 33
+        ContextWord.Priv => 34
+        ContextWord.Protocol => 35
+        ContextWord.Pure => 36
+        ContextWord.Read => 37
+        ContextWord.Rest => 38
+        ContextWord.Stable => 39
+        ContextWord.Stack => 40
+        ContextWord.Stride => 41
+        ContextWord.Tags => 42
+        ContextWord.Targets => 43
+        ContextWord.Task => 44
+        ContextWord.Terminates => 45
+        ContextWord.Unique => 46
+        ContextWord.Validate => 47
+        ContextWord.View => 48
+        ContextWord.Wait => 49
+        ContextWord.Write => 50
+        ContextWord.WriteOneClear => 51
+    }
+} ContextWord.index
+
+fn ContextWord.from_index(index: usize) -> Option[ContextWord] {
+    return match index {
+        0 => Some(ContextWord.All)
+        1 => Some(ContextWord.Allow)
+        2 => Some(ContextWord.Any)
+        3 => Some(ContextWord.As)
+        4 => Some(ContextWord.At)
+        5 => Some(ContextWord.Bank)
+        6 => Some(ContextWord.Be)
+        7 => Some(ContextWord.Because)
+        8 => Some(ContextWord.Bit)
+        9 => Some(ContextWord.By)
+        10 => Some(ContextWord.Bytes)
+        11 => Some(ContextWord.Changes)
+        12 => Some(ContextWord.Closed)
+        13 => Some(ContextWord.Convention)
+        14 => Some(ContextWord.Deny)
+        15 => Some(ContextWord.Dep)
+        16 => Some(ContextWord.Depth)
+        17 => Some(ContextWord.Device)
+        18 => Some(ContextWord.Entry)
+        19 => Some(ContextWord.Example)
+        20 => Some(ContextWord.Flexible)
+        21 => Some(ContextWord.From)
+        22 => Some(ContextWord.Ipc)
+        23 => Some(ContextWord.Keyed)
+        24 => Some(ContextWord.Language)
+        25 => Some(ContextWord.Le)
+        26 => Some(ContextWord.Length)
+        27 => Some(ContextWord.Machine)
+        28 => Some(ContextWord.Manual)
+        29 => Some(ContextWord.Migrate)
+        30 => Some(ContextWord.Noalloc)
+        31 => Some(ContextWord.Notrap)
+        32 => Some(ContextWord.Open)
+        33 => Some(ContextWord.Preserves)
+        34 => Some(ContextWord.Priv)
+        35 => Some(ContextWord.Protocol)
+        36 => Some(ContextWord.Pure)
+        37 => Some(ContextWord.Read)
+        38 => Some(ContextWord.Rest)
+        39 => Some(ContextWord.Stable)
+        40 => Some(ContextWord.Stack)
+        41 => Some(ContextWord.Stride)
+        42 => Some(ContextWord.Tags)
+        43 => Some(ContextWord.Targets)
+        44 => Some(ContextWord.Task)
+        45 => Some(ContextWord.Terminates)
+        46 => Some(ContextWord.Unique)
+        47 => Some(ContextWord.Validate)
+        48 => Some(ContextWord.View)
+        49 => Some(ContextWord.Wait)
+        50 => Some(ContextWord.Write)
+        51 => Some(ContextWord.WriteOneClear)
+        else => None
+    }
+} ContextWord.from_index
+
+/// The syntactic rules reachable from the start rule `item`, in order of first reach.
+pkg enum Rule derives Copy, Eq {
+    Item
+    ItemStart
+    Visibility
+    ItemModifier
+    TypeModifier
+    FnModifier
+    ReservedHeadWord
+    ItemKind
+    FnItem
+    FnHead
+    ItemLabel
+    GenericParams
+    GenericParam
+    Bound
+    Path
+    GenericArgs
+    GenericArg
+    TypeExpr
+    FnType
+    FnKind
+    FnTypeHead
+    FnTypeParamList
+    FnTypeParam
+    Mode
+    FnResult
+    FailsClause
+    UsesClause
+    LimitsClause
+    Limit
+    ConventionClause
+    WhereClause
+    Expr
+    JumpExpr
+    FailExpr
+    OperatorExpr
+    Negation
+    Operand
+    PrefixExpr
+    MarkedExpr
+    FailureMarker
+    AfterFailureMarker
+    AfterAwait
+    WhenExpr
+    WhenAccess
+    WhenPlace
+    PlaceRoot
+    WhenBody
+    Block
+    Stmt
+    LetStmt
+    Pattern
+    LiteralPattern
+    PatternLiteral
+    RangeTail
+    RangeBound
+    NamedPattern
+    FieldPatternList
+    FieldPattern
+    VarStmt
+    DiscardStmt
+    WhileStmt
+    LoopBlock
+    LoopInvariant
+    ForStmt
+    LoopStmt
+    DeferStmt
+    CallExpr
+    PostfixExpr
+    PrimaryExpr
+    Literal
+    PathExpr
+    QuantifierExpr
+    IfExpr
+    MatchExpr
+    MatchArm
+    ArmBody
+    ClosureExpr
+    CaptureList
+    Capture
+    ClosureBody
+    TrustedExpr
+    TrustedBody
+    AssignOperator
+    TrustedLeadStmt
+    UndeferStmt
+    Place
+    PlaceStep
+    ExpectStmt
+    AssumeStmt
+    TodoExpr
+    DbgExpr
+    PostfixSuffix
+    ArgList
+    Arg
+    ExprStmt
+    AfterMode
+    Marker
+    ValueOperator
+    CompareOperator
+    MultiplicativeOperator
+    AdditiveOperator
+    BitwiseOperator
+    ShiftOperator
+    RangeOperator
+    LogicTail
+    LogicOperand
+    RelationTail
+    ArithmeticTail
+    Term
+    CompareTail
+    Comparand
+    MixedOperator
+    OperatorTail
+    BitwiseTail
+    OtherOperator
+    BinaryOperator
+    ParamList
+    Param
+    SelfFieldSet
+    FnEnd
+    FnBody
+    ClauseRegion
+    ClauseLine
+    RequiresClause
+    EnsuresClause
+    ExampleClause
+    DecreasesClause
+    TodoClause
+    WaiveClause
+    StructItem
+    DerivesClause
+    StructMember
+    Field
+    InvariantLine
+    EnumItem
+    EnumMember
+    Variant
+    VariantPayload
+    PayloadList
+    PayloadField
+    InterfaceItem
+    InterfaceMember
+    MethodEnd
+    MethodBody
+    ImplItem
+    ImplParams
+    ImplParam
+    LayoutItem
+    LayoutRepr
+    LayoutOrder
+    TagLine
+    LayoutMember
+    LayoutField
+    RegistersItem
+    RegisterMember
+    RegisterLine
+    RegisterTail
+    RegisterAccess
+    ConstItem
+    ConstAssertItem
+    RegistryItem
+    UniqueList
+    ContributeItem
+    TestItem
+    TestTarget
+    TestParams
+    RetiredItem
+    RetiredOld
+    RetiredHead
+    RetiredNew
+    RetiredClass
+    PackageItem
+    Directive
+    LanguageDirective
+    TargetsDirective
+    TargetList
+    Target
+    EntryDirective
+    DepDirective
+    AllowDirective
+    Authority
+    NameList
+    DenyDirective
+} Rule
+
+/// The rule's name in the grammar.
+pkg proj fn Rule.name(self) -> Str
+    waive length "one arm per rule"
+{
+    return match self {
+        Rule.Item => "item"
+        Rule.ItemStart => "item_start"
+        Rule.Visibility => "visibility"
+        Rule.ItemModifier => "item_modifier"
+        Rule.TypeModifier => "type_modifier"
+        Rule.FnModifier => "fn_modifier"
+        Rule.ReservedHeadWord => "reserved_head_word"
+        Rule.ItemKind => "item_kind"
+        Rule.FnItem => "fn_item"
+        Rule.FnHead => "fn_head"
+        Rule.ItemLabel => "item_label"
+        Rule.GenericParams => "generic_params"
+        Rule.GenericParam => "generic_param"
+        Rule.Bound => "bound"
+        Rule.Path => "path"
+        Rule.GenericArgs => "generic_args"
+        Rule.GenericArg => "generic_arg"
+        Rule.TypeExpr => "type_expr"
+        Rule.FnType => "fn_type"
+        Rule.FnKind => "fn_kind"
+        Rule.FnTypeHead => "fn_type_head"
+        Rule.FnTypeParamList => "fn_type_param_list"
+        Rule.FnTypeParam => "fn_type_param"
+        Rule.Mode => "mode"
+        Rule.FnResult => "fn_result"
+        Rule.FailsClause => "fails_clause"
+        Rule.UsesClause => "uses_clause"
+        Rule.LimitsClause => "limits_clause"
+        Rule.Limit => "limit"
+        Rule.ConventionClause => "convention_clause"
+        Rule.WhereClause => "where_clause"
+        Rule.Expr => "expr"
+        Rule.JumpExpr => "jump_expr"
+        Rule.FailExpr => "fail_expr"
+        Rule.OperatorExpr => "operator_expr"
+        Rule.Negation => "negation"
+        Rule.Operand => "operand"
+        Rule.PrefixExpr => "prefix_expr"
+        Rule.MarkedExpr => "marked_expr"
+        Rule.FailureMarker => "failure_marker"
+        Rule.AfterFailureMarker => "after_failure_marker"
+        Rule.AfterAwait => "after_await"
+        Rule.WhenExpr => "when_expr"
+        Rule.WhenAccess => "when_access"
+        Rule.WhenPlace => "when_place"
+        Rule.PlaceRoot => "place_root"
+        Rule.WhenBody => "when_body"
+        Rule.Block => "block"
+        Rule.Stmt => "stmt"
+        Rule.LetStmt => "let_stmt"
+        Rule.Pattern => "pattern"
+        Rule.LiteralPattern => "literal_pattern"
+        Rule.PatternLiteral => "pattern_literal"
+        Rule.RangeTail => "range_tail"
+        Rule.RangeBound => "range_bound"
+        Rule.NamedPattern => "named_pattern"
+        Rule.FieldPatternList => "field_pattern_list"
+        Rule.FieldPattern => "field_pattern"
+        Rule.VarStmt => "var_stmt"
+        Rule.DiscardStmt => "discard_stmt"
+        Rule.WhileStmt => "while_stmt"
+        Rule.LoopBlock => "loop_block"
+        Rule.LoopInvariant => "loop_invariant"
+        Rule.ForStmt => "for_stmt"
+        Rule.LoopStmt => "loop_stmt"
+        Rule.DeferStmt => "defer_stmt"
+        Rule.CallExpr => "call_expr"
+        Rule.PostfixExpr => "postfix_expr"
+        Rule.PrimaryExpr => "primary_expr"
+        Rule.Literal => "literal"
+        Rule.PathExpr => "path_expr"
+        Rule.QuantifierExpr => "quantifier_expr"
+        Rule.IfExpr => "if_expr"
+        Rule.MatchExpr => "match_expr"
+        Rule.MatchArm => "match_arm"
+        Rule.ArmBody => "arm_body"
+        Rule.ClosureExpr => "closure_expr"
+        Rule.CaptureList => "capture_list"
+        Rule.Capture => "capture"
+        Rule.ClosureBody => "closure_body"
+        Rule.TrustedExpr => "trusted_expr"
+        Rule.TrustedBody => "trusted_body"
+        Rule.AssignOperator => "assign_operator"
+        Rule.TrustedLeadStmt => "trusted_lead_stmt"
+        Rule.UndeferStmt => "undefer_stmt"
+        Rule.Place => "place"
+        Rule.PlaceStep => "place_step"
+        Rule.ExpectStmt => "expect_stmt"
+        Rule.AssumeStmt => "assume_stmt"
+        Rule.TodoExpr => "todo_expr"
+        Rule.DbgExpr => "dbg_expr"
+        Rule.PostfixSuffix => "postfix_suffix"
+        Rule.ArgList => "arg_list"
+        Rule.Arg => "arg"
+        Rule.ExprStmt => "expr_stmt"
+        Rule.AfterMode => "after_mode"
+        Rule.Marker => "marker"
+        Rule.ValueOperator => "value_operator"
+        Rule.CompareOperator => "compare_operator"
+        Rule.MultiplicativeOperator => "multiplicative_operator"
+        Rule.AdditiveOperator => "additive_operator"
+        Rule.BitwiseOperator => "bitwise_operator"
+        Rule.ShiftOperator => "shift_operator"
+        Rule.RangeOperator => "range_operator"
+        Rule.LogicTail => "logic_tail"
+        Rule.LogicOperand => "logic_operand"
+        Rule.RelationTail => "relation_tail"
+        Rule.ArithmeticTail => "arithmetic_tail"
+        Rule.Term => "term"
+        Rule.CompareTail => "compare_tail"
+        Rule.Comparand => "comparand"
+        Rule.MixedOperator => "mixed_operator"
+        Rule.OperatorTail => "operator_tail"
+        Rule.BitwiseTail => "bitwise_tail"
+        Rule.OtherOperator => "other_operator"
+        Rule.BinaryOperator => "binary_operator"
+        Rule.ParamList => "param_list"
+        Rule.Param => "param"
+        Rule.SelfFieldSet => "self_field_set"
+        Rule.FnEnd => "fn_end"
+        Rule.FnBody => "fn_body"
+        Rule.ClauseRegion => "clause_region"
+        Rule.ClauseLine => "clause_line"
+        Rule.RequiresClause => "requires_clause"
+        Rule.EnsuresClause => "ensures_clause"
+        Rule.ExampleClause => "example_clause"
+        Rule.DecreasesClause => "decreases_clause"
+        Rule.TodoClause => "todo_clause"
+        Rule.WaiveClause => "waive_clause"
+        Rule.StructItem => "struct_item"
+        Rule.DerivesClause => "derives_clause"
+        Rule.StructMember => "struct_member"
+        Rule.Field => "field"
+        Rule.InvariantLine => "invariant_line"
+        Rule.EnumItem => "enum_item"
+        Rule.EnumMember => "enum_member"
+        Rule.Variant => "variant"
+        Rule.VariantPayload => "variant_payload"
+        Rule.PayloadList => "payload_list"
+        Rule.PayloadField => "payload_field"
+        Rule.InterfaceItem => "interface_item"
+        Rule.InterfaceMember => "interface_member"
+        Rule.MethodEnd => "method_end"
+        Rule.MethodBody => "method_body"
+        Rule.ImplItem => "impl_item"
+        Rule.ImplParams => "impl_params"
+        Rule.ImplParam => "impl_param"
+        Rule.LayoutItem => "layout_item"
+        Rule.LayoutRepr => "layout_repr"
+        Rule.LayoutOrder => "layout_order"
+        Rule.TagLine => "tag_line"
+        Rule.LayoutMember => "layout_member"
+        Rule.LayoutField => "layout_field"
+        Rule.RegistersItem => "registers_item"
+        Rule.RegisterMember => "register_member"
+        Rule.RegisterLine => "register_line"
+        Rule.RegisterTail => "register_tail"
+        Rule.RegisterAccess => "register_access"
+        Rule.ConstItem => "const_item"
+        Rule.ConstAssertItem => "const_assert_item"
+        Rule.RegistryItem => "registry_item"
+        Rule.UniqueList => "unique_list"
+        Rule.ContributeItem => "contribute_item"
+        Rule.TestItem => "test_item"
+        Rule.TestTarget => "test_target"
+        Rule.TestParams => "test_params"
+        Rule.RetiredItem => "retired_item"
+        Rule.RetiredOld => "retired_old"
+        Rule.RetiredHead => "retired_head"
+        Rule.RetiredNew => "retired_new"
+        Rule.RetiredClass => "retired_class"
+        Rule.PackageItem => "package_item"
+        Rule.Directive => "directive"
+        Rule.LanguageDirective => "language_directive"
+        Rule.TargetsDirective => "targets_directive"
+        Rule.TargetList => "target_list"
+        Rule.Target => "target"
+        Rule.EntryDirective => "entry_directive"
+        Rule.DepDirective => "dep_directive"
+        Rule.AllowDirective => "allow_directive"
+        Rule.Authority => "authority"
+        Rule.NameList => "name_list"
+        Rule.DenyDirective => "deny_directive"
+    }
+} Rule.name
+
+/// The position of the rule in order of first reach.
+fn Rule.index(self) -> usize
+    waive length "one arm per rule"
+{
+    return match self {
+        Rule.Item => 0
+        Rule.ItemStart => 1
+        Rule.Visibility => 2
+        Rule.ItemModifier => 3
+        Rule.TypeModifier => 4
+        Rule.FnModifier => 5
+        Rule.ReservedHeadWord => 6
+        Rule.ItemKind => 7
+        Rule.FnItem => 8
+        Rule.FnHead => 9
+        Rule.ItemLabel => 10
+        Rule.GenericParams => 11
+        Rule.GenericParam => 12
+        Rule.Bound => 13
+        Rule.Path => 14
+        Rule.GenericArgs => 15
+        Rule.GenericArg => 16
+        Rule.TypeExpr => 17
+        Rule.FnType => 18
+        Rule.FnKind => 19
+        Rule.FnTypeHead => 20
+        Rule.FnTypeParamList => 21
+        Rule.FnTypeParam => 22
+        Rule.Mode => 23
+        Rule.FnResult => 24
+        Rule.FailsClause => 25
+        Rule.UsesClause => 26
+        Rule.LimitsClause => 27
+        Rule.Limit => 28
+        Rule.ConventionClause => 29
+        Rule.WhereClause => 30
+        Rule.Expr => 31
+        Rule.JumpExpr => 32
+        Rule.FailExpr => 33
+        Rule.OperatorExpr => 34
+        Rule.Negation => 35
+        Rule.Operand => 36
+        Rule.PrefixExpr => 37
+        Rule.MarkedExpr => 38
+        Rule.FailureMarker => 39
+        Rule.AfterFailureMarker => 40
+        Rule.AfterAwait => 41
+        Rule.WhenExpr => 42
+        Rule.WhenAccess => 43
+        Rule.WhenPlace => 44
+        Rule.PlaceRoot => 45
+        Rule.WhenBody => 46
+        Rule.Block => 47
+        Rule.Stmt => 48
+        Rule.LetStmt => 49
+        Rule.Pattern => 50
+        Rule.LiteralPattern => 51
+        Rule.PatternLiteral => 52
+        Rule.RangeTail => 53
+        Rule.RangeBound => 54
+        Rule.NamedPattern => 55
+        Rule.FieldPatternList => 56
+        Rule.FieldPattern => 57
+        Rule.VarStmt => 58
+        Rule.DiscardStmt => 59
+        Rule.WhileStmt => 60
+        Rule.LoopBlock => 61
+        Rule.LoopInvariant => 62
+        Rule.ForStmt => 63
+        Rule.LoopStmt => 64
+        Rule.DeferStmt => 65
+        Rule.CallExpr => 66
+        Rule.PostfixExpr => 67
+        Rule.PrimaryExpr => 68
+        Rule.Literal => 69
+        Rule.PathExpr => 70
+        Rule.QuantifierExpr => 71
+        Rule.IfExpr => 72
+        Rule.MatchExpr => 73
+        Rule.MatchArm => 74
+        Rule.ArmBody => 75
+        Rule.ClosureExpr => 76
+        Rule.CaptureList => 77
+        Rule.Capture => 78
+        Rule.ClosureBody => 79
+        Rule.TrustedExpr => 80
+        Rule.TrustedBody => 81
+        Rule.AssignOperator => 82
+        Rule.TrustedLeadStmt => 83
+        Rule.UndeferStmt => 84
+        Rule.Place => 85
+        Rule.PlaceStep => 86
+        Rule.ExpectStmt => 87
+        Rule.AssumeStmt => 88
+        Rule.TodoExpr => 89
+        Rule.DbgExpr => 90
+        Rule.PostfixSuffix => 91
+        Rule.ArgList => 92
+        Rule.Arg => 93
+        Rule.ExprStmt => 94
+        Rule.AfterMode => 95
+        Rule.Marker => 96
+        Rule.ValueOperator => 97
+        Rule.CompareOperator => 98
+        Rule.MultiplicativeOperator => 99
+        Rule.AdditiveOperator => 100
+        Rule.BitwiseOperator => 101
+        Rule.ShiftOperator => 102
+        Rule.RangeOperator => 103
+        Rule.LogicTail => 104
+        Rule.LogicOperand => 105
+        Rule.RelationTail => 106
+        Rule.ArithmeticTail => 107
+        Rule.Term => 108
+        Rule.CompareTail => 109
+        Rule.Comparand => 110
+        Rule.MixedOperator => 111
+        Rule.OperatorTail => 112
+        Rule.BitwiseTail => 113
+        Rule.OtherOperator => 114
+        Rule.BinaryOperator => 115
+        Rule.ParamList => 116
+        Rule.Param => 117
+        Rule.SelfFieldSet => 118
+        Rule.FnEnd => 119
+        Rule.FnBody => 120
+        Rule.ClauseRegion => 121
+        Rule.ClauseLine => 122
+        Rule.RequiresClause => 123
+        Rule.EnsuresClause => 124
+        Rule.ExampleClause => 125
+        Rule.DecreasesClause => 126
+        Rule.TodoClause => 127
+        Rule.WaiveClause => 128
+        Rule.StructItem => 129
+        Rule.DerivesClause => 130
+        Rule.StructMember => 131
+        Rule.Field => 132
+        Rule.InvariantLine => 133
+        Rule.EnumItem => 134
+        Rule.EnumMember => 135
+        Rule.Variant => 136
+        Rule.VariantPayload => 137
+        Rule.PayloadList => 138
+        Rule.PayloadField => 139
+        Rule.InterfaceItem => 140
+        Rule.InterfaceMember => 141
+        Rule.MethodEnd => 142
+        Rule.MethodBody => 143
+        Rule.ImplItem => 144
+        Rule.ImplParams => 145
+        Rule.ImplParam => 146
+        Rule.LayoutItem => 147
+        Rule.LayoutRepr => 148
+        Rule.LayoutOrder => 149
+        Rule.TagLine => 150
+        Rule.LayoutMember => 151
+        Rule.LayoutField => 152
+        Rule.RegistersItem => 153
+        Rule.RegisterMember => 154
+        Rule.RegisterLine => 155
+        Rule.RegisterTail => 156
+        Rule.RegisterAccess => 157
+        Rule.ConstItem => 158
+        Rule.ConstAssertItem => 159
+        Rule.RegistryItem => 160
+        Rule.UniqueList => 161
+        Rule.ContributeItem => 162
+        Rule.TestItem => 163
+        Rule.TestTarget => 164
+        Rule.TestParams => 165
+        Rule.RetiredItem => 166
+        Rule.RetiredOld => 167
+        Rule.RetiredHead => 168
+        Rule.RetiredNew => 169
+        Rule.RetiredClass => 170
+        Rule.PackageItem => 171
+        Rule.Directive => 172
+        Rule.LanguageDirective => 173
+        Rule.TargetsDirective => 174
+        Rule.TargetList => 175
+        Rule.Target => 176
+        Rule.EntryDirective => 177
+        Rule.DepDirective => 178
+        Rule.AllowDirective => 179
+        Rule.Authority => 180
+        Rule.NameList => 181
+        Rule.DenyDirective => 182
+    }
+} Rule.index
+
+fn Rule.from_index(index: usize) -> Option[Rule]
+    waive length "one arm per rule"
+{
+    return match index {
+        0 => Some(Rule.Item)
+        1 => Some(Rule.ItemStart)
+        2 => Some(Rule.Visibility)
+        3 => Some(Rule.ItemModifier)
+        4 => Some(Rule.TypeModifier)
+        5 => Some(Rule.FnModifier)
+        6 => Some(Rule.ReservedHeadWord)
+        7 => Some(Rule.ItemKind)
+        8 => Some(Rule.FnItem)
+        9 => Some(Rule.FnHead)
+        10 => Some(Rule.ItemLabel)
+        11 => Some(Rule.GenericParams)
+        12 => Some(Rule.GenericParam)
+        13 => Some(Rule.Bound)
+        14 => Some(Rule.Path)
+        15 => Some(Rule.GenericArgs)
+        16 => Some(Rule.GenericArg)
+        17 => Some(Rule.TypeExpr)
+        18 => Some(Rule.FnType)
+        19 => Some(Rule.FnKind)
+        20 => Some(Rule.FnTypeHead)
+        21 => Some(Rule.FnTypeParamList)
+        22 => Some(Rule.FnTypeParam)
+        23 => Some(Rule.Mode)
+        24 => Some(Rule.FnResult)
+        25 => Some(Rule.FailsClause)
+        26 => Some(Rule.UsesClause)
+        27 => Some(Rule.LimitsClause)
+        28 => Some(Rule.Limit)
+        29 => Some(Rule.ConventionClause)
+        30 => Some(Rule.WhereClause)
+        31 => Some(Rule.Expr)
+        32 => Some(Rule.JumpExpr)
+        33 => Some(Rule.FailExpr)
+        34 => Some(Rule.OperatorExpr)
+        35 => Some(Rule.Negation)
+        36 => Some(Rule.Operand)
+        37 => Some(Rule.PrefixExpr)
+        38 => Some(Rule.MarkedExpr)
+        39 => Some(Rule.FailureMarker)
+        40 => Some(Rule.AfterFailureMarker)
+        41 => Some(Rule.AfterAwait)
+        42 => Some(Rule.WhenExpr)
+        43 => Some(Rule.WhenAccess)
+        44 => Some(Rule.WhenPlace)
+        45 => Some(Rule.PlaceRoot)
+        46 => Some(Rule.WhenBody)
+        47 => Some(Rule.Block)
+        48 => Some(Rule.Stmt)
+        49 => Some(Rule.LetStmt)
+        50 => Some(Rule.Pattern)
+        51 => Some(Rule.LiteralPattern)
+        52 => Some(Rule.PatternLiteral)
+        53 => Some(Rule.RangeTail)
+        54 => Some(Rule.RangeBound)
+        55 => Some(Rule.NamedPattern)
+        56 => Some(Rule.FieldPatternList)
+        57 => Some(Rule.FieldPattern)
+        58 => Some(Rule.VarStmt)
+        59 => Some(Rule.DiscardStmt)
+        60 => Some(Rule.WhileStmt)
+        61 => Some(Rule.LoopBlock)
+        62 => Some(Rule.LoopInvariant)
+        63 => Some(Rule.ForStmt)
+        64 => Some(Rule.LoopStmt)
+        65 => Some(Rule.DeferStmt)
+        66 => Some(Rule.CallExpr)
+        67 => Some(Rule.PostfixExpr)
+        68 => Some(Rule.PrimaryExpr)
+        69 => Some(Rule.Literal)
+        70 => Some(Rule.PathExpr)
+        71 => Some(Rule.QuantifierExpr)
+        72 => Some(Rule.IfExpr)
+        73 => Some(Rule.MatchExpr)
+        74 => Some(Rule.MatchArm)
+        75 => Some(Rule.ArmBody)
+        76 => Some(Rule.ClosureExpr)
+        77 => Some(Rule.CaptureList)
+        78 => Some(Rule.Capture)
+        79 => Some(Rule.ClosureBody)
+        80 => Some(Rule.TrustedExpr)
+        81 => Some(Rule.TrustedBody)
+        82 => Some(Rule.AssignOperator)
+        83 => Some(Rule.TrustedLeadStmt)
+        84 => Some(Rule.UndeferStmt)
+        85 => Some(Rule.Place)
+        86 => Some(Rule.PlaceStep)
+        87 => Some(Rule.ExpectStmt)
+        88 => Some(Rule.AssumeStmt)
+        89 => Some(Rule.TodoExpr)
+        90 => Some(Rule.DbgExpr)
+        91 => Some(Rule.PostfixSuffix)
+        92 => Some(Rule.ArgList)
+        93 => Some(Rule.Arg)
+        94 => Some(Rule.ExprStmt)
+        95 => Some(Rule.AfterMode)
+        96 => Some(Rule.Marker)
+        97 => Some(Rule.ValueOperator)
+        98 => Some(Rule.CompareOperator)
+        99 => Some(Rule.MultiplicativeOperator)
+        100 => Some(Rule.AdditiveOperator)
+        101 => Some(Rule.BitwiseOperator)
+        102 => Some(Rule.ShiftOperator)
+        103 => Some(Rule.RangeOperator)
+        104 => Some(Rule.LogicTail)
+        105 => Some(Rule.LogicOperand)
+        106 => Some(Rule.RelationTail)
+        107 => Some(Rule.ArithmeticTail)
+        108 => Some(Rule.Term)
+        109 => Some(Rule.CompareTail)
+        110 => Some(Rule.Comparand)
+        111 => Some(Rule.MixedOperator)
+        112 => Some(Rule.OperatorTail)
+        113 => Some(Rule.BitwiseTail)
+        114 => Some(Rule.OtherOperator)
+        115 => Some(Rule.BinaryOperator)
+        116 => Some(Rule.ParamList)
+        117 => Some(Rule.Param)
+        118 => Some(Rule.SelfFieldSet)
+        119 => Some(Rule.FnEnd)
+        120 => Some(Rule.FnBody)
+        121 => Some(Rule.ClauseRegion)
+        122 => Some(Rule.ClauseLine)
+        123 => Some(Rule.RequiresClause)
+        124 => Some(Rule.EnsuresClause)
+        125 => Some(Rule.ExampleClause)
+        126 => Some(Rule.DecreasesClause)
+        127 => Some(Rule.TodoClause)
+        128 => Some(Rule.WaiveClause)
+        129 => Some(Rule.StructItem)
+        130 => Some(Rule.DerivesClause)
+        131 => Some(Rule.StructMember)
+        132 => Some(Rule.Field)
+        133 => Some(Rule.InvariantLine)
+        134 => Some(Rule.EnumItem)
+        135 => Some(Rule.EnumMember)
+        136 => Some(Rule.Variant)
+        137 => Some(Rule.VariantPayload)
+        138 => Some(Rule.PayloadList)
+        139 => Some(Rule.PayloadField)
+        140 => Some(Rule.InterfaceItem)
+        141 => Some(Rule.InterfaceMember)
+        142 => Some(Rule.MethodEnd)
+        143 => Some(Rule.MethodBody)
+        144 => Some(Rule.ImplItem)
+        145 => Some(Rule.ImplParams)
+        146 => Some(Rule.ImplParam)
+        147 => Some(Rule.LayoutItem)
+        148 => Some(Rule.LayoutRepr)
+        149 => Some(Rule.LayoutOrder)
+        150 => Some(Rule.TagLine)
+        151 => Some(Rule.LayoutMember)
+        152 => Some(Rule.LayoutField)
+        153 => Some(Rule.RegistersItem)
+        154 => Some(Rule.RegisterMember)
+        155 => Some(Rule.RegisterLine)
+        156 => Some(Rule.RegisterTail)
+        157 => Some(Rule.RegisterAccess)
+        158 => Some(Rule.ConstItem)
+        159 => Some(Rule.ConstAssertItem)
+        160 => Some(Rule.RegistryItem)
+        161 => Some(Rule.UniqueList)
+        162 => Some(Rule.ContributeItem)
+        163 => Some(Rule.TestItem)
+        164 => Some(Rule.TestTarget)
+        165 => Some(Rule.TestParams)
+        166 => Some(Rule.RetiredItem)
+        167 => Some(Rule.RetiredOld)
+        168 => Some(Rule.RetiredHead)
+        169 => Some(Rule.RetiredNew)
+        170 => Some(Rule.RetiredClass)
+        171 => Some(Rule.PackageItem)
+        172 => Some(Rule.Directive)
+        173 => Some(Rule.LanguageDirective)
+        174 => Some(Rule.TargetsDirective)
+        175 => Some(Rule.TargetList)
+        176 => Some(Rule.Target)
+        177 => Some(Rule.EntryDirective)
+        178 => Some(Rule.DepDirective)
+        179 => Some(Rule.AllowDirective)
+        180 => Some(Rule.Authority)
+        181 => Some(Rule.NameList)
+        182 => Some(Rule.DenyDirective)
+        else => None
+    }
+} Rule.from_index
+
+/// The token classes and virtual tokens that syntactic rules name.
+pkg enum Class derives Copy, Eq {
+    Ident
+    Int
+    Float
+    Text
+    Bytes
+    Char
+    Byte
+    TextLine
+    Doc
+    FileDoc
+    Nl
+    Col0
+    Eof
+} Class
+
+/// The class as grammar notation names it.
+pkg proj fn Class.name(self) -> Str {
+    return match self {
+        Class.Ident => "IDENT"
+        Class.Int => "INT"
+        Class.Float => "FLOAT"
+        Class.Text => "TEXT"
+        Class.Bytes => "BYTES"
+        Class.Char => "CHAR"
+        Class.Byte => "BYTE"
+        Class.TextLine => "TEXT_LINE"
+        Class.Doc => "DOC"
+        Class.FileDoc => "FILE_DOC"
+        Class.Nl => "NL"
+        Class.Col0 => "COL0"
+        Class.Eof => "EOF"
+    }
+} Class.name
+
+/// The position of the class among the classes.
+fn Class.index(self) -> usize {
+    return match self {
+        Class.Ident => 0
+        Class.Int => 1
+        Class.Float => 2
+        Class.Text => 3
+        Class.Bytes => 4
+        Class.Char => 5
+        Class.Byte => 6
+        Class.TextLine => 7
+        Class.Doc => 8
+        Class.FileDoc => 9
+        Class.Nl => 10
+        Class.Col0 => 11
+        Class.Eof => 12
+    }
+} Class.index
+
+fn Class.from_index(index: usize) -> Option[Class] {
+    return match index {
+        0 => Some(Class.Ident)
+        1 => Some(Class.Int)
+        2 => Some(Class.Float)
+        3 => Some(Class.Text)
+        4 => Some(Class.Bytes)
+        5 => Some(Class.Char)
+        6 => Some(Class.Byte)
+        7 => Some(Class.TextLine)
+        8 => Some(Class.Doc)
+        9 => Some(Class.FileDoc)
+        10 => Some(Class.Nl)
+        11 => Some(Class.Col0)
+        12 => Some(Class.Eof)
+        else => None
+    }
+} Class.from_index

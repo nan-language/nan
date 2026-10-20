@@ -86,9 +86,8 @@ impl Checker<'_> {
     /// The unused code of a package: its private items no reachable item names, its fields no
     /// item reads, its dependencies no item names and its grants nothing uses.
     pub fn check_unused(&self, package: PackageId) {
-        let functions = self.member_functions();
         for &module in &self.db.package(package).modules {
-            self.check_unused_items(module, &functions);
+            self.check_unused_items(module);
             self.check_unused_fields(module);
         }
         let unused_grants = self.unused_grants(package);
@@ -161,7 +160,7 @@ impl Checker<'_> {
     /// impl lines, contributions and const asserts, its landing fns, the function its package's
     /// `entry` directive names, and each private item a reachable item names, a test naming its
     /// target; a tombstone is neither reachable nor unused.
-    fn check_unused_items(&self, module: ModuleId, functions: &HashMap<&str, Vec<ItemId>>) {
+    fn check_unused_items(&self, module: ModuleId) {
         let items = &self.db.module(module).items;
         let private = |item: ItemId| {
             let ast = self.db.ast(item);
@@ -191,7 +190,7 @@ impl Checker<'_> {
             .collect();
         let mut pending: Vec<ItemId> = reached.iter().copied().collect();
         while let Some(item) = pending.pop() {
-            let mut names = self.names(item, functions);
+            let mut names = (*self.names(item)).clone();
             if let ItemKind::Test(test) = &self.db.ast(item).kind {
                 names.extend(self.test_target(item, test).map(|target| match target {
                     Target::Function(function) => function,

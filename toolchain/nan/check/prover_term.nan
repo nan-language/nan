@@ -1,0 +1,411 @@
+//! Terms: the values of a query, each interned once with its type, so that identical terms are one term.
+
+/// An instruction a term applies: an operator, or an instruction whose result the prover knows
+/// only as its application.
+enum Op derives Eq, Hash {
+    Unary(nir::UnaryOp)
+    Binary(nir::BinaryOp)
+    /// A struct value from its fields in declaration order.
+    Construct(ty::Ty)
+    /// An enum value of a variant, by its index, from its payload fields.
+    Variant(ty: ty::Ty, index: u32)
+    Constant(nir::Constant)
+    FnRef(nir::FnRef)
+    Closure(u32)
+    Convert(to: ty::Ty, via: Option[text::String])
+} Op
+
+enum Term derives Eq, Hash {
+    /// A parameter of the function, by its value number.
+    Param(u32)
+    /// The content at entry of the place a reference parameter designates, by the parameter's
+    /// value number.
+    Entry(u32)
+    Lit(nir::Literal)
+    App(op: Op, args: mem::List[u32])
+    Call(callee: nir::FnRef, args: mem::List[u32])
+    Field(base: u32, name: text::String)
+    Ite(condition: u32, then: u32, otherwise: u32)
+    Quot(dividend: u32, divisor: u32)
+    Rem(dividend: u32, divisor: u32)
+    Tag(u32)
+    Fresh(u32)
+    Skolem(u32)
+    Bound(u32)
+    /// The connectives of formulas, which canonicalisation removes.
+    And(mem::List[u32])
+    Or(mem::List[u32])
+    Not(u32)
+    /// `all` or `any` over a range, its body the formula its region yields for the bound symbol.
+    Quant(all: bool, low: u32, high: u32, inclusive: bool, bound: u32, body: u32)
+} Term
+
+/// The sort of a term.
+enum Sort derives Copy, Eq {
+    Int
+    Bool
+    Other
+} Sort
+
+struct Terms {
+    /// The allocator the lists and maps its operations compute draw on.
+    alloc: mem::Alloc
+    terms: mem::List[Term]
+    types: mem::List[ty::Ty]
+    index: mem::HashMap[Term, u32]
+    /// The next fresh, skolem and bound symbol number.
+    symbols: u32
+} Terms
+
+/// The terms it applies its operation to, in written order.
+fn Term.parts(self, alloc: mem::Alloc) -> mem::List[u32] {
+    var parts = mem::List[u32].empty(alloc)
+    match self {
+        Term.App(op: _, args: args) or Term.Call(callee: _, args: args) or Term.And(args) or Term.Or(args) => {
+            for part in args {
+                mut parts.push(part)
+            }
+        }
+        Term.Field(base: part, name: _) or Term.Tag(part) or Term.Not(part) => mut parts.push(part)
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            mut parts.push(condition)
+            mut parts.push(then)
+            mut parts.push(otherwise)
+        }
+        Term.Quot(dividend: dividend, divisor: divisor) or Term.Rem(dividend: dividend, divisor: divisor) => {
+            mut parts.push(dividend)
+            mut parts.push(divisor)
+        }
+        Term.Quant(all: _, low: low, high: high, inclusive: _, bound: bound, body: body) => {
+            mut parts.push(low)
+            mut parts.push(high)
+            mut parts.push(bound)
+            mut parts.push(body)
+        }
+        else => {}
+    }
+    return parts
+} Term.parts
+
+/// The term of the same form over other parts, given in the order `parts` lists them.
+fn Term.replacing_parts(self, parts: Slice[u32], alloc: mem::Alloc) -> Term {
+    return match self {
+        Term.App(op: op, args: _) => Term.App(op: op.copy(alloc), args: listed_terms(parts, alloc))
+        Term.Call(callee: callee, args: _) => Term.Call(callee: callee.copy(alloc), args: listed_terms(parts, alloc))
+        Term.And(_) => Term.And(listed_terms(parts, alloc))
+        Term.Or(_) => Term.Or(listed_terms(parts, alloc))
+        Term.Field(base: _, name: name) => Term.Field(base: parts[0], name: text::String.of(name.as_str(), alloc))
+        Term.Tag(_) => Term.Tag(parts[0])
+        Term.Not(_) => Term.Not(parts[0])
+        Term.Ite(condition: _, then: _, otherwise: _) => Term.Ite(condition: parts[0], then: parts[1], otherwise: parts[2])
+        Term.Quot(dividend: _, divisor: _) => Term.Quot(dividend: parts[0], divisor: parts[1])
+        Term.Rem(dividend: _, divisor: _) => Term.Rem(dividend: parts[0], divisor: parts[1])
+        Term.Quant(all: all, low: _, high: _, inclusive: inclusive, bound: _, body: _) => Term.Quant(all: all, low: parts[0], high: parts[1], inclusive: inclusive, bound: parts[2], body: parts[3])
+        else => self.copy(alloc)
+    }
+} Term.replacing_parts
+
+/// An empty store drawing on an allocator.
+fn Terms.empty(alloc: mem::Alloc) -> Terms {
+    return Terms(alloc: alloc, terms: mem::List[Term].empty(alloc), types: mem::List[ty::Ty].empty(alloc), index: mem::HashMap[Term, u32].empty(seed: 0, alloc), symbols: 0)
+} Terms.empty
+
+/// A copy of the store, as the solver's states copy it at a case split.
+fn Terms.copy(self) -> Terms {
+    let alloc = self.alloc
+    var terms = mem::List[Term].empty(alloc)
+    var index = mem::HashMap[Term, u32].empty(seed: 0, alloc)
+    for id in 0..<self.terms.len() {
+        mut terms.push(self.terms[id].copy(alloc))
+        discard mut index.insert(self.terms[id].copy(alloc), value: u32.fit(id))
+    }
+    var types = mem::List[ty::Ty].empty(alloc)
+    for held in self.types {
+        mut types.push(held)
+    }
+    return Terms(alloc: alloc, terms: take terms, types: take types, index: take index, symbols: self.symbols)
+} Terms.copy
+
+fn Terms.intern(mut self, take term: Term, ty: ty::Ty) -> u32 {
+    let Some(known) = self.index.get(term) else {
+        let id = u32.fit(self.terms.len())
+        mut self.terms.push(term.copy(self.alloc))
+        mut self.types.push(ty)
+        discard mut self.index.insert(take term, value: id)
+        return id
+    }
+    return known
+} Terms.intern
+
+/// The term of this form, if the store holds it.
+fn Terms.lookup(self, term: Term) -> Option[u32] {
+    let Some(known) = self.index.get(term) else {
+        return None
+    }
+    return Some(known)
+} Terms.lookup
+
+proj fn Terms.get(self, id: u32) -> Term {
+    return self.terms[usize.widen(id)]
+} Terms.get
+
+fn Terms.ty(self, id: u32) -> ty::Ty {
+    return self.types[usize.widen(id)]
+} Terms.ty
+
+fn Terms.len(self) -> usize {
+    return self.terms.len()
+} Terms.len
+
+fn Terms.sort(self, id: u32) -> Sort {
+    return match self.get(id) {
+        Term.Tag(_) or Term.Quot(dividend: _, divisor: _) or Term.Rem(dividend: _, divisor: _) => Sort.Int
+        Term.Quant(all: _, low: _, high: _, inclusive: _, bound: _, body: _) or Term.And(_) or Term.Or(_) or Term.Not(_) => Sort.Bool
+        else => sort_of(self.ty(id))
+    }
+} Terms.sort
+
+fn Terms.fresh(mut self, ty: ty::Ty) -> u32 {
+    self.symbols += 1
+    return mut self.intern(Term.Fresh(self.symbols - 1), ty)
+} Terms.fresh
+
+fn Terms.skolem(mut self, ty: ty::Ty) -> u32 {
+    self.symbols += 1
+    return mut self.intern(Term.Skolem(self.symbols - 1), ty)
+} Terms.skolem
+
+fn Terms.bound(mut self, ty: ty::Ty) -> u32 {
+    self.symbols += 1
+    return mut self.intern(Term.Bound(self.symbols - 1), ty)
+} Terms.bound
+
+fn Terms.literal(mut self, take literal: nir::Literal) -> u32 {
+    let ty = match literal {
+        nir::Literal.Int(value: _, scalar: scalar) or nir::Literal.Float(bits: _, scalar: scalar) => ty::Ty.scalar(scalar)
+        nir::Literal.Bool(_) => ty::Ty.scalar(ty::Scalar.Bool)
+        nir::Literal.Char(_) => ty::Ty.scalar(ty::Scalar.Char)
+        else => ty::Ty.unit()
+    }
+    return mut self.intern(Term.Lit(take literal), ty)
+} Terms.literal
+
+fn Terms.boolean(mut self, value: bool) -> u32 {
+    return mut self.literal(nir::Literal.Bool(value))
+} Terms.boolean
+
+fn Terms.integer(mut self, value: wide::Wide, scalar: ty::Scalar) -> u32 {
+    return mut self.literal(nir::Literal.Int(value: value, scalar: scalar))
+} Terms.integer
+
+fn Terms.compare(mut self, op: nir::BinaryOp, left: u32, right: u32) -> u32 {
+    let alloc = self.alloc
+    return mut self.intern(Term.App(op: Op.Binary(op), args: term_pair(left, right, alloc)), ty: ty::Ty.scalar(ty::Scalar.Bool))
+} Terms.compare
+
+/// The conjunction of formulas, without their `true` operands.
+fn Terms.conjunction(mut self, take parts: mem::List[u32]) -> u32 {
+    var kept = mem::List[u32].empty(self.alloc)
+    for part in parts {
+        if self.bool_value(part) != Some(true) {
+            mut kept.push(part)
+        }
+    }
+    for part in kept {
+        if self.bool_value(part) == Some(false) {
+            return mut self.boolean(false)
+        }
+    }
+    return match kept.len() {
+        0 => mut self.boolean(true)
+        1 => kept[0]
+        else => mut self.intern(Term.And(take kept), ty: ty::Ty.scalar(ty::Scalar.Bool))
+    }
+} Terms.conjunction
+
+/// The disjunction of formulas, without their `false` operands.
+fn Terms.disjunction(mut self, take parts: mem::List[u32]) -> u32 {
+    var kept = mem::List[u32].empty(self.alloc)
+    for part in parts {
+        if self.bool_value(part) != Some(false) {
+            mut kept.push(part)
+        }
+    }
+    for part in kept {
+        if self.bool_value(part) == Some(true) {
+            return mut self.boolean(true)
+        }
+    }
+    return match kept.len() {
+        0 => mut self.boolean(false)
+        1 => kept[0]
+        else => mut self.intern(Term.Or(take kept), ty: ty::Ty.scalar(ty::Scalar.Bool))
+    }
+} Terms.disjunction
+
+fn Terms.negation(mut self, part: u32) -> u32 {
+    match self.bool_value(part) {
+        Some(value) => return mut self.boolean(not value)
+        None => {}
+    }
+    match self.get(part) {
+        Term.Not(inner) => return inner
+        else => {}
+    }
+    return mut self.intern(Term.Not(part), ty: ty::Ty.scalar(ty::Scalar.Bool))
+} Terms.negation
+
+/// `guard ⇒ part`.
+fn Terms.implies(mut self, guard: u32, part: u32) -> u32 {
+    let alloc = self.alloc
+    let negated = mut self.negation(guard)
+    return mut self.disjunction(term_pair(negated, right: part, alloc))
+} Terms.implies
+
+/// `ite(c, a, b)`, or the arm a literal condition selects, or the one term both arms are.
+fn Terms.ite(mut self, condition: u32, then: u32, otherwise: u32) -> u32 {
+    match self.bool_value(condition) {
+        Some(true) => return then
+        Some(false) => return otherwise
+        None => {}
+    }
+    if then == otherwise {
+        return then
+    }
+    let ty = self.ty(then)
+    return mut self.intern(Term.Ite(condition: condition, then: then, otherwise: otherwise), ty)
+} Terms.ite
+
+/// A term of the same form as `id` over other parts.
+fn Terms.rebuild(mut self, id: u32, parts: Slice[u32]) -> u32 {
+    let alloc = self.alloc
+    match self.get(id) {
+        Term.And(_) => return mut self.conjunction(listed_terms(parts, alloc))
+        Term.Or(_) => return mut self.disjunction(listed_terms(parts, alloc))
+        Term.Not(_) => return mut self.negation(parts[0])
+        Term.Ite(condition: _, then: _, otherwise: _) => return mut self.ite(parts[0], then: parts[1], otherwise: parts[2])
+        else => {}
+    }
+    let ty = self.ty(id)
+    let rebuilt = self.get(id).replacing_parts(parts, alloc)
+    return mut self.intern(take rebuilt, ty)
+} Terms.rebuild
+
+/// The term with `to` in place of each occurrence of the symbol `from`.
+fn Terms.substitute(mut self, id: u32, from: u32, to: u32) -> u32 {
+    var done = mem::HashMap[u32, u32].empty(seed: 0, alloc: self.alloc)
+    discard mut done.insert(from, value: to)
+    return mut self.replaced(id, mut done)
+} Terms.substitute
+
+fn Terms.replaced(mut self, id: u32, mut done: mem::HashMap[u32, u32]) -> u32 {
+    let Some(known) = done.get(id) else {
+        let parts = self.get(id).parts(self.alloc)
+        var replaced = id
+        if parts.len() > 0 {
+            var renewed = mem::List[u32].empty(self.alloc)
+            for part in parts {
+                mut renewed.push(mut self.replaced(part, mut done))
+            }
+            if renewed != parts {
+                replaced = mut self.rebuild(id, parts: renewed.view())
+            }
+        }
+        discard mut done.insert(id, value: replaced)
+        return replaced
+    }
+    return known
+} Terms.replaced
+
+/// The literal boolean a term is, if it is one.
+fn Terms.bool_value(self, id: u32) -> Option[bool] {
+    return match self.get(id) {
+        Term.Lit(nir::Literal.Bool(value)) => Some(value)
+        else => None
+    }
+} Terms.bool_value
+
+/// The literal integer a term is, if it is one.
+fn Terms.int_value(self, id: u32) -> Option[wide::Wide] {
+    return match self.get(id) {
+        Term.Lit(nir::Literal.Int(value: value, scalar: _)) => Some(value)
+        Term.Lit(nir::Literal.Char(c)) => Some(wide::Wide.of_u64(u64.widen(c.to_bits())))
+        else => None
+    }
+} Terms.int_value
+
+/// The sort of a type's values: integers for integer scalars and `char`, booleans for `bool`.
+fn sort_of(ty: ty::Ty) -> Sort {
+    let Some(scalar) = ty.interned_scalar() else {
+        return Sort.Other
+    }
+    if scalar == ty::Scalar.Bool {
+        return Sort.Bool
+    }
+    if scalar.is_integer() or scalar == ty::Scalar.Char {
+        return Sort.Int
+    }
+    return Sort.Other
+} sort_of
+
+/// A copy of the term.
+fn Term.copy(self, alloc: mem::Alloc) -> Term {
+    return match self {
+        Term.Param(value) => Term.Param(value)
+        Term.Entry(value) => Term.Entry(value)
+        Term.Lit(literal) => Term.Lit(literal.copy(alloc))
+        Term.App(op: op, args: args) => Term.App(op: op.copy(alloc), args: listed_terms(args.view(), alloc))
+        Term.Call(callee: callee, args: args) => Term.Call(callee: callee.copy(alloc), args: listed_terms(args.view(), alloc))
+        Term.Field(base: base, name: name) => Term.Field(base: base, name: text::String.of(name.as_str(), alloc))
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => Term.Ite(condition: condition, then: then, otherwise: otherwise)
+        Term.Quot(dividend: dividend, divisor: divisor) => Term.Quot(dividend: dividend, divisor: divisor)
+        Term.Rem(dividend: dividend, divisor: divisor) => Term.Rem(dividend: dividend, divisor: divisor)
+        Term.Tag(part) => Term.Tag(part)
+        Term.Fresh(number) => Term.Fresh(number)
+        Term.Skolem(number) => Term.Skolem(number)
+        Term.Bound(number) => Term.Bound(number)
+        Term.And(parts) => Term.And(listed_terms(parts.view(), alloc))
+        Term.Or(parts) => Term.Or(listed_terms(parts.view(), alloc))
+        Term.Not(part) => Term.Not(part)
+        Term.Quant(all: all, low: low, high: high, inclusive: inclusive, bound: bound, body: body) => Term.Quant(all: all, low: low, high: high, inclusive: inclusive, bound: bound, body: body)
+    }
+} Term.copy
+
+/// A copy of the operation.
+fn Op.copy(self, alloc: mem::Alloc) -> Op {
+    return match self {
+        Op.Unary(unary) => Op.Unary(unary)
+        Op.Binary(binary) => Op.Binary(binary)
+        Op.Construct(constructed) => Op.Construct(constructed)
+        Op.Variant(ty: variant_ty, index: index) => Op.Variant(ty: variant_ty, index: index)
+        Op.Constant(constant) => Op.Constant(constant)
+        Op.FnRef(callee) => Op.FnRef(callee.copy(alloc))
+        Op.Closure(index) => Op.Closure(index)
+        Op.Convert(to: to, via: via) => Op.Convert(to: to, via: copied_word(via, alloc))
+    }
+} Op.copy
+
+/// A list of the terms of a slice.
+fn listed_terms(ids: Slice[u32], alloc: mem::Alloc) -> mem::List[u32] {
+    var listed = mem::List[u32].empty(alloc)
+    for id in ids {
+        mut listed.push(id)
+    }
+    return listed
+} listed_terms
+
+/// The list of two terms.
+fn term_pair(left: u32, right: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var pair = mem::List[u32].empty(alloc)
+    mut pair.push(left)
+    mut pair.push(right)
+    return pair
+} term_pair
+
+/// A copy of an optional text.
+fn copied_word(word: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(held) = word else {
+        return None
+    }
+    return Some(text::String.of(held.as_str(), alloc))
+} copied_word

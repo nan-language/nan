@@ -1,0 +1,1094 @@
+//! The std operations the interpreter supplies, its supplied operations and intrinsics: named and bit conversions, the members of scalars, ranges, slices, cursors, `Option`, `Untrusted` and `Str`, atomics, stores and collections, texts, codecs, hardware and its sims, the capabilities of the testing world, channels, rendering, and the conformances the toolchain supplies and the methods derives write.
+
+/// The width in bytes and byte order of an integer reader such as `u32_le`.
+struct IntegerAccess derives Copy {
+    width: usize
+    /// Whether the most significant byte comes first.
+    big: bool
+} IntegerAccess
+
+/// A std function without a body, called by its canonical path; a run reaching one the
+/// interpreter does not supply ends missing.
+fn Interpreter.native_call(
+    mut self,
+    item: ty::ItemId,
+    type_args: Slice[ty::Arg],
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End
+    waive length "one dispatch per family of supplied operations, in the order they are tried"
+{
+    let path = self.ck.db().canonical(item)
+    let whole = path.as_str()
+    let start = member_start(whole)
+    var owner_end = whole.byte_len()
+    var member_begin = whole.byte_len()
+    if start > 0 {
+        owner_end = start - 1
+        member_begin = start
+    }
+    let Some(owner) = whole.slice_bytes(0, end: owner_end) else {
+        fail End.Missing
+    }
+    let Some(member) = whole.slice_bytes(member_begin, end: whole.byte_len()) else {
+        fail End.Missing
+    }
+    let given = args.view()
+    match try mut self.hardware_member(owner, member, type_args, args: given, at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match stated_facts(whole, alloc: self.alloc) {
+        Some(facts) => {
+            if facts.device or facts.privileged {
+                fail self.uninterpretable(at)
+            }
+        }
+        None => {}
+    }
+    if owner.starts_with("core::") {
+        let Some(name) = owner.slice_bytes(6, end: owner.byte_len()) else {
+            fail End.Missing
+        }
+        match ty::Scalar.from_name(name) {
+            Some(scalar) => return try mut self.scalar_member(scalar, member, args: given, at)
+            None => {}
+        }
+    }
+    if owner == "hw::Ptr" {
+        match try mut self.pointer_member(member, type_args, args: given, at) {
+            Some(flow) => return flow
+            None => {}
+        }
+    }
+    match try mut self.store_member(owner, member, type_args, args: given, at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match try mut self.collection_member(owner, member, type_args, args: given, at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match try mut self.text_member(owner, member, type_args, args: given, at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match mut self.sim_member(owner, member, type_args, args: given) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match try mut self.codec_member(owner, member, type_args, args: given, at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    match try mut self.task_member(owner, member, type_args, args: given, at) {
+        Some(flow) => return flow
+        None => {}
+    }
+    if owner.starts_with("core::atomic::") {
+        let Some(name) = owner.slice_bytes(14, end: owner.byte_len()) else {
+            fail End.Missing
+        }
+        match mut self.atomic_member(name, member, args: given) {
+            Some(flow) => return flow
+            None => {}
+        }
+    }
+    if owner == "core::Renderer" {
+        match mut self.renderer_member(member, args: given) {
+            Some(flow) => return flow
+            None => {}
+        }
+    }
+    return try mut self.core_member(owner, member, type_args, args: given, at, site)
+} Interpreter.native_call
+
+/// The members of core's ranges, slices, arrays, texts, cursors, `Option`, `Untrusted` and
+/// totally ordered floats, and `testing::same`; a run reaching another ends missing.
+fn Interpreter.core_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let alloc = self.alloc
+    match owner {
+        "core::Range" => {
+            if member == "next" {
+                return InterpFlow.Return(mut self.range_next(args[0]))
+            }
+        }
+        "core::SliceCursor" or "core::SliceCursorMut" => {
+            if member == "next" {
+                return InterpFlow.Return(mut self.slice_next(args[0]))
+            }
+        }
+        "core::CharCursor" => {
+            if member == "next" {
+                return InterpFlow.Return(mut self.char_next(args[0]))
+            }
+        }
+        "core::ArrayCursor" => {
+            if member == "next" {
+                return InterpFlow.Return(mut self.array_next(args[0]))
+            }
+        }
+        "core::Slice" or "core::SliceMut" or "core::Array" or "core::Str" => return try mut self.view_member(owner, member, type_args, args, at, site)
+        "core::Option" => {
+            if member == "value_or" {
+                let option = self.deref(args[0])
+                match option {
+                    Val.Variant(item: _, index: 0, fields: payload) => return InterpFlow.Return(self.deref(payload.contents()[0]))
+                    else => return InterpFlow.Return(args[1].copy(alloc))
+                }
+            }
+            if member == "extract" {
+                let Val.Ref(place) = args[0] else {
+                    expect false
+                    fail End.Missing
+                }
+                let held = self.memory.get(place).copy(alloc)
+                let none = Val.none(self.ty_item("core", name: "Option"), alloc)
+                mut self.memory.set(place, stored: take none)
+                return InterpFlow.Return(take held)
+            }
+        }
+        "core::TotalF64" or "core::TotalF32" => {
+            if member == "cmp" {
+                let left = self.deref(args[0])
+                let right = self.deref(args[1])
+                let order = self.order(left.fields()[0], right: right.fields()[0])
+                return InterpFlow.Return(ordering_value(self.ty_item("core", name: "Ordering"), order, alloc))
+            }
+        }
+        "core::Untrusted" => return try mut self.untrusted_member(member, args, at)
+        "testing::same" => {
+            if member == "" {
+                return InterpFlow.Return(Val.Bool(self.equal(args[0], right: args[1])))
+            }
+        }
+        else => {}
+    }
+    fail End.Missing
+} Interpreter.core_member
+
+/// A member of `core::Slice`, `core::SliceMut`, `core::Array` or `core::Str`; a run reaching
+/// another ends missing.
+fn Interpreter.view_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End
+    waive length "one arm per member, in the order the members are tried"
+{
+    let alloc = self.alloc
+    let slice_owner = owner == "core::Slice" or owner == "core::SliceMut"
+    let viewing = slice_owner or owner == "core::Array"
+    if slice_owner and member == "len" {
+        let view = mut self.view(args[0])
+        return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(view.len))))
+    }
+    if viewing and (member == "at" or member == "at_mut") {
+        let view = mut self.view(args[0])
+        let index = args[1].int_value()
+        if index.is_negative() or not index.lt(wide::Wide.of_u64(u64.widen(view.len))) {
+            fail self.bounds_trap(site, at)
+        }
+        return InterpFlow.Return(Val.Ref(view.array.with(u32.truncate(view.start + usize.widen(index.low_bits())), alloc)))
+    }
+    if viewing and (member == "cursor" or member == "cursor_mut") {
+        var name = "SliceCursorMut"
+        if member == "cursor" {
+            name = "SliceCursor"
+        }
+        let cursor = self.ty_item("core", name)
+        let view = mut self.view(args[0])
+        return InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc)))
+    }
+    if owner == "core::Str" and member == "cursor" {
+        let cursor = self.ty_item("core", name: "CharCursor")
+        let view = mut self.view(args[0])
+        return InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc)))
+    }
+    if owner == "core::Array" and member == "into_cursor" {
+        let cursor = self.ty_item("core", name: "ArrayCursor")
+        var fields = Val.single(self.deref(args[0]), alloc)
+        mut fields.push(Val.Int(wide::Wide.zero()))
+        return InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc)))
+    }
+    if owner == "core::SliceMut" and member == "fill" {
+        let view = mut self.view(args[0])
+        for index in 0..<view.len {
+            mut self.memory.set(view.array.with(u32.truncate(view.start + index), alloc), stored: args[1].copy(alloc))
+        }
+        return InterpFlow.Return(Val.Unit)
+    }
+    if owner == "core::SliceMut" and member == "copy_from" {
+        let view = mut self.view(args[0])
+        let source = mut self.view(args[1])
+        var index: usize = 0
+        for value in take self.view_values(source) {
+            mut self.memory.set(view.array.with(u32.truncate(view.start + index), alloc), stored: take value)
+            index += 1
+        }
+        return InterpFlow.Return(Val.Unit)
+    }
+    if (owner == "core::Array" and (member == "view" or member == "view_mut")) or (owner == "core::SliceMut" and member == "view") or (owner == "core::Str" and member == "as_bytes") {
+        let view = mut self.view(args[0])
+        return InterpFlow.Return(Val.View(take view))
+    }
+    if slice_owner and (member == "prefix" or member == "prefix_mut") {
+        let view = mut self.view(args[0])
+        let count = usize.widen(args[1].int_value().low_bits())
+        let option = self.ty_item("core", name: "Option")
+        if count <= view.len {
+            return InterpFlow.Return(Val.some(option, value: Val.View(View(array: view.array.copy(alloc), start: view.start, len: count)), alloc))
+        }
+        return InterpFlow.Return(Val.none(option, alloc))
+    }
+    if slice_owner and (member == "split_at" or member == "split_at_mut") {
+        let view = mut self.view(args[0])
+        let option = self.ty_item("core", name: "Option")
+        let Some(parts) = self.split_view(view, at: usize.widen(args[1].int_value().low_bits())) else {
+            return InterpFlow.Return(Val.none(option, alloc))
+        }
+        return InterpFlow.Return(Val.some(option, value: take parts, alloc))
+    }
+    if slice_owner {
+        match IntegerAccess.named(member) {
+            Some(access) => return InterpFlow.Return(mut self.integer_read(access, args))
+            None => {}
+        }
+    }
+    if owner == "core::SliceMut" and member.starts_with("write_") {
+        let Some(name) = member.slice_bytes(6, end: member.byte_len()) else {
+            fail End.Missing
+        }
+        match IntegerAccess.named(name) {
+            Some(access) => {
+                mut self.integer_write(access, args)
+                return InterpFlow.Return(Val.Unit)
+            }
+            None => {}
+        }
+    }
+    if owner == "core::Str" and member == "slice_bytes" {
+        return InterpFlow.Return(mut self.str_slice(args))
+    }
+    if owner == "core::Array" and member == "filled" {
+        var count: usize = 0
+        match type_args[1] {
+            ty::Arg.Const(ty::Const.Int(written)) => {
+                count = usize.widen(written.low_bits())
+            }
+            else => {
+                expect false
+            }
+        }
+        var elements = mem::List[Val].empty(alloc)
+        mut elements.reserve(count)
+        for _ in 0..<count {
+            mut elements.push(args[0].copy(alloc))
+        }
+        return InterpFlow.Return(Val.Array(mem::Shared.of(take elements, alloc)))
+    }
+    fail End.Missing
+} Interpreter.view_member
+
+/// An integer reader of a slice, such as `u32_le`: the bytes at its index, in its byte order.
+fn Interpreter.integer_read(mut self, access: IntegerAccess, args: Slice[Val]) -> Val {
+    let view = mut self.view(args[0])
+    let start = view.start + usize.widen(args[1].int_value().low_bits())
+    let bytes = self.viewed(View(array: view.array.copy(self.alloc), start: start, len: access.width))
+    var value = wide::Wide.zero()
+    for index in 0..<bytes.len() {
+        var position = bytes.len() - 1 - index
+        if access.big {
+            position = index
+        }
+        value = value.shift_left(8).bit_or(bytes[position].int_value())
+    }
+    return Val.Int(value)
+} Interpreter.integer_read
+
+/// An integer writer of a slice, such as `write_u32_le`: the value's bytes at its index, in
+/// its byte order.
+fn Interpreter.integer_write(mut self, access: IntegerAccess, args: Slice[Val]) {
+    let view = mut self.view(args[0])
+    let start = view.start + usize.widen(args[1].int_value().low_bits())
+    let value = args[2].int_value()
+    for index in 0..<access.width {
+        var shift = 8 * index
+        if access.big {
+            shift = 8 * (access.width - 1 - index)
+        }
+        let byte = value.shift_right(u32.truncate(shift)).bit_and(wide::Wide.of_u64(0xFF))
+        mut self.memory.set(view.array.with(u32.truncate(start + index), alloc: self.alloc), stored: Val.Int(byte))
+    }
+} Interpreter.integer_write
+
+/// `Str.slice_bytes`: the text between two byte indexes that are char boundaries, none
+/// otherwise.
+fn Interpreter.str_slice(mut self, args: Slice[Val]) -> Val {
+    let alloc = self.alloc
+    let view = mut self.view(args[0])
+    let bytes = mut self.bytes(args[0])
+    let start = usize.widen(args[1].int_value().low_bits())
+    let end = usize.widen(args[2].int_value().low_bits())
+    let option = self.ty_item("core", name: "Option")
+    if start <= end and end <= bytes.len() and is_text_boundary(bytes.view(), at: start) and is_text_boundary(bytes.view(), at: end) {
+        return Val.some(option, value: Val.View(View(array: view.array.copy(alloc), start: view.start + start, len: end - start)), alloc)
+    }
+    return Val.none(option, alloc)
+} Interpreter.str_slice
+
+/// Whether a byte index of a text is at its end or at the start of a char.
+fn is_text_boundary(bytes: Slice[u8], at: usize) -> bool {
+    return at == bytes.len() or (at < bytes.len() and (bytes[at] & 0xC0) != 0x80)
+} is_text_boundary
+
+/// A member of `core::Untrusted`; a run reaching another ends missing.
+fn Interpreter.untrusted_member(mut self, member: Str, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let untrusted = self.ty_item("core", name: "Untrusted")
+    match member {
+        "of" => return InterpFlow.Return(Val.Struct(item: untrusted, fields: mem::Shared.of(Val.single(args[0].copy(alloc), alloc), alloc)))
+        "inspect" => return InterpFlow.Return(self.deref(args[0]).fields()[0].copy(alloc))
+        "into_cleared" => {
+            let inner = self.deref(args[0])
+            return InterpFlow.Return(mut self.cleared(contents: inner.fields()[0]))
+        }
+        "byte_len" => {
+            let inner = self.deref(args[0])
+            let view = mut self.view(inner.fields()[0])
+            return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(view.len))))
+        }
+        "view" or "view_mut" => {
+            let inner = self.deref(args[0])
+            let view = mut self.view(inner.fields()[0])
+            return InterpFlow.Return(Val.Struct(item: untrusted, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc)))
+        }
+        "append" or "try_append" => {
+            let Val.Ref(place) = args[0] else {
+                expect false
+                fail End.Missing
+            }
+            let bytes = self.deref(args[1])
+            let view = mut self.view(bytes.fields()[0])
+            let values = self.view_values(view)
+            if not mut self.append(place: place.with(0, alloc), values: values.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) {
+                return try self.exhausted(fallible: member == "try_append", at)
+            }
+            return InterpFlow.Return(Val.Unit)
+        }
+        "copy_prefix" or "try_copy_prefix" => {
+            let inner = self.deref(args[0])
+            let view = mut self.view(inner.fields()[0])
+            let count = usize.widen(args[1].int_value().low_bits())
+            if count > view.len {
+                fail self.trap("trap.requires", at)
+            }
+            let values = self.view_values(View(array: view.array.copy(alloc), start: view.start, len: count))
+            let cell = self.cell_of(args[2])
+            let Some(bytes) = mut self.holding(path: "mem::Bytes", elements: take values, cell, element: ty::Ty.scalar(ty::Scalar.Unsigned8)) else {
+                return try self.exhausted(fallible: member == "try_copy_prefix", at)
+            }
+            return InterpFlow.Return(Val.Struct(item: untrusted, fields: mem::Shared.of(Val.single(take bytes, alloc), alloc)))
+        }
+        "prefix" or "split_at" => {
+            let inner = self.deref(args[0])
+            let view = mut self.view(inner.fields()[0])
+            let split = usize.widen(args[1].int_value().low_bits())
+            let option = self.ty_item("core", name: "Option")
+            if split > view.len {
+                return InterpFlow.Return(Val.none(option, alloc))
+            }
+            let head = untrusted_view(untrusted, view: View(array: view.array.copy(alloc), start: view.start, len: split), alloc)
+            if member == "prefix" {
+                return InterpFlow.Return(Val.some(option, value: take head, alloc))
+            }
+            let tail = untrusted_view(untrusted, view: View(array: view.array.copy(alloc), start: view.start + split, len: view.len - split), alloc)
+            var parts = Val.single(take head, alloc)
+            mut parts.push(take tail)
+            let whole = Val.Struct(item: self.ty_item("core", name: "Parts"), fields: mem::Shared.of(take parts, alloc))
+            return InterpFlow.Return(Val.some(option, value: take whole, alloc))
+        }
+        else => fail End.Missing
+    }
+} Interpreter.untrusted_member
+
+/// An `Untrusted` value holding a view.
+fn untrusted_view(untrusted: ty::ItemId, take view: View, alloc: mem::Alloc) -> Val {
+    return Val.Struct(item: untrusted, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))
+} untrusted_view
+
+/// Contents with every byte set to 0: the elements of an array, or the storage of a byte list.
+fn Interpreter.cleared(mut self, contents: Val) -> Val {
+    let alloc = self.alloc
+    match contents {
+        Val.Array(elements) => return Val.Array(mem::Shared.of(zero_values(elements.contents().len(), alloc), alloc))
+        Val.Struct(item: _, fields: _) => {
+            let storage = self.storage(contents)
+            let len = self.memory.get(storage).fields().len()
+            mut self.memory.set(storage, stored: Val.Array(mem::Shared.of(zero_values(len, alloc), alloc)))
+            return contents.copy(alloc)
+        }
+        else => return contents.copy(alloc)
+    }
+} Interpreter.cleared
+
+/// A list of `count` integers 0.
+fn zero_values(count: usize, alloc: mem::Alloc) -> mem::List[Val] {
+    var zeros = mem::List[Val].empty(alloc)
+    mut zeros.reserve(count)
+    for _ in 0..<count {
+        mut zeros.push(Val.Int(wide::Wide.zero()))
+    }
+    return zeros
+} zero_values
+
+/// The width in bytes and byte order of an integer reader such as `u32_le`.
+fn IntegerAccess.named(name: Str) -> Option[IntegerAccess] {
+    let Some(split) = name.find("_") else {
+        return None
+    }
+    let Some(written) = name.slice_bytes(0, end: split) else {
+        return None
+    }
+    let Some(order) = name.slice_bytes(split + 1, end: name.byte_len()) else {
+        return None
+    }
+    var width: usize = 0
+    match written {
+        "u16" => {
+            width = 2
+        }
+        "u32" => {
+            width = 4
+        }
+        "u64" => {
+            width = 8
+        }
+        else => return None
+    }
+    return match order {
+        "le" => Some(IntegerAccess(width: width, big: false))
+        "be" => Some(IntegerAccess(width: width, big: true))
+        else => None
+    }
+} IntegerAccess.named
+
+/// The parts of a view split at an index, none past its end.
+fn Interpreter.split_view(self, view: View, at: usize) -> Option[Val] {
+    if at > view.len {
+        return None
+    }
+    let alloc = self.alloc
+    let parts = self.ty_item("core", name: "Parts")
+    let head = View(array: view.array.copy(alloc), start: view.start, len: at)
+    let tail = View(array: view.array.copy(alloc), start: view.start + at, len: view.len - at)
+    var fields = Val.single(Val.View(take head), alloc)
+    mut fields.push(Val.View(take tail))
+    return Some(Val.Struct(item: parts, fields: mem::Shared.of(take fields, alloc)))
+} Interpreter.split_view
+
+/// `core::Range.next`: the low bound, then the range past it.
+fn Interpreter.range_next(mut self, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let Val.Ref(loc) = cursor else {
+        expect false
+        return Val.Absent
+    }
+    let range = self.memory.get(loc).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = range else {
+        expect false
+        return Val.Absent
+    }
+    let bounds = fields.contents()
+    let low = bounds[0].int_value()
+    let high = bounds[1].int_value()
+    let inclusive = bounds[2].bool_value()
+    let option = self.ty_item("core", name: "Option")
+    if high.lt(low) or (not inclusive and high.le(low)) {
+        return Val.none(option, alloc)
+    }
+    var next = mem::List[Val].empty(alloc)
+    if low.lt(high) {
+        mut next.push(range_element(bounds[0], value: low.wrapping_add(wide::Wide.one())))
+        mut next.push(bounds[1].copy(alloc))
+        mut next.push(bounds[2].copy(alloc))
+    } else {
+        mut next.push(bounds[0].copy(alloc))
+        mut next.push(bounds[1].copy(alloc))
+        mut next.push(Val.Bool(false))
+    }
+    mut self.memory.set(loc, stored: Val.Struct(item: item, fields: mem::Shared.of(take next, alloc)))
+    return Val.some(option, value: range_element(bounds[0], value: low), alloc)
+} Interpreter.range_next
+
+/// A value of a range's elements: a char for a range of chars, an integer otherwise.
+fn range_element(low: Val, value: wide::Wide) -> Val {
+    return match low {
+        Val.Char(_) => Val.Char(char.checked_from_bits(u32.truncate(value.low_bits())).value_or('\0'))
+        else => Val.Int(value)
+    }
+} range_element
+
+/// The `next` of a char cursor: the char its bytes start with, then the bytes past it.
+fn Interpreter.char_next(mut self, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let Val.Ref(loc) = cursor else {
+        expect false
+        return Val.Absent
+    }
+    let state = self.memory.get(loc).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = state else {
+        expect false
+        return Val.Absent
+    }
+    let Val.View(view) = fields.contents()[0] else {
+        expect false
+        return Val.Absent
+    }
+    let option = self.ty_item("core", name: "Option")
+    var bytes = mem::Bytes.empty(alloc)
+    for byte in self.viewed(view) {
+        if bytes.len() == 4 {
+            break
+        }
+        mut bytes.push(u8.truncate(byte.int_value().low_bits()))
+    }
+    let Some(decoded) = lossy_first_char(bytes.view()) else {
+        return Val.none(option, alloc)
+    }
+    let width = decoded.utf8_len()
+    let rest = View(array: view.array.copy(alloc), start: view.start + width, len: view.len - width)
+    mut self.memory.set(loc, stored: Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.View(take rest), alloc), alloc)))
+    return Val.some(option, value: Val.Char(decoded), alloc)
+} Interpreter.char_next
+
+/// The first char of bytes read as UTF-8 with each invalid sequence replaced by U+FFFD, none
+/// for no bytes.
+fn lossy_first_char(bytes: Slice[u8]) -> Option[char] {
+    if bytes.len() == 0 {
+        return None
+    }
+    let lead = bytes[0]
+    if lead < 0x80 {
+        return char.checked_from_bits(u32.widen(lead))
+    }
+    var width: usize = 0
+    var low: u8 = 0x80
+    var high: u8 = 0xBF
+    var code = u32.widen(lead)
+    if lead >= 0xC2 and lead <= 0xDF {
+        width = 2
+        code = code & 0x1F
+    } else if lead >= 0xE0 and lead <= 0xEF {
+        width = 3
+        code = code & 0x0F
+        if lead == 0xE0 {
+            low = 0xA0
+        }
+        if lead == 0xED {
+            high = 0x9F
+        }
+    } else if lead >= 0xF0 and lead <= 0xF4 {
+        width = 4
+        code = code & 0x07
+        if lead == 0xF0 {
+            low = 0x90
+        }
+        if lead == 0xF4 {
+            high = 0x8F
+        }
+    } else {
+        return char.checked_from_bits(0xFFFD)
+    }
+    for index in 1..<width {
+        if index >= bytes.len() {
+            return char.checked_from_bits(0xFFFD)
+        }
+        let byte = bytes[index]
+        if byte < low or byte > high {
+            return char.checked_from_bits(0xFFFD)
+        }
+        low = 0x80
+        high = 0xBF
+        code = (code << 6) | u32.widen(byte & 0x3F)
+    }
+    return char.checked_from_bits(code)
+} lossy_first_char
+
+/// The `next` of an array cursor: the element at its position, which then moves past it.
+fn Interpreter.array_next(mut self, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let Val.Ref(loc) = cursor else {
+        expect false
+        return Val.Absent
+    }
+    let state = self.memory.get(loc).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = state else {
+        expect false
+        return Val.Absent
+    }
+    let parts = fields.contents()
+    let option = self.ty_item("core", name: "Option")
+    let position = usize.widen(parts[1].int_value().low_bits())
+    let elements = parts[0].fields()
+    if position >= elements.len() {
+        return Val.none(option, alloc)
+    }
+    let element = elements[position].copy(alloc)
+    var next = Val.single(parts[0].copy(alloc), alloc)
+    mut next.push(Val.Int(wide::Wide.of_u64(u64.widen(position)).wrapping_add(wide::Wide.one())))
+    mut self.memory.set(loc, stored: Val.Struct(item: item, fields: mem::Shared.of(take next, alloc)))
+    return Val.some(option, value: take element, alloc)
+} Interpreter.array_next
+
+/// The `next` of a slice cursor: a reference to its first element, then the rest.
+fn Interpreter.slice_next(mut self, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let Val.Ref(loc) = cursor else {
+        expect false
+        return Val.Absent
+    }
+    let state = self.memory.get(loc).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = state else {
+        expect false
+        return Val.Absent
+    }
+    let Val.View(view) = fields.contents()[0] else {
+        expect false
+        return Val.Absent
+    }
+    let option = self.ty_item("core", name: "Option")
+    if view.len == 0 {
+        return Val.none(option, alloc)
+    }
+    let element = view.array.with(u32.truncate(view.start), alloc)
+    let rest = View(array: view.array.copy(alloc), start: view.start + 1, len: view.len - 1)
+    mut self.memory.set(loc, stored: Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.View(take rest), alloc), alloc)))
+    return Val.some(option, value: Val.Ref(take element), alloc)
+} Interpreter.slice_next
+
+/// A method of an interface a type implements through a conformance the toolchain supplies;
+/// a run reaching one the interpreter does not supply ends missing.
+fn Interpreter.native_conformance(
+    mut self,
+    ty: ty::Ty,
+    method: Str,
+    type_args: Slice[ty::Arg],
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    match method {
+        "render" => try mut self.render_builtin(ty, args: args.view(), at, site)
+        "hash" => {
+            var hasher: Option[ty::Ty] = None
+            if type_args.len() > 1 {
+                hasher = type_args[1].ty()
+            }
+            try mut self.hash_builtin(ty, hasher, args: args.view(), at, site)
+        }
+        else => {}
+    }
+    match method {
+        "render" or "hash" => return InterpFlow.Return(Val.Unit)
+        "eq" => return InterpFlow.Return(Val.Bool(self.equal(args[0], right: args[1])))
+        "cmp" => return InterpFlow.Return(ordering_value(self.ty_item("core", name: "Ordering"), order: self.order(args[0], right: args[1]), alloc: self.alloc))
+        "default" => return InterpFlow.Return(try mut self.default_of(ty, at, site))
+        else => fail End.Missing
+    }
+} Interpreter.native_conformance
+
+/// The default of a type whose `Default` the toolchain supplies: 0 or its like for a scalar,
+/// the empty text for a fixed text, and the default of each element for an array.
+fn Interpreter.default_of(mut self, ty: ty::Ty, at: ItemSpan, site: RunSite) -> Val fails End {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let types = ck.types()
+    match first types.kind(ty) {
+        ty::TyKind.Scalar(ty::Scalar.Bool) => return Val.Bool(false)
+        ty::TyKind.Scalar(ty::Scalar.Char) => return Val.Char('\0')
+        ty::TyKind.Scalar(ty::Scalar.Float32) => return Val.Float32(0.0)
+        ty::TyKind.Scalar(ty::Scalar.Float64) => return Val.Float64(0.0)
+        ty::TyKind.Scalar(_) => return Val.Int(wide::Wide.zero())
+        ty::TyKind.Item(item: item, args: args) => {
+            let listed = types.arg_list(args)
+            let path = ck.db().canonical(item)
+            if path.as_str() == "text::Fixed" {
+                let bound = usize.widen(const_arg_bits(listed, index: 0))
+                var fields = Val.single(Val.Array(mem::Shared.of(zero_values(bound, alloc), alloc)), alloc)
+                mut fields.push(Val.Int(wide::Wide.zero()))
+                return Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc))
+            }
+            if path.as_str() == "core::Array" {
+                let count = usize.widen(const_arg_bits(listed, index: 1))
+                var element = ty::Ty.unit()
+                if listed.len() > 0 {
+                    element = listed[0].ty().value_or(ty::Ty.unit())
+                }
+                let value = try mut self.core_conformance(interface_name: "Default", method: "default", ty: element, args: mem::List[Val].empty(alloc), at, site)
+                var elements = mem::List[Val].empty(alloc)
+                mut elements.reserve(count)
+                for _ in 0..<count {
+                    mut elements.push(value.copy(alloc))
+                }
+                return Val.Array(mem::Shared.of(take elements, alloc))
+            }
+            fail End.Missing
+        }
+        else => return Val.Unit
+    }
+} Interpreter.default_of
+
+/// The low bits of the const integer argument at `index`, 0 for none.
+fn const_arg_bits(args: Slice[ty::Arg], index: usize) -> u64 {
+    if index >= args.len() {
+        return 0
+    }
+    return match args[index] {
+        ty::Arg.Const(ty::Const.Int(written)) => written.low_bits()
+        else => 0
+    }
+} const_arg_bits
+
+fn ordering_value(item: ty::ItemId, order: core::Ordering, alloc: mem::Alloc) -> Val {
+    let index: u32 = match order {
+        core::Ordering.Less => 0
+        core::Ordering.Equal => 1
+        core::Ordering.Greater => 2
+    }
+    return Val.Variant(item: item, index: index, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))
+} ordering_value
+
+/// A method a derive writes for a type: equality and order over its fields or variants in
+/// declaration order, its rendering and hash, and the default of a struct; a run reaching
+/// another ends missing.
+fn Interpreter.native_derived(
+    mut self,
+    owner: ty::ItemId,
+    type_args: Slice[ty::Arg],
+    method: Str,
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    match method {
+        "render" => try mut self.render_derived(owner, type_args, args: args.view(), at, site)
+        "hash" => try mut self.hash_derived(owner, type_args, args: args.view(), at, site)
+        else => {}
+    }
+    match method {
+        "render" or "hash" => return InterpFlow.Return(Val.Unit)
+        "eq" => return InterpFlow.Return(Val.Bool(self.equal(args[0], right: args[1])))
+        "cmp" => return InterpFlow.Return(ordering_value(self.ty_item("core", name: "Ordering"), order: self.order(args[0], right: args[1]), alloc: self.alloc))
+        "default" => return InterpFlow.Return(try mut self.derived_default(owner, type_args, at, site))
+        else => fail End.Missing
+    }
+} Interpreter.native_derived
+
+/// The default a derive writes for a struct: the default of each field.
+fn Interpreter.derived_default(mut self, owner: ty::ItemId, type_args: Slice[ty::Arg], at: ItemSpan, site: RunSite) -> Val fails End {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let types = ck.types()
+    let sig = ck.sig(owner)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        fail End.Missing
+    }
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: type_args, alloc)
+    var values = mem::List[Val].empty(alloc)
+    for field in fields {
+        let field_ty = subst.ty(types, ty: field.ty)
+        mut values.push(try mut self.core_conformance(interface_name: "Default", method: "default", ty: field_ty, args: mem::List[Val].empty(alloc), at, site))
+    }
+    return Val.Struct(item: owner, fields: mem::Shared.of(take values, alloc))
+} Interpreter.derived_default
+
+/// An intrinsic the toolchain supplies: a `Dyn` view or a template, and the rendering of a
+/// template; the others bring a fact that makes them uninterpretable.
+fn Interpreter.native_intrinsic(
+    mut self,
+    path: Str,
+    type_args: Slice[ty::Arg],
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    match try mut self.render_intrinsic(path, type_args, args: Val.copies(args.view(), alloc: self.alloc), at, site) {
+        Some(flow) => return flow
+        None => {}
+    }
+    if path == "Dyn.view" {
+        let Some(view) = self.dyn_view(type_args, value: args[0]) else {
+            fail End.Missing
+        }
+        return InterpFlow.Return(take view)
+    }
+    fail self.uninterpretable(at)
+} Interpreter.native_intrinsic
+
+/// A `Dyn[I]` view of a value of type `T`, its type arguments `Dyn[I]` and `T`: the value with
+/// the function implementing each of `I`'s methods for `T`.
+fn Interpreter.dyn_view(self, type_args: Slice[ty::Arg], value: Val) -> Option[Val] {
+    let ck = self.ck.share()
+    let Some(dyn_ty) = type_args[0].ty() else {
+        return None
+    }
+    let ty::TyKind.Dyn(bound) = ck.types().kind(dyn_ty) else {
+        return None
+    }
+    let Some(source) = type_args[1].ty() else {
+        return None
+    }
+    let sig = ck.sig(bound.item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return None
+    }
+    var implementations = mem::List[nir::FnRef].empty(self.alloc)
+    for method in methods {
+        let Some(implementation) = ck.implementation(source, interface_item: bound.item, method: method.name.as_str()) else {
+            return None
+        }
+        mut implementations.push(take implementation)
+    }
+    return Some(Val.Dyn(mem::Shared.of(DynVal(value: value.copy(self.alloc), methods: take implementations), alloc: self.alloc)))
+} Interpreter.dyn_view
+
+/// Releases what a value owns: the memory of the std containers, stores, boxes and shared
+/// values it holds.
+fn Interpreter.native_release(mut self, value: Val) {
+    mut self.store_release(value)
+} Interpreter.native_release
+
+/// The value a reference designates, or the value itself.
+fn Interpreter.deref(self, value: Val) -> Val {
+    match value {
+        Val.Ref(loc) => return self.deref(self.memory.get(loc))
+        else => return value.copy(self.alloc)
+    }
+} Interpreter.deref
+
+/// The elements a slice, text, array, container or cursor value views.
+fn Interpreter.view(mut self, value: Val) -> View {
+    let alloc = self.alloc
+    match value {
+        Val.Ref(loc) => {
+            let held = self.memory.get(loc)
+            match held {
+                Val.Array(elements) => return View(array: loc.copy(alloc), start: 0, len: elements.contents().len())
+                else => {}
+            }
+            let other = held.copy(alloc)
+            return mut self.view(other)
+        }
+        Val.View(view) => return view.copy(alloc)
+        Val.Struct(item: _, fields: fields) => {
+            let parts = fields.contents()
+            if parts.len() == 0 {
+                expect false
+                return View(array: Loc(extent: 0, path: mem::List[u32].empty(alloc)), start: 0, len: 0)
+            }
+            match parts[0] {
+                Val.Ref(loc) => {
+                    let len = self.memory.get(loc).fields().len()
+                    return View(array: loc.copy(alloc), start: 0, len: len)
+                }
+                else => {}
+            }
+            let other = parts[0].copy(alloc)
+            return mut self.view(other)
+        }
+        Val.Array(elements) => {
+            let len = elements.contents().len()
+            let extent = mut self.memory.alloc(value.copy(alloc), writable: false, size: u64.widen(len))
+            return View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: len)
+        }
+        else => {}
+    }
+    expect false
+    return View(array: Loc(extent: 0, path: mem::List[u32].empty(alloc)), start: 0, len: 0)
+} Interpreter.view
+
+/// The bytes a text or byte-string value views.
+fn Interpreter.bytes(mut self, value: Val) -> mem::Bytes {
+    let view = mut self.view(value)
+    var bytes = mem::Bytes.empty(self.alloc)
+    for byte in self.viewed(view) {
+        mut bytes.push(u8.truncate(byte.int_value().low_bits()))
+    }
+    return bytes
+} Interpreter.bytes
+
+/// A std type item, by its module and name.
+fn Interpreter.ty_item(self, module: Str, name: Str) -> ty::ItemId {
+    let db = self.ck.db()
+    match db.std_item(module, name) {
+        Some(found) => return found
+        None => {}
+    }
+    if module == "core" {
+        match db.core_item(name) {
+            Some(found) => return found
+            None => {}
+        }
+    }
+    expect false
+    return ty::ItemId(index: 0)
+} Interpreter.ty_item
+
+fn Interpreter.uninterpretable(self, at: ItemSpan) -> End {
+    return End.Uninterpretable(self.report("uninterpretable", at))
+} Interpreter.uninterpretable
+
+fn Interpreter.bounds_trap(self, site: RunSite, at: ItemSpan) -> End {
+    if self.stops_at(site, depth: 1) {
+        return End.Confirmed
+    }
+    return self.trap("trap.bounds", at)
+} Interpreter.bounds_trap
+
+fn Interpreter.conversion_trap(self, site: RunSite, at: ItemSpan) -> End {
+    if self.stops_at(site, depth: 1) {
+        return End.Confirmed
+    }
+    return self.trap("trap.conversion", at)
+} Interpreter.conversion_trap
+
+/// Structural equality: of scalars by value, of texts and slices by their elements, of
+/// structs, enum values and arrays part by part.
+fn Interpreter.equal(self, left: Val, right: Val) -> bool {
+    return self.order(left, right) == core::Ordering.Equal
+} Interpreter.equal
+
+/// Structural order: scalars by value, enum values by variant then payload, structs and
+/// arrays part by part in order, the std types the interpreter models by their compared
+/// parts.
+fn Interpreter.order(self, left: Val, right: Val) -> core::Ordering {
+    match left {
+        Val.Ref(loc) => return self.order(self.memory.get(loc), right)
+        else => {}
+    }
+    match right {
+        Val.Ref(loc) => return self.order(left, right: self.memory.get(loc))
+        else => {}
+    }
+    match left {
+        Val.Float32(a) => {
+            match right {
+                Val.Float32(b) => return a.total_cmp(b)
+                else => {}
+            }
+        }
+        Val.Float64(a) => {
+            match right {
+                Val.Float64(b) => return a.total_cmp(b)
+                else => {}
+            }
+        }
+        Val.View(a) => {
+            match right {
+                Val.View(b) => return self.order_all(self.viewed(a), right: self.viewed(b))
+                else => {}
+            }
+        }
+        Val.Variant(item: _, index: a, fields: payload) => {
+            match right {
+                Val.Variant(item: _, index: b, fields: other_payload) => {
+                    let variants = a.cmp(b)
+                    if variants != core::Ordering.Equal {
+                        return variants
+                    }
+                    return self.order_all(payload.contents().view(), right: other_payload.contents().view())
+                }
+                else => {}
+            }
+        }
+        Val.Struct(item: _, fields: _) => {
+            match right {
+                Val.Struct(item: _, fields: _) => {
+                    let left_parts = self.compared(left)
+                    let right_parts = self.compared(right)
+                    return self.order_all(left_parts.view(), right: right_parts.view())
+                }
+                else => {}
+            }
+        }
+        Val.Array(a) => {
+            match right {
+                Val.Array(b) => return self.order_all(a.contents().view(), right: b.contents().view())
+                else => {}
+            }
+        }
+        Val.Unit => {
+            match right {
+                Val.Unit => return core::Ordering.Equal
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return left.int_value().cmp(right.int_value())
+} Interpreter.order
+
+/// The parts structural order compares of a struct: a collection's elements, a fixed
+/// text's bytes, a box's or shared value's contents, the memory a store or once map holds,
+/// a capability's table entry, and the fields of any other struct.
+fn Interpreter.compared(self, value: Val) -> mem::List[Val] {
+    let alloc = self.alloc
+    let Val.Struct(item: item, fields: fields) = value else {
+        expect false
+        return mem::List[Val].empty(alloc)
+    }
+    let parts = fields.contents()
+    let path = self.ck.db().canonical(item)
+    match path.as_str() {
+        "mem::List" or "mem::Bytes" or "mem::Map" or "mem::HashMap" or "mem::Set" or "text::String" => {
+            let held = self.deref(parts[0])
+            return Val.copies(held.fields(), alloc)
+        }
+        "text::Fixed" => {
+            let len = usize.widen(parts[1].int_value().low_bits())
+            let Some(bytes) = parts[0].fields().prefix(len) else {
+                expect false
+                return mem::List[Val].empty(alloc)
+            }
+            return Val.copies(bytes, alloc)
+        }
+        "mem::Box" or "mem::Shared" => return Val.single(self.deref(parts[0]), alloc)
+        "mem::Pool" or "mem::Arena" or "mem::OnceMap" or "text::Interner" or "sys::Fs" or "sys::Net" or "sys::Clock" or "sys::Random" or "sys::Log" or "sys::Stdio" or "task::Executor" => {
+            match parts[0] {
+                Val.Ref(loc) => return Val.single(Val.Int(wide::Wide.of_u64(u64.widen(loc.extent))), alloc)
+                else => return Val.single(parts[0].copy(alloc), alloc)
+            }
+        }
+        else => return Val.copies(parts.view(), alloc)
+    }
+} Interpreter.compared
+
+fn Interpreter.order_all(self, left: Slice[Val], right: Slice[Val]) -> core::Ordering {
+    var index: usize = 0
+    while index < left.len() and index < right.len() {
+        let order = self.order(left[index], right: right[index])
+        if order != core::Ordering.Equal {
+            return order
+        }
+        index += 1
+    }
+    return left.len().cmp(right.len())
+} Interpreter.order_all

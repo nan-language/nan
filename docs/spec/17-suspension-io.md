@@ -40,7 +40,7 @@ test sleeps_in_nested_frames for pause_twice {
 The **entry** of a task is the code it starts with: the [task closure](16-concurrency.md#task-closures) or named function whose `task fn` value starts it, the body of a [test](22-testing.md#test-items) for the task of that test, or, on `x86_64-host`, the [entry function](27-program-model.md#entry) for the first task of a program.
 
 - When the entry's own head states `limits stack N`, the task's stack holds at least N bytes, and every final build lowering the entry checks that its stack use is at most N ([stack limits](10-effects-digests.md#stack-limits)).
-- Otherwise, on `x86_64-host`, the stack holds 64 KiB, the default task stack of that target's [descriptor](27-program-model.md#descriptors).
+- Otherwise, on `x86_64-host`, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
 - On `x86_64-host`, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
 
 ```nan

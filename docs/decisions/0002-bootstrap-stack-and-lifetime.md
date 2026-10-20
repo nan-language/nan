@@ -1,6 +1,6 @@
 # 0002. Bootstrap stack and lifetime
 
-Status: accepted
+Status: accepted; its host entry task stack superseded by 0038
 
 ## Context
 

@@ -1,0 +1,159 @@
+//! The machine files of a package as loaded: its lock, its history and the API snapshots of its modules, each with its bytes and what it reads as.
+
+/// A machine file: its path relative to the workspace root, its bytes, and what it reads as.
+pkg struct Loaded[T] {
+    pkg path: text::String
+    pkg bytes: mem::Bytes
+    pkg read: Result[T, machine::Invalid]
+} Loaded
+
+/// The file itself, as a part, so that what a pattern binds from its fields are parts.
+pkg proj fn Loaded.as_part(self) -> Loaded[T] = self
+
+/// What the file holds, when it is valid.
+pkg proj fn Loaded.valid(self) -> Option[T] {
+    let Ok(held) = self.as_part().read else {
+        return None
+    }
+    return Some(held)
+} Loaded.valid
+
+/// The reason the file is not valid, when it is not.
+fn Loaded.invalid(self) -> Option[machine::Invalid] {
+    let Err(invalid) = self.read else {
+        return None
+    }
+    return Some(invalid)
+} Loaded.invalid
+
+/// An API snapshot, by the module name its file is named after.
+pkg struct NamedSnapshot {
+    pkg module: text::String
+    pkg loaded: Loaded[machine::Snapshot]
+} NamedSnapshot
+
+pkg struct Machine {
+    pkg lock_file: Option[Loaded[machine::Lock]]
+    pkg history_file: Option[Loaded[machine::History]]
+    /// The API snapshots, by the module name their file is named after, in byte order.
+    pkg snapshots: mem::List[NamedSnapshot]
+} Machine
+
+/// Loads the machine files at `paths`, those of the package directory `dir`.
+fn Machine.load(
+    dir: Str,
+    paths: Slice[text::String],
+    source: fn(path: Str) -> mem::Bytes fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Machine fails platform::IoError {
+    var loaded = Machine(lock_file: None, history_file: None, snapshots: mem::List[NamedSnapshot].empty(alloc))
+    var prefix = text::String.of(dir, alloc)
+    mut prefix.append("/.nan/")
+    for path in paths {
+        if not path.starts_with(prefix.as_str()) {
+            continue
+        }
+        let Some(within) = path.slice_bytes(prefix.byte_len(), end: path.byte_len()) else {
+            continue
+        }
+        if within == "lock.nan" {
+            let bytes = try source(path.as_str())
+            let read = machine::Lock.read(bytes.view(), grammar, alloc)
+            loaded.lock_file = Some(Loaded(path: text::String.of(path.as_str(), alloc), bytes: take bytes, read: take read))
+            continue
+        }
+        if within == "history.nan" {
+            let bytes = try source(path.as_str())
+            let read = machine::History.read(bytes.view(), grammar, alloc)
+            loaded.history_file = Some(Loaded(path: text::String.of(path.as_str(), alloc), bytes: take bytes, read: take read))
+            continue
+        }
+        if not within.starts_with("api/") or not within.ends_with(".nan") or within.byte_len() < 8 {
+            continue
+        }
+        let Some(module) = within.slice_bytes(4, end: within.byte_len() - 4) else {
+            continue
+        }
+        let bytes = try source(path.as_str())
+        let read = machine::Snapshot.read(bytes.view(), grammar, alloc)
+        let snapshot = Loaded(path: text::String.of(path.as_str(), alloc), bytes: take bytes, read: take read)
+        mut loaded.snapshots.push(NamedSnapshot(module: text::String.of(module, alloc), loaded: take snapshot))
+    }
+    mut loaded.snapshots.sort_by(fn(left: NamedSnapshot, right: NamedSnapshot) => left.module.cmp(right.module))
+    return loaded
+} Machine.load
+
+/// A diagnostic per machine file that is not valid.
+fn Machine.diagnostics(self, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    match self.lock_file {
+        Some(lock) => add_invalid(mut found, path: lock.path.as_str(), invalid: lock.invalid(), alloc)
+        None => {}
+    }
+    match self.history_file {
+        Some(history) => add_invalid(mut found, path: history.path.as_str(), invalid: history.invalid(), alloc)
+        None => {}
+    }
+    for snapshot in self.snapshots {
+        add_invalid(mut found, path: snapshot.loaded.path.as_str(), invalid: snapshot.loaded.invalid(), alloc)
+    }
+    return found
+} Machine.diagnostics
+
+fn add_invalid(mut found: mem::List[diagnostic::Diagnostic], path: Str, invalid: Option[machine::Invalid], alloc: mem::Alloc) {
+    let Some(reason) = invalid else {
+        return
+    }
+    mut found.push(diagnostic::Diagnostic.at(reason.code, path, line: reason.line, alloc))
+} add_invalid
+
+pkg proj fn Machine.lock(self) -> Option[machine::Lock] {
+    let Some(loaded) = self.lock_file else {
+        return None
+    }
+    return loaded.valid()
+} Machine.lock
+
+pkg proj fn Machine.history(self) -> Option[machine::History] {
+    let Some(loaded) = self.history_file else {
+        return None
+    }
+    return loaded.valid()
+} Machine.history
+
+/// The valid API snapshot of a module, by its name.
+pkg proj fn Machine.snapshot(self, module: Str) -> Option[machine::Snapshot] {
+    for snapshot in self.snapshots {
+        if snapshot.module.as_str() == module {
+            return snapshot.loaded.valid()
+        }
+    }
+    return None
+} Machine.snapshot
+
+/// The bytes of a machine file of the package, by path.
+pkg proj fn Machine.bytes(self, path: Str) -> Option[Slice[u8]] {
+    match self.lock_file {
+        Some(lock) => {
+            if lock.path.as_str() == path {
+                return Some(lock.bytes.view())
+            }
+        }
+        None => {}
+    }
+    match self.history_file {
+        Some(history) => {
+            if history.path.as_str() == path {
+                return Some(history.bytes.view())
+            }
+        }
+        None => {}
+    }
+    for snapshot in self.snapshots {
+        if snapshot.loaded.path.as_str() == path {
+            return Some(snapshot.loaded.bytes.view())
+        }
+    }
+    return None
+} Machine.bytes

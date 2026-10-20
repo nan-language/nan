@@ -1,0 +1,408 @@
+//! What consumers see of an item, as `nan show --api` prints it: its doc comments, its interface text with the status of each ensures clause, the impl lines naming it, the properties of a struct or enum and the digest of a function.
+
+/// Whether an interface text line opens an ensures clause, and whether that clause is a
+/// disputed one, written in a `todo`.
+struct EnsuresLine derives Copy {
+    clause: bool
+    disputed: bool
+} EnsuresLine
+
+/// Whether consumers see an item: a `pub` item, or an impl line whose impl target and
+/// interface are `pub`.
+fn Checker.consumers_see(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    let declared = db.ast(item)
+    match declared.kind {
+        ast::ItemKind.Impl(_) => {}
+        else => return declared.visibility == ast::Visibility.Pub
+    }
+    let sig = self.sig(item)
+    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+        return false
+    }
+    var seen = false
+    match first target {
+        Some(TypeKey.Item(owner)) => {
+            seen = db.ast(owner).visibility == ast::Visibility.Pub
+        }
+        Some(_) => {
+            seen = true
+        }
+        None => {}
+    }
+    if not seen {
+        return false
+    }
+    let Some(interface_bound) = bound else {
+        return false
+    }
+    return db.ast(interface_bound.item).visibility == ast::Visibility.Pub
+} Checker.consumers_see
+
+/// Whether code in a module sees an impl line: its impl target and interface are visible
+/// there.
+fn Checker.seen_from(self, viewer: ty::ModuleId, line: ty::ItemId) -> bool {
+    let db = self.db()
+    let sig = self.sig(line)
+    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+        return false
+    }
+    var seen = false
+    match first target {
+        Some(TypeKey.Item(owner)) => {
+            seen = db.visible(viewer, item: owner)
+        }
+        Some(_) => {
+            seen = true
+        }
+        None => {}
+    }
+    if not seen {
+        return false
+    }
+    let Some(interface_bound) = bound else {
+        return false
+    }
+    return db.visible(viewer, item: interface_bound.item)
+} Checker.seen_from
+
+/// The lines of an item's `api` record before its digest: its doc comments when `docs`
+/// holds, its interface text as consumers or code in the module `viewer` see it, each ensures
+/// clause followed by its status, the impl lines naming it that consumers or that code see
+/// and, for a struct or enum, its properties.
+fn Checker.api_lines(self, item: ty::ItemId, docs: bool, viewer: Option[ty::ModuleId]) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    var lines = mem::List[text::String].empty(alloc)
+    if docs {
+        let doc_line = syntax.item_lines(syntax.items[data.index]).low
+        for line in doc_line..<db.head_line(item) {
+            mut lines.push(output::printable(syntax.line_text(line), alloc))
+        }
+    }
+    let statuses = self.ensures_statuses(item)
+    for line in take statused(self.interface_text(item, viewer), statuses: statuses.view()) {
+        mut lines.push(take line)
+    }
+    for other in self.naming_impls(item, viewer) {
+        for line in take self.interface_text(other, viewer: None) {
+            mut lines.push(take line)
+        }
+    }
+    match db.ast(item).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => mut lines.push(self.properties_line(item))
+        else => {}
+    }
+    return lines
+} Checker.api_lines
+
+/// The impl lines naming an item as their impl target or interface that consumers, or code
+/// in the module `viewer`, see, by file path and line.
+fn Checker.naming_impls(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var impls = mem::List[ty::ItemId].empty(self.alloc())
+    for index in 0..<db.items.len() {
+        let other = ty::ItemId(index: u32.fit(index))
+        match db.ast(other).kind {
+            ast::ItemKind.Impl(_) => {}
+            else => continue
+        }
+        var seen = false
+        match viewer {
+            Some(module) => {
+                seen = self.seen_from(module, line: other)
+            }
+            None => {
+                seen = self.consumers_see(other)
+            }
+        }
+        if seen and self.impl_names(other, item) {
+            mut impls.push(other)
+        }
+    }
+    mut impls.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => self.impl_order(left, right))
+    return impls
+} Checker.naming_impls
+
+/// Whether an impl line names an item as its impl target or its interface.
+fn Checker.impl_names(self, line: ty::ItemId, item: ty::ItemId) -> bool {
+    let sig = self.sig(line)
+    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+        return false
+    }
+    if target == Some(TypeKey.Item(item)) {
+        return true
+    }
+    let Some(interface_bound) = bound else {
+        return false
+    }
+    return interface_bound.item == item
+} Checker.impl_names
+
+/// The order of impl lines: by file path, then by line.
+fn Checker.impl_order(self, left: ty::ItemId, right: ty::ItemId) -> core::Ordering {
+    let db = self.db()
+    let paths = db.item_file(left).path.as_str().cmp(db.item_file(right).path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return db.head_line(left).cmp(db.head_line(right))
+} Checker.impl_order
+
+/// The `properties:` line of a struct or enum: the properties consumers see.
+fn Checker.properties_line(self, item: ty::ItemId) -> text::String {
+    let alloc = self.alloc()
+    let props = self.consumer_props(item)
+    var seen = mem::List[text::String].empty(alloc)
+    if props.has(Property.Linear) {
+        mut seen.push(text::String.of("linear", alloc))
+    }
+    if props.has(Property.View) {
+        mut seen.push(text::String.of("view", alloc))
+    }
+    if props.has(Property.Copy) {
+        mut seen.push(text::String.of("Copy", alloc))
+    }
+    if props.has(Property.Send) {
+        mut seen.push(text::String.of("Send", alloc))
+    }
+    if props.has(Property.Inert) {
+        mut seen.push(text::String.of("Inert", alloc))
+    }
+    if props.has(Property.AnyBits) {
+        mut seen.push(text::String.of("AnyBits", alloc))
+    }
+    var line = text::String.of("properties: ", alloc)
+    mut line.append(or_none(seen.view(), separator: ", ", alloc).as_str())
+    return line
+} Checker.properties_line
+
+/// The properties consumers see of a struct or enum: those of a closed type as computed, and
+/// of an open one its head's and those its `derives` clause lists.
+fn Checker.consumer_props(self, item: ty::ItemId) -> Props {
+    let declared = self.db().ast(item)
+    let props = self.definition_props(item)
+    if not declared.has_modifier(ast::TypeModifier.Open) {
+        return props
+    }
+    var seen = props
+    seen.send = item_derives(declared, name: "Send")
+    seen.inert = item_derives(declared, name: "Inert")
+    seen.any_bits = item_derives(declared, name: "AnyBits")
+    return seen
+} Checker.consumer_props
+
+/// Whether a struct's or enum's `derives` clause lists a name.
+fn item_derives(declared: ast::Item, name: Str) -> bool {
+    let derived = match declared.kind {
+        ast::ItemKind.Struct(structure) => structure.derived.view()
+        ast::ItemKind.Enum(enumeration) => enumeration.derived.view()
+        else => return false
+    }
+    for entry in derived {
+        if entry.text.as_str() == name {
+            return true
+        }
+    }
+    return false
+} item_derives
+
+/// The status of each ensures clause of a function with a body, in clause order: the first
+/// of open, assumed, checked and proven among those of its obligations.
+fn Checker.ensures_statuses(self, item: ty::ItemId) -> mem::List[Status] {
+    var statuses = mem::List[Status].empty(self.alloc())
+    let Some(body) = self.typed(item) else {
+        return statuses
+    }
+    if not self.db().ast(item).kind.is_fn_with_body() {
+        return statuses
+    }
+    let obligations = self.obligations(item)
+    var index: u32 = 0
+    for clause in body.contents().clauses {
+        if clause.role != ClauseRole.Ensures {
+            continue
+        }
+        mut statuses.push(clause_status(obligations.contents().view(), index, disputed: clause.disputed))
+        index += 1
+    }
+    return statuses
+} Checker.ensures_statuses
+
+/// The status of an ensures clause from those of the body obligations checking it.
+fn clause_status(sites: Slice[Obligated], index: u32, disputed: bool) -> Status {
+    var open = disputed
+    var assumed = false
+    var checked = false
+    for site in sites {
+        if site.role != nir::Role.Body or site.clause != Some(index) {
+            continue
+        }
+        match site.status {
+            Status.Open => {
+                open = true
+            }
+            Status.Assumed => {
+                assumed = true
+            }
+            Status.Checked => {
+                checked = true
+            }
+            Status.Proven => {}
+        }
+    }
+    if open {
+        return Status.Open
+    }
+    if assumed {
+        return Status.Assumed
+    }
+    if checked {
+        return Status.Checked
+    }
+    return Status.Proven
+} clause_status
+
+/// A function's digest as its digest line writes it after `digest: `.
+fn Checker.digest_text(self, item: ty::ItemId) -> text::String {
+    let alloc = self.alloc()
+    let held = self.digest(item)
+    let digest = held.contents()
+    var effects = mem::List[text::String].empty(alloc)
+    if digest.wait {
+        mut effects.push(text::String.of("wait", alloc))
+    }
+    if digest.alloc {
+        mut effects.push(text::String.of("alloc", alloc))
+    }
+    if digest.sync {
+        mut effects.push(text::String.of("sync", alloc))
+    }
+    if digest.float {
+        mut effects.push(text::String.of("float", alloc))
+    }
+    var authority = mem::List[text::String].empty(alloc)
+    if digest.device {
+        mut authority.push(text::String.of("device", alloc))
+    }
+    if digest.privileged {
+        mut authority.push(text::String.of("priv", alloc))
+    }
+    match digest.capabilities {
+        Some(capabilities) => match digest.validators {
+            Some(validators) => {
+                self.push_sorted_paths(mut authority, items: capabilities)
+                self.push_sorted_paths(mut authority, items: validators)
+            }
+            None => mut authority.push(text::String.of("any", alloc))
+        }
+        None => mut authority.push(text::String.of("any", alloc))
+    }
+    var terminates = "may-not-terminate"
+    if digest.terminates {
+        terminates = "terminates"
+    }
+    var may_trap = "no"
+    if self.may_trap(item) {
+        may_trap = "yes"
+    }
+    var written = text::String.of("effects ", alloc)
+    mut written.append(or_none(effects.view(), separator: " ", alloc).as_str())
+    mut written.append(" | authority ")
+    mut written.append(or_none(authority.view(), separator: " ", alloc).as_str())
+    mut written.append(" | may-trap ")
+    mut written.append(may_trap)
+    mut written.append(" | ")
+    mut written.append(terminates)
+    return written
+} Checker.digest_text
+
+/// Appends the canonical paths of items, sorted.
+fn Checker.push_sorted_paths(self, mut paths: mem::List[text::String], items: mem::Set[ty::ItemId]) {
+    var sorted = mem::List[text::String].empty(self.alloc())
+    for item in items {
+        mut sorted.push(self.db().canonical(item))
+    }
+    mut sorted.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    for path in take sorted {
+        mut paths.push(take path)
+    }
+} Checker.push_sorted_paths
+
+fn or_none(entries: Slice[text::String], separator: Str, alloc: mem::Alloc) -> text::String {
+    if entries.len() == 0 {
+        return text::String.of("none", alloc)
+    }
+    var joined = text::String.empty(alloc)
+    for index in 0..<entries.len() {
+        if index > 0 {
+            mut joined.append(separator)
+        }
+        mut joined.append(entries[index].as_str())
+    }
+    return joined
+} or_none
+
+/// Interface text lines with each ensures clause followed by its status, `checked` for a clause
+/// of a function without a body.
+fn statused(take lines: mem::List[text::String], statuses: Slice[Status]) -> mem::List[text::String] {
+    var clause: usize = 0
+    var at: usize = 0
+    while at < lines.len() {
+        let kind = ensures_line(lines[at].as_str())
+        if kind.clause {
+            let depth = leading_space(lines[at].as_str())
+            var end = at
+            while end + 1 < lines.len() and leading_space(lines[end + 1].as_str()) > depth {
+                end += 1
+            }
+            var status = "checked"
+            if clause < statuses.len() {
+                status = statuses[clause].word()
+            } else if kind.disputed {
+                status = "open"
+            }
+            var held = mut lines.at_mut(end)
+            mut held.append(" [")
+            mut held.append(status)
+            mut held.push(']')
+            clause += 1
+            at = end
+        }
+        at += 1
+    }
+    return lines
+} statused
+
+/// Whether a line, past its leading white space, opens an ensures clause, and whether it is
+/// a disputed one written in a `todo`.
+fn ensures_line(line: Str) -> EnsuresLine {
+    let Some(text) = line.slice_bytes(leading_space(line), end: line.byte_len()) else {
+        return EnsuresLine(clause: false, disputed: false)
+    }
+    let disputed = text.starts_with("todo ") and text.find(" ensures ").is_some()
+    return EnsuresLine(clause: text.starts_with("ensures ") or disputed, disputed: disputed)
+} ensures_line
+
+/// The bytes of a line's leading white space.
+fn leading_space(line: Str) -> usize {
+    var count: usize = 0
+    var chars = line.cursor()
+    loop {
+        let Some(c) = mut chars.next() else {
+            return count
+        }
+        if not is_white_space(c) {
+            return count
+        }
+        count += c.utf8_len()
+    }
+} leading_space
+
+/// Whether a character has the Unicode `White_Space` property.
+fn is_white_space(c: char) -> bool {
+    let code = c.to_bits()
+    return (code >= 0x9 and code <= 0xD) or code == 0x20 or code == 0x85 or code == 0xA0 or code == 0x1680 or (code >= 0x2000 and code <= 0x200A) or code == 0x2028 or code == 0x2029 or code == 0x202F or code == 0x205F or code == 0x3000
+} is_white_space

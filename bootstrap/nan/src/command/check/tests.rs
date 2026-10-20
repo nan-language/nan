@@ -409,3 +409,29 @@ fn a_store_entry_holding_another_release_than_the_lock_names_is_a_root_mismatch(
         "{output}"
     );
 }
+
+#[test]
+fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
+    let scratch = Scratch::new(&[
+        (
+            "app/package.nan",
+            "//! A package.\n\npackage app {\n    language 1\n    targets x86_64-bare, x86_64-host\n} app\n",
+        ),
+        ("app/app.nan", "//! Root.\n"),
+        (
+            "app/platform@bare/platform.nan",
+            "//! Platform.\n\nfn broken() {\n} broken\n",
+        ),
+        (
+            "app/platform@host/platform.nan",
+            "//! Platform.\n\nfn broken() {\n    let k: fn() uses other = t\n} broken\n",
+        ),
+    ]);
+    let run = run_in(&scratch.0, "check");
+    assert!(
+        run.output
+            .contains("\nerror effect.uses-unknown app/platform@host/platform.nan:4 "),
+        "{}",
+        run.output
+    );
+}

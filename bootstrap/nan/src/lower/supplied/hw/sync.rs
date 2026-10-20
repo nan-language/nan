@@ -406,7 +406,7 @@ pub fn anchor_with(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 &[Held::Address(anchor)],
             );
             supply.forward_failure(lo, fx, &called);
-            let some = lo.variant_value(fx, &option, "Some", &[called.result], false);
+            let some = lo.variant_value(fx, &option, "Some", &[called.result], None);
             supply.ret(lo, fx, some);
         });
     }

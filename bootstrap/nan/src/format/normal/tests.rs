@@ -107,3 +107,17 @@ fn reduced_forms_drop_what_naming_code_does_not_see() {
     assert_eq!(constant.normalised, "pub const example::STEP: u32 = 5\n");
     assert_eq!(constant.interface, None);
 }
+
+#[test]
+fn an_integer_literal_beyond_128_bits_is_its_decimal_value() {
+    let forms = forms_of(
+        "pub const BIG: u64 = 0x1_0000_0000_0000_0000_0000_0000_0000_0000\n",
+        "example::BIG",
+        None,
+        false,
+    );
+    assert_eq!(
+        forms.normalised,
+        "pub const example::BIG: u64 = 340282366920938463463374607431768211456\n"
+    );
+}

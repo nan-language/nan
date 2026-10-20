@@ -196,6 +196,24 @@ pub fn retries() -> u32 = 3
 pub fn retries() -> u32 = 5 // error: item.duplicate
 ```
 
+```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+pub fn Gauge.raised(self) -> u32 = self.level.saturating_add(1)
+
+pub fn Gauge.raised(self) -> u32 = self.level.saturating_add(2) // error: item.duplicate
+```
+
+```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+pub fn Gauge.level(self) -> u32 = self.level // error: item.duplicate
+```
+
 ## Modifiers
 
 A **modifier** is a word between the visibility and the kind keyword that changes the rules of an item.

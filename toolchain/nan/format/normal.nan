@@ -1,0 +1,1319 @@
+//! The normalised form of an item, its interface form and its interface text: the canonical format flat and without comments, its paths, literals, order-free members and bindings written canonically, and the parts of it that code naming the item sees.
+
+/// What the checker knows of an item beyond its syntax and the items its paths name.
+pkg struct Known {
+    /// The canonical path of the item, or of a tombstone's old form.
+    pkg own: Option[text::String]
+    /// Whether a transparent function's body enters its interface form or text.
+    pkg transparent: bool
+    /// The fields of a struct its interface form or text shows.
+    pkg fields: Reach
+    /// The facts line of a struct or enum.
+    pkg facts: Option[text::String]
+} Known
+
+/// Which fields of a struct a reader sees.
+pkg enum Reach derives Copy, Eq {
+    /// Every field: a reader in the struct's module.
+    Module
+    /// Its `pkg` and `pub` fields: a reader in its package.
+    Package
+    /// Its `pub` fields.
+    Consumer
+} Reach
+
+/// An item's normalised form, and its interface form, which a const's value decides and none
+/// gives here.
+pkg struct Forms {
+    pkg normalised: text::String
+    pkg interface_form: Option[text::String]
+} Forms
+
+/// The normalised and interface forms of a parsed item. `resolve` gives what a path written in
+/// the item's module names: an item's canonical path or a core vocabulary name; none when it
+/// names neither.
+pkg fn Forms.of(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    alloc: mem::Alloc,
+    ) -> Forms {
+    let Some(tree) = item.tree else {
+        expect false
+        return Forms(normalised: text::String.empty(alloc), interface_form: None)
+    }
+    let normal = Normal(facts: Facts.collect(file, tree, alloc), bindings: Bindings.collect(file, tree, alloc))
+    let punned = Punning.collect(file, tree, bindings: normal.bindings, alloc)
+    var toks = flat_tokens(file, item, facts: normal.facts, punned: punned.labels, alloc)
+    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, alloc)
+    for run in normal.runs(file, tree, alloc) {
+        normal.sort(mut toks, run, alloc)
+    }
+    normal.number(mut toks, renamed, alloc)
+    let normalised = text_of_lines(normal.render(toks.view(), alloc), alloc)
+    let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Form, alloc) else {
+        return Forms(normalised: take normalised, interface_form: None)
+    }
+    let reduced = reduction.apply(take toks, alloc)
+    var lines = normal.render(reduced.view(), alloc)
+    match known.facts {
+        Some(facts) => mut lines.push(text::String.of(facts.as_str(), alloc))
+        None => {
+        }
+    }
+    return Forms(normalised: take normalised, interface_form: Some(text_of_lines(lines, alloc)))
+} Forms.of
+
+/// The interface text of a parsed item: the lines of its canonical format, without comments,
+/// that hold its interface form.
+pkg fn interface_text(file: syntax::SourceFile, item: syntax::ItemSyntax, known: Known, alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(tree) = item.tree else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    let facts = Facts.collect(file, tree, alloc)
+    let punned = Punning.collect(file, tree, bindings: Bindings.collect(file, tree, alloc), alloc)
+    var toks = uncommented(item_tokens(file, item, facts, punned: punned.labels, alloc), alloc)
+    let roles = trailing_commas(mut toks, facts, flat: false, alloc)
+    let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Text, alloc) else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    var kept = mem::List[bool].empty(alloc)
+    for tok in toks {
+        var shown = true
+        match tok.source {
+            Some(source) => {
+                shown = not reduction.dropped.contains(source)
+            }
+            None => {
+            }
+        }
+        mut kept.push(shown)
+    }
+    let kept_roles = roles.kept(kept, alloc)
+    let reduced = reduction.apply(take toks, alloc)
+    return facts.render_lines(reduced.view(), roles: kept_roles, alloc)
+} interface_text
+
+/// Which bindings a fragment's normalised text numbers.
+pkg enum Numbering derives Copy, Eq {
+    /// Those it introduces, in order of introduction; every other binding keeps its name.
+    Introduced
+    /// Every binding it names, in order of first occurrence in it.
+    Named
+} Numbering
+
+/// The tokens `range` of a parsed item on one line, written as its normalised form writes them:
+/// paths canonical, literals canonical, order-free members sorted, and bindings numbered as
+/// `numbering` states. `resolve` is as for `Forms.of`.
+pkg fn normalised_fragment(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    range: syntax::TokenSpan,
+    numbering: Numbering,
+    alloc: mem::Alloc,
+    ) -> text::String {
+    let Some(tree) = item.tree else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let normal = Normal(facts: Facts.collect(file, tree, alloc), bindings: Bindings.collect(file, tree, alloc))
+    let punned = Punning.collect(file, tree, bindings: normal.bindings, alloc)
+    var toks = flat_tokens(file, item, facts: normal.facts, punned: punned.labels, alloc)
+    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, alloc)
+    for run in normal.runs(file, tree, alloc) {
+        normal.sort(mut toks, run, alloc)
+    }
+    retain_within(mut toks, range, alloc)
+    var numbers = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    for tok in mut toks {
+        let Some(source) = tok.source else {
+            continue
+        }
+        let Some(binding) = renamed.get(source) else {
+            continue
+        }
+        if numbering == Numbering.Introduced and not (binding >= range.head and binding <= range.last) {
+            tok.text = dollar_replaced(tok.text.as_str(), by: file.text(usize.widen(binding)), alloc)
+            continue
+        }
+        tok.text = numbered(tok.text.as_str(), number: binding_number(mut numbers, binding), alloc)
+    }
+    return spaced_line(normal.render(toks.view(), alloc), alloc)
+} normalised_fragment
+
+/// The flat text of the tokens `range` of a parsed item: on one line, without comments, each
+/// breakable list flat and each text run written as the normalised form writes it.
+pkg fn flat_text(file: syntax::SourceFile, item: syntax::ItemSyntax, range: syntax::TokenSpan, alloc: mem::Alloc) -> text::String {
+    let Some(tree) = item.tree else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let facts = Facts.collect(file, tree, alloc)
+    let punned = Punning.collect(file, tree, bindings: Bindings.collect(file, tree, alloc), alloc)
+    var toks = flat_tokens(file, item, facts, punned: punned.labels, alloc)
+    retain_within(mut toks, range, alloc)
+    for tok in mut toks {
+        if tok.kind == syntax::TokenKind.Text or tok.kind == syntax::TokenKind.TextLine {
+            match literal(tok.kind, spelt: tok.text.as_str(), alloc) {
+                Some(canonical) => {
+                    tok.text = canonical
+                }
+                None => {
+                }
+            }
+        }
+    }
+    merge_runs(mut toks, alloc)
+    let roles = Roles.flat(toks.len(), lists: facts.lists.len(), alloc)
+    return spaced_line(facts.render_lines(toks.view(), roles, alloc), alloc)
+} flat_text
+
+/// The item's tokens without comments, none breaking its line, each breakable list flat.
+fn flat_tokens(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    facts: Facts,
+    punned: mem::HashMap[u32, Unit],
+    alloc: mem::Alloc,
+    ) -> mem::List[Tok] {
+    var toks = uncommented(item_tokens(file, item, facts, punned, alloc), alloc)
+    for tok in mut toks {
+        tok.newline = false
+    }
+    discard trailing_commas(mut toks, facts, flat: true, alloc)
+    return toks
+} flat_tokens
+
+/// Keeps the tokens whose source lies in a range.
+fn retain_within(mut toks: mem::List[Tok], range: syntax::TokenSpan, alloc: mem::Alloc) {
+    var pending = drained(mut toks, alloc)
+    loop {
+        let Some(tok) = mut pending.pop() else {
+            return
+        }
+        let Some(source) = tok.source else {
+            continue
+        }
+        if source >= range.head and source <= range.last {
+            mut toks.push(take tok)
+        }
+    }
+} retain_within
+
+/// The number of a binding in order of first occurrence, numbering it next when it has none.
+fn binding_number(mut numbers: mem::HashMap[u32, usize], binding: u32) -> usize {
+    let next = numbers.len() + 1
+    let Some(number) = numbers.get(binding) else {
+        discard mut numbers.insert(binding, value: next)
+        return next
+    }
+    return number
+} binding_number
+
+/// The tokens without their comments and doc comments.
+fn uncommented(take toks: mem::List[Tok], alloc: mem::Alloc) -> mem::List[Tok] {
+    var kept = mem::List[Tok].empty(alloc)
+    for tok in take toks {
+        if tok.kind == syntax::TokenKind.Doc or tok.kind == syntax::TokenKind.FileDoc {
+            continue
+        }
+        var bare = tok
+        bare.comments = mem::List[text::String].empty(alloc)
+        bare.trailing = None
+        mut kept.push(take bare)
+    }
+    return kept
+} uncommented
+
+/// The lines, each ended by LF.
+fn text_of_lines(lines: mem::List[text::String], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for index in 0..<lines.len() {
+        if index > 0 {
+            mut written.push('\n')
+        }
+        mut written.append(lines[index].as_str())
+    }
+    mut written.push('\n')
+    return written
+} text_of_lines
+
+/// The lines joined by spaces, without the whitespace starting them.
+fn spaced_line(lines: mem::List[text::String], alloc: mem::Alloc) -> text::String {
+    var line = text::String.empty(alloc)
+    for index in 0..<lines.len() {
+        if index > 0 {
+            mut line.push(' ')
+        }
+        mut line.append(lines[index].as_str())
+    }
+    var start: usize = 0
+    var chars = line.cursor()
+    loop {
+        let Some(c) = mut chars.next() else {
+            break
+        }
+        if not is_whitespace(c) {
+            break
+        }
+        start += c.utf8_len()
+    }
+    let Some(rest) = line.slice_bytes(start, end: line.byte_len()) else {
+        expect false
+        return line
+    }
+    return text::String.of(rest, alloc)
+} spaced_line
+
+/// Whether a character is white space as Unicode defines it.
+fn is_whitespace(c: char) -> bool {
+    return match c {
+        '\t' or '\n' or '\u{B}' or '\u{C}' or '\r' or ' ' or '\u{85}' or '\u{A0}' or '\u{1680}' => true
+        '\u{2000}'..='\u{200A}' or '\u{2028}' or '\u{2029}' or '\u{202F}' or '\u{205F}' or '\u{3000}' => true
+        else => false
+    }
+} is_whitespace
+
+/// The facts and bindings of an item its normalised form writes.
+struct Normal {
+    facts: Facts
+    bindings: Bindings
+} Normal
+
+/// A list of order-free members to sort, at its depth in the tree.
+struct Run {
+    elements: mem::List[syntax::TokenSpan]
+    depth: usize
+} Run
+
+fn Normal.render(self, toks: Slice[Tok], alloc: mem::Alloc) -> mem::List[text::String] {
+    return self.facts.render_lines(toks, roles: Roles.flat(toks.len(), lists: self.facts.lists.len(), alloc), alloc)
+} Normal.render
+
+/// Writes the item's declared names, paths and literals canonically and its bindings as
+/// `$`; returns the binding each renamed token belongs to.
+fn Normal.substitute(
+    self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    mut toks: mem::List[Tok],
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    punned: Punning,
+    alloc: mem::Alloc,
+    ) -> mem::HashMap[u32, u32] {
+    var written = mem::HashMap[u32, Option[text::String]].empty(seed: 0, alloc)
+    match known.own {
+        Some(own) => {
+            for span in self.declared(file, tree, alloc) {
+                replace(mut written, span, by: text::String.of(own.as_str(), alloc))
+            }
+        }
+        None => {
+        }
+    }
+    for path in self.paths(file, tree, alloc) {
+        match resolve(path.segments.view()) {
+            Some(resolved) => replace(mut written, span: path.span, by: take resolved)
+            None => {
+            }
+        }
+    }
+    var renamed = mem::HashMap[u32, u32].empty(seed: 0, alloc)
+    for entry in self.bindings.of.cursor() {
+        if not self.bindings.parameters.contains(entry.value()) {
+            discard mut renamed.insert(entry.key(), value: entry.value())
+        }
+    }
+    var pending = drained(mut toks, alloc)
+    loop {
+        let Some(popped) = mut pending.pop() else {
+            break
+        }
+        var tok = popped
+        let Some(source) = tok.source else {
+            mut toks.push(take tok)
+            continue
+        }
+        match written.get(source) {
+            Some(None) => continue
+            Some(Some(by)) => {
+                tok.text = text::String.of(by.as_str(), alloc)
+            }
+            None => {
+                if renamed.contains(source) {
+                    tok.text = text::String.of("$", alloc)
+                } else {
+                    match literal(tok.kind, spelt: tok.text.as_str(), alloc) {
+                        Some(canonical) => {
+                            tok.text = canonical
+                        }
+                        None => {
+                        }
+                    }
+                }
+            }
+        }
+        match punned.values.get(source) {
+            Some(name) => {
+                if renamed.contains(name) {
+                    var labelled = text::String.of(file.text(usize.widen(name)), alloc)
+                    mut labelled.append(": ")
+                    mut labelled.append(tok.text.as_str())
+                    tok.text = labelled
+                }
+            }
+            None => {
+            }
+        }
+        mut toks.push(take tok)
+    }
+    merge_runs(mut toks, alloc)
+    return renamed
+} Normal.substitute
+
+/// Writes the tokens of a span as one text: its first token as `by`, the others as nothing.
+fn replace(mut written: mem::HashMap[u32, Option[text::String]], span: syntax::TokenSpan, take by: text::String) {
+    discard mut written.insert(span.head, value: Some(take by))
+    for token in (span.head + 1)..=span.last {
+        discard mut written.insert(token, value: None)
+    }
+} replace
+
+/// The spans of the item's declared name and closing label, and of a tombstone's old form.
+fn Normal.declared(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[syntax::TokenSpan] {
+    var spans = mem::List[syntax::TokenSpan].empty(alloc)
+    for node in tree.descendants(tree.root(), alloc) {
+        match tree.rule(node) {
+            syntax::Rule.FnHead or syntax::Rule.FnBody => label_span(tree, node, mut spans, alloc)
+            syntax::Rule.StructItem or syntax::Rule.EnumItem or syntax::Rule.InterfaceItem or syntax::Rule.LayoutItem or syntax::Rule.RegistersItem or syntax::Rule.PackageItem => {
+                name_span(file, tree, node, mut spans)
+                label_span(tree, node, mut spans, alloc)
+            }
+            syntax::Rule.RegistryItem or syntax::Rule.TestItem or syntax::Rule.ConstItem or syntax::Rule.ContributeItem => name_span(file, tree, node, mut spans)
+            syntax::Rule.RetiredOld => {
+                var member: Option[u32] = None
+                for token in tree.child_tokens(node) {
+                    if is_ident(file, token) {
+                        member = Some(token)
+                    }
+                }
+                match find_in(tree, node: Some(node), rule: syntax::Rule.Path) {
+                    Some(path) => {
+                        match tree.span(path, alloc) {
+                            Some(span) => mut spans.push(syntax::TokenSpan(head: span.head, last: member.value_or(span.last)))
+                            None => {
+                            }
+                        }
+                    }
+                    None => {
+                    }
+                }
+            }
+            else => {
+            }
+        }
+    }
+    return spans
+} Normal.declared
+
+/// Adds the span of a node's closing label, if it has one holding tokens.
+fn label_span(tree: syntax::Tree, node: u32, mut spans: mem::List[syntax::TokenSpan], alloc: mem::Alloc) {
+    let Some(label) = tree.find(node, rule: syntax::Rule.ItemLabel) else {
+        return
+    }
+    match tree.span(label, alloc) {
+        Some(span) => mut spans.push(span)
+        None => {
+        }
+    }
+} label_span
+
+/// Adds the token of a node's first identifier, if it has one.
+fn name_span(file: syntax::SourceFile, tree: syntax::Tree, node: u32, mut spans: mem::List[syntax::TokenSpan]) {
+    match first_ident(file, tree, node) {
+        Some(token) => mut spans.push(syntax::TokenSpan(head: token, last: token))
+        None => {
+        }
+    }
+} name_span
+
+fn first_ident(file: syntax::SourceFile, tree: syntax::Tree, node: u32) -> Option[u32] {
+    for token in tree.child_tokens(node) {
+        if is_ident(file, token) {
+            return Some(token)
+        }
+    }
+    return None
+} first_ident
+
+/// A path of an item that may name an item, with its segments.
+struct PathUse {
+    span: syntax::TokenSpan
+    segments: mem::List[text::String]
+} PathUse
+
+/// The paths of the item that may name an item, with their segments: not a label, a
+/// binding, a parameter, a generic parameter, a field of the struct, `Self` or a tombstone's
+/// old form.
+fn Normal.paths(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[PathUse] {
+    var local = mem::HashMap[text::String, Unit].empty(seed: 0, alloc)
+    discard mut local.insert(text::String.of("Self", alloc), value: Unit)
+    for node in tree.descendants(tree.root(), alloc) {
+        let rule = tree.rule(node)
+        if rule == syntax::Rule.GenericParam or rule == syntax::Rule.ImplParam or rule == syntax::Rule.Field {
+            match first_ident(file, tree, node) {
+                Some(token) => {
+                    discard mut local.insert(text::String.of(file.text(usize.widen(token)), alloc), value: Unit)
+                }
+                None => {
+                }
+            }
+        }
+    }
+    var found = mem::List[PathUse].empty(alloc)
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(tree.root())
+    loop {
+        let Some(node) = mut pending.pop() else {
+            return found
+        }
+        let children = child_node_list(tree, node, alloc)
+        match first tree.rule(node) {
+            syntax::Rule.Arg or syntax::Rule.FieldPattern or syntax::Rule.PayloadField if children.len() == 2 => mut pending.push(children[1])
+            syntax::Rule.RetiredOld => {
+                for child in children {
+                    if tree.rule(child) != syntax::Rule.Path {
+                        mut pending.push(child)
+                    }
+                }
+            }
+            syntax::Rule.Path => {
+                let tokens = child_token_list(tree, node, alloc)
+                var segments = mem::List[text::String].empty(alloc)
+                for token in tokens {
+                    if is_ident(file, token) {
+                        mut segments.push(text::String.of(file.text(usize.widen(token)), alloc))
+                    }
+                }
+                let local_path = segments.len() == 1 and (self.bindings.of.contains(tokens[0]) or local.contains(segments[0]))
+                if not local_path {
+                    mut found.push(PathUse(span: syntax::TokenSpan(head: tokens[0], last: tokens[tokens.len() - 1]), segments: take segments))
+                }
+            }
+            else => {
+                for child in children {
+                    mut pending.push(child)
+                }
+            }
+        }
+    }
+} Normal.paths
+
+/// A node of the tree at its depth.
+struct DepthNode derives Copy {
+    node: u32
+    depth: usize
+} DepthNode
+
+/// The lists of order-free members: the fields and invariant lines of a struct, the
+/// variants of an enum and their labelled payload fields, unless the type derives `Ord`,
+/// `Render` or `Generate`, the entries of `limits` and `derives` clauses and the arms of a
+/// `match` that is not `match first`; innermost first.
+fn Normal.runs(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[Run] {
+    var ordered = false
+    for node in tree.descendants(tree.root(), alloc) {
+        if tree.rule(node) != syntax::Rule.DerivesClause {
+            continue
+        }
+        for token in tree.child_tokens(node) {
+            let word = file.text(usize.widen(token))
+            if word == "Ord" or word == "Render" or word == "Generate" {
+                ordered = true
+            }
+        }
+        break
+    }
+    var runs = mem::List[Run].empty(alloc)
+    var pending = mem::List[DepthNode].empty(alloc)
+    mut pending.push(DepthNode(node: tree.root(), depth: 0))
+    loop {
+        let Some(current) = mut pending.pop() else {
+            break
+        }
+        let children = child_node_list(tree, node: current.node, alloc)
+        add_runs(file, tree, current, children, ordered, mut runs, alloc)
+        for child in children {
+            mut pending.push(DepthNode(node: child, depth: current.depth + 1))
+        }
+    }
+    mut runs.retain(fn(run: Run) => run.elements.len() > 1)
+    mut runs.sort_by(fn(left: Run, right: Run) => right.depth.cmp(left.depth))
+    return runs
+} Normal.runs
+
+/// Adds the runs of order-free members a node holds.
+fn add_runs(
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    current: DepthNode,
+    children: mem::List[u32],
+    ordered: bool,
+    mut runs: mem::List[Run],
+    alloc: mem::Alloc,
+    ) {
+    let depth = current.depth
+    match tree.rule(current.node) {
+        syntax::Rule.StructItem => {
+            var fields = mem::List[syntax::TokenSpan].empty(alloc)
+            var invariants = mem::List[syntax::TokenSpan].empty(alloc)
+            for child in children {
+                if tree.rule(child) != syntax::Rule.StructMember {
+                    continue
+                }
+                if tree.find(child, rule: syntax::Rule.Field).is_some() {
+                    mut fields.push(member_span(tree, node: child, alloc))
+                } else {
+                    mut invariants.push(member_span(tree, node: child, alloc))
+                }
+            }
+            if not ordered {
+                mut runs.push(Run(elements: take fields, depth: depth))
+            }
+            mut runs.push(Run(elements: take invariants, depth: depth))
+        }
+        syntax::Rule.EnumItem => {
+            if not ordered {
+                mut runs.push(Run(elements: member_spans(tree, children, rule: syntax::Rule.EnumMember, alloc), depth: depth))
+            }
+        }
+        syntax::Rule.VariantPayload => {
+            if not ordered {
+                let fields = tree.list_elements(tree.find(current.node, rule: syntax::Rule.PayloadList), element: syntax::Rule.PayloadField, alloc)
+                var labelled = true
+                for field in fields {
+                    if child_node_list(tree, node: field, alloc).len() != 2 {
+                        labelled = false
+                    }
+                }
+                if labelled {
+                    mut runs.push(Run(elements: member_spans(tree, children: fields, rule: syntax::Rule.PayloadField, alloc), depth: depth))
+                }
+            }
+        }
+        syntax::Rule.LimitsClause => {
+            var entries = mem::List[syntax::TokenSpan].empty(alloc)
+            for child in children {
+                mut entries.push(member_span(tree, node: child, alloc))
+            }
+            mut runs.push(Run(elements: take entries, depth: depth))
+        }
+        syntax::Rule.DerivesClause => {
+            var names = mem::List[syntax::TokenSpan].empty(alloc)
+            for token in tree.child_tokens(current.node) {
+                if is_ident(file, token) {
+                    mut names.push(syntax::TokenSpan(head: token, last: token))
+                }
+            }
+            mut runs.push(Run(elements: take names, depth: depth))
+        }
+        syntax::Rule.MatchExpr => {
+            if not holds_keyword(file, tree, node: current.node, keyword: syntax::Keyword.First) {
+                mut runs.push(Run(elements: member_spans(tree, children, rule: syntax::Rule.MatchArm, alloc), depth: depth))
+            }
+        }
+        else => {
+        }
+    }
+} add_runs
+
+fn holds_keyword(file: syntax::SourceFile, tree: syntax::Tree, node: u32, keyword: syntax::Keyword) -> bool {
+    for token in tree.child_tokens(node) {
+        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Keyword(keyword) {
+            return true
+        }
+    }
+    return false
+} holds_keyword
+
+/// The span of a member, which holds tokens.
+fn member_span(tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> syntax::TokenSpan {
+    let Some(span) = tree.span(node, alloc) else {
+        expect false
+        return syntax::TokenSpan(head: 0, last: 0)
+    }
+    return span
+} member_span
+
+/// The spans of the children expanding `rule`.
+fn member_spans(tree: syntax::Tree, children: mem::List[u32], rule: syntax::Rule, alloc: mem::Alloc) -> mem::List[syntax::TokenSpan] {
+    var spans = mem::List[syntax::TokenSpan].empty(alloc)
+    for child in children {
+        if tree.rule(child) == rule {
+            mut spans.push(member_span(tree, node: child, alloc))
+        }
+    }
+    return spans
+} member_spans
+
+/// A range of positions in a list of tokens.
+struct Positions derives Copy {
+    start: usize
+    end: usize
+} Positions
+
+/// Sorts the members of a run in byte order of their text: each moves to the slot of its
+/// rank, the tokens between members keeping their place.
+fn Normal.sort(self, mut toks: mem::List[Tok], run: Run, alloc: mem::Alloc) {
+    var spans = mem::List[Positions].empty(alloc)
+    for element in run.elements {
+        var start: Option[usize] = None
+        var end: usize = 0
+        for at in 0..<toks.len() {
+            let Some(source) = toks[at].source else {
+                continue
+            }
+            if source >= element.head and source <= element.last {
+                if start.is_none() {
+                    start = Some(at)
+                }
+                end = at + 1
+            }
+        }
+        match start {
+            Some(found) => mut spans.push(Positions(start: found, end: end))
+            None => {
+            }
+        }
+    }
+    if spans.len() < 2 {
+        return
+    }
+    mut spans.sort_by(fn(left: Positions, right: Positions) => left.start.cmp(right.start))
+    var keys = mem::List[text::String].empty(alloc)
+    for span in spans {
+        let Some(halves) = toks.view().split_at(span.start) else {
+            expect false
+            return
+        }
+        let Some(member) = halves.tail.prefix(span.end - span.start) else {
+            expect false
+            return
+        }
+        let lines = self.render(member, alloc)
+        var key = text::String.empty(alloc)
+        for index in 0..<lines.len() {
+            if index > 0 {
+                mut key.push('\n')
+            }
+            mut key.append(lines[index].as_str())
+        }
+        mut keys.push(take key)
+    }
+    var ranked = mem::List[usize].empty(alloc)
+    for index in 0..<spans.len() {
+        mut ranked.push(index)
+    }
+    mut ranked.sort_by(fn(left: usize, right: usize) => keys[left].cmp(keys[right]))
+    let start = spans[0].start
+    var order = mem::List[usize].empty(alloc)
+    for slot in 0..<ranked.len() {
+        let element = ranked[slot]
+        for at in spans[element].start..<spans[element].end {
+            mut order.push(at)
+        }
+        if slot + 1 < spans.len() {
+            for at in spans[slot].end..<spans[slot + 1].start {
+                mut order.push(at)
+            }
+        }
+    }
+    var moved = mem::List[Tok].empty(alloc)
+    for at in order {
+        mut moved.push(toks[at].duplicate(alloc))
+    }
+    var offset: usize = 0
+    for tok in take moved {
+        toks[start + offset] = tok
+        offset += 1
+    }
+} Normal.sort
+
+/// Numbers the bindings `$1`, `$2` and so on in order of their first introduction.
+fn Normal.number(self, mut toks: mem::List[Tok], renamed: mem::HashMap[u32, u32], alloc: mem::Alloc) {
+    var numbers = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    for tok in mut toks {
+        let Some(source) = tok.source else {
+            continue
+        }
+        let Some(origin) = renamed.get(source) else {
+            continue
+        }
+        tok.text = numbered(tok.text.as_str(), number: binding_number(mut numbers, binding: origin), alloc)
+    }
+} Normal.number
+
+/// The text with its last `$` written as `$` and a number.
+fn numbered(written: Str, number: usize, alloc: mem::Alloc) -> text::String {
+    var dollar = text::String.of("$", alloc)
+    mut dollar.write(text::fmt("{number}", number), budget: 64)
+    return dollar_replaced(written, by: dollar.as_str(), alloc)
+} numbered
+
+/// The text with its last `$` replaced by `by`.
+fn dollar_replaced(written: Str, by: Str, alloc: mem::Alloc) -> text::String {
+    let bytes = written.as_bytes()
+    var at = bytes.len()
+    loop {
+        expect at > 0
+        at -= 1
+        if bytes[at] == b'$' {
+            break
+        }
+    }
+    let Some(before) = written.slice_bytes(0, end: at) else {
+        expect false
+        return text::String.of(written, alloc)
+    }
+    let Some(after) = written.slice_bytes(at + 1, end: written.byte_len()) else {
+        expect false
+        return text::String.of(written, alloc)
+    }
+    var replaced = text::String.of(before, alloc)
+    mut replaced.append(by)
+    mut replaced.append(after)
+    return replaced
+} dollar_replaced
+
+/// What a reduction serves: an interface form, or an interface text.
+enum Reading derives Copy, Eq {
+    Form
+    Text
+} Reading
+
+/// The tokens an interface form or text leaves out of an item, and the default bodies it
+/// writes `default`.
+struct Reduction {
+    dropped: mem::HashMap[u32, Unit]
+    defaults: mem::HashMap[u32, Unit]
+} Reduction
+
+fn Reduction.apply(self, take toks: mem::List[Tok], alloc: mem::Alloc) -> mem::List[Tok] {
+    var kept = mem::List[Tok].empty(alloc)
+    for tok in take toks {
+        var written = tok
+        match written.source {
+            Some(source) => {
+                if self.dropped.contains(source) {
+                    continue
+                }
+                if self.defaults.contains(source) {
+                    written.text = text::String.of("default", alloc)
+                    written.kind = syntax::TokenKind.Ident
+                }
+            }
+            None => {
+            }
+        }
+        mut kept.push(take written)
+    }
+    return kept
+} Reduction.apply
+
+/// The reduction of an item to its interface form or text; none for the interface form of a
+/// const.
+fn Reduction.of(
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    known: Known,
+    reading: Reading,
+    alloc: mem::Alloc,
+    ) -> Option[Reduction] {
+    var reduction = Reduction(dropped: mem::HashMap[u32, Unit].empty(seed: 0, alloc), defaults: mem::HashMap[u32, Unit].empty(seed: 0, alloc))
+    let Some(kind) = tree.kind() else {
+        return Some(take reduction)
+    }
+    var regions = mem::List[u32].empty(alloc)
+    match first kind.rule {
+        syntax::Rule.FnItem => mut reduction.drop_body(file, tree, item: kind.node, known, mut regions, alloc)
+        syntax::Rule.StructItem => mut reduction.drop_hidden_fields(file, tree, item: kind.node, known, alloc)
+        syntax::Rule.InterfaceItem => mut reduction.default_methods(file, tree, item: kind.node, mut regions, alloc)
+        syntax::Rule.TestItem if reading == Reading.Form => mut reduction.keep_test_head(file, tree, item: kind.node, alloc)
+        syntax::Rule.PackageItem if reading == Reading.Form => mut reduction.keep_package_head(tree, item: kind.node, alloc)
+        syntax::Rule.ConstItem if reading == Reading.Form => return None
+        else => {
+        }
+    }
+    for region in regions {
+        for line in tree.child_nodes(region) {
+            var nodes = tree.child_nodes(line)
+            let Some(clause) = mut nodes.next() else {
+                continue
+            }
+            let kept = match tree.rule(clause) {
+                syntax::Rule.RequiresClause or syntax::Rule.EnsuresClause or syntax::Rule.ExampleClause => true
+                syntax::Rule.TodoClause => child_node_list(tree, node: clause, alloc).len() > 0
+                else => false
+            }
+            if not kept {
+                mut reduction.drop_node(tree, node: line, alloc)
+            }
+        }
+    }
+    return Some(take reduction)
+} Reduction.of
+
+/// Drops the tokens of a node.
+fn Reduction.drop_node(mut self, tree: syntax::Tree, node: u32, alloc: mem::Alloc) {
+    let Some(span) = tree.span(node, alloc) else {
+        expect false
+        return
+    }
+    for token in span.head..=span.last {
+        mark(mut self.dropped, token)
+    }
+} Reduction.drop_node
+
+/// Drops a function's body and, unless it enters the interface, a transparent function's
+/// expression; collects its clause region.
+fn Reduction.drop_body(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    item: u32,
+    known: Known,
+    mut regions: mem::List[u32],
+    alloc: mem::Alloc,
+    ) {
+    let Some(end) = tree.find(item, rule: syntax::Rule.FnEnd) else {
+        return
+    }
+    let transparent = holds_punct(file, tokens: child_token_list(tree, node: end, alloc), punct: syntax::Punct.Eq)
+    for child in tree.children(end) {
+        match child {
+            syntax::Child.Token(token) => {
+                if is_punct(file, token, punct: syntax::Punct.LBrace) {
+                    mark(mut self.dropped, token)
+                } else if is_punct(file, token, punct: syntax::Punct.Eq) and not known.transparent {
+                    mark(mut self.dropped, token)
+                }
+            }
+            syntax::Child.Node(node) => {
+                let rule = tree.rule(node)
+                if rule == syntax::Rule.FnBody {
+                    mut self.drop_node(tree, node, alloc)
+                } else if transparent and rule == syntax::Rule.Expr {
+                    if not known.transparent {
+                        mut self.drop_node(tree, node, alloc)
+                    }
+                } else if rule == syntax::Rule.ClauseRegion {
+                    mut regions.push(node)
+                }
+            }
+        }
+    }
+} Reduction.drop_body
+
+/// Drops the fields of a struct its reader does not see, and the invariant lines naming them.
+fn Reduction.drop_hidden_fields(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    item: u32,
+    known: Known,
+    alloc: mem::Alloc,
+    ) {
+    var hidden = mem::HashMap[text::String, Unit].empty(seed: 0, alloc)
+    var invariants = mem::List[u32].empty(alloc)
+    for member in tree.child_nodes(item) {
+        let Some(field) = tree.find(member, rule: syntax::Rule.Field) else {
+            if tree.rule(member) == syntax::Rule.StructMember {
+                mut invariants.push(member)
+            }
+            continue
+        }
+        var visibility: Option[syntax::TokenKind] = None
+        match tree.find(field, rule: syntax::Rule.Visibility) {
+            Some(node) => {
+                var tokens = tree.child_tokens(node)
+                match mut tokens.next() {
+                    Some(token) => {
+                        visibility = Some(file.tokens[usize.widen(token)].kind)
+                    }
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        let seen = match known.fields {
+            Reach.Module => true
+            Reach.Package => visibility.is_some()
+            Reach.Consumer => visibility == Some(syntax::TokenKind.Keyword(syntax::Keyword.Pub))
+        }
+        if seen {
+            continue
+        }
+        match first_ident(file, tree, node: field) {
+            Some(token) => {
+                discard mut hidden.insert(text::String.of(file.text(usize.widen(token)), alloc), value: Unit)
+            }
+            None => {
+            }
+        }
+        mut self.drop_node(tree, node: member, alloc)
+    }
+    for line in invariants {
+        if names_hidden(file, tree, node: line, hidden, alloc) {
+            mut self.drop_node(tree, node: line, alloc)
+        }
+    }
+} Reduction.drop_hidden_fields
+
+/// Whether a node holds a path of one token naming a hidden field.
+fn names_hidden(
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    hidden: mem::HashMap[text::String, Unit],
+    alloc: mem::Alloc,
+    ) -> bool {
+    for inner in tree.descendants(node, alloc) {
+        if tree.rule(inner) != syntax::Rule.Path {
+            continue
+        }
+        let held = tree.children(inner)
+        if held.len() != 1 {
+            continue
+        }
+        let syntax::Child.Token(token) = held[0] else {
+            continue
+        }
+        if hidden.contains(text::String.of(file.text(usize.widen(token)), alloc)) {
+            return true
+        }
+    }
+    return false
+} names_hidden
+
+/// Writes each default method body of an interface `default`; collects the clause regions.
+fn Reduction.default_methods(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    item: u32,
+    mut regions: mem::List[u32],
+    alloc: mem::Alloc,
+    ) {
+    for member in tree.child_nodes(item) {
+        let Some(end) = tree.find(member, rule: syntax::Rule.MethodEnd) else {
+            continue
+        }
+        match tree.find(end, rule: syntax::Rule.ClauseRegion) {
+            Some(region) => mut regions.push(region)
+            None => {
+            }
+        }
+        let Some(body) = tree.find(end, rule: syntax::Rule.MethodBody) else {
+            continue
+        }
+        let Some(span) = tree.span(body, alloc) else {
+            expect false
+            return
+        }
+        mark(mut self.defaults, token: span.head)
+        for token in (span.head + 1)..=span.last {
+            if file.tokens[usize.widen(token)].kind != syntax::TokenKind.Nl {
+                mark(mut self.dropped, token)
+            }
+        }
+    }
+} Reduction.default_methods
+
+/// Keeps of a test its `test`, name and `for`, and its target.
+fn Reduction.keep_test_head(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    item: u32,
+    alloc: mem::Alloc,
+    ) {
+    var kept = mem::HashMap[u32, Unit].empty(seed: 0, alloc)
+    var started = false
+    var taken: usize = 0
+    for child in tree.children(item) {
+        let syntax::Child.Token(token) = child else {
+            continue
+        }
+        if not started {
+            if file.tokens[usize.widen(token)].kind != syntax::TokenKind.Keyword(syntax::Keyword.Test) {
+                continue
+            }
+            started = true
+        }
+        if taken < 3 {
+            mark(mut kept, token)
+            taken += 1
+        }
+    }
+    match tree.find(item, rule: syntax::Rule.TestTarget) {
+        Some(target) => {
+            let Some(span) = tree.span(target, alloc) else {
+                expect false
+                return
+            }
+            for token in span.head..=span.last {
+                mark(mut kept, token)
+            }
+        }
+        None => {
+        }
+    }
+    let Some(whole_span) = tree.span(item, alloc) else {
+        expect false
+        return
+    }
+    for token in whole_span.head..=whole_span.last {
+        if not kept.contains(token) {
+            mark(mut self.dropped, token)
+        }
+    }
+} Reduction.keep_test_head
+
+/// Keeps of a package item its `language` and `targets` directives.
+fn Reduction.keep_package_head(mut self, tree: syntax::Tree, item: u32, alloc: mem::Alloc) {
+    for directive in tree.child_nodes(item) {
+        var nodes = tree.child_nodes(directive)
+        var kept = false
+        match mut nodes.next() {
+            Some(inner) => {
+                let rule = tree.rule(inner)
+                kept = rule == syntax::Rule.LanguageDirective or rule == syntax::Rule.TargetsDirective
+            }
+            None => {
+            }
+        }
+        if tree.rule(directive) == syntax::Rule.Directive and not kept {
+            mut self.drop_node(tree, node: directive, alloc)
+        }
+    }
+} Reduction.keep_package_head
+
+/// A literal written canonically; a text run's line as its content, which its run joins.
+fn literal(kind: syntax::TokenKind, spelt: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let bytes = spelt.as_bytes()
+    match kind {
+        syntax::TokenKind.Int => return Some(canonical_integer(spelt, alloc))
+        syntax::TokenKind.Float => return Some(canonical_float(spelt, alloc))
+        syntax::TokenKind.Text or syntax::TokenKind.Char => {
+            let value = syntax::text_value(spelt, alloc)
+            return Some(quoted(value.as_bytes(), delimiter: bytes[0], bytes: false, alloc))
+        }
+        syntax::TokenKind.Bytes or syntax::TokenKind.Byte => {
+            let value = byte_value(spelt, alloc)
+            var written = text::String.of("b", alloc)
+            mut written.append(quoted(value.view(), delimiter: bytes[1], bytes: true, alloc).as_str())
+            return Some(take written)
+        }
+        syntax::TokenKind.TextLine => {
+            let Some(content) = spelt.slice_bytes(2, end: spelt.byte_len()) else {
+                expect false
+                return None
+            }
+            var wrapped = text::String.of("\"", alloc)
+            mut wrapped.append(content)
+            mut wrapped.push('"')
+            return Some(syntax::text_value(wrapped.as_str(), alloc))
+        }
+        else => return None
+    }
+} literal
+
+/// Writes each text run as one text literal.
+fn merge_runs(mut toks: mem::List[Tok], alloc: mem::Alloc) {
+    var pending = drained(mut toks, alloc)
+    var in_run = false
+    loop {
+        let Some(tok) = mut pending.pop() else {
+            break
+        }
+        let line = tok.kind == syntax::TokenKind.TextLine
+        if line and in_run {
+            let last = toks.len() - 1
+            mut (mut toks.at_mut(last)).text.push('\n')
+            mut (mut toks.at_mut(last)).text.append(tok.text.as_str())
+            continue
+        }
+        in_run = line
+        mut toks.push(take tok)
+    }
+    for tok in mut toks {
+        if tok.kind == syntax::TokenKind.TextLine {
+            let run = quoted(tok.text.as_bytes(), delimiter: b'"', bytes: false, alloc)
+            tok.text = run
+            tok.kind = syntax::TokenKind.Text
+        }
+    }
+} merge_runs
+
+/// An integer literal in decimal without separators or leading zeros, keeping its suffix.
+fn canonical_integer(spelt: Str, alloc: mem::Alloc) -> text::String {
+    var digits = mem::Bytes.empty(alloc)
+    for byte in spelt.as_bytes() {
+        if byte != b'_' {
+            mut digits.push(byte)
+        }
+    }
+    var radix: u32 = 10
+    var start: usize = 0
+    if digits.len() >= 2 and digits[0] == b'0' and digits[1] == b'x' {
+        radix = 16
+        start = 2
+    } else if digits.len() >= 2 and digits[0] == b'0' and digits[1] == b'b' {
+        radix = 2
+        start = 2
+    }
+    var end = digits.len()
+    for at in start..<digits.len() {
+        if not is_radix_digit(digits[at], radix) {
+            end = at
+            break
+        }
+    }
+    let Some(halves) = digits.view().split_at(start) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let Some(body) = halves.tail.prefix(end - start) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let value = Natural.of_digits(body, radix, alloc)
+    var written = value.to_decimal(alloc)
+    mut written.append(suffix_after(digits, at: end, alloc).as_str())
+    return written
+} canonical_integer
+
+/// The text of literal digits from `at`: the suffix after its number.
+fn suffix_after(digits: mem::Bytes, at: usize, alloc: mem::Alloc) -> text::String {
+    let Some(halves) = digits.view().split_at(at) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let Ok(suffix) = attempt text::String.try_from_utf8(halves.tail, alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return suffix
+} suffix_after
+
+fn is_radix_digit(byte: u8, radix: u32) -> bool {
+    if radix == 16 {
+        return is_hex_digit(byte)
+    }
+    if radix == 2 {
+        return byte == b'0' or byte == b'1'
+    }
+    return is_decimal_digit(byte)
+} is_radix_digit
+
+/// A float literal as the shortest decimal that reads back as its value, keeping its suffix.
+fn canonical_float(spelt: Str, alloc: mem::Alloc) -> text::String {
+    var digits = mem::Bytes.empty(alloc)
+    for byte in spelt.as_bytes() {
+        if byte != b'_' {
+            mut digits.push(byte)
+        }
+    }
+    var end = digits.len()
+    for at in 0..<digits.len() {
+        if not (is_decimal_digit(digits[at]) or digits[at] == b'.') {
+            end = at
+            break
+        }
+    }
+    let Some(number) = digits.view().prefix(end) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let suffix = suffix_after(digits, at: end, alloc)
+    var written = text::String.empty(alloc)
+    if suffix.as_str() == "f32" {
+        written = float_text(nearest_float(number, precision: 24, max_exponent: 127, alloc), precision: 24, max_exponent: 127, alloc)
+    } else {
+        written = float_text(nearest_float(number, precision: 53, max_exponent: 1_023, alloc), precision: 53, max_exponent: 1_023, alloc)
+    }
+    if written.find(".").is_none() {
+        mut written.append(".0")
+    }
+    mut written.append(suffix.as_str())
+    return written
+} canonical_float
+
+/// The bytes of a byte or byte-string literal, its escapes replaced.
+fn byte_value(spelt: Str, alloc: mem::Alloc) -> mem::Bytes {
+    let bytes = spelt.as_bytes()
+    var value = mem::Bytes.empty(alloc)
+    var at: usize = 2
+    while at + 1 < bytes.len() {
+        let byte = bytes[at]
+        at += 1
+        if byte != b'\\' {
+            mut value.push(byte)
+            continue
+        }
+        expect at + 1 < bytes.len()
+        let escaped = bytes[at]
+        at += 1
+        match escaped {
+            b'n' => mut value.push(b'\n')
+            b'r' => mut value.push(b'\r')
+            b't' => mut value.push(b'\t')
+            b'0' => mut value.push(0)
+            b'x' => {
+                expect at + 2 < bytes.len() and is_hex_digit(bytes[at]) and is_hex_digit(bytes[at + 1])
+                mut value.push(u8.truncate(digit_value(bytes[at]) * 16 + digit_value(bytes[at + 1])))
+                at += 2
+            }
+            else => mut value.push(escaped)
+        }
+    }
+    return value
+} byte_value
+
+/// A literal between delimiters, writing `\xHH` for the delimiter, the backslash, each byte
+/// below `0x20` or equal to `0x7F` and, in a byte literal, each byte above `0x7F`.
+fn quoted(value: Slice[u8], delimiter: u8, bytes: bool, alloc: mem::Alloc) -> text::String {
+    var raw = mem::Bytes.empty(alloc)
+    mut raw.push(delimiter)
+    for byte in value {
+        let escaped = byte < 0x20 or byte == 0x7F or byte == b'\\' or byte == delimiter or (bytes and byte > 0x7F)
+        if escaped {
+            mut raw.append(b"\\x")
+            mut raw.push(hex_digit(byte >> 4))
+            mut raw.push(hex_digit(byte & 0xF))
+        } else {
+            mut raw.push(byte)
+        }
+    }
+    mut raw.push(delimiter)
+    let Ok(written) = attempt text::String.try_from_utf8(raw.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return written
+} quoted
+
+/// The uppercase hexadecimal digit of a value below 16.
+fn hex_digit(value: u8) -> u8 {
+    if value < 10 {
+        return b'0' + value
+    }
+    return b'A' + value - 10
+} hex_digit

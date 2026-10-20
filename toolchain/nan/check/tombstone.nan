@@ -1,0 +1,931 @@
+//! Tombstones: the forms their rewrites take, what a rewrite names beside its replacement, and the old forms that live items, members and the tombstones of other modules take.
+
+/// What a tombstone's path rewrite names: the visibility of its replacement when live, and the
+/// type a member is reached through.
+struct PathRewrite derives Copy {
+    visibility: Option[ast::Visibility]
+    through: Option[ty::ItemId]
+} PathRewrite
+
+/// The aliases tombstones give the keys of a type's fields and variants: each old key, by
+/// the key its rewrite reaches through further tombstones.
+fn Checker.key_aliases(self, item: ty::ItemId) -> mem::HashMap[mem::Bytes, mem::Bytes] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var prefix = db.type_path(TypeKey.Item(item))
+    mut prefix.push('.')
+    var renamed = mem::Map[text::String, text::String].empty(alloc)
+    for entry in db.tombstones.cursor() {
+        let form = entry.key()
+        if not form.starts_with(prefix.as_str()) {
+            continue
+        }
+        let Some(old) = form.slice_bytes(prefix.byte_len(), end: form.byte_len()) else {
+            continue
+        }
+        let tombstones = entry.value()
+        if tombstones.len() == 0 {
+            continue
+        }
+        let ast::ItemKind.Retired(retired_item) = db.ast(tombstones[0]).kind else {
+            continue
+        }
+        let ast::RetiredNew.Rewrite(expr: rewrite, preserves: preserves) = retired_item.new else {
+            continue
+        }
+        if not preserves {
+            continue
+        }
+        let Some(new) = rewritten_name(rewrite, alloc) else {
+            continue
+        }
+        discard mut renamed.insert(text::String.of(old, alloc), value: take new)
+    }
+    var aliases = mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc)
+    for entry in renamed.cursor() {
+        let old = entry.key()
+        var current = text::String.of(old.as_str(), alloc)
+        var steps: usize = 0
+        loop {
+            let Some(next) = renamed.get(current) else {
+                break
+            }
+            if steps > renamed.len() {
+                break
+            }
+            current = text::String.of(next.as_str(), alloc)
+            steps += 1
+        }
+        discard mut aliases.insert(text::String.of(old.as_str(), alloc).into_bytes(), value: take current.into_bytes())
+    }
+    return aliases
+} Checker.key_aliases
+
+/// The rules of a tombstone, the first it breaks reported on it: the form of its rewrite and
+/// what the rewrite names, then whether its old form is taken.
+fn Checker.check_tombstone(self, item: ty::ItemId) {
+    let db = self.db()
+    let declared = db.ast(item)
+    let ast::ItemKind.Retired(retired_item) = declared.kind else {
+        return
+    }
+    let package_id = db.package_of(item)
+    let segments = retired_item.path.segments
+    var foreign_path = false
+    if segments.len() > 1 {
+        let head = segments[0].text.as_str()
+        if db.module_named(package_id, name: head).is_none() {
+            match db.alias(package_id, name: head) {
+                Some(aliased) => {
+                    foreign_path = aliased != package_id
+                }
+                None => {}
+            }
+        }
+    }
+    var code: Option[diagnostic::Code] = None
+    if foreign_path {
+        code = Some(diagnostic::Code.RetiredForeignPath)
+    } else {
+        match retired_item.new {
+            ast::RetiredNew.Rewrite(expr: rewrite, preserves: _) => {
+                code = self.rewrite_problem(item, retired_item, rewrite)
+            }
+            ast::RetiredNew.Manual => {}
+        }
+    }
+    if code.is_none() and not db.in_history(item) and self.form_taken(item, retired_item) {
+        code = Some(diagnostic::Code.RetiredFormTaken)
+    }
+    if code.is_none() and self.unused_tombstone(item, retired_item) {
+        code = Some(diagnostic::Code.UnusedTombstone)
+    }
+    match code {
+        Some(found) => self.report(item, token: declared.token, code: found)
+        None => {}
+    }
+} Checker.check_tombstone
+
+/// Whether a tombstone retires a member of a type deriving `Encode`, whose key it keeps.
+fn Checker.keeps_encode_key(self, module: ty::ModuleId, retired_item: ast::RetiredItem) -> bool {
+    if retired_item.member.is_none() {
+        return false
+    }
+    let db = self.db()
+    let Ok(Named.Item(owner)) = db.resolve(module, path: retired_item.path) else {
+        return false
+    }
+    match db.ast(owner).kind {
+        ast::ItemKind.Struct(structure) => return names_encode(structure.derived.view())
+        ast::ItemKind.Enum(enumeration) => return names_encode(enumeration.derived.view())
+        else => return false
+    }
+} Checker.keeps_encode_key
+
+/// Whether a tombstone in source retires nothing the release its package's history head
+/// names exports: no item or member consumers see has its old form's canonical path, a
+/// function with the old head's parameter modes and types for an old head. A tombstone
+/// keeping an `Encode` key is never unused.
+fn Checker.unused_tombstone(self, item: ty::ItemId, retired_item: ast::RetiredItem) -> bool {
+    let db = self.db()
+    let alloc = self.alloc()
+    let module = db.module_of(item)
+    if db.in_history(item) or self.keeps_encode_key(module, retired_item) {
+        return false
+    }
+    let Some(form) = db.old_form(module, tombstone: retired_item) else {
+        return false
+    }
+    let Some(exported) = self.head_exports(db.package_of(item)) else {
+        return false
+    }
+    let held = exported.contents()
+    match held.get(form) {
+        Some(entry) => {
+            if retired_item.head.is_none() or entry.text.len() == 0 {
+                return false
+            }
+            let line = output::lossy(db.syntax(item).line_text(db.head_line(item)), alloc)
+            if not line.starts_with("retired ") {
+                return false
+            }
+            let Some(rest) = line.slice_bytes(8, end: line.byte_len()) else {
+                return false
+            }
+            let Some(arrow) = rest.find(" => ") else {
+                return false
+            }
+            let Some(old_head) = rest.slice_bytes(0, end: arrow) else {
+                return false
+            }
+            return not same_texts(head_param_texts(old_head, alloc).view(), right: head_param_texts(entry.text[0].as_str(), alloc).view())
+        }
+        None => {}
+    }
+    let bytes = form.as_bytes()
+    var dot = bytes.len()
+    while dot > 0 and bytes[dot - 1] != b'.' {
+        dot -= 1
+    }
+    if dot == 0 {
+        return true
+    }
+    let Some(owner) = form.slice_bytes(0, end: dot - 1) else {
+        return true
+    }
+    let Some(member) = form.slice_bytes(dot, end: form.byte_len()) else {
+        return true
+    }
+    match held.get_by(fn(key: text::String) => key.as_str().cmp(owner)) {
+        Some(entry) => return not entry.declares(member)
+        None => return true
+    }
+} Checker.unused_tombstone
+
+/// The exported items of the release a package's history head names, from the local store.
+fn Checker.head_exports(self, package_id: ty::PackageId) -> Option[mem::Shared[mem::Map[text::String, machine::ApiEntry]]] {
+    let state = self.state.contents()
+    match state.head_exports.get(package_id) {
+        Some(known) => match known {
+            Some(shared) => return Some(shared.share())
+            None => return None
+        }
+        None => {}
+    }
+    let alloc = self.alloc()
+    let Some(history) = self.db().source(package_id).machine.history() else {
+        return None
+    }
+    let Some(head) = history.head else {
+        return None
+    }
+    var exported: Option[mem::Shared[mem::Map[text::String, machine::ApiEntry]]] = None
+    match self.store_entries() {
+        Some(entries) => {
+            for entry in entries {
+                if entry.root(alloc) == head {
+                    exported = Some(mem::Shared.of(release_exports(entry.artefact.view(), grammar: self.session().grammar.contents(), alloc), alloc))
+                    break
+                }
+            }
+        }
+        None => {}
+    }
+    match state.head_exports.insert(package_id, value: take exported) {
+        Some(shared) => return Some(shared.share())
+        None => return None
+    }
+} Checker.head_exports
+
+/// The rule a tombstone's rewrite breaks: its form, a name resolving to nothing live, and
+/// a name it gives narrower visibility than its replacement's.
+fn Checker.rewrite_problem(self, item: ty::ItemId, retired_item: ast::RetiredItem, rewrite: ast::Expr) -> Option[diagnostic::Code] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let module = db.module_of(item)
+    var replacement: Option[ast::Visibility] = None
+    var named = mem::List[ast::Visibility].empty(alloc)
+    match retired_item.head {
+        Some(head) => {
+            let Some(sig) = self.fn_sig(item) else {
+                return None
+            }
+            if self.has_failed_type(sig) {
+                return None
+            }
+            if not self.head_rewrite_form(rewrite) {
+                return Some(diagnostic::Code.RetiredBadRewrite)
+            }
+            let Some(body) = self.typed_rewrite(item, head, rewrite) else {
+                return Some(diagnostic::Code.RetiredBadRewrite)
+            }
+            let Some(typed) = body.root else {
+                return Some(diagnostic::Code.RetiredBadRewrite)
+            }
+            let found = self.replacement_of(typed)
+            rewrite.visit_paths(fn[mut named](path: ast::Path) {
+                match db.resolve(module, path) {
+                    Ok(Named.Item(named_item)) => mut named.push(db.ast(named_item).visibility)
+                    else => {}
+                }
+            })
+            self.named_members(typed, mut named)
+            match found {
+                Some(replaced) => {
+                    replacement = Some(db.ast(replaced).visibility)
+                }
+                None => {}
+            }
+        }
+        None => {
+            let Some(rewritten) = self.path_rewrite(module, retired_item, rewrite) else {
+                return Some(diagnostic::Code.RetiredBadRewrite)
+            }
+            replacement = rewritten.visibility
+            match rewritten.through {
+                Some(owner) => mut named.push(db.ast(owner).visibility)
+                None => {}
+            }
+        }
+    }
+    let Some(live) = replacement else {
+        return None
+    }
+    for visibility in named {
+        if openness(visibility) < openness(live) {
+            return Some(diagnostic::Code.RetiredRewriteHidden)
+        }
+    }
+    return None
+} Checker.rewrite_problem
+
+/// Whether the rewrite of a tombstone with an old head is a call or a path whose only markers
+/// are `mut` and `take`.
+fn Checker.head_rewrite_form(self, rewrite: ast::Expr) -> bool {
+    var marked = false
+    rewrite.visit(fn[mut marked](expr: ast::Expr) {
+        match expr.kind {
+            ast::ExprKind.Marked(failure: failure, awaited: awaited, mode: _, inner: _) => if failure.is_some() or awaited.is_some() {
+                marked = true
+            }
+            else => {}
+        }
+    })
+    if marked {
+        return false
+    }
+    match rewrite.kind {
+        ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => return is_call_or_path(inner.contents())
+        else => return is_call_or_path(rewrite)
+    }
+} Checker.head_rewrite_form
+
+/// The rewrite of a tombstone without an old head, when it is a path optionally followed by
+/// a member of the old form's type when the old form is a member, each naming something live
+/// or the old form of a `preserves` tombstone: the visibility of its replacement when live,
+/// and the type a member is reached through.
+fn Checker.path_rewrite(self, module: ty::ModuleId, retired_item: ast::RetiredItem, rewrite: ast::Expr) -> Option[PathRewrite] {
+    match rewrite.kind {
+        ast::ExprKind.Path(path: path, args: None) => return self.rewrite_through(module, retired_item, path, member: None)
+        ast::ExprKind.Field(base: base, name: name) => match base.contents().kind {
+            ast::ExprKind.Path(path: path, args: None) => return self.rewrite_through(module, retired_item, path, member: Some(name.text.as_str()))
+            else => return None
+        }
+        else => return None
+    }
+} Checker.path_rewrite
+
+/// The visibility of a field or variant of a struct, layout or enum: a field's the narrower
+/// of its own and its type's.
+fn Checker.field_or_variant(self, owner: ty::ItemId, member: Str) -> Option[ast::Visibility] {
+    let db = self.db()
+    let own = db.ast(owner).visibility
+    let sig = self.sig(owner)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                if field.name.as_str() == member {
+                    return Some(narrower_visibility(field.visibility, right: own))
+                }
+            }
+            return None
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                if variant.name.as_str() == member {
+                    return Some(own)
+                }
+            }
+            return None
+        }
+        else => return None
+    }
+} Checker.field_or_variant
+
+/// The visibility of what a typed rewrite names through members: the functions and
+/// interface methods it calls and the fields it reads, its outermost call's callee aside.
+fn Checker.named_members(self, typed: TExpr, mut named: mem::List[ast::Visibility]) {
+    var count: usize = 0
+    typed.each_child(fn[mut count](child: TExpr) {
+        count += 1
+    })
+    var index = count
+    while index > 0 {
+        index -= 1
+        let wanted = index
+        var at: usize = 0
+        typed.each_child(fn[mut at, mut named](child: TExpr) {
+            if at == wanted {
+                self.named_member(child, mut named)
+            }
+            at += 1
+        })
+    }
+} Checker.named_members
+
+/// Reports a live item, and each member of it, whose canonical path is the old form that a
+/// tombstone of its package's history keeps, a function only when it has that tombstone's
+/// old parameter modes and types.
+fn Checker.check_history_forms(self, item: ty::ItemId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let declared = db.ast(item)
+    if declared.name(alloc).is_none() {
+        return
+    }
+    match declared.kind {
+        ast::ItemKind.Retired(_) or ast::ItemKind.Impl(_) => return
+        else => {}
+    }
+    let package_id = db.package_of(item)
+    let path = db.canonical(item)
+    let is_fn = match declared.kind {
+        ast::ItemKind.Fn(_) => true
+        else => false
+    }
+    var taken = false
+    for tombstone in self.kept_tombstones(path.as_str(), package_id) {
+        let ast::ItemKind.Retired(retired_item) = db.ast(tombstone).kind else {
+            continue
+        }
+        if retired_item.head.is_none() or not is_fn or same_shapes(self.param_shapes(item), right: self.param_shapes(tombstone)) {
+            taken = true
+            break
+        }
+    }
+    if taken {
+        self.report(item, token: declared.token, code: diagnostic::Code.RetiredFormTaken)
+    }
+    match declared.kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                self.report_kept_member(item, path: path.as_str(), member: field.name, package_id)
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                self.report_kept_member(item, path: path.as_str(), member: variant.name, package_id)
+            }
+        }
+        ast::ItemKind.Interface(interface_item) => {
+            for method in interface_item.methods {
+                self.report_kept_member(item, path: path.as_str(), member: method.name, package_id)
+            }
+        }
+        ast::ItemKind.Layout(layout_item) => {
+            for field in layout_item.fields {
+                self.report_kept_member(item, path: path.as_str(), member: field.name, package_id)
+            }
+        }
+        else => {}
+    }
+} Checker.check_history_forms
+
+/// Whether a live item or member, a tombstone of the history with the same identity, or a
+/// tombstone of another module with the same identity that comes first by file path and line,
+/// takes a tombstone's old form.
+fn Checker.form_taken(self, item: ty::ItemId, retired_item: ast::RetiredItem) -> bool {
+    let db = self.db()
+    let module = db.module_of(item)
+    let Some(form) = db.old_form(module, tombstone: retired_item) else {
+        return false
+    }
+    let own = if retired_item.head.is_some() {
+        self.param_shapes(item)
+    } else {
+        None
+    }
+    return db.about(None, compute: fn() -> bool {
+        return self.form_taken_within(item, module, form: form.as_str(), own)
+    })
+} Checker.form_taken
+
+/// What an expression's outermost call or path names: the function it calls, the interface of
+/// the method it calls, the type it constructs, or the item it names.
+fn Checker.replacement_of(self, expr: TExpr) -> Option[ty::ItemId] {
+    match expr.kind {
+        TKind.Call(call) => match call.contents().callee {
+            Callee.Function(item: found) => return Some(found)
+            Callee.Method(bound: bound, method: _, self_ty: _, dynamic: _) => return Some(bound.item)
+            else => return None
+        }
+        TKind.Construct(variant: _, values: _, wrapped: _) => match self.types().kind(expr.ty) {
+            ty::TyKind.Item(item: found, args: _) => return Some(found)
+            else => return None
+        }
+        TKind.Value(found) or TKind.FnValue(item: found, type_args: _) => return Some(found)
+        else => return None
+    }
+} Checker.replacement_of
+
+/// The modes and types of the parameters a head's text writes, without their names.
+fn head_param_texts(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    let Some(open) = head.find("(") else {
+        return found
+    }
+    let bytes = head.as_bytes()
+    var depth: i32 = 0
+    var close = bytes.len()
+    var at = open
+    while at < bytes.len() {
+        let byte = bytes[at]
+        if byte == b'(' or byte == b'[' {
+            depth += 1
+        } else if byte == b')' or byte == b']' {
+            depth -= 1
+            if depth == 0 {
+                close = at
+                break
+            }
+        }
+        at += 1
+    }
+    var pieces = mem::List[text::String].empty(alloc)
+    depth = 0
+    var start = open + 1
+    at = open + 1
+    while at < close {
+        let byte = bytes[at]
+        if byte == b'(' or byte == b'[' {
+            depth += 1
+        } else if byte == b')' or byte == b']' {
+            depth -= 1
+        } else if byte == b',' and depth == 0 {
+            mut pieces.push(sliced(head, start, end: at, alloc))
+            start = at + 1
+        }
+        at += 1
+    }
+    mut pieces.push(sliced(head, start, end: close, alloc))
+    for piece in pieces {
+        let shown = param_text(piece.as_str(), alloc)
+        if not shown.is_empty() {
+            mut found.push(take shown)
+        }
+    }
+    return found
+} head_param_texts
+
+/// The name a `preserves` rewrite renames a member to: its field's or its path's last segment.
+fn rewritten_name(rewrite: ast::Expr, alloc: mem::Alloc) -> Option[text::String] {
+    match rewrite.kind {
+        ast::ExprKind.Field(base: _, name: name) => return Some(text::String.of(name.text.as_str(), alloc))
+        ast::ExprKind.Path(path: path, args: _) => {
+            let count = path.segments.len()
+            if count == 0 {
+                return None
+            }
+            return Some(text::String.of(path.segments[count - 1].text.as_str(), alloc))
+        }
+        else => return None
+    }
+} rewritten_name
+
+/// Whether an expression is a call or a path.
+fn is_call_or_path(expr: ast::Expr) -> bool {
+    match expr.kind {
+        ast::ExprKind.Call(callee: _, args: _) or ast::ExprKind.Path(path: _, args: _) => return true
+        else => return false
+    }
+} is_call_or_path
+
+/// Whether a function signature holds a failed type.
+fn Checker.has_failed_type(self, sig: FnSig) -> bool {
+    let types = self.types()
+    for param in sig.params {
+        if types.has_error(param.ty) {
+            return true
+        }
+    }
+    if types.has_error(sig.result) {
+        return true
+    }
+    match sig.failure {
+        Some(failure) => return types.has_error(failure)
+        None => return false
+    }
+} Checker.has_failed_type
+
+/// The rewrite `path`, or `path.member`, of a tombstone without an old head, as `path_rewrite`
+/// judges it.
+fn Checker.rewrite_through(self, module: ty::ModuleId, retired_item: ast::RetiredItem, path: ast::Path, member: Option[Str]) -> Option[PathRewrite] {
+    let db = self.db()
+    if retired_item.member.is_some() {
+        if member.is_none() {
+            return None
+        }
+        if db.owner_key(module, owner: retired_item.path) != db.owner_key(module, owner: path) {
+            return None
+        }
+    }
+    let Some(member_name) = member else {
+        match db.resolve(module, path) {
+            Ok(Named.Item(named_item)) => return Some(PathRewrite(visibility: Some(db.ast(named_item).visibility), through: None))
+            else => {}
+        }
+        let Some(spelled) = db.spelled(module, path) else {
+            return None
+        }
+        if self.preserved_form(spelled.as_str()) {
+            return Some(PathRewrite(visibility: None, through: None))
+        }
+        return None
+    }
+    let Some(key) = db.owner_key(module, owner: path) else {
+        return None
+    }
+    let owner = match key {
+        TypeKey.Item(found) => Some(found)
+        else => None
+    }
+    var live: Option[ast::Visibility] = None
+    let functions = db.members(key, name: member_name)
+    if functions.len() > 0 {
+        live = Some(db.ast(functions[0]).visibility)
+    } else {
+        match owner {
+            Some(found) => {
+                live = self.field_or_variant(found, member: member_name)
+            }
+            None => {}
+        }
+    }
+    match live {
+        Some(visibility) => return Some(PathRewrite(visibility: Some(visibility), through: owner))
+        None => {}
+    }
+    var form = db.type_path(key)
+    mut form.push('.')
+    mut form.append(member_name)
+    if self.preserved_form(form.as_str()) {
+        return Some(PathRewrite(visibility: None, through: owner))
+    }
+    return None
+} Checker.rewrite_through
+
+/// Whether a tombstone retiring `form` preserves it.
+fn Checker.preserved_form(self, form: Str) -> bool {
+    let db = self.db()
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form)) else {
+        return false
+    }
+    for tombstone in tombstones {
+        let ast::ItemKind.Retired(found) = db.ast(tombstone).kind else {
+            continue
+        }
+        match found.new {
+            ast::RetiredNew.Rewrite(expr: _, preserves: preserves) => if preserves {
+                return true
+            }
+            ast::RetiredNew.Manual => {}
+        }
+    }
+    return false
+} Checker.preserved_form
+
+/// The visibility of what an expression of a typed rewrite names through members, then of
+/// what the expressions it holds name, those last first.
+fn Checker.named_member(self, expr: TExpr, mut named: mem::List[ast::Visibility]) {
+    let db = self.db()
+    match self.replacement_of(expr) {
+        Some(callee) => mut named.push(db.ast(callee).visibility)
+        None => {}
+    }
+    match expr.kind {
+        TKind.Field(base: base, name: name) => match self.types().kind(base.contents().ty) {
+            ty::TyKind.Item(item: owner, args: _) => match self.field_or_variant(owner, member: name.as_str()) {
+                Some(visibility) => mut named.push(visibility)
+                None => {}
+            }
+            else => {}
+        }
+        else => {}
+    }
+    self.named_members(expr, mut named)
+} Checker.named_member
+
+/// The tombstones of a package's history that keep `form`.
+fn Checker.kept_tombstones(self, form: Str, package_id: ty::PackageId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var kept = mem::List[ty::ItemId].empty(self.alloc())
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form)) else {
+        return kept
+    }
+    for tombstone in tombstones {
+        if db.in_history(tombstone) and db.package_of(tombstone) == package_id {
+            mut kept.push(tombstone)
+        }
+    }
+    return kept
+} Checker.kept_tombstones
+
+/// Reports a member of a live item whose canonical path a tombstone of its package's history
+/// keeps.
+fn Checker.report_kept_member(self, item: ty::ItemId, path: Str, member: ast::Name, package_id: ty::PackageId) {
+    var form = text::String.of(path, alloc: self.alloc())
+    mut form.push('.')
+    mut form.append(member.text.as_str())
+    if self.kept_tombstones(form.as_str(), package_id).len() > 0 {
+        self.report(item, token: member.token, code: diagnostic::Code.RetiredFormTaken)
+    }
+} Checker.report_kept_member
+
+/// Whether a live item or member of an item's package, or an earlier tombstone with the same
+/// identity, takes `form`.
+fn Checker.form_taken_within(self, item: ty::ItemId, module: ty::ModuleId, form: Str, own: Option[mem::List[ParamShape]]) -> bool {
+    let db = self.db()
+    let alloc = self.alloc()
+    let package_id = db.package_of(item)
+    for module_id in db.package_data(package_id).modules {
+        for other in db.module(module_id).items {
+            let declared = db.declaration(other)
+            match declared.kind {
+                ast::ItemKind.Retired(_) => continue
+                else => {}
+            }
+            if declared.name(alloc).is_some() and db.canonical(other).as_str() == form {
+                let is_fn = match declared.kind {
+                    ast::ItemKind.Fn(_) => true
+                    else => false
+                }
+                if own.is_none() or not is_fn or same_shapes(self.param_shapes(other), right: own) {
+                    return true
+                }
+            }
+            if self.member_form_taken(other, form) {
+                return true
+            }
+        }
+    }
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form)) else {
+        return false
+    }
+    for other in tombstones {
+        let earlier = db.in_history(other) or (db.module_of(other) != module and self.placed_before(other, right: item))
+        if not earlier or db.is_std(other) {
+            continue
+        }
+        let ast::ItemKind.Retired(earlier_item) = db.ast(other).kind else {
+            continue
+        }
+        if earlier_item.head.is_some() == own.is_some() and (own.is_none() or same_shapes(self.param_shapes(other), right: own)) {
+            return true
+        }
+    }
+    return false
+} Checker.form_taken_within
+
+/// Whether a member of a struct, layout, enum or interface has `form` for canonical path.
+fn Checker.member_form_taken(self, other: ty::ItemId, form: Str) -> bool {
+    let alloc = self.alloc()
+    var members = mem::List[text::String].empty(alloc)
+    let sig = self.sig(other)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut members.push(text::String.of(field.name.as_str(), alloc))
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                mut members.push(text::String.of(variant.name.as_str(), alloc))
+            }
+        }
+        SigKind.Interface(methods: methods) => {
+            for method in methods {
+                mut members.push(text::String.of(method.name.as_str(), alloc))
+            }
+        }
+        else => return false
+    }
+    let path = self.db().canonical(other)
+    for member in members {
+        var written = text::String.of(path.as_str(), alloc)
+        mut written.push('.')
+        mut written.append(member.as_str())
+        if written.as_str() == form {
+            return true
+        }
+    }
+    return false
+} Checker.member_form_taken
+
+/// Whether one item's head comes before another's, by file path and line.
+fn Checker.placed_before(self, left: ty::ItemId, right: ty::ItemId) -> bool {
+    let db = self.db()
+    let paths = db.item_file(left).path.as_str().cmp(db.item_file(right).path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths == core::Ordering.Less
+    }
+    return db.head_line(left) < db.head_line(right)
+} Checker.placed_before
+
+/// A parameter's mode and type, without its name.
+struct ParamShape derives Copy, Eq {
+    mode: ast::Mode
+    ty: ty::Ty
+} ParamShape
+
+/// The modes and types of a function's parameters.
+fn Checker.param_shapes(self, function: ty::ItemId) -> Option[mem::List[ParamShape]] {
+    let Some(sig) = self.fn_sig(function) else {
+        return None
+    }
+    var shapes = mem::List[ParamShape].empty(self.alloc())
+    for param in sig.params {
+        mut shapes.push(ParamShape(mode: param.mode, ty: param.ty))
+    }
+    return Some(take shapes)
+} Checker.param_shapes
+
+fn same_shapes(left: Option[mem::List[ParamShape]], right: Option[mem::List[ParamShape]]) -> bool {
+    let Some(left_shapes) = left else {
+        return right.is_none()
+    }
+    let Some(right_shapes) = right else {
+        return false
+    }
+    if left_shapes.len() != right_shapes.len() {
+        return false
+    }
+    for index in 0..<left_shapes.len() {
+        if left_shapes[index] != right_shapes[index] {
+            return false
+        }
+    }
+    return true
+} same_shapes
+
+fn same_texts(left: Slice[text::String], right: Slice[text::String]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for index in 0..<left.len() {
+        if left[index].as_str() != right[index].as_str() {
+            return false
+        }
+    }
+    return true
+} same_texts
+
+/// The bytes `start..<end` of a text, as a string.
+fn sliced(written: Str, start: usize, end: usize, alloc: mem::Alloc) -> text::String {
+    let Some(piece) = written.slice_bytes(start, end) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text::String.of(piece, alloc)
+} sliced
+
+/// A parameter's text without its name: its mode and type, or its type.
+fn param_text(written: Str, alloc: mem::Alloc) -> text::String {
+    let param = trimmed_copy(written, alloc)
+    let Some(colon) = param.find(":") else {
+        return param
+    }
+    let named = trimmed_copy(sliced(param.as_str(), start: 0, end: colon, alloc).as_str(), alloc)
+    let ty_text = trimmed_copy(sliced(param.as_str(), start: colon + 1, end: param.byte_len(), alloc).as_str(), alloc)
+    let Some(space) = named.find(" ") else {
+        return ty_text
+    }
+    var shown = sliced(named.as_str(), start: 0, end: space, alloc)
+    mut shown.push(' ')
+    mut shown.append(ty_text.as_str())
+    return shown
+} param_text
+
+/// A copy of a text without the white space at its ends.
+fn trimmed_copy(written: Str, alloc: mem::Alloc) -> text::String {
+    let run = platform::trimmed_run(written)
+    return sliced(written, start: run.start, end: run.end, alloc)
+} trimmed_copy
+
+/// The exported items of a release, by canonical path: the entries its interface records with
+/// an interface hash.
+fn release_exports(artefact_bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::Map[text::String, machine::ApiEntry] {
+    var found = mem::Map[text::String, machine::ApiEntry].empty(alloc)
+    let Ok(decoded) = artefact::decode(artefact_bytes, alloc) else {
+        return found
+    }
+    for written in interface_texts(decoded.code_root.view(), alloc) {
+        if written.is_empty() {
+            continue
+        }
+        var file = text::String.of(written.as_str(), alloc)
+        mut file.append("check \"")
+        mut file.append(hashing::HashValue.of(written.as_bytes()).full(alloc).as_str())
+        mut file.append("\"\n")
+        let Ok(snapshot) = machine::Snapshot.read(file.as_bytes(), grammar, alloc) else {
+            continue
+        }
+        for entry in take snapshot.entries {
+            if entry.interface_hash.is_some() {
+                discard mut found.insert(text::String.of(entry.path.as_str(), alloc), value: take entry)
+            }
+        }
+    }
+    return found
+} release_exports
+
+/// The interface texts of a code root's interface part, one per module.
+fn interface_texts(code_root: Slice[u8], alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    let Some(content) = root_part(code_root, wanted: 3) else {
+        return found
+    }
+    let Some(parts) = code_root.split_at(content.start) else {
+        return found
+    }
+    let Some(held) = parts.tail.prefix(content.next - content.start) else {
+        return found
+    }
+    let Some(pairs) = artefact::read_uvar(held, at: 0) else {
+        return found
+    }
+    let count = match pairs.value.to_u64() {
+        Some(small) => small
+        None => 0xFFFF_FFFF_FFFF_FFFF
+    }
+    var at = pairs.next
+    var index: u64 = 0
+    while index < count {
+        let Some(module) = artefact::read_bytes(held, at) else {
+            return found
+        }
+        let Some(written) = artefact::read_bytes(held, at: module.next) else {
+            return found
+        }
+        at = written.next
+        mut found.push(output::lossy(written.copy(held, alloc).view(), alloc))
+        index += 1
+    }
+    return found
+} interface_texts
+
+/// The content of the part of a code root with the key `wanted`.
+fn root_part(code_root: Slice[u8], wanted: u64) -> Option[artefact::Chunk] {
+    let Some(count) = artefact::read_uvar(code_root, at: 0) else {
+        return None
+    }
+    let total = match count.value.to_u64() {
+        Some(small) => small
+        None => 0xFFFF_FFFF_FFFF_FFFF
+    }
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(key) = artefact::read_uvar(code_root, at) else {
+            return None
+        }
+        let Some(content) = artefact::read_bytes(code_root, at: key.next) else {
+            return None
+        }
+        if key.value == wide::Wide.of_u64(wanted) {
+            return Some(content)
+        }
+        at = content.next
+        index += 1
+    }
+    return None
+} root_part

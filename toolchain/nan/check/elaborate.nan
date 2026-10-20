@@ -1,0 +1,2373 @@
+//! Elaboration: the translation of an accepted item's checked source into its NIR unit. Each typed body, clause and predicate becomes a NIR function; bindings become values or slots, control flow becomes blocks, and calls carry the requires, bounds and predicate checks their callees and operations state.
+
+/// Why elaboration stops: a construct that failed through an error on another item, so the item
+/// has no unit, or a construct it cannot translate, which is an internal error.
+enum Fault {
+    Failed
+    Unsupported(text::String)
+} Fault
+
+/// The interface method a function implements: the interface, the method's index, and the
+/// interface's unit's type arguments with the function's type as `Self`.
+struct Implemented derives Copy {
+    item: ty::ItemId
+    method: usize
+    args: ty::Args
+} Implemented
+
+/// An ensures clause as its unit's functions compute it: its ensures function's index, the
+/// `old` functions it reads, in order, and whether it is disputed.
+struct EnsuresClause {
+    index: u32
+    olds: mem::List[u32]
+    disputed: bool
+} EnsuresClause
+
+/// A field local of a struct's typed predicates, with the field's name.
+struct FieldLocal {
+    local: LocalId
+    name: text::String
+} FieldLocal
+
+/// The typed predicates of a struct: its fields as the locals the conditions name, with their
+/// names, and its `where` and `invariant` conditions in member order.
+struct TypedPredicates {
+    body: mem::Shared[TBody]
+    fields: mem::List[FieldLocal]
+    conditions: mem::List[TExpr]
+} TypedPredicates
+
+/// A const parameter and its type.
+struct ConstParam derives Copy {
+    param: ty::Param
+    scalar: ty::Scalar
+} ConstParam
+
+/// The typed `where` conditions of an item's const parameters, in parameter order, with the
+/// const parameters and their types.
+struct TypedWheres {
+    body: mem::Shared[TBody]
+    params: mem::List[ConstParam]
+    conditions: mem::List[TExpr]
+} TypedWheres
+
+/// The closure functions of an item's typed body that a rewrite inlined into it finds first, and
+/// how many functions its own closures take so far.
+struct InlinedClosures derives Copy {
+    own: u32
+    inlined: u32
+} InlinedClosures
+
+/// An invariant line or assume statement of a role's function, by its condition's first token.
+struct ConditionKey derives Copy, Eq, Hash {
+    role: nir::Role
+    token: u32
+} ConditionKey
+
+/// The functions of a unit as elaboration produces them, and its numbering of indexed roles.
+struct UnitDraft {
+    item: ty::ItemId
+    functions: mem::List[nir::Function]
+    counts: mem::HashMap[nir::Role, u32]
+    /// The closure functions of the item's typed body, once a rewrite inlined into it needs
+    /// functions for its own closures after them, and how many those take so far.
+    inlined_closures: Option[InlinedClosures]
+    /// The index of each invariant line and assume statement, by its condition's first token.
+    conditions: mem::HashMap[ConditionKey, u32]
+    /// The first token of each trusted block or expression, by premise index.
+    premises: mem::List[u32]
+} UnitDraft
+
+/// A rewrite inlined at a call: the index the unit's functions of its closures start at, the
+/// span of the call, and the arguments of its tombstone's generic parameters.
+struct Inlined {
+    base: u32
+    span: nir::Span
+    subst: ty::Subst
+} Inlined
+
+/// How a local of the typed body is held in the function being elaborated.
+enum Held {
+    /// A value: a Copy or view binding, a parameter received by value or reference, or a name a
+    /// pattern binds by `load` or reference.
+    Value(nir::Value)
+    /// A slot holding the binding.
+    Slot(nir::Value)
+    /// A place of the code a rewrite is inlined into: a parameter of the rewrite whose argument
+    /// passes it by read or `mut`.
+    Place(nir::Place)
+    /// A literal: a parameter of an inlined rewrite whose argument is one.
+    Literal(nir::Literal)
+} Held
+
+/// An ensures clause a function checks at each return, by index, with the indexes of the old
+/// terms it reads.
+struct OwnEnsures {
+    index: u32
+    olds: mem::List[u32]
+} OwnEnsures
+
+/// The ensures clauses a function checks at each return: its own, by index from `start`, with
+/// the indexes of the old terms each reads, and those it inherits.
+struct Exits {
+    ensures_clauses: mem::List[OwnEnsures]
+    inherited: Option[Inherited]
+} Exits
+
+/// The ensures an implementing function meets for the interface method it implements, where
+/// that method's requires held at entry: the interface's unit with its type arguments, the
+/// clauses that are not disputed and the requires that are not disputed, with the values entry
+/// computes of each requires and old term.
+struct Inherited {
+    implemented: Implemented
+    ensures_clauses: mem::List[EnsuresClause]
+    requires_clauses: mem::List[u32]
+    requires_values: mem::List[nir::Value]
+    old_values: mem::HashMap[u32, nir::Value]
+} Inherited
+
+/// A scope of the code being elaborated: the slots it created and the deferred calls registered
+/// with it.
+struct ElabScope {
+    slots: mem::List[nir::Value]
+    deferred: mem::List[Deferred]
+} ElabScope
+
+/// A deferred call: its call expression, and the places it names.
+struct Deferred {
+    token: u32
+    call: TExpr
+    places: mem::List[nir::Place]
+} Deferred
+
+/// The targets of a loop being elaborated: its header and exit blocks and the scope depth
+/// outside its body.
+struct ElabLoop derives Copy {
+    header: nir::BlockId
+    exit: nir::BlockId
+    depth: usize
+} ElabLoop
+
+/// An `await when` body being elaborated: the scope depth outside it and the exits leaving it.
+struct WhenBody {
+    depth: usize
+    leaves: mem::List[Leave]
+} WhenBody
+
+/// An exit leaving an `await when` body: the block of the enclosing code its region jumps to,
+/// that block's parameter holding the value the exit carries, the places moved on its path,
+/// and the exit it continues there.
+struct Leave {
+    block: nir::BlockId
+    value: Option[nir::Value]
+    moved: mem::Set[nir::Place]
+    exit: Exit
+    token: u32
+} Leave
+
+enum Exit derives Copy, Eq {
+    Return
+    Fail
+    Loop(index: usize, breaks: bool)
+} Exit
+
+/// A parameter or capture of the function being elaborated, with its mode.
+struct OwnParam derives Copy {
+    local: LocalId
+    mode: ast::Mode
+} OwnParam
+
+/// A `take` parameter and the value entry stores into its slot.
+struct TakeParam derives Copy {
+    local: LocalId
+    value: nir::Value
+} TakeParam
+
+/// The struct value and field a field local of a predicate function stands for.
+struct FieldValue {
+    value: nir::Value
+    name: text::String
+} FieldValue
+
+/// The elaboration of one NIR function. It owns the draft of the unit it elaborates into while
+/// it elaborates, and gives it back when it finishes.
+struct Elab {
+    ck: Checker
+    item: ty::ItemId
+    unit: UnitDraft
+    body: mem::Shared[TBody]
+    role: nir::Role
+    b: Builder
+    params: mem::List[nir::Param]
+    held: mem::HashMap[LocalId, Held]
+    /// The places moved on the path being elaborated.
+    moved: mem::Set[nir::Place]
+    scopes: mem::List[ElabScope]
+    loops: mem::List[ElabLoop]
+    /// The loops of the enclosing code a closure lies in, which the typed body numbers first.
+    loop_base: usize
+    exits: Exits
+    /// The function's failure type, into which failures convert.
+    failure_ty: Option[ty::Ty]
+    /// The function's result type, whose values the exit's predicate checks cover.
+    exit_ty: Option[ty::Ty]
+    /// The function's own parameters and captures with their modes.
+    own_params: mem::List[OwnParam]
+    /// The `take` parameters, which entry stores into slots.
+    take_params: mem::List[TakeParam]
+    /// The slots of `take` parameters, released after the ensures checks.
+    take_slots: mem::List[nir::Value]
+    /// The value of each old term at entry, by index.
+    old_values: mem::HashMap[u32, nir::Value]
+    /// The old parameter of an ensures function, by its term's first token.
+    olds: mem::HashMap[u32, nir::Value]
+    /// The `result` parameter of an ensures function.
+    result: Option[nir::Value]
+    /// The decreases measure at entry.
+    measure: Option[nir::Value]
+    /// The struct value and field of each field local of a predicate function.
+    fields: mem::HashMap[LocalId, FieldValue]
+    /// The parameter of each const parameter of a `where` function.
+    const_params: mem::HashMap[ty::Param, nir::Value]
+    /// The premise index of the trusted code being elaborated.
+    premise: Option[u32]
+    /// The temporaries of the statement being elaborated still holding values on the path being
+    /// elaborated, released at its end.
+    temps: mem::List[nir::Value]
+    /// The wrapped parts projection calls give, which own nothing.
+    wrapped: mem::Set[nir::Value]
+    /// The `await when` body being elaborated.
+    when_body: Option[WhenBody]
+    /// The scope whose slots the temporaries of the statement being elaborated are.
+    temp_scope: usize
+    /// The tombstones whose rewrites the code being elaborated is inlined from, outermost first.
+    forwarding: mem::List[ty::ItemId]
+    /// The index the unit's functions of the typed body's closures start at: 0 but for an
+    /// inlined rewrite's closures.
+    closure_base: u32
+    /// Whether the function is a projection, whose returned `if` or `match` returns the value of
+    /// each branch in the form its head gives.
+    projection: bool
+} Elab
+
+/// A capture of a closure as its function receives it.
+struct Capture derives Copy {
+    local: LocalId
+    outer: LocalId
+    mode: ast::Mode
+} Capture
+
+/// A finished function, and the draft of the unit its elaboration owned, given back.
+struct FinishedFunction {
+    function: nir::Function
+    unit: UnitDraft
+} FinishedFunction
+
+
+/// An `old` term of an ensures clause, or a decreases clause, by its first token, with the type
+/// of its value.
+struct TypedToken derives Copy {
+    token: u32
+    ty: ty::Ty
+} TypedToken
+
+/// An `old` term by its first token, with its index among the unit's old functions.
+struct OldIndex derives Copy {
+    token: u32
+    index: u32
+} OldIndex
+
+/// A listed capture of a closure, with the token of its entry in the capture list.
+struct CaptureAt derives Copy {
+    token: u32
+    capture: Capture
+} CaptureAt
+
+/// The NIR unit of an item the checker accepts; none for a rejected item, a package, a
+/// tombstone, or an item whose elaboration faulted, which reports an internal error.
+fn Checker.unit(self, item: ty::ItemId) -> Option[mem::Shared[nir::NirUnit]] {
+    let state = self.state.contents()
+    state.db.note(item)
+    match state.units.get(item) {
+        Some(known) => return shared_unit(known)
+        None => {}
+    }
+    var unit: Option[mem::Shared[nir::NirUnit]] = None
+    if not self.rejected(item) {
+        let elaborated = state.db.about(Some(item), compute: fn() => attempt self.elaborate(item))
+        match elaborated {
+            Ok(Some(built)) => {
+                unit = Some(mem::Shared.of(take built, alloc: self.alloc()))
+            }
+            Ok(None) or Err(Fault.Failed) => {}
+            Err(Fault.Unsupported(_)) => {
+                expect false
+            }
+        }
+    }
+    return shared_unit(state.units.insert(item, value: take unit))
+} Checker.unit
+
+/// Another handle of a unit, if any.
+fn shared_unit(unit: Option[mem::Shared[nir::NirUnit]]) -> Option[mem::Shared[nir::NirUnit]] {
+    let Some(held) = unit else {
+        return None
+    }
+    return Some(held.share())
+} shared_unit
+
+fn Checker.elaborate(self, item: ty::ItemId) -> Option[nir::NirUnit] fails Fault {
+    self.type_parts(item)
+    let alloc = self.alloc()
+    var unit = UnitDraft.new(item, alloc)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(function) => {
+            let sig = self.fn_sig(item)
+            let typed = self.typed(item)
+            let Some(fn_sig) = sig else {
+                return None
+            }
+            let Some(body) = typed else {
+                return None
+            }
+            mut unit.number_conditions(body.contents(), alloc)
+            let has_body = match function.body {
+                ast::FnBody.None => false
+                else => true
+            }
+            unit = try self.function_unit(take unit, sig: fn_sig, body, has_body, role: nir::Role.Body)
+        }
+        ast::ItemKind.Interface(_) => {
+            let Some(methods) = try self.method_units(take unit) else {
+                return None
+            }
+            unit = methods
+        }
+        ast::ItemKind.Struct(_) => {
+            unit = try self.predicate_functions(take unit)
+        }
+        ast::ItemKind.Const(_) or ast::ItemKind.ConstAssert(_) or ast::ItemKind.Contribute(_) => {
+            let Some(body) = self.typed(item) else {
+                return None
+            }
+            mut unit.number_conditions(body.contents(), alloc)
+            unit = try self.value_unit(take unit, body)
+        }
+        ast::ItemKind.Test(_) => {
+            let Some(body) = self.typed(item) else {
+                return None
+            }
+            mut unit.number_conditions(body.contents(), alloc)
+            unit = try self.test_unit(take unit, body)
+        }
+        ast::ItemKind.Retired(_) or ast::ItemKind.Package => return None
+        else => {}
+    }
+    unit = try self.where_functions(take unit)
+    let finished = take unit.finish(alloc)
+    return Some(take finished)
+} Checker.elaborate
+
+/// The default and contract functions of an interface's methods; none when it has no interface
+/// signature.
+fn Checker.method_units(self, take unit: UnitDraft) -> Option[UnitDraft] fails Fault {
+    let item = unit.item
+    let sig = self.sig(item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return None
+    }
+    var bodies = mem::List[mem::Shared[TBody]].empty(self.alloc())
+    let state = self.state.contents()
+    for index in 0..<methods.len() {
+        match state.method_bodies.get(MethodKey(item: item, method: index)) {
+            Some(body) => mut bodies.push(body.share())
+            None => {}
+        }
+    }
+    for body in bodies {
+        mut unit.number_conditions(body.contents(), alloc: self.alloc())
+    }
+    for position in 0..<methods.len() {
+        if position >= bodies.len() {
+            break
+        }
+        let method = methods[position]
+        unit = try self.function_unit(take unit, sig: method.sig, body: bodies[position], has_body: method.default, role: nir::Role.Default)
+    }
+    return Some(take unit)
+} Checker.method_units
+
+/// The functions of a test: its body, closures and statement functions.
+fn Checker.test_unit(self, take unit: UnitDraft, body: mem::Shared[TBody]) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let item = unit.item
+    let held = body.contents()
+    let Some(root) = held.root else {
+        expect false
+        return unit
+    }
+    var elab = Elab.new(self, unit: take unit, body, role: nir::Role.Body)
+    let no_modes = mem::List[ast::Mode].empty(alloc)
+    mut elab.declare_params(held.params.view(), modes: no_modes.view())
+    try mut elab.function_root(root)
+    let span = nir::Span.at(self.db().ast(item).token)
+    let finished = take elab.finish(ty::Ty.unit(), failure: None, wait: false, closure: None, span)
+    var back = take finished.into_unit(0)
+    back = try self.closure_functions(take back, body, inlined: None)
+    return try self.statement_functions(take back, body)
+} Checker.test_unit
+
+/// Types without reporting what checking an item types beside its body, when its check has
+/// not: a struct's predicates, an interface's method bodies and the `where` conditions of
+/// its const parameters.
+fn Checker.type_parts(self, item: ty::ItemId) {
+    let state = self.state.contents()
+    let typed = match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) => state.typed_predicates.get(item).is_some()
+        ast::ItemKind.Interface(_) => state.method_bodies.get(MethodKey(item: item, method: 0)).is_some()
+        else => true
+    }
+    if not typed {
+        discard self.typed(item)
+    }
+    let Some(generics) = self.generic_params(item) else {
+        return
+    }
+    if state.typed_wheres.get(item).is_some() {
+        return
+    }
+    discard state.muted.fetch_add(1)
+    self.where_conditions(item, generics)
+    discard state.muted.fetch_sub(1)
+} Checker.type_parts
+
+/// The typed body of an item, its clauses included: the one its check produced, or one typed
+/// without reporting.
+fn Checker.typed(self, item: ty::ItemId) -> Option[mem::Shared[TBody]] {
+    let state = self.state.contents()
+    state.db.note(item)
+    match state.bodies.get(item) {
+        Some(body) => return Some(body.share())
+        None => {}
+    }
+    discard state.muted.fetch_add(1)
+    let checked = state.db.about(Some(item), compute: fn() => self.check_bodies(item))
+    discard state.muted.fetch_sub(1)
+    let Some(body) = checked else {
+        return None
+    }
+    let stored = state.bodies.insert(item, value: mem::Shared.of(take body, alloc: self.alloc()))
+    return Some(stored.share())
+} Checker.typed
+
+/// The functions of a function or interface method: its body (or default body), checking
+/// entry, closures and contract functions, numbered after those of earlier methods. The draft
+/// of the unit comes back with them.
+fn Checker.function_unit(
+    self,
+    take unit: UnitDraft,
+    sig: FnSig,
+    body: mem::Shared[TBody],
+    has_body: bool,
+    role: nir::Role,
+    ) -> UnitDraft fails Fault {
+    let olds = mut unit.number_olds(body.contents(), alloc: self.alloc())
+    if has_body and body.contents().root.is_some() {
+        unit = try self.body_functions(take unit, sig, body, role, olds)
+    }
+    unit = try self.contract_functions(take unit, sig, body, olds)
+    return try self.statement_functions(take unit, body)
+} Checker.function_unit
+
+/// The body function of a function or interface method, its checking entry and its closures.
+fn Checker.body_functions(
+    self,
+    take unit: UnitDraft,
+    sig: FnSig,
+    body: mem::Shared[TBody],
+    role: nir::Role,
+    olds: mem::HashMap[u32, u32],
+    ) -> UnitDraft fails Fault {
+    let span = nir::Span.at(self.db().ast(unit.item).token)
+    let failure = inhabited_failure(sig.failure)
+    let held = body.contents()
+    let Some(root) = held.root else {
+        return unit
+    }
+    let index = mut unit.next(role)
+    let start = unit.count(nir::Role.Ensures)
+    var inherited: Option[Inherited] = None
+    if role == nir::Role.Body {
+        inherited = self.inherited(unit.item)
+    }
+    var elab = Elab.new(self, unit: take unit, body, role)
+    elab.exits = Exits.of(held, olds, start, alloc: self.alloc())
+    elab.exits.inherited = inherited
+    elab.failure_ty = failure
+    elab.exit_ty = Some(sig.result)
+    elab.projection = role == nir::Role.Body and sig.is_proj()
+    let modes = sig.params_modes(self.alloc())
+    mut elab.declare_params(held.params.view(), modes: modes.view())
+    try mut elab.enter(olds)
+    try mut elab.function_root(root)
+    let finished = take elab.finish(sig.result, failure, wait: sig.wait, closure: None, span)
+    var back = take finished.into_unit(index)
+    var checked = false
+    for clause in held.clauses {
+        if clause.role == ClauseRole.Requires and not clause.disputed {
+            checked = true
+        }
+    }
+    if role == nir::Role.Body and checked {
+        let entry = Elab.entry_function(self, unit: take back, body, sig, span)
+        back = take entry.into_unit(0)
+    }
+    return try self.closure_functions(take back, body, inlined: None)
+} Checker.body_functions
+
+/// The failure type a function may fail with: none for `Never`.
+fn inhabited_failure(failure: Option[ty::Ty]) -> Option[ty::Ty] {
+    let Some(raised) = failure else {
+        return None
+    }
+    if raised == ty::Ty.never() {
+        return None
+    }
+    return Some(raised)
+} inhabited_failure
+
+/// The body function of a const, const assert or contribution, without parameters.
+fn Checker.value_unit(self, take unit: UnitDraft, body: mem::Shared[TBody]) -> UnitDraft fails Fault {
+    let held = body.contents()
+    let Some(root) = held.root else {
+        expect false
+        return unit
+    }
+    let span = nir::Span.at(self.db().ast(unit.item).token)
+    var elab = Elab.new(self, unit: take unit, body, role: nir::Role.Body)
+    try mut elab.function_root_value(root)
+    let finished = take elab.finish(root.ty, failure: None, wait: false, closure: None, span)
+    var back = take finished.into_unit(0)
+    back = try self.closure_functions(take back, body, inlined: None)
+    return try self.statement_functions(take back, body)
+} Checker.value_unit
+
+/// The closure functions of a body, each taking its captures, then its own parameters.
+fn Checker.closure_functions(self, take unit: UnitDraft, body: mem::Shared[TBody], inlined: Option[Inlined]) -> UnitDraft fails Fault {
+    let held = body.contents()
+    let Some(root) = held.root else {
+        return unit
+    }
+    var closures = mem::List[u32].empty(self.alloc())
+    collect_closures(root, found: mut closures)
+    mut closures.sort_by(fn(left: u32, right: u32) => left.cmp(right))
+    for index in closures {
+        let Some(closure) = root.closure_numbered(index) else {
+            continue
+        }
+        unit = try self.closure_function(take unit, body, closure, inlined)
+    }
+    return unit
+} Checker.closure_functions
+
+/// The function of one closure of a body: its captures, then its own parameters.
+fn Checker.closure_function(
+    self,
+    take unit: UnitDraft,
+    body: mem::Shared[TBody],
+    closure: TClosure,
+    inlined: Option[Inlined],
+    ) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let held = body.contents()
+    var base: u32 = 0
+    match inlined {
+        Some(known) => {
+            base = known.base
+        }
+        None => {}
+    }
+    var elab = Elab.new(self, unit: take unit, body, role: nir::Role.Closure)
+    elab.closure_base = base
+    let mark = elab.b.mark()
+    for capture in closure_captures(closure, alloc) {
+        let local = held.local(capture.local)
+        let nty = elab.param_ty(capture.mode, ty: local.ty)
+        let value = mut elab.b.value(nty)
+        mut elab.params.push(nir::Param(mode: capture.mode, value: value, name: text::String.of(local.name.as_str(), alloc), span: nir::Span.at(local.token)))
+        discard mut elab.held.insert(capture.local, value: Held.Value(value))
+        mut elab.own_params.push(OwnParam(local: capture.local, mode: capture.mode))
+        if capture.mode == ast::Mode.Take {
+            mut elab.take_params.push(TakeParam(local: capture.local, value: value))
+        }
+    }
+    var modes = mem::List[ast::Mode].empty(alloc)
+    for param in closure.ty.params {
+        mut modes.push(param.mode)
+    }
+    mut elab.declare_params(closure.params.view(), modes: modes.view())
+    let failure = inhabited_failure(closure.ty.failure)
+    elab.failure_ty = failure
+    elab.exit_ty = Some(closure.ty.result)
+    try mut elab.enter(mem::HashMap[u32, u32].empty(seed: 0, alloc))
+    try mut elab.closure_root(closure)
+    let head = nir::ClosureHead(task: closure.task, limit_set: closure.ty.limit_set)
+    var result = closure.ty.result
+    var raised = failure
+    var span = nir::Span.at(closure.body.token)
+    match inlined {
+        Some(known) => {
+            let types = self.types()
+            mut elab.b.since(mark, span: known.span, subst: known.subst, types)
+            for param in mut elab.params {
+                param.span = known.span
+            }
+            result = known.subst.ty(types, ty: result)
+            raised = substituted_failure(raised, subst: known.subst, types)
+            span = known.span
+        }
+        None => {}
+    }
+    let finished = take elab.finish(result, failure: raised, wait: closure.ty.wait, closure: Some(head), span)
+    return take finished.into_unit(base + closure.index - 1)
+} Checker.closure_function
+
+/// A failure type with generic parameters replaced by `subst`.
+fn substituted_failure(failure: Option[ty::Ty], subst: ty::Subst, types: ty::Types) -> Option[ty::Ty] {
+    let Some(raised) = failure else {
+        return None
+    }
+    return Some(subst.ty(types, ty: raised))
+} substituted_failure
+
+/// The requires, ensures, decreases, old and example functions of a function's clauses.
+fn Checker.contract_functions(
+    self,
+    take unit: UnitDraft,
+    sig: FnSig,
+    body: mem::Shared[TBody],
+    olds: mem::HashMap[u32, u32],
+    ) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let held = body.contents()
+    let all_read = copied_locals(held.params.view(), alloc)
+    let modes = sig.params_modes(alloc)
+    var kept = mem::List[LocalId].empty(alloc)
+    for position in 0..<held.params.len() {
+        if position >= modes.len() {
+            break
+        }
+        if modes[position] != ast::Mode.Take {
+            mut kept.push(held.params[position])
+        }
+    }
+    for clause in held.clauses {
+        unit = try self.clause_function(take unit, sig, body, clause, kept: kept.view(), all_read: all_read.view())
+    }
+    for clause in held.clauses {
+        if clause.role != ClauseRole.Ensures {
+            continue
+        }
+        var tokens = mem::List[u32].empty(alloc)
+        collect_old_terms(clause.expr, found: mut tokens)
+        for token in tokens {
+            let Some(term) = clause.expr.old_term(token) else {
+                continue
+            }
+            var elab = Elab.new(self, unit: take unit, body, role: nir::Role.Old)
+            mut elab.declare_read_params(all_read.view())
+            try mut elab.function_root_value(term)
+            let finished = take elab.finish(term.ty, failure: None, wait: false, closure: None, span: nir::Span.at(token))
+            unit = take finished.into_unit(olds.at(token))
+        }
+    }
+    for example in held.examples {
+        unit = try self.example_function(take unit, example)
+    }
+    return unit
+} Checker.contract_functions
+
+/// The function of a requires, ensures or decreases clause, taking the parameters by read, an
+/// ensures clause the parameters it keeps, its `result` and its `old` values.
+fn Checker.clause_function(
+    self,
+    take unit: UnitDraft,
+    sig: FnSig,
+    body: mem::Shared[TBody],
+    clause: TClause,
+    kept: Slice[LocalId],
+    all_read: Slice[LocalId],
+    ) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let role = match clause.role {
+        ClauseRole.Requires => nir::Role.Requires
+        ClauseRole.Ensures => nir::Role.Ensures
+        ClauseRole.Decreases => nir::Role.Decreases
+    }
+    let index = mut unit.next(role)
+    let span = nir::Span.at(clause.token)
+    var elab = Elab.new(self, unit: take unit, body, role)
+    if clause.role == ClauseRole.Ensures {
+        mut elab.declare_read_params(kept)
+        let result = mut elab.read_param("result", ty: sig.result, span)
+        elab.result = Some(result)
+        var terms = mem::List[TypedToken].empty(alloc)
+        collect_olds(clause.expr, visit: fn[mut terms](token: u32, ty: ty::Ty) => mut terms.push(TypedToken(token: token, ty: ty)))
+        mut terms.sort_by(fn(left: TypedToken, right: TypedToken) => left.token.cmp(right.token))
+        for term in terms {
+            let value = mut elab.read_param("old", ty: term.ty, span: nir::Span.at(term.token))
+            discard mut elab.olds.insert(term.token, value: value)
+        }
+    } else {
+        mut elab.declare_read_params(all_read)
+    }
+    try mut elab.function_root_value(clause.expr)
+    let finished = take elab.finish(clause.expr.ty, failure: None, wait: false, closure: None, span)
+    return take finished.into_unit(index)
+} Checker.clause_function
+
+/// The function of an example and its closures' functions.
+fn Checker.example_function(self, take unit: UnitDraft, example: TExample) -> UnitDraft fails Fault {
+    let index = mut unit.next(nir::Role.Example)
+    let held = example.body.contents()
+    let Some(root) = held.root else {
+        expect false
+        return unit
+    }
+    var elab = Elab.new(self, unit: take unit, body: example.body, role: nir::Role.Example)
+    try mut elab.function_root_value(root)
+    let finished = take elab.finish(root.ty, failure: None, wait: false, closure: None, span: nir::Span.at(example.token))
+    let back = take finished.into_unit(index)
+    return try self.closure_functions(take back, body: example.body, inlined: None)
+} Checker.example_function
+
+/// The invariant and assume functions of a body's loop invariants and `assume` statements,
+/// each taking the bindings it names by first mention.
+fn Checker.statement_functions(self, take unit: UnitDraft, body: mem::Shared[TBody]) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let held = body.contents()
+    let Some(root) = held.root else {
+        return unit
+    }
+    var keys = mem::List[ConditionKey].empty(alloc)
+    collect_conditions(root, found: mut keys)
+    for key in keys {
+        let Some(condition) = root.condition(key) else {
+            continue
+        }
+        let index = unit.conditions.at(key)
+        var elab = Elab.new(self, unit: take unit, body, role: key.role)
+        let named = named_bindings(condition, alloc)
+        mut elab.declare_read_params(named.view())
+        try mut elab.function_root_value(condition)
+        let finished = take elab.finish(condition.ty, failure: None, wait: false, closure: None, span: nir::Span.at(condition.token))
+        unit = take finished.into_unit(index)
+    }
+    return unit
+} Checker.statement_functions
+
+/// The predicate functions of a struct, one per `where` and `invariant` line, each taking
+/// the struct value.
+fn Checker.predicate_functions(self, take unit: UnitDraft) -> UnitDraft fails Fault {
+    let alloc = self.alloc()
+    let item = unit.item
+    let state = self.state.contents()
+    let Some(found) = state.typed_predicates.get(item) else {
+        return unit
+    }
+    let predicates = found.share()
+    let types = self.types()
+    let sig = self.sig(item)
+    var args = mem::List[ty::Arg].empty(alloc)
+    for def in sig.contents().generics {
+        match def.constant {
+            Some(_) => mut args.push(ty::Arg.Const(ty::Const.Param(def.param)))
+            None => mut args.push(ty::Arg.Ty(types.intern(ty::TyKind.Param(def.param))))
+        }
+    }
+    let struct_ty = types.item(item, args: take args)
+    let held = predicates.contents()
+    for index in 0..<held.conditions.len() {
+        let condition = held.conditions[index]
+        let span = nir::Span.at(condition.token)
+        var elab = Elab.new(self, unit: take unit, body: held.body, role: nir::Role.Predicate)
+        let value = mut elab.read_param("self", ty: struct_ty, span)
+        for field in held.fields {
+            discard mut elab.fields.insert(field.local, value: FieldValue(value: value, name: text::String.of(field.name.as_str(), alloc)))
+        }
+        try mut elab.function_root_value(condition)
+        let finished = take elab.finish(condition.ty, failure: None, wait: false, closure: None, span)
+        unit = take finished.into_unit(u32.fit(index))
+    }
+    return unit
+} Checker.predicate_functions
+
+/// The `where` functions of an item's const parameters, each taking the const parameters.
+fn Checker.where_functions(self, take unit: UnitDraft) -> UnitDraft fails Fault {
+    let item = unit.item
+    let state = self.state.contents()
+    let Some(found) = state.typed_wheres.get(item) else {
+        return unit
+    }
+    let wheres = found.share()
+    let held = wheres.contents()
+    for index in 0..<held.conditions.len() {
+        let condition = held.conditions[index]
+        let span = nir::Span.at(condition.token)
+        var elab = Elab.new(self, unit: take unit, body: held.body, role: nir::Role.Where)
+        for param in held.params {
+            let name = self.generic_name(param.param)
+            let value = mut elab.read_param(name.as_str(), ty: ty::Ty.scalar(param.scalar), span)
+            discard mut elab.const_params.insert(param.param, value: value)
+        }
+        try mut elab.function_root_value(condition)
+        let finished = take elab.finish(condition.ty, failure: None, wait: false, closure: None, span)
+        unit = take finished.into_unit(u32.fit(index))
+    }
+    return unit
+} Checker.where_functions
+
+/// The name of a generic parameter, as its item declares it.
+fn Checker.generic_name(self, param: ty::Param) -> text::String {
+    let sig = self.sig(param.owner)
+    for def in sig.contents().generics {
+        if def.param == param {
+            return text::String.of(def.name.as_str(), alloc: self.alloc())
+        }
+    }
+    return text::String.of("Self", alloc: self.alloc())
+} Checker.generic_name
+
+/// Whether NIR copies a value of the type: a type parameter is Copy exactly when bounded by
+/// `Copy`.
+fn Checker.nir_copy(self, ty: ty::Ty) -> bool {
+    match self.types().kind(ty) {
+        ty::TyKind.Param(param) => {
+            for bound in self.param_bounds(param) {
+                if self.db().canonical(bound.item).as_str() == "core::Copy" {
+                    return true
+                }
+            }
+            return false
+        }
+        else => return self.has(ty, property: Property.Copy)
+    }
+} Checker.nir_copy
+
+/// Whether NIR treats a value of the type as a view: a type parameter never is.
+fn Checker.nir_view(self, ty: ty::Ty) -> bool {
+    match self.types().kind(ty) {
+        ty::TyKind.Param(_) => return false
+        else => return self.has(ty, property: Property.View)
+    }
+} Checker.nir_view
+
+/// Whether a function is a boundary function of its module: `pub` or `pkg`, or implementing
+/// an interface method.
+fn Checker.is_boundary(self, function: ty::ItemId) -> bool {
+    return self.db().ast(function).visibility != ast::Visibility.Private or self.implemented_lines(function).len() > 0
+} Checker.is_boundary
+
+/// The requires clauses of a function item, by index, with whether each is disputed.
+fn Checker.requires_clauses(self, function: ty::ItemId) -> mem::List[RequiresClause] {
+    let Some(body) = self.typed(function) else {
+        return mem::List[RequiresClause].empty(self.alloc())
+    }
+    return clause_indexes(body.contents(), role: ClauseRole.Requires, start: 0, alloc: self.alloc())
+} Checker.requires_clauses
+
+/// The requires a function's body meets at entry, as the functions computing them: its own
+/// clauses that are not disputed, or, for an implementing function with none, those of the
+/// interface method it implements.
+fn Checker.entry_requires(self, function: ty::ItemId) -> mem::List[nir::FnRef] {
+    let alloc = self.alloc()
+    var refs = mem::List[nir::FnRef].empty(alloc)
+    let own = self.requires_clauses(function)
+    var undisputed = false
+    for clause in own {
+        if not clause.disputed {
+            undisputed = true
+        }
+    }
+    if undisputed {
+        let sig = self.sig(function)
+        var listed = mem::List[ty::Arg].empty(alloc)
+        for def in sig.contents().generics {
+            mut listed.push(def.param_arg(self.types()))
+        }
+        let args = self.types().args(take listed)
+        for clause in own {
+            if not clause.disputed {
+                mut refs.push(nir::FnRef(callable: nir::Callable.Item(item: function, role: nir::Role.Requires, index: clause.index), args: args))
+            }
+        }
+        return refs
+    }
+    let Some(implemented) = self.implemented_method(function) else {
+        return refs
+    }
+    for clause in self.method_requires(implemented.item, method: implemented.method) {
+        if not clause.disputed {
+            mut refs.push(nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Requires, index: clause.index), args: implemented.args))
+        }
+    }
+    return refs
+} Checker.entry_requires
+
+/// The typed bodies of an interface's methods, in method order.
+fn Checker.method_typed(self, interface_item: ty::ItemId) -> mem::List[mem::Shared[TBody]] {
+    var bodies = mem::List[mem::Shared[TBody]].empty(self.alloc())
+    let sig = self.sig(interface_item)
+    let count = match sig.contents().kind {
+        SigKind.Interface(methods: methods) => methods.len()
+        else => 0
+    }
+    let state = self.state.contents()
+    for method in 0..<count {
+        match state.method_bodies.get(MethodKey(item: interface_item, method: method)) {
+            Some(body) => mut bodies.push(body.share())
+            None => {}
+        }
+    }
+    return bodies
+} Checker.method_typed
+
+/// The requires clauses of an interface method, by their index in the interface's unit,
+/// with whether each is disputed.
+fn Checker.method_requires(self, interface_item: ty::ItemId, method: usize) -> mem::List[RequiresClause] {
+    let alloc = self.alloc()
+    let state = self.state.contents()
+    var start: u32 = 0
+    for index in 0..<method {
+        match state.method_bodies.get(MethodKey(item: interface_item, method: index)) {
+            Some(body) => {
+                start += u32.fit(clause_indexes(body.contents(), role: ClauseRole.Requires, start: 0, alloc).len())
+            }
+            None => {}
+        }
+    }
+    let Some(body) = state.method_bodies.get(MethodKey(item: interface_item, method: method)) else {
+        return mem::List[RequiresClause].empty(alloc)
+    }
+    return clause_indexes(body.contents(), role: ClauseRole.Requires, start, alloc)
+} Checker.method_requires
+
+/// The ensures clauses of a function item, or of one of an interface's methods, as their
+/// unit's functions compute them.
+fn Checker.ensures_clauses(self, item: ty::ItemId, method: Option[usize]) -> mem::List[EnsuresClause] {
+    let alloc = self.alloc()
+    var bodies = mem::List[mem::Shared[TBody]].empty(alloc)
+    match method {
+        None => {
+            match self.typed(item) {
+                Some(body) => mut bodies.push(take body)
+                None => {}
+            }
+        }
+        Some(last) => {
+            let state = self.state.contents()
+            for index in 0..<(last + 1) {
+                match state.method_bodies.get(MethodKey(item: item, method: index)) {
+                    Some(body) => mut bodies.push(body.share())
+                    None => {}
+                }
+            }
+        }
+    }
+    var clauses = mem::List[EnsuresClause].empty(alloc)
+    var index: u32 = 0
+    var old: u32 = 0
+    for position in 0..<bodies.len() {
+        let held = bodies[position].contents()
+        for clause in held.clauses {
+            if clause.role != ClauseRole.Ensures {
+                continue
+            }
+            var count: u32 = 0
+            collect_olds(clause.expr, visit: fn[mut count](token: u32, ty: ty::Ty) {
+                count += 1
+            })
+            if method.is_none() or method == Some(position) {
+                var olds = mem::List[u32].empty(alloc)
+                for read in old..<(old + count) {
+                    mut olds.push(read)
+                }
+                mut clauses.push(EnsuresClause(index: index, olds: take olds, disputed: clause.disputed))
+            }
+            index += 1
+            old += count
+        }
+    }
+    return clauses
+} Checker.ensures_clauses
+
+/// The function implementing an interface's method for a type: the function its impl line's
+/// module declares or the interface's default body, a derived method, or the method through a
+/// generic parameter's bound or a conformance the toolchain supplies.
+fn Checker.implementation(self, ty: ty::Ty, interface_item: ty::ItemId, method: Str) -> Option[nir::FnRef] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let Some(index) = self.interface_method(interface_item, name: method) else {
+        return None
+    }
+    var self_args = mem::List[ty::Arg].empty(alloc)
+    mut self_args.push(ty::Arg.Ty(ty))
+    let through_bound = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: u32.fit(index)), args: types.args(take self_args))
+    let found = self.type_key(ty)
+    let Some(key) = found else {
+        return Some(take through_bound)
+    }
+    match types.kind(ty) {
+        ty::TyKind.Param(_) => return Some(take through_bound)
+        else => {}
+    }
+    for line in self.impl_lines(key) {
+        let line_sig = self.sig(line)
+        let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = line_sig.contents().kind else {
+            continue
+        }
+        if bound.item != interface_item {
+            continue
+        }
+        return Some(self.line_implementation(line, bound, key, ty, method, index))
+    }
+    match key {
+        TypeKey.Item(owner) => {
+            if self.derives_interface(owner, interface_item) {
+                if not is_listed("eq cmp hash default render write generate", word: method) {
+                    return None
+                }
+                return Some(nir::FnRef(callable: nir::Callable.Derived(owner: owner, method: text::String.of(method, alloc)), args: types.args_of(ty)))
+            }
+        }
+        else => {}
+    }
+    return Some(take through_bound)
+} Checker.implementation
+
+/// The function implementing a method through an impl line naming the interface: the
+/// function the line's module declares, or the interface's default body.
+fn Checker.line_implementation(
+    self,
+    line: ty::ItemId,
+    bound: ty::Bound,
+    key: TypeKey,
+    ty: ty::Ty,
+    method: Str,
+    index: usize,
+    ) -> nir::FnRef {
+    let alloc = self.alloc()
+    let types = self.types()
+    let subst = self.type_subst(key, ty)
+    match self.implementing_function(line, name: method) {
+        Some(function) => {
+            let sig = self.sig(function)
+            var args = mem::List[ty::Arg].empty(alloc)
+            for def in sig.contents().generics {
+                match subst.get(def.param) {
+                    Some(arg) => mut args.push(arg)
+                    None => mut args.push(ty::Arg.Ty(types.intern(ty::TyKind.Param(def.param))))
+                }
+            }
+            return nir::FnRef.item(function, args: types.args(take args))
+        }
+        None => {}
+    }
+    var args = mem::List[ty::Arg].empty(alloc)
+    for arg in types.arg_list(bound.args) {
+        mut args.push(subst.arg(types, arg))
+    }
+    mut args.push(ty::Arg.Ty(ty))
+    return nir::FnRef(callable: nir::Callable.Item(item: bound.item, role: nir::Role.Default, index: self.default_index(bound.item, method: index)), args: types.args(take args))
+} Checker.line_implementation
+
+/// The implementation of a method for a call giving the method `args`: those of `Self` and
+/// the interface, then the method's own. An implementing function receives the own ones for
+/// its own generic parameters, a derived method or default body after the others, and a call
+/// through a bound or a supplied conformance all of them.
+fn Checker.call_implementation(self, take implementation: nir::FnRef, interface_item: ty::ItemId, args: Slice[ty::Arg]) -> nir::FnRef {
+    let alloc = self.alloc()
+    let types = self.types()
+    let interface_sig = self.sig(interface_item)
+    var interface_args: usize = 0
+    for def in interface_sig.contents().generics {
+        if not def.param.is_self() {
+            interface_args += 1
+        }
+    }
+    let skipped = 1 + interface_args
+    var own = mem::List[ty::Arg].empty(alloc)
+    if skipped <= args.len() {
+        for position in skipped..<args.len() {
+            mut own.push(args[position])
+        }
+    }
+    var listed = mem::List[ty::Arg].empty(alloc)
+    match implementation.callable {
+        nir::Callable.Method(item: _, method: _) => {
+            for arg in args {
+                mut listed.push(arg)
+            }
+        }
+        nir::Callable.Derived(owner: _, method: _) or nir::Callable.Item(item: _, role: nir::Role.Default, index: _) => {
+            for arg in types.arg_list(implementation.args) {
+                mut listed.push(arg)
+            }
+            for arg in own {
+                mut listed.push(arg)
+            }
+        }
+        nir::Callable.Item(item: item, role: nir::Role.Body, index: _) => {
+            listed = self.function_args(item, args: implementation.args, own: own.view())
+        }
+        else => return implementation
+    }
+    var called = implementation
+    called.args = types.args(take listed)
+    return called
+} Checker.call_implementation
+
+/// The type arguments of an implementing function called with a method's own arguments: those
+/// for its own generic parameters, in order, the implementation's for the others.
+fn Checker.function_args(self, item: ty::ItemId, args: ty::Args, own: Slice[ty::Arg]) -> mem::List[ty::Arg] {
+    let types = self.types()
+    let given = types.arg_list(args)
+    let sig = self.sig(item)
+    let generics = sig.contents().generics
+    var listed = mem::List[ty::Arg].empty(self.alloc())
+    var next: usize = 0
+    for position in 0..<generics.len() {
+        if position >= given.len() {
+            break
+        }
+        if generics[position].param.owner == item and next < own.len() {
+            mut listed.push(own[next])
+            next += 1
+        } else {
+            if generics[position].param.owner == item {
+                next += 1
+            }
+            mut listed.push(given[position])
+        }
+    }
+    return listed
+} Checker.function_args
+
+/// The substitution of the generic parameters of an item's unit from the type arguments of a
+/// reference to one of its functions, in the item's order. A reference into an interface's
+/// unit then gives the referenced method's own, which stand for the own parameters of every
+/// method by position, as each function of the unit belongs to one method.
+fn Checker.unit_subst(self, item: ty::ItemId, args: Slice[ty::Arg]) -> ty::Subst {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let held = sig.contents()
+    var subst = ty::Subst.of(generic_params(held.generics.view(), alloc).view(), args, alloc)
+    let SigKind.Interface(methods: methods) = held.kind else {
+        return subst
+    }
+    let start = held.generics.len()
+    if start > args.len() {
+        return subst
+    }
+    for method in methods {
+        let own = method.sig.own_generics()
+        for position in 0..<own.len() {
+            if start + position >= args.len() {
+                break
+            }
+            mut subst.insert(own[position].param, arg: args[start + position])
+        }
+    }
+    return subst
+} Checker.unit_subst
+
+/// Whether a function is a foreign fn.
+fn Checker.is_foreign(self, function: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(item) = self.db().ast(function).kind else {
+        return false
+    }
+    let Some(modifier) = item.modifier else {
+        return false
+    }
+    return modifier.kind == ast::FnModifier.Foreign
+} Checker.is_foreign
+
+/// The index among an interface's default bodies of a method's default body.
+fn Checker.default_index(self, interface_item: ty::ItemId, method: usize) -> u32 {
+    let sig = self.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return 0
+    }
+    var count: u32 = 0
+    for index in 0..<method {
+        if methods[index].default {
+            count += 1
+        }
+    }
+    return count
+} Checker.default_index
+
+/// The interface method a function implements through an impl line naming its type.
+fn Checker.implemented_method(self, function: ty::ItemId) -> Option[Implemented] {
+    let db = self.db()
+    let ast::ItemKind.Fn(item) = db.ast(function).kind else {
+        return None
+    }
+    let Some(key) = db.owners.get(function) else {
+        return None
+    }
+    let self_ty = match key {
+        TypeKey.Item(owner) => self.own_type(owner)
+        TypeKey.Scalar(scalar) => ty::Ty.scalar(scalar)
+        TypeKey.Unit => ty::Ty.unit()
+    }
+    for line in self.implemented_lines(function) {
+        let sig = self.sig(line)
+        let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+            continue
+        }
+        let Some(method) = self.interface_method(bound.item, name: item.label.name.text.as_str()) else {
+            continue
+        }
+        let args = self.interface_args(bound.item, self_ty, args: self.types().arg_list(bound.args))
+        return Some(Implemented(item: bound.item, method: method, args: args))
+    }
+    return None
+} Checker.implemented_method
+
+/// The ensures an implementing function inherits from the interface method it implements:
+/// none when that method has no ensures clause that is not disputed.
+fn Checker.inherited(self, function: ty::ItemId) -> Option[Inherited] {
+    let alloc = self.alloc()
+    let Some(implemented) = self.implemented_method(function) else {
+        return None
+    }
+    var kept = mem::List[EnsuresClause].empty(alloc)
+    let clauses = self.ensures_clauses(implemented.item, method: Some(implemented.method))
+    for clause in take clauses {
+        if not clause.disputed {
+            mut kept.push(take clause)
+        }
+    }
+    if kept.len() == 0 {
+        return None
+    }
+    var required = mem::List[u32].empty(alloc)
+    for clause in self.method_requires(implemented.item, method: implemented.method) {
+        if not clause.disputed {
+            mut required.push(clause.index)
+        }
+    }
+    return Some(Inherited(implemented: implemented, ensures_clauses: take kept, requires_clauses: take required, requires_values: mem::List[nir::Value].empty(alloc), old_values: mem::HashMap[u32, nir::Value].empty(seed: 0, alloc)))
+} Checker.inherited
+
+/// The type arguments of an interface's unit for a `Self` type and the arguments of a bound
+/// naming the interface: the interface's own parameters', then `Self`.
+fn Checker.interface_args(self, interface_item: ty::ItemId, self_ty: ty::Ty, args: Slice[ty::Arg]) -> ty::Args {
+    let sig = self.sig(interface_item)
+    let declared = sig.contents().generics.len()
+    var own: usize = 0
+    if declared > 0 {
+        own = declared - 1
+    }
+    var listed = mem::List[ty::Arg].empty(self.alloc())
+    for position in 0..<args.len() {
+        if position >= own {
+            break
+        }
+        mut listed.push(args[position])
+    }
+    mut listed.push(ty::Arg.Ty(self_ty))
+    return self.types().args(take listed)
+} Checker.interface_args
+
+/// The number of predicates of a struct.
+fn Checker.predicate_count(self, item: ty::ItemId) -> u32 {
+    let ast::ItemKind.Struct(structure) = self.db().ast(item).kind else {
+        return 0
+    }
+    var count: u32 = 0
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                if field.where_clause.is_some() {
+                    count += 1
+                }
+            }
+            ast::StructMember.Invariant(_) => {
+                count += 1
+            }
+        }
+    }
+    return count
+} Checker.predicate_count
+
+/// Whether a value of the type reaches a struct with predicates through its fields.
+fn Checker.has_predicates_within(self, ty: ty::Ty) -> bool {
+    var seen = mem::List[ty::ItemId].empty(self.alloc())
+    return self.reaches_predicates(ty, seen: mut seen)
+} Checker.has_predicates_within
+
+fn Checker.reaches_predicates(self, ty: ty::Ty, mut seen: mem::List[ty::ItemId]) -> bool {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return false
+    }
+    if holds_item(seen.view(), item) {
+        return false
+    }
+    mut seen.push(item)
+    if self.predicate_count(item) > 0 {
+        return true
+    }
+    let sig = self.sig(item)
+    let held = sig.contents()
+    let SigKind.Struct(fields: fields) = held.kind else {
+        return false
+    }
+    let subst = ty::Subst.of(generic_params(held.generics.view(), alloc: self.alloc()).view(), args: types.arg_list(args), alloc: self.alloc())
+    for field in fields {
+        if self.reaches_predicates(subst.ty(types, ty: field.ty), seen: mut seen) {
+            return true
+        }
+    }
+    return false
+} Checker.reaches_predicates
+
+/// The clauses of one role of a typed body, by index from `start`, with whether each is
+/// disputed.
+fn clause_indexes(body: TBody, role: ClauseRole, start: u32, alloc: mem::Alloc) -> mem::List[RequiresClause] {
+    var found = mem::List[RequiresClause].empty(alloc)
+    var index = start
+    for clause in body.clauses {
+        if clause.role == role {
+            mut found.push(RequiresClause(index: index, disputed: clause.disputed))
+            index += 1
+        }
+    }
+    return found
+} clause_indexes
+
+fn UnitDraft.new(item: ty::ItemId, alloc: mem::Alloc) -> UnitDraft {
+    return UnitDraft(item: item, functions: mem::List[nir::Function].empty(alloc), counts: mem::HashMap[nir::Role, u32].empty(seed: 0, alloc), inlined_closures: None, conditions: mem::HashMap[ConditionKey, u32].empty(seed: 0, alloc), premises: mem::List[u32].empty(alloc))
+} UnitDraft.new
+
+/// The index of the first of `count` closure functions of a rewrite inlined into `body`, the
+/// item's typed body: after those of its own closures and of the rewrites inlined earlier.
+fn UnitDraft.inline_closures(mut self, body: TBody, count: u32, alloc: mem::Alloc) -> u32 {
+    var held = InlinedClosures(own: 0, inlined: 0)
+    match self.inlined_closures {
+        Some(known) => {
+            held = known
+        }
+        None => {
+            held = InlinedClosures(own: own_closure_count(body, alloc), inlined: 0)
+        }
+    }
+    self.inlined_closures = Some(InlinedClosures(own: held.own, inlined: held.inlined + count))
+    return held.own + held.inlined
+} UnitDraft.inline_closures
+
+/// The greatest index of the closures of a typed body, its clauses' and examples' included.
+fn own_closure_count(body: TBody, alloc: mem::Alloc) -> u32 {
+    var closures = mem::List[u32].empty(alloc)
+    match body.root {
+        Some(root) => collect_closures(root, found: mut closures)
+        None => {}
+    }
+    for clause in body.clauses {
+        collect_closures(clause.expr, found: mut closures)
+    }
+    for example in body.examples {
+        let held = example.body.contents()
+        match held.root {
+            Some(root) => collect_closures(root, found: mut closures)
+            None => {}
+        }
+    }
+    var greatest: u32 = 0
+    for index in closures {
+        if index > greatest {
+            greatest = index
+        }
+    }
+    return greatest
+} own_closure_count
+
+/// The number of functions of a role so far.
+fn UnitDraft.count(self, role: nir::Role) -> u32 {
+    return self.counts.get(role).value_or(0)
+} UnitDraft.count
+
+/// The next index of a role.
+fn UnitDraft.next(mut self, role: nir::Role) -> u32 {
+    let index = self.count(role)
+    discard mut self.counts.insert(role, value: index + 1)
+    return index
+} UnitDraft.next
+
+/// Numbers the old terms of a function's ensures clauses in source order, after earlier
+/// methods' terms; returns each one's index by its first token.
+fn UnitDraft.number_olds(mut self, body: TBody, alloc: mem::Alloc) -> mem::HashMap[u32, u32] {
+    var tokens = mem::List[u32].empty(alloc)
+    for clause in body.clauses {
+        if clause.role == ClauseRole.Ensures {
+            collect_olds(clause.expr, visit: fn[mut tokens](token: u32, ty: ty::Ty) => mut tokens.push(token))
+        }
+    }
+    mut tokens.sort_by(fn(left: u32, right: u32) => left.cmp(right))
+    var olds = mem::HashMap[u32, u32].empty(seed: 0, alloc)
+    for token in tokens {
+        let index = mut self.next(nir::Role.Old)
+        discard mut olds.insert(token, value: index)
+    }
+    return olds
+} UnitDraft.number_olds
+
+/// Numbers the loop invariants and `assume` conditions of a body in source order, after
+/// earlier methods'.
+fn UnitDraft.number_conditions(mut self, body: TBody, alloc: mem::Alloc) {
+    let Some(root) = body.root else {
+        return
+    }
+    var keys = mem::List[ConditionKey].empty(alloc)
+    collect_conditions(root, found: mut keys)
+    for key in keys {
+        let index = mut self.next(key.role)
+        discard mut self.conditions.insert(key, value: index)
+    }
+} UnitDraft.number_conditions
+
+/// The premise index of a trusted block or expression, by its first token, numbered in
+/// order of first request until the unit is finished.
+fn UnitDraft.premise(mut self, token: u32) -> u32 {
+    for index in 0..<self.premises.len() {
+        if self.premises[index] == token {
+            return u32.fit(index)
+        }
+    }
+    mut self.premises.push(token)
+    return u32.fit(self.premises.len() - 1)
+} UnitDraft.premise
+
+/// The draft's functions and numbering moved out into a draft of their own, leaving this one
+/// without functions.
+fn UnitDraft.extract(mut self, alloc: mem::Alloc) -> UnitDraft {
+    var counts = mem::HashMap[nir::Role, u32].empty(seed: 0, alloc)
+    for entry in self.counts {
+        discard mut counts.insert(entry.key(), value: entry.value())
+    }
+    var conditions = mem::HashMap[ConditionKey, u32].empty(seed: 0, alloc)
+    for entry in self.conditions {
+        discard mut conditions.insert(entry.key(), value: entry.value())
+    }
+    var premises = mem::List[u32].empty(alloc)
+    for token in self.premises {
+        mut premises.push(token)
+    }
+    return UnitDraft(item: self.item, functions: drained_list(mut self.functions, alloc), counts: take counts, inlined_closures: self.inlined_closures, conditions: take conditions, premises: take premises)
+} UnitDraft.extract
+
+fn UnitDraft.add(mut self, take function: nir::Function) {
+    mut self.functions.push(take function)
+} UnitDraft.add
+
+/// The unit, its premises renumbered in source order.
+fn UnitDraft.finish(take self, alloc: mem::Alloc) -> nir::NirUnit {
+    var functions = self.functions
+    mut functions.sort_by(fn(left: nir::Function, right: nir::Function) => function_order(left, right))
+    var premises = mem::List[u32].empty(alloc)
+    for token in self.premises {
+        mut premises.push(token)
+    }
+    mut premises.sort_by(fn(left: u32, right: u32) => left.cmp(right))
+    var renumbered = mem::List[u32].empty(alloc)
+    for token in self.premises {
+        for rank in 0..<premises.len() {
+            if premises[rank] == token {
+                mut renumbered.push(u32.fit(rank))
+            }
+        }
+    }
+    for function in mut functions {
+        for block in mut function.blocks {
+            renumber_premises(mut block, renumbered: renumbered.view())
+        }
+    }
+    return nir::NirUnit(item: self.item, functions: take functions, premises: take premises)
+} UnitDraft.finish
+
+/// The order of a unit's functions: by role, then by index.
+fn function_order(left: nir::Function, right: nir::Function) -> core::Ordering {
+    let by_role = left.role.cmp(right.role)
+    if by_role != core::Ordering.Equal {
+        return by_role
+    }
+    return left.index.cmp(right.index)
+} function_order
+
+/// Replaces the premise index of each instruction of a block by its rank in source order.
+fn renumber_premises(mut block: nir::Block, renumbered: Slice[u32]) {
+    for inst in mut block.insts {
+        match inst.premise {
+            Some(premise) => {
+                inst.premise = Some(renumbered[usize.widen(premise)])
+            }
+            None => {}
+        }
+    }
+} renumber_premises
+
+/// The unit with the function added at an index.
+fn FinishedFunction.into_unit(take self, index: u32) -> UnitDraft {
+    var function = self.function
+    function.index = index
+    var unit = self.unit
+    mut unit.add(take function)
+    return unit
+} FinishedFunction.into_unit
+
+/// No ensures clause and nothing inherited.
+fn Exits.empty(alloc: mem::Alloc) -> Exits {
+    return Exits(ensures_clauses: mem::List[OwnEnsures].empty(alloc), inherited: None)
+} Exits.empty
+
+fn Exits.of(body: TBody, olds: mem::HashMap[u32, u32], start: u32, alloc: mem::Alloc) -> Exits {
+    var clauses = mem::List[OwnEnsures].empty(alloc)
+    var index: u32 = 0
+    for clause in body.clauses {
+        if clause.role != ClauseRole.Ensures {
+            continue
+        }
+        if not clause.disputed {
+            var read = mem::List[u32].empty(alloc)
+            collect_olds(clause.expr, visit: fn[mut read](token: u32, ty: ty::Ty) => mut read.push(olds.at(token)))
+            mut read.sort_by(fn(left: u32, right: u32) => left.cmp(right))
+            mut clauses.push(OwnEnsures(index: start + index, olds: take read))
+        }
+        index += 1
+    }
+    return Exits(ensures_clauses: take clauses, inherited: None)
+} Exits.of
+
+/// A scope without slots or deferred calls.
+fn ElabScope.empty(alloc: mem::Alloc) -> ElabScope {
+    return ElabScope(slots: mem::List[nir::Value].empty(alloc), deferred: mem::List[Deferred].empty(alloc))
+} ElabScope.empty
+
+/// The elaboration of one function of a unit, owning the unit's draft until it finishes.
+fn Elab.new(ck: Checker, take unit: UnitDraft, body: mem::Shared[TBody], role: nir::Role) -> Elab {
+    let alloc = ck.alloc()
+    let item = unit.item
+    var scopes = mem::List[ElabScope].empty(alloc)
+    mut scopes.push(ElabScope.empty(alloc))
+    return Elab(
+        ck: ck.share(),
+        item: item,
+        unit: take unit,
+        body: body.share(),
+        role: role,
+        b: Builder.new(alloc),
+        params: mem::List[nir::Param].empty(alloc),
+        held: mem::HashMap[LocalId, Held].empty(seed: 0, alloc),
+        moved: mem::Set[nir::Place].empty(alloc),
+        scopes: take scopes,
+        loops: mem::List[ElabLoop].empty(alloc),
+        loop_base: 0,
+        exits: Exits.empty(alloc),
+        failure_ty: None,
+        exit_ty: None,
+        own_params: mem::List[OwnParam].empty(alloc),
+        take_params: mem::List[TakeParam].empty(alloc),
+        take_slots: mem::List[nir::Value].empty(alloc),
+        old_values: mem::HashMap[u32, nir::Value].empty(seed: 0, alloc),
+        olds: mem::HashMap[u32, nir::Value].empty(seed: 0, alloc),
+        result: None,
+        measure: None,
+        fields: mem::HashMap[LocalId, FieldValue].empty(seed: 0, alloc),
+        const_params: mem::HashMap[ty::Param, nir::Value].empty(seed: 0, alloc),
+        premise: None,
+        temps: mem::List[nir::Value].empty(alloc),
+        wrapped: mem::Set[nir::Value].empty(alloc),
+        when_body: None,
+        temp_scope: 0,
+        forwarding: mem::List[ty::ItemId].empty(alloc),
+        closure_base: 0,
+        projection: false,
+    )
+} Elab.new
+
+/// The NIR type of a parameter received in a mode: `take` by value, `mut` by writable
+/// reference, read by value when Copy or a view and by reference otherwise.
+fn Elab.param_ty(self, mode: ast::Mode, ty: ty::Ty) -> nir::NTy {
+    return match mode {
+        ast::Mode.Take => nir::NTy.Owned(ty)
+        ast::Mode.Mut => nir::NTy.RefMut(ty)
+        ast::Mode.Read => if self.ck.nir_copy(ty) or self.ck.nir_view(ty) {
+            nir::NTy.Owned(ty)
+        } else {
+            nir::NTy.Ref(ty)
+        }
+    }
+} Elab.param_ty
+
+/// Declares the parameters of a body or closure in their modes; a missing mode is the
+/// local's own.
+fn Elab.declare_params(mut self, locals: Slice[LocalId], modes: Slice[ast::Mode]) {
+    let alloc = self.ck.alloc()
+    for index in 0..<locals.len() {
+        let local = locals[index]
+        let data = self.body.contents().local(local)
+        var mode = ast::Mode.Read
+        if index < modes.len() {
+            mode = modes[index]
+        } else {
+            match data.kind {
+                LocalKind.Param(declared) => {
+                    mode = declared
+                }
+                else => {}
+            }
+        }
+        let name = text::String.of(data.name.as_str(), alloc)
+        let span = nir::Span.at(data.token)
+        let nty = self.param_ty(mode, ty: data.ty)
+        let value = mut self.b.value(nty)
+        mut self.params.push(nir::Param(mode: mode, value: value, name: take name, span: span))
+        discard mut self.held.insert(local, value: Held.Value(value))
+        mut self.own_params.push(OwnParam(local: local, mode: mode))
+        if mode == ast::Mode.Take {
+            mut self.take_params.push(TakeParam(local: local, value: value))
+        }
+    }
+} Elab.declare_params
+
+/// Declares read parameters for locals of the typed body, as contract functions take them.
+fn Elab.declare_read_params(mut self, locals: Slice[LocalId]) {
+    for local in locals {
+        let data = self.body.contents().local(local)
+        let name = text::String.of(data.name.as_str(), alloc: self.ck.alloc())
+        let ty = data.ty
+        let span = nir::Span.at(data.token)
+        let value = mut self.read_param(name.as_str(), ty, span)
+        discard mut self.held.insert(local, value: Held.Value(value))
+    }
+} Elab.declare_read_params
+
+/// A read parameter of a contract function.
+fn Elab.read_param(mut self, name: Str, ty: ty::Ty, span: nir::Span) -> nir::Value {
+    let nty = self.param_ty(ast::Mode.Read, ty)
+    let value = mut self.b.value(nty)
+    mut self.params.push(nir::Param(mode: ast::Mode.Read, value: value, name: text::String.of(name, alloc: self.ck.alloc()), span: span))
+    return value
+} Elab.read_param
+
+/// The entry code: a slot per `take` parameter, then a call of each old function of the
+/// ensures clauses in index order, then of the decreases function.
+fn Elab.enter(mut self, olds: mem::HashMap[u32, u32]) fails Fault {
+    let alloc = self.ck.alloc()
+    for position in 0..<self.take_params.len() {
+        let param = self.take_params[position]
+        let data = self.body.contents().local(param.local)
+        let span = nir::Span.at(data.token)
+        let ty = data.ty
+        let name = text::String.of(data.name.as_str(), alloc)
+        let slot = mut self.emit_value(nir::Op.Slot(name: Some(take name), ty: ty), ty: nir::NTy.Owned(ty), span)
+        mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc), operand: nir::Operand.Value(param.value)), span)
+        discard mut self.held.insert(param.local, value: Held.Slot(slot))
+        mut self.take_slots.push(slot)
+    }
+    mut self.take_params.truncate(0)
+    var terms = mem::List[OldIndex].empty(alloc)
+    for entry in olds {
+        mut terms.push(OldIndex(token: entry.key(), index: entry.value()))
+    }
+    mut terms.sort_by(fn(left: OldIndex, right: OldIndex) => left.index.cmp(right.index))
+    let decreasing = self.decreases_clause()
+    if terms.len() == 0 and decreasing.is_none() and self.exits.inherited.is_none() {
+        return
+    }
+    let args = try mut self.param_operands()
+    mut self.enter_inherited(args.view())
+    for term in terms {
+        let ty = self.old_term_ty(term.token)
+        let fn_ref = self.own(nir::Role.Old, index: term.index)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(args.view(), alloc), ty, span: nir::Span.at(term.token))
+        discard mut self.old_values.insert(term.index, value: value)
+    }
+    let Some(measured) = decreasing else {
+        return
+    }
+    let fn_ref = self.own(nir::Role.Decreases, index: 0)
+    let value = mut self.call_value(take fn_ref, args: take args, ty: measured.ty, span: nir::Span.at(measured.token))
+    self.measure = Some(value)
+} Elab.enter
+
+/// The decreases clause the function's entry measures, by its token, with its type: a body's
+/// or default body's own.
+fn Elab.decreases_clause(self) -> Option[TypedToken] {
+    if self.role != nir::Role.Body and self.role != nir::Role.Default {
+        return None
+    }
+    for clause in self.body.contents().clauses {
+        if clause.role == ClauseRole.Decreases {
+            return Some(TypedToken(token: clause.token, ty: clause.expr.ty))
+        }
+    }
+    return None
+} Elab.decreases_clause
+
+/// The entry calls of the requires and old functions of the interface method an implementing
+/// function inherits ensures from, keeping their values.
+fn Elab.enter_inherited(mut self, args: Slice[nir::Operand]) {
+    let alloc = self.ck.alloc()
+    let Some(taken) = mut self.exits.inherited.extract() else {
+        return
+    }
+    var inherited = taken
+    let span = nir::Span.at(self.ck.db().ast(self.item).token)
+    let implemented = inherited.implemented
+    let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
+    var required = mem::List[u32].empty(alloc)
+    for index in inherited.requires_clauses {
+        mut required.push(index)
+    }
+    for index in required {
+        let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Requires, index: index), args: implemented.args)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(args, alloc), ty: bool_ty, span)
+        mut inherited.requires_values.push(value)
+    }
+    var olds = mem::List[u32].empty(alloc)
+    for clause in inherited.ensures_clauses {
+        for old in clause.olds {
+            mut olds.push(old)
+        }
+    }
+    for old in olds {
+        let ty = self.interface_old_ty(implemented, old)
+        let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: implemented.item, role: nir::Role.Old, index: old), args: implemented.args)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(args, alloc), ty, span)
+        discard mut inherited.old_values.insert(old, value: value)
+    }
+    self.exits.inherited = Some(take inherited)
+} Elab.enter_inherited
+
+/// The type an interface's old function returns, its `Self` the implementing type.
+fn Elab.interface_old_ty(self, implemented: Implemented, old: u32) -> ty::Ty {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    var result = ty::Ty.error()
+    let unit = self.ck.unit(implemented.item)
+    match unit {
+        Some(held) => {
+            match held.contents().function(nir::Role.Old, index: old) {
+                Some(function) => {
+                    result = function.result
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let sig = self.ck.sig(implemented.item)
+    let subst = ty::Subst.of(generic_params(sig.contents().generics.view(), alloc).view(), args: types.arg_list(implemented.args), alloc)
+    return subst.ty(types, ty: result)
+} Elab.interface_old_ty
+
+/// The type of the old term starting at a token.
+fn Elab.old_term_ty(self, token: u32) -> ty::Ty {
+    var found = ty::Ty.error()
+    for clause in self.body.contents().clauses {
+        collect_olds(clause.expr, visit: fn[mut found](at: u32, ty: ty::Ty) {
+            if at == token {
+                found = ty
+            }
+        })
+    }
+    return found
+} Elab.old_term_ty
+
+/// A reference to a NIR function of this unit.
+fn Elab.own(self, role: nir::Role, index: u32) -> nir::FnRef {
+    return nir::FnRef(callable: nir::Callable.Item(item: self.item, role: role, index: index), args: self.own_args())
+} Elab.own
+
+/// The unit's generic parameters as type arguments, as its own functions are called.
+fn Elab.own_args(self) -> ty::Args {
+    let types = self.ck.types()
+    let sig = self.ck.sig(self.item)
+    var args = mem::List[ty::Arg].empty(self.ck.alloc())
+    for def in sig.contents().generics {
+        match def.constant {
+            Some(_) => mut args.push(ty::Arg.Const(ty::Const.Param(def.param)))
+            None => mut args.push(ty::Arg.Ty(types.intern(ty::TyKind.Param(def.param))))
+        }
+    }
+    return types.args(take args)
+} Elab.own_args
+
+/// The operands passing the function's parameters by read, `take` ones from their slots.
+fn Elab.param_operands(mut self) -> mem::List[nir::Operand] fails Fault {
+    let alloc = self.ck.alloc()
+    var operands = mem::List[nir::Operand].empty(alloc)
+    let locals = copied_locals(self.body.contents().params.view(), alloc)
+    for local in locals {
+        let data = self.body.contents().local(local)
+        let ty = data.ty
+        let span = nir::Span.at(data.token)
+        let place = try mut self.local_place(local)
+        mut operands.push(mut self.read_operand(take place, ty, span))
+    }
+    return operands
+} Elab.param_operands
+
+fn Elab.emit(mut self, take op: nir::Op, span: nir::Span) {
+    let premise = self.premise
+    discard mut self.b.emit(take op, result: None, span, premise)
+} Elab.emit
+
+fn Elab.emit_value(mut self, take op: nir::Op, ty: nir::NTy, span: nir::Span) -> nir::Value {
+    let premise = self.premise
+    let Some(value) = mut self.b.emit(take op, result: Some(ty), span, premise) else {
+        expect false
+        return nir::Value(index: 0)
+    }
+    return value
+} Elab.emit_value
+
+fn Elab.end(mut self, take term: nir::Terminator, span: nir::Span) {
+    mut self.b.end(take term, span)
+} Elab.end
+
+/// The finished function, with the draft of the unit given back.
+fn Elab.finish(
+    take self,
+    result: ty::Ty,
+    failure: Option[ty::Ty],
+    wait: bool,
+    closure: Option[nir::ClosureHead],
+    span: nir::Span,
+    ) -> FinishedFunction {
+    let alloc = self.ck.alloc()
+    var values = mem::List[nir::Value].empty(alloc)
+    for param in self.params {
+        mut values.push(param.value)
+    }
+    let built = take self.b.finish(values.view())
+    var params = mem::List[nir::Param].empty(alloc)
+    var position: usize = 0
+    for param in take self.params {
+        if position >= built.params.len() {
+            break
+        }
+        mut params.push(nir::Param(mode: param.mode, value: built.params[position], name: take param.name, span: param.span))
+        position += 1
+    }
+    let function = nir::Function(role: self.role, index: 0, params: take params, result: result, failure: failure, wait: wait, closure: closure, blocks: take built.blocks, types: take built.types, span: span)
+    return FinishedFunction(function: take function, unit: take self.unit)
+} Elab.finish
+
+/// The modes of its parameters, in order.
+fn FnSig.params_modes(self, alloc: mem::Alloc) -> mem::List[ast::Mode] {
+    var modes = mem::List[ast::Mode].empty(alloc)
+    for param in self.params {
+        mut modes.push(param.mode)
+    }
+    return modes
+} FnSig.params_modes
+
+/// The captures of a closure in its function's order: its capture list, then its unlisted read
+/// captures in order of first use.
+fn closure_captures(closure: TClosure, alloc: mem::Alloc) -> mem::List[Capture] {
+    var listed = mem::List[CaptureAt].empty(alloc)
+    for capture in closure.captures {
+        let Some(word) = capture.listed else {
+            continue
+        }
+        mut listed.push(CaptureAt(token: word.token, capture: Capture(local: capture.local, outer: capture.outer, mode: word.kind)))
+    }
+    mut listed.sort_by(fn(left: CaptureAt, right: CaptureAt) => left.token.cmp(right.token))
+    var captures = mem::List[Capture].empty(alloc)
+    for entry in listed {
+        mut captures.push(entry.capture)
+    }
+    for capture in closure.captures {
+        if capture.listed.is_none() {
+            mut captures.push(Capture(local: capture.local, outer: capture.outer, mode: ast::Mode.Read))
+        }
+    }
+    return captures
+} closure_captures
+
+/// The indexes of the closures an expression holds, at any depth.
+fn collect_closures(expr: TExpr, mut found: mem::List[u32]) {
+    match expr.kind {
+        TKind.Closure(closure) => mut found.push(closure.contents().index)
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => collect_closures(child, mut found))
+} collect_closures
+
+/// The closure an expression holds that its typed body numbers `index`, at any depth.
+proj fn TExpr.closure_numbered(self, index: u32) -> Option[TClosure] {
+    match self.kind {
+        TKind.Closure(closure) => {
+            let held = closure.contents()
+            if held.index == index {
+                return Some(held)
+            }
+        }
+        else => {}
+    }
+    let found = self.found_within(fn(expr: TExpr) => expr.is_closure_numbered(index))
+    let Some(expr) = found else {
+        return None
+    }
+    let TKind.Closure(closure) = expr.kind else {
+        return None
+    }
+    return Some(closure.contents())
+} TExpr.closure_numbered
+
+/// Whether the expression is the closure its typed body numbers `index`.
+fn TExpr.is_closure_numbered(self, index: u32) -> bool {
+    let TKind.Closure(closure) = self.kind else {
+        return false
+    }
+    return closure.contents().index == index
+} TExpr.is_closure_numbered
+
+/// Visits each `old(e)` term of an ensures clause with its first token and the type of `e`.
+fn collect_olds(expr: TExpr, visit: fn(token: u32, ty: ty::Ty)) {
+    match expr.kind {
+        TKind.Old(inner) => {
+            visit(expr.token, ty: inner.contents().ty)
+            return
+        }
+        else => {}
+    }
+    expr.each_child(fn(child: TExpr) => collect_olds(child, visit))
+} collect_olds
+
+/// The first token of each `old(e)` term.
+fn collect_old_terms(expr: TExpr, mut found: mem::List[u32]) {
+    match expr.kind {
+        TKind.Old(_) => {
+            mut found.push(expr.token)
+            return
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => collect_old_terms(child, mut found))
+} collect_old_terms
+
+/// The `e` of the `old(e)` term an expression holds starting at a token, at any depth.
+proj fn TExpr.old_term(self, token: u32) -> Option[TExpr] {
+    match self.kind {
+        TKind.Old(inner) => {
+            if self.token == token {
+                return Some(inner.contents())
+            }
+        }
+        else => {}
+    }
+    let found = self.found_within(fn(expr: TExpr) => expr.is_old_term_at(token))
+    let Some(term) = found else {
+        return None
+    }
+    let TKind.Old(inner) = term.kind else {
+        return None
+    }
+    return Some(inner.contents())
+} TExpr.old_term
+
+/// Whether the expression is an `old(e)` term starting at a token.
+fn TExpr.is_old_term_at(self, token: u32) -> bool {
+    return match self.kind {
+        TKind.Old(_) => self.token == token
+        else => false
+    }
+} TExpr.is_old_term_at
+
+/// The loop invariants and `assume` conditions of a body, closures included, by role and first
+/// token, in source order.
+fn collect_conditions(expr: TExpr, mut found: mem::List[ConditionKey]) {
+    walk_conditions(expr, mut found)
+    mut found.sort_by(fn(left: ConditionKey, right: ConditionKey) => left.token.cmp(right.token))
+} collect_conditions
+
+fn walk_conditions(expr: TExpr, mut found: mem::List[ConditionKey]) {
+    match expr.kind {
+        TKind.Block(block) or TKind.If(condition: _, then: block, otherwise: _) => block.statement_conditions(mut found)
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => walk_conditions(child, mut found))
+} walk_conditions
+
+/// The loop invariants and `assume` conditions of the block's statements, those of the loop
+/// bodies and `else` blocks of `let` the statements hold included.
+fn TBlock.statement_conditions(self, mut found: mem::List[ConditionKey]) {
+    for stmt in self.stmts {
+        match stmt.kind {
+            TStmtKind.While(condition: _, invariants: invariants, body: body) or TStmtKind.For(pattern: _, mode: _, iterated: _, cursor: _, invariants: invariants, body: body) or TStmtKind.Loop(invariants: invariants, body: body) => {
+                for condition in invariants {
+                    mut found.push(ConditionKey(role: nir::Role.Invariant, token: condition.token))
+                }
+                body.statement_conditions(mut found)
+            }
+            TStmtKind.Let(pattern: _, value: _, otherwise: Some(otherwise)) => otherwise.statement_conditions(mut found)
+            TStmtKind.Assume(condition) => mut found.push(ConditionKey(role: nir::Role.Assume, token: condition.token))
+            else => {}
+        }
+    }
+} TBlock.statement_conditions
+
+/// The loop invariant or `assume` condition an expression holds with a role and first token, at
+/// any depth.
+proj fn TExpr.condition(self, key: ConditionKey) -> Option[TExpr] {
+    return self.found_within(fn(expr: TExpr) => expr.token == key.token)
+} TExpr.condition
+
+/// The first expression this one holds at any depth, in the order `each_child` visits them,
+/// that matches.
+proj fn TExpr.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.kind {
+        TKind.Field(base: inner, name: _) or TKind.Unary(op: _, operand: inner) => {
+            let child = inner.contents()
+            if matches(child) {
+                return Some(child)
+            }
+            return child.found_within(matches)
+        }
+        TKind.Trusted(inner) or TKind.Dbg(inner) or TKind.Fail(inner) or TKind.Old(inner) => {
+            let child = inner.contents()
+            if matches(child) {
+                return Some(child)
+            }
+            return child.found_within(matches)
+        }
+        TKind.Call(call) or TKind.Index(call) => return call.contents().found_within(matches)
+        TKind.Construct(variant: _, values: values, wrapped: _) => {
+            for value in values {
+                if matches(value.value) {
+                    return Some(value.value)
+                }
+                let found = value.value.found_within(matches)
+                if found.is_some() {
+                    return found
+                }
+            }
+            return None
+        }
+        TKind.Block(block) => return block.found_within(matches)
+        TKind.Closure(closure) => {
+            let body = closure.contents().body
+            if matches(body) {
+                return Some(body)
+            }
+            return body.found_within(matches)
+        }
+        TKind.Return(value) => {
+            let Some(returned) = value else {
+                return None
+            }
+            let child = returned.contents()
+            if matches(child) {
+                return Some(child)
+            }
+            return child.found_within(matches)
+        }
+        else => return self.found_in_branches(matches)
+    }
+} TExpr.found_within
+
+/// The first expression an operator, conditional, match, `await when` or quantifier holds at
+/// any depth, in the order `each_child` visits them, that matches.
+proj fn TExpr.found_in_branches(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.kind {
+        TKind.Binary(op: _, left: left, right: right) => {
+            let first_operand = left.contents()
+            if matches(first_operand) {
+                return Some(first_operand)
+            }
+            let found = first_operand.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            let second_operand = right.contents()
+            if matches(second_operand) {
+                return Some(second_operand)
+            }
+            return second_operand.found_within(matches)
+        }
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            let tested = condition.contents()
+            if matches(tested) {
+                return Some(tested)
+            }
+            let found = tested.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            let in_then = then.found_within(matches)
+            if in_then.is_some() {
+                return in_then
+            }
+            let Some(other) = otherwise else {
+                return None
+            }
+            let alternative = other.contents()
+            if matches(alternative) {
+                return Some(alternative)
+            }
+            return alternative.found_within(matches)
+        }
+        TKind.Match(scrutinee: scrutinee, arms: arms) => {
+            let matched = scrutinee.contents()
+            if matches(matched) {
+                return Some(matched)
+            }
+            let found = matched.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            for arm in arms {
+                let in_arm = arm.found_within(matches)
+                if in_arm.is_some() {
+                    return in_arm
+                }
+            }
+            return None
+        }
+        else => return self.found_in_regions(matches)
+    }
+} TExpr.found_in_branches
+
+/// The first expression an `await when` or quantifier holds at any depth, in the order
+/// `each_child` visits them, that matches.
+proj fn TExpr.found_in_regions(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.kind {
+        TKind.When(attempted: _, accesses: accesses, body: body) => {
+            for access in accesses {
+                if matches(access.place) {
+                    return Some(access.place)
+                }
+                let found = access.place.found_within(matches)
+                if found.is_some() {
+                    return found
+                }
+            }
+            let region = body.contents()
+            if matches(region) {
+                return Some(region)
+            }
+            return region.found_within(matches)
+        }
+        TKind.Quantifier(all: _, local: _, range: range, body: body) => {
+            let bounds = range.contents()
+            if matches(bounds) {
+                return Some(bounds)
+            }
+            let found = bounds.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            let region = body.contents()
+            if matches(region) {
+                return Some(region)
+            }
+            return region.found_within(matches)
+        }
+        else => return None
+    }
+} TExpr.found_in_regions
+
+/// The first expression a call's function value and arguments hold, at any depth, in the
+/// order `each_child` visits them, that matches.
+proj fn Call.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.callee {
+        Callee.Value(value) => {
+            let callee = value.contents()
+            if matches(callee) {
+                return Some(callee)
+            }
+            let found = callee.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+        }
+        else => {}
+    }
+    for arg in self.args {
+        if matches(arg.expr) {
+            return Some(arg.expr)
+        }
+        let found = arg.expr.found_within(matches)
+        if found.is_some() {
+            return found
+        }
+    }
+    return None
+} Call.found_within
+
+/// The first expression an arm's guard and body hold, at any depth, in the order `each_child`
+/// visits them, that matches.
+proj fn TArm.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    let arm = self.as_part()
+    match arm.guard {
+        Some(guard) => {
+            if matches(guard) {
+                return Some(guard)
+            }
+            let found = guard.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+        }
+        None => {}
+    }
+    let body = arm.body
+    if matches(body) {
+        return Some(body)
+    }
+    return body.found_within(matches)
+} TArm.found_within
+
+/// The first expression a block's statements hold, at any depth, in the order `each_child`
+/// visits them, that matches.
+proj fn TBlock.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    for stmt in self.stmts {
+        let found = stmt.found_within(matches)
+        if found.is_some() {
+            return found
+        }
+    }
+    return None
+} TBlock.found_within
+
+/// The first expression a statement holds, at any depth, in the order `each_child` visits
+/// them, that matches.
+proj fn TStmt.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.as_part().kind {
+        TStmtKind.Let(pattern: _, value: value, otherwise: otherwise) => {
+            if matches(value) {
+                return Some(value)
+            }
+            let found = value.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            let Some(block) = otherwise else {
+                return None
+            }
+            return block.found_within(matches)
+        }
+        TStmtKind.Var(local: _, value: value) => {
+            if matches(value) {
+                return Some(value)
+            }
+            return value.found_within(matches)
+        }
+        TStmtKind.Discard(value) or TStmtKind.Defer(value) or TStmtKind.Undefer(value) or TStmtKind.Expect(value) or TStmtKind.Assume(value) or TStmtKind.Expr(value) => {
+            if matches(value) {
+                return Some(value)
+            }
+            return value.found_within(matches)
+        }
+        TStmtKind.Assign(target: target, op: _, value: value) => {
+            if matches(target) {
+                return Some(target)
+            }
+            let found = target.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            if matches(value) {
+                return Some(value)
+            }
+            return value.found_within(matches)
+        }
+        else => return self.found_in_loop(matches)
+    }
+} TStmt.found_within
+
+/// The first expression a loop statement holds, at any depth, in the order `each_child` visits
+/// them, that matches.
+proj fn TStmt.found_in_loop(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
+    match self.as_part().kind {
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => {
+            if matches(condition) {
+                return Some(condition)
+            }
+            let found = condition.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            for clause in invariants {
+                if matches(clause) {
+                    return Some(clause)
+                }
+                let within = clause.found_within(matches)
+                if within.is_some() {
+                    return within
+                }
+            }
+            return body.found_within(matches)
+        }
+        TStmtKind.For(pattern: _, mode: _, iterated: iterated, cursor: _, invariants: invariants, body: body) => {
+            if matches(iterated) {
+                return Some(iterated)
+            }
+            let found = iterated.found_within(matches)
+            if found.is_some() {
+                return found
+            }
+            for clause in invariants {
+                if matches(clause) {
+                    return Some(clause)
+                }
+                let within = clause.found_within(matches)
+                if within.is_some() {
+                    return within
+                }
+            }
+            return body.found_within(matches)
+        }
+        TStmtKind.Loop(invariants: invariants, body: body) => {
+            for clause in invariants {
+                if matches(clause) {
+                    return Some(clause)
+                }
+                let within = clause.found_within(matches)
+                if within.is_some() {
+                    return within
+                }
+            }
+            return body.found_within(matches)
+        }
+        else => return None
+    }
+} TStmt.found_in_loop
+
+/// The bindings a condition names, by first mention, its quantifiers' own excepted.
+fn named_bindings(expr: TExpr, alloc: mem::Alloc) -> mem::List[LocalId] {
+    var named = mem::List[LocalId].empty(alloc)
+    var quantified = mem::Set[LocalId].empty(alloc)
+    collect_locals(expr, mut named, mut quantified)
+    return named
+} named_bindings
+
+fn collect_locals(expr: TExpr, mut named: mem::List[LocalId], mut quantified: mem::Set[LocalId]) {
+    match expr.kind {
+        TKind.Local(local) => {
+            if not quantified.contains(local) and not holds_local(named.view(), local) {
+                mut named.push(local)
+            }
+        }
+        TKind.Quantifier(all: _, local: local, range: _, body: _) => {
+            discard mut quantified.insert(local)
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut named, mut quantified](child: TExpr) => collect_locals(child, mut named, mut quantified))
+} collect_locals

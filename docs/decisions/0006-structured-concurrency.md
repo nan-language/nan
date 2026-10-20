@@ -1,6 +1,6 @@
 # 0006. Structured concurrency
 
-Status: accepted
+Status: accepted; its host entry task stack superseded by 0038
 
 ## Context
 

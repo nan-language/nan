@@ -6,6 +6,7 @@ mod expr;
 mod pattern;
 mod retired;
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::Checker;
@@ -15,7 +16,7 @@ use super::resolve::PathError;
 use super::sig::{FnSig, GenericDef, Problems, SigKind};
 use super::tir::{
     ClauseRole, Local, LocalId, LocalKind, TBlock, TBody, TClause, TExample, TExpr, TKind,
-    TPatternKind, TStmt, TStmtKind,
+    TPattern, TPatternKind, TStmt, TStmtKind,
 };
 use super::ty::{Param, Scalar, Ty};
 use super::unused::{Binding, Usage};
@@ -211,6 +212,10 @@ pub struct Body<'c, 'a> {
     pub examples: Vec<TExample>,
     /// What typing records of the use of the body's bindings.
     pub usage: Usage,
+    /// The view bindings of a part, and those of a wrapped part, which projections return and
+    /// `Some`, `Ok` and `Err` wrap unmarked.
+    pub part_bindings: HashSet<LocalId>,
+    pub wrapped_bindings: HashSet<LocalId>,
     /// The generic scope and the item being typed that the body replaced in the checker.
     enclosing: (Vec<GenericDef>, Option<ItemId>),
 }
@@ -256,6 +261,8 @@ impl<'c, 'a> Body<'c, 'a> {
             clauses: Vec::new(),
             examples: Vec::new(),
             usage: Usage::default(),
+            part_bindings: HashSet::new(),
+            wrapped_bindings: HashSet::new(),
             enclosing,
         }
     }
@@ -661,6 +668,11 @@ impl<'c, 'a> Body<'c, 'a> {
                 if matches!(&typed.kind, TKind::Call(call) | TKind::Index(call) if call.proj) {
                     self.usage.parts.insert(local);
                 }
+                if self.is_part(&typed) {
+                    self.part_bindings.insert(local);
+                } else if self.is_wrapped_part(&typed) {
+                    self.wrapped_bindings.insert(local);
+                }
                 self.usage.bindings.insert(
                     local,
                     Binding {
@@ -848,6 +860,7 @@ impl<'c, 'a> Body<'c, 'a> {
             block_typed
         });
         let typed_pattern = self.top_pattern(pattern, &scrutinee, LocalKind::Pattern);
+        self.bind_views(&typed_pattern, &typed);
         if let (TPatternKind::Binding(local), None) = (&typed_pattern.kind, otherwise_block) {
             self.usage.bindings.insert(
                 *local,
@@ -885,6 +898,37 @@ impl<'c, 'a> Body<'c, 'a> {
             },
             diverges,
         )
+    }
+
+    /// Records the bindings a pattern matching `value` makes as view bindings: of a part, each
+    /// of them; of a wrapped part, a binding of the whole as a wrapped part and each other as a
+    /// part.
+    pub fn bind_views(&mut self, pattern: &TPattern, value: &TExpr) {
+        if self.is_part(value) {
+            self.bind_parts(pattern);
+        } else if self.is_wrapped_part(value) {
+            match &pattern.kind {
+                TPatternKind::Binding(local) => {
+                    self.wrapped_bindings.insert(*local);
+                }
+                _ => self.bind_parts(pattern),
+            }
+        }
+    }
+
+    /// Records each binding of a pattern as a view binding of a part.
+    fn bind_parts(&mut self, pattern: &TPattern) {
+        match &pattern.kind {
+            TPatternKind::Binding(local) => {
+                self.part_bindings.insert(*local);
+            }
+            TPatternKind::Fields(_, fields) => {
+                for (_, field) in fields {
+                    self.bind_parts(field);
+                }
+            }
+            TPatternKind::Wildcard | TPatternKind::Value(..) | TPatternKind::Failed => {}
+        }
     }
 
     /// An initializer: checked against the declared type, or fixed without an expected type.
@@ -1384,7 +1428,10 @@ impl Body<'_, '_> {
             } => (*mode, &**inner),
             _ => (Mode::Read, iterated),
         };
-        let typed = self.expr(inner, None);
+        let typed = match mode {
+            Mode::Mut => self.mut_operand(inner, None),
+            _ => self.expr(inner, None),
+        };
         let (cursor, element) = self.cursor_of(&typed, mode, iterated.token);
         self.loops.push(Loop {
             label: None,
@@ -1393,6 +1440,9 @@ impl Body<'_, '_> {
         });
         self.push_scope();
         let typed_pattern = self.top_pattern(pattern, &element, LocalKind::Element(mode));
+        if mode != Mode::Take && self.ck.next_projects(&cursor) {
+            self.bind_parts(&typed_pattern);
+        }
         if !element.has_error() && self.refutable(&typed_pattern) == Some(true) {
             self.report(pattern.token, Code::PatternRefutable);
         }

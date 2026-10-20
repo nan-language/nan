@@ -154,10 +154,10 @@ fn merge(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, size: u64) {
         vector::free_storage(lo, fx, parts);
         let frame = fx.slot(8, 8);
         fx.store(first, frame, 0);
-        let ok = lo.variant_value(fx, &result_ty, "Ok", &[Held::Address(frame)], false);
+        let ok = lo.variant_value(fx, &result_ty, "Ok", &[Held::Address(frame)], None);
         supply.ret(lo, fx, ok);
     });
-    let err = lo.variant_value(fx, &result_ty, "Err", &[Held::Address(parts)], false);
+    let err = lo.variant_value(fx, &result_ty, "Err", &[Held::Address(parts)], None);
     supply.ret(lo, fx, err);
 }
 

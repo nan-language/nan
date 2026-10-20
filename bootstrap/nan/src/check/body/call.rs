@@ -13,7 +13,7 @@ use crate::check::db::ItemId;
 use crate::check::props::Property;
 use crate::check::resolve::Named;
 use crate::check::sig::{FnSig, ParamSig, Payload, SigKind};
-use crate::check::tir::{Builtin, Call, Callee, Lit, LocalKind, TArg, TExpr, TKind};
+use crate::check::tir::{Builtin, Call, Callee, Form, Lit, LocalKind, TArg, TExpr, TKind};
 use crate::check::ty::{Arg, Args, Const, FnTy, Param, Scalar, Subst, Ty, no_args};
 use crate::check::unused::FieldLabel;
 use crate::diagnostic::{Code, Fix};
@@ -684,6 +684,16 @@ impl Body<'_, '_> {
         self.expr(value, expected)
     }
 
+    /// A value written with `mut`: a place whose indexing calls `at_mut` when it writes through
+    /// an index, as the place of a `mut` access, or else an operand.
+    pub fn mut_operand(&mut self, value: &ast::Expr, expected: Option<&Ty>) -> TExpr {
+        if !through_index(value) {
+            return self.operand(value, expected);
+        }
+        self.place(value, false)
+            .unwrap_or_else(|| TExpr::failed(value.token))
+    }
+
     /// `hw::mint_root()`: the target's root grant, minted once by its platform package's entry
     /// landing fn, outside every loop and closure.
     fn mint_root(&mut self, token: Tok, args: &[ast::Arg], markers: Markers) -> TExpr {
@@ -1182,6 +1192,7 @@ impl Body<'_, '_> {
                 };
                 self.call(base, None, Some(chain))
             }
+            _ if matches!(markers.mode, Some((Mode::Mut, _))) => self.mut_operand(base, None),
             _ => self.operand(base, None),
         };
         if receiver.ty.has_error() {
@@ -1423,18 +1434,12 @@ impl Body<'_, '_> {
     ) -> TExpr {
         let head = callable.head.clone();
         let params = &head.params;
-        let method = receiver.is_some();
-        let expected_count = if method {
-            params.len() - 1
-        } else {
-            params.len()
-        };
-        if args.len() != expected_count {
+        let offset = usize::from(receiver.is_some());
+        if args.len() + offset != params.len() {
             self.report(token, Code::ExprArgumentCount);
             self.skim_args(args);
             return TExpr::failed(token);
         }
-        let offset = usize::from(method);
         let self_first = callable.receiver_first && head.has_self();
         self.check_labels(&params[offset..], args, self_first);
         if callable.from_expected
@@ -1496,7 +1501,10 @@ impl Body<'_, '_> {
                 }
                 _ => {
                     let hint = (!callable.infer.open(&pattern)).then_some(&pattern);
-                    let typed = self.operand(value, hint);
+                    let typed = match marker {
+                        Some((Mode::Mut, _)) => self.mut_operand(value, hint),
+                        _ => self.operand(value, hint),
+                    };
                     if let (Ty::Fn(found), Ty::Fn(wanted)) = (&typed.ty, &pattern) {
                         if let TKind::FnValue { item: function, .. } = typed.kind
                             && wanted.kind == FnKind::Task
@@ -1970,7 +1978,7 @@ impl Body<'_, '_> {
             return;
         };
         let fix = self.reordered(
-            &params[leading + 1..],
+            params.get(leading + 1..).unwrap_or_default(),
             args.get(leading + 1..).unwrap_or_default(),
         );
         let fix = fix.unwrap_or_else(|| match &arg.label {
@@ -2106,18 +2114,24 @@ impl Body<'_, '_> {
         self.report_fixed(construct, code, vec![fix]);
     }
 
-    /// Whether a typed expression is a part: the result of a projection call whose result type,
-    /// its type parameters counted as no view, is neither a view nor an `Option` or `Result`, or
-    /// a field of one.
-    fn is_part(&self, expr: &TExpr) -> bool {
+    /// Whether a typed expression is a part: the result of a projection call of that form, an
+    /// indexing, a view binding of a part, or a field of one.
+    pub fn is_part(&self, expr: &TExpr) -> bool {
         match &expr.kind {
-            TKind::Call(call) => {
-                let result = &call.head.result;
-                let wrapped = matches!(result, Ty::Item(item, _) if self.wraps(*item));
-                call.proj && !wrapped && !self.ck.counts_as_view(result)
-            }
+            TKind::Call(call) => call.proj && self.ck.projection_form(call) == Form::Part,
             TKind::Index(_) => true,
+            TKind::Local(local) => self.part_bindings.contains(local),
             TKind::Field { base, .. } => self.is_part(base),
+            _ => false,
+        }
+    }
+
+    /// Whether a typed expression is a wrapped part: the result of a projection call of that
+    /// form, or a view binding of one.
+    pub fn is_wrapped_part(&self, expr: &TExpr) -> bool {
+        match &expr.kind {
+            TKind::Call(call) => call.proj && self.ck.projection_form(call) == Form::Wrapped,
+            TKind::Local(local) => self.wrapped_bindings.contains(local),
             _ => false,
         }
     }
@@ -2226,6 +2240,7 @@ impl Body<'_, '_> {
         let mut values: Vec<(String, TExpr)> = Vec::new();
         let mut named: Vec<String> = Vec::new();
         let mut failed = false;
+        let mut wrapped = false;
         for arg in args {
             let (name, ty) = if labelled {
                 let Some(label) = arg.label_name() else {
@@ -2297,17 +2312,18 @@ impl Body<'_, '_> {
             if let TKind::Closure(_) = typed.kind {
                 self.report(value.token, Code::ClosureSecondClass);
             }
-            let wraps_part = marker.is_none() && self.is_part(&typed) && self.wraps(item);
-            if !wraps_part {
-                self.check_mode(
-                    (value.token, value.last),
-                    &typed,
-                    Mode::Take,
-                    marker,
-                    false,
-                    false,
-                );
-            }
+            let wraps_part =
+                self.wraps(item) && self.is_part(&typed) && !self.ck.has(&typed.ty, Property::Copy);
+            let mode = if wraps_part { Mode::Read } else { Mode::Take };
+            self.check_mode(
+                (value.token, value.last),
+                &typed,
+                mode,
+                marker,
+                false,
+                false,
+            );
+            wrapped |= wraps_part;
             values.push((name, typed));
         }
         if labelled && !failed {
@@ -2339,7 +2355,11 @@ impl Body<'_, '_> {
             token,
             last: token,
             ty,
-            kind: TKind::Construct { variant, values },
+            kind: TKind::Construct {
+                variant,
+                values,
+                wrapped,
+            },
         }
     }
 
@@ -3062,6 +3082,16 @@ fn builtin_call(token: Tok, builtin: Builtin, source: TExpr, result: Ty) -> TExp
             failure: None,
             awaited: false,
         })),
+    }
+}
+
+/// Whether an expression is a field path through an index, whose `mut` access writes the
+/// element.
+fn through_index(expr: &ast::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Index { .. } => true,
+        ExprKind::Field { base, .. } => through_index(base),
+        _ => false,
     }
 }
 

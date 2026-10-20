@@ -360,7 +360,9 @@ impl Layouts {
             return Some(words(&["store", "position"]));
         }
         if path == "mem::HashMap" {
-            return Some(words(&["data", "len", "capacity", "alloc", "seed"]));
+            return Some(words(&[
+                "data", "len", "capacity", "alloc", "seed", "index", "slots",
+            ]));
         }
         if path == "mem::Pool" {
             return Some(words(&["data", "len", "capacity", "alloc", "count"]));

@@ -1,0 +1,2172 @@
+//! The procedure: propagation over equivalence classes of terms, intervals, congruences, a difference graph, clauses and quantifier instances, then case splits to depth 2, all within one query's fuel.
+
+/// The steps a query may take, shared by all its branches and its candidate.
+const FUEL: u32 = 10_000
+
+/// The depth below which an open state is split.
+const SPLIT_DEPTH: u32 = 2
+
+/// The difference graph's zero node.
+const ZERO_NODE: u32 = 0xFFFF_FFFF
+
+/// Why propagation stops early.
+enum Halt derives Copy, Eq {
+    Contradiction
+    Fuel
+} Halt
+
+/// The interval and congruence of an integer class.
+struct Class derives Copy, Eq {
+    low: Option[wide::Wide]
+    high: Option[wide::Wide]
+    residue: wide::Wide
+    modulus: wide::Wide
+} Class
+
+/// The class of any integer.
+const ANY_CLASS: Class = Class(low: None, high: None, residue: wide::Wide.zero(), modulus: wide::Wide.one())
+
+/// A clause of the state with its encoding, by which clauses are in term order.
+struct StateClause {
+    id: u32
+    key: mem::Shared[mem::Bytes]
+    literals: mem::List[Literal]
+} StateClause
+
+/// An asserted linear atom with its encoding, and whether it is an equality.
+struct AssertedAtom {
+    key: mem::Shared[mem::Bytes]
+    sum: Linear
+    equality: bool
+} AssertedAtom
+
+/// Two terms.
+struct TermPair derives Copy, Eq, Hash {
+    left: u32
+    right: u32
+} TermPair
+
+/// A clause instantiated, with the term instantiated at.
+struct Instance derives Copy {
+    clause: u32
+    term: u32
+} Instance
+
+struct State {
+    terms: Terms
+    encodings: Encodings
+    parent: mem::List[u32]
+    size: mem::List[u32]
+    classes: mem::List[Class]
+    registered: mem::List[bool]
+    /// The applications, ite terms, `mul` applications and integer terms, each in term order.
+    apps: mem::List[u32]
+    ites: mem::List[u32]
+    muls: mem::List[u32]
+    integers: mem::List[u32]
+    /// The linear literal of each integer comparison term.
+    comparisons: mem::HashMap[u32, Literal]
+    clauses: mem::List[StateClause]
+    asserted: mem::HashMap[Literal, Unit]
+    /// The asserted linear atoms in term order.
+    atoms: mem::List[AssertedAtom]
+    disequalities: mem::List[Linear]
+    /// The pairs of terms an asserted disequality keeps apart.
+    separated: mem::List[TermPair]
+    /// The difference graph: the bound w of each edge (from, to), meaning to − from ≤ w, over
+    /// class roots and the zero node.
+    graph: mem::HashMap[TermPair, wide::Wide]
+    /// The clauses instantiated, with the term instantiated at.
+    instances: mem::List[Instance]
+    truth: u32
+    falsity: u32
+    next_clause: u32
+} State
+
+/// A query's procedure: its fuel, shared by every branch and the candidate.
+struct Solver {
+    ck: Checker
+    package_id: ty::PackageId
+    steps: u32
+} Solver
+
+/// What the procedure ends with.
+enum Decision {
+    Proved
+    /// A branch ended without contradiction, at depth 2 or with no atom to split on.
+    Open(state: mem::Box[State], at_depth: bool)
+    Exhausted
+} Decision
+
+/// What a case split asserts in its first branch and negates in its second.
+enum Split {
+    Term(u32)
+    Literal(Literal)
+} Split
+
+/// An open branch of a search: its state, and whether it is at depth 2.
+struct OpenBranch {
+    state: State
+    at_depth: bool
+} OpenBranch
+
+/// The bounds of a sum over its terms' intervals; none for an unbounded side, or one leaving
+/// the integers the prover computes with.
+struct SumBounds derives Copy {
+    low: Option[wide::Wide]
+    high: Option[wide::Wide]
+} SumBounds
+
+/// An application in an `all` body that instantiation is triggered by, with the position of
+/// its bound symbol argument.
+struct Trigger derives Copy {
+    term: u32
+    position: usize
+} Trigger
+
+/// The integers congruent to a residue modulo a modulus.
+struct Congruence derives Copy {
+    residue: wide::Wide
+    modulus: wide::Wide
+} Congruence
+
+/// A clause holding an `all` literal, as instantiation reads it: its id and its literals.
+struct QuantifiedClause {
+    id: u32
+    literals: mem::List[Literal]
+} QuantifiedClause
+
+/// A term with its key, by which terms are in term order.
+struct KeyedNode {
+    key: mem::Shared[mem::Bytes]
+    node: u32
+} KeyedNode
+
+/// The condition and arms of an ite term.
+struct IteArms derives Copy {
+    condition: u32
+    then: u32
+    otherwise: u32
+} IteArms
+
+fn Class.single(self) -> Option[wide::Wide] {
+    let Some(low) = self.low else {
+        return None
+    }
+    let Some(high) = self.high else {
+        return None
+    }
+    if low == high {
+        return Some(low)
+    }
+    return None
+} Class.single
+
+/// Its bounds moved inward to the nearest values its congruence allows.
+fn Class.fitted(self) -> Class {
+    if self.modulus < wide::Wide.of_i64(2) {
+        return self
+    }
+    var fitted = self
+    match self.low {
+        Some(low) => {
+            fitted.low = low.checked_add(euclid_rem(self.residue.wrapping_sub(low), divisor: self.modulus))
+        }
+        None => {}
+    }
+    match self.high {
+        Some(high) => {
+            fitted.high = high.checked_sub(euclid_rem(high.wrapping_sub(self.residue), divisor: self.modulus))
+        }
+        None => {}
+    }
+    return fitted
+} Class.fitted
+
+fn Class.is_empty(self) -> bool {
+    let Some(low) = self.low else {
+        return false
+    }
+    let Some(high) = self.high else {
+        return false
+    }
+    return high < low
+} Class.is_empty
+
+/// The bounds of the products of two classes' values; none for an unbounded side or one
+/// leaving the integers the prover computes with.
+fn Class.product_bounds(self, other: Class) -> Option[SumBounds] {
+    let Some(a_low) = self.low else {
+        return None
+    }
+    let Some(a_high) = self.high else {
+        return None
+    }
+    let Some(b_low) = other.low else {
+        return None
+    }
+    let Some(b_high) = other.high else {
+        return None
+    }
+    let Some(first_product) = a_low.checked_mul(b_low) else {
+        return None
+    }
+    let Some(second_product) = a_low.checked_mul(b_high) else {
+        return None
+    }
+    let Some(third_product) = a_high.checked_mul(b_low) else {
+        return None
+    }
+    let Some(fourth_product) = a_high.checked_mul(b_high) else {
+        return None
+    }
+    let low = first_product.min_of(second_product).min_of(third_product).min_of(fourth_product)
+    let high = first_product.max_of(second_product).max_of(third_product).max_of(fourth_product)
+    return Some(SumBounds(low: Some(low), high: Some(high)))
+} Class.product_bounds
+
+fn Solver.new(take ck: Checker, package_id: ty::PackageId) -> Solver {
+    return Solver(ck: take ck, package_id: package_id, steps: 0)
+} Solver.new
+
+fn Solver.step(mut self) fails Halt {
+    if self.steps == FUEL {
+        fail Halt.Fuel
+    }
+    self.steps += 1
+} Solver.step
+
+fn Solver.decide(mut self, take query: CanonQuery) -> Decision {
+    let alloc = self.ck.alloc()
+    let CanonQuery(terms: held, clauses: clauses, origins: _, hash: _) = query
+    var state = State.of(take held, alloc)
+    state.truth = mut state.terms.boolean(true)
+    state.falsity = mut state.terms.boolean(false)
+    let truth = state.truth
+    let falsity = state.falsity
+    mut self.register(mut state, term: truth)
+    mut self.register(mut state, term: falsity)
+    for clause in take clauses {
+        mut self.add_clause(mut state, take clause)
+    }
+    match attempt mut self.search(take state, depth: 0) {
+        Ok(None) => return Decision.Proved
+        Ok(Some(open)) => {
+            let OpenBranch(state: branch, at_depth: at_depth) = open
+            return Decision.Open(state: mem::Heap.of(alloc).boxed(take branch), at_depth: at_depth)
+        }
+        Err(_) => return Decision.Exhausted
+    }
+} Solver.decide
+
+/// A state of a query's store holding no class, clause or atom yet.
+fn State.of(take terms: Terms, alloc: mem::Alloc) -> State {
+    return State(
+        terms: take terms,
+        encodings: Encodings.empty(alloc),
+        parent: mem::List[u32].empty(alloc),
+        size: mem::List[u32].empty(alloc),
+        classes: mem::List[Class].empty(alloc),
+        registered: mem::List[bool].empty(alloc),
+        apps: mem::List[u32].empty(alloc),
+        ites: mem::List[u32].empty(alloc),
+        muls: mem::List[u32].empty(alloc),
+        integers: mem::List[u32].empty(alloc),
+        comparisons: mem::HashMap[u32, Literal].empty(seed: 0, alloc),
+        clauses: mem::List[StateClause].empty(alloc),
+        asserted: mem::HashMap[Literal, Unit].empty(seed: 0, alloc),
+        atoms: mem::List[AssertedAtom].empty(alloc),
+        disequalities: mem::List[Linear].empty(alloc),
+        separated: mem::List[TermPair].empty(alloc),
+        graph: mem::HashMap[TermPair, wide::Wide].empty(seed: 0, alloc),
+        instances: mem::List[Instance].empty(alloc),
+        truth: 0,
+        falsity: 0,
+        next_clause: 0,
+    )
+} State.of
+
+/// Propagates, then splits below depth 2; the open branch, or none when every branch ends in
+/// a contradiction.
+fn Solver.search(mut self, take state: State, depth: u32) -> Option[OpenBranch] fails Halt {
+    let alloc = state.terms.alloc
+    match attempt mut self.propagate(mut state) {
+        Err(Halt.Contradiction) => return None
+        Err(Halt.Fuel) => fail Halt.Fuel
+        Ok(_) => {}
+    }
+    if depth == SPLIT_DEPTH {
+        return Some(OpenBranch(state: take state, at_depth: true))
+    }
+    let split = match attempt mut self.split(mut state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Some(OpenBranch(state: take state, at_depth: false))
+        Err(Halt.Contradiction) => return None
+        Err(Halt.Fuel) => fail Halt.Fuel
+    }
+    for round in 0..<2u32 {
+        try mut self.step()
+        var branch = state.copy(alloc)
+        match attempt mut self.assert_split(mut branch, split, value: round == 0) {
+            Err(Halt.Contradiction) => continue
+            Err(Halt.Fuel) => fail Halt.Fuel
+            Ok(_) => {}
+        }
+        let Some(open) = try mut self.search(take branch, depth: depth + 1) else {
+            continue
+        }
+        return Some(take open)
+    }
+    return None
+} Solver.search
+
+/// Asserts a split's atom in a branch, or its negation.
+fn Solver.assert_split(mut self, mut state: State, split: Split, value: bool) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    match split {
+        Split.Term(term) => return try mut self.assert_term(mut state, term, value)
+        Split.Literal(literal) => {
+            if value {
+                return try mut self.assert_literal(mut state, literal)
+            }
+            return try mut self.assert_literal(mut state, literal: literal.negation(alloc))
+        }
+    }
+} Solver.assert_split
+
+/// The atom to split on: the condition of the first ite term whose condition is undecided,
+/// else the first undecided literal, other than an `all`, of the first clause neither
+/// satisfied nor asserting.
+fn Solver.split(mut self, mut state: State) -> Option[Split] fails Halt {
+    let alloc = state.terms.alloc
+    for position in 0..<state.ites.len() {
+        let Some(arms) = state.terms.ite_arms(state.ites[position]) else {
+            continue
+        }
+        let decided = try mut self.decided(mut state, term: arms.condition)
+        if decided.is_none() {
+            return Some(Split.Term(arms.condition))
+        }
+    }
+    for index in 0..<state.clauses.len() {
+        var open = mem::List[Literal].empty(alloc)
+        var satisfied = false
+        for position in 0..<state.clauses[index].literals.len() {
+            let literal = state.clauses[index].literals[position].copy(alloc)
+            match try mut self.evaluate(mut state, literal) {
+                Some(true) => {
+                    satisfied = true
+                }
+                Some(false) => {}
+                None => mut open.push(take literal)
+            }
+        }
+        if satisfied or open.len() < 2 {
+            continue
+        }
+        for literal in take open {
+            if literal.all_atom().is_some() {
+                continue
+            }
+            if literal.negated {
+                return Some(Split.Literal(literal.negation(alloc)))
+            }
+            return Some(Split.Literal(take literal))
+        }
+    }
+    return None
+} Solver.split
+
+/// Runs rounds of the rules until a contradiction or a round that changes nothing.
+fn Solver.propagate(mut self, mut state: State) fails Halt {
+    loop {
+        let merged = try mut self.congruence(mut state)
+        let selected = try mut self.ite_terms(mut state)
+        let narrowed = try mut self.intervals(mut state)
+        let congruent = try mut self.congruences(mut state)
+        let differences = try mut self.differences(mut state)
+        let asserted = try mut self.clauses(mut state)
+        let instantiated = try mut self.quantifiers(mut state)
+        if not (merged or selected or narrowed or congruent or differences or asserted or instantiated) {
+            return
+        }
+    }
+} Solver.propagate
+
+/// Rule 1: applications of one function to arguments in the same classes merge, and so do
+/// integer classes holding the same single value.
+fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    var seen = mem::HashMap[Term, u32].empty(seed: 0, alloc)
+    for position in 0..<state.apps.len() {
+        let app = state.apps[position]
+        var roots = mem::List[u32].empty(alloc)
+        for part in state.terms.get(app).parts(alloc) {
+            mut roots.push(state.find(part))
+        }
+        let shape = state.terms.get(app).replacing_parts(roots.view(), alloc)
+        let known = seen.get(shape)
+        match known {
+            Some(other) => {
+                let merged = try mut self.merge(mut state, a: app, b: other)
+                changed = changed or merged
+            }
+            None => {
+                discard mut seen.insert(take shape, value: app)
+            }
+        }
+    }
+    var values = mem::HashMap[wide::Wide, u32].empty(seed: 0, alloc)
+    for position in 0..<state.integers.len() {
+        let term = state.integers[position]
+        let root = state.find(term)
+        let Some(value) = state.classes[usize.widen(root)].single() else {
+            continue
+        }
+        let known = values.get(value)
+        match known {
+            Some(other) => {
+                let merged = try mut self.merge(mut state, a: term, b: other)
+                changed = changed or merged
+            }
+            None => {
+                discard mut values.insert(value, value: term)
+            }
+        }
+    }
+    return changed
+} Solver.congruence
+
+/// Rule 2: an ite term merges with the arm its decided condition selects; otherwise it lies
+/// within its arms' hull, and a class excluding one arm decides the condition.
+fn Solver.ite_terms(mut self, mut state: State) -> bool fails Halt {
+    var changed = false
+    for position in 0..<state.ites.len() {
+        let ite = state.ites[position]
+        let Some(arms) = state.terms.ite_arms(ite) else {
+            continue
+        }
+        match try mut self.decided(mut state, term: arms.condition) {
+            Some(true) => {
+                let merged = try mut self.merge(mut state, a: ite, b: arms.then)
+                changed = changed or merged
+            }
+            Some(false) => {
+                let merged = try mut self.merge(mut state, a: ite, b: arms.otherwise)
+                changed = changed or merged
+            }
+            None => {
+                let undecided = try mut self.undecided_ite(mut state, ite, arms)
+                changed = changed or undecided
+            }
+        }
+    }
+    return changed
+} Solver.ite_terms
+
+/// An ite term whose condition is undecided: an integer one lies within its arms' hull, and
+/// a class excluding one arm decides the condition.
+fn Solver.undecided_ite(mut self, mut state: State, ite: u32, arms: IteArms) -> bool fails Halt {
+    var changed = false
+    if state.terms.sort(ite) == Sort.Int {
+        let a = state.class(arms.then)
+        let b = state.class(arms.otherwise)
+        var low: Option[wide::Wide] = None
+        match a.low {
+            Some(first_low) => match b.low {
+                Some(second_low) => {
+                    low = Some(first_low.min_of(second_low))
+                }
+                None => {}
+            }
+            None => {}
+        }
+        var high: Option[wide::Wide] = None
+        match a.high {
+            Some(first_high) => match b.high {
+                Some(second_high) => {
+                    high = Some(first_high.max_of(second_high))
+                }
+                None => {}
+            }
+            None => {}
+        }
+        changed = try mut self.narrow(mut state, term: ite, low, high)
+    }
+    if state.excludes(ite, b: arms.then) {
+        let asserted = try mut self.assert_term(mut state, term: arms.condition, value: false)
+        return changed or asserted
+    }
+    if state.excludes(ite, b: arms.otherwise) {
+        let asserted = try mut self.assert_term(mut state, term: arms.condition, value: true)
+        return changed or asserted
+    }
+    return changed
+} Solver.undecided_ite
+
+/// Rule 3: each asserted atom narrows its terms' intervals from the others', each
+/// disequality excludes a bound of one term once its other terms are single, and each `mul`
+/// application lies within its operands' products.
+fn Solver.intervals(mut self, mut state: State) -> bool fails Halt {
+    let atoms = try mut self.atom_intervals(mut state)
+    let excluded = try mut self.disequality_intervals(mut state)
+    let products = try mut self.product_intervals(mut state)
+    return atoms or excluded or products
+} Solver.intervals
+
+/// Each asserted atom's terms narrowed from the intervals of its others.
+fn Solver.atom_intervals(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    for position in 0..<state.atoms.len() {
+        let sum = state.atoms[position].sum.copy(alloc)
+        let equality = state.atoms[position].equality
+        for index in 0..<sum.terms.len() {
+            let summand = sum.terms[index]
+            let others = state.sum(sum, skip: Some(index))
+            let bounds = summand_bounds(sum.constant, others, equality, coefficient: summand.coefficient)
+            let narrowed = try mut self.narrow(mut state, term: summand.term, low: bounds.low, high: bounds.high)
+            changed = changed or narrowed
+        }
+    }
+    return changed
+} Solver.atom_intervals
+
+/// The bounds a term of coefficient `coefficient` has in an atom with the constant
+/// `constant`, from the bounds of the atom's other terms: the rest of the constant above
+/// their least, and for an equality below their greatest, divided by the coefficient.
+fn summand_bounds(constant: wide::Wide, others: SumBounds, equality: bool, coefficient: wide::Wide) -> SumBounds {
+    var rest_high: Option[wide::Wide] = None
+    match others.low {
+        Some(low) => {
+            rest_high = constant.checked_sub(low)
+        }
+        None => {}
+    }
+    var rest_low: Option[wide::Wide] = None
+    if equality {
+        match others.high {
+            Some(high) => {
+                rest_low = constant.checked_sub(high)
+            }
+            None => {}
+        }
+    }
+    if coefficient > wide::Wide.zero() {
+        return SumBounds(low: divided_bound(rest_low, coefficient, ceiling: true), high: divided_bound(rest_high, coefficient, ceiling: false))
+    }
+    return SumBounds(low: divided_bound(rest_high, coefficient, ceiling: true), high: divided_bound(rest_low, coefficient, ceiling: false))
+} summand_bounds
+
+/// A bound divided by a coefficient, rounded up or down.
+fn divided_bound(bound: Option[wide::Wide], coefficient: wide::Wide, ceiling: bool) -> Option[wide::Wide] {
+    let Some(value) = bound else {
+        return None
+    }
+    if ceiling {
+        return Some(ceil_div(value, divisor: coefficient))
+    }
+    return Some(floor_div(value, divisor: coefficient))
+} divided_bound
+
+/// The term of a sum a disequality may exclude a value of: its one term without a single
+/// value, or its first when every term has one.
+fn State.open_summand(self, sum: Linear) -> Option[usize] {
+    var open: Option[usize] = None
+    var count: usize = 0
+    for index in 0..<sum.terms.len() {
+        if self.class(sum.terms[index].term).single().is_none() {
+            if count == 0 {
+                open = Some(index)
+            }
+            count += 1
+        }
+    }
+    if count == 1 {
+        return open
+    }
+    if count == 0 and sum.terms.len() > 0 {
+        return Some(0)
+    }
+    return None
+} State.open_summand
+
+/// Each disequality excluding a bound of its one term without a single value.
+fn Solver.disequality_intervals(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    for position in 0..<state.disequalities.len() {
+        let sum = state.disequalities[position].copy(alloc)
+        let Some(index) = state.open_summand(sum) else {
+            continue
+        }
+        let others = state.sum(sum, skip: Some(index))
+        let summand = sum.terms[index]
+        let Some(low) = others.low else {
+            continue
+        }
+        let Some(rest) = sum.constant.checked_sub(low) else {
+            continue
+        }
+        if not trunc_rem(rest, divisor: summand.coefficient).is_zero() {
+            continue
+        }
+        let excluded = trunc_div(rest, divisor: summand.coefficient)
+        let class = state.class(summand.term)
+        if class.low == Some(excluded) {
+            let narrowed = try mut self.narrow(mut state, term: summand.term, low: excluded.checked_add(wide::Wide.one()), high: None)
+            changed = changed or narrowed
+        } else if class.high == Some(excluded) {
+            let narrowed = try mut self.narrow(mut state, term: summand.term, low: None, high: excluded.checked_sub(wide::Wide.one()))
+            changed = changed or narrowed
+        }
+    }
+    return changed
+} Solver.disequality_intervals
+
+/// Each `mul` application within the products of its operands' intervals.
+fn Solver.product_intervals(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    for position in 0..<state.muls.len() {
+        let mul = state.muls[position]
+        let parts = state.terms.get(mul).parts(alloc)
+        let a = state.class(parts[0])
+        let b = state.class(parts[1])
+        let Some(bounds) = a.product_bounds(b) else {
+            continue
+        }
+        let narrowed = try mut self.narrow(mut state, term: mul, low: bounds.low, high: bounds.high)
+        changed = changed or narrowed
+    }
+    return changed
+} Solver.product_intervals
+
+/// Rule 4: each asserted equality gives each of its terms of coefficient ±1 the congruence
+/// its other terms' residues and moduli imply.
+fn Solver.congruences(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    for position in 0..<state.atoms.len() {
+        if not state.atoms[position].equality {
+            continue
+        }
+        let sum = state.atoms[position].sum.copy(alloc)
+        for index in 0..<sum.terms.len() {
+            let summand = sum.terms[index]
+            if summand.coefficient.wrapping_abs() != wide::Wide.one() {
+                continue
+            }
+            let Some(implied) = state.implied_congruence(sum, index) else {
+                continue
+            }
+            let narrowed = try mut self.congruent(mut state, term: summand.term, residue: implied.residue, modulus: implied.modulus)
+            changed = changed or narrowed
+        }
+    }
+    return changed
+} Solver.congruences
+
+/// The congruence an equality implies for its term at `index`, of coefficient ±1, from its
+/// other terms' single values, residues and moduli; none for a modulus below 2 or one leaving
+/// the integers the prover computes with.
+fn State.implied_congruence(self, sum: Linear, index: usize) -> Option[Congruence] {
+    var modulus = wide::Wide.zero()
+    var total = wide::Wide.zero()
+    for other in 0..<sum.terms.len() {
+        if other == index {
+            continue
+        }
+        let summand = sum.terms[other]
+        let class = self.class(summand.term)
+        var residue = class.residue
+        var held_modulus = class.modulus
+        match class.single() {
+            Some(value) => {
+                residue = value
+                held_modulus = wide::Wide.zero()
+            }
+            None => {}
+        }
+        let Some(scaled_modulus) = summand.coefficient.checked_mul(held_modulus) else {
+            return None
+        }
+        let Some(scaled_residue) = summand.coefficient.checked_mul(residue) else {
+            return None
+        }
+        modulus = wide_gcd(modulus, b: scaled_modulus)
+        let Some(next) = total.checked_add(scaled_residue) else {
+            return None
+        }
+        total = next
+    }
+    if modulus < wide::Wide.of_i64(2) {
+        return None
+    }
+    let Some(rest) = sum.constant.checked_sub(total) else {
+        return None
+    }
+    let residue = euclid_rem(sum.terms[index].coefficient.wrapping_mul(rest), divisor: modulus)
+    return Some(Congruence(residue: residue, modulus: modulus))
+} State.implied_congruence
+
+/// Rule 5: the asserted atoms of two terms of coefficients 1 and −1, and the intervals of
+/// their classes, as edges of the difference graph, which is then closed by shortest paths.
+fn Solver.differences(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var edges = state.difference_edges(alloc)
+    var nodes = mut self.edge_nodes(mut state, edges)
+    if nodes.len() == 0 {
+        return false
+    }
+    for node in nodes {
+        let class = state.classes[usize.widen(node)]
+        match class.high {
+            Some(high) => lower_edge(mut edges, from: ZERO_NODE, to: node, weight: high)
+            None => {}
+        }
+        let Some(low) = class.low else {
+            continue
+        }
+        let Some(weight) = low.checked_neg() else {
+            continue
+        }
+        lower_edge(mut edges, from: node, to: ZERO_NODE, weight)
+    }
+    mut nodes.push(ZERO_NODE)
+    var changed = try mut self.closed_paths(mut edges, nodes: nodes.view())
+    state.graph = copied_graph(edges, alloc)
+    for node in nodes {
+        if node == ZERO_NODE {
+            continue
+        }
+        let high = edges.get(TermPair(left: ZERO_NODE, right: node))
+        var low: Option[wide::Wide] = None
+        match edges.get(TermPair(left: node, right: ZERO_NODE)) {
+            Some(weight) => {
+                low = weight.checked_neg()
+            }
+            None => {}
+        }
+        let narrowed = try mut self.narrow(mut state, term: node, low, high)
+        changed = changed or narrowed
+    }
+    for index in 0..<nodes.len() {
+        for later in (index + 1)..<nodes.len() {
+            let a = nodes[index]
+            let b = nodes[later]
+            if a == ZERO_NODE or b == ZERO_NODE {
+                continue
+            }
+            if at_most_zero(edges.get(TermPair(left: a, right: b))) and at_most_zero(edges.get(TermPair(left: b, right: a))) {
+                let merged = try mut self.merge(mut state, a, b)
+                changed = changed or merged
+            }
+        }
+    }
+    return changed
+} Solver.differences
+
+/// Whether an edge exists and its bound is at most 0.
+fn at_most_zero(weight: Option[wide::Wide]) -> bool {
+    let Some(held) = weight else {
+        return false
+    }
+    return held <= wide::Wide.zero()
+} at_most_zero
+
+/// The edges of the difference graph over the current class roots: the graph's, then those
+/// of the asserted atoms of two terms of coefficients 1 and −1.
+fn State.difference_edges(self, alloc: mem::Alloc) -> mem::HashMap[TermPair, wide::Wide] {
+    var edges = mem::HashMap[TermPair, wide::Wide].empty(seed: 0, alloc)
+    for entry in self.graph {
+        let pair = entry.key()
+        var from = ZERO_NODE
+        if pair.left != ZERO_NODE {
+            from = self.find(pair.left)
+        }
+        var to = ZERO_NODE
+        if pair.right != ZERO_NODE {
+            to = self.find(pair.right)
+        }
+        lower_edge(mut edges, from, to, weight: entry.value())
+    }
+    for atom in self.atoms {
+        let Some(ends) = atom.sum.difference() else {
+            continue
+        }
+        let p = self.find(ends.left)
+        let n = self.find(ends.right)
+        lower_edge(mut edges, from: n, to: p, weight: atom.sum.constant)
+        if atom.equality {
+            lower_edge(mut edges, from: p, to: n, weight: atom.sum.constant.wrapping_neg())
+        }
+    }
+    return edges
+} State.difference_edges
+
+/// The nodes of edges other than the zero node, in term order, each once.
+fn Solver.edge_nodes(mut self, mut state: State, edges: mem::HashMap[TermPair, wide::Wide]) -> mem::List[u32] {
+    let alloc = state.terms.alloc
+    var keyed = mem::List[KeyedNode].empty(alloc)
+    for entry in edges {
+        let pair = entry.key()
+        if pair.left != ZERO_NODE {
+            let key = mut state.encodings.term(self.ck, terms: state.terms, id: pair.left)
+            mut keyed.push(KeyedNode(key: take key, node: pair.left))
+        }
+        if pair.right != ZERO_NODE {
+            let key = mut state.encodings.term(self.ck, terms: state.terms, id: pair.right)
+            mut keyed.push(KeyedNode(key: take key, node: pair.right))
+        }
+    }
+    mut keyed.sort_by(fn(left: KeyedNode, right: KeyedNode) => left.key.contents().view().cmp(right.key.contents().view()))
+    var nodes = mem::List[u32].empty(alloc)
+    for entry in keyed {
+        if nodes.len() > 0 and nodes[nodes.len() - 1] == entry.node {
+            continue
+        }
+        mut nodes.push(entry.node)
+    }
+    return nodes
+} Solver.edge_nodes
+
+/// Closes the difference graph by shortest paths through each node in turn, each shortened
+/// edge a step; a negative cycle is a contradiction.
+fn Solver.closed_paths(mut self, mut edges: mem::HashMap[TermPair, wide::Wide], nodes: Slice[u32]) -> bool fails Halt {
+    var changed = false
+    for k in nodes {
+        for i in nodes {
+            let incoming = edges.get(TermPair(left: i, right: k))
+            let Some(ik) = incoming else {
+                continue
+            }
+            for j in nodes {
+                let outgoing = edges.get(TermPair(left: k, right: j))
+                let Some(kj) = outgoing else {
+                    continue
+                }
+                let Some(through) = ik.checked_add(kj) else {
+                    continue
+                }
+                if i == j and through.is_negative() {
+                    fail Halt.Contradiction
+                }
+                if i == j {
+                    continue
+                }
+                let direct = edges.get(TermPair(left: i, right: j))
+                if shorter_than(through, direct) {
+                    try mut self.step()
+                    discard mut edges.insert(TermPair(left: i, right: j), value: through)
+                    changed = true
+                }
+            }
+        }
+    }
+    return changed
+} Solver.closed_paths
+
+/// Whether a path's bound is below an edge's, or no edge exists.
+fn shorter_than(through: wide::Wide, direct: Option[wide::Wide]) -> bool {
+    let Some(held) = direct else {
+        return true
+    }
+    return through < held
+} shorter_than
+
+/// Lowers the bound of an edge to a weight, adding the edge when it is missing.
+fn lower_edge(mut edges: mem::HashMap[TermPair, wide::Wide], from: u32, to: u32, weight: wide::Wide) {
+    let key = TermPair(left: from, right: to)
+    let held = edges.get(key)
+    match held {
+        Some(known) => {
+            if weight < known {
+                discard mut edges.insert(key, value: weight)
+            }
+        }
+        None => {
+            discard mut edges.insert(key, value: weight)
+        }
+    }
+} lower_edge
+
+/// A copy of a difference graph.
+fn copied_graph(graph: mem::HashMap[TermPair, wide::Wide], alloc: mem::Alloc) -> mem::HashMap[TermPair, wide::Wide] {
+    var copied = mem::HashMap[TermPair, wide::Wide].empty(seed: 0, alloc)
+    for entry in graph {
+        discard mut copied.insert(entry.key(), value: entry.value())
+    }
+    return copied
+} copied_graph
+
+/// Rule 6: a clause whose literals are all false is a contradiction, and one with exactly
+/// one literal that is not false, and none true, asserts it.
+fn Solver.clauses(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    var index: usize = 0
+    while index < state.clauses.len() {
+        let clause = index
+        index += 1
+        var open: Option[usize] = None
+        var count: usize = 0
+        var satisfied = false
+        for position in 0..<state.clauses[clause].literals.len() {
+            let literal = state.clauses[clause].literals[position].copy(alloc)
+            let value = try mut self.evaluate(mut state, literal)
+            if value == Some(true) {
+                satisfied = true
+                break
+            }
+            if value.is_none() {
+                if count == 0 {
+                    open = Some(position)
+                }
+                count += 1
+            }
+        }
+        if satisfied {
+            continue
+        }
+        if count == 0 {
+            fail Halt.Contradiction
+        }
+        let Some(position) = open else {
+            continue
+        }
+        if count == 1 {
+            let literal = state.clauses[clause].literals[position].copy(alloc)
+            let asserted = try mut self.assert_literal(mut state, literal)
+            changed = changed or asserted
+        }
+    }
+    return changed
+} Solver.clauses
+
+/// Rule 7: each clause holding an `all` literal is instantiated at each term that applies
+/// one of its triggers' functions, once per class of that term.
+fn Solver.quantifiers(mut self, mut state: State) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    var entries = mem::List[QuantifiedClause].empty(alloc)
+    for entry in state.clauses {
+        if holds_all(entry.literals.view()) {
+            mut entries.push(QuantifiedClause(id: entry.id, literals: copied_literals(entry.literals.view(), alloc)))
+        }
+    }
+    for entry in entries {
+        for position in 0..<entry.literals.len() {
+            let Some(forall) = entry.literals[position].all_atom() else {
+                continue
+            }
+            for trigger in state.terms.triggers(forall) {
+                let instantiated = try mut self.trigger_instances(mut state, entry, position, forall, trigger)
+                changed = changed or instantiated
+            }
+        }
+    }
+    return changed
+} Solver.quantifiers
+
+/// Whether a clause holds an `all` literal.
+fn holds_all(literals: Slice[Literal]) -> bool {
+    for literal in literals {
+        if literal.all_atom().is_some() {
+            return true
+        }
+    }
+    return false
+} holds_all
+
+/// Instantiates a clause's `all` literal at each application, among the state's, of its
+/// trigger's function whose other arguments are in its arguments' classes, once per class
+/// of the argument at the trigger's position.
+fn Solver.trigger_instances(
+    mut self,
+    mut state: State,
+    entry: QuantifiedClause,
+    position: usize,
+    forall: Forall,
+    trigger: Trigger,
+    ) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    var changed = false
+    let parts = state.terms.get(trigger.term).parts(alloc)
+    var apps = mem::List[u32].empty(alloc)
+    for app in state.apps {
+        mut apps.push(app)
+    }
+    for app in apps {
+        if not state.instantiates(trigger, parts: parts.view(), app) {
+            continue
+        }
+        let app_parts = state.terms.get(app).parts(alloc)
+        let instance = app_parts[trigger.position]
+        if state.instantiated(entry.id, root: state.find(instance)) {
+            continue
+        }
+        try mut self.step()
+        mut state.instances.push(Instance(clause: entry.id, term: instance))
+        mut self.instantiate(mut state, literals: entry.literals.view(), position, forall, instance)
+        changed = true
+    }
+    return changed
+} Solver.trigger_instances
+
+/// Whether an application applies a trigger's function to arguments in the classes of the
+/// trigger's, but at its position.
+fn State.instantiates(self, trigger: Trigger, parts: Slice[u32], app: u32) -> bool {
+    let candidate = self.terms.get(app)
+    let candidate_parts = candidate.parts(self.terms.alloc)
+    if candidate_parts.len() != parts.len() or not candidate.same_form(self.terms.get(trigger.term)) {
+        return false
+    }
+    for at in 0..<parts.len() {
+        if at == trigger.position {
+            continue
+        }
+        if not self.is_registered(parts[at]) {
+            return false
+        }
+        if self.find(parts[at]) != self.find(candidate_parts[at]) {
+            return false
+        }
+    }
+    return true
+} State.instantiates
+
+/// Whether a clause is instantiated at a term of a class.
+fn State.instantiated(self, clause: u32, root: u32) -> bool {
+    for instance in self.instances {
+        if instance.clause == clause and self.find(instance.term) == root {
+            return true
+        }
+    }
+    return false
+} State.instantiated
+
+/// Whether two terms apply the same function, apart from their parts.
+fn Term.same_form(self, other: Term) -> bool {
+    match self {
+        Term.App(op: op, args: _) => return match other {
+            Term.App(op: other_op, args: _) => op == other_op
+            else => false
+        }
+        Term.Call(callee: callee, args: _) => return match other {
+            Term.Call(callee: other_callee, args: _) => callee == other_callee
+            else => false
+        }
+        Term.Field(base: _, name: name) => return match other {
+            Term.Field(base: _, name: other_name) => name == other_name
+            else => false
+        }
+        Term.Quant(all: all, low: _, high: _, inclusive: inclusive, bound: _, body: _) => return match other {
+            Term.Quant(all: other_all, low: _, high: _, inclusive: other_inclusive, bound: _, body: _) => all == other_all and inclusive == other_inclusive
+            else => false
+        }
+        Term.And(_) or Term.Or(_) or Term.Tag(_) or Term.Not(_) or Term.Ite(condition: _, then: _, otherwise: _) or Term.Quot(dividend: _, divisor: _) or Term.Rem(dividend: _, divisor: _) => return self.variant_index() == other.variant_index()
+        else => return self == other
+    }
+} Term.same_form
+
+/// The position of a term's variant among those of `Term`.
+fn Term.variant_index(self) -> u32 {
+    return match self {
+        Term.Param(_) => 0
+        Term.Entry(_) => 1
+        Term.Lit(_) => 2
+        Term.App(op: _, args: _) => 3
+        Term.Call(callee: _, args: _) => 4
+        Term.Field(base: _, name: _) => 5
+        Term.Ite(condition: _, then: _, otherwise: _) => 6
+        Term.Quot(dividend: _, divisor: _) => 7
+        Term.Rem(dividend: _, divisor: _) => 8
+        Term.Tag(_) => 9
+        Term.Fresh(_) => 10
+        Term.Skolem(_) => 11
+        Term.Bound(_) => 12
+        Term.And(_) => 13
+        Term.Or(_) => 14
+        Term.Not(_) => 15
+        Term.Quant(all: _, low: _, high: _, inclusive: _, bound: _, body: _) => 16
+    }
+} Term.variant_index
+
+/// Adds the clause with its `all` literal at `position` replaced by its body at `instance`,
+/// guarded by the range, canonicalised.
+fn Solver.instantiate(
+    mut self,
+    mut state: State,
+    literals: Slice[Literal],
+    position: usize,
+    forall: Forall,
+    instance: u32,
+    ) {
+    let alloc = state.terms.alloc
+    var canon = Canon.new(self.ck.share(), package_id: self.package_id)
+    var parts = mem::List[Formula].empty(alloc)
+    for at in 0..<literals.len() {
+        if at != position {
+            mut parts.push(Formula.Lit(literals[at].copy(alloc)))
+        }
+    }
+    let above = mut state.terms.compare(nir::BinaryOp.Le, left: forall.low, right: instance)
+    var op = nir::BinaryOp.Lt
+    if forall.inclusive {
+        op = nir::BinaryOp.Le
+    }
+    let below = mut state.terms.compare(op, left: instance, right: forall.high)
+    let body = mut state.terms.substitute(forall.body, from: forall.bound, to: instance)
+    mut parts.push(Formula.Leaf(term: above, holding: false))
+    mut parts.push(Formula.Leaf(term: below, holding: false))
+    mut parts.push(mut canon.formula(mut state.terms, term: body, positive: true))
+    mut canon.emit(mut state.terms, formula: Formula.Or(take parts), origin: Origin.Fact)
+    var known = mem::Set[u32].empty(alloc)
+    for term in 0..<state.registered.len() {
+        if state.registered[term] {
+            discard mut known.insert(u32.fit(term))
+        }
+    }
+    let ranges = mut canon.ranges(mut state.terms, mut known)
+    for clause in take ranges {
+        mut self.add_clause(mut state, take clause)
+    }
+    let produced = canon.clauses
+    for entry in take produced {
+        let OriginClause(clause: clause, origin: _) = entry
+        mut self.add_clause(mut state, take clause)
+    }
+} Solver.instantiate
+
+/// Adds a clause in term order, registering its terms.
+fn Solver.add_clause(mut self, mut state: State, take clause: mem::List[Literal]) {
+    let alloc = state.terms.alloc
+    for literal in clause {
+        match literal.atom {
+            Atom.All(forall) => {
+                mut self.register(mut state, term: forall.low)
+                mut self.register(mut state, term: forall.high)
+                for term in state.terms.closed_parts(forall) {
+                    mut self.register(mut state, term)
+                }
+            }
+            else => {
+                for term in literal.atom.terms(alloc) {
+                    mut self.register(mut state, term)
+                }
+            }
+        }
+    }
+    let sorted = self.ck.sorted_clause(state.terms, encodings: mut state.encodings, take clause)
+    let key = mem::Shared.of(mut state.encodings.clause(self.ck, terms: state.terms, clause: sorted.view()), alloc)
+    let at = state.clause_position(key.contents().view())
+    mut state.clauses.insert(at, value: StateClause(id: state.next_clause, key: take key, literals: take sorted))
+    state.next_clause += 1
+} Solver.add_clause
+
+/// The position of the first clause whose key is greater than a key.
+fn State.clause_position(self, key: Slice[u8]) -> usize {
+    var low: usize = 0
+    var high = self.clauses.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if self.clauses[middle].key.contents().view().cmp(key) == core::Ordering.Greater {
+            high = middle
+        } else {
+            low = middle + 1
+        }
+    }
+    return low
+} State.clause_position
+
+/// The position of the first asserted atom whose key is greater than a key.
+fn State.atom_position(self, key: Slice[u8]) -> usize {
+    var low: usize = 0
+    var high = self.atoms.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if self.atoms[middle].key.contents().view().cmp(key) == core::Ordering.Greater {
+            high = middle
+        } else {
+            low = middle + 1
+        }
+    }
+    return low
+} State.atom_position
+
+/// The position of the first term of a list in term order whose key is greater than a key.
+fn Encodings.position_of(mut self, ck: Checker, terms: Terms, list: Slice[u32], key: Slice[u8]) -> usize {
+    var low: usize = 0
+    var high = list.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        let other = mut self.term(ck, terms, id: list[middle])
+        if other.contents().view().cmp(key) == core::Ordering.Greater {
+            high = middle
+        } else {
+            low = middle + 1
+        }
+    }
+    return low
+} Encodings.position_of
+
+/// Gives a term and its parts their own classes, and files it among the state's terms.
+fn Solver.register(mut self, mut state: State, term: u32) {
+    if state.is_registered(term) {
+        return
+    }
+    let alloc = state.terms.alloc
+    let quantified = state.terms.get(term).is_quant()
+    let parts = state.terms.get(term).parts(alloc)
+    if not quantified {
+        for part in parts {
+            mut self.register(mut state, term: part)
+        }
+    }
+    let index = usize.widen(term)
+    while state.parent.len() <= index {
+        mut state.parent.push(0)
+        mut state.size.push(0)
+        mut state.classes.push(ANY_CLASS)
+        mut state.registered.push(false)
+    }
+    state.parent[index] = term
+    state.size[index] = 1
+    state.registered[index] = true
+    let sort = state.terms.sort(term)
+    match state.terms.int_value(term) {
+        Some(value) => {
+            state.classes[index] = Class(low: Some(value), high: Some(value), residue: wide::Wide.zero(), modulus: wide::Wide.one())
+        }
+        None => {}
+    }
+    let key = mut state.encodings.term(self.ck, terms: state.terms, id: term)
+    if parts.len() > 0 and not quantified {
+        let at = mut state.encodings.position_of(self.ck, terms: state.terms, list: state.apps.view(), key: key.contents().view())
+        mut state.apps.insert(at, value: term)
+    }
+    if state.terms.get(term).is_ite() {
+        let at = mut state.encodings.position_of(self.ck, terms: state.terms, list: state.ites.view(), key: key.contents().view())
+        mut state.ites.insert(at, value: term)
+    }
+    if sort == Sort.Int {
+        let at = mut state.encodings.position_of(self.ck, terms: state.terms, list: state.integers.view(), key: key.contents().view())
+        mut state.integers.insert(at, value: term)
+        if state.terms.is_product(term) {
+            let place = mut state.encodings.position_of(self.ck, terms: state.terms, list: state.muls.view(), key: key.contents().view())
+            mut state.muls.insert(place, value: term)
+        }
+    }
+    mut self.file_comparison(mut state, term)
+} Solver.register
+
+/// Records the linear literal of an integer comparison term.
+fn Solver.file_comparison(mut self, mut state: State, term: u32) {
+    if state.terms.integer_comparison(term).is_none() {
+        return
+    }
+    let alloc = state.terms.alloc
+    var canon = Canon.new(self.ck.share(), package_id: self.package_id)
+    match mut canon.comparison(mut state.terms, term, positive: true) {
+        Some(Folded.Lit(literal)) => {
+            discard mut state.comparisons.insert(term, value: take literal)
+        }
+        Some(Folded.True) => {
+            discard mut state.comparisons.insert(term, value: Literal.tautology(true, alloc))
+        }
+        Some(Folded.False) => {
+            discard mut state.comparisons.insert(term, value: Literal.tautology(false, alloc))
+        }
+        None => {}
+    }
+} Solver.file_comparison
+
+/// Whether a term is a `mul` application with no literal operand.
+fn Terms.is_product(self, term: u32) -> bool {
+    let Term.App(op: Op.Binary(nir::BinaryOp.Mul), args: args) = self.get(term) else {
+        return false
+    }
+    for part in args {
+        if self.int_value(part).is_some() {
+            return false
+        }
+    }
+    return true
+} Terms.is_product
+
+/// The condition and arms of an ite term.
+fn Terms.ite_arms(self, term: u32) -> Option[IteArms] {
+    let Term.Ite(condition: condition, then: then, otherwise: otherwise) = self.get(term) else {
+        return None
+    }
+    return Some(IteArms(condition: condition, then: then, otherwise: otherwise))
+} Terms.ite_arms
+
+/// Merges two classes: their intervals and congruences intersect.
+fn Solver.merge(mut self, mut state: State, a: u32, b: u32) -> bool fails Halt {
+    let left = state.find(a)
+    let right = state.find(b)
+    if left == right {
+        return false
+    }
+    try mut self.step()
+    let truth = state.find(state.truth)
+    let falsity = state.find(state.falsity)
+    if (left == truth and right == falsity) or (left == falsity and right == truth) {
+        fail Halt.Contradiction
+    }
+    if state.keeps_apart(left, right) {
+        fail Halt.Contradiction
+    }
+    var root = left
+    var child = right
+    if state.size[usize.widen(left)] < state.size[usize.widen(right)] {
+        root = right
+        child = left
+    }
+    state.parent[usize.widen(child)] = root
+    let added = state.size[usize.widen(child)]
+    state.size[usize.widen(root)] += added
+    let root_class = state.classes[usize.widen(root)]
+    let child_class = state.classes[usize.widen(child)]
+    let Some(merged) = root_class.intersect(child_class) else {
+        fail Halt.Contradiction
+    }
+    state.classes[usize.widen(root)] = merged
+    return true
+} Solver.merge
+
+/// Narrows a class's interval, inward to its congruence.
+fn Solver.narrow(mut self, mut state: State, term: u32, low: Option[wide::Wide], high: Option[wide::Wide]) -> bool fails Halt {
+    let root = usize.widen(state.find(term))
+    let class = state.classes[root]
+    var next = class
+    match low {
+        Some(bound) => {
+            next.low = Some(bound)
+            match class.low {
+                Some(old) => {
+                    next.low = Some(old.max_of(bound))
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    match high {
+        Some(bound) => {
+            next.high = Some(bound)
+            match class.high {
+                Some(old) => {
+                    next.high = Some(old.min_of(bound))
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let fitted = next.fitted()
+    if fitted == class {
+        return false
+    }
+    try mut self.step()
+    if fitted.is_empty() {
+        fail Halt.Contradiction
+    }
+    state.classes[root] = fitted
+    return true
+} Solver.narrow
+
+fn Solver.congruent(mut self, mut state: State, term: u32, residue: wide::Wide, modulus: wide::Wide) -> bool fails Halt {
+    let root = usize.widen(state.find(term))
+    let class = state.classes[root]
+    let Some(congruence) = try crt(class.residue, m1: class.modulus, r2: residue, m2: modulus) else {
+        return false
+    }
+    let next = Class(low: class.low, high: class.high, residue: congruence.residue, modulus: congruence.modulus).fitted()
+    if next == class {
+        return false
+    }
+    try mut self.step()
+    if next.is_empty() {
+        fail Halt.Contradiction
+    }
+    state.classes[root] = next
+    return true
+} Solver.congruent
+
+/// Asserts a literal: a boolean atom merges with `true` or `false`, a linear atom joins
+/// the asserted atoms, and a negated equality records a disequality.
+fn Solver.assert_literal(mut self, mut state: State, literal: Literal) -> bool fails Halt {
+    let alloc = state.terms.alloc
+    if state.asserted.contains(literal) {
+        return false
+    }
+    if literal.negated and literal.atom.is_le() {
+        return try mut self.assert_literal(mut state, literal: literal.negation(alloc))
+    }
+    try mut self.step()
+    discard mut state.asserted.insert(literal.copy(alloc), value: Unit)
+    match literal.atom {
+        Atom.Bool(term) => try mut self.assert_boolean(mut state, term, negated: literal.negated)
+        Atom.Le(sum) => mut self.add_atom(mut state, literal, sum, equality: false)
+        Atom.Eq(sum) => {
+            if literal.negated {
+                try mut self.add_disequality(mut state, sum)
+            } else {
+                mut self.add_atom(mut state, literal, sum, equality: true)
+            }
+        }
+        Atom.All(_) => {}
+    }
+    return true
+} Solver.assert_literal
+
+/// Whether an atom is `≤`.
+fn Atom.is_le(self) -> bool {
+    return match self {
+        Atom.Le(_) => true
+        else => false
+    }
+} Atom.is_le
+
+/// Merges a boolean atom with `true` or `false`, and asserts its linear literal for an integer
+/// comparison.
+fn Solver.assert_boolean(mut self, mut state: State, term: u32, negated: bool) fails Halt {
+    let alloc = state.terms.alloc
+    var target = state.truth
+    if negated {
+        target = state.falsity
+    }
+    discard try mut self.merge(mut state, a: term, b: target)
+    let comparison = match state.comparisons.get(term) {
+        Some(found) => Some(found.copy(alloc))
+        None => None
+    }
+    let Some(compared) = comparison else {
+        return
+    }
+    if negated {
+        discard try mut self.assert_literal(mut state, literal: compared.negation(alloc))
+        return
+    }
+    discard try mut self.assert_literal(mut state, literal: compared)
+} Solver.assert_boolean
+
+/// Joins a linear atom to the asserted atoms, in term order.
+fn Solver.add_atom(mut self, mut state: State, literal: Literal, sum: Linear, equality: bool) {
+    let alloc = state.terms.alloc
+    let key = mem::Shared.of(mut state.encodings.literal(self.ck, terms: state.terms, literal), alloc)
+    let at = state.atom_position(key.contents().view())
+    mut state.atoms.insert(at, value: AssertedAtom(key: take key, sum: sum.copy(alloc), equality: equality))
+} Solver.add_atom
+
+/// Records a disequality, and the pair of terms it keeps apart when it is a difference of
+/// two terms equal to 0.
+fn Solver.add_disequality(mut self, mut state: State, sum: Linear) fails Halt {
+    let alloc = state.terms.alloc
+    mut state.disequalities.push(sum.copy(alloc))
+    let Some(ends) = sum.difference() else {
+        return
+    }
+    if not sum.constant.is_zero() {
+        return
+    }
+    if state.find(ends.left) == state.find(ends.right) {
+        fail Halt.Contradiction
+    }
+    mut state.separated.push(ends)
+} Solver.add_disequality
+
+/// Asserts that a boolean term is `true` or `false`, and its linear literal for an integer
+/// comparison.
+fn Solver.assert_term(mut self, mut state: State, term: u32, value: bool) -> bool fails Halt {
+    let literal = Literal(negated: not value, atom: Atom.Bool(term))
+    return try mut self.assert_literal(mut state, literal)
+} Solver.assert_term
+
+/// Whether a boolean term's class is `true` or `false`, or its linear literal is decided;
+/// a decided comparison merges with its value.
+fn Solver.decided(mut self, mut state: State, term: u32) -> Option[bool] fails Halt {
+    let root = state.find(term)
+    if root == state.find(state.truth) {
+        return Some(true)
+    }
+    if root == state.find(state.falsity) {
+        return Some(false)
+    }
+    let value = match state.comparisons.get(term) {
+        Some(literal) => state.entails(literal)
+        None => return None
+    }
+    match value {
+        Some(holds) => {
+            var target = state.falsity
+            if holds {
+                target = state.truth
+            }
+            discard try mut self.merge(mut state, a: term, b: target)
+        }
+        None => {}
+    }
+    return value
+} Solver.decided
+
+/// Whether a literal is true or false in the state, if it decides it.
+fn Solver.evaluate(mut self, mut state: State, literal: Literal) -> Option[bool] fails Halt {
+    if state.asserted.contains(literal) {
+        return Some(true)
+    }
+    if state.asserted.contains(literal.negation(state.terms.alloc)) {
+        return Some(false)
+    }
+    var value: Option[bool] = None
+    match literal.atom {
+        Atom.Bool(term) => {
+            value = try mut self.decided(mut state, term)
+        }
+        Atom.All(_) => {}
+        Atom.Le(sum) => {
+            value = state.entails_atom(sum, equality: false)
+        }
+        Atom.Eq(sum) => {
+            value = state.entails_atom(sum, equality: true)
+        }
+    }
+    let Some(holds) = value else {
+        return None
+    }
+    return Some(holds != literal.negated)
+} Solver.evaluate
+
+/// A copy of the state, as a case split gives each branch.
+fn State.copy(self, alloc: mem::Alloc) -> State {
+    var comparisons = mem::HashMap[u32, Literal].empty(seed: 0, alloc)
+    for entry in self.comparisons {
+        discard mut comparisons.insert(entry.key(), value: entry.value().copy(alloc))
+    }
+    var clauses = mem::List[StateClause].empty(alloc)
+    for entry in self.clauses {
+        mut clauses.push(StateClause(id: entry.id, key: entry.key.share(), literals: copied_literals(entry.literals.view(), alloc)))
+    }
+    var asserted = mem::HashMap[Literal, Unit].empty(seed: 0, alloc)
+    for entry in self.asserted {
+        discard mut asserted.insert(entry.key().copy(alloc), value: Unit)
+    }
+    var atoms = mem::List[AssertedAtom].empty(alloc)
+    for atom in self.atoms {
+        mut atoms.push(AssertedAtom(key: atom.key.share(), sum: atom.sum.copy(alloc), equality: atom.equality))
+    }
+    var disequalities = mem::List[Linear].empty(alloc)
+    for sum in self.disequalities {
+        mut disequalities.push(sum.copy(alloc))
+    }
+    return State(
+        terms: self.terms.copy(),
+        encodings: self.encodings.copy(alloc),
+        parent: listed_terms(self.parent.view(), alloc),
+        size: listed_terms(self.size.view(), alloc),
+        classes: copied_classes(self.classes.view(), alloc),
+        registered: copied_flags(self.registered.view(), alloc),
+        apps: listed_terms(self.apps.view(), alloc),
+        ites: listed_terms(self.ites.view(), alloc),
+        muls: listed_terms(self.muls.view(), alloc),
+        integers: listed_terms(self.integers.view(), alloc),
+        comparisons: take comparisons,
+        clauses: take clauses,
+        asserted: take asserted,
+        atoms: take atoms,
+        disequalities: take disequalities,
+        separated: copied_pairs(self.separated.view(), alloc),
+        graph: copied_graph(self.graph, alloc),
+        instances: copied_instances(self.instances.view(), alloc),
+        truth: self.truth,
+        falsity: self.falsity,
+        next_clause: self.next_clause,
+    )
+} State.copy
+
+/// A list of the classes of a slice.
+fn copied_classes(classes: Slice[Class], alloc: mem::Alloc) -> mem::List[Class] {
+    var copied = mem::List[Class].empty(alloc)
+    for class in classes {
+        mut copied.push(class)
+    }
+    return copied
+} copied_classes
+
+/// A list of the flags of a slice.
+fn copied_flags(flags: Slice[bool], alloc: mem::Alloc) -> mem::List[bool] {
+    var copied = mem::List[bool].empty(alloc)
+    for flag in flags {
+        mut copied.push(flag)
+    }
+    return copied
+} copied_flags
+
+/// A list of the pairs of a slice.
+fn copied_pairs(pairs: Slice[TermPair], alloc: mem::Alloc) -> mem::List[TermPair] {
+    var copied = mem::List[TermPair].empty(alloc)
+    for pair in pairs {
+        mut copied.push(pair)
+    }
+    return copied
+} copied_pairs
+
+/// A list of the instances of a slice.
+fn copied_instances(instances: Slice[Instance], alloc: mem::Alloc) -> mem::List[Instance] {
+    var copied = mem::List[Instance].empty(alloc)
+    for instance in instances {
+        mut copied.push(instance)
+    }
+    return copied
+} copied_instances
+
+fn State.find(self, term: u32) -> u32 {
+    var current = term
+    while self.parent[usize.widen(current)] != current {
+        current = self.parent[usize.widen(current)]
+    }
+    return current
+} State.find
+
+fn State.is_registered(self, term: u32) -> bool {
+    let index = usize.widen(term)
+    return index < self.registered.len() and self.registered[index]
+} State.is_registered
+
+/// Whether a disequality excludes a value for a term: one keeping its class apart from a
+/// class of that single value, or one whose other terms all have single values.
+fn State.excluded(self, term: u32, value: wide::Wide) -> bool {
+    let root = self.find(term)
+    for pair in self.separated {
+        let p = self.find(pair.left)
+        let q = self.find(pair.right)
+        if p == root and self.classes[usize.widen(q)].single() == Some(value) {
+            return true
+        }
+        if q == root and self.classes[usize.widen(p)].single() == Some(value) {
+            return true
+        }
+    }
+    for sum in self.disequalities {
+        if self.excludes_through(sum, root, value) {
+            return true
+        }
+    }
+    return false
+} State.excluded
+
+/// Whether a disequality excludes a value for a class: the class's coefficient times the
+/// value plus the single values of its other terms is its constant.
+fn State.excludes_through(self, sum: Linear, root: u32, value: wide::Wide) -> bool {
+    var total: Option[wide::Wide] = Some(wide::Wide.zero())
+    var own = wide::Wide.zero()
+    for summand in sum.terms {
+        let other = self.find(summand.term)
+        if other == root {
+            own = own.wrapping_add(summand.coefficient)
+            continue
+        }
+        let single = self.classes[usize.widen(other)].single()
+        let Some(held) = total else {
+            continue
+        }
+        let Some(known) = single else {
+            total = None
+            continue
+        }
+        match summand.coefficient.checked_mul(known) {
+            Some(product) => {
+                total = held.checked_add(product)
+            }
+            None => {
+                total = None
+            }
+        }
+    }
+    if own.is_zero() {
+        return false
+    }
+    let Some(held) = total else {
+        return false
+    }
+    let Some(scaled) = own.checked_mul(value) else {
+        return false
+    }
+    return scaled.checked_add(held) == Some(sum.constant)
+} State.excludes_through
+
+fn State.class(self, term: u32) -> Class {
+    return self.classes[usize.widen(self.find(term))]
+} State.class
+
+/// Whether a term is registered and its class is `true`, `false`, or neither.
+fn State.truth_of(self, term: u32) -> Option[bool] {
+    if not self.is_registered(term) {
+        return None
+    }
+    let root = self.find(term)
+    if root == self.find(self.truth) {
+        return Some(true)
+    }
+    if root == self.find(self.falsity) {
+        return Some(false)
+    }
+    return None
+} State.truth_of
+
+/// The bounds of Σ ci × ti over the terms' intervals, without the term at `skip`.
+fn State.sum(self, linear_sum: Linear, skip: Option[usize]) -> SumBounds {
+    var low: Option[wide::Wide] = Some(wide::Wide.zero())
+    var high: Option[wide::Wide] = Some(wide::Wide.zero())
+    for index in 0..<linear_sum.terms.len() {
+        if Some(index) == skip {
+            continue
+        }
+        let summand = linear_sum.terms[index]
+        let class = self.class(summand.term)
+        let a = scaled_bound(class.low, factor: summand.coefficient)
+        let b = scaled_bound(class.high, factor: summand.coefficient)
+        var least = b
+        var most = a
+        if summand.coefficient > wide::Wide.zero() {
+            least = a
+            most = b
+        }
+        low = added_bound(low, value: least)
+        high = added_bound(high, value: most)
+    }
+    return SumBounds(low: low, high: high)
+} State.sum
+
+/// A bound times a factor; none for none or one leaving the integers the prover computes
+/// with.
+fn scaled_bound(bound: Option[wide::Wide], factor: wide::Wide) -> Option[wide::Wide] {
+    let Some(value) = bound else {
+        return None
+    }
+    return value.checked_mul(factor)
+} scaled_bound
+
+/// The sum of two bounds; none for none or one leaving the integers the prover computes with.
+fn added_bound(total: Option[wide::Wide], value: Option[wide::Wide]) -> Option[wide::Wide] {
+    let Some(held) = total else {
+        return None
+    }
+    let Some(added) = value else {
+        return None
+    }
+    return held.checked_add(added)
+} added_bound
+
+/// Whether the state entails a positive linear literal or its negation.
+fn State.entails(self, literal: Literal) -> Option[bool] {
+    var value: Option[bool] = None
+    match literal.atom {
+        Atom.Le(sum) => {
+            value = self.entails_atom(sum, equality: false)
+        }
+        Atom.Eq(sum) => {
+            value = self.entails_atom(sum, equality: true)
+        }
+        else => return None
+    }
+    let Some(holds) = value else {
+        return None
+    }
+    return Some(holds != literal.negated)
+} State.entails
+
+fn State.entails_atom(self, linear_sum: Linear, equality: bool) -> Option[bool] {
+    if self.cancels(linear_sum) {
+        if equality {
+            return Some(linear_sum.constant.is_zero())
+        }
+        return Some(not linear_sum.constant.is_negative())
+    }
+    match self.bounds_entail(linear_sum, equality) {
+        Some(holds) => return Some(holds)
+        None => {}
+    }
+    return self.graph_entails(linear_sum, equality)
+} State.entails_atom
+
+/// Whether the coefficients of a sum's terms add up to 0 in each class.
+fn State.cancels(self, linear_sum: Linear) -> bool {
+    var by_class = mem::List[LinearTerm].empty(self.terms.alloc)
+    for summand in linear_sum.terms {
+        let root = self.find(summand.term)
+        var found = false
+        for index in 0..<by_class.len() {
+            if by_class[index].term == root {
+                let total = by_class[index].coefficient.wrapping_add(summand.coefficient)
+                by_class[index] = LinearTerm(coefficient: total, term: root)
+                found = true
+                break
+            }
+        }
+        if not found {
+            mut by_class.push(LinearTerm(coefficient: summand.coefficient, term: root))
+        }
+    }
+    for entry in by_class {
+        if not entry.coefficient.is_zero() {
+            return false
+        }
+    }
+    return true
+} State.cancels
+
+/// Whether the bounds of a sum's terms entail an atom or its negation, or, for an equality,
+/// a disequality asserted negates it.
+fn State.bounds_entail(self, linear_sum: Linear, equality: bool) -> Option[bool] {
+    let bounds = self.sum(linear_sum, skip: None)
+    let constant = linear_sum.constant
+    if equality {
+        if above_constant(bounds.low, constant) or below_constant(bounds.high, constant) {
+            return Some(false)
+        }
+        if bounds.low == Some(constant) and bounds.high == Some(constant) {
+            return Some(true)
+        }
+        for held in self.disequalities {
+            if held == linear_sum {
+                return Some(false)
+            }
+        }
+        return None
+    }
+    match bounds.high {
+        Some(high) => {
+            if high <= constant {
+                return Some(true)
+            }
+        }
+        None => {}
+    }
+    if above_constant(bounds.low, constant) {
+        return Some(false)
+    }
+    return None
+} State.bounds_entail
+
+/// Whether a bound exists and exceeds a constant.
+fn above_constant(bound: Option[wide::Wide], constant: wide::Wide) -> bool {
+    let Some(value) = bound else {
+        return false
+    }
+    return value > constant
+} above_constant
+
+/// Whether a bound exists and lies below a constant.
+fn below_constant(bound: Option[wide::Wide], constant: wide::Wide) -> bool {
+    let Some(value) = bound else {
+        return false
+    }
+    return value < constant
+} below_constant
+
+/// Whether the difference graph entails an atom p − n of a difference, or its negation.
+fn State.graph_entails(self, linear_sum: Linear, equality: bool) -> Option[bool] {
+    let Some(ends) = linear_sum.difference() else {
+        return None
+    }
+    let constant = linear_sum.constant
+    let p = self.find(ends.left)
+    let n = self.find(ends.right)
+    let up = self.graph.get(TermPair(left: n, right: p))
+    let down = self.graph.get(TermPair(left: p, right: n))
+    let negated = constant.wrapping_neg()
+    if below_constant(down, constant: negated) {
+        return Some(false)
+    }
+    if equality {
+        if below_constant(up, constant) {
+            return Some(false)
+        }
+        if up == Some(constant) and down == Some(negated) {
+            return Some(true)
+        }
+        return None
+    }
+    match up {
+        Some(weight) => {
+            if weight <= constant {
+                return Some(true)
+            }
+        }
+        None => {}
+    }
+    return None
+} State.graph_entails
+
+/// Whether a term's class excludes another's: disjoint intervals, a disequality, or
+/// opposite truth values.
+fn State.excludes(self, a: u32, b: u32) -> bool {
+    let left = self.find(a)
+    let right = self.find(b)
+    if left == right {
+        return false
+    }
+    let x = self.truth_of(a)
+    let y = self.truth_of(b)
+    match x {
+        Some(first_truth) => match y {
+            Some(second_truth) => return first_truth != second_truth
+            None => {}
+        }
+        None => {}
+    }
+    let first_class = self.classes[usize.widen(left)]
+    let second_class = self.classes[usize.widen(right)]
+    if below_bound(first_class.high, low: second_class.low) or below_bound(second_class.high, low: first_class.low) {
+        return true
+    }
+    return self.keeps_apart(left, right)
+} State.excludes
+
+/// Whether an upper bound and a lower bound exist and the upper lies below the lower.
+fn below_bound(high: Option[wide::Wide], low: Option[wide::Wide]) -> bool {
+    let Some(upper) = high else {
+        return false
+    }
+    let Some(lower) = low else {
+        return false
+    }
+    return upper < lower
+} below_bound
+
+/// Whether an asserted disequality keeps two classes apart.
+fn State.keeps_apart(self, left: u32, right: u32) -> bool {
+    for pair in self.separated {
+        let p = self.find(pair.left)
+        let q = self.find(pair.right)
+        if (p == left and q == right) or (p == right and q == left) {
+            return true
+        }
+    }
+    return false
+} State.keeps_apart
+
+/// The two terms of a linear atom p − n, when its coefficients are 1 and −1.
+fn Linear.difference(self) -> Option[TermPair] {
+    if self.terms.len() != 2 {
+        return None
+    }
+    let one = wide::Wide.one()
+    let minus = wide::Wide.of_i64(-1)
+    if self.terms[0].coefficient == one and self.terms[1].coefficient == minus {
+        return Some(TermPair(left: self.terms[0].term, right: self.terms[1].term))
+    }
+    if self.terms[0].coefficient == minus and self.terms[1].coefficient == one {
+        return Some(TermPair(left: self.terms[1].term, right: self.terms[0].term))
+    }
+    return None
+} Linear.difference
+
+/// A literal that is always true or always false.
+fn Literal.tautology(value: bool, alloc: mem::Alloc) -> Literal {
+    return Literal(negated: not value, atom: Atom.Le(Linear(terms: mem::List[LinearTerm].empty(alloc), constant: wide::Wide.zero())))
+} Literal.tautology
+
+/// The applications in an `all` body with its bound symbol as exactly one argument and no
+/// bound symbol among the others, each with that argument's position.
+fn Terms.triggers(self, forall: Forall) -> mem::List[Trigger] {
+    let alloc = self.alloc
+    var found = mem::List[Trigger].empty(alloc)
+    var seen = mem::Set[u32].empty(alloc)
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(forall.body)
+    loop {
+        let Some(term) = mut pending.pop() else {
+            break
+        }
+        if not mut seen.insert(term) {
+            continue
+        }
+        let parts = self.get(term).parts(alloc)
+        var count: usize = 0
+        var index: usize = 0
+        for position in 0..<parts.len() {
+            if parts[position] == forall.bound {
+                if count == 0 {
+                    index = position
+                }
+                count += 1
+            }
+        }
+        if count == 1 and not self.get(term).is_connective() and self.closed_but(parts.view(), index) {
+            mut found.push(Trigger(term: term, position: index))
+        }
+        for part in parts {
+            mut pending.push(part)
+        }
+    }
+    mut found.sort_by(fn(left: Trigger, right: Trigger) => trigger_order(left, right))
+    return found
+} Terms.triggers
+
+/// Whether no part but the one at `index` holds a bound symbol.
+fn Terms.closed_but(self, parts: Slice[u32], index: usize) -> bool {
+    for other in 0..<parts.len() {
+        if other != index and self.has_bound(parts[other]) {
+            return false
+        }
+    }
+    return true
+} Terms.closed_but
+
+/// The order of triggers: by term, then by position.
+fn trigger_order(left: Trigger, right: Trigger) -> core::Ordering {
+    let terms = left.term.cmp(right.term)
+    if terms != core::Ordering.Equal {
+        return terms
+    }
+    return left.position.cmp(right.position)
+} trigger_order
+
+fn Terms.has_bound(self, term: u32) -> bool {
+    match self.get(term) {
+        Term.Bound(_) => return true
+        else => {}
+    }
+    for part in self.get(term).parts(self.alloc) {
+        if self.has_bound(part) {
+            return true
+        }
+    }
+    return false
+} Terms.has_bound
+
+/// The subterms of an `all` body without bound symbols, whose classes its triggers compare.
+fn Terms.closed_parts(self, forall: Forall) -> mem::List[u32] {
+    var parts = mem::List[u32].empty(self.alloc)
+    for trigger in self.triggers(forall) {
+        let held = self.get(trigger.term).parts(self.alloc)
+        for at in 0..<held.len() {
+            if at != trigger.position {
+                mut parts.push(held[at])
+            }
+        }
+    }
+    return parts
+} Terms.closed_parts
+
+/// x ≡ r1 (mod m1) and x ≡ r2 (mod m2) as one congruence; a contradiction when they have no
+/// common solution, none when the result leaves the integers computed with.
+fn crt(r1: wide::Wide, m1: wide::Wide, r2: wide::Wide, m2: wide::Wide) -> Option[Congruence] fails Halt {
+    let g = wide_gcd(m1, b: m2)
+    let gap = r2.wrapping_sub(r1)
+    if not euclid_rem(gap, divisor: g).is_zero() {
+        fail Halt.Contradiction
+    }
+    let m1g = trunc_div(m1, divisor: g)
+    let Some(lcm) = m1g.checked_mul(m2) else {
+        return None
+    }
+    let m2g = trunc_div(m2, divisor: g)
+    let Some(inverse) = modular_inverse(euclid_rem(m1g, divisor: m2g), m: m2g) else {
+        return None
+    }
+    let Some(k) = euclid_rem(trunc_div(gap, divisor: g), divisor: m2g).checked_mul(inverse) else {
+        return None
+    }
+    let Some(scaled) = m1.checked_mul(euclid_rem(k, divisor: m2g)) else {
+        return None
+    }
+    let Some(x) = scaled.checked_add(r1) else {
+        return None
+    }
+    return Some(Congruence(residue: euclid_rem(x, divisor: lcm), modulus: lcm))
+} crt
+
+/// The inverse of a modulo m, for a and m coprime.
+fn modular_inverse(a: wide::Wide, m: wide::Wide) -> Option[wide::Wide] {
+    if m == wide::Wide.one() {
+        return Some(wide::Wide.zero())
+    }
+    var old_r = a
+    var r = m
+    var old_s = wide::Wide.one()
+    var s = wide::Wide.zero()
+    while not r.is_zero() {
+        let quotient = trunc_div(old_r, divisor: r)
+        let next_r = old_r.wrapping_sub(quotient.wrapping_mul(r))
+        old_r = r
+        r = next_r
+        let Some(product) = quotient.checked_mul(s) else {
+            return None
+        }
+        let Some(next_s) = old_s.checked_sub(product) else {
+            return None
+        }
+        old_s = s
+        s = next_s
+    }
+    if old_r != wide::Wide.one() {
+        return None
+    }
+    return Some(euclid_rem(old_s, divisor: m))
+} modular_inverse
+
+/// The intersection of two classes' intervals and congruences; none when empty.
+fn Class.intersect(self, other: Class) -> Option[Class] {
+    var low = self.low
+    match self.low {
+        Some(x) => match other.low {
+            Some(y) => {
+                low = Some(x.max_of(y))
+            }
+            None => {}
+        }
+        None => {
+            low = other.low
+        }
+    }
+    var high = self.high
+    match self.high {
+        Some(x) => match other.high {
+            Some(y) => {
+                high = Some(x.min_of(y))
+            }
+            None => {}
+        }
+        None => {
+            high = other.high
+        }
+    }
+    var residue = self.residue
+    var modulus = self.modulus
+    match attempt crt(self.residue, m1: self.modulus, r2: other.residue, m2: other.modulus) {
+        Err(_) => return None
+        Ok(Some(congruence)) => {
+            residue = congruence.residue
+            modulus = congruence.modulus
+        }
+        Ok(None) => {}
+    }
+    let class = Class(low: low, high: high, residue: residue, modulus: modulus).fitted()
+    if class.is_empty() {
+        return None
+    }
+    return Some(class)
+} Class.intersect
+
+fn floor_div(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let quotient = trunc_div(value, divisor)
+    if not trunc_rem(value, divisor).is_zero() and value.is_negative() != divisor.is_negative() {
+        return quotient.wrapping_sub(wide::Wide.one())
+    }
+    return quotient
+} floor_div
+
+fn ceil_div(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let quotient = trunc_div(value, divisor)
+    if not trunc_rem(value, divisor).is_zero() and value.is_negative() == divisor.is_negative() {
+        return quotient.wrapping_add(wide::Wide.one())
+    }
+    return quotient
+} ceil_div

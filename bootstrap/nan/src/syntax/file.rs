@@ -526,7 +526,8 @@ impl Parser {
         }
     }
 
-    /// Whether the run of doc comment lines at `at` documents what the parse reads next.
+    /// Whether the run of doc comment lines at `at` documents what the parse reads next: in a std
+    /// file, the next item after a function that ends at its head or its clauses.
     fn doc_run(&self, state: &State, at: usize) -> DocRun {
         let (run, after) = self.doc_run_tokens(at);
         let mut probe: Vec<Token> = run.iter().map(|&index| self.file.tokens[index]).collect();
@@ -543,6 +544,7 @@ impl Parser {
         match dry.feed(first, &self.file.source, &mut Discard) {
             Ok(Fed::Done) => DocRun::ItemEnds,
             Ok(Fed::Consumed) if dry.accepts(&probe[1..], &self.file.source) => DocRun::Admitted,
+            _ if self.std && dry.innermost_rule() == Some(Rule::FnEnd) => DocRun::ItemEnds,
             _ => DocRun::Misplaced,
         }
     }

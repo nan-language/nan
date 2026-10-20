@@ -7,8 +7,9 @@
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::body::Held;
-use super::super::fx::{Fx, PTR, unaligned};
+use super::super::fx::{Fx, PTR};
 use super::super::layout::Shape;
+use super::super::types::Wrap;
 use super::super::{Lowering, data::const_arg};
 use super::{Supply, element_at};
 use crate::check::ty::{Scalar, Ty};
@@ -187,8 +188,7 @@ fn slice(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let at = supply.param(1).scalar();
             let value = supply.param(2).scalar();
             let address = fx.b.ins().iadd(start, at);
-            let value = if big { fx.b.ins().bswap(value) } else { value };
-            fx.b.ins().store(unaligned(), value, address, 0);
+            fx.store_ordered(value, address, 0, true, big);
             supply.done(lo, fx);
         }
         member if member.starts_with('u') => {
@@ -200,8 +200,7 @@ fn slice(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 4 => types::I32,
                 _ => types::I64,
             };
-            let value = fx.b.ins().load(ty, unaligned(), address, 0);
-            let value = if big { fx.b.ins().bswap(value) } else { value };
+            let value = fx.load_ordered(ty, address, 0, true, big);
             supply.ret(lo, fx, Held::Scalar(value));
         }
         other => panic!("no lowering of {}.{other}", supply.path),
@@ -247,17 +246,16 @@ fn write_option_element(
     address: Value,
     present: Value,
     element: Value,
-    wrapped: bool,
+    wrapped: Option<Wrap>,
 ) {
     let element_ty = option
         .type_arg(0)
         .cloned()
         .expect("an option's payload type");
-    let held_as_address = wrapped && lo.is_part(&element_ty);
-    let layout_ty = if wrapped {
-        lo.wrapped_type(option)
-    } else {
-        option.clone()
+    let held_as_address = wrapped.is_some_and(|wrap| lo.is_part(&element_ty, wrap));
+    let layout_ty = match wrapped {
+        Some(wrap) => lo.wrapped_type(option, wrap),
+        None => option.clone(),
     };
     lo.write_option_with(fx, &layout_ty, address, present, |lo, fx, payload| {
         if held_as_address {
@@ -284,7 +282,7 @@ fn slice_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     });
     let sret = supply.sret.expect("an option's address");
     let option = lo.std_ty("core", "Option", vec![element_ty.clone()]);
-    write_option_element(lo, fx, &option, sret, present, start, true);
+    write_option_element(lo, fx, &option, sret, present, start, supply.wrap);
     supply.done(lo, fx);
 }
 
@@ -306,7 +304,7 @@ fn array_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     fx.store(kept, cursor, position_at);
     let sret = supply.sret.expect("an option's address");
     let option = supply.abi.result.clone();
-    write_option_element(lo, fx, &option, sret, present, element, false);
+    write_option_element(lo, fx, &option, sret, present, element, None);
     supply.done(lo, fx);
 }
 

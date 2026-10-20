@@ -1,0 +1,408 @@
+//! The LL(1) parse over the grammar's tables, under the resolutions the grammar publishes.
+
+struct Frame derives Copy {
+    seq: usize
+    elem: usize
+    count: usize
+    rule: Option[Rule]
+    /// The index of the first token the frame read.
+    start: usize
+} Frame
+
+/// Why the parse stopped before consuming a token.
+enum Failure {
+    /// A token the grammar does not accept, with the terminals it accepts there.
+    Token(at: usize, expected: TermSet)
+    /// A rejected alternative, parsed from the token at `start`.
+    Rejected(code: diagnostic::Code, start: usize)
+    /// `match`, or an `NL` inside a `{` the item opens, in a single-line item.
+    MultipleLines(at: usize)
+} Failure
+
+enum Fed derives Copy, Eq {
+    /// The token belongs to the parse and was consumed.
+    Consumed
+    /// The start rule completed before the token.
+    Done
+} Fed
+
+/// The next token, its index, and the token after it, which the context-word exceptions and the
+/// resolution of `limits` commas read.
+struct Lookahead derives Copy {
+    token: Token
+    next: Option[Token]
+    at: usize
+} Lookahead
+
+/// The first token and the end token index of a prefix expression.
+struct Operand derives Copy, Eq {
+    start: usize
+    end: usize
+} Operand
+
+/// A parse in progress: the frames of the expanded rules and what the item read so far opened.
+struct State {
+    /// The start rule until the first token chooses its alternative.
+    start: Option[Rule]
+    frames: mem::List[Frame]
+    single_line: bool
+    braces: usize
+    pascal_path: bool
+    /// The last prefix expression parsed.
+    last_operand: Option[Operand]
+} State
+
+/// Receives the parse's tree events.
+interface Sink {
+    fn open(mut self, rule: Rule)
+    fn token(mut self, at: usize)
+    fn close(mut self)
+} Sink
+
+impl Builder: Sink
+
+/// A sink for dry runs, which keep no tree.
+struct Discard derives Copy {
+} Discard
+
+impl Discard: Sink
+
+fn Discard.open(mut self, rule: Rule) {
+} Discard.open
+
+fn Discard.token(mut self, at: usize) {
+} Discard.token
+
+fn Discard.close(mut self) {
+} Discard.close
+
+/// How well a lookahead matches what can start a symbol; lower ranks win. A context word beats
+/// `IDENT`, and an alternative outside every rejection beats a rejected one.
+fn rank(reached: First, look: Look) -> Option[u8] {
+    match look.context {
+        Some(word) => {
+            if reached.ok.contains(Term.Context(word)) {
+                return Some(0)
+            }
+            if reached.rejected.contains(Term.Context(word)) {
+                return Some(1)
+            }
+        }
+        None => {}
+    }
+    match look.term {
+        Some(term) => {
+            if reached.ok.contains(term) {
+                return Some(2)
+            }
+            if reached.rejected.contains(term) {
+                return Some(3)
+            }
+        }
+        None => {}
+    }
+    return None
+} rank
+
+struct Look derives Copy {
+    term: Option[Term]
+    context: Option[ContextWord]
+} Look
+
+fn Look.of(lookahead: Lookahead, source: Slice[u8]) -> Look {
+    var next_kind: Option[TokenKind] = None
+    match lookahead.next {
+        Some(next) => {
+            next_kind = Some(next.kind)
+        }
+        None => {}
+    }
+    var context = lookahead.token.context_word(source)
+    match context {
+        Some(ContextWord.Task) => {
+            if next_kind != Some(TokenKind.Keyword(Keyword.Fn)) {
+                context = None
+            }
+        }
+        Some(ContextWord.All) or Some(ContextWord.Any) => {
+            if next_kind != Some(TokenKind.Ident) {
+                context = None
+            }
+        }
+        Some(ContextWord.Manual) => {
+            if next_kind != Some(TokenKind.Text) {
+                context = None
+            }
+        }
+        else => {}
+    }
+    return Look(term: lookahead.token.kind.term(), context: context)
+} Look.of
+
+/// Whether the lookahead can start `rule`, through a rejected alternative or not.
+fn starts(rule: Rule, lookahead: Lookahead, source: Slice[u8], grammar: Grammar) -> bool {
+    return rank(grammar.analysis.choice(rule.choice(grammar)), look: Look.of(lookahead, source)).is_some()
+} starts
+
+/// Whether an identifier has the PascalCase shape: an uppercase letter, then letters and digits
+/// holding a lowercase letter unless it is one letter.
+pkg fn is_pascal(name: Slice[u8]) -> bool {
+    if name.len() == 0 or not (name[0] >= b'A' and name[0] <= b'Z') {
+        return false
+    }
+    var lowercase = false
+    for byte in name {
+        let lower = byte >= b'a' and byte <= b'z'
+        let upper = byte >= b'A' and byte <= b'Z'
+        let digit = byte >= b'0' and byte <= b'9'
+        if not (lower or upper or digit) {
+            return false
+        }
+        lowercase = lowercase or lower
+    }
+    return name.len() == 1 or lowercase
+} is_pascal
+
+fn State.new(start: Rule, alloc: mem::Alloc) -> State {
+    return State(start: Some(start), frames: mem::List[Frame].empty(alloc), single_line: false, braces: 0, pascal_path: false, last_operand: None)
+} State.new
+
+fn State.clone(self, alloc: mem::Alloc) -> State {
+    var frames = mem::List[Frame].empty(alloc)
+    for frame in self.frames {
+        mut frames.push(frame)
+    }
+    return State(start: self.start, frames: take frames, single_line: self.single_line, braces: self.braces, pascal_path: self.pascal_path, last_operand: self.last_operand)
+} State.clone
+
+fn State.push_rule[S: Sink](mut self, rule: Rule, seq: usize, at: usize, mut sink: S, grammar: Grammar) {
+    mut sink.open(rule)
+    let single_line_kind = match rule {
+        Rule.ImplItem or Rule.ConstItem or Rule.ConstAssertItem or Rule.RegistryItem or Rule.ContributeItem or Rule.RetiredItem => true
+        else => false
+    }
+    var single_line_fn = false
+    if rule == Rule.FnEnd {
+        single_line_fn = match grammar.seqs[seq].elems[0].atom {
+            Atom.Term(Term.Punct(Punct.Eq)) or Atom.Rule(Rule.ConventionClause) => true
+            else => false
+        }
+    }
+    self.single_line = self.single_line or single_line_kind or single_line_fn
+    mut self.frames.push(Frame(seq: seq, elem: 0, count: 0, rule: Some(rule), start: at))
+} State.push_rule
+
+/// The alternative of a choice the lookahead selects, if any.
+fn State.choose(choice: usize, look: Look, grammar: Grammar) -> Option[usize] {
+    var best: Option[usize] = None
+    var best_rank: u8 = 0
+    for alt in grammar.choices[choice] {
+        let Some(ranked) = rank(grammar.analysis.seq(alt), look) else {
+            continue
+        }
+        if best.is_none() or ranked < best_rank {
+            best = Some(alt)
+            best_rank = ranked
+        }
+    }
+    if best.is_some() {
+        return best
+    }
+    for alt in grammar.choices[choice] {
+        if grammar.analysis.seq(alt).nullable {
+            return Some(alt)
+        }
+    }
+    return None
+} State.choose
+
+/// Advances the parse to the lookahead token: expands and completes rules until the token is
+/// consumed, the start rule completes before it, or the parse fails at it.
+fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut sink: S, grammar: Grammar) -> Fed fails Failure
+    waive length "one loop over the frames, as the Rust parse"
+{
+    let look = Look.of(lookahead, source)
+    let at = lookahead.at
+    var expected = TermSet.default()
+    match mut self.start.extract() {
+        Some(start) => {
+            let choice = start.choice(grammar)
+            let Some(alt) = State.choose(choice, look, grammar) else {
+                fail Failure.Token(at: at, expected: grammar.analysis.choice(choice).ok)
+            }
+            mut self.push_rule(start, seq: alt, at, mut sink, grammar)
+        }
+        None => {}
+    }
+    loop {
+        let depth = self.frames.len()
+        if depth == 0 {
+            return Fed.Done
+        }
+        let top = depth - 1
+        let frame = self.frames[top]
+        let elems = grammar.seqs[frame.seq].elems
+        if frame.elem == elems.len() {
+            discard mut self.frames.pop()
+            match grammar.seqs[frame.seq].rejection {
+                Some(code) => fail Failure.Rejected(code: code, start: frame.start)
+                None => {}
+            }
+            match frame.rule {
+                Some(rule) => {
+                    mut sink.close()
+                    if rule == Rule.PrefixExpr {
+                        self.last_operand = Some(Operand(start: frame.start, end: at))
+                    }
+                }
+                None => {}
+            }
+            if top > 0 {
+                self.frames[top - 1].count += 1
+            }
+            continue
+        }
+        let elem = elems[frame.elem]
+        let may = match elem.repeat {
+            Repeat.One or Repeat.Opt => frame.count == 0
+            Repeat.Star or Repeat.Plus => true
+        }
+        let must = match elem.repeat {
+            Repeat.One or Repeat.Plus => frame.count == 0
+            Repeat.Opt or Repeat.Star => false
+        }
+        if not may {
+            self.frames[top].elem += 1
+            self.frames[top].count = 0
+            continue
+        }
+        let atom_first = grammar.analysis.atom(elem.atom, grammar)
+        let can_start = rank(atom_first, look).is_some()
+        let resolved = self.resolves(frame, atom: elem.atom, lookahead, source, grammar)
+        if not must and not (can_start and resolved) {
+            if not can_start {
+                mut expected.union(atom_first.ok)
+            }
+            self.frames[top].elem += 1
+            self.frames[top].count = 0
+            continue
+        }
+        match elem.atom {
+            Atom.Term(term) => {
+                if not can_start {
+                    mut expected.insert(term)
+                    fail Failure.Token(at: at, expected: expected)
+                }
+                self.frames[top].count += 1
+                try mut self.consume(lookahead, source, mut sink)
+                return Fed.Consumed
+            }
+            Atom.Rule(rule) => {
+                let Some(alt) = State.choose(rule.choice(grammar), look, grammar) else {
+                    mut expected.union(atom_first.ok)
+                    fail Failure.Token(at: at, expected: expected)
+                }
+                mut self.push_rule(rule, seq: alt, at, mut sink, grammar)
+            }
+            Atom.Group(choice) => {
+                let Some(alt) = State.choose(choice, look, grammar) else {
+                    mut expected.union(atom_first.ok)
+                    fail Failure.Token(at: at, expected: expected)
+                }
+                mut self.frames.push(Frame(seq: alt, elem: 0, count: 0, rule: None, start: at))
+            }
+        }
+    }
+} State.feed
+
+/// Whether the resolutions the grammar publishes let an element the lookahead can start begin
+/// there: generic arguments after a PascalCase path segment, and a `limits` comma before a limit.
+fn State.resolves(self, frame: Frame, atom: Atom, lookahead: Lookahead, source: Slice[u8], grammar: Grammar) -> bool {
+    if frame.rule == Some(Rule.PathExpr) and atom == Atom.Rule(Rule.GenericArgs) {
+        return self.pascal_path
+    }
+    let group = match atom {
+        Atom.Group(_) => true
+        else => false
+    }
+    if frame.rule == Some(Rule.LimitsClause) and group {
+        let Some(next) = lookahead.next else {
+            return false
+        }
+        let after = Lookahead(token: next, next: None, at: lookahead.at)
+        return rank(grammar.analysis.choice(Rule.Limit.choice(grammar)), look: Look.of(after, source)).is_some()
+    }
+    return true
+} State.resolves
+
+fn State.consume[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut sink: S) fails Failure {
+    let token = lookahead.token
+    match first token.kind {
+        TokenKind.Keyword(Keyword.Match) if self.single_line => fail Failure.MultipleLines(at: lookahead.at)
+        TokenKind.Nl if self.single_line and self.braces > 0 => fail Failure.MultipleLines(at: lookahead.at)
+        TokenKind.Punct(Punct.LBrace) => {
+            self.braces += 1
+        }
+        TokenKind.Punct(Punct.RBrace) => {
+            self.braces = self.braces.saturating_sub(1)
+        }
+        else => {}
+    }
+    if token.kind == TokenKind.Ident {
+        let Some(parts) = source.split_at(usize.widen(token.start)) else {
+            expect false
+            return
+        }
+        let Some(name) = parts.tail.prefix(usize.widen(token.end - token.start)) else {
+            expect false
+            return
+        }
+        self.pascal_path = is_pascal(name)
+    }
+    mut sink.token(lookahead.at)
+} State.consume
+
+/// The rule of the innermost frame that expands one.
+fn State.innermost_rule(self) -> Option[Rule] {
+    var index = self.frames.len()
+    while index > 0 {
+        index -= 1
+        match self.frames[index].rule {
+            Some(rule) => return Some(rule)
+            None => {}
+        }
+    }
+    return None
+} State.innermost_rule
+
+/// The atom the innermost frame stands at, if it has not passed its end.
+fn State.current_atom(self, grammar: Grammar) -> Option[Atom] {
+    let depth = self.frames.len()
+    if depth == 0 {
+        return None
+    }
+    let frame = self.frames[depth - 1]
+    let elems = grammar.seqs[frame.seq].elems
+    if frame.elem >= elems.len() {
+        return None
+    }
+    return Some(elems[frame.elem].atom)
+} State.current_atom
+
+/// Whether the parse accepts these tokens in order, each read with the next as lookahead.
+fn State.accepts(self, tokens: Slice[Token], source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> bool {
+    var state = self.clone(alloc)
+    var dry = Discard()
+    for index in 0..<tokens.len() {
+        var next: Option[Token] = None
+        if index + 1 < tokens.len() {
+            next = Some(tokens[index + 1])
+        }
+        let lookahead = Lookahead(token: tokens[index], next: next, at: ~0usize)
+        match attempt mut state.feed(lookahead, source, sink: mut dry, grammar) {
+            Ok(Fed.Consumed) => {}
+            else => return false
+        }
+    }
+    return true
+} State.accepts

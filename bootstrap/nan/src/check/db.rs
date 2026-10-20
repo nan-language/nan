@@ -3,7 +3,7 @@
 //! each module declares, the functions named after each type and the tombstones of retired forms.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ty::Scalar;
 use crate::syntax::ast;
@@ -114,9 +114,11 @@ struct Reads {
     subjects: Vec<(Option<ItemId>, Option<u32>)>,
     /// The items each subject's queries read, each once, in order of first read.
     read: HashMap<ItemId, Vec<ItemId>>,
+    noted: HashSet<(ItemId, ItemId)>,
     /// The items read while checking each line of a subject's text, line 0 standing for its
     /// reads outside every line checked, in order of first read.
     on_lines: HashMap<(ItemId, u32), Vec<ItemId>>,
+    noted_on_lines: HashSet<(ItemId, u32, ItemId)>,
 }
 
 /// Whether a variant selector matches a target.
@@ -324,6 +326,11 @@ impl<'a> Db<'a> {
         *self.reads.borrow_mut() = Some(Reads::default());
     }
 
+    /// Whether the queries' reads are being recorded.
+    pub fn recording(&self) -> bool {
+        self.reads.borrow().is_some()
+    }
+
     /// Records that the current subject reads an item's facts.
     pub fn note(&self, item: ItemId) {
         let mut reads = self.reads.borrow_mut();
@@ -336,16 +343,16 @@ impl<'a> Db<'a> {
         if subject == item {
             return;
         }
-        let read = reads.read.entry(subject).or_default();
-        if !read.contains(&item) {
-            read.push(item);
+        if reads.noted.insert((subject, item)) {
+            reads.read.entry(subject).or_default().push(item);
         }
-        let on_line = reads
-            .on_lines
-            .entry((subject, line.unwrap_or(0)))
-            .or_default();
-        if !on_line.contains(&item) {
-            on_line.push(item);
+        let line = line.unwrap_or(0);
+        if reads.noted_on_lines.insert((subject, line, item)) {
+            reads
+                .on_lines
+                .entry((subject, line))
+                .or_default()
+                .push(item);
         }
     }
 

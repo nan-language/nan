@@ -232,12 +232,11 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
             let lines = file.syntax.item_lines(syntax);
             let head = match item {
                 Some(item) => db.item(item).head_line(),
-                None => {
-                    crate::syntax::ast::lower(&file.syntax, syntax.tree.as_ref().expect("a tree"))
-                        .map_or(*lines.start(), |ast| {
-                            file.syntax.tokens[ast.token as usize].line
-                        })
-                }
+                None => file.lowered()[index]
+                    .as_ref()
+                    .map_or(*lines.start(), |ast| {
+                        file.syntax.tokens[ast.token as usize].line
+                    }),
             };
             if !scope.holds(workspace, &file.path, Some(head))
                 || !listed.insert((file.path.clone(), head))

@@ -1,0 +1,206 @@
+//! The facts of the operations std declares without a body, which the toolchain supplies: those their owning chapters state for named operations, and those growth, interior mutability, capabilities and floats give the others.
+
+/// The supplied operations that draw memory although no `try_` form names them.
+const DRAWING: Str = "mem::Shared.make_mut mem::wire::Codec.decode text::json::Codec.decode task::Scope.spawn task::race sys::Fs.read_all sys::Domain.run sys::Cx.spawn sys::sim::fs sys::sim::stdio hw::PerCpu.of hw::sim::Registers.of hw::sim::Registers.queue hw::sim::Registers.queue_at boot::Kernel.anchor host::Runner.run testing::world"
+
+/// The supplied operations whose owning chapters name traps other than exhausted memory: stale
+/// handles, indexes past an end, duplicate windows, and exhausted capability tables and cells.
+const TRAPPING: Str = "mem::Alloc.split mem::Arena.at mem::Pool.at mem::Pool.at_mut mem::Pool.remove text::Interner.resolve task::Join.join sys::revocable sys::Fs.subdir sys::Fs.read_only sys::Net.only_host sys::sim::net sys::sim::random hw::sim::Registers.mmio hw::sim::Registers.ports hw::sim::Registers.set_at hw::sim::Registers.last_written_at"
+
+/// The supplied operations that change an atomic count without a type with interior mutability.
+const COUNTED_OPERATIONS: Str = "mem::Shared.share mem::Shared.make_mut"
+
+/// The std types storing their contents inline, which never draw memory.
+const INLINE_STORED: Str = "text::Fixed mem::Bounded"
+
+/// The device, priv and sync facts the owning chapters state for pointers, register windows,
+/// DMA and privileged intrinsics, by the canonical path of an operation or of the type it is a
+/// member of.
+fn stated_facts(path: Str, alloc: mem::Alloc) -> Option[Digest] {
+    let start = member_start(path)
+    var owner_end = path.byte_len()
+    var member_from = path.byte_len()
+    if start > 0 {
+        owner_end = start - 1
+        member_from = start
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        return None
+    }
+    let Some(member) = path.slice_bytes(member_from, end: path.byte_len()) else {
+        return None
+    }
+    var digest = Digest.none(alloc)
+    match owner {
+        "hw::Ptr" => {
+            digest.sync = member == "read" or member == "write" or member == "copy" or member.starts_with("atomic_")
+        }
+        "hw::fence" => {
+            digest.sync = true
+        }
+        "hw::UserAddr" => {
+            if member != "copy_in" {
+                return None
+            }
+            digest.sync = true
+        }
+        "hw::Mmio" or "hw::Ports" or "hw::Dma" or "hw::DmaShared" or "hw::dma_fence" => {
+            digest.device = true
+        }
+        "hw::Ring0" => {
+            digest.privileged = true
+        }
+        else => return None
+    }
+    return Some(take digest)
+} stated_facts
+
+/// The digest of a supplied operation: waiting as its head states and terminating unless it
+/// waits; the facts its owning chapter states; drawing memory when it grows or makes
+/// storage; the sync fact on a type with interior mutability or an atomic count; the
+/// primitive capabilities it receives or is a member of, other than allocators; and float
+/// use when its head takes or gives a float. A head demanding `pure` or `noalloc` leaves out what it excludes.
+fn Checker.supplied(self, item: ty::ItemId) -> Digest {
+    let alloc = self.alloc()
+    let Some(head) = self.fn_sig(item) else {
+        return Digest.declared(wait: false, limit_set: ty::LimitSet.none(), alloc)
+    }
+    let db = self.db()
+    let types = self.types()
+    let path = db.canonical(item)
+    var digest = match stated_facts(path.as_str(), alloc) {
+        Some(stated) => stated
+        None => Digest.none(alloc)
+    }
+    digest.wait = head.wait
+    digest.terminates = not head.wait
+    var float = is_float_ty(types.scalar_of(head.result))
+    for param in head.params {
+        if is_float_ty(types.scalar_of(param.ty)) {
+            float = true
+        }
+    }
+    digest.float = float
+    if head.limit_set.pure {
+        return digest
+    }
+    digest.alloc = not head.limit_set.noalloc and self.draws(item, path: path.as_str(), head)
+    var owner: Option[ty::ItemId] = None
+    match db.owners.get(item) {
+        Some(TypeKey.Item(found)) => {
+            owner = Some(found)
+        }
+        else => {}
+    }
+    let counted = is_listed(COUNTED_OPERATIONS, word: path.as_str())
+    var interior = false
+    if not counted {
+        match owner {
+            Some(found) => {
+                interior = is_listed(INTERIOR_TYPES, word: db.canonical(found).as_str())
+            }
+            None => {}
+        }
+    }
+    if counted or interior {
+        digest.sync = true
+    }
+    var capabilities = mem::Set[ty::ItemId].empty(alloc)
+    for param in head.params {
+        let ty::TyKind.Item(item: capability, args: _) = types.kind(param.ty) else {
+            continue
+        }
+        if self.is_held_capability(capability) {
+            discard mut capabilities.insert(capability)
+        }
+    }
+    match owner {
+        Some(found) => {
+            if self.is_held_capability(found) {
+                discard mut capabilities.insert(found)
+            }
+        }
+        None => {}
+    }
+    digest.capabilities = Some(take capabilities)
+    return digest
+} Checker.supplied
+
+/// Whether a scalar is a float.
+fn is_float_ty(scalar: Option[ty::Scalar]) -> bool {
+    return match scalar {
+        Some(found) => found.is_float()
+        None => false
+    }
+} is_float_ty
+
+/// Whether an item is a primitive capability other than an allocator, which a supplied
+/// operation's digest holds.
+fn Checker.is_held_capability(self, capability: ty::ItemId) -> bool {
+    if not self.is_primitive_capability(capability) {
+        return false
+    }
+    let path = self.db().canonical(capability)
+    return path.as_str() != "mem::Alloc"
+} Checker.is_held_capability
+
+/// Whether a supplied operation takes its read argument as the place holding it, whatever
+/// its type: `hw::Ptr.of`, whose pointer is to that place.
+fn Checker.reads_in_place(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    if not db.is_std(item) {
+        return false
+    }
+    let path = db.canonical(item)
+    return path.as_str() == "hw::Ptr.of"
+} Checker.reads_in_place
+
+/// Whether a supplied operation has a trap site: unless its head demands `notrap`, when it
+/// draws memory other than through a `try_` form, or its owning chapter names a trap.
+fn Checker.supplied_traps(self, item: ty::ItemId) -> bool {
+    let Some(head) = self.fn_sig(item) else {
+        return true
+    }
+    if head.limit_set.notrap {
+        return false
+    }
+    let path = self.db().canonical(item)
+    let spelt = path.as_str()
+    let Some(member) = spelt.slice_bytes(member_start(spelt), end: spelt.byte_len()) else {
+        return false
+    }
+    let exhausts = self.draws(item, path: spelt, head) and not member.starts_with("try_")
+    return exhausts or is_listed(TRAPPING, word: spelt)
+} Checker.supplied_traps
+
+/// Whether a supplied operation draws memory: a `try_` form, an operation with one, or one
+/// its owning chapter names as drawing, on a type that does not store its contents inline.
+fn Checker.draws(self, item: ty::ItemId, path: Str, head: FnSig) -> bool {
+    if head.limit_set.pure or head.limit_set.noalloc {
+        return false
+    }
+    let start = member_start(path)
+    var owner_end: usize = 0
+    if start > 0 {
+        owner_end = start - 1
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        return false
+    }
+    let Some(member) = path.slice_bytes(start, end: path.byte_len()) else {
+        return false
+    }
+    if is_listed(INLINE_STORED, word: owner) {
+        return false
+    }
+    if is_listed(DRAWING, word: path) or member.starts_with("try_") {
+        return true
+    }
+    let db = self.db()
+    let Some(key) = db.owners.get(item) else {
+        return false
+    }
+    var fallible = text::String.of("try_", alloc: self.alloc())
+    mut fallible.append(member)
+    return db.members(key, name: fallible.as_str()).len() > 0
+} Checker.draws

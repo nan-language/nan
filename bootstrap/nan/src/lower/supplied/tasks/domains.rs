@@ -30,7 +30,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 let this = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, index as i64);
                 let ty = ty.clone();
                 fx.when(this, |fx| {
-                    let value = lo.variant_value(fx, &ty, name, &[], false);
+                    let value = lo.variant_value(fx, &ty, name, &[], None);
                     lo.store_held(fx, slot, value, &ty);
                 });
             }
@@ -96,7 +96,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         lo.record_free(fx, record);
         let value = fx.slot(8, 8);
         fx.store(trap, value, 0);
-        let err = lo.variant_value(fx, &option, "Err", &[Held::Address(value)], false);
+        let err = lo.variant_value(fx, &option, "Err", &[Held::Address(value)], None);
         lo.store_held(fx, slot, err, &option);
         let held = lo.held_at(fx, &option, slot);
         supply.ret(lo, fx, held);
@@ -113,7 +113,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         |lo, fx| {
             let result = fx.load(PTR, first, task::RESULT);
             let held = lo.held_at(fx, &result_ty, result);
-            let ok = lo.variant_value(fx, &option, "Ok", &[held], false);
+            let ok = lo.variant_value(fx, &option, "Ok", &[held], None);
             lo.store_held(fx, slot, ok, &option);
             lo.transfer(fx, &option, slot, caller_domain, caller_domain);
             Vec::new()

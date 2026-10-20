@@ -1,0 +1,835 @@
+//! The item database of one check under one target: the workspace's and std's packages, their modules with the variants the target selects, their items lowered to abstract syntax, the names each module declares, the functions named after each type and the tombstones of retired forms.
+
+/// What a function named `Type.name` is named after.
+enum TypeKey derives Copy, Eq, Hash {
+    Scalar(ty::Scalar)
+    Unit
+    Item(ty::ItemId)
+} TypeKey
+
+/// Where a package of a database lies: a closure's member, or a std package the toolchain
+/// carries, by its index among the packages of the std workspace.
+enum PackageSource derives Copy, Eq, Hash {
+    Member(workspace::Member)
+    Carried(usize)
+} PackageSource
+
+/// A source file of a package: one of its files or of its history's, by index.
+struct FileRef derives Copy, Eq, Hash {
+    source: PackageSource
+    history: bool
+    index: usize
+} FileRef
+
+struct PackageData {
+    source: PackageSource
+    name: text::String
+    /// Whether it is a std package.
+    std: bool
+    /// Whether it is a std package the toolchain carries, which no check reports on, rather than
+    /// one of the workspace.
+    carried: bool
+    /// Whether it is checked without being reported on: a release of the local store, or a
+    /// workspace package another closure checks.
+    quiet: bool
+    /// The closure member it is; none for a carried std package.
+    member: Option[workspace::Member]
+    /// Its modules, by their index in the package.
+    modules: mem::List[ty::ModuleId]
+    root: Option[ty::ModuleId]
+    /// The package each of its `dep` aliases names, when it lies in the workspace.
+    deps: mem::Map[text::String, Option[ty::PackageId]]
+} PackageData
+
+struct ModuleData {
+    package_id: ty::PackageId
+    name: text::String
+    root: bool
+    /// Its items in byte order of file path, then position.
+    items: mem::List[ty::ItemId]
+    /// The items each name declares, functions named after a type excepted.
+    names: mem::Map[text::String, mem::List[ty::ItemId]]
+    /// Whether one of its files holds an item the parse abandoned.
+    abandoned: bool
+    /// Its source files of the variant the target selects, in byte order of path.
+    files: mem::List[FileRef]
+} ModuleData
+
+/// An item of the database, whose abstract syntax its file's lowering holds.
+struct ItemData derives Copy {
+    module: ty::ModuleId
+    file: FileRef
+    /// Its index among the items of its file.
+    index: usize
+} ItemData
+
+struct Db {
+    /// The workspace and the std packages the database reads.
+    session: Session
+    target: workspace::Target
+    packages: mem::List[PackageData]
+    modules: mem::List[ModuleData]
+    items: mem::List[ItemData]
+    /// The package each std alias names.
+    std: mem::Map[text::String, ty::PackageId]
+    /// The functions named after each type, by member name.
+    member_table: mem::HashMap[TypeKey, mem::Map[text::String, mem::List[ty::ItemId]]]
+    /// The type each function named after one is named after.
+    owners: mem::HashMap[ty::ItemId, TypeKey]
+    /// The tombstones, by the canonical path of their old form.
+    tombstones: mem::Map[text::String, mem::List[ty::ItemId]]
+    /// What the queries read, once recording starts.
+    reads: Reads
+    /// No item, which `members` views for a member no function is named after.
+    no_items: mem::List[ty::ItemId]
+    /// An item standing for none, which `declaration` gives after its trap for a missing one.
+    absent: ast::Item
+} Db
+
+/// The items whose facts each subject's queries read.
+struct Reads {
+    /// Whether recording has started.
+    recording: core::atomic::AtomicBool
+    /// The item the queries being computed are about, `NO_ID` for none or for a rule relating
+    /// several items.
+    subject: core::atomic::AtomicU32
+    /// The line of the subject's text being checked, `NO_ID` for none.
+    line: core::atomic::AtomicU32
+    /// The items each subject's queries read, each once, in order of first read.
+    read: mem::OnceMap[ty::ItemId, mem::Arena[ty::ItemId]]
+    noted: mem::OnceMap[ItemRead, Unit]
+    /// The items read while checking each line of a subject's text, line 0 standing for its
+    /// reads outside every line checked, in order of first read.
+    on_lines: mem::OnceMap[LineKey, mem::Arena[ty::ItemId]]
+    noted_on_lines: mem::OnceMap[LineRead, Unit]
+    /// The lines of each subject's text with recorded reads, in order of first read.
+    lines: mem::OnceMap[ty::ItemId, mem::Arena[u32]]
+} Reads
+
+/// A subject and an item its queries read.
+struct ItemRead derives Copy, Eq, Hash {
+    subject: ty::ItemId
+    item: ty::ItemId
+} ItemRead
+
+/// A line of a subject's text.
+struct LineKey derives Copy, Eq, Hash {
+    subject: ty::ItemId
+    line: u32
+} LineKey
+
+/// A line of a subject's text and an item read while checking it.
+struct LineRead derives Copy, Eq, Hash {
+    subject: ty::ItemId
+    line: u32
+    item: ty::ItemId
+} LineRead
+
+fn Reads.empty(alloc: mem::Alloc) -> Reads {
+    return Reads(recording: core::atomic::AtomicBool.of(false), subject: core::atomic::AtomicU32.of(NO_ID), line: core::atomic::AtomicU32.of(NO_ID), read: mem::OnceMap[ty::ItemId, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted: mem::OnceMap[ItemRead, Unit].empty(seed: 0, alloc), on_lines: mem::OnceMap[LineKey, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted_on_lines: mem::OnceMap[LineRead, Unit].empty(seed: 0, alloc), lines: mem::OnceMap[ty::ItemId, mem::Arena[u32]].empty(seed: 0, alloc))
+} Reads.empty
+
+/// Whether a variant selector matches a target.
+fn selects(selector: Str, target: workspace::Target) -> bool {
+    return match selector {
+        "x86_64-host" or "host" => target == workspace::Target.Host
+        "x86_64-uefi" or "uefi" => target == workspace::Target.Uefi
+        "x86_64-bare" or "bare" => target == workspace::Target.Bare
+        "x86_64" => target != workspace::Target.Any
+        else => false
+    }
+} selects
+
+/// The database of a closure's packages and std under `target`: the workspace packages it
+/// checks, its other members quiet, and each std package no member is named like, carried.
+fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Target) -> Db {
+    let alloc = session.alloc
+    var db = Db(session: session.share(), target: target, packages: mem::List[PackageData].empty(alloc), modules: mem::List[ModuleData].empty(alloc), items: mem::List[ItemData].empty(alloc), std: mem::Map[text::String, ty::PackageId].empty(alloc), member_table: mem::HashMap[TypeKey, mem::Map[text::String, mem::List[ty::ItemId]]].empty(seed: 0, alloc), owners: mem::HashMap[ty::ItemId, TypeKey].empty(seed: 0, alloc), tombstones: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc), reads: Reads.empty(alloc), no_items: mem::List[ty::ItemId].empty(alloc), absent: ast::Item(token: 0, visibility: ast::Visibility.Private, type_modifiers: mem::List[ast::Word[ast::TypeModifier]].empty(alloc), kind: ast::ItemKind.Package))
+    let held = session.workspace.contents()
+    var members = mem::List[workspace::Member].empty(alloc)
+    for entry in closure.members {
+        mut members.push(entry.value())
+    }
+    mut members.sort_by(fn(left: workspace::Member, right: workspace::Member) => left.cmp(right))
+    for member in members {
+        let source = held.member(member)
+        if source.manifest.is_none() {
+            continue
+        }
+        let quiet = match member {
+            workspace::Member.Source(index) => not holds_index(closure.checked.view(), wanted: index)
+            workspace::Member.Release(_) => true
+        }
+        mut db.add_package(source, at: PackageSource.Member(member), quiet)
+    }
+    let carried = session.std.contents()
+    for index in 0..<carried.packages.len() {
+        let source = carried.packages[index]
+        let Some(name) = source.name() else {
+            continue
+        }
+        if source.manifest.is_some() and closure.member(name).is_none() {
+            mut db.add_package(source, at: PackageSource.Carried(index), quiet: false)
+        }
+    }
+    for index in 0..<db.packages.len() {
+        let data = db.packages[index]
+        if data.std and is_alias(data.name.as_str()) {
+            discard mut db.std.insert(text::String.of(data.name.as_str(), alloc), value: ty::PackageId(index: u32.fit(index)))
+        }
+    }
+    var deps = mem::List[mem::Map[text::String, Option[ty::PackageId]]].empty(alloc)
+    for data in db.packages {
+        mut deps.push(db.package_deps(data, closure))
+    }
+    var index: usize = 0
+    for found in take deps {
+        db.packages[index].deps = found
+        index += 1
+    }
+    return db
+} Db.build
+
+/// Whether a list of indexes holds one.
+fn holds_index(indexes: Slice[usize], wanted: usize) -> bool {
+    for index in indexes {
+        if index == wanted {
+            return true
+        }
+    }
+    return false
+} holds_index
+
+/// Whether a package name is a std alias.
+fn is_alias(name: Str) -> bool {
+    for alias in stdlib::PACKAGES {
+        if alias.name() == name {
+            return true
+        }
+    }
+    return false
+} is_alias
+
+/// The package each `dep` alias of a package names, when it lies in the database.
+fn Db.package_deps(self, data: PackageData, closure: workspace::Closure) -> mem::Map[text::String, Option[ty::PackageId]] {
+    let alloc = self.session.alloc
+    var deps = mem::Map[text::String, Option[ty::PackageId]].empty(alloc)
+    let source = self.source_of(data.source)
+    let Some(manifest) = source.manifest else {
+        expect false
+        return deps
+    }
+    for dep in manifest.deps {
+        var found: Option[ty::PackageId] = None
+        match data.member {
+            Some(member) => {
+                match closure.alias(member, alias: dep.alias.as_str()) {
+                    Some(named) => {
+                        found = self.package_of_member(named)
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        discard mut deps.insert(text::String.of(dep.alias.as_str(), alloc), value: found)
+    }
+    return deps
+} Db.package_deps
+
+/// The package of the database that is a closure's member.
+fn Db.package_of_member(self, member: workspace::Member) -> Option[ty::PackageId] {
+    for index in 0..<self.packages.len() {
+        if self.packages[index].member == Some(member) {
+            return Some(ty::PackageId(index: u32.fit(index)))
+        }
+    }
+    return None
+} Db.package_of_member
+
+/// The package a source names.
+proj fn Db.source_of(self, source: PackageSource) -> workspace::Package {
+    return match source {
+        PackageSource.Member(member) => self.session.workspace.contents().member(member)
+        PackageSource.Carried(index) => self.session.std.contents().packages[index]
+    }
+} Db.source_of
+
+/// Adds a package: a closure's member, or a carried std package without one.
+fn Db.add_package(mut self, source: workspace::Package, at: PackageSource, quiet: bool) {
+    let alloc = self.session.alloc
+    let member = match at {
+        PackageSource.Member(held) => Some(held)
+        PackageSource.Carried(_) => None
+    }
+    let carried = member.is_none()
+    let id = ty::PackageId(index: u32.fit(self.packages.len()))
+    let Some(named) = source.name() else {
+        expect false
+        return
+    }
+    let name = text::String.of(named, alloc)
+    let std = stdlib::is_std(name.as_str())
+    var modules = mem::List[ty::ModuleId].empty(alloc)
+    var root: Option[ty::ModuleId] = None
+    for index in 0..<source.modules.len() {
+        let module = source.modules[index]
+        let selected = selected_dirs(module, target: self.target, alloc)
+        var is_root = false
+        for dir in module.dirs {
+            if dir.path.as_str() == source.dir.as_str() {
+                is_root = true
+            }
+        }
+        let module_id = ty::ModuleId(index: u32.fit(self.modules.len()))
+        if is_root {
+            root = Some(module_id)
+        }
+        var data = ModuleData(package_id: id, name: text::String.of(module.name.as_str(), alloc), root: is_root, items: mem::List[ty::ItemId].empty(alloc), names: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc), abandoned: false, files: mem::List[FileRef].empty(alloc))
+        for position in 0..<source.files.len() {
+            let file = source.files[position]
+            if file.module == Some(index) and selects_dir(file.path.as_str(), selected: selected.view()) {
+                mut data.files.push(FileRef(source: at, history: false, index: position))
+            }
+        }
+        var files = mem::List[FileRef].empty(alloc)
+        for file in data.files {
+            mut files.push(file)
+        }
+        for position in 0..<source.history.len() {
+            if source.history[position].module == Some(index) {
+                mut files.push(FileRef(source: at, history: true, index: position))
+            }
+        }
+        for file in files {
+            mut self.add_items(mut data, module: module_id, file, source)
+        }
+        mut self.modules.push(take data)
+        mut modules.push(module_id)
+    }
+    mut self.packages.push(PackageData(source: at, name: take name, std: std, carried: carried, quiet: quiet, member: member, modules: take modules, root: root, deps: mem::Map[text::String, Option[ty::PackageId]].empty(alloc)))
+} Db.add_package
+
+/// The directories of a module whose files the target selects: the variant whose selector
+/// matches it, or else the first variant by path; every directory of a module without variants.
+fn selected_dirs(module: workspace::Module, target: workspace::Target, alloc: mem::Alloc) -> mem::List[text::String] {
+    var selected = mem::List[text::String].empty(alloc)
+    var variants = false
+    for dir in module.dirs {
+        if dir.selector.is_some() {
+            variants = true
+        }
+    }
+    if not variants {
+        for dir in module.dirs {
+            mut selected.push(text::String.of(dir.path.as_str(), alloc))
+        }
+        return selected
+    }
+    for dir in module.dirs {
+        let Some(selector) = dir.selector else {
+            continue
+        }
+        if selects(selector.as_str(), target) {
+            mut selected.push(text::String.of(dir.path.as_str(), alloc))
+            return selected
+        }
+    }
+    var chosen: Option[usize] = None
+    for index in 0..<module.dirs.len() {
+        match chosen {
+            Some(least) => {
+                if module.dirs[index].path.as_str() < module.dirs[least].path.as_str() {
+                    chosen = Some(index)
+                }
+            }
+            None => {
+                chosen = Some(index)
+            }
+        }
+    }
+    let Some(least) = chosen else {
+        return selected
+    }
+    mut selected.push(text::String.of(module.dirs[least].path.as_str(), alloc))
+    return selected
+} selected_dirs
+
+/// Whether a file's directory is one of the selected directories.
+fn selects_dir(path: Str, selected: Slice[text::String]) -> bool {
+    let bytes = path.as_bytes()
+    var end = bytes.len()
+    loop {
+        if end == 0 {
+            return false
+        }
+        end -= 1
+        if bytes[end] == b'/' {
+            break
+        }
+    }
+    let Some(dir) = path.slice_bytes(0, end: end) else {
+        return false
+    }
+    for held in selected {
+        if held.as_str() == dir {
+            return true
+        }
+    }
+    return false
+} selects_dir
+
+/// Adds the items of a module's file, lowered to abstract syntax.
+fn Db.add_items(mut self, mut data: ModuleData, module: ty::ModuleId, file: FileRef, source: workspace::Package) {
+    let alloc = self.session.alloc
+    let held = match file.history {
+        true => source.history[file.index]
+        false => source.files[file.index]
+    }
+    let lowered = held.lowered(alloc)
+    for position in 0..<held.syntax.items.len() {
+        let syntax = held.syntax.items[position]
+        if syntax.abandoned {
+            if syntax.tree.is_some() {
+                data.abandoned = true
+            }
+            continue
+        }
+        let Some(item) = lowered[position] else {
+            continue
+        }
+        let item_id = ty::ItemId(index: u32.fit(self.items.len()))
+        if not is_member(item) {
+            match item.name(alloc) {
+                Some(name) => add_named(mut data.names, take name, item: item_id, alloc)
+                None => {}
+            }
+        }
+        mut data.items.push(item_id)
+        mut self.items.push(ItemData(module: module, file: file, index: position))
+    }
+} Db.add_items
+
+/// Adds an item to those a name declares.
+fn add_named(mut names: mem::Map[text::String, mem::List[ty::ItemId]], take name: text::String, item: ty::ItemId, alloc: mem::Alloc) {
+    if names.contains(name) {
+        var declared = mut names.at_mut(name)
+        mut declared.push(item)
+        return
+    }
+    var declared = mem::List[ty::ItemId].empty(alloc)
+    mut declared.push(item)
+    discard mut names.insert(take name, value: take declared)
+} add_named
+
+proj fn Db.item(self, id: ty::ItemId) -> ItemData {
+    self.note(id)
+    return self.items[usize.widen(id.index)]
+} Db.item
+
+/// An item's syntax read for its name and kind alone, which the names of its module show.
+proj fn Db.declaration(self, id: ty::ItemId) -> ast::Item {
+    let data = self.items[usize.widen(id.index)]
+    let lowered = self.file(data.file).lowered(self.session.alloc)
+    let Some(item) = lowered[data.index] else {
+        expect false
+        return self.absent
+    }
+    return item
+} Db.declaration
+
+/// The item of this database parsed from the same item of the same file as another
+/// database's.
+fn Db.same(self, other: ItemData) -> Option[ty::ItemId] {
+    for index in 0..<self.items.len() {
+        let data = self.items[index]
+        if data.file == other.file and data.index == other.index {
+            return Some(ty::ItemId(index: u32.fit(index)))
+        }
+    }
+    return None
+} Db.same
+
+/// Starts recording what the queries read.
+fn Db.record(self) {
+    self.reads.recording.store(true)
+} Db.record
+
+/// Whether the queries' reads are being recorded.
+fn Db.recording(self) -> bool {
+    return self.reads.recording.load()
+} Db.recording
+
+/// Records that the current subject reads an item's facts.
+fn Db.note(self, item: ty::ItemId) {
+    let reads = self.reads
+    if not reads.recording.load() {
+        return
+    }
+    let Some(subject) = item_of_bits(reads.subject.load()) else {
+        return
+    }
+    if subject == item {
+        return
+    }
+    let alloc = self.session.alloc
+    if reads.noted.get(ItemRead(subject: subject, item: item)).is_none() {
+        reads.noted.insert(ItemRead(subject: subject, item: item), value: Unit)
+        let read_items = match reads.read.get(subject) {
+            Some(known) => known
+            None => reads.read.insert(subject, value: mem::Arena[ty::ItemId].empty(alloc))
+        }
+        discard read_items.push(item)
+    }
+    var line = reads.line.load()
+    if line == NO_ID {
+        line = 0
+    }
+    if reads.noted_on_lines.get(LineRead(subject: subject, line: line, item: item)).is_some() {
+        return
+    }
+    reads.noted_on_lines.insert(LineRead(subject: subject, line: line, item: item), value: Unit)
+    let key = LineKey(subject: subject, line: line)
+    let on_line = match reads.on_lines.get(key) {
+        Some(known) => known
+        None => reads.on_line_opened(key, alloc)
+    }
+    discard on_line.push(item)
+} Db.note
+
+/// The reads of a line of a subject's text newly recorded, the line counted among its subject's.
+proj fn Reads.on_line_opened(self, key: LineKey, alloc: mem::Alloc) -> mem::Arena[ty::ItemId] {
+    let lines = match self.lines.get(key.subject) {
+        Some(known) => known
+        None => self.lines.insert(key.subject, value: mem::Arena[u32].empty(alloc))
+    }
+    discard lines.push(key.line)
+    return self.on_lines.insert(key, value: mem::Arena[ty::ItemId].empty(alloc))
+} Reads.on_line_opened
+
+/// Computes a query about `subject`, or about no item, its reads recorded as that subject's.
+fn Db.about[T](self, subject: Option[ty::ItemId], compute: fn() -> T) -> T {
+    let reads = self.reads
+    if not reads.recording.load() {
+        return compute()
+    }
+    let outer_subject = reads.subject.swap(item_bits(subject))
+    let outer_line = reads.line.swap(NO_ID)
+    let computed = compute()
+    reads.subject.store(outer_subject)
+    reads.line.store(outer_line)
+    return computed
+} Db.about
+
+/// Computes the checking of a line of the current subject's text, its reads recorded also as
+/// that line's.
+fn Db.on_line[T](self, line: u32, compute: fn() -> T) -> T {
+    let reads = self.reads
+    if not reads.recording.load() {
+        return compute()
+    }
+    let enclosing = reads.line.swap(line)
+    let computed = compute()
+    reads.line.store(enclosing)
+    return computed
+} Db.on_line
+
+/// The items read while checking a line of a subject's text, or outside every line checked
+/// for line 0, in order of first read.
+fn Db.read_on(self, subject: ty::ItemId, line: u32) -> mem::List[ty::ItemId] {
+    var items = mem::List[ty::ItemId].empty(self.session.alloc)
+    let Some(on_line) = self.reads.on_lines.get(LineKey(subject: subject, line: line)) else {
+        return items
+    }
+    for item in on_line.cursor() {
+        mut items.push(item)
+    }
+    return items
+} Db.read_on
+
+/// The lines of a subject's text whose checking was recorded, 0 aside.
+fn Db.lines_read(self, subject: ty::ItemId) -> mem::List[u32] {
+    var lines = mem::List[u32].empty(self.session.alloc)
+    let Some(recorded) = self.reads.lines.get(subject) else {
+        return lines
+    }
+    for line in recorded.cursor() {
+        if line > 0 {
+            mut lines.push(line)
+        }
+    }
+    return lines
+} Db.lines_read
+
+/// The items a subject's queries read, in order of first read.
+fn Db.read_by(self, subject: ty::ItemId) -> mem::List[ty::ItemId] {
+    var items = mem::List[ty::ItemId].empty(self.session.alloc)
+    let Some(recorded) = self.reads.read.get(subject) else {
+        return items
+    }
+    for item in recorded.cursor() {
+        mut items.push(item)
+    }
+    return items
+} Db.read_by
+
+proj fn Db.module(self, id: ty::ModuleId) -> ModuleData {
+    return self.modules[usize.widen(id.index)]
+} Db.module
+
+proj fn Db.package_data(self, id: ty::PackageId) -> PackageData {
+    return self.packages[usize.widen(id.index)]
+} Db.package_data
+
+/// The package a package of the database is.
+proj fn Db.source(self, id: ty::PackageId) -> workspace::Package {
+    return self.source_of(self.packages[usize.widen(id.index)].source)
+} Db.source
+
+/// A source file of a package of the database.
+proj fn Db.file(self, file: FileRef) -> workspace::File {
+    let source = self.source_of(file.source)
+    if file.history {
+        return source.history[file.index]
+    }
+    return source.files[file.index]
+} Db.file
+
+/// The file of an item.
+proj fn Db.item_file(self, item: ty::ItemId) -> workspace::File {
+    return self.file(self.item(item).file)
+} Db.item_file
+
+/// The syntax of an item's file.
+proj fn Db.syntax(self, item: ty::ItemId) -> syntax::SourceFile {
+    return self.item_file(item).syntax
+} Db.syntax
+
+/// The line of one of an item's tokens.
+fn Db.line(self, item: ty::ItemId, token: u32) -> u32 {
+    return self.syntax(item).tokens[usize.widen(token)].line
+} Db.line
+
+/// The text of one of an item's tokens.
+proj fn Db.text(self, item: ty::ItemId, token: u32) -> Str {
+    return self.syntax(item).text(usize.widen(token))
+} Db.text
+
+/// The line of an item's head.
+fn Db.head_line(self, item: ty::ItemId) -> u32 {
+    return self.line(item, token: self.ast(item).token)
+} Db.head_line
+
+/// Whether an item is a tombstone of its package's history.
+fn Db.in_history(self, item: ty::ItemId) -> bool {
+    return self.items[usize.widen(item.index)].file.history
+} Db.in_history
+
+fn Db.module_of(self, item: ty::ItemId) -> ty::ModuleId {
+    return self.item(item).module
+} Db.module_of
+
+fn Db.package_of(self, item: ty::ItemId) -> ty::PackageId {
+    return self.module(self.module_of(item)).package_id
+} Db.package_of
+
+fn Db.is_std(self, item: ty::ItemId) -> bool {
+    return self.package_data(self.package_of(item)).std
+} Db.is_std
+
+/// Whether an item belongs to a std package the toolchain carries.
+fn Db.is_carried(self, item: ty::ItemId) -> bool {
+    return self.package_data(self.package_of(item)).carried
+} Db.is_carried
+
+/// Whether an item belongs to a package the check reports on: neither carried nor quiet.
+fn Db.is_reported(self, item: ty::ItemId) -> bool {
+    let data = self.package_data(self.package_of(item))
+    return not data.carried and not data.quiet
+} Db.is_reported
+
+proj fn Db.ast(self, item: ty::ItemId) -> ast::Item {
+    self.note(item)
+    return self.declaration(item)
+} Db.ast
+
+/// The first item of a module declaring `name`, functions named after a type excepted.
+fn Db.lookup(self, module: ty::ModuleId, name: Str) -> Option[ty::ItemId] {
+    let Some(items) = self.module(module).names.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return None
+    }
+    if items.len() == 0 {
+        return None
+    }
+    return Some(items[0])
+} Db.lookup
+
+/// The module of a package with that name, the root module under the package's name.
+fn Db.module_named(self, package_id: ty::PackageId, name: Str) -> Option[ty::ModuleId] {
+    let data = self.package_data(package_id)
+    if name == data.name.as_str() {
+        return data.root
+    }
+    for module in data.modules {
+        let held = self.module(module)
+        if not held.root and held.name.as_str() == name {
+            return Some(module)
+        }
+    }
+    return None
+} Db.module_named
+
+/// The package an alias names in `package_id`: a `dep` alias, or a std alias.
+fn Db.alias(self, package_id: ty::PackageId, name: Str) -> Option[ty::PackageId] {
+    match self.package_data(package_id).deps.get_by(fn(key: text::String) => key.as_str().cmp(name)) {
+        Some(found) => return found
+        None => {}
+    }
+    let Some(aliased) = self.std.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return None
+    }
+    return Some(aliased)
+} Db.alias
+
+/// Whether a `dep` alias of `package_id` names a package outside the workspace.
+fn Db.unavailable(self, package_id: ty::PackageId, name: Str) -> bool {
+    let Some(found) = self.package_data(package_id).deps.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return false
+    }
+    return found.is_none()
+} Db.unavailable
+
+fn Db.core(self) -> ty::PackageId {
+    let Some(found) = self.std.get_by(fn(key: text::String) => key.as_str().cmp("core")) else {
+        expect false
+        return ty::PackageId(index: 0)
+    }
+    return found
+} Db.core
+
+/// The core item of that name.
+fn Db.core_item(self, name: Str) -> Option[ty::ItemId] {
+    let Some(root) = self.package_data(self.core()).root else {
+        return None
+    }
+    return self.lookup(root, name)
+} Db.core_item
+
+/// The item of a std module, given as its alias and module path, of that name.
+fn Db.std_item(self, module: Str, name: Str) -> Option[ty::ItemId] {
+    let split = module.find("::")
+    let written = match split {
+        Some(at) => module.slice_bytes(0, end: at)
+        None => module.slice_bytes(0, end: module.byte_len())
+    }
+    let Some(alias) = written else {
+        return None
+    }
+    let Some(package_id) = self.std.get_by(fn(key: text::String) => key.as_str().cmp(alias)) else {
+        return None
+    }
+    var found = self.package_data(package_id).root
+    match split {
+        Some(at) => {
+            let Some(below) = module.slice_bytes(at + 2, end: module.byte_len()) else {
+                return None
+            }
+            found = self.module_named(package_id, name: below)
+        }
+        None => {}
+    }
+    let Some(within) = found else {
+        return None
+    }
+    return self.lookup(within, name)
+} Db.std_item
+
+/// The functions named after a type with a member name.
+proj fn Db.members(self, key: TypeKey, name: Str) -> Slice[ty::ItemId] {
+    let Some(named) = self.member_table.get(key) else {
+        return self.no_items.view()
+    }
+    let Some(functions) = named.get_by(fn(member: text::String) => member.as_str().cmp(name)) else {
+        return self.no_items.view()
+    }
+    return functions.view()
+} Db.members
+
+/// The module path as tool output writes it: the package name, then the module's name below
+/// the root.
+fn Db.module_path(self, module: ty::ModuleId) -> text::String {
+    let data = self.module(module)
+    var path = text::String.of(self.package_data(data.package_id).name.as_str(), alloc: self.session.alloc)
+    if not data.root {
+        mut path.append("::")
+        mut path.append(data.name.as_str())
+    }
+    return path
+} Db.module_path
+
+/// The canonical path of a named item, or of a tombstone's old form.
+fn Db.canonical(self, item: ty::ItemId) -> text::String {
+    let alloc = self.session.alloc
+    let data = self.items[usize.widen(item.index)]
+    match self.ast(item).kind {
+        ast::ItemKind.Retired(tombstone) => {
+            return match self.old_form(data.module, tombstone) {
+                Some(form) => form
+                None => text::String.empty(alloc)
+            }
+        }
+        else => {}
+    }
+    let name = match self.declaration(item).name(alloc) {
+        Some(declared) => declared
+        None => text::String.empty(alloc)
+    }
+    let Some(key) = self.owners.get(item) else {
+        var path = self.module_path(data.module)
+        mut path.append("::")
+        mut path.append(name.as_str())
+        return path
+    }
+    var path = self.type_path(key)
+    mut path.push('.')
+    let Some(member) = name.slice_bytes(member_start(name.as_str()), end: name.byte_len()) else {
+        return path
+    }
+    mut path.append(member)
+    return path
+} Db.canonical
+
+/// Where the member name of a function named `Type.name` starts: after its last `.`.
+fn member_start(name: Str) -> usize {
+    let bytes = name.as_bytes()
+    var at = bytes.len()
+    while at > 0 {
+        at -= 1
+        if bytes[at] == b'.' {
+            return at + 1
+        }
+    }
+    return 0
+} member_start
+
+/// The canonical path of a type that functions are named after.
+fn Db.type_path(self, key: TypeKey) -> text::String {
+    let alloc = self.session.alloc
+    return match key {
+        TypeKey.Item(item) => self.canonical(item)
+        TypeKey.Scalar(scalar) => {
+            var path = text::String.of("core::", alloc)
+            mut path.append(scalar.name())
+            return path
+        }
+        TypeKey.Unit => text::String.of("core::Unit", alloc)
+    }
+} Db.type_path
+
+/// Whether an item is a function named after a type.
+fn is_member(item: ast::Item) -> bool {
+    let ast::ItemKind.Fn(function) = item.kind else {
+        return false
+    }
+    return function.label.owner.is_some()
+} is_member

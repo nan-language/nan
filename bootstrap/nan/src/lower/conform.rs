@@ -11,6 +11,7 @@ use super::call::{Invoked, adapt_value};
 use super::fx::{Fx, PTR};
 use super::layout::Shape;
 use crate::check::db::ItemId;
+use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Args, FnTy, Ty};
 use crate::nir::{Callable, FnRef, NTy};
 
@@ -25,9 +26,9 @@ impl Lowering<'_, '_> {
 
     /// The head of a derived method for its owner applied to `args`, and whether it is a
     /// projection.
-    pub fn derived_head(&mut self, owner: ItemId, method: &str, args: &Args) -> (FnTy, bool) {
+    pub fn derived_head(&mut self, owner: ItemId, method: &str, args: &Args) -> FnTy {
         let (ty, own) = derived_parts(self, owner, args);
-        (self.conformance_head(&ty, method, &own), false)
+        self.conformance_head(&ty, method, &own)
     }
 
     /// The head of an interface method a type implements through a conformance, with the
@@ -142,6 +143,14 @@ pub fn supplied(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty, method: &str
         scalar(lo, fx, abi, ty, method);
         return;
     }
+    if let Ty::Item(item, _) = ty
+        && let SigKind::Layout {
+            bits: Some(bits), ..
+        } = &lo.ck.sig(*item).kind
+    {
+        layout(lo, fx, abi, &bits.clone(), method);
+        return;
+    }
     if super::supplied::mem::conformance(lo, fx, abi, ty, method) {
         return;
     }
@@ -238,6 +247,17 @@ fn scalar(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty, method: &str) {
         }
         other => panic!("the scalar conformance {other}"),
     };
+    finish(lo, fx, abi, sret, held);
+}
+
+/// The conformances of a layout, by its bits value of type `bits`.
+fn layout(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, bits: &Ty, method: &str) {
+    let (sret, params) = params(fx, abi);
+    let own = match method {
+        "hash" => vec![Arg::Ty(abi.params[1].0.ty().clone())],
+        _ => Vec::new(),
+    };
+    let held = lo.call_method(fx, bits, method_interface(method), own, &params);
     finish(lo, fx, abi, sret, held);
 }
 

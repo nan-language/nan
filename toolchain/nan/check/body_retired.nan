@@ -1,0 +1,1237 @@
+//! Retired forms: the rewrite of a tombstone with an old head, typed as that head's body, and the uses matching old forms, which forward to the tombstone's rewrite when it preserves behaviour, are otherwise reported as moved, and are ambiguous when they match several.
+
+/// A call that may match old forms, its receiver aside: what checking it against a head needs.
+view struct Use {
+    token: u32
+    args: Slice[ast::Arg]
+    expected: Option[ty::Ty]
+    markers: Markers
+} Use
+
+/// The code and reported construct of an error diagnostic.
+struct ErrorSite derives Copy, Eq {
+    code: diagnostic::Code
+    span: Option[diagnostic::Span]
+} ErrorSite
+
+/// The member a tombstone's rewrite `T.m` names, and whether the tombstone preserves
+/// behaviour.
+struct RenamedMember {
+    name: ast::Name
+    preserves: bool
+} RenamedMember
+
+/// An argument a call gives a tombstone's old head: the parameter it stands for, the first and
+/// last tokens of its value, and whether that value is a place or a literal.
+struct GivenArg {
+    name: text::String
+    token: u32
+    last: u32
+    simple: bool
+} GivenArg
+
+/// A name of a tombstone's rewrite that its fix writes otherwise: its tokens, the text written
+/// in its place, and the argument it stands for.
+struct Occurrence {
+    token: u32
+    last: u32
+    written: text::String
+    argument: Option[usize]
+} Occurrence
+
+/// The rewrite of a tombstone with an old head, typed as the body of a function of its module
+/// having that head, preceded by the `try` and `await` its outermost call needs; none when it
+/// does not check so.
+fn Checker.typed_rewrite(self, tombstone: ty::ItemId, head: ast::Head, rewrite: ast::Expr) -> Option[TBody] {
+    let Some(sig) = self.fn_sig(tombstone) else {
+        return None
+    }
+    let start = self.db().syntax(tombstone).tokens[usize.widen(rewrite.token)].start
+    let unmarked = self.rewrite_probe(tombstone, head, rewrite, sig, failure: None, awaited: None)
+    var failure: Option[ast::Word[ast::FailureMarker]] = None
+    if reported_from(unmarked.diagnostics.view(), code: diagnostic::Code.ErrorUnhandled, start) {
+        failure = Some(ast::Word(kind: ast::FailureMarker.Try, token: rewrite.token))
+    }
+    var awaited: Option[u32] = None
+    if reported_from(unmarked.diagnostics.view(), code: diagnostic::Code.EffectAwaitMissing, start) {
+        awaited = Some(rewrite.token)
+    }
+    let typed = self.rewrite_probe(tombstone, head, rewrite, sig, failure, awaited)
+    for found in typed.diagnostics {
+        if found.code.class() == diagnostic::Class.Error {
+            return None
+        }
+    }
+    let Probed(value: body, diagnostics: _) = typed
+    return Some(take body)
+} Checker.typed_rewrite
+
+/// Whether a diagnostic of a code is reported on a construct starting at a byte.
+fn reported_from(found: Slice[diagnostic::Diagnostic], code: diagnostic::Code, start: u32) -> bool {
+    for reported in found {
+        let Some(span) = reported.span else {
+            continue
+        }
+        if reported.code == code and span.start == start {
+            return true
+        }
+    }
+    return false
+} reported_from
+
+/// A tombstone's rewrite typed as the body of a function having its old head, the outermost
+/// call marked with `failure` and `awaited`, with the diagnostics typing it finds withheld.
+fn Checker.rewrite_probe(
+    self,
+    tombstone: ty::ItemId,
+    head: ast::Head,
+    rewrite: ast::Expr,
+    sig: FnSig,
+    failure: Option[ast::Word[ast::FailureMarker]],
+    awaited: Option[u32],
+    ) -> Probed[TBody] {
+    return self.withheld(probe: fn() -> TBody {
+        let alloc = self.alloc()
+        var body = Body.new(self, item: tombstone, generics: GenericDef.copies(sig.generics.view(), alloc))
+        mut body.push_frame(Body.function_frame(sig.result, failure: sig.failure, alloc))
+        mut body.declare_params(head.params.view(), sig)
+        var markers = Markers.none()
+        markers.failure = failure
+        markers.awaited = awaited
+        markers.mode = match rewrite.kind {
+            ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(marker), inner: _) => Some(marker)
+            else => None
+        }
+        let typed = match rewrite.kind {
+            ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => mut body.rewrite_value(rewrite, inner: inner.contents(), result: sig.result, markers)
+            else => mut body.rewrite_value(rewrite, inner: rewrite, result: sig.result, markers)
+        }
+        if sig.result != ty::Ty.unit() {
+            body.expect_type(typed, expected: sig.result, token: rewrite.token)
+        } else if typed.ty != ty::Ty.unit() and typed.ty != ty::Ty.never() and typed.ty != ty::Ty.error() {
+            body.unused_result(Tail(token: rewrite.token, last: rewrite.last, ty: typed.ty))
+        }
+        let clauses = Clauses.of(head, fixable: false)
+        body.check_effects(rewrite.token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: false)
+        return take body.finish(Some(take typed))
+    })
+} Checker.rewrite_probe
+
+/// A tombstone's rewrite typed against its old head's result: its outermost call, its markers
+/// aside, when it is one, and otherwise the whole expression.
+fn Body.rewrite_value(mut self, rewrite: ast::Expr, inner: ast::Expr, result: ty::Ty, markers: Markers) -> TExpr {
+    match inner.kind {
+        ast::ExprKind.Call(callee: _, args: _) => return mut self.call(inner, expected: Some(result), markers: Some(markers))
+        else => return mut self.expr(rewrite, expected: Some(result))
+    }
+} Body.rewrite_value
+
+/// The reason quoting a tombstone: its line declaring its old form when it lies in the source
+/// of a reported package, a note of its old form otherwise.
+fn Checker.quoted(self, tombstone: ty::ItemId) -> diagnostic::Reason {
+    let db = self.db()
+    let tokens = db.syntax(tombstone).tokens
+    let token = db.ast(tombstone).token
+    var arrow = usize.widen(token)
+    while arrow < tokens.len() and tokens[arrow].kind != syntax::TokenKind.Punct(syntax::Punct.FatArrow) {
+        arrow += 1
+    }
+    expect arrow < tokens.len()
+    let old = self.flat(tombstone, range: nir::Span(head: token + 1, last: u32.fit(arrow) - 1))
+    if db.is_reported(tombstone) and not db.in_history(tombstone) {
+        return self.reason(tombstone, token, role: diagnostic::Role.Declared, subject: take old)
+    }
+    return diagnostic::Reason.note(old.as_str(), alloc: self.alloc())
+} Checker.quoted
+
+/// Whether a tombstone's old form is visible from a module: where its replacement is, and
+/// everywhere for a `manual` one or while its replacement is being found.
+fn Checker.old_form_visible(self, tombstone: ty::ItemId, from: ty::ModuleId) -> bool {
+    let ast::ItemKind.Retired(declared) = self.db().ast(tombstone).kind else {
+        return false
+    }
+    var replacement: Option[ty::ItemId] = None
+    match declared.new {
+        ast::RetiredNew.Manual => return true
+        ast::RetiredNew.Rewrite(expr: _, preserves: _) => {
+            if declared.head.is_some() {
+                if self.replacing(tombstone) {
+                    return true
+                }
+                replacement = self.replacement_while_replacing(tombstone)
+            } else {
+                match self.rewrite_named(tombstone) {
+                    Some(Named.Item(item)) => {
+                        replacement = Some(item)
+                    }
+                    Some(Named.Variant(item: item, index: _)) => {
+                        replacement = Some(item)
+                    }
+                    else => {}
+                }
+            }
+        }
+    }
+    let Some(replaced) = replacement else {
+        return true
+    }
+    return self.db().visible(from, item: replaced)
+} Checker.old_form_visible
+
+/// Whether a tombstone's replacement is being found.
+fn Checker.replacing(self, tombstone: ty::ItemId) -> bool {
+    return self.state.contents().replacing.get().position(fn(held: ty::ItemId) => held == tombstone).is_some()
+} Checker.replacing
+
+/// The item a tombstone with an old head is replaced by, found from its typed rewrite while
+/// it is counted as being replaced.
+fn Checker.replacement_while_replacing(self, tombstone: ty::ItemId) -> Option[ty::ItemId] {
+    let state = self.state.contents()
+    var replacing = mem::List[ty::ItemId].empty(self.alloc())
+    for held in state.replacing.get() {
+        mut replacing.push(held)
+    }
+    mut replacing.push(tombstone)
+    let restored = state.replacing.replace(take replacing)
+    let body = self.typed(tombstone)
+    state.replacing.restore(restored)
+    let Some(typed) = body else {
+        return None
+    }
+    let Some(root) = typed.contents().root else {
+        return None
+    }
+    return self.replacement_of(root)
+} Checker.replacement_while_replacing
+
+/// The tombstone without an old head whose old form is a canonical path, visible from a
+/// module.
+fn Checker.renaming(self, form: Str, from: ty::ModuleId) -> Option[ty::ItemId] {
+    let db = self.db()
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form)) else {
+        return None
+    }
+    for tombstone in tombstones {
+        let headless = match db.ast(tombstone).kind {
+            ast::ItemKind.Retired(declared) => declared.head.is_none()
+            else => false
+        }
+        if headless and self.old_form_visible(tombstone, from) {
+            return Some(tombstone)
+        }
+    }
+    return None
+} Checker.renaming
+
+/// The tombstone without an old head whose old form a path written in `module` that names
+/// nothing matches.
+fn Checker.renamed_path(self, module: ty::ModuleId, path: ast::Path) -> Option[ty::ItemId] {
+    let Some(spelt) = self.db().spelled(module, path) else {
+        return None
+    }
+    return self.renaming(spelt.as_str(), from: module)
+} Checker.renamed_path
+
+/// What a tombstone's rewrite names: what its path names, or the variant or function its
+/// member names of the type its path names.
+fn Checker.rewrite_named(self, tombstone: ty::ItemId) -> Option[Named] {
+    let db = self.db()
+    let ast::ItemKind.Retired(declared) = db.ast(tombstone).kind else {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: expr, preserves: _) = declared.new else {
+        return None
+    }
+    let module = db.module_of(tombstone)
+    match expr.kind {
+        ast::ExprKind.Path(path: path, args: None) => {
+            let Ok(named) = db.resolve(module, path) else {
+                return None
+            }
+            return Some(named)
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            let ast::ExprKind.Path(path: path, args: None) = base.contents().kind else {
+                return None
+            }
+            let Some(key) = db.owner_key(module, owner: path) else {
+                return None
+            }
+            match self.variant_named(key, name: name.text.as_str()) {
+                Some(variant) => return Some(variant)
+                None => {}
+            }
+            let members = db.members(key, name: name.text.as_str())
+            if members.len() == 0 {
+                return None
+            }
+            return Some(Named.Item(members[0]))
+        }
+        else => return None
+    }
+} Checker.rewrite_named
+
+/// The variant of that name of the enum a type key names.
+fn Checker.variant_named(self, key: TypeKey, name: Str) -> Option[Named] {
+    let TypeKey.Item(item) = key else {
+        return None
+    }
+    let sig = self.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    let Some(index) = variants.position(fn(variant: VariantSig) => variant.name.as_str() == name) else {
+        return None
+    }
+    return Some(Named.Variant(item: item, index: index))
+} Checker.variant_named
+
+/// What a use matching the old form of a `preserves` tombstone without an old head names in
+/// its place; none for another tombstone.
+fn Checker.forwarding(self, tombstone: ty::ItemId) -> Option[Named] {
+    let ast::ItemKind.Retired(declared) = self.db().ast(tombstone).kind else {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: _, preserves: true) = declared.new else {
+        return None
+    }
+    return self.rewrite_named(tombstone)
+} Checker.forwarding
+
+/// The text of what a tombstone's rewrite names, written in a module's path forms.
+fn Checker.rewrite_written(self, tombstone: ty::ItemId, module: ty::ModuleId) -> Option[text::String] {
+    let Some(named) = self.rewrite_named(tombstone) else {
+        return None
+    }
+    match named {
+        Named.Item(item) => return Some(self.item_written(item, from: module))
+        Named.Variant(item: enumeration, index: variant) => {
+            let sig = self.sig(enumeration)
+            let SigKind.Enum(variants: variants) = sig.contents().kind else {
+                return None
+            }
+            var written = self.item_written(enumeration, from: module)
+            mut written.push('.')
+            mut written.append(variants[variant].name.as_str())
+            return Some(take written)
+        }
+        else => return None
+    }
+} Checker.rewrite_written
+
+/// Reports a use of an item on its tokens `head..=last` matching a tombstone's old form,
+/// with `fix` writing the rewrite in its place unless the tombstone has none: forwarding for
+/// `preserves`, moved otherwise, quoting the tombstone.
+fn Checker.report_retired(self, item: ty::ItemId, construct: nir::Span, tombstone: ty::ItemId, take fix: Option[diagnostic::Fix]) {
+    let ast::ItemKind.Retired(declared) = self.db().ast(tombstone).kind else {
+        return
+    }
+    let alloc = self.alloc()
+    var code = diagnostic::Code.NameMoved
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    match declared.new {
+        ast::RetiredNew.Rewrite(expr: _, preserves: preserves) => {
+            if preserves {
+                code = diagnostic::Code.RetiredForwardedUse
+            } else {
+                mut because.push(self.quoted(tombstone))
+            }
+            match fix {
+                Some(given) => mut fixes.push(take given)
+                None => {}
+            }
+        }
+        ast::RetiredNew.Manual => mut because.push(self.quoted(tombstone))
+    }
+    var reported = self.on(item, construct, code)
+    reported.because = because
+    reported.fixes = fixes
+    reported.offer = diagnostic::Offer.Each
+    self.report_diagnostic(item, take reported)
+} Checker.report_retired
+
+/// Reports a path an item writes on its tokens `head..=last` matching the old form of a
+/// tombstone without an old head, with the exact fix writing what its rewrite names.
+fn Checker.report_renamed_path(self, item: ty::ItemId, construct: nir::Span, tombstone: ty::ItemId) {
+    var fix: Option[diagnostic::Fix] = None
+    match self.rewrite_written(tombstone, module: self.db().module_of(item)) {
+        Some(written) => {
+            fix = Some(self.fix_replacing(item, head: construct.head, last: construct.last, text: written.as_str()))
+        }
+        None => {}
+    }
+    self.report_retired(item, construct, tombstone, take fix)
+} Checker.report_renamed_path
+
+/// Reports a path an item writes in `module`, naming nothing, that matches the old form of a
+/// tombstone without an old head, and gives what a forwarding use names in its place.
+fn Checker.forward_path(self, item: ty::ItemId, module: ty::ModuleId, path: ast::Path) -> Option[Named] {
+    let Some(tombstone) = self.renamed_path(module, path) else {
+        return None
+    }
+    let construct = nir::Span(head: path.token(), last: path.segments[path.segments.len() - 1].token)
+    self.report_renamed_path(item, construct, tombstone)
+    return self.forwarding(tombstone)
+} Checker.forward_path
+
+/// What a path an item writes in `module` names, forwarding a path that names nothing
+/// through a tombstone without an old head; an error already reported when it matches one
+/// that does not forward.
+fn Checker.resolve_use(self, item: ty::ItemId, module: ty::ModuleId, path: ast::Path) -> Result[Named, PathError] {
+    let resolved = self.db().resolve(module, path)
+    let Err(error) = resolved else {
+        return resolved
+    }
+    if error.code != Some(diagnostic::Code.NameUnknown) or self.renamed_path(module, path).is_none() {
+        return resolved
+    }
+    let Some(named) = self.forward_path(item, module, path) else {
+        return Err(PathError(code: None, token: error.token))
+    }
+    return Ok(named)
+} Checker.resolve_use
+
+/// The tombstone without an old head whose old form is member `name` of a type, visible from
+/// a module.
+fn Checker.member_renaming(self, key: TypeKey, name: Str, from: ty::ModuleId) -> Option[ty::ItemId] {
+    var form = self.db().type_path(key)
+    mut form.push('.')
+    mut form.append(name)
+    return self.renaming(form.as_str(), from)
+} Checker.member_renaming
+
+/// Reports a member `name` an item writes on its token, of a type naming no such member,
+/// that matches the old form of a tombstone without an old head, and gives the member a
+/// forwarding use names in its place, on that token.
+fn Checker.forward_member(self, item: ty::ItemId, name: ast::Name, tombstone: ty::ItemId) -> Option[ast::Name] {
+    let Some(member) = self.rewrite_member(tombstone) else {
+        self.report_retired(item, construct: nir::Span.at(name.token), tombstone, fix: None)
+        return None
+    }
+    let fix = self.fix_replacing(item, head: name.token, last: name.token, text: member.name.text.as_str())
+    self.report_retired(item, construct: nir::Span.at(name.token), tombstone, fix: Some(take fix))
+    if not member.preserves {
+        return None
+    }
+    let RenamedMember(name: renamed, preserves: _) = member
+    let ast::Name(text: renamed_text, token: _) = renamed
+    return Some(ast::Name(text: take renamed_text, token: name.token))
+} Checker.forward_member
+
+/// The member a tombstone's rewrite of the form `T.m` names, and whether it preserves
+/// behaviour.
+fn Checker.rewrite_member(self, tombstone: ty::ItemId) -> Option[RenamedMember] {
+    let ast::ItemKind.Retired(declared) = self.db().ast(tombstone).kind else {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: expr, preserves: preserves) = declared.new else {
+        return None
+    }
+    let ast::ExprKind.Field(base: _, name: renamed) = expr.kind else {
+        return None
+    }
+    return Some(RenamedMember(name: ast::Name(text: text::String.of(renamed.text.as_str(), alloc: self.alloc()), token: renamed.token), preserves: preserves))
+} Checker.rewrite_member
+
+/// The canonical path member `name` of a type has.
+fn Body.member_form(self, ty: ty::Ty, name: Str) -> Option[text::String] {
+    let Some(key) = self.ck.type_key(ty) else {
+        return None
+    }
+    var form = self.ck.db().type_path(key)
+    mut form.push('.')
+    mut form.append(name)
+    return Some(take form)
+} Body.member_form
+
+/// Whether a tombstone writes an old head.
+fn Body.has_old_head(self, tombstone: ty::ItemId) -> bool {
+    return match self.ck.db().ast(tombstone).kind {
+        ast::ItemKind.Retired(declared) => declared.head.is_some()
+        else => false
+    }
+} Body.has_old_head
+
+/// The tombstones whose old form is `form` that a call matches, `live` being the callable of
+/// the live function its path or member names and `headed` making a tombstone's old head the
+/// call's callable: those without an old head when it names none, and when its arguments do
+/// not check against `live`, those with an old head they check against.
+fn Body.matched(
+    mut self,
+    form: Str,
+    live: Option[Callable],
+    receiver: Option[TExpr],
+    call: Use,
+    headed: fn(mut body: Body, tombstone: ty::ItemId) -> Option[Callable],
+    ) -> mem::List[ty::ItemId] {
+    let alloc = self.ck.alloc()
+    let ck = self.ck.share()
+    var visible = mem::List[ty::ItemId].empty(alloc)
+    match ck.db().tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form)) {
+        Some(tombstones) => {
+            for tombstone in tombstones {
+                if ck.old_form_visible(tombstone, from: self.module) {
+                    mut visible.push(tombstone)
+                }
+            }
+        }
+        None => {}
+    }
+    var with_head = mem::List[ty::ItemId].empty(alloc)
+    var matched = mem::List[ty::ItemId].empty(alloc)
+    for tombstone in visible {
+        if self.has_old_head(tombstone) {
+            mut with_head.push(tombstone)
+        } else if live.is_none() {
+            mut matched.push(tombstone)
+        }
+    }
+    if with_head.len() == 0 {
+        return matched
+    }
+    let skimmed = mut self.probe(typing: fn(mut body: Body) {
+        mut body.skim_args(call.args)
+    })
+    let Probed(value: _, diagnostics: skim_found) = skimmed
+    let alone = error_sites(take skim_found, alloc)
+    match live {
+        Some(callable) => {
+            if mut self.checks_against(callable.copy(alloc), receiver, call, alone: alone.view()) {
+                return matched
+            }
+        }
+        None => {}
+    }
+    for tombstone in with_head {
+        let Some(callable) = headed(mut self, tombstone) else {
+            continue
+        }
+        if mut self.checks_against(take callable, receiver, call, alone: alone.view()) {
+            mut matched.push(tombstone)
+        }
+    }
+    return matched
+} Body.matched
+
+/// Whether a call's arguments check against a callable: probing the call finds no error that
+/// typing its arguments alone does not.
+fn Body.checks_against(mut self, take callable: Callable, receiver: Option[TExpr], call: Use, alone: Slice[ErrorSite]) -> bool {
+    let alloc = self.ck.alloc()
+    var held = Some(take callable)
+    let probed = mut self.probe(typing: fn[mut held](mut body: Body) -> TExpr {
+        let Some(applied) = mut held.extract() else {
+            return TExpr.failed(call.token)
+        }
+        return mut body.apply(call.token, callable: take applied, receiver: TExpr.optional_copy(receiver, alloc), args: call.args, expected: call.expected, markers: call.markers)
+    })
+    let Probed(value: _, diagnostics: probe_found) = probed
+    let found = error_sites(take probe_found, alloc)
+    for site in found {
+        var known = false
+        for earlier in alone {
+            if earlier == site {
+                known = true
+            }
+        }
+        if not known {
+            return false
+        }
+    }
+    return true
+} Body.checks_against
+
+/// Reports a use matching several old forms, quoting their tombstones, unless one of them or
+/// one of its arguments fails.
+fn Body.ambiguous_use(mut self, construct: nir::Span, tombstones: Slice[ty::ItemId], call: Use) -> TExpr {
+    let alloc = self.ck.alloc()
+    let skimmed = mut self.probe(typing: fn(mut body: Body) {
+        mut body.skim_args(call.args)
+    })
+    let Probed(value: _, diagnostics: skim_found) = skimmed
+    var failed = false
+    for tombstone in tombstones {
+        if self.ck.rejected(tombstone) {
+            failed = true
+            break
+        }
+    }
+    if not failed and error_sites(take skim_found, alloc).len() == 0 {
+        var because = mem::List[diagnostic::Reason].empty(alloc)
+        for tombstone in tombstones {
+            mut because.push(self.ck.quoted(tombstone))
+        }
+        var reported = self.ck.on(self.item, construct, code: diagnostic::Code.RetiredAmbiguousUse)
+        reported.because = because
+        self.ck.report_diagnostic(self.item, take reported)
+    }
+    mut self.skim_args(call.args)
+    return TExpr.failed(call.token)
+} Body.ambiguous_use
+
+/// The exact fix writing a tombstone's rewrite in place of a call, from `start` to its last
+/// token: in the using module's path forms, `self` replaced by the receiver's text for a call
+/// on a value, whose first token is `receiver`, and each other parameter by its argument's;
+/// none when an argument other than a place or a literal is not used exactly once, in argument
+/// order and before any call.
+fn Body.forwarded_fix(
+    self,
+    tombstone: ty::ItemId,
+    receiver: Option[u32],
+    start: u32,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> Option[diagnostic::Fix] {
+    let alloc = self.ck.alloc()
+    let db = self.ck.db()
+    let ast::ItemKind.Retired(declared) = db.ast(tombstone).kind else {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: rewrite, preserves: _) = declared.new else {
+        return None
+    }
+    let Some(head) = declared.head else {
+        return None
+    }
+    let using_file = db.syntax(self.item)
+    let Some(last) = markers.last else {
+        return None
+    }
+    var receiver_text: Option[text::String] = None
+    match receiver {
+        Some(receiver_token) => {
+            let Some(receiver_last) = markers.receiver else {
+                return None
+            }
+            receiver_text = Some(self.ck.written(self.item, head: receiver_token, last: receiver_last))
+        }
+        None => {}
+    }
+    let Some(given) = self.given_args(head, received: receiver.is_some(), args) else {
+        return None
+    }
+    let Some(occurrences) = self.rewrite_occurrences(tombstone, rewrite, given: given.view(), receiver_text) else {
+        return None
+    }
+    let source = db.syntax(tombstone)
+    let first_byte = source.tokens[usize.widen(rewrite.token)].start
+    let end = source.tokens[usize.widen(rewrite.last)].end
+    var written = text::String.empty(alloc)
+    var at = first_byte
+    for occurrence in occurrences {
+        let from = source.tokens[usize.widen(occurrence.token)].start
+        mut written.append(lossy_between(source.source.view(), start: at, end: from, alloc).as_str())
+        mut written.append(occurrence.written.as_str())
+        at = source.tokens[usize.widen(occurrence.last)].end
+    }
+    mut written.append(lossy_between(source.source.view(), start: at, end, alloc).as_str())
+    let from = using_file.tokens[usize.widen(start)].start
+    let to = using_file.tokens[usize.widen(last)].end
+    return Some(self.ck.fix_bytes(self.item, start: from, end: to, text: written.as_str()))
+} Body.forwarded_fix
+
+/// The arguments a call gives a tombstone's old head, each with the parameter it stands for:
+/// its label, or the next parameter for an unlabelled one, `self` aside for a call on a value;
+/// none when the head has too few parameters.
+fn Body.given_args(self, head: ast::Head, received: bool, args: Slice[ast::Arg]) -> Option[mem::List[GivenArg]] {
+    let alloc = self.ck.alloc()
+    var unnamed = mem::List[text::String].empty(alloc)
+    for param in head.params {
+        if not received or not param.is_self() {
+            mut unnamed.push(text::String.of(param.name(), alloc))
+        }
+    }
+    var next_unnamed: usize = 0
+    var given = mem::List[GivenArg].empty(alloc)
+    for arg in args {
+        var name = text::String.empty(alloc)
+        match arg.label_name() {
+            Some(label) => {
+                name = text::String.of(label.text.as_str(), alloc)
+            }
+            None => {
+                if next_unnamed >= unnamed.len() {
+                    return None
+                }
+                name = text::String.of(unnamed[next_unnamed].as_str(), alloc)
+                next_unnamed += 1
+            }
+        }
+        let given_arg = match arg.value.kind {
+            ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => GivenArg.of(take name, value: inner.contents())
+            else => GivenArg.of(take name, value: arg.value)
+        }
+        mut given.push(take given_arg)
+    }
+    return Some(take given)
+} Body.given_args
+
+/// The index of the argument given for a parameter.
+fn GivenArg.position_named(given: Slice[GivenArg], name: Str) -> Option[usize] {
+    for index in 0..<given.len() {
+        if given[index].name.as_str() == name {
+            return Some(index)
+        }
+    }
+    return None
+} GivenArg.position_named
+
+/// An argument's value standing for a parameter.
+fn GivenArg.of(take name: text::String, value: ast::Expr) -> GivenArg {
+    let simple = match value.kind {
+        ast::ExprKind.Literal(_) or ast::ExprKind.Path(path: _, args: _) or ast::ExprKind.SelfValue or ast::ExprKind.Field(base: _, name: _) => true
+        else => false
+    }
+    return GivenArg(name: take name, token: value.token, last: value.last, simple: simple)
+} GivenArg.of
+
+/// The names of a tombstone's rewrite its fix writes otherwise, in token order: `self` for a
+/// call on a value, each parameter given an argument, and each path to another module's item;
+/// none when `self` has no receiver or an argument other than a place or a literal is not used
+/// exactly once, in argument order and before any call.
+fn Body.rewrite_occurrences(
+    self,
+    tombstone: ty::ItemId,
+    rewrite: ast::Expr,
+    given: Slice[GivenArg],
+    receiver_text: Option[text::String],
+    ) -> Option[mem::List[Occurrence]] {
+    let alloc = self.ck.alloc()
+    let tombstone_module = self.ck.db().module_of(tombstone)
+    var occurrences = mem::List[Occurrence].empty(alloc)
+    var calls = mem::List[u32].empty(alloc)
+    var unreceived = false
+    rewrite.visit(fn[mut occurrences, mut calls, mut unreceived](inner: ast::Expr) {
+        var argument: Option[usize] = None
+        var is_self = false
+        match first inner.kind {
+            ast::ExprKind.SelfValue => {
+                is_self = true
+                argument = GivenArg.position_named(given, name: "self")
+            }
+            ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => {
+                argument = GivenArg.position_named(given, name: path.segments[0].text.as_str())
+            }
+            ast::ExprKind.Call(callee: _, args: _) => {
+                mut calls.push(inner.last)
+                return
+            }
+            else => return
+        }
+        if is_self {
+            match receiver_text {
+                Some(text_given) => {
+                    mut occurrences.push(Occurrence(token: inner.token, last: inner.last, written: text::String.of(text_given.as_str(), alloc), argument: None))
+                    return
+                }
+                None => {}
+            }
+        }
+        match argument {
+            Some(index) => {
+                mut occurrences.push(Occurrence(token: inner.token, last: inner.last, written: self.ck.written(self.item, head: given[index].token, last: given[index].last), argument: Some(index)))
+                return
+            }
+            None => {}
+        }
+        if is_self {
+            unreceived = true
+            return
+        }
+        if tombstone_module == self.module {
+            return
+        }
+        let ast::ExprKind.Path(path: path, args: _) = inner.kind else {
+            return
+        }
+        match self.ck.db().resolve(tombstone_module, path) {
+            Ok(Named.Item(item)) => mut occurrences.push(Occurrence(token: inner.token, last: inner.last, written: self.ck.item_written(item, from: self.module), argument: None))
+            else => {}
+        }
+    })
+    if unreceived or not in_order(given, occurrences: occurrences.view(), calls: calls.view(), alloc) {
+        return None
+    }
+    mut occurrences.sort_by(fn(left: Occurrence, right: Occurrence) => left.token.cmp(right.token))
+    return Some(take occurrences)
+} Body.rewrite_occurrences
+
+/// Whether each argument other than a place or a literal is used exactly once in a rewrite,
+/// in argument order and before any call.
+fn in_order(given: Slice[GivenArg], occurrences: Slice[Occurrence], calls: Slice[u32], alloc: mem::Alloc) -> bool {
+    var order = mem::List[u32].empty(alloc)
+    for index in 0..<given.len() {
+        if given[index].simple {
+            continue
+        }
+        var uses_at = mem::List[u32].empty(alloc)
+        for occurrence in occurrences {
+            if occurrence.argument == Some(index) {
+                mut uses_at.push(occurrence.token)
+            }
+        }
+        if uses_at.len() != 1 {
+            return false
+        }
+        let used = uses_at[0]
+        for call_last in calls {
+            if call_last < used {
+                return false
+            }
+        }
+        mut order.push(used)
+    }
+    for index in 1..<order.len() {
+        if order[index - 1] > order[index] {
+            return false
+        }
+    }
+    return true
+} in_order
+
+/// The bytes `start..end` of a source as text, each ill-formed sequence replaced.
+fn lossy_between(source: Slice[u8], start: u32, end: u32, alloc: mem::Alloc) -> text::String {
+    let Some(parts) = source.split_at(usize.widen(start)) else {
+        return text::String.empty(alloc)
+    }
+    let Some(bytes) = parts.tail.prefix(usize.widen(end - start)) else {
+        return text::String.empty(alloc)
+    }
+    return output::lossy(bytes, alloc)
+} lossy_between
+
+/// The callable a tombstone's old head makes of a call of its path.
+fn Body.retired_head(mut self, tombstone: ty::ItemId) -> Option[Callable] {
+    let Some(head) = self.ck.fn_sig(tombstone) else {
+        return None
+    }
+    return Some(Callable.function(tombstone, take head, alloc: self.ck.alloc()))
+} Body.retired_head
+
+/// The index of the field among the `fields` of a construction or pattern that a label names:
+/// the field it names, or, for a struct `owner`, the one a tombstone renaming it forwards to;
+/// none when it names none, which is reported.
+fn Body.labelled_field(self, owner: Option[ty::ItemId], label: ast::Name, fields: Slice[LabelledTy]) -> Option[usize] {
+    let named = LabelledTy.position_in(fields, name: label.text.as_str())
+    if named < fields.len() {
+        return Some(named)
+    }
+    var renaming: Option[ty::ItemId] = None
+    match owner {
+        Some(held) => {
+            renaming = self.ck.member_renaming(TypeKey.Item(held), name: label.text.as_str(), from: self.module)
+        }
+        None => {}
+    }
+    let Some(tombstone) = renaming else {
+        self.report(label.token, code: diagnostic::Code.NameUnknown)
+        return None
+    }
+    let Some(renamed) = self.ck.forward_member(self.item, name: label, tombstone) else {
+        return None
+    }
+    let forwarded = LabelledTy.position_in(fields, name: renamed.text.as_str())
+    if forwarded < fields.len() {
+        return Some(forwarded)
+    }
+    return None
+} Body.labelled_field
+
+/// A tombstone as a candidate member of a type.
+fn Body.retired_candidate(self, tombstone: ty::ItemId, ty: ty::Ty) -> Candidate {
+    let subst = match self.ck.type_key(ty) {
+        Some(key) => self.ck.type_subst(key, ty)
+        None => ty::Subst.empty(self.ck.alloc())
+    }
+    return Candidate.Function(item: tombstone, subst: take subst)
+} Body.retired_candidate
+
+/// A method call on a value matching old forms: checked against the one tombstone's old head,
+/// or as a call of the member a rename names; reported ambiguous when it matches several.
+fn Body.retired_method(mut self, take receiver: TExpr, name: ast::Name, matched: Slice[ty::ItemId], call: Use) -> TExpr {
+    let start = match call.markers.mode {
+        Some(marker) => marker.token
+        None => receiver.token
+    }
+    let last = match call.markers.last {
+        Some(held) => held
+        None => name.token
+    }
+    let construct = nir::Span(head: start, last: last)
+    if matched.len() != 1 {
+        return mut self.ambiguous_use(construct, tombstones: matched, call)
+    }
+    let tombstone = matched[0]
+    if not self.has_old_head(tombstone) {
+        let Some(renamed) = self.ck.forward_member(self.item, name, tombstone) else {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+        if self.ck.method_candidates(receiver.ty, name: renamed.text.as_str()).len() != 1 {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+        return mut self.method_on(call.token, take receiver, name: renamed, args: call.args, expected: call.expected, markers: call.markers)
+    }
+    let fix = self.forwarded_fix(tombstone, receiver: Some(receiver.token), start, args: call.args, markers: call.markers)
+    self.ck.report_retired(self.item, construct, tombstone, take fix)
+    let receiver_ty = receiver.ty
+    let candidate = self.retired_candidate(tombstone, ty: receiver_ty)
+    match mut self.callable(take candidate, self_ty: receiver_ty) {
+        Some(callable) => return mut self.apply(call.token, take callable, receiver: Some(take receiver), args: call.args, expected: call.expected, markers: call.markers)
+        None => {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+    }
+} Body.retired_method
+
+/// A call of a member through its type matching old forms, `written_args` when the type path
+/// writes its arguments: checked against the one tombstone's old head, or as a call of the
+/// member a rename names; reported ambiguous when it matches several.
+fn Body.retired_member(
+    mut self,
+    ty: ty::Ty,
+    base: ast::Expr,
+    name: ast::Name,
+    written_args: bool,
+    matched: Slice[ty::ItemId],
+    call: Use,
+    ) -> TExpr {
+    let start = match call.markers.mode {
+        Some(marker) => marker.token
+        None => base.token
+    }
+    let last = match call.markers.last {
+        Some(held) => held
+        None => name.token
+    }
+    let construct = nir::Span(head: start, last: last)
+    if matched.len() != 1 {
+        return mut self.ambiguous_use(construct, tombstones: matched, call)
+    }
+    let tombstone = matched[0]
+    if not self.has_old_head(tombstone) {
+        let Some(renamed) = self.ck.forward_member(self.item, name, tombstone) else {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+        if self.ck.method_candidates(ty, name: renamed.text.as_str()).len() != 1 {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+        return mut self.member_call(call.token, target: TypeTarget.Type(ty), base, name: renamed, args: call.args, expected: call.expected, markers: call.markers)
+    }
+    let fix = self.forwarded_fix(tombstone, receiver: None, start, args: call.args, markers: call.markers)
+    self.ck.report_retired(self.item, construct, tombstone, take fix)
+    let candidate = self.retired_candidate(tombstone, ty)
+    match mut self.member_callable(take candidate, ty, written_args) {
+        Some(callable) => return mut self.apply(call.token, take callable, receiver: None, args: call.args, expected: call.expected, markers: call.markers)
+        None => {
+            mut self.skim_args(call.args)
+            return TExpr.failed(call.token)
+        }
+    }
+} Body.retired_member
+
+/// A call whose path would have the canonical path an old form has, matching old forms with
+/// old heads: checked against the one tombstone's old head; reported ambiguous when it
+/// matches several.
+fn Body.retired_call(mut self, callee: ast::Expr, matched: Slice[ty::ItemId], call: Use) -> TExpr {
+    let last = match call.markers.last {
+        Some(held) => held
+        None => callee.last
+    }
+    let construct = nir::Span(head: callee.token, last: last)
+    if matched.len() != 1 {
+        return mut self.ambiguous_use(construct, tombstones: matched, call)
+    }
+    let tombstone = matched[0]
+    let fix = self.forwarded_fix(tombstone, receiver: None, start: callee.token, args: call.args, markers: call.markers)
+    self.ck.report_retired(self.item, construct, tombstone, take fix)
+    let Some(head) = self.ck.fn_sig(tombstone) else {
+        mut self.skim_args(call.args)
+        return TExpr.failed(call.token)
+    }
+    let callable = Callable.function(tombstone, take head, alloc: self.ck.alloc())
+    return mut self.apply(call.token, take callable, receiver: None, args: call.args, expected: call.expected, markers: call.markers)
+} Body.retired_call
+
+/// The code and construct of each error among diagnostics.
+fn error_sites(take found: mem::List[diagnostic::Diagnostic], alloc: mem::Alloc) -> mem::List[ErrorSite] {
+    var sites = mem::List[ErrorSite].empty(alloc)
+    for reported in found {
+        if reported.code.class() == diagnostic::Class.Error {
+            mut sites.push(ErrorSite(code: reported.code, span: reported.span))
+        }
+    }
+    return sites
+} error_sites
+
+/// A copy of a callable.
+fn Callable.copy(self, alloc: mem::Alloc) -> Callable {
+    return Callable(callee: self.callee.copy(alloc), head: self.head.copy(alloc), infer: self.infer.copy(alloc), from_expected: self.from_expected, receiver_first: self.receiver_first)
+} Callable.copy
+
+/// A copy of an inference.
+fn Infer.copy(self, alloc: mem::Alloc) -> Infer {
+    var params = mem::List[ty::Param].empty(alloc)
+    for param in self.params {
+        mut params.push(param)
+    }
+    var subst = ty::Subst.empty(alloc)
+    mut subst.extend(self.subst)
+    return Infer(params: take params, subst: take subst)
+} Infer.copy
+
+/// A copy of what a call calls.
+fn Callee.copy(self, alloc: mem::Alloc) -> Callee {
+    return match self {
+        Callee.Function(item: item) => Callee.Function(item: item)
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: dynamic) => Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: dynamic)
+        Callee.Value(value) => Callee.Value(TExpr.boxed_copy(value, alloc))
+        Callee.Builtin(builtin) => Callee.Builtin(builtin.copy(alloc))
+    }
+} Callee.copy
+
+/// A copy of an operation the toolchain supplies.
+fn Builtin.copy(self, alloc: mem::Alloc) -> Builtin {
+    return match self {
+        Builtin.Conversion(conversion) => Builtin.Conversion(copied_nir_builtin(conversion, alloc))
+        Builtin.DynView => Builtin.DynView
+        Builtin.Template => Builtin.Template
+        Builtin.DmaAccess => Builtin.DmaAccess
+        Builtin.MintRoot => Builtin.MintRoot
+    }
+} Builtin.copy
+
+/// A copy of a NIR builtin.
+fn copied_nir_builtin(builtin: nir::Builtin, alloc: mem::Alloc) -> nir::Builtin {
+    return match builtin {
+        nir::Builtin.Conversion(conversion: conversion, scalar: scalar) => nir::Builtin.Conversion(conversion: conversion, scalar: scalar)
+        nir::Builtin.Bits(conversion: conversion, owner: owner) => nir::Builtin.Bits(conversion: conversion, owner: owner)
+        nir::Builtin.Intrinsic(path) => nir::Builtin.Intrinsic(text::String.of(path.as_str(), alloc))
+    }
+} copied_nir_builtin
+
+/// A copy of a call.
+fn Call.copy(self, alloc: mem::Alloc) -> Call {
+    var args = mem::List[TArg].empty(alloc)
+    for arg in self.args {
+        mut args.push(TArg(expr: arg.expr.copy(alloc), mode: arg.mode))
+    }
+    return Call(token: self.token, callee: self.callee.copy(alloc), type_args: self.type_args, args: take args, head: ty::copy_fn_ty(self.head, alloc), projection: self.projection, failure: self.failure, awaited: self.awaited)
+} Call.copy
+
+/// A copy of a typed expression.
+fn TExpr.copy(self, alloc: mem::Alloc) -> TExpr {
+    return TExpr(token: self.token, last: self.last, ty: self.ty, kind: self.kind.copy(alloc))
+} TExpr.copy
+
+/// A boxed copy of a boxed typed expression.
+fn TExpr.boxed_copy(boxed: mem::Box[TExpr], alloc: mem::Alloc) -> mem::Box[TExpr] {
+    return mem::Heap.of(alloc).boxed(boxed.contents().copy(alloc))
+} TExpr.boxed_copy
+
+/// A copy of an optional typed expression.
+fn TExpr.optional_copy(value: Option[TExpr], alloc: mem::Alloc) -> Option[TExpr] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} TExpr.optional_copy
+
+/// A copy of an optional boxed typed expression.
+fn TExpr.optional_boxed_copy(value: Option[mem::Box[TExpr]], alloc: mem::Alloc) -> Option[mem::Box[TExpr]] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(TExpr.boxed_copy(held, alloc))
+} TExpr.optional_boxed_copy
+
+/// A copy of what a typed expression is.
+fn TKind.copy(self, alloc: mem::Alloc) -> TKind {
+    let heap = mem::Heap.of(alloc)
+    return match self {
+        TKind.Failed => TKind.Failed
+        TKind.Literal(lit) => TKind.Literal(lit.copy(alloc))
+        TKind.Unit => TKind.Unit
+        TKind.Result => TKind.Result
+        TKind.Old(inner) => TKind.Old(TExpr.boxed_copy(inner, alloc))
+        TKind.Register(block: block, index: index) => TKind.Register(block: block, index: index)
+        TKind.ConstParam(param) => TKind.ConstParam(param)
+        TKind.Local(local) => TKind.Local(local)
+        TKind.Value(item) => TKind.Value(item)
+        TKind.FnValue(item: item, type_args: type_args) => TKind.FnValue(item: item, type_args: type_args)
+        TKind.Field(base: base, name: name) => TKind.Field(base: TExpr.boxed_copy(base, alloc), name: text::String.of(name.as_str(), alloc))
+        TKind.Call(call) => TKind.Call(heap.boxed(call.contents().copy(alloc)))
+        TKind.Index(call) => TKind.Index(heap.boxed(call.contents().copy(alloc)))
+        TKind.Construct(variant: variant, values: values, wrapped: wrapped) => TKind.Construct(variant: variant, values: TLabelled.copies(values.view(), alloc), wrapped: wrapped)
+        TKind.Unary(op: op, operand: operand) => TKind.Unary(op: op, operand: TExpr.boxed_copy(operand, alloc))
+        TKind.Binary(op: op, left: left, right: right) => TKind.Binary(op: op, left: TExpr.boxed_copy(left, alloc), right: TExpr.boxed_copy(right, alloc))
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => TKind.If(condition: TExpr.boxed_copy(condition, alloc), then: then.copy(alloc), otherwise: TExpr.optional_boxed_copy(otherwise, alloc))
+        TKind.Block(block) => TKind.Block(block.copy(alloc))
+        TKind.Match(scrutinee: scrutinee, arms: arms) => TKind.Match(scrutinee: TExpr.boxed_copy(scrutinee, alloc), arms: TArm.copies(arms.view(), alloc))
+        TKind.Closure(closure) => TKind.Closure(heap.boxed(closure.contents().copy(alloc)))
+        TKind.When(attempted: attempted, accesses: accesses, body: body) => TKind.When(attempted: attempted, accesses: TAccess.copies(accesses.view(), alloc), body: TExpr.boxed_copy(body, alloc))
+        TKind.Trusted(inner) => TKind.Trusted(TExpr.boxed_copy(inner, alloc))
+        TKind.Todo(intent) => TKind.Todo(text::String.of(intent.as_str(), alloc))
+        TKind.Dbg(inner) => TKind.Dbg(TExpr.boxed_copy(inner, alloc))
+        TKind.Return(value) => TKind.Return(TExpr.optional_boxed_copy(value, alloc))
+        TKind.Break(index) => TKind.Break(index)
+        TKind.Continue(index) => TKind.Continue(index)
+        TKind.Fail(inner) => TKind.Fail(TExpr.boxed_copy(inner, alloc))
+        TKind.Quantifier(all: all, local: local, range: range, body: body) => TKind.Quantifier(all: all, local: local, range: TExpr.boxed_copy(range, alloc), body: TExpr.boxed_copy(body, alloc))
+    }
+} TKind.copy
+
+/// A copy of a literal's value.
+fn Lit.copy(self, alloc: mem::Alloc) -> Lit {
+    return match self {
+        Lit.Int(value) => Lit.Int(value)
+        Lit.Float(bits) => Lit.Float(bits)
+        Lit.Bool(value) => Lit.Bool(value)
+        Lit.Char(c) => Lit.Char(c)
+        Lit.Text(written) => Lit.Text(text::String.of(written.as_str(), alloc))
+        Lit.Bytes(bytes) => Lit.Bytes(copied_bytes(bytes.view(), alloc))
+    }
+} Lit.copy
+
+/// Copies of the labelled values of a construction.
+fn TLabelled.copies(values: Slice[TLabelled], alloc: mem::Alloc) -> mem::List[TLabelled] {
+    var copies = mem::List[TLabelled].empty(alloc)
+    for value in values {
+        mut copies.push(TLabelled(name: text::String.of(value.name.as_str(), alloc), value: value.value.copy(alloc)))
+    }
+    return copies
+} TLabelled.copies
+
+/// Copies of the accesses of `await when`.
+fn TAccess.copies(accesses: Slice[TAccess], alloc: mem::Alloc) -> mem::List[TAccess] {
+    var copies = mem::List[TAccess].empty(alloc)
+    for access in accesses {
+        mut copies.push(TAccess(mode: access.mode, place: access.place.copy(alloc), local: access.local))
+    }
+    return copies
+} TAccess.copies
+
+/// Copies of the arms of a match.
+fn TArm.copies(arms: Slice[TArm], alloc: mem::Alloc) -> mem::List[TArm] {
+    var copies = mem::List[TArm].empty(alloc)
+    for arm in arms {
+        var patterns = mem::List[TPattern].empty(alloc)
+        for pattern in arm.patterns {
+            mut patterns.push(pattern.copy(alloc))
+        }
+        mut copies.push(TArm(token: arm.token, patterns: take patterns, guard: TExpr.optional_copy(arm.guard, alloc), body: arm.body.copy(alloc)))
+    }
+    return copies
+} TArm.copies
+
+/// A copy of a closure.
+fn TClosure.copy(self, alloc: mem::Alloc) -> TClosure {
+    var params = mem::List[LocalId].empty(alloc)
+    for param in self.params {
+        mut params.push(param)
+    }
+    var captures = mem::List[TCapture].empty(alloc)
+    for capture in self.captures {
+        mut captures.push(TCapture(local: capture.local, outer: capture.outer, listed: capture.listed))
+    }
+    return TClosure(task: self.task, params: take params, captures: take captures, ty: ty::copy_fn_ty(self.ty, alloc), body: self.body.copy(alloc), index: self.index, loops: self.loops, lent: self.lent, demanded: self.demanded)
+} TClosure.copy
+
+/// A copy of a typed block.
+fn TBlock.copy(self, alloc: mem::Alloc) -> TBlock {
+    var stmts = mem::List[TStmt].empty(alloc)
+    for stmt in self.stmts {
+        mut stmts.push(TStmt(token: stmt.token, kind: stmt.kind.copy(alloc)))
+    }
+    return TBlock(end: self.end, stmts: take stmts)
+} TBlock.copy
+
+/// A copy of an optional typed block.
+fn TBlock.optional_copy(block: Option[TBlock], alloc: mem::Alloc) -> Option[TBlock] {
+    let Some(held) = block else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} TBlock.optional_copy
+
+/// Copies of typed expressions.
+fn TExpr.copies(exprs: Slice[TExpr], alloc: mem::Alloc) -> mem::List[TExpr] {
+    var copies = mem::List[TExpr].empty(alloc)
+    for expr in exprs {
+        mut copies.push(expr.copy(alloc))
+    }
+    return copies
+} TExpr.copies
+
+/// A copy of what a typed statement is.
+fn TStmtKind.copy(self, alloc: mem::Alloc) -> TStmtKind {
+    return match self {
+        TStmtKind.Let(pattern: pattern, value: value, otherwise: otherwise) => TStmtKind.Let(pattern: pattern.copy(alloc), value: value.copy(alloc), otherwise: TBlock.optional_copy(otherwise, alloc))
+        TStmtKind.Var(local: local, value: value) => TStmtKind.Var(local: local, value: value.copy(alloc))
+        TStmtKind.Discard(value) => TStmtKind.Discard(value.copy(alloc))
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => TStmtKind.While(condition: condition.copy(alloc), invariants: TExpr.copies(invariants.view(), alloc), body: body.copy(alloc))
+        TStmtKind.For(pattern: pattern, mode: mode, iterated: iterated, cursor: cursor, invariants: invariants, body: body) => TStmtKind.For(pattern: pattern.copy(alloc), mode: mode, iterated: iterated.copy(alloc), cursor: cursor, invariants: TExpr.copies(invariants.view(), alloc), body: body.copy(alloc))
+        TStmtKind.Loop(invariants: invariants, body: body) => TStmtKind.Loop(invariants: TExpr.copies(invariants.view(), alloc), body: body.copy(alloc))
+        TStmtKind.Defer(value) => TStmtKind.Defer(value.copy(alloc))
+        TStmtKind.Undefer(value) => TStmtKind.Undefer(value.copy(alloc))
+        TStmtKind.Expect(value) => TStmtKind.Expect(value.copy(alloc))
+        TStmtKind.Assume(value) => TStmtKind.Assume(value.copy(alloc))
+        TStmtKind.Expr(value) => TStmtKind.Expr(value.copy(alloc))
+        TStmtKind.Assign(target: target, op: op, value: value) => TStmtKind.Assign(target: target.copy(alloc), op: op, value: value.copy(alloc))
+    }
+} TStmtKind.copy
+
+/// A copy of a typed pattern.
+fn TPattern.copy(self, alloc: mem::Alloc) -> TPattern {
+    return TPattern(token: self.token, ty: self.ty, kind: self.kind.copy(alloc))
+} TPattern.copy
+
+/// A copy of what a typed pattern is.
+fn TPatternKind.copy(self, alloc: mem::Alloc) -> TPatternKind {
+    return match self {
+        TPatternKind.Wildcard => TPatternKind.Wildcard
+        TPatternKind.Binding(local) => TPatternKind.Binding(local)
+        TPatternKind.Value(space: space, compared: compared) => TPatternKind.Value(space: space.copy(alloc), compared: compared.copy(alloc))
+        TPatternKind.Fields(variant: variant, fields: fields) => TPatternKind.Fields(variant: variant, fields: TFieldPattern.copies(fields.view(), alloc))
+        TPatternKind.Failed => TPatternKind.Failed
+    }
+} TPatternKind.copy
+
+/// Copies of the field patterns of a pattern.
+fn TFieldPattern.copies(fields: Slice[TFieldPattern], alloc: mem::Alloc) -> mem::List[TFieldPattern] {
+    var copies = mem::List[TFieldPattern].empty(alloc)
+    for field in fields {
+        mut copies.push(TFieldPattern(name: text::String.of(field.name.as_str(), alloc), pattern: field.pattern.copy(alloc)))
+    }
+    return copies
+} TFieldPattern.copies
+
+/// A copy of the values a pattern matches.
+fn ValueSpace.copy(self, alloc: mem::Alloc) -> ValueSpace {
+    return match self {
+        ValueSpace.Ints(low: low, high: high) => ValueSpace.Ints(low: low, high: high)
+        ValueSpace.Bool(value) => ValueSpace.Bool(value)
+        ValueSpace.Bytes(bytes) => ValueSpace.Bytes(copied_bytes(bytes.view(), alloc))
+        ValueSpace.Unknown => ValueSpace.Unknown
+    }
+} ValueSpace.copy
+
+/// A copy of how a pattern tests a value.
+fn ValueTest.copy(self, alloc: mem::Alloc) -> ValueTest {
+    return match self {
+        ValueTest.Eq(compared) => ValueTest.Eq(compared.copy(alloc))
+        ValueTest.Range(low: low, high: high, exclusive: exclusive) => ValueTest.Range(low: low.copy(alloc), high: high.copy(alloc), exclusive: exclusive)
+    }
+} ValueTest.copy
+
+/// A copy of a value a pattern compares with.
+fn Compared.copy(self, alloc: mem::Alloc) -> Compared {
+    return match self {
+        Compared.Literal(lit) => Compared.Literal(lit.copy(alloc))
+        Compared.Const(item) => Compared.Const(item)
+    }
+} Compared.copy

@@ -1,0 +1,2712 @@
+//! Typing expressions: literals, paths and member paths, fields, operators, ranges, conditionals and matches, closures, `await when`, trusted code, holes, quantifiers and jumps.
+
+/// What the base of a member path names when it names no value.
+enum TypeTarget derives Copy {
+    Type(ty::Ty)
+    Interface(ty::ItemId)
+    Module
+    Failed
+} TypeTarget
+
+/// A core type item applied to its arguments, or a failed type when std lacks it.
+fn Checker.core_ty(self, name: Str, take args: mem::List[ty::Arg]) -> ty::Ty {
+    let db = self.db()
+    var found = db.core_item(name)
+    if found.is_none() {
+        found = db.std_item("core", name)
+    }
+    let Some(item) = found else {
+        return ty::Ty.error()
+    }
+    return self.types().item(item, take args)
+} Checker.core_ty
+
+fn Checker.str_ty(self) -> ty::Ty {
+    return self.core_ty("Str", args: mem::List[ty::Arg].empty(self.alloc()))
+} Checker.str_ty
+
+fn Checker.slice_ty(self, element: ty::Ty) -> ty::Ty {
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    mut args.push(ty::Arg.Ty(element))
+    return self.core_ty("Slice", take args)
+} Checker.slice_ty
+
+fn Checker.option_ty(self, value: ty::Ty) -> ty::Ty {
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    mut args.push(ty::Arg.Ty(value))
+    return self.core_ty("Option", take args)
+} Checker.option_ty
+
+fn Checker.result_ty(self, value: ty::Ty, error: ty::Ty) -> ty::Ty {
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    mut args.push(ty::Arg.Ty(value))
+    mut args.push(ty::Arg.Ty(error))
+    return self.core_ty("Result", take args)
+} Checker.result_ty
+
+/// The canonical path of the item a type instantiates, when it is a std item.
+fn Checker.std_path(self, ty: ty::Ty) -> Option[text::String] {
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(ty) else {
+        return None
+    }
+    let db = self.db()
+    if not db.is_std(item) {
+        return None
+    }
+    return Some(db.canonical(item))
+} Checker.std_path
+
+fn Checker.is_std(self, ty: ty::Ty, path: Str) -> bool {
+    let Some(found) = self.std_path(ty) else {
+        return false
+    }
+    return found.as_str() == path
+} Checker.is_std
+
+/// Records a typed hole, outside probes.
+fn Body.record_hole(self, token: u32, ty: ty::Ty) {
+    let state = self.ck.state.contents()
+    if state.muted.load() > 0 {
+        return
+    }
+    discard state.holes.push(Hole(item: self.item, token: token, expected: ty))
+} Body.record_hole
+
+/// Reports `a.b` where `a` names a module or alias, with the fix writing `a::b`.
+fn Body.dot_for_path(self, name: ast::Name) {
+    let syntax = self.ck.db().syntax(self.item)
+    let dot = u32.truncate(syntax.previous(usize.widen(name.token)).value_or(usize.widen(name.token)))
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_replacing(self.item, head: dot, last: dot, text: "::"))
+    self.report_fixed(nir::Span(head: dot, last: name.token), code: diagnostic::Code.NameDotForPath, take fixes)
+} Body.dot_for_path
+
+/// Reports `Option` or `Result`, starting at `head`, before a core variant, with the fix
+/// removing the qualifier.
+fn Body.qualified_core_variant(self, head: u32, name: ast::Name) {
+    let syntax = self.ck.db().syntax(self.item)
+    let start = syntax.tokens[usize.widen(head)].start
+    let end = syntax.tokens[usize.widen(name.token)].start
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_bytes(self.item, start, end, text: ""))
+    self.report_fixed(nir::Span(head: head, last: name.token), code: diagnostic::Code.TypeQualifiedCoreVariant, take fixes)
+} Body.qualified_core_variant
+
+/// The fix of signed `/`, `%` or `>>`: `a.div_trunc(b)`, `a.rem_trunc(b)` or
+/// `a.shr_arith(b)`, a left operand that is no postfix expression parenthesised; for a
+/// compound assignment `left op= right` to a binding or field path `p`, `p = ` and that fixed
+/// form.
+fn Body.signed_operation(self, op: ast::BinaryOp, left: ast::Expr, right: ast::Expr, compound: bool) -> Option[diagnostic::Fix] {
+    let alloc = self.ck.alloc()
+    let method = match op {
+        ast::BinaryOp.Div => "div_trunc"
+        ast::BinaryOp.Rem => "rem_trunc"
+        else => "shr_arith"
+    }
+    let written = self.ck.written(self.item, head: left.token, last: left.last)
+    var applied = text::String.empty(alloc)
+    match left.kind {
+        ast::ExprKind.Unary(op: _, operand: _) or ast::ExprKind.Binary(op: _, op_token: _, left: _, right: _) => {
+            mut applied.push('(')
+            mut applied.append(written.as_str())
+            mut applied.push(')')
+        }
+        else => mut applied.append(written.as_str())
+    }
+    let argument = self.ck.written(self.item, head: right.token, last: right.last)
+    mut applied.push('.')
+    mut applied.append(method)
+    mut applied.push('(')
+    mut applied.append(argument.as_str())
+    mut applied.push(')')
+    if not compound {
+        return Some(self.ck.fix_replacing(self.item, head: left.token, last: right.last, text: applied.as_str()))
+    }
+    if not is_path_place(left) {
+        return None
+    }
+    var assigned = text::String.of(written.as_str(), alloc)
+    mut assigned.append(" = ")
+    mut assigned.append(applied.as_str())
+    return Some(self.ck.fix_replacing(self.item, head: left.token, last: right.last, text: assigned.as_str()))
+} Body.signed_operation
+
+/// Whether an expression is a binding or a field path from one.
+fn is_path_place(expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Path(path: path, args: None) => path.segments.len() == 1
+        ast::ExprKind.SelfValue => true
+        ast::ExprKind.Field(base: base, name: _) => is_path_place(base.contents())
+        else => false
+    }
+} is_path_place
+
+/// Whether an expression's type needs an expected type to be fixed: an unsuffixed number literal,
+/// such a literal negated or parenthesised, a hole or `None`.
+fn Body.needs_expected(self, expr: ast::Expr) -> bool {
+    match expr.kind {
+        ast::ExprKind.Literal(literal) => {
+            if literal.kind != ast::LiteralKind.Int and literal.kind != ast::LiteralKind.Float {
+                return false
+            }
+            return literal_suffix(self.text(literal.tokens[0])).is_none()
+        }
+        ast::ExprKind.Unary(op: op, operand: operand) => {
+            if op == ast::UnaryOp.Not {
+                return false
+            }
+            return self.needs_expected(operand.contents())
+        }
+        ast::ExprKind.Paren(inner) => return self.needs_expected(inner.contents())
+        ast::ExprKind.Todo(_) => return true
+        ast::ExprKind.Path(path: path, args: None) => return path.segments.len() == 1 and path.segments[0].text.as_str() == "None"
+        else => return false
+    }
+} Body.needs_expected
+
+/// Types an expression against its expected type, reporting a type that differs.
+fn Body.check(mut self, expr: ast::Expr, expected: ty::Ty) -> TExpr {
+    let typed = mut self.expr(expr, expected: Some(expected))
+    self.expect_type(typed, expected, token: expr.token)
+    return typed
+} Body.check
+
+/// Types an expression whose context already failed a rule: what it holds is checked, and
+/// nothing about its own type is reported.
+fn Body.skim(mut self, expr: ast::Expr) -> TExpr {
+    return mut self.expr(expr, expected: Some(ty::Ty.error()))
+} Body.skim
+
+/// Reports a typed expression whose type differs from its expected type, a function or
+/// function value expected to fit a function type judged by fit.
+fn Body.expect_type(self, typed: TExpr, expected: ty::Ty, token: u32) {
+    let types = self.ck.types()
+    if typed.ty == expected or typed.ty.is_never() or types.has_error(typed.ty) or types.has_error(expected) {
+        return
+    }
+    match types.kind(expected) {
+        ty::TyKind.Fn(wanted) => {
+            match types.kind(typed.ty) {
+                ty::TyKind.Fn(found) => {
+                    self.fit(types.fn_of(found), wanted: types.fn_of(wanted), token)
+                    return
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    self.report_mismatch(token, expected, found: typed.ty)
+} Body.expect_type
+
+/// The fit rule: kind, head, failures and waiting, in this order, the first unmet reported.
+fn Body.fit(self, found: ty::FnTy, wanted: ty::FnTy, token: u32) {
+    let types = self.ck.types()
+    var kind_fits = false
+    match wanted.kind {
+        ast::FnKind.Plain => {
+            if wanted.convention.is_none() {
+                kind_fits = found.kind == ast::FnKind.Plain and found.convention.is_none()
+            } else {
+                kind_fits = found.convention == wanted.convention
+            }
+        }
+        ast::FnKind.Task => {
+            kind_fits = (found.kind == ast::FnKind.Plain or found.kind == ast::FnKind.Task) and found.convention.is_none()
+        }
+        ast::FnKind.Interrupt => {
+            kind_fits = found.kind == ast::FnKind.Interrupt
+        }
+    }
+    if not kind_fits {
+        self.report(token, code: diagnostic::Code.EffectFitKind)
+        return
+    }
+    var heads_fit = found.params.len() == wanted.params.len()
+    if heads_fit {
+        for index in 0..<found.params.len() {
+            let found_param = found.params[index]
+            let wanted_param = wanted.params[index]
+            if found_param.mode != wanted_param.mode or not same_type(found_param.ty, right: wanted_param.ty, types) {
+                heads_fit = false
+                break
+            }
+        }
+    }
+    if not heads_fit or not same_type(found.result, right: wanted.result, types) {
+        self.report(token, code: diagnostic::Code.EffectFitHead)
+        return
+    }
+    match found.failure {
+        Some(raised) => {
+            let allowed = match wanted.failure {
+                Some(declared) => same_type(raised, right: declared, types)
+                None => false
+            }
+            if not allowed and raised != ty::Ty.never() {
+                self.report(token, code: diagnostic::Code.EffectFitFails)
+                return
+            }
+        }
+        None => {}
+    }
+    if found.wait and not wanted.wait {
+        self.report(token, code: diagnostic::Code.EffectFitWait)
+    }
+} Body.fit
+
+fn Body.expr(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    return mut self.expr_jump(expr, expected, jump: false)
+} Body.expr
+
+/// Types an expression; `jump` when it stands where `return`, `break`, `continue` and `fail`
+/// may: as a whole expression statement or a match arm's expression body.
+fn Body.expr_jump(mut self, expr: ast::Expr, expected: Option[ty::Ty], jump: bool) -> TExpr {
+    var typed = mut self.expr_kind(expr, expected, jump)
+    typed.last = expr.last
+    return typed
+} Body.expr_jump
+
+fn Body.expr_kind(mut self, expr: ast::Expr, expected: Option[ty::Ty], jump: bool) -> TExpr {
+    let token = expr.token
+    let heap = mem::Heap.of(self.ck.alloc())
+    match expr.kind {
+        ast::ExprKind.Literal(literal) => return mut self.literal(token, literal, expected, negative: false)
+        ast::ExprKind.Path(path: path, args: args) => return mut self.path_expr(token, path, args, expected)
+        ast::ExprKind.SelfValue => {
+            let found = mut self.lookup_local("self")
+            let Some(local) = found else {
+                self.report(token, code: diagnostic::Code.NameUnknown)
+                return TExpr.failed(token)
+            }
+            return mut self.local_expr(token, local)
+        }
+        ast::ExprKind.Paren(inner) => {
+            var typed = mut self.expr(inner.contents(), expected)
+            typed.token = token
+            return typed
+        }
+        ast::ExprKind.If(condition: _, then: _, otherwise: _) => return mut self.value_if(expr, expected)
+        ast::ExprKind.Match(ordered: _, scrutinee: _, arms: _) => return mut self.value_match(expr, expected)
+        ast::ExprKind.Closure(_) => {
+            self.report(token, code: diagnostic::Code.ClosureSecondClass)
+            return TExpr.failed(token)
+        }
+        ast::ExprKind.Trusted(premise: premise, body: body) => {
+            match body {
+                ast::TrustedBody.Block(_) => {
+                    if not jump {
+                        self.report(token, code: diagnostic::Code.TrustedBlockValue)
+                    }
+                }
+                ast::TrustedBody.Expr(_) => {}
+            }
+            return mut self.trusted_expr(token, premise, body, expected)
+        }
+        ast::ExprKind.Todo(reason) => return mut self.todo_expr(token, last: expr.last, reason, expected)
+        ast::ExprKind.Dbg(inner) => {
+            self.report(token, code: diagnostic::Code.TestDbg)
+            let typed = mut self.expr(inner.contents(), expected)
+            let dbg_ty = typed.ty
+            return TExpr(token: token, last: token, ty: dbg_ty, kind: TKind.Dbg(heap.boxed(take typed)))
+        }
+        ast::ExprKind.Quantifier(all: all, name: name, range: range, body: body) => return mut self.quantifier(token, all, name, range: range.contents(), body: body.contents())
+        ast::ExprKind.Field(base: base, name: name) => return mut self.field_expr(token, base: base.contents(), name, expected)
+        ast::ExprKind.Call(callee: _, args: _) => return mut self.call(expr, expected, markers: None)
+        ast::ExprKind.Index(base: base, index: index) => return mut self.index(token, base: base.contents(), index: index.contents(), write: false)
+        ast::ExprKind.Unary(op: op, operand: operand) => return mut self.unary(token, op, operand: operand.contents(), expected)
+        ast::ExprKind.Binary(op: op, op_token: op_token, left: left, right: right) => return mut self.binary(token, op, op_token, left: left.contents(), right: right.contents(), expected)
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: _) => return mut self.marked(expr, expected)
+        ast::ExprKind.When(accesses: _, body: _) => return mut self.when_expr(expr, attempted: None, expected)
+        ast::ExprKind.Return(_) or ast::ExprKind.Break(_) or ast::ExprKind.Continue(_) or ast::ExprKind.Fail(_) => return mut self.jump_expr(expr, jump)
+    }
+} Body.expr_kind
+
+/// `return`, `break`, `continue` or `fail`, where `jump` tells a jump may stand.
+fn Body.jump_expr(mut self, expr: ast::Expr, jump: bool) -> TExpr {
+    let token = expr.token
+    if not jump {
+        self.report(token, code: diagnostic::Code.ExprMisplacedJump)
+        return TExpr.failed(token)
+    }
+    match expr.kind {
+        ast::ExprKind.Return(value) => return mut self.return_expr(token, value)
+        ast::ExprKind.Break(label) => {
+            let target = match mut self.jump_target(token, label, breaks: true) {
+                Some(index) => TKind.Break(index)
+                None => TKind.Failed
+            }
+            return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: take target)
+        }
+        ast::ExprKind.Continue(label) => {
+            let target = match mut self.jump_target(token, label, breaks: false) {
+                Some(index) => TKind.Continue(index)
+                None => TKind.Failed
+            }
+            return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: take target)
+        }
+        ast::ExprKind.Fail(value) => return mut self.fail_expr(token, value: value.contents())
+        else => return mut self.expr(expr, expected: None)
+    }
+} Body.jump_expr
+
+/// `todo` in an expression: a hole of the type expected there, or `Unit` as a whole expression
+/// statement.
+fn Body.todo_expr(mut self, token: u32, last: u32, reason: ast::Text, expected: Option[ty::Ty]) -> TExpr {
+    if spaces_only(reason.value.as_str()) {
+        self.report(reason.token, code: diagnostic::Code.TodoEmptyReason)
+    }
+    if self.cx.contract {
+        self.report(token, code: diagnostic::Code.ContractIllDefined)
+    }
+    let depth = self.frames.len()
+    self.frames[depth - 1].holds_todo = true
+    var hole = expected
+    if hole.is_none() and self.statement == Some(nir::Span(head: token, last: last)) {
+        hole = Some(ty::Ty.unit())
+    }
+    let Some(hole_ty) = hole else {
+        self.report(token, code: diagnostic::Code.TodoUntyped)
+        return TExpr.failed(token)
+    }
+    self.ck.report(self.item, token, code: diagnostic::Code.TodoHole)
+    self.record_hole(token, ty: hole_ty)
+    return TExpr(token: token, last: token, ty: hole_ty, kind: TKind.Todo(text::String.of(reason.value.as_str(), alloc: self.ck.alloc())))
+} Body.todo_expr
+
+/// The type of `Unit` code, or `Never` for code that diverges.
+fn diverging_ty(diverges: bool) -> ty::Ty {
+    if diverges {
+        return ty::Ty.never()
+    }
+    return ty::Ty.unit()
+} diverging_ty
+
+/// A literal of the type its suffix or expected type fixes; `negative` for the operand of a
+/// negative literal.
+fn Body.literal(mut self, token: u32, literal: ast::Literal, expected: Option[ty::Ty], negative: bool) -> TExpr {
+    let ck = self.ck.share()
+    var literal_ty = ty::Ty.error()
+    match literal.kind {
+        ast::LiteralKind.Int or ast::LiteralKind.Float => {
+            let Some(number_ty) = self.number_type(token, literal, expected, negative) else {
+                return TExpr.failed(token)
+            }
+            literal_ty = number_ty
+        }
+        ast::LiteralKind.Text or ast::LiteralKind.TextRun => {
+            literal_ty = ck.str_ty()
+        }
+        ast::LiteralKind.Bytes => {
+            literal_ty = ck.slice_ty(ty::Ty.scalar(ty::Scalar.Unsigned8))
+        }
+        ast::LiteralKind.Char => {
+            literal_ty = ty::Ty.scalar(ty::Scalar.Char)
+        }
+        ast::LiteralKind.Byte => {
+            literal_ty = ty::Ty.scalar(ty::Scalar.Unsigned8)
+        }
+        ast::LiteralKind.True or ast::LiteralKind.False => {
+            literal_ty = ty::Ty.scalar(ty::Scalar.Bool)
+        }
+    }
+    let value = self.literal_value(literal, ty: literal_ty, negative)
+    return TExpr(token: token, last: token, ty: literal_ty, kind: TKind.Literal(take value))
+} Body.literal
+
+/// The type of a number literal: the scalar its suffix or expected type fixes, its value within
+/// the type's range; none, reported, when neither fixes one or the value lies outside it.
+fn Body.number_type(self, token: u32, literal: ast::Literal, expected: Option[ty::Ty], negative: bool) -> Option[ty::Ty] {
+    let types = self.ck.types()
+    let alloc = self.ck.alloc()
+    let written = self.text(literal.tokens[0])
+    let is_int = literal.kind == ast::LiteralKind.Int
+    var number_ty = ty::Ty.error()
+    match literal_suffix(written) {
+        Some(scalar) => {
+            number_ty = ty::Ty.scalar(scalar)
+        }
+        None => {
+            let Some(wanted) = expected else {
+                self.report(token, code: diagnostic::Code.TypeLiteralUntyped)
+                return None
+            }
+            if wanted == ty::Ty.error() or wanted == ty::Ty.never() {
+                return None
+            }
+            let fits = match types.scalar_of(wanted) {
+                Some(scalar) => (is_int and scalar.is_integer()) or (not is_int and scalar.is_float())
+                None => false
+            }
+            if not fits {
+                let shown = match is_int {
+                    true => "an integer type"
+                    false => "a float type"
+                }
+                self.ck.report_expected(self.item, token, code: diagnostic::Code.TypeMismatch, expected: self.ck.show(wanted, from: self.module), found: text::String.of(shown, alloc))
+                return None
+            }
+            number_ty = wanted
+        }
+    }
+    let Some(scalar) = types.scalar_of(number_ty) else {
+        return Some(number_ty)
+    }
+    if is_int and scalar.is_integer() {
+        var value = int_literal(written).value_or(wide::Wide.max())
+        if negative {
+            value = value.wrapping_neg()
+        }
+        let range = scalar.range()
+        if value.lt(range.low) or range.high.lt(value) {
+            self.report(token, code: diagnostic::Code.TypeLiteralRange)
+            return None
+        }
+    } else if not is_int {
+        let digits = float_digits(written, alloc)
+        let single = scalar == ty::Scalar.Float32
+        if is_infinity(format::float_bits(digits.view(), single, alloc), single) {
+            self.report(token, code: diagnostic::Code.TypeLiteralRange)
+            return None
+        }
+    } else {
+        self.report_mismatch(token, expected: number_ty, found: ty::Ty.scalar(ty::Scalar.UnsignedSize))
+        return None
+    }
+    return Some(number_ty)
+} Body.number_type
+
+/// The digits of a float literal, without its suffix and underscores.
+fn float_digits(written: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var end = written.byte_len()
+    var trimming = true
+    while trimming {
+        let Some(head) = written.slice_bytes(0, end) else {
+            break
+        }
+        trimming = head.ends_with("f32")
+        if trimming {
+            end -= 3
+        }
+    }
+    trimming = true
+    while trimming {
+        let Some(head) = written.slice_bytes(0, end) else {
+            break
+        }
+        trimming = head.ends_with("f64")
+        if trimming {
+            end -= 3
+        }
+    }
+    var digits = mem::Bytes.empty(alloc)
+    let bytes = written.as_bytes()
+    for at in 0..<end {
+        if bytes[at] != b'_' {
+            mut digits.push(bytes[at])
+        }
+    }
+    return digits
+} float_digits
+
+/// Whether float bits, of an `f32` when `single`, are an infinity.
+fn is_infinity(bits: u64, single: bool) -> bool {
+    if single {
+        return (bits & 0x7FFF_FFFF) == 0x7F80_0000
+    }
+    return (bits & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000
+} is_infinity
+
+/// The value a literal of a valid type denotes.
+fn Body.literal_value(self, literal: ast::Literal, ty: ty::Ty, negative: bool) -> Lit {
+    let alloc = self.ck.alloc()
+    let written = self.text(literal.tokens[0])
+    match literal.kind {
+        ast::LiteralKind.Int => {
+            var value = int_literal(written).value_or(wide::Wide.zero())
+            if negative {
+                value = value.wrapping_neg()
+            }
+            return Lit.Int(value)
+        }
+        ast::LiteralKind.Float => {
+            let digits = float_digits(written, alloc)
+            let single = ty == ty::Ty.scalar(ty::Scalar.Float32)
+            var bits = format::float_bits(digits.view(), single, alloc)
+            if negative {
+                if single {
+                    bits = bits | 0x8000_0000
+                } else {
+                    bits = bits | 0x8000_0000_0000_0000
+                }
+            }
+            return Lit.Float(bits)
+        }
+        ast::LiteralKind.Text => return Lit.Text(syntax::text_value(written, alloc))
+        ast::LiteralKind.TextRun => return Lit.Text(self.text_run_value(literal))
+        ast::LiteralKind.Bytes => {
+            var bytes = mem::Bytes.empty(alloc)
+            let Some(quoted) = written.slice_bytes(1, end: written.byte_len()) else {
+                return Lit.Bytes(take bytes)
+            }
+            let value = syntax::text_value(quoted, alloc)
+            var chars = value.cursor()
+            loop {
+                let Some(c) = mut chars.next() else {
+                    break
+                }
+                mut bytes.push(u8.truncate(c.to_bits()))
+            }
+            return Lit.Bytes(take bytes)
+        }
+        ast::LiteralKind.Char => {
+            let value = syntax::text_value(written, alloc)
+            var chars = value.cursor()
+            let Some(c) = mut chars.next() else {
+                return Lit.Char('\0')
+            }
+            return Lit.Char(c)
+        }
+        ast::LiteralKind.Byte => {
+            let Some(quoted) = written.slice_bytes(1, end: written.byte_len()) else {
+                return Lit.Int(wide::Wide.zero())
+            }
+            let value = syntax::text_value(quoted, alloc)
+            var chars = value.cursor()
+            let Some(c) = mut chars.next() else {
+                return Lit.Int(wide::Wide.zero())
+            }
+            return Lit.Int(wide::Wide.of_u64(u64.widen(c.to_bits())))
+        }
+        ast::LiteralKind.True => return Lit.Bool(true)
+        ast::LiteralKind.False => return Lit.Bool(false)
+    }
+} Body.literal_value
+
+/// The value of a text run: its lines' values, each after its `\\`, joined by line ends.
+fn Body.text_run_value(self, literal: ast::Literal) -> text::String {
+    let alloc = self.ck.alloc()
+    var joined = text::String.empty(alloc)
+    for index in 0..<literal.tokens.len() {
+        if index > 0 {
+            mut joined.push('\n')
+        }
+        let written = self.text(literal.tokens[index])
+        let Some(rest) = written.slice_bytes(2, end: written.byte_len()) else {
+            continue
+        }
+        var quoted = text::String.of("\"", alloc)
+        mut quoted.append(rest)
+        mut quoted.push('"')
+        let value = syntax::text_value(quoted.as_str(), alloc)
+        mut joined.append(value.as_str())
+    }
+    return joined
+} Body.text_run_value
+
+/// A use of a local, a `take` parameter appearing in an ensures clause only inside `old`.
+fn Body.local_expr(mut self, token: u32, local: LocalId) -> TExpr {
+    mut self.note_use(local)
+    let held = self.local(local)
+    let taken = held.kind == LocalKind.Param(ast::Mode.Take)
+    if taken and self.cx.ensures_clause and not self.cx.old {
+        self.report(token, code: diagnostic::Code.ContractTakenParameter)
+    }
+    return TExpr(token: token, last: token, ty: held.ty, kind: TKind.Local(local))
+} Body.local_expr
+
+/// A path in an expression: a local, a const parameter, `result`, `Unit`, or an item.
+fn Body.path_expr(
+    mut self,
+    token: u32,
+    path: ast::Path,
+    args: Option[mem::List[ast::GenericArg]],
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    if path.segments.len() == 1 and args.is_none() {
+        let name = path.segments[0].text.as_str()
+        if self.cx.ensures_clause and name == "result" {
+            match self.result {
+                Some(returned) => {
+                    if self.cx.old {
+                        self.report(token, code: diagnostic::Code.ContractOldForm)
+                    }
+                    return TExpr(token: token, last: token, ty: returned, kind: TKind.Result)
+                }
+                None => {}
+            }
+        }
+        let found = mut self.lookup_local(name)
+        match found {
+            Some(local) => return mut self.local_expr(token, local)
+            None => {}
+        }
+        for def in self.generics {
+            if def.name.as_str() != name {
+                continue
+            }
+            let Some(scalar) = def.constant else {
+                self.report(token, code: diagnostic::Code.NameUnknown)
+                return TExpr.failed(token)
+            }
+            return TExpr(token: token, last: token, ty: ty::Ty.scalar(scalar), kind: TKind.ConstParam(def.param))
+        }
+    }
+    match self.intrinsic(path) {
+        Some(Intrinsic.Template) => {
+            self.report(token, code: diagnostic::Code.TextTemplatePosition)
+            return TExpr.failed(token)
+        }
+        Some(Intrinsic.MintRoot) => {
+            self.report(token, code: diagnostic::Code.HwMintRootMisplaced)
+            return TExpr.failed(token)
+        }
+        None => {}
+    }
+    let ck = self.ck.share()
+    let resolved = ck.resolve_use(self.item, module: self.module, path)
+    let named = match resolved {
+        Ok(found) => found
+        Err(error) => {
+            self.report_path(error)
+            return TExpr.failed(token)
+        }
+    }
+    match named {
+        Named.Unit => {
+            if args.is_none() {
+                return TExpr(token: token, last: token, ty: ty::Ty.unit(), kind: TKind.Unit)
+            }
+            self.report(token, code: diagnostic::Code.NameUnknown)
+            return TExpr.failed(token)
+        }
+        Named.Variant(item: enumeration, index: variant) => return mut self.unit_variant(token, enumeration, variant, args, expected)
+        Named.Item(item) => {
+            if not ck.db().visible(self.module, item) {
+                self.report(token, code: diagnostic::Code.NamePrivate)
+            }
+            return mut self.item_value(token, item, expected)
+        }
+        else => {
+            self.report(token, code: diagnostic::Code.NameUnknown)
+            return TExpr.failed(token)
+        }
+    }
+} Body.path_expr
+
+/// An item named as a value: a const, registry, contribution or function.
+fn Body.item_value(mut self, token: u32, item: ty::ItemId, expected: Option[ty::Ty]) -> TExpr {
+    let ck = self.ck.share()
+    let sig = ck.sig(item)
+    var value_ty = ty::Ty.error()
+    var named = false
+    match ck.db().ast(item).kind {
+        ast::ItemKind.Const(_) => {
+            match sig.contents().kind {
+                SigKind.Const(ty: const_ty) => {
+                    value_ty = const_ty
+                    named = true
+                }
+                else => {}
+            }
+        }
+        ast::ItemKind.Registry(_) => {
+            match sig.contents().kind {
+                SigKind.Registry(entry: entry) => {
+                    value_ty = ck.slice_ty(entry)
+                    named = true
+                }
+                else => {}
+            }
+        }
+        ast::ItemKind.Contribute(contribution) => {
+            value_ty = ck.contribution_entry(item, contribution)
+            named = true
+        }
+        ast::ItemKind.Fn(_) => {
+            match sig.contents().kind {
+                SigKind.Fn(function) => return mut self.function_value(token, item, function, expected)
+                else => {}
+            }
+        }
+        else => {}
+    }
+    if not named {
+        self.report(token, code: diagnostic::Code.NameUnknown)
+        return TExpr.failed(token)
+    }
+    return TExpr(token: token, last: token, ty: value_ty, kind: TKind.Value(item))
+} Body.item_value
+
+/// A function item used as a value: its function type, a generic one taking its arguments
+/// from the expected function type.
+fn Body.function_value(mut self, token: u32, item: ty::ItemId, function: FnSig, expected: Option[ty::Ty]) -> TExpr {
+    if function.is_proj() {
+        self.report(token, code: diagnostic::Code.ClosureProjectionValue)
+        return TExpr.failed(token)
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    ck.check_validator_use(self.item, token, function: item)
+    if ck.is_trusted_primitive(item) {
+        self.report(token, code: diagnostic::Code.TrustedPrimitiveOutside)
+    }
+    if function.modifier == Some(ast::FnModifier.Landing) and not ck.is_platform_contribution(self.item) {
+        self.report(token, code: diagnostic::Code.HwLandingCalled)
+    }
+    let fn_id = types.fn_ty(function.fn_ty(alloc))
+    var subst = ty::Subst.empty(alloc)
+    if function.generics.len() > 0 {
+        var params = mem::List[ty::Param].empty(alloc)
+        for def in function.generics {
+            mut params.push(def.param)
+        }
+        match expected {
+            Some(wanted) => {
+                match types.kind(wanted) {
+                    ty::TyKind.Fn(_) => {
+                        var inferred = mem::List[ty::Param].empty(alloc)
+                        for param in params {
+                            mut inferred.push(param)
+                        }
+                        var infer = Infer.new(take inferred, alloc)
+                        discard mut infer.unify(types.intern(ty::TyKind.Fn(fn_id)), found: wanted, types)
+                        subst = infer.subst
+                    }
+                    else => {}
+                }
+            }
+            None => {}
+        }
+        for param in params {
+            if subst.get(param).is_none() {
+                self.report(token, code: diagnostic::Code.GenericUninferred)
+                return TExpr.failed(token)
+            }
+        }
+    }
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    for def in function.generics {
+        match def.constant {
+            Some(_) => mut type_args.push(subst.arg(types, arg: ty::Arg.Const(ty::Const.Param(def.param))))
+            None => mut type_args.push(ty::Arg.Ty(subst.ty(types, ty: types.intern(ty::TyKind.Param(def.param)))))
+        }
+    }
+    let substituted = subst.fn_ty(types, fn_ty: types.fn_of(fn_id))
+    return TExpr(token: token, last: token, ty: types.intern(ty::TyKind.Fn(types.fn_ty(take substituted))), kind: TKind.FnValue(item: item, type_args: types.args(take type_args)))
+} Body.function_value
+
+/// A unit variant written as a value, its enum's arguments written, from the expected type,
+/// or uninferred.
+fn Body.unit_variant(
+    mut self,
+    token: u32,
+    enumeration: ty::ItemId,
+    variant: usize,
+    args: Option[mem::List[ast::GenericArg]],
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let sig = ck.sig(enumeration)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return TExpr.failed(token)
+    }
+    match variants[variant].payload {
+        Payload.None => {}
+        else => {
+            self.report(token, code: diagnostic::Code.TypePayloadShape)
+            return TExpr.failed(token)
+        }
+    }
+    let Some(variant_ty) = mut self.enum_args(token, item: enumeration, args, expected) else {
+        return TExpr.failed(token)
+    }
+    return TExpr(token: token, last: token, ty: variant_ty, kind: TKind.Construct(variant: Some(variant), values: mem::List[TLabelled].empty(ck.alloc()), wrapped: false))
+} Body.unit_variant
+
+/// The type of a generic type's construction or variant path: its arguments as written, or
+/// fixed by the expected type, or uninferred when it has parameters.
+fn Body.enum_args(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    args: Option[mem::List[ast::GenericArg]],
+    expected: Option[ty::Ty],
+    ) -> Option[ty::Ty] {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let generics = ck.shapes(item)
+    let params = generics.contents()
+    match args {
+        Some(written) => {
+            if written.len() != params.len() {
+                self.report(token, code: diagnostic::Code.GenericArity)
+                return None
+            }
+            var problems = Problems.empty(alloc)
+            var resolved = mem::List[ty::Arg].empty(alloc)
+            for index in 0..<written.len() {
+                mut resolved.push(ck.generic_arg(TypeCtx(item: self.item, module: self.module, generics: self.generics.view(), self_param: self.self_param), arg: written[index], param: params[index], mut problems))
+            }
+            let typed = types.item(item, args: take resolved)
+            mut problems.instantiations.push(Instantiated(ty: typed, token: token))
+            ck.report_problems(self.item, problems)
+            return Some(typed)
+        }
+        None => {}
+    }
+    if params.len() == 0 {
+        return Some(types.item(item, args: mem::List[ty::Arg].empty(alloc)))
+    }
+    return self.expected_variant_ty(token, item, expected)
+} Body.enum_args
+
+/// `base.name`: a member through a type or interface, or a field of a value.
+fn Body.field_expr(mut self, token: u32, base: ast::Expr, name: ast::Name, expected: Option[ty::Ty]) -> TExpr {
+    let target = mut self.type_target(base)
+    match target {
+        Some(TypeTarget.Type(found)) => return mut self.member_value(token, ty: found, name, expected)
+        Some(TypeTarget.Interface(_)) => {
+            self.report(token, code: diagnostic::Code.ExprMethodValue)
+            return TExpr.failed(token)
+        }
+        Some(TypeTarget.Module) => {
+            self.dot_for_path(name)
+            return TExpr.failed(token)
+        }
+        Some(TypeTarget.Failed) => return TExpr.failed(token)
+        None => {}
+    }
+    let typed_base = mut self.expr(base, expected: None)
+    return mut self.field_of(token, base: take typed_base, name, read: true)
+} Body.field_expr
+
+/// The fields of a struct's or layout's signature.
+proj fn Sig.declared_fields(self) -> Option[Slice[FieldSig]] {
+    match self.kind {
+        SigKind.Struct(fields: fields) => return Some(fields.view())
+        SigKind.Layout(fields: fields, tags: _, bits: _) => return Some(fields.view())
+        else => return None
+    }
+} Sig.declared_fields
+
+/// A field of a value: of its struct or layout, where visible; `read` unless the field is
+/// the target of `=`.
+fn Body.field_of(mut self, token: u32, take base: TExpr, name: ast::Name, read: bool) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let base_ty = base.ty
+    if base_ty == ty::Ty.error() {
+        return TExpr.failed(token)
+    }
+    let ty::TyKind.Item(item: owner, args: args) = types.kind(base_ty) else {
+        self.no_field(name, ty: base_ty)
+        return TExpr.failed(token)
+    }
+    let sig = ck.sig(owner)
+    let held = sig.contents()
+    var found: Option[usize] = None
+    match held.declared_fields() {
+        Some(fields) => {
+            for index in 0..<fields.len() {
+                if fields[index].name == name.text {
+                    found = Some(index)
+                    break
+                }
+            }
+        }
+        None => {}
+    }
+    let Some(index) = found else {
+        match ck.member_renaming(TypeKey.Item(owner), name: name.text.as_str(), from: self.module) {
+            Some(tombstone) => {
+                return match ck.forward_member(self.item, name, tombstone) {
+                    Some(renamed) => mut self.field_of(token, take base, name: renamed, read)
+                    None => TExpr.failed(token)
+                }
+            }
+            None => {}
+        }
+        self.no_field(name, ty: base_ty)
+        return TExpr.failed(token)
+    }
+    let Some(fields) = held.declared_fields() else {
+        return TExpr.failed(token)
+    }
+    let field = fields[index]
+    self.name_member(name.token, member: Member.Field(owner: owner, name: text::String.of(name.text.as_str(), alloc)))
+    if read {
+        ck.record_read(owner, field: name.text.as_str())
+    }
+    if not ck.db().field_visible(self.module, owner, visibility: field.visibility) {
+        self.report(name.token, code: diagnostic::Code.TypeHiddenField)
+    }
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in held.generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(args), alloc)
+    let field_ty = subst.ty(types, ty: field.ty)
+    return TExpr(token: token, last: token, ty: field_ty, kind: TKind.Field(base: mem::Heap.of(alloc).boxed(take base), name: text::String.of(name.text.as_str(), alloc)))
+} Body.field_of
+
+/// Reports a name that is no field of a value's type: a method named as a value, or an unknown
+/// member.
+fn Body.no_field(self, name: ast::Name, ty: ty::Ty) {
+    let candidates = self.ck.method_candidates(ty, name: name.text.as_str())
+    if candidates.len() == 0 {
+        self.unknown_member(name, ty, stub: None)
+    } else {
+        self.report(name.token, code: diagnostic::Code.ExprMethodValue)
+    }
+} Body.no_field
+
+/// What the base of a member path names when it names no value: a type, an interface, a
+/// module or alias, or nothing that resolves.
+fn Body.type_target(mut self, base: ast::Expr) -> Option[TypeTarget] {
+    let ast::ExprKind.Path(path: path, args: args) = base.kind else {
+        return None
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    if path.segments.len() == 1 and args.is_none() {
+        let name = path.segments[0].text.as_str()
+        let found = mut self.lookup_local(name)
+        if found.is_some() {
+            return None
+        }
+        for def in self.generics {
+            if def.name.as_str() != name {
+                continue
+            }
+            if def.constant.is_some() {
+                return None
+            }
+            return Some(TypeTarget.Type(types.intern(ty::TyKind.Param(def.param))))
+        }
+        if name == "Self" {
+            match self.self_param {
+                Some(param) => return Some(TypeTarget.Type(types.intern(ty::TyKind.Param(param))))
+                None => {}
+            }
+        }
+    }
+    let Ok(named) = ck.resolve_use(self.item, module: self.module, path) else {
+        return None
+    }
+    match named {
+        Named.Module(_) => return Some(TypeTarget.Module)
+        Named.Scalar(_) or Named.Unit or Named.Dyn => return Some(TypeTarget.Type(mut self.path_type(base.token, path, args)))
+        Named.Item(item) => {
+            let db = ck.db()
+            match db.ast(item).kind {
+                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+                    if not db.visible(self.module, item) {
+                        self.report(base.token, code: diagnostic::Code.NamePrivate)
+                    }
+                    if args.is_some() {
+                        return Some(TypeTarget.Type(mut self.path_type(base.token, path, args)))
+                    }
+                    return Some(TypeTarget.Type(ck.own_type(item)))
+                }
+                ast::ItemKind.Registers(_) => return Some(TypeTarget.Type(types.intern(ty::TyKind.Registers(item))))
+                ast::ItemKind.Interface(_) => return Some(TypeTarget.Interface(item))
+                else => return None
+            }
+        }
+        Named.Variant(item: _, index: _) or Named.Never => return Some(TypeTarget.Failed)
+    }
+} Body.type_target
+
+/// The type a path written at `token` with arguments denotes as a type expression of the body,
+/// its problems reported.
+fn Body.path_type(mut self, token: u32, path: ast::Path, args: Option[mem::List[ast::GenericArg]]) -> ty::Ty {
+    var problems = Problems.empty(self.ck.alloc())
+    let ctx = TypeCtx(item: self.item, module: self.module, generics: self.generics.view(), self_param: self.self_param)
+    let resolved = self.ck.path_type(ctx, path, args, mut problems)
+    self.ck.report_problems(self.item, problems)
+    self.ck.check_value_type(self.item, ty: resolved, token: token)
+    return resolved
+} Body.path_type
+
+/// `T.name` written without an argument list: a unit variant, a tag, a register, or a
+/// function as a value.
+fn Body.member_value(mut self, token: u32, ty: ty::Ty, name: ast::Name, expected: Option[ty::Ty]) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    if ty == ty::Ty.error() {
+        return TExpr.failed(token)
+    }
+    match types.kind(ty) {
+        ty::TyKind.Registers(block) => return self.register_value(token, block, name)
+        ty::TyKind.Item(item: item, args: args) => {
+            if self.core_variant_qualified(item, name: name.text.as_str()) {
+                self.qualified_core_variant(token, name)
+                return TExpr.failed(token)
+            }
+            let found = mut self.variant_value(token, item, args, ty, name, expected)
+            match found {
+                Some(typed) => return typed
+                None => {}
+            }
+        }
+        else => {}
+    }
+    if types.scalar_of(ty).is_some() and is_conversion(name.text.as_str()) {
+        self.report(token, code: diagnostic::Code.NumConversionValue)
+        return TExpr.failed(token)
+    }
+    let candidates = ck.method_candidates(ty, name: name.text.as_str())
+    var function: Option[ty::ItemId] = None
+    for candidate in candidates {
+        match candidate {
+            Candidate.Function(item: item, subst: _) => {
+                function = Some(item)
+                break
+            }
+            Candidate.Method(bound: _, method: _, self_ty: _, function: Some(implementing), dynamic: _) => {
+                function = Some(implementing.item)
+                break
+            }
+            else => {}
+        }
+    }
+    match function {
+        Some(found) => {
+            let Some(sig) = ck.fn_sig(found) else {
+                return TExpr.failed(token)
+            }
+            if not ck.db().visible(self.module, item: found) {
+                self.report(name.token, code: diagnostic::Code.NamePrivate)
+            }
+            self.name_member(name.token, member: Member.Function(found))
+            return mut self.function_value(token, item: found, function: sig, expected)
+        }
+        None => {}
+    }
+    match ck.type_key(ty) {
+        Some(key) => {
+            match ck.member_renaming(key, name: name.text.as_str(), from: self.module) {
+                Some(tombstone) => {
+                    return match ck.forward_member(self.item, name, tombstone) {
+                        Some(renamed) => mut self.member_value(token, ty, name: renamed, expected)
+                        None => TExpr.failed(token)
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let written = ck.written(self.item, head: token, last: name.token)
+    if not ck.report_newer_release(self.item, construct: nir::Span(head: token, last: name.token), written: written.as_str()) {
+        self.report(name.token, code: diagnostic::Code.NameUnknown)
+    }
+    return TExpr.failed(token)
+} Body.member_value
+
+/// `R.name`: a register of a registers block, as an `hw::Register` of its type.
+fn Body.register_value(self, token: u32, block: ty::ItemId, name: ast::Name) -> TExpr {
+    let types = self.ck.types()
+    let sig = self.ck.sig(block)
+    match sig.contents().kind {
+        SigKind.Registers(members: members) => {
+            for index in 0..<members.len() {
+                let register = members[index]
+                if register.name != name.text {
+                    continue
+                }
+                var register_ty = ty::Ty.error()
+                match self.ck.db().std_item("hw", name: "Register") {
+                    Some(register_item) => {
+                        var args = mem::List[ty::Arg].empty(self.ck.alloc())
+                        mut args.push(ty::Arg.Ty(types.intern(ty::TyKind.Registers(block))))
+                        mut args.push(ty::Arg.Ty(register.ty))
+                        register_ty = types.item(register_item, take args)
+                    }
+                    None => {}
+                }
+                return TExpr(token: token, last: token, ty: register_ty, kind: TKind.Register(block: block, index: index))
+            }
+        }
+        else => {}
+    }
+    self.report(name.token, code: diagnostic::Code.NameUnknown)
+    return TExpr.failed(token)
+} Body.register_value
+
+/// `T.name` naming a variant of the enum or a tag of the layout `item` that `ty` instantiates,
+/// as a value; none when the name is neither.
+fn Body.variant_value(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    args: ty::Args,
+    ty: ty::Ty,
+    name: ast::Name,
+    expected: Option[ty::Ty],
+    ) -> Option[TExpr] {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let sig = ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Enum(variants: variants) => {
+            let Some(variant) = variants.position(fn(declared: VariantSig) => declared.name == name.text) else {
+                return None
+            }
+            self.name_member(name.token, member: Member.Variant(owner: item, name: text::String.of(name.text.as_str(), alloc)))
+            var variant_ty = ty
+            let shapes = ck.shapes(item)
+            if shapes.contents().len() == 0 {
+                variant_ty = types.item(item, args: mem::List[ty::Arg].empty(alloc))
+            } else if self.holds_own_param(item, args) {
+                let Some(wanted) = self.expected_variant_ty(token, item, expected) else {
+                    return Some(TExpr.failed(token))
+                }
+                variant_ty = wanted
+            }
+            match variants[variant].payload {
+                Payload.None => {}
+                else => {
+                    self.report(token, code: diagnostic::Code.TypePayloadShape)
+                    return Some(TExpr.failed(token))
+                }
+            }
+            return Some(TExpr(token: token, last: token, ty: variant_ty, kind: TKind.Construct(variant: Some(variant), values: mem::List[TLabelled].empty(alloc), wrapped: false)))
+        }
+        SigKind.Layout(fields: _, tags: tags, bits: _) => {
+            let Some(tag) = tags.position(fn(declared: text::String) => declared == name.text) else {
+                return None
+            }
+            return Some(TExpr(token: token, last: token, ty: ty, kind: TKind.Construct(variant: Some(tag), values: mem::List[TLabelled].empty(alloc), wrapped: false)))
+        }
+        else => return None
+    }
+} Body.variant_value
+
+/// The type of a generic enum's construction or variant path written without arguments: the
+/// expected type when it instantiates the enum; none, reported unless that type failed,
+/// otherwise.
+fn Body.expected_variant_ty(self, token: u32, item: ty::ItemId, expected: Option[ty::Ty]) -> Option[ty::Ty] {
+    let Some(wanted) = expected else {
+        self.report(token, code: diagnostic::Code.GenericUninferred)
+        return None
+    }
+    match self.ck.types().kind(wanted) {
+        ty::TyKind.Item(item: found, args: _) => {
+            if found == item {
+                return Some(wanted)
+            }
+        }
+        else => {}
+    }
+    if wanted != ty::Ty.error() {
+        self.report(token, code: diagnostic::Code.GenericUninferred)
+    }
+    return None
+} Body.expected_variant_ty
+
+/// Whether type arguments hold one of `item`'s own generic parameters.
+fn Body.holds_own_param(self, item: ty::ItemId, args: ty::Args) -> bool {
+    let types = self.ck.types()
+    for arg in types.arg_list(args) {
+        let ty::Arg.Ty(arg_ty) = arg else {
+            continue
+        }
+        let ty::TyKind.Param(param) = types.kind(arg_ty) else {
+            continue
+        }
+        if param.owner == item {
+            return true
+        }
+    }
+    return false
+} Body.holds_own_param
+
+/// Whether `Option` or `Result` qualifies one of their core variants.
+fn Body.core_variant_qualified(self, item: ty::ItemId, name: Str) -> bool {
+    let path = self.ck.db().canonical(item)
+    return match path.as_str() {
+        "core::Option" => name == "Some" or name == "None"
+        "core::Result" => name == "Ok" or name == "Err"
+        else => false
+    }
+} Body.core_variant_qualified
+
+fn Body.unary(mut self, token: u32, op: ast::UnaryOp, operand: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    let heap = mem::Heap.of(self.ck.alloc())
+    let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
+    if op == ast::UnaryOp.Not {
+        let typed = mut self.check(operand, expected: bool_ty)
+        return TExpr(token: token, last: token, ty: bool_ty, kind: TKind.Unary(op: op, operand: heap.boxed(take typed)))
+    }
+    if op == ast::UnaryOp.Neg {
+        match operand.kind {
+            ast::ExprKind.Literal(literal) => {
+                if literal.kind == ast::LiteralKind.Int or literal.kind == ast::LiteralKind.Float {
+                    return mut self.negative_literal(token, literal, expected)
+                }
+            }
+            else => {}
+        }
+    }
+    let typed = mut self.expr(operand, expected)
+    let operated = self.unary_result(token, op, operand_ty: typed.ty)
+    return TExpr(token: token, last: token, ty: operated, kind: TKind.Unary(op: op, operand: heap.boxed(take typed)))
+} Body.unary
+
+/// The result type of `-` or `~` on an operand's type: what its `core::Neg` or `core::BitNot`
+/// impl gives, reported when it has none and for `-` on an unsigned integer.
+fn Body.unary_result(self, token: u32, op: ast::UnaryOp, operand_ty: ty::Ty) -> ty::Ty {
+    let types = self.ck.types()
+    if operand_ty == ty::Ty.error() {
+        return ty::Ty.error()
+    }
+    let unsigned = match types.scalar_of(operand_ty) {
+        Some(scalar) => op == ast::UnaryOp.Neg and scalar.is_integer() and not scalar.is_signed()
+        None => false
+    }
+    if unsigned {
+        self.report(token, code: diagnostic::Code.NumUnsignedNegation)
+        return ty::Ty.error()
+    }
+    let name = match op == ast::UnaryOp.Neg {
+        true => "Neg"
+        false => "BitNot"
+    }
+    let Some(interface_item) = self.ck.db().std_item("core", name) else {
+        return ty::Ty.error()
+    }
+    let Some(conforming) = self.ck.conformance(operand_ty, interface_item) else {
+        self.report(token, code: diagnostic::Code.InterfaceNotImplemented)
+        return ty::Ty.error()
+    }
+    let held = types.arg_list(conforming.args)
+    if held.len() == 0 {
+        return ty::Ty.error()
+    }
+    return held[0].ty().value_or(ty::Ty.error())
+} Body.unary_result
+
+/// A number literal negated: its value negated, a nonzero one of an unsigned type reported.
+fn Body.negative_literal(mut self, token: u32, literal: ast::Literal, expected: Option[ty::Ty]) -> TExpr {
+    let typed = mut self.literal(token, literal, expected, negative: true)
+    let Some(scalar) = self.ck.types().scalar_of(typed.ty) else {
+        return typed
+    }
+    if scalar.is_integer() and not scalar.is_signed() and literal.kind == ast::LiteralKind.Int {
+        let value = int_literal(self.text(literal.tokens[0])).value_or(wide::Wide.zero())
+        if not value.is_zero() {
+            self.report(token, code: diagnostic::Code.TypeLiteralRange)
+            return TExpr.failed(token)
+        }
+    }
+    return typed
+} Body.negative_literal
+
+fn Body.binary(
+    mut self,
+    token: u32,
+    op: ast::BinaryOp,
+    op_token: u32,
+    left: ast::Expr,
+    right: ast::Expr,
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    if op == ast::BinaryOp.And or op == ast::BinaryOp.Or {
+        let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
+        let typed_left = mut self.check(left, expected: bool_ty)
+        let typed_right = mut self.check(right, expected: bool_ty)
+        let heap = mem::Heap.of(self.ck.alloc())
+        return TExpr(token: token, last: token, ty: bool_ty, kind: TKind.Binary(op: op, left: heap.boxed(take typed_left), right: heap.boxed(take typed_right)))
+    }
+    if op.is_range() {
+        return mut self.range(token, op, low: left, high: right, expected)
+    }
+    if not self.needs_expected(left) {
+        let left_typed = mut self.expr(left, expected: None)
+        return mut self.operator(token, op, op_token, left: take left_typed, right_typed: None, left_operand: left, right_operand: right, compound: false)
+    }
+    let shift = op == ast::BinaryOp.Shl or op == ast::BinaryOp.Shr
+    if not shift and not self.needs_expected(right) {
+        let right_typed = mut self.expr(right, expected: None)
+        let left_typed = mut self.expr(left, expected: Some(right_typed.ty))
+        return mut self.operator(token, op, op_token, left: take left_typed, right_typed: Some(take right_typed), left_operand: left, right_operand: right, compound: false)
+    }
+    var hint = expected
+    if op.is_comparison() {
+        hint = None
+    }
+    let left_typed = mut self.expr(left, expected: hint)
+    return mut self.operator(token, op, op_token, left: take left_typed, right_typed: None, left_operand: left, right_operand: right, compound: false)
+} Body.binary
+
+/// The binary operator `target op value` of a compound assignment, its target typed; the left
+/// operand of the result stands for the target by its type alone.
+fn Body.binary_op(
+    mut self,
+    op: ast::BinaryOp,
+    op_token: u32,
+    typed: TExpr,
+    target: ast::Expr,
+    value: ast::Expr,
+    ) -> TExpr {
+    let left = TExpr(token: typed.token, last: typed.last, ty: typed.ty, kind: TKind.Failed)
+    return mut self.operator(target.token, op, op_token, take left, right_typed: None, left_operand: target, right_operand: value, compound: true)
+} Body.binary_op
+
+/// Applies an operator to a typed left operand: the operator interface its type implements
+/// fixes the right operand's expected type and the result. The operands are written
+/// `left_operand` and `right_operand`, the target and value of a compound assignment
+/// `target op= value` when `compound`.
+fn Body.operator(
+    mut self,
+    token: u32,
+    op: ast::BinaryOp,
+    op_token: u32,
+    take left: TExpr,
+    take right_typed: Option[TExpr],
+    left_operand: ast::Expr,
+    right_operand: ast::Expr,
+    compound: bool,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let heap = mem::Heap.of(ck.alloc())
+    let ty = left.ty
+    var operated = ty::Ty.error()
+    var right_expected = ty::Ty.error()
+    let scalar = types.scalar_of(ty)
+    let float = match scalar {
+        Some(held) => held.is_float()
+        None => false
+    }
+    if ty == ty::Ty.error() {
+        operated = ty::Ty.error()
+    } else if float and op.is_comparison() {
+        right_expected = ty
+        operated = ty::Ty.scalar(ty::Scalar.Bool)
+    } else if op.is_comparison() {
+        let name = match op == ast::BinaryOp.Eq or op == ast::BinaryOp.Ne {
+            true => "Eq"
+            false => "Ord"
+        }
+        let implements = match ck.db().core_item(name) {
+            Some(interface_item) => ck.implements(ty, interface_item)
+            None => false
+        }
+        if implements {
+            right_expected = ty
+        } else {
+            self.report(op_token, code: diagnostic::Code.InterfaceNotImplemented)
+        }
+        operated = ty::Ty.scalar(ty::Scalar.Bool)
+    } else {
+        match signed_code(op, scalar) {
+            Some(code) => {
+                var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+                match self.signed_operation(op, left: left_operand, right: right_operand, compound) {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+                self.report_fixed(nir::Span(head: left_operand.token, last: right_operand.last), code, take fixes)
+                let right = mut self.right_operand(take right_typed, right: right_operand, expected: ty)
+                return TExpr(token: token, last: token, ty: ty::Ty.error(), kind: TKind.Binary(op: op, left: heap.boxed(take left), right: heap.boxed(take right)))
+            }
+            None => {}
+        }
+        let name = match op {
+            ast::BinaryOp.Add => "Add"
+            ast::BinaryOp.Sub => "Sub"
+            ast::BinaryOp.Mul => "Mul"
+            ast::BinaryOp.Div => "Div"
+            ast::BinaryOp.Rem => "Rem"
+            ast::BinaryOp.BitAnd => "BitAnd"
+            ast::BinaryOp.BitOr => "BitOr"
+            ast::BinaryOp.BitXor => "BitXor"
+            ast::BinaryOp.Shl => "Shl"
+            else => "Shr"
+        }
+        var conformance: Option[Conforming] = None
+        match ck.db().std_item("core", name) {
+            Some(interface_item) => {
+                conformance = ck.conformance(ty, interface_item)
+            }
+            None => {}
+        }
+        match conformance {
+            Some(conforming) => {
+                let held = types.arg_list(conforming.args)
+                if held.len() == 2 {
+                    right_expected = held[0].ty().value_or(ty::Ty.error())
+                    operated = held[1].ty().value_or(ty::Ty.error())
+                }
+            }
+            None => self.report(op_token, code: diagnostic::Code.InterfaceNotImplemented)
+        }
+    }
+    let right = mut self.right_operand(take right_typed, right: right_operand, expected: right_expected)
+    return TExpr(token: token, last: token, ty: operated, kind: TKind.Binary(op: op, left: heap.boxed(take left), right: heap.boxed(take right)))
+} Body.operator
+
+/// The code of signed `/`, `%` or `>>` on a scalar type.
+fn signed_code(op: ast::BinaryOp, scalar: Option[ty::Scalar]) -> Option[diagnostic::Code] {
+    let Some(held) = scalar else {
+        return None
+    }
+    if not held.is_signed() {
+        return None
+    }
+    return match op {
+        ast::BinaryOp.Div or ast::BinaryOp.Rem => Some(diagnostic::Code.NumSignedDivision)
+        ast::BinaryOp.Shr => Some(diagnostic::Code.NumSignedShiftRight)
+        else => None
+    }
+} signed_code
+
+/// The right operand of an operator against the type it expects: already typed, or typed now.
+fn Body.right_operand(mut self, take right_typed: Option[TExpr], right: ast::Expr, expected: ty::Ty) -> TExpr {
+    let Some(typed) = right_typed else {
+        return mut self.check(right, expected)
+    }
+    self.expect_type(typed, expected, token: right.token)
+    return typed
+} Body.right_operand
+
+/// A range expression: both bounds of one integer scalar or `char` type, a `core::Range`.
+fn Body.range(
+    mut self,
+    token: u32,
+    op: ast::BinaryOp,
+    low: ast::Expr,
+    high: ast::Expr,
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    var element_hint: Option[ty::Ty] = None
+    match expected {
+        Some(wanted) => {
+            if ck.is_std(wanted, path: "core::Range") {
+                element_hint = types.type_arg(wanted, index: 0)
+            }
+        }
+        None => {}
+    }
+    if self.needs_expected(low) and not self.needs_expected(high) {
+        let high_typed = mut self.expr(high, expected: None)
+        let low_typed = mut self.check(low, expected: high_typed.ty)
+        return self.range_value(token, op, take low_typed, take high_typed)
+    }
+    if self.needs_expected(low) {
+        let low_typed = mut self.expr(low, expected: element_hint)
+        let high_typed = mut self.check(high, expected: low_typed.ty)
+        return self.range_value(token, op, take low_typed, take high_typed)
+    }
+    let low_typed = mut self.expr(low, expected: None)
+    let high_typed = mut self.check(high, expected: low_typed.ty)
+    return self.range_value(token, op, take low_typed, take high_typed)
+} Body.range
+
+/// The typed range of typed bounds: a `core::Range` of their element type, reported unless it is
+/// an integer scalar or `char`.
+fn Body.range_value(self, token: u32, op: ast::BinaryOp, take low_typed: TExpr, take high_typed: TExpr) -> TExpr {
+    let types = self.ck.types()
+    let alloc = self.ck.alloc()
+    let element = low_typed.ty
+    var valid = element == ty::Ty.error()
+    match types.scalar_of(element) {
+        Some(scalar) => {
+            valid = scalar.is_integer() or scalar == ty::Scalar.Char
+        }
+        None => {}
+    }
+    if not valid {
+        self.report(token, code: diagnostic::Code.ExprRangeType)
+    }
+    var range_ty = ty::Ty.error()
+    if valid and not types.has_error(element) {
+        var args = mem::List[ty::Arg].empty(alloc)
+        mut args.push(ty::Arg.Ty(element))
+        range_ty = self.ck.core_ty("Range", take args)
+    }
+    let heap = mem::Heap.of(alloc)
+    return TExpr(token: token, last: token, ty: range_ty, kind: TKind.Binary(op: op, left: heap.boxed(take low_typed), right: heap.boxed(take high_typed)))
+} Body.range_value
+
+/// An `if` or `match` in statement position: its blocks hold statements and its arms'
+/// expression bodies are in statement position.
+fn Body.statement_branches(mut self, expr: ast::Expr) -> TExpr {
+    let token = expr.token
+    match expr.kind {
+        ast::ExprKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            let heap = mem::Heap.of(self.ck.alloc())
+            let typed_condition = mut self.check(condition.contents(), expected: ty::Ty.scalar(ty::Scalar.Bool))
+            let then_typed = mut self.block(then)
+            let Diverging(value: then_block, diverges: then_diverges) = then_typed
+            var typed_otherwise: Option[mem::Box[TExpr]] = None
+            var otherwise_diverges = false
+            match otherwise {
+                Some(chained) => {
+                    match chained.contents() {
+                        ast::Else.Block(block) => {
+                            let typed = mut self.block(block)
+                            let Diverging(value: else_block, diverges: diverges) = typed
+                            otherwise_diverges = diverges
+                            typed_otherwise = Some(heap.boxed(TExpr(token: block.token, last: block.end, ty: diverging_ty(diverges), kind: TKind.Block(take else_block))))
+                        }
+                        ast::Else.If(nested) => {
+                            let typed = mut self.statement_branches(nested)
+                            otherwise_diverges = typed.ty.is_never()
+                            typed_otherwise = Some(heap.boxed(take typed))
+                        }
+                    }
+                }
+                None => {}
+            }
+            let diverges = then_diverges and typed_otherwise.is_some() and otherwise_diverges
+            return TExpr(token: token, last: token, ty: diverging_ty(diverges), kind: TKind.If(condition: heap.boxed(take typed_condition), then: take then_block, otherwise: take typed_otherwise))
+        }
+        ast::ExprKind.Match(ordered: ordered, scrutinee: scrutinee, arms: arms) => return mut self.match_expr(token, ordered, scrutinee: scrutinee.contents(), arms: arms.view(), expected: None, statement: true)
+        else => return mut self.expr(expr, expected: None)
+    }
+} Body.statement_branches
+
+/// A value-yielding `if`: each branch diverges or holds one value statement, and an `else`.
+fn Body.value_if(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    let ast::ExprKind.If(condition: condition, then: then, otherwise: otherwise) = expr.kind else {
+        expect false
+        return TExpr.failed(expr.token)
+    }
+    let token = expr.token
+    let heap = mem::Heap.of(self.ck.alloc())
+    let typed_condition = mut self.check(condition.contents(), expected: ty::Ty.scalar(ty::Scalar.Bool))
+    var fixed = expected
+    let then_typed = mut self.value_block(then, mut fixed)
+    var typed_otherwise: Option[mem::Box[TExpr]] = None
+    var otherwise_never = false
+    match otherwise {
+        Some(chained) => {
+            match chained.contents() {
+                ast::Else.Block(block) => {
+                    let typed = mut self.value_block(block, mut fixed)
+                    otherwise_never = typed.ty.is_never()
+                    typed_otherwise = Some(heap.boxed(take typed))
+                }
+                ast::Else.If(nested) => {
+                    let typed = mut self.value_if(nested, expected: fixed)
+                    if fixed.is_none() and not typed.ty.is_never() {
+                        fixed = Some(typed.ty)
+                    }
+                    otherwise_never = typed.ty.is_never()
+                    typed_otherwise = Some(heap.boxed(take typed))
+                }
+            }
+        }
+        None => self.report(token, code: diagnostic::Code.ExprMissingElse)
+    }
+    var value_ty = fixed.value_or(ty::Ty.error())
+    if then_typed.ty.is_never() and typed_otherwise.is_some() and otherwise_never {
+        value_ty = ty::Ty.never()
+    }
+    let TExpr(token: _, last: _, ty: _, kind: then_kind) = then_typed
+    let TKind.Block(then_block) = then_kind else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return TExpr(token: token, last: token, ty: value_ty, kind: TKind.If(condition: heap.boxed(take typed_condition), then: take then_block, otherwise: take typed_otherwise))
+} Body.value_if
+
+/// A branch block of a value-yielding `if`: it diverges, or holds one expression statement
+/// whose expression is its value.
+fn Body.value_block(mut self, block: ast::Block, mut fixed: Option[ty::Ty]) -> TExpr {
+    let alloc = self.ck.alloc()
+    if block.stmts.len() == 1 {
+        let stmt = block.stmts[0]
+        match stmt.kind {
+            ast::StmtKind.Expr(value) => {
+                mut self.push_scope()
+                let typed = mut self.expr_jump(value, expected: fixed, jump: true)
+                mut self.pop_scope()
+                match fixed {
+                    Some(wanted) => self.expect_type(typed, expected: wanted, token: value.token)
+                    None => {
+                        if not typed.ty.is_never() {
+                            fixed = Some(typed.ty)
+                        }
+                    }
+                }
+                let value_ty = typed.ty
+                var stmts = mem::List[TStmt].empty(alloc)
+                mut stmts.push(TStmt(token: stmt.token, kind: TStmtKind.Expr(take typed)))
+                return TExpr(token: block.token, last: block.end, ty: value_ty, kind: TKind.Block(TBlock(end: block.end, stmts: take stmts)))
+            }
+            else => {}
+        }
+    }
+    let tailed = mut self.tail_block(block)
+    let TailedBlock(block: typed, diverges: diverges, tail: tail) = tailed
+    if not diverges {
+        var at = block.token
+        if block.stmts.len() > 0 {
+            at = block.stmts[0].token
+        }
+        self.report(at, code: diagnostic::Code.ExprBranchForm)
+    } else {
+        match tail {
+            Some(unused) => self.unused_result(unused)
+            None => {}
+        }
+    }
+    var block_ty = ty::Ty.error()
+    if diverges {
+        block_ty = ty::Ty.never()
+    }
+    return TExpr(token: block.token, last: block.end, ty: block_ty, kind: TKind.Block(take typed))
+} Body.value_block
+
+fn Body.value_match(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    let ast::ExprKind.Match(ordered: ordered, scrutinee: scrutinee, arms: arms) = expr.kind else {
+        expect false
+        return TExpr.failed(expr.token)
+    }
+    return mut self.match_expr(expr.token, ordered, scrutinee: scrutinee.contents(), arms: arms.view(), expected, statement: false)
+} Body.value_match
+
+/// A `match`: its scrutinee, then each arm's patterns, guard and body, its arms' disjointness
+/// and exhaustiveness; `ordered` for `match first`.
+fn Body.match_expr(
+    mut self,
+    token: u32,
+    ordered: bool,
+    scrutinee: ast::Expr,
+    arms: Slice[ast::Arm],
+    expected: Option[ty::Ty],
+    statement: bool,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let scrutinee_typed = mut self.expr(scrutinee, expected: None)
+    let scrutinee_ty = scrutinee_typed.ty
+    var fixed = expected
+    var typed_arms = mem::List[TArm].empty(alloc)
+    var else_seen = false
+    var all_never = true
+    for arm in arms {
+        mut self.push_scope()
+        var patterns = mem::List[TPattern].empty(alloc)
+        match arm.patterns {
+            ast::ArmPatterns.Patterns(written) => {
+                patterns = mut self.arm_patterns(arm.token, patterns: written.view(), ty: scrutinee_ty)
+                for pattern in patterns {
+                    mut self.bind_views(pattern, value: scrutinee_typed)
+                }
+            }
+            ast::ArmPatterns.Else => {
+                if else_seen {
+                    self.report(arm.token, code: diagnostic::Code.ExprOverlappingArms)
+                }
+                else_seen = true
+            }
+        }
+        var guard: Option[TExpr] = None
+        match arm.guard {
+            Some(written) => {
+                if not ordered {
+                    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+                    mut fixes.push(ck.fix_appending(self.item, after: token, text: " first"))
+                    self.report_fixed(nir::Span(head: written.token, last: written.last), code: diagnostic::Code.ExprGuardOutsideFirst, take fixes)
+                }
+                guard = Some(mut self.check(written, expected: ty::Ty.scalar(ty::Scalar.Bool)))
+            }
+            None => {}
+        }
+        let body = mut self.arm_body(arm.body, mut fixed, statement)
+        all_never = all_never and body.ty.is_never()
+        mut self.pop_scope()
+        mut typed_arms.push(TArm(token: arm.token, patterns: take patterns, guard: take guard, body: take body))
+    }
+    if not types.has_error(scrutinee_ty) {
+        self.check_arms(token, ordered, ty: scrutinee_ty, arms: typed_arms.view(), written_arms: arms)
+    }
+    var match_ty = fixed.value_or(ty::Ty.error())
+    if all_never {
+        match_ty = ty::Ty.never()
+    } else if statement {
+        match_ty = ty::Ty.unit()
+    }
+    return TExpr(token: token, last: token, ty: match_ty, kind: TKind.Match(scrutinee: mem::Heap.of(alloc).boxed(take scrutinee_typed), arms: take typed_arms))
+} Body.match_expr
+
+/// The body of a match arm: a block, or an expression in statement position or yielding the
+/// match's value, whose type `fixed` fixes or takes.
+fn Body.arm_body(mut self, body: ast::ArmBody, mut fixed: Option[ty::Ty], statement: bool) -> TExpr {
+    match body {
+        ast::ArmBody.Block(block) => {
+            let tailed = mut self.tail_block(block)
+            let TailedBlock(block: typed, diverges: diverges, tail: tail) = tailed
+            if not statement and not diverges {
+                var at = block.token
+                if block.stmts.len() > 0 {
+                    at = block.stmts[0].token
+                }
+                self.report(at, code: diagnostic::Code.ExprBranchForm)
+            } else {
+                match tail {
+                    Some(unused) => self.unused_result(unused)
+                    None => {}
+                }
+            }
+            return TExpr(token: block.token, last: block.end, ty: diverging_ty(diverges), kind: TKind.Block(take typed))
+        }
+        ast::ArmBody.Expr(value) => {
+            if statement {
+                let enclosing = self.statement
+                self.statement = Some(nir::Span(head: value.token, last: value.last))
+                let typed = match value.kind {
+                    ast::ExprKind.If(condition: _, then: _, otherwise: _) or ast::ExprKind.Match(ordered: _, scrutinee: _, arms: _) => mut self.statement_branches(value)
+                    else => mut self.expr_jump(value, expected: None, jump: true)
+                }
+                self.statement = enclosing
+                if typed.ty != ty::Ty.unit() and typed.ty != ty::Ty.never() and typed.ty != ty::Ty.error() {
+                    self.unused_result(Tail(token: value.token, last: value.last, ty: typed.ty))
+                }
+                return typed
+            }
+            let typed = mut self.expr_jump(value, expected: fixed, jump: true)
+            match fixed {
+                Some(wanted) => self.expect_type(typed, expected: wanted, token: value.token)
+                None => {
+                    if not typed.ty.is_never() {
+                        fixed = Some(typed.ty)
+                    }
+                }
+            }
+            return typed
+        }
+    }
+} Body.arm_body
+
+/// A closure written as an argument for a parameter of function type `wanted`, in the role
+/// `written` gives it.
+fn Body.closure(mut self, token: u32, closure: ast::Closure, wanted: Option[ty::FnTyId], written: Written) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    var task = false
+    var short_result: Option[ty::Ty] = None
+    var demanded = ty::LimitSet.none()
+    match wanted {
+        Some(id) => {
+            let wanted_ty = types.fn_of(id)
+            task = wanted_ty.kind == ast::FnKind.Task
+            short_result = Some(wanted_ty.result)
+            demanded = wanted_ty.limit_set
+        }
+        None => {}
+    }
+    self.closures += 1
+    let index = self.closures
+    if written == Written.ScopeBody {
+        mut self.scope_bodies.push(index)
+    }
+    let listed = self.capture_list(closure)
+    var params = mem::List[ty::FnParam].empty(alloc)
+    for param in closure.params {
+        let param_ty = mut self.type_expr(param.ty)
+        mut params.push(ty::FnParam(mode: param.mode, name: text::String.of(param.name.text.as_str(), alloc), ty: param_ty))
+    }
+    let result = mut self.closure_result(closure, short_result)
+    let failure = mut self.written_type(closure.failure)
+    let wait = match closure.usage {
+        Some(written_usage) => written_usage.is_wait()
+        None => false
+    }
+    mut self.note_captures(closure)
+    let loops = self.loops.len()
+    let scopes = self.scopes.len()
+    mut self.push_frame(Frame(result: result, failure: failure, tested: false, closure: index, task: task, listed: take listed, captures: mem::List[FrameCapture].empty(alloc), loops: loops, scopes: scopes, holds_todo: false, may_fail: None, several_failures: false, may_wait: false))
+    mut self.push_scope()
+    let param_ids = mut self.declare_closure_params(closure, typed: params.view())
+    var body = TExpr.failed(token)
+    var body_result = result
+    match closure.body {
+        ast::ClosureBody.Short(value) => {
+            body = mut self.expr(value.contents(), expected: short_result)
+            body_result = body.ty
+        }
+        ast::ClosureBody.Block(block) => {
+            let typed = mut self.result_block(block, result)
+            body = TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed))
+        }
+    }
+    mut self.pop_scope()
+    let Some(frame) = mut self.frames.pop() else {
+        expect false
+        return TExpr.failed(token)
+    }
+    var kind = ast::FnKind.Plain
+    if task {
+        kind = ast::FnKind.Task
+    }
+    let item = self.item
+    let closure_ty = ty::FnTy(kind: kind, params: take params, result: body_result, failure: failure, wait: wait, limit_set: limit_demands(closure.limit_set, interrupt_fn: false, token_text: fn(at: u32) => text::String.of(ck.db().text(item, token: at), alloc)), convention: None)
+    self.closure_rules(token, closure, frame, closure_ty)
+    let captures = self.closure_captures(closure, frame)
+    let lent = match written {
+        Written.Lent(scope) => Some(scope)
+        else => None
+    }
+    let fn_id = types.fn_ty(ty::copy_fn_ty(closure_ty, alloc))
+    let typed = TClosure(task: task, params: take param_ids, captures: take captures, ty: take closure_ty, body: take body, index: index, loops: loops, lent: lent, demanded: demanded)
+    return TExpr(token: token, last: token, ty: types.intern(ty::TyKind.Fn(fn_id)), kind: TKind.Closure(mem::Heap.of(alloc).boxed(take typed)))
+} Body.closure
+
+/// The type a written type expression denotes, if one is written.
+fn Body.written_type(mut self, written: Option[ast::TypeExpr]) -> Option[ty::Ty] {
+    let Some(written_ty) = written else {
+        return None
+    }
+    return Some(mut self.type_expr(written_ty))
+} Body.written_type
+
+/// Declares a closure's parameters with their typed parameters' types.
+fn Body.declare_closure_params(mut self, closure: ast::Closure, typed: Slice[ty::FnParam]) -> mem::List[LocalId] {
+    var param_ids = mem::List[LocalId].empty(self.ck.alloc())
+    for at in 0..<closure.params.len() {
+        if at >= typed.len() {
+            break
+        }
+        let param = closure.params[at]
+        mut param_ids.push(mut self.declare(param.name, ty: typed[at].ty, kind: LocalKind.Param(param.mode)))
+    }
+    return param_ids
+} Body.declare_closure_params
+
+/// A closure's capture list as its frame holds it, each name listed again reported.
+fn Body.capture_list(self, closure: ast::Closure) -> mem::List[ListedCapture] {
+    let alloc = self.ck.alloc()
+    var listed = mem::List[ListedCapture].empty(alloc)
+    for at in 0..<closure.captures.len() {
+        let capture = closure.captures[at]
+        for before in 0..<at {
+            if closure.captures[before].name.text == capture.name.text {
+                self.report(capture.token, code: diagnostic::Code.ClosureCaptureDuplicate)
+                break
+            }
+        }
+        mut listed.push(ListedCapture(name: text::String.of(capture.name.text.as_str(), alloc), mode: capture.mode, token: capture.token))
+    }
+    return listed
+} Body.capture_list
+
+/// The result type a closure's head writes, or for a short closure the one its function type
+/// gives.
+fn Body.closure_result(mut self, closure: ast::Closure, short_result: Option[ty::Ty]) -> ty::Ty {
+    match closure.result {
+        Some(written) => return mut self.type_expr(written)
+        None => {}
+    }
+    return match closure.body {
+        ast::ClosureBody.Short(_) => short_result.value_or(ty::Ty.error())
+        ast::ClosureBody.Block(_) => ty::Ty.unit()
+    }
+} Body.closure_result
+
+/// Notes the use of each local a closure's capture list names, reporting a name naming none.
+fn Body.note_captures(mut self, closure: ast::Closure) {
+    for capture in closure.captures {
+        let found = mut self.lookup_local(capture.name.text.as_str())
+        match found {
+            Some(local) => mut self.note_use(local)
+            None => self.report(capture.name.token, code: diagnostic::Code.NameUnknown)
+        }
+    }
+} Body.note_captures
+
+/// The rules of a closure's head once its body is typed: its limits, its function type, a
+/// stack size under a kernel target for a task closure, its failure type, and the effects its
+/// body has.
+fn Body.closure_rules(self, token: u32, closure: ast::Closure, frame: Frame, closure_ty: ty::FnTy) {
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    let item = self.item
+    match closure.limit_set {
+        Some(clause) => {
+            let found = limit_problems(clause, wait: closure_ty.wait, interrupt_fn: false, token_text: fn(at: u32) => text::String.of(ck.db().text(item, token: at), alloc), alloc)
+            for problem in found {
+                ck.report_problem(item, token: problem.token, code: problem.code)
+            }
+        }
+        None => {}
+    }
+    match ck.fn_type_problem(closure_ty) {
+        Some(code) => self.report(token, code)
+        None => {}
+    }
+    let target = ck.db().target
+    if closure_ty.kind == ast::FnKind.Task and (target == workspace::Target.Uefi or target == workspace::Target.Bare) and closure_ty.limit_set.stack.is_none() {
+        self.report(token, code: diagnostic::Code.SuspendStackMissing)
+    }
+    match closure_ty.failure {
+        Some(raised) => {
+            match closure.failure {
+                Some(written) => {
+                    if not ck.is_failure_type(raised) {
+                        self.report(written.token, code: diagnostic::Code.ErrorFailureType)
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    match closure.body {
+        ast::ClosureBody.Short(value) => {
+            if frame.may_fail.is_some() or frame.may_wait {
+                let short = value.contents()
+                var fixes = mem::List[diagnostic::Fix].empty(alloc)
+                match self.long_closure(token, closure, expr: short, ty: closure_ty, frame) {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+                self.report_fixed(nir::Span(head: short.token, last: short.last), code: diagnostic::Code.ClosureShortEffect, take fixes)
+            }
+        }
+        ast::ClosureBody.Block(_) => self.check_effects(token, frame, head: closure_ty, clauses: Clauses.of_closure(closure), exempt: false)
+    }
+} Body.closure_rules
+
+/// The captures of a closure's frame, each with its entry in the capture list, the entries
+/// that capture nothing reported.
+fn Body.closure_captures(self, closure: ast::Closure, frame: Frame) -> mem::List[TCapture] {
+    let alloc = self.ck.alloc()
+    var captures = mem::List[TCapture].empty(alloc)
+    for capture in frame.captures {
+        let outer = self.local(capture.reached)
+        var listed: Option[ast::Word[ast::Mode]] = None
+        for entry in frame.listed {
+            if entry.name == outer.name {
+                listed = Some(ast::Word(kind: entry.mode, token: entry.token))
+                break
+            }
+        }
+        mut captures.push(TCapture(local: capture.local, outer: capture.reached, listed: listed))
+    }
+    for entry in frame.listed {
+        var used = false
+        for capture in frame.captures {
+            if self.local(capture.reached).name == entry.name {
+                used = true
+                break
+            }
+        }
+        if used {
+            continue
+        }
+        for capture in closure.captures {
+            if capture.token != entry.token {
+                continue
+            }
+            var fixes = mem::List[diagnostic::Fix].empty(alloc)
+            mut fixes.push(self.ck.fix_capture_deleted(self.item, head: capture.token, last: capture.name.token))
+            self.report_fixed(nir::Span(head: capture.token, last: capture.name.token), code: diagnostic::Code.ClosureCaptureUnused, take fixes)
+            break
+        }
+    }
+    return captures
+} Body.closure_captures
+
+/// The long form of a short closure written at `token` whose expression may fail or wait:
+/// its head with the result, `fails` and `uses wait` the expression needs, and a block
+/// returning the expression.
+fn Body.long_closure(
+    self,
+    token: u32,
+    closure: ast::Closure,
+    expr: ast::Expr,
+    ty: ty::FnTy,
+    frame: Frame,
+    ) -> Option[diagnostic::Fix] {
+    if frame.several_failures {
+        return None
+    }
+    let ck = self.ck.share()
+    let yields = ty.result != ty::Ty.unit() and ty.result != ty::Ty.never()
+    var long = ck.written(self.item, head: token, last: closure.close)
+    if yields {
+        mut long.append(" -> ")
+        let shown = ck.show(ty.result, from: self.module)
+        mut long.append(shown.as_str())
+    }
+    match frame.may_fail {
+        Some(failure) => {
+            mut long.append(" fails ")
+            let shown = ck.show(failure, from: self.module)
+            mut long.append(shown.as_str())
+        }
+        None => {}
+    }
+    if frame.may_wait {
+        mut long.append(" uses wait")
+    }
+    let written = ck.written(self.item, head: expr.token, last: expr.last)
+    let indentation = ck.indentation(self.item, token)
+    mut long.append(" {\n")
+    mut long.append(indentation.as_str())
+    mut long.append("    ")
+    if yields {
+        mut long.append("return ")
+    }
+    mut long.append(written.as_str())
+    mut long.push('\n')
+    mut long.append(indentation.as_str())
+    mut long.push('}')
+    return Some(ck.fix_replacing(self.item, head: token, last: expr.last, text: long.as_str()))
+} Body.long_closure
+
+/// The rules a body's effects judge its head by: `fails` and `uses wait` written exactly when
+/// the body needs them, the unneeded ones judged unless `exempt`, and a cancellable failure
+/// type beside waiting.
+fn Body.check_effects(
+    self,
+    token: u32,
+    frame: Frame,
+    head: ty::FnTy,
+    clauses: Clauses,
+    exempt: bool,
+    ) {
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    let construct = nir::Span(head: token, last: clauses.last)
+    let has_fails = head.failure.is_some()
+    match frame.may_fail {
+        Some(raised) => {
+            if not has_fails {
+                var fixes = mem::List[diagnostic::Fix].empty(alloc)
+                if clauses.fixable and not frame.several_failures and not ck.types().has_error(raised) {
+                    var added = text::String.of(" fails ", alloc)
+                    let shown = ck.show(raised, from: self.module)
+                    mut added.append(shown.as_str())
+                    mut fixes.push(ck.fix_appending(self.item, after: clauses.after, text: added.as_str()))
+                }
+                self.report_fixed(construct, code: diagnostic::Code.ItemFailsMissing, take fixes)
+            }
+        }
+        None => {}
+    }
+    if frame.may_wait and not head.wait {
+        if head.kind == ast::FnKind.Interrupt {
+            self.report(token, code: diagnostic::Code.KernelIrqWait)
+        } else {
+            var fixes = mem::List[diagnostic::Fix].empty(alloc)
+            if clauses.fixable {
+                match clauses.failure {
+                    Some(failure) => mut fixes.push(ck.fix_appending(self.item, after: failure.last, text: " uses wait"))
+                    None => mut fixes.push(ck.fix_appending(self.item, after: clauses.after, text: " fails task::Cancelled uses wait"))
+                }
+            }
+            self.report_fixed(construct, code: diagnostic::Code.ItemWaitMissing, take fixes)
+        }
+    }
+    if ck.cancel_unmapped(head, may_fail: frame.may_fail.is_some()) {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match head.failure {
+            None => mut fixes.push(ck.fix_appending(self.item, after: clauses.after, text: " fails task::Cancelled"))
+            Some(failure) => {
+                match ck.cancelled_variant_fix(failure) {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+            }
+        }
+        self.report_fixed(construct, code: diagnostic::Code.ErrorCancelUnmapped, take fixes)
+    }
+    if exempt or frame.holds_todo {
+        return
+    }
+    let syntax = ck.db().syntax(self.item)
+    if frame.may_fail.is_none() and has_fails and not head.wait {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match clauses.failure {
+            Some(failure) => {
+                match syntax.previous(usize.widen(failure.head)) {
+                    Some(keyword) => mut fixes.push(ck.fix_deleting(self.item, head: u32.truncate(keyword), last: failure.last))
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        self.report_fixed(construct, code: diagnostic::Code.ItemFailsUnneeded, take fixes)
+    }
+    if not frame.may_wait and head.wait {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match clauses.usage {
+            Some(usage) => mut fixes.push(ck.fix_deleting(self.item, head: usage.head, last: usage.last))
+            None => {}
+        }
+        self.report_fixed(construct, code: diagnostic::Code.ItemWaitUnneeded, take fixes)
+    }
+} Body.check_effects
+
+fn Body.trusted_expr(
+    mut self,
+    token: u32,
+    premise: ast::Text,
+    body: ast::TrustedBody,
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    if spaces_only(premise.value.as_str()) {
+        self.report(premise.token, code: diagnostic::Code.TrustedEmptyPremise)
+    }
+    if self.cx.trusted_code {
+        self.report(token, code: diagnostic::Code.TrustedNested)
+    }
+    let ck = self.ck.share()
+    ck.require(self.item, token, authority: workspace::Authority.Trusted)
+    let saved = self.cx
+    self.cx.trusted_code = true
+    var typed = TExpr.failed(token)
+    match body {
+        ast::TrustedBody.Expr(value) => {
+            typed = mut self.expr(value.contents(), expected)
+        }
+        ast::TrustedBody.Block(block) => {
+            let checked = mut self.block(block)
+            let Diverging(value: typed_block, diverges: diverges) = checked
+            typed = TExpr(token: block.token, last: block.end, ty: diverging_ty(diverges), kind: TKind.Block(take typed_block))
+        }
+    }
+    self.cx = saved
+    let trusted_ty = typed.ty
+    return TExpr(token: token, last: token, ty: trusted_ty, kind: TKind.Trusted(mem::Heap.of(ck.alloc()).boxed(take typed)))
+} Body.trusted_expr
+
+fn Body.quantifier(
+    mut self,
+    token: u32,
+    all: bool,
+    name: ast::Name,
+    range: ast::Expr,
+    body: ast::Expr,
+    ) -> TExpr {
+    if not self.cx.quantifiers {
+        self.report(token, code: diagnostic::Code.ContractQuantifierOutside)
+        return TExpr.failed(token)
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    let range_typed = mut self.expr(range, expected: None)
+    var element = ty::Ty.error()
+    if ck.is_std(range_typed.ty, path: "core::Range") {
+        element = types.type_arg(range_typed.ty, index: 0).value_or(ty::Ty.error())
+    } else if range_typed.ty != ty::Ty.error() {
+        self.report(range.token, code: diagnostic::Code.ContractIllDefined)
+    }
+    let is_range_expr = match range.kind {
+        ast::ExprKind.Binary(op: op, op_token: _, left: _, right: _) => op.is_range()
+        else => false
+    }
+    if not is_range_expr and not types.has_error(range_typed.ty) {
+        self.report(range.token, code: diagnostic::Code.ContractIllDefined)
+    }
+    mut self.push_scope()
+    let local = mut self.declare(name, ty: element, kind: LocalKind.Quantified)
+    let body_typed = mut self.check(body, expected: ty::Ty.scalar(ty::Scalar.Bool))
+    mut self.pop_scope()
+    let heap = mem::Heap.of(ck.alloc())
+    return TExpr(token: token, last: token, ty: ty::Ty.scalar(ty::Scalar.Bool), kind: TKind.Quantifier(all: all, local: local, range: heap.boxed(take range_typed), body: heap.boxed(take body_typed)))
+} Body.quantifier
+
+fn Body.return_expr(mut self, token: u32, value: Option[mem::Box[ast::Expr]]) -> TExpr {
+    let ck = self.ck.share()
+    let heap = mem::Heap.of(ck.alloc())
+    let result = self.frame().result
+    let Some(boxed) = value else {
+        if result != ty::Ty.unit() and not ck.types().has_error(result) {
+            self.report_mismatch(token, expected: result, found: ty::Ty.unit())
+        }
+        return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: TKind.Return(None))
+    }
+    let returned = boxed.contents()
+    if result != ty::Ty.unit() {
+        let typed = mut self.check(returned, expected: result)
+        return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: TKind.Return(Some(heap.boxed(take typed))))
+    }
+    let typed = mut self.expr(returned, expected: None)
+    let unit = match first returned.kind {
+        ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => path.segments[0].text.as_str() == "Unit"
+        else => false
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+    if unit {
+        mut fixes.push(ck.fix_deleting(self.item, head: returned.token, last: returned.last))
+    } else if typed.ty.is_never() {
+        mut fixes.push(ck.fix_deleting_forward(self.item, head: token, last: token))
+    } else {
+        let written = ck.written(self.item, head: returned.token, last: returned.last)
+        let indentation = ck.indentation(self.item, token)
+        var replaced = text::String.empty(ck.alloc())
+        if typed.ty != ty::Ty.unit() {
+            mut replaced.append("discard ")
+        }
+        mut replaced.append(written.as_str())
+        mut replaced.push('\n')
+        mut replaced.append(indentation.as_str())
+        mut replaced.append("return")
+        mut fixes.push(ck.fix_replacing(self.item, head: token, last: returned.last, text: replaced.as_str()))
+    }
+    self.report_fixed(nir::Span(head: token, last: returned.last), code: diagnostic::Code.StmtReturnValue, take fixes)
+    return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: TKind.Return(Some(heap.boxed(take typed))))
+} Body.return_expr
+
+/// The loop a `break` or `continue` acts on, within the current frame.
+fn Body.jump_target(mut self, token: u32, label: Option[ast::Name], breaks: bool) -> Option[usize] {
+    let base = self.frame().loops
+    var found: Option[usize] = None
+    match label {
+        Some(written) => {
+            var index = self.loops.len()
+            while index > base {
+                index -= 1
+                let named = match self.loops[index].label {
+                    Some(held) => held == written.text
+                    None => false
+                }
+                if named {
+                    found = Some(index)
+                    break
+                }
+            }
+            let Some(at) = found else {
+                self.report(written.token, code: diagnostic::Code.StmtUnknownLabel)
+                return None
+            }
+            self.loops[at].label_used = true
+        }
+        None => {
+            if self.loops.len() == base {
+                self.report(token, code: diagnostic::Code.StmtNoLoop)
+                return None
+            }
+            found = Some(self.loops.len() - 1)
+        }
+    }
+    if breaks {
+        match found {
+            Some(at) => {
+                self.loops[at].broken = true
+            }
+            None => {}
+        }
+    }
+    return found
+} Body.jump_target
+
+fn Body.fail_expr(mut self, token: u32, value: ast::Expr) -> TExpr {
+    if self.cx.example {
+        self.report(token, code: diagnostic::Code.ExampleForm)
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    let failure = self.frame().failure
+    let tested = self.frame().tested
+    var typed = TExpr.failed(token)
+    match failure {
+        Some(declared) => {
+            if tested {
+                typed = mut self.expr(value, expected: None)
+            } else {
+                typed = mut self.expr(value, expected: Some(declared))
+                if not types.has_error(typed.ty) and not types.has_error(declared) and not ck.converts(typed.ty, to: declared) {
+                    var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+                    match ck.variant_added_fix(typed.ty, to: declared) {
+                        Some(fix) => mut fixes.push(take fix)
+                        None => {}
+                    }
+                    self.report_fixed(nir::Span(head: token, last: value.last), code: diagnostic::Code.ErrorUnconvertible, take fixes)
+                }
+            }
+        }
+        None => {
+            typed = mut self.expr(value, expected: None)
+        }
+    }
+    let depth = self.frames.len()
+    mut (mut self.frames.at_mut(depth - 1)).raise(typed.ty)
+    return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: TKind.Fail(mem::Heap.of(ck.alloc()).boxed(take typed)))
+} Body.fail_expr
+
+/// `await when`: the cowns its accesses name, and its body with each place naming the
+/// cown's value.
+fn Body.when_expr(mut self, expr: ast::Expr, attempted: Option[u32], expected: Option[ty::Ty]) -> TExpr {
+    let ast::ExprKind.When(accesses: accesses, body: body) = expr.kind else {
+        return mut self.expr(expr, expected)
+    }
+    let token = expr.token
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    if self.cx.when_body {
+        self.report(token, code: diagnostic::Code.TaskWhenWait)
+    }
+    let depth = self.frames.len()
+    self.frames[depth - 1].may_wait = true
+    var places = mem::List[TExpr].empty(alloc)
+    var values = mem::List[ty::Ty].empty(alloc)
+    var seen = mem::List[text::String].empty(alloc)
+    for access in accesses {
+        var path = text::String.of(access.root.text.as_str(), alloc)
+        for field in access.fields {
+            mut path.push('.')
+            mut path.append(field.text.as_str())
+        }
+        if seen.position(fn(held: text::String) => held == path).is_some() {
+            var last = access.root.token
+            let count = access.fields.len()
+            if count > 0 {
+                last = access.fields[count - 1].token
+            }
+            var fixes = mem::List[diagnostic::Fix].empty(alloc)
+            match ck.fix_element_deleted(self.item, head: access.token, last) {
+                Some(fix) => mut fixes.push(take fix)
+                None => {}
+            }
+            self.report_fixed(nir::Span(head: access.token, last: last), code: diagnostic::Code.TaskWhenDuplicate, take fixes)
+        }
+        mut seen.push(take path)
+        let place = mut self.when_place(access, mut values)
+        mut places.push(take place)
+    }
+    mut self.push_scope()
+    var typed_accesses = mem::List[TAccess].empty(alloc)
+    var position: usize = 0
+    for place in take places {
+        let access = accesses[position]
+        let id = LocalId(index: u32.truncate(self.locals.len()))
+        let closure = self.frame().closure
+        mut self.locals.push(Local(name: text::String.of(access.root.text.as_str(), alloc), ty: values[position], kind: LocalKind.Param(access.mode), token: access.root.token, captured: None, closure: closure))
+        let scope = self.scopes.len()
+        mut (mut self.scopes.at_mut(scope - 1)).push(id)
+        mut typed_accesses.push(TAccess(mode: access.mode, place: take place, local: id))
+        position += 1
+    }
+    let saved = self.cx
+    self.cx.when_body = true
+    var body_typed = TExpr.failed(token)
+    var value_ty = ty::Ty.unit()
+    match body {
+        ast::WhenBody.Block(block) => {
+            let checked = mut self.block(block)
+            let Diverging(value: typed_block, diverges: diverges) = checked
+            body_typed = TExpr(token: block.token, last: block.end, ty: diverging_ty(diverges), kind: TKind.Block(take typed_block))
+        }
+        ast::WhenBody.Expr(value) => {
+            body_typed = mut self.expr(value.contents(), expected)
+            value_ty = body_typed.ty
+        }
+    }
+    self.cx = saved
+    mut self.pop_scope()
+    var when_ty = value_ty
+    if attempted.is_some() {
+        when_ty = ty::Ty.error()
+        match ck.db().std_item("task", name: "Poisoned") {
+            Some(poisoned) => {
+                when_ty = ck.result_ty(value_ty, error: types.item(poisoned, args: mem::List[ty::Arg].empty(alloc)))
+            }
+            None => {}
+        }
+    }
+    return TExpr(token: token, last: token, ty: when_ty, kind: TKind.When(attempted: attempted.is_some(), accesses: take typed_accesses, body: mem::Heap.of(alloc).boxed(take body_typed)))
+} Body.when_expr
+
+/// The place an access of `await when` names, the type of the value its cown holds added to
+/// `values`.
+fn Body.when_place(mut self, access: ast::WhenAccess, mut values: mem::List[ty::Ty]) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    var segments = mem::List[ast::Name].empty(alloc)
+    mut segments.push(ast::Name(text: text::String.of(access.root.text.as_str(), alloc), token: access.root.token))
+    let root = ast::Path(segments: take segments)
+    var place = mut self.path_expr(access.root.token, path: root, args: None, expected: None)
+    for field in access.fields {
+        place = mut self.field_of(access.root.token, base: take place, name: field, read: true)
+    }
+    var held = ty::Ty.error()
+    if ck.is_std(place.ty, path: "task::Cown") {
+        held = types.type_arg(place.ty, index: 0).value_or(ty::Ty.error())
+    } else if not types.has_error(place.ty) {
+        self.report(access.token, code: diagnostic::Code.TaskWhenNotCown)
+    }
+    mut values.push(held)
+    return place
+} Body.when_place
+
+/// An assignment target: a place, a local and a path of fields and indexes from it, the
+/// target of `=` when `assigned`.
+fn Body.place(mut self, target: ast::Expr, assigned: bool) -> Option[TExpr] {
+    match first target.kind {
+        ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => {
+            let found = mut self.lookup_local(path.segments[0].text.as_str())
+            let Some(local) = found else {
+                discard mut self.expr(target, expected: None)
+                return None
+            }
+            return Some(TExpr(token: target.token, last: target.last, ty: self.local(local).ty, kind: TKind.Local(local)))
+        }
+        ast::ExprKind.SelfValue => return Some(mut self.expr(target, expected: None))
+        ast::ExprKind.Field(base: base, name: name) => {
+            let names_type = mut self.type_target(base.contents())
+            if names_type.is_some() {
+                discard mut self.expr(target, expected: None)
+                return None
+            }
+            let Some(typed_base) = mut self.place(base.contents(), assigned: false) else {
+                return None
+            }
+            return Some(mut self.field_of(target.token, base: take typed_base, name, read: not assigned))
+        }
+        ast::ExprKind.Index(base: base, index: index) => return Some(mut self.index(target.token, base: base.contents(), index: index.contents(), write: true))
+        else => {
+            discard mut self.expr(target, expected: None)
+            return None
+        }
+    }
+} Body.place
+
+/// Whether two types are the same, a failed part matching anything.
+fn same_type(left: ty::Ty, right: ty::Ty, types: ty::Types) -> bool {
+    return left == right or types.has_error(left) or types.has_error(right)
+} same_type
+
+/// The entry type of the registry a contribution adds to, when its path names one.
+fn Checker.contribution_entry(self, item: ty::ItemId, contribution: ast::ContributeItem) -> ty::Ty {
+    let db = self.db()
+    let Ok(Named.Item(registry_item)) = db.resolve(db.module_of(item), path: contribution.registry_path) else {
+        return ty::Ty.error()
+    }
+    let sig = self.sig(registry_item)
+    return match sig.contents().kind {
+        SigKind.Registry(entry: entry) => entry
+        else => ty::Ty.error()
+    }
+} Checker.contribution_entry
+
+/// Generic arguments as diagnostics write them after what they apply to, from a module:
+/// nothing without any.
+fn Checker.show_args(self, args: Slice[ty::Arg], from: ty::ModuleId) -> text::String {
+    var shown = text::String.empty(self.alloc())
+    if args.len() == 0 {
+        return shown
+    }
+    mut shown.push('[')
+    for index in 0..<args.len() {
+        if index > 0 {
+            mut shown.append(", ")
+        }
+        match args[index] {
+            ty::Arg.Ty(arg_ty) => {
+                let part = self.show(arg_ty, from)
+                mut shown.append(part.as_str())
+            }
+            ty::Arg.Const(ty::Const.Int(value)) => mut shown.write(text::fmt("{value}", value), budget: 1_000_000)
+            ty::Arg.Const(ty::Const.Bool(value)) => {
+                if value {
+                    mut shown.append("true")
+                } else {
+                    mut shown.append("false")
+                }
+            }
+            ty::Arg.Const(ty::Const.Param(param)) => {
+                let part = self.param_name(param)
+                mut shown.append(part.as_str())
+            }
+            ty::Arg.Const(ty::Const.Error) => mut shown.append("_")
+        }
+    }
+    mut shown.push(']')
+    return shown
+} Checker.show_args
+
+/// A type as diagnostics write it, from a module.
+fn Checker.show(self, ty: ty::Ty, from: ty::ModuleId) -> text::String {
+    let alloc = self.alloc()
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => return text::String.of(scalar.name(), alloc)
+        ty::TyKind.Unit => return text::String.of("Unit", alloc)
+        ty::TyKind.Never => return text::String.of("Never", alloc)
+        ty::TyKind.Error => return text::String.of("_", alloc)
+        ty::TyKind.Item(item: item, args: args) => {
+            var shown = self.item_written(item, from)
+            let written = self.show_args(types.arg_list(args), from)
+            mut shown.append(written.as_str())
+            return shown
+        }
+        ty::TyKind.Registers(item) => return self.item_written(item, from)
+        ty::TyKind.Param(param) => return self.param_name(param)
+        ty::TyKind.Dyn(bound) => {
+            var shown = text::String.of("Dyn[", alloc)
+            let interface_name = self.item_written(bound.item, from)
+            mut shown.append(interface_name.as_str())
+            let written = self.show_args(types.arg_list(bound.args), from)
+            mut shown.append(written.as_str())
+            mut shown.push(']')
+            return shown
+        }
+        ty::TyKind.Fn(id) => return self.show_fn(types.fn_of(id), from)
+    }
+} Checker.show
+
+/// A function type as diagnostics write it, from a module.
+fn Checker.show_fn(self, fn_ty: ty::FnTy, from: ty::ModuleId) -> text::String {
+    let alloc = self.alloc()
+    var params = text::String.empty(alloc)
+    for index in 0..<fn_ty.params.len() {
+        if index > 0 {
+            mut params.append(", ")
+        }
+        let param = fn_ty.params[index]
+        match param.mode {
+            ast::Mode.Read => {}
+            ast::Mode.Mut => mut params.append("mut ")
+            ast::Mode.Take => mut params.append("take ")
+        }
+        mut params.append(param.name.as_str())
+        mut params.append(": ")
+        let shown = self.show(param.ty, from)
+        mut params.append(shown.as_str())
+    }
+    var written = match fn_ty.kind {
+        ast::FnKind.Plain => text::String.empty(alloc)
+        ast::FnKind.Task => text::String.of("task ", alloc)
+        ast::FnKind.Interrupt => text::String.of("interrupt ", alloc)
+    }
+    mut written.append("fn(")
+    mut written.append(params.as_str())
+    mut written.push(')')
+    if fn_ty.result != ty::Ty.unit() {
+        mut written.append(" -> ")
+        let shown = self.show(fn_ty.result, from)
+        mut written.append(shown.as_str())
+    }
+    match fn_ty.failure {
+        Some(failure) => {
+            mut written.append(" fails ")
+            let shown = self.show(failure, from)
+            mut written.append(shown.as_str())
+        }
+        None => {}
+    }
+    if fn_ty.wait {
+        mut written.append(" uses wait")
+    }
+    return written
+} Checker.show_fn
+
+fn Checker.param_name(self, param: ty::Param) -> text::String {
+    let alloc = self.alloc()
+    if param.is_self() {
+        return text::String.of("Self", alloc)
+    }
+    let sig = self.sig(param.owner)
+    let held = sig.contents()
+    for def in held.generics {
+        if def.param == param {
+            return text::String.of(def.name.as_str(), alloc)
+        }
+    }
+    match held.kind {
+        SigKind.Interface(methods: methods) => {
+            for method in methods {
+                for def in method.sig.generics {
+                    if def.param == param {
+                        return text::String.of(def.name.as_str(), alloc)
+                    }
+                }
+            }
+        }
+        else => {}
+    }
+    return text::String.of("_", alloc)
+} Checker.param_name
+
+/// An item's path as a module writes it: bare in its own module or as core vocabulary.
+fn Checker.item_written(self, item: ty::ItemId, from: ty::ModuleId) -> text::String {
+    let alloc = self.alloc()
+    let db = self.db()
+    let name = match db.ast(item).name(alloc) {
+        Some(declared) => declared
+        None => text::String.empty(alloc)
+    }
+    let module = db.module_of(item)
+    let spelt = name.as_str()
+    var named_end = spelt.byte_len()
+    match spelt.find(".") {
+        Some(at) => {
+            named_end = at
+        }
+        None => {}
+    }
+    var bare = module == from
+    if not bare {
+        match spelt.slice_bytes(0, end: named_end) {
+            Some(named) => {
+                bare = is_core_vocabulary(named) and db.is_std(item)
+            }
+            None => {}
+        }
+    }
+    if bare {
+        return name
+    }
+    let data = db.module(module)
+    let owner = db.package_data(data.package_id)
+    var written = text::String.empty(alloc)
+    if owner.std {
+        mut written.append(owner.name.as_str())
+        mut written.append("::")
+        if not data.root {
+            mut written.append(data.name.as_str())
+            mut written.append("::")
+        }
+        mut written.append(name.as_str())
+        return written
+    }
+    let viewer = db.module(from).package_id
+    if viewer == data.package_id {
+        if data.root {
+            mut written.append(owner.name.as_str())
+        } else {
+            mut written.append(data.name.as_str())
+        }
+        mut written.append("::")
+        mut written.append(name.as_str())
+        return written
+    }
+    var aliased = false
+    for entry in db.package_data(viewer).deps.cursor() {
+        if entry.value() == Some(data.package_id) {
+            mut written.append(entry.key().as_str())
+            aliased = true
+            break
+        }
+    }
+    if not aliased {
+        mut written.append(owner.name.as_str())
+    }
+    mut written.append("::")
+    if not data.root {
+        mut written.append(data.name.as_str())
+        mut written.append("::")
+    }
+    mut written.append(name.as_str())
+    return written
+} Checker.item_written

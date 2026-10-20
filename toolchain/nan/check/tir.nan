@@ -1,0 +1,454 @@
+//! The typed form of a body: each expression with its type and what it resolves to, the locals it binds, and each call with its callee, arguments, modes and markers. Ownership, digests and limits read bodies in this form.
+
+struct LocalId derives Copy, Eq, Ord, Hash {
+    index: u32
+} LocalId
+
+enum LocalKind derives Copy, Eq {
+    /// A parameter of the function, closure or test, received in its mode.
+    Param(ast::Mode)
+    Let
+    Var
+    /// A name a pattern of a `let` or match arm binds.
+    Pattern
+    /// A name a `for` pattern binds, in the loop's form.
+    Element(ast::Mode)
+    /// A capture of a closure, in its mode.
+    Capture(ast::Mode)
+    /// A quantifier variable.
+    Quantified
+} LocalKind
+
+struct Local {
+    name: text::String
+    ty: ty::Ty
+    kind: LocalKind
+    token: u32
+    /// The local of the enclosing body a capture names.
+    captured: Option[LocalId]
+    /// The closure declaring it, 0 for the item's own body.
+    closure: u32
+} Local
+
+/// The form of a projection result.
+enum Form derives Copy, Eq {
+    /// A part of the receiver, named in place.
+    Part
+    /// An `Option` or `Result` whose non-Copy payloads are parts.
+    Wrapped
+    /// A view value its holder owns.
+    View
+} Form
+
+/// What a call calls.
+enum Callee {
+    /// A function item, with its generic arguments.
+    Function(item: ty::ItemId)
+    /// An interface method, through a generic parameter's bound, `Dyn`, or the impl of `self_ty`.
+    Method(bound: ty::Bound, method: usize, self_ty: ty::Ty, dynamic: bool)
+    /// A function value: a parameter, binding, field or other expression of function type.
+    Value(mem::Box[TExpr])
+    /// An operation the toolchain supplies.
+    Builtin(Builtin)
+} Callee
+
+enum Builtin derives Eq {
+    /// A named conversion or bit conversion.
+    Conversion(nir::Builtin)
+    /// `Dyn[I].view`, `Dyn[I].view_mut` and `mem::Box[Dyn[I]].from_box`.
+    DynView
+    /// `text::fmt`.
+    Template
+    /// A DMA access call.
+    DmaAccess
+    /// `hw::mint_root()`.
+    MintRoot
+} Builtin
+
+struct TArg {
+    expr: TExpr
+    /// The parameter's mode.
+    mode: ast::Mode
+} TArg
+
+struct Call {
+    token: u32
+    callee: Callee
+    /// The callee's generic arguments: those of the type or interface it is a member of, then
+    /// its own.
+    type_args: ty::Args
+    /// The arguments, the receiver first for a method call.
+    args: mem::List[TArg]
+    /// The function type of the head called, instantiated.
+    head: ty::FnTy
+    /// Whether the callee is a projection, and so its result a part, wrapped part or view value.
+    projection: bool
+    failure: Option[ast::Word[ast::FailureMarker]]
+    /// Whether the call is marked `await`.
+    awaited: bool
+} Call
+
+struct TExpr {
+    token: u32
+    /// The expression's last token.
+    last: u32
+    ty: ty::Ty
+    kind: TKind
+} TExpr
+
+/// The value a literal denotes; a number takes the type of its expression.
+enum Lit derives Eq {
+    Int(wide::Wide)
+    /// A float's bits, as wide as its type.
+    Float(u64)
+    Bool(bool)
+    Char(char)
+    Text(text::String)
+    Bytes(mem::Bytes)
+} Lit
+
+/// A value of a construction, by the field or payload label it gives; a single payload's
+/// label is empty.
+struct TLabelled {
+    name: text::String
+    value: TExpr
+} TLabelled
+
+/// An access of `await when`: its mode, the place accessed and the local binding it.
+struct TAccess {
+    mode: ast::Mode
+    place: TExpr
+    local: LocalId
+} TAccess
+
+enum TKind {
+    /// A construct that failed a rule; nothing depends on it.
+    Failed
+    Literal(Lit)
+    Unit
+    /// `result` in an ensures clause.
+    Result
+    /// `old(e)` in an ensures clause.
+    Old(mem::Box[TExpr])
+    /// `R.name`, a register of a registers block.
+    Register(block: ty::ItemId, index: usize)
+    /// A const generic parameter.
+    ConstParam(ty::Param)
+    Local(LocalId)
+    /// A const, registry or contribution, which names a value and never a place.
+    Value(ty::ItemId)
+    /// A function item used as a value, with its generic arguments.
+    FnValue(item: ty::ItemId, type_args: ty::Args)
+    Field(base: mem::Box[TExpr], name: text::String)
+    Call(mem::Box[Call])
+    /// `x[i]`, a call of `at` or `at_mut`.
+    Index(mem::Box[Call])
+    /// A construction of a struct, layout or variant (by its index), with its values in the
+    /// order written; a single payload's value is unlabelled. It is `wrapped` when it is `Some`,
+    /// `Ok` or `Err` of a part that is not Copy.
+    Construct(variant: Option[usize], values: mem::List[TLabelled], wrapped: bool)
+    Unary(op: ast::UnaryOp, operand: mem::Box[TExpr])
+    /// A binary operator, a range included.
+    Binary(op: ast::BinaryOp, left: mem::Box[TExpr], right: mem::Box[TExpr])
+    If(condition: mem::Box[TExpr], then: TBlock, otherwise: Option[mem::Box[TExpr]])
+    /// A block in expression position: an `else` block, a trusted block or an arm's block.
+    Block(TBlock)
+    Match(scrutinee: mem::Box[TExpr], arms: mem::List[TArm])
+    Closure(mem::Box[TClosure])
+    /// `await when`, or `await when attempt` yielding a `Result`.
+    When(attempted: bool, accesses: mem::List[TAccess], body: mem::Box[TExpr])
+    Trusted(mem::Box[TExpr])
+    /// `todo` with its intent.
+    Todo(text::String)
+    Dbg(mem::Box[TExpr])
+    Return(Option[mem::Box[TExpr]])
+    Break(usize)
+    Continue(usize)
+    Fail(mem::Box[TExpr])
+    /// `all` or `any`, binding `local` to each value of the range.
+    Quantifier(all: bool, local: LocalId, range: mem::Box[TExpr], body: mem::Box[TExpr])
+} TKind
+
+struct TArm {
+    token: u32
+    patterns: mem::List[TPattern]
+    guard: Option[TExpr]
+    body: TExpr
+} TArm
+
+/// The arm itself, as a part, so that what a pattern binds from its fields are parts.
+proj fn TArm.as_part(self) -> TArm = self
+
+struct TPattern {
+    token: u32
+    ty: ty::Ty
+    kind: TPatternKind
+} TPattern
+
+/// The values a literal, constant or range pattern matches.
+enum ValueSpace derives Eq {
+    /// An inclusive interval of integers or char scalar values.
+    Ints(low: wide::Wide, high: wide::Wide)
+    Bool(bool)
+    /// Text or bytes, which no finite set of values covers.
+    Bytes(mem::Bytes)
+    /// A value the checker does not know, as a failed constant's.
+    Unknown
+} ValueSpace
+
+/// A field of a struct, layout, variant or `Unit` pattern, by its name.
+struct TFieldPattern {
+    name: text::String
+    pattern: TPattern
+} TFieldPattern
+
+enum TPatternKind {
+    Wildcard
+    Binding(LocalId)
+    /// A literal, constant or range: it matches without moving or copying.
+    Value(space: ValueSpace, compared: ValueTest)
+    /// A struct, layout, variant or `Unit` pattern: the variant's index, and each field's
+    /// pattern.
+    Fields(variant: Option[usize], fields: mem::List[TFieldPattern])
+    Failed
+} TPatternKind
+
+/// How a literal, constant or range pattern tests a value: equal to one, or at least a low bound
+/// and at most a high one, or below it when the range excludes it.
+enum ValueTest {
+    Eq(Compared)
+    Range(low: Compared, high: Compared, exclusive: bool)
+} ValueTest
+
+/// A value a pattern compares with.
+enum Compared {
+    Literal(Lit)
+    Const(ty::ItemId)
+} Compared
+
+struct TClosure {
+    task: bool
+    params: mem::List[LocalId]
+    captures: mem::List[TCapture]
+    ty: ty::FnTy
+    body: TExpr
+    index: u32
+    /// The loops of the enclosing code it lies in, which loops in it number after.
+    loops: usize
+    /// For the task closure of a lexical spawn, the body closure of its scope.
+    lent: Option[u32]
+    /// The limits the function type it is written for demands.
+    demanded: ty::LimitSet
+} TClosure
+
+/// A capture: the closure's local, the enclosing local it names, and the mode and token of its
+/// entry in the capture list.
+struct TCapture {
+    local: LocalId
+    outer: LocalId
+    listed: Option[ast::Word[ast::Mode]]
+} TCapture
+
+struct TBlock {
+    end: u32
+    stmts: mem::List[TStmt]
+} TBlock
+
+struct TStmt {
+    token: u32
+    kind: TStmtKind
+} TStmt
+
+/// The statement itself, as a part, so that what a pattern binds from its kind are parts.
+proj fn TStmt.as_part(self) -> TStmt = self
+
+enum TStmtKind {
+    Let(pattern: TPattern, value: TExpr, otherwise: Option[TBlock])
+    Var(local: LocalId, value: TExpr)
+    Discard(TExpr)
+    While(condition: TExpr, invariants: mem::List[TExpr], body: TBlock)
+    /// A `for` loop: the expression the cursor comes from, and the cursor's type.
+    For(pattern: TPattern, mode: ast::Mode, iterated: TExpr, cursor: ty::Ty, invariants: mem::List[TExpr], body: TBlock)
+    Loop(invariants: mem::List[TExpr], body: TBlock)
+    Defer(TExpr)
+    Undefer(TExpr)
+    Expect(TExpr)
+    Assume(TExpr)
+    Expr(TExpr)
+    /// `target = value`, or `target op= value` with the operator a compound assignment applies.
+    Assign(target: TExpr, op: Option[ast::BinaryOp], value: TExpr)
+} TStmtKind
+
+enum ClauseRole derives Copy, Eq {
+    Requires
+    Ensures
+    Decreases
+} ClauseRole
+
+/// A requires, ensures or decreases clause in typed form, a contract term over the parameters.
+struct TClause {
+    token: u32
+    role: ClauseRole
+    disputed: bool
+    expr: TExpr
+} TClause
+
+/// An example clause, typed as the body of a function without parameters.
+struct TExample {
+    token: u32
+    disputed: bool
+    body: mem::Shared[TBody]
+} TExample
+
+/// A body in typed form.
+struct TBody {
+    locals: mem::List[Local]
+    /// The parameters of the function or test, in order.
+    params: mem::List[LocalId]
+    /// The requires, ensures and decreases clauses, in clause order.
+    clauses: mem::List[TClause]
+    examples: mem::List[TExample]
+    root: Option[TExpr]
+} TBody
+
+/// A body without locals, clauses, examples or root expression.
+fn TBody.empty(alloc: mem::Alloc) -> TBody {
+    return TBody(locals: mem::List[Local].empty(alloc), params: mem::List[LocalId].empty(alloc), clauses: mem::List[TClause].empty(alloc), examples: mem::List[TExample].empty(alloc), root: None)
+} TBody.empty
+
+/// Whether modes allow assigning it or accessing it by `mut`.
+fn Local.assignable(self) -> bool {
+    return match self.kind {
+        LocalKind.Var => true
+        LocalKind.Param(mode) or LocalKind.Element(mode) or LocalKind.Capture(mode) => mode == ast::Mode.Mut or mode == ast::Mode.Take
+        else => false
+    }
+} Local.assignable
+
+/// Whether modes allow moving it.
+fn Local.movable(self) -> bool {
+    return match self.kind {
+        LocalKind.Var or LocalKind.Let or LocalKind.Pattern => true
+        LocalKind.Param(mode) or LocalKind.Element(mode) => mode == ast::Mode.Take
+        else => false
+    }
+} Local.movable
+
+fn TExpr.failed(token: u32) -> TExpr {
+    return TExpr(token: token, last: token, ty: ty::Ty.error(), kind: TKind.Failed)
+} TExpr.failed
+
+/// Visits each expression this one holds directly, those of its blocks' statements included.
+fn TExpr.each_child(self, visit: fn(child: TExpr)) {
+    match self.kind {
+        TKind.Field(base: inner, name: _) or TKind.Unary(op: _, operand: inner) => visit(inner.contents())
+        TKind.Trusted(inner) or TKind.Dbg(inner) or TKind.Fail(inner) or TKind.Old(inner) => visit(inner.contents())
+        TKind.Call(call) or TKind.Index(call) => {
+            let held = call.contents()
+            match held.callee {
+                Callee.Value(value) => visit(value.contents())
+                else => {}
+            }
+            for arg in held.args {
+                visit(arg.expr)
+            }
+        }
+        TKind.Construct(variant: _, values: values, wrapped: _) => {
+            for value in values {
+                visit(value.value)
+            }
+        }
+        TKind.Binary(op: _, left: left, right: right) => {
+            visit(left.contents())
+            visit(right.contents())
+        }
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            visit(condition.contents())
+            then.each_child(visit)
+            match otherwise {
+                Some(other) => visit(other.contents())
+                None => {}
+            }
+        }
+        TKind.Block(block) => block.each_child(visit)
+        TKind.Match(scrutinee: scrutinee, arms: arms) => {
+            visit(scrutinee.contents())
+            for arm in arms {
+                match arm.guard {
+                    Some(guard) => visit(guard)
+                    None => {}
+                }
+                visit(arm.body)
+            }
+        }
+        TKind.Closure(closure) => visit(closure.contents().body)
+        TKind.When(attempted: _, accesses: accesses, body: body) => {
+            for access in accesses {
+                visit(access.place)
+            }
+            visit(body.contents())
+        }
+        TKind.Return(value) => {
+            match value {
+                Some(returned) => visit(returned.contents())
+                None => {}
+            }
+        }
+        TKind.Quantifier(all: _, local: _, range: range, body: body) => {
+            visit(range.contents())
+            visit(body.contents())
+        }
+        else => {}
+    }
+} TExpr.each_child
+
+/// Visits each expression the block's statements hold directly.
+fn TBlock.each_child(self, visit: fn(child: TExpr)) {
+    for stmt in self.stmts {
+        stmt.each_child(visit)
+    }
+} TBlock.each_child
+
+/// Visits each expression the statement holds directly, those of its blocks included.
+fn TStmt.each_child(self, visit: fn(child: TExpr)) {
+    match self.kind {
+        TStmtKind.Let(pattern: _, value: value, otherwise: otherwise) => {
+            visit(value)
+            match otherwise {
+                Some(block) => block.each_child(visit)
+                None => {}
+            }
+        }
+        TStmtKind.Var(local: _, value: value) => visit(value)
+        TStmtKind.Discard(value) or TStmtKind.Defer(value) or TStmtKind.Undefer(value) => visit(value)
+        TStmtKind.Expect(value) or TStmtKind.Assume(value) or TStmtKind.Expr(value) => visit(value)
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => {
+            visit(condition)
+            for clause in invariants {
+                visit(clause)
+            }
+            body.each_child(visit)
+        }
+        TStmtKind.For(pattern: _, mode: _, iterated: iterated, cursor: _, invariants: invariants, body: body) => {
+            visit(iterated)
+            for clause in invariants {
+                visit(clause)
+            }
+            body.each_child(visit)
+        }
+        TStmtKind.Loop(invariants: invariants, body: body) => {
+            for clause in invariants {
+                visit(clause)
+            }
+            body.each_child(visit)
+        }
+        TStmtKind.Assign(target: target, op: _, value: value) => {
+            visit(target)
+            visit(value)
+        }
+    }
+} TStmt.each_child
+
+proj fn TBody.local(self, id: LocalId) -> Local {
+    return self.locals[usize.widen(id.index)]
+} TBody.local

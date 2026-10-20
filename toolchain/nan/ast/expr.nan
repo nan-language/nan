@@ -1,0 +1,696 @@
+//! Lowering statements, expressions and patterns from their trees.
+
+/// An operand or operator of an operator expression, in source order.
+enum Piece {
+    Operand(Expr)
+    Operator(op: BinaryOp, token: u32)
+} Piece
+
+/// The pieces of an operator expression, read once in order with one piece of lookahead.
+struct Pieces {
+    rest: mem::ListCursor[Piece]
+    ahead: Option[Piece]
+} Pieces
+
+/// The operator the next piece is, if it is one.
+fn Pieces.peek_operator(mut self) -> Option[BinaryOp] {
+    if self.ahead.is_none() {
+        self.ahead = mut self.rest.next()
+    }
+    return match self.ahead {
+        Some(Piece.Operator(op: op, token: _)) => Some(op)
+        else => None
+    }
+} Pieces.peek_operator
+
+fn Pieces.next(mut self) -> Option[Piece] {
+    let ahead = mut self.ahead.extract()
+    if ahead.is_some() {
+        return ahead
+    }
+    return mut self.rest.next()
+} Pieces.next
+
+/// The markers read before a marked expression: its failure marker, `await` and mode.
+struct Markers derives Copy {
+    failure: Option[Word[FailureMarker]]
+    awaited: Option[u32]
+    mode: Option[Word[Mode]]
+} Markers
+
+/// The statements directly under `node`.
+fn Lowering.stmts(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Stmt] {
+    var stmts = mem::List[Stmt].empty(self.alloc)
+    for stmt in self.nodes_of(node, rule: syntax::Rule.Stmt, tree) {
+        mut stmts.push(self.stmt(self.first_node(stmt, tree), file, tree))
+    }
+    return stmts
+} Lowering.stmts
+
+fn Lowering.block(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Block {
+    let tokens = self.tokens(node, tree)
+    return Block(token: tokens[0], end: tokens[tokens.len() - 1], stmts: self.stmts(node, file, tree))
+} Lowering.block
+
+fn Lowering.optional_block(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[Block] {
+    let Some(found) = node else {
+        return None
+    }
+    return Some(self.block(found, file, tree))
+} Lowering.optional_block
+
+fn Lowering.loop_block(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> LoopBlock {
+    var invariants = mem::List[Expr].empty(self.alloc)
+    for line in self.nodes_of(node, rule: syntax::Rule.LoopInvariant, tree) {
+        let Some(asserted) = tree.find(line, rule: syntax::Rule.Expr) else {
+            continue
+        }
+        mut invariants.push(self.expr(asserted, file, tree))
+    }
+    return LoopBlock(invariants: take invariants, block: self.block(node, file, tree))
+} Lowering.loop_block
+
+/// The `index`th expression directly under `node`.
+fn Lowering.expr_at(
+    self,
+    node: u32,
+    index: usize,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Expr {
+    return self.expr(self.nodes_of(node, rule: syntax::Rule.Expr, tree)[index], file, tree)
+} Lowering.expr_at
+
+/// A statement, from the node of its kind's rule.
+fn Lowering.stmt(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Stmt {
+    let token = self.first_token(node, tree)
+    let kind = match tree.rule(node) {
+        syntax::Rule.LetStmt => StmtKind.Let(pattern: self.pattern(self.child(node, rule: syntax::Rule.Pattern, tree), file, tree), ty: self.optional_type(tree.find(node, rule: syntax::Rule.TypeExpr), file, tree), value: self.expr_at(node, index: 0, file, tree), otherwise: self.optional_block(tree.find(node, rule: syntax::Rule.Block), file, tree))
+        syntax::Rule.VarStmt => StmtKind.Var(name: self.name_of(node, file, tree), ty: self.optional_type(tree.find(node, rule: syntax::Rule.TypeExpr), file, tree), value: self.expr_at(node, index: 0, file, tree))
+        syntax::Rule.DiscardStmt => StmtKind.Discard(self.expr_at(node, index: 0, file, tree))
+        syntax::Rule.WhileStmt => StmtKind.While(condition: self.expr_at(node, index: 0, file, tree), body: self.loop_block(self.child(node, rule: syntax::Rule.LoopBlock, tree), file, tree))
+        syntax::Rule.ForStmt => StmtKind.For(pattern: self.pattern(self.child(node, rule: syntax::Rule.Pattern, tree), file, tree), iterated: self.expr_at(node, index: 0, file, tree), body: self.loop_block(self.child(node, rule: syntax::Rule.LoopBlock, tree), file, tree))
+        syntax::Rule.LoopStmt => StmtKind.Loop(label: self.token_name(self.idents(node, file, tree).get(1), file), body: self.loop_block(self.child(node, rule: syntax::Rule.LoopBlock, tree), file, tree))
+        syntax::Rule.DeferStmt => StmtKind.Defer(self.call_expr(self.child(node, rule: syntax::Rule.CallExpr, tree), file, tree))
+        syntax::Rule.UndeferStmt => StmtKind.Undefer(self.place(self.child(node, rule: syntax::Rule.Place, tree), file, tree))
+        syntax::Rule.ExpectStmt => StmtKind.Expect(self.expr_at(node, index: 0, file, tree))
+        syntax::Rule.AssumeStmt => StmtKind.Assume(condition: self.expr_at(node, index: 0, file, tree), reason: self.text_of(self.first_of(node, kind: syntax::TokenKind.Text, file, tree), file))
+        syntax::Rule.TrustedLeadStmt => return self.stmt(self.first_node(node, tree), file, tree)
+        else => self.expr_stmt(node, file, tree)
+    }
+    return Stmt(token: token, kind: take kind)
+} Lowering.stmt
+
+/// An expression statement, or an assignment, from an `expr_stmt` node.
+fn Lowering.expr_stmt(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> StmtKind {
+    let exprs = self.nodes_of(node, rule: syntax::Rule.Expr, tree)
+    let target = self.expr(exprs[0], file, tree)
+    let Some(operator) = tree.find(node, rule: syntax::Rule.AssignOperator) else {
+        return StmtKind.Expr(take target)
+    }
+    let op_token = self.tokens(operator, tree)[0]
+    let op = match self.kind(op_token, file) {
+        syntax::TokenKind.Punct(syntax::Punct.PlusEq) => AssignOp.Add
+        syntax::TokenKind.Punct(syntax::Punct.MinusEq) => AssignOp.Sub
+        syntax::TokenKind.Punct(syntax::Punct.StarEq) => AssignOp.Mul
+        syntax::TokenKind.Punct(syntax::Punct.SlashEq) => AssignOp.Div
+        syntax::TokenKind.Punct(syntax::Punct.PercentEq) => AssignOp.Rem
+        syntax::TokenKind.Punct(syntax::Punct.AmpEq) => AssignOp.BitAnd
+        syntax::TokenKind.Punct(syntax::Punct.PipeEq) => AssignOp.BitOr
+        syntax::TokenKind.Punct(syntax::Punct.CaretEq) => AssignOp.BitXor
+        syntax::TokenKind.Punct(syntax::Punct.ShlEq) => AssignOp.Shl
+        syntax::TokenKind.Punct(syntax::Punct.ShrEq) => AssignOp.Shr
+        else => AssignOp.Set
+    }
+    return StmtKind.Assign(target: take target, op: op, op_token: op_token, value: self.expr(exprs[1], file, tree))
+} Lowering.expr_stmt
+
+/// A place written after `undefer`, as the expression naming it.
+fn Lowering.place(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(self.child(node, rule: syntax::Rule.PlaceRoot, tree), tree)
+    var expr = self.root_expr(token, file)
+    for step in self.nodes_of(node, rule: syntax::Rule.PlaceStep, tree) {
+        let last = self.last(step, tree)
+        let kind = match tree.find(step, rule: syntax::Rule.Expr) {
+            Some(index) => ExprKind.Index(base: self.heap.boxed(take expr), index: self.heap.boxed(self.expr(index, file, tree)))
+            None => ExprKind.Field(base: self.heap.boxed(take expr), name: self.name_of(step, file, tree))
+        }
+        expr = Expr(token: token, last: last, kind: take kind)
+    }
+    return expr
+} Lowering.place
+
+/// The expression of a place root: `self` or a one-segment path.
+fn Lowering.root_expr(self, token: u32, file: syntax::SourceFile) -> Expr {
+    if self.kind(token, file) == syntax::TokenKind.Keyword(syntax::Keyword.SelfValue) {
+        return Expr(token: token, last: token, kind: ExprKind.SelfValue)
+    }
+    var segments = mem::List[Name].empty(self.alloc)
+    mut segments.push(self.name(token, file))
+    return Expr(token: token, last: token, kind: ExprKind.Path(path: Path(segments: take segments), args: None))
+} Lowering.root_expr
+
+fn Lowering.expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    match tree.rule(node) {
+        syntax::Rule.Expr => return self.expr(self.first_node(node, tree), file, tree)
+        syntax::Rule.JumpExpr => return self.jump(node, file, tree)
+        syntax::Rule.FailExpr => return Expr(token: self.first_token(node, tree), last: self.last(node, tree), kind: ExprKind.Fail(self.heap.boxed(self.expr(self.child(node, rule: syntax::Rule.OperatorExpr, tree), file, tree))))
+        syntax::Rule.QuantifierExpr => return self.quantifier(node, file, tree)
+        syntax::Rule.OperatorExpr => return self.operator_expr(node, file, tree)
+        syntax::Rule.PrefixExpr => return self.prefix(node, file, tree)
+        syntax::Rule.CallExpr => return self.call_expr(node, file, tree)
+        else => {}
+    }
+    expect false
+    return Expr(token: 0, last: 0, kind: ExprKind.SelfValue)
+} Lowering.expr
+
+fn Lowering.jump(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let tokens = self.tokens(node, tree)
+    let token = tokens[0]
+    let kind = match self.kind(token, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Return) => ExprKind.Return(self.returned(tree.find(node, rule: syntax::Rule.Expr), file, tree))
+        syntax::TokenKind.Keyword(syntax::Keyword.Break) => ExprKind.Break(self.token_name(tokens.get(1), file))
+        else => ExprKind.Continue(self.token_name(tokens.get(1), file))
+    }
+    return Expr(token: token, last: self.last(node, tree), kind: take kind)
+} Lowering.jump
+
+/// The value a `return` writes, if any.
+fn Lowering.returned(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[mem::Box[Expr]] {
+    let Some(value) = node else {
+        return None
+    }
+    return Some(self.heap.boxed(self.expr(value, file, tree)))
+} Lowering.returned
+
+fn Lowering.quantifier(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let tokens = self.tokens(node, tree)
+    let exprs = self.nodes_of(node, rule: syntax::Rule.Expr, tree)
+    return Expr(token: tokens[0], last: self.last(node, tree), kind: ExprKind.Quantifier(all: self.spells(tokens[0], word: "all", file), name: self.name(tokens[1], file), range: self.heap.boxed(self.expr(exprs[0], file, tree)), body: self.heap.boxed(self.expr(exprs[1], file, tree))))
+} Lowering.quantifier
+
+fn Lowering.operator_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    var pieces = mem::List[Piece].empty(self.alloc)
+    self.flatten(node, mut pieces, file, tree)
+    var stream = Pieces(rest: take pieces.into_cursor(), ahead: None)
+    let Some(Piece.Operand(leading)) = mut stream.next() else {
+        expect false
+        return Expr(token: 0, last: 0, kind: ExprKind.SelfValue)
+    }
+    return climb(take leading, pieces: mut stream, floor: 0, heap: self.heap)
+} Lowering.operator_expr
+
+/// Collects the operands and binary operators of an operator expression in source order.
+fn Lowering.flatten(
+    self,
+    node: u32,
+    mut pieces: mem::List[Piece],
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) {
+    for child in tree.children(node) {
+        match child {
+            syntax::Child.Node(inner) => match tree.rule(inner) {
+                syntax::Rule.PrefixExpr => mut pieces.push(Piece.Operand(self.prefix(inner, file, tree)))
+                syntax::Rule.Negation => mut pieces.push(Piece.Operand(self.negation(inner, file, tree)))
+                else => self.flatten(inner, mut pieces, file, tree)
+            }
+            syntax::Child.Token(token) => match self.binary_op(token, file) {
+                Some(op) => mut pieces.push(Piece.Operator(op: op, token: token))
+                None => {}
+            }
+        }
+    }
+} Lowering.flatten
+
+/// The `not` a negation node writes before its operand.
+fn Lowering.negation(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    var operand_pieces = mem::List[Piece].empty(self.alloc)
+    self.flatten(self.child(node, rule: syntax::Rule.Operand, tree), pieces: mut operand_pieces, file, tree)
+    let Some(Piece.Operand(operand)) = mut operand_pieces.pop() else {
+        expect false
+        return Expr(token: 0, last: 0, kind: ExprKind.SelfValue)
+    }
+    let last = operand.last
+    return Expr(token: self.first_token(node, tree), last: last, kind: ExprKind.Unary(op: UnaryOp.Not, operand: self.heap.boxed(take operand)))
+} Lowering.negation
+
+fn Lowering.binary_op(self, token: u32, file: syntax::SourceFile) -> Option[BinaryOp] {
+    return match self.kind(token, file) {
+        syntax::TokenKind.Punct(syntax::Punct.Star) => Some(BinaryOp.Mul)
+        syntax::TokenKind.Punct(syntax::Punct.Slash) => Some(BinaryOp.Div)
+        syntax::TokenKind.Punct(syntax::Punct.Percent) => Some(BinaryOp.Rem)
+        syntax::TokenKind.Punct(syntax::Punct.Plus) => Some(BinaryOp.Add)
+        syntax::TokenKind.Punct(syntax::Punct.Minus) => Some(BinaryOp.Sub)
+        syntax::TokenKind.Punct(syntax::Punct.EqEq) => Some(BinaryOp.Eq)
+        syntax::TokenKind.Punct(syntax::Punct.NotEq) => Some(BinaryOp.Ne)
+        syntax::TokenKind.Punct(syntax::Punct.Lt) => Some(BinaryOp.Lt)
+        syntax::TokenKind.Punct(syntax::Punct.Le) => Some(BinaryOp.Le)
+        syntax::TokenKind.Punct(syntax::Punct.Gt) => Some(BinaryOp.Gt)
+        syntax::TokenKind.Punct(syntax::Punct.Ge) => Some(BinaryOp.Ge)
+        syntax::TokenKind.Punct(syntax::Punct.Amp) => Some(BinaryOp.BitAnd)
+        syntax::TokenKind.Punct(syntax::Punct.Pipe) => Some(BinaryOp.BitOr)
+        syntax::TokenKind.Punct(syntax::Punct.Caret) => Some(BinaryOp.BitXor)
+        syntax::TokenKind.Punct(syntax::Punct.Shl) => Some(BinaryOp.Shl)
+        syntax::TokenKind.Punct(syntax::Punct.Shr) => Some(BinaryOp.Shr)
+        syntax::TokenKind.Punct(syntax::Punct.DotDotLt) => Some(BinaryOp.RangeExclusive)
+        syntax::TokenKind.Punct(syntax::Punct.DotDotEq) => Some(BinaryOp.RangeInclusive)
+        syntax::TokenKind.Keyword(syntax::Keyword.And) => Some(BinaryOp.And)
+        syntax::TokenKind.Keyword(syntax::Keyword.Or) => Some(BinaryOp.Or)
+        else => None
+    }
+} Lowering.binary_op
+
+fn Lowering.prefix(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(node, tree)
+    match tree.find(node, rule: syntax::Rule.PrefixExpr) {
+        Some(inner) => {
+            let op = match self.kind(token, file) {
+                syntax::TokenKind.Punct(syntax::Punct.Minus) => UnaryOp.Neg
+                else => UnaryOp.BitNot
+            }
+            let operand = self.prefix(inner, file, tree)
+            let last = operand.last
+            return Expr(token: token, last: last, kind: ExprKind.Unary(op: op, operand: self.heap.boxed(take operand)))
+        }
+        None => {}
+    }
+    match tree.find(node, rule: syntax::Rule.MarkedExpr) {
+        Some(marked) => return self.marked(marked, file, tree)
+        None => {}
+    }
+    return self.postfix(self.child(node, rule: syntax::Rule.PostfixExpr, tree), file, tree)
+} Lowering.prefix
+
+fn Lowering.call_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    return match tree.find(node, rule: syntax::Rule.MarkedExpr) {
+        Some(marked) => self.marked(marked, file, tree)
+        None => self.postfix(self.child(node, rule: syntax::Rule.PostfixExpr, tree), file, tree)
+    }
+} Lowering.call_expr
+
+/// Markers and the expression they mark, through the nested `after_*` rules.
+fn Lowering.marked(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(node, tree)
+    var markers = Markers(failure: None, awaited: None, mode: None)
+    var current = node
+    loop {
+        let Some(inner) = self.read_markers(current, mut markers, file, tree) else {
+            expect false
+            return Expr(token: 0, last: 0, kind: ExprKind.SelfValue)
+        }
+        match tree.rule(inner) {
+            syntax::Rule.PostfixExpr => return self.marked_by(token, markers, inner: self.postfix(inner, file, tree))
+            syntax::Rule.WhenExpr => return self.marked_by(token, markers, inner: self.when_expr(inner, file, tree))
+            else => {
+                current = inner
+            }
+        }
+    }
+} Lowering.marked
+
+/// Reads the markers directly under `node` into `markers`, and returns the last node they lead to.
+fn Lowering.read_markers(
+    self,
+    node: u32,
+    mut markers: Markers,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Option[u32] {
+    var next: Option[u32] = None
+    for child in tree.children(node) {
+        match child {
+            syntax::Child.Token(marker) => match self.kind(marker, file) {
+                syntax::TokenKind.Keyword(syntax::Keyword.Await) => {
+                    markers.awaited = Some(marker)
+                }
+                syntax::TokenKind.Keyword(syntax::Keyword.Try) => {
+                    markers.failure = Some(Word(kind: FailureMarker.Try, token: marker))
+                }
+                syntax::TokenKind.Keyword(syntax::Keyword.Attempt) => {
+                    markers.failure = Some(Word(kind: FailureMarker.Attempt, token: marker))
+                }
+                else => {}
+            }
+            syntax::Child.Node(inner) => match tree.rule(inner) {
+                syntax::Rule.FailureMarker => {
+                    markers.failure = Some(self.failure_marker(inner, file, tree))
+                }
+                syntax::Rule.Mode => {
+                    markers.mode = Some(self.mode_marker(inner, file, tree))
+                }
+                syntax::Rule.AfterFailureMarker or syntax::Rule.AfterAwait or syntax::Rule.AfterMode or syntax::Rule.PostfixExpr or syntax::Rule.WhenExpr => {
+                    next = Some(inner)
+                }
+                else => {}
+            }
+        }
+    }
+    return next
+} Lowering.read_markers
+
+fn Lowering.failure_marker(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Word[FailureMarker] {
+    let marker = self.tokens(node, tree)[0]
+    let kind = match self.kind(marker, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Try) => FailureMarker.Try
+        else => FailureMarker.Attempt
+    }
+    return Word(kind: kind, token: marker)
+} Lowering.failure_marker
+
+fn Lowering.mode_marker(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Word[Mode] {
+    let marker = self.tokens(node, tree)[0]
+    let written = match self.kind(marker, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Mut) => Mode.Mut
+        else => Mode.Take
+    }
+    return Word(kind: written, token: marker)
+} Lowering.mode_marker
+
+fn Lowering.marked_by(self, token: u32, markers: Markers, take inner: Expr) -> Expr {
+    let last = inner.last
+    return Expr(token: token, last: last, kind: ExprKind.Marked(failure: markers.failure, awaited: markers.awaited, mode: markers.mode, inner: self.heap.boxed(take inner)))
+} Lowering.marked_by
+
+fn Lowering.when_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(node, tree)
+    var accesses = mem::List[WhenAccess].empty(self.alloc)
+    for access in self.nodes_of(node, rule: syntax::Rule.WhenAccess, tree) {
+        mut accesses.push(self.when_access(access, file, tree))
+    }
+    let body_node = self.child(node, rule: syntax::Rule.WhenBody, tree)
+    let body = match tree.find(body_node, rule: syntax::Rule.Block) {
+        Some(block) => WhenBody.Block(self.block(block, file, tree))
+        None => WhenBody.Expr(self.heap.boxed(self.expr(self.child(body_node, rule: syntax::Rule.Expr, tree), file, tree)))
+    }
+    return Expr(token: token, last: self.last(node, tree), kind: ExprKind.When(accesses: take accesses, body: take body))
+} Lowering.when_expr
+
+fn Lowering.when_access(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> WhenAccess {
+    let place = self.child(node, rule: syntax::Rule.WhenPlace, tree)
+    let root = self.child(place, rule: syntax::Rule.PlaceRoot, tree)
+    let tokens = self.tokens(node, tree)
+    var mode = Mode.Read
+    if tokens.len() > 0 {
+        match self.kind(tokens[0], file) {
+            syntax::TokenKind.Keyword(syntax::Keyword.Mut) => {
+                mode = Mode.Mut
+            }
+            syntax::TokenKind.Keyword(syntax::Keyword.Take) => {
+                mode = Mode.Take
+            }
+            else => {}
+        }
+    }
+    return WhenAccess(token: self.first_token(node, tree), mode: mode, root: self.name(self.first_token(root, tree), file), fields: self.ident_names(place, file, tree))
+} Lowering.when_access
+
+fn Lowering.postfix(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(node, tree)
+    var expr = self.primary(self.child(node, rule: syntax::Rule.PrimaryExpr, tree), file, tree)
+    for suffix in self.nodes_of(node, rule: syntax::Rule.PostfixSuffix, tree) {
+        let kind = match self.kind(self.tokens(suffix, tree)[0], file) {
+            syntax::TokenKind.Punct(syntax::Punct.Dot) => ExprKind.Field(base: self.heap.boxed(take expr), name: self.name_of(suffix, file, tree))
+            syntax::TokenKind.Punct(syntax::Punct.LParen) => ExprKind.Call(callee: self.heap.boxed(take expr), args: self.args(tree.find(suffix, rule: syntax::Rule.ArgList), file, tree))
+            else => ExprKind.Index(base: self.heap.boxed(take expr), index: self.heap.boxed(self.expr(self.child(suffix, rule: syntax::Rule.Expr, tree), file, tree)))
+        }
+        expr = Expr(token: token, last: self.last(suffix, tree), kind: take kind)
+    }
+    return expr
+} Lowering.postfix
+
+fn Lowering.args(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Arg] {
+    var args = mem::List[Arg].empty(self.alloc)
+    for arg in tree.list_elements(list, element: syntax::Rule.Arg, alloc: self.alloc) {
+        var exprs = mem::List[Expr].empty(self.alloc)
+        for expr in self.nodes_of(arg, rule: syntax::Rule.Expr, tree) {
+            mut exprs.push(self.expr(expr, file, tree))
+        }
+        var lowered = take exprs.into_cursor()
+        let Some(leading) = mut lowered.next() else {
+            expect false
+            continue
+        }
+        let token = leading.token
+        match mut lowered.next() {
+            Some(value) => mut args.push(Arg(token: token, label: Some(take leading), value: take value))
+            None => mut args.push(Arg(token: token, label: None, value: take leading))
+        }
+    }
+    return args
+} Lowering.args
+
+fn Lowering.primary(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let token = self.first_token(node, tree)
+    var children = tree.child_nodes(node)
+    let Some(inner) = mut children.next() else {
+        return Expr(token: token, last: self.last(node, tree), kind: ExprKind.SelfValue)
+    }
+    let kind = match tree.rule(inner) {
+        syntax::Rule.Literal => ExprKind.Literal(self.literal(inner, file, tree))
+        syntax::Rule.PathExpr => ExprKind.Path(path: self.path(self.child(inner, rule: syntax::Rule.Path, tree), file, tree), args: self.optional_args(tree.find(inner, rule: syntax::Rule.GenericArgs), file, tree))
+        syntax::Rule.OperatorExpr or syntax::Rule.QuantifierExpr => ExprKind.Paren(self.heap.boxed(self.expr(inner, file, tree)))
+        syntax::Rule.IfExpr => return self.if_expr(inner, file, tree)
+        syntax::Rule.MatchExpr => self.match_expr(inner, file, tree)
+        syntax::Rule.ClosureExpr => ExprKind.Closure(self.heap.boxed(self.closure(inner, file, tree)))
+        syntax::Rule.TrustedExpr => self.trusted_expr(inner, file, tree)
+        syntax::Rule.TodoExpr => ExprKind.Todo(self.text_of(self.first_of(inner, kind: syntax::TokenKind.Text, file, tree), file))
+        syntax::Rule.DbgExpr => ExprKind.Dbg(self.heap.boxed(self.expr(self.child(inner, rule: syntax::Rule.Expr, tree), file, tree)))
+        else => ExprKind.SelfValue
+    }
+    return Expr(token: token, last: self.last(node, tree), kind: take kind)
+} Lowering.primary
+
+fn Lowering.literal(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Literal {
+    let tokens = self.tokens(node, tree)
+    let kind = match self.kind(tokens[0], file) {
+        syntax::TokenKind.Int => LiteralKind.Int
+        syntax::TokenKind.Float => LiteralKind.Float
+        syntax::TokenKind.Text => LiteralKind.Text
+        syntax::TokenKind.TextLine => LiteralKind.TextRun
+        syntax::TokenKind.Bytes => LiteralKind.Bytes
+        syntax::TokenKind.Char => LiteralKind.Char
+        syntax::TokenKind.Byte => LiteralKind.Byte
+        syntax::TokenKind.Keyword(syntax::Keyword.True) => LiteralKind.True
+        else => LiteralKind.False
+    }
+    return Literal(kind: kind, tokens: take tokens)
+} Lowering.literal
+
+fn Lowering.if_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Expr {
+    let blocks = self.nodes_of(node, rule: syntax::Rule.Block, tree)
+    let otherwise = match first tree.find(node, rule: syntax::Rule.IfExpr) {
+        Some(chained) => Some(self.heap.boxed(Else.If(self.if_expr(chained, file, tree))))
+        None if blocks.len() > 1 => Some(self.heap.boxed(Else.Block(self.block(blocks[1], file, tree))))
+        None => None
+    }
+    return Expr(token: self.first_token(node, tree), last: self.last(node, tree), kind: ExprKind.If(condition: self.heap.boxed(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree)), then: self.block(blocks[0], file, tree), otherwise: take otherwise))
+} Lowering.if_expr
+
+fn Lowering.match_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> ExprKind {
+    var arms = mem::List[Arm].empty(self.alloc)
+    for arm in self.nodes_of(node, rule: syntax::Rule.MatchArm, tree) {
+        mut arms.push(self.arm(arm, file, tree))
+    }
+    return ExprKind.Match(ordered: self.has_token(node, kind: syntax::TokenKind.Keyword(syntax::Keyword.First), file, tree), scrutinee: self.heap.boxed(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree)), arms: take arms)
+} Lowering.match_expr
+
+fn Lowering.arm(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Arm {
+    var patterns = ArmPatterns.Else
+    if not self.has_token(node, kind: syntax::TokenKind.Keyword(syntax::Keyword.Else), file, tree) {
+        var listed = mem::List[Pattern].empty(self.alloc)
+        for pattern in self.nodes_of(node, rule: syntax::Rule.Pattern, tree) {
+            mut listed.push(self.pattern(pattern, file, tree))
+        }
+        patterns = ArmPatterns.Patterns(take listed)
+    }
+    let body_node = self.child(node, rule: syntax::Rule.ArmBody, tree)
+    let body = match tree.find(body_node, rule: syntax::Rule.Block) {
+        Some(block) => ArmBody.Block(self.block(block, file, tree))
+        None => ArmBody.Expr(self.expr(self.child(body_node, rule: syntax::Rule.Expr, tree), file, tree))
+    }
+    return Arm(token: self.first_token(node, tree), patterns: take patterns, guard: self.optional_expr(tree.find(node, rule: syntax::Rule.Expr), file, tree), body: take body)
+} Lowering.arm
+
+fn Lowering.closure(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Closure {
+    let captures = self.captures(tree.find(node, rule: syntax::Rule.CaptureList), file, tree)
+    let body_node = self.child(node, rule: syntax::Rule.ClosureBody, tree)
+    let HeadTail(result: result, failure: failure, usage: usage, limit_set: limit_set) = self.head_tail(body_node, file, tree)
+    let body = match tree.find(body_node, rule: syntax::Rule.Block) {
+        Some(block) => ClosureBody.Block(self.block(block, file, tree))
+        None => ClosureBody.Short(self.heap.boxed(self.expr(self.child(body_node, rule: syntax::Rule.Expr, tree), file, tree)))
+    }
+    return Closure(captures: take captures, params: self.fn_type_params(tree.find(node, rule: syntax::Rule.FnTypeParamList), file, tree), close: self.close(node, file, tree), result: take result, failure: take failure, usage: take usage, limit_set: take limit_set, body: take body)
+} Lowering.closure
+
+fn Lowering.captures(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Capture] {
+    var captures = mem::List[Capture].empty(self.alloc)
+    let Some(written) = list else {
+        return captures
+    }
+    for capture in self.nodes_of(written, rule: syntax::Rule.Capture, tree) {
+        let mode = self.mode(capture, file, tree)
+        let root = self.child(capture, rule: syntax::Rule.PlaceRoot, tree)
+        mut captures.push(Capture(mode: mode, token: self.first_token(capture, tree), name: self.name(self.first_token(root, tree), file)))
+    }
+    return captures
+} Lowering.captures
+
+fn Lowering.trusted_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> ExprKind {
+    let premise = self.text_of(self.first_of(node, kind: syntax::TokenKind.Text, file, tree), file)
+    let body = self.child(node, rule: syntax::Rule.TrustedBody, tree)
+    let opener = self.first_of(node, kind: syntax::TokenKind.Punct(syntax::Punct.LBrace), file, tree)
+    let end = self.last(node, tree)
+    let lead = tree.find(body, rule: syntax::Rule.TrustedLeadStmt)
+    if lead.is_none() and not self.has_token(body, kind: syntax::TokenKind.Nl, file, tree) {
+        let expr = self.expr(self.child(body, rule: syntax::Rule.Expr, tree), file, tree)
+        return ExprKind.Trusted(premise: take premise, body: TrustedBody.Expr(self.heap.boxed(take expr)))
+    }
+    var stmts = mem::List[Stmt].empty(self.alloc)
+    match lead {
+        Some(written) => mut stmts.push(self.stmt(written, file, tree))
+        None => mut stmts.push(Stmt(token: self.first_token(body, tree), kind: self.expr_stmt(body, file, tree)))
+    }
+    let rest = self.stmts(body, file, tree)
+    for stmt in take rest {
+        mut stmts.push(take stmt)
+    }
+    return ExprKind.Trusted(premise: take premise, body: TrustedBody.Block(Block(token: opener, end: end, stmts: take stmts)))
+} Lowering.trusted_expr
+
+fn Lowering.pattern(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Pattern {
+    let token = self.first_token(node, tree)
+    var children = tree.child_nodes(node)
+    let Some(inner) = mut children.next() else {
+        return Pattern(token: token, kind: PatternKind.Wildcard)
+    }
+    let kind = match tree.rule(inner) {
+        syntax::Rule.LiteralPattern => PatternKind.Literal(literal: self.pattern_literal(self.child(inner, rule: syntax::Rule.PatternLiteral, tree), file, tree), range: self.optional_range(tree.find(inner, rule: syntax::Rule.RangeTail), file, tree))
+        syntax::Rule.NamedPattern => self.named_pattern(inner, file, tree)
+        else => PatternKind.Wildcard
+    }
+    return Pattern(token: token, kind: take kind)
+} Lowering.pattern
+
+fn Lowering.named_pattern(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> PatternKind {
+    let path = self.path(self.child(node, rule: syntax::Rule.Path, tree), file, tree)
+    let member = self.token_name(self.idents(node, file, tree).get(0), file)
+    var fields: Option[mem::List[FieldPattern]] = None
+    if self.has_token(node, kind: syntax::TokenKind.Punct(syntax::Punct.LParen), file, tree) {
+        fields = Some(self.field_patterns(tree.find(node, rule: syntax::Rule.FieldPatternList), file, tree))
+    }
+    return PatternKind.Named(path: take path, member: take member, fields: take fields, range: self.optional_range(tree.find(node, rule: syntax::Rule.RangeTail), file, tree))
+} Lowering.named_pattern
+
+fn Lowering.field_patterns(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[FieldPattern] {
+    var fields = mem::List[FieldPattern].empty(self.alloc)
+    for field in tree.list_elements(list, element: syntax::Rule.FieldPattern, alloc: self.alloc) {
+        var patterns = mem::List[Pattern].empty(self.alloc)
+        for pattern in self.nodes_of(field, rule: syntax::Rule.Pattern, tree) {
+            mut patterns.push(self.pattern(pattern, file, tree))
+        }
+        var lowered = take patterns.into_cursor()
+        let Some(leading) = mut lowered.next() else {
+            expect false
+            continue
+        }
+        let token = leading.token
+        match mut lowered.next() {
+            Some(pattern) => mut fields.push(FieldPattern(token: token, label: Some(take leading), pattern: take pattern))
+            None => mut fields.push(FieldPattern(token: token, label: None, pattern: take leading))
+        }
+    }
+    return fields
+} Lowering.field_patterns
+
+fn Lowering.pattern_literal(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> PatternLiteral {
+    let tokens = self.tokens(node, tree)
+    let negative = self.kind(tokens[0], file) == syntax::TokenKind.Punct(syntax::Punct.Minus)
+    let token = tokens[tokens.len() - 1]
+    let kind = match self.kind(token, file) {
+        syntax::TokenKind.Int => LiteralKind.Int
+        syntax::TokenKind.Float => LiteralKind.Float
+        syntax::TokenKind.Text => LiteralKind.Text
+        syntax::TokenKind.Bytes => LiteralKind.Bytes
+        syntax::TokenKind.Char => LiteralKind.Char
+        syntax::TokenKind.Byte => LiteralKind.Byte
+        syntax::TokenKind.Keyword(syntax::Keyword.True) => LiteralKind.True
+        else => LiteralKind.False
+    }
+    var literal_tokens = mem::List[u32].empty(self.alloc)
+    mut literal_tokens.push(token)
+    let literal = Literal(kind: kind, tokens: take literal_tokens)
+    return match kind {
+        LiteralKind.Int or LiteralKind.Float => PatternLiteral.Number(negative: negative, literal: take literal)
+        else => PatternLiteral.Other(take literal)
+    }
+} Lowering.pattern_literal
+
+fn Lowering.range_tail(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> PatternRange {
+    let kind = match self.kind(self.tokens(node, tree)[0], file) {
+        syntax::TokenKind.Punct(syntax::Punct.DotDotEq) => RangeKind.Inclusive
+        else => RangeKind.Exclusive
+    }
+    let bound_node = self.child(node, rule: syntax::Rule.RangeBound, tree)
+    let bound = match tree.find(bound_node, rule: syntax::Rule.PatternLiteral) {
+        Some(literal) => RangeBound.Literal(self.pattern_literal(literal, file, tree))
+        None => RangeBound.Path(self.path(self.child(bound_node, rule: syntax::Rule.Path, tree), file, tree))
+    }
+    return PatternRange(kind: kind, bound: take bound)
+} Lowering.range_tail
+
+fn Lowering.optional_range(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[PatternRange] {
+    let Some(found) = node else {
+        return None
+    }
+    return Some(self.range_tail(found, file, tree))
+} Lowering.optional_range
+
+/// Builds the binary tree of operands joined by operators binding at least as tightly as `floor`,
+/// left-associative.
+fn climb(take left: Expr, mut pieces: Pieces, floor: u8, heap: mem::Heap) -> Expr {
+    loop {
+        let Some(op) = mut pieces.peek_operator() else {
+            return left
+        }
+        let level = precedence(op)
+        if level < floor {
+            return left
+        }
+        let Some(Piece.Operator(op: _, token: op_token)) = mut pieces.next() else {
+            expect false
+            return left
+        }
+        let Some(Piece.Operand(operand)) = mut pieces.next() else {
+            expect false
+            return left
+        }
+        var right = operand
+        loop {
+            let Some(next) = mut pieces.peek_operator() else {
+                break
+            }
+            if precedence(next) <= level {
+                break
+            }
+            right = climb(take right, mut pieces, floor: level + 1, heap)
+        }
+        let token = left.token
+        let last = right.last
+        left = Expr(token: token, last: last, kind: ExprKind.Binary(op: op, op_token: op_token, left: heap.boxed(take left), right: heap.boxed(take right)))
+    }
+} climb
+
+/// How tightly an operator binds; the grammar rejects every combination of operators without a
+/// relative precedence, so those share a level.
+fn precedence(op: BinaryOp) -> u8 {
+    return match op {
+        BinaryOp.Or => 1
+        BinaryOp.And => 2
+        BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge => 3
+        BinaryOp.Add or BinaryOp.Sub => 4
+        BinaryOp.Mul or BinaryOp.Div or BinaryOp.Rem => 5
+        else => 6
+    }
+} precedence

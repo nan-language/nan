@@ -1,0 +1,211 @@
+//! Tests of reading workspaces of in-memory files.
+
+const TEST_MANIFEST: Str = "//! A package.\n\npackage app {\n    language 1\n    targets any\n} app\n"
+
+/// Adds a file of a path and a text to the files of a test workspace.
+fn add_test_file(mut files: mem::List[artefact::SourceFile], path: Str, contents: Str, alloc: mem::Alloc) {
+    mut files.push(artefact::SourceFile(path: text::String.of(path, alloc), content: copied_bytes(contents.as_bytes(), alloc)))
+} add_test_file
+
+/// The manifest of the package `app` holding `directives`.
+fn manifest_holding(directives: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of("//! A package.\n\npackage app {\n", alloc)
+    mut written.append(directives)
+    mut written.append("} app\n")
+    return written
+} manifest_holding
+
+/// The diagnostics of reading a workspace but those of its locks, each as its path, line and code,
+/// separated by `;`.
+fn reported_codes(workspace: Workspace, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for reported in workspace.diagnostics(alloc) {
+        if reported.code.name().starts_with("dep.") {
+            continue
+        }
+        if written.byte_len() > 0 {
+            mut written.push(';')
+        }
+        match reported.path {
+            Some(path) => mut written.append(path.as_str())
+            None => {}
+        }
+        mut written.write(text::fmt(":{line}:", line: reported.line.value_or(0)), budget: 100)
+        mut written.append(reported.code.name())
+    }
+    return written
+} reported_codes
+
+/// The diagnostics of reading the workspace of one manifest of `app` holding `directives`.
+fn manifest_codes(directives: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: manifest_holding(directives, alloc).as_str(), alloc)
+    return reported_codes(Workspace.of_files("root", files: files.view(), grammar, alloc), alloc)
+} manifest_codes
+
+test manifest_directives_are_checked for Manifest.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let missing = manifest_codes("    language 1\n", grammar, alloc)
+    expect missing.as_str() == "app/package.nan:3:manifest.missing-directive"
+    let twice = manifest_codes("    language 1\n    language 1\n    targets any\n", grammar, alloc)
+    expect twice.as_str() == "app/package.nan:5:manifest.duplicate"
+    let any = manifest_codes("    language 1\n    targets any, x86_64-host\n", grammar, alloc)
+    expect any.as_str() == "app/package.nan:5:manifest.any-not-alone"
+    let repeated = manifest_codes("    language 1\n    targets x86_64-host, x86_64-host\n", grammar, alloc)
+    expect repeated.as_str() == "app/package.nan:5:manifest.duplicate"
+    let reserved = manifest_codes("    language 1\n    targets x86_64-nanos\n", grammar, alloc)
+    expect reserved.as_str() == "app/package.nan:5:manifest.reserved-target"
+    let unknown = manifest_codes("    language 1\n    targets x86_64-arm\n", grammar, alloc)
+    expect unknown.as_str() == "app/package.nan:5:manifest.unknown-target"
+    let unsupported = manifest_codes("    language 2\n    targets any\n", grammar, alloc)
+    expect unsupported.as_str() == "app/package.nan:4:language.unsupported"
+    let form = manifest_codes("    language 1u8\n    targets any\n", grammar, alloc)
+    expect form.as_str() == "app/package.nan:4:language.version-form"
+    let versioned = manifest_codes("    language 1\n    targets any\n    dep units \"units@1.2\"\n", grammar, alloc)
+    expect versioned.as_str() == "app/package.nan:6:manifest.bad-source"
+    let absolute = manifest_codes("    language 1\n    targets any\n    dep units \"/abs\"\n", grammar, alloc)
+    expect absolute.as_str() == "app/package.nan:6:manifest.bad-source"
+} manifest_directives_are_checked
+
+test repeated_sources_and_grants_are_duplicates for Manifest.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let paths = manifest_codes("    language 1\n    targets any\n    dep a \"../units\"\n    dep b \"./../units\"\n", grammar, alloc)
+    expect paths.as_str() == "app/package.nan:7:manifest.duplicate"
+    let stored = manifest_codes("    language 1\n    targets any\n    dep a \"nan.dev/units\"\n    dep b \"nan.dev/units\"\n", grammar, alloc)
+    expect stored.as_str() == "app/package.nan:7:manifest.duplicate"
+    let names = manifest_codes("    language 1\n    targets any\n    allow device in app, app\n", grammar, alloc)
+    expect names.as_str() == "app/package.nan:6:manifest.duplicate"
+    let grants = manifest_codes("    language 1\n    targets any\n    allow trusted in app\n    allow trusted in other\n", grammar, alloc)
+    expect grants.as_str() == "app/package.nan:7:manifest.duplicate"
+    let own = manifest_codes("    language 1\n    targets any\n    deny app -> app\n", grammar, alloc)
+    expect own.as_str() == "app/package.nan:6:manifest.deny-self"
+    let denials = manifest_codes("    language 1\n    targets any\n    deny a -> b\n    deny a -> b\n", grammar, alloc)
+    expect denials.as_str() == "app/package.nan:7:manifest.duplicate"
+    let distinct = manifest_codes("    language 1\n    targets any\n    dep a \"../../units\"\n    dep b \"../units\"\n", grammar, alloc)
+    expect distinct.byte_len() == 0
+} repeated_sources_and_grants_are_duplicates
+
+test an_unsupported_language_leaves_the_other_files_unread for Package.load {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: manifest_holding("    language 2\n    targets any\n", alloc).as_str(), alloc)
+    add_test_file(mut files, path: "app/app.nan", contents: "//! Root.\n", alloc)
+    let workspace = Workspace.of_files("root", files: files.view(), grammar, alloc)
+    var count: usize = 0
+    for _ in workspace.files() {
+        count += 1
+    }
+    expect count == 1
+} an_unsupported_language_leaves_the_other_files_unread
+
+test manifests_stand_alone_in_package_nan for Package.check_misplaced_manifests {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var lone = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut lone, path: "app/package.nan", contents: "//! A package.\n\nconst X: u32 = 1\n", alloc)
+    let missing = reported_codes(Workspace.of_files("root", files: lone.view(), grammar, alloc), alloc)
+    expect missing.as_str() == "app/package.nan:1:manifest.missing"
+    var misplaced = mem::List[artefact::SourceFile].empty(alloc)
+    var manifest = text::String.of(TEST_MANIFEST, alloc)
+    mut manifest.append("\nconst X: u32 = 1\n")
+    add_test_file(mut misplaced, path: "app/package.nan", contents: manifest.as_str(), alloc)
+    add_test_file(mut misplaced, path: "app/app.nan", contents: "//! Root.\n\npackage other {\n    language 1\n    targets any\n} other\n", alloc)
+    let found = reported_codes(Workspace.of_files("root", files: misplaced.view(), grammar, alloc), alloc)
+    expect found.as_str() == "app/package.nan:8:manifest.misplaced;app/app.nan:3:manifest.misplaced"
+} manifests_stand_alone_in_package_nan
+
+test modules_hold_their_summary_files for check_modules {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: TEST_MANIFEST, alloc)
+    add_test_file(mut files, path: "app/other.nan", contents: "//! Not the root summary.\n", alloc)
+    add_test_file(mut files, path: "app/deep/units/units.nan", contents: "//! Units.\n", alloc)
+    add_test_file(mut files, path: "app/deep/units/more.nan", contents: "//! More units.\n", alloc)
+    add_test_file(mut files, path: "app/net/socket.nan", contents: "//! Sockets.\n", alloc)
+    let workspace = Workspace.of_files("root", files: files.view(), grammar, alloc)
+    let found = reported_codes(workspace, alloc)
+    expect found.as_str() == "app/net/socket.nan:1:doc.module-file-missing;app/package.nan:3:doc.module-file-missing"
+    let modules = workspace.packages[0].modules
+    expect modules.len() == 3
+    expect modules[0].name.as_str() == "units" and modules[1].name.as_str() == "net" and modules[2].name.as_str() == "app"
+} modules_hold_their_summary_files
+
+/// The diagnostics of a package declaring `x86_64-bare` and `x86_64-host` with a module `io` in
+/// each of the directories `variants` names, separated by `,`.
+fn variant_codes(variants: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: manifest_holding("    language 1\n    targets x86_64-bare, x86_64-host\n", alloc).as_str(), alloc)
+    add_test_file(mut files, path: "app/app.nan", contents: "//! Root.\n", alloc)
+    for variant in take split_text(variants, separator: b',', alloc) {
+        var path = text::String.of("app/", alloc)
+        mut path.append(variant.as_str())
+        mut path.append("/io.nan")
+        add_test_file(mut files, path: path.as_str(), contents: "//! Input and output.\n", alloc)
+    }
+    return reported_codes(Workspace.of_files("root", files: files.view(), grammar, alloc), alloc)
+} variant_codes
+
+test variants_cover_each_declared_target_once for check_modules {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let covered = variant_codes("io@bare,io@host", grammar, alloc)
+    expect covered.byte_len() == 0
+    let missing = variant_codes("io@bare", grammar, alloc)
+    expect missing.as_str() == "app/package.nan:5:module.variant-missing"
+    let overlap = variant_codes("io@bare,io@host,io@x86_64", grammar, alloc)
+    expect overlap.as_str() == "app/io@x86_64/io.nan:1:module.variant-overlap"
+    let unmatched = variant_codes("io@bare,io@host,io@uefi", grammar, alloc)
+    expect unmatched.as_str() == "app/io@uefi/io.nan:1:module.variant-unmatched"
+    let mixed = variant_codes("io,io@bare,io@host", grammar, alloc)
+    expect mixed.as_str() == "app/io@bare/io.nan:1:module.variant-mixed;app/io@host/io.nan:1:module.variant-mixed"
+} variants_cover_each_declared_target_once
+
+/// The canonical path of the item holding a line of a file, empty for none.
+fn canonical_at(workspace: Workspace, path: Str, line: u32, alloc: mem::Alloc) -> text::String {
+    let Some(found) = workspace.item_at(path, line, alloc) else {
+        return text::String.empty(alloc)
+    }
+    return found.canonical(alloc)
+} canonical_at
+
+test items_have_canonical_paths for Workspace.item_at {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: TEST_MANIFEST, alloc)
+    add_test_file(mut files, path: "app/app.nan", contents: "//! Root.\n\npub closed struct Gauge {\n    pub level: u32\n} Gauge\n\nfn Gauge.raise(mut self) {\n} Gauge.raise\n\nfn units::Scale.half(self) = 1\n", alloc)
+    add_test_file(mut files, path: "app/units/units.nan", contents: "//! Units.\n\npub closed enum Scale {\n    Base\n} Scale\n", alloc)
+    let workspace = Workspace.of_files("root", files: files.view(), grammar, alloc)
+    let manifest = canonical_at(workspace, path: "app/package.nan", line: 4, alloc)
+    expect manifest.as_str() == "app"
+    let gauge = canonical_at(workspace, path: "app/app.nan", line: 4, alloc)
+    expect gauge.as_str() == "app::Gauge"
+    let raise = canonical_at(workspace, path: "app/app.nan", line: 7, alloc)
+    expect raise.as_str() == "app::Gauge.raise"
+    let half = canonical_at(workspace, path: "app/app.nan", line: 10, alloc)
+    expect half.as_str() == "app::units::Scale.half"
+    let scale = canonical_at(workspace, path: "app/units/units.nan", line: 4, alloc)
+    expect scale.as_str() == "app::units::Scale"
+} items_have_canonical_paths
+
+test two_sources_of_one_package_name_split_it for ClosureReader.split {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let units = "//! Units.\n\npackage units {\n    language 1\n    targets any\n} units\n"
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    add_test_file(mut files, path: "units/package.nan", contents: units, alloc)
+    add_test_file(mut files, path: "copy/package.nan", contents: units, alloc)
+    add_test_file(mut files, path: "app/package.nan", contents: manifest_holding("    language 1\n    targets any\n    dep a \"../units\"\n    dep b \"../copy\"\n    dep c \"./../units\"\n", alloc).as_str(), alloc)
+    let workspace = Workspace.of_files("root", files: files.view(), grammar, alloc)
+    var split = mem::List[u32].empty(alloc)
+    for reported in workspace.diagnostics(alloc) {
+        if reported.code == diagnostic::Code.DepSplitPackage {
+            mut split.push(reported.line.value_or(0))
+        }
+    }
+    expect split.len() == 1 and split[0] == 7
+} two_sources_of_one_package_name_split_it

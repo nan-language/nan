@@ -8,9 +8,10 @@ use std::rc::Rc;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{self, InstBuilder, Type, Value as IrValue, types};
 
-use super::abi::{Abi, Repr, Returned, substituted};
+use super::abi::{Abi, Given, Repr, Returned, substituted};
 use super::fx::{Fx, PTR};
 use super::runtime::Routine;
+use super::types::Wrap;
 use super::{Lowering, trap};
 use crate::check::db::ItemId;
 use crate::check::ty::{Args, Scalar, Subst, Ty};
@@ -77,8 +78,8 @@ pub struct Body<'b, 'c, 'a, 'f> {
     types: Vec<NTy>,
     /// Whether each value is a slot, whose held address is the slot's storage.
     slots: Vec<bool>,
-    /// Whether each value holds a wrapped part.
-    wrapped: Vec<bool>,
+    /// How each value holds a wrapped part, none for a value holding none.
+    wrapped: Vec<Option<Wrap>>,
     blocks: Vec<ir::Block>,
     /// The region holding each block, by the region's first block.
     region_of: HashMap<BlockId, BlockId>,
@@ -122,7 +123,7 @@ pub fn lower(
         values: vec![None; function.types.len()],
         types: Vec::new(),
         slots: vec![false; function.types.len()],
-        wrapped: vec![false; function.types.len()],
+        wrapped: vec![None; function.types.len()],
         blocks: Vec::new(),
         region_of: HashMap::new(),
         exits: HashMap::new(),
@@ -223,7 +224,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
     /// returning an `Option` or `Result`, variants built from references, and block
     /// parameters receiving one of these.
     fn mark_wrapped(&mut self, function: &Function) {
-        let mut wrapped = vec![false; function.types.len()];
+        let mut wrapped: Vec<Option<Wrap>> = vec![None; function.types.len()];
         let projection_result = self.wraps_result();
         loop {
             let mut changed = false;
@@ -234,17 +235,17 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                     };
                     let marks = match &inst.op {
                         Op::Call(call) => self.call_wraps(call),
-                        Op::Variant { payload, ty, .. } => {
-                            (projection_result.as_ref() == Some(&self.subst.ty(ty)))
-                                || payload_operands(payload)
-                                    .iter()
-                                    .any(|operand| self.operand_is_reference(operand, &wrapped))
-                        }
+                        Op::Variant { payload, ty, .. } => match &projection_result {
+                            Some((given, wrap)) if *given == self.subst.ty(ty) => Some(*wrap),
+                            _ => payload_operands(payload)
+                                .iter()
+                                .find_map(|operand| self.operand_wrap(operand, &wrapped)),
+                        },
                         Op::Dbg(Operand::Value(value)) => wrapped[value.0 as usize],
-                        _ => false,
+                        _ => None,
                     };
-                    if marks && !wrapped[result.0 as usize] {
-                        wrapped[result.0 as usize] = true;
+                    if marks.is_some() && wrapped[result.0 as usize].is_none() {
+                        wrapped[result.0 as usize] = marks;
                         changed = true;
                     }
                 }
@@ -257,8 +258,11 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                     }
                     Terminator::Call { call, ok, .. } => {
                         let target = &function.blocks[ok.0 as usize];
-                        if self.call_wraps(call) && !wrapped[target.params[0].0 as usize] {
-                            wrapped[target.params[0].0 as usize] = true;
+                        let param = target.params[0].0 as usize;
+                        if let Some(wrap) = self.call_wraps(call)
+                            && wrapped[param].is_none()
+                        {
+                            wrapped[param] = Some(wrap);
                             changed = true;
                         }
                     }
@@ -267,10 +271,11 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
                 for (target, args) in incoming {
                     let params = &function.blocks[target.0 as usize].params;
                     for (param, arg) in params.iter().zip(args) {
-                        let carries =
-                            matches!(arg, Operand::Value(value) if wrapped[value.0 as usize]);
-                        if carries && !wrapped[param.0 as usize] {
-                            wrapped[param.0 as usize] = true;
+                        if let Operand::Value(value) = arg
+                            && let Some(wrap) = wrapped[value.0 as usize]
+                            && wrapped[param.0 as usize].is_none()
+                        {
+                            wrapped[param.0 as usize] = Some(wrap);
                             changed = true;
                         }
                     }
@@ -283,8 +288,9 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         self.wrapped = wrapped;
     }
 
-    /// Whether a value holds a wrapped part, laid out as its type's wrapped type.
-    pub fn wrapped_flag(&self, value: Value) -> bool {
+    /// How a value holds a wrapped part, laid out as its type's wrapped type; none when it holds
+    /// none.
+    pub fn wrapped_flag(&self, value: Value) -> Option<Wrap> {
         self.wrapped[value.0 as usize]
     }
 
@@ -321,67 +327,48 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         String::from_utf8_lossy(&source[first.start as usize..last.end as usize]).into_owned()
     }
 
-    /// The result type of a projection whose results are wrapped parts, when this function is
-    /// the body of one.
-    fn wraps_result(&self) -> Option<Ty> {
+    /// The result type of a projection whose results are wrapped parts and how they hold their
+    /// payloads, when this function is the body of one.
+    fn wraps_result(&self) -> Option<(Ty, Wrap)> {
         let function = self.function();
         if !matches!(function.role, Role::Body | Role::Entry) {
             return None;
         }
         let sig = self.lo.ck.fn_sig(self.item)?;
-        let result = self.subst.ty(&function.result);
-        (sig.is_proj() && self.lo.wraps(&result)).then_some(result)
+        match self.lo.sig_given(&sig)? {
+            Given::Wrapped(wrap) => Some((self.subst.ty(&function.result), wrap)),
+            _ => None,
+        }
     }
 
-    /// Whether a call's result is a wrapped part: a projection's `Option` or `Result`.
-    fn call_wraps(&self, call: &crate::nir::Call) -> bool {
-        let projection = match &call.callee {
-            crate::nir::Callee::Fn(fn_ref) => self.lo.callable_is_proj(&fn_ref.callable),
+    /// How a call's result holds a wrapped part, when it is one: a projection's `Option` or
+    /// `Result` returned as a value, not as a reference to a part.
+    fn call_wraps(&self, call: &crate::nir::Call) -> Option<Wrap> {
+        let given = match &call.callee {
+            crate::nir::Callee::Fn(fn_ref) => self.lo.callable_given(&fn_ref.callable),
             crate::nir::Callee::Dyn {
                 interface, method, ..
-            } => self.lo.method_is_proj(*interface, *method),
-            crate::nir::Callee::Value(_) => false,
+            } => self.lo.method_given(*interface, *method),
+            crate::nir::Callee::Value(_) => None,
         };
-        projection
-            && self
-                .call_result_ty(call)
-                .is_some_and(|result| self.lo.wraps(&result))
-    }
-
-    /// The type a call's result has in this function.
-    fn call_result_ty(&self, call: &crate::nir::Call) -> Option<Ty> {
-        let function = self.function();
-        for block in &function.blocks {
-            for inst in &block.insts {
-                if let Op::Call(candidate) = &inst.op
-                    && std::ptr::eq(candidate, call)
-                {
-                    return inst
-                        .result
-                        .map(|result| self.subst.ty(function.ty(result).ty()));
-                }
-            }
-            if let Terminator::Call {
-                call: candidate,
-                ok,
-                ..
-            } = &block.term
-                && std::ptr::eq(candidate, call)
-            {
-                let param = function.blocks[ok.0 as usize].params[0];
-                return Some(self.subst.ty(function.ty(param).ty()));
-            }
+        match given {
+            Some(Given::Wrapped(wrap)) => Some(wrap),
+            _ => None,
         }
-        None
     }
 
-    fn operand_is_reference(&self, operand: &Operand, wrapped: &[bool]) -> bool {
+    /// How a variant payload operand makes the variant a wrapped part: a reference, writable when
+    /// mutable, or a wrapped part.
+    fn operand_wrap(&self, operand: &Operand, wrapped: &[Option<Wrap>]) -> Option<Wrap> {
         match operand {
-            Operand::Value(value) => {
-                self.function().ty(*value).is_reference() || wrapped[value.0 as usize]
-            }
-            Operand::Place(Mode::Read | Mode::Mut, _) => true,
-            _ => false,
+            Operand::Value(value) => match self.function().ty(*value) {
+                NTy::Ref(_) => Some(Wrap { writable: false }),
+                NTy::RefMut(_) => Some(Wrap { writable: true }),
+                NTy::Owned(_) => wrapped[value.0 as usize],
+            },
+            Operand::Place(Mode::Read, _) => Some(Wrap { writable: false }),
+            Operand::Place(Mode::Mut, _) => Some(Wrap { writable: true }),
+            _ => None,
         }
     }
 
@@ -586,7 +573,7 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
             } => {
                 let result = inst.result.expect("a variant value");
                 let ty = self.nty(result).ty().clone();
-                let wrapped = self.is_wrapped(result);
+                let wrapped = self.wrapping(result);
                 Some(self.variant(&ty, variant, payload, wrapped))
             }
             Op::Is { place, variant, .. } => {
@@ -748,9 +735,9 @@ impl<'b, 'c, 'a, 'f> Body<'b, 'c, 'a, 'f> {
         let params = &unit.functions[self.function].blocks[jump.block.0 as usize].params;
         let mut args = Vec::new();
         for (param, operand) in params.iter().zip(&jump.args) {
-            let (held, nty) = match self.is_wrapped(*param) {
-                true => self.operand(operand),
-                false => self.owned_operand(operand),
+            let (held, nty) = match self.wrapping(*param) {
+                Some(_) => self.operand(operand),
+                None => self.owned_operand(operand),
             };
             let wanted = self.value_repr(*param);
             args.extend(self.adapt(held, &nty, wanted).values());

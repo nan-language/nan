@@ -1,0 +1,245 @@
+//! Concrete syntax trees: one node per grammar rule the parse expands, over the file's tokens.
+
+/// A child of a node: a node, or a token of the file by its index.
+pkg enum Child derives Copy, Eq {
+    Node(u32)
+    Token(u32)
+} Child
+
+struct Node derives Copy {
+    rule: Rule
+    /// The node's children, as the range `start..end` of the tree's children.
+    start: u32
+    end: u32
+} Node
+
+/// The tree of one item. Nodes refer to the tokens of their file by index.
+pkg struct Tree {
+    nodes: mem::List[Node]
+    child_list: mem::List[Child]
+    root_node: u32
+} Tree
+
+/// The first and the last token under a node.
+pkg struct TokenSpan derives Copy, Eq {
+    pkg head: u32
+    pkg last: u32
+} TokenSpan
+
+pkg fn Tree.empty(alloc: mem::Alloc) -> Tree = Tree(nodes: mem::List[Node].empty(alloc), child_list: mem::List[Child].empty(alloc), root_node: 0)
+
+pkg fn Tree.root(self) -> u32 = self.root_node
+
+pkg fn Tree.rule(self, node: u32) -> Rule {
+    return self.nodes[usize.widen(node)].rule
+} Tree.rule
+
+pkg proj fn Tree.children(self, node: u32) -> Slice[Child] {
+    let held = self.nodes[usize.widen(node)]
+    return match self.child_list.view().split_at(usize.widen(held.start)) {
+        Some(parts) => match parts.tail.prefix(usize.widen(held.end - held.start)) {
+            Some(children) => children
+            None => self.child_list.view()
+        }
+        None => self.child_list.view()
+    }
+} Tree.children
+
+pkg proj fn Tree.child_nodes(self, node: u32) -> ChildNodes {
+    return ChildNodes(children: self.children(node), index: 0)
+} Tree.child_nodes
+
+pkg proj fn Tree.child_tokens(self, node: u32) -> ChildTokens {
+    return ChildTokens(children: self.children(node), index: 0)
+} Tree.child_tokens
+
+/// The child nodes of a node, in order.
+pkg view struct ChildNodes {
+    children: Slice[Child]
+    index: usize
+} ChildNodes
+
+pkg fn ChildNodes.next(mut self) -> Option[u32] {
+    while self.index < self.children.len() {
+        let child = self.children[self.index]
+        self.index += 1
+        match child {
+            Child.Node(node) => return Some(node)
+            Child.Token(_) => {}
+        }
+    }
+    return None
+} ChildNodes.next
+
+/// The child tokens of a node, in order.
+pkg view struct ChildTokens {
+    children: Slice[Child]
+    index: usize
+} ChildTokens
+
+pkg fn ChildTokens.next(mut self) -> Option[u32] {
+    while self.index < self.children.len() {
+        let child = self.children[self.index]
+        self.index += 1
+        match child {
+            Child.Token(token) => return Some(token)
+            Child.Node(_) => {}
+        }
+    }
+    return None
+} ChildTokens.next
+
+/// The first child node of `node` expanding `rule`.
+pkg fn Tree.find(self, node: u32, rule: Rule) -> Option[u32] {
+    for child in self.child_nodes(node) {
+        if self.rule(child) == rule {
+            return Some(child)
+        }
+    }
+    return None
+} Tree.find
+
+/// The element nodes of a list rule that nests itself after each comma, such as `param_list`.
+pkg fn Tree.list_elements(self, list: Option[u32], element: Rule, alloc: mem::Alloc) -> mem::List[u32] {
+    var elements = mem::List[u32].empty(alloc)
+    var current = list
+    loop {
+        let Some(node) = current else {
+            return elements
+        }
+        match self.find(node, rule: element) {
+            Some(found) => mut elements.push(found)
+            None => {}
+        }
+        current = self.find(node, rule: self.rule(node))
+    }
+} Tree.list_elements
+
+/// Every node under `node`, itself included, in source order.
+pkg fn Tree.descendants(self, node: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var found = mem::List[u32].empty(alloc)
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(node)
+    loop {
+        let Some(next) = mut pending.pop() else {
+            return found
+        }
+        mut found.push(next)
+        let children = pending.len()
+        for child in self.child_nodes(next) {
+            mut pending.push(child)
+        }
+        var low = children
+        var high = pending.len()
+        while low + 1 < high {
+            high -= 1
+            let swapped = pending[low]
+            pending[low] = pending[high]
+            pending[high] = swapped
+            low += 1
+        }
+    }
+} Tree.descendants
+
+/// The first and last token under `node`, if it holds any.
+pkg fn Tree.span(self, node: u32, alloc: mem::Alloc) -> Option[TokenSpan] {
+    let Some(first_token) = self.first_token(node, alloc) else {
+        return None
+    }
+    let Some(last_token) = self.last_token(node, alloc) else {
+        return None
+    }
+    return Some(TokenSpan(head: first_token, last: last_token))
+} Tree.span
+
+fn Tree.first_token(self, node: u32, alloc: mem::Alloc) -> Option[u32] {
+    var pending = mem::List[Child].empty(alloc)
+    mut pending.push(Child.Node(node))
+    loop {
+        let Some(child) = mut pending.pop() else {
+            return None
+        }
+        match child {
+            Child.Token(token) => return Some(token)
+            Child.Node(inner) => {
+                let children = self.children(inner)
+                var index = children.len()
+                while index > 0 {
+                    index -= 1
+                    mut pending.push(children[index])
+                }
+            }
+        }
+    }
+} Tree.first_token
+
+fn Tree.last_token(self, node: u32, alloc: mem::Alloc) -> Option[u32] {
+    var pending = mem::List[Child].empty(alloc)
+    mut pending.push(Child.Node(node))
+    loop {
+        let Some(child) = mut pending.pop() else {
+            return None
+        }
+        match child {
+            Child.Token(token) => return Some(token)
+            Child.Node(inner) => {
+                for grandchild in self.children(inner) {
+                    mut pending.push(grandchild)
+                }
+            }
+        }
+    }
+} Tree.last_token
+
+/// A node the builder has opened and not yet closed, with the children it holds so far.
+struct OpenNode {
+    rule: Rule
+    children: mem::List[Child]
+} OpenNode
+
+/// Builds a tree from the parse's events: nodes open and close around the tokens they hold.
+struct Builder {
+    tree: Tree
+    open_nodes: mem::List[OpenNode]
+    alloc: mem::Alloc
+} Builder
+
+fn Builder.empty(alloc: mem::Alloc) -> Builder = Builder(tree: Tree.empty(alloc), open_nodes: mem::List[OpenNode].empty(alloc), alloc: alloc)
+
+fn Builder.open(mut self, rule: Rule) {
+    mut self.open_nodes.push(OpenNode(rule: rule, children: mem::List[Child].empty(self.alloc)))
+} Builder.open
+
+fn Builder.token(mut self, at: usize) {
+    let depth = self.open_nodes.len()
+    expect depth > 0
+    mut (mut self.open_nodes.at_mut(depth - 1)).children.push(Child.Token(u32.truncate(at)))
+} Builder.token
+
+fn Builder.close(mut self) {
+    let Some(closed) = mut self.open_nodes.pop() else {
+        expect false
+        return
+    }
+    let OpenNode(rule: rule, children: children) = closed
+    let start = u32.truncate(self.tree.child_list.len())
+    for child in take children {
+        mut self.tree.child_list.push(child)
+    }
+    let id = u32.truncate(self.tree.nodes.len())
+    mut self.tree.nodes.push(Node(rule: rule, start: start, end: u32.truncate(self.tree.child_list.len())))
+    let depth = self.open_nodes.len()
+    if depth == 0 {
+        self.tree.root_node = id
+        return
+    }
+    mut (mut self.open_nodes.at_mut(depth - 1)).children.push(Child.Node(id))
+} Builder.close
+
+/// Closes every open node, as an abandoned item leaves them, and returns the tree.
+fn Builder.finish(take self) -> Tree {
+    while self.open_nodes.len() > 0 {
+        mut self.close()
+    }
+    return self.tree
+} Builder.finish

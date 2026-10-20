@@ -16,6 +16,7 @@ use super::super::super::fx::{Fx, PTR};
 use super::super::super::runtime::{Routine, holdings, report, tasks};
 use super::super::super::transfer;
 use super::super::{Supply, hw};
+use super::index;
 use super::maps::Entries;
 use super::segments;
 use super::vector::{self, Element};
@@ -459,7 +460,7 @@ pub fn projected(
     let result = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let part = lo.is_part(value);
+    let part = supply.wrap.is_some_and(|wrap| lo.is_part(value, wrap));
     let value = value.clone();
     lo.write_option_with(fx, &layout_ty, result, found, |lo, fx, payload| {
         if part {
@@ -732,7 +733,8 @@ pub fn release_pool(lo: &mut Lowering, fx: &mut Fx, element: &Ty, address: Value
     vector::free_storage(lo, fx, address);
 }
 
-/// A member of `mem::OnceMap[K, V]`: key-value entries in segments, found by `eq`.
+/// A member of `mem::OnceMap[K, V]`: key-value entries in segments, found through its hash
+/// index under its lock.
 fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let (key, value) = (supply.type_arg(0), supply.type_arg(1));
     let entries = Entries::of_map(lo, key.clone(), value.clone());
@@ -744,6 +746,8 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "empty" => {
             let cell = handle(fx, supply.param(1));
             let header = segments::header(lo, fx, cell);
+            let seed = supply.param(0).scalar();
+            fx.store(seed, header, segments::SEED);
             let sret = supply.sret.expect("a once map's address");
             fx.store(header, sret, 0);
             supply.done(lo, fx);
@@ -765,10 +769,18 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     slot
                 }
             };
-            let zero = fx.ptr(0);
-            let (index, len) = scan_from(lo, fx, header, &entries, sought, zero);
-            let found = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
+            let seed = fx.load(types::I64, header, segments::SEED);
+            let fragment = index::fragment(lo, fx, &key, sought, seed);
+            let record = fx.offset(header, segments::INDEX);
+            let lock = fx.offset(header, segments::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let (index, found) = index::find(lo, fx, record, fragment, |lo, fx, index| {
+                let at = segments::at(fx, header, index, entries.shape);
+                let stored = fx.offset(at, entries.key_at);
+                lo.equal(fx, &key, stored, sought)
+            });
             if supply.member() == "get" {
+                lo.call_routine(fx, Routine::Unlock, &[lock]);
                 let address = fx.choose(
                     found,
                     &[PTR],
@@ -782,12 +794,6 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 return;
             }
             let value_held = supply.param(2);
-            let lock = fx.offset(header, segments::LOCK);
-            lo.call_routine(fx, Routine::Lock, &[lock]);
-            let (rest, len) = scan_from(lo, fx, header, &entries, sought, len);
-            let added = fx.b.ins().icmp(IntCC::UnsignedLessThan, rest, len);
-            let index = fx.b.ins().select(found, index, rest);
-            let found = fx.b.ins().bor(found, added);
             let address = fx.choose_in(
                 lo,
                 found,
@@ -802,9 +808,18 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     vec![fx.offset(at, value_at)]
                 },
                 |lo, fx| {
+                    let len = fx.load(PTR, header, segments::LEN);
+                    let taken = [(key_held, key.clone()), (value_held, value.clone())];
                     let room = segments::reserve_one(lo, fx, header, entries.shape);
                     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
-                    let taken = [(key_held, key.clone()), (value_held, value.clone())];
+                    fx.when(failed, |fx| {
+                        lo.call_routine(fx, Routine::Unlock, &[lock]);
+                        supply.exhausted(lo, fx, &taken);
+                    });
+                    let needed = fx.b.ins().iadd_imm_s(len, 1);
+                    let alloc = segments::alloc(fx, header);
+                    let room = index::reserve(lo, fx, record, alloc, needed);
+                    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
                     fx.when(failed, |fx| {
                         lo.call_routine(fx, Routine::Unlock, &[lock]);
                         supply.exhausted(lo, fx, &taken);
@@ -814,8 +829,8 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     lo.store_held(fx, key_slot, key_held, &key);
                     let value_slot = fx.offset(at, value_at);
                     lo.store_held(fx, value_slot, value_held, &value);
-                    let next = fx.b.ins().iadd_imm_s(len, 1);
-                    fx.store(next, header, segments::LEN);
+                    index::insert(fx, record, fragment, len);
+                    fx.store(needed, header, segments::LEN);
                     lo.call_routine(fx, Routine::Unlock, &[lock]);
                     vec![value_slot]
                 },
@@ -824,38 +839,4 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         member => panic!("no lowering of mem::OnceMap.{member}"),
     }
-}
-
-/// The index of the entry of segmented storage from `start` whose key equals the one at
-/// `sought`, or the length, and that length.
-fn scan_from(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    header: Value,
-    entries: &Entries,
-    sought: Value,
-    start: Value,
-) -> (Value, Value) {
-    let len = fx.load(PTR, header, segments::LEN);
-    let index = fx.repeat(&[start], |fx, state| {
-        let index = state[0];
-        let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-        let next = fx.choose(
-            inside,
-            &[PTR, types::I8],
-            |fx| {
-                let at = segments::at(fx, header, index, entries.shape);
-                let stored = fx.offset(at, entries.key_at);
-                let equal = lo.equal(fx, &entries.key, stored, sought);
-                let next = fx.b.ins().iadd_imm_s(index, 1);
-                vec![
-                    fx.b.ins().select(equal, index, next),
-                    fx.b.ins().bxor_imm_s(equal, 1),
-                ]
-            },
-            |fx| vec![index, fx.int(types::I8, 0)],
-        );
-        (next[1], vec![next[0]])
-    })[0];
-    (index, len)
 }

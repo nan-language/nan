@@ -1,0 +1,1411 @@
+//! The canonical format of one parsed item: canonical order, punned labels and trailing commas, line breaks, depth and spacing.
+
+/// A token of the formatted item.
+struct Tok {
+    /// Its source token; none for a trailing comma the format adds.
+    source: Option[u32]
+    kind: syntax::TokenKind
+    text: text::String
+    /// Whether the source breaks the line before it.
+    newline: bool
+    /// Whether it is the last token of its line in the source, comments aside.
+    ends_line: bool
+    /// Comment lines before it, their openers spaced.
+    comments: mem::List[text::String]
+    /// The comment ending its line.
+    trailing: Option[text::String]
+} Tok
+
+/// A copy of the token.
+fn Tok.duplicate(self, alloc: mem::Alloc) -> Tok {
+    var comments = mem::List[text::String].empty(alloc)
+    for comment in self.comments {
+        mut comments.push(text::String.of(comment.as_str(), alloc))
+    }
+    var trailing: Option[text::String] = None
+    match self.trailing {
+        Some(comment) => {
+            trailing = Some(text::String.of(comment.as_str(), alloc))
+        }
+        None => {
+        }
+    }
+    return Tok(source: self.source, kind: self.kind, text: text::String.of(self.text.as_str(), alloc), newline: self.newline, ends_line: self.ends_line, comments: take comments, trailing: take trailing)
+} Tok.duplicate
+
+enum ListKind derives Copy, Eq {
+    /// The parameters of a function item, an interface method or a test.
+    Params
+    /// Any other breakable list.
+    Breakable
+} ListKind
+
+/// A breakable list.
+struct List {
+    kind: ListKind
+    opener: u32
+    closer: u32
+    commas: mem::List[u32]
+    /// The last token of each element.
+    ends: mem::List[u32]
+} List
+
+/// A run of elements the canonical order sorts by key, the tokens between them staying in place.
+struct Sorted {
+    elements: mem::List[syntax::TokenSpan]
+    keys: mem::List[SortKey]
+} Sorted
+
+/// The key of an element of a sorted run: its rank, then its text.
+struct SortKey derives Eq, Ord {
+    rank: u8
+    text: text::String
+} SortKey
+
+/// What the item's tree fixes about the format of its tokens.
+struct Facts {
+    lists: mem::List[List]
+    /// For each token of a comma-separated list that lies on one line, the outermost such list
+    /// holding it, numbered.
+    one_line: mem::HashMap[u32, usize]
+    unary: mem::HashMap[u32, Unit]
+    target_dash: mem::HashMap[u32, Unit]
+    test_opener: mem::HashMap[u32, Unit]
+    trusted_braces: mem::HashMap[u32, Unit]
+    /// The `}` of each braced item's closing line.
+    closing: mem::HashMap[u32, Unit]
+    /// The first token of each clause line, and the first token of the head it belongs to.
+    clause_heads: mem::HashMap[u32, u32]
+    /// The `{` opening a body after a clause region, and the first token of its head.
+    body_heads: mem::HashMap[u32, u32]
+    /// The `example` opening each example clause, which a following `(` does not call.
+    example_words: mem::HashMap[u32, Unit]
+    sorted: mem::List[Sorted]
+} Facts
+
+/// The canonical lines of an item the parse did not abandon.
+fn canonical_lines(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(tree) = item.tree else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    let facts = Facts.collect(file, tree, alloc)
+    let bound = Bindings.collect(file, tree, alloc)
+    let punned = Punning.collect(file, tree, bindings: bound, alloc)
+    var toks = item_tokens(file, item, facts, punned: punned.labels, alloc)
+    let roles = trailing_commas(mut toks, facts, flat: false, alloc)
+    return facts.render_lines(toks.view(), roles, alloc)
+} canonical_lines
+
+fn mark(mut set: mem::HashMap[u32, Unit], token: u32) {
+    discard mut set.insert(token, value: Unit)
+} mark
+
+fn Facts.collect(file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> Facts {
+    var facts = Facts(lists: mem::List[List].empty(alloc), one_line: mem::HashMap[u32, usize].empty(seed: 0, alloc), unary: mem::HashMap[u32, Unit].empty(seed: 0, alloc), target_dash: mem::HashMap[u32, Unit].empty(seed: 0, alloc), test_opener: mem::HashMap[u32, Unit].empty(seed: 0, alloc), trusted_braces: mem::HashMap[u32, Unit].empty(seed: 0, alloc), closing: mem::HashMap[u32, Unit].empty(seed: 0, alloc), clause_heads: mem::HashMap[u32, u32].empty(seed: 0, alloc), body_heads: mem::HashMap[u32, u32].empty(seed: 0, alloc), example_words: mem::HashMap[u32, Unit].empty(seed: 0, alloc), sorted: mem::List[Sorted].empty(alloc))
+    var one_line = mem::List[syntax::TokenSpan].empty(alloc)
+    let head = item_head(tree, alloc)
+    for node in tree.descendants(tree.root(), alloc) {
+        let tokens = child_token_list(tree, node, alloc)
+        mut facts.collect_lists(file, tree, node, tokens, mut one_line, alloc)
+        mut facts.collect_marks(file, tree, node, tokens)
+        mut facts.collect_orders(file, tree, node, tokens, head, alloc)
+    }
+    mut one_line.sort_by(widest_first)
+    var reach: Option[u32] = None
+    for index in 0..<one_line.len() {
+        let span = one_line[index]
+        match reach {
+            Some(reached) => {
+                if span.head <= reached {
+                    continue
+                }
+            }
+            None => {
+            }
+        }
+        reach = Some(span.last)
+        for token in span.head..=span.last {
+            discard mut facts.one_line.insert(token, value: index)
+        }
+    }
+    return facts
+} Facts.collect
+
+/// The order of one-line spans: by first token, the widest first.
+fn widest_first(left: syntax::TokenSpan, right: syntax::TokenSpan) -> core::Ordering {
+    if left.head != right.head {
+        return left.head.cmp(right.head)
+    }
+    return right.last.cmp(left.last)
+} widest_first
+
+/// The first token of the first node of the item's start that holds tokens.
+fn item_head(tree: syntax::Tree, alloc: mem::Alloc) -> Option[u32] {
+    let Some(start) = tree.find(tree.root(), rule: syntax::Rule.ItemStart) else {
+        return None
+    }
+    for child in tree.children(start) {
+        match child {
+            syntax::Child.Node(node) => {
+                match tree.span(node, alloc) {
+                    Some(span) => return Some(span.head)
+                    None => {
+                    }
+                }
+            }
+            syntax::Child.Token(_) => {
+            }
+        }
+    }
+    return None
+} item_head
+
+/// Records the breakable lists and one-line spans a node starts.
+fn Facts.collect_lists(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    tokens: mem::List[u32],
+    mut one_line: mem::List[syntax::TokenSpan],
+    alloc: mem::Alloc,
+    ) {
+    let rule = tree.rule(node)
+    match first rule {
+        syntax::Rule.FnHead or syntax::Rule.InterfaceMember or syntax::Rule.TestParams or syntax::Rule.RetiredHead => {
+            var kind = ListKind.Params
+            if rule == syntax::Rule.RetiredHead {
+                kind = ListKind.Breakable
+            }
+            mut self.paren_list(file, tree, node, list: syntax::Rule.ParamList, element: syntax::Rule.Param, kind, alloc)
+            if rule == syntax::Rule.TestParams {
+                for token in tokens {
+                    if is_punct(file, token, punct: syntax::Punct.LParen) {
+                        mark(mut self.test_opener, token)
+                    }
+                }
+            }
+        }
+        syntax::Rule.FnTypeHead or syntax::Rule.ClosureExpr => mut self.paren_list(file, tree, node, list: syntax::Rule.FnTypeParamList, element: syntax::Rule.FnTypeParam, kind: ListKind.Breakable, alloc)
+        syntax::Rule.PostfixSuffix if tokens.len() > 0 and is_punct(file, token: tokens[0], punct: syntax::Punct.LParen) => mut self.paren_list(file, tree, node, list: syntax::Rule.ArgList, element: syntax::Rule.Arg, kind: ListKind.Breakable, alloc)
+        syntax::Rule.VariantPayload => mut self.paren_list(file, tree, node, list: syntax::Rule.PayloadList, element: syntax::Rule.PayloadField, kind: ListKind.Breakable, alloc)
+        syntax::Rule.NamedPattern if holds_punct(file, tokens, punct: syntax::Punct.LParen) => mut self.paren_list(file, tree, node, list: syntax::Rule.FieldPatternList, element: syntax::Rule.FieldPattern, kind: ListKind.Breakable, alloc)
+        syntax::Rule.GenericParams or syntax::Rule.GenericArgs or syntax::Rule.ImplParams or syntax::Rule.CaptureList or syntax::Rule.DerivesClause or syntax::Rule.LimitsClause or syntax::Rule.UniqueList or syntax::Rule.TargetList or syntax::Rule.NameList => {
+            match tree.span(node, alloc) {
+                Some(span) => mut one_line.push(span)
+                None => {
+                }
+            }
+        }
+        syntax::Rule.WhenExpr => {
+            var last: Option[u32] = None
+            for child in tree.child_nodes(node) {
+                if tree.rule(child) == syntax::Rule.WhenAccess {
+                    last = None
+                    match tree.span(child, alloc) {
+                        Some(span) => {
+                            last = Some(span.last)
+                        }
+                        None => {
+                        }
+                    }
+                }
+            }
+            match last {
+                Some(ending) => {
+                    if tokens.len() > 0 {
+                        mut one_line.push(syntax::TokenSpan(head: tokens[0], last: ending))
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        else => {
+        }
+    }
+} Facts.collect_lists
+
+fn holds_punct(file: syntax::SourceFile, tokens: mem::List[u32], punct: syntax::Punct) -> bool {
+    for token in tokens {
+        if is_punct(file, token, punct) {
+            return true
+        }
+    }
+    return false
+} holds_punct
+
+/// Records the unary operators, target dashes, trusted braces and closing braces a node holds.
+fn Facts.collect_marks(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    tokens: mem::List[u32],
+    ) {
+    match tree.rule(node) {
+        syntax::Rule.PrefixExpr or syntax::Rule.PatternLiteral or syntax::Rule.GenericArg => {
+            let children = tree.children(node)
+            if children.len() > 0 {
+                match children[0] {
+                    syntax::Child.Token(token) => {
+                        if is_punct(file, token, punct: syntax::Punct.Minus) or is_punct(file, token, punct: syntax::Punct.Tilde) {
+                            mark(mut self.unary, token)
+                        }
+                    }
+                    syntax::Child.Node(_) => {
+                    }
+                }
+            }
+        }
+        syntax::Rule.Target => {
+            for token in tokens {
+                if is_punct(file, token, punct: syntax::Punct.Minus) {
+                    mark(mut self.target_dash, token)
+                }
+            }
+        }
+        syntax::Rule.TrustedExpr => {
+            for token in tokens {
+                if is_punct(file, token, punct: syntax::Punct.LBrace) or is_punct(file, token, punct: syntax::Punct.RBrace) {
+                    mark(mut self.trusted_braces, token)
+                }
+            }
+        }
+        syntax::Rule.StructItem or syntax::Rule.EnumItem or syntax::Rule.InterfaceItem or syntax::Rule.LayoutItem or syntax::Rule.RegistersItem or syntax::Rule.PackageItem or syntax::Rule.FnBody => {
+            var closer: Option[u32] = None
+            for token in tokens {
+                if is_punct(file, token, punct: syntax::Punct.RBrace) {
+                    closer = Some(token)
+                }
+            }
+            match closer {
+                Some(token) => mark(mut self.closing, token)
+                None => {
+                }
+            }
+        }
+        else => {
+        }
+    }
+} Facts.collect_marks
+
+/// Records the clause regions, bodies, example words and canonical orders a node fixes.
+fn Facts.collect_orders(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    tokens: mem::List[u32],
+    head: Option[u32],
+    alloc: mem::Alloc,
+    ) {
+    let rule = tree.rule(node)
+    match rule {
+        syntax::Rule.FnEnd => {
+            let Some(region) = tree.find(node, rule: syntax::Rule.ClauseRegion) else {
+                return
+            }
+            let Some(head_token) = head else {
+                return
+            }
+            mut self.clauses(tree, region, head: head_token, alloc)
+            for token in tokens {
+                if is_punct(file, token, punct: syntax::Punct.LBrace) {
+                    discard mut self.body_heads.insert(token, value: head_token)
+                    break
+                }
+            }
+        }
+        syntax::Rule.ExampleClause => {
+            if tokens.len() > 0 {
+                mark(mut self.example_words, token: tokens[0])
+            }
+        }
+        syntax::Rule.InterfaceMember => mut self.member_clauses(file, tree, node, tokens, alloc)
+        syntax::Rule.ItemStart => mut self.modifier_order(file, tree, node, alloc)
+        syntax::Rule.PackageItem => mut self.directive_order(file, tree, node, alloc)
+        syntax::Rule.TargetList => {
+            let targets = child_node_list(tree, node, alloc)
+            if targets.len() >= 2 {
+                var keys = mem::List[SortKey].empty(alloc)
+                for target in targets {
+                    mut keys.push(SortKey(rank: 0, text: joined(file, tree, node: target, alloc)))
+                }
+                mut self.sort(tree, nodes: targets, take keys, alloc)
+            }
+        }
+        syntax::Rule.NameList or syntax::Rule.DerivesClause => mut self.name_order(file, rule, tokens, alloc)
+        syntax::Rule.LimitsClause => mut self.limit_order(file, tree, node, alloc)
+        else => {
+        }
+    }
+} Facts.collect_orders
+
+/// Records the clause region and body of an interface method, which belong to its head.
+fn Facts.member_clauses(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    tokens: mem::List[u32],
+    alloc: mem::Alloc,
+    ) {
+    var member_head: Option[u32] = None
+    for token in tokens {
+        match file.tokens[usize.widen(token)].kind {
+            syntax::TokenKind.Keyword(syntax::Keyword.Proj) or syntax::TokenKind.Keyword(syntax::Keyword.Fn) => {
+                member_head = Some(token)
+                break
+            }
+            else => {
+            }
+        }
+    }
+    let end = tree.find(node, rule: syntax::Rule.MethodEnd)
+    let Some(region) = find_in(tree, node: end, rule: syntax::Rule.ClauseRegion) else {
+        return
+    }
+    let Some(head) = member_head else {
+        return
+    }
+    mut self.clauses(tree, region, head, alloc)
+    let Some(body) = find_in(tree, node: end, rule: syntax::Rule.MethodBody) else {
+        return
+    }
+    var body_tokens = tree.child_tokens(body)
+    match mut body_tokens.next() {
+        Some(opener) => {
+            discard mut self.body_heads.insert(opener, value: head)
+        }
+        None => {
+        }
+    }
+} Facts.member_clauses
+
+/// Sorts the type modifiers of an item: openness, then `linear`, then `view`.
+fn Facts.modifier_order(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    alloc: mem::Alloc,
+    ) {
+    var modifiers = mem::List[u32].empty(alloc)
+    var all_type = true
+    for child in tree.child_nodes(node) {
+        if tree.rule(child) == syntax::Rule.ItemModifier {
+            mut modifiers.push(child)
+            if tree.find(child, rule: syntax::Rule.TypeModifier).is_none() {
+                all_type = false
+            }
+        }
+    }
+    if not all_type or modifiers.len() <= 1 {
+        return
+    }
+    var keys = mem::List[SortKey].empty(alloc)
+    for modifier in modifiers {
+        let Some(span) = tree.span(modifier, alloc) else {
+            expect false
+            return
+        }
+        let word = file.text(usize.widen(span.head))
+        var rank: u8 = 2
+        if word == "closed" or word == "open" {
+            rank = 0
+        } else if word == "linear" {
+            rank = 1
+        }
+        mut keys.push(SortKey(rank: rank, text: text::String.empty(alloc)))
+    }
+    mut self.sort(tree, nodes: modifiers, take keys, alloc)
+} Facts.modifier_order
+
+/// Sorts the directives of a package item by kind, and dependencies, allowances and denials by
+/// text.
+fn Facts.directive_order(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    alloc: mem::Alloc,
+    ) {
+    var directives = mem::List[u32].empty(alloc)
+    for child in tree.child_nodes(node) {
+        if tree.rule(child) == syntax::Rule.Directive {
+            mut directives.push(child)
+        }
+    }
+    if directives.len() < 2 {
+        return
+    }
+    var keys = mem::List[SortKey].empty(alloc)
+    for directive in directives {
+        var nodes = tree.child_nodes(directive)
+        let Some(inner) = mut nodes.next() else {
+            expect false
+            return
+        }
+        let key = match tree.rule(inner) {
+            syntax::Rule.LanguageDirective => SortKey(rank: 0, text: text::String.empty(alloc))
+            syntax::Rule.TargetsDirective => SortKey(rank: 1, text: text::String.empty(alloc))
+            syntax::Rule.EntryDirective => SortKey(rank: 2, text: text::String.empty(alloc))
+            syntax::Rule.DepDirective => SortKey(rank: 3, text: directive_words(file, tree, directive: inner, alloc))
+            syntax::Rule.AllowDirective => SortKey(rank: 4, text: authority_text(file, tree, directive: inner, alloc))
+            else => SortKey(rank: 5, text: directive_words(file, tree, directive: inner, alloc))
+        }
+        mut keys.push(take key)
+    }
+    mut self.sort(tree, nodes: directives, take keys, alloc)
+} Facts.directive_order
+
+/// The identifiers of a directive after its first, separated by spaces.
+fn directive_words(file: syntax::SourceFile, tree: syntax::Tree, directive: u32, alloc: mem::Alloc) -> text::String {
+    var words = text::String.empty(alloc)
+    var seen: usize = 0
+    for token in tree.child_tokens(directive) {
+        if not is_ident(file, token) {
+            continue
+        }
+        seen += 1
+        if seen == 1 {
+            continue
+        }
+        if seen > 2 {
+            mut words.push(' ')
+        }
+        mut words.append(file.text(usize.widen(token)))
+    }
+    return words
+} directive_words
+
+/// The text of an `allow` directive's authority, without spaces.
+fn authority_text(file: syntax::SourceFile, tree: syntax::Tree, directive: u32, alloc: mem::Alloc) -> text::String {
+    let Some(authority) = tree.find(directive, rule: syntax::Rule.Authority) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return joined(file, tree, node: authority, alloc)
+} authority_text
+
+/// Sorts the names of a name list by text, and the entries of a `derives` clause in the order
+/// of the derivable names.
+fn Facts.name_order(
+    mut self,
+    file: syntax::SourceFile,
+    rule: syntax::Rule,
+    tokens: mem::List[u32],
+    alloc: mem::Alloc,
+    ) {
+    var elements = mem::List[syntax::TokenSpan].empty(alloc)
+    var keys = mem::List[SortKey].empty(alloc)
+    for token in tokens {
+        if not is_ident(file, token) {
+            continue
+        }
+        mut elements.push(syntax::TokenSpan(head: token, last: token))
+        let name = file.text(usize.widen(token))
+        if rule == syntax::Rule.NameList {
+            mut keys.push(SortKey(rank: 0, text: text::String.of(name, alloc)))
+        } else {
+            mut keys.push(SortKey(rank: derive_rank(name), text: text::String.empty(alloc)))
+        }
+    }
+    mut self.sorted.push(Sorted(elements: take elements, keys: take keys))
+} Facts.name_order
+
+/// The position of a name among the derivable names, or past them.
+fn derive_rank(name: Str) -> u8 {
+    return match name {
+        "Copy" => 0
+        "Eq" => 1
+        "Ord" => 2
+        "Hash" => 3
+        "Default" => 4
+        "Render" => 5
+        "Encode" => 6
+        "Generate" => 7
+        "Send" => 8
+        "Inert" => 9
+        "AnyBits" => 10
+        else => 11
+    }
+} derive_rank
+
+/// Sorts the entries of a `limits` clause in the order of the limit words.
+fn Facts.limit_order(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    alloc: mem::Alloc,
+    ) {
+    let entries = child_node_list(tree, node, alloc)
+    if entries.len() < 2 {
+        return
+    }
+    var keys = mem::List[SortKey].empty(alloc)
+    for limit in entries {
+        let Some(span) = tree.span(limit, alloc) else {
+            expect false
+            return
+        }
+        let rank: u8 = match file.text(usize.widen(span.head)) {
+            "pure" => 0
+            "notrap" => 1
+            "terminates" => 2
+            "noalloc" => 3
+            "stack" => 4
+            else => 5
+        }
+        mut keys.push(SortKey(rank: rank, text: text::String.empty(alloc)))
+    }
+    mut self.sort(tree, nodes: entries, take keys, alloc)
+} Facts.limit_order
+
+/// Records a parenthesised list whose elements are `element` nodes of a self-nesting `list`.
+fn Facts.paren_list(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    list: syntax::Rule,
+    element: syntax::Rule,
+    kind: ListKind,
+    alloc: mem::Alloc,
+    ) {
+    var opener: Option[u32] = None
+    var closer: Option[u32] = None
+    for token in tree.child_tokens(node) {
+        if opener.is_none() and is_punct(file, token, punct: syntax::Punct.LParen) {
+            opener = Some(token)
+        }
+        if closer.is_none() and is_punct(file, token, punct: syntax::Punct.RParen) {
+            closer = Some(token)
+        }
+    }
+    let Some(opened) = opener else {
+        expect false
+        return
+    }
+    let Some(closed) = closer else {
+        expect false
+        return
+    }
+    var commas = mem::List[u32].empty(alloc)
+    var ends = mem::List[u32].empty(alloc)
+    var next = tree.find(node, rule: list)
+    loop {
+        let Some(current) = next else {
+            break
+        }
+        for token in tree.child_tokens(current) {
+            if is_punct(file, token, punct: syntax::Punct.Comma) {
+                mut commas.push(token)
+            }
+        }
+        match tree.find(current, rule: element) {
+            Some(found) => {
+                match tree.span(found, alloc) {
+                    Some(span) => mut ends.push(span.last)
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        next = tree.find(current, rule: list)
+    }
+    mut self.lists.push(List(kind: kind, opener: opened, closer: closed, commas: take commas, ends: take ends))
+} Facts.paren_list
+
+/// Records the clause lines of a clause region and the head they belong to, and sorts them by
+/// group.
+fn Facts.clauses(
+    mut self,
+    tree: syntax::Tree,
+    region: u32,
+    head: u32,
+    alloc: mem::Alloc,
+    ) {
+    let lines = child_node_list(tree, node: region, alloc)
+    for line in lines {
+        let Some(span) = tree.span(line, alloc) else {
+            expect false
+            return
+        }
+        discard mut self.clause_heads.insert(span.head, value: head)
+    }
+    if lines.len() < 2 {
+        return
+    }
+    var keys = mem::List[SortKey].empty(alloc)
+    for line in lines {
+        var nodes = tree.child_nodes(line)
+        let Some(clause) = mut nodes.next() else {
+            expect false
+            return
+        }
+        mut keys.push(SortKey(rank: syntax::clause_group(tree, clause), text: text::String.empty(alloc)))
+    }
+    mut self.sort(tree, nodes: lines, take keys, alloc)
+} Facts.clauses
+
+/// Records a sorted run of nodes, each with its key, when it holds two or more.
+fn Facts.sort(
+    mut self,
+    tree: syntax::Tree,
+    nodes: mem::List[u32],
+    take keys: mem::List[SortKey],
+    alloc: mem::Alloc,
+    ) {
+    if nodes.len() < 2 {
+        return
+    }
+    var elements = mem::List[syntax::TokenSpan].empty(alloc)
+    for node in nodes {
+        let Some(span) = tree.span(node, alloc) else {
+            expect false
+            return
+        }
+        mut elements.push(span)
+    }
+    mut self.sorted.push(Sorted(elements: take elements, keys: take keys))
+} Facts.sort
+
+/// The text of a node's tokens, without spaces.
+fn joined(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    let Some(span) = tree.span(node, alloc) else {
+        expect false
+        return written
+    }
+    for token in span.head..=span.last {
+        mut written.append(file.text(usize.widen(token)))
+    }
+    return written
+} joined
+
+/// The comments of an item's tokens: the comment lines before each, and the comment ending its
+/// line.
+struct Attached {
+    comments: mem::HashMap[u32, mem::List[text::String]]
+    trailing: mem::HashMap[u32, text::String]
+} Attached
+
+/// The item's tokens in canonical order, without punned labels, each with its comments.
+fn item_tokens(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    facts: Facts,
+    punned: mem::HashMap[u32, Unit],
+    alloc: mem::Alloc,
+    ) -> mem::List[Tok] {
+    var order = mem::List[u32].empty(alloc)
+    for token in item.head..<item.end {
+        if not file.comment[token] and file.tokens[token].kind != syntax::TokenKind.Col0 {
+            mut order.push(u32.truncate(token))
+        }
+    }
+    for sorted in facts.sorted {
+        reorder(mut order, sorted, alloc)
+    }
+    var attached = attached_comments(file, item, alloc)
+    var toks = mem::List[Tok].empty(alloc)
+    var carried = mem::List[text::String].empty(alloc)
+    for token in order {
+        let at = usize.widen(token)
+        let source = file.tokens[at]
+        match mut attached.comments.remove(token) {
+            Some(own) => {
+                for comment in take own {
+                    mut carried.push(take comment)
+                }
+            }
+            None => {
+            }
+        }
+        if punned.contains(token) {
+            continue
+        }
+        var ends_line = false
+        match next_real(file, after: at) {
+            Some(next) => {
+                ends_line = file.tokens[next].line > source.line
+            }
+            None => {
+            }
+        }
+        var newline = false
+        if not source.kind.is_virtual() {
+            newline = true
+            match previous_real(file, before: at) {
+                Some(previous) => {
+                    newline = file.tokens[previous].line < source.line
+                }
+                None => {
+                }
+            }
+        }
+        let written = token_text(file, at, kind: source.kind, alloc)
+        mut toks.push(Tok(source: Some(token), kind: source.kind, text: take written, newline: newline, ends_line: ends_line, comments: take carried, trailing: mut attached.trailing.remove(token)))
+        carried = mem::List[text::String].empty(alloc)
+    }
+    return toks
+} item_tokens
+
+/// The text a token is written with before normalisation.
+fn token_text(file: syntax::SourceFile, at: usize, kind: syntax::TokenKind, alloc: mem::Alloc) -> text::String {
+    return match kind {
+        syntax::TokenKind.Doc or syntax::TokenKind.FileDoc => opener_spaced(file.text(at), alloc)
+        syntax::TokenKind.Int or syntax::TokenKind.Float => group_number(file.text(at), alloc)
+        syntax::TokenKind.Nl => text::String.empty(alloc)
+        else => text::String.of(file.text(at), alloc)
+    }
+} token_text
+
+fn is_real(file: syntax::SourceFile, at: usize) -> bool {
+    return not file.comment[at] and not file.tokens[at].kind.is_virtual()
+} is_real
+
+/// The first token after `after` that is neither a comment nor virtual.
+fn next_real(file: syntax::SourceFile, after: usize) -> Option[usize] {
+    for at in (after + 1)..<file.tokens.len() {
+        if is_real(file, at) {
+            return Some(at)
+        }
+    }
+    return None
+} next_real
+
+/// The last token before `before` that is neither a comment nor virtual.
+fn previous_real(file: syntax::SourceFile, before: usize) -> Option[usize] {
+    var at = before
+    while at > 0 {
+        at -= 1
+        if is_real(file, at) {
+            return Some(at)
+        }
+    }
+    return None
+} previous_real
+
+/// The comment lines and line-ending comments of an item's lines, by the tokens they attach to.
+fn attached_comments(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: mem::Alloc) -> Attached {
+    var attached = Attached(comments: mem::HashMap[u32, mem::List[text::String]].empty(seed: 0, alloc), trailing: mem::HashMap[u32, text::String].empty(seed: 0, alloc))
+    var pending = mem::List[text::String].empty(alloc)
+    var index = item.head
+    for line in file.item_lines(item) {
+        var last_on_line: Option[u32] = None
+        while index < item.end and file.tokens[index].line == line {
+            let kind = file.tokens[index].kind
+            let commented = file.comment[index]
+            if commented and (kind == syntax::TokenKind.Doc or kind == syntax::TokenKind.FileDoc) {
+                mut pending.push(opener_spaced(file.text(index), alloc))
+            } else if not commented and not kind.is_virtual() {
+                discard mut attached.comments.insert(u32.truncate(index), value: take pending)
+                pending = mem::List[text::String].empty(alloc)
+                last_on_line = Some(u32.truncate(index))
+            }
+            index += 1
+        }
+        let physical = file.lines[usize.widen(line) - 1]
+        let Some(offset) = physical.comment else {
+            continue
+        }
+        let comment = comment_text(file, start: offset, end: physical.end, alloc)
+        match last_on_line {
+            Some(token) => {
+                discard mut attached.trailing.insert(token, value: take comment)
+            }
+            None => mut pending.push(take comment)
+        }
+    }
+    return attached
+} attached_comments
+
+/// Rearranges the tokens of a sorted run: each element moves to the slot of its rank, the tokens
+/// between elements keep their place.
+fn reorder(mut order: mem::List[u32], sorted: Sorted, alloc: mem::Alloc) {
+    var starts = mem::List[usize].empty(alloc)
+    var ends = mem::List[usize].empty(alloc)
+    for element in sorted.elements {
+        var start: Option[usize] = None
+        var end: usize = 0
+        for at in 0..<order.len() {
+            let token = order[at]
+            if token >= element.head and token <= element.last {
+                if start.is_none() {
+                    start = Some(at)
+                }
+                end = at + 1
+            }
+        }
+        let Some(found) = start else {
+            expect false
+            return
+        }
+        mut starts.push(found)
+        mut ends.push(end)
+    }
+    var ranked = mem::List[usize].empty(alloc)
+    for index in 0..<starts.len() {
+        mut ranked.push(index)
+    }
+    mut ranked.sort_by(fn(left: usize, right: usize) => sorted.keys[left].cmp(sorted.keys[right]))
+    let start = starts[0]
+    let end = ends[ends.len() - 1]
+    var segment = mem::List[u32].empty(alloc)
+    for slot in 0..<ranked.len() {
+        let element = ranked[slot]
+        for at in starts[element]..<ends[element] {
+            mut segment.push(order[at])
+        }
+        if slot + 1 < starts.len() {
+            for at in ends[slot]..<starts[slot + 1] {
+                mut segment.push(order[at])
+            }
+        }
+    }
+    expect segment.len() + start == end
+    for offset in 0..<segment.len() {
+        order[start + offset] = segment[offset]
+    }
+} reorder
+
+/// A token's part in a list of the item.
+enum Role derives Copy, Eq {
+    Opener(usize)
+    Comma(usize)
+    Closer(usize)
+} Role
+
+/// The roles of the tokens in lists, and whether each breakable list is broken.
+struct Roles {
+    roles: mem::List[Option[Role]]
+    broken: mem::List[bool]
+} Roles
+
+/// The roles of tokens whose lists are all flat, which need none.
+fn Roles.flat(tokens: usize, lists: usize, alloc: mem::Alloc) -> Roles {
+    var roles = mem::List[Option[Role]].empty(alloc)
+    for _ in 0..<tokens {
+        mut roles.push(None)
+    }
+    var broken = mem::List[bool].empty(alloc)
+    for _ in 0..<lists {
+        mut broken.push(false)
+    }
+    return Roles(roles: take roles, broken: take broken)
+} Roles.flat
+
+/// The roles of the tokens kept.
+fn Roles.kept(self, kept: mem::List[bool], alloc: mem::Alloc) -> Roles {
+    var roles = mem::List[Option[Role]].empty(alloc)
+    var index: usize = 0
+    while index < self.roles.len() and index < kept.len() {
+        if kept[index] {
+            mut roles.push(self.roles[index])
+        }
+        index += 1
+    }
+    var broken = mem::List[bool].empty(alloc)
+    for list in self.broken {
+        mut broken.push(list)
+    }
+    return Roles(roles: take roles, broken: take broken)
+} Roles.kept
+
+/// The positions of the tokens with a source, by their source token.
+fn positions(toks: mem::List[Tok], alloc: mem::Alloc) -> mem::HashMap[u32, usize] {
+    var at = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    for index in 0..<toks.len() {
+        match toks[index].source {
+            Some(source) => {
+                discard mut at.insert(source, value: index)
+            }
+            None => {
+            }
+        }
+    }
+    return at
+} positions
+
+/// Which breakable lists are broken, and where trailing commas are added after or dropped.
+struct CommaEdits {
+    broken: mem::List[bool]
+    added: mem::List[bool]
+    dropped: mem::List[bool]
+} CommaEdits
+
+/// Decides which breakable lists are broken, every one when `flat` is false, gives a broken list
+/// its trailing comma and takes a flat list's away.
+fn trailing_commas(mut toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc) -> Roles {
+    let edits = comma_edits(toks, facts, flat, alloc)
+    var pending = drained(mut toks, alloc)
+    var carried = mem::List[text::String].empty(alloc)
+    var index: usize = 0
+    loop {
+        let Some(popped) = mut pending.pop() else {
+            break
+        }
+        var tok = popped
+        let at = index
+        index += 1
+        if edits.dropped[at] {
+            carried = tok.comments
+            continue
+        }
+        if carried.len() > 0 {
+            for comment in take tok.comments {
+                mut carried.push(take comment)
+            }
+            tok.comments = carried
+            carried = mem::List[text::String].empty(alloc)
+        }
+        mut toks.push(take tok)
+        if edits.added[at] {
+            mut toks.push(Tok(source: None, kind: syntax::TokenKind.Punct(syntax::Punct.Comma), text: text::String.of(",", alloc), newline: false, ends_line: false, comments: mem::List[text::String].empty(alloc), trailing: None))
+        }
+    }
+    let at = positions(toks, alloc)
+    var roles = mem::List[Option[Role]].empty(alloc)
+    for _ in 0..<toks.len() {
+        mut roles.push(None)
+    }
+    for list in 0..<facts.lists.len() {
+        let shape = facts.lists[list]
+        let opener = at.at(shape.opener)
+        let closer = at.at(shape.closer)
+        roles[opener] = Some(Role.Opener(list))
+        for comma in shape.commas {
+            match at.get(comma) {
+                Some(found) => {
+                    roles[found] = Some(Role.Comma(list))
+                }
+                None => {
+                }
+            }
+        }
+        roles[closer] = Some(Role.Closer(list))
+        if toks[closer - 1].source.is_none() {
+            roles[closer - 1] = Some(Role.Comma(list))
+        }
+    }
+    let CommaEdits(broken: broken, added: _, dropped: _) = edits
+    return Roles(roles: take roles, broken: take broken)
+} trailing_commas
+
+/// The tokens of a list in reverse order, the list left empty.
+fn drained(mut toks: mem::List[Tok], alloc: mem::Alloc) -> mem::List[Tok] {
+    var reversed = mem::List[Tok].empty(alloc)
+    loop {
+        let Some(tok) = mut toks.pop() else {
+            return reversed
+        }
+        mut reversed.push(take tok)
+    }
+} drained
+
+/// The breaks and trailing comma edits of each breakable list of the tokens.
+fn comma_edits(toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc) -> CommaEdits {
+    let at = positions(toks, alloc)
+    var commented_before = mem::List[usize].empty(alloc)
+    var commented: usize = 0
+    mut commented_before.push(commented)
+    for tok in toks {
+        if tok.comments.len() > 0 or tok.trailing.is_some() {
+            commented += 1
+        }
+        mut commented_before.push(commented)
+    }
+    var edits = CommaEdits(broken: mem::List[bool].empty(alloc), added: mem::List[bool].empty(alloc), dropped: mem::List[bool].empty(alloc))
+    for _ in 0..<toks.len() {
+        mut edits.added.push(false)
+        mut edits.dropped.push(false)
+    }
+    for list in 0..<facts.lists.len() {
+        let shape = facts.lists[list]
+        let opener = at.at(shape.opener)
+        let closer = at.at(shape.closer)
+        var commas = mem::List[usize].empty(alloc)
+        for comma in shape.commas {
+            match at.get(comma) {
+                Some(found) => mut commas.push(found)
+                None => {
+                }
+            }
+        }
+        let list_commented = toks[opener].trailing.is_some() or commented_before[closer] > commented_before[opener + 1] or toks[closer].comments.len() > 0
+        var broken = false
+        if not flat and shape.ends.len() > 0 {
+            broken = match shape.kind {
+                ListKind.Params => shape.ends.len() > 4 or list_commented
+                ListKind.Breakable => toks[opener].ends_line or any_ends_line(toks, commas)
+            }
+        }
+        mut edits.broken.push(broken)
+        var closing_comma: Option[usize] = None
+        for comma in commas {
+            if comma + 1 == closer {
+                closing_comma = Some(comma)
+                break
+            }
+        }
+        match closing_comma {
+            Some(comma) => {
+                if not broken {
+                    edits.dropped[comma] = true
+                }
+            }
+            None => {
+                if broken {
+                    edits.added[at.at(shape.ends[shape.ends.len() - 1])] = true
+                }
+            }
+        }
+    }
+    return edits
+} comma_edits
+
+fn any_ends_line(toks: mem::List[Tok], commas: mem::List[usize]) -> bool {
+    for comma in commas {
+        if toks[comma].ends_line {
+            return true
+        }
+    }
+    return false
+} any_ends_line
+
+/// An opening delimiter the layout is inside.
+struct Open derives Copy {
+    anchor: usize
+    list: Option[usize]
+    /// The depth of the line holding the first token of the current unit of its context.
+    unit: Option[usize]
+} Open
+
+/// Whether the token's source is in a set.
+fn source_in(set: mem::HashMap[u32, Unit], tok: Tok) -> bool {
+    return match tok.source {
+        Some(source) => set.contains(source)
+        None => false
+    }
+} source_in
+
+fn is_tok(tok: Tok, punct: syntax::Punct) -> bool = tok.kind == syntax::TokenKind.Punct(punct)
+
+/// The one-line list holding a token, numbered.
+fn Facts.one_line_of(self, tok: Tok) -> Option[usize] {
+    let Some(source) = tok.source else {
+        return None
+    }
+    return self.one_line.get(source)
+} Facts.one_line_of
+
+/// Whether the line breaks before the token at `at`, not the item's first.
+fn Facts.breaks_before(self, toks: Slice[Tok], roles: Roles, at: usize) -> bool {
+    let previous = toks[at - 1]
+    let current = toks[at]
+    if previous.kind == syntax::TokenKind.Nl or previous.trailing.is_some() or current.comments.len() > 0 {
+        return true
+    }
+    let previous_line = self.one_line_of(previous)
+    if previous_line.is_some() and previous_line == self.one_line_of(current) {
+        return false
+    }
+    match roles.roles[at] {
+        Some(Role.Closer(list)) => return roles.broken[list]
+        else => {
+        }
+    }
+    match roles.roles[at - 1] {
+        Some(Role.Opener(list)) or Some(Role.Comma(list)) => return roles.broken[list]
+        else => {
+        }
+    }
+    if is_tok(previous, punct: syntax::Punct.LBrace) and not source_in(self.trusted_braces, tok: previous) {
+        return true
+    }
+    if is_tok(current, punct: syntax::Punct.RBrace) and not source_in(self.trusted_braces, tok: current) {
+        return true
+    }
+    return current.newline
+} Facts.breaks_before
+
+/// Whether one space separates two tokens on a line.
+fn Facts.spaced(self, toks: Slice[Tok], left: usize, right: usize) -> bool {
+    let a = toks[left]
+    let b = toks[right]
+    match a.kind {
+        syntax::TokenKind.Punct(syntax::Punct.LParen) or syntax::TokenKind.Punct(syntax::Punct.LBracket) => return false
+        else => {
+        }
+    }
+    match b.kind {
+        syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) or syntax::TokenKind.Punct(syntax::Punct.Comma) or syntax::TokenKind.Punct(syntax::Punct.Colon) => return false
+        else => {
+        }
+    }
+    if is_tight(a.kind) or is_tight(b.kind) or source_in(self.target_dash, tok: a) or source_in(self.target_dash, tok: b) {
+        return false
+    }
+    if source_in(self.unary, tok: a) {
+        return is_tok(a, punct: syntax::Punct.Minus) and is_tok(b, punct: syntax::Punct.Minus)
+    }
+    let calls = match a.kind {
+        syntax::TokenKind.Ident or syntax::TokenKind.Keyword(syntax::Keyword.SelfValue) or syntax::TokenKind.Keyword(syntax::Keyword.Fn) or syntax::TokenKind.Keyword(syntax::Keyword.Dbg) => true
+        syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) => true
+        else => false
+    }
+    let opens = match b.kind {
+        syntax::TokenKind.Punct(syntax::Punct.LParen) or syntax::TokenKind.Punct(syntax::Punct.LBracket) => true
+        else => false
+    }
+    if opens and calls and not source_in(self.example_words, tok: a) {
+        return source_in(self.test_opener, tok: b)
+    }
+    return true
+} Facts.spaced
+
+fn is_tight(kind: syntax::TokenKind) -> bool {
+    return match kind {
+        syntax::TokenKind.Punct(syntax::Punct.Dot) or syntax::TokenKind.Punct(syntax::Punct.ColonColon) => true
+        syntax::TokenKind.Punct(syntax::Punct.DotDotLt) or syntax::TokenKind.Punct(syntax::Punct.DotDotEq) => true
+        else => false
+    }
+} is_tight
+
+fn is_closer(kind: syntax::TokenKind) -> bool {
+    return match kind {
+        syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) or syntax::TokenKind.Punct(syntax::Punct.RBrace) => true
+        else => false
+    }
+} is_closer
+
+/// The lines of the tokens: each line's tokens, spaced, at its depth, after its comment lines.
+fn Facts.render_lines(self, toks: Slice[Tok], roles: Roles, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[mem::List[usize]].empty(alloc)
+    for at in 0..<toks.len() {
+        if toks[at].kind == syntax::TokenKind.Nl {
+            continue
+        }
+        if lines.len() == 0 or self.breaks_before(toks, roles, at) {
+            var line = mem::List[usize].empty(alloc)
+            mut line.push(at)
+            mut lines.push(take line)
+        } else {
+            let last = lines.len() - 1
+            mut (mut lines.at_mut(last)).push(at)
+        }
+    }
+    var out = mem::List[text::String].empty(alloc)
+    var contexts = Contexts(open: mem::List[Open].empty(alloc), file_unit: None)
+    var depth_of = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    var previous_depth: usize = 0
+    for index in 0..<lines.len() {
+        let line = lines[index]
+        let lead = line[0]
+        let source = toks[lead].source.value_or(~0u32)
+        let closes = is_closer(toks[lead].kind)
+        var base: usize = 0
+        let open_count = contexts.open.len()
+        if open_count > 0 {
+            base = contexts.open[open_count - 1].anchor + 1
+        }
+        let depth = self.line_depth(toks, roles, contexts, depth_of, lead, previous_depth, base)
+        var comment_depth = depth
+        if closes {
+            comment_depth = base
+        } else {
+            match self.body_heads.get(source) {
+                Some(head) => {
+                    comment_depth = depth_of.get(head).value_or(0) + 1
+                }
+                None => {
+                }
+            }
+        }
+        for comment in toks[lead].comments {
+            var written = indentation(comment_depth, alloc)
+            mut written.append(comment.as_str())
+            mut out.push(take written)
+        }
+        mut out.push(self.line_text(toks, line, depth, alloc))
+        for at in line {
+            match toks[at].source {
+                Some(token) => {
+                    discard mut depth_of.insert(token, value: depth)
+                }
+                None => {
+                }
+            }
+        }
+        previous_depth = depth
+        var end = toks.len()
+        if index + 1 < lines.len() {
+            end = lines[index + 1][0]
+        }
+        for at in lead..<end {
+            mut contexts.track(toks[at], role: roles.roles[at], depth)
+        }
+    }
+    return out
+} Facts.render_lines
+
+/// A line of tokens at its depth, spaced, with the comment ending it.
+fn Facts.line_text(
+    self,
+    toks: Slice[Tok],
+    line: mem::List[usize],
+    depth: usize,
+    alloc: mem::Alloc,
+    ) -> text::String {
+    var written = indentation(depth, alloc)
+    for position in 0..<line.len() {
+        let at = line[position]
+        if position > 0 and self.spaced(toks, left: line[position - 1], right: at) {
+            mut written.push(' ')
+        }
+        mut written.append(toks[at].text.as_str())
+    }
+    match toks[line[line.len() - 1]].trailing {
+        Some(comment) => {
+            mut written.push(' ')
+            mut written.append(comment.as_str())
+        }
+        None => {
+        }
+    }
+    return written
+} Facts.line_text
+
+/// The depth of a line starting with the token at `lead`.
+fn Facts.line_depth(
+    self,
+    toks: Slice[Tok],
+    roles: Roles,
+    contexts: Contexts,
+    depth_of: mem::HashMap[u32, usize],
+    lead: usize,
+    previous_depth: usize,
+    base: usize,
+    ) -> usize {
+    let source = toks[lead].source.value_or(~0u32)
+    if is_closer(toks[lead].kind) {
+        let count = contexts.open.len()
+        expect count > 0
+        let open = contexts.open[count - 1]
+        var params = false
+        match open.list {
+            Some(list) => {
+                params = self.lists[list].kind == ListKind.Params and roles.broken[list]
+            }
+            None => {
+            }
+        }
+        let top_level = open.anchor == 0 and not self.closing.contains(source)
+        if params or top_level {
+            return open.anchor + 1
+        }
+        return open.anchor
+    }
+    match self.clause_heads.get(source) {
+        Some(head) => return depth_of.get(head).value_or(0) + 1
+        None => {
+        }
+    }
+    match self.body_heads.get(source) {
+        Some(head) => return depth_of.get(head).value_or(0)
+        None => {
+        }
+    }
+    if toks[lead].kind == syntax::TokenKind.TextLine and lead > 0 and toks[lead - 1].kind == syntax::TokenKind.TextLine {
+        return previous_depth
+    }
+    return match contexts.unit() {
+        Some(unit) => unit + 1
+        None => base
+    }
+} Facts.line_depth
+
+/// Four spaces per level of depth.
+fn indentation(depth: usize, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for _ in 0..<depth {
+        mut written.append("    ")
+    }
+    return written
+} indentation
+
+/// The delimiters open at a point of the layout, and the current unit of each context.
+struct Contexts {
+    open: mem::List[Open]
+    /// The depth of the line holding the first token of the file context's current unit.
+    file_unit: Option[usize]
+} Contexts
+
+fn Contexts.unit(self) -> Option[usize] {
+    let count = self.open.len()
+    if count == 0 {
+        return self.file_unit
+    }
+    return self.open[count - 1].unit
+} Contexts.unit
+
+/// The current unit of the innermost context, started at `depth` when none is current.
+fn Contexts.started_unit(mut self, depth: usize) -> usize {
+    let count = self.open.len()
+    if count == 0 {
+        let Some(unit) = self.file_unit else {
+            self.file_unit = Some(depth)
+            return depth
+        }
+        return unit
+    }
+    let Some(unit) = self.open[count - 1].unit else {
+        self.open[count - 1].unit = Some(depth)
+        return depth
+    }
+    return unit
+} Contexts.started_unit
+
+/// Ends the current unit of the innermost context.
+fn Contexts.end_unit(mut self) {
+    let count = self.open.len()
+    if count == 0 {
+        self.file_unit = None
+        return
+    }
+    self.open[count - 1].unit = None
+} Contexts.end_unit
+
+/// Moves past a token on a line of `depth`: a separator ends its context's unit, an opener
+/// opens a context anchored at the unit holding it, and any other token starts a unit when
+/// none is current.
+fn Contexts.track(mut self, tok: Tok, role: Option[Role], depth: usize) {
+    match tok.kind {
+        syntax::TokenKind.Punct(syntax::Punct.LParen) or syntax::TokenKind.Punct(syntax::Punct.LBracket) or syntax::TokenKind.Punct(syntax::Punct.LBrace) => {
+            let anchor = mut self.started_unit(depth)
+            var list: Option[usize] = None
+            match role {
+                Some(Role.Opener(opened)) => {
+                    list = Some(opened)
+                }
+                else => {
+                }
+            }
+            mut self.open.push(Open(anchor: anchor, list: list, unit: None))
+        }
+        syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) or syntax::TokenKind.Punct(syntax::Punct.RBrace) => {
+            discard mut self.open.pop()
+        }
+        syntax::TokenKind.Nl or syntax::TokenKind.Punct(syntax::Punct.Comma) => mut self.end_unit()
+        else => {
+            discard mut self.started_unit(depth)
+        }
+    }
+} Contexts.track

@@ -1,0 +1,557 @@
+//! Closing a prefix: the fewest tokens after which a source file derives the prefix's part before its first dead token, typed holes uncounted, written as canonical source text.
+
+/// A prefix closed: the byte of its first dead token, and what closing appends, as pieces and as
+/// the source the two make.
+pkg struct Closed {
+    pkg dead: Option[u32]
+    pkg pieces: mem::List[Piece]
+    pkg source: mem::Bytes
+} Closed
+
+/// What closing appends on one line of the closed source: a closer, a maximal run of appended
+/// tokens other than typed holes, or a typed hole.
+pkg struct Piece {
+    pkg line: u32
+    /// The bytes it occupies in the closed source.
+    pkg span: diagnostic::Span
+    pkg text: text::String
+    pkg hole: bool
+} Piece
+
+/// A token closing appends.
+enum Appended {
+    Token(text::String)
+    Nl
+    Col0
+    Hole
+} Appended
+
+/// The cost of deriving each choice and sequence minimally: tokens counted, virtual ones
+/// included and typed holes not; rejected alternatives derive nothing.
+struct Costs {
+    choices: mem::List[u32]
+    seqs: mem::List[u32]
+} Costs
+
+const UNBOUNDED: u32 = ~0u32 / 4
+
+fn Costs.compute(grammar: Grammar, alloc: mem::Alloc) -> Costs {
+    var costs = Costs(choices: mem::List[u32].empty(alloc), seqs: mem::List[u32].empty(alloc))
+    for _ in 0..<grammar.choices.len() {
+        mut costs.choices.push(UNBOUNDED)
+    }
+    for _ in 0..<grammar.seqs.len() {
+        mut costs.seqs.push(UNBOUNDED)
+    }
+    loop {
+        var changed = false
+        for seq in 0..<grammar.seqs.len() {
+            let def = grammar.seqs[seq]
+            if def.rejection.is_some() {
+                continue
+            }
+            let cost = costs.elems(def.elems, grammar)
+            if cost < costs.seqs[seq] {
+                costs.seqs[seq] = cost
+                changed = true
+            }
+        }
+        for choice in 0..<grammar.choices.len() {
+            var cost = UNBOUNDED
+            for seq in grammar.choices[choice] {
+                if costs.seqs[seq] < cost {
+                    cost = costs.seqs[seq]
+                }
+            }
+            if cost < costs.choices[choice] {
+                costs.choices[choice] = cost
+                changed = true
+            }
+        }
+        if not changed {
+            return costs
+        }
+    }
+} Costs.compute
+
+/// The cost of the elements of a sequence that must appear.
+fn Costs.elems(self, elems: mem::List[ElemDef], grammar: Grammar) -> u32 {
+    var cost: u32 = 0
+    for elem in elems {
+        if elem.repeat == Repeat.One or elem.repeat == Repeat.Plus {
+            cost += self.atom(elem.atom, grammar)
+            if cost > UNBOUNDED {
+                cost = UNBOUNDED
+            }
+        }
+    }
+    return cost
+} Costs.elems
+
+fn Costs.atom(self, atom: Atom, grammar: Grammar) -> u32 {
+    return match first atom {
+        Atom.Term(_) => 1
+        Atom.Rule(Rule.TodoExpr) => 0
+        Atom.Rule(rule) => self.choices[rule.choice(grammar)]
+        Atom.Group(choice) => self.choices[choice]
+    }
+} Costs.atom
+
+/// The cheapest alternative of a choice, the one written first among equals.
+fn Costs.cheapest(self, choice: usize, grammar: Grammar) -> usize {
+    var best: Option[usize] = None
+    var best_cost: u32 = 0
+    for seq in grammar.choices[choice] {
+        if grammar.seqs[seq].rejection.is_some() {
+            continue
+        }
+        if best.is_none() or self.seqs[seq] < best_cost {
+            best = Some(seq)
+            best_cost = self.seqs[seq]
+        }
+    }
+    let Some(cheapest) = best else {
+        expect false
+        return 0
+    }
+    return cheapest
+} Costs.cheapest
+
+/// The bytes of a prefix kept before closing, and whether they end a line.
+struct Cut derives Copy {
+    kept: usize
+    ends_line: bool
+} Cut
+
+/// Closes a prefix of a source file: keeps its part before its first dead token and appends the
+/// fewest tokens completing the item it ends in.
+pkg fn close_prefix(prefix: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Closed {
+    var kept = cut(prefix, grammar, alloc)
+    var file = match prefix.prefix(kept.kept) {
+        Some(part) => parse_prefix(part, grammar, alloc)
+        None => parse_prefix(prefix, grammar, alloc)
+    }
+    let dead = file.dead()
+    match dead {
+        Some(at) => {
+            kept = match prefix.prefix(usize.widen(at)) {
+                Some(part) => cut(part, grammar, alloc)
+                None => cut(prefix, grammar, alloc)
+            }
+            file = match prefix.prefix(kept.kept) {
+                Some(part) => parse_prefix(part, grammar, alloc)
+                None => parse_prefix(prefix, grammar, alloc)
+            }
+        }
+        None => {}
+    }
+    var appended = mem::List[Appended].empty(alloc)
+    let count = file.items.len()
+    if count > 0 {
+        match finishing(file, head: file.items[count - 1].head, ends_line: kept.ends_line, grammar, alloc) {
+            Some(tokens) => {
+                appended = tokens
+            }
+            None => {}
+        }
+    }
+    var source = mem::Bytes.empty(alloc)
+    match prefix.prefix(kept.kept) {
+        Some(part) => mut source.append(part)
+        None => {}
+    }
+    let pieces = render(file, ends_line: kept.ends_line, appended, mut source, alloc)
+    return Closed(dead: dead, pieces: take pieces, source: take source)
+} close_prefix
+
+/// The first byte at which the parse failed before the end of the last token, if any.
+fn SourceFile.dead(self) -> Option[u32] {
+    var last: u32 = 0
+    var index = self.tokens.len()
+    while index > 0 {
+        index -= 1
+        if not self.tokens[index].kind.is_virtual() {
+            last = self.tokens[index].end
+            break
+        }
+    }
+    var dead: Option[u32] = None
+    for reported in self.diagnostics {
+        let Some(failing) = reported.failing else {
+            continue
+        }
+        let earliest = match dead {
+            Some(earlier) => failing < earlier
+            None => true
+        }
+        if failing < last and earliest {
+            dead = Some(failing)
+        }
+    }
+    return dead
+} SourceFile.dead
+
+/// The bytes of a prefix kept before closing, and whether they end a line: a prefix not ending
+/// with LF loses the token reaching its cut, an unterminated literal included, and the spaces
+/// before it.
+fn cut(prefix: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Cut {
+    if prefix.len() == 0 or prefix[prefix.len() - 1] == b'\n' {
+        return Cut(kept: prefix.len(), ends_line: true)
+    }
+    let file = parse_prefix(prefix, grammar, alloc)
+    let line = file.lines[file.lines.len() - 1]
+    var reaching = prefix.len()
+    var found = false
+    for reported in file.diagnostics {
+        if reported.code != diagnostic::Code.LexUnterminatedLiteral {
+            continue
+        }
+        let Some(at) = reported.failing else {
+            continue
+        }
+        if at >= line.start {
+            reaching = usize.widen(at)
+            found = true
+            break
+        }
+    }
+    if not found {
+        for token in file.tokens {
+            if not token.kind.is_virtual() and usize.widen(token.end) == prefix.len() {
+                reaching = usize.widen(token.start)
+                break
+            }
+        }
+    }
+    var trimmed = reaching
+    while trimmed > 0 and prefix[trimmed - 1] == b' ' {
+        trimmed -= 1
+    }
+    if trimmed < usize.widen(line.start) {
+        trimmed = usize.widen(line.start)
+    }
+    return Cut(kept: trimmed, ends_line: false)
+} cut
+
+/// The parse of a prefix's kept part, lexed as a file ending in a line end.
+fn parse_prefix(kept: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> SourceFile {
+    var source = mem::Bytes.empty(alloc)
+    mut source.append(kept)
+    if source.len() > 0 and source[source.len() - 1] != b'\n' {
+        mut source.push(b'\n')
+    }
+    return parse(take source, grammar, alloc)
+} parse_prefix
+
+/// The tokens completing the item starting at `head`, fed up to the prefix's end: no `EOF`, and
+/// no `NL` after a last token that the prefix does not end its line with, or that continues its
+/// logical line or is a `TEXT_LINE`.
+fn finishing(
+    file: SourceFile,
+    head: usize,
+    ends_line: bool,
+    grammar: Grammar,
+    alloc: mem::Alloc,
+    ) -> Option[mem::List[Appended]] {
+    var end = file.tokens.len() - 1
+    var last = end
+    var found = false
+    while last > 0 and not found {
+        last -= 1
+        found = not file.tokens[last].kind.is_virtual()
+    }
+    if not found {
+        return None
+    }
+    let kind = file.tokens[last].kind
+    if not ends_line or kind.is_continuing() or kind == TokenKind.TextLine {
+        end = last + 1
+    }
+    var state = State.new(Rule.Item, alloc)
+    var dry = Discard()
+    var at = head
+    while at < end {
+        let next = file.next(at + 1)
+        var after: Option[Token] = None
+        if next < end {
+            after = Some(file.tokens[next])
+        }
+        match attempt mut state.feed(Lookahead(token: file.tokens[at], next: after, at: at), source: file.source.view(), sink: mut dry, grammar) {
+            Ok(Fed.Consumed) => {
+                at = next
+            }
+            Ok(Fed.Done) => return Some(mem::List[Appended].empty(alloc))
+            Err(_) => return None
+        }
+    }
+    var label = text::String.empty(alloc)
+    match file.declared_name(head, failed: state, alloc) {
+        Some(name) => {
+            label = name
+        }
+        None => {}
+    }
+    var completing = Completion(costs: Costs.compute(grammar, alloc), label: take label, out: mem::List[Appended].empty(alloc), alloc: alloc)
+    mut completing.complete(state, grammar)
+    let completed = completing.out
+    return Some(take completed)
+} finishing
+
+/// The tokens a completion appends, derived minimally under the costs of the grammar.
+struct Completion {
+    costs: Costs
+    /// The name a closing label spells.
+    label: text::String
+    out: mem::List[Appended]
+    alloc: mem::Alloc
+} Completion
+
+/// Appends the tokens completing a parse: the remaining parts of each open frame, innermost
+/// first, each derived minimally.
+fn Completion.complete(mut self, state: State, grammar: Grammar) {
+    var depth = state.frames.len()
+    while depth > 0 {
+        depth -= 1
+        let frame = state.frames[depth]
+        let elems = grammar.seqs[frame.seq].elems
+        for index in frame.elem..<elems.len() {
+            var count: usize = 0
+            if index == frame.elem {
+                count = frame.count
+                if depth + 1 < state.frames.len() {
+                    count += 1
+                }
+            }
+            let closing_label = index > 0 and elems[index - 1].atom == Atom.Term(Term.Punct(Punct.RBrace))
+            mut self.elem(elems[index], count, closing_label, grammar)
+        }
+    }
+} Completion.complete
+
+/// Derives an element of a sequence minimally when it must appear: an optional or repeated part
+/// is skipped.
+fn Completion.elem(
+    mut self,
+    elem: ElemDef,
+    count: usize,
+    closing_label: bool,
+    grammar: Grammar,
+    ) {
+    let must = elem.repeat == Repeat.One or elem.repeat == Repeat.Plus
+    if not must or count > 0 {
+        return
+    }
+    let ident = elem.atom == Atom.Rule(Rule.ItemLabel) or elem.atom == Atom.Term(Term.Class(Class.Ident))
+    if closing_label and ident {
+        mut self.out.push(Appended.Token(text::String.of(self.label.as_str(), alloc: self.alloc)))
+    } else {
+        mut self.derive(elem.atom, grammar)
+    }
+} Completion.elem
+
+/// Derives an atom minimally: a typed hole for `todo_expr`, and otherwise the cheapest
+/// alternative, the one written first among equals.
+fn Completion.derive(mut self, atom: Atom, grammar: Grammar) {
+    var choice: usize = 0
+    match first atom {
+        Atom.Term(term) => {
+            mut self.out.push(Appended.of(term, alloc: self.alloc))
+            return
+        }
+        Atom.Rule(Rule.TodoExpr) => {
+            mut self.out.push(Appended.Hole)
+            return
+        }
+        Atom.Rule(rule) => {
+            choice = rule.choice(grammar)
+        }
+        Atom.Group(group) => {
+            choice = group
+        }
+    }
+    let seq = self.costs.cheapest(choice, grammar)
+    let elems = grammar.seqs[seq].elems
+    for index in 0..<elems.len() {
+        let closing_label = index > 0 and elems[index - 1].atom == Atom.Term(Term.Punct(Punct.RBrace))
+        mut self.elem(elems[index], count: 0, closing_label, grammar)
+    }
+} Completion.derive
+
+/// An appended terminal: its spelling, `hole` for an identifier, `0` for an integer and
+/// `"hole"` for a text.
+fn Appended.of(term: Term, alloc: mem::Alloc) -> Appended {
+    return match first term {
+        Term.Keyword(keyword) => Appended.Token(text::String.of(keyword.spelling(), alloc))
+        Term.Punct(punct) => Appended.Token(text::String.of(punct.spelling(), alloc))
+        Term.Context(word) => Appended.Token(text::String.of(word.spelling(), alloc))
+        Term.Class(Class.Nl) => Appended.Nl
+        Term.Class(Class.Col0) => Appended.Col0
+        Term.Class(Class.Int) => Appended.Token(text::String.of("0", alloc))
+        Term.Class(Class.Float) => Appended.Token(text::String.of("0.0", alloc))
+        Term.Class(Class.Text) or Term.Class(Class.TextLine) => Appended.Token(text::String.of("\"hole\"", alloc))
+        Term.Class(Class.Bytes) => Appended.Token(text::String.of("b\"hole\"", alloc))
+        Term.Class(Class.Char) => Appended.Token(text::String.of("'h'", alloc))
+        Term.Class(Class.Byte) => Appended.Token(text::String.of("b'h'", alloc))
+        Term.Class(_) => Appended.Token(text::String.of("hole", alloc))
+    }
+} Appended.of
+
+/// Whether canonical spacing puts a space between two tokens on a line.
+fn spaced(before: Str, after: Str) -> bool {
+    let tight = before == "(" or before == "[" or before == "." or before == "::" or before == "..<" or before == "..="
+    let closing = after == ")" or after == "]" or after == "," or after == ":" or after == "." or after == "::" or after == "..<" or after == "..="
+    var called = false
+    if after == "(" or after == "[" {
+        called = before == ")" or before == "]" or before == "self" or before == "fn" or before == "dbg" or starts_word(before)
+    }
+    return not (tight or closing or called)
+} spaced
+
+/// Whether a text starts with an ASCII letter or `_`.
+fn starts_word(spelt: Str) -> bool {
+    let bytes = spelt.as_bytes()
+    if bytes.len() == 0 {
+        return false
+    }
+    let lead = bytes[0]
+    return (lead >= b'a' and lead <= b'z') or (lead >= b'A' and lead <= b'Z') or lead == b'_'
+} starts_word
+
+/// Writes the appended tokens after the kept source: a line end for `NL`, column 0 after `COL0`,
+/// otherwise the indentation of the braces open in the source, and canonical spacing on a line.
+/// Returns the closers and typed holes, each on its line.
+fn render(
+    file: SourceFile,
+    ends_line: bool,
+    appended: mem::List[Appended],
+    mut source: mem::Bytes,
+    alloc: mem::Alloc,
+    ) -> mem::List[Piece]
+    waive length "one pass over the appended tokens, as the Rust rendering"
+{
+    var depth = file.open_braces()
+    var line = u32.truncate(file.lines.len())
+    if ends_line and file.lines.len() > 0 {
+        line += 1
+    }
+    if source.len() == 0 {
+        line = 1
+    }
+    var line_start = ends_line
+    var column_zero = false
+    var previous = text::String.empty(alloc)
+    var index = file.tokens.len()
+    while index > 0 {
+        index -= 1
+        if not file.tokens[index].kind.is_virtual() {
+            mut previous.append(file.text(index))
+            break
+        }
+    }
+    var pieces = mem::List[Piece].empty(alloc)
+    for token in appended {
+        var written = text::String.empty(alloc)
+        var hole = false
+        match token {
+            Appended.Nl => {
+                mut source.push(b'\n')
+                line += 1
+                line_start = true
+                column_zero = false
+                continue
+            }
+            Appended.Col0 => {
+                if not line_start {
+                    mut source.push(b'\n')
+                    line += 1
+                    line_start = true
+                }
+                column_zero = true
+                continue
+            }
+            Appended.Token(spelt) => mut written.append(spelt.as_str())
+            Appended.Hole => {
+                mut written.append("todo \"hole\"")
+                hole = true
+            }
+        }
+        if written.as_str() == "}" and depth > 0 {
+            depth -= 1
+        }
+        if line_start {
+            if not column_zero {
+                for _ in 0..<(4 * depth) {
+                    mut source.push(b' ')
+                }
+            }
+        } else if spaced(previous.as_str(), after: written.as_str()) {
+            mut source.push(b' ')
+        }
+        let start = u32.truncate(source.len())
+        mut source.append(written.as_bytes())
+        let end = u32.truncate(source.len())
+        let count = pieces.len()
+        if not hole and count > 0 and not pieces[count - 1].hole and pieces[count - 1].line == line {
+            let merged = match source.view().split_at(usize.widen(pieces[count - 1].span.start)) {
+                Some(parts) => output::lossy(parts.tail, alloc)
+                None => text::String.empty(alloc)
+            }
+            pieces[count - 1].text = merged
+            pieces[count - 1].span.end = end
+        } else {
+            mut pieces.push(Piece(line: line, span: diagnostic::Span(start: start, end: end), text: text::String.of(written.as_str(), alloc), hole: hole))
+        }
+        if written.as_str() == "{" {
+            depth += 1
+        }
+        previous = written
+        line_start = false
+        column_zero = false
+    }
+    if not line_start {
+        mut source.push(b'\n')
+    }
+    return pieces
+} render
+
+/// The depth of the braces the tokens of a file leave open, not read as comments.
+fn SourceFile.open_braces(self) -> usize {
+    var depth: i64 = 0
+    for at in 0..<self.tokens.len() {
+        if self.comment[at] {
+            continue
+        }
+        match self.tokens[at].kind {
+            TokenKind.Punct(Punct.LBrace) => {
+                depth += 1
+            }
+            TokenKind.Punct(Punct.RBrace) => {
+                depth -= 1
+            }
+            else => {}
+        }
+    }
+    if depth < 0 {
+        return 0
+    }
+    return usize.fit(depth)
+} SourceFile.open_braces
+
+test a_prefix_closes_with_the_fewest_tokens for close_prefix {
+    let alloc = testing::world().alloc
+    let closed = close_prefix(b"//! A.\n\npub fn clamp_level(level: u32, ceiling: u32) -> u32 {\n    if level > ceiling {\n", grammar: Grammar.load(alloc), alloc)
+    expect closed.pieces.len() == 2
+    expect closed.pieces[0].line == 5 and closed.pieces[0].text.as_str() == "}" and not closed.pieces[0].hole
+    expect closed.pieces[1].line == 6 and closed.pieces[1].text.as_str() == "} clamp_level" and not closed.pieces[1].hole
+    let source = try text::String.try_from_utf8(closed.source.view(), alloc)
+    expect source.ends_with("    if level > ceiling {\n    }\n} clamp_level\n")
+} a_prefix_closes_with_the_fewest_tokens
+
+test a_missing_expression_is_a_typed_hole_and_the_cut_token_is_dropped for close_prefix {
+    let alloc = testing::world().alloc
+    let closed = close_prefix(b"//! A.\n\npub fn level() -> u32 {\n    return 1 + lev", grammar: Grammar.load(alloc), alloc)
+    expect closed.pieces.len() > 0
+    expect closed.pieces[0].line == 4 and closed.pieces[0].text.as_str() == "todo \"hole\"" and closed.pieces[0].hole
+    let source = try text::String.try_from_utf8(closed.source.view(), alloc)
+    expect source.find("    return 1 + todo \"hole\"\n} level\n").is_some()
+} a_missing_expression_is_a_typed_hole_and_the_cut_token_is_dropped

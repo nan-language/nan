@@ -1,0 +1,650 @@
+//! Dependency closures: the release through which a workspace package's lock reaches each package of its dependency closure, std aside — a workspace package checked from source while its locked release holds its current source files, else the release the local store holds — and the closures that workspace packages share.
+
+/// Where a package of a closure comes from: a workspace package checked from source, or a
+/// release of the local store, by its index among the workspace's releases.
+pkg enum Member derives Copy, Eq, Ord, Hash {
+    Source(usize)
+    Release(usize)
+} Member
+
+/// A member and one of its `dep` aliases.
+pkg struct AliasKey derives Eq, Ord, Hash {
+    pkg member: Member
+    pkg alias: text::String
+} AliasKey
+
+/// A dependency closure: its members by package name, the workspace packages checked and
+/// reported in it, and the member each alias of each member names.
+pkg struct Closure {
+    pkg members: mem::Map[text::String, Member]
+    pkg checked: mem::List[usize]
+    pkg aliases: mem::Map[AliasKey, Member]
+} Closure
+
+/// The member of a package name.
+pkg fn Closure.member(self, name: Str) -> Option[Member] {
+    return members_get(self.members, name)
+} Closure.member
+
+/// The member an alias of a member names.
+pkg fn Closure.alias(self, member: Member, alias: Str) -> Option[Member] {
+    return aliases_get(self.aliases, member, alias)
+} Closure.alias
+
+fn members_get(members: mem::Map[text::String, Member], name: Str) -> Option[Member] {
+    let Some(found) = members.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return None
+    }
+    return Some(found)
+} members_get
+
+fn aliases_get(aliases: mem::Map[AliasKey, Member], member: Member, alias: Str) -> Option[Member] {
+    let Some(found) = aliases.get_by(fn(key: AliasKey) => key.order(member, alias)) else {
+        return None
+    }
+    return Some(found)
+} aliases_get
+
+/// The order of a key against a member and an alias, as keys are ordered.
+fn AliasKey.order(self, member: Member, alias: Str) -> core::Ordering {
+    let members = self.member.cmp(member)
+    if members != core::Ordering.Equal {
+        return members
+    }
+    return self.alias.as_str().cmp(alias)
+} AliasKey.order
+
+/// A store entry loaded as a package, by the code root of its release.
+pkg struct Release {
+    pkg root: hashing::HashValue
+    pkg entry: mem::Shared[store::Entry]
+    pkg pack: Package
+} Release
+
+/// What reading the closures of the workspace packages gives: the closures, the releases they
+/// read from the store, the store entries confirming the current states of path sources, and
+/// the diagnostics of their locks.
+struct Read {
+    pkg closures: mem::List[Closure]
+    pkg releases: mem::List[Release]
+    pkg confirmed: mem::List[mem::Shared[store::Entry]]
+    pkg found: mem::List[diagnostic::Diagnostic]
+} Read
+
+/// The closures of the workspace packages, reading releases through `store_entry`: the store
+/// entry holding a release, by its code root.
+fn read_closures(
+    packages: Slice[Package],
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Read fails platform::IoError {
+    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
+    var owns = mem::List[Option[Own]].empty(alloc)
+    for index in 0..<packages.len() {
+        let own = try mut reader.own(packages, index, store_entry, grammar)
+        mut owns.push(take own)
+    }
+    var closures = mem::List[Closure].empty(alloc)
+    var index: usize = 0
+    for held in take owns {
+        let at = index
+        index += 1
+        let Some(own) = held else {
+            continue
+        }
+        var fitting: Option[usize] = None
+        for position in 0..<closures.len() {
+            if fits(own, closure: closures[position], packages) {
+                fitting = Some(position)
+                break
+            }
+        }
+        let Some(position) = fitting else {
+            var checked = mem::List[usize].empty(alloc)
+            mut checked.push(at)
+            mut closures.push(Closure(members: take own.members, checked: take checked, aliases: take own.aliases))
+            continue
+        }
+        var closure = mut closures.at_mut(position)
+        for entry in take own.members {
+            discard mut closure.members.insert(take entry.key, value: entry.value)
+        }
+        for entry in take own.aliases {
+            discard mut closure.aliases.insert(take entry.key, value: entry.value)
+        }
+        mut closure.checked.push(at)
+    }
+    let ClosureReader(releases: releases, confirmed: confirmed, found: found, alloc: _) = reader
+    return Read(closures: take closures, releases: take releases, confirmed: take confirmed, found: take found)
+} read_closures
+
+/// Whether a package's own closure agrees with a closure: on the members of their package names,
+/// on the members of their aliases, and on the packages the closure checks.
+fn fits(own: Own, closure: Closure, packages: Slice[Package]) -> bool {
+    for entry in own.members {
+        match members_get(closure.members, name: entry.key().as_str()) {
+            Some(known) => {
+                if known != entry.value() {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    for entry in own.aliases {
+        let key = entry.key()
+        match aliases_get(closure.aliases, member: key.member, alias: key.alias.as_str()) {
+            Some(known) => {
+                if known != entry.value() {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    for checked in closure.checked {
+        let name = match packages[checked].name() {
+            Some(named) => named
+            None => ""
+        }
+        match members_get(own.members, name) {
+            Some(member) => {
+                if member != Member.Source(checked) {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    return true
+} fits
+
+/// A package's own closure.
+struct Own {
+    members: mem::Map[text::String, Member]
+    aliases: mem::Map[AliasKey, Member]
+} Own
+
+struct ClosureReader {
+    releases: mem::List[Release]
+    confirmed: mem::List[mem::Shared[store::Entry]]
+    found: mem::List[diagnostic::Diagnostic]
+    alloc: mem::Alloc
+} ClosureReader
+
+fn ClosureReader.report(mut self, code: diagnostic::Code, pack: Package, line: u32) {
+    var path = text::String.of(pack.dir.as_str(), alloc: self.alloc)
+    mut path.append("/package.nan")
+    for known in self.found {
+        let Some(known_path) = known.path else {
+            continue
+        }
+        if known.code == code and known.line == Some(line) and known_path == path {
+            return
+        }
+    }
+    mut self.found.push(diagnostic::Diagnostic.at(code, path: path.as_str(), line, alloc: self.alloc))
+} ClosureReader.report
+
+/// The workspace package at a directory, by index.
+fn package_at_dir(packages: Slice[Package], dir: Str) -> Option[usize] {
+    for index in 0..<packages.len() {
+        if packages[index].dir.as_str() == dir and packages[index].manifest.is_some() {
+            return Some(index)
+        }
+    }
+    return None
+} package_at_dir
+
+/// The release of a store entry, loaded once into a directory.
+fn ClosureReader.release(mut self, take entry: mem::Shared[store::Entry], dir: Str, grammar: syntax::Grammar) -> usize fails platform::IoError {
+    let root = entry.contents().root(self.alloc)
+    for index in 0..<self.releases.len() {
+        let release = self.releases[index]
+        if release.root == root and release.pack.dir.as_str() == dir {
+            return index
+        }
+    }
+    let loaded = try Package.from_entry(entry.contents(), dir, grammar, alloc: self.alloc)
+    mut self.releases.push(Release(root: root, entry: take entry, pack: take loaded))
+    return self.releases.len() - 1
+} ClosureReader.release
+
+/// The directory of a member's package and its `dep` directives: alias, source as written and
+/// whether it is a path.
+struct MemberDeps {
+    dir: text::String
+    deps: mem::List[DepSource]
+} MemberDeps
+
+fn ClosureReader.member_deps(self, packages: Slice[Package], member: Member) -> MemberDeps {
+    return match member {
+        Member.Source(index) => deps_of(packages[index], alloc: self.alloc)
+        Member.Release(index) => deps_of(self.releases[index].pack, alloc: self.alloc)
+    }
+} ClosureReader.member_deps
+
+/// The directory of a package and every one of its `dep` directives.
+fn deps_of(pack: Package, alloc: mem::Alloc) -> MemberDeps {
+    var deps = mem::List[DepSource].empty(alloc)
+    match pack.manifest {
+        Some(manifest) => {
+            for dep in manifest.deps {
+                mut deps.push(DepSource(alias: text::String.of(dep.alias.as_str(), alloc), written: text::String.of(dep.written.as_str(), alloc), path: dep.path))
+            }
+        }
+        None => {}
+    }
+    return MemberDeps(dir: text::String.of(pack.dir.as_str(), alloc), deps: take deps)
+} deps_of
+
+/// A workspace package's own closure, reporting its lock's diagnostics; none without a
+/// manifest.
+fn ClosureReader.own(
+    mut self,
+    packages: Slice[Package],
+    index: usize,
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    ) -> Option[Own] fails platform::IoError {
+    let alloc = self.alloc
+    let pack = packages[index]
+    let Some(manifest) = pack.manifest else {
+        return None
+    }
+    let me = Member.Source(index)
+    var own = Own(members: mem::Map[text::String, Member].empty(alloc), aliases: mem::Map[AliasKey, Member].empty(alloc))
+    discard mut own.members.insert(text::String.of(manifest.name.as_str(), alloc), value: me)
+    mut self.split(packages, index)
+    let Some(lock) = pack.machine.lock() else {
+        if pack.machine.lock_file.is_none() {
+            for dep in manifest.deps {
+                if dep.source.is_some() {
+                    mut self.report(diagnostic::Code.DepLockStale, pack, line: dep.line)
+                }
+            }
+        }
+        self.unlocked(packages, index, own: mut own)
+        return Some(take own)
+    }
+    var lines = mem::Map[text::String, Member].empty(alloc)
+    for line in lock.deps {
+        let member = try mut self.locked_member(packages, index, line, store_entry, grammar)
+        let Some(found) = member else {
+            continue
+        }
+        discard mut lines.insert(text::String.of(line.package_name.as_str(), alloc), value: found)
+        discard mut own.members.insert(text::String.of(line.package_name.as_str(), alloc), value: found)
+    }
+    for dep in manifest.deps {
+        if dep.source.is_none() {
+            continue
+        }
+        var matched = false
+        for line in lock.deps {
+            let Some(alias) = line.alias else {
+                continue
+            }
+            if alias != dep.alias {
+                continue
+            }
+            if line.source == dep.written {
+                matched = true
+                match members_get(lines, name: line.package_name.as_str()) {
+                    Some(member) => {
+                        discard mut own.aliases.insert(AliasKey(member: me, alias: text::String.of(dep.alias.as_str(), alloc)), value: member)
+                    }
+                    None => {}
+                }
+            }
+            break
+        }
+        if not matched {
+            mut self.report(diagnostic::Code.DepLockStale, pack, line: dep.line)
+        }
+    }
+    mut self.reach(packages, index, lines, own: mut own)
+    return Some(take own)
+} ClosureReader.own
+
+/// The member a line of a workspace package's lock reaches, reporting why it reaches none.
+fn ClosureReader.locked_member(
+    mut self,
+    packages: Slice[Package],
+    index: usize,
+    line: machine::Locked,
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    ) -> Option[Member] fails platform::IoError {
+    let alloc = self.alloc
+    let pack = packages[index]
+    let Some(manifest) = pack.manifest else {
+        expect false
+        return None
+    }
+    var reaching = manifest.line
+    for dep in manifest.deps {
+        if dep.written == line.source {
+            reaching = dep.line
+            break
+        }
+    }
+    let held = try store_entry(line.root)
+    let mismatched = root_mismatched(held, root: line.root, alloc)
+    if mismatched {
+        mut self.report(diagnostic::Code.ArtefactRootMismatch, pack, line: reaching)
+    }
+    var entry: Option[mem::Shared[store::Entry]] = None
+    if not mismatched {
+        entry = held
+    }
+    if not line.source.starts_with(".") {
+        let Some(stored) = entry else {
+            if not mismatched {
+                mut self.report(diagnostic::Code.DepReleaseMissing, pack, line: reaching)
+            }
+            return None
+        }
+        return Some(Member.Release(try mut self.release(take stored, dir: line.package_name.as_str(), grammar)))
+    }
+    let dir = resolve_source(pack.dir.as_str(), source: line.source.as_str(), alloc)
+    var source: Option[usize] = None
+    match package_at_dir(packages, dir: dir.as_str()) {
+        Some(at) => {
+            if packages[at].name() == Some(line.package_name.as_str()) and entry_holds(entry, pack: packages[at], alloc) {
+                source = Some(at)
+            }
+        }
+        None => {}
+    }
+    match source {
+        Some(at) => {
+            match entry {
+                Some(confirming) => mut self.confirmed.push(take confirming)
+                None => {}
+            }
+            return Some(Member.Source(at))
+        }
+        None => {}
+    }
+    let Some(stored) = entry else {
+        if not mismatched {
+            mut self.report(diagnostic::Code.DepReleaseMissing, pack, line: reaching)
+        }
+        let Some(at) = package_at_dir(packages, dir: dir.as_str()) else {
+            return None
+        }
+        return Some(Member.Source(at))
+    }
+    return Some(Member.Release(try mut self.release(take stored, dir: dir.as_str(), grammar)))
+} ClosureReader.locked_member
+
+/// Whether the store holds an entry for a root whose release has another code root.
+fn root_mismatched(held: Option[mem::Shared[store::Entry]], root: hashing::HashValue, alloc: mem::Alloc) -> bool {
+    let Some(stored) = held else {
+        return false
+    }
+    return stored.contents().root(alloc) != root
+} root_mismatched
+
+/// Whether an entry holds a package's current source files.
+fn entry_holds(entry: Option[mem::Shared[store::Entry]], pack: Package, alloc: mem::Alloc) -> bool {
+    let Some(stored) = entry else {
+        return false
+    }
+    return holds_sources(stored.contents(), pack, alloc)
+} entry_holds
+
+/// Records the aliases through which the closure's members reach each other, reporting a
+/// dependency the lock does not hold, a cycle back to the package and a lock line nothing
+/// reaches.
+fn ClosureReader.reach(
+    mut self,
+    packages: Slice[Package],
+    index: usize,
+    lines: mem::Map[text::String, Member],
+    mut own: Own,
+    ) {
+    let alloc = self.alloc
+    let pack = packages[index]
+    let Some(manifest) = pack.manifest else {
+        expect false
+        return
+    }
+    let Some(lock) = pack.machine.lock() else {
+        expect false
+        return
+    }
+    let me = Member.Source(index)
+    var reached = mem::List[text::String].empty(alloc)
+    var members = mem::List[Member].empty(alloc)
+    for entry in own.members {
+        if entry.value() != me {
+            mut members.push(entry.value())
+        }
+    }
+    for member in members {
+        let held = self.member_deps(packages, member)
+        for dep in held.deps {
+            var written = text::String.of(dep.written.as_str(), alloc)
+            if dep.path {
+                let target = resolve_source(held.dir.as_str(), source: dep.written.as_str(), alloc)
+                written = relative_source(pack.dir.as_str(), to: target.as_str(), alloc)
+            }
+            let Some(at) = line_of_source(lock, source: written.as_str()) else {
+                mut self.report(diagnostic::Code.DepLockStale, pack, line: manifest.line)
+                continue
+            }
+            let line = lock.deps[at]
+            mut reached.push(text::String.of(line.package_name.as_str(), alloc))
+            match members_get(lines, name: line.package_name.as_str()) {
+                Some(target) => {
+                    discard mut own.aliases.insert(AliasKey(member: member, alias: text::String.of(dep.alias.as_str(), alloc)), value: target)
+                }
+                None => {}
+            }
+            if line.package_name == manifest.name {
+                mut self.report(diagnostic::Code.DepCycle, pack, line: first_dep_line(manifest))
+            }
+        }
+    }
+    for line in lock.deps {
+        if line.alias.is_none() and not holds_text(reached.view(), wanted: line.package_name.as_str()) {
+            mut self.report(diagnostic::Code.DepLockStale, pack, line: manifest.line)
+            return
+        }
+    }
+} ClosureReader.reach
+
+/// The index of the first line of a lock whose source is `source`.
+fn line_of_source(lock: machine::Lock, source: Str) -> Option[usize] {
+    for index in 0..<lock.deps.len() {
+        if lock.deps[index].source.as_str() == source {
+            return Some(index)
+        }
+    }
+    return None
+} line_of_source
+
+/// The line of a manifest's first `dep` directive, or of its `package` keyword without one.
+fn first_dep_line(manifest: Manifest) -> u32 {
+    if manifest.deps.len() > 0 {
+        return manifest.deps[0].line
+    }
+    return manifest.line
+} first_dep_line
+
+/// Reports each `dep` directive of a workspace package reaching the package name an earlier
+/// directive in alias order reaches through another source: a path source the package at its
+/// directory, a store name the package its lock line names.
+fn ClosureReader.split(mut self, packages: Slice[Package], index: usize) {
+    let alloc = self.alloc
+    let pack = packages[index]
+    let Some(manifest) = pack.manifest else {
+        return
+    }
+    var deps = mem::List[usize].empty(alloc)
+    for position in 0..<manifest.deps.len() {
+        if manifest.deps[position].source.is_some() {
+            mut deps.push(position)
+        }
+    }
+    mut deps.sort_by(fn(left: usize, right: usize) => manifest.deps[left].alias.cmp(manifest.deps[right].alias))
+    var seen = mem::Map[text::String, text::String].empty(alloc)
+    var split = mem::List[u32].empty(alloc)
+    for position in deps {
+        let dep = manifest.deps[position]
+        var source = text::String.of(dep.written.as_str(), alloc)
+        if dep.path {
+            source = resolve_source(pack.dir.as_str(), source: dep.written.as_str(), alloc)
+        }
+        let Some(name) = reached_name(packages, pack, dep, source: source.as_str(), alloc) else {
+            continue
+        }
+        match seen.get(name) {
+            Some(earlier) => {
+                if earlier != source {
+                    mut split.push(dep.line)
+                }
+            }
+            None => {
+                discard mut seen.insert(take name, value: take source)
+            }
+        }
+    }
+    for line in split {
+        mut self.report(diagnostic::Code.DepSplitPackage, pack, line)
+    }
+} ClosureReader.split
+
+/// The package name a `dep` directive of a workspace package reaches from its source: for a path,
+/// the name of the package at its directory; for a store name, the package its lock line names.
+fn reached_name(packages: Slice[Package], pack: Package, dep: Dep, source: Str, alloc: mem::Alloc) -> Option[text::String] {
+    if dep.path {
+        let Some(at) = package_at_dir(packages, dir: source) else {
+            return None
+        }
+        let Some(name) = packages[at].name() else {
+            return None
+        }
+        return Some(text::String.of(name, alloc))
+    }
+    let Some(lock) = pack.machine.lock() else {
+        return None
+    }
+    let Some(at) = line_of_source(lock, source: dep.written.as_str()) else {
+        return None
+    }
+    return Some(text::String.of(lock.deps[at].package_name.as_str(), alloc))
+} reached_name
+
+/// The closure of a package without a valid lock: its path dependencies from source, through
+/// their own path dependencies.
+fn ClosureReader.unlocked(self, packages: Slice[Package], index: usize, mut own: Own) {
+    let alloc = self.alloc
+    var pending = mem::List[usize].empty(alloc)
+    mut pending.push(index)
+    var seen = mem::List[usize].empty(alloc)
+    mut seen.push(index)
+    loop {
+        let Some(current) = mut pending.pop() else {
+            return
+        }
+        let Some(manifest) = packages[current].manifest else {
+            continue
+        }
+        for dep in manifest.deps {
+            if not dep.path {
+                continue
+            }
+            let Some(dir) = dep.source else {
+                continue
+            }
+            let Some(target) = package_at_dir(packages, dir: dir.as_str()) else {
+                continue
+            }
+            let name = match packages[target].name() {
+                Some(named) => named
+                None => ""
+            }
+            if members_get(own.members, name).is_none() {
+                discard mut own.members.insert(text::String.of(name, alloc), value: Member.Source(target))
+            }
+            discard mut own.aliases.insert(AliasKey(member: Member.Source(current), alias: text::String.of(dep.alias.as_str(), alloc)), value: Member.Source(target))
+            if not holds_index(seen.view(), wanted: target) {
+                mut seen.push(target)
+                mut pending.push(target)
+            }
+        }
+    }
+} ClosureReader.unlocked
+
+/// Whether an index is among `indexes`.
+fn holds_index(indexes: Slice[usize], wanted: usize) -> bool {
+    for index in indexes {
+        if index == wanted {
+            return true
+        }
+    }
+    return false
+} holds_index
+
+/// Whether a store entry holds a package's current source files, its machine files aside.
+pkg fn holds_sources(entry: store::Entry, pack: Package, alloc: mem::Alloc) -> bool {
+    var prefix = text::String.of(pack.dir.as_str(), alloc)
+    mut prefix.push('/')
+    var current = mem::List[usize].empty(alloc)
+    for index in 0..<pack.files.len() {
+        if pack.files[index].path.starts_with(prefix.as_str()) {
+            mut current.push(index)
+        }
+    }
+    let cut = prefix.byte_len()
+    mut current.sort_by(fn(left: usize, right: usize) => file_order(pack.files[left], right: pack.files[right], cut))
+    var stored = mem::List[usize].empty(alloc)
+    for index in 0..<entry.sources.len() {
+        if not entry.sources[index].path.starts_with(".nan/") {
+            mut stored.push(index)
+        }
+    }
+    mut stored.sort_by(fn(left: usize, right: usize) => source_order(entry.sources[left], right: entry.sources[right]))
+    if current.len() != stored.len() {
+        return false
+    }
+    for position in 0..<current.len() {
+        let file = pack.files[current[position]]
+        let held = entry.sources[stored[position]]
+        let Some(within) = file.path.slice_bytes(cut, end: file.path.byte_len()) else {
+            return false
+        }
+        if within != held.path.as_str() or file.syntax.source.view() != held.content.view() {
+            return false
+        }
+    }
+    return true
+} holds_sources
+
+/// The order of two files of a package by their path within it, then their bytes.
+fn file_order(left: File, right: File, cut: usize) -> core::Ordering {
+    let Some(left_path) = left.path.slice_bytes(cut, end: left.path.byte_len()) else {
+        return core::Ordering.Equal
+    }
+    let Some(right_path) = right.path.slice_bytes(cut, end: right.path.byte_len()) else {
+        return core::Ordering.Equal
+    }
+    let paths = left_path.cmp(right_path)
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return left.syntax.source.cmp(right.syntax.source)
+} file_order
+
+/// The order of two stored files by path, then bytes.
+fn source_order(left: artefact::SourceFile, right: artefact::SourceFile) -> core::Ordering {
+    let paths = left.path.cmp(right.path)
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return left.content.cmp(right.content)
+} source_order

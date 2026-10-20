@@ -62,6 +62,17 @@ impl Local {
     }
 }
 
+/// The form of a projection result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Form {
+    /// A part of the receiver, named in place.
+    Part,
+    /// An `Option` or `Result` whose non-Copy payloads are parts.
+    Wrapped,
+    /// A view value its holder owns.
+    View,
+}
+
 /// What a call calls.
 #[derive(Clone, Debug)]
 pub enum Callee {
@@ -323,10 +334,12 @@ pub enum TKind {
     /// `x[i]`, a call of `at` or `at_mut`.
     Index(Box<Call>),
     /// A construction of a struct, layout or variant (by its index), with its values in the
-    /// order written; a single payload's value is unlabelled.
+    /// order written; a single payload's value is unlabelled. It is `wrapped` when it is `Some`,
+    /// `Ok` or `Err` of a part that is not Copy.
     Construct {
         variant: Option<usize>,
         values: Vec<(String, TExpr)>,
+        wrapped: bool,
     },
     Unary {
         op: UnaryOp,

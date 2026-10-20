@@ -5,14 +5,17 @@
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, Signature, Value as IrValue, types};
 use cranelift_module::{FuncId, Linkage, Module};
 
-use super::abi::{Abi, Repr, Returned};
+use super::abi::{Abi, Given, Repr, Returned};
 use super::body::{Body, Held};
 use super::fx::{Fx, PTR};
+use super::types::Wrap;
 use super::{Instance, Lowering, stack, supplied};
 use crate::check::db::ItemId;
-use crate::check::sig::SigKind;
+use crate::check::sig::{FnSig, SigKind};
+use crate::check::tir::Form;
 use crate::check::ty::{Arg, Args, FnTy, Subst, Ty};
 use crate::nir::{BlockId, Call, Callable, Callee, FnRef, NTy, Op, Operand, Role, Value};
+use crate::syntax::ast::Mode;
 
 /// What a call calls.
 enum Target {
@@ -22,6 +25,14 @@ enum Target {
     Indirect {
         code: IrValue,
         env: IrValue,
+        abi: Abi,
+        kind: stack::Kind,
+    },
+    /// Through the method table of a `Dyn` value: the method's code address, which takes the
+    /// address of the value as its receiver, and how its stack use is bounded.
+    Dyn {
+        code: IrValue,
+        data: IrValue,
         abi: Abi,
         kind: stack::Kind,
     },
@@ -117,12 +128,11 @@ impl Body<'_, '_, '_, '_> {
                     Ty::Dyn(bound) => bound.args.clone(),
                     _ => self.lo.box_dyn_args(&dyn_ty),
                 };
-                let mut abi = self.lo.dyn_abi(*interface, &args, *method);
-                abi.env = true;
+                let abi = self.lo.dyn_abi(*interface, &args, *method);
                 let (head, _) = self.lo.method_head(&Ty::Unit, *interface, &args, *method);
-                Target::Indirect {
+                Target::Dyn {
                     code,
-                    env: data,
+                    data,
                     abi,
                     kind: stack::Kind::Bounded(head.limits.stack),
                 }
@@ -208,7 +218,9 @@ impl Body<'_, '_, '_, '_> {
         targets: Option<(BlockId, BlockId)>,
     ) -> Option<Held> {
         let (abi, foreign) = match &target {
-            Target::Direct(_, abi) | Target::Indirect { abi, .. } => (abi.clone(), None),
+            Target::Direct(_, abi) | Target::Indirect { abi, .. } | Target::Dyn { abi, .. } => {
+                (abi.clone(), None)
+            }
             Target::Foreign(_, params, returned, _) => (
                 Abi {
                     env: false,
@@ -242,14 +254,21 @@ impl Body<'_, '_, '_, '_> {
             args.push(slot);
             slot
         });
-        let passed = self.passed(operands, &abi, foreign.is_some());
+        let passed = match &target {
+            Target::Dyn { data, .. } => {
+                let mut passed = vec![*data];
+                passed.extend(self.passed(&operands[1..], &abi.params[1..], false));
+                passed
+            }
+            _ => self.passed(operands, &abi.params, foreign.is_some()),
+        };
         args.extend(passed);
         let inst = match &target {
             Target::Direct(id, _) | Target::Foreign(id, ..) => {
                 let reference = self.lo.func_ref(self.fx, *id);
                 self.fx.b.ins().call(reference, &args)
             }
-            Target::Indirect { code, abi, .. } => {
+            Target::Indirect { code, abi, .. } | Target::Dyn { code, abi, .. } => {
                 let signature = self.fx.b.import_signature(abi.signature());
                 self.fx.b.ins().call_indirect(signature, *code, &args)
             }
@@ -269,7 +288,7 @@ impl Body<'_, '_, '_, '_> {
                 }
             }
             Target::Foreign(.., stack) => stack::Kind::Bounded(*stack),
-            Target::Indirect { kind, .. } => kind.clone(),
+            Target::Indirect { kind, .. } | Target::Dyn { kind, .. } => kind.clone(),
         };
         self.record_site(inst, kind);
         let returns = self.fx.b.inst_results(inst).to_vec();
@@ -288,7 +307,17 @@ impl Body<'_, '_, '_, '_> {
         let Some((ok, fail)) = targets else {
             return Some(value);
         };
-        let flag = flag.expect("a failing call");
+        let Some(flag) = flag else {
+            if abi.result == Ty::Never {
+                self.unreachable_after();
+                return None;
+            }
+            let ok_args = self.target_args(ok, value, &NTy::Owned(abi.result.clone()));
+            let ok_args: Vec<ir::BlockArg> = ok_args.into_iter().map(Into::into).collect();
+            let ok_block = self.block_of(ok);
+            self.fx.b.ins().jump(ok_block, &ok_args);
+            return None;
+        };
         let failure = failure_slot.expect("a failure slot");
         let failure_ty = abi.fails.clone().expect("a failure type");
         let failure_held = match self.lo.owned_repr(&failure_ty) {
@@ -309,11 +338,16 @@ impl Body<'_, '_, '_, '_> {
         None
     }
 
-    /// The values passing operands as an ABI's parameters, as the C convention of the host
-    /// passes them when `foreign`.
-    fn passed(&mut self, operands: &[Operand], abi: &Abi, foreign: bool) -> Vec<IrValue> {
+    /// The values passing operands as the parameters `params` describe, as the C convention of
+    /// the host passes them when `foreign`.
+    fn passed(
+        &mut self,
+        operands: &[Operand],
+        params: &[(NTy, Repr)],
+        foreign: bool,
+    ) -> Vec<IrValue> {
         let mut args = Vec::new();
-        for (operand, (nty, repr)) in operands.iter().zip(&abi.params) {
+        for (operand, (nty, repr)) in operands.iter().zip(params) {
             let (held, operand_nty) = self.operand(operand);
             let held = match foreign {
                 true => held,
@@ -325,7 +359,7 @@ impl Body<'_, '_, '_, '_> {
             let held = self.adapt(held, &operand_nty, *repr);
             args.extend(held.values());
         }
-        for (operand, (nty, _)) in operands.iter().zip(&abi.params) {
+        for (operand, (nty, _)) in operands.iter().zip(params) {
             self.fit(operand, nty.ty());
         }
         args
@@ -348,7 +382,7 @@ impl Body<'_, '_, '_, '_> {
         let id = self.lo.instance(instance);
         let record = self.fx.slot(size, 8);
         let mut args = vec![record];
-        args.extend(self.passed(operands, &abi, false));
+        args.extend(self.passed(operands, &abi.params, false));
         let reference = self.lo.func_ref(self.fx, id);
         self.fx.b.ins().call(reference, &args);
         record
@@ -630,36 +664,56 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// Whether calls of a callable return as a projection does.
-    pub fn callable_is_proj(&self, callable: &Callable) -> bool {
+    /// How calls of a callable give their result, none unless it is a projection.
+    pub fn callable_given(&self, callable: &Callable) -> Option<Given> {
         match callable {
             Callable::Item { item, role, index } => match role {
-                Role::Body | Role::Entry => self.ck.fn_sig(*item).is_some_and(|sig| sig.is_proj()),
-                Role::Default => self.interface_method_is_proj(*item, *index),
-                _ => false,
+                Role::Body | Role::Entry => self.sig_given(&self.ck.fn_sig(*item)?),
+                Role::Default => self.default_given(*item, *index),
+                _ => None,
             },
-            Callable::Method { interface, method } => self.method_is_proj(*interface, *method),
-            _ => false,
+            Callable::Method { interface, method } => self.method_given(*interface, *method),
+            _ => None,
         }
     }
 
-    pub fn method_is_proj(&self, interface: ItemId, method: u32) -> bool {
+    /// How an interface's method `method` gives its result, none unless it is a projection.
+    pub fn method_given(&self, interface: ItemId, method: u32) -> Option<Given> {
         match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods[method as usize].sig.is_proj(),
-            _ => false,
+            SigKind::Interface { methods } => self.sig_given(&methods[method as usize].sig),
+            _ => None,
         }
     }
 
-    /// Whether the default body of an interface's `index`th defaulted method is a projection.
-    pub fn interface_method_is_proj(&self, interface: ItemId, index: u32) -> bool {
+    /// How the default body of an interface's `index`th defaulted method gives its result, none
+    /// unless it is a projection.
+    fn default_given(&self, interface: ItemId, index: u32) -> Option<Given> {
         match &self.ck.sig(interface).kind {
-            SigKind::Interface { methods } => methods
-                .iter()
+            SigKind::Interface { methods } => (methods.iter())
                 .filter(|method| method.default)
                 .nth(index as usize)
-                .is_some_and(|method| method.sig.is_proj()),
-            _ => false,
+                .and_then(|method| self.sig_given(&method.sig)),
+            _ => None,
         }
+    }
+
+    /// How a function head gives its result, none unless it is a projection: in the form its
+    /// declared result type fixes, a wrapped part of a mut projection holding its Copy payloads
+    /// as parts.
+    pub fn sig_given(&self, sig: &FnSig) -> Option<Given> {
+        if !sig.is_proj() {
+            return None;
+        }
+        Some(match self.ck.declared_form(&sig.result) {
+            Form::Part => Given::Part,
+            Form::Wrapped => Given::Wrapped(Wrap {
+                writable: sig
+                    .params
+                    .first()
+                    .is_some_and(|param| param.mode == Mode::Mut),
+            }),
+            Form::View => Given::View,
+        })
     }
 
     /// The head of an instance as a function type, its types concrete.
@@ -691,7 +745,7 @@ impl Lowering<'_, '_> {
                 owner,
                 method,
                 args,
-            } => self.derived_head(*owner, method, args).0,
+            } => self.derived_head(*owner, method, args),
             Instance::Conformance { ty, method, args } => self.conformance_head(ty, method, args),
             other => panic!("the head of {other:?}"),
         }
@@ -705,7 +759,7 @@ impl Lowering<'_, '_> {
         interface: ItemId,
         args: &Args,
         method: u32,
-    ) -> (FnTy, bool) {
+    ) -> (FnTy, Option<Given>) {
         let sig = self.ck.sig(interface);
         let SigKind::Interface { methods } = &sig.kind else {
             panic!("a method of no interface");
@@ -723,12 +777,20 @@ impl Lowering<'_, '_> {
             },
             Arg::Ty(self_ty.clone()),
         );
-        (subst.fn_ty(&method.sig.fn_ty()), method.sig.is_proj())
+        (
+            subst.fn_ty(&method.sig.fn_ty()),
+            self.sig_given(&method.sig),
+        )
     }
 
     /// The head of an interface's default body numbered `index`, given the interface's
     /// arguments, `Self`, then the method's own.
-    fn default_head(&mut self, interface: ItemId, index: u32, args: &Args) -> (FnTy, bool) {
+    fn default_head(
+        &mut self,
+        interface: ItemId,
+        index: u32,
+        args: &Args,
+    ) -> (FnTy, Option<Given>) {
         let sig = self.ck.sig(interface);
         let SigKind::Interface { methods } = &sig.kind else {
             panic!("a default body of no interface");
@@ -758,14 +820,14 @@ impl Lowering<'_, '_> {
     /// The calling form of a `Dyn` method: the value's address, then the method's parameters.
     pub fn dyn_abi(&mut self, interface: ItemId, args: &Args, method: u32) -> Abi {
         let placeholder = Ty::Unit;
-        let (fn_ty, projection) = self.method_head(&placeholder, interface, args, method);
+        let (fn_ty, given) = self.method_head(&placeholder, interface, args, method);
         let mut params = vec![(NTy::Ref(Ty::Unit), Repr::Address)];
         for param in &fn_ty.params[1..] {
             let nty = self.param_nty(param.mode, param.ty.clone());
             let repr = self.repr(&nty);
             params.push((nty, repr));
         }
-        let (result, returned) = self.result_form(&fn_ty.result, projection);
+        let (result, returned) = self.result_form(&fn_ty.result, given);
         let fails = super::abi::failure(&fn_ty.fails);
         Abi {
             env: false,

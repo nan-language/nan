@@ -1,0 +1,547 @@
+//! Hash values: a BLAKE3-256 digest tagged `0x01`, with its checksummed base32 forms.
+
+/// A hash: the algorithm tag, then the 32-byte digest.
+pkg struct HashValue derives Copy, Eq, Ord, Hash {
+    pkg bytes: Array[u8, 33]
+} HashValue
+
+/// The algorithm tag of BLAKE3-256.
+const TAG: u8 = 0x01
+
+const ALPHABET: Str = "abcdefghijklmnopqrstuvwxyz234567"
+
+pkg fn HashValue.of(data: Slice[u8]) -> HashValue {
+    var bytes = Array[u8, 33].filled(TAG)
+    let digest = blake3(data)
+    for index in 0..<32usize {
+        bytes[index + 1] = digest[index]
+    }
+    return HashValue(bytes: bytes)
+} HashValue.of
+
+/// The checksummed base32 of all 33 bytes, 55 characters.
+pkg fn HashValue.full(self, alloc: mem::Alloc) -> text::String {
+    return checksummed_base32(self.bytes.view(), alloc)
+} HashValue.full
+
+/// The checksummed base32 of the tag and the first 9 bytes of the digest, 18 characters.
+pkg fn HashValue.short(self, alloc: mem::Alloc) -> text::String {
+    let Some(head) = self.bytes.view().prefix(10) else {
+        return text::String.empty(alloc)
+    }
+    return checksummed_base32(head, alloc)
+} HashValue.short
+
+/// The bytes a hash's short or full form writes: 18 or 55 characters of the alphabet with zero
+/// padding bits and a correct checksum, over the tag `0x01`; none for any other text.
+pkg fn parse_form(text: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var length: usize = 0
+    if text.byte_len() == 18 {
+        length = 10
+    } else if text.byte_len() == 55 {
+        length = 33
+    } else {
+        return None
+    }
+    let Some(read) = read_checksummed_base32(text, length, alloc) else {
+        return None
+    }
+    if read[0] != TAG {
+        return None
+    }
+    return Some(take read)
+} parse_form
+
+/// The position of a character in the alphabet.
+fn digit_of(byte: u8) -> Option[u32] {
+    for at in 0..<32usize {
+        if ALPHABET.as_bytes()[at] == byte {
+            return Some(u32.fit(at))
+        }
+    }
+    return None
+} digit_of
+
+/// The `length` bytes whose checksummed base32 is `text`, if any.
+pkg fn read_checksummed_base32(text: Str, length: usize, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let written = text.as_bytes()
+    if written.len() != (length * 8 + 4) / 5 + 2 {
+        return None
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    var bits: u32 = 0
+    var held: u32 = 0
+    for at in 0..<(written.len() - 2) {
+        let Some(digit) = digit_of(written[at]) else {
+            return None
+        }
+        bits = (bits << 5) | digit
+        held += 5
+        if held >= 8 {
+            held -= 8
+            mut bytes.push(u8.truncate(bits >> held))
+        }
+    }
+    for at in (written.len() - 2)..<written.len() {
+        if digit_of(written[at]) == None {
+            return None
+        }
+    }
+    let padding_zero = (bits & ((1u32 << held) - 1)) == 0
+    if bytes.len() != length or not padding_zero {
+        return None
+    }
+    let again = checksummed_base32(bytes.view(), alloc)
+    if again.as_str() != text {
+        return None
+    }
+    return Some(take bytes)
+} read_checksummed_base32
+
+/// The base32 of `bytes`, most significant bit first and the last character padded with zero
+/// bits, followed by two characters encoding the first 10 bits of their BLAKE3-256 digest.
+pkg fn checksummed_base32(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    var bits: u32 = 0
+    var held: u32 = 0
+    for byte in bytes {
+        bits = (bits << 8) | u32.widen(byte)
+        held += 8
+        while held >= 5 {
+            held -= 5
+            letter(mut out, position: (bits >> held) & 31)
+        }
+    }
+    if held > 0 {
+        letter(mut out, position: (bits << (5 - held)) & 31)
+    }
+    let digest = blake3(bytes)
+    let check = (u32.widen(digest[0]) << 2) | (u32.widen(digest[1]) >> 6)
+    letter(mut out, position: check >> 5)
+    letter(mut out, position: check & 31)
+    return out
+} checksummed_base32
+
+/// Appends the character of the alphabet at a position below 32.
+fn letter(mut out: text::String, position: u32) {
+    let at = usize.widen(position)
+    let Some(one) = ALPHABET.slice_bytes(at, end: at + 1) else {
+        return
+    }
+    mut out.append(one)
+} letter
+
+/// The words of the initial chaining value.
+const IV0: u32 = 0x6A09_E667
+
+const IV1: u32 = 0xBB67_AE85
+
+const IV2: u32 = 0x3C6E_F372
+
+const IV3: u32 = 0xA54F_F53A
+
+const IV4: u32 = 0x510E_527F
+
+const IV5: u32 = 0x9B05_688C
+
+const IV6: u32 = 0x1F83_D9AB
+
+const IV7: u32 = 0x5BE0_CD19
+
+const CHUNK_START: u32 = 1
+
+const CHUNK_END: u32 = 2
+
+const PARENT_FLAG: u32 = 4
+
+const ROOT_FLAG: u32 = 8
+
+const BLOCK_LEN: usize = 64
+
+const CHUNK_LEN: usize = 1_024
+
+/// Sixteen words: the state of a compression, its output or a message block.
+struct Words derives Copy {
+    w0: u32
+    w1: u32
+    w2: u32
+    w3: u32
+    w4: u32
+    w5: u32
+    w6: u32
+    w7: u32
+    w8: u32
+    w9: u32
+    w10: u32
+    w11: u32
+    w12: u32
+    w13: u32
+    w14: u32
+    w15: u32
+} Words
+
+/// A chaining value: eight words.
+struct Chain derives Copy {
+    c0: u32
+    c1: u32
+    c2: u32
+    c3: u32
+    c4: u32
+    c5: u32
+    c6: u32
+    c7: u32
+} Chain
+
+fn Chain.initial() -> Chain = Chain(c0: IV0, c1: IV1, c2: IV2, c3: IV3, c4: IV4, c5: IV5, c6: IV6, c7: IV7)
+
+/// The four quarter-rounds of a round mixing the columns of the state.
+fn columns(state: Words, m: Words) -> Words {
+    var s0 = state.w0
+    var s1 = state.w1
+    var s2 = state.w2
+    var s3 = state.w3
+    var s4 = state.w4
+    var s5 = state.w5
+    var s6 = state.w6
+    var s7 = state.w7
+    var s8 = state.w8
+    var s9 = state.w9
+    var s10 = state.w10
+    var s11 = state.w11
+    var s12 = state.w12
+    var s13 = state.w13
+    var s14 = state.w14
+    var s15 = state.w15
+    s0 = s0.wrapping_add(s4).wrapping_add(m.w0)
+    s12 = s12 ^ s0
+    s12 = (s12 >> 16) | (s12 << 16)
+    s8 = s8.wrapping_add(s12)
+    s4 = s4 ^ s8
+    s4 = (s4 >> 12) | (s4 << 20)
+    s0 = s0.wrapping_add(s4).wrapping_add(m.w1)
+    s12 = s12 ^ s0
+    s12 = (s12 >> 8) | (s12 << 24)
+    s8 = s8.wrapping_add(s12)
+    s4 = s4 ^ s8
+    s4 = (s4 >> 7) | (s4 << 25)
+    s1 = s1.wrapping_add(s5).wrapping_add(m.w2)
+    s13 = s13 ^ s1
+    s13 = (s13 >> 16) | (s13 << 16)
+    s9 = s9.wrapping_add(s13)
+    s5 = s5 ^ s9
+    s5 = (s5 >> 12) | (s5 << 20)
+    s1 = s1.wrapping_add(s5).wrapping_add(m.w3)
+    s13 = s13 ^ s1
+    s13 = (s13 >> 8) | (s13 << 24)
+    s9 = s9.wrapping_add(s13)
+    s5 = s5 ^ s9
+    s5 = (s5 >> 7) | (s5 << 25)
+    s2 = s2.wrapping_add(s6).wrapping_add(m.w4)
+    s14 = s14 ^ s2
+    s14 = (s14 >> 16) | (s14 << 16)
+    s10 = s10.wrapping_add(s14)
+    s6 = s6 ^ s10
+    s6 = (s6 >> 12) | (s6 << 20)
+    s2 = s2.wrapping_add(s6).wrapping_add(m.w5)
+    s14 = s14 ^ s2
+    s14 = (s14 >> 8) | (s14 << 24)
+    s10 = s10.wrapping_add(s14)
+    s6 = s6 ^ s10
+    s6 = (s6 >> 7) | (s6 << 25)
+    s3 = s3.wrapping_add(s7).wrapping_add(m.w6)
+    s15 = s15 ^ s3
+    s15 = (s15 >> 16) | (s15 << 16)
+    s11 = s11.wrapping_add(s15)
+    s7 = s7 ^ s11
+    s7 = (s7 >> 12) | (s7 << 20)
+    s3 = s3.wrapping_add(s7).wrapping_add(m.w7)
+    s15 = s15 ^ s3
+    s15 = (s15 >> 8) | (s15 << 24)
+    s11 = s11.wrapping_add(s15)
+    s7 = s7 ^ s11
+    s7 = (s7 >> 7) | (s7 << 25)
+    return Words(w0: s0, w1: s1, w2: s2, w3: s3, w4: s4, w5: s5, w6: s6, w7: s7, w8: s8, w9: s9, w10: s10, w11: s11, w12: s12, w13: s13, w14: s14, w15: s15)
+} columns
+
+/// The four quarter-rounds of a round mixing the diagonals of the state.
+fn diagonals(state: Words, m: Words) -> Words {
+    var s0 = state.w0
+    var s1 = state.w1
+    var s2 = state.w2
+    var s3 = state.w3
+    var s4 = state.w4
+    var s5 = state.w5
+    var s6 = state.w6
+    var s7 = state.w7
+    var s8 = state.w8
+    var s9 = state.w9
+    var s10 = state.w10
+    var s11 = state.w11
+    var s12 = state.w12
+    var s13 = state.w13
+    var s14 = state.w14
+    var s15 = state.w15
+    s0 = s0.wrapping_add(s5).wrapping_add(m.w8)
+    s15 = s15 ^ s0
+    s15 = (s15 >> 16) | (s15 << 16)
+    s10 = s10.wrapping_add(s15)
+    s5 = s5 ^ s10
+    s5 = (s5 >> 12) | (s5 << 20)
+    s0 = s0.wrapping_add(s5).wrapping_add(m.w9)
+    s15 = s15 ^ s0
+    s15 = (s15 >> 8) | (s15 << 24)
+    s10 = s10.wrapping_add(s15)
+    s5 = s5 ^ s10
+    s5 = (s5 >> 7) | (s5 << 25)
+    s1 = s1.wrapping_add(s6).wrapping_add(m.w10)
+    s12 = s12 ^ s1
+    s12 = (s12 >> 16) | (s12 << 16)
+    s11 = s11.wrapping_add(s12)
+    s6 = s6 ^ s11
+    s6 = (s6 >> 12) | (s6 << 20)
+    s1 = s1.wrapping_add(s6).wrapping_add(m.w11)
+    s12 = s12 ^ s1
+    s12 = (s12 >> 8) | (s12 << 24)
+    s11 = s11.wrapping_add(s12)
+    s6 = s6 ^ s11
+    s6 = (s6 >> 7) | (s6 << 25)
+    s2 = s2.wrapping_add(s7).wrapping_add(m.w12)
+    s13 = s13 ^ s2
+    s13 = (s13 >> 16) | (s13 << 16)
+    s8 = s8.wrapping_add(s13)
+    s7 = s7 ^ s8
+    s7 = (s7 >> 12) | (s7 << 20)
+    s2 = s2.wrapping_add(s7).wrapping_add(m.w13)
+    s13 = s13 ^ s2
+    s13 = (s13 >> 8) | (s13 << 24)
+    s8 = s8.wrapping_add(s13)
+    s7 = s7 ^ s8
+    s7 = (s7 >> 7) | (s7 << 25)
+    s3 = s3.wrapping_add(s4).wrapping_add(m.w14)
+    s14 = s14 ^ s3
+    s14 = (s14 >> 16) | (s14 << 16)
+    s9 = s9.wrapping_add(s14)
+    s4 = s4 ^ s9
+    s4 = (s4 >> 12) | (s4 << 20)
+    s3 = s3.wrapping_add(s4).wrapping_add(m.w15)
+    s14 = s14 ^ s3
+    s14 = (s14 >> 8) | (s14 << 24)
+    s9 = s9.wrapping_add(s14)
+    s4 = s4 ^ s9
+    s4 = (s4 >> 7) | (s4 << 25)
+    return Words(w0: s0, w1: s1, w2: s2, w3: s3, w4: s4, w5: s5, w6: s6, w7: s7, w8: s8, w9: s9, w10: s10, w11: s11, w12: s12, w13: s13, w14: s14, w15: s15)
+} diagonals
+
+/// The message words in the order of the next round.
+fn permuted(m: Words) -> Words {
+    return Words(
+        w0: m.w2,
+        w1: m.w6,
+        w2: m.w3,
+        w3: m.w10,
+        w4: m.w7,
+        w5: m.w0,
+        w6: m.w4,
+        w7: m.w13,
+        w8: m.w1,
+        w9: m.w11,
+        w10: m.w12,
+        w11: m.w5,
+        w12: m.w9,
+        w13: m.w14,
+        w14: m.w15,
+        w15: m.w8,
+    )
+} permuted
+
+/// The inputs of one compression: chaining value, message block, counter, block length and flags.
+struct Compression derives Copy {
+    cv: Chain
+    block: Words
+    counter: u64
+    len: u32
+    flags: u32
+} Compression
+
+fn compress(input: Compression) -> Words {
+    let cv = input.cv
+    var state = Words(
+        w0: cv.c0,
+        w1: cv.c1,
+        w2: cv.c2,
+        w3: cv.c3,
+        w4: cv.c4,
+        w5: cv.c5,
+        w6: cv.c6,
+        w7: cv.c7,
+        w8: IV0,
+        w9: IV1,
+        w10: IV2,
+        w11: IV3,
+        w12: u32.truncate(input.counter),
+        w13: u32.truncate(input.counter >> 32),
+        w14: input.len,
+        w15: input.flags,
+    )
+    var m = input.block
+    for index in 0..<7u32 {
+        state = diagonals(columns(state, m: m), m: m)
+        if index < 6 {
+            m = permuted(m)
+        }
+    }
+    return Words(
+        w0: state.w0 ^ state.w8,
+        w1: state.w1 ^ state.w9,
+        w2: state.w2 ^ state.w10,
+        w3: state.w3 ^ state.w11,
+        w4: state.w4 ^ state.w12,
+        w5: state.w5 ^ state.w13,
+        w6: state.w6 ^ state.w14,
+        w7: state.w7 ^ state.w15,
+        w8: state.w8 ^ cv.c0,
+        w9: state.w9 ^ cv.c1,
+        w10: state.w10 ^ cv.c2,
+        w11: state.w11 ^ cv.c3,
+        w12: state.w12 ^ cv.c4,
+        w13: state.w13 ^ cv.c5,
+        w14: state.w14 ^ cv.c6,
+        w15: state.w15 ^ cv.c7,
+    )
+} compress
+
+fn chaining_value(output: Compression) -> Chain {
+    let words = compress(output)
+    return Chain(c0: words.w0, c1: words.w1, c2: words.w2, c3: words.w3, c4: words.w4, c5: words.w5, c6: words.w6, c7: words.w7)
+} chaining_value
+
+fn parent(left: Chain, right: Chain) -> Compression {
+    let block = Words(
+        w0: left.c0,
+        w1: left.c1,
+        w2: left.c2,
+        w3: left.c3,
+        w4: left.c4,
+        w5: left.c5,
+        w6: left.c6,
+        w7: left.c7,
+        w8: right.c0,
+        w9: right.c1,
+        w10: right.c2,
+        w11: right.c3,
+        w12: right.c4,
+        w13: right.c5,
+        w14: right.c6,
+        w15: right.c7,
+    )
+    return Compression(cv: Chain.initial(), block: block, counter: 0, len: 64, flags: PARENT_FLAG)
+} parent
+
+/// The message block of the 64 bytes of `data` from `start`.
+fn full_block(data: Slice[u8], start: usize) -> Words
+    requires start <= data.len() and data.len() - start >= 64
+{
+    return Words(
+        w0: data.u32_le(start),
+        w1: data.u32_le(start + 4),
+        w2: data.u32_le(start + 8),
+        w3: data.u32_le(start + 12),
+        w4: data.u32_le(start + 16),
+        w5: data.u32_le(start + 20),
+        w6: data.u32_le(start + 24),
+        w7: data.u32_le(start + 28),
+        w8: data.u32_le(start + 32),
+        w9: data.u32_le(start + 36),
+        w10: data.u32_le(start + 40),
+        w11: data.u32_le(start + 44),
+        w12: data.u32_le(start + 48),
+        w13: data.u32_le(start + 52),
+        w14: data.u32_le(start + 56),
+        w15: data.u32_le(start + 60),
+    )
+} full_block
+
+/// The message block of the `count` bytes of `data` from `start`, fewer than 64, zero-padded.
+fn partial_block(data: Slice[u8], start: usize, count: usize) -> Words {
+    var bytes = Array[u8, 64].filled(0)
+    for index in 0..<count {
+        if index < 64 and start + index < data.len() {
+            bytes[index] = data[start + index]
+        }
+    }
+    return full_block(bytes.view(), start: 0)
+} partial_block
+
+/// The output of one chunk, its 1 to 1024 bytes being those of `data` from `start`, or of the
+/// empty input.
+fn chunk(data: Slice[u8], start: usize, counter: u64) -> Compression {
+    var length = data.len() - start
+    if length > CHUNK_LEN {
+        length = CHUNK_LEN
+    }
+    var cv = Chain.initial()
+    var offset: usize = 0
+    var flags = CHUNK_START
+    while length - offset > BLOCK_LEN {
+        cv = chaining_value(Compression(cv: cv, block: full_block(data, start: start + offset), counter: counter, len: 64, flags: flags))
+        offset += BLOCK_LEN
+        flags = 0
+    }
+    let last = length - offset
+    var block = partial_block(data, start: start + offset, count: last)
+    if last == BLOCK_LEN {
+        block = full_block(data, start: start + offset)
+    }
+    return Compression(cv: cv, block: block, counter: counter, len: u32.fit(last), flags: flags | CHUNK_END)
+} chunk
+
+/// The BLAKE3-256 digest of `data`.
+pkg fn blake3(data: Slice[u8]) -> Array[u8, 32] {
+    var chunks = (data.len() + CHUNK_LEN - 1) / CHUNK_LEN
+    if chunks == 0 {
+        chunks = 1
+    }
+    var stack = mem::Bounded[Chain, 64].empty()
+    let last = chunks - 1
+    for index in 0..<last {
+        var cv = chaining_value(chunk(data, start: index * CHUNK_LEN, counter: u64.widen(index)))
+        var total = u64.widen(index) + 1
+        while (total & 1) == 0 {
+            let Some(left) = mut stack.pop() else {
+                break
+            }
+            cv = chaining_value(parent(left, right: cv))
+            total = total >> 1
+        }
+        mut stack.push(cv)
+    }
+    var output = chunk(data, start: last * CHUNK_LEN, counter: u64.widen(last))
+    loop {
+        let Some(left) = mut stack.pop() else {
+            break
+        }
+        output = parent(left, right: chaining_value(output))
+    }
+    output.flags = output.flags | ROOT_FLAG
+    let finished = compress(output)
+    var digest = Array[u8, 32].filled(0)
+    put_word(mut digest, at: 0, word: finished.w0)
+    put_word(mut digest, at: 4, word: finished.w1)
+    put_word(mut digest, at: 8, word: finished.w2)
+    put_word(mut digest, at: 12, word: finished.w3)
+    put_word(mut digest, at: 16, word: finished.w4)
+    put_word(mut digest, at: 20, word: finished.w5)
+    put_word(mut digest, at: 24, word: finished.w6)
+    put_word(mut digest, at: 28, word: finished.w7)
+    return digest
+} blake3
+
+/// Writes a word's little-endian bytes into a digest at `at`.
+fn put_word(mut digest: Array[u8, 32], at: usize, word: u32)
+    requires at <= 28
+{
+    digest[at] = u8.truncate(word)
+    digest[at + 1] = u8.truncate(word >> 8)
+    digest[at + 2] = u8.truncate(word >> 16)
+    digest[at + 3] = u8.truncate(word >> 24)
+} put_word

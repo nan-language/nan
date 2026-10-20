@@ -726,14 +726,11 @@ impl Checker<'_> {
                 .filter(|file| file.module == Some(index))
             {
                 let syntax = &file.syntax;
-                for span in &syntax.items {
-                    let Some(tree) = &span.tree else {
+                for (span, item) in syntax.items.iter().zip(file.lowered()) {
+                    let (Some(tree), Some(item)) = (&span.tree, item) else {
                         continue;
                     };
-                    let Some(item) = ast::lower(syntax, tree) else {
-                        continue;
-                    };
-                    let Some(identity) = super::package::exported_identity(&item) else {
+                    let Some(identity) = super::package::exported_identity(item) else {
                         continue;
                     };
                     let comments = doc_comments(syntax, tree, item.visibility)

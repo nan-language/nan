@@ -1,0 +1,826 @@
+//! Exact fixes: applying them to sources, the in-memory re-check deciding which ones a diagnostic offers, and the edits showing them.
+
+/// The replacements of a fix in one file, by their index among the fix's edits, in order of
+/// position.
+struct Shift {
+    path: text::String
+    edits: mem::List[usize]
+} Shift
+
+/// The sources of the files a fix changes, once its replacements, which do not overlap, are
+/// made.
+fn applied(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+    var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
+    let shifts = shifts_of(fix, alloc)
+    for shift in shifts {
+        let Some(at) = workspace.file(shift.path.as_str()) else {
+            continue
+        }
+        let source = workspace.file_at(at).syntax.source.view()
+        var made = mem::Bytes.empty(alloc)
+        var position: usize = 0
+        for index in shift.edits {
+            let replacement = fix.edits[index].replacement
+            append_range(mut made, source, from: position, to: usize.widen(replacement.start))
+            mut made.append(replacement.text.as_bytes())
+            position = usize.widen(replacement.end)
+        }
+        append_range(mut made, source, from: position, to: source.len())
+        discard mut changed.insert(text::String.of(shift.path.as_str(), alloc), value: take made)
+    }
+    return changed
+} applied
+
+/// Appends the bytes `from..to` of a source.
+fn append_range(mut out: mem::Bytes, source: Slice[u8], from: usize, to: usize) {
+    if to < from {
+        return
+    }
+    let Some(parts) = source.split_at(from) else {
+        return
+    }
+    let Some(kept) = parts.tail.prefix(to - from) else {
+        return
+    }
+    mut out.append(kept)
+} append_range
+
+/// The bytes `from..to` of a source as text, each ill-formed sequence written as U+FFFD.
+fn lossy_range(source: Slice[u8], from: usize, to: usize, alloc: mem::Alloc) -> text::String {
+    if to < from {
+        return text::String.empty(alloc)
+    }
+    let Some(parts) = source.split_at(from) else {
+        return text::String.empty(alloc)
+    }
+    let Some(kept) = parts.tail.prefix(to - from) else {
+        return text::String.empty(alloc)
+    }
+    return output::lossy(kept, alloc)
+} lossy_range
+
+/// The shifts of a fix, one per file it changes, in byte order of path.
+fn shifts_of(fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[Shift] {
+    var shifts = mem::List[Shift].empty(alloc)
+    for index in 0..<fix.edits.len() {
+        let path = fix.edits[index].path.as_str()
+        var found: Option[usize] = None
+        for position in 0..<shifts.len() {
+            if shifts[position].path.as_str() == path {
+                found = Some(position)
+            }
+        }
+        match found {
+            Some(position) => {
+                mut (mut shifts.at_mut(position)).edits.push(index)
+            }
+            None => {
+                var edits = mem::List[usize].empty(alloc)
+                mut edits.push(index)
+                mut shifts.push(Shift(path: text::String.of(path, alloc), edits: take edits))
+            }
+        }
+    }
+    for shift in mut shifts {
+        mut shift.edits.sort_by(fn(left: usize, right: usize) => replacement_order(fix, left, right: right))
+    }
+    mut shifts.sort_by(fn(left: Shift, right: Shift) => left.path.as_str().cmp(right.path.as_str()))
+    return shifts
+} shifts_of
+
+/// The order of two replacements of a fix by start, then end.
+fn replacement_order(fix: diagnostic::Fix, left: usize, right: usize) -> core::Ordering {
+    let former = fix.edits[left].replacement
+    let latter = fix.edits[right].replacement
+    if former.start != latter.start {
+        return former.start.cmp(latter.start)
+    }
+    return former.end.cmp(latter.end)
+} replacement_order
+
+/// The shift of a fix in the file at a path, none when the fix changes nothing there.
+fn shift_in(shifts: Slice[Shift], path: Str) -> Option[usize] {
+    for index in 0..<shifts.len() {
+        if shifts[index].path.as_str() == path {
+            return Some(index)
+        }
+    }
+    return None
+} shift_in
+
+/// How much longer a replacement's text is than the bytes it replaces.
+fn delta(replacement: diagnostic::Replacement) -> i64 {
+    return i64.fit(replacement.text.as_str().byte_len()) - i64.widen(replacement.end - replacement.start)
+} delta
+
+/// The position of the character at `position` once the fix is made, none inside a changed
+/// text.
+fn Shift.position(self, fix: diagnostic::Fix, position: u32) -> Option[u32] {
+    var shifted = i64.widen(position)
+    for index in self.edits {
+        let replacement = fix.edits[index].replacement
+        if position >= replacement.end {
+            shifted += delta(replacement)
+        } else if position >= replacement.start {
+            return None
+        }
+    }
+    return Some(u32.truncate(shifted))
+} Shift.position
+
+/// The bytes each replacement's text holds once the fix is made.
+fn Shift.replaced(self, fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[diagnostic::Span] {
+    var texts = mem::List[diagnostic::Span].empty(alloc)
+    var shifted: i64 = 0
+    for index in self.edits {
+        let replacement = fix.edits[index].replacement
+        let start = u32.truncate(i64.widen(replacement.start) + shifted)
+        shifted += delta(replacement)
+        mut texts.push(diagnostic::Span(start: start, end: start + u32.fit(replacement.text.as_str().byte_len())))
+    }
+    return texts
+} Shift.replaced
+
+/// The bytes a run holds once the fix is made: from the first replacement starting before
+/// `from` on, and through each starting before `to`.
+fn Shift.run(self, fix: diagnostic::Fix, from: u32, to: u32, end_of_file: bool) -> diagnostic::Span {
+    var before_from: i64 = 0
+    var before_to: i64 = 0
+    for index in self.edits {
+        let replacement = fix.edits[index].replacement
+        if replacement.start < from {
+            before_from += delta(replacement)
+        }
+        if replacement.start < to or (end_of_file and replacement.start == to) {
+            before_to += delta(replacement)
+        }
+    }
+    return diagnostic::Span(start: u32.truncate(i64.widen(from) + before_from), end: u32.truncate(i64.widen(to) + before_to))
+} Shift.run
+
+/// The bytes a construct holds once the fix is made, with the texts inserted at its ends.
+fn Shift.construct(self, fix: diagnostic::Fix, span: diagnostic::Span) -> diagnostic::Span {
+    var shifted: i64 = 0
+    var after: Option[u32] = None
+    var before: Option[u32] = None
+    for index in self.edits {
+        let replacement = fix.edits[index].replacement
+        let new_start = u32.truncate(i64.widen(replacement.start) + shifted)
+        let new_end = new_start + u32.fit(replacement.text.as_str().byte_len())
+        let inserted = replacement.start == replacement.end
+        if after.is_none() and (replacement.end > span.start or (inserted and replacement.start == span.start)) {
+            if replacement.start < span.start {
+                after = Some(new_start)
+            } else {
+                after = Some(u32.truncate(i64.widen(span.start) + shifted))
+            }
+        }
+        if replacement.start < span.end or (inserted and replacement.start == span.end) {
+            if replacement.end > span.end {
+                before = Some(new_end)
+            } else {
+                before = Some(u32.truncate(i64.widen(span.end) + shifted + delta(replacement)))
+            }
+        }
+        shifted += delta(replacement)
+    }
+    let start = after.value_or(u32.truncate(i64.widen(span.start) + shifted))
+    let end = before.value_or(span.end)
+    if end < start {
+        return diagnostic::Span(start: start, end: start)
+    }
+    return diagnostic::Span(start: start, end: end)
+} Shift.construct
+
+/// Whether a construct overlaps a replacement's text: it starts before the text's end and ends
+/// after its start.
+fn overlaps(construct: diagnostic::Span, text: diagnostic::Span) -> bool {
+    var end = text.end
+    if end < text.start + 1 {
+        end = text.start + 1
+    }
+    return construct.start < end and construct.end > text.start
+} overlaps
+
+/// The workspace once a fix is made.
+pkg fn fixed_by(workspace: workspace::Workspace, fix: diagnostic::Fix, grammar: syntax::Grammar, alloc: mem::Alloc) -> workspace::Workspace {
+    return workspace.overlaid(applied(workspace, fix, alloc), grammar, alloc)
+} fixed_by
+
+/// The lines a record holds for its fixes: per fix and edit, `fix <number> <path>`, then the old
+/// lines each prefixed `- ` and the new ones `+ `.
+pkg fn shown(workspace: workspace::Workspace, fixes: Slice[diagnostic::Fix], alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    for number in 0..<fixes.len() {
+        let edits = edits_of(workspace, fix: fixes[number], alloc)
+        for edit in edits {
+            var header = text::String.of("fix ", alloc)
+            mut header.write(text::fmt("{number} ", number: number + 1), budget: 100)
+            mut header.append(edit.path.as_str())
+            mut lines.push(take header)
+            for line in edit.old {
+                mut lines.push(changed_line("-", line: line.as_str(), alloc))
+            }
+            for line in edit.new {
+                mut lines.push(changed_line("+", line: line.as_str(), alloc))
+            }
+        }
+    }
+    return lines
+} shown
+
+/// A line of an edit marked by its sign.
+fn changed_line(sign: Str, line: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(sign, alloc)
+    if line.byte_len() > 0 {
+        mut written.push(' ')
+        mut written.append(output::printable(line.as_bytes(), alloc).as_str())
+    }
+    return written
+} changed_line
+
+/// Keeps in each diagnostic the fixes it offers among those its rule names, each re-checked over
+/// the scope written `written` from `current`; where its rule states neither expected nor found,
+/// they show the reported construct before and after the first offered fix.
+pkg fn offer(session: check::Session, current: Str, written: Option[Str], mut diagnostics: mem::List[diagnostic::Diagnostic]) {
+    let alloc = session.alloc
+    var before = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in diagnostics {
+        mut before.push(reported.copy(alloc))
+    }
+    for reported in mut diagnostics {
+        offer_each(session, mut reported, before: before.view(), current, written)
+    }
+} offer
+
+/// Keeps in one diagnostic the fixes it offers.
+fn offer_each(session: check::Session, mut reported: diagnostic::Diagnostic, before: Slice[diagnostic::Diagnostic], current: Str, written: Option[Str]) {
+    let alloc = session.alloc
+    let original = session.workspace.contents()
+    var offered = mem::List[diagnostic::Fix].empty(alloc)
+    var fitting = mem::List[usize].empty(alloc)
+    var earliest: Option[mem::Shared[workspace::Workspace]] = None
+    for index in 0..<reported.fixes.len() {
+        let fix = reported.fixes[index]
+        let after = mem::Shared.of(fixed_by(original, fix, grammar: session.grammar.contents(), alloc), alloc: alloc)
+        let Some(resolved) = scope::Scope.resolve(after.contents(), current, written, alloc) else {
+            continue
+        }
+        let rechecking = check::Session.of(after.share(), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+        let rechecked = rechecking.reported(resolved.scope)
+        if not passes(original, fixed: reported, fix, before, after: after.contents(), rechecked: rechecked.view(), alloc) {
+            continue
+        }
+        if earliest.is_none() {
+            earliest = Some(after.share())
+        }
+        mut fitting.push(index)
+        mut offered.push(copied_fix(fix, alloc))
+        if reported.offer == diagnostic::Offer.First {
+            break
+        }
+    }
+    if reported.offer == diagnostic::Offer.Unique and offered.len() != 1 {
+        offered = mem::List[diagnostic::Fix].empty(alloc)
+    }
+    if reported.code == diagnostic::Code.NameUnknown {
+        reported.because = listed_first(reported.because.view(), fitting: fitting.view(), alloc)
+    }
+    match earliest {
+        Some(after) => {
+            if offered.len() > 0 {
+                describe(original, after: after.contents(), fix: offered[0], mut reported, alloc)
+            }
+        }
+        None => {}
+    }
+    reported.fixes = offered
+} offer_each
+
+/// The notes of a diagnostic, those naming a fitting fix first, each part in its order.
+fn listed_first(notes: Slice[diagnostic::Reason], fitting: Slice[usize], alloc: mem::Alloc) -> mem::List[diagnostic::Reason] {
+    var ordered = mem::List[diagnostic::Reason].empty(alloc)
+    for index in 0..<notes.len() {
+        if fits(fitting, index) {
+            mut ordered.push(copied_reason(notes[index], alloc))
+        }
+    }
+    for index in 0..<notes.len() {
+        if not fits(fitting, index) {
+            mut ordered.push(copied_reason(notes[index], alloc))
+        }
+    }
+    return ordered
+} listed_first
+
+fn fits(fitting: Slice[usize], index: usize) -> bool {
+    for fit in fitting {
+        if fit == index {
+            return true
+        }
+    }
+    return false
+} fits
+
+fn copied_reason(reason: diagnostic::Reason, alloc: mem::Alloc) -> diagnostic::Reason {
+    var at: Option[diagnostic::At] = None
+    match reason.at {
+        Some(place) => {
+            at = Some(diagnostic::At(path: text::String.of(place.path.as_str(), alloc), line: place.line))
+        }
+        None => {}
+    }
+    return diagnostic::Reason(role: reason.role, subject: text::String.of(reason.subject.as_str(), alloc), at: take at)
+} copied_reason
+
+fn copied_fix(fix: diagnostic::Fix, alloc: mem::Alloc) -> diagnostic::Fix {
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    for edit in fix.edits {
+        let replacement = diagnostic::Replacement(start: edit.replacement.start, end: edit.replacement.end, text: text::String.of(edit.replacement.text.as_str(), alloc))
+        mut edits.push(diagnostic::Edit(path: text::String.of(edit.path.as_str(), alloc), replacement: take replacement))
+    }
+    return diagnostic::Fix(edits: take edits)
+} copied_fix
+
+/// The first byte of a diagnostic's construct.
+fn start_of(reported: diagnostic::Diagnostic) -> Option[u32] {
+    let Some(span) = reported.span else {
+        return None
+    }
+    return Some(span.start)
+} start_of
+
+/// Where the first byte of a diagnostic's construct stands once a fix is made, none inside a
+/// changed text.
+fn moved(reported: diagnostic::Diagnostic, shifts: Slice[Shift], fix: diagnostic::Fix) -> Option[u32] {
+    let Some(start) = start_of(reported) else {
+        return None
+    }
+    let Some(path) = reported.path else {
+        return Some(start)
+    }
+    let Some(shift) = shift_in(shifts, path: path.as_str()) else {
+        return Some(start)
+    }
+    return shifts[shift].position(fix, position: start)
+} moved
+
+/// Whether a diagnostic's construct overlaps one of a fix's replaced texts.
+fn replaced_by(reported: diagnostic::Diagnostic, shifts: Slice[Shift], fix: diagnostic::Fix, alloc: mem::Alloc) -> bool {
+    let Some(path) = reported.path else {
+        return false
+    }
+    let Some(span) = reported.span else {
+        return false
+    }
+    let Some(shift) = shift_in(shifts, path: path.as_str()) else {
+        return false
+    }
+    let pieces = shifts[shift].replaced(fix, alloc)
+    for piece in pieces {
+        if overlaps(span, text: piece) {
+            return true
+        }
+    }
+    return false
+} replaced_by
+
+/// Whether a fix of `fixed` passes the re-check: no diagnostic of its code left on its construct
+/// or a replacement, and each error either one the workspace reported before or one the fixed
+/// diagnostic kept unchecked, beside the replacements: anywhere for a declaration, whose uses
+/// depend on it, and otherwise later in its item or on its line than its failing token, or than
+/// its construct's start when the parse did not fail.
+fn passes(
+    workspace: workspace::Workspace,
+    fixed: diagnostic::Diagnostic,
+    fix: diagnostic::Fix,
+    before: Slice[diagnostic::Diagnostic],
+    after: workspace::Workspace,
+    rechecked: Slice[diagnostic::Diagnostic],
+    alloc: mem::Alloc,
+    ) -> bool {
+    let shifts = shifts_of(fix, alloc)
+    let fixed_at = moved(fixed, shifts: shifts.view(), fix)
+    for reported in rechecked {
+        if reported.code != fixed.code {
+            continue
+        }
+        let on_construct = reported.path == fixed.path and fixed_at.is_some() and start_of(reported) == fixed_at
+        if on_construct or replaced_by(reported, shifts: shifts.view(), fix, alloc) {
+            return false
+        }
+    }
+    let anchor = anchor_of(fixed, shifts: shifts.view(), fix, fixed_at, alloc)
+    let declaration = fixed.failing.is_none() and declared_at(workspace, fixed)
+    for reported in rechecked {
+        if reported.code.class() != diagnostic::Class.Error {
+            continue
+        }
+        if reported_before(reported, before, shifts: shifts.view(), fix) {
+            continue
+        }
+        if replaced_by(reported, shifts: shifts.view(), fix, alloc) {
+            return false
+        }
+        if not declaration and not masked(reported, fixed, anchor, after) {
+            return false
+        }
+    }
+    return true
+} passes
+
+/// Whether a diagnostic's construct starts in an item's declaration.
+fn declared_at(workspace: workspace::Workspace, fixed: diagnostic::Diagnostic) -> bool {
+    let Some(path) = fixed.path else {
+        return false
+    }
+    let Some(span) = fixed.span else {
+        return false
+    }
+    return declares(workspace, path: path.as_str(), position: span.start)
+} declared_at
+
+/// The position from which errors a fix leaves count as kept unchecked by the fixed diagnostic:
+/// its failing token's, or its construct's, once the fix is made, or else the first replaced
+/// text's.
+fn anchor_of(fixed: diagnostic::Diagnostic, shifts: Slice[Shift], fix: diagnostic::Fix, fixed_at: Option[u32], alloc: mem::Alloc) -> Option[u32] {
+    let shift = match fixed.path {
+        Some(path) => shift_in(shifts, path: path.as_str())
+        None => None
+    }
+    var failing = fixed_at
+    match fixed.failing {
+        Some(at) => {
+            failing = match shift {
+                Some(index) => shifts[index].position(fix, position: at)
+                None => Some(at)
+            }
+        }
+        None => {}
+    }
+    if failing.is_some() {
+        return failing
+    }
+    let Some(index) = shift else {
+        return None
+    }
+    let pieces = shifts[index].replaced(fix, alloc)
+    if pieces.len() == 0 {
+        return None
+    }
+    return Some(pieces[0].start)
+} anchor_of
+
+/// Whether an error the re-check reports was reported before, where the fix moves it.
+fn reported_before(reported: diagnostic::Diagnostic, before: Slice[diagnostic::Diagnostic], shifts: Slice[Shift], fix: diagnostic::Fix) -> bool {
+    for earlier in before {
+        if earlier.code == reported.code and earlier.path == reported.path and moved(earlier, shifts, fix) == start_of(reported) {
+            return true
+        }
+    }
+    return false
+} reported_before
+
+/// Whether an error lies in what the fixed diagnostic kept unchecked: in its file from the
+/// anchor on, on the anchor's line or in the item holding it.
+fn masked(reported: diagnostic::Diagnostic, fixed: diagnostic::Diagnostic, anchor: Option[u32], after: workspace::Workspace) -> bool {
+    let Some(path) = fixed.path else {
+        return false
+    }
+    let Some(from) = anchor else {
+        return false
+    }
+    let Some(at) = start_of(reported) else {
+        return false
+    }
+    let Some(reported_path) = reported.path else {
+        return false
+    }
+    if reported_path.as_str() != path.as_str() or at < from {
+        return false
+    }
+    let Some(changed_at) = after.file(path.as_str()) else {
+        return false
+    }
+    let file = after.file_at(changed_at).syntax
+    let line = line_of(file, position: from)
+    if reported.line == Some(line) {
+        return true
+    }
+    let Some(item) = file.item_at(line) else {
+        return false
+    }
+    let Some(reported_line) = reported.line else {
+        return false
+    }
+    return file.item_lines(item).contains(reported_line)
+} masked
+
+/// Whether a byte of a file lies in an item's declaration, whose uses anywhere depend on it,
+/// rather than in a body.
+fn declares(workspace: workspace::Workspace, path: Str, position: u32) -> bool {
+    let Some(at) = workspace.file(path) else {
+        return false
+    }
+    let file = workspace.file_at(at).syntax
+    for item in file.items {
+        let opening = file.tokens[item.head]
+        let closing = file.tokens[item.end - 1]
+        if opening.start > position or position > closing.end {
+            continue
+        }
+        let Some(tree) = item.tree else {
+            continue
+        }
+        if tree.declares(file, position) {
+            return true
+        }
+    }
+    return false
+} declares
+
+/// The line holding a byte of a file.
+fn line_of(file: syntax::SourceFile, position: u32) -> u32 {
+    var low: usize = 0
+    var high = file.lines.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if file.lines[middle].start <= position {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    if low == 0 {
+        return 1
+    }
+    return u32.fit(low)
+} line_of
+
+/// Writes expected and found from the first offered fix, when the rule states neither and the
+/// fix changes the reported construct's text: found is that text as written, expected that text
+/// once the fix is made, absent when empty. A rule offering the first of alternatives states as
+/// expected the alternative that is the fix.
+fn describe(workspace: workspace::Workspace, after: workspace::Workspace, fix: diagnostic::Fix, mut reported: diagnostic::Diagnostic, alloc: mem::Alloc) {
+    let stated = reported.expected.is_some() or reported.found.is_some()
+    if stated and reported.offer != diagnostic::Offer.First {
+        return
+    }
+    let Some(span) = reported.span else {
+        return
+    }
+    let Some(path) = reported.path else {
+        return
+    }
+    let shifts = shifts_of(fix, alloc)
+    let Some(shift) = shift_in(shifts.view(), path: path.as_str()) else {
+        return
+    }
+    let Some(written_at) = workspace.file(path.as_str()) else {
+        return
+    }
+    let Some(changed_at) = after.file(path.as_str()) else {
+        return
+    }
+    if not touches(shifts[shift], fix, span) {
+        return
+    }
+    let expected = construct_text(after.file_at(changed_at).syntax, span: shifts[shift].construct(fix, span), alloc)
+    let found = construct_text(workspace.file_at(written_at).syntax, span, alloc)
+    if expected.as_str().byte_len() > 0 {
+        reported.expected = Some(take expected)
+    } else {
+        reported.expected = None
+    }
+    if not stated {
+        reported.found = Some(take found)
+    }
+} describe
+
+/// Whether a shift's replacements change a construct's text: one overlaps it, or inserts at or
+/// inside it.
+fn touches(shift: Shift, fix: diagnostic::Fix, span: diagnostic::Span) -> bool {
+    for index in shift.edits {
+        let replacement = fix.edits[index].replacement
+        if replacement.start == replacement.end {
+            if span.start <= replacement.start and replacement.start <= span.end {
+                return true
+            }
+        } else if replacement.start < span.end and replacement.end > span.start {
+            return true
+        }
+    }
+    return false
+} touches
+
+/// The text of a construct as diagnostics write it: as written on one line, and on several as
+/// its lines without comments and indentation, joined by single spaces.
+fn construct_text(file: syntax::SourceFile, span: diagnostic::Span, alloc: mem::Alloc) -> text::String {
+    let source = file.source.view()
+    var last_byte = span.end
+    if last_byte < span.start + 1 {
+        last_byte = span.start + 1
+    }
+    let top = line_of(file, position: span.start)
+    let last = line_of(file, position: last_byte - 1)
+    if top == last {
+        return lossy_range(source, from: usize.widen(span.start), to: usize.widen(span.end), alloc)
+    }
+    var joined = text::String.empty(alloc)
+    for number in top..=last {
+        let line = file.lines[usize.widen(number) - 1]
+        var from = line.start
+        if span.start > from {
+            from = span.start
+        }
+        var to = line.comment.value_or(line.end)
+        if span.end < to {
+            to = span.end
+        }
+        let part = lossy_range(source, from: usize.widen(from), to: usize.widen(to), alloc)
+        let kept = platform::trimmed_run(part.as_str())
+        let Some(trimmed) = part.as_str().slice_bytes(kept.start, end: kept.end) else {
+            continue
+        }
+        if trimmed.is_empty() {
+            continue
+        }
+        if joined.as_str().byte_len() > 0 {
+            mut joined.push(' ')
+        }
+        mut joined.append(trimmed)
+    }
+    return joined
+} construct_text
+
+/// A run of whole lines of a file, by their numbers.
+struct LineRun derives Copy {
+    top: u32
+    last: u32
+} LineRun
+
+/// The lines holding a replacement's changed text.
+fn held(file: syntax::SourceFile, replacement: diagnostic::Replacement) -> LineRun {
+    let top = line_of(file, position: replacement.start)
+    var last = top
+    if replacement.end > replacement.start {
+        last = line_of(file, position: replacement.end - 1)
+    }
+    return LineRun(top: top, last: last)
+} held
+
+/// An edit showing a fix in one file: a run of whole lines and those lines once it is made.
+struct Edit {
+    path: text::String
+    old: mem::List[text::String]
+    new: mem::List[text::String]
+} Edit
+
+/// The edits showing a fix, by path: each a run of the lines holding its changed texts, extended
+/// by earlier lines, or later ones at the file's start, until its text occurs once in its file.
+fn edits_of(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[Edit] {
+    let changed = applied(workspace, fix, alloc)
+    let shifts = shifts_of(fix, alloc)
+    var edits = mem::List[Edit].empty(alloc)
+    for shift in shifts {
+        let Some(at) = workspace.file(shift.path.as_str()) else {
+            continue
+        }
+        let file = workspace.file_at(at).syntax
+        let Some(made) = changed.get_by(fn(key: text::String) => key.as_str().cmp(shift.path.as_str())) else {
+            continue
+        }
+        var runs = mem::List[LineRun].empty(alloc)
+        for index in shift.edits {
+            mut runs.push(unique(file, run: held(file, replacement: fix.edits[index].replacement)))
+        }
+        let joined = merged(take runs, alloc)
+        for run in joined {
+            let from = file.lines[usize.widen(run.top) - 1].start
+            let to = line_end(file, line: run.last)
+            let after = shift.run(fix, from, to, end_of_file: usize.widen(to) == file.source.len())
+            let old = lines_of(file.source.view(), from: usize.widen(from), to: usize.widen(to), alloc)
+            let new = lines_of(made.view(), from: usize.widen(after.start), to: usize.widen(after.end), alloc)
+            mut edits.push(Edit(path: text::String.of(shift.path.as_str(), alloc), old: take old, new: take new))
+        }
+    }
+    return edits
+} edits_of
+
+/// The byte after a line's line end, or the file's end.
+fn line_end(file: syntax::SourceFile, line: u32) -> u32 {
+    let index = usize.widen(line)
+    if index < file.lines.len() {
+        return file.lines[index].start
+    }
+    return u32.fit(file.source.len())
+} line_end
+
+/// A run of lines extended by the line before it, or after it at the file's first line, until
+/// its text occurs exactly once in the file, overlapping occurrences counted.
+fn unique(file: syntax::SourceFile, run: LineRun) -> LineRun {
+    let count = u32.fit(file.lines.len())
+    let source = file.source.view()
+    var top = run.top
+    var last = run.last
+    loop {
+        let from = usize.widen(file.lines[usize.widen(top) - 1].start)
+        let to = usize.widen(line_end(file, line: last))
+        if occurrences(source, from, to) <= 1 or (top == 1 and last == count) {
+            return LineRun(top: top, last: last)
+        }
+        if top > 1 {
+            top -= 1
+        } else {
+            last += 1
+        }
+    }
+} unique
+
+/// How many times the bytes `from..to` of a source occur in it, overlapping occurrences
+/// counted, up to two.
+fn occurrences(source: Slice[u8], from: usize, to: usize) -> usize {
+    let length = to - from
+    var found: usize = 0
+    for at in 0..=(source.len() - length) {
+        var same = true
+        for offset in 0..<length {
+            if source[at + offset] != source[from + offset] {
+                same = false
+                break
+            }
+        }
+        if same {
+            found += 1
+            if found > 1 {
+                return found
+            }
+        }
+    }
+    return found
+} occurrences
+
+/// Runs of lines, those sharing a line merged, in line order.
+fn merged(take runs: mem::List[LineRun], alloc: mem::Alloc) -> mem::List[LineRun] {
+    var sorted = runs
+    mut sorted.sort_by(fn(left: LineRun, right: LineRun) => run_order(left, right))
+    var joined = mem::List[LineRun].empty(alloc)
+    var open: Option[LineRun] = None
+    for run in sorted {
+        match open {
+            Some(current) => {
+                if run.top <= current.last {
+                    if run.last > current.last {
+                        open = Some(LineRun(top: current.top, last: run.last))
+                    }
+                } else {
+                    mut joined.push(current)
+                    open = Some(run)
+                }
+            }
+            None => {
+                open = Some(run)
+            }
+        }
+    }
+    match open {
+        Some(current) => {
+            mut joined.push(current)
+        }
+        None => {}
+    }
+    return joined
+} merged
+
+fn run_order(left: LineRun, right: LineRun) -> core::Ordering {
+    if left.top != right.top {
+        return left.top.cmp(right.top)
+    }
+    return left.last.cmp(right.last)
+} run_order
+
+/// The lines of the bytes `from..to` of a text of whole lines, without their line ends.
+fn lines_of(written: Slice[u8], from: usize, to: usize, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    if to <= from {
+        return lines
+    }
+    let whole = lossy_range(written, from, to, alloc)
+    let bytes = whole.as_bytes()
+    var end = bytes.len()
+    if end > 0 and bytes[end - 1] == 0x0A {
+        end -= 1
+    }
+    var start: usize = 0
+    for at in 0..=end {
+        if at < end and bytes[at] != 0x0A {
+            continue
+        }
+        let Some(line) = whole.as_str().slice_bytes(start, end: at) else {
+            break
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = at + 1
+    }
+    return lines
+} lines_of

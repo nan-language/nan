@@ -1,0 +1,439 @@
+//! Machine files: the lock, the history and the API snapshots the toolchain writes in a package's `.nan` directory, each a kind line, one record per logical line and a check line holding the hash of every byte before it.
+
+enum Kind derives Copy, Eq {
+    Lock
+    History
+    Api
+} Kind
+
+proj fn Kind.word(self) -> Str {
+    return match self {
+        Kind.Lock => "lock"
+        Kind.History => "history"
+        Kind.Api => "api"
+    }
+} Kind.word
+
+/// Why a machine file is not valid: the code and the line it is reported on.
+pkg struct Invalid derives Copy, Eq {
+    pkg code: diagnostic::Code
+    pkg line: u32
+} Invalid
+
+fn Invalid.at(line: u32) -> Invalid = Invalid(code: diagnostic::Code.FormatMachineInvalid, line: line)
+
+/// A token of a record: a word (an identifier or keyword), an integer, a text's value or a
+/// punctuation mark.
+enum Tok {
+    Word(text::String)
+    Int(text::String)
+    Text(text::String)
+    Punct(text::String)
+} Tok
+
+/// A record: the physical lines it spans, its tokens and its text.
+struct Record {
+    line: u32
+    last_line: u32
+    tokens: mem::List[Tok]
+    text: text::String
+} Record
+
+/// The records of a machine file between its kind line and its check line.
+struct Parsed {
+    records: mem::List[Record]
+    check_line: u32
+    check_holds: bool
+} Parsed
+
+/// The file's validity once its records parse: an invalid check is reported on its line.
+fn Parsed.checked[T](self, take value: T) -> Result[T, Invalid] {
+    if self.check_holds {
+        return Ok(take value)
+    }
+    return Err(Invalid.at(self.check_line))
+} Parsed.checked
+
+/// Reads the common syntax of a machine file of a kind.
+fn read(kind: Kind, bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[Parsed, Invalid] {
+    let valid = text::utf8::valid_prefix(bytes)
+    if valid < bytes.len() {
+        var line: u32 = 1
+        for at in 0..<valid {
+            if bytes[at] == b'\n' {
+                line += 1
+            }
+        }
+        return Err(Invalid.at(line))
+    }
+    let lexed = syntax::lex(bytes, grammar, alloc)
+    let physical = u32.truncate(lexed.lines.len())
+    if lexed.diagnostics.len() > 0 {
+        return Err(Invalid.at(lexed.diagnostics[0].line))
+    }
+    for index in 0..<lexed.lines.len() {
+        if lexed.lines[index].comment.is_some() {
+            return Err(Invalid.at(u32.truncate(index) + 1))
+        }
+    }
+    if bytes.len() == 0 or bytes[bytes.len() - 1] != b'\n' {
+        return Err(Invalid.at(physical))
+    }
+    let source = syntax::source_text(bytes, alloc)
+    var records = match grouped(lexed, source: source.as_str(), grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    var covered: u32 = 0
+    for record in records {
+        if record.line != covered + 1 {
+            return Err(Invalid.at(covered + 1))
+        }
+        covered = record.last_line
+    }
+    if covered != physical {
+        return Err(Invalid.at(covered + 1))
+    }
+    if records.len() == 0 or records[0].last_line != 1 {
+        return Err(Invalid.at(1))
+    }
+    match kind_line_error(records[0].tokens.view(), kind) {
+        Some(invalid) => return Err(invalid)
+        None => {}
+    }
+    let Some(last) = mut records.pop() else {
+        expect false
+        return Err(Invalid.at(1))
+    }
+    if records.len() == 0 {
+        return Err(Invalid.at(last.line))
+    }
+    let Some(parts) = bytes.split_at(bytes.len() - last.text.byte_len() - 1) else {
+        expect false
+        return Err(Invalid.at(last.line))
+    }
+    let Some(holds) = check_holds(last, checked: parts.head, alloc) else {
+        return Err(Invalid.at(last.line))
+    }
+    discard mut records.remove(0)
+    return Ok(Parsed(records: take records, check_line: last.line, check_holds: holds))
+} read
+
+/// The records of a lexed machine file: the tokens of each logical line, with the text of the
+/// physical lines from that of its first token to that of its last.
+fn grouped(lexed: syntax::Lexed, source: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[mem::List[Record], Invalid] {
+    let lines = lexed.lines.view()
+    var records = mem::List[Record].empty(alloc)
+    var open = false
+    var line: u32 = 0
+    var last_line: u32 = 0
+    var held = mem::List[Tok].empty(alloc)
+    for token in lexed.tokens {
+        match token.kind {
+            syntax::TokenKind.Col0 or syntax::TokenKind.Eof => {
+                if open {
+                    mut records.push(Record(line: line, last_line: last_line, tokens: take held, text: lines_text(lines, source, from: line, to: last_line, alloc)))
+                    held = mem::List[Tok].empty(alloc)
+                    open = false
+                }
+            }
+            syntax::TokenKind.Nl => {}
+            else => {
+                let Some(tok) = token_of(token, source, grammar, alloc) else {
+                    return Err(Invalid.at(token.line))
+                }
+                if not open {
+                    open = true
+                    line = token.line
+                }
+                last_line = token.line
+                mut held.push(take tok)
+            }
+        }
+    }
+    if open {
+        mut records.push(Record(line: line, last_line: last_line, tokens: take held, text: lines_text(lines, source, from: line, to: last_line, alloc)))
+    }
+    return Ok(take records)
+} grouped
+
+/// The record token a source token is; none for a kind no record holds and for a text not
+/// written as a machine file writes it.
+fn token_of(token: syntax::Token, source: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[Tok] {
+    let Some(spelt) = source.slice_bytes(usize.widen(token.start), end: usize.widen(token.end)) else {
+        expect false
+        return None
+    }
+    match token.kind {
+        syntax::TokenKind.Ident or syntax::TokenKind.Keyword(_) => return Some(Tok.Word(text::String.of(spelt, alloc)))
+        syntax::TokenKind.Int => return Some(Tok.Int(text::String.of(spelt, alloc)))
+        syntax::TokenKind.Text => {
+            let value = syntax::text_value(spelt, alloc)
+            let written = escaped(value.as_str(), grammar, alloc)
+            if written.as_str() != spelt {
+                return None
+            }
+            return Some(Tok.Text(take value))
+        }
+        syntax::TokenKind.Punct(_) => return Some(Tok.Punct(text::String.of(spelt, alloc)))
+        else => return None
+    }
+} token_of
+
+/// The text of the physical lines `from` to `to`, joined by LF.
+fn lines_text(lines: Slice[syntax::Line], source: Str, from: u32, to: u32, alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    for number in from..=to {
+        if number > from {
+            mut joined.push('\n')
+        }
+        let line = lines[usize.widen(number) - 1]
+        let Some(content) = source.slice_bytes(usize.widen(line.start), end: usize.widen(line.end)) else {
+            expect false
+            return joined
+        }
+        mut joined.append(content)
+    }
+    return joined
+} lines_text
+
+/// Why the tokens of a first line are not the kind line of a kind; none when they are.
+fn kind_line_error(tokens: Slice[Tok], kind: Kind) -> Option[Invalid] {
+    if tokens.len() != 3 {
+        return Some(Invalid.at(1))
+    }
+    let Tok.Word(magic) = tokens[0] else {
+        return Some(Invalid.at(1))
+    }
+    let Tok.Word(word) = tokens[1] else {
+        return Some(Invalid.at(1))
+    }
+    let Tok.Int(version) = tokens[2] else {
+        return Some(Invalid.at(1))
+    }
+    if magic.as_str() != "nan" or word.as_str() != kind.word() {
+        return Some(Invalid.at(1))
+    }
+    if version.as_str() != "1" {
+        return Some(Invalid(code: diagnostic::Code.FormatMachineVersion, line: 1))
+    }
+    return None
+} kind_line_error
+
+/// Whether a check line holds the hash of the bytes before it; none when it is not a check line.
+fn check_holds(last: Record, checked: Slice[u8], alloc: mem::Alloc) -> Option[bool] {
+    if last.tokens.len() != 2 or last.last_line != last.line {
+        return None
+    }
+    let Tok.Word(check) = last.tokens[0] else {
+        return None
+    }
+    let Tok.Text(hash) = last.tokens[1] else {
+        return None
+    }
+    if check.as_str() != "check" {
+        return None
+    }
+    let expected = hashing::HashValue.of(checked).full(alloc)
+    return Some(hash.as_str() == expected.as_str())
+} check_holds
+
+/// Writes a machine file of a kind from its record lines: none when it holds no record.
+fn write(kind: Kind, lines: Slice[text::String], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    if lines.is_empty() {
+        return None
+    }
+    var written = text::String.of("nan ", alloc)
+    mut written.append(kind.word())
+    mut written.append(" 1\n")
+    for line in lines {
+        mut written.append(line.as_str())
+        mut written.push('\n')
+    }
+    let check = hashing::HashValue.of(written.as_bytes()).full(alloc)
+    mut written.append("check \"")
+    mut written.append(check.as_str())
+    mut written.append("\"\n")
+    return Some(take written.into_bytes())
+} write
+
+/// A text as a machine file writes it: quoted, with `\`, `"` and LF escaped and every other code
+/// point below U+0020, U+007F and every rejected code point written `\u{H}`.
+pkg fn escaped(value: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of("\"", alloc)
+    for c in value {
+        if c == '\\' {
+            mut out.append("\\\\")
+        } else if c == '"' {
+            mut out.append("\\\"")
+        } else if c == '\n' {
+            mut out.append("\\n")
+        } else if c.to_bits() < 0x20 or c == '\u{7F}' or syntax::is_rejected(c, grammar) {
+            mut out.append("\\u{")
+            push_hex(mut out, value: c.to_bits())
+            mut out.push('}')
+        } else {
+            mut out.push(c)
+        }
+    }
+    mut out.push('"')
+    return out
+} escaped
+
+const HEX_DIGITS: Str = "0123456789ABCDEF"
+
+/// Appends a value in uppercase hexadecimal without leading zeros.
+fn push_hex(mut out: text::String, value: u32) {
+    var shift: u32 = 28
+    while shift > 0 and (value >> shift) == 0 {
+        shift -= 4
+    }
+    loop {
+        let digit = usize.widen((value >> shift) & 0xF)
+        let Some(spelt) = HEX_DIGITS.slice_bytes(digit, end: digit + 1) else {
+            return
+        }
+        mut out.append(spelt)
+        if shift == 0 {
+            return
+        }
+        shift -= 4
+    }
+} push_hex
+
+/// The hash a text holds in full form.
+pkg fn hash_of(written: Str, alloc: mem::Alloc) -> Option[hashing::HashValue] {
+    let Some(bytes) = hashing::parse_form(written, alloc) else {
+        return None
+    }
+    if bytes.len() != 33 {
+        return None
+    }
+    var held = Array[u8, 33].filled(0)
+    for index in 0..<33usize {
+        held[index] = bytes[index]
+    }
+    return Some(hashing::HashValue(bytes: held))
+} hash_of
+
+/// A record's tokens read in order.
+view struct Cursor {
+    tokens: Slice[Tok]
+    at: usize
+    alloc: mem::Alloc
+} Cursor
+
+proj fn Record.cursor(self, alloc: mem::Alloc) -> Cursor {
+    return Cursor(tokens: self.tokens.view(), at: 0, alloc: alloc)
+} Record.cursor
+
+fn Cursor.word(mut self) -> Option[text::String] {
+    if self.at >= self.tokens.len() {
+        return None
+    }
+    let Tok.Word(word) = self.tokens[self.at] else {
+        return None
+    }
+    self.at += 1
+    return Some(text::String.of(word.as_str(), alloc: self.alloc))
+} Cursor.word
+
+/// Reads the word `expected` when it comes next.
+fn Cursor.takes(mut self, expected: Str) -> bool {
+    if self.at >= self.tokens.len() {
+        return false
+    }
+    let Tok.Word(word) = self.tokens[self.at] else {
+        return false
+    }
+    if word.as_str() != expected {
+        return false
+    }
+    self.at += 1
+    return true
+} Cursor.takes
+
+fn Cursor.punct(mut self, expected: Str) -> bool {
+    if self.at >= self.tokens.len() {
+        return false
+    }
+    let Tok.Punct(punct) = self.tokens[self.at] else {
+        return false
+    }
+    if punct.as_str() != expected {
+        return false
+    }
+    self.at += 1
+    return true
+} Cursor.punct
+
+fn Cursor.text(mut self) -> Option[text::String] {
+    if self.at >= self.tokens.len() {
+        return None
+    }
+    let Tok.Text(value) = self.tokens[self.at] else {
+        return None
+    }
+    self.at += 1
+    return Some(text::String.of(value.as_str(), alloc: self.alloc))
+} Cursor.text
+
+fn Cursor.hash(mut self) -> Option[hashing::HashValue] {
+    let Some(written) = mut self.text() else {
+        return None
+    }
+    return hash_of(written.as_str(), alloc: self.alloc)
+} Cursor.hash
+
+/// Whether an integer comes next.
+fn Cursor.next_is_int(self) -> bool {
+    if self.at >= self.tokens.len() {
+        return false
+    }
+    let Tok.Int(_) = self.tokens[self.at] else {
+        return false
+    }
+    return true
+} Cursor.next_is_int
+
+/// A decimal integer written without separators, suffix or leading zeros.
+fn Cursor.int(mut self) -> Option[u64] {
+    let index = self.at
+    if index >= self.tokens.len() {
+        return None
+    }
+    self.at += 1
+    let Tok.Int(digits) = self.tokens[index] else {
+        return None
+    }
+    let written = digits.as_bytes()
+    for byte in written {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+    }
+    if written.len() > 1 and written[0] == b'0' {
+        return None
+    }
+    return platform::parse_decimal(digits.as_str())
+} Cursor.int
+
+/// A target name: `any` or a word, `-` and a word.
+fn Cursor.target(mut self) -> Option[text::String] {
+    let Some(leading) = mut self.word() else {
+        return None
+    }
+    let dashed = mut self.punct("-")
+    if not dashed {
+        return Some(take leading)
+    }
+    let Some(trailing) = mut self.word() else {
+        return None
+    }
+    var joined = leading
+    mut joined.push('-')
+    mut joined.append(trailing.as_str())
+    return Some(take joined)
+} Cursor.target
+
+fn Cursor.done(self) -> bool = self.at == self.tokens.len()

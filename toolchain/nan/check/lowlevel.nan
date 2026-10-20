@@ -1,0 +1,927 @@
+//! Low-level items: the representation of layouts, the registers of registers blocks, the heads and conventions of foreign functions, and the trusted primitives.
+
+/// The trusted primitives: std functions callable only inside trusted code.
+const PRIMITIVES: Str = "hw::Ptr.read hw::Ptr.write hw::Ptr.offset hw::Ptr.cast hw::Ptr.copy hw::fence hw::Mmio.map hw::Ports.map hw::TrapFrame.set_ip"
+
+/// The privileged intrinsics that are trusted primitives too.
+const PRIVILEGED_PRIMITIVES: Str = "write_cr3 read_msr write_msr"
+
+/// The target a calling convention serves.
+fn convention_target(convention: Str) -> Option[workspace::Target] {
+    return match convention {
+        "sysv" => Some(workspace::Target.Host)
+        "win64" => Some(workspace::Target.Uefi)
+        else => None
+    }
+} convention_target
+
+/// The bits of an integer layout.
+enum LayoutShape {
+    /// Its fields in declaration order.
+    Fields(mem::List[LayoutBits])
+    /// Its tags' values, in declaration order.
+    Tags(mem::List[u64])
+} LayoutShape
+
+/// Where a field of an integer layout lies: its lowest bit and its width, both 0 for `rest`.
+struct LayoutBits derives Copy {
+    low: u32
+    width: u32
+    kind: BitsKind
+} LayoutBits
+
+enum BitsKind derives Copy, Eq {
+    /// `bit i`, a `bool`.
+    Bool
+    /// `bit i..=j`.
+    Ranged
+    /// `T at i`, an unsigned integer or integer layout.
+    Typed
+    /// `rest`, the bits no other field covers.
+    Rest
+} BitsKind
+
+/// The bits or bytes `low..=high` a layout field or register covers.
+struct FieldSpan derives Copy {
+    low: u64
+    high: u64
+} FieldSpan
+
+/// A register placed in its block: the bytes `start..stop` and its access.
+struct PlacedRegister derives Copy {
+    start: u64
+    stop: u64
+    access: ast::Access
+} PlacedRegister
+
+/// Whether a std function is a trusted primitive.
+fn Checker.is_trusted_primitive(self, function: ty::ItemId) -> bool {
+    let db = self.db()
+    if not db.is_std(function) {
+        return false
+    }
+    let path = db.canonical(function)
+    let written = path.as_str()
+    if is_listed(PRIMITIVES, word: written) {
+        return true
+    }
+    if written.starts_with("hw::Ptr.") {
+        let Some(member) = written.slice_bytes(8, end: written.byte_len()) else {
+            return false
+        }
+        if member.starts_with("atomic_") {
+            return true
+        }
+    }
+    if written.starts_with("hw::Ring0.") {
+        let Some(member) = written.slice_bytes(10, end: written.byte_len()) else {
+            return false
+        }
+        return is_listed(PRIVILEGED_PRIMITIVES, word: member)
+    }
+    return false
+} Checker.is_trusted_primitive
+
+/// The size of a type with a fixed layout: a scalar, `hw::Ptr`, a layout or an array of
+/// these.
+fn Checker.fixed_size(self, ty: ty::Ty) -> Option[u64] {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => return Some(scalar_size(scalar))
+        ty::TyKind.Item(item: item, args: args) => {
+            if self.is_std(ty, path: "hw::Ptr") {
+                return Some(8)
+            }
+            if self.is_std(ty, path: "core::Array") {
+                return self.array_size(types.arg_list(args))
+            }
+            return self.layout_size(item)
+        }
+        else => return None
+    }
+} Checker.fixed_size
+
+/// The size of an array, by its arguments, when its element type has a fixed layout.
+fn Checker.array_size(self, args: Slice[ty::Arg]) -> Option[u64] {
+    if args.len() == 0 {
+        return None
+    }
+    let ty::Arg.Ty(element) = args[0] else {
+        return None
+    }
+    if args.len() < 2 {
+        return None
+    }
+    let ty::Arg.Const(ty::Const.Int(count)) = args[1] else {
+        return None
+    }
+    let Some(elements) = count.to_u64() else {
+        return None
+    }
+    let Some(size) = self.fixed_size(element) else {
+        return None
+    }
+    return Some(size.wrapping_mul(elements))
+} Checker.array_size
+
+/// The size in bytes of a layout's representation.
+fn Checker.layout_size(self, item: ty::ItemId) -> Option[u64] {
+    let db = self.db()
+    let ast::ItemKind.Layout(layout_item) = db.ast(item).kind else {
+        return None
+    }
+    return match layout_item.repr {
+        ast::LayoutRepr.Integer(ty: scalar_name, order: _) => match ty::Scalar.from_name(scalar_name.text.as_str()) {
+            Some(scalar) => Some(scalar_size(scalar))
+            None => None
+        }
+        ast::LayoutRepr.Bytes(size: size, order: _) => match int_literal(db.text(item, token: size)) {
+            Some(value) => value.to_u64()
+            None => None
+        }
+    }
+} Checker.layout_size
+
+/// The value of an `INT` token of an item, 0 when it does not fit, its low 64 bits kept.
+fn Checker.literal_at(self, item: ty::ItemId, token: u32) -> u64 {
+    return int_literal(self.db().text(item, token)).value_or(wide::Wide.zero()).low_bits()
+} Checker.literal_at
+
+/// The bits of an integer layout: each field's place in the representation, or each tag's
+/// value; none for a bytes layout.
+fn Checker.layout_shape(self, item: ty::ItemId) -> Option[LayoutShape] {
+    let alloc = self.alloc()
+    let ast::ItemKind.Layout(layout_item) = self.db().ast(item).kind else {
+        return None
+    }
+    let ast::LayoutRepr.Integer(ty: _, order: _) = layout_item.repr else {
+        return None
+    }
+    match layout_item.tags {
+        Some(tags) => {
+            var values = mem::List[u64].empty(alloc)
+            for tag in tags {
+                mut values.push(u64.widen(u32.truncate(self.literal_at(item, token: tag.value))))
+            }
+            return Some(LayoutShape.Tags(take values))
+        }
+        None => {}
+    }
+    var types = mem::List[ty::Ty].empty(alloc)
+    let sig = self.sig(item)
+    match sig.contents().kind {
+        SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut types.push(field.ty)
+            }
+        }
+        else => {}
+    }
+    var fields = mem::List[LayoutBits].empty(alloc)
+    for index in 0..<layout_item.fields.len() {
+        if index >= types.len() {
+            break
+        }
+        mut fields.push(self.field_bits(item, kind: layout_item.fields[index].kind, typed: types[index]))
+    }
+    return Some(LayoutShape.Fields(take fields))
+} Checker.layout_shape
+
+/// Where a field of an integer layout lies.
+fn Checker.field_bits(self, item: ty::ItemId, kind: ast::LayoutFieldKind, typed: ty::Ty) -> LayoutBits {
+    match kind {
+        ast::LayoutFieldKind.Bit(low: low_bit, high: None) => return LayoutBits(low: u32.truncate(self.literal_at(item, token: low_bit)), width: 1, kind: BitsKind.Bool)
+        ast::LayoutFieldKind.Bit(low: low_bit, high: Some(high_bit)) => {
+            let low = u32.truncate(self.literal_at(item, token: low_bit))
+            let high = u32.truncate(self.literal_at(item, token: high_bit))
+            return LayoutBits(low: low, width: high.wrapping_sub(low).wrapping_add(1), kind: BitsKind.Ranged)
+        }
+        ast::LayoutFieldKind.Typed(ty: _, at: at) => {
+            let width = u32.truncate(self.field_width(typed, bytes: false).value_or(0))
+            return LayoutBits(low: u32.truncate(self.literal_at(item, token: at)), width: width, kind: BitsKind.Typed)
+        }
+        ast::LayoutFieldKind.Rest => return LayoutBits(low: 0, width: 0, kind: BitsKind.Rest)
+    }
+} Checker.field_bits
+
+/// The rules of a layout item: its representation, literals, byte order, tags and fields.
+fn Checker.check_layout(self, item: ty::ItemId) {
+    let db = self.db()
+    let node = db.ast(item)
+    let ast::ItemKind.Layout(layout_item) = node.kind else {
+        return
+    }
+    let Some(width) = self.layout_width(item, layout_item) else {
+        return
+    }
+    let bytes = match layout_item.repr {
+        ast::LayoutRepr.Bytes(size: _, order: _) => true
+        ast::LayoutRepr.Integer(ty: _, order: _) => false
+    }
+    self.check_byte_order(item, layout_item, width, head: node.token)
+    match self.suffixed_literal(item, layout_item) {
+        Some(literal) => {
+            self.report(item, token: literal, code: diagnostic::Code.LayoutLiteral)
+            return
+        }
+        None => {}
+    }
+    match layout_item.tags {
+        Some(tags) => {
+            self.check_tags(item, tags: tags.view(), bits: width * 8)
+            return
+        }
+        None => {}
+    }
+    self.check_layout_fields(item, written: layout_item, width, bytes)
+} Checker.check_layout
+
+/// The width in bytes a layout's representation declares, none once the rule it breaks is
+/// reported.
+fn Checker.layout_width(self, item: ty::ItemId, layout_item: ast::LayoutItem) -> Option[u64] {
+    match layout_item.repr {
+        ast::LayoutRepr.Integer(ty: scalar_name, order: _) => {
+            match ty::Scalar.from_name(scalar_name.text.as_str()) {
+                Some(scalar) => {
+                    if scalar.is_unsigned_bits() {
+                        return Some(scalar_size(scalar))
+                    }
+                }
+                None => {}
+            }
+            self.report(item, token: scalar_name.token, code: diagnostic::Code.LayoutRepr)
+            return None
+        }
+        ast::LayoutRepr.Bytes(size: size, order: _) => {
+            if layout_item.tags.is_some() {
+                self.report(item, token: size, code: diagnostic::Code.LayoutRepr)
+                return None
+            }
+            let written = self.db().text(item, token: size)
+            if suffixed(written) {
+                self.report(item, token: size, code: diagnostic::Code.LayoutLiteral)
+                return None
+            }
+            let Some(declared) = bytes_size(written) else {
+                self.report(item, token: size, code: diagnostic::Code.LayoutRepr)
+                return None
+            }
+            return Some(declared)
+        }
+    }
+} Checker.layout_width
+
+/// The size a bytes layout writes, when it is at least 1.
+fn bytes_size(written: Str) -> Option[u64] {
+    let Some(value) = int_literal(written) else {
+        return None
+    }
+    let Some(size) = value.to_u64() else {
+        return None
+    }
+    if size < 1 {
+        return None
+    }
+    return Some(size)
+} bytes_size
+
+/// The byte order of a layout: stated exactly when its representation is wider than a byte.
+fn Checker.check_byte_order(self, item: ty::ItemId, layout_item: ast::LayoutItem, width: u64, head: u32) {
+    let byte_order = match layout_item.repr {
+        ast::LayoutRepr.Integer(ty: _, order: written) => written
+        ast::LayoutRepr.Bytes(size: _, order: written) => written
+    }
+    if (width > 1) == byte_order.is_some() {
+        return
+    }
+    let fix = match byte_order {
+        Some(written) => self.fix_deleting(item, head: written.token, last: written.token)
+        None => match layout_item.repr {
+            ast::LayoutRepr.Integer(ty: scalar_name, order: _) => self.fix_appending(item, after: scalar_name.token, text: " le")
+            ast::LayoutRepr.Bytes(size: size, order: _) => self.fix_appending(item, after: size, text: " le")
+        }
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    mut fixes.push(take fix)
+    self.report_fixed(item, construct: nir::Span.at(head), code: diagnostic::Code.LayoutEndianness, take fixes, offer: diagnostic::Offer.Each)
+} Checker.check_byte_order
+
+/// The first literal of a layout's tags and fields that carries a suffix.
+fn Checker.suffixed_literal(self, item: ty::ItemId, layout_item: ast::LayoutItem) -> Option[u32] {
+    let db = self.db()
+    match layout_item.tags {
+        Some(tags) => {
+            for tag in tags {
+                if suffixed(db.text(item, token: tag.value)) {
+                    return Some(tag.value)
+                }
+            }
+        }
+        None => {}
+    }
+    for field in layout_item.fields {
+        match field.kind {
+            ast::LayoutFieldKind.Bit(low: low_bit, high: high_bit) => {
+                if suffixed(db.text(item, token: low_bit)) {
+                    return Some(low_bit)
+                }
+                match high_bit {
+                    Some(written) => {
+                        if suffixed(db.text(item, token: written)) {
+                            return Some(written)
+                        }
+                    }
+                    None => {}
+                }
+            }
+            ast::LayoutFieldKind.Typed(ty: _, at: at) => {
+                if suffixed(db.text(item, token: at)) {
+                    return Some(at)
+                }
+            }
+            ast::LayoutFieldKind.Rest => {}
+        }
+    }
+    return None
+} Checker.suffixed_literal
+
+/// The tags of a tags layout: at least one, each a distinct value fitting `bits` bits.
+fn Checker.check_tags(self, item: ty::ItemId, tags: Slice[ast::Tag], bits: u64) {
+    let db = self.db()
+    if tags.len() == 0 {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.LayoutTagValue)
+        return
+    }
+    var values = mem::List[wide::Wide].empty(self.alloc())
+    for index in 0..<tags.len() {
+        let tag = tags[index]
+        for earlier in 0..<index {
+            if tags[earlier].name.text == tag.name.text {
+                self.report(item, token: tag.name.token, code: diagnostic::Code.TypeDuplicateMember)
+                break
+            }
+        }
+        var fits = false
+        var repeated = false
+        match int_literal(db.text(item, token: tag.value)) {
+            Some(value) => {
+                fits = not value.is_negative() and (bits >= 64 or value.lt(wide::Wide.one().shift_left(u32.truncate(bits))))
+                repeated = values.position(fn(held: wide::Wide) => held == value).is_some()
+                mut values.push(value)
+            }
+            None => {}
+        }
+        if not fits or repeated {
+            self.report(item, token: tag.value, code: diagnostic::Code.LayoutTagValue)
+        }
+    }
+} Checker.check_tags
+
+/// The fields of a layout: their forms and types for its kind, within its `width` bytes, and
+/// each bit or byte covered by exactly one.
+fn Checker.check_layout_fields(self, item: ty::ItemId, written: ast::LayoutItem, width: u64, bytes: bool) {
+    let alloc = self.alloc()
+    var units = width
+    if not bytes {
+        units = width * 8
+    }
+    let held = self.sig(item)
+    let SigKind.Layout(fields: fields, tags: _, bits: _) = held.contents().kind else {
+        return
+    }
+    var covered = mem::List[bool].empty(alloc)
+    for _ in 0..<units {
+        mut covered.push(false)
+    }
+    var rests: u32 = 0
+    for index in 0..<written.fields.len() {
+        if index >= fields.len() {
+            break
+        }
+        let field = written.fields[index]
+        for earlier in 0..<index {
+            if written.fields[earlier].name.text == field.name.text {
+                self.report(item, token: field.name.token, code: diagnostic::Code.TypeDuplicateMember)
+                break
+            }
+        }
+        let Some(span) = self.field_span(item, field, typed: fields[index].ty, bytes, mut rests) else {
+            continue
+        }
+        if span.high >= units {
+            self.report(item, token: field.name.token, code: diagnostic::Code.LayoutOutOfRange)
+            continue
+        }
+        var unit = span.low
+        while unit <= span.high {
+            if covered[usize.widen(unit)] {
+                self.report(item, token: field.name.token, code: diagnostic::Code.LayoutOverlap)
+                break
+            }
+            covered[usize.widen(unit)] = true
+            unit += 1
+        }
+    }
+    if rests == 0 and covered.position(fn(unit_covered: bool) => not unit_covered).is_some() {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match written.repr {
+            ast::LayoutRepr.Integer(ty: _, order: _) => {
+                match self.member_added(item, member: "reserved: rest") {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+            }
+            ast::LayoutRepr.Bytes(size: _, order: _) => {}
+        }
+        self.report_fixed(item, construct: nir::Span.at(self.db().ast(item).token), code: diagnostic::Code.LayoutUncovered, take fixes, offer: diagnostic::Offer.Each)
+    }
+} Checker.check_layout_fields
+
+/// The bits or bytes a layout field covers; none for `rest`, counted in `rests`, or for a field
+/// whose form or type its layout rejects, once reported.
+fn Checker.field_span(self, item: ty::ItemId, field: ast::LayoutField, typed: ty::Ty, bytes: bool, mut rests: u32) -> Option[FieldSpan] {
+    match field.kind {
+        ast::LayoutFieldKind.Rest => {
+            if bytes {
+                self.report(item, token: field.name.token, code: diagnostic::Code.LayoutFieldForm)
+                return None
+            }
+            rests += 1
+            if rests > 1 {
+                self.report(item, token: field.name.token, code: diagnostic::Code.LayoutOverlap)
+            }
+            return None
+        }
+        ast::LayoutFieldKind.Bit(low: low_bit, high: high_bit) => {
+            if bytes {
+                self.report(item, token: field.name.token, code: diagnostic::Code.LayoutFieldForm)
+                return None
+            }
+            let low = self.literal_at(item, token: low_bit)
+            let high = match high_bit {
+                Some(written) => self.literal_at(item, token: written)
+                None => low
+            }
+            if high <= low and field_ranged(field.kind) {
+                self.report(item, token: field.name.token, code: diagnostic::Code.LayoutFieldForm)
+                return None
+            }
+            return Some(FieldSpan(low: low, high: high))
+        }
+        ast::LayoutFieldKind.Typed(ty: _, at: at) => {
+            let Some(size) = self.field_width(typed, bytes) else {
+                if not self.types().has_error(typed) {
+                    self.report(item, token: field.name.token, code: diagnostic::Code.LayoutFieldType)
+                }
+                return None
+            }
+            let low = self.literal_at(item, token: at)
+            return Some(FieldSpan(low: low, high: low.wrapping_add(size).wrapping_sub(1)))
+        }
+    }
+} Checker.field_span
+
+/// The width a typed layout field occupies: bits in an integer layout, for an unsigned
+/// integer type or integer layout; bytes in a bytes layout, for an integer scalar, a layout
+/// or an array of these.
+fn Checker.field_width(self, ty: ty::Ty, bytes: bool) -> Option[u64] {
+    let types = self.types()
+    let db = self.db()
+    if not bytes {
+        match types.kind(ty) {
+            ty::TyKind.Scalar(scalar) => {
+                if scalar.is_unsigned_bits() {
+                    return Some(scalar_size(scalar) * 8)
+                }
+                return None
+            }
+            ty::TyKind.Item(item: item, args: _) => {
+                let ast::ItemKind.Layout(layout_item) = db.ast(item).kind else {
+                    return None
+                }
+                let ast::LayoutRepr.Integer(ty: _, order: _) = layout_item.repr else {
+                    return None
+                }
+                let Some(size) = self.layout_size(item) else {
+                    return None
+                }
+                return Some(size * 8)
+            }
+            else => return None
+        }
+    }
+    var element = ty
+    if self.is_std(ty, path: "core::Array") {
+        let Some(inner) = types.type_arg(ty, index: 0) else {
+            return None
+        }
+        element = inner
+    }
+    let allowed = match types.kind(element) {
+        ty::TyKind.Scalar(scalar) => scalar.is_integer()
+        ty::TyKind.Item(item: item, args: _) => self.is_layout_item(item)
+        else => false
+    }
+    if not allowed {
+        return None
+    }
+    return self.fixed_size(ty)
+} Checker.field_width
+
+/// Whether an item is a layout.
+fn Checker.is_layout_item(self, item: ty::ItemId) -> bool {
+    return match self.db().ast(item).kind {
+        ast::ItemKind.Layout(_) => true
+        else => false
+    }
+} Checker.is_layout_item
+
+/// The rules of a registers item: register types, literals, alignment, strides and overlaps.
+fn Checker.check_registers(self, item: ty::ItemId) {
+    let alloc = self.alloc()
+    let ast::ItemKind.Registers(register_block) = self.db().ast(item).kind else {
+        return
+    }
+    let held = self.sig(item)
+    let SigKind.Registers(members: typed) = held.contents().kind else {
+        return
+    }
+    var placed = mem::List[PlacedRegister].empty(alloc)
+    for index in 0..<register_block.members.len() {
+        if index >= typed.len() {
+            break
+        }
+        let register = register_block.members[index]
+        let token = register.name.token
+        for earlier in 0..<index {
+            if register_block.members[earlier].name.text == register.name.text {
+                self.report(item, token, code: diagnostic::Code.TypeDuplicateMember)
+                break
+            }
+        }
+        let Some(span) = self.register_span(item, register, typed: typed[index].ty) else {
+            continue
+        }
+        var overlapping = false
+        for earlier in placed {
+            let disjoint = span.high <= earlier.start or span.low >= earlier.stop
+            let split = (earlier.access == ast::Access.Read and register.access == ast::Access.Write) or (earlier.access == ast::Access.Write and register.access == ast::Access.Read)
+            if not disjoint and not split {
+                overlapping = true
+                break
+            }
+        }
+        if overlapping {
+            self.report(item, token, code: diagnostic::Code.RegisterOverlap)
+        }
+        mut placed.push(PlacedRegister(start: span.low, stop: span.high, access: register.access))
+    }
+} Checker.check_registers
+
+/// The bytes `low..high` a register occupies; none for a register whose type, literals,
+/// alignment or stride its block rejects, once reported.
+fn Checker.register_span(self, item: ty::ItemId, register: ast::Register, typed: ty::Ty) -> Option[FieldSpan] {
+    let types = self.types()
+    let db = self.db()
+    let token = register.name.token
+    if types.has_error(typed) {
+        return None
+    }
+    let array = self.is_std(typed, path: "core::Array")
+    var element = typed
+    if array {
+        element = types.type_arg(typed, index: 0).value_or(ty::Ty.error())
+    }
+    let size = match self.fixed_size(element) {
+        Some(found) => match found {
+            1 or 2 or 4 or 8 => found
+            else => 0
+        }
+        None => 0
+    }
+    if size == 0 or not self.has(element, property: Property.AnyBits) {
+        self.report(item, token, code: diagnostic::Code.RegisterType)
+        return None
+    }
+    var suffix = suffixed(db.text(item, token: register.at))
+    match register.stride {
+        Some(written) => {
+            suffix = suffix or suffixed(db.text(item, token: written))
+        }
+        None => {}
+    }
+    if suffix {
+        self.report(item, token, code: diagnostic::Code.RegisterLiteral)
+        return None
+    }
+    let offset = self.literal_at(item, token: register.at)
+    if offset % size != 0 {
+        self.report(item, token, code: diagnostic::Code.RegisterMisaligned)
+        return None
+    }
+    let stride = match register.stride {
+        Some(written) => Some(self.literal_at(item, token: written))
+        None => None
+    }
+    var count: u64 = 1
+    let args = types.arg_list(types.args_of(typed))
+    if array and args.len() > 1 {
+        match args[1] {
+            ty::Arg.Const(ty::Const.Int(written)) => {
+                count = written.low_bits()
+            }
+            else => {}
+        }
+    }
+    let strided = match stride {
+        Some(step) => array and step != 0 and step % size == 0
+        None => not array
+    }
+    if not strided {
+        self.report(item, token, code: diagnostic::Code.RegisterStride)
+        return None
+    }
+    let end = offset.wrapping_add(stride.value_or(size).wrapping_mul(count.wrapping_sub(1))).wrapping_add(size)
+    return Some(FieldSpan(low: offset, high: end))
+} Checker.register_span
+
+/// The head of a foreign fn: read parameters of integer and float scalars, pointers and
+/// AnyBits layouts, such a result or `Unit` or `Never`, one identifier as its name, and no
+/// generic parameters or `fails`.
+fn Checker.check_foreign(self, item: ty::ItemId, function: ast::FnItem, sig: FnSig) {
+    let token = self.db().ast(item).token
+    var signature = function.label.owner.is_none() and sig.generics.len() == 0 and sig.failure.is_none()
+    if signature {
+        for param in sig.params {
+            if param.mode != ast::Mode.Read or not self.passable(param.ty) {
+                signature = false
+                break
+            }
+        }
+    }
+    signature = signature and (self.passable(sig.result) or sig.result == ty::Ty.unit() or sig.result == ty::Ty.never())
+    if not signature {
+        self.report(item, token, code: diagnostic::Code.TrustedForeignSignature)
+        return
+    }
+    match function.convention {
+        Some(convention) => self.check_convention(item, token: convention.token, convention: convention.value.as_str())
+        None => {}
+    }
+} Checker.check_foreign
+
+/// Whether a foreign fn passes a type: an integer or float scalar, a pointer or an AnyBits
+/// layout.
+fn Checker.passable(self, ty: ty::Ty) -> bool {
+    let types = self.types()
+    return match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => scalar.is_number()
+        ty::TyKind.Item(item: item, args: _) => self.is_std(ty, path: "hw::Ptr") or (self.is_layout_item(item) and self.has(ty, property: Property.AnyBits))
+        else => types.has_error(ty)
+    }
+} Checker.passable
+
+/// The head of a landing fn: read parameters of integer scalars, pointers, AnyBits layouts,
+/// Untrusted integers and arrays of these, such a result, `Unit`, `Never` or its target's
+/// root grant, and no generic parameters, `fails` or `uses wait`.
+fn Checker.check_landing(self, item: ty::ItemId, sig: FnSig) {
+    let grant = self.is_std(sig.result, path: "host::World") or self.is_std(sig.result, path: "boot::Machine") or self.is_std(sig.result, path: "boot::Kernel")
+    let result = self.raw_value(sig.result) or sig.result == ty::Ty.unit() or sig.result == ty::Ty.never() or grant
+    var signature = sig.generics.len() == 0 and sig.failure.is_none() and not sig.wait
+    if signature {
+        for param in sig.params {
+            if param.mode != ast::Mode.Read or not self.raw_param(param.ty) {
+                signature = false
+                break
+            }
+        }
+    }
+    if not signature or not result {
+        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.HwLandingSignature)
+    }
+} Checker.check_landing
+
+/// Whether a landing fn takes a type: an integer scalar, a pointer, an AnyBits layout or an
+/// Untrusted integer, or an array of these.
+fn Checker.raw_param(self, ty: ty::Ty) -> bool {
+    var element = ty
+    if self.is_std(ty, path: "core::Array") {
+        element = self.types().type_arg(ty, index: 0).value_or(ty::Ty.error())
+    }
+    let untrusted_integer = self.is_std(element, path: "core::Untrusted") and self.first_arg_integer(element)
+    return untrusted_integer or self.raw_value(element)
+} Checker.raw_param
+
+/// Whether a type's first type argument is an integer scalar.
+fn Checker.first_arg_integer(self, ty: ty::Ty) -> bool {
+    let types = self.types()
+    let Some(inner) = types.type_arg(ty, index: 0) else {
+        return false
+    }
+    let Some(scalar) = types.scalar_of(inner) else {
+        return false
+    }
+    return scalar.is_integer()
+} Checker.first_arg_integer
+
+/// Whether a type is an integer scalar, a pointer or an AnyBits layout.
+fn Checker.raw_value(self, ty: ty::Ty) -> bool {
+    let types = self.types()
+    return match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => scalar.is_integer()
+        ty::TyKind.Item(item: item, args: _) => self.is_std(ty, path: "hw::Ptr") or (self.is_layout_item(item) and self.has(ty, property: Property.AnyBits))
+        else => types.has_error(ty)
+    }
+} Checker.raw_value
+
+/// A completion operation whose buffer type holds an `hw::Dma` outside an `Untrusted`.
+fn Checker.check_dma_completion(self, item: ty::ItemId, sig: FnSig) {
+    let completion = sig.wait and self.is_std(sig.result, path: "task::Completion")
+    if not completion {
+        return
+    }
+    let Some(buffer) = self.types().type_arg(sig.result, index: 0) else {
+        return
+    }
+    if self.exposes_dma(buffer) {
+        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.HwDmaCompletion)
+    }
+} Checker.check_dma_completion
+
+/// Whether a type holds an `hw::Dma` other than inside an `Untrusted`.
+fn Checker.exposes_dma(self, ty: ty::Ty) -> bool {
+    if self.is_std(ty, path: "hw::Dma") {
+        return true
+    }
+    if self.is_std(ty, path: "core::Untrusted") {
+        return false
+    }
+    let types = self.types()
+    for arg in types.arg_list(types.args_of(ty)) {
+        let ty::Arg.Ty(arg_ty) = arg else {
+            continue
+        }
+        if self.exposes_dma(arg_ty) {
+            return true
+        }
+    }
+    return false
+} Checker.exposes_dma
+
+/// The rules an instantiation of a low-level std type breaks: a register window or register
+/// of something other than a registers block, a port window over an 8-byte register, and a
+/// DMA buffer or user address of a type without a fixed layout.
+fn Checker.lowlevel_problem(self, ty: ty::Ty) -> Option[diagnostic::Code] {
+    let types = self.types()
+    let Some(path) = self.std_path(ty) else {
+        return None
+    }
+    let written = path.as_str()
+    if not is_listed("hw::Mmio hw::Ports hw::Register hw::Dma hw::DmaShared hw::UserAddr", word: written) {
+        return None
+    }
+    let Some(argument) = types.type_arg(ty, index: 0) else {
+        return None
+    }
+    if types.has_error(argument) {
+        return None
+    }
+    match types.kind(argument) {
+        ty::TyKind.Param(_) => return None
+        else => {}
+    }
+    if written == "hw::Mmio" or written == "hw::Ports" or written == "hw::Register" {
+        let ty::TyKind.Registers(register_block) = types.kind(argument) else {
+            return Some(diagnostic::Code.RegisterWindowType)
+        }
+        if written == "hw::Ports" and self.has_wide_register(register_block) {
+            return Some(diagnostic::Code.RegisterPortWidth)
+        }
+        return None
+    }
+    if self.fixed_size(argument).is_none() {
+        return Some(diagnostic::Code.HwLayoutUnfixed)
+    }
+    return None
+} Checker.lowlevel_problem
+
+/// Whether a registers block has an 8-byte register.
+fn Checker.has_wide_register(self, register_block: ty::ItemId) -> bool {
+    let types = self.types()
+    let sig = self.sig(register_block)
+    let SigKind.Registers(members: members) = sig.contents().kind else {
+        return false
+    }
+    for register in members {
+        var element = register.ty
+        if self.is_std(register.ty, path: "core::Array") {
+            element = types.type_arg(register.ty, index: 0).value_or(ty::Ty.error())
+        }
+        if self.fixed_size(element) == Some(8) {
+            return true
+        }
+    }
+    return false
+} Checker.has_wide_register
+
+/// A registers block written as the type of a value, which it has none of.
+fn Checker.check_value_type(self, item: ty::ItemId, ty: ty::Ty, token: u32) {
+    match self.types().kind(ty) {
+        ty::TyKind.Registers(_) => self.report(item, token, code: diagnostic::Code.RegisterWindowType)
+        else => {}
+    }
+} Checker.check_value_type
+
+/// The types of an item's values: its parameters and result, fields and payloads, const
+/// type and registry entry, none a registers block.
+fn Checker.check_value_types(self, item: ty::ItemId) {
+    let token = self.db().ast(item).token
+    let held = self.sig(item)
+    match held.contents().kind {
+        SigKind.Fn(head) => {
+            for param in head.params {
+                self.check_value_type(item, ty: param.ty, token: param.token)
+            }
+            self.check_value_type(item, ty: head.result, token)
+        }
+        SigKind.Struct(fields: fields) => {
+            for field in fields {
+                self.check_value_type(item, ty: field.ty, token: field.token)
+            }
+        }
+        SigKind.Enum(variants: variants) => self.check_payload_types(item, variants: variants.view())
+        SigKind.Const(ty: const_ty) => self.check_value_type(item, ty: const_ty, token)
+        SigKind.Registry(entry: entry) => self.check_value_type(item, ty: entry, token)
+        else => {}
+    }
+} Checker.check_value_types
+
+/// The payload types of an enum's variants, each reported on its variant.
+fn Checker.check_payload_types(self, item: ty::ItemId, variants: Slice[VariantSig]) {
+    for variant in variants {
+        match variant.payload {
+            Payload.None => {}
+            Payload.Single(payload_ty) => self.check_value_type(item, ty: payload_ty, token: variant.token)
+            Payload.Labelled(labelled) => {
+                for field in labelled {
+                    self.check_value_type(item, ty: field.ty, token: variant.token)
+                }
+            }
+        }
+    }
+} Checker.check_payload_types
+
+/// A convention clause: a known convention serving every target its package declares.
+fn Checker.check_convention(self, item: ty::ItemId, token: u32, convention: Str) {
+    let Some(target) = convention_target(convention) else {
+        self.report(item, token, code: diagnostic::Code.TrustedConventionUnknown)
+        return
+    }
+    let db = self.db()
+    let Some(manifest) = db.source(db.package_of(item)).manifest else {
+        return
+    }
+    for declared in manifest.targets {
+        if declared != target {
+            self.report(item, token, code: diagnostic::Code.TrustedConventionTarget)
+            return
+        }
+    }
+} Checker.check_convention
+
+fn scalar_size(scalar: ty::Scalar) -> u64 {
+    return match scalar {
+        ty::Scalar.Unsigned8 or ty::Scalar.Signed8 or ty::Scalar.Bool => 1
+        ty::Scalar.Unsigned16 or ty::Scalar.Signed16 => 2
+        ty::Scalar.Unsigned32 or ty::Scalar.Signed32 or ty::Scalar.Float32 or ty::Scalar.Char => 4
+        ty::Scalar.Unsigned64 or ty::Scalar.Signed64 or ty::Scalar.Float64 or ty::Scalar.UnsignedSize or ty::Scalar.SignedSize => 8
+    }
+} scalar_size
+
+/// Whether an `INT` token's text carries a literal suffix.
+fn suffixed(written: Str) -> bool {
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start + 1 < bytes.len() and bytes[start] == b'0' and bytes[start + 1] == b'x' {
+        start += 2
+    }
+    while start + 1 < bytes.len() and bytes[start] == b'0' and bytes[start + 1] == b'b' {
+        start += 2
+    }
+    let hex = written.starts_with("0x")
+    for index in start..<bytes.len() {
+        let byte = bytes[index]
+        if byte == b'u' or byte == b'i' or (not hex and byte == b'f') {
+            return true
+        }
+    }
+    return false
+} suffixed
+
+/// Whether a layout field is a ranged `bit i..=j`.
+fn field_ranged(kind: ast::LayoutFieldKind) -> bool {
+    return match kind {
+        ast::LayoutFieldKind.Bit(low: _, high: Some(_)) => true
+        else => false
+    }
+} field_ranged

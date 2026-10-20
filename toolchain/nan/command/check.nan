@@ -1,0 +1,557 @@
+//! `nan check`: the diagnostics of a scope with the fixes they offer, an agent's last-green record, closure radii and prefix checking.
+
+/// Runs `nan check` in a session's workspace.
+fn run_check(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    match invocation.prefix {
+        Some(prefix) => {
+            return prefixed(invocation, session, current, written: prefix.as_str(), alloc)
+        }
+        None => {}
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        let unknown = match invocation.scope() {
+            Some(written) => written
+            None => "."
+        }
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: unknown, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let Some(agent) = invocation.agent_name() else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+    }
+    var diagnostics = session.reported(resolved.scope)
+    fix::offer(session, current, written: invocation.scope(), diagnostics: mut diagnostics)
+    let std = session.std.contents()
+    var errors: usize = 0
+    var incomplete: usize = 0
+    var failed = mem::List[diagnostic::At].empty(alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        let class = reported.code.class()
+        if class == diagnostic::Class.Error {
+            errors += 1
+            match reported.path {
+                Some(path) => {
+                    match reported.line {
+                        Some(line) => {
+                            mut failed.push(diagnostic::At(path: text::String.of(path.as_str(), alloc), line: line))
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        } else if class == diagnostic::Class.Incompleteness {
+            incomplete += 1
+        }
+        mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+    }
+    let green = try last_green(session, scope: resolved.scope, agent, errors: failed.view(), alloc)
+    for changed in take green {
+        mut records.push(take changed)
+    }
+    if invocation.radius {
+        let measured = radii(session, scope: resolved.scope, alloc)
+        for radius in take measured {
+            mut records.push(take radius)
+        }
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
+    mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: incomplete))
+    var verdict = output::Verdict.Ok
+    if errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} run_check
+
+/// The agent `--agent` names, `default` without one; none for a name that is not one.
+proj fn Invocation.agent_name(self) -> Option[Str] {
+    let agent = match self.agent {
+        Some(named) => named.as_str()
+        None => "default"
+    }
+    if agent.is_empty() {
+        return None
+    }
+    for byte in agent.as_bytes() {
+        let letter = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z')
+        if not letter and not (byte >= b'0' and byte <= b'9') and byte != b'_' and byte != b'-' {
+            return None
+        }
+    }
+    return Some(take agent)
+} Invocation.agent_name
+
+/// An entry of a last-green record: an item's location, interface hash and api lines.
+struct GreenEntry {
+    location: text::String
+    hash: text::String
+    api: mem::List[text::String]
+} GreenEntry
+
+/// The entries of an agent's last-green record, by item.
+fn green_entries(root: Str, agent: Str, alloc: mem::Alloc) -> mem::Map[text::String, GreenEntry] {
+    var entries = mem::Map[text::String, GreenEntry].empty(alloc)
+    var relative = text::String.of(".nan/green/", alloc)
+    mut relative.append(agent)
+    let Ok(written) = attempt platform::read_text(platform::join(root, name: relative.as_str(), alloc).as_str(), alloc) else {
+        return entries
+    }
+    var current = text::String.empty(alloc)
+    var open = false
+    for line in take text_lines(written.as_str(), alloc) {
+        if open and line.starts_with("    ") {
+            let Some(api) = line.as_str().slice_bytes(4, end: line.byte_len()) else {
+                continue
+            }
+            var target = mut entries.at_mut(current)
+            mut target.api.push(text::String.of(api, alloc))
+            continue
+        }
+        open = false
+        if not line.starts_with("item ") {
+            continue
+        }
+        let Some(rest) = line.as_str().slice_bytes(5, end: line.byte_len()) else {
+            continue
+        }
+        let fields = split_spaces(rest, alloc)
+        if fields.len() < 3 {
+            continue
+        }
+        current = text::String.of(fields[0].as_str(), alloc)
+        let held = GreenEntry(location: text::String.of(fields[1].as_str(), alloc), hash: text::String.of(fields[2].as_str(), alloc), api: mem::List[text::String].empty(alloc))
+        discard mut entries.insert(text::String.of(current.as_str(), alloc), value: take held)
+        open = true
+    }
+    return entries
+} green_entries
+
+/// The lines of a text: split at each line feed, a carriage return ending one dropped, without a
+/// last empty line after a final line feed.
+fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        var kept = end
+        if kept > start and bytes[kept - 1] == b'\r' {
+            kept -= 1
+        }
+        let Some(line) = written.slice_bytes(start, end: kept) else {
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = end + 1
+    }
+    return lines
+} text_lines
+
+/// The parts of a text between its spaces, each space separating two.
+fn split_spaces(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var parts = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b' ' {
+            continue
+        }
+        let Some(part) = written.slice_bytes(start, end: at) else {
+            return parts
+        }
+        mut parts.push(text::String.of(part, alloc))
+        start = at + 1
+    }
+    return parts
+} split_spaces
+
+fn green_interface(green: check::Green, alloc: mem::Alloc) -> text::String {
+    let Some(hash) = green.interface_hash else {
+        return text::String.of("-", alloc)
+    }
+    return hash.full(alloc)
+} green_interface
+
+/// A `changed` record per item whose interface hash differs from its last-green entry, merging
+/// its entry's api lines with its current ones; an item without an entry has none.
+fn changed_since(entries: mem::Map[text::String, GreenEntry], greens: Slice[check::Green], writer: Option[text::String], alloc: mem::Alloc) -> mem::List[output::Record] {
+    var records = mem::List[output::Record].empty(alloc)
+    for green in greens {
+        let Some(known) = entries.get(green.path) else {
+            continue
+        }
+        if known.hash.as_str() == green_interface(green, alloc).as_str() {
+            continue
+        }
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(written_for(green.path.as_str(), writer, alloc))
+        mut fields.push(located(green.file.as_str(), line: green.line, alloc))
+        mut records.push(output::Record(word: text::String.of("changed", alloc), fields: take fields, lines: diff::merged(known.api.view(), new: green.api.view(), alloc)))
+    }
+    return records
+} changed_since
+
+/// Keeps an agent's last-green record: after a check reporting no error, replaces the entries of
+/// the items of its scope; after one reporting errors, returns a `changed` record per item of the
+/// closure sets of the lines holding one whose interface hash differs from its entry.
+fn last_green(session: check::Session, scope: scope::Scope, agent: Str, errors: Slice[diagnostic::At], alloc: mem::Alloc) -> mem::List[output::Record] fails platform::IoError {
+    let held = session.workspace.contents()
+    var entries = green_entries(held.root.as_str(), agent, alloc)
+    if errors.len() > 0 {
+        let greens = session.greens(None, lines: errors)
+        return changed_since(entries, greens: greens.view(), writer: writer_of(held, scope, alloc), alloc)
+    }
+    mut entries.retain(fn(key: text::String, value: GreenEntry) => not located_in(scope, workspace: held, location: value.location.as_str()))
+    let greens = session.greens(Some(scope.copied(alloc)), lines: mem::List[diagnostic::At].empty(alloc).view())
+    for green in greens {
+        var api = mem::List[text::String].empty(alloc)
+        for line in green.api {
+            mut api.push(text::String.of(line.as_str(), alloc))
+        }
+        let held_entry = GreenEntry(location: located(green.file.as_str(), line: green.line, alloc), hash: green_interface(green, alloc), api: take api)
+        discard mut entries.insert(text::String.of(green.path.as_str(), alloc), value: take held_entry)
+    }
+    var written = text::String.empty(alloc)
+    for item in entries {
+        let kept = item.value()
+        mut written.append("item ")
+        mut written.append(item.key().as_str())
+        mut written.push(' ')
+        mut written.append(kept.location.as_str())
+        mut written.push(' ')
+        mut written.append(kept.hash.as_str())
+        mut written.push('\n')
+        for line in kept.api {
+            mut written.append("    ")
+            mut written.append(line.as_str())
+            mut written.push('\n')
+        }
+    }
+    var path = text::String.of(".nan/green/", alloc)
+    mut path.append(agent)
+    try journal::replace_alone(held.root.as_str(), path: path.as_str(), content: written.as_bytes(), alloc)
+    return mem::List[output::Record].empty(alloc)
+} last_green
+
+/// Whether a scope holds the location `<file>:<line>` of a last-green entry.
+fn located_in(scope: scope::Scope, workspace: workspace::Workspace, location: Str) -> bool {
+    let Some(at) = last_colon(location) else {
+        return scope.holds(workspace, path: "", line: None)
+    }
+    let Some(file) = location.slice_bytes(0, end: at) else {
+        return false
+    }
+    let Some(line) = location.slice_bytes(at + 1, end: location.byte_len()) else {
+        return false
+    }
+    return scope.holds(workspace, path: file, line: line_number(line))
+} located_in
+
+/// The position of the last `:` of a text.
+fn last_colon(written: Str) -> Option[usize] {
+    let bytes = written.as_bytes()
+    var at = bytes.len()
+    while at > 0 {
+        at -= 1
+        if bytes[at] == b':' {
+            return Some(at)
+        }
+    }
+    return None
+} last_colon
+
+/// An item's closure radius as a `radius` record writes it.
+struct Radius {
+    radius: usize
+    item: text::String
+} Radius
+
+/// A `radius` record per item of the scope with its closure radius, largest first, then by
+/// path.
+fn radii(session: check::Session, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[output::Record] {
+    let held = session.workspace.contents()
+    let writer = writer_of(held, scope, alloc)
+    var measured = mem::List[Radius].empty(alloc)
+    let packs = session.contexts(scope, line: None)
+    for pack in packs {
+        let radius = output::units_of(pack_records(held, pack, writer, alloc).view(), alloc)
+        mut measured.push(Radius(radius: radius, item: written_for(pack.path.as_str(), writer, alloc)))
+    }
+    mut measured.sort_by(fn(left: Radius, right: Radius) => radius_order(left, right))
+    var records = mem::List[output::Record].empty(alloc)
+    for each in measured {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(each.item.as_str(), alloc))
+        var written = text::String.empty(alloc)
+        mut written.write(text::fmt("{radius}", radius: each.radius), budget: 100)
+        mut fields.push(take written)
+        mut records.push(output::Record(word: text::String.of("radius", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    return records
+} radii
+
+fn radius_order(left: Radius, right: Radius) -> core::Ordering {
+    if left.radius != right.radius {
+        return right.radius.cmp(left.radius)
+    }
+    return left.item.as_str().cmp(right.item.as_str())
+} radius_order
+
+/// Whether prefix checking reports a diagnostic of this code with an exact fix as pending
+/// clauses.
+fn is_pending(code: diagnostic::Code) -> bool {
+    return match code {
+        diagnostic::Code.ItemFailsMissing or diagnostic::Code.ItemWaitMissing or diagnostic::Code.ErrorCancelUnmapped or diagnostic::Code.ErrorUnconvertible => true
+        else => false
+    }
+} is_pending
+
+/// Whether prefix checking leaves out a diagnostic of this code when its construct holds a token
+/// closing appends.
+fn is_open_construct(code: diagnostic::Code) -> bool {
+    return match code {
+        diagnostic::Code.ClosureCaptureMode or diagnostic::Code.ClosureCaptureUnused or diagnostic::Code.ExprArgumentCount or diagnostic::Code.ExprBranchForm or diagnostic::Code.ExprMissingElse or diagnostic::Code.ExprNonExhaustive => true
+        diagnostic::Code.GenericParameterUnused or diagnostic::Code.ItemFailsUnneeded or diagnostic::Code.ItemWaitUnneeded or diagnostic::Code.OwnLinearDropped or diagnostic::Code.StmtElseNotDiverging or diagnostic::Code.StmtMissingReturn => true
+        diagnostic::Code.StmtUnusedLabel or diagnostic::Code.TextHoleUnbound or diagnostic::Code.ThresholdUnusedWaiver or diagnostic::Code.TypeMissingField or diagnostic::Code.TypePayloadShape or diagnostic::Code.UnusedLocal => true
+        else => false
+    }
+} is_open_construct
+
+/// The session of a workspace whose file at `path` holds `contents`.
+fn overlaid_session(session: check::Session, path: Str, contents: Slice[u8], alloc: mem::Alloc) -> check::Session {
+    var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(contents)
+    discard mut changed.insert(text::String.of(path, alloc), value: take bytes)
+    let overlaid = session.workspace.contents().overlaid(changed, grammar: session.grammar.contents(), alloc)
+    return check::Session.of(mem::Shared.of(take overlaid, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+} overlaid_session
+
+/// `nan check --prefix`: the error at the prefix's first dead token, the diagnostics of the
+/// prefix closed, its pending clauses, and the typed holes and closers closing appends.
+fn prefixed(invocation: Invocation, session: check::Session, current: Str, written: Str, alloc: mem::Alloc) -> output::Output {
+    let held = session.workspace.contents()
+    var path_end = written.byte_len()
+    var line: Option[u32] = None
+    match last_colon(written) {
+        Some(at) => {
+            let Some(left) = written.slice_bytes(0, end: at) else {
+                return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+            }
+            if left.ends_with(".nan") {
+                path_end = at
+                let Some(right) = written.slice_bytes(at + 1, end: written.byte_len()) else {
+                    return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+                }
+                line = line_number(right)
+            }
+        }
+        None => {}
+    }
+    let Some(path) = written.slice_bytes(0, end: path_end) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let Some(at) = held.file(path) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let file = held.file_at(at).syntax
+    let source = file.source.view()
+    var end = source.len()
+    match line {
+        Some(number) => {
+            let index = usize.widen(number)
+            if index < file.lines.len() {
+                end = usize.widen(file.lines[index].start)
+            } else if index > file.lines.len() {
+                return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+            }
+        }
+        None => {}
+    }
+    let Some(parts) = source.split_at(end) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    return closed_prefix(invocation, session, current, written, path, prefix: parts.head, alloc)
+} prefixed
+
+/// Prefix checking of the bytes `prefix` of the file at `path`, given as `written`.
+fn closed_prefix(invocation: Invocation, session: check::Session, current: Str, written: Str, path: Str, prefix: Slice[u8], alloc: mem::Alloc) -> output::Output {
+    let closed = syntax::close_prefix(prefix, grammar: session.grammar.contents(), alloc)
+    let fixed_session = overlaid_session(session, path, contents: closed.source.view(), alloc)
+    let fixed = fixed_session.workspace.contents()
+    let std = session.std.contents()
+    let scope = scope::Scope.File(text::String.of(path, alloc))
+    let scoped = text::String.of(path, alloc)
+    var diagnostics = fixed_session.reported(scope)
+    fix::offer(fixed_session, current, written: Some(scoped.as_str()), diagnostics: mut diagnostics)
+    var records = mem::List[output::Record].empty(alloc)
+    var dead: usize = 0
+    match closed.dead {
+        Some(failing) => {
+            let prefix_session = overlaid_session(session, path, contents: prefix, alloc)
+            let unclosed = prefix_session.reported(scope)
+            for reported in unclosed {
+                if reported.failing == Some(failing) {
+                    mut records.push(record(prefix_session.workspace.contents(), std, scope, reported, alloc))
+                    dead = 1
+                    break
+                }
+            }
+        }
+        None => {}
+    }
+    var pending = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        if appended(closed, reported) {
+            continue
+        }
+        if is_pending(reported.code) and reported.fixes.len() > 0 {
+            for clause in take pending_clauses(fixed, scope, reported, alloc) {
+                mut pending.push(take clause)
+            }
+            continue
+        }
+        mut records.push(record(fixed, std, scope, reported, alloc))
+    }
+    var others: usize = 0
+    for shown in records {
+        if shown.word.as_str() != "error" {
+            others += 1
+        }
+    }
+    let errors = records.len() - dead - others
+    let pending_count = pending.len()
+    for clause in take pending {
+        mut records.push(take clause)
+    }
+    let hole_count = piece_records(mut records, fixed_session, closed, path, scope, alloc)
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("dead", alloc), value: dead))
+    mut summary.push(output::Count(name: text::String.of("pending", alloc), value: pending_count))
+    mut summary.push(output::Count(name: text::String.of("holes", alloc), value: hole_count))
+    var verdict = output::Verdict.Ok
+    if dead > 0 or errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} closed_prefix
+
+/// Adds a `hole` record per typed hole closing appends, with the type it expects, and a `close`
+/// record per other piece. Returns the number of holes.
+fn piece_records(mut records: mem::List[output::Record], fixed_session: check::Session, closed: syntax::Closed, path: Str, scope: scope::Scope, alloc: mem::Alloc) -> usize {
+    let fixed = fixed_session.workspace.contents()
+    let holes = fixed_session.holes()
+    let writer = writer_of(fixed, scope, alloc)
+    var hole_count: usize = 0
+    for piece in closed.pieces {
+        if not piece.hole {
+            mut records.push(output::Record(word: text::String.of("close", alloc), fields: split_spaces(piece.text.as_str(), alloc), lines: mem::List[text::String].empty(alloc)))
+            continue
+        }
+        hole_count += 1
+        var expected = text::String.of("-", alloc)
+        for hole in holes {
+            if hole.path.as_str() == path and hole.line == piece.line {
+                expected = text::String.of(hole.expected.as_str(), alloc)
+                break
+            }
+        }
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(located(path, line: piece.line, alloc))
+        mut fields.push(item_written(fixed, writer, path, line: piece.line, known: None, alloc))
+        mut fields.push(take expected)
+        mut records.push(output::Record(word: text::String.of("hole", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    return hole_count
+} piece_records
+
+/// Whether a diagnostic of the closed prefix lies on a line closing appends to, or is of a code
+/// left out when its construct holds an appended token.
+fn appended(closed: syntax::Closed, reported: diagnostic::Diagnostic) -> bool {
+    match reported.line {
+        Some(line) => {
+            for piece in closed.pieces {
+                if piece.line == line {
+                    return true
+                }
+            }
+        }
+        None => {}
+    }
+    if not is_open_construct(reported.code) {
+        return false
+    }
+    var judged = reported.span
+    if reported.judged.is_some() {
+        judged = reported.judged
+    }
+    let Some(span) = judged else {
+        return false
+    }
+    for piece in closed.pieces {
+        if piece.span.start < span.end and piece.span.end > span.start {
+            return true
+        }
+    }
+    return false
+} appended
+
+/// The `pending` records of a diagnostic whose fix adds clauses: one per clause, at its line.
+fn pending_clauses(workspace: workspace::Workspace, scope: scope::Scope, reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> mem::List[output::Record] {
+    var records = mem::List[output::Record].empty(alloc)
+    let Some(path) = reported.path else {
+        return records
+    }
+    let Some(line) = reported.line else {
+        return records
+    }
+    let writer = writer_of(workspace, scope, alloc)
+    let item = item_written(workspace, writer, path: path.as_str(), line, known: None, alloc)
+    var added = text::String.empty(alloc)
+    var parts: usize = 0
+    for edit in reported.fixes[0].edits {
+        if parts > 0 {
+            mut added.push(' ')
+        }
+        parts += 1
+        let replaced = edit.replacement.text.as_str()
+        let kept = platform::trimmed_run(replaced)
+        let Some(trimmed) = replaced.slice_bytes(kept.start, end: kept.end) else {
+            continue
+        }
+        mut added.append(trimmed)
+    }
+    var clauses = mem::List[text::String].empty(alloc)
+    match added.as_str().find(" uses wait") {
+        Some(at) => {
+            if at > 0 {
+                let Some(failure) = added.as_str().slice_bytes(0, end: at) else {
+                    return records
+                }
+                mut clauses.push(text::String.of(failure, alloc))
+                mut clauses.push(text::String.of("uses wait", alloc))
+            }
+        }
+        None => {}
+    }
+    if clauses.len() == 0 {
+        mut clauses.push(take added)
+    }
+    for clause in clauses {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(located(path.as_str(), line, alloc))
+        mut fields.push(text::String.of(item.as_str(), alloc))
+        for word in take split_spaces(clause.as_str(), alloc) {
+            mut fields.push(take word)
+        }
+        mut records.push(output::Record(word: text::String.of("pending", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    return records
+} pending_clauses

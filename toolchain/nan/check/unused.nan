@@ -1,0 +1,625 @@
+//! Unused code under one target: the private items no reachable item names, the bindings no expression uses, the fields no item reads, the dependencies no item names and the manifest grants nothing uses.
+
+/// The constructs whose ends end the scopes of the bindings they hold.
+fn is_scope_rule(rule: syntax::Rule) -> bool {
+    return match rule {
+        syntax::Rule.Block or syntax::Rule.LoopBlock or syntax::Rule.FnBody or syntax::Rule.MethodBody => true
+        syntax::Rule.ForStmt or syntax::Rule.MatchArm or syntax::Rule.ClosureBody or syntax::Rule.TrustedBody => true
+        else => false
+    }
+} is_scope_rule
+
+/// The derives whose methods read every field.
+const READING_DERIVES: Str = "Eq Ord Hash Render Encode"
+
+/// A `let` or `var` statement binding one name without `else`: its first token, its
+/// initializer's first and last tokens, and whether the initializer has type `Unit` or `Never`.
+struct Binding derives Copy {
+    statement: u32
+    value: nir::Span
+    unit: bool
+} Binding
+
+/// What typing a body records of the use of its bindings: the `let` and `var` statements
+/// binding one name, the bindings expressions use and those statements assign, by the binding
+/// outside closures, the `var` bindings of parts, assigning which writes the part, and the
+/// bindings of the later alternatives of an arm by those of its first that they stand for.
+struct Usage {
+    bindings: mem::HashMap[LocalId, Binding]
+    used: mem::Set[LocalId]
+    assigned: mem::Set[LocalId]
+    parts: mem::Set[LocalId]
+    alternatives: mem::HashMap[LocalId, mem::List[LocalId]]
+} Usage
+
+fn Usage.empty(alloc: mem::Alloc) -> Usage {
+    return Usage(bindings: mem::HashMap[LocalId, Binding].empty(seed: 0, alloc), used: mem::Set[LocalId].empty(alloc), assigned: mem::Set[LocalId].empty(alloc), parts: mem::Set[LocalId].empty(alloc), alternatives: mem::HashMap[LocalId, mem::List[LocalId]].empty(seed: 0, alloc))
+} Usage.empty
+
+/// A `label: value` naming a field in a construction or struct pattern of an item: its tokens,
+/// and whether its value is a place, a literal or `_`.
+struct FieldLabel derives Copy {
+    item: ty::ItemId
+    head: u32
+    last: u32
+    simple: bool
+} FieldLabel
+
+/// Records that a body reads a field, when it is a struct's.
+fn Checker.record_read(self, owner: ty::ItemId, field: Str) {
+    let ast::ItemKind.Struct(_) = self.db().declaration(owner).kind else {
+        return
+    }
+    let key = FieldKey(owner: owner, name: text::String.of(field, alloc: self.alloc()))
+    self.state.contents().fields_read.insert(take key, value: Unit)
+} Checker.record_read
+
+/// Records a `label: value` naming a field, when it is a struct's.
+fn Checker.record_label(self, owner: ty::ItemId, field: Str, label: FieldLabel) {
+    let ast::ItemKind.Struct(_) = self.db().declaration(owner).kind else {
+        return
+    }
+    let alloc = self.alloc()
+    let state = self.state.contents()
+    let key = FieldKey(owner: owner, name: text::String.of(field, alloc))
+    let labels = match state.field_labels.get(key) {
+        Some(known) => known
+        None => state.field_labels.insert(take key, value: mem::Arena[FieldLabel].empty(alloc))
+    }
+    discard labels.push(label)
+} Checker.record_label
+
+/// The unused code of a package: its private items no reachable item names, its fields no
+/// item reads, its dependencies no item names and its grants nothing uses.
+fn Checker.check_unused(self, package_id: ty::PackageId) {
+    let db = self.db()
+    for module in db.package_data(package_id).modules {
+        self.check_unused_items(module)
+        self.check_unused_fields(module)
+    }
+    let unused_grants = self.unused_grants(package_id)
+    self.check_unused_dependencies(package_id, unused_grants: unused_grants.view())
+    let path = db.source(package_id).files[0].path.as_str()
+    for grant in unused_grants {
+        discard self.state.contents().unused.push(diagnostic::Diagnostic.at(diagnostic::Code.UnusedGrant, path, line: grant.line, alloc: self.alloc()))
+    }
+} Checker.check_unused
+
+/// The `dep` directives of a package whose alias no item names and no `allow contribute`
+/// directive lists as a name among the grants nothing uses, each with the fix deleting it.
+fn Checker.check_unused_dependencies(self, package_id: ty::PackageId, unused_grants: Slice[UnusedGrant]) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let source = db.source(package_id)
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    var contributing = mem::Set[text::String].empty(alloc)
+    for allow in manifest.allows {
+        let workspace::Authority.Contribute(_) = allow.authority else {
+            continue
+        }
+        for name in allow.names {
+            if not grant_unused(unused_grants, line: allow.line, name: name.as_str()) {
+                discard mut contributing.insert(text::String.of(name.as_str(), alloc))
+            }
+        }
+    }
+    let named = self.package_path_starts(package_id)
+    let file = source.files[0]
+    for dep in manifest.deps {
+        let alias = dep.alias.as_str()
+        if named.contains_by(fn(value: text::String) => value.as_str().cmp(alias)) or contributing.contains_by(fn(value: text::String) => value.as_str().cmp(alias)) {
+            continue
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.UnusedDependency, path: file.path.as_str(), line: dep.line, alloc)
+        reported.span = line_span(file.syntax, line: dep.line)
+        match self.fix_dependency_deleted(package_id, alias) {
+            Some(fix) => mut reported.fixes.push(take fix)
+            None => {}
+        }
+        discard self.state.contents().unused.push(take reported)
+    }
+} Checker.check_unused_dependencies
+
+/// The private items of a module that no reachable item names, each reported on its first
+/// line with the fix deleting it. Reachable are its items that are not private, its tests,
+/// impl lines, contributions and const asserts, its landing fns, the function its package's
+/// `entry` directive names, and each private item a reachable item names, a test naming its
+/// target; a tombstone is neither reachable nor unused.
+fn Checker.check_unused_items(self, module: ty::ModuleId) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let items = db.module(module).items
+    var reached = mem::Set[ty::ItemId].empty(alloc)
+    var pending = mem::List[ty::ItemId].empty(alloc)
+    for item in items {
+        let tombstone = match db.ast(item).kind {
+            ast::ItemKind.Retired(_) => true
+            else => false
+        }
+        if not self.private_item(item) and not tombstone {
+            discard mut reached.insert(item)
+            mut pending.push(item)
+        }
+    }
+    while pending.len() > 0 {
+        let Some(item) = mut pending.pop() else {
+            break
+        }
+        var names = mem::Set[ty::ItemId].empty(alloc)
+        for named in self.names(item).contents() {
+            discard mut names.insert(named)
+        }
+        match db.ast(item).kind {
+            ast::ItemKind.Test(tested) => {
+                match self.test_target(item, tested) {
+                    Some(TestTarget.Function(function)) => {
+                        discard mut names.insert(function)
+                    }
+                    Some(TestTarget.Derived(derived)) => {
+                        discard mut names.insert(derived)
+                    }
+                    None => {}
+                }
+            }
+            else => {}
+        }
+        for named in names {
+            if db.module_of(named) == module and self.private_item(named) and not reached.contains(named) {
+                discard mut reached.insert(named)
+                mut pending.push(named)
+            }
+        }
+    }
+    for item in items {
+        if not self.private_item(item) or reached.contains(item) {
+            continue
+        }
+        let data = db.item(item)
+        let syntax = db.syntax(item)
+        let line = syntax.tokens[syntax.items[data.index].head].line
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.UnusedItem, path: "", line, alloc)
+        mut reported.fixes.push(self.fix_deleting_item(item))
+        self.report_unused(item, take reported)
+    }
+} Checker.check_unused_items
+
+/// The fields of a module's structs that no item of the package reads, but the `pub` fields
+/// of `pub` structs, each reported on its first line. A field is read by an access other
+/// than the target of `=`, a struct pattern giving it a pattern other than `_`, a predicate
+/// naming it, and the methods its struct's derives of `Eq`, `Ord`, `Hash`, `Render` and
+/// `Encode` write.
+fn Checker.check_unused_fields(self, module: ty::ModuleId) {
+    let alloc = self.alloc()
+    let db = self.db()
+    for item in db.module(module).items {
+        let declared = db.ast(item)
+        let ast::ItemKind.Struct(structure) = declared.kind else {
+            continue
+        }
+        if derives_reading(structure) {
+            continue
+        }
+        let predicated = predicated_fields(structure, alloc)
+        for field in structure.fields() {
+            let exempt = field.visibility == ast::Visibility.Pub and declared.visibility == ast::Visibility.Pub
+            let name = field.name.text.as_str()
+            if exempt or predicated.contains_by(fn(value: text::String) => value.as_str().cmp(name)) {
+                continue
+            }
+            let key = FieldKey(owner: item, name: text::String.of(name, alloc))
+            if self.state.contents().fields_read.get(key).is_some() {
+                continue
+            }
+            let syntax = db.syntax(item)
+            let head = documented_from(syntax, token: field.token)
+            let last = match field.where_clause {
+                Some(condition) => condition.last
+                None => field.ty.last
+            }
+            var reported = diagnostic::Diagnostic.at(diagnostic::Code.UnusedField, path: "", line: syntax.tokens[usize.widen(head)].line, alloc)
+            reported.span = Some(diagnostic::Span(start: syntax.tokens[usize.widen(field.token)].start, end: syntax.tokens[usize.widen(last)].end))
+            match self.fix_field_deleted(item, head, last, name) {
+                Some(fix) => mut reported.fixes.push(take fix)
+                None => {}
+            }
+            self.report_unused(item, take reported)
+        }
+    }
+} Checker.check_unused_fields
+
+/// The fix deleting the lines of a struct's field, its tokens `head..=last`, and its
+/// `label: value` in each construction and struct pattern; none when one of these values is
+/// not a place, a literal or `_`, or is its list's only element.
+fn Checker.fix_field_deleted(self, item: ty::ItemId, head: u32, last: u32, name: Str) -> Option[diagnostic::Fix] {
+    var fix = self.fix_deleting_lines(item, head, last)
+    let alloc = self.alloc()
+    let key = FieldKey(owner: item, name: text::String.of(name, alloc))
+    let Some(labels) = self.state.contents().field_labels.get(key) else {
+        return Some(take fix)
+    }
+    var seen = mem::Set[LabelAt].empty(alloc)
+    for label in labels.cursor() {
+        let at = LabelAt(item: label.item, head: label.head)
+        if seen.contains(at) {
+            continue
+        }
+        discard mut seen.insert(at)
+        if not label.simple {
+            return None
+        }
+        let Some(element) = self.fix_element_deleted(label.item, head: label.head, last: label.last) else {
+            return None
+        }
+        fix = take fix.joined(take element)
+    }
+    return Some(take fix)
+} Checker.fix_field_deleted
+
+/// The fix deleting a `dep` directive's line, its alias from each grant listing it, and each
+/// grant it leaves listing nothing.
+fn Checker.fix_dependency_deleted(self, package_id: ty::PackageId, alias: Str) -> Option[diagnostic::Fix] {
+    let alloc = self.alloc()
+    let source = self.db().source(package_id)
+    let Some(manifest) = source.manifest else {
+        return None
+    }
+    let file = source.files[0]
+    let syntax = file.syntax
+    var dep_line: Option[u32] = None
+    for dep in manifest.deps {
+        if dep.alias.as_str() == alias {
+            dep_line = Some(dep.line)
+            break
+        }
+    }
+    let Some(line) = dep_line else {
+        return None
+    }
+    var deleted = mem::List[diagnostic::Span].empty(alloc)
+    mut deleted.push(whole_line(syntax, line))
+    for allow in manifest.allows {
+        if not lists_name(allow.names.view(), name: alias) {
+            continue
+        }
+        if allow.names.len() == 1 {
+            mut deleted.push(whole_line(syntax, line: allow.line))
+            continue
+        }
+        let Some(span) = grant_name_span(syntax, line: allow.line, alias, alloc) else {
+            return None
+        }
+        mut deleted.push(span)
+    }
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    for span in deleted {
+        let replacement = diagnostic::Replacement(start: span.start, end: span.end, text: text::String.empty(alloc))
+        mut edits.push(diagnostic::Edit(path: text::String.of(file.path.as_str(), alloc), replacement: take replacement))
+    }
+    return Some(diagnostic::Fix(edits: take edits))
+} Checker.fix_dependency_deleted
+
+/// The bindings of a typed body that no expression uses: `var` bindings, pattern bindings,
+/// those of an arm's alternatives as one, and names `for` patterns bind, whose types are not
+/// linear; none when one of the `roots` holds a failed construct. The fix of a `let` or `var`
+/// statement binding one name writes `discard` in place of its binding, or nothing when its
+/// initializer has type `Unit` or `Never`, unless a statement assigns it; that of any other
+/// binding writes `_` in place of its name.
+fn Checker.check_unused_locals(self, item: ty::ItemId, locals: Slice[Local], usage: Usage, roots: Slice[TExpr]) {
+    for root in roots {
+        if root.holds_failure() {
+            return
+        }
+    }
+    let types = self.types()
+    for index in 0..<locals.len() {
+        let local = locals[index]
+        let id = LocalId(index: u32.fit(index))
+        let bound = match local.kind {
+            LocalKind.Var or LocalKind.Pattern or LocalKind.Element(_) => true
+            else => false
+        }
+        if not bound or usage.used.contains(id) or is_alternative(usage, id) or types.has_error(local.ty) or self.has(local.ty, property: Property.Linear) {
+            continue
+        }
+        self.report_unused_local(item, locals, usage, id)
+    }
+} Checker.check_unused_locals
+
+/// The token starting a member, its doc comment's first line included.
+fn documented_from(syntax: syntax::SourceFile, token: u32) -> u32 {
+    var head = usize.widen(token)
+    loop {
+        let Some(line_end) = syntax.previous(head) else {
+            break
+        }
+        if syntax.tokens[line_end].kind != syntax::TokenKind.Nl {
+            break
+        }
+        let Some(doc) = syntax.previous(line_end) else {
+            break
+        }
+        if syntax.tokens[doc].kind != syntax::TokenKind.Doc {
+            break
+        }
+        head = doc
+    }
+    return u32.fit(head)
+} documented_from
+
+/// The last token of the innermost block, loop, arm or closure body of a tree holding a token:
+/// where the scope of a binding there ends.
+fn scope_end(tree: syntax::Tree, token: u32, alloc: mem::Alloc) -> Option[u32] {
+    var best: Option[syntax::TokenSpan] = None
+    for node in tree.descendants(tree.root(), alloc) {
+        if not is_scope_rule(tree.rule(node)) {
+            continue
+        }
+        let Some(span) = tree.span(node, alloc) else {
+            continue
+        }
+        if span.head > token or token > span.last {
+            continue
+        }
+        match best {
+            Some(current) => {
+                if span.last - span.head < current.last - current.head {
+                    best = Some(span)
+                }
+            }
+            None => {
+                best = Some(span)
+            }
+        }
+    }
+    let Some(found) = best else {
+        return None
+    }
+    return Some(found.last)
+} scope_end
+
+/// Whether a typed expression holds a construct that failed a rule.
+fn TExpr.holds_failure(self) -> bool {
+    var failed = match self.kind {
+        TKind.Failed => true
+        else => false
+    }
+    self.each_child(fn[mut failed](child: TExpr) {
+        if child.holds_failure() {
+            failed = true
+        }
+    })
+    return failed
+} TExpr.holds_failure
+
+/// Reports an unused binding: a `let` or `var` statement binding one name, with the fix writing
+/// `discard` in place of its binding, or nothing for a `Unit` or `Never` initializer, unless a
+/// statement assigns it; any other with the fix writing `_` in place of its name and those of
+/// the alternatives standing for it.
+fn Checker.report_unused_local(self, item: ty::ItemId, locals: Slice[Local], usage: Usage, id: LocalId) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let local = locals[usize.widen(id.index)]
+    var construct = nir::Span(head: local.token, last: local.token)
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    match usage.bindings.get(id) {
+        Some(binding) => {
+            construct = nir::Span(head: binding.statement, last: binding.value.last)
+            if not usage.assigned.contains(id) {
+                let tokens = db.syntax(item).tokens
+                let start = tokens[usize.widen(binding.statement)].start
+                let end = tokens[usize.widen(binding.value.head)].start
+                if binding.unit {
+                    mut fixes.push(self.fix_bytes(item, start, end, text: ""))
+                } else {
+                    mut fixes.push(self.fix_bytes(item, start, end, text: "discard "))
+                }
+            }
+        }
+        None => {
+            var fix = self.fix_replacing(item, head: local.token, last: local.token, text: "_")
+            match usage.alternatives.get(id) {
+                Some(later) => {
+                    for alternative in later {
+                        let token = locals[usize.widen(alternative.index)].token
+                        fix = take fix.joined(self.fix_replacing(item, head: token, last: token, text: "_"))
+                    }
+                }
+                None => {}
+            }
+            mut fixes.push(take fix)
+        }
+    }
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    var reported = self.on(item, construct, code: diagnostic::Code.UnusedLocal)
+    match syntax.items[data.index].tree {
+        Some(tree) => {
+            match scope_end(tree, token: local.token, alloc) {
+                Some(end) => {
+                    reported.judged = Some(diagnostic::Span(start: syntax.tokens[usize.widen(construct.head)].start, end: syntax.tokens[usize.widen(end)].end))
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    reported.fixes = fixes
+    self.report_unused(item, take reported)
+} Checker.report_unused_local
+
+/// Whether a binding is one of an arm's later alternatives.
+fn is_alternative(usage: Usage, id: LocalId) -> bool {
+    for entry in usage.alternatives {
+        for later in entry.value() {
+            if later == id {
+                return true
+            }
+        }
+    }
+    return false
+} is_alternative
+
+/// Whether a private item is unreachable unless another names it: a function, type,
+/// interface, layout, registers block, const or registry that is not a landing fn and not the
+/// function the package's `entry` directive names.
+fn Checker.private_item(self, item: ty::ItemId) -> bool {
+    let declared = self.db().ast(item)
+    let lands = match declared.kind {
+        ast::ItemKind.Fn(function) => match function.modifier {
+            Some(modifier) => modifier.kind == ast::FnModifier.Landing
+            None => false
+        }
+        else => false
+    }
+    let kind = match declared.kind {
+        ast::ItemKind.Fn(_) or ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Interface(_) => true
+        ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) or ast::ItemKind.Const(_) or ast::ItemKind.Registry(_) => true
+        else => false
+    }
+    return declared.visibility == ast::Visibility.Private and kind and not lands and not self.names_entry(item)
+} Checker.private_item
+
+/// The texts of the tokens starting a path in a package's items.
+fn Checker.package_path_starts(self, package_id: ty::PackageId) -> mem::Set[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var named = mem::Set[text::String].empty(alloc)
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            let data = db.item(item)
+            let syntax = db.syntax(item)
+            let span = syntax.items[data.index]
+            for index in syntax.path_starts(span.head, end: span.end) {
+                discard mut named.insert(text::String.of(syntax.text(index), alloc))
+            }
+        }
+    }
+    return named
+} Checker.package_path_starts
+
+/// Whether a grant nothing uses lists a name on a line.
+fn grant_unused(unused_grants: Slice[UnusedGrant], line: u32, name: Str) -> bool {
+    for grant in unused_grants {
+        if grant.line == line and grant.name.as_str() == name {
+            return true
+        }
+    }
+    return false
+} grant_unused
+
+/// Whether a list of names holds one.
+fn lists_name(names: Slice[text::String], name: Str) -> bool {
+    for listed in names {
+        if listed.as_str() == name {
+            return true
+        }
+    }
+    return false
+} lists_name
+
+/// The bytes from the first to the last token of a line that is not virtual.
+fn line_span(syntax: syntax::SourceFile, line: u32) -> Option[diagnostic::Span] {
+    var head: Option[usize] = None
+    var last: usize = 0
+    for index in 0..<syntax.tokens.len() {
+        let token = syntax.tokens[index]
+        if token.line != line or token.kind.is_virtual() {
+            continue
+        }
+        if head.is_none() {
+            head = Some(index)
+        }
+        last = index
+    }
+    let Some(found) = head else {
+        return None
+    }
+    return Some(diagnostic::Span(start: syntax.tokens[found].start, end: syntax.tokens[last].end))
+} line_span
+
+/// The bytes of a line, its line end included.
+fn whole_line(syntax: syntax::SourceFile, line: u32) -> diagnostic::Span {
+    let index = usize.widen(line)
+    let start = syntax.lines[index - 1].start
+    var end = u32.fit(syntax.source.len())
+    if index < syntax.lines.len() {
+        end = syntax.lines[index].start
+    }
+    return diagnostic::Span(start: start, end: end)
+} whole_line
+
+/// The bytes deleting a name from a grant listing several: with the comma before it, or with
+/// the comma and space after it when it comes first.
+fn grant_name_span(syntax: syntax::SourceFile, line: u32, alias: Str, alloc: mem::Alloc) -> Option[diagnostic::Span] {
+    var tokens = mem::List[usize].empty(alloc)
+    for index in 0..<syntax.tokens.len() {
+        if syntax.tokens[index].line == line {
+            mut tokens.push(index)
+        }
+    }
+    var found: Option[usize] = None
+    for position in 0..<tokens.len() {
+        let index = tokens[position]
+        if syntax.tokens[index].kind == syntax::TokenKind.Ident and syntax.text(index) == alias {
+            found = Some(position)
+        }
+    }
+    let Some(at) = found else {
+        return None
+    }
+    let comma = syntax::TokenKind.Punct(syntax::Punct.Comma)
+    if at > 0 and syntax.tokens[tokens[at - 1]].kind == comma {
+        return Some(diagnostic::Span(start: syntax.tokens[tokens[at - 1]].start, end: syntax.tokens[tokens[at]].end))
+    }
+    if at + 2 >= tokens.len() {
+        return None
+    }
+    return Some(diagnostic::Span(start: syntax.tokens[tokens[at]].start, end: syntax.tokens[tokens[at + 2]].start))
+} grant_name_span
+
+/// Whether a struct derives one of the interfaces whose methods read every field.
+fn derives_reading(structure: ast::StructItem) -> bool {
+    for entry in structure.derived {
+        if is_listed(READING_DERIVES, word: entry.text.as_str()) {
+            return true
+        }
+    }
+    return false
+} derives_reading
+
+/// The names of a struct's fields its where clauses and invariants name alone.
+fn predicated_fields(structure: ast::StructItem, alloc: mem::Alloc) -> mem::Set[text::String] {
+    var predicated = mem::Set[text::String].empty(alloc)
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                match field.where_clause {
+                    Some(condition) => {
+                        condition.visit_paths(fn[mut predicated](path: ast::Path) {
+                            if path.segments.len() == 1 {
+                                discard mut predicated.insert(text::String.of(path.segments[0].text.as_str(), alloc))
+                            }
+                        })
+                    }
+                    None => {}
+                }
+            }
+            ast::StructMember.Invariant(condition) => {
+                condition.visit_paths(fn[mut predicated](path: ast::Path) {
+                    if path.segments.len() == 1 {
+                        discard mut predicated.insert(text::String.of(path.segments[0].text.as_str(), alloc))
+                    }
+                })
+            }
+        }
+    }
+    return predicated
+} predicated_fields
+
+/// A `label: value` by the item and the token it starts at.
+struct LabelAt derives Copy, Eq, Ord {
+    item: ty::ItemId
+    head: u32
+} LabelAt

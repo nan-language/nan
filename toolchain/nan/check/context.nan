@@ -1,0 +1,505 @@
+//! Closure sets: the context packs `nan context` prints, recorded while checking items or lines, the completeness test over them, and the last-green entries of items and of the closure sets of lines.
+
+/// An item's context pack, as `nan context` prints it.
+pkg struct Context {
+    pkg path: text::String
+    pkg file: text::String
+    pkg line: u32
+    pkg lines: core::Range[u32]
+    /// Its package's name and its closure set's manifest directives, in canonical order.
+    pkg package_name: text::String
+    pkg directives: mem::List[text::String]
+    /// Its module's path and the names of the module's items, in byte order.
+    pkg module: text::String
+    pkg names: mem::List[text::String]
+    /// The records of the items, members and expression types checking it reads.
+    pkg apis: mem::List[ApiItem]
+} Context
+
+/// An item's last-green entry: its canonical path and location, its interface hash and its
+/// `nan show --api` lines.
+pkg struct Green {
+    pkg path: text::String
+    pkg file: text::String
+    pkg line: u32
+    pkg interface_hash: Option[hashing::HashValue]
+    pkg api: mem::List[text::String]
+} Green
+
+/// The context packs of the items whose heads lie in a scope, by path and line, each closure set
+/// recorded while checking the item under the first target its package is checked under: of the
+/// item, or of its line `line`.
+pkg fn Session.contexts(self, scope: scope::Scope, line: Option[u32]) -> mem::List[Context] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let checkers = self.checkers()
+    var packs = mem::List[Context].empty(alloc)
+    var listed = mem::Set[HeadAt].empty(alloc)
+    for entry in checkers {
+        let checker = entry.checker
+        let db = checker.db()
+        db.record()
+        for index in 0..<db.items.len() {
+            let item = ty::ItemId(index: u32.fit(index))
+            let data = db.item(item)
+            let targets = check_targets(db.source(db.package_of(item)), alloc)
+            let is_first = targets.len() > 0 and targets[0] == entry.target
+            if not db.is_reported(item) or not is_first {
+                continue
+            }
+            let path = db.file(data.file).path.as_str()
+            let head = db.head_line(item)
+            if not scope.holds(held, path: path, line: Some(head)) {
+                continue
+            }
+            if not mut listed.insert(HeadAt(path: text::String.of(path, alloc), line: head)) {
+                continue
+            }
+            mut packs.push(checker.context(checkers.view(), item, line: line))
+        }
+    }
+    mut packs.sort_by(fn(left: Context, right: Context) => context_order(left, right))
+    return packs
+} Session.contexts
+
+/// The items an item's closure set holds beside it: those checking it reads and the types of
+/// its expressions, in order of first read. The database must be recording.
+fn Checker.closure(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let alloc = self.alloc()
+    self.state.contents().checking.store(db.package_of(item).index)
+    db.about(Some(item), compute: fn() {
+        self.check_item(item)
+        self.check_elaborated(item)
+    })
+    var read = db.read_by(item)
+    match self.typed_body(item) {
+        Some(body) => {
+            let typed = body.contents()
+            var types = mem::List[ty::ItemId].empty(alloc)
+            for local in typed.locals {
+                self.type_items(local.ty, found: mut types)
+            }
+            match typed.root {
+                Some(root) => self.expression_types(root, starts: fn(token: u32) => true, found: mut types)
+                None => {}
+            }
+            for found in types {
+                if read.position(fn(value: ty::ItemId) => value == found).is_none() {
+                    mut read.push(found)
+                }
+            }
+        }
+        None => {}
+    }
+    mut read.retain(fn(value: ty::ItemId) => value != item)
+    return read
+} Checker.closure
+
+/// The items the closure set of a line of an item holds beside the item: those checking the
+/// head, clause or statement starting at the nearest recorded line at or above it reads, with
+/// the item types of the expressions starting on that line.
+fn Checker.line_closure(self, item: ty::ItemId, line: u32) -> mem::List[ty::ItemId] {
+    discard self.closure(item)
+    let db = self.db()
+    let alloc = self.alloc()
+    var checked: u32 = 0
+    for recorded in db.lines_read(item) {
+        if recorded <= line and recorded > checked {
+            checked = recorded
+        }
+    }
+    var read = db.read_on(item, line: checked)
+    match self.typed_body(item) {
+        Some(body) => match body.contents().root {
+            Some(root) => {
+                var types = mem::List[ty::ItemId].empty(alloc)
+                self.expression_types(root, starts: fn(token: u32) => db.line(item, token: token) == checked, found: mut types)
+                for found in types {
+                    if read.position(fn(value: ty::ItemId) => value == found).is_none() {
+                        mut read.push(found)
+                    }
+                }
+            }
+            None => {}
+        }
+        None => {}
+    }
+    mut read.retain(fn(value: ty::ItemId) => value != item)
+    return read
+} Checker.line_closure
+
+/// An item's context pack, recording its closure set, or that of its line `line`, by checking
+/// it.
+fn Checker.context(self, checkers: Slice[TargetChecker], item: ty::ItemId, line: Option[u32]) -> Context {
+    let db = self.db()
+    let alloc = self.alloc()
+    let data = db.item(item)
+    let package_id = db.package_of(item)
+    let core = db.core()
+    let closure = match line {
+        Some(at) => self.line_closure(item, line: at)
+        None => self.closure(item)
+    }
+    var apis = mem::List[ApiItem].empty(alloc)
+    for read in closure {
+        let declared = db.declaration(read)
+        match declared.kind {
+            ast::ItemKind.Impl(_) => continue
+            else => {}
+        }
+        if db.package_of(read) == core {
+            match declared.name(alloc) {
+                Some(name) => if is_core_vocabulary(name.as_str()) {
+                    continue
+                }
+                None => {}
+            }
+        }
+        let other = db.item(read)
+        var lines = self.api_lines(read, docs: false, viewer: Some(data.module))
+        for digest in take self.digest_lines(checkers, item: read) {
+            mut lines.push(take digest)
+        }
+        mut apis.push(ApiItem(path: self.shown_path(read), package_name: text::String.of(db.package_data(db.package_of(read)).name.as_str(), alloc), file: text::String.of(db.file(other.file).path.as_str(), alloc), line: db.head_line(read), lines: take lines))
+    }
+    var names = mem::List[text::String].empty(alloc)
+    for other in db.module(data.module).items {
+        match db.declaration(other).name(alloc) {
+            Some(name) => mut names.push(take name)
+            None => {}
+        }
+    }
+    mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var distinct = mem::List[text::String].empty(alloc)
+    for name in take names {
+        let count = distinct.len()
+        if count == 0 or distinct[count - 1].as_str() != name.as_str() {
+            mut distinct.push(take name)
+        }
+    }
+    let file = db.file(data.file)
+    let path = match self.canonical_path(item) {
+        Some(canonical) => canonical
+        None => text::String.empty(alloc)
+    }
+    return Context(path: take path, file: text::String.of(file.path.as_str(), alloc), line: db.head_line(item), lines: file.syntax.item_lines(file.syntax.items[data.index]), package_name: text::String.of(db.package_data(package_id).name.as_str(), alloc), directives: self.closure_directives(item), module: db.module_path(data.module), names: take distinct, apis: take apis)
+} Checker.context
+
+/// The manifest directives of an item's closure set, in canonical order: its package's
+/// `language`, `targets` and `entry` directives, the `dep` directive of each alias it uses
+/// and the directives naming its module.
+fn Checker.closure_directives(self, item: ty::ItemId) -> mem::List[text::String] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let data = db.item(item)
+    let package_data = db.package_data(db.package_of(item))
+    let module_data = db.module(data.module)
+    let module_name = if module_data.root {
+        package_data.name.as_str()
+    } else {
+        module_data.name.as_str()
+    }
+    let syntax = db.file(data.file).syntax
+    let span = syntax.items[data.index]
+    var aliases = mem::Set[text::String].empty(alloc)
+    for index in syntax.path_starts(span.head, end: span.end) {
+        discard mut aliases.insert(text::String.of(syntax.text(index), alloc))
+    }
+    var directives = mem::List[text::String].empty(alloc)
+    let manifest = db.source(db.package_of(item)).files[0].syntax
+    var tree_index: Option[usize] = None
+    for index in 0..<manifest.items.len() {
+        if manifest.items[index].tree.is_some() and not manifest.items[index].abandoned {
+            tree_index = Some(index)
+            break
+        }
+    }
+    let Some(at) = tree_index else {
+        return directives
+    }
+    let Some(tree) = manifest.items[at].tree else {
+        return directives
+    }
+    var found = mem::List[DirectiveLine].empty(alloc)
+    for node in tree.descendants(tree.root(), alloc) {
+        if tree.rule(node) != syntax::Rule.Directive {
+            continue
+        }
+        var children = tree.child_nodes(node)
+        let Some(inner) = mut children.next() else {
+            continue
+        }
+        let Some(key) = directive_key(manifest, tree, inner, aliases, module_name, alloc) else {
+            continue
+        }
+        let Some(directive) = tree.span(inner, alloc) else {
+            expect false
+            continue
+        }
+        mut found.push(DirectiveLine(key: take key, shown: shown_line(manifest, line: manifest.tokens[usize.widen(directive.head)].line, alloc)))
+    }
+    mut found.sort_by(fn(left: DirectiveLine, right: DirectiveLine) => left.cmp(right))
+    for line in take found {
+        mut directives.push(take line.shown)
+    }
+    return directives
+} Checker.closure_directives
+
+/// The items a type names: its own, its arguments' and those of its parts.
+fn Checker.type_items(self, ty: ty::Ty, mut found: mem::List[ty::ItemId]) {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Item(item: named, args: args) => {
+            mut found.push(named)
+            for arg in types.arg_list(args) {
+                match arg {
+                    ty::Arg.Ty(inner) => self.type_items(inner, mut found)
+                    ty::Arg.Const(_) => {}
+                }
+            }
+        }
+        ty::TyKind.Fn(id) => {
+            let function = types.fn_of(id)
+            for param in function.params {
+                self.type_items(param.ty, mut found)
+            }
+            self.type_items(function.result, mut found)
+            match function.failure {
+                Some(failure) => self.type_items(failure, mut found)
+                None => {}
+            }
+        }
+        ty::TyKind.Dyn(bound) => mut found.push(bound.item)
+        ty::TyKind.Registers(named) => mut found.push(named)
+        else => {}
+    }
+} Checker.type_items
+
+/// The items the types of an expression and of those it holds name, for those starting at a
+/// token `starts` accepts.
+fn Checker.expression_types(self, expr: TExpr, starts: fn(token: u32) -> bool, mut found: mem::List[ty::ItemId]) {
+    if starts(expr.token) {
+        self.type_items(expr.ty, mut found)
+    }
+    expr.each_child(fn[mut found](child: TExpr) => self.expression_types(child, starts, mut found))
+} Checker.expression_types
+
+/// The last-green entries of the workspace's items: of those whose heads lie in a scope, if any,
+/// and of those in the closure sets of `lines`, each once, by path.
+pkg fn Session.greens(self, scope: Option[scope::Scope], lines: Slice[diagnostic::At]) -> mem::List[Green] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let checkers = self.checkers()
+    var found = mem::List[Green].empty(alloc)
+    var listed = mem::Set[HeadAt].empty(alloc)
+    for entry in checkers {
+        let checker = entry.checker
+        let db = checker.db()
+        if lines.len() > 0 {
+            db.record()
+        }
+        for item in take checker.green_items(held, scope, lines) {
+            let data = db.item(item)
+            let path = db.file(data.file).path.as_str()
+            let head = db.head_line(item)
+            if not mut listed.insert(HeadAt(path: text::String.of(path, alloc), line: head)) {
+                continue
+            }
+            var api = checker.api_lines(item, docs: true, viewer: None)
+            for digest in take checker.digest_lines(checkers.view(), item: item) {
+                mut api.push(take digest)
+            }
+            mut found.push(Green(path: checker.shown_path(item), file: text::String.of(path, alloc), line: head, interface_hash: checker.hashes(item).interface_hash, api: take api))
+        }
+    }
+    mut found.sort_by(fn(left: Green, right: Green) => green_order(left, right))
+    return found
+} Session.greens
+
+/// The items whose last-green entries a checker gives, in order and with repeats: each reported
+/// item whose head lies in a scope, if any, and each reported item holding one of `lines`
+/// followed by the reported items of its closure set of that line.
+fn Checker.green_items(self, held: workspace::Workspace, scope: Option[scope::Scope], lines: Slice[diagnostic::At]) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var items = mem::List[ty::ItemId].empty(self.alloc())
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        let data = db.item(item)
+        if not db.is_reported(item) {
+            continue
+        }
+        let file = db.file(data.file)
+        match scope {
+            Some(within) => if within.holds(held, path: file.path.as_str(), line: Some(db.head_line(item))) {
+                mut items.push(item)
+            }
+            None => {}
+        }
+        let item_lines = file.syntax.item_lines(file.syntax.items[data.index])
+        for at in lines {
+            if at.path.as_str() != file.path.as_str() or not item_lines.contains(at.line) {
+                continue
+            }
+            mut items.push(item)
+            for read in self.line_closure(item, line: at.line) {
+                if db.is_reported(read) {
+                    mut items.push(read)
+                }
+            }
+        }
+    }
+    return items
+} Checker.green_items
+
+/// The path a record shows an item by: its canonical path, or its own.
+fn Checker.shown_path(self, item: ty::ItemId) -> text::String {
+    match self.canonical_path(item) {
+        Some(canonical) => return canonical
+        None => {}
+    }
+    match self.own_path(item) {
+        Some(own) => return own
+        None => return text::String.empty(self.alloc())
+    }
+} Checker.shown_path
+
+/// The rank and key ordering a manifest directive among those of a closure set: `language`,
+/// `targets` and `entry`, the `dep` directive of an alias the set uses, then the `allow` and
+/// `deny` directives naming its module; none for another directive.
+fn directive_key(manifest: syntax::SourceFile, tree: syntax::Tree, inner: u32, aliases: mem::Set[text::String], module_name: Str, alloc: mem::Alloc) -> Option[DirectiveKey] {
+    var words = mem::List[u32].empty(alloc)
+    for held in tree.descendants(inner, alloc) {
+        for token in tree.child_tokens(held) {
+            if manifest.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+                mut words.push(token)
+            }
+        }
+    }
+    var key = text::String.empty(alloc)
+    match tree.rule(inner) {
+        syntax::Rule.LanguageDirective => return Some(DirectiveKey(rank: 0, key: take key))
+        syntax::Rule.TargetsDirective => return Some(DirectiveKey(rank: 1, key: take key))
+        syntax::Rule.EntryDirective => return Some(DirectiveKey(rank: 2, key: take key))
+        syntax::Rule.DepDirective => {
+            if words.len() < 2 {
+                return None
+            }
+            let alias = manifest.text(usize.widen(words[1]))
+            if not aliases.contains_by(fn(value: text::String) => value.as_str().cmp(alias)) {
+                return None
+            }
+            mut key.append(alias)
+            return Some(DirectiveKey(rank: 3, key: take key))
+        }
+        syntax::Rule.AllowDirective => return allowed_key(manifest, tree, inner, module_name, alloc)
+        syntax::Rule.DenyDirective => {
+            var naming = false
+            for index in 1..<words.len() {
+                if manifest.text(usize.widen(words[index])) == module_name {
+                    naming = true
+                }
+            }
+            if not naming {
+                return None
+            }
+            for index in 0..<words.len() {
+                if index > 0 {
+                    mut key.push(' ')
+                }
+                mut key.append(manifest.text(usize.widen(words[index])))
+            }
+            return Some(DirectiveKey(rank: 5, key: take key))
+        }
+        else => return None
+    }
+} directive_key
+
+/// The key of an `allow` directive naming a module: its authority's tokens, joined by spaces.
+fn allowed_key(manifest: syntax::SourceFile, tree: syntax::Tree, inner: u32, module_name: Str, alloc: mem::Alloc) -> Option[DirectiveKey] {
+    let Some(names) = tree.find(inner, rule: syntax::Rule.NameList) else {
+        return None
+    }
+    var naming = false
+    for token in tree.child_tokens(names) {
+        if manifest.text(usize.widen(token)) == module_name {
+            naming = true
+        }
+    }
+    if not naming {
+        return None
+    }
+    let Some(authority) = tree.find(inner, rule: syntax::Rule.Authority) else {
+        expect false
+        return None
+    }
+    let Some(written) = tree.span(authority, alloc) else {
+        expect false
+        return None
+    }
+    var key = text::String.empty(alloc)
+    for token in written.head..=written.last {
+        if token > written.head {
+            mut key.push(' ')
+        }
+        mut key.append(manifest.text(usize.widen(token)))
+    }
+    return Some(DirectiveKey(rank: 4, key: take key))
+} allowed_key
+
+/// A manifest line as a record shows it: printable, without its leading white space.
+fn shown_line(manifest: syntax::SourceFile, line: u32, alloc: mem::Alloc) -> text::String {
+    let printed = output::printable(manifest.line_text(line), alloc)
+    let trimmed = platform::trimmed_run(printed.as_str())
+    var shown = text::String.empty(alloc)
+    if trimmed.end == 0 {
+        return shown
+    }
+    let Some(rest) = printed.slice_bytes(trimmed.start, end: printed.byte_len()) else {
+        expect false
+        return shown
+    }
+    mut shown.append(rest)
+    return shown
+} shown_line
+
+/// An item's location, by its file's path and its head's line.
+struct HeadAt derives Eq, Ord {
+    path: text::String
+    line: u32
+} HeadAt
+
+/// What orders a manifest directive among those of a closure set: its kind's rank, then the
+/// alias or authority it names.
+struct DirectiveKey derives Eq, Ord {
+    rank: u8
+    key: text::String
+} DirectiveKey
+
+/// A manifest directive of a closure set, as a record shows it, with its key.
+struct DirectiveLine derives Eq, Ord {
+    key: DirectiveKey
+    shown: text::String
+} DirectiveLine
+
+/// Context packs by file path, then line.
+fn context_order(left: Context, right: Context) -> core::Ordering {
+    let files = left.file.as_str().cmp(right.file.as_str())
+    if files != core::Ordering.Equal {
+        return files
+    }
+    return left.line.cmp(right.line)
+} context_order
+
+/// Last-green entries by path, then file path, then line.
+fn green_order(left: Green, right: Green) -> core::Ordering {
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    let files = left.file.as_str().cmp(right.file.as_str())
+    if files != core::Ordering.Equal {
+        return files
+    }
+    return left.line.cmp(right.line)
+} green_order

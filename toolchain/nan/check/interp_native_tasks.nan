@@ -1,0 +1,69 @@
+//! The channels interpreter runs make without a wait: a channel's senders and receiver share a buffer drawn for its capacity, counting the handles that keep it; sending and receiving wait, which interpreter runs never do.
+
+/// The positions of a channel's shared parts: its buffer, its allocation and its handles.
+const CHANNEL_BUFFER: usize = 0
+
+const CHANNEL_ALLOCATION: usize = 1
+
+const CHANNEL_HANDLES: usize = 2
+
+/// A member of `task::Channel` or `task::Sender` an interpreter run can call; none for another.
+fn Interpreter.task_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if owner == "task::Channel" and (member == "bounded" or member == "try_bounded") {
+        var element = ty::Ty.unit()
+        if type_args.len() > 0 {
+            element = type_args[0].ty().value_or(ty::Ty.unit())
+        }
+        let placed = self.ck.interp_layout(element)
+        let cell = self.cell_of(args[1])
+        var bytes = placed.size.saturating_mul(args[0].int_value().low_bits())
+        if bytes < 1 {
+            bytes = 1
+        }
+        let Some(allocation) = mut self.budgets.allocate(cell, size: bytes, align: placed.align) else {
+            return Some(try self.exhausted(fallible: member == "try_bounded", at))
+        }
+        var state = Val.single(Val.Array(mem::Shared.of(mem::List[Val].empty(alloc), alloc)), alloc)
+        mut state.push(Val.Int(wide::Wide.of_u64(u64.widen(allocation))))
+        mut state.push(Val.Int(wide::Wide.of_u64(2)))
+        let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take state, alloc)), writable: true, size: 0)
+        let shared = Val.Ref(Loc(extent: extent, path: mem::List[u32].empty(alloc)))
+        let sender = Val.Struct(item: self.ty_item("task", name: "Sender"), fields: mem::Shared.of(Val.single(shared.copy(alloc), alloc), alloc))
+        let receiver = Val.Struct(item: self.ty_item("task", name: "Receiver"), fields: mem::Shared.of(Val.single(take shared, alloc), alloc))
+        var ends = Val.single(take sender, alloc)
+        mut ends.push(take receiver)
+        return Some(InterpFlow.Return(Val.Struct(item: self.ty_item("task", name: "Channel"), fields: mem::Shared.of(take ends, alloc))))
+    }
+    if owner == "task::Sender" and member == "split" {
+        let sender = self.deref(args[0])
+        let handles = sender.fields()[0].place().with(u32.fit(CHANNEL_HANDLES), alloc)
+        let count = self.memory.get(handles).int_value()
+        mut self.memory.set(handles, stored: Val.Int(count.wrapping_add(wide::Wide.one())))
+        return Some(InterpFlow.Return(take sender))
+    }
+    return None
+} Interpreter.task_member
+
+/// Releases a sender or receiver: the last handle of a channel releases its buffered values
+/// and returns its buffer's memory.
+fn Interpreter.task_release(mut self, handle: Val) {
+    let alloc = self.alloc
+    let state = handle.fields()[0].place()
+    let handles = state.with(u32.fit(CHANNEL_HANDLES), alloc)
+    let left = self.memory.get(handles).int_value().wrapping_sub(wide::Wide.one())
+    mut self.memory.set(handles, stored: Val.Int(left))
+    if left.is_zero() {
+        let buffered = self.memory.get(state.with(u32.fit(CHANNEL_BUFFER), alloc)).copy(alloc)
+        mut self.store_release(buffered)
+        let allocation = self.memory.get(state.with(u32.fit(CHANNEL_ALLOCATION), alloc)).int_value()
+        mut self.budgets.free(u32.truncate(allocation.low_bits()))
+    }
+} Interpreter.task_release

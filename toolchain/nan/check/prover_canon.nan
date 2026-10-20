@@ -1,0 +1,1486 @@
+//! Canonicalisation: the premises and negated goal of a query as clauses of literals over linear integer atoms, boolean atoms and bounded `all`; then the relevant clauses alone, their symbols renumbered, sorted into term order.
+
+/// A term of a linear sum with its coefficient.
+struct LinearTerm derives Copy, Eq, Hash {
+    coefficient: wide::Wide
+    term: u32
+} LinearTerm
+
+/// Σ ci × ti and a constant.
+struct Linear derives Eq, Hash {
+    terms: mem::List[LinearTerm]
+    constant: wide::Wide
+} Linear
+
+enum Atom derives Eq, Hash {
+    /// Σ ci × ti ≤ c.
+    Le(Linear)
+    /// Σ ci × ti = c.
+    Eq(Linear)
+    Bool(u32)
+    All(Forall)
+} Atom
+
+/// `all x in low..<high: body`, or `..=`, the body a formula over the bound symbol x.
+struct Forall derives Copy, Eq, Hash {
+    low: u32
+    high: u32
+    inclusive: bool
+    bound: u32
+    body: u32
+} Forall
+
+struct Literal derives Eq, Hash {
+    negated: bool
+    atom: Atom
+} Literal
+
+/// Where a premise comes from, as statuses read it.
+enum Origin derives Copy, Eq {
+    Fact
+    /// The operand of an `assume`.
+    Assume
+    /// The condition of an obligation site, by its index among its function's sites.
+    Site(usize)
+    Goal
+} Origin
+
+/// A formula in negation normal form, its leaves not yet atoms.
+enum Formula {
+    True
+    False
+    And(mem::List[Formula])
+    Or(mem::List[Formula])
+    /// A comparison or boolean term, holding or negated.
+    Leaf(term: u32, holding: bool)
+    Lit(Literal)
+    /// A boolean term holding or negated, expanded only where a clause reaches it.
+    Term(term: u32, holding: bool)
+} Formula
+
+/// A leaf as a literal, or the truth value it folds to.
+enum Folded {
+    True
+    False
+    Lit(Literal)
+} Folded
+
+/// A symbol standing for an ite condition whose defining clauses are not yet emitted.
+struct DefinedCondition derives Copy {
+    condition: u32
+    symbol: u32
+} DefinedCondition
+
+/// A term in a polarity.
+struct PolarTerm derives Copy, Eq, Hash {
+    term: u32
+    positive: bool
+} PolarTerm
+
+/// A division by its dividend and divisor.
+struct Division derives Copy, Eq, Hash {
+    dividend: u32
+    divisor: u32
+} Division
+
+/// A clause with the origin of the premise it comes from.
+struct OriginClause {
+    clause: mem::List[Literal]
+    origin: Origin
+} OriginClause
+
+/// The canonicalisation of a query's premises and goal; the term store it extends goes beside
+/// it.
+struct Canon {
+    ck: Checker
+    /// The package of the code judged, beside which another package's open enum may grow.
+    package_id: ty::PackageId
+    normal: mem::HashMap[u32, u32]
+    /// The fresh boolean symbol standing for each ite condition that is not an atom.
+    conditions: mem::HashMap[u32, u32]
+    /// The symbols standing for conditions whose defining clauses are not yet emitted.
+    defined: mem::List[DefinedCondition]
+    /// The fresh boolean symbol standing for each conjunction a term gives in a polarity.
+    shared: mem::HashMap[PolarTerm, u32]
+    /// The divisions whose facts are given, by dividend and divisor.
+    divided: mem::HashMap[Division, Unit]
+    clauses: mem::List[OriginClause]
+} Canon
+
+/// A canonical query: its relevant clauses in term order over its own store, each with the
+/// origin of the premise it comes from.
+struct CanonQuery {
+    terms: Terms
+    clauses: mem::List[mem::List[Literal]]
+    origins: mem::List[Origin]
+    /// The obligation hash: the hash of the concatenated encodings of its clauses.
+    hash: hashing::HashValue
+} CanonQuery
+
+/// Copies terms into a new store, numbering fresh, skolem and bound symbols in order of first
+/// occurrence; the store copied from goes beside it.
+struct Transfer {
+    to: Terms
+    map: mem::HashMap[u32, u32]
+} Transfer
+
+/// A conjunction within a clause, standing as a fresh boolean symbol, and its parts.
+struct Conjunction {
+    symbol: u32
+    parts: mem::List[Formula]
+} Conjunction
+
+/// An integer comparison: its operator and operands.
+struct IntComparison derives Copy {
+    op: nir::BinaryOp
+    left: u32
+    right: u32
+} IntComparison
+
+/// How a linear sum interprets an integer term.
+enum Arithmetic derives Copy {
+    Add(left: u32, right: u32)
+    Sub(left: u32, right: u32)
+    Neg(u32)
+    /// A product with a literal operand: the literal's value and the other operand.
+    Scaled(literal: wide::Wide, other: u32)
+    Inv(u32)
+    /// Any other term, an atom of the sum.
+    Opaque
+} Arithmetic
+
+/// What the range premises of an integer term follow from.
+enum RangeShape derives Copy {
+    /// A literal, ite or bound symbol, which has none.
+    Bare
+    Tag(u32)
+    Divided(dividend: u32, divisor: u32)
+    /// An interpreted arithmetic term, defined by the sum it interprets.
+    Defined
+    Binary(op: nir::BinaryOp, left: u32, right: u32)
+    /// Any other term, ranged by its type.
+    Typed
+} RangeShape
+
+/// A literal with its encoding, by which literals are in term order.
+struct KeyedLiteral {
+    key: mem::Bytes
+    literal: Literal
+} KeyedLiteral
+
+/// A term of a sum with its term's key.
+struct KeyedSummand {
+    key: mem::Shared[mem::Bytes]
+    summand: LinearTerm
+} KeyedSummand
+
+/// A clause with its encoding and the origin of the premise it comes from.
+struct SortedClause {
+    key: mem::Bytes
+    clause: mem::List[Literal]
+    origin: Origin
+} SortedClause
+
+/// The literal holding exactly when this one does not.
+fn Literal.negation(self, alloc: mem::Alloc) -> Literal {
+    if not self.negated {
+        match self.atom {
+            Atom.Le(sum) => return Literal(negated: false, atom: Atom.Le(Linear(terms: opposite_terms(sum.terms.view(), alloc), constant: sum.constant.wrapping_neg().wrapping_sub(wide::Wide.one()))))
+            else => {}
+        }
+    }
+    return Literal(negated: not self.negated, atom: self.atom.copy(alloc))
+} Literal.negation
+
+/// The bounded `all` a literal holds without negating it.
+fn Literal.held_all(self) -> Option[Forall] {
+    if self.negated {
+        return None
+    }
+    return self.all_atom()
+} Literal.held_all
+
+/// The bounded `all` of a literal's atom.
+fn Literal.all_atom(self) -> Option[Forall] {
+    return match self.atom {
+        Atom.All(forall) => Some(forall)
+        else => None
+    }
+} Literal.all_atom
+
+/// The terms of a sum with their coefficients negated.
+fn opposite_terms(linear_terms: Slice[LinearTerm], alloc: mem::Alloc) -> mem::List[LinearTerm] {
+    var opposite = mem::List[LinearTerm].empty(alloc)
+    for summand in linear_terms {
+        mut opposite.push(LinearTerm(coefficient: summand.coefficient.wrapping_neg(), term: summand.term))
+    }
+    return opposite
+} opposite_terms
+
+fn Canon.new(take ck: Checker, package_id: ty::PackageId) -> Canon {
+    let alloc = ck.alloc()
+    return Canon(ck: take ck, package_id: package_id, normal: mem::HashMap[u32, u32].empty(seed: 0, alloc), conditions: mem::HashMap[u32, u32].empty(seed: 0, alloc), defined: mem::List[DefinedCondition].empty(alloc), shared: mem::HashMap[PolarTerm, u32].empty(seed: 0, alloc), divided: mem::HashMap[Division, Unit].empty(seed: 0, alloc), clauses: mem::List[OriginClause].empty(alloc))
+} Canon.new
+
+fn Canon.premise(mut self, mut terms: Terms, term: u32, origin: Origin) {
+    let formula = mut self.formula(mut terms, term, positive: true)
+    mut self.emit(mut terms, take formula, origin)
+} Canon.premise
+
+fn Canon.negated_goal(mut self, mut terms: Terms, goal: u32) {
+    let formula = mut self.formula(mut terms, term: goal, positive: false)
+    mut self.emit(mut terms, take formula, origin: Origin.Goal)
+} Canon.negated_goal
+
+/// A formula as negation normal form, one connective deep, its operands terms: guards and
+/// boolean ites as disjunctions, `not` pushed onto atoms, and each `any` within no `all` as
+/// its body for a skolem symbol.
+fn Canon.formula(mut self, mut terms: Terms, term: u32, positive: bool) -> Formula {
+    let alloc = terms.alloc
+    let boolean = terms.sort(term) == Sort.Bool
+    match first terms.get(term) {
+        Term.Lit(nir::Literal.Bool(value)) => {
+            if value == positive {
+                return Formula.True
+            }
+            return Formula.False
+        }
+        Term.And(parts) => return polar_parts(parts.view(), positive, conjunction: positive, alloc)
+        Term.Or(parts) => return polar_parts(parts.view(), positive, conjunction: not positive, alloc)
+        Term.Not(inner) => return mut self.formula(mut terms, term: inner, positive: not positive)
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) if boolean => return ite_formula(condition, then, otherwise, positive, alloc)
+        Term.Quant(all: all, low: low, high: high, inclusive: inclusive, bound: bound, body: body) => {
+            var held = body
+            if not positive {
+                held = mut terms.negation(body)
+            }
+            let forall = Forall(low: low, high: high, inclusive: inclusive, bound: bound, body: held)
+            if all == positive {
+                return Formula.Lit(Literal(negated: false, atom: Atom.All(forall)))
+            }
+            return mut self.witness(mut terms, quantified: forall)
+        }
+        else => {}
+    }
+    return Formula.Leaf(term: term, holding: positive)
+} Canon.formula
+
+/// The parts of a conjunction or disjunction in a polarity, joined by `and` or `or`.
+fn polar_parts(parts: Slice[u32], positive: bool, conjunction: bool, alloc: mem::Alloc) -> Formula {
+    var formulas = mem::List[Formula].empty(alloc)
+    for part in parts {
+        mut formulas.push(Formula.Term(term: part, holding: positive))
+    }
+    if conjunction {
+        return Formula.And(take formulas)
+    }
+    return Formula.Or(take formulas)
+} polar_parts
+
+/// A boolean ite in a polarity: its condition implies its first arm, and its negation the
+/// other.
+fn ite_formula(condition: u32, then: u32, otherwise: u32, positive: bool, alloc: mem::Alloc) -> Formula {
+    let forward = formula_pair(Formula.Term(term: condition, holding: false), second: Formula.Term(term: then, holding: positive), alloc)
+    let backward = formula_pair(Formula.Term(term: condition, holding: true), second: Formula.Term(term: otherwise, holding: positive), alloc)
+    var parts = mem::List[Formula].empty(alloc)
+    mut parts.push(take forward)
+    mut parts.push(take backward)
+    return Formula.And(take parts)
+} ite_formula
+
+/// The disjunction of two formulas.
+fn formula_pair(take first_formula: Formula, take second: Formula, alloc: mem::Alloc) -> Formula {
+    var parts = mem::List[Formula].empty(alloc)
+    mut parts.push(take first_formula)
+    mut parts.push(take second)
+    return Formula.Or(take parts)
+} formula_pair
+
+/// `any x in low..<high: body` as the body for a skolem symbol k, with low ≤ k and k < high.
+fn Canon.witness(mut self, mut terms: Terms, quantified: Forall) -> Formula {
+    let alloc = terms.alloc
+    let ty = terms.ty(quantified.bound)
+    let skolem = mut terms.skolem(ty)
+    let body = mut terms.substitute(quantified.body, from: quantified.bound, to: skolem)
+    let above = mut terms.compare(nir::BinaryOp.Le, left: quantified.low, right: skolem)
+    var op = nir::BinaryOp.Lt
+    if quantified.inclusive {
+        op = nir::BinaryOp.Le
+    }
+    let below = mut terms.compare(op, left: skolem, right: quantified.high)
+    var parts = mem::List[Formula].empty(alloc)
+    mut parts.push(Formula.Term(term: body, holding: true))
+    mut parts.push(Formula.Leaf(term: above, holding: true))
+    mut parts.push(Formula.Leaf(term: below, holding: true))
+    return Formula.And(take parts)
+} Canon.witness
+
+/// The term, following `not`, and the polarity at which it gives its formula's shape.
+fn Canon.stripped(self, terms: Terms, term: u32, positive: bool) -> PolarTerm {
+    match terms.get(term) {
+        Term.Not(inner) => return self.stripped(terms, term: inner, positive: not positive)
+        else => return PolarTerm(term: term, positive: positive)
+    }
+} Canon.stripped
+
+fn Canon.negate(mut self, mut terms: Terms, take formula: Formula) -> Formula {
+    let alloc = terms.alloc
+    match formula {
+        Formula.True => return Formula.False
+        Formula.False => return Formula.True
+        Formula.And(parts) => return Formula.Or(mut self.negated_parts(mut terms, take parts))
+        Formula.Or(parts) => return Formula.And(mut self.negated_parts(mut terms, take parts))
+        Formula.Leaf(term: term, holding: holding) => return Formula.Leaf(term: term, holding: not holding)
+        Formula.Term(term: term, holding: holding) => return Formula.Term(term: term, holding: not holding)
+        Formula.Lit(literal) => {
+            let Some(forall) = literal.held_all() else {
+                return Formula.Lit(literal.negation(alloc))
+            }
+            let body = mut terms.negation(forall.body)
+            return mut self.witness(mut terms, quantified: Forall(low: forall.low, high: forall.high, inclusive: forall.inclusive, bound: forall.bound, body: body))
+        }
+    }
+} Canon.negate
+
+/// Each formula of a list negated, in order.
+fn Canon.negated_parts(mut self, mut terms: Terms, take parts: mem::List[Formula]) -> mem::List[Formula] {
+    var negated = mem::List[Formula].empty(terms.alloc)
+    for part in take parts {
+        mut negated.push(mut self.negate(mut terms, formula: take part))
+    }
+    return negated
+} Canon.negated_parts
+
+/// Adds a formula's clauses: each conjunct its own premise.
+fn Canon.emit(mut self, mut terms: Terms, take formula: Formula, origin: Origin) {
+    match formula {
+        Formula.True => return
+        Formula.And(parts) => {
+            for part in take parts {
+                mut self.emit(mut terms, formula: take part, origin)
+            }
+            return
+        }
+        Formula.Term(term: term, holding: holding) => {
+            let expanded = mut self.formula(mut terms, term, positive: holding)
+            mut self.emit(mut terms, formula: take expanded, origin)
+            return
+        }
+        else => {}
+    }
+    mut self.clause(mut terms, take formula, origin)
+} Canon.emit
+
+/// Adds a disjunction as a clause, a conjunction within it standing as a fresh boolean
+/// symbol, followed by the clauses defining each symbol it introduces.
+fn Canon.clause(mut self, mut terms: Terms, take formula: Formula, origin: Origin) {
+    let alloc = terms.alloc
+    var leaves = mem::List[Formula].empty(alloc)
+    var conjunctions = mem::List[Conjunction].empty(alloc)
+    mut self.disjuncts(mut terms, take formula, mut leaves, mut conjunctions)
+    let mark = self.defined.len()
+    var literals = mem::List[Literal].empty(alloc)
+    var satisfied = false
+    for leaf in take leaves {
+        match mut self.literal(mut terms, take leaf) {
+            Folded.True => {
+                satisfied = true
+            }
+            Folded.False => {}
+            Folded.Lit(literal) => mut literals.push(take literal)
+        }
+    }
+    if not satisfied {
+        mut self.clauses.push(OriginClause(clause: take literals, origin: origin))
+    }
+    for conjunction in take conjunctions {
+        let Conjunction(symbol: symbol, parts: parts) = conjunction
+        var back = mem::List[Formula].empty(alloc)
+        mut back.push(Formula.Leaf(term: symbol, holding: true))
+        for part in take parts {
+            mut self.emit(mut terms, formula: formula_pair(Formula.Leaf(term: symbol, holding: false), second: part.copy(alloc), alloc), origin)
+            mut back.push(mut self.negate(mut terms, formula: take part))
+        }
+        mut self.emit(mut terms, formula: Formula.Or(take back), origin)
+    }
+    var defined = mem::List[DefinedCondition].empty(alloc)
+    for index in mark..<self.defined.len() {
+        mut defined.push(self.defined[index])
+    }
+    mut self.defined.truncate(mark)
+    for entry in defined {
+        let forward = mut self.formula(mut terms, term: entry.condition, positive: true)
+        mut self.emit(mut terms, formula: formula_pair(Formula.Leaf(term: entry.symbol, holding: false), second: take forward, alloc), origin)
+        let backward = mut self.formula(mut terms, term: entry.condition, positive: false)
+        mut self.emit(mut terms, formula: formula_pair(Formula.Leaf(term: entry.symbol, holding: true), second: take backward, alloc), origin)
+    }
+} Canon.clause
+
+fn Canon.disjuncts(mut self, mut terms: Terms, take formula: Formula, mut leaves: mem::List[Formula], mut conjunctions: mem::List[Conjunction]) {
+    match formula {
+        Formula.Or(parts) => {
+            for part in take parts {
+                mut self.disjuncts(mut terms, formula: take part, mut leaves, mut conjunctions)
+            }
+            return
+        }
+        Formula.And(parts) => {
+            let symbol = mut terms.fresh(ty::Ty.scalar(ty::Scalar.Bool))
+            mut leaves.push(Formula.Leaf(term: symbol, holding: true))
+            mut conjunctions.push(Conjunction(symbol: symbol, parts: take parts))
+            return
+        }
+        Formula.Term(term: term, holding: holding) => {
+            mut self.term_disjuncts(mut terms, term, positive: holding, mut leaves, mut conjunctions)
+            return
+        }
+        else => {}
+    }
+    mut leaves.push(take formula)
+} Canon.disjuncts
+
+/// The disjuncts a boolean term gives in a polarity; a conjunction stands as a fresh boolean
+/// symbol, the same for every clause reaching the term in that polarity.
+fn Canon.term_disjuncts(
+    mut self,
+    mut terms: Terms,
+    term: u32,
+    positive: bool,
+    mut leaves: mem::List[Formula],
+    mut conjunctions: mem::List[Conjunction],
+    ) {
+    let shape = self.stripped(terms, term, positive)
+    match self.shared.get(shape) {
+        Some(symbol) => {
+            mut leaves.push(Formula.Leaf(term: symbol, holding: true))
+            return
+        }
+        None => {}
+    }
+    let expanded = mut self.formula(mut terms, term, positive)
+    match expanded {
+        Formula.And(parts) => {
+            let symbol = mut terms.fresh(ty::Ty.scalar(ty::Scalar.Bool))
+            discard mut self.shared.insert(shape, value: symbol)
+            mut leaves.push(Formula.Leaf(term: symbol, holding: true))
+            mut conjunctions.push(Conjunction(symbol: symbol, parts: take parts))
+            return
+        }
+        else => {}
+    }
+    mut self.disjuncts(mut terms, formula: take expanded, mut leaves, mut conjunctions)
+} Canon.term_disjuncts
+
+/// A leaf as a literal: an integer comparison as a linear atom, any other term as a
+/// boolean atom; a literal boolean as its truth value.
+fn Canon.literal(mut self, mut terms: Terms, take leaf: Formula) -> Folded {
+    match leaf {
+        Formula.True => return Folded.True
+        Formula.False => return Folded.False
+        Formula.Lit(literal) => return Folded.Lit(take literal)
+        Formula.Leaf(term: term, holding: positive) => {
+            match mut self.comparison(mut terms, term, positive) {
+                Some(folded) => return folded
+                None => {}
+            }
+            let atom = mut self.normal_of(mut terms, term)
+            match terms.bool_value(atom) {
+                Some(value) => {
+                    if value == positive {
+                        return Folded.True
+                    }
+                    return Folded.False
+                }
+                None => return Folded.Lit(Literal(negated: not positive, atom: Atom.Bool(atom)))
+            }
+        }
+        else => {
+            expect false
+            return Folded.False
+        }
+    }
+} Canon.literal
+
+/// An integer comparison as a linear atom, its coefficients divided by their greatest
+/// common divisor; none for another term, or one whose sums leave the integers the prover
+/// computes with.
+fn Canon.comparison(mut self, mut terms: Terms, term: u32, positive: bool) -> Option[Folded] {
+    let Some(compared) = terms.integer_comparison(term) else {
+        return None
+    }
+    var op = compared.op
+    if not positive {
+        op = complement_op(op)
+    }
+    let Some(left) = mut self.linear_sum(mut terms, term: compared.left) else {
+        return None
+    }
+    let Some(right) = mut self.linear_sum(mut terms, term: compared.right) else {
+        return None
+    }
+    var difference = left
+    for summand in right.terms {
+        let Some(negated) = summand.coefficient.checked_neg() else {
+            return None
+        }
+        if not add_term(mut difference.terms, coefficient: negated, term: summand.term) {
+            return None
+        }
+    }
+    let Some(gap) = difference.constant.checked_sub(right.constant) else {
+        return None
+    }
+    mut difference.terms.retain(fn(value: LinearTerm) => not value.coefficient.is_zero())
+    let Some(constant) = gap.checked_neg() else {
+        return None
+    }
+    let Some(bound) = comparison_bound(op, constant) else {
+        return None
+    }
+    let summands = difference.terms
+    var folded = Folded.False
+    match op {
+        nir::BinaryOp.Le or nir::BinaryOp.Lt => {
+            folded = folded_le(take summands, constant: bound)
+        }
+        nir::BinaryOp.Ge or nir::BinaryOp.Gt => {
+            folded = folded_le(opposite_terms(summands.view(), alloc: terms.alloc), constant: bound)
+        }
+        else => {
+            folded = folded_eq(take summands, constant: bound)
+        }
+    }
+    if op != nir::BinaryOp.Ne {
+        return Some(take folded)
+    }
+    match folded {
+        Folded.True => return Some(Folded.False)
+        Folded.False => return Some(Folded.True)
+        Folded.Lit(literal) => return Some(Folded.Lit(Literal(negated: true, atom: take literal.atom)))
+    }
+} Canon.comparison
+
+/// The constant a comparison of a sum with `constant` compares it with, once written as
+/// `≤` or `=`: decreased by one for `<`, negated for `≥` and `>`; none when it leaves the
+/// integers the prover computes with.
+fn comparison_bound(op: nir::BinaryOp, constant: wide::Wide) -> Option[wide::Wide] {
+    return match op {
+        nir::BinaryOp.Lt => constant.checked_sub(wide::Wide.one())
+        nir::BinaryOp.Ge => constant.checked_neg()
+        nir::BinaryOp.Gt => match constant.checked_neg() {
+            Some(negated) => negated.checked_sub(wide::Wide.one())
+            None => None
+        }
+        else => Some(constant)
+    }
+} comparison_bound
+
+/// The operator and operands of an integer comparison term.
+fn Terms.integer_comparison(self, term: u32) -> Option[IntComparison] {
+    let Term.App(op: Op.Binary(op), args: args) = self.get(term) else {
+        return None
+    }
+    if not op.is_comparison() or self.sort(args[0]) != Sort.Int {
+        return None
+    }
+    return Some(IntComparison(op: op, left: args[0], right: args[1]))
+} Terms.integer_comparison
+
+/// An integer term as a sum: literals, `add`, `sub`, `neg`, `mul` by a literal and `inv`
+/// interpreted, every other term an atom of the sum.
+fn Canon.linear_sum(mut self, mut terms: Terms, term: u32) -> Option[Linear] {
+    var sum = Linear(terms: mem::List[LinearTerm].empty(terms.alloc), constant: wide::Wide.zero())
+    if not mut self.add_linear(mut terms, term, factor: wide::Wide.one(), mut sum) {
+        return None
+    }
+    mut sum.terms.retain(fn(value: LinearTerm) => not value.coefficient.is_zero())
+    return Some(take sum)
+} Canon.linear_sum
+
+/// Adds a term times a factor to a sum; false when the sum leaves the integers the prover
+/// computes with.
+fn Canon.add_linear(mut self, mut terms: Terms, term: u32, factor: wide::Wide, mut sum: Linear) -> bool {
+    match terms.int_value(term) {
+        Some(value) => return add_constant(mut sum, factor, value)
+        None => {}
+    }
+    match terms.arithmetic(term) {
+        Arithmetic.Add(left: left, right: right) => {
+            if not mut self.add_linear(mut terms, term: left, factor, mut sum) {
+                return false
+            }
+            return mut self.add_linear(mut terms, term: right, factor, mut sum)
+        }
+        Arithmetic.Sub(left: left, right: right) => {
+            if not mut self.add_linear(mut terms, term: left, factor, mut sum) {
+                return false
+            }
+            let Some(negated) = factor.checked_neg() else {
+                return false
+            }
+            return mut self.add_linear(mut terms, term: right, factor: negated, mut sum)
+        }
+        Arithmetic.Neg(operand) => {
+            let Some(negated) = factor.checked_neg() else {
+                return false
+            }
+            return mut self.add_linear(mut terms, term: operand, factor: negated, mut sum)
+        }
+        Arithmetic.Scaled(literal: literal, other: other) => {
+            let Some(scaled) = factor.checked_mul(literal) else {
+                return false
+            }
+            return mut self.add_linear(mut terms, term: other, factor: scaled, mut sum)
+        }
+        Arithmetic.Inv(operand) => {
+            let Some(scalar) = terms.ty(term).interned_scalar() else {
+                return false
+            }
+            var shift = wide::Wide.of_i64(-1)
+            if not scalar.is_signed() {
+                shift = scalar.range().high
+            }
+            if not add_constant(mut sum, factor, value: shift) {
+                return false
+            }
+            let Some(negated) = factor.checked_neg() else {
+                return false
+            }
+            return mut self.add_linear(mut terms, term: operand, factor: negated, mut sum)
+        }
+        Arithmetic.Opaque => {
+            let atom = mut self.normal_of(mut terms, term)
+            return add_term(mut sum.terms, coefficient: factor, term: atom)
+        }
+    }
+} Canon.add_linear
+
+/// Adds a value times a factor to a sum's constant; false when it leaves the integers the
+/// prover computes with.
+fn add_constant(mut sum: Linear, factor: wide::Wide, value: wide::Wide) -> bool {
+    let Some(product) = factor.checked_mul(value) else {
+        return false
+    }
+    let Some(total) = sum.constant.checked_add(product) else {
+        return false
+    }
+    sum.constant = total
+    return true
+} add_constant
+
+/// How a linear sum interprets a term.
+fn Terms.arithmetic(self, term: u32) -> Arithmetic {
+    let Term.App(op: op, args: args) = self.get(term) else {
+        return Arithmetic.Opaque
+    }
+    match op {
+        Op.Binary(nir::BinaryOp.Add) => return Arithmetic.Add(left: args[0], right: args[1])
+        Op.Binary(nir::BinaryOp.Sub) => return Arithmetic.Sub(left: args[0], right: args[1])
+        Op.Binary(nir::BinaryOp.Mul) => {
+            match self.int_value(args[0]) {
+                Some(value) => return Arithmetic.Scaled(literal: value, other: args[1])
+                None => {}
+            }
+            match self.int_value(args[1]) {
+                Some(value) => return Arithmetic.Scaled(literal: value, other: args[0])
+                None => {}
+            }
+            return Arithmetic.Opaque
+        }
+        Op.Unary(nir::UnaryOp.Neg) => return Arithmetic.Neg(args[0])
+        Op.Unary(nir::UnaryOp.Inv) => return Arithmetic.Inv(args[0])
+        else => return Arithmetic.Opaque
+    }
+} Terms.arithmetic
+
+/// A term with each ite condition that is not an atom replaced by a fresh boolean symbol.
+fn Canon.normal_of(mut self, mut terms: Terms, term: u32) -> u32 {
+    match self.normal.get(term) {
+        Some(known) => return known
+        None => {}
+    }
+    let alloc = terms.alloc
+    let parts = terms.get(term).parts(alloc)
+    var normal = term
+    if terms.get(term).is_ite() {
+        let condition = mut self.condition(mut terms, condition: parts[0])
+        let then = mut self.normal_of(mut terms, term: parts[1])
+        let otherwise = mut self.normal_of(mut terms, term: parts[2])
+        normal = mut terms.ite(condition, then, otherwise)
+    } else if not terms.get(term).is_quant() {
+        var normals = mem::List[u32].empty(alloc)
+        for part in parts {
+            mut normals.push(mut self.normal_of(mut terms, term: part))
+        }
+        if normals != parts {
+            normal = mut terms.rebuild(term, parts: normals.view())
+        }
+    }
+    discard mut self.normal.insert(term, value: normal)
+    return normal
+} Canon.normal_of
+
+fn Canon.condition(mut self, mut terms: Terms, condition: u32) -> u32 {
+    let normal = mut self.normal_of(mut terms, term: condition)
+    if not terms.get(normal).is_connective() and not terms.get(normal).is_ite() {
+        return normal
+    }
+    match self.conditions.get(normal) {
+        Some(symbol) => return symbol
+        None => {}
+    }
+    let symbol = mut terms.fresh(ty::Ty.scalar(ty::Scalar.Bool))
+    discard mut self.conditions.insert(normal, value: symbol)
+    mut self.defined.push(DefinedCondition(condition: normal, symbol: symbol))
+    return symbol
+} Canon.condition
+
+/// Whether a term is an ite.
+fn Term.is_ite(self) -> bool {
+    return match self {
+        Term.Ite(condition: _, then: _, otherwise: _) => true
+        else => false
+    }
+} Term.is_ite
+
+/// Whether a term is an `all` or `any`.
+fn Term.is_quant(self) -> bool {
+    return match self {
+        Term.Quant(all: _, low: _, high: _, inclusive: _, bound: _, body: _) => true
+        else => false
+    }
+} Term.is_quant
+
+/// Whether a term is a connective of formulas: `and`, `or`, `not`, `all` or `any`.
+fn Term.is_connective(self) -> bool {
+    return match self {
+        Term.And(_) or Term.Or(_) or Term.Not(_) or Term.Quant(all: _, low: _, high: _, inclusive: _, bound: _, body: _) => true
+        else => false
+    }
+} Term.is_connective
+
+/// Whether a term is a literal.
+fn Term.is_lit(self) -> bool {
+    return match self {
+        Term.Lit(_) => true
+        else => false
+    }
+} Term.is_lit
+
+/// The range premises and division facts of the integer symbols and applications of the
+/// clauses added, in order of their first occurrence, skipping the terms in `known`.
+fn Canon.ranges(mut self, mut terms: Terms, mut known: mem::Set[u32]) -> mem::List[mem::List[Literal]] {
+    let alloc = terms.alloc
+    var order = mem::List[u32].empty(alloc)
+    for entry in self.clauses {
+        for literal in entry.clause {
+            let held = match literal.atom {
+                Atom.All(forall) => term_pair(forall.low, right: forall.high, alloc)
+                else => literal.atom.terms(alloc)
+            }
+            for term in held {
+                self.collect(terms, term, mut known, mut order)
+            }
+        }
+    }
+    var premises = mem::List[mem::List[Literal]].empty(alloc)
+    var index: usize = 0
+    while index < order.len() {
+        let term = order[index]
+        index += 1
+        let ranged = mut self.range_of(mut terms, term)
+        for premise in take ranged {
+            for summand in premise.linear_terms(alloc) {
+                self.collect(terms, term: summand.term, mut known, mut order)
+            }
+            var single = mem::List[Literal].empty(alloc)
+            mut single.push(take premise)
+            mut premises.push(take single)
+        }
+    }
+    return premises
+} Canon.ranges
+
+/// Adds the integer terms within a term outside quantifiers, each after its parts.
+fn Canon.collect(self, terms: Terms, term: u32, mut known: mem::Set[u32], mut order: mem::List[u32]) {
+    if not mut known.insert(term) {
+        return
+    }
+    if terms.get(term).is_quant() {
+        return
+    }
+    for part in terms.get(term).parts(terms.alloc) {
+        self.collect(terms, term: part, mut known, mut order)
+    }
+    if terms.sort(term) == Sort.Int {
+        mut order.push(term)
+    }
+} Canon.collect
+
+/// The range premises of an integer term, with the facts of a division, remainder, bitwise
+/// and or shift the prover knows through facts.
+fn Canon.range_of(mut self, mut terms: Terms, term: u32) -> mem::List[Literal] {
+    let alloc = terms.alloc
+    let scalar = terms.ty(term).interned_scalar()
+    var facts = mem::List[Literal].empty(alloc)
+    match terms.range_shape(term) {
+        RangeShape.Bare => {}
+        RangeShape.Tag(tagged) => self.tag_range(terms, term, tagged, mut facts)
+        RangeShape.Divided(dividend: dividend, divisor: divisor) => {
+            push_typed_range(mut facts, term, scalar, alloc)
+            mut self.division_facts(mut terms, term, dividend, divisor, mut facts)
+        }
+        RangeShape.Defined => return mut self.definition(mut terms, term)
+        RangeShape.Binary(op: op, left: left, right: right) => push_binary_range(mut facts, term, op, left, right, scalar, alloc)
+        RangeShape.Typed => push_typed_range(mut facts, term, scalar, alloc)
+    }
+    return facts
+} Canon.range_of
+
+/// What the range premises of a term follow from.
+fn Terms.range_shape(self, term: u32) -> RangeShape {
+    match self.get(term) {
+        Term.Lit(_) or Term.Ite(condition: _, then: _, otherwise: _) or Term.Bound(_) => return RangeShape.Bare
+        Term.Tag(tagged) => return RangeShape.Tag(tagged)
+        Term.Quot(dividend: dividend, divisor: divisor) or Term.Rem(dividend: dividend, divisor: divisor) => return RangeShape.Divided(dividend: dividend, divisor: divisor)
+        Term.App(op: Op.Binary(op), args: args) => {
+            if op == nir::BinaryOp.Add or op == nir::BinaryOp.Sub {
+                return RangeShape.Defined
+            }
+            if op == nir::BinaryOp.Mul and (self.int_value(args[0]).is_some() or self.int_value(args[1]).is_some()) {
+                return RangeShape.Defined
+            }
+            return RangeShape.Binary(op: op, left: args[0], right: args[1])
+        }
+        Term.App(op: Op.Unary(op), args: _) => {
+            if op == nir::UnaryOp.Neg or op == nir::UnaryOp.Inv {
+                return RangeShape.Defined
+            }
+            return RangeShape.Typed
+        }
+        else => return RangeShape.Typed
+    }
+} Terms.range_shape
+
+/// The range premises of an enum tag: at least 0 and, for an enum that cannot grow beside
+/// the code judged, below its variant count.
+fn Canon.tag_range(self, terms: Terms, term: u32, tagged: u32, mut facts: mem::List[Literal]) {
+    let alloc = terms.alloc
+    mut facts.push(range_at_least(term, value: wide::Wide.zero(), alloc))
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(terms.ty(tagged)) else {
+        return
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return
+    }
+    if self.foreign_open(item) {
+        return
+    }
+    let count = wide::Wide.of_u64(u64.widen(variants.len()))
+    mut facts.push(range_at_most(term, value: count.wrapping_sub(wide::Wide.one()), alloc))
+} Canon.tag_range
+
+/// The facts of a division and remainder, given once per dividend and divisor: the
+/// remainder below the divisor, and the dividend as the divisor times the quotient plus the
+/// remainder.
+fn Canon.division_facts(
+    mut self,
+    mut terms: Terms,
+    term: u32,
+    dividend: u32,
+    divisor: u32,
+    mut facts: mem::List[Literal],
+    ) {
+    let alloc = terms.alloc
+    let division = Division(dividend: dividend, divisor: divisor)
+    if self.divided.contains(division) {
+        return
+    }
+    discard mut self.divided.insert(division, value: Unit)
+    let ty = terms.ty(term)
+    let quotient = mut terms.intern(Term.Quot(dividend: dividend, divisor: divisor), ty)
+    let remainder = mut terms.intern(Term.Rem(dividend: dividend, divisor: divisor), ty)
+    let one = wide::Wide.one()
+    let value = terms.int_value(divisor).value_or(one)
+    mut facts.push(Literal(negated: false, atom: Atom.Le(Linear(terms: single_summand(one, term: remainder, alloc), constant: value.wrapping_sub(one)))))
+    let Some(sum) = mut self.linear_sum(mut terms, term: dividend) else {
+        return
+    }
+    var summands = sum.terms
+    mut summands.push(LinearTerm(coefficient: value.wrapping_neg(), term: quotient))
+    mut summands.push(LinearTerm(coefficient: one.wrapping_neg(), term: remainder))
+    mut facts.push(Literal(negated: false, atom: Atom.Eq(Linear(terms: take summands, constant: sum.constant.wrapping_neg()))))
+} Canon.division_facts
+
+/// The range premises of a binary application: those an unsigned division, shift,
+/// remainder or bitwise and has below its operands, none for arithmetic and a signed shift
+/// left, its type's range for any other.
+fn push_binary_range(
+    mut facts: mem::List[Literal],
+    term: u32,
+    op: nir::BinaryOp,
+    left: u32,
+    right: u32,
+    scalar: Option[ty::Scalar],
+    alloc: mem::Alloc,
+    ) {
+    var signed = false
+    match scalar {
+        Some(held) => {
+            signed = held.is_signed()
+        }
+        None => {}
+    }
+    let unsigned = scalar.is_some() and not signed
+    let zero = wide::Wide.zero()
+    match first op {
+        nir::BinaryOp.Add or nir::BinaryOp.Sub or nir::BinaryOp.Mul => {}
+        nir::BinaryOp.Shl if signed => {}
+        nir::BinaryOp.Div or nir::BinaryOp.Shr if unsigned => {
+            mut facts.push(range_at_least(term, value: zero, alloc))
+            mut facts.push(range_below(term, other: left, offset: zero, alloc))
+        }
+        nir::BinaryOp.Rem if unsigned => {
+            mut facts.push(range_at_least(term, value: zero, alloc))
+            mut facts.push(range_below(term, other: left, offset: zero, alloc))
+            mut facts.push(range_below(term, other: right, offset: wide::Wide.of_i64(-1), alloc))
+        }
+        nir::BinaryOp.Band if unsigned => {
+            mut facts.push(range_at_least(term, value: zero, alloc))
+            mut facts.push(range_below(term, other: left, offset: zero, alloc))
+            mut facts.push(range_below(term, other: right, offset: zero, alloc))
+        }
+        else => push_typed_range(mut facts, term, scalar, alloc)
+    }
+} push_binary_range
+
+/// The range premises a term's type gives: those of `char` and of an integer type.
+fn push_typed_range(mut facts: mem::List[Literal], term: u32, scalar: Option[ty::Scalar], alloc: mem::Alloc) {
+    let Some(held) = scalar else {
+        return
+    }
+    if held == ty::Scalar.Char {
+        mut facts.push(range_at_least(term, value: wide::Wide.zero(), alloc))
+        mut facts.push(range_at_most(term, value: wide::Wide.of_u64(0x10_FFFF), alloc))
+        return
+    }
+    if not held.is_integer() {
+        return
+    }
+    let range = held.range()
+    mut facts.push(range_at_least(term, value: range.low, alloc))
+    mut facts.push(range_at_most(term, value: range.high, alloc))
+} push_typed_range
+
+/// `term ≥ value`, as −term ≤ −value.
+fn range_at_least(term: u32, value: wide::Wide, alloc: mem::Alloc) -> Literal {
+    return Literal(negated: false, atom: Atom.Le(Linear(terms: single_summand(wide::Wide.of_i64(-1), term, alloc), constant: value.wrapping_neg())))
+} range_at_least
+
+/// `term ≤ value`.
+fn range_at_most(term: u32, value: wide::Wide, alloc: mem::Alloc) -> Literal {
+    return Literal(negated: false, atom: Atom.Le(Linear(terms: single_summand(wide::Wide.one(), term, alloc), constant: value)))
+} range_at_most
+
+/// `term − other ≤ offset`.
+fn range_below(term: u32, other: u32, offset: wide::Wide, alloc: mem::Alloc) -> Literal {
+    var summands = single_summand(wide::Wide.one(), term, alloc)
+    mut summands.push(LinearTerm(coefficient: wide::Wide.of_i64(-1), term: other))
+    return Literal(negated: false, atom: Atom.Le(Linear(terms: take summands, constant: offset)))
+} range_below
+
+/// The terms of a sum of one term.
+fn single_summand(coefficient: wide::Wide, term: u32, alloc: mem::Alloc) -> mem::List[LinearTerm] {
+    var summands = mem::List[LinearTerm].empty(alloc)
+    mut summands.push(LinearTerm(coefficient: coefficient, term: term))
+    return summands
+} single_summand
+
+/// The equality an interpreted arithmetic term holding a place where no sum stands for it,
+/// such as an ite's arm, has with the sum it interprets.
+fn Canon.definition(mut self, mut terms: Terms, term: u32) -> mem::List[Literal] {
+    let alloc = terms.alloc
+    var facts = mem::List[Literal].empty(alloc)
+    let Some(sum) = mut self.linear_sum(mut terms, term) else {
+        return facts
+    }
+    var summands = single_summand(wide::Wide.one(), term, alloc)
+    for summand in sum.terms {
+        mut summands.push(LinearTerm(coefficient: summand.coefficient.wrapping_neg(), term: summand.term))
+    }
+    match folded_eq(take summands, constant: sum.constant) {
+        Folded.Lit(literal) => mut facts.push(take literal)
+        else => {}
+    }
+    return facts
+} Canon.definition
+
+/// Whether an enum is open and declared by another package than the code judged.
+fn Canon.foreign_open(self, item: ty::ItemId) -> bool {
+    let db = self.ck.db()
+    return db.ast(item).has_modifier(ast::TypeModifier.Open) and db.package_of(item) != self.package_id
+} Canon.foreign_open
+
+fn complement_op(op: nir::BinaryOp) -> nir::BinaryOp {
+    return match op {
+        nir::BinaryOp.Lt => nir::BinaryOp.Ge
+        nir::BinaryOp.Le => nir::BinaryOp.Gt
+        nir::BinaryOp.Gt => nir::BinaryOp.Le
+        nir::BinaryOp.Ge => nir::BinaryOp.Lt
+        nir::BinaryOp.Eq => nir::BinaryOp.Ne
+        else => nir::BinaryOp.Eq
+    }
+} complement_op
+
+/// Adds a coefficient of a term to a sum's terms; false when it leaves the integers the
+/// prover computes with.
+fn add_term(mut linear_terms: mem::List[LinearTerm], coefficient: wide::Wide, term: u32) -> bool {
+    for index in 0..<linear_terms.len() {
+        if linear_terms[index].term == term {
+            let Some(total) = linear_terms[index].coefficient.checked_add(coefficient) else {
+                return false
+            }
+            linear_terms[index] = LinearTerm(coefficient: total, term: term)
+            return true
+        }
+    }
+    mut linear_terms.push(LinearTerm(coefficient: coefficient, term: term))
+    return true
+} add_term
+
+fn wide_gcd(a: wide::Wide, b: wide::Wide) -> wide::Wide {
+    var left = a.wrapping_abs()
+    var right = b.wrapping_abs()
+    while not right.is_zero() {
+        let remainder = trunc_rem(left, divisor: right)
+        left = right
+        right = remainder
+    }
+    return left
+} wide_gcd
+
+fn coefficient_divisor(linear_terms: Slice[LinearTerm]) -> wide::Wide {
+    var divisor = wide::Wide.zero()
+    for summand in linear_terms {
+        divisor = wide_gcd(divisor, b: summand.coefficient)
+    }
+    return divisor
+} coefficient_divisor
+
+/// Σ ci × ti ≤ c, divided by the coefficients' divisor, c rounded toward negative infinity.
+fn folded_le(take linear_terms: mem::List[LinearTerm], constant: wide::Wide) -> Folded {
+    if linear_terms.len() == 0 {
+        if constant.is_negative() {
+            return Folded.False
+        }
+        return Folded.True
+    }
+    let divisor = coefficient_divisor(linear_terms.view())
+    for index in 0..<linear_terms.len() {
+        let summand = linear_terms[index]
+        linear_terms[index] = LinearTerm(coefficient: trunc_div(summand.coefficient, divisor), term: summand.term)
+    }
+    return Folded.Lit(Literal(negated: false, atom: Atom.Le(Linear(terms: take linear_terms, constant: euclid_div(constant, divisor)))))
+} folded_le
+
+/// Σ ci × ti = c, divided by the coefficients' divisor; false when it does not divide c.
+fn folded_eq(take linear_terms: mem::List[LinearTerm], constant: wide::Wide) -> Folded {
+    if linear_terms.len() == 0 {
+        if constant.is_zero() {
+            return Folded.True
+        }
+        return Folded.False
+    }
+    let divisor = coefficient_divisor(linear_terms.view())
+    if not trunc_rem(constant, divisor).is_zero() {
+        return Folded.False
+    }
+    for index in 0..<linear_terms.len() {
+        let summand = linear_terms[index]
+        linear_terms[index] = LinearTerm(coefficient: trunc_div(summand.coefficient, divisor), term: summand.term)
+    }
+    return Folded.Lit(Literal(negated: false, atom: Atom.Eq(Linear(terms: take linear_terms, constant: trunc_div(constant, divisor)))))
+} folded_eq
+
+/// The quotient rounded toward zero; a zero divisor or an overflow traps.
+fn trunc_div(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let Some(quotient) = value.checked_div_trunc(divisor) else {
+        expect false
+        return wide::Wide.zero()
+    }
+    return quotient
+} trunc_div
+
+/// The remainder of the quotient rounded toward zero; a zero divisor traps.
+fn trunc_rem(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let Some(remainder) = value.checked_rem_trunc(divisor) else {
+        expect false
+        return wide::Wide.zero()
+    }
+    return remainder
+} trunc_rem
+
+/// The quotient rounded toward negative infinity for a positive divisor; a zero divisor or
+/// an overflow traps.
+fn euclid_div(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let Some(quotient) = value.checked_div_euclid(divisor) else {
+        expect false
+        return wide::Wide.zero()
+    }
+    return quotient
+} euclid_div
+
+/// The remainder at least 0 and below the divisor's magnitude; a zero divisor traps.
+fn euclid_rem(value: wide::Wide, divisor: wide::Wide) -> wide::Wide {
+    let Some(remainder) = value.checked_rem_euclid(divisor) else {
+        expect false
+        return wide::Wide.zero()
+    }
+    return remainder
+} euclid_rem
+
+/// The terms an atom holds directly.
+fn Atom.terms(self, alloc: mem::Alloc) -> mem::List[u32] {
+    var held = mem::List[u32].empty(alloc)
+    match self {
+        Atom.Le(sum) or Atom.Eq(sum) => {
+            for summand in sum.terms {
+                mut held.push(summand.term)
+            }
+        }
+        Atom.Bool(term) => mut held.push(term)
+        Atom.All(forall) => {
+            mut held.push(forall.low)
+            mut held.push(forall.high)
+            mut held.push(forall.bound)
+            mut held.push(forall.body)
+        }
+    }
+    return held
+} Atom.terms
+
+fn Literal.linear_terms(self, alloc: mem::Alloc) -> mem::List[LinearTerm] {
+    return match self.atom {
+        Atom.Le(sum) or Atom.Eq(sum) => copied_terms(sum.terms.view(), alloc)
+        else => mem::List[LinearTerm].empty(alloc)
+    }
+} Literal.linear_terms
+
+/// Canonicalises a query: premises in order, then the range premises of their terms, then the
+/// negated goal.
+fn Checker.canonical_query(self, mut terms: Terms, package_id: ty::PackageId, premises: Slice[Premise], goal: u32) -> CanonQuery {
+    let alloc = self.alloc()
+    var canon = Canon.new(self.share(), package_id)
+    for premise in premises {
+        mut canon.premise(mut terms, term: premise.term, origin: premise.origin)
+    }
+    let start = canon.clauses.len()
+    mut canon.negated_goal(mut terms, goal)
+    var known = mem::Set[u32].empty(alloc)
+    let ranges = mut canon.ranges(mut terms, mut known)
+    let produced = canon.clauses
+    var all = mem::List[OriginClause].empty(alloc)
+    var tail = mem::List[OriginClause].empty(alloc)
+    for entry in take produced {
+        if all.len() < start {
+            mut all.push(take entry)
+        } else {
+            mut tail.push(take entry)
+        }
+    }
+    for clause in take ranges {
+        mut all.push(OriginClause(clause: take clause, origin: Origin.Fact))
+    }
+    for entry in take tail {
+        mut all.push(take entry)
+    }
+    let relevant = terms.relevant(all.view())
+    var transfer = Transfer(to: Terms.empty(alloc), map: mem::HashMap[u32, u32].empty(seed: 0, alloc))
+    var moved = mem::List[OriginClause].empty(alloc)
+    for index in 0..<all.len() {
+        if relevant[index] {
+            mut moved.push(OriginClause(clause: mut transfer.clause(terms, clause: all[index].clause.view()), origin: all[index].origin))
+        }
+    }
+    let store = transfer.to
+    return self.sorted_query(take store, take moved)
+} Checker.canonical_query
+
+/// The query of clauses over their own store: the clauses in term order, each sorted, with
+/// the hash of their concatenated encodings.
+fn Checker.sorted_query(self, take store: Terms, take moved: mem::List[OriginClause]) -> CanonQuery {
+    let alloc = self.alloc()
+    var encodings = Encodings.empty(alloc)
+    var sorted = mem::List[SortedClause].empty(alloc)
+    for entry in take moved {
+        let OriginClause(clause: clause, origin: origin) = entry
+        let ordered = self.sorted_clause(store, mut encodings, take clause)
+        let key = mut encodings.clause(self, terms: store, clause: ordered.view())
+        mut sorted.push(SortedClause(key: take key, clause: take ordered, origin: origin))
+    }
+    mut sorted.sort_by(fn(left: SortedClause, right: SortedClause) => left.key.view().cmp(right.key.view()))
+    var concatenated = mem::Bytes.empty(alloc)
+    var clauses = mem::List[mem::List[Literal]].empty(alloc)
+    var origins = mem::List[Origin].empty(alloc)
+    for entry in take sorted {
+        let SortedClause(key: key, clause: clause, origin: origin) = entry
+        mut concatenated.append(key.view())
+        mut clauses.push(take clause)
+        mut origins.push(origin)
+    }
+    return CanonQuery(terms: take store, clauses: take clauses, origins: take origins, hash: hashing::HashValue.of(concatenated.view()))
+} Checker.sorted_query
+
+/// A clause in term order: the terms of each atom, then its literals, an equality whose first
+/// coefficient is negative negated.
+fn Checker.sorted_clause(self, terms: Terms, mut encodings: Encodings, take clause: mem::List[Literal]) -> mem::List[Literal] {
+    let alloc = self.alloc()
+    var keyed = mem::List[KeyedLiteral].empty(alloc)
+    for literal in take clause {
+        let ordered = self.ordered_literal(terms, mut encodings, take literal)
+        let key = mut encodings.literal(self, terms, literal: ordered)
+        mut keyed.push(KeyedLiteral(key: take key, literal: take ordered))
+    }
+    mut keyed.sort_by(fn(left: KeyedLiteral, right: KeyedLiteral) => left.key.view().cmp(right.key.view()))
+    var sorted = mem::List[Literal].empty(alloc)
+    for entry in take keyed {
+        let KeyedLiteral(key: _, literal: literal) = entry
+        mut sorted.push(take literal)
+    }
+    return sorted
+} Checker.sorted_clause
+
+/// A literal with the terms of its sum in term order, an equality whose first coefficient is
+/// negative negated.
+fn Checker.ordered_literal(self, terms: Terms, mut encodings: Encodings, take literal: Literal) -> Literal {
+    let Literal(negated: negated, atom: atom) = literal
+    match atom {
+        Atom.Le(sum) => return Literal(negated: negated, atom: Atom.Le(self.ordered_sum(terms, mut encodings, sum, equality: false)))
+        Atom.Eq(sum) => return Literal(negated: negated, atom: Atom.Eq(self.ordered_sum(terms, mut encodings, sum, equality: true)))
+        else => {}
+    }
+    return Literal(negated: negated, atom: take atom)
+} Checker.ordered_literal
+
+/// A sum with its terms in term order, negated when it is an equality whose first coefficient
+/// is then negative.
+fn Checker.ordered_sum(self, terms: Terms, mut encodings: Encodings, sum: Linear, equality: bool) -> Linear {
+    let alloc = self.alloc()
+    var keyed = mem::List[KeyedSummand].empty(alloc)
+    for summand in sum.terms {
+        let key = mut encodings.term(self, terms, id: summand.term)
+        mut keyed.push(KeyedSummand(key: take key, summand: summand))
+    }
+    mut keyed.sort_by(fn(left: KeyedSummand, right: KeyedSummand) => left.key.contents().view().cmp(right.key.contents().view()))
+    var flip = false
+    if equality and keyed.len() > 0 {
+        flip = keyed[0].summand.coefficient.is_negative()
+    }
+    var ordered = mem::List[LinearTerm].empty(alloc)
+    for entry in keyed {
+        var coefficient = entry.summand.coefficient
+        if flip {
+            coefficient = coefficient.wrapping_neg()
+        }
+        mut ordered.push(LinearTerm(coefficient: coefficient, term: entry.summand.term))
+    }
+    var constant = sum.constant
+    if flip {
+        constant = constant.wrapping_neg()
+    }
+    return Linear(terms: take ordered, constant: constant)
+} Checker.ordered_sum
+
+/// Which clauses are relevant: those of the negated goal, and each sharing a symbol or an
+/// application with a relevant one; every clause when the negated goal holds no symbol or
+/// application, as when asking whether premises entail `false`.
+fn Terms.relevant(self, clauses: Slice[OriginClause]) -> mem::List[bool] {
+    let alloc = self.alloc
+    var keys = mem::List[mem::List[u32]].empty(alloc)
+    var holding = mem::HashMap[u32, mem::List[usize]].empty(seed: 0, alloc)
+    var goal_keys = false
+    for index in 0..<clauses.len() {
+        var seen = mem::Set[u32].empty(alloc)
+        for literal in clauses[index].clause {
+            for term in literal.atom.terms(alloc) {
+                self.subterms(term, mut seen)
+            }
+        }
+        var listed = mem::List[u32].empty(alloc)
+        for key in seen {
+            mut listed.push(key)
+            if not holding.contains(key) {
+                discard mut holding.insert(key, value: mem::List[usize].empty(alloc))
+            }
+            var held = mut holding.at_mut(key)
+            mut held.push(index)
+        }
+        if clauses[index].origin == Origin.Goal and listed.len() > 0 {
+            goal_keys = true
+        }
+        mut keys.push(take listed)
+    }
+    var relevant = mem::List[bool].empty(alloc)
+    var pending = mem::List[usize].empty(alloc)
+    for index in 0..<clauses.len() {
+        let kept = clauses[index].origin == Origin.Goal or not goal_keys
+        mut relevant.push(kept)
+        if kept {
+            mut pending.push(index)
+        }
+    }
+    var reached = mem::Set[u32].empty(alloc)
+    loop {
+        let Some(index) = mut pending.pop() else {
+            break
+        }
+        for key in keys[index] {
+            if not mut reached.insert(key) {
+                continue
+            }
+            for other in holding.at(key) {
+                if not relevant[other] {
+                    relevant[other] = true
+                    mut pending.push(other)
+                }
+            }
+        }
+    }
+    return relevant
+} Terms.relevant
+
+/// The symbols and applications within a term, itself included.
+fn Terms.subterms(self, term: u32, mut seen: mem::Set[u32]) {
+    if self.get(term).is_lit() {
+        return
+    }
+    if not mut seen.insert(term) {
+        return
+    }
+    for part in self.get(term).parts(self.alloc) {
+        self.subterms(term: part, mut seen)
+    }
+} Terms.subterms
+
+fn Transfer.clause(mut self, from: Terms, clause: Slice[Literal]) -> mem::List[Literal] {
+    var moved = mem::List[Literal].empty(from.alloc)
+    for literal in clause {
+        let atom = match literal.atom {
+            Atom.Le(sum) => Atom.Le(mut self.linear_sum(from, sum))
+            Atom.Eq(sum) => Atom.Eq(mut self.linear_sum(from, sum))
+            Atom.Bool(term) => Atom.Bool(mut self.term(from, term))
+            Atom.All(forall) => Atom.All(mut self.forall(from, forall))
+        }
+        mut moved.push(Literal(negated: literal.negated, atom: take atom))
+    }
+    return moved
+} Transfer.clause
+
+/// A bounded `all` over the new store.
+fn Transfer.forall(mut self, from: Terms, forall: Forall) -> Forall {
+    let low = mut self.term(from, term: forall.low)
+    let high = mut self.term(from, term: forall.high)
+    let bound = mut self.term(from, term: forall.bound)
+    let body = mut self.term(from, term: forall.body)
+    return Forall(low: low, high: high, inclusive: forall.inclusive, bound: bound, body: body)
+} Transfer.forall
+
+fn Transfer.linear_sum(mut self, from: Terms, sum: Linear) -> Linear {
+    var moved = mem::List[LinearTerm].empty(from.alloc)
+    for summand in sum.terms {
+        mut moved.push(LinearTerm(coefficient: summand.coefficient, term: mut self.term(from, term: summand.term)))
+    }
+    return Linear(terms: take moved, constant: sum.constant)
+} Transfer.linear_sum
+
+fn Transfer.term(mut self, from: Terms, term: u32) -> u32 {
+    match self.map.get(term) {
+        Some(known) => return known
+        None => {}
+    }
+    let alloc = from.alloc
+    let ty = from.ty(term)
+    var moved: u32 = 0
+    match from.get(term) {
+        Term.Fresh(_) => {
+            moved = mut self.to.fresh(ty)
+        }
+        Term.Skolem(_) => {
+            moved = mut self.to.skolem(ty)
+        }
+        Term.Bound(_) => {
+            moved = mut self.to.bound(ty)
+        }
+        else => {
+            var renumbered = mem::List[u32].empty(alloc)
+            for part in from.get(term).parts(alloc) {
+                mut renumbered.push(mut self.term(from, term: part))
+            }
+            let rebuilt = from.get(term).replacing_parts(renumbered.view(), alloc)
+            moved = mut self.to.intern(take rebuilt, ty)
+        }
+    }
+    discard mut self.map.insert(term, value: moved)
+    return moved
+} Transfer.term
+
+/// A copy of the literal.
+fn Literal.copy(self, alloc: mem::Alloc) -> Literal {
+    return Literal(negated: self.negated, atom: self.atom.copy(alloc))
+} Literal.copy
+
+/// A copy of the atom.
+fn Atom.copy(self, alloc: mem::Alloc) -> Atom {
+    return match self {
+        Atom.Le(sum) => Atom.Le(sum.copy(alloc))
+        Atom.Eq(sum) => Atom.Eq(sum.copy(alloc))
+        Atom.Bool(term) => Atom.Bool(term)
+        Atom.All(forall) => Atom.All(forall)
+    }
+} Atom.copy
+
+/// A copy of the sum.
+fn Linear.copy(self, alloc: mem::Alloc) -> Linear {
+    return Linear(terms: copied_terms(self.terms.view(), alloc), constant: self.constant)
+} Linear.copy
+
+/// A list of the terms of a sum.
+fn copied_terms(linear_terms: Slice[LinearTerm], alloc: mem::Alloc) -> mem::List[LinearTerm] {
+    var copied = mem::List[LinearTerm].empty(alloc)
+    for summand in linear_terms {
+        mut copied.push(summand)
+    }
+    return copied
+} copied_terms
+
+/// A copy of the formula.
+fn Formula.copy(self, alloc: mem::Alloc) -> Formula {
+    return match self {
+        Formula.True => Formula.True
+        Formula.False => Formula.False
+        Formula.And(parts) => Formula.And(copied_formulas(parts.view(), alloc))
+        Formula.Or(parts) => Formula.Or(copied_formulas(parts.view(), alloc))
+        Formula.Leaf(term: term, holding: holding) => Formula.Leaf(term: term, holding: holding)
+        Formula.Lit(literal) => Formula.Lit(literal.copy(alloc))
+        Formula.Term(term: term, holding: holding) => Formula.Term(term: term, holding: holding)
+    }
+} Formula.copy
+
+/// A copy of each formula of a list.
+fn copied_formulas(formulas: Slice[Formula], alloc: mem::Alloc) -> mem::List[Formula] {
+    var copied = mem::List[Formula].empty(alloc)
+    for formula in formulas {
+        mut copied.push(formula.copy(alloc))
+    }
+    return copied
+} copied_formulas
+
+/// A copy of each literal of a clause.
+fn copied_literals(literals: Slice[Literal], alloc: mem::Alloc) -> mem::List[Literal] {
+    var copied = mem::List[Literal].empty(alloc)
+    for literal in literals {
+        mut copied.push(literal.copy(alloc))
+    }
+    return copied
+} copied_literals

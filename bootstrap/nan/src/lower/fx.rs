@@ -35,17 +35,12 @@ pub fn unaligned() -> MemFlagsData {
     MemFlagsData::new().with_notrap()
 }
 
-/// The flags of a scalar access: possibly unaligned, possibly big-endian.
-pub fn access(unaligned_access: bool, big: bool) -> MemFlagsData {
-    let flags = if unaligned_access {
+/// The flags of a scalar access, possibly unaligned.
+fn access(unaligned_access: bool) -> MemFlagsData {
+    if unaligned_access {
         unaligned()
     } else {
         trusted()
-    };
-    if big {
-        flags.with_endianness(ir::Endianness::Big)
-    } else {
-        flags
     }
 }
 
@@ -93,6 +88,43 @@ impl<'f> Fx<'f> {
 
     pub fn store(&mut self, value: Value, addr: Value, offset: u64) {
         self.b.ins().store(trusted(), value, addr, offset as i32);
+    }
+
+    /// The scalar of type `ty` at `offset` past `addr`, possibly unaligned, held in big-endian
+    /// byte order when `big` holds.
+    pub fn load_ordered(
+        &mut self,
+        ty: Type,
+        addr: Value,
+        offset: u64,
+        unaligned_access: bool,
+        big: bool,
+    ) -> Value {
+        let value = (self.b.ins()).load(ty, access(unaligned_access), addr, offset as i32);
+        self.ordered(value, big)
+    }
+
+    /// Stores a scalar at `offset` past `addr`, possibly unaligned, in big-endian byte order
+    /// when `big` holds.
+    pub fn store_ordered(
+        &mut self,
+        value: Value,
+        addr: Value,
+        offset: u64,
+        unaligned_access: bool,
+        big: bool,
+    ) {
+        let value = self.ordered(value, big);
+        (self.b.ins()).store(access(unaligned_access), value, addr, offset as i32);
+    }
+
+    /// A scalar with its bytes reversed when `big` holds, which turns a value into its
+    /// big-endian memory form and back.
+    fn ordered(&mut self, value: Value, big: bool) -> Value {
+        if !big || self.b.func.dfg.value_type(value).bytes() == 1 {
+            return value;
+        }
+        self.b.ins().bswap(value)
     }
 
     /// The address `offset` bytes past `addr`.

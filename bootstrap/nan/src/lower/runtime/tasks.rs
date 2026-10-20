@@ -211,8 +211,10 @@ pub mod trap_record {
     pub const BYTES: u64 = 16;
 }
 
-/// The default size of a task's stack and the size of its guard region.
+/// The default size of a task's stack, of the entry task's stack on `x86_64-host`, and of a
+/// guard region.
 pub const STACK: u64 = 65_536;
+pub const ENTRY_STACK: u64 = 67_108_864;
 pub const GUARD: u64 = 4_096;
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library

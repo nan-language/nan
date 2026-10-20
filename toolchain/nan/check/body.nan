@@ -1,0 +1,1974 @@
+//! Bodies: the typing of the statements and expressions of every body an item holds, the rules each reports, and the typed form ownership, digests and limits read.
+
+/// The function, closure or other body whose `return`, `fail` and `try` statements act on.
+struct Frame {
+    result: ty::Ty
+    /// F: the failure type `fail` and `try` convert to, none when nothing may fail.
+    failure: Option[ty::Ty]
+    /// Whether every failure converts unchanged, as in a test body.
+    tested: bool
+    /// The closure index, 0 for the item's own body.
+    closure: u32
+    task: bool
+    /// The capture list of a closure: name, mode and token.
+    listed: mem::List[ListedCapture]
+    /// The locals of enclosing frames this frame reaches, and the capture local standing for each.
+    captures: mem::List[FrameCapture]
+    /// The index in `loops` where this frame's loops start.
+    loops: usize
+    /// The index in `scopes` where this frame's scopes start.
+    scopes: usize
+    /// Whether the body holds a `todo` expression.
+    holds_todo: bool
+    /// The type of the first failure the body may raise.
+    may_fail: Option[ty::Ty]
+    /// Whether the failures the body may raise have several types.
+    several_failures: bool
+    /// Whether the body reaches a wait other than through its own parameters.
+    may_wait: bool
+} Frame
+
+/// An entry of a closure's capture list: its name, mode and token.
+struct ListedCapture {
+    name: text::String
+    mode: ast::Mode
+    token: u32
+} ListedCapture
+
+/// A local of an enclosing frame a frame reaches, and the capture local standing for it.
+struct FrameCapture derives Copy, Eq {
+    reached: LocalId
+    local: LocalId
+} FrameCapture
+
+/// The `fails` and `uses` clauses of a function head or closure as written, which its body's
+/// effects judge.
+struct Clauses derives Copy {
+    /// The token after which a missing `fails` clause is written: the result type's last, or
+    /// the `)` closing the parameters.
+    after: u32
+    /// The first and last tokens of the written failure type.
+    failure: Option[nir::Span]
+    /// The `uses` token and its word's token.
+    usage: Option[nir::Span]
+    /// The head's last token.
+    last: u32
+    /// Whether a missing clause has an exact fix.
+    fixable: bool
+} Clauses
+
+/// What a closure argument is written as, beyond its parameter's function type.
+enum Written derives Copy, Eq {
+    /// The body closure of a `task::scope` call.
+    ScopeBody
+    /// The task closure of a lexical spawn, in the scope whose body closure is numbered.
+    Lent(u32)
+    Other
+} Written
+
+/// The final expression statement of a block whose value is unused.
+struct Tail derives Copy {
+    token: u32
+    last: u32
+    ty: ty::Ty
+} Tail
+
+struct Loop {
+    label: Option[text::String]
+    /// Whether a `break` names this loop.
+    broken: bool
+    /// Whether a `break` or `continue` names its label.
+    label_used: bool
+} Loop
+
+/// What the code being typed may contain, by where it lies.
+struct BodyContext derives Copy, Default {
+    /// A contract term: requires, ensures, decreases, invariant, assume, predicate or `where`.
+    contract: bool
+    /// An ensures clause, where `result` and `old` are read.
+    ensures_clause: bool
+    /// A requires clause.
+    requires_clause: bool
+    example: bool
+    /// Inside trusted code.
+    trusted_code: bool
+    /// Inside the body of `await when`.
+    when_body: bool
+    /// Inside `old(...)`.
+    old: bool
+    /// An expect condition or contract term, where quantifiers are legal.
+    quantifiers: bool
+} BodyContext
+
+/// A lexical spawn whose `task::scope` call is still being typed: its body closure, the child's
+/// failure type and the spawn's token.
+struct LexicalSpawn derives Copy {
+    body: u32
+    failure: ty::Ty
+    token: u32
+} LexicalSpawn
+
+/// The generic scope and the item being typed that a body replaced in the checker: the token
+/// restoring the scope, and the item's bits.
+struct Enclosing derives Copy {
+    scope: u32
+    within: u32
+} Enclosing
+
+struct Body {
+    ck: Checker
+    item: ty::ItemId
+    module: ty::ModuleId
+    generics: mem::List[GenericDef]
+    self_param: Option[ty::Param]
+    locals: mem::List[Local]
+    /// The parameters of the function or test, in order.
+    params: mem::List[LocalId]
+    /// Lexical scopes of bound names.
+    scopes: mem::List[mem::List[LocalId]]
+    frames: mem::List[Frame]
+    loops: mem::List[Loop]
+    closures: u32
+    cx: BodyContext
+    /// Whether the body has minted its root grant.
+    minted: bool
+    /// The type of `result` in an ensures clause.
+    result: Option[ty::Ty]
+    /// Whether exhaustiveness counts only the declared variants of open enums.
+    closed: core::atomic::AtomicBool
+    /// The names the pattern being typed binds so far.
+    bound_names: mem::List[text::String]
+    /// The closures that are the body closures of `task::scope` calls.
+    scope_bodies: mem::List[u32]
+    /// The lexical spawns whose `task::scope` call is still being typed.
+    lexical_spawns: mem::List[LexicalSpawn]
+    /// The first and last tokens of the expression in statement position being typed.
+    statement: Option[nir::Span]
+    typed_clauses: mem::List[TClause]
+    examples: mem::List[TExample]
+    /// What typing records of the use of the body's bindings.
+    usage: Usage
+    /// The view bindings of a part, and those of a wrapped part, which projections return and
+    /// `Some`, `Ok` and `Err` wrap unmarked.
+    part_bindings: mem::Set[LocalId]
+    wrapped_bindings: mem::Set[LocalId]
+    /// The folded names of the values the module declares, once a local's name is checked
+    /// against them, under key 0.
+    folded_values: mem::OnceMap[u8, mem::Set[text::String]]
+    /// The generic scope and the item being typed that the body replaced in the checker, which
+    /// closing the body restores.
+    enclosing: Enclosing
+} Body
+
+/// A typed construct and whether it diverges.
+struct Diverging[T] {
+    value: T
+    diverges: bool
+} Diverging
+
+/// A typed block, whether it diverges, and the unused value of its final expression statement.
+struct TailedBlock {
+    block: TBlock
+    diverges: bool
+    tail: Option[Tail]
+} TailedBlock
+
+/// The invariants and block of a loop body, typed.
+struct TypedLoop {
+    invariants: mem::List[TExpr]
+    block: TBlock
+} TypedLoop
+
+/// The cursor a `for` form obtains, and the element type its `next` yields.
+struct CursorTypes derives Copy {
+    cursor: ty::Ty
+    element: ty::Ty
+} CursorTypes
+
+/// Records a failure the body may raise.
+fn Frame.raise(mut self, failure: ty::Ty) {
+    match self.may_fail {
+        Some(earlier) => {
+            if earlier != failure {
+                self.several_failures = true
+            }
+        }
+        None => {
+            self.may_fail = Some(failure)
+        }
+    }
+} Frame.raise
+
+/// A copy of a frame.
+fn Frame.copy(self, alloc: mem::Alloc) -> Frame {
+    var listed = mem::List[ListedCapture].empty(alloc)
+    for entry in self.listed {
+        mut listed.push(ListedCapture(name: text::String.of(entry.name.as_str(), alloc), mode: entry.mode, token: entry.token))
+    }
+    var captures = mem::List[FrameCapture].empty(alloc)
+    for capture in self.captures {
+        mut captures.push(capture)
+    }
+    return Frame(result: self.result, failure: self.failure, tested: self.tested, closure: self.closure, task: self.task, listed: take listed, captures: take captures, loops: self.loops, scopes: self.scopes, holds_todo: self.holds_todo, may_fail: self.may_fail, several_failures: self.several_failures, may_wait: self.may_wait)
+} Frame.copy
+
+fn Clauses.of(head: ast::Head, fixable: bool) -> Clauses {
+    return Clauses.written(head.close, result: head.result, failure: head.failure, usage: head.usage, limit_set: head.limit_set, fixable)
+} Clauses.of
+
+fn Clauses.of_closure(closure: ast::Closure) -> Clauses {
+    return Clauses.written(closure.close, result: closure.result, failure: closure.failure, usage: closure.usage, limit_set: closure.limit_set, fixable: true)
+} Clauses.of_closure
+
+fn Clauses.written(
+    close: u32,
+    result: Option[ast::TypeExpr],
+    failure: Option[ast::TypeExpr],
+    usage: Option[ast::Uses],
+    limit_set: Option[ast::Limits],
+    fixable: bool,
+    ) -> Clauses {
+    var after = close
+    var function_result = false
+    match result {
+        Some(written) => {
+            after = written.last
+            function_result = match written.kind {
+                ast::TypeKind.Fn(_) => true
+                else => false
+            }
+        }
+        None => {}
+    }
+    var last = after
+    var failure_span: Option[nir::Span] = None
+    match failure {
+        Some(written) => {
+            last = written.last
+            failure_span = Some(nir::Span(head: written.token, last: written.last))
+        }
+        None => {}
+    }
+    var usage_span: Option[nir::Span] = None
+    match usage {
+        Some(written) => {
+            last = written.word.token
+            usage_span = Some(nir::Span(head: written.token, last: written.word.token))
+        }
+        None => {}
+    }
+    match limit_set {
+        Some(written) => {
+            let count = written.entries.len()
+            if count > 0 {
+                let limit = written.entries[count - 1]
+                last = match limit.size {
+                    Some(size) => size
+                    None => limit.token
+                }
+            }
+        }
+        None => {}
+    }
+    return Clauses(after: after, failure: failure_span, usage: usage_span, last: last, fixable: fixable and not function_result)
+} Clauses.written
+
+/// Restores the generic scope and the item being typed that the body replaced in the checker.
+fn Body.close(self) {
+    let state = self.ck.state.contents()
+    state.scope.restore(self.enclosing.scope)
+    state.within.store(self.enclosing.within)
+} Body.close
+
+fn Body.new(ck: Checker, item: ty::ItemId, take generics: mem::List[GenericDef]) -> Body {
+    let alloc = ck.alloc()
+    var self_param: Option[ty::Param] = None
+    for def in generics {
+        if def.param.is_self() {
+            self_param = Some(def.param)
+            break
+        }
+    }
+    let state = ck.state.contents()
+    let scope = state.scope.replace(GenericDef.copies(generics.view(), alloc))
+    let within = state.within.swap(item.index)
+    var scopes = mem::List[mem::List[LocalId]].empty(alloc)
+    mut scopes.push(mem::List[LocalId].empty(alloc))
+    return Body(
+        ck: ck.share(),
+        item: item,
+        module: ck.db().module_of(item),
+        generics: take generics,
+        self_param: self_param,
+        locals: mem::List[Local].empty(alloc),
+        params: mem::List[LocalId].empty(alloc),
+        scopes: take scopes,
+        frames: mem::List[Frame].empty(alloc),
+        loops: mem::List[Loop].empty(alloc),
+        closures: 0,
+        cx: BodyContext.default(),
+        minted: false,
+        result: None,
+        closed: core::atomic::AtomicBool.of(false),
+        bound_names: mem::List[text::String].empty(alloc),
+        scope_bodies: mem::List[u32].empty(alloc),
+        lexical_spawns: mem::List[LexicalSpawn].empty(alloc),
+        statement: None,
+        typed_clauses: mem::List[TClause].empty(alloc),
+        examples: mem::List[TExample].empty(alloc),
+        usage: Usage.empty(alloc),
+        part_bindings: mem::Set[LocalId].empty(alloc),
+        wrapped_bindings: mem::Set[LocalId].empty(alloc),
+        folded_values: mem::OnceMap[u8, mem::Set[text::String]].empty(seed: 0, alloc),
+        enclosing: Enclosing(scope: scope, within: within),
+    )
+} Body.new
+
+/// A copy of generic parameters.
+fn GenericDef.copies(generics: Slice[GenericDef], alloc: mem::Alloc) -> mem::List[GenericDef] {
+    var copies = mem::List[GenericDef].empty(alloc)
+    for def in generics {
+        mut copies.push(def.copy(alloc))
+    }
+    return copies
+} GenericDef.copies
+
+/// A copy of a generic parameter.
+fn GenericDef.copy(self, alloc: mem::Alloc) -> GenericDef {
+    var bounds = mem::List[ty::Bound].empty(alloc)
+    for bound in self.bounds {
+        mut bounds.push(bound)
+    }
+    return GenericDef(name: text::String.of(self.name.as_str(), alloc), param: self.param, bounds: take bounds, constant: self.constant)
+} GenericDef.copy
+
+fn Body.report(self, token: u32, code: diagnostic::Code) {
+    self.ck.report(self.item, token, code)
+} Body.report
+
+/// Types something only to judge it: returns what typing it gives and the diagnostics it
+/// finds on the body's item, leaving the body as it was.
+fn Body.probe[T](mut self, typing: fn(mut body: Body) -> T) -> Probed[T] {
+    let alloc = self.ck.alloc()
+    var saved_locals = mem::List[Local].empty(alloc)
+    for local in self.locals {
+        mut saved_locals.push(local.copy(alloc))
+    }
+    var saved_scopes = mem::List[mem::List[LocalId]].empty(alloc)
+    for scope in self.scopes {
+        var copy = mem::List[LocalId].empty(alloc)
+        for local in scope {
+            mut copy.push(local)
+        }
+        mut saved_scopes.push(take copy)
+    }
+    var saved_frames = mem::List[Frame].empty(alloc)
+    for frame in self.frames {
+        mut saved_frames.push(frame.copy(alloc))
+    }
+    let saved_closures = self.closures
+    let saved_minted = self.minted
+    var saved_bodies = mem::List[u32].empty(alloc)
+    for closure in self.scope_bodies {
+        mut saved_bodies.push(closure)
+    }
+    var saved_spawns = mem::List[LexicalSpawn].empty(alloc)
+    for spawn in self.lexical_spawns {
+        mut saved_spawns.push(spawn)
+    }
+    let saved_usage = self.usage.copy(alloc)
+    let ck = self.ck.share()
+    let item = self.item
+    let probed = ck.heard(item, probe: fn[mut self]() -> T {
+        return typing(mut self)
+    })
+    self.locals = saved_locals
+    self.scopes = saved_scopes
+    self.frames = saved_frames
+    self.closures = saved_closures
+    self.minted = saved_minted
+    self.scope_bodies = saved_bodies
+    self.lexical_spawns = saved_spawns
+    self.usage = saved_usage
+    return probed
+} Body.probe
+
+/// A copy of a local.
+fn Local.copy(self, alloc: mem::Alloc) -> Local {
+    return Local(name: text::String.of(self.name.as_str(), alloc), ty: self.ty, kind: self.kind, token: self.token, captured: self.captured, closure: self.closure)
+} Local.copy
+
+/// A copy of what typing recorded of the use of a body's bindings.
+fn Usage.copy(self, alloc: mem::Alloc) -> Usage {
+    var copy = Usage.empty(alloc)
+    for entry in self.bindings.cursor() {
+        discard mut copy.bindings.insert(entry.key(), value: entry.value())
+    }
+    for local in self.used.cursor() {
+        discard mut copy.used.insert(local)
+    }
+    for local in self.assigned.cursor() {
+        discard mut copy.assigned.insert(local)
+    }
+    for local in self.parts.cursor() {
+        discard mut copy.parts.insert(local)
+    }
+    for entry in self.alternatives.cursor() {
+        var later = mem::List[LocalId].empty(alloc)
+        for local in entry.value() {
+            mut later.push(local)
+        }
+        discard mut copy.alternatives.insert(entry.key(), value: take later)
+    }
+    return copy
+} Usage.copy
+
+/// Records the member a name of the body names.
+fn Body.name_member(self, token: u32, take member: Member) {
+    discard self.ck.state.contents().members_named.push(MemberNamed(item: self.item, token: token, member: take member))
+} Body.name_member
+
+/// Records the members a method resolution candidate names, reporting a function not visible
+/// from the body's module.
+fn Body.name_candidate(self, token: u32, candidate: Candidate, name: Str) {
+    match candidate {
+        Candidate.Function(item: item, subst: _) => {
+            if not self.ck.db().visible(self.module, item) {
+                self.report(token, code: diagnostic::Code.NamePrivate)
+            }
+            self.name_member(token, member: Member.Function(item))
+        }
+        Candidate.Method(bound: bound, method: _, self_ty: _, function: function, dynamic: _) => {
+            self.name_member(token, member: Member.Method(owner: bound.item, name: text::String.of(name, alloc: self.ck.alloc())))
+            match function {
+                Some(implementing) => self.name_member(token, member: Member.Function(implementing.item))
+                None => {}
+            }
+        }
+    }
+} Body.name_candidate
+
+/// Reports a diagnostic on the tokens `head..=last` with the fixes its rule names.
+fn Body.report_fixed(self, construct: nir::Span, code: diagnostic::Code, take fixes: mem::List[diagnostic::Fix]) {
+    self.ck.report_fixed(self.item, construct, code, take fixes, offer: diagnostic::Offer.Each)
+} Body.report_fixed
+
+fn Body.report_path(self, error: PathError) {
+    match first error.code {
+        Some(diagnostic::Code.NameUnknown) => self.unknown_path(error.token, stub: None)
+        Some(code) => self.ck.report_problem(self.item, token: error.token, code)
+        None => {}
+    }
+} Body.report_path
+
+/// Reports the unknown path holding `token`, its candidates the names in scope, the items its
+/// module may name and the core vocabulary, or `stub` when none is near.
+fn Body.unknown_path(self, token: u32, take stub: Option[text::String]) {
+    let alloc = self.ck.alloc()
+    var candidates = mem::List[text::String].empty(alloc)
+    for scope in self.scopes {
+        for local in scope {
+            mut candidates.push(text::String.of(self.locals[usize.widen(local.index)].name.as_str(), alloc))
+        }
+    }
+    let items = self.ck.item_candidates(self.module)
+    for candidate in take items {
+        mut candidates.push(take candidate)
+    }
+    let vocabulary = core_vocabulary(alloc)
+    for name in take vocabulary {
+        mut candidates.push(take name)
+    }
+    let span = self.ck.path_span(self.item, token)
+    self.ck.report_unknown(self.item, construct: span, take candidates, take stub)
+} Body.unknown_path
+
+/// Reports an unknown member of a type, its candidates the type's members the body's module
+/// may name, or `stub` when none is near.
+fn Body.unknown_member(self, name: ast::Name, ty: ty::Ty, take stub: Option[text::String]) {
+    let candidates = self.ck.member_candidates(self.module, ty)
+    self.ck.report_unknown(self.item, construct: nir::Span.at(name.token), take candidates, take stub)
+} Body.unknown_member
+
+fn Body.report_mismatch(self, token: u32, expected: ty::Ty, found: ty::Ty) {
+    self.ck.report_expected(self.item, token, code: diagnostic::Code.TypeMismatch, expected: self.ck.show(expected, from: self.module), found: self.ck.show(found, from: self.module))
+} Body.report_mismatch
+
+proj fn Body.text(self, token: u32) -> Str {
+    return self.ck.db().text(self.item, token)
+} Body.text
+
+fn Body.line(self, token: u32) -> u32 {
+    return self.ck.db().line(self.item, token)
+} Body.line
+
+proj fn Body.frame(self) -> Frame {
+    return self.frames[self.frames.len() - 1]
+} Body.frame
+
+fn Body.push_frame(mut self, take frame: Frame) {
+    mut self.frames.push(take frame)
+} Body.push_frame
+
+fn Body.function_frame(result: ty::Ty, failure: Option[ty::Ty], alloc: mem::Alloc) -> Frame {
+    return Frame(result: result, failure: failure, tested: false, closure: 0, task: false, listed: mem::List[ListedCapture].empty(alloc), captures: mem::List[FrameCapture].empty(alloc), loops: 0, scopes: 0, holds_todo: false, may_fail: None, several_failures: false, may_wait: false)
+} Body.function_frame
+
+/// Declares a local in the innermost scope, after the rules on its name.
+fn Body.declare(mut self, name: ast::Name, ty: ty::Ty, kind: LocalKind) -> LocalId {
+    self.check_local_name(name, kind)
+    let id = LocalId(index: u32.fit(self.locals.len()))
+    let closure = self.frame().closure
+    mut self.locals.push(Local(name: text::String.of(name.text.as_str(), alloc: self.ck.alloc()), ty: ty, kind: kind, token: name.token, captured: None, closure: closure))
+    let depth = self.scopes.len()
+    mut (mut self.scopes.at_mut(depth - 1)).push(id)
+    return id
+} Body.declare
+
+/// The rules on a binding's, parameter's or quantifier variable's name: its convention, no
+/// shadowing of a local whose scope overlaps, of a module value or core vocabulary name, and
+/// no folded clash with either.
+fn Body.check_local_name(self, name: ast::Name, kind: LocalKind) {
+    let alloc = self.ck.alloc()
+    let spelt = name.text.as_str()
+    let capture = match kind {
+        LocalKind.Capture(_) => true
+        else => false
+    }
+    if not capture and not is_snake(spelt) {
+        self.report(name.token, code: diagnostic::Code.NameCase)
+        discard self.ck.state.contents().misnamed.push(Misnamed(item: self.item, token: name.token, case: Case.Snake))
+        return
+    }
+    let db = self.ck.db()
+    var shadows = self.local_named(spelt)
+    if not shadows {
+        match db.lookup(self.module, name: spelt) {
+            Some(item) => {
+                shadows = in_values_namespace(db.declaration(item))
+            }
+            None => {}
+        }
+    }
+    if shadows or is_core_vocabulary(spelt) {
+        self.report(name.token, code: diagnostic::Code.StmtShadowing)
+        return
+    }
+    let folded = fold(spelt, alloc)
+    let clashes_local = self.local_folds_to(folded.as_str())
+    let clashes_value = self.value_folds().contains(folded)
+    let clashes_scalar = db.package_of(self.item) != db.core() and ty::Scalar.from_name(folded.as_str()).is_some()
+    if clashes_scalar {
+        self.report(name.token, code: diagnostic::Code.NameCoreRedefined)
+    } else if clashes_local or clashes_value {
+        self.report(name.token, code: diagnostic::Code.NameClash)
+    }
+} Body.check_local_name
+
+/// Whether a local in scope has a name.
+fn Body.local_named(self, name: Str) -> bool {
+    for scope in self.scopes {
+        for local in scope {
+            if self.locals[usize.widen(local.index)].name.as_str() == name {
+                return true
+            }
+        }
+    }
+    return false
+} Body.local_named
+
+/// Whether a local in scope has a name of that folded form.
+fn Body.local_folds_to(self, folded: Str) -> bool {
+    let alloc = self.ck.alloc()
+    for scope in self.scopes {
+        for local in scope {
+            if fold(self.locals[usize.widen(local.index)].name.as_str(), alloc).as_str() == folded {
+                return true
+            }
+        }
+    }
+    return false
+} Body.local_folds_to
+
+/// The folded names of the values the body's module declares.
+proj fn Body.value_folds(self) -> mem::Set[text::String] {
+    let held = match self.folded_values.get(0) {
+        Some(known) => known
+        None => self.folded_values.insert(0, value: self.module_value_folds())
+    }
+    return held
+} Body.value_folds
+
+fn Body.module_value_folds(self) -> mem::Set[text::String] {
+    let alloc = self.ck.alloc()
+    let db = self.ck.db()
+    var folds = mem::Set[text::String].empty(alloc)
+    for item in db.module(self.module).items {
+        let declared = db.declaration(item)
+        if not in_values_namespace(declared) {
+            continue
+        }
+        let Some(name) = declared_name(declared, alloc) else {
+            continue
+        }
+        discard mut folds.insert(fold(name.text.as_str(), alloc))
+    }
+    return folds
+} Body.module_value_folds
+
+fn Body.push_scope(mut self) {
+    mut self.scopes.push(mem::List[LocalId].empty(self.ck.alloc()))
+} Body.push_scope
+
+fn Body.pop_scope(mut self) {
+    discard mut self.scopes.pop()
+} Body.pop_scope
+
+/// The local a name names in scope, through the captures of the closures between.
+fn Body.lookup_local(mut self, name: Str) -> Option[LocalId] {
+    var depth = self.scopes.len()
+    var found: Option[LocalId] = None
+    while depth > 0 and found.is_none() {
+        depth -= 1
+        let scope = self.scopes[depth]
+        var at = scope.len()
+        while at > 0 {
+            at -= 1
+            if self.locals[usize.widen(scope[at].index)].name.as_str() == name {
+                found = Some(scope[at])
+                break
+            }
+        }
+    }
+    let Some(declared) = found else {
+        return None
+    }
+    var id = declared
+    for frame in 0..<self.frames.len() {
+        if self.frames[frame].closure == 0 or self.frames[frame].scopes <= depth {
+            continue
+        }
+        id = mut self.capture(frame, outer: id)
+    }
+    return Some(id)
+} Body.lookup_local
+
+/// The capture local standing in a closure's frame for a local of an enclosing frame.
+fn Body.capture(mut self, frame: usize, outer: LocalId) -> LocalId {
+    for captured in self.frames[frame].captures {
+        if captured.reached == outer {
+            return captured.local
+        }
+    }
+    let alloc = self.ck.alloc()
+    let local = self.locals[usize.widen(outer.index)]
+    var mode = ast::Mode.Read
+    for listed in self.frames[frame].listed {
+        if listed.name == local.name {
+            mode = listed.mode
+            break
+        }
+    }
+    let id = LocalId(index: u32.fit(self.locals.len()))
+    let captured = Local(name: text::String.of(local.name.as_str(), alloc), ty: local.ty, kind: LocalKind.Capture(mode), token: local.token, captured: Some(outer), closure: self.frames[frame].closure)
+    mut self.locals.push(take captured)
+    mut (mut self.frames.at_mut(frame)).captures.push(FrameCapture(reached: outer, local: id))
+    return id
+} Body.capture
+
+proj fn Body.local(self, id: LocalId) -> Local {
+    return self.locals[usize.widen(id.index)]
+} Body.local
+
+/// The binding outside closures a local stands for.
+fn Body.binding(self, local: LocalId) -> LocalId {
+    var current = local
+    loop {
+        let Some(outer) = self.locals[usize.widen(current.index)].captured else {
+            return current
+        }
+        current = outer
+    }
+} Body.binding
+
+/// Records that an expression uses a local.
+fn Body.note_use(mut self, local: LocalId) {
+    let binding = self.binding(local)
+    discard mut self.usage.used.insert(binding)
+} Body.note_use
+
+/// The typed form, once typing ends and its unused bindings are reported.
+fn Body.finish(take self, take root: Option[TExpr]) -> TBody {
+    var roots = mem::List[TExpr].empty(self.ck.alloc())
+    match root {
+        Some(typed) => mut roots.push(take typed)
+        None => {}
+    }
+    self.ck.check_unused_locals(self.item, locals: self.locals.view(), usage: self.usage, roots: roots.view())
+    self.close()
+    return TBody(locals: take self.locals, params: take self.params, clauses: take self.typed_clauses, examples: take self.examples, root: mut roots.pop())
+} Body.finish
+
+/// A block's statements; returns the typed block and whether it diverges.
+fn Body.block(mut self, block: ast::Block) -> Diverging[TBlock] {
+    let tailed = mut self.tail_block(block)
+    let TailedBlock(block: typed, diverges: diverges, tail: tail) = tailed
+    match tail {
+        Some(unused) => self.unused_result(unused)
+        None => {}
+    }
+    return Diverging(value: take typed, diverges: diverges)
+} Body.block
+
+/// Reports a value an expression statement leaves unused, with the fix inserting `discard`.
+fn Body.unused_result(self, tail: Tail) {
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_inserting(self.item, before: tail.token, text: "discard "))
+    self.report_fixed(nir::Span(head: tail.token, last: tail.last), code: diagnostic::Code.StmtUnusedResult, take fixes)
+} Body.unused_result
+
+/// A block and whether it diverges, the unused value of its final expression statement
+/// withheld for the caller to judge.
+fn Body.tail_block(mut self, block: ast::Block) -> TailedBlock {
+    mut self.push_scope()
+    var stmts = mem::List[TStmt].empty(self.ck.alloc())
+    var diverged = false
+    var reported = false
+    var tail: Option[Tail] = None
+    let count = block.stmts.len()
+    for index in 0..<count {
+        let stmt = block.stmts[index]
+        if diverged and not reported {
+            self.report(stmt.token, code: diagnostic::Code.StmtUnreachable)
+            reported = true
+        }
+        let typed = mut self.stmt(stmt)
+        let Diverging(value: typed_stmt, diverges: diverges) = typed
+        match unused_tail(typed_stmt, written: stmt) {
+            Some(unused) => {
+                if index + 1 == count {
+                    tail = Some(unused)
+                } else {
+                    self.unused_result(unused)
+                }
+            }
+            None => {}
+        }
+        if diverges {
+            diverged = true
+        }
+        mut stmts.push(take typed_stmt)
+    }
+    mut self.pop_scope()
+    return TailedBlock(block: TBlock(end: block.end, stmts: take stmts), diverges: diverged, tail: tail)
+} Body.tail_block
+
+/// The unused value of an expression statement, unless its type is `Unit`, `Never` or failed.
+fn unused_tail(typed: TStmt, written: ast::Stmt) -> Option[Tail] {
+    let TStmtKind.Expr(expr) = typed.kind else {
+        return None
+    }
+    let ast::StmtKind.Expr(source) = written.kind else {
+        return None
+    }
+    if expr.ty == ty::Ty.unit() or expr.ty == ty::Ty.never() or expr.ty == ty::Ty.error() {
+        return None
+    }
+    return Some(Tail(token: expr.token, last: source.last, ty: expr.ty))
+} unused_tail
+
+/// The block body of a function or closure whose result type is `result`: one that does not
+/// diverge misses its `return`, and the unused value of its final statement is reported only
+/// when inserting `return` before that statement would not yield the result.
+fn Body.result_block(mut self, block: ast::Block, result: ty::Ty) -> TBlock {
+    let tailed = mut self.tail_block(block)
+    let TailedBlock(block: typed, diverges: diverges, tail: tail) = tailed
+    let missing = not diverges and result != ty::Ty.unit() and not self.ck.types().has_error(result)
+    if missing {
+        var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+        let count = block.stmts.len()
+        if count > 0 {
+            mut fixes.push(self.ck.fix_inserting(self.item, before: block.stmts[count - 1].token, text: "return "))
+        }
+        self.report_fixed(nir::Span.at(block.end), code: diagnostic::Code.StmtMissingReturn, take fixes)
+    }
+    match tail {
+        Some(unused) => {
+            if not (missing and unused.ty == result) {
+                self.unused_result(unused)
+            }
+        }
+        None => {}
+    }
+    return typed
+} Body.result_block
+
+/// One statement; returns its typed form and whether it diverges.
+fn Body.stmt(mut self, stmt: ast::Stmt) -> Diverging[TStmt] {
+    let line = self.line(stmt.token)
+    let ck = self.ck.share()
+    return ck.db().on_line(line, compute: fn[mut self]() -> Diverging[TStmt] {
+        return mut self.stmt_on_line(stmt)
+    })
+} Body.stmt
+
+fn Body.stmt_on_line(mut self, stmt: ast::Stmt) -> Diverging[TStmt] {
+    let typed = match stmt.kind {
+        ast::StmtKind.Let(pattern: pattern, ty: ty, value: value, otherwise: otherwise) => mut self.let_stmt(stmt, pattern, ty, value, otherwise)
+        ast::StmtKind.Var(name: name, ty: ty, value: value) => mut self.var_stmt(stmt, name, ty, value)
+        ast::StmtKind.Discard(expr) => mut self.discard_stmt(stmt, expr)
+        ast::StmtKind.While(condition: condition, body: body) => mut self.while_stmt(condition, body)
+        ast::StmtKind.For(pattern: pattern, iterated: iterated, body: body) => Diverging(value: mut self.for_stmt(pattern, iterated, body), diverges: false)
+        ast::StmtKind.Loop(label: label, body: body) => mut self.loop_stmt(label, body)
+        ast::StmtKind.Defer(call) => Diverging(value: TStmtKind.Defer(mut self.defer_stmt(call)), diverges: false)
+        ast::StmtKind.Undefer(place) => Diverging(value: TStmtKind.Undefer(mut self.expr(place, expected: None)), diverges: false)
+        ast::StmtKind.Expect(condition) => mut self.expect_stmt(condition)
+        ast::StmtKind.Assume(condition: condition, reason: reason) => mut self.assume_stmt(stmt, condition, reason)
+        ast::StmtKind.Expr(expr) => mut self.expr_stmt(expr)
+        ast::StmtKind.Assign(target: target, op: op, op_token: op_token, value: value) => mut self.assign(target, op, op_token, value)
+    }
+    let Diverging(value: kind, diverges: diverges) = typed
+    return Diverging(value: TStmt(token: stmt.token, kind: take kind), diverges: diverges)
+} Body.stmt_on_line
+
+fn Body.var_stmt(mut self, stmt: ast::Stmt, name: ast::Name, ty: Option[ast::TypeExpr], value: ast::Expr) -> Diverging[TStmtKind] {
+    var declared: Option[ty::Ty] = None
+    match ty {
+        Some(written) => {
+            declared = Some(mut self.type_expr(written))
+        }
+        None => {}
+    }
+    let typed = mut self.initializer(value, declared)
+    let local_ty = match declared {
+        Some(declared_ty) => declared_ty
+        None => typed.ty
+    }
+    let diverges = typed.ty.is_never()
+    let local = mut self.declare(name, ty: local_ty, kind: LocalKind.Var)
+    if typed.calls_projection() {
+        discard mut self.usage.parts.insert(local)
+    }
+    if self.is_part(typed) {
+        discard mut self.part_bindings.insert(local)
+    } else if self.is_wrapped_part(typed) {
+        discard mut self.wrapped_bindings.insert(local)
+    }
+    let unit = typed.ty == ty::Ty.unit() or typed.ty == ty::Ty.never()
+    discard mut self.usage.bindings.insert(local, value: Binding(statement: stmt.token, value: nir::Span(head: value.token, last: value.last), unit: unit))
+    return Diverging(value: TStmtKind.Var(local: local, value: take typed), diverges: diverges)
+} Body.var_stmt
+
+/// Whether an expression is a call or index of a projection.
+fn TExpr.calls_projection(self) -> bool {
+    return match self.kind {
+        TKind.Call(call) or TKind.Index(call) => call.contents().projection
+        else => false
+    }
+} TExpr.calls_projection
+
+fn Body.discard_stmt(mut self, stmt: ast::Stmt, expr: ast::Expr) -> Diverging[TStmtKind] {
+    let typed = mut self.expr(expr, expected: None)
+    if typed.ty == ty::Ty.unit() or typed.ty == ty::Ty.never() {
+        var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+        mut fixes.push(self.ck.fix_deleting_forward(self.item, head: stmt.token, last: stmt.token))
+        self.report_fixed(nir::Span.at(stmt.token), code: diagnostic::Code.StmtDiscardUnit, take fixes)
+    }
+    let diverges = typed.ty.is_never()
+    return Diverging(value: TStmtKind.Discard(take typed), diverges: diverges)
+} Body.discard_stmt
+
+fn Body.while_stmt(mut self, condition: ast::Expr, body: ast::LoopBlock) -> Diverging[TStmtKind] {
+    let typed_condition = mut self.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+    let looped = mut self.loop_body(body, label: None)
+    let TypedLoop(invariants: invariants, block: block) = looped
+    return Diverging(value: TStmtKind.While(condition: take typed_condition, invariants: take invariants, body: take block), diverges: false)
+} Body.while_stmt
+
+fn Body.loop_stmt(mut self, label: Option[ast::Name], body: ast::LoopBlock) -> Diverging[TStmtKind] {
+    var loop_label: Option[text::String] = None
+    match label {
+        Some(written) => {
+            self.check_label(written)
+            loop_label = Some(text::String.of(written.text.as_str(), alloc: self.ck.alloc()))
+        }
+        None => {}
+    }
+    mut self.loops.push(Loop(label: take loop_label, broken: false, label_used: false))
+    let looped = mut self.loop_body_in(body)
+    let count = self.loops.len()
+    let broken = self.loops[count - 1].broken
+    let label_used = self.loops[count - 1].label_used
+    discard mut self.loops.pop()
+    match label {
+        Some(written) => {
+            if not label_used {
+                let keyword = keyword_before(self.ck.db().syntax(self.item), token: written.token)
+                var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+                mut fixes.push(self.ck.fix_deleting(self.item, head: keyword, last: written.token))
+                self.report_fixed(nir::Span(head: keyword, last: written.token), code: diagnostic::Code.StmtUnusedLabel, take fixes)
+            }
+        }
+        None => {}
+    }
+    let TypedLoop(invariants: invariants, block: block) = looped
+    return Diverging(value: TStmtKind.Loop(invariants: take invariants, body: take block), diverges: not broken)
+} Body.loop_stmt
+
+/// The token before one of a file's tokens that is not read as a comment, or the token itself
+/// when none is.
+fn keyword_before(syntax: syntax::SourceFile, token: u32) -> u32 {
+    var at = usize.widen(token)
+    while at > 0 {
+        at -= 1
+        if not syntax.comment[at] {
+            return u32.fit(at)
+        }
+    }
+    return token
+} keyword_before
+
+fn Body.expect_stmt(mut self, condition: ast::Expr) -> Diverging[TStmtKind] {
+    let saved = self.cx
+    self.cx.quantifiers = true
+    let typed = mut self.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+    self.cx = saved
+    self.check_expect_purity(condition)
+    return Diverging(value: TStmtKind.Expect(take typed), diverges: false)
+} Body.expect_stmt
+
+fn Body.assume_stmt(mut self, stmt: ast::Stmt, condition: ast::Expr, reason: ast::Text) -> Diverging[TStmtKind] {
+    if self.cx.trusted_code {
+        self.ck.require(self.item, token: stmt.token, authority: workspace::Authority.Trusted)
+    } else {
+        let alloc = self.ck.alloc()
+        let written = self.ck.written(self.item, head: condition.token, last: condition.last)
+        var replacement = text::String.of("expect ", alloc)
+        mut replacement.append(written.as_str())
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        mut fixes.push(self.ck.fix_replacing(self.item, head: stmt.token, last: reason.token, text: replacement.as_str()))
+        self.report_fixed(nir::Span(head: stmt.token, last: reason.token), code: diagnostic::Code.ContractAssumeUntrusted, take fixes)
+        self.ck.perform(self.item, authority: workspace::Authority.Trusted)
+    }
+    var blank = true
+    for byte in reason.value.as_bytes() {
+        if byte != b' ' {
+            blank = false
+        }
+    }
+    if blank {
+        self.report(reason.token, code: diagnostic::Code.ContractEmptyReason)
+    }
+    let saved = self.cx
+    self.cx.contract = true
+    self.cx.quantifiers = true
+    let typed = mut self.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+    self.cx = saved
+    return Diverging(value: TStmtKind.Assume(take typed), diverges: false)
+} Body.assume_stmt
+
+fn Body.expr_stmt(mut self, expr: ast::Expr) -> Diverging[TStmtKind] {
+    let typed = mut self.statement_expr(expr)
+    let diverges = typed.ty.is_never()
+    return Diverging(value: TStmtKind.Expr(take typed), diverges: diverges)
+} Body.expr_stmt
+
+/// The expression of an expression statement, in statement position, its `if` and `match`
+/// yielding no value.
+fn Body.statement_expr(mut self, expr: ast::Expr) -> TExpr {
+    let enclosing = self.statement
+    self.statement = Some(nir::Span(head: expr.token, last: expr.last))
+    let typed = match expr.kind {
+        ast::ExprKind.If(condition: _, then: _, otherwise: _) or ast::ExprKind.Match(ordered: _, scrutinee: _, arms: _) => mut self.statement_branches(expr)
+        else => mut self.expr_jump(expr, expected: None, jump: true)
+    }
+    self.statement = enclosing
+    return typed
+} Body.statement_expr
+
+fn Body.let_stmt(
+    mut self,
+    stmt: ast::Stmt,
+    pattern: ast::Pattern,
+    ty: Option[ast::TypeExpr],
+    value: ast::Expr,
+    otherwise: Option[ast::Block],
+    ) -> Diverging[TStmtKind] {
+    var declared: Option[ty::Ty] = None
+    match ty {
+        Some(written) => {
+            declared = Some(mut self.type_expr(written))
+        }
+        None => {}
+    }
+    let typed = mut self.initializer(value, declared)
+    match pattern.kind {
+        ast::PatternKind.Wildcard => self.wildcard_binding(stmt, value, ty: typed.ty)
+        else => {}
+    }
+    let scrutinee = match declared {
+        Some(declared_ty) => declared_ty
+        None => typed.ty
+    }
+    let diverges = typed.ty.is_never()
+    var typed_otherwise: Option[TBlock] = None
+    match otherwise {
+        Some(block) => {
+            let checked = mut self.block(block)
+            let Diverging(value: block_typed, diverges: block_diverges) = checked
+            if not block_diverges {
+                self.report(stmt.token, code: diagnostic::Code.StmtElseNotDiverging)
+            }
+            typed_otherwise = Some(take block_typed)
+        }
+        None => {}
+    }
+    let typed_pattern = mut self.top_pattern(pattern, ty: scrutinee, kind: LocalKind.Pattern)
+    mut self.bind_views(typed_pattern, value: typed)
+    match typed_pattern.kind {
+        TPatternKind.Binding(local) => {
+            if otherwise.is_none() {
+                let unit = typed.ty == ty::Ty.unit() or typed.ty == ty::Ty.never()
+                discard mut self.usage.bindings.insert(local, value: Binding(statement: stmt.token, value: nir::Span(head: value.token, last: value.last), unit: unit))
+            }
+        }
+        else => {}
+    }
+    if not self.ck.types().has_error(typed.ty) and not self.ck.types().has_error(scrutinee) {
+        match self.refutable(typed_pattern) {
+            Some(refutable) => {
+                if refutable and typed_otherwise.is_none() {
+                    self.report(pattern.token, code: diagnostic::Code.PatternRefutable)
+                } else if not refutable {
+                    self.irrefutable_else(stmt, otherwise)
+                }
+            }
+            None => {}
+        }
+    }
+    return Diverging(value: TStmtKind.Let(pattern: take typed_pattern, value: take typed, otherwise: take typed_otherwise), diverges: diverges)
+} Body.let_stmt
+
+/// Reports a `let _ =` binding, with the fix writing `discard` in place of `let _ =`, or
+/// nothing when the value has type `Unit` or `Never`.
+fn Body.wildcard_binding(self, stmt: ast::Stmt, value: ast::Expr, ty: ty::Ty) {
+    let syntax = self.ck.db().syntax(self.item)
+    let start = syntax.tokens[usize.widen(stmt.token)].start
+    let end = syntax.tokens[usize.widen(value.token)].start
+    let kept = if ty == ty::Ty.unit() or ty == ty::Ty.never() {
+        ""
+    } else {
+        "discard "
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_bytes(self.item, start, end, text: kept))
+    self.report_fixed(nir::Span(head: stmt.token, last: value.last), code: diagnostic::Code.StmtWildcardBinding, take fixes)
+} Body.wildcard_binding
+
+/// Reports the `else` block of a `let` whose pattern is irrefutable, with the fix deleting it.
+fn Body.irrefutable_else(self, stmt: ast::Stmt, otherwise: Option[ast::Block]) {
+    let Some(block) = otherwise else {
+        return
+    }
+    let keyword = keyword_before(self.ck.db().syntax(self.item), token: block.token)
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_deleting(self.item, head: keyword, last: block.end))
+    self.report_fixed(nir::Span(head: stmt.token, last: block.end), code: diagnostic::Code.StmtIrrefutableElse, take fixes)
+} Body.irrefutable_else
+
+/// Records the bindings a pattern matching `value` makes as view bindings: of a part, each
+/// of them; of a wrapped part, a binding of the whole as a wrapped part and each other as a
+/// part.
+fn Body.bind_views(mut self, pattern: TPattern, value: TExpr) {
+    if self.is_part(value) {
+        mut self.bind_parts(pattern)
+        return
+    }
+    if not self.is_wrapped_part(value) {
+        return
+    }
+    match pattern.kind {
+        TPatternKind.Binding(local) => {
+            discard mut self.wrapped_bindings.insert(local)
+        }
+        else => mut self.bind_parts(pattern)
+    }
+} Body.bind_views
+
+/// Records each binding of a pattern as a view binding of a part.
+fn Body.bind_parts(mut self, pattern: TPattern) {
+    match pattern.kind {
+        TPatternKind.Binding(local) => {
+            discard mut self.part_bindings.insert(local)
+        }
+        TPatternKind.Fields(variant: _, fields: fields) => {
+            for field in fields {
+                mut self.bind_parts(field.pattern)
+            }
+        }
+        TPatternKind.Wildcard or TPatternKind.Value(space: _, compared: _) or TPatternKind.Failed => {}
+    }
+} Body.bind_parts
+
+/// An initializer: checked against the declared type, or fixed without an expected type.
+fn Body.initializer(mut self, value: ast::Expr, declared: Option[ty::Ty]) -> TExpr {
+    return match declared {
+        Some(declared_ty) => mut self.check(value, expected: declared_ty)
+        None => mut self.expr(value, expected: None)
+    }
+} Body.initializer
+
+fn Body.assign(mut self, target: ast::Expr, op: ast::AssignOp, op_token: u32, value: ast::Expr) -> Diverging[TStmtKind] {
+    let target_typed = mut self.place(target, assigned: op == ast::AssignOp.Set)
+    match place_root(target_typed) {
+        Some(root) => {
+            let binding = self.binding(root)
+            discard mut self.usage.assigned.insert(binding)
+            let element_mut = match self.locals[usize.widen(root.index)].kind {
+                LocalKind.Element(ast::Mode.Mut) => true
+                else => false
+            }
+            let writes_part = element_mut or self.usage.parts.contains(binding)
+            if op != ast::AssignOp.Set or writes_part {
+                mut self.note_use(root)
+            }
+        }
+        None => {}
+    }
+    let Some(target_place) = target_typed else {
+        self.report(target.token, code: diagnostic::Code.StmtAssignTarget)
+        let skimmed = mut self.skim(value)
+        return Diverging(value: TStmtKind.Assign(target: TExpr.failed(target.token), op: None, value: take skimmed), diverges: false)
+    }
+    let value_typed = match op.binary() {
+        None => mut self.check(value, expected: target_place.ty)
+        Some(binary) => mut self.compound_value(binary, op_token, target_place, target, value)
+    }
+    let diverges = value_typed.ty.is_never()
+    return Diverging(value: TStmtKind.Assign(target: take target_place, op: op.binary(), value: take value_typed), diverges: diverges)
+} Body.assign
+
+/// The local at the root of an assignment target, when it is a place.
+fn place_root(target: Option[TExpr]) -> Option[LocalId] {
+    let Some(place) = target else {
+        return None
+    }
+    return place.root_local()
+} place_root
+
+/// The value a compound assignment assigns: the right operand of its operator applied to the
+/// target, reported unless its result has the target's type.
+fn Body.compound_value(
+    mut self,
+    op: ast::BinaryOp,
+    op_token: u32,
+    target_place: TExpr,
+    target: ast::Expr,
+    value: ast::Expr,
+    ) -> TExpr {
+    let result = mut self.binary_op(op, op_token, typed: target_place, target, value)
+    let failed = self.ck.types().has_error(result.ty) or self.ck.types().has_error(target_place.ty)
+    if not failed and result.ty != target_place.ty {
+        self.report_mismatch(value.token, expected: target_place.ty, found: result.ty)
+    }
+    return take result.into_right()
+} Body.compound_value
+
+/// The right operand of a binary operator, or the expression itself for another.
+fn TExpr.into_right(take self) -> TExpr {
+    match self.kind {
+        TKind.Binary(op: _, left: _, right: right) => return take right.into_contents()
+        else => {}
+    }
+    return self
+} TExpr.into_right
+
+/// The body of a `while` loop: its invariants and block, as a loop `break` may leave.
+fn Body.loop_body(mut self, body: ast::LoopBlock, take label: Option[text::String]) -> TypedLoop {
+    mut self.loops.push(Loop(label: take label, broken: false, label_used: false))
+    let typed = mut self.loop_body_in(body)
+    discard mut self.loops.pop()
+    return typed
+} Body.loop_body
+
+fn Body.loop_body_in(mut self, body: ast::LoopBlock) -> TypedLoop {
+    mut self.push_scope()
+    var invariants = mem::List[TExpr].empty(self.ck.alloc())
+    for condition in body.invariants {
+        let saved = self.cx
+        self.cx.contract = true
+        self.cx.quantifiers = true
+        let typed = mut self.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+        self.cx = saved
+        mut invariants.push(take typed)
+    }
+    let checked = mut self.block(body.block)
+    mut self.pop_scope()
+    let Diverging(value: block, diverges: _) = checked
+    return TypedLoop(invariants: take invariants, block: take block)
+} Body.loop_body_in
+
+/// A loop label: no label of an enclosing loop of the same frame spells it.
+fn Body.check_label(self, label: ast::Name) {
+    let base = self.frame().loops
+    for index in base..<self.loops.len() {
+        match self.loops[index].label {
+            Some(known) => {
+                if known == label.text {
+                    self.report(label.token, code: diagnostic::Code.StmtShadowing)
+                    break
+                }
+            }
+            None => {}
+        }
+    }
+    if not is_snake(label.text.as_str()) {
+        self.report(label.token, code: diagnostic::Code.NameCase)
+        discard self.ck.state.contents().misnamed.push(Misnamed(item: self.item, token: label.token, case: Case.Snake))
+    }
+} Body.check_label
+
+/// The type a type expression written in the body denotes, reporting its problems.
+fn Body.type_expr(mut self, ty: ast::TypeExpr) -> ty::Ty {
+    var problems = Problems.empty(self.ck.alloc())
+    let ctx = TypeCtx(item: self.item, module: self.module, generics: self.generics.view(), self_param: self.self_param)
+    let resolved = self.ck.type_expr(ctx, ty, mut problems)
+    self.ck.report_problems(self.item, problems)
+    self.ck.check_value_type(self.item, ty: resolved, token: ty.token)
+    return resolved
+} Body.type_expr
+
+/// Types every body an item holds and reports their rules; returns the typed form of its
+/// function, test, const or contribution body.
+fn Checker.check_bodies(self, item: ty::ItemId) -> Option[TBody] {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(function) => {
+            let SigKind.Fn(fn_sig) = sig.contents().kind else {
+                return None
+            }
+            return Some(self.function_body(item, function, sig: fn_sig))
+        }
+        ast::ItemKind.Test(tested) => return Some(self.test_body(item, tested))
+        ast::ItemKind.Retired(tombstone) => {
+            let Some(head) = tombstone.head else {
+                return None
+            }
+            let ast::RetiredNew.Rewrite(expr: rewrite, preserves: _) = tombstone.new else {
+                return None
+            }
+            if not self.head_rewrite_form(rewrite) {
+                return None
+            }
+            return self.typed_rewrite(item, head, rewrite)
+        }
+        ast::ItemKind.Const(constant) => {
+            let SigKind.Const(ty: const_ty) = sig.contents().kind else {
+                return None
+            }
+            var body = Body.new(self, item, generics: mem::List[GenericDef].empty(alloc))
+            mut body.push_frame(Body.function_frame(const_ty, failure: None, alloc))
+            let typed = if constant.ty.is_some() {
+                mut body.check(constant.value, expected: const_ty)
+            } else {
+                mut body.expr(constant.value, expected: None)
+            }
+            return Some(take body.finish(Some(take typed)))
+        }
+        ast::ItemKind.ConstAssert(condition) => {
+            var body = Body.new(self, item, generics: mem::List[GenericDef].empty(alloc))
+            mut body.push_frame(Body.function_frame(ty::Ty.scalar(ty::Scalar.Bool), failure: None, alloc))
+            let typed = mut body.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+            return Some(take body.finish(Some(take typed)))
+        }
+        ast::ItemKind.Contribute(contribution) => {
+            let entry = self.contribution_entry(item, contribution)
+            var body = Body.new(self, item, generics: mem::List[GenericDef].empty(alloc))
+            mut body.push_frame(Body.function_frame(entry, failure: None, alloc))
+            let typed = mut body.check(contribution.value, expected: entry)
+            return Some(take body.finish(Some(take typed)))
+        }
+        ast::ItemKind.Struct(structure) => {
+            self.predicates(item, structure, generics: sig.contents().generics.view())
+            return None
+        }
+        ast::ItemKind.Interface(declaring) => {
+            self.method_bodies_of(item, declaring)
+            return None
+        }
+        else => return None
+    }
+} Checker.check_bodies
+
+/// The bodies of an interface's methods, each with its signature.
+fn Checker.method_bodies_of(self, item: ty::ItemId, declaring: ast::InterfaceItem) {
+    let sig = self.sig(item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return
+    }
+    var count = declaring.methods.len()
+    if methods.len() < count {
+        count = methods.len()
+    }
+    for index in 0..<count {
+        self.method_body(item, index, method: declaring.methods[index], sig: methods[index].sig)
+    }
+} Checker.method_bodies_of
+
+fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnSig) -> TBody {
+    let alloc = self.alloc()
+    var body = Body.new(self, item, generics: GenericDef.copies(sig.generics.view(), alloc))
+    mut body.push_frame(Body.function_frame(sig.result, failure: sig.failure, alloc))
+    mut body.declare_params(function.head.params.view(), sig)
+    mut body.clauses(function.clauses.view(), sig)
+    var root: Option[TExpr] = None
+    var bodiless = false
+    match function.body {
+        ast::FnBody.Block(block) => {
+            let typed = mut body.result_block(block, result: sig.result)
+            root = Some(TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed)))
+        }
+        ast::FnBody.Expr(expr) => {
+            root = Some(mut body.check(expr, expected: sig.result))
+        }
+        ast::FnBody.None => {
+            bodiless = true
+        }
+    }
+    if not bodiless {
+        let token = self.db().ast(item).token
+        let entry = self.names_entry(item)
+        let fixable = not entry or self.db().target == workspace::Target.Host
+        let clauses = Clauses.of(function.head, fixable)
+        body.check_effects(token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: entry)
+    }
+    return take body.finish(take root)
+} Checker.function_body
+
+/// Whether a function is the root module's function that its package's `entry` directive
+/// names, whose head forms are fixed.
+fn Checker.names_entry(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    let module = db.module_of(item)
+    let data = db.module(module)
+    let source = db.source(data.package_id)
+    let ast::ItemKind.Fn(function) = db.ast(item).kind else {
+        return false
+    }
+    if not data.root or function.label.owner.is_some() {
+        return false
+    }
+    let Some(manifest) = source.manifest else {
+        return false
+    }
+    let Some(entry) = manifest.entry else {
+        return false
+    }
+    return entry.name == function.label.name.text
+} Checker.names_entry
+
+/// Whether a function is its package's entry function: the one the `entry` directive names,
+/// in a program declaring exactly one concrete target.
+fn Checker.is_entry(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    let source = db.source(db.package_of(item))
+    var program = false
+    match source.manifest {
+        Some(manifest) => {
+            program = manifest.targets.len() == 1 and manifest.targets[0] != workspace::Target.Any
+        }
+        None => {}
+    }
+    return program and self.names_entry(item)
+} Checker.is_entry
+
+fn Checker.method_body(self, item: ty::ItemId, index: usize, method: ast::Method, sig: FnSig) {
+    let alloc = self.alloc()
+    var body = Body.new(self, item, generics: GenericDef.copies(sig.generics.view(), alloc))
+    mut body.push_frame(Body.function_frame(sig.result, failure: sig.failure, alloc))
+    mut body.declare_params(method.head.params.view(), sig)
+    mut body.clauses(method.clauses.view(), sig)
+    let Some(block) = method.body else {
+        let typed = take body.finish(None)
+        discard self.state.contents().method_bodies.insert(MethodKey(item: item, method: index), value: mem::Shared.of(take typed, alloc))
+        return
+    }
+    let typed_block = mut body.result_block(block, result: sig.result)
+    let clauses = Clauses.of(method.head, fixable: true)
+    body.check_effects(method.token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: true)
+    let typed = take body.finish(Some(TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed_block))))
+    let shared = mem::Shared.of(take typed, alloc)
+    self.check_flow(item, body: shared.share(), projection: method.projection)
+    self.check_float_use(item, body: shared.share())
+    discard self.state.contents().method_bodies.insert(MethodKey(item: item, method: index), value: take shared)
+} Checker.method_body
+
+fn Checker.test_body(self, item: ty::ItemId, tested: ast::TestItem) -> TBody {
+    let alloc = self.alloc()
+    var body = Body.new(self, item, generics: mem::List[GenericDef].empty(alloc))
+    var frame = Body.function_frame(ty::Ty.unit(), failure: None, alloc)
+    frame.tested = true
+    mut body.push_frame(take frame)
+    match tested.params {
+        Some(params) => mut body.declare_test_params(params.view())
+        None => {}
+    }
+    let checked = mut body.block(tested.body)
+    let Diverging(value: typed, diverges: _) = checked
+    return take body.finish(Some(TExpr(token: tested.body.token, last: tested.body.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed))))
+} Checker.test_body
+
+/// Declares a test's parameters, the inputs a property test generates.
+fn Body.declare_test_params(mut self, params: Slice[ast::Param]) {
+    for param in params {
+        match param.kind {
+            ast::ParamKind.Named(name: name, ty: written) => {
+                let param_ty = mut self.type_expr(written)
+                let id = mut self.declare(name, ty: param_ty, kind: LocalKind.Param(param.mode))
+                mut self.params.push(id)
+            }
+            ast::ParamKind.SelfValue => {}
+        }
+    }
+} Body.declare_test_params
+
+/// The predicates of a struct: bool contract terms over its fields.
+fn Checker.predicates(self, item: ty::ItemId, structure: ast::StructItem, generics: Slice[GenericDef]) {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return
+    }
+    var body = Body.new(self, item, generics: GenericDef.copies(generics, alloc))
+    mut body.push_frame(Body.function_frame(ty::Ty.scalar(ty::Scalar.Bool), failure: None, alloc))
+    body.cx.contract = true
+    body.cx.quantifiers = true
+    var field_locals = mem::List[FieldLocal].empty(alloc)
+    for field in fields {
+        let id = LocalId(index: u32.fit(body.locals.len()))
+        mut body.locals.push(Local(name: text::String.of(field.name.as_str(), alloc), ty: field.ty, kind: LocalKind.Let, token: field.token, captured: None, closure: 0))
+        mut (mut body.scopes.at_mut(0)).push(id)
+        mut field_locals.push(FieldLocal(local: id, name: text::String.of(field.name.as_str(), alloc)))
+    }
+    var conditions = mem::List[TExpr].empty(alloc)
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                match field.where_clause {
+                    Some(predicate) => mut conditions.push(mut body.check(predicate, expected: ty::Ty.scalar(ty::Scalar.Bool)))
+                    None => {}
+                }
+            }
+            ast::StructMember.Invariant(predicate) => mut conditions.push(mut body.check(predicate, expected: ty::Ty.scalar(ty::Scalar.Bool)))
+        }
+    }
+    self.check_unused_locals(item, locals: body.locals.view(), usage: body.usage, roots: conditions.view())
+    let typed = TypedPredicates(body: mem::Shared.of(take body.finish(None), alloc), fields: take field_locals, conditions: take conditions)
+    discard self.state.contents().typed_predicates.insert(item, value: mem::Shared.of(take typed, alloc))
+} Checker.predicates
+
+/// The `where` conditions of an item's const parameters: bool contract terms over the const
+/// parameters.
+fn Checker.where_conditions(self, item: ty::ItemId, generics: Slice[ast::GenericParam]) {
+    var written = false
+    for param in generics {
+        if param.where_clause.is_some() {
+            written = true
+        }
+    }
+    if not written {
+        return
+    }
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let defs = sig.contents().generics
+    var body = Body.new(self, item, generics: GenericDef.copies(defs.view(), alloc))
+    mut body.push_frame(Body.function_frame(ty::Ty.scalar(ty::Scalar.Bool), failure: None, alloc))
+    body.cx.contract = true
+    body.cx.quantifiers = true
+    var params = mem::List[ConstParam].empty(alloc)
+    for def in defs {
+        match def.constant {
+            Some(scalar) => mut params.push(ConstParam(param: def.param, scalar: scalar))
+            None => {}
+        }
+    }
+    var conditions = mem::List[TExpr].empty(alloc)
+    for param in generics {
+        let Some(condition) = param.where_clause else {
+            continue
+        }
+        let line = self.db().line(item, token: condition.token)
+        let typed = self.db().on_line(line, compute: fn[mut body]() -> TExpr {
+            return mut body.check(condition, expected: ty::Ty.scalar(ty::Scalar.Bool))
+        })
+        mut conditions.push(take typed)
+    }
+    let typed = TypedWheres(body: mem::Shared.of(take body.finish(None), alloc), params: take params, conditions: take conditions)
+    discard self.state.contents().typed_wheres.insert(item, value: mem::Shared.of(take typed, alloc))
+} Checker.where_conditions
+
+/// Declares a head's parameters, `self` included.
+fn Body.declare_params(mut self, params: Slice[ast::Param], sig: FnSig) {
+    let alloc = self.ck.alloc()
+    var count = params.len()
+    if sig.params.len() < count {
+        count = sig.params.len()
+    }
+    for index in 0..<count {
+        let param = params[index]
+        let param_ty = sig.params[index].ty
+        var id = LocalId(index: u32.fit(self.locals.len()))
+        match param.kind {
+            ast::ParamKind.Named(name: name, ty: _) => {
+                id = mut self.declare(name, ty: param_ty, kind: LocalKind.Param(param.mode))
+            }
+            ast::ParamKind.SelfValue => {
+                mut self.locals.push(Local(name: text::String.of("self", alloc), ty: param_ty, kind: LocalKind.Param(param.mode), token: param.token, captured: None, closure: 0))
+                let depth = self.scopes.len()
+                mut (mut self.scopes.at_mut(depth - 1)).push(id)
+            }
+        }
+        mut self.params.push(id)
+    }
+} Body.declare_params
+
+/// The clause region: requires, ensures and decreases are contract terms over the
+/// parameters; examples are checked as a parameterless function's returned expression.
+fn Body.clauses(mut self, clauses: Slice[ast::Clause], sig: FnSig) {
+    for clause in clauses {
+        let line = self.line(clause.token)
+        let ck = self.ck.share()
+        ck.db().on_line(line, compute: fn[mut self]() {
+            mut self.clause(clause, sig)
+        })
+    }
+} Body.clauses
+
+fn Body.clause(mut self, clause: ast::Clause, sig: FnSig) {
+    if clause.disputed {
+        self.report(clause.token, code: diagnostic::Code.TodoDisputed)
+    }
+    match clause.kind {
+        ast::ClauseKind.Missing => self.report(clause.token, code: diagnostic::Code.TodoMissingSpec)
+        else => {}
+    }
+    let saved = self.cx
+    let boolean = ty::Ty.scalar(ty::Scalar.Bool)
+    match clause.kind {
+        ast::ClauseKind.Requires(term) => {
+            self.cx.contract = true
+            self.cx.requires_clause = true
+            self.cx.quantifiers = true
+            let typed = mut self.check(term, expected: boolean)
+            mut self.typed_clauses.push(TClause(token: clause.token, role: ClauseRole.Requires, disputed: clause.disputed, expr: take typed))
+        }
+        ast::ClauseKind.Ensures(term) => {
+            self.cx.contract = true
+            self.cx.ensures_clause = true
+            self.cx.quantifiers = true
+            self.result = Some(sig.result)
+            let typed = mut self.check(term, expected: boolean)
+            self.result = None
+            mut self.typed_clauses.push(TClause(token: clause.token, role: ClauseRole.Ensures, disputed: clause.disputed, expr: take typed))
+        }
+        ast::ClauseKind.Decreases(term) => {
+            self.cx.contract = true
+            let typed = mut self.expr(term, expected: None)
+            let unsigned = match self.ck.types().scalar_of(typed.ty) {
+                Some(scalar) => scalar.is_integer() and not scalar.is_signed()
+                None => false
+            }
+            if not unsigned and not self.ck.types().has_error(typed.ty) {
+                self.report_mismatch(term.token, expected: ty::Ty.scalar(ty::Scalar.Unsigned64), found: typed.ty)
+            }
+            mut self.typed_clauses.push(TClause(token: clause.token, role: ClauseRole.Decreases, disputed: clause.disputed, expr: take typed))
+        }
+        ast::ClauseKind.Example(example) => {
+            let typed = mut self.example(example)
+            mut self.examples.push(TExample(token: clause.token, disputed: clause.disputed, body: mem::Shared.of(take typed, alloc: self.ck.alloc())))
+        }
+        ast::ClauseKind.Missing or ast::ClauseKind.Waive(length: _, reason: _) => {}
+    }
+    self.cx = saved
+} Body.clause
+
+/// A `for` statement: the cursor its form obtains from the iterated expression, and its
+/// pattern bound to each element.
+fn Body.for_stmt(mut self, pattern: ast::Pattern, iterated: ast::Expr, body: ast::LoopBlock) -> TStmtKind {
+    let mode = match iterated.kind {
+        ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(marker), inner: _) => marker.kind
+        else => ast::Mode.Read
+    }
+    let typed = match iterated.kind {
+        ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => mut self.iterated_operand(inner.contents(), mode)
+        else => mut self.iterated_operand(iterated, mode)
+    }
+    let found = mut self.cursor_of(typed, mode, token: iterated.token)
+    mut self.loops.push(Loop(label: None, broken: false, label_used: false))
+    mut self.push_scope()
+    let typed_pattern = mut self.top_pattern(pattern, ty: found.element, kind: LocalKind.Element(mode))
+    if mode != ast::Mode.Take and self.ck.next_projects(found.cursor) {
+        mut self.bind_parts(typed_pattern)
+    }
+    if not self.ck.types().has_error(found.element) and self.refutable(typed_pattern) == Some(true) {
+        self.report(pattern.token, code: diagnostic::Code.PatternRefutable)
+    }
+    let looped = mut self.loop_body_in(body)
+    mut self.pop_scope()
+    discard mut self.loops.pop()
+    let TypedLoop(invariants: invariants, block: block) = looped
+    return TStmtKind.For(pattern: take typed_pattern, mode: mode, iterated: take typed, cursor: found.cursor, invariants: take invariants, body: take block)
+} Body.for_stmt
+
+/// The iterated expression of a `for` form, a place reached by `mut` for `for x in mut xs`.
+fn Body.iterated_operand(mut self, value: ast::Expr, mode: ast::Mode) -> TExpr {
+    if mode == ast::Mode.Mut {
+        return mut self.mut_operand(value, expected: None)
+    }
+    return mut self.expr(value, expected: None)
+} Body.iterated_operand
+
+/// The cursor a `for` form obtains, and the element type its `next` yields.
+fn Body.cursor_of(mut self, iterated: TExpr, mode: ast::Mode, token: u32) -> CursorTypes {
+    let failed = CursorTypes(cursor: ty::Ty.error(), element: ty::Ty.error())
+    if self.ck.types().has_error(iterated.ty) {
+        return failed
+    }
+    var cursor: Option[ty::Ty] = None
+    if mode == ast::Mode.Read and self.cursor_element(iterated.ty).is_some() {
+        cursor = Some(iterated.ty)
+    } else {
+        let name = match mode {
+            ast::Mode.Read => "cursor"
+            ast::Mode.Mut => "cursor_mut"
+            ast::Mode.Take => "into_cursor"
+        }
+        var candidates = self.ck.method_candidates(iterated.ty, name)
+        if candidates.len() > 0 {
+            let candidate = mut candidates.remove(0)
+            cursor = self.candidate_result(take candidate, self_ty: iterated.ty)
+        }
+    }
+    let Some(obtained) = cursor else {
+        self.report(token, code: diagnostic::Code.OwnNotIterable)
+        return failed
+    }
+    let Some(element) = self.cursor_element(obtained) else {
+        self.report(token, code: diagnostic::Code.OwnNotIterable)
+        return failed
+    }
+    return CursorTypes(cursor: obtained, element: element)
+} Body.cursor_of
+
+/// The element type a cursor type's `next(mut self) -> Option[T]` yields, when it has one
+/// stating neither `fails` nor `uses wait`.
+fn Body.cursor_element(self, cursor: ty::Ty) -> Option[ty::Ty] {
+    var candidates = self.ck.method_candidates(cursor, name: "next")
+    if candidates.len() == 0 {
+        return None
+    }
+    let candidate = mut candidates.remove(0)
+    let Some(head) = self.candidate_head(take candidate, self_ty: cursor) else {
+        return None
+    }
+    let takes_mut_self = head.params.len() == 1 and head.params[0].is_self and head.params[0].mode == ast::Mode.Mut
+    if not takes_mut_self or head.failure.is_some() or head.wait {
+        return None
+    }
+    if not self.ck.is_std(head.result, path: "core::Option") {
+        return None
+    }
+    return self.ck.types().type_arg(head.result, index: 0)
+} Body.cursor_element
+
+/// The head a method candidate stands for, its type's and interface's arguments substituted.
+fn Body.candidate_head(self, take candidate: Candidate, self_ty: ty::Ty) -> Option[FnSig] {
+    let types = self.ck.types()
+    match candidate {
+        Candidate.Function(item: item, subst: subst) => {
+            let Some(head) = self.ck.fn_sig(item) else {
+                return None
+            }
+            return Some(take head.substituted(subst, types))
+        }
+        Candidate.Method(bound: bound, method: method, self_ty: candidate_self, function: function, dynamic: dynamic) => {
+            match function {
+                Some(implementing) => {
+                    if not dynamic {
+                        let Some(head) = self.ck.fn_sig(implementing.item) else {
+                            return None
+                        }
+                        var full = match self.ck.type_key(self_ty) {
+                            Some(key) => self.ck.type_subst(key, ty: self_ty)
+                            None => ty::Subst.empty(self.ck.alloc())
+                        }
+                        mut full.extend(implementing.subst)
+                        return Some(take head.substituted(full, types))
+                    }
+                }
+                None => {}
+            }
+            return self.ck.method_head(bound, method, self_ty: candidate_self)
+        }
+    }
+} Body.candidate_head
+
+fn Body.candidate_result(self, take candidate: Candidate, self_ty: ty::Ty) -> Option[ty::Ty] {
+    let Some(head) = self.candidate_head(take candidate, self_ty) else {
+        return None
+    }
+    return Some(head.result)
+} Body.candidate_result
+
+/// A deferred call: the rules of deferred calls first, in order, then the call as written at
+/// the statement.
+fn Body.defer_stmt(mut self, call: ast::Expr) -> TExpr {
+    return match call.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: mode, inner: inner) => mut self.deferred(call, postfix: inner.contents(), mode)
+        else => mut self.deferred(call, postfix: call, mode: None)
+    }
+} Body.defer_stmt
+
+/// A deferred call whose postfix expression, its markers aside, is `postfix`, `mode` its
+/// receiver's marker.
+fn Body.deferred(mut self, call: ast::Expr, postfix: ast::Expr, mode: Option[ast::Word[ast::Mode]]) -> TExpr {
+    let ast::ExprKind.Call(callee: callee, args: args) = postfix.kind else {
+        self.report(call.token, code: diagnostic::Code.DeferNotCall)
+        return TExpr.failed(call.token)
+    }
+    var receiver_ok = true
+    match callee.contents().kind {
+        ast::ExprKind.Field(base: base, name: _) => {
+            let target = mut self.type_target(base.contents())
+            receiver_ok = target.is_some() or defer_operand(base.contents())
+        }
+        ast::ExprKind.Path(path: _, args: _) => {}
+        else => {
+            self.report(call.token, code: diagnostic::Code.DeferNotCall)
+            return TExpr.failed(call.token)
+        }
+    }
+    var args_ok = true
+    for arg in args {
+        let operand = match arg.value.kind {
+            ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => defer_operand(inner.contents())
+            else => defer_operand(arg.value)
+        }
+        if not operand {
+            args_ok = false
+            break
+        }
+    }
+    if not receiver_ok or not args_ok {
+        self.report(call.token, code: diagnostic::Code.DeferOperandForm)
+        return TExpr.failed(call.token)
+    }
+    var markers = Markers.none()
+    markers.mode = mode
+    let ck = self.ck.share()
+    discard ck.state.contents().muted.fetch_add(1)
+    let probe = mut self.call(postfix, expected: None, markers: Some(markers))
+    discard ck.state.contents().muted.fetch_sub(1)
+    let called = match probe.kind {
+        TKind.Call(_) => true
+        else => false
+    }
+    if not called {
+        if not self.ck.types().has_error(probe.ty) {
+            self.report(call.token, code: diagnostic::Code.DeferNotCall)
+        } else {
+            discard mut self.call(postfix, expected: None, markers: Some(markers))
+        }
+        return TExpr.failed(call.token)
+    }
+    let Some(code) = self.deferred_code(probe) else {
+        return mut self.marked_or_call(call)
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    if code == diagnostic::Code.DeferWaits {
+        match self.waiting_fix(call, postfix, probe) {
+            Some(fix) => mut fixes.push(take fix)
+            None => {}
+        }
+    }
+    self.report_fixed(nir::Span(head: call.token, last: call.last), code, take fixes)
+    return probe
+} Body.deferred
+
+/// The rule a deferred call breaks by its head: waiting, failing or having a result.
+fn Body.deferred_code(self, probe: TExpr) -> Option[diagnostic::Code] {
+    let TKind.Call(probed) = probe.kind else {
+        return None
+    }
+    let called = probed.contents()
+    let types = self.ck.types()
+    var waits = called.head.wait
+    for arg in called.args {
+        match types.kind(arg.expr.ty) {
+            ty::TyKind.Fn(id) => {
+                if types.fn_of(id).wait {
+                    waits = true
+                }
+            }
+            else => {}
+        }
+    }
+    if waits {
+        return Some(diagnostic::Code.DeferWaits)
+    }
+    match called.head.failure {
+        Some(failure) => {
+            if failure != ty::Ty.never() {
+                return Some(diagnostic::Code.DeferFails)
+            }
+        }
+        None => {}
+    }
+    if called.head.result != ty::Ty.unit() and called.head.result != ty::Ty.error() {
+        return Some(diagnostic::Code.DeferHasResult)
+    }
+    return None
+} Body.deferred_code
+
+/// The fix of a deferred call that waits, the probe of its typed call.
+fn Body.waiting_fix(self, call: ast::Expr, postfix: ast::Expr, probe: TExpr) -> Option[diagnostic::Fix] {
+    let TKind.Call(probed) = probe.kind else {
+        return None
+    }
+    return self.abandoned(call, postfix, probed: probed.contents())
+} Body.waiting_fix
+
+/// The fix of a deferred call that waits: `take p.abandon()` in its place, when it passes its
+/// receiver `p` by `take` and the receiver's type has an abandon method.
+fn Body.abandoned(self, call: ast::Expr, postfix: ast::Expr, probed: Call) -> Option[diagnostic::Fix] {
+    if probed.args.len() == 0 {
+        return None
+    }
+    let receiver = probed.args[0]
+    if receiver.mode != ast::Mode.Take or self.ck.method_candidates(receiver.expr.ty, name: "abandon").len() == 0 {
+        return None
+    }
+    let ast::ExprKind.Call(callee: callee, args: _) = postfix.kind else {
+        return None
+    }
+    let ast::ExprKind.Field(base: base, name: _) = callee.contents().kind else {
+        return None
+    }
+    let place = self.ck.written(self.item, head: base.contents().token, last: base.contents().last)
+    var replacement = text::String.of("take ", alloc: self.ck.alloc())
+    mut replacement.append(place.as_str())
+    mut replacement.append(".abandon()")
+    return Some(self.ck.fix_replacing(self.item, head: call.token, last: call.last, text: replacement.as_str()))
+} Body.abandoned
+
+fn Body.marked_or_call(mut self, call: ast::Expr) -> TExpr {
+    return match call.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: _) => mut self.marked(call, expected: None)
+        else => mut self.call(call, expected: None, markers: None)
+    }
+} Body.marked_or_call
+
+/// An expect condition contains no `await`, `mut` or `take` marker.
+fn Body.check_expect_purity(self, condition: ast::Expr) {
+    if has_effect_marker(condition) {
+        self.report(condition.token, code: diagnostic::Code.ContractImpureCondition)
+    }
+} Body.check_expect_purity
+
+/// An example, typed as the returned expression of a function without parameters.
+fn Body.example(mut self, example: ast::Expr) -> TBody {
+    let alloc = self.ck.alloc()
+    var body = Body.new(self.ck, item: self.item, generics: mem::List[GenericDef].empty(alloc))
+    mut body.push_frame(Body.function_frame(ty::Ty.scalar(ty::Scalar.Bool), failure: None, alloc))
+    body.cx.example = true
+    let typed = mut body.check(example, expected: ty::Ty.scalar(ty::Scalar.Bool))
+    var roots = mem::List[TExpr].empty(alloc)
+    mut roots.push(take typed)
+    self.ck.check_unused_locals(self.item, locals: body.locals.view(), usage: body.usage, roots: roots.view())
+    return take body.finish(mut roots.pop())
+} Body.example
+
+/// A head with its type's and own generic arguments substituted.
+fn FnSig.substituted(take self, subst: ty::Subst, types: ty::Types) -> FnSig {
+    for param in mut self.params {
+        param.ty = subst.ty(types, ty: param.ty)
+    }
+    self.result = subst.ty(types, ty: self.result)
+    let failure = self.failure
+    match failure {
+        Some(written) => {
+            self.failure = Some(subst.ty(types, ty: written))
+        }
+        None => {}
+    }
+    return self
+} FnSig.substituted
+
+/// A copy of a head.
+fn FnSig.copy(self, alloc: mem::Alloc) -> FnSig {
+    var params = mem::List[ParamSig].empty(alloc)
+    for param in self.params {
+        mut params.push(ParamSig(name: text::String.of(param.name.as_str(), alloc), mode: param.mode, ty: param.ty, token: param.token, is_self: param.is_self))
+    }
+    var convention: Option[text::String] = None
+    match self.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    return FnSig(generics: GenericDef.copies(self.generics.view(), alloc), inherited: self.inherited, params: take params, result: self.result, failure: self.failure, wait: self.wait, limit_set: self.limit_set, modifier: self.modifier, convention: take convention)
+} FnSig.copy
+
+/// The local at the root of a place.
+fn TExpr.root_local(self) -> Option[LocalId] {
+    match self.kind {
+        TKind.Local(local) => return Some(local)
+        TKind.Field(base: base, name: _) => return base.contents().root_local()
+        TKind.Index(call) => {
+            let held = call.contents()
+            if held.args.len() == 0 {
+                return None
+            }
+            return held.args[0].expr.root_local()
+        }
+        else => return None
+    }
+} TExpr.root_local
+
+/// Whether an operand of a deferred call has a legal form: a place without index steps, a
+/// literal, or a path naming a const item, a unit variant or a function item.
+fn defer_operand(expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Path(path: _, args: _) or ast::ExprKind.SelfValue or ast::ExprKind.Literal(_) => true
+        ast::ExprKind.Field(base: base, name: _) => defer_operand(base.contents())
+        else => false
+    }
+} defer_operand
+
+/// Whether an expression holds an `await`, `mut` or `take` marker outside closures.
+fn has_effect_marker(expr: ast::Expr) -> bool {
+    match expr.kind {
+        ast::ExprKind.Marked(failure: _, awaited: awaited, mode: mode, inner: inner) => return awaited.is_some() or mode.is_some() or has_effect_marker(inner.contents())
+        ast::ExprKind.Paren(inner) or ast::ExprKind.Dbg(inner) => return has_effect_marker(inner.contents())
+        ast::ExprKind.Field(base: base, name: _) => return has_effect_marker(base.contents())
+        ast::ExprKind.Call(callee: callee, args: args) => {
+            if has_effect_marker(callee.contents()) {
+                return true
+            }
+            for arg in args {
+                if has_effect_marker(arg.value) {
+                    return true
+                }
+            }
+            return false
+        }
+        ast::ExprKind.Index(base: base, index: index) => return has_effect_marker(base.contents()) or has_effect_marker(index.contents())
+        ast::ExprKind.Unary(op: _, operand: operand) => return has_effect_marker(operand.contents())
+        ast::ExprKind.Binary(op: _, op_token: _, left: left, right: right) => return has_effect_marker(left.contents()) or has_effect_marker(right.contents())
+        ast::ExprKind.When(accesses: _, body: _) => return true
+        else => return false
+    }
+} has_effect_marker

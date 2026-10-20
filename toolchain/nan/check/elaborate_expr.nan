@@ -1,0 +1,960 @@
+//! Elaborating expressions: values, places and the control flow of conditionals, logical operators and quantifiers.
+
+/// The core interface an operator calls on operands that are not scalars, and its method.
+struct OperatorMethod {
+    interface_name: text::String
+    method: text::String
+} OperatorMethod
+
+/// What an elaborated expression yields.
+enum Out {
+    /// A value or a literal.
+    Operand(nir::Operand)
+    /// A place: a binding's slot or reference, a field path from one, or a projection's result.
+    Place(nir::Place)
+    /// Nothing: control left the expression.
+    Never
+} Out
+
+/// A NIR literal of a typed literal's value.
+fn Elab.literal(self, lit: Lit, ty: ty::Ty) -> nir::Literal fails Fault {
+    let alloc = self.ck.alloc()
+    let scalar = self.ck.types().scalar_of(ty)
+    match lit {
+        Lit.Int(value) => {
+            let Some(held) = scalar else {
+                fail Fault.Unsupported(text::String.of("a literal of no scalar type", alloc))
+            }
+            return nir::Literal.Int(value: value, scalar: held)
+        }
+        Lit.Float(bits) => {
+            let Some(held) = scalar else {
+                fail Fault.Unsupported(text::String.of("a literal of no scalar type", alloc))
+            }
+            return nir::Literal.Float(bits: bits, scalar: held)
+        }
+        Lit.Bool(truth) => return nir::Literal.Bool(truth)
+        Lit.Char(c) => return nir::Literal.Char(c)
+        Lit.Text(written) => return nir::Literal.Text(text::String.of(written.as_str(), alloc))
+        Lit.Bytes(bytes) => return nir::Literal.Bytes(copied_bytes(bytes.view(), alloc))
+    }
+} Elab.literal
+
+fn Elab.span(token: u32) -> nir::Span {
+    return nir::Span.at(token)
+} Elab.span
+
+/// The span of a typed expression, from its first token to its last.
+fn Elab.spanning(expr: TExpr) -> nir::Span {
+    return nir::Span(head: expr.token, last: expr.last)
+} Elab.spanning
+
+/// The place a local names.
+fn Elab.local_place(mut self, local: LocalId) -> nir::Place fails Fault {
+    let alloc = self.ck.alloc()
+    match self.fields.get(local) {
+        Some(field) => return nir::Place.of(field.value, alloc).step(field.name.as_str(), alloc)
+        None => {}
+    }
+    match self.held.get(local) {
+        Some(Held.Value(value)) => return nir::Place.of(value, alloc)
+        Some(Held.Slot(value)) => return nir::Place.of(value, alloc)
+        Some(Held.Place(place)) => return place.copy(alloc)
+        else => {}
+    }
+    var message = text::String.of("the binding ", alloc)
+    mut message.append(self.body.contents().local(local).name.as_str())
+    mut message.append(" has no place")
+    fail Fault.Unsupported(take message)
+} Elab.local_place
+
+/// Whether a place is its root alone, an owned value that is not a slot: the value itself.
+fn Elab.owned_root(self, place: nir::Place) -> bool {
+    return place.steps.len() == 0 and not self.b.is_slot(place.root) and not self.b.ty(place.root).is_reference()
+} Elab.owned_root
+
+/// The value at a place, copied when Copy and moved otherwise.
+fn Elab.take_place(mut self, take place: nir::Place, ty: ty::Ty, span: nir::Span) -> nir::Operand {
+    if self.owned_root(place) {
+        return nir::Operand.Value(place.root)
+    }
+    if self.ck.nir_copy(ty) {
+        return nir::Operand.Value(mut self.emit_value(nir::Op.Load(take place), ty: nir::NTy.Owned(ty), span))
+    }
+    let moved = place.copy(self.ck.alloc())
+    let value = mut self.emit_value(nir::Op.Move(take moved), ty: nir::NTy.Owned(ty), span)
+    discard mut self.moved.insert(take place)
+    return nir::Operand.Value(value)
+} Elab.take_place
+
+/// The operand passing a place by read: its value when Copy or a view, the place otherwise.
+fn Elab.read_operand(mut self, take place: nir::Place, ty: ty::Ty, span: nir::Span) -> nir::Operand {
+    if self.owned_root(place) {
+        return nir::Operand.Value(place.root)
+    }
+    if self.ck.nir_copy(ty) or self.ck.nir_view(ty) {
+        return nir::Operand.Value(mut self.emit_value(nir::Op.Load(take place), ty: nir::NTy.Owned(ty), span))
+    }
+    return nir::Operand.Place(mode: ast::Mode.Read, place: take place)
+} Elab.read_operand
+
+/// An expression read in place: a place is passed as itself, however small its type, and any
+/// other expression as a read argument.
+fn Elab.borrowed(mut self, expr: TExpr) -> Option[nir::Operand] fails Fault {
+    let out = try mut self.expr(expr)
+    match out {
+        Out.Place(place) => {
+            if self.owned_root(place) {
+                return Some(nir::Operand.Value(place.root))
+            }
+            return Some(nir::Operand.Place(mode: ast::Mode.Read, place: take place))
+        }
+        else => return mut self.argument(take out, expr, mode: ast::Mode.Read)
+    }
+} Elab.borrowed
+
+/// An expression as a value: places read, copied or moved.
+fn Elab.operand(mut self, expr: TExpr) -> Option[nir::Operand] fails Fault {
+    let out = try mut self.expr(expr)
+    match out {
+        Out.Operand(operand) => return Some(take operand)
+        Out.Place(place) => return Some(mut self.take_place(take place, ty: expr.ty, span: Elab.spanning(expr)))
+        Out.Never => return None
+    }
+} Elab.operand
+
+/// An expression as a place: a temporary that is not Copy goes into a slot released at the
+/// statement's end, and a Copy temporary is its own root.
+fn Elab.place(mut self, expr: TExpr) -> Option[nir::Place] fails Fault {
+    let out = try mut self.expr(expr)
+    match out {
+        Out.Place(place) => return Some(take place)
+        Out.Operand(operand) => return Some(mut self.temporary(take operand, ty: expr.ty, token: expr.token))
+        Out.Never => return None
+    }
+} Elab.place
+
+/// A place holding a value: the value itself when Copy, a view or a wrapped part, else a
+/// temporary of the statement being elaborated.
+fn Elab.temporary(mut self, take operand: nir::Operand, ty: ty::Ty, token: u32) -> nir::Place {
+    let alloc = self.ck.alloc()
+    match operand {
+        nir::Operand.Value(value) => {
+            if self.ck.nir_copy(ty) or self.ck.nir_view(ty) or self.wrapped.contains(value) {
+                return nir::Place.of(value, alloc)
+            }
+        }
+        else => {}
+    }
+    let slot = mut self.slot_holding(take operand, ty, token)
+    mut self.temps.push(slot)
+    let at = self.temp_scope
+    var scope = mut self.scopes.at_mut(at)
+    mut scope.slots.push(slot)
+    return nir::Place.of(slot, alloc)
+} Elab.temporary
+
+/// An unnamed slot initialised with a value.
+fn Elab.slot_holding(mut self, take operand: nir::Operand, ty: ty::Ty, token: u32) -> nir::Value {
+    let span = Elab.span(token)
+    let slot = mut self.emit_value(nir::Op.Slot(name: None, ty: ty), ty: nir::NTy.Owned(ty), span)
+    let place = nir::Place.of(slot, alloc: self.ck.alloc())
+    mut self.emit(nir::Op.Init(place: take place, operand: take operand), span)
+    return slot
+} Elab.slot_holding
+
+fn Elab.expr(mut self, expr: TExpr) -> Out fails Fault {
+    if not self.b.open() {
+        return Out.Never
+    }
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    match expr.kind {
+        TKind.Failed => fail Fault.Failed
+        TKind.Literal(lit) => return Out.Operand(nir::Operand.Literal(try self.literal(lit, ty: expr.ty)))
+        TKind.Unit => return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+        TKind.Result => {
+            let Some(result) = self.result else {
+                fail Fault.Unsupported(text::String.of("`result` outside an ensures clause", alloc))
+            }
+            return Out.Place(nir::Place.of(result, alloc))
+        }
+        TKind.Old(_) => {
+            let Some(value) = self.olds.get(expr.token) else {
+                fail Fault.Unsupported(text::String.of("`old` outside an ensures clause", alloc))
+            }
+            return Out.Place(nir::Place.of(value, alloc))
+        }
+        TKind.Local(local) => {
+            match self.held.get(local) {
+                Some(Held.Literal(literal)) => return Out.Operand(nir::Operand.Literal(literal.copy(alloc)))
+                else => {}
+            }
+            return Out.Place(try mut self.local_place(local))
+        }
+        TKind.Value(item) => return Out.Operand(nir::Operand.Value(mut self.emit_value(nir::Op.Constant(nir::Constant.Item(item)), ty: nir::NTy.Owned(expr.ty), span)))
+        TKind.FnValue(item: item, type_args: type_args) => return Out.Operand(nir::Operand.Value(mut self.emit_value(nir::Op.FnRef(nir::FnRef.item(item, args: type_args)), ty: nir::NTy.Owned(expr.ty), span)))
+        TKind.ConstParam(param) => {
+            match self.const_params.get(param) {
+                Some(value) => return Out.Operand(nir::Operand.Value(value))
+                None => {}
+            }
+            return Out.Operand(nir::Operand.Value(mut self.emit_value(nir::Op.Constant(nir::Constant.Param(param)), ty: nir::NTy.Owned(expr.ty), span)))
+        }
+        TKind.Register(block: block, index: index) => return Out.Operand(nir::Operand.Value(mut self.emit_value(nir::Op.Constant(nir::Constant.Register(block: block, register: u32.fit(index))), ty: nir::NTy.Owned(expr.ty), span)))
+        TKind.Field(base: base, name: name) => {
+            let Some(place) = try mut self.place(base.contents()) else {
+                return Out.Never
+            }
+            return Out.Place(place.step(name.as_str(), alloc))
+        }
+        TKind.Call(call) or TKind.Index(call) => return try mut self.call(call.contents(), ty: expr.ty, span)
+        TKind.Construct(variant: variant, values: values, wrapped: wrapped) => return try mut self.construct(expr, variant, values: values.view(), wrapped)
+        TKind.Unary(op: op, operand: operand) => return try mut self.unary(expr, op, operand: operand.contents())
+        TKind.Binary(op: op, left: left, right: right) => return try mut self.binary(expr, op, left: left.contents(), right: right.contents())
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => return try mut self.if_expr(expr, condition: condition.contents(), then, otherwise)
+        TKind.Block(block) => return try mut self.block_expr(block, ty: expr.ty)
+        TKind.Match(scrutinee: scrutinee, arms: arms) => return try mut self.match_expr(expr, scrutinee: scrutinee.contents(), arms: arms.view())
+        TKind.Closure(closure) => return try mut self.closure_value(expr, closure: closure.contents())
+        TKind.When(attempted: attempted, accesses: accesses, body: body) => return try mut self.when_expr(expr, attempted, accesses: accesses.view(), body: body.contents())
+        else => return try mut self.control_expr(expr)
+    }
+} Elab.expr
+
+/// The expressions that change control or the state of the elaboration: trusted code, `todo`,
+/// `dbg`, `return`, `break`, `continue`, `fail` and quantifiers.
+fn Elab.control_expr(mut self, expr: TExpr) -> Out fails Fault {
+    let span = Elab.spanning(expr)
+    match expr.kind {
+        TKind.Trusted(body) => {
+            let premise = mut self.unit.premise(expr.token)
+            let outer = self.premise
+            self.premise = Some(premise)
+            let out = attempt mut self.expr(body.contents())
+            self.premise = outer
+            match out {
+                Ok(value) => return value
+                Err(fault) => fail fault
+            }
+        }
+        TKind.Todo(intent) => {
+            let written = text::String.of(intent.as_str(), alloc: self.ck.alloc())
+            mut self.end(nir::Terminator.Todo(take written), span)
+            return Out.Never
+        }
+        TKind.Dbg(inner) => {
+            let Some(operand) = try mut self.arg(inner.contents(), mode: ast::Mode.Take) else {
+                return Out.Never
+            }
+            return Out.Operand(nir::Operand.Value(mut self.emit_value(nir::Op.Dbg(take operand), ty: nir::NTy.Owned(expr.ty), span)))
+        }
+        TKind.Return(value) => {
+            match value {
+                Some(returned) => try mut self.return_expr(Some(returned.contents()), token: expr.token)
+                None => try mut self.return_expr(None, token: expr.token)
+            }
+            return Out.Never
+        }
+        TKind.Break(index) => {
+            try mut self.leave_loop(index, breaks: true, token: expr.token)
+            return Out.Never
+        }
+        TKind.Continue(index) => {
+            try mut self.leave_loop(index, breaks: false, token: expr.token)
+            return Out.Never
+        }
+        TKind.Fail(value) => {
+            try mut self.fail_expr(value.contents(), token: expr.token)
+            return Out.Never
+        }
+        TKind.Quantifier(all: all, local: local, range: range, body: body) => return try mut self.quantifier(expr, all, local, range: range.contents(), body: body.contents())
+        else => fail Fault.Unsupported(text::String.of("an expression of no kind elaboration knows", alloc: self.ck.alloc()))
+    }
+} Elab.control_expr
+
+/// The value a block yields: its one expression statement's, or nothing.
+fn Elab.block_expr(mut self, block: TBlock, ty: ty::Ty) -> Out fails Fault {
+    let yields = ty != ty::Ty.unit() and ty != ty::Ty.never()
+    mut self.scopes.push(ElabScope.empty(self.ck.alloc()))
+    var out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    let count = block.stmts.len()
+    var last: usize = 0
+    if count > 0 {
+        last = count - 1
+    }
+    for index in 0..<count {
+        if not self.b.open() {
+            break
+        }
+        let stmt = block.stmts[index]
+        if yields and index == last and stmt.yields_value() {
+            let TStmtKind.Expr(value) = stmt.kind else {
+                continue
+            }
+            let yielded = try mut self.expr(value)
+            out = mut self.arm_value(take yielded, ty, span: Elab.spanning(value))
+        } else {
+            try mut self.stmt(stmt)
+        }
+    }
+    try mut self.close_scope(block.end)
+    if not self.b.open() {
+        return Out.Never
+    }
+    return out
+} Elab.block_expr
+
+/// Whether a statement is an expression statement, the value a block yields when last.
+fn TStmt.yields_value(self) -> bool {
+    return match self.kind {
+        TStmtKind.Expr(_) => true
+        else => false
+    }
+} TStmt.yields_value
+
+fn Elab.construct(mut self, expr: TExpr, variant: Option[usize], values: Slice[TLabelled], wrapped: bool) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    var operands = mem::List[nir::Labelled].empty(alloc)
+    var mode = ast::Mode.Take
+    if wrapped {
+        mode = ast::Mode.Read
+    }
+    for labelled in values {
+        let Some(operand) = try mut self.arg(labelled.value, mode) else {
+            return Out.Never
+        }
+        mut operands.push(nir::Labelled(name: text::String.of(labelled.name.as_str(), alloc), operand: take operand))
+    }
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(expr.ty) else {
+        fail Fault.Unsupported(text::String.of("a construction of no item type", alloc))
+    }
+    let sig = self.ck.sig(item)
+    let op = try self.construction(expr.ty, kind: sig.contents().kind, variant, take operands)
+    let value = mut self.emit_value(take op, ty: nir::NTy.Owned(expr.ty), span)
+    if wrapped {
+        discard mut self.wrapped.insert(value)
+    }
+    if variant.is_none() {
+        try mut self.predicate_checks(nir::Place.of(value, alloc), ty: expr.ty, span)
+    }
+    return Out.Operand(nir::Operand.Value(value))
+} Elab.construct
+
+/// The instruction building a construction of a type of a signature's kind from its labelled
+/// operands: its fields in declaration order, or a variant with its payload.
+fn Elab.construction(self, ty: ty::Ty, kind: SigKind, variant: Option[usize], take operands: mem::List[nir::Labelled]) -> nir::Op fails Fault {
+    let alloc = self.ck.alloc()
+    match kind {
+        SigKind.Struct(fields: fields) => {
+            if variant.is_none() {
+                return nir::Op.Construct(ty: ty, fields: ordered_fields(fields.view(), operands: operands.view(), alloc))
+            }
+        }
+        SigKind.Layout(fields: fields, tags: tags, bits: _) => {
+            match variant {
+                None => return nir::Op.Construct(ty: ty, fields: ordered_fields(fields.view(), operands: operands.view(), alloc))
+                Some(index) => return nir::Op.Variant(ty: ty, variant: text::String.of(tags[index].as_str(), alloc), payload: nir::Payload.None)
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            let Some(index) = variant else {
+                fail Fault.Unsupported(text::String.of("a construction of an unknown shape", alloc))
+            }
+            let declared = variants[index]
+            let name = text::String.of(declared.name.as_str(), alloc)
+            match declared.payload {
+                Payload.None => return nir::Op.Variant(ty: ty, variant: take name, payload: nir::Payload.None)
+                Payload.Single(_) => {
+                    let Some(last) = mut operands.pop() else {
+                        fail Fault.Unsupported(text::String.of("a payload without value", alloc))
+                    }
+                    return nir::Op.Variant(ty: ty, variant: take name, payload: nir::Payload.Single(take last.operand))
+                }
+                Payload.Labelled(labels) => return nir::Op.Variant(ty: ty, variant: take name, payload: nir::Payload.Labelled(labelled_payload(labels.view(), operands: operands.view(), alloc)))
+            }
+        }
+        else => {}
+    }
+    fail Fault.Unsupported(text::String.of("a construction of an unknown shape", alloc))
+} Elab.construction
+
+/// The operands of a struct or layout construction in field order.
+fn ordered_fields(fields: Slice[FieldSig], operands: Slice[nir::Labelled], alloc: mem::Alloc) -> mem::List[nir::Labelled] {
+    var ordered = mem::List[nir::Labelled].empty(alloc)
+    for field in fields {
+        for operand in operands {
+            if operand.name.as_str() == field.name.as_str() {
+                mut ordered.push(nir::Labelled(name: text::String.of(operand.name.as_str(), alloc), operand: operand.operand.copy(alloc)))
+                break
+            }
+        }
+    }
+    return ordered
+} ordered_fields
+
+/// The operands of a labelled variant payload in label order.
+fn labelled_payload(labels: Slice[LabelledTy], operands: Slice[nir::Labelled], alloc: mem::Alloc) -> mem::List[nir::Labelled] {
+    var ordered = mem::List[nir::Labelled].empty(alloc)
+    for label in labels {
+        for operand in operands {
+            if operand.name.as_str() == label.name.as_str() {
+                mut ordered.push(nir::Labelled(name: text::String.of(operand.name.as_str(), alloc), operand: operand.operand.copy(alloc)))
+                break
+            }
+        }
+    }
+    return ordered
+} labelled_payload
+
+fn Elab.unary(mut self, expr: TExpr, op: ast::UnaryOp, operand: TExpr) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    let Some(value) = try mut self.operand(operand) else {
+        return Out.Never
+    }
+    let scalar = self.ck.types().scalar_of(operand.ty)
+    var nir_op = nir::UnaryOp.Not
+    match op {
+        ast::UnaryOp.Not => {}
+        ast::UnaryOp.Neg => {
+            if scalar.is_none() {
+                var args = mem::List[nir::Operand].empty(alloc)
+                mut args.push(take value)
+                return try mut self.operator_call(expr, path: "Neg", method: "neg", args: take args)
+            }
+            nir_op = nir::UnaryOp.Neg
+        }
+        ast::UnaryOp.BitNot => {
+            if scalar.is_none() {
+                var args = mem::List[nir::Operand].empty(alloc)
+                mut args.push(take value)
+                return try mut self.operator_call(expr, path: "BitNot", method: "bit_not", args: take args)
+            }
+            nir_op = nir::UnaryOp.Inv
+        }
+    }
+    let result = mut self.emit_value(nir::Op.Unary(op: nir_op, operand: take value), ty: nir::NTy.Owned(expr.ty), span)
+    return Out.Operand(nir::Operand.Value(result))
+} Elab.unary
+
+fn Elab.binary(
+    mut self,
+    expr: TExpr,
+    op: ast::BinaryOp,
+    left: TExpr,
+    right: TExpr,
+    ) -> Out fails Fault {
+    let span = Elab.spanning(expr)
+    match op {
+        ast::BinaryOp.And or ast::BinaryOp.Or => return try mut self.logical(op == ast::BinaryOp.And, left, right, span)
+        ast::BinaryOp.RangeExclusive or ast::BinaryOp.RangeInclusive => return try mut self.range_value(expr, inclusive: op == ast::BinaryOp.RangeInclusive, left, right)
+        else => {}
+    }
+    let by_instruction = self.by_instruction(op, ty: left.ty)
+    let left_value = if by_instruction {
+        try mut self.operand(left)
+    } else {
+        try mut self.arg(left, mode: ast::Mode.Read)
+    }
+    let Some(left_operand) = left_value else {
+        return Out.Never
+    }
+    let right_value = if by_instruction {
+        try mut self.operand(right)
+    } else {
+        try mut self.arg(right, mode: ast::Mode.Read)
+    }
+    let Some(right_operand) = right_value else {
+        return Out.Never
+    }
+    let Some(result) = try mut self.operator_values(op, left: take left_operand, right: take right_operand, operand_ty: left.ty, result_ty: expr.ty, span) else {
+        return Out.Never
+    }
+    return Out.Operand(take result)
+} Elab.binary
+
+/// A range value: its bounds and whether it includes the high one.
+fn Elab.range_value(mut self, expr: TExpr, inclusive: bool, left: TExpr, right: TExpr) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(low) = try mut self.operand(left) else {
+        return Out.Never
+    }
+    let Some(high) = try mut self.operand(right) else {
+        return Out.Never
+    }
+    var fields = mem::List[nir::Labelled].empty(alloc)
+    mut fields.push(nir::Labelled(name: text::String.of("low", alloc), operand: take low))
+    mut fields.push(nir::Labelled(name: text::String.of("high", alloc), operand: take high))
+    mut fields.push(nir::Labelled(name: text::String.of("inclusive", alloc), operand: nir::Operand.Literal(nir::Literal.Bool(inclusive))))
+    let value = mut self.emit_value(nir::Op.Construct(ty: expr.ty, fields: take fields), ty: nir::NTy.Owned(expr.ty), span: Elab.spanning(expr))
+    return Out.Operand(nir::Operand.Value(value))
+} Elab.range_value
+
+/// Whether an operator on operands of a type is an instruction: on scalars, and `==` and
+/// `!=` on `Str` and `Slice[u8]`; otherwise it calls its operator interface.
+fn Elab.by_instruction(self, op: ast::BinaryOp, ty: ty::Ty) -> bool {
+    let textual = self.ck.is_std(ty, path: "core::Str") or ty == self.ck.slice_ty(ty::Ty.scalar(ty::Scalar.Unsigned8))
+    return self.ck.types().scalar_of(ty).is_some() or (textual and (op == ast::BinaryOp.Eq or op == ast::BinaryOp.Ne))
+} Elab.by_instruction
+
+/// An operator applied to evaluated operands of `operand_ty`: its instruction, or the call of
+/// its operator interface's method, an ordering comparison testing the `core::Ordering` it
+/// returns.
+fn Elab.operator_values(
+    mut self,
+    op: ast::BinaryOp,
+    take left: nir::Operand,
+    take right: nir::Operand,
+    operand_ty: ty::Ty,
+    result_ty: ty::Ty,
+    span: nir::Span,
+    ) -> Option[nir::Operand] fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(instruction) = binary_instruction(op) else {
+        fail Fault.Unsupported(text::String.of("a logical or range operator on values", alloc))
+    }
+    if self.by_instruction(op, ty: operand_ty) {
+        let result = mut self.emit_value(nir::Op.Binary(op: instruction, left: take left, right: take right), ty: nir::NTy.Owned(result_ty), span)
+        return Some(nir::Operand.Value(result))
+    }
+    let operator = operator_interface(instruction, alloc)
+    let db = self.ck.db()
+    var found = db.core_item(operator.interface_name.as_str())
+    if found.is_none() {
+        found = db.std_item("core", name: operator.interface_name.as_str())
+    }
+    let Some(interface_item) = found else {
+        var message = text::String.of("the core interface ", alloc)
+        mut message.append(operator.interface_name.as_str())
+        fail Fault.Unsupported(take message)
+    }
+    let callee = try self.implementation(operand_ty, interface_item, method: operator.method.as_str())
+    var args = mem::List[nir::Operand].empty(alloc)
+    mut args.push(take left)
+    mut args.push(take right)
+    let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
+    match instruction {
+        nir::BinaryOp.Eq or nir::BinaryOp.Ne => {
+            let equal = mut self.call_value(take callee, args: take args, ty: bool_ty, span)
+            if instruction == nir::BinaryOp.Eq {
+                return Some(nir::Operand.Value(equal))
+            }
+            return Some(nir::Operand.Value(mut self.emit_value(nir::Op.Unary(op: nir::UnaryOp.Not, operand: nir::Operand.Value(equal)), ty: nir::NTy.Owned(bool_ty), span)))
+        }
+        nir::BinaryOp.Lt or nir::BinaryOp.Le or nir::BinaryOp.Gt or nir::BinaryOp.Ge => return Some(nir::Operand.Value(try mut self.ordering_test(instruction, take callee, take args, span)))
+        else => return Some(nir::Operand.Value(mut self.call_value(take callee, args: take args, ty: result_ty, span)))
+    }
+} Elab.operator_values
+
+/// An ordering comparison through `cmp`: the test of the `core::Ordering` it returns, negated
+/// for `>=` and `<=`.
+fn Elab.ordering_test(mut self, instruction: nir::BinaryOp, take callee: nir::FnRef, take args: mem::List[nir::Operand], span: nir::Span) -> nir::Value fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(item) = self.ck.db().std_item("core", name: "Ordering") else {
+        fail Fault.Unsupported(text::String.of("core::Ordering", alloc))
+    }
+    let ordering = self.ck.types().item(item, args: mem::List[ty::Arg].empty(alloc))
+    let bool_ty = ty::Ty.scalar(ty::Scalar.Bool)
+    let order = mut self.call_value(take callee, args: take args, ty: ordering, span)
+    let variant = match instruction {
+        nir::BinaryOp.Lt or nir::BinaryOp.Ge => "Less"
+        else => "Greater"
+    }
+    let negate = instruction == nir::BinaryOp.Ge or instruction == nir::BinaryOp.Le
+    let tested = mut self.emit_value(nir::Op.Is(place: nir::Place.of(order, alloc), ty: ordering, variant: text::String.of(variant, alloc)), ty: nir::NTy.Owned(bool_ty), span)
+    if not negate {
+        return tested
+    }
+    return mut self.emit_value(nir::Op.Unary(op: nir::UnaryOp.Not, operand: nir::Operand.Value(tested)), ty: nir::NTy.Owned(bool_ty), span)
+} Elab.ordering_test
+
+/// The instruction of a binary operator on values; none for a logical or range operator.
+fn binary_instruction(op: ast::BinaryOp) -> Option[nir::BinaryOp] {
+    return match op {
+        ast::BinaryOp.Add => Some(nir::BinaryOp.Add)
+        ast::BinaryOp.Sub => Some(nir::BinaryOp.Sub)
+        ast::BinaryOp.Mul => Some(nir::BinaryOp.Mul)
+        ast::BinaryOp.Div => Some(nir::BinaryOp.Div)
+        ast::BinaryOp.Rem => Some(nir::BinaryOp.Rem)
+        ast::BinaryOp.BitAnd => Some(nir::BinaryOp.Band)
+        ast::BinaryOp.BitOr => Some(nir::BinaryOp.Bor)
+        ast::BinaryOp.BitXor => Some(nir::BinaryOp.Bxor)
+        ast::BinaryOp.Shl => Some(nir::BinaryOp.Shl)
+        ast::BinaryOp.Shr => Some(nir::BinaryOp.Shr)
+        ast::BinaryOp.Eq => Some(nir::BinaryOp.Eq)
+        ast::BinaryOp.Ne => Some(nir::BinaryOp.Ne)
+        ast::BinaryOp.Lt => Some(nir::BinaryOp.Lt)
+        ast::BinaryOp.Le => Some(nir::BinaryOp.Le)
+        ast::BinaryOp.Gt => Some(nir::BinaryOp.Gt)
+        ast::BinaryOp.Ge => Some(nir::BinaryOp.Ge)
+        else => None
+    }
+} binary_instruction
+
+/// The core interface an operator instruction calls on operands that are not scalars, and its
+/// method.
+fn operator_interface(instruction: nir::BinaryOp, alloc: mem::Alloc) -> OperatorMethod {
+    let interface_name = match instruction {
+        nir::BinaryOp.Eq or nir::BinaryOp.Ne => "Eq"
+        nir::BinaryOp.Lt or nir::BinaryOp.Le or nir::BinaryOp.Gt or nir::BinaryOp.Ge => "Ord"
+        nir::BinaryOp.Add => "Add"
+        nir::BinaryOp.Sub => "Sub"
+        nir::BinaryOp.Mul => "Mul"
+        nir::BinaryOp.Div => "Div"
+        nir::BinaryOp.Rem => "Rem"
+        nir::BinaryOp.Band => "BitAnd"
+        nir::BinaryOp.Bor => "BitOr"
+        nir::BinaryOp.Bxor => "BitXor"
+        nir::BinaryOp.Shl => "Shl"
+        nir::BinaryOp.Shr => "Shr"
+    }
+    let method = match instruction {
+        nir::BinaryOp.Eq or nir::BinaryOp.Ne => "eq"
+        nir::BinaryOp.Lt or nir::BinaryOp.Le or nir::BinaryOp.Gt or nir::BinaryOp.Ge => "cmp"
+        nir::BinaryOp.Add => "add"
+        nir::BinaryOp.Sub => "sub"
+        nir::BinaryOp.Mul => "mul"
+        nir::BinaryOp.Div => "div"
+        nir::BinaryOp.Rem => "rem"
+        nir::BinaryOp.Band => "bit_and"
+        nir::BinaryOp.Bor => "bit_or"
+        nir::BinaryOp.Bxor => "bit_xor"
+        nir::BinaryOp.Shl => "shl"
+        nir::BinaryOp.Shr => "shr"
+    }
+    return OperatorMethod(interface_name: text::String.of(interface_name, alloc), method: text::String.of(method, alloc))
+} operator_interface
+
+/// `a and b`, `a or b`: a branch on `a` to the block computing `b`, or to the join with the
+/// value `a` decides.
+fn Elab.logical(
+    mut self,
+    conjunction: bool,
+    left: TExpr,
+    right: TExpr,
+    span: nir::Span,
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(left_value) = try mut self.operand(left) else {
+        return Out.Never
+    }
+    let compute = mut self.b.block()
+    let join = mut self.b.block()
+    let result = mut self.b.block_param(join, ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)))
+    var decided_args = mem::List[nir::Operand].empty(alloc)
+    mut decided_args.push(nir::Operand.Literal(nir::Literal.Bool(not conjunction)))
+    let decided = nir::Jump(block: join, args: take decided_args)
+    if conjunction {
+        mut self.end(nir::Terminator.Branch(operand: take left_value, then: nir::Jump.to(compute, alloc), otherwise: take decided), span)
+    } else {
+        mut self.end(nir::Terminator.Branch(operand: take left_value, then: take decided, otherwise: nir::Jump.to(compute, alloc)), span)
+    }
+    mut self.b.at(compute)
+    let right_value = try mut self.releasing_temps(right.token, elaborate: fn(mut elab: Elab) -> Option[nir::Operand] fails Fault {
+        return try mut elab.operand(right)
+    })
+    match right_value {
+        Some(value) => {
+            var args = mem::List[nir::Operand].empty(alloc)
+            mut args.push(take value)
+            mut self.b.jump(join, args: take args, span)
+        }
+        None => {}
+    }
+    mut self.b.at(join)
+    return Out.Operand(nir::Operand.Value(result))
+} Elab.logical
+
+/// A value-yielding or statement `if`: a branch, a block per branch and a join, holding the
+/// value as its parameter when the `if` yields one; a false `if` without `else` branches to
+/// the join unless the other branch moved what it must release.
+fn Elab.if_expr(
+    mut self,
+    expr: TExpr,
+    condition: TExpr,
+    then: TBlock,
+    otherwise: Option[mem::Box[TExpr]],
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    let Some(tested) = try mut self.operand(condition) else {
+        return Out.Never
+    }
+    let Some(entry) = self.b.current_block() else {
+        expect false
+        return Out.Never
+    }
+    let entry_moved = nir::Place.copies(self.moved, alloc)
+    let temps = self.temps.len()
+    let then_block = mut self.b.block()
+    mut self.b.at(then_block)
+    let then_out = try mut self.block_expr(then, ty: expr.ty)
+    let then_end = mut self.arm_end(take then_out, ty: expr.ty, token: then.end, temps)
+    let unchanged = then_end.block.is_none() or then_end.moved == entry_moved
+    if otherwise.is_none() and unchanged {
+        let join = mut self.b.block()
+        match then_end.block {
+            Some(block) => {
+                mut self.b.at(block)
+                mut self.b.jump(join, args: mem::List[nir::Operand].empty(alloc), span)
+            }
+            None => {}
+        }
+        mut self.b.at(entry)
+        mut self.end(nir::Terminator.Branch(operand: take tested, then: nir::Jump.to(then_block, alloc), otherwise: nir::Jump.to(join, alloc)), span)
+        self.moved = entry_moved
+        mut self.b.at(join)
+        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    }
+    let else_block = mut self.b.block()
+    mut self.b.at(entry)
+    mut self.end(nir::Terminator.Branch(operand: take tested, then: nir::Jump.to(then_block, alloc), otherwise: nir::Jump.to(else_block, alloc)), span)
+    mut self.b.at(else_block)
+    self.moved = entry_moved
+    var else_out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    match otherwise {
+        Some(other) => {
+            else_out = try mut self.expr(other.contents())
+        }
+        None => {}
+    }
+    let else_end = mut self.arm_end(take else_out, ty: expr.ty, token: expr.token, temps)
+    var arms = mem::List[ArmEnd].empty(alloc)
+    mut arms.push(take then_end)
+    mut arms.push(take else_end)
+    return mut self.join(take arms, ty: expr.ty, span)
+} Elab.if_expr
+
+/// `await when`: the cown handles by their access modes, and the region that receives a
+/// reference to each cown's value and yields the body's value.
+fn Elab.when_expr(
+    mut self,
+    expr: TExpr,
+    attempted: bool,
+    accesses: Slice[TAccess],
+    body: TExpr,
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    var operands = mem::List[nir::Operand].empty(alloc)
+    for access in accesses {
+        let Some(place) = try mut self.place(access.place) else {
+            return Out.Never
+        }
+        mut operands.push(nir::Operand.Place(mode: access.mode, place: take place))
+    }
+    let Some(outer) = self.b.current_block() else {
+        expect false
+        return Out.Never
+    }
+    mut self.b.open_region()
+    let entry = mut self.b.block()
+    for access in accesses {
+        let local_ty = self.body.contents().local(access.local).ty
+        let reference = match access.mode {
+            ast::Mode.Mut => nir::NTy.RefMut(local_ty)
+            else => nir::NTy.Ref(local_ty)
+        }
+        let value = mut self.b.block_param(entry, ty: reference)
+        discard mut self.held.insert(access.local, value: Held.Value(value))
+    }
+    mut self.b.at(entry)
+    let enclosing = mut self.when_body.extract()
+    self.when_body = Some(WhenBody(depth: self.scopes.len(), leaves: mem::List[Leave].empty(alloc)))
+    let yielded = try mut self.releasing_temps(body.token, elaborate: fn(mut elab: Elab) -> Option[nir::Operand] fails Fault {
+        return try mut elab.operand(body)
+    })
+    match yielded {
+        Some(value) => mut self.end(nir::Terminator.Yield(take value), span)
+        None => {}
+    }
+    let Some(finished) = mut self.when_body.extract() else {
+        expect false
+        return Out.Never
+    }
+    self.when_body = enclosing
+    let region = mut self.b.close_region()
+    mut self.b.at(outer)
+    let op = nir::Op.When(attempted: attempted, accesses: take operands, region: take region)
+    var out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    if expr.ty == ty::Ty.unit() {
+        mut self.emit(take op, span)
+    } else {
+        out = Out.Operand(nir::Operand.Value(mut self.emit_value(take op, ty: nir::NTy.Owned(expr.ty), span)))
+    }
+    try mut self.continue_leaves(take finished.leaves)
+    return out
+} Elab.when_expr
+
+/// A quantifier: `all` or `any` over its range, its region binding the element.
+fn Elab.quantifier(
+    mut self,
+    expr: TExpr,
+    all: bool,
+    local: LocalId,
+    range: TExpr,
+    body: TExpr,
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    let TKind.Binary(op: op, left: low_bound, right: high_bound) = range.kind else {
+        fail Fault.Unsupported(text::String.of("a quantifier over no range expression", alloc))
+    }
+    let Some(low) = try mut self.operand(low_bound.contents()) else {
+        return Out.Never
+    }
+    let Some(high) = try mut self.operand(high_bound.contents()) else {
+        return Out.Never
+    }
+    let element = self.body.contents().local(local).ty
+    let Some(outer) = self.b.current_block() else {
+        expect false
+        return Out.Never
+    }
+    mut self.b.open_region()
+    let entry = mut self.b.block()
+    let bound = mut self.b.block_param(entry, ty: nir::NTy.Owned(element))
+    discard mut self.held.insert(local, value: Held.Value(bound))
+    mut self.b.at(entry)
+    let value = try mut self.operand(body)
+    match value {
+        Some(yielded) => mut self.end(nir::Terminator.Yield(take yielded), span)
+        None => {}
+    }
+    let region = mut self.b.close_region()
+    mut self.b.at(outer)
+    let result = mut self.emit_value(nir::Op.Quantifier(all: all, low: take low, high: take high, inclusive: op == ast::BinaryOp.RangeInclusive, region: take region), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
+    return Out.Operand(nir::Operand.Value(result))
+} Elab.quantifier
+
+/// The call of an operator interface's method on a non-scalar: the implementing function
+/// the left operand's type gives.
+fn Elab.operator_call(
+    mut self,
+    expr: TExpr,
+    path: Str,
+    method: Str,
+    take args: mem::List[nir::Operand],
+    ) -> Out fails Fault {
+    let span = Elab.spanning(expr)
+    let Some(interface_item) = self.ck.db().std_item("core", name: path) else {
+        var message = text::String.of("the core interface ", alloc: self.ck.alloc())
+        mut message.append(path)
+        fail Fault.Unsupported(take message)
+    }
+    let callee = try self.implementation(expr.ty, interface_item, method)
+    let value = mut self.call_value(take callee, args: take args, ty: expr.ty, span)
+    return Out.Operand(nir::Operand.Value(value))
+} Elab.operator_call
+
+/// The function implementing an interface's method for a type.
+fn Elab.implementation(self, ty: ty::Ty, interface_item: ty::ItemId, method: Str) -> nir::FnRef fails Fault {
+    let Some(found) = self.ck.implementation(ty, interface_item, method) else {
+        var message = text::String.of("the implementation of ", alloc: self.ck.alloc())
+        mut message.append(method)
+        fail Fault.Unsupported(take message)
+    }
+    return found
+} Elab.implementation
+
+/// A closure expression: its value holding one operand per capture, in its mode.
+fn Elab.closure_value(mut self, expr: TExpr, closure: TClosure) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    var operands = mem::List[nir::Operand].empty(alloc)
+    for capture in closure_captures(closure, alloc) {
+        match self.held.get(capture.outer) {
+            Some(Held.Literal(literal)) => {
+                mut operands.push(nir::Operand.Literal(literal.copy(alloc)))
+                continue
+            }
+            else => {}
+        }
+        let outer_ty = self.body.contents().local(capture.outer).ty
+        let place = try mut self.local_place(capture.outer)
+        let operand = match capture.mode {
+            ast::Mode.Read => mut self.read_operand(take place, ty: outer_ty, span)
+            ast::Mode.Mut => nir::Operand.Place(mode: ast::Mode.Mut, place: take place)
+            ast::Mode.Take => mut self.moved_operand(take place)
+        }
+        mut operands.push(take operand)
+    }
+    try mut self.closure_predicate_checks(closure, span)
+    let index = self.closure_base + closure.index - 1
+    let value = mut self.emit_value(nir::Op.Closure(index: index, captures: take operands), ty: nir::NTy.Owned(expr.ty), span)
+    return Out.Operand(nir::Operand.Value(value))
+} Elab.closure_value
+
+/// The operand moving a place, which counts as moved afterwards.
+fn Elab.moved_operand(mut self, take place: nir::Place) -> nir::Operand {
+    discard mut self.moved.insert(place.copy(self.ck.alloc()))
+    return nir::Operand.Place(mode: ast::Mode.Take, place: take place)
+} Elab.moved_operand
+
+/// The operand an argument passes for a parameter in a mode.
+fn Elab.arg(mut self, expr: TExpr, mode: ast::Mode) -> Option[nir::Operand] fails Fault {
+    let out = try mut self.expr(expr)
+    return mut self.argument(take out, expr, mode)
+} Elab.arg
+
+/// The operand passing an elaborated argument expression in a mode.
+fn Elab.argument(mut self, take out: Out, expr: TExpr, mode: ast::Mode) -> Option[nir::Operand] {
+    match out {
+        Out.Never => return None
+        Out.Operand(operand) => return Some(mut self.operand_argument(take operand, expr, mode))
+        Out.Place(place) => return Some(mut self.place_argument(take place, expr, mode))
+    }
+} Elab.argument
+
+/// The operand passing a value an argument expression yields in a mode: a value that is
+/// neither Copy nor a view by read from a temporary, any by `mut` from a temporary slot.
+fn Elab.operand_argument(mut self, take operand: nir::Operand, expr: TExpr, mode: ast::Mode) -> nir::Operand {
+    match mode {
+        ast::Mode.Read => {
+            let nir::Operand.Value(value) = operand else {
+                return operand
+            }
+            if self.ck.nir_copy(expr.ty) or self.ck.nir_view(expr.ty) {
+                return operand
+            }
+            let place = mut self.temporary(nir::Operand.Value(value), ty: expr.ty, token: expr.token)
+            return mut self.read_operand(take place, ty: expr.ty, span: Elab.spanning(expr))
+        }
+        ast::Mode.Mut => {
+            let slot = mut self.slot_holding(take operand, ty: expr.ty, token: expr.token)
+            mut self.temps.push(slot)
+            let at = self.temp_scope
+            var scope = mut self.scopes.at_mut(at)
+            mut scope.slots.push(slot)
+            return nir::Operand.Place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc: self.ck.alloc()))
+        }
+        ast::Mode.Take => return operand
+    }
+} Elab.operand_argument
+
+/// The operand passing a place an argument expression names in a mode.
+fn Elab.place_argument(mut self, take place: nir::Place, expr: TExpr, mode: ast::Mode) -> nir::Operand {
+    let span = Elab.spanning(expr)
+    match mode {
+        ast::Mode.Read => return mut self.read_operand(take place, ty: expr.ty, span)
+        ast::Mode.Mut => return nir::Operand.Place(mode: ast::Mode.Mut, place: take place)
+        ast::Mode.Take => {
+            if self.ck.nir_copy(expr.ty) or self.owned_root(place) {
+                return mut self.take_place(take place, ty: expr.ty, span)
+            }
+            return mut self.moved_operand(take place)
+        }
+    }
+} Elab.place_argument
+
+/// A call returning a value of `ty`.
+fn Elab.call_value(
+    mut self,
+    take callee: nir::FnRef,
+    take args: mem::List[nir::Operand],
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> nir::Value {
+    return mut self.emit_value(nir::Op.Call(nir::Call(awaited: false, callee: nir::Callee.Fn(take callee), args: take args)), ty: nir::NTy.Owned(ty), span)
+} Elab.call_value

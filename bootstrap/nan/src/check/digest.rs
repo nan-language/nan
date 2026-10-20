@@ -2,7 +2,7 @@
 //! digests of what it reaches, and the limits that demand them, judged at each site of the code
 //! that brings a fact.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use super::Checker;
@@ -138,6 +138,53 @@ pub struct Digests {
     computing: Vec<ItemId>,
 }
 
+/// The state of Tarjan's algorithm: each function entered with its number and low link, the
+/// functions not yet in a component, and the functions whose dependencies are being walked, each
+/// with its dependencies and the next to walk.
+#[derive(Default)]
+struct Search {
+    numbered: HashMap<ItemId, (usize, usize)>,
+    stack: Vec<ItemId>,
+    on_stack: HashSet<ItemId>,
+    frames: Vec<(ItemId, Rc<Vec<ItemId>>, usize)>,
+}
+
+impl Search {
+    fn enter(&mut self, checker: &Checker, item: ItemId) {
+        let number = self.numbered.len();
+        self.numbered.insert(item, (number, number));
+        self.stack.push(item);
+        self.on_stack.insert(item);
+        let dependencies = checker.body_dependencies(item).unwrap_or_default();
+        self.frames.push((item, dependencies, 0));
+    }
+
+    /// Lowers a function's low link to `number`.
+    fn lower(&mut self, item: ItemId, number: usize) {
+        let low = &mut self.numbered.get_mut(&item).expect("a numbered item").1;
+        *low = (*low).min(number);
+    }
+}
+
+/// A full search of the dependencies from a function: the functions it visits, in order, and for
+/// each function checked as a dependency, how many were visited when it was first checked.
+#[derive(Default)]
+struct FullSearch {
+    visited: Vec<ItemId>,
+    checked: HashMap<ItemId, usize>,
+}
+
+/// The strongly connected components of the functions' dependencies found so far.
+#[derive(Default)]
+pub struct Cycles {
+    /// Each function's component, by index.
+    component: HashMap<ItemId, usize>,
+    /// Whether each component holds a cycle: several functions, or one depending on itself.
+    cyclic: Vec<bool>,
+    /// Whether components are being found, during which a query searches the dependencies.
+    finding: bool,
+}
+
 impl Checker<'_> {
     /// The digest of a function item: computed from its body, supplied for a std function
     /// without one, and otherwise declared.
@@ -242,32 +289,204 @@ impl Checker<'_> {
     }
 
     /// Whether two functions belong to one cycle: each reaches the other through dependencies.
+    /// While reads are recorded, the search reads each function it reaches.
     pub fn same_cycle(&self, first: ItemId, second: ItemId) -> bool {
-        self.reaches(first, second, &mut Vec::new()) && self.reaches(second, first, &mut Vec::new())
+        if self.db.recording() || self.cycles.borrow().finding {
+            return self.reaches(first, second, &mut HashSet::new())
+                && self.reaches(second, first, &mut HashSet::new());
+        }
+        match first == second {
+            true => self.in_cycle(first),
+            false => self.component(first) == self.component(second),
+        }
     }
 
     /// Whether a function belongs to a cycle: it reaches itself through its dependencies.
+    /// While reads are recorded, the search reads each function it reaches.
     pub fn in_cycle(&self, item: ItemId) -> bool {
-        self.reaches(item, item, &mut Vec::new())
+        if self.db.recording() || self.cycles.borrow().finding {
+            return self.reaches(item, item, &mut HashSet::new());
+        }
+        let component = self.component(item);
+        self.cycles.borrow().cyclic[component]
+    }
+
+    /// The members of a function's cycle among `reachable`, recording what testing each member
+    /// after the function itself with `same_cycle` reads, in the same order: the search from
+    /// the function runs once, and a search from a member not in its cycle, which visits every
+    /// function the member reaches, skips the functions whose reachable functions it has all
+    /// read.
+    pub fn recorded_cycle(&self, item: ItemId, reachable: Vec<ItemId>) -> Vec<ItemId> {
+        let search = self.db.about(None, || {
+            let mut search = FullSearch::default();
+            self.search_from(item, &mut HashSet::new(), &mut search);
+            search
+        });
+        let mut noted = 0;
+        let mut closed: HashSet<ItemId> = HashSet::new();
+        let mut members = Vec::new();
+        for member in reachable {
+            if member == item {
+                members.push(member);
+                continue;
+            }
+            let stop = search.checked.get(&member).copied();
+            let end = stop.unwrap_or(search.visited.len());
+            if end > noted {
+                for visited in &search.visited[noted..end] {
+                    self.db.note(*visited);
+                }
+                noted = end;
+            }
+            if stop.is_none() {
+                continue;
+            }
+            let together = self
+                .db
+                .about(None, || self.component(member) == self.component(item));
+            if together {
+                if self.reaches(member, item, &mut HashSet::new()) {
+                    members.push(member);
+                }
+                continue;
+            }
+            let mut visited = Vec::new();
+            self.note_reached(member, &closed, &mut HashSet::new(), &mut visited);
+            closed.extend(visited);
+        }
+        members
+    }
+
+    /// Visits the functions a function reaches as `reaches` does with no target, in order.
+    fn search_from(&self, from: ItemId, seen: &mut HashSet<ItemId>, search: &mut FullSearch) {
+        if !seen.insert(from) {
+            return;
+        }
+        search.visited.push(from);
+        let Some(dependencies) = self.body_dependencies(from) else {
+            return;
+        };
+        for dependency in dependencies.iter() {
+            let count = search.visited.len();
+            search.checked.entry(*dependency).or_insert(count);
+            self.search_from(*dependency, seen, search);
+        }
+    }
+
+    /// Reads the functions a function reaches as `reaches` does with a target it never finds,
+    /// skipping the `closed` functions, whose reachable functions are all read, and lists those
+    /// it visits.
+    fn note_reached(
+        &self,
+        from: ItemId,
+        closed: &HashSet<ItemId>,
+        seen: &mut HashSet<ItemId>,
+        visited: &mut Vec<ItemId>,
+    ) {
+        if closed.contains(&from) || !seen.insert(from) {
+            return;
+        }
+        visited.push(from);
+        let Some(dependencies) = self.body_dependencies(from) else {
+            return;
+        };
+        for dependency in dependencies.iter() {
+            self.note_reached(*dependency, closed, seen, visited);
+        }
+    }
+
+    /// The strongly connected component of the dependencies holding a function.
+    fn component(&self, item: ItemId) -> usize {
+        if let Some(found) = self.cycles.borrow().component.get(&item) {
+            return *found;
+        }
+        self.cycles.borrow_mut().finding = true;
+        self.find_components(item);
+        self.cycles.borrow_mut().finding = false;
+        self.cycles.borrow().component[&item]
+    }
+
+    /// Tarjan's algorithm from a function over the functions it reaches outside the components
+    /// already found.
+    fn find_components(&self, root: ItemId) {
+        let mut search = Search::default();
+        search.enter(self, root);
+        while let Some((item, dependencies, next)) = search.frames.last_mut() {
+            let item = *item;
+            if let Some(&dependency) = dependencies.get(*next) {
+                *next += 1;
+                if self.cycles.borrow().component.contains_key(&dependency) {
+                    continue;
+                }
+                match search.numbered.get(&dependency).copied() {
+                    Some((number, _)) if search.on_stack.contains(&dependency) => {
+                        search.lower(item, number);
+                    }
+                    Some(_) => {}
+                    None => search.enter(self, dependency),
+                }
+                continue;
+            }
+            let (_, dependencies, _) = search.frames.pop().expect("a frame");
+            let (number, low) = search.numbered[&item];
+            if let Some(&(parent, _, _)) = search.frames.last() {
+                search.lower(parent, low);
+            }
+            if low != number {
+                continue;
+            }
+            let mut members = Vec::new();
+            loop {
+                let member = search.stack.pop().expect("a member on the stack");
+                search.on_stack.remove(&member);
+                members.push(member);
+                if member == item {
+                    break;
+                }
+            }
+            let mut cycles = self.cycles.borrow_mut();
+            let component = cycles.cyclic.len();
+            cycles
+                .cyclic
+                .push(members.len() > 1 || dependencies.contains(&item));
+            for member in members {
+                cycles.component.insert(member, component);
+            }
+        }
     }
 
     /// Whether a function reaches `target` through its dependencies: the functions it calls
     /// directly and those it supplies as function arguments.
-    fn reaches(&self, from: ItemId, target: ItemId, seen: &mut Vec<ItemId>) -> bool {
-        if seen.contains(&from) {
+    fn reaches(&self, from: ItemId, target: ItemId, seen: &mut HashSet<ItemId>) -> bool {
+        if !seen.insert(from) {
             return false;
         }
-        seen.push(from);
-        let Some(body) = self.typed_body(from) else {
+        let Some(dependencies) = self.body_dependencies(from) else {
             return false;
         };
-        let mut dependencies = Vec::new();
-        if let Some(root) = &body.root {
-            collect_dependencies(root, &mut dependencies);
-        }
         dependencies
-            .into_iter()
-            .any(|dependency| dependency == target || self.reaches(dependency, target, seen))
+            .iter()
+            .any(|dependency| *dependency == target || self.reaches(*dependency, target, seen))
+    }
+
+    /// The dependencies of a function with a body, in order of occurrence; reading them reads
+    /// the function as `typed_body` does.
+    fn body_dependencies(&self, item: ItemId) -> Option<Rc<Vec<ItemId>>> {
+        if let Some(known) = self.body_dependencies.borrow().get(&item) {
+            self.db.note(item);
+            return known.clone();
+        }
+        let found = self.typed_body(item).map(|body| {
+            let mut found = Vec::new();
+            if let Some(root) = &body.root {
+                collect_dependencies(root, &mut found);
+            }
+            Rc::new(found)
+        });
+        self.body_dependencies
+            .borrow_mut()
+            .insert(item, found.clone());
+        found
     }
 
     fn has_decreases(&self, item: ItemId) -> bool {

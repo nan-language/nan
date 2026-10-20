@@ -860,7 +860,9 @@ impl Body<'_, '_> {
         }
     }
 
-    /// Whether `vector` matches a value no row of `matrix` matches.
+    /// Whether `vector` matches a value no row of `matrix` matches. Every type being inhabited,
+    /// when the first column misses a constructor of its type, the rows it starts with a wildcard
+    /// decide alone.
     fn useful(&self, matrix: &[Vec<Pat>], vector: &[Pat], types: &[Ty]) -> bool {
         let Some((head, rest)) = vector.split_first() else {
             return matrix.is_empty();
@@ -899,40 +901,64 @@ impl Body<'_, '_> {
                 });
                 self.useful(&rows, rest, rest_types)
             }
-            Pat::Wild => match self.shape(ty) {
-                Shape::Bool => [true, false].into_iter().any(|value| {
-                    let rows = self.rows_with(matrix, |pat| {
-                        matches!(pat, Pat::Wild) || *pat == Pat::Bool(value)
-                    });
-                    self.useful(&rows, rest, rest_types)
-                }),
-                Shape::Ints(ranges) => ranges.into_iter().any(|(low, high)| {
-                    self.split_ints(matrix, low, high)
-                        .into_iter()
-                        .any(|(low, high)| {
+            Pat::Wild => {
+                let heads = || matrix.iter().filter_map(|row| row.first());
+                let default = || self.rows_with(matrix, |pat| matches!(pat, Pat::Wild));
+                match self.shape(ty) {
+                    Shape::Bool => {
+                        let complete = [true, false]
+                            .iter()
+                            .all(|value| heads().any(|pat| *pat == Pat::Bool(*value)));
+                        if !complete {
+                            return self.useful(&default(), rest, rest_types);
+                        }
+                        [true, false].into_iter().any(|value| {
+                            let rows = self.rows_with(matrix, |pat| {
+                                matches!(pat, Pat::Wild) || *pat == Pat::Bool(value)
+                            });
+                            self.useful(&rows, rest, rest_types)
+                        })
+                    }
+                    Shape::Ints(ranges) => {
+                        let pieces: Vec<(i128, i128)> = (ranges.into_iter())
+                            .flat_map(|(low, high)| self.split_ints(matrix, low, high))
+                            .collect();
+                        let complete = pieces.iter().all(|(low, high)| {
+                            heads().any(|pat| {
+                                matches!(pat, Pat::Ints(start, end) if start <= low && high <= end)
+                            })
+                        });
+                        if !complete {
+                            return self.useful(&default(), rest, rest_types);
+                        }
+                        pieces.into_iter().any(|(low, high)| {
                             let rows = self.rows_covering_ints(matrix, low, high);
                             self.useful(&rows, rest, rest_types)
                         })
-                }),
-                Shape::Ctors { fields, open } => {
-                    let default = self.rows_with(matrix, |pat| matches!(pat, Pat::Wild));
-                    if open && self.useful(&default, rest, rest_types) {
-                        return true;
                     }
-                    fields.into_iter().enumerate().any(|(index, field_types)| {
-                        let specialized = self.specialize(matrix, index, &field_types);
-                        let mut next: Vec<Pat> = field_types.iter().map(|_| Pat::Wild).collect();
-                        next.extend(rest.iter().cloned());
-                        let mut next_types = field_types;
-                        next_types.extend(rest_types.iter().cloned());
-                        self.useful(&specialized, &next, &next_types)
-                    })
+                    Shape::Ctors { fields, open } => {
+                        let complete = !open
+                            && (0..fields.len()).all(|index| {
+                                heads().any(
+                                    |pat| matches!(pat, Pat::Ctor(found, _) if *found == index),
+                                )
+                            });
+                        if !complete {
+                            return self.useful(&default(), rest, rest_types);
+                        }
+                        fields.into_iter().enumerate().any(|(index, field_types)| {
+                            let specialized = self.specialize(matrix, index, &field_types);
+                            let mut next: Vec<Pat> =
+                                field_types.iter().map(|_| Pat::Wild).collect();
+                            next.extend(rest.iter().cloned());
+                            let mut next_types = field_types;
+                            next_types.extend(rest_types.iter().cloned());
+                            self.useful(&specialized, &next, &next_types)
+                        })
+                    }
+                    Shape::Infinite => self.useful(&default(), rest, rest_types),
                 }
-                Shape::Infinite => {
-                    let rows = self.rows_with(matrix, |pat| matches!(pat, Pat::Wild));
-                    self.useful(&rows, rest, rest_types)
-                }
-            },
+            }
         }
     }
 

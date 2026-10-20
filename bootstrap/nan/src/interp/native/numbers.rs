@@ -69,10 +69,18 @@ pub fn scalar_member(
             Val::Int(i128::from(bits.trailing_zeros().min(scalar.bits())))
         }
         "wide_mul" => {
-            let product = a * b();
             let wide = interp.ty_item("core", "WideProduct");
-            let low = product.rem_euclid(1i128 << 64);
-            let high = (product - low) >> 64;
+            let (high, low) = match scalar.is_signed() {
+                true => {
+                    let product = a * b();
+                    let low = product.rem_euclid(1i128 << 64);
+                    ((product - low) >> 64, low)
+                }
+                false => {
+                    let product = (a as u128) * (b() as u128);
+                    ((product >> 64) as i128, i128::from(product as u64))
+                }
+            };
             Val::Struct(wide, Rc::new(vec![Val::Int(high), Val::Int(low)]))
         }
         _ => return Err(End::Missing),

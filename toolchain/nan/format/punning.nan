@@ -1,0 +1,189 @@
+//! Punned arguments: in a call, an argument after the first whose value is a binding or parameter, alone or after a mode, spelt like its label, which `nan fmt` writes without its label.
+
+pkg struct Punning {
+    /// The label and colon tokens of the punned arguments written with their labels.
+    pkg labels: mem::HashMap[u32, Unit]
+    /// The name token of each punned argument, by the first token of its value.
+    pkg values: mem::HashMap[u32, u32]
+} Punning
+
+/// The punned arguments of an item's calls.
+pkg fn Punning.collect(file: syntax::SourceFile, tree: syntax::Tree, bindings: Bindings, alloc: mem::Alloc) -> Punning {
+    var found = Punning(labels: mem::HashMap[u32, Unit].empty(seed: 0, alloc), values: mem::HashMap[u32, u32].empty(seed: 0, alloc))
+    for node in tree.descendants(tree.root(), alloc) {
+        if tree.rule(node) == syntax::Rule.PostfixExpr {
+            mut found.calls(file, tree, bindings, postfix: node, alloc)
+        }
+    }
+    return found
+} Punning.collect
+
+/// Records the punned arguments of each call suffix of a postfix expression. A suffix whose
+/// callee's last name is PascalCase is a construction, whose labels are never punned.
+fn Punning.calls(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    bindings: Bindings,
+    postfix: u32,
+    alloc: mem::Alloc,
+    ) {
+    var nodes = tree.child_nodes(postfix)
+    var callee: Option[u32] = None
+    match mut nodes.next() {
+        Some(primary) => {
+            callee = path_end(file, tree, primary)
+        }
+        None => {
+        }
+    }
+    loop {
+        let Some(suffix) = mut nodes.next() else {
+            return
+        }
+        let tokens = child_token_list(tree, node: suffix, alloc)
+        match file.tokens[usize.widen(tokens[0])].kind {
+            syntax::TokenKind.Punct(syntax::Punct.Dot) => {
+                callee = None
+                if tokens.len() > 1 {
+                    callee = Some(tokens[1])
+                }
+            }
+            syntax::TokenKind.Punct(syntax::Punct.LParen) => {
+                var construction = false
+                match callee {
+                    Some(name) => {
+                        construction = syntax::is_pascal(file.text(usize.widen(name)).as_bytes())
+                    }
+                    None => {
+                    }
+                }
+                if not construction {
+                    mut self.arguments(file, tree, bindings, args: tree.list_elements(tree.find(suffix, rule: syntax::Rule.ArgList), element: syntax::Rule.Arg, alloc), alloc)
+                }
+                callee = None
+            }
+            else => {
+                callee = None
+            }
+        }
+    }
+} Punning.calls
+
+/// The last identifier of a primary expression that is a path.
+fn path_end(file: syntax::SourceFile, tree: syntax::Tree, primary: u32) -> Option[u32] {
+    let Some(path) = find_in(tree, node: tree.find(primary, rule: syntax::Rule.PathExpr), rule: syntax::Rule.Path) else {
+        return None
+    }
+    var last: Option[u32] = None
+    for token in tree.child_tokens(path) {
+        if is_ident(file, token) {
+            last = Some(token)
+        }
+    }
+    return last
+} path_end
+
+fn Punning.arguments(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    bindings: Bindings,
+    args: mem::List[u32],
+    alloc: mem::Alloc,
+    ) {
+    var index: usize = 1
+    while index < args.len() {
+        let arg = args[index]
+        index += 1
+        let exprs = child_node_list(tree, node: arg, alloc)
+        var label: Option[u32] = None
+        var value: u32 = 0
+        if exprs.len() == 2 {
+            label = Some(exprs[0])
+            value = exprs[1]
+        } else if exprs.len() == 1 {
+            value = exprs[0]
+        } else {
+            continue
+        }
+        let Some(name) = marked_name(file, tree, node: value) else {
+            continue
+        }
+        if not bindings.of.contains(name) {
+            continue
+        }
+        let Some(span) = tree.span(value, alloc) else {
+            expect false
+            return
+        }
+        match label {
+            Some(labelled) => {
+                let Some(written) = lone_name(file, tree, node: labelled) else {
+                    continue
+                }
+                if file.text(usize.widen(written)) != file.text(usize.widen(name)) {
+                    continue
+                }
+                var tokens = tree.child_tokens(arg)
+                let Some(colon) = mut tokens.next() else {
+                    expect false
+                    return
+                }
+                discard mut self.labels.insert(written, value: Unit)
+                discard mut self.labels.insert(colon, value: Unit)
+            }
+            None => {
+            }
+        }
+        discard mut self.values.insert(span.head, value: name)
+    }
+} Punning.arguments
+
+/// The identifier an expression is, when it is a lone one-segment path.
+fn lone_name(file: syntax::SourceFile, tree: syntax::Tree, node: u32) -> Option[u32] {
+    let held = tree.children(node)
+    if held.len() != 1 {
+        return None
+    }
+    return match held[0] {
+        syntax::Child.Node(only) => lone_name(file, tree, node: only)
+        syntax::Child.Token(token) => lone_token(file, tree, node, token)
+    }
+} lone_name
+
+/// The token alone in a node, when the node is a path and the token an identifier.
+fn lone_token(file: syntax::SourceFile, tree: syntax::Tree, node: u32, token: u32) -> Option[u32] {
+    if tree.rule(node) == syntax::Rule.Path and is_ident(file, token) {
+        return Some(token)
+    }
+    return None
+} lone_token
+
+/// The identifier an expression is, alone or after a mode.
+fn marked_name(file: syntax::SourceFile, tree: syntax::Tree, node: u32) -> Option[u32] {
+    let held = tree.children(node)
+    if held.len() == 1 {
+        match held[0] {
+            syntax::Child.Node(only) => return marked_name(file, tree, node: only)
+            syntax::Child.Token(_) => {
+            }
+        }
+    }
+    if held.len() == 2 {
+        match held[0] {
+            syntax::Child.Node(mode) => {
+                if tree.rule(mode) == syntax::Rule.Mode {
+                    match held[1] {
+                        syntax::Child.Node(rest) => return lone_name(file, tree, node: rest)
+                        syntax::Child.Token(_) => {
+                        }
+                    }
+                }
+            }
+            syntax::Child.Token(_) => {
+            }
+        }
+    }
+    return lone_name(file, tree, node)
+} marked_name

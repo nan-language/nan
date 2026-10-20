@@ -190,7 +190,7 @@ fn decode(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, format: Format) {
             let this = fx.b.ins().icmp_imm_s(IntCC::Equal, code, index as i64 + 1);
             let fails = fails.clone();
             fx.when(this, |fx| {
-                let value = lo.variant_value(fx, &fails, name, &[], false);
+                let value = lo.variant_value(fx, &fails, name, &[], None);
                 lo.store_held(fx, error, value, &fails);
             });
         }

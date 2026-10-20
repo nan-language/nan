@@ -1,0 +1,310 @@
+//! Where the program talks to Linux: files, directories, locks and processes through glibc.
+
+/// What a call of the system failed with: the kinds the toolchain tells apart, or the error number
+/// of any other failure, 0 when the system gave none.
+pkg enum IoError derives Copy, Eq, Render {
+    NotFound
+    AlreadyExists
+    BrokenPipe
+    InvalidData
+    Other(i32)
+} IoError
+
+const ENOENT: i32 = 2
+
+const EINTR: i32 = 4
+
+const EEXIST: i32 = 17
+
+const ENOTDIR: i32 = 20
+
+const EINVAL: i32 = 22
+
+const EPIPE: i32 = 32
+
+const ERANGE: i32 = 34
+
+const ENAMETOOLONG: i32 = 36
+
+const ELOOP: i32 = 40
+
+/// The most bytes of a path the system reads, its NUL included.
+const PATH_MAX: usize = 4_096
+
+foreign fn __errno_location() -> hw::Ptr[i32] limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn strlen(start: hw::Ptr[u8]) -> usize convention "sysv"
+
+/// The error number the last failing call of the C library on this thread set.
+fn last_code() -> i32 {
+    return trusted "the C library gives the calling thread's error number, an int that lives as long as the thread" { __errno_location().read() }
+} last_code
+
+/// Clears the calling thread's error number, for a call that reports failure only through it.
+fn clear_code() {
+    trusted "the C library gives the calling thread's error number, an int that lives as long as the thread" {
+        __errno_location().write(0)
+    }
+} clear_code
+
+fn error_of(code: i32) -> IoError {
+    return match code {
+        ENOENT => IoError.NotFound
+        EEXIST => IoError.AlreadyExists
+        EPIPE => IoError.BrokenPipe
+        else => IoError.Other(code)
+    }
+} error_of
+
+/// The error the last failing call of the C library on this thread gave.
+fn last_error() -> IoError {
+    return error_of(last_code())
+} last_error
+
+/// Bytes as the C library reads a path or name: the bytes, then a NUL.
+struct CText {
+    bytes: Array[u8, 4_096]
+} CText
+
+/// The C form of bytes holding no NUL and fewer than `PATH_MAX`.
+fn c_text(bytes: Slice[u8]) -> CText fails IoError {
+    if bytes.len() >= PATH_MAX {
+        fail IoError.Other(ENAMETOOLONG)
+    }
+    var held = Array[u8, 4_096].filled(0)
+    for at in 0..<bytes.len() {
+        if bytes[at] == 0 {
+            fail IoError.Other(EINVAL)
+        }
+        held[at] = bytes[at]
+    }
+    return CText(bytes: held)
+} c_text
+
+/// The program's arguments as texts; none when one is not well-formed UTF-8.
+pkg validator fn arguments(raw: Untrusted[mem::List[mem::Bytes]], alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    var args = mem::List[text::String].empty(alloc)
+    for arg in raw.inspect() {
+        let Ok(written) = attempt text::String.try_from_utf8(arg.view(), alloc) else {
+            return None
+        }
+        mut args.push(take written)
+    }
+    return Some(take args)
+} arguments
+
+/// The id of this process.
+pkg fn process_id() -> u32 {
+    return getpid().to_bits()
+} process_id
+
+/// The bytes of a NUL-terminated text at `start`.
+fn copied_text(start: hw::Ptr[u8], alloc: mem::Alloc) -> mem::Bytes {
+    let length = trusted "start addresses a NUL-terminated text" { strlen(start) }
+    var copy = mem::Bytes.zeroed(length, alloc)
+    let target = hw::Ptr.of_view_mut(mut copy.view_mut())
+    trusted "start addresses length bytes before its NUL and target the length bytes of copy" {
+        start.copy(target, count: length)
+    }
+    return copy
+} copied_text
+
+/// The real user id of this process, as the kernel gives its status.
+pkg fn running_user(alloc: mem::Alloc) -> u32 fails IoError {
+    let status = try read_text("/proc/self/status", alloc)
+    let written = status.as_str()
+    var at: usize = 0
+    while at < written.byte_len() {
+        let line = next_line(written, at)
+        at = line.next
+        let Some(content) = written.slice_bytes(line.start, end: line.end) else {
+            break
+        }
+        if not content.starts_with("Uid:") {
+            continue
+        }
+        let word = first_word(content, from: 4)
+        let Some(ids) = content.slice_bytes(word.start, end: word.end) else {
+            break
+        }
+        let Some(value) = parse_decimal(ids) else {
+            break
+        }
+        let Some(uid) = u32.checked_fit(value) else {
+            break
+        }
+        return uid
+    }
+    fail IoError.Other(0)
+} running_user
+
+/// The home directory the system's user database gives a user.
+pkg fn home(uid: u32, alloc: mem::Alloc) -> Option[text::String] fails IoError {
+    let users = match first attempt read_text("/etc/passwd", alloc) {
+        Ok(users) => users
+        Err(IoError.NotFound) => return None
+        Err(error) => fail error
+    }
+    let written = users.as_str()
+    var at: usize = 0
+    while at < written.byte_len() {
+        let line = next_line(written, at)
+        at = line.next
+        let Some(content) = written.slice_bytes(line.start, end: line.end) else {
+            break
+        }
+        let Some(dir) = user_home(content, uid, alloc) else {
+            continue
+        }
+        return Some(take dir)
+    }
+    return None
+} home
+
+/// The home directory a user database line gives when it holds 7 fields, the third `uid` and the
+/// sixth not empty.
+fn user_home(line: Str, uid: u32, alloc: mem::Alloc) -> Option[text::String] {
+    let bytes = line.as_bytes()
+    var field: usize = 0
+    var start: usize = 0
+    var id = Run(start: 0, end: 0)
+    var dir = Run(start: 0, end: 0)
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b':' {
+            continue
+        }
+        if field == 2 {
+            id = Run(start: start, end: at)
+        }
+        if field == 5 {
+            dir = Run(start: start, end: at)
+        }
+        field += 1
+        start = at + 1
+    }
+    if field != 7 or dir.start == dir.end {
+        return None
+    }
+    let Some(written) = line.slice_bytes(id.start, end: id.end) else {
+        return None
+    }
+    if parse_decimal(written) != Some(u64.widen(uid)) {
+        return None
+    }
+    let Some(path) = line.slice_bytes(dir.start, end: dir.end) else {
+        return None
+    }
+    return Some(text::String.of(path, alloc))
+} user_home
+
+/// The value of a decimal number as the toolchain's own files and the system's write it: digits,
+/// after at most one `+`, not exceeding 2^64 - 1.
+pkg fn parse_decimal(digits: Str) -> Option[u64] {
+    var written = digits.as_bytes()
+    if written.len() > 1 and written[0] == b'+' {
+        let Some(parts) = written.split_at(1) else {
+            return None
+        }
+        written = parts.tail
+    }
+    if written.len() == 0 {
+        return None
+    }
+    var value: u64 = 0
+    for byte in written {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(u64.widen(byte - b'0')) else {
+            return None
+        }
+        value = next
+    }
+    return Some(value)
+} parse_decimal
+
+/// Where a line of a text lies, its ending excluded, and where the next one starts.
+struct Line derives Copy {
+    start: usize
+    end: usize
+    next: usize
+} Line
+
+/// The line of `written` starting at `at`: up to its LF, a CR before the LF excluded, or up to
+/// the end of the text.
+fn next_line(written: Str, at: usize) -> Line {
+    let bytes = written.as_bytes()
+    for index in at..<bytes.len() {
+        if bytes[index] != b'\n' {
+            continue
+        }
+        if index > at and bytes[index - 1] == b'\r' {
+            return Line(start: at, end: index - 1, next: index + 1)
+        }
+        return Line(start: at, end: index, next: index + 1)
+    }
+    return Line(start: at, end: bytes.len(), next: bytes.len())
+} next_line
+
+/// Where a run of characters lies in a text.
+pkg struct Run derives Copy {
+    pkg start: usize
+    pkg end: usize
+} Run
+
+/// The bytes of a text without the white space at its ends, empty at its start when it holds
+/// nothing else.
+pkg fn trimmed_run(written: Str) -> Run {
+    var start: usize = 0
+    var end: usize = 0
+    var found = false
+    var at: usize = 0
+    for c in written {
+        let width = c.utf8_len()
+        if not is_white_space(c) {
+            if not found {
+                start = at
+                found = true
+            }
+            end = at + width
+        }
+        at += width
+    }
+    return Run(start: start, end: end)
+} trimmed_run
+
+/// The first run of characters that are not white space in `written` from `from`, empty at the
+/// end of the text when there is none.
+fn first_word(written: Str, from: usize) -> Run {
+    let bytes = written.as_bytes()
+    var at = from
+    var start = bytes.len()
+    while at < bytes.len() {
+        let Some(c) = text::utf8::char_at(bytes, at) else {
+            return Run(start: bytes.len(), end: bytes.len())
+        }
+        let white = is_white_space(c)
+        if white and start < bytes.len() {
+            return Run(start: start, end: at)
+        }
+        if not white and start == bytes.len() {
+            start = at
+        }
+        at += c.utf8_len()
+    }
+    return Run(start: start, end: bytes.len())
+} first_word
+
+/// Whether a character has the Unicode `White_Space` property.
+pkg fn is_white_space(c: char) -> bool {
+    return match c {
+        '\t'..='\r' or ' ' or '\u{85}' or '\u{A0}' or '\u{1680}' => true
+        '\u{2000}'..='\u{200A}' or '\u{2028}' or '\u{2029}' or '\u{202F}' or '\u{205F}' or '\u{3000}' => true
+        else => false
+    }
+} is_white_space

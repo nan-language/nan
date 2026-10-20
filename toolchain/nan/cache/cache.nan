@@ -1,0 +1,213 @@
+//! The user directory and its build cache, whose files hold their contents, then their digest.
+
+/// The home directory a process uses in place of the one the user database gives, and the
+/// directory of its local store in place of the user directory's `store`, as a harness gives
+/// them.
+pkg struct HomeOverride {
+    pkg home: text::String
+    pkg store: Option[text::String]
+} HomeOverride
+
+pkg fn copied_override(home: Option[HomeOverride], alloc: mem::Alloc) -> Option[HomeOverride] {
+    let Some(given) = home else {
+        return None
+    }
+    var store: Option[text::String] = None
+    match given.store {
+        Some(path) => {
+            store = Some(text::String.of(path.as_str(), alloc))
+        }
+        None => {}
+    }
+    return Some(HomeOverride(home: text::String.of(given.home.as_str(), alloc), store: take store))
+} copied_override
+
+/// The build cache of the running user, with the directory of its local store; without a
+/// directory when the user database gives the user no home directory, so that no record is found
+/// and none is kept.
+pkg struct Cache {
+    dir: Option[text::String]
+    store_path: Option[text::String]
+    uid: u32
+    alloc: mem::Alloc
+} Cache
+
+/// The local store's directory in the user directory, once checked, and how to check its files.
+pkg struct StoreDir {
+    pkg dir: Option[text::String]
+    pkg uid: u32
+    pkg alloc: mem::Alloc
+} StoreDir
+
+/// Whether a file or directory of the store is exposed: its path as `~/.nan/...` when it is.
+pkg fn StoreDir.exposed(self, path: Str) -> Option[Exposed] fails platform::IoError {
+    let held = match first attempt platform::symlink_metadata(path) {
+        Ok(held) => held
+        Err(platform::IoError.NotFound) => return None
+        Err(error) => fail error
+    }
+    if exposed(held, uid: self.uid) {
+        return Some(Exposed())
+    }
+    return None
+} StoreDir.exposed
+
+/// A part of the user directory that a symbolic link could redirect or another user could
+/// write.
+pkg struct Exposed {
+} Exposed
+
+/// The running user's build cache, after checking the user directory, `cache` and `store`
+/// and creating each that is missing; `given` replaces the home directory and the store.
+pkg fn Cache.open(given: Option[HomeOverride], alloc: mem::Alloc) -> Result[Cache, Exposed] fails platform::IoError {
+    let uid = try platform::running_user(alloc)
+    var found: Option[text::String] = None
+    var chosen: Option[text::String] = None
+    match given {
+        Some(replaced) => {
+            found = Some(text::String.of(replaced.home.as_str(), alloc))
+            chosen = copied(replaced.store, alloc)
+        }
+        None => {
+            found = try platform::home(uid, alloc)
+        }
+    }
+    let Some(home) = found else {
+        return Ok(Cache(dir: None, store_path: None, uid: uid, alloc: alloc))
+    }
+    let user = platform::join(home.as_str(), name: ".nan", alloc)
+    let cache = platform::join(user.as_str(), name: "cache", alloc)
+    let store = match chosen {
+        Some(dir) => dir
+        None => platform::join(user.as_str(), name: "store", alloc)
+    }
+    var dirs = mem::List[text::String].empty(alloc)
+    mut dirs.push(text::String.of(user.as_str(), alloc))
+    mut dirs.push(text::String.of(cache.as_str(), alloc))
+    mut dirs.push(text::String.of(store.as_str(), alloc))
+    var missing = mem::List[text::String].empty(alloc)
+    for dir in take dirs {
+        let held = match first attempt platform::symlink_metadata(dir.as_str()) {
+            Ok(held) => held
+            Err(platform::IoError.NotFound) => {
+                mut missing.push(take dir)
+                continue
+            }
+            Err(error) => fail error
+        }
+        if exposed(held, uid) {
+            return Err(Exposed())
+        }
+    }
+    for dir in missing {
+        let made = attempt platform::create_dir(dir.as_str(), mode: 0b111_000_000)
+        match first made {
+            Ok(_) => {}
+            Err(platform::IoError.AlreadyExists) => {
+                let held = try platform::symlink_metadata(dir.as_str())
+                if exposed(held, uid) {
+                    return Err(Exposed())
+                }
+            }
+            Err(error) => fail error
+        }
+    }
+    return Ok(Cache(dir: Some(take cache), store_path: Some(take store), uid: uid, alloc: alloc))
+} Cache.open
+
+/// A copy of an optional text.
+fn copied(held: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(value) = held else {
+        return None
+    }
+    return Some(text::String.of(value.as_str(), alloc))
+} copied
+
+/// The local store of the user directory.
+pkg fn Cache.store(self) -> StoreDir {
+    return StoreDir(dir: copied(self.store_path, alloc: self.alloc), uid: self.uid, alloc: self.alloc)
+} Cache.store
+
+/// The contents of a cache entry, none when it is missing or its digest does not match.
+pkg fn Cache.entry(self, key: hashing::HashValue) -> Result[Option[mem::Bytes], Exposed] fails platform::IoError {
+    let name = entry_name(key, alloc: self.alloc)
+    return try self.record(name.as_str())
+} Cache.entry
+
+/// Writes a cache entry under its key unless one is there.
+pkg fn Cache.put(self, key: hashing::HashValue, contents: Slice[u8]) fails platform::IoError {
+    let name = entry_name(key, alloc: self.alloc)
+    let Some(dir) = self.dir else {
+        return
+    }
+    if platform::exists(platform::join(dir.as_str(), name: name.as_str(), alloc: self.alloc).as_str()) {
+        return
+    }
+    try self.replace(name.as_str(), contents)
+} Cache.put
+
+/// The name of a cache entry's file: `entry-` and its key in full form.
+fn entry_name(key: hashing::HashValue, alloc: mem::Alloc) -> text::String {
+    var name = text::String.of("entry-", alloc)
+    mut name.append(key.full(alloc).as_str())
+    return name
+} entry_name
+
+/// The contents of a cache record, none when it is missing or its digest does not match.
+pkg fn Cache.record(self, name: Str) -> Result[Option[mem::Bytes], Exposed] fails platform::IoError {
+    let Some(dir) = self.dir else {
+        return Ok(None)
+    }
+    let path = platform::join(dir.as_str(), name, alloc: self.alloc)
+    let held = match first attempt platform::symlink_metadata(path.as_str()) {
+        Ok(held) => held
+        Err(platform::IoError.NotFound) => return Ok(None)
+        Err(error) => fail error
+    }
+    if exposed(held, uid: self.uid) {
+        return Err(Exposed())
+    }
+    let file = try platform::read_file(path.as_str(), alloc: self.alloc)
+    return Ok(checked_contents(file.view(), alloc: self.alloc))
+} Cache.record
+
+/// The contents of a file holding contents followed by their digest, none when the digest does
+/// not match or the file is shorter than one.
+fn checked_contents(file: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    if file.len() < 32 {
+        return None
+    }
+    let Some(parts) = file.split_at(file.len() - 32) else {
+        return None
+    }
+    let digest = hashing::blake3(parts.head)
+    if digest.view() != parts.tail {
+        return None
+    }
+    var contents = mem::Bytes.empty(alloc)
+    mut contents.append(parts.head)
+    return Some(take contents)
+} checked_contents
+
+/// Replaces a cache record, writing it whole under a new name and renaming it into place.
+pkg fn Cache.replace(self, name: Str, contents: Slice[u8]) fails platform::IoError {
+    let Some(dir) = self.dir else {
+        return
+    }
+    var fresh_name = text::String.of(".", alloc: self.alloc)
+    mut fresh_name.append(name)
+    mut fresh_name.write(text::fmt(".{id}", id: platform::process_id()), budget: 32)
+    let fresh = platform::join(dir.as_str(), name: fresh_name.as_str(), alloc: self.alloc)
+    let file = try platform::File.create(fresh.as_str(), mode: 0b110_000_000)
+    defer take file.close()
+    try file.write_all(contents)
+    let digest = hashing::blake3(contents)
+    try file.write_all(digest.view())
+    try platform::rename_path(fresh.as_str(), to: platform::join(dir.as_str(), name, alloc: self.alloc).as_str())
+} Cache.replace
+
+/// Whether a part of the user directory is a symbolic link, belongs to another user, or is
+/// writable by its group or by others.
+fn exposed(held: platform::Metadata, uid: u32) -> bool {
+    return held.is_symlink() or held.uid != uid or (held.mode & 0b000_010_010) != 0
+} exposed

@@ -1,0 +1,486 @@
+//! The canonical encoding of query terms, literals and clauses, whose byte order is the term order.
+
+/// The opcodes of the query forms, after those of NIR's instructions and terminators.
+const OPCODE_ITE: u64 = 50
+
+const OPCODE_QUOTIENT: u64 = 51
+
+const OPCODE_REMAINDER: u64 = 52
+
+const OPCODE_TAG: u64 = 53
+
+const OPCODE_FRESH: u64 = 54
+
+const OPCODE_SKOLEM: u64 = 55
+
+const OPCODE_BOUND: u64 = 56
+
+/// The connectives a term may hold as an operand, which no instruction names.
+const OPCODE_AND: u64 = 57
+
+const OPCODE_OR: u64 = 58
+
+/// The bits that a shift right by 7 keeps of a 128-bit value read as unsigned.
+const UVAR_REST_MASK: wide::Wide = wide::Wide.max().shift_right(6)
+
+/// The keys of a store's terms, each computed once: the BLAKE3-256 digest of the term's
+/// encoding, in which each argument term is written as its key.
+struct Encodings {
+    keys: mem::List[Option[mem::Shared[mem::Bytes]]]
+} Encodings
+
+/// No keys yet.
+fn Encodings.empty(alloc: mem::Alloc) -> Encodings {
+    return Encodings(keys: mem::List[Option[mem::Shared[mem::Bytes]]].empty(alloc))
+} Encodings.empty
+
+/// A copy of the keys, as the solver's states copy them at a case split.
+fn Encodings.copy(self, alloc: mem::Alloc) -> Encodings {
+    var keys = mem::List[Option[mem::Shared[mem::Bytes]]].empty(alloc)
+    for key in self.keys {
+        match key {
+            Some(done) => mut keys.push(Some(done.share()))
+            None => mut keys.push(None)
+        }
+    }
+    return Encodings(keys: take keys)
+} Encodings.copy
+
+fn Encodings.term(mut self, ck: Checker, terms: Terms, id: u32) -> mem::Shared[mem::Bytes] {
+    let index = usize.widen(id)
+    if index < self.keys.len() {
+        match self.keys[index] {
+            Some(done) => return done.share()
+            None => {}
+        }
+    }
+    let alloc = ck.alloc()
+    var out = mem::Bytes.empty(alloc)
+    mut self.write_term(ck, terms, id, mut out)
+    let digest = hashing::blake3(out.view())
+    var key = mem::Bytes.empty(alloc)
+    mut key.append(digest.view())
+    let done = mem::Shared.of(take key, alloc)
+    while self.keys.len() <= index {
+        mut self.keys.push(None)
+    }
+    self.keys[index] = Some(done.share())
+    return done
+} Encodings.term
+
+fn Encodings.literal(mut self, ck: Checker, terms: Terms, literal: Literal) -> mem::Bytes {
+    var out = mem::Bytes.empty(ck.alloc())
+    encoding::uvar(mut out, value: truth_number(literal.negated))
+    match literal.atom {
+        Atom.Le(sum) or Atom.Eq(sum) => {
+            let equality = match literal.atom {
+                Atom.Eq(_) => true
+                else => false
+            }
+            encoding::uvar(mut out, value: truth_number(equality))
+            encoding::uvar(mut out, value: u64.widen(sum.terms.len()))
+            for summand in sum.terms {
+                encode_svar(mut out, value: summand.coefficient)
+                mut self.write_key(ck, terms, id: summand.term, mut out)
+            }
+            encode_svar(mut out, value: sum.constant)
+        }
+        Atom.Bool(term) => {
+            encoding::uvar(mut out, value: 2)
+            mut self.write_key(ck, terms, id: term, mut out)
+        }
+        Atom.All(forall) => {
+            encoding::uvar(mut out, value: 3)
+            mut self.write_key(ck, terms, id: forall.low, mut out)
+            mut self.write_key(ck, terms, id: forall.high, mut out)
+            encoding::uvar(mut out, value: truth_number(forall.inclusive))
+            mut self.write_key(ck, terms, id: forall.bound, mut out)
+            mut self.write_key(ck, terms, id: forall.body, mut out)
+        }
+    }
+    return out
+} Encodings.literal
+
+fn Encodings.clause(mut self, ck: Checker, terms: Terms, clause: Slice[Literal]) -> mem::Bytes {
+    var out = mem::Bytes.empty(ck.alloc())
+    encoding::uvar(mut out, value: u64.widen(clause.len()))
+    for literal in clause {
+        let encoded = mut self.literal(ck, terms, literal)
+        mut out.append(encoded.view())
+    }
+    return out
+} Encodings.clause
+
+fn Encodings.write_term(mut self, ck: Checker, terms: Terms, id: u32, mut out: mem::Bytes) {
+    match terms.get(id) {
+        Term.Param(value) => {
+            encoding::uvar(mut out, value: 0)
+            encoding::uvar(mut out, value: u64.widen(value))
+        }
+        Term.Entry(value) => {
+            encoding::uvar(mut out, value: 1)
+            encoding::uvar(mut out, value: u64.widen(value))
+        }
+        Term.Lit(value) => {
+            encoding::uvar(mut out, value: 2)
+            nir::literal(mut out, value)
+        }
+        Term.App(op: op, args: args) => {
+            encoding::uvar(mut out, value: 3)
+            ck.encode_operation(mut out, op)
+            mut self.write_parts(ck, terms, parts: args.view(), mut out)
+        }
+        Term.Call(callee: callee, args: args) => {
+            encoding::uvar(mut out, value: 4)
+            encoding::uvar(mut out, value: 33)
+            ck.encode_fn_ref(mut out, callee)
+            mut self.write_parts(ck, terms, parts: args.view(), mut out)
+        }
+        Term.Field(base: base, name: name) => {
+            encoding::uvar(mut out, value: 5)
+            mut self.write_key(ck, terms, id: base, mut out)
+            encoding::bytes(mut out, value: name.as_bytes())
+        }
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            encoding::uvar(mut out, value: 6)
+            encoding::uvar(mut out, value: OPCODE_ITE)
+            mut self.write_key(ck, terms, id: condition, mut out)
+            mut self.write_key(ck, terms, id: then, mut out)
+            mut self.write_key(ck, terms, id: otherwise, mut out)
+        }
+        Term.Quot(dividend: dividend, divisor: divisor) or Term.Rem(dividend: dividend, divisor: divisor) => {
+            encoding::uvar(mut out, value: 6)
+            encoding::uvar(mut out, value: division_opcode(terms, id))
+            mut self.write_key(ck, terms, id: dividend, mut out)
+            mut self.write_key(ck, terms, id: divisor, mut out)
+        }
+        Term.Tag(part) => {
+            encoding::uvar(mut out, value: 6)
+            encoding::uvar(mut out, value: OPCODE_TAG)
+            mut self.write_key(ck, terms, id: part, mut out)
+        }
+        Term.Fresh(number) or Term.Skolem(number) or Term.Bound(number) => {
+            encoding::uvar(mut out, value: 7)
+            encoding::uvar(mut out, value: symbol_opcode(terms, id))
+            encoding::uvar(mut out, value: u64.widen(number))
+        }
+        Term.And(parts) or Term.Or(parts) => {
+            encoding::uvar(mut out, value: 3)
+            encoding::uvar(mut out, value: connective_opcode(terms, id))
+            mut self.write_parts(ck, terms, parts: parts.view(), mut out)
+        }
+        Term.Not(part) => {
+            encoding::uvar(mut out, value: 3)
+            encoding::uvar(mut out, value: 32)
+            encoding::uvar(mut out, value: 1)
+            mut self.write_key(ck, terms, id: part, mut out)
+        }
+        Term.Quant(all: all, low: low, high: high, inclusive: inclusive, bound: bound, body: body) => {
+            encoding::uvar(mut out, value: 3)
+            var opcode: u64 = 39
+            if all {
+                opcode = 38
+            }
+            encoding::uvar(mut out, value: opcode)
+            mut self.write_key(ck, terms, id: low, mut out)
+            mut self.write_key(ck, terms, id: high, mut out)
+            encoding::uvar(mut out, value: truth_number(inclusive))
+            mut self.write_key(ck, terms, id: bound, mut out)
+            mut self.write_key(ck, terms, id: body, mut out)
+        }
+    }
+} Encodings.write_term
+
+/// Writes a term's key.
+fn Encodings.write_key(mut self, ck: Checker, terms: Terms, id: u32, mut out: mem::Bytes) {
+    let key = mut self.term(ck, terms, id)
+    mut out.append(key.contents().view())
+} Encodings.write_key
+
+/// Writes the count of a term's operands, then each operand's key.
+fn Encodings.write_parts(mut self, ck: Checker, terms: Terms, parts: Slice[u32], mut out: mem::Bytes) {
+    encoding::uvar(mut out, value: u64.widen(parts.len()))
+    for part in parts {
+        mut self.write_key(ck, terms, id: part, mut out)
+    }
+} Encodings.write_parts
+
+/// The opcode of a quotient or remainder term.
+fn division_opcode(terms: Terms, id: u32) -> u64 {
+    return match terms.get(id) {
+        Term.Quot(dividend: _, divisor: _) => OPCODE_QUOTIENT
+        else => OPCODE_REMAINDER
+    }
+} division_opcode
+
+/// The opcode of a fresh, skolem or bound symbol.
+fn symbol_opcode(terms: Terms, id: u32) -> u64 {
+    return match terms.get(id) {
+        Term.Fresh(_) => OPCODE_FRESH
+        Term.Skolem(_) => OPCODE_SKOLEM
+        else => OPCODE_BOUND
+    }
+} symbol_opcode
+
+/// The opcode of a conjunction or disjunction.
+fn connective_opcode(terms: Terms, id: u32) -> u64 {
+    return match terms.get(id) {
+        Term.And(_) => OPCODE_AND
+        else => OPCODE_OR
+    }
+} connective_opcode
+
+/// A flag as the uvar 1 or 0.
+fn truth_number(value: bool) -> u64 {
+    return match value {
+        true => 1
+        false => 0
+    }
+} truth_number
+
+/// The 128 bits of a value, read as unsigned, as a uvar.
+fn encode_uvar(mut out: mem::Bytes, value: wide::Wide) {
+    var rest = value
+    loop {
+        let Some(small) = rest.to_u64() else {
+            mut out.push(u8.truncate(rest.low_bits() & 0x7F) | 0x80)
+            rest = rest.shift_right(7).bit_and(UVAR_REST_MASK)
+            continue
+        }
+        encoding::uvar(mut out, value: small)
+        return
+    }
+} encode_uvar
+
+/// A signed integer as the uvar 2n, or −2n − 1 when negative.
+fn encode_svar(mut out: mem::Bytes, value: wide::Wide) {
+    let one = wide::Wide.one()
+    if value.is_negative() {
+        encode_uvar(mut out, value: value.wrapping_add(one).wrapping_neg().shift_left(1).bit_or(one))
+        return
+    }
+    encode_uvar(mut out, value: value.shift_left(1))
+} encode_svar
+
+/// An instruction's opcode and its parts other than operands.
+fn Checker.encode_operation(self, mut out: mem::Bytes, op: Op) {
+    match op {
+        Op.Unary(unary) => encoding::uvar(mut out, value: unary_opcode(unary))
+        Op.Binary(binary) => encoding::uvar(mut out, value: binary_opcode(binary))
+        Op.Construct(constructed) => {
+            encoding::uvar(mut out, value: 9)
+            self.encode_ty(mut out, ty: constructed)
+        }
+        Op.Variant(ty: variant_ty, index: index) => {
+            encoding::uvar(mut out, value: 10)
+            self.encode_ty(mut out, ty: variant_ty)
+            encoding::uvar(mut out, value: u64.widen(index))
+        }
+        Op.Constant(constant) => {
+            encoding::uvar(mut out, value: 8)
+            match constant {
+                nir::Constant.Item(item) => {
+                    encoding::uvar(mut out, value: 0)
+                    self.encode_item_path(mut out, item)
+                }
+                nir::Constant.Param(param) => {
+                    encoding::uvar(mut out, value: 1)
+                    encoding::uvar(mut out, value: u64.widen(param.index))
+                }
+                nir::Constant.Register(block: block, register: register) => {
+                    encoding::uvar(mut out, value: 2)
+                    self.encode_item_path(mut out, item: block)
+                    encoding::uvar(mut out, value: u64.widen(register))
+                }
+            }
+        }
+        Op.FnRef(callee) => {
+            encoding::uvar(mut out, value: 7)
+            self.encode_fn_ref(mut out, callee)
+        }
+        Op.Closure(index) => {
+            encoding::uvar(mut out, value: 12)
+            encoding::uvar(mut out, value: u64.widen(index))
+        }
+        Op.Convert(to: to, via: via) => {
+            encoding::uvar(mut out, value: 13)
+            self.encode_ty(mut out, ty: to)
+            match via {
+                Some(variant) => {
+                    encoding::uvar(mut out, value: 1)
+                    encoding::bytes(mut out, value: variant.as_bytes())
+                }
+                None => encoding::uvar(mut out, value: 0)
+            }
+        }
+    }
+} Checker.encode_operation
+
+/// The opcode of a unary instruction.
+fn unary_opcode(op: nir::UnaryOp) -> u64 {
+    return match op {
+        nir::UnaryOp.Neg => 14
+        nir::UnaryOp.Inv => 25
+        nir::UnaryOp.Not => 32
+    }
+} unary_opcode
+
+/// The opcode of a binary instruction.
+fn binary_opcode(op: nir::BinaryOp) -> u64 {
+    return match op {
+        nir::BinaryOp.Add => 15
+        nir::BinaryOp.Sub => 16
+        nir::BinaryOp.Mul => 17
+        nir::BinaryOp.Div => 18
+        nir::BinaryOp.Rem => 19
+        nir::BinaryOp.Shl => 20
+        nir::BinaryOp.Shr => 21
+        nir::BinaryOp.Band => 22
+        nir::BinaryOp.Bor => 23
+        nir::BinaryOp.Bxor => 24
+        nir::BinaryOp.Eq => 26
+        nir::BinaryOp.Ne => 27
+        nir::BinaryOp.Lt => 28
+        nir::BinaryOp.Le => 29
+        nir::BinaryOp.Gt => 30
+        nir::BinaryOp.Ge => 31
+    }
+} binary_opcode
+
+/// A role's position in the role table.
+fn role_number(role: nir::Role) -> u64 {
+    return match role {
+        nir::Role.Body => 0
+        nir::Role.Entry => 1
+        nir::Role.Closure => 2
+        nir::Role.Requires => 3
+        nir::Role.Ensures => 4
+        nir::Role.Old => 5
+        nir::Role.Example => 6
+        nir::Role.Decreases => 7
+        nir::Role.Invariant => 8
+        nir::Role.Assume => 9
+        nir::Role.Predicate => 10
+        nir::Role.Where => 11
+        nir::Role.Default => 12
+    }
+} role_number
+
+/// An item's canonical path as bytes.
+fn Checker.encode_item_path(self, mut out: mem::Bytes, item: ty::ItemId) {
+    let path = self.db().canonical(item)
+    encoding::bytes(mut out, value: path.as_bytes())
+} Checker.encode_item_path
+
+/// A function reference: its path, role and index, and type arguments.
+fn Checker.encode_fn_ref(self, mut out: mem::Bytes, callee: nir::FnRef) {
+    let alloc = self.alloc()
+    var path = text::String.empty(alloc)
+    var role: u64 = 0
+    var index: u64 = 0
+    match callee.callable {
+        nir::Callable.Item(item: item, role: called, index: function) => {
+            path = self.db().canonical(item)
+            role = role_number(called)
+            index = u64.widen(function)
+        }
+        nir::Callable.Method(item: interface_item, method: method) => {
+            path = self.db().canonical(interface_item)
+            mut path.push('.')
+            let sig = self.sig(interface_item)
+            match sig.contents().kind {
+                SigKind.Interface(methods: methods) => mut path.append(methods[usize.widen(method)].name.as_str())
+                else => mut path.write(text::fmt("{method}", method), budget: 32)
+            }
+        }
+        nir::Callable.Derived(owner: owner, method: method) => {
+            path = self.db().canonical(owner)
+            mut path.push('.')
+            mut path.append(method.as_str())
+        }
+        nir::Callable.Builtin(nir::Builtin.Conversion(conversion: conversion, scalar: scalar)) => {
+            path = text::String.of(scalar.name(), alloc)
+            mut path.push('.')
+            mut path.append(conversion.word())
+        }
+        nir::Callable.Builtin(nir::Builtin.Bits(conversion: conversion, owner: owner)) => {
+            match owner {
+                nir::BitsOwner.Scalar(scalar) => {
+                    path = text::String.of(scalar.name(), alloc)
+                }
+                nir::BitsOwner.Layout(item) => {
+                    path = self.db().canonical(item)
+                }
+            }
+            mut path.push('.')
+            mut path.append(conversion.word())
+        }
+        nir::Callable.Builtin(nir::Builtin.Intrinsic(written)) => {
+            path = text::String.of(written.as_str(), alloc)
+        }
+    }
+    encoding::bytes(mut out, value: path.as_bytes())
+    encoding::uvar(mut out, value: role)
+    encoding::uvar(mut out, value: index)
+    self.encode_args(mut out, args: callee.args)
+} Checker.encode_fn_ref
+
+fn Checker.encode_args(self, mut out: mem::Bytes, args: ty::Args) {
+    let types = self.types()
+    let listed = types.arg_list(args)
+    encoding::uvar(mut out, value: u64.widen(listed.len()))
+    for arg in listed {
+        match arg {
+            ty::Arg.Ty(arg_ty) => self.encode_ty(mut out, ty: arg_ty)
+            ty::Arg.Const(constant) => {
+                encoding::uvar(mut out, value: 5)
+                match constant {
+                    ty::Const.Int(value) => encode_svar(mut out, value)
+                    ty::Const.Bool(value) => encoding::uvar(mut out, value: truth_number(value))
+                    ty::Const.Param(param) => encoding::uvar(mut out, value: u64.widen(param.index))
+                    ty::Const.Error => {}
+                }
+            }
+        }
+    }
+} Checker.encode_args
+
+fn Checker.encode_ty(self, mut out: mem::Bytes, ty: ty::Ty) {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => {
+            encoding::uvar(mut out, value: 0)
+            encoding::uvar(mut out, value: nir::scalar_position(scalar))
+        }
+        ty::TyKind.Unit => encoding::uvar(mut out, value: 1)
+        ty::TyKind.Never => encoding::uvar(mut out, value: 2)
+        ty::TyKind.Item(item: item, args: args) => {
+            encoding::uvar(mut out, value: 3)
+            self.encode_item_path(mut out, item)
+            self.encode_args(mut out, args)
+        }
+        ty::TyKind.Param(param) => {
+            encoding::uvar(mut out, value: 4)
+            encoding::uvar(mut out, value: u64.widen(param.index))
+        }
+        ty::TyKind.Fn(id) => {
+            encoding::uvar(mut out, value: 6)
+            let fn_ty = types.fn_of(id)
+            encoding::uvar(mut out, value: u64.widen(fn_ty.params.len()))
+            for param in fn_ty.params {
+                self.encode_ty(mut out, ty: param.ty)
+            }
+            self.encode_ty(mut out, ty: fn_ty.result)
+        }
+        ty::TyKind.Dyn(bound) => {
+            encoding::uvar(mut out, value: 9)
+            self.encode_item_path(mut out, item: bound.item)
+            self.encode_args(mut out, args: bound.args)
+        }
+        ty::TyKind.Registers(item) => {
+            encoding::uvar(mut out, value: 10)
+            self.encode_item_path(mut out, item)
+        }
+        ty::TyKind.Error => encoding::uvar(mut out, value: 11)
+    }
+} Checker.encode_ty

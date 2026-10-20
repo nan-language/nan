@@ -171,11 +171,16 @@ fn snapshot() -> Snapshot {
                     principal: "ana@example.org".to_owned(),
                     item: hash,
                     closure: hash,
-                    entries: vec![ClosureEntry {
-                        path: "hw::Ptr.read".to_owned(),
-                        body: false,
-                        hash,
-                    }],
+                    entries: [false, true]
+                        .map(|body| ClosureEntry {
+                            path: "hw::Ptr.read".to_owned(),
+                            body,
+                            hash,
+                        })
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                     signature: None,
                 }],
                 ..Entry::default()

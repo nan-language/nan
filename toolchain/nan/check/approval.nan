@@ -1,0 +1,183 @@
+//! Approvals: the authority summary of a package, the closure summary and epoch pairs a final-link root's final closure needs, and the rules that the root's lock approves them.
+
+/// What a final closure needs its root's lock to approve: pairs of a package and an entry of its
+/// authority summary, and pairs of a canonical path and a behaviour epoch.
+struct Needed {
+    pairs: mem::Set[NeededPair]
+    epochs: mem::Set[NeededEpoch]
+} Needed
+
+/// A package, by name, and an entry of its authority summary.
+struct NeededPair derives Eq, Ord {
+    package_name: text::String
+    entry: machine::SummaryEntry
+} NeededPair
+
+/// A canonical path and a behaviour epoch.
+struct NeededEpoch derives Eq, Ord {
+    path: text::String
+    epoch: u64
+} NeededEpoch
+
+/// The rules of a final-link root's approvals: each needed pair of its closure summary and
+/// each needed epoch pair its lock does not approve, listed on its `package` line.
+fn Checker.check_approvals(self, root: ty::PackageId) {
+    let alloc = self.alloc()
+    let source = self.db().source(root)
+    let Some(lock) = source.machine.lock() else {
+        return
+    }
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    let needed = self.needed(root)
+    var path = text::String.of(source.dir.as_str(), alloc)
+    mut path.append("/package.nan")
+    let grammar = self.session().grammar.contents()
+    var unapproved = mem::List[text::String].empty(alloc)
+    for pair in needed.pairs {
+        if approves(lock, pair) {
+            continue
+        }
+        var written = text::String.of(pair.package_name.as_str(), alloc)
+        mut written.push(' ')
+        mut written.append(pair.entry.written(grammar, alloc).as_str())
+        mut unapproved.push(take written)
+    }
+    var epochs = mem::List[text::String].empty(alloc)
+    for pair in needed.epochs {
+        if approves_epoch(lock, pair) {
+            continue
+        }
+        var written = text::String.of(pair.path.as_str(), alloc)
+        mut written.push(' ')
+        mut written.write(text::fmt("{epoch}", epoch: pair.epoch), budget: 32)
+        mut epochs.push(take written)
+    }
+    self.report_unapproved(path.as_str(), line: manifest.line, code: diagnostic::Code.AuthorityWideningUnapproved, listed: unapproved.view())
+    self.report_unapproved(path.as_str(), line: manifest.line, code: diagnostic::Code.DepEpochUnapproved, listed: epochs.view())
+} Checker.check_approvals
+
+/// Whether a lock approves a pair of a package and an entry of its authority summary.
+fn approves(lock: machine::Lock, pair: NeededPair) -> bool {
+    for approval in lock.approved {
+        if approval.package_name == pair.package_name and approval.entry == pair.entry {
+            return true
+        }
+    }
+    return false
+} approves
+
+/// Whether a lock approves a pair of a canonical path and a behaviour epoch.
+fn approves_epoch(lock: machine::Lock, pair: NeededEpoch) -> bool {
+    for approved in lock.epochs {
+        if approved.path == pair.path and approved.epoch == pair.epoch {
+            return true
+        }
+    }
+    return false
+} approves_epoch
+
+/// Reports the pairs a lock does not approve, each a note, on a manifest's `package` line.
+fn Checker.report_unapproved(self, path: Str, line: u32, code: diagnostic::Code, listed: Slice[text::String]) {
+    if listed.len() == 0 {
+        return
+    }
+    let alloc = self.alloc()
+    var reported = diagnostic::Diagnostic.at(code, path, line, alloc)
+    for pair in listed {
+        mut reported.because.push(diagnostic::Reason.note(pair.as_str(), alloc))
+    }
+    self.push_found(take reported)
+} Checker.report_unapproved
+
+/// The authority summary of a package: the capabilities and validators its functions' digests
+/// hold, `alloc`, `device` and `priv` when a digest holds them, and each trust escape kind of
+/// each item holding one.
+fn Checker.authority_summary(self, package_id: ty::PackageId) -> mem::Set[machine::SummaryEntry] {
+    let db = self.db()
+    var summary = mem::Set[machine::SummaryEntry].empty(self.alloc())
+    for entry in take self.package_ledger(package_id) {
+        if entry.escape {
+            let kind = machine::EscapeKind.from_word(entry.kind.word()).value_or(machine::EscapeKind.Trusted)
+            discard mut summary.insert(machine::SummaryEntry.Escape(kind: kind, path: take entry.item))
+        }
+    }
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            match db.ast(item).kind {
+                ast::ItemKind.Fn(_) => self.add_digest_entries(item, mut summary)
+                else => {}
+            }
+        }
+    }
+    return summary
+} Checker.authority_summary
+
+/// Adds to an authority summary the entries a function's digest holds.
+fn Checker.add_digest_entries(self, item: ty::ItemId, mut summary: mem::Set[machine::SummaryEntry]) {
+    let db = self.db()
+    let held = self.digest(item)
+    let digest = held.contents()
+    if digest.alloc {
+        discard mut summary.insert(machine::SummaryEntry.Alloc)
+    }
+    if digest.device {
+        discard mut summary.insert(machine::SummaryEntry.Device)
+    }
+    if digest.privileged {
+        discard mut summary.insert(machine::SummaryEntry.Priv)
+    }
+    match digest.capabilities {
+        Some(capabilities) => {
+            for capability in capabilities {
+                discard mut summary.insert(machine::SummaryEntry.Capability(db.canonical(capability)))
+            }
+        }
+        None => {}
+    }
+    match digest.validators {
+        Some(validators) => {
+            for validating in validators {
+                discard mut summary.insert(machine::SummaryEntry.Validator(db.canonical(validating)))
+            }
+        }
+        None => {}
+    }
+} Checker.add_digest_entries
+
+/// What a final-link root's final closure needs its lock to approve; nothing for a package
+/// that is no program.
+fn Checker.needed(self, root: ty::PackageId) -> Needed {
+    let alloc = self.alloc()
+    let db = self.db()
+    var needed = Needed(pairs: mem::Set[NeededPair].empty(alloc), epochs: mem::Set[NeededEpoch].empty(alloc))
+    let program = match db.source(root).manifest {
+        Some(manifest) => manifest.entry.is_some()
+        None => false
+    }
+    if not program {
+        return needed
+    }
+    for package_id in self.dependency_closure(root) {
+        let data = db.package_data(package_id)
+        if data.std {
+            continue
+        }
+        for entry in take self.authority_summary(package_id) {
+            discard mut needed.pairs.insert(NeededPair(package_name: text::String.of(data.name.as_str(), alloc), entry: take entry))
+        }
+        let Some(workspace::Member.Release(index)) = data.member else {
+            continue
+        }
+        let Some(summary) = db.session.workspace.contents().releases[index].entry.contents().summary else {
+            continue
+        }
+        for exported in summary.items {
+            if exported.epoch > 0 {
+                discard mut needed.epochs.insert(NeededEpoch(path: text::String.of(exported.path.as_str(), alloc), epoch: exported.epoch))
+            }
+        }
+    }
+    return needed
+} Checker.needed

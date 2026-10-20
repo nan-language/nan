@@ -1,0 +1,377 @@
+//! Paths: what a path written in a module names, under the four path forms and the core vocabulary, the visibility of items, and the linking of functions named after a type.
+
+/// What a path names at item level.
+enum Named derives Copy, Eq {
+    Item(ty::ItemId)
+    /// A module, a package's root module named by its alias or package name included.
+    Module(ty::ModuleId)
+    Scalar(ty::Scalar)
+    Unit
+    Never
+    Dyn
+    /// `Some`, `None`, `Ok` or `Err`: a variant of a core enum.
+    Variant(item: ty::ItemId, index: usize)
+} Named
+
+/// A path that names nothing legal: the code and the segment it is reported at, or no code for a
+/// path through a `dep` alias whose package is outside the workspace, which reports nothing.
+struct PathError derives Copy, Eq {
+    code: Option[diagnostic::Code]
+    token: u32
+} PathError
+
+/// The core vocabulary names that are items of `core`.
+const CORE_ITEMS: Str = "Option Result Array Slice SliceMut Str Untrusted Eq Ord Hash Copy Default Render Encode Generate Send Inert AnyBits Any"
+
+/// The core vocabulary names that are no item: the scalars, `Unit`, `Never`, `Dyn` and the
+/// variants of `Option` and `Result`.
+const CORE_NAMES: Str = "Unit Never Dyn Some None Ok Err"
+
+/// The core vocabulary names.
+fn core_vocabulary(alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    for scalar in ty::Scalar.all(alloc) {
+        mut names.push(text::String.of(scalar.name(), alloc))
+    }
+    for name in Words(list: CORE_NAMES, at: 0) {
+        mut names.push(text::String.of(name, alloc))
+    }
+    for name in Words(list: CORE_ITEMS, at: 0) {
+        mut names.push(text::String.of(name, alloc))
+    }
+    return names
+} core_vocabulary
+
+/// Whether a name is in the core vocabulary.
+fn is_core_vocabulary(name: Str) -> bool {
+    return ty::Scalar.from_name(name).is_some() or is_listed(CORE_NAMES, word: name) or is_listed(CORE_ITEMS, word: name)
+} is_core_vocabulary
+
+/// Whether a path is reserved: one of two or more segments starting with `ui`, or starting with
+/// `sys::infer`, `sys::load` or `core::simd`.
+fn reserved(path: ast::Path) -> bool {
+    if path.segments.len() < 2 {
+        return false
+    }
+    let head = path.segments[0].text.as_str()
+    let second = path.segments[1].text.as_str()
+    return match head {
+        "ui" => true
+        "sys" => second == "infer" or second == "load"
+        "core" => second == "simd"
+        else => false
+    }
+} reserved
+
+/// A core vocabulary name as the checker reads it.
+fn Db.core_name(self, name: Str) -> Option[Named] {
+    match ty::Scalar.from_name(name) {
+        Some(scalar) => return Some(Named.Scalar(scalar))
+        None => {}
+    }
+    match name {
+        "Unit" => return Some(Named.Unit)
+        "Never" => return Some(Named.Never)
+        "Dyn" => return Some(Named.Dyn)
+        "Some" or "None" => {
+            let Some(option) = self.core_item("Option") else {
+                return None
+            }
+            return Some(Named.Variant(item: option, index: variant_index(name == "None")))
+        }
+        "Ok" or "Err" => {
+            let Some(result) = self.core_item("Result") else {
+                return None
+            }
+            return Some(Named.Variant(item: result, index: variant_index(name == "Err")))
+        }
+        else => {}
+    }
+    if not is_listed(CORE_ITEMS, word: name) {
+        return None
+    }
+    let Some(item) = self.core_item(name) else {
+        return None
+    }
+    return Some(Named.Item(item))
+} Db.core_name
+
+/// The index of a core enum's variant: 1 for its second.
+fn variant_index(second: bool) -> usize {
+    if second {
+        return 1
+    }
+    return 0
+} variant_index
+
+/// The error of a path naming nothing at one of its segments.
+fn unknown_at(path: ast::Path, index: usize) -> PathError {
+    return PathError(code: Some(diagnostic::Code.NameUnknown), token: path.segments[index].token)
+} unknown_at
+
+/// What a path written in `from` names, ignoring locals and generic parameters.
+fn Db.resolve(self, from: ty::ModuleId, path: ast::Path) -> Result[Named, PathError] {
+    let segments = path.segments
+    if reserved(path) {
+        return Err(PathError(code: Some(diagnostic::Code.NameReserved), token: segments[0].token))
+    }
+    let package_id = self.module(from).package_id
+    let head = segments[0].text.as_str()
+    if segments.len() == 1 {
+        match self.lookup(from, name: head) {
+            Some(item) => return Ok(Named.Item(item))
+            None => {}
+        }
+        match self.core_name(head) {
+            Some(named) => return Ok(named)
+            None => {}
+        }
+        match self.module_named(package_id, name: head) {
+            Some(module) => return Ok(Named.Module(module))
+            None => {}
+        }
+        let Some(aliased) = self.alias(package_id, name: head) else {
+            return Err(unknown_at(path, index: 0))
+        }
+        let Some(root) = self.package_data(aliased).root else {
+            return Err(unknown_at(path, index: 0))
+        }
+        return Ok(Named.Module(root))
+    }
+    let declared = self.lookup(from, name: head).is_some() or self.core_name(head).is_some()
+    if declared and self.module_named(package_id, name: head).is_none() and self.alias(package_id, name: head).is_none() {
+        return Err(PathError(code: Some(diagnostic::Code.NameColonForMember), token: segments[1].token))
+    }
+    var module = from
+    var rest: usize = 1
+    match self.module_named(package_id, name: head) {
+        Some(named) => {
+            module = named
+        }
+        None => {
+            let Some(aliased) = self.alias(package_id, name: head) else {
+                var code: Option[diagnostic::Code] = None
+                if not self.unavailable(package_id, name: head) {
+                    code = Some(diagnostic::Code.NameUnknown)
+                }
+                return Err(PathError(code: code, token: segments[0].token))
+            }
+            let is_std = self.package_data(package_id).std
+            if head == "core" and is_core_vocabulary(segments[1].text.as_str()) and not is_std {
+                return Err(PathError(code: Some(diagnostic::Code.NameRedundantPath), token: segments[0].token))
+            }
+            if segments.len() == 2 {
+                let Some(root) = self.package_data(aliased).root else {
+                    return Err(unknown_at(path, index: 0))
+                }
+                module = root
+            } else {
+                let Some(below) = self.module_named(aliased, name: segments[1].text.as_str()) else {
+                    return Err(unknown_at(path, index: 1))
+                }
+                if self.module(below).root and not is_std {
+                    return Err(PathError(code: Some(diagnostic::Code.NameRedundantPath), token: segments[1].token))
+                }
+                module = below
+                rest = 2
+            }
+        }
+    }
+    if module == from and not self.package_data(package_id).std {
+        return Err(PathError(code: Some(diagnostic::Code.NameRedundantPath), token: segments[0].token))
+    }
+    let Some(item) = self.lookup(module, name: segments[rest].text.as_str()) else {
+        return Err(unknown_at(path, index: rest))
+    }
+    if rest + 1 < segments.len() {
+        return Err(PathError(code: Some(diagnostic::Code.NameColonForMember), token: segments[rest + 1].token))
+    }
+    return Ok(Named.Item(item))
+} Db.resolve
+
+/// Whether a field of a type, declared with `visibility`, is visible from `from`: the lesser
+/// of its own and its type's visibility.
+fn Db.field_visible(self, from: ty::ModuleId, owner: ty::ItemId, visibility: ast::Visibility) -> bool {
+    let module = self.item(owner).module
+    let field = match visibility {
+        ast::Visibility.Pub => true
+        ast::Visibility.Pkg => self.module(module).package_id == self.module(from).package_id
+        ast::Visibility.Private => module == from
+    }
+    return field and self.visible(from, item: owner)
+} Db.field_visible
+
+/// Whether `item` may be named from `from`.
+fn Db.visible(self, from: ty::ModuleId, item: ty::ItemId) -> bool {
+    let data = self.item(item)
+    let declared = match self.declaration(item).visibility {
+        ast::Visibility.Pub => true
+        ast::Visibility.Pkg => self.module(data.module).package_id == self.module(from).package_id
+        ast::Visibility.Private => data.module == from
+    }
+    if not declared {
+        return false
+    }
+    return match self.owners.get(item) {
+        Some(TypeKey.Item(owner)) => self.visible(from, item: owner)
+        else => true
+    }
+} Db.visible
+
+/// The type a function's label names it after, resolved from its module.
+fn Db.owner_key(self, module: ty::ModuleId, owner: ast::Path) -> Option[TypeKey] {
+    let Ok(named) = self.resolve(module, path: owner) else {
+        return None
+    }
+    return match named {
+        Named.Item(item) => match self.ast(item).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => Some(TypeKey.Item(item))
+            else => None
+        }
+        Named.Scalar(scalar) => Some(TypeKey.Scalar(scalar))
+        Named.Unit => Some(TypeKey.Unit)
+        else => None
+    }
+} Db.owner_key
+
+/// The canonical path a path written in `from` spells, whether or not it names an item: its
+/// last segment in the module or aliased package its other segments name, a module of the
+/// package counting even without files.
+fn Db.spelled(self, from: ty::ModuleId, path: ast::Path) -> Option[text::String] {
+    let alloc = self.session.alloc
+    let package_id = self.module(from).package_id
+    let segments = path.segments
+    var spelt = text::String.empty(alloc)
+    if segments.len() == 1 {
+        spelt = self.module_path(from)
+    } else if segments.len() == 2 {
+        let head = segments[0].text.as_str()
+        match self.module_named(package_id, name: head) {
+            Some(module) => {
+                spelt = self.module_path(module)
+            }
+            None => {
+                match self.alias(package_id, name: head) {
+                    Some(aliased) => {
+                        mut spelt.append(self.package_data(aliased).name.as_str())
+                    }
+                    None => {
+                        mut spelt.append(self.package_data(package_id).name.as_str())
+                        mut spelt.append("::")
+                        mut spelt.append(head)
+                    }
+                }
+            }
+        }
+    } else if segments.len() == 3 {
+        let Some(aliased) = self.alias(package_id, name: segments[0].text.as_str()) else {
+            return None
+        }
+        mut spelt.append(self.package_data(aliased).name.as_str())
+        mut spelt.append("::")
+        mut spelt.append(segments[1].text.as_str())
+    } else {
+        return None
+    }
+    mut spelt.append("::")
+    mut spelt.append(segments[segments.len() - 1].text.as_str())
+    return Some(take spelt)
+} Db.spelled
+
+/// The canonical path of a tombstone's old form, read in its module.
+fn Db.old_form(self, module: ty::ModuleId, tombstone: ast::RetiredItem) -> Option[text::String] {
+    let Some(member) = tombstone.member else {
+        return self.spelled(module, path: tombstone.path)
+    }
+    let Some(key) = self.owner_key(module, owner: tombstone.path) else {
+        let Some(spelt) = self.spelled(module, path: tombstone.path) else {
+            return None
+        }
+        return Some(form_of(take spelt, member: member.text.as_str()))
+    }
+    return Some(form_of(self.type_path(key), member: member.text.as_str()))
+} Db.old_form
+
+/// The path of a member of an owner: `owner.member`.
+fn form_of(take owner: text::String, member: Str) -> text::String {
+    mut owner.push('.')
+    mut owner.append(member)
+    return owner
+} form_of
+
+/// Links each function named `Type.name` to its type, and each tombstone to the canonical
+/// path of its old form.
+fn Db.link(mut self) {
+    let alloc = self.session.alloc
+    var tombstones = mem::List[OldForm].empty(alloc)
+    for index in 0..<self.items.len() {
+        let data = self.items[index]
+        let ast::ItemKind.Retired(tombstone) = self.declaration(ty::ItemId(index: u32.fit(index))).kind else {
+            continue
+        }
+        let Some(form) = self.old_form(data.module, tombstone) else {
+            continue
+        }
+        mut tombstones.push(OldForm(item: ty::ItemId(index: u32.fit(index)), form: take form))
+    }
+    for retiring in take tombstones {
+        let OldForm(item: item, form: form) = retiring
+        if self.tombstones.contains(form) {
+            var held = mut self.tombstones.at_mut(form)
+            mut held.push(item)
+            continue
+        }
+        var held = mem::List[ty::ItemId].empty(alloc)
+        mut held.push(item)
+        discard mut self.tombstones.insert(take form, value: take held)
+    }
+    mut self.link_members()
+} Db.link
+
+/// A tombstone and the canonical path of its old form.
+struct OldForm {
+    item: ty::ItemId
+    form: text::String
+} OldForm
+
+/// A function named `Type.name`, the type and its member name.
+struct MemberLink {
+    item: ty::ItemId
+    key: TypeKey
+    name: text::String
+} MemberLink
+
+/// Records the type each function named `Type.name` is named after.
+fn Db.link_members(mut self) {
+    let alloc = self.session.alloc
+    var links = mem::List[MemberLink].empty(alloc)
+    for index in 0..<self.items.len() {
+        let data = self.items[index]
+        let ast::ItemKind.Fn(function) = self.declaration(ty::ItemId(index: u32.fit(index))).kind else {
+            continue
+        }
+        let Some(owner) = function.label.owner else {
+            continue
+        }
+        let Some(key) = self.owner_key(data.module, owner) else {
+            continue
+        }
+        mut links.push(MemberLink(item: ty::ItemId(index: u32.fit(index)), key: key, name: text::String.of(function.label.name.text.as_str(), alloc)))
+    }
+    for link in take links {
+        let MemberLink(item: item, key: key, name: name) = link
+        discard mut self.owners.insert(item, value: key)
+        if not self.member_table.contains(key) {
+            discard mut self.member_table.insert(key, value: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc))
+        }
+        var named = mut self.member_table.at_mut(key)
+        if named.contains(name) {
+            var functions = mut named.at_mut(name)
+            mut functions.push(item)
+            continue
+        }
+        var functions = mem::List[ty::ItemId].empty(alloc)
+        mut functions.push(item)
+        discard mut named.insert(take name, value: take functions)
+    }
+} Db.link_members

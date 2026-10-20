@@ -1,0 +1,367 @@
+//! A command's scope: what it acts on, and the lines of the workspace it covers.
+
+pkg enum Scope {
+    Workspace
+    /// A package, by its index in the workspace.
+    Package(usize)
+    /// A module, by its package's index in the workspace and its index in the package.
+    Module(package_index: usize, module: usize)
+    File(text::String)
+    /// The lines of an item or member.
+    Lines(path: text::String, lines: core::Range[u32])
+} Scope
+
+pkg fn Scope.copied(self, alloc: mem::Alloc) -> Scope {
+    return match self {
+        Scope.Workspace => Scope.Workspace
+        Scope.Package(index) => Scope.Package(index)
+        Scope.Module(package_index: index, module: module) => Scope.Module(package_index: index, module: module)
+        Scope.File(path) => Scope.File(text::String.of(path.as_str(), alloc))
+        Scope.Lines(path: path, lines: lines) => Scope.Lines(path: text::String.of(path.as_str(), alloc), lines: lines)
+    }
+} Scope.copied
+
+/// A scope, and how a verdict line writes it.
+pkg struct Resolved {
+    pkg scope: Scope
+    pkg written: text::String
+} Resolved
+
+/// The scope an argument names, or the default scope: the package holding `current`, or `.`.
+/// Returns the scope and how a verdict line writes an omitted one.
+pkg fn Scope.resolve(
+    workspace: workspace::Workspace,
+    current: Str,
+    written: Option[Str],
+    alloc: mem::Alloc,
+    ) -> Option[Resolved] {
+    var holding: Option[usize] = None
+    for index in 0..<workspace.packages.len() {
+        let base = platform::join(workspace.root.as_str(), name: workspace.packages[index].dir.as_str(), alloc)
+        if platform::strip_prefix(current, base: base.as_str(), alloc).is_some() {
+            holding = Some(index)
+            break
+        }
+    }
+    let Some(argument) = written else {
+        let Some(index) = holding else {
+            return Some(Resolved(scope: Scope.Workspace, written: text::String.of(".", alloc)))
+        }
+        let pack = workspace.packages[index]
+        let name = match pack.name() {
+            Some(package_name) => package_name
+            None => pack.dir.as_str()
+        }
+        return Some(Resolved(scope: Scope.Package(index), written: text::String.of(name, alloc)))
+    }
+    let Some(found) = written_scope(workspace, argument, holding, alloc) else {
+        return None
+    }
+    return Some(Resolved(scope: take found, written: text::String.of(argument, alloc)))
+} Scope.resolve
+
+/// The scope an argument names, the package holding the current directory reading a path its
+/// root module writes.
+fn written_scope(workspace: workspace::Workspace, argument: Str, holding: Option[usize], alloc: mem::Alloc) -> Option[Scope] {
+    if argument == "." {
+        return Some(Scope.Workspace)
+    }
+    if argument.ends_with(".nan") {
+        let Some(_) = workspace.file(argument) else {
+            return None
+        }
+        return Some(Scope.File(text::String.of(argument, alloc)))
+    }
+    match file_line(argument) {
+        Some(at) => {
+            let Some(path) = argument.slice_bytes(0, end: at.colon) else {
+                return None
+            }
+            let Some(located) = workspace.file(path) else {
+                return None
+            }
+            let file = workspace.file_at(located)
+            let Some(item) = file.syntax.item_at(at.line) else {
+                return None
+            }
+            return Some(Scope.Lines(path: text::String.of(path, alloc), lines: file.syntax.item_lines(item)))
+        }
+        None => {}
+    }
+    match named(workspace, argument, relative: None, alloc) {
+        Some(found) => return Some(take found)
+        None => {}
+    }
+    let Some(index) = holding else {
+        return None
+    }
+    return named(workspace, argument, relative: Some(index), alloc)
+} written_scope
+
+/// Where the last `:` of an argument lies and the line after it, when the text before it names a
+/// source file and the text after it is a line number.
+struct FileLine derives Copy {
+    colon: usize
+    line: u32
+} FileLine
+
+fn file_line(argument: Str) -> Option[FileLine] {
+    let bytes = argument.as_bytes()
+    var colon = bytes.len()
+    while colon > 0 {
+        colon -= 1
+        if bytes[colon] == b':' {
+            let Some(path) = argument.slice_bytes(0, end: colon) else {
+                return None
+            }
+            if not path.ends_with(".nan") {
+                return None
+            }
+            let Some(number) = argument.slice_bytes(colon + 1, end: bytes.len()) else {
+                return None
+            }
+            let Some(value) = platform::parse_decimal(number) else {
+                return None
+            }
+            let Some(line) = u32.checked_fit(value) else {
+                return None
+            }
+            return Some(FileLine(colon: colon, line: line))
+        }
+    }
+    return None
+} file_line
+
+/// Whether the scope covers a line of a file, or the file as a whole when `line` is absent.
+pkg fn Scope.holds(self, workspace: workspace::Workspace, path: Str, line: Option[u32]) -> bool {
+    let file = workspace.file(path)
+    match self {
+        Scope.Workspace => return true
+        Scope.Package(index) => {
+            let Some(at) = file else {
+                return false
+            }
+            return at.package_index == index
+        }
+        Scope.Module(package_index: index, module: module) => {
+            let Some(at) = file else {
+                return false
+            }
+            return at.package_index == index and workspace.file_at(at).module == Some(module)
+        }
+        Scope.File(scoped) => return scoped.as_str() == path
+        Scope.Lines(path: scoped, lines: lines) => {
+            let Some(number) = line else {
+                return false
+            }
+            return scoped.as_str() == path and lines.contains(number)
+        }
+    }
+} Scope.holds
+
+/// The index of the one package the scope lies in, if it holds no other.
+pkg fn Scope.package_index(self, workspace: workspace::Workspace) -> Option[usize] {
+    match self {
+        Scope.Workspace => {
+            if workspace.packages.len() == 1 {
+                return Some(0)
+            }
+            return None
+        }
+        Scope.Package(index) => return Some(index)
+        Scope.Module(package_index: index, module: _) => return Some(index)
+        Scope.File(path) => return file_package(workspace, path: path.as_str())
+        Scope.Lines(path: path, lines: _) => return file_package(workspace, path: path.as_str())
+    }
+} Scope.package_index
+
+/// The index of the package holding a file of the workspace.
+fn file_package(workspace: workspace::Workspace, path: Str) -> Option[usize] {
+    let Some(at) = workspace.file(path) else {
+        return None
+    }
+    return Some(at.package_index)
+} file_package
+
+/// The parts of a path between its `::` separators, empty ones included.
+fn path_segments(path: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var segments = mem::List[text::String].empty(alloc)
+    let bytes = path.as_bytes()
+    var start: usize = 0
+    var at: usize = 0
+    while at + 1 < bytes.len() {
+        if bytes[at] == b':' and bytes[at + 1] == b':' {
+            let Some(segment) = path.slice_bytes(start, end: at) else {
+                return segments
+            }
+            mut segments.push(text::String.of(segment, alloc))
+            at += 2
+            start = at
+        } else {
+            at += 1
+        }
+    }
+    let Some(last) = path.slice_bytes(start, end: bytes.len()) else {
+        return segments
+    }
+    mut segments.push(text::String.of(last, alloc))
+    return segments
+} path_segments
+
+/// The package, module, item or member a path names: a canonical path, or with `relative`, a path
+/// as that package's root module writes it.
+fn named(workspace: workspace::Workspace, argument: Str, relative: Option[usize], alloc: mem::Alloc) -> Option[Scope] {
+    var segments = path_segments(argument, alloc)
+    var index: usize = 0
+    match relative {
+        Some(given) => {
+            index = given
+        }
+        None => {
+            var found: Option[usize] = None
+            for candidate in 0..<workspace.packages.len() {
+                if workspace.packages[candidate].name() == Some(segments[0].as_str()) {
+                    found = Some(candidate)
+                    break
+                }
+            }
+            let Some(named_index) = found else {
+                return None
+            }
+            index = named_index
+            discard mut segments.remove(0)
+        }
+    }
+    let pack = workspace.packages[index]
+    var root: Option[usize] = None
+    for module in 0..<pack.modules.len() {
+        for dir in pack.modules[module].dirs {
+            if dir.path == pack.dir and root.is_none() {
+                root = Some(module)
+            }
+        }
+    }
+    if segments.len() == 0 {
+        return Some(Scope.Package(index))
+    }
+    if segments.len() == 1 {
+        let name = segments[0].as_str()
+        for module in 0..<pack.modules.len() {
+            if pack.modules[module].name.as_str() == name and Some(module) != root {
+                return Some(Scope.Module(package_index: index, module: module))
+            }
+        }
+        let Some(root_module) = root else {
+            return None
+        }
+        return member(pack, module: root_module, name, alloc)
+    }
+    if segments.len() == 2 {
+        for module in 0..<pack.modules.len() {
+            if pack.modules[module].name == segments[0] {
+                return member(pack, module, name: segments[1].as_str(), alloc)
+            }
+        }
+    }
+    return None
+} named
+
+/// An item of a module's files: its file and its index among the file's items.
+struct ItemAt derives Copy {
+    file: usize
+    item: usize
+} ItemAt
+
+/// The first item of a module's files with a tree whose head declares `name`.
+fn item_named(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc) -> Option[ItemAt] {
+    for file in 0..<pack.files.len() {
+        let held = pack.files[file]
+        if held.module != Some(module) {
+            continue
+        }
+        for item in 0..<held.syntax.items.len() {
+            let Some(tree) = held.syntax.items[item].tree else {
+                continue
+            }
+            let Some(declared) = tree.name(held.syntax, alloc) else {
+                continue
+            }
+            if declared.as_str() == name {
+                return Some(ItemAt(file: file, item: item))
+            }
+        }
+    }
+    return None
+} item_named
+
+/// The lines of the item of `module` named `name`, or of the member `Type.member` it names.
+fn member(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc) -> Option[Scope] {
+    match item_named(pack, module, name, alloc) {
+        Some(at) => {
+            let file = pack.files[at.file]
+            return Some(Scope.Lines(path: text::String.of(file.path.as_str(), alloc), lines: file.syntax.item_lines(file.syntax.items[at.item])))
+        }
+        None => {}
+    }
+    let Some(dot) = name.find(".") else {
+        return None
+    }
+    let Some(owner) = name.slice_bytes(0, end: dot) else {
+        return None
+    }
+    let Some(declared) = name.slice_bytes(dot + 1, end: name.byte_len()) else {
+        return None
+    }
+    let Some(at) = item_named(pack, module, name: owner, alloc) else {
+        return None
+    }
+    let file = pack.files[at.file]
+    let Some(tree) = file.syntax.items[at.item].tree else {
+        return None
+    }
+    let Some(kind) = tree.kind() else {
+        return None
+    }
+    let Some(line) = member_node(file.syntax, tree, node: kind.node, name: declared, alloc) else {
+        return None
+    }
+    let Some(span) = tree.span(line, alloc) else {
+        return None
+    }
+    let first_line = file.syntax.tokens[usize.widen(span.head)].line
+    let last_line = file.syntax.tokens[usize.widen(span.last)].line
+    return Some(Scope.Lines(path: text::String.of(file.path.as_str(), alloc), lines: first_line..=last_line))
+} member
+
+/// The member line of a type or interface declaring `name`: a field, variant, tag, register or
+/// method.
+fn member_node(file: syntax::SourceFile, tree: syntax::Tree, node: u32, name: Str, alloc: mem::Alloc) -> Option[u32] {
+    for line in tree.child_nodes(node) {
+        let rule = tree.rule(line)
+        let member_line = rule == syntax::Rule.StructMember or rule == syntax::Rule.EnumMember or rule == syntax::Rule.TagLine or rule == syntax::Rule.LayoutMember or rule == syntax::Rule.RegisterMember or rule == syntax::Rule.InterfaceMember
+        if member_line and declares(file, tree, line, name, alloc) {
+            return Some(line)
+        }
+    }
+    return None
+} member_node
+
+/// Whether a member line declares `name`.
+fn declares(file: syntax::SourceFile, tree: syntax::Tree, line: u32, name: Str, alloc: mem::Alloc) -> bool {
+    for inner in tree.descendants(line, alloc) {
+        let rule = tree.rule(inner)
+        let declaring = rule == syntax::Rule.Field or rule == syntax::Rule.Variant or rule == syntax::Rule.TagLine or rule == syntax::Rule.LayoutMember or rule == syntax::Rule.RegisterLine or rule == syntax::Rule.InterfaceMember
+        if not declaring {
+            continue
+        }
+        for token in tree.child_tokens(inner) {
+            if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+                if file.text(usize.widen(token)) == name {
+                    return true
+                }
+                break
+            }
+        }
+    }
+    return false
+} declares

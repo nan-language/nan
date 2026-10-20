@@ -1,0 +1,751 @@
+//! Reading items from their trees, and the rules of item heads, labels and clause regions.
+
+/// The node of an item's kind, and the rule it expands.
+pkg struct KindNode derives Copy, Eq {
+    pkg rule: Rule
+    pkg node: u32
+} KindNode
+
+/// A modifier before an item's kind keyword: the rule it is read by, and its token.
+struct Modifier derives Copy {
+    rule: Rule
+    token: u32
+} Modifier
+
+fn SourceFile.kind_of(self, token: u32) -> TokenKind {
+    return self.tokens[usize.widen(token)].kind
+} SourceFile.kind_of
+
+proj fn SourceFile.token_text(self, token: u32) -> Str {
+    return self.text(usize.widen(token))
+} SourceFile.token_text
+
+fn SourceFile.line_of(self, token: u32) -> u32 {
+    return self.tokens[usize.widen(token)].line
+} SourceFile.line_of
+
+/// The `item_start` node of the item's tree.
+fn Tree.start(self) -> Option[u32] {
+    return self.find(self.root(), rule: Rule.ItemStart)
+} Tree.start
+
+/// The node of the item's kind: the rule after `item_kind`, past the `const` it may share.
+pkg fn Tree.kind(self) -> Option[KindNode] {
+    let Some(start) = self.start() else {
+        return None
+    }
+    let Some(kind) = self.find(start, rule: Rule.ItemKind) else {
+        return None
+    }
+    var nodes = self.child_nodes(kind)
+    let Some(node) = mut nodes.next() else {
+        return None
+    }
+    return Some(KindNode(rule: self.rule(node), node: node))
+} Tree.kind
+
+pkg fn Tree.visibility(self) -> Option[u32] {
+    let Some(start) = self.start() else {
+        return None
+    }
+    let Some(visibility) = self.find(start, rule: Rule.Visibility) else {
+        return None
+    }
+    var tokens = self.child_tokens(visibility)
+    return mut tokens.next()
+} Tree.visibility
+
+/// The modifiers before the kind keyword.
+fn Tree.modifiers(self, alloc: mem::Alloc) -> mem::List[Modifier] {
+    var modifiers = mem::List[Modifier].empty(alloc)
+    let Some(start) = self.start() else {
+        return modifiers
+    }
+    for modifier in self.child_nodes(start) {
+        if self.rule(modifier) != Rule.ItemModifier {
+            continue
+        }
+        var inner_nodes = self.child_nodes(modifier)
+        let Some(inner) = mut inner_nodes.next() else {
+            continue
+        }
+        let Some(span) = self.span(inner, alloc) else {
+            continue
+        }
+        mut modifiers.push(Modifier(rule: self.rule(inner), token: span.head))
+    }
+    return modifiers
+} Tree.modifiers
+
+/// The text of the tokens directly under `node`, without spaces.
+fn Tree.tokens_text(self, node: u32, file: SourceFile, alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    for token in self.child_tokens(node) {
+        mut joined.append(file.token_text(token))
+    }
+    return joined
+} Tree.tokens_text
+
+/// The first token directly under `node` of the kind `kind`.
+fn Tree.child_token_of(self, node: u32, kind: TokenKind, file: SourceFile) -> Option[u32] {
+    for token in self.child_tokens(node) {
+        if file.kind_of(token) == kind {
+            return Some(token)
+        }
+    }
+    return None
+} Tree.child_token_of
+
+/// The first and last token under a node that holds tokens.
+fn Tree.held(self, node: u32, alloc: mem::Alloc) -> TokenSpan {
+    let Some(span) = self.span(node, alloc) else {
+        expect false
+        return TokenSpan(head: 0, last: 0)
+    }
+    return span
+} Tree.held
+
+/// The bytes from a token's start to the next token's on its line, or to its own end.
+fn SourceFile.span_with_space_after(self, token: u32) -> diagnostic::Span {
+    let at = self.tokens[usize.widen(token)]
+    let next = self.tokens[self.next(usize.widen(token) + 1)]
+    var end = at.end
+    if next.line == at.line and not next.kind.is_virtual() {
+        end = next.start
+    }
+    return diagnostic::Span(start: at.start, end: end)
+} SourceFile.span_with_space_after
+
+/// The bytes from the end of the token before `head` to the end of `last`.
+fn SourceFile.span_with_space_before(self, head: u32, last: u32) -> diagnostic::Span {
+    var before = self.tokens[usize.widen(head)].start
+    match self.previous(usize.widen(head)) {
+        Some(index) => {
+            before = self.tokens[index].end
+        }
+        None => {}
+    }
+    return diagnostic::Span(start: before, end: self.tokens[usize.widen(last)].end)
+} SourceFile.span_with_space_before
+
+/// A diagnostic on the tokens `tokens`, with the fix replacing the bytes `range` with `written`.
+fn SourceFile.fixed(
+    self,
+    tokens: TokenSpan,
+    code: diagnostic::Code,
+    range: diagnostic::Span,
+    written: Str,
+    alloc: mem::Alloc,
+    ) -> FileDiagnostic {
+    let at = self.tokens[usize.widen(tokens.head)]
+    var reported = FileDiagnostic.new(at.line, code, alloc)
+    reported.span = Some(diagnostic::Span(start: at.start, end: self.tokens[usize.widen(tokens.last)].end))
+    var fix = mem::List[diagnostic::Replacement].empty(alloc)
+    mut fix.push(diagnostic::Replacement(start: range.start, end: range.end, text: text::String.of(written, alloc)))
+    mut reported.fixes.push(take fix)
+    return reported
+} SourceFile.fixed
+
+/// The name the item's head declares, as the head spells it.
+pkg fn Tree.name(self, file: SourceFile, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(kind) = self.kind() else {
+        return None
+    }
+    match kind.rule {
+        Rule.FnItem => {
+            let Some(head) = self.find(kind.node, rule: Rule.FnHead) else {
+                return None
+            }
+            let Some(label) = self.find(head, rule: Rule.ItemLabel) else {
+                return None
+            }
+            return Some(self.tokens_text(label, file, alloc))
+        }
+        Rule.StructItem or Rule.EnumItem or Rule.InterfaceItem or Rule.LayoutItem or Rule.RegistersItem => {}
+        Rule.TestItem or Rule.PackageItem or Rule.RegistryItem or Rule.ConstItem or Rule.ContributeItem => {}
+        else => return None
+    }
+    let Some(ident) = self.child_token_of(kind.node, kind: TokenKind.Ident, file) else {
+        return None
+    }
+    return Some(text::String.of(file.token_text(ident), alloc))
+} Tree.name
+
+/// Whether a byte of the item lies in its declaration rather than in a body: for a function,
+/// before the `{` or `=` opening its body; for a test, never; for other kinds, always.
+pkg fn Tree.declares(self, file: SourceFile, position: u32) -> bool {
+    let Some(kind) = self.kind() else {
+        return true
+    }
+    if kind.rule == Rule.TestItem {
+        return false
+    }
+    if kind.rule != Rule.FnItem {
+        return true
+    }
+    let Some(end) = self.find(kind.node, rule: Rule.FnEnd) else {
+        return true
+    }
+    for token in self.child_tokens(end) {
+        match file.kind_of(token) {
+            TokenKind.Punct(Punct.LBrace) or TokenKind.Punct(Punct.Eq) => return position < file.tokens[usize.widen(token)].start
+            else => {}
+        }
+    }
+    return true
+} Tree.declares
+
+/// The last token of a function item's head.
+pkg fn Tree.head_end(self, alloc: mem::Alloc) -> Option[u32] {
+    let Some(kind) = self.kind() else {
+        return None
+    }
+    if kind.rule != Rule.FnItem {
+        return None
+    }
+    let Some(head) = self.find(kind.node, rule: Rule.FnHead) else {
+        return None
+    }
+    let Some(span) = self.span(head, alloc) else {
+        return None
+    }
+    return Some(span.last)
+} Tree.head_end
+
+/// The line of the item's first token after its doc comment.
+pkg fn Tree.head_line(self, file: SourceFile, alloc: mem::Alloc) -> Option[u32] {
+    let Some(start) = self.start() else {
+        return None
+    }
+    for child in self.children(start) {
+        let Child.Node(node) = child else {
+            continue
+        }
+        let Some(span) = self.span(node, alloc) else {
+            continue
+        }
+        return Some(file.line_of(span.head))
+    }
+    return None
+} Tree.head_line
+
+/// The group of a clause in the order of the clause region.
+pkg fn clause_group(tree: Tree, clause: u32) -> u8 {
+    let rule = tree.rule(clause)
+    var marked: Option[Rule] = None
+    if rule == Rule.TodoClause {
+        var nodes = tree.child_nodes(clause)
+        match mut nodes.next() {
+            Some(node) => {
+                marked = Some(tree.rule(node))
+            }
+            None => {}
+        }
+    }
+    if rule == Rule.RequiresClause or marked == Some(Rule.RequiresClause) {
+        return 0
+    }
+    if rule == Rule.EnsuresClause or marked == Some(Rule.EnsuresClause) {
+        return 1
+    }
+    if rule == Rule.ExampleClause or marked == Some(Rule.ExampleClause) {
+        return 2
+    }
+    if rule == Rule.DecreasesClause {
+        return 3
+    }
+    if rule == Rule.TodoClause {
+        return 4
+    }
+    return 5
+} clause_group
+
+/// The diagnostics the rules of item shape find: those reported without a fix, then those with.
+struct Checks {
+    found: mem::List[FileDiagnostic]
+    fixed: mem::List[FileDiagnostic]
+    alloc: mem::Alloc
+} Checks
+
+fn Checks.report(mut self, line: u32, code: diagnostic::Code) {
+    mut self.found.push(FileDiagnostic.new(line, code, alloc: self.alloc))
+} Checks.report
+
+/// Checks the rules of item shape that the parse leaves to the parsed item.
+fn check_item(tree: Tree, file: SourceFile, alloc: mem::Alloc) -> mem::List[FileDiagnostic] {
+    var checks = Checks(found: mem::List[FileDiagnostic].empty(alloc), fixed: mem::List[FileDiagnostic].empty(alloc), alloc: alloc)
+    let Some(kind) = tree.kind() else {
+        return checks.found
+    }
+    let no_visibility = match kind.rule {
+        Rule.ImplItem or Rule.ConstAssertItem or Rule.ContributeItem => true
+        Rule.TestItem or Rule.RetiredItem or Rule.PackageItem => true
+        else => false
+    }
+    match tree.visibility() {
+        Some(token) => {
+            if no_visibility {
+                let deleted = file.span_with_space_after(token)
+                mut checks.fixed.push(file.fixed(TokenSpan(head: token, last: token), code: diagnostic::Code.ItemVisibilityNotAllowed, range: deleted, written: "", alloc))
+            }
+        }
+        None => {}
+    }
+    mut checks.modifiers(tree, file, kind)
+    match kind.rule {
+        Rule.FnItem => check_fn(tree, file, node: kind.node, mut checks)
+        Rule.InterfaceItem => check_interface(tree, file, node: kind.node, mut checks)
+        Rule.TestItem => {
+            match tree.find(kind.node, rule: Rule.TestParams) {
+                Some(test_params) => {
+                    for param in tree.list_elements(tree.find(test_params, rule: Rule.ParamList), element: Rule.Param, alloc) {
+                        report_self(tree, file, param, mut checks)
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    mut checks.label(tree, file, kind)
+    var found = checks.found
+    for each in take checks.fixed {
+        mut found.push(take each)
+    }
+    return found
+} check_item
+
+/// Checks the modifiers of an item: where each may stand, conflicts between them, and the
+/// openness a struct or enum states.
+fn Checks.modifiers(mut self, tree: Tree, file: SourceFile, kind: KindNode) {
+    let alloc = self.alloc
+    var transparent = false
+    if kind.rule == Rule.FnItem {
+        match tree.find(kind.node, rule: Rule.FnEnd) {
+            Some(end) => {
+                let children = tree.children(end)
+                if children.len() > 0 {
+                    match children[0] {
+                        Child.Token(token) => {
+                            transparent = file.kind_of(token) == TokenKind.Punct(Punct.Eq)
+                        }
+                        Child.Node(_) => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    let type_kind = kind.rule == Rule.StructItem or kind.rule == Rule.EnumItem
+    var type_modifiers = mem::List[u32].empty(alloc)
+    var fn_modifier: Option[u32] = None
+    for modifier in tree.modifiers(alloc) {
+        let token = modifier.token
+        let word = file.token_text(token)
+        let line = file.line_of(token)
+        if modifier.rule == Rule.TypeModifier {
+            if not type_kind {
+                mut self.report(line, code: diagnostic::Code.ItemModifierMisplaced)
+                continue
+            }
+            if listed_word(type_modifiers, word, file) {
+                mut self.fixed.push(file.fixed(TokenSpan(head: token, last: token), code: diagnostic::Code.ItemModifierConflict, range: file.span_with_space_after(token), written: "", alloc))
+            } else if is_openness(word) and listed_openness(type_modifiers, file) {
+                mut self.report(line, code: diagnostic::Code.ItemModifierConflict)
+            }
+            mut type_modifiers.push(token)
+        } else if modifier.rule == Rule.FnModifier {
+            mut self.fn_modifier(mut fn_modifier, token, file, kind, transparent)
+        }
+    }
+    if type_kind {
+        mut self.openness(tree, file, type_modifiers)
+    }
+} Checks.modifiers
+
+/// Checks a function modifier at `token`, after the one `fn_modifier` holds if any.
+fn Checks.fn_modifier(
+    mut self,
+    mut fn_modifier: Option[u32],
+    token: u32,
+    file: SourceFile,
+    kind: KindNode,
+    transparent: bool,
+    ) {
+    let word = file.token_text(token)
+    let line = file.line_of(token)
+    if kind.rule != Rule.FnItem {
+        mut self.report(line, code: diagnostic::Code.ItemModifierMisplaced)
+        return
+    }
+    if transparent and word == "foreign" {
+        mut self.report(line, code: diagnostic::Code.ItemForeignForm)
+        return
+    }
+    if transparent and word != "proj" {
+        mut self.report(line, code: diagnostic::Code.ItemModifierMisplaced)
+        return
+    }
+    match fn_modifier {
+        Some(other) => {
+            if file.token_text(other) == word {
+                mut self.fixed.push(file.fixed(TokenSpan(head: token, last: token), code: diagnostic::Code.ItemModifierConflict, range: file.span_with_space_after(token), written: "", alloc: self.alloc))
+            } else {
+                mut self.report(line, code: diagnostic::Code.ItemModifierConflict)
+            }
+        }
+        None => {
+            fn_modifier = Some(token)
+        }
+    }
+} Checks.fn_modifier
+
+/// Checks that a struct or enum states its openness exactly when it is `pub`.
+fn Checks.openness(mut self, tree: Tree, file: SourceFile, type_modifiers: mem::List[u32]) {
+    var openness: Option[u32] = None
+    for token in type_modifiers {
+        if is_openness(file.token_text(token)) {
+            openness = Some(token)
+            break
+        }
+    }
+    var public = false
+    match tree.visibility() {
+        Some(token) => {
+            public = file.kind_of(token) == TokenKind.Keyword(Keyword.Pub)
+        }
+        None => {}
+    }
+    match openness {
+        None => {
+            if public {
+                let Some(line) = tree.head_line(file, alloc: self.alloc) else {
+                    expect false
+                    return
+                }
+                mut self.report(line, code: diagnostic::Code.ItemOpennessMissing)
+            }
+        }
+        Some(token) => {
+            if not public {
+                mut self.fixed.push(file.fixed(TokenSpan(head: token, last: token), code: diagnostic::Code.ItemOpennessNotPub, range: file.span_with_space_after(token), written: "", alloc: self.alloc))
+            }
+        }
+    }
+} Checks.openness
+
+fn is_openness(word: Str) -> bool = word == "closed" or word == "open"
+
+/// Whether one of the modifier tokens spells `word`.
+fn listed_word(tokens: mem::List[u32], word: Str, file: SourceFile) -> bool {
+    for token in tokens {
+        if file.token_text(token) == word {
+            return true
+        }
+    }
+    return false
+} listed_word
+
+/// Whether one of the modifier tokens states an openness.
+fn listed_openness(tokens: mem::List[u32], file: SourceFile) -> bool {
+    for token in tokens {
+        if is_openness(file.token_text(token)) {
+            return true
+        }
+    }
+    return false
+} listed_openness
+
+/// Checks the label closing the item: it spells the name the head declares.
+fn Checks.label(mut self, tree: Tree, file: SourceFile, kind: KindNode) {
+    let alloc = self.alloc
+    var closing: Option[u32] = Some(kind.node)
+    if kind.rule == Rule.FnItem {
+        closing = None
+        match tree.find(kind.node, rule: Rule.FnEnd) {
+            Some(end) => {
+                closing = tree.find(end, rule: Rule.FnBody)
+            }
+            None => {}
+        }
+    } else if kind.rule == Rule.TestItem {
+        closing = tree.find(kind.node, rule: Rule.FnBody)
+    }
+    let Some(closer) = closing else {
+        return
+    }
+    var label: Option[u32] = None
+    for child in tree.child_nodes(closer) {
+        if tree.rule(child) == Rule.ItemLabel {
+            label = Some(child)
+        }
+    }
+    let Some(labelled) = label else {
+        return
+    }
+    let Some(name) = tree.name(file, alloc) else {
+        return
+    }
+    if tree.tokens_text(labelled, file, alloc) == name {
+        return
+    }
+    let span = tree.held(labelled, alloc)
+    let written = diagnostic::Span(start: file.tokens[usize.widen(span.head)].start, end: file.tokens[usize.widen(span.last)].end)
+    mut self.fixed.push(file.fixed(span, code: diagnostic::Code.ItemLabelMismatch, range: written, written: name.as_str(), alloc))
+} Checks.label
+
+/// Checks each method of an interface: its head, its clause order and its closing label.
+fn check_interface(tree: Tree, file: SourceFile, node: u32, mut checks: Checks) {
+    let alloc = checks.alloc
+    for member in tree.child_nodes(node) {
+        if tree.rule(member) != Rule.InterfaceMember {
+            continue
+        }
+        check_head(tree, file, head: member, method: true, mut checks)
+        let method_end = tree.find(member, rule: Rule.MethodEnd)
+        let Some(end) = method_end else {
+            continue
+        }
+        match tree.find(end, rule: Rule.ClauseRegion) {
+            Some(region) => check_clause_order(tree, file, region, mut checks)
+            None => {}
+        }
+        let Some(body) = tree.find(end, rule: Rule.MethodBody) else {
+            continue
+        }
+        let Some(name) = tree.child_token_of(member, kind: TokenKind.Ident, file) else {
+            continue
+        }
+        let label = tree.child_token_of(body, kind: TokenKind.Ident, file)
+        match label {
+            Some(labelled) => {
+                if file.token_text(labelled) != file.token_text(name) {
+                    let at = file.tokens[usize.widen(labelled)]
+                    mut checks.fixed.push(file.fixed(TokenSpan(head: labelled, last: labelled), code: diagnostic::Code.ItemLabelMismatch, range: diagnostic::Span(start: at.start, end: at.end), written: file.token_text(name), alloc))
+                }
+            }
+            None => {
+                let Some(closer) = tree.child_token_of(body, kind: TokenKind.Punct(Punct.RBrace), file) else {
+                    expect false
+                    return
+                }
+                let end_byte = file.tokens[usize.widen(closer)].end
+                var written = text::String.empty(alloc)
+                mut written.push(' ')
+                mut written.append(file.token_text(name))
+                mut checks.fixed.push(file.fixed(TokenSpan(head: closer, last: closer), code: diagnostic::Code.ItemLabelMismatch, range: diagnostic::Span(start: end_byte, end: end_byte), written: written.as_str(), alloc))
+            }
+        }
+    }
+} check_interface
+
+fn check_fn(tree: Tree, file: SourceFile, node: u32, mut checks: Checks) {
+    let alloc = checks.alloc
+    let Some(head) = tree.find(node, rule: Rule.FnHead) else {
+        return
+    }
+    let Some(end) = tree.find(node, rule: Rule.FnEnd) else {
+        return
+    }
+    check_head(tree, file, head, method: false, mut checks)
+    var foreign_fn = false
+    for modifier in tree.modifiers(alloc) {
+        if file.kind_of(modifier.token) == TokenKind.Keyword(Keyword.Foreign) {
+            foreign_fn = true
+        }
+    }
+    let child = tree.children(end)[0]
+    var first_line: u32 = 0
+    var convention = false
+    var transparent = false
+    match child {
+        Child.Token(token) => {
+            first_line = file.line_of(token)
+            transparent = file.kind_of(token) == TokenKind.Punct(Punct.Eq)
+        }
+        Child.Node(inner) => {
+            first_line = file.line_of(tree.held(inner, alloc).head)
+            convention = tree.rule(inner) == Rule.ConventionClause
+        }
+    }
+    let region = tree.find(end, rule: Rule.ClauseRegion)
+    if foreign_fn and not convention and not transparent {
+        var line = first_line
+        match region {
+            Some(clauses) => {
+                line = file.line_of(tree.held(clauses, alloc).head)
+            }
+            None => {}
+        }
+        mut checks.report(line, code: diagnostic::Code.ItemForeignForm)
+    } else if convention and not foreign_fn {
+        mut checks.report(first_line, code: diagnostic::Code.ItemForeignForm)
+    }
+    match tree.find(head, rule: Rule.LimitsClause) {
+        Some(limit_clause) => {
+            if transparent {
+                let span = tree.held(limit_clause, alloc)
+                let deleted = file.span_with_space_before(span.head, last: span.last)
+                mut checks.fixed.push(file.fixed(span, code: diagnostic::Code.ItemTransparentLimits, range: deleted, written: "", alloc))
+            }
+        }
+        None => {}
+    }
+    match region {
+        Some(clauses) => check_clause_order(tree, file, region: clauses, mut checks)
+        None => {}
+    }
+} check_fn
+
+/// Checks a function head or interface method head: its result and its `self` parameters.
+fn check_head(
+    tree: Tree,
+    file: SourceFile,
+    head: u32,
+    method: bool,
+    mut checks: Checks,
+    ) {
+    let alloc = checks.alloc
+    match tree.find(head, rule: Rule.FnResult) {
+        Some(result) => {
+            if tree.is_unit(result, file, alloc) {
+                let span = tree.held(result, alloc)
+                let deleted = file.span_with_space_before(span.head, last: span.last)
+                mut checks.fixed.push(file.fixed(span, code: diagnostic::Code.ItemUnitResult, range: deleted, written: "", alloc))
+            }
+        }
+        None => {}
+    }
+    var type_member = method
+    if not method {
+        match tree.find(head, rule: Rule.ItemLabel) {
+            Some(label) => {
+                type_member = tree.child_token_of(label, kind: TokenKind.Punct(Punct.Dot), file).is_some()
+            }
+            None => {}
+        }
+    }
+    let params = tree.list_elements(tree.find(head, rule: Rule.ParamList), element: Rule.Param, alloc)
+    for index in 0..<params.len() {
+        if not (type_member and index == 0) {
+            report_self(tree, file, param: params[index], mut checks)
+        }
+    }
+} check_head
+
+/// Whether a function result is the type `Unit` alone.
+fn Tree.is_unit(self, result: u32, file: SourceFile, alloc: mem::Alloc) -> bool {
+    let Some(type_node) = self.find(result, rule: Rule.TypeExpr) else {
+        return false
+    }
+    let children = self.children(type_node)
+    if children.len() != 1 {
+        return false
+    }
+    let Child.Node(path) = children[0] else {
+        return false
+    }
+    if self.rule(path) != Rule.Path {
+        return false
+    }
+    return self.tokens_text(path, file, alloc).as_str() == "Unit"
+} Tree.is_unit
+
+fn report_self(tree: Tree, file: SourceFile, param: u32, mut checks: Checks) {
+    let Some(token) = tree.child_token_of(param, kind: TokenKind.Keyword(Keyword.SelfValue), file) else {
+        return
+    }
+    mut checks.report(file.line_of(token), code: diagnostic::Code.ItemSelfMisplaced)
+} report_self
+
+/// A clause line of a clause region: its group and the first and last token of its clause.
+struct ClauseLine derives Copy {
+    group: u8
+    head: u32
+    last: u32
+} ClauseLine
+
+/// Reports each clause line that follows a line of a later group, with the fix moving it to just
+/// before the first line of a later group.
+fn check_clause_order(tree: Tree, file: SourceFile, region: u32, mut checks: Checks) {
+    let alloc = checks.alloc
+    var clause_lines = mem::List[ClauseLine].empty(alloc)
+    for line in tree.child_nodes(region) {
+        var clauses = tree.child_nodes(line)
+        let Some(clause) = mut clauses.next() else {
+            continue
+        }
+        let Some(span) = tree.span(clause, alloc) else {
+            continue
+        }
+        mut clause_lines.push(ClauseLine(group: clause_group(tree, clause), head: span.head, last: span.last))
+    }
+    var latest: u8 = 0
+    for clause_line in clause_lines {
+        let group = clause_line.group
+        if group < latest {
+            var later = clause_line
+            for other in clause_lines {
+                if other.group > group {
+                    later = other
+                    break
+                }
+            }
+            let start = file.lines[usize.widen(file.line_of(clause_line.head)) - 1].start
+            let end = file.line_start_at(file.line_of(clause_line.last) + 1)
+            let target = file.lines[usize.widen(file.line_of(later.head)) - 1].start
+            let at = file.tokens[usize.widen(clause_line.head)]
+            var reported = FileDiagnostic.new(at.line, code: diagnostic::Code.ItemClauseOrder, alloc)
+            reported.span = Some(diagnostic::Span(start: at.start, end: file.tokens[usize.widen(clause_line.last)].end))
+            var fix = mem::List[diagnostic::Replacement].empty(alloc)
+            mut fix.push(diagnostic::Replacement(start: target, end: target, text: output::lossy(file.source_bytes(start, end), alloc)))
+            mut fix.push(diagnostic::Replacement(start: start, end: end, text: text::String.empty(alloc)))
+            mut reported.fixes.push(take fix)
+            mut checks.fixed.push(take reported)
+        }
+        if group > latest {
+            latest = group
+        }
+    }
+} check_clause_order
+
+test modifiers_belong_to_their_kinds_once_each for check_item {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("closed fn f() = 1\n", expected: "2 item.modifier-misplaced", grammar, alloc)
+    expect_codes("proj struct S {\n    x: u32\n} S\n", expected: "2 item.modifier-misplaced", grammar, alloc)
+    expect_codes("pub closed open struct S {\n    x: u32\n} S\n", expected: "2 item.modifier-conflict", grammar, alloc)
+    expect_codes("pub linear closed linear struct S {\n    x: u32\n} S\n", expected: "2 item.modifier-conflict", grammar, alloc)
+    expect_codes("proj validator fn f(x: u32) -> u32 {\n    return x\n} f\n", expected: "2 item.modifier-conflict", grammar, alloc)
+    expect_codes("interrupt fn f() = 1\n", expected: "2 item.modifier-misplaced", grammar, alloc)
+    expect_codes("proj fn f(self) -> u32 = 1\n", expected: "2 item.self-misplaced", grammar, alloc)
+    expect_codes("pub enum E {\n    A\n} E\n", expected: "2 item.openness-missing", grammar, alloc)
+    expect_codes("pkg closed enum E {\n    A\n} E\n", expected: "2 item.openness-not-pub", grammar, alloc)
+    expect_codes("pub impl S: I\n", expected: "2 item.visibility-not-allowed", grammar, alloc)
+    expect_codes("pkg const assert true\n", expected: "2 item.visibility-not-allowed", grammar, alloc)
+} modifiers_belong_to_their_kinds_once_each
+
+test heads_end_in_their_kind_of_body for check_item {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("fn f() convention \"win64\"\n", expected: "2 item.foreign-form", grammar, alloc)
+    expect_codes("foreign fn f() {\n} f\n", expected: "2 item.foreign-form", grammar, alloc)
+    expect_codes("foreign fn f() = 1\n", expected: "2 item.foreign-form", grammar, alloc)
+    expect_codes("foreign fn f() convention \"win64\"\n", expected: "", grammar, alloc)
+    expect_codes("fn f() -> u32 limits pure = 1\n", expected: "2 item.transparent-limits", grammar, alloc)
+    expect_codes("fn f() -> Unit {\n} f\n", expected: "2 item.unit-result", grammar, alloc)
+    expect_codes("interface I {\n    fn f(self) -> Unit\n} I\n", expected: "3 item.unit-result", grammar, alloc)
+    expect_codes("fn S.f(x: u32, self) = 1\n", expected: "2 item.self-misplaced", grammar, alloc)
+    expect_codes("fn S.f(mut self, x: u32) = 1\n", expected: "", grammar, alloc)
+    expect_codes("test t for f (self) {\n} t\n", expected: "2 item.self-misplaced", grammar, alloc)
+} heads_end_in_their_kind_of_body
+
+test closing_labels_and_clause_lines_follow_their_items for check_item {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("struct S {\n    x: u32\n} T\n", expected: "4 item.label-mismatch", grammar, alloc)
+    expect_codes("fn S.f() {\n} f\n", expected: "3 item.label-mismatch", grammar, alloc)
+    expect_codes("interface I {\n    fn f(self) {\n    } g\n} I\n", expected: "4 item.label-mismatch", grammar, alloc)
+    expect_codes("fn f(x: u32) -> u32\n    requires x > 0\n    todo \"pin\" ensures result > 0\n    example f(1) == 1\n    waive length \"why\"\n{\n    return x\n} f\n", expected: "", grammar, alloc)
+    expect_codes("fn f(x: u32) -> u32\n    ensures result > 0\n    todo \"pin\" requires x > 0\n{\n    return x\n} f\n", expected: "4 item.clause-order", grammar, alloc)
+} closing_labels_and_clause_lines_follow_their_items

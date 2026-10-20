@@ -1,0 +1,143 @@
+//! The rules of function heads, closures and function types that read their types and modifier: the forms of interrupt fns, a view result outside a projection, a state token beside `uses wait`, the receiver a projection takes, and a foreign function that waits.
+
+/// The core types whose type parameters accept views and hold their arguments as they are.
+const VIEW_CONTAINERS: Str = "core::Array core::ArrayCursor core::Option core::Result core::Untrusted core::Slice core::SliceMut"
+
+/// The core types that are views exactly when an argument is.
+const VIEW_HOLDERS: Str = "core::Option core::Result core::Array core::ArrayCursor core::Untrusted"
+
+/// The rule a head breaks by its types: a view result outside a projection, or a parameter
+/// holding a state token beside `uses wait`.
+fn Checker.head_problem(self, params: Slice[ty::Ty], result: ty::Ty, wait: bool, projection: bool) -> Option[diagnostic::Code] {
+    if not projection and self.counts_as_view(result) {
+        return Some(diagnostic::Code.PropViewResult)
+    }
+    if wait {
+        for param in params {
+            if self.holds_token(param) {
+                return Some(diagnostic::Code.PropTokenWait)
+            }
+        }
+    }
+    return None
+} Checker.head_problem
+
+/// The rule a function or method head breaks, a projection's receiver included.
+fn Checker.fn_head_problem(self, sig: FnSig) -> Option[diagnostic::Code] {
+    let alloc = self.alloc()
+    if sig.modifier == Some(ast::FnModifier.Interrupt) and (sig.generics.len() > 0 or not self.is_irq_form(sig.fn_ty(alloc))) {
+        return Some(diagnostic::Code.KernelIrqHead)
+    }
+    var params = mem::List[ty::Ty].empty(alloc)
+    for param in sig.params {
+        mut params.push(param.ty)
+    }
+    let typed = self.head_problem(params.view(), result: sig.result, wait: sig.wait, projection: sig.is_proj())
+    if typed.is_some() {
+        return typed
+    }
+    let receiver = sig.params.len() > 0 and sig.params[0].is_self and sig.params[0].mode != ast::Mode.Take
+    if sig.is_proj() and not receiver {
+        return Some(diagnostic::Code.OwnProjReceiver)
+    }
+    if sig.modifier == Some(ast::FnModifier.Foreign) and sig.wait {
+        return Some(diagnostic::Code.EffectForeignWait)
+    }
+    return None
+} Checker.fn_head_problem
+
+/// The rule a function type breaks.
+fn Checker.fn_type_problem(self, fn_ty: ty::FnTy) -> Option[diagnostic::Code] {
+    if fn_ty.kind == ast::FnKind.Interrupt and not self.is_irq_form(fn_ty) {
+        return Some(diagnostic::Code.KernelIrqHead)
+    }
+    var params = mem::List[ty::Ty].empty(self.alloc())
+    for param in fn_ty.params {
+        mut params.push(param.ty)
+    }
+    let typed = self.head_problem(params.view(), result: fn_ty.result, wait: fn_ty.wait, projection: false)
+    if typed.is_some() {
+        return typed
+    }
+    if fn_ty.convention.is_some() and fn_ty.wait {
+        return Some(diagnostic::Code.EffectForeignWait)
+    }
+    return None
+} Checker.fn_type_problem
+
+/// The form of a projection call's result, fixed by its head's declared result type with each
+/// type parameter counted as no view.
+fn Checker.projection_form(self, call: Call) -> Form {
+    var declared = call.head.result
+    match call.callee {
+        Callee.Function(item: item) => {
+            match self.fn_sig(item) {
+                Some(head) => {
+                    declared = head.result
+                }
+                None => {}
+            }
+        }
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
+            let interface_sig = self.sig(bound.item)
+            match interface_sig.contents().kind {
+                SigKind.Interface(methods: methods) => {
+                    declared = methods[method].sig.result
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return self.declared_form(declared)
+} Checker.projection_form
+
+/// The form of a projection's result whose head declares the result type `declared`, each
+/// type parameter counted as no view.
+fn Checker.declared_form(self, declared: ty::Ty) -> Form {
+    let view = self.counts_as_view(declared)
+    let wraps = self.is_std(declared, path: "core::Option") or self.is_std(declared, path: "core::Result")
+    if view {
+        return Form.View
+    }
+    if wraps {
+        return Form.Wrapped
+    }
+    return Form.Part
+} Checker.declared_form
+
+/// Whether a type is a view with each type parameter counted as none.
+fn Checker.counts_as_view(self, ty: ty::Ty) -> bool {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Param(_) => return false
+        ty::TyKind.Dyn(_) => return true
+        ty::TyKind.Item(item: _, args: args) => {
+            let holder = match self.std_path(ty) {
+                Some(path) => is_listed(VIEW_HOLDERS, word: path.as_str())
+                None => false
+            }
+            if holder {
+                for arg in types.arg_list(args) {
+                    let Some(held) = arg.ty() else {
+                        continue
+                    }
+                    if self.counts_as_view(held) {
+                        return true
+                    }
+                }
+                return false
+            }
+        }
+        else => {}
+    }
+    return self.has(ty, property: Property.View)
+} Checker.counts_as_view
+
+/// Whether a type is a core type whose type parameters accept views.
+fn Checker.is_view_container(self, ty: ty::Ty) -> bool {
+    let Some(path) = self.std_path(ty) else {
+        return false
+    }
+    return is_listed(VIEW_CONTAINERS, word: path.as_str())
+} Checker.is_view_container

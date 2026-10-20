@@ -1,0 +1,1569 @@
+//! Patterns: their forms and types, the names they bind, refutability, and the disjointness and exhaustiveness of match arms, decided exactly over the values of each type.
+
+/// A pattern as exhaustiveness reads it.
+enum Pat derives Eq {
+    Wild
+    Ints(low: wide::Wide, high: wide::Wide)
+    Bool(bool)
+    Bytes(mem::Bytes)
+    /// A constructor: a variant's index, or 0 for a struct, layout or `Unit`, with its fields in
+    /// declaration order.
+    Ctor(index: usize, fields: mem::List[Pat])
+} Pat
+
+/// An inclusive interval of integers or char scalar values.
+struct Interval derives Copy, Eq {
+    low: wide::Wide
+    high: wide::Wide
+} Interval
+
+/// The constructors of a type, as exhaustiveness counts them.
+enum Shape {
+    /// Integers or chars, as the intervals of the type.
+    Ints(mem::List[Interval])
+    Bool
+    /// Variants with the types of their fields; `open` when values outside them exist.
+    Ctors(fields: mem::List[mem::List[ty::Ty]], open: bool)
+    /// Values no finite set of patterns covers.
+    Infinite
+} Shape
+
+/// The value a literal or constant pattern matches, and what it compares with.
+struct PatternValue {
+    space: ValueSpace
+    compared: Compared
+} PatternValue
+
+/// A name an alternative of an arm binds, with its type.
+struct BoundName derives Eq {
+    name: text::String
+    ty: ty::Ty
+} BoundName
+
+/// The fields a variant, struct or layout pattern names, with their types, and whether they
+/// are labelled.
+struct PatternFields {
+    declared: mem::List[LabelledTy]
+    labelled: bool
+} PatternFields
+
+/// Types a whole pattern of a `let`, `for` or arm, whose names are distinct.
+fn Body.top_pattern(mut self, pattern: ast::Pattern, ty: ty::Ty, kind: LocalKind) -> TPattern {
+    mut self.bound_names.truncate(0)
+    return mut self.pattern(pattern, ty, kind)
+} Body.top_pattern
+
+/// Types the alternatives of an arm: each binds the names of the first with the same types.
+fn Body.arm_patterns(mut self, token: u32, patterns: Slice[ast::Pattern], ty: ty::Ty) -> mem::List[TPattern] {
+    let alloc = self.ck.alloc()
+    var typed = mem::List[TPattern].empty(alloc)
+    var first_bound = mem::List[BoundName].empty(alloc)
+    var first_locals = mem::List[LocalId].empty(alloc)
+    var have_first = false
+    var mismatched = false
+    for pattern in patterns {
+        let start = self.locals.len()
+        var hidden: Option[mem::List[LocalId]] = None
+        if have_first {
+            hidden = mut self.scopes.pop()
+            mut self.scopes.push(mem::List[LocalId].empty(alloc))
+        }
+        mut typed.push(mut self.top_pattern(pattern, ty, kind: LocalKind.Pattern))
+        var bound = mem::List[BoundName].empty(alloc)
+        for index in start..<self.locals.len() {
+            let local = self.locals[index]
+            mut bound.push(BoundName(name: text::String.of(local.name.as_str(), alloc), ty: local.ty))
+        }
+        mut bound.sort_by(fn(left: BoundName, right: BoundName) => left.name.as_str().cmp(right.name.as_str()))
+        if not have_first {
+            have_first = true
+            first_bound = bound
+            for index in start..<self.locals.len() {
+                mut first_locals.push(LocalId(index: u32.fit(index)))
+            }
+            continue
+        }
+        if first_bound != bound {
+            mismatched = true
+        }
+        discard mut self.scopes.pop()
+        match mut hidden.extract() {
+            Some(restored) => mut self.scopes.push(take restored)
+            None => {}
+        }
+        for index in start..<self.locals.len() {
+            for earlier in first_locals {
+                if self.locals[usize.widen(earlier.index)].name == self.locals[index].name {
+                    mut self.add_alternative(earlier, later: LocalId(index: u32.fit(index)))
+                    break
+                }
+            }
+        }
+    }
+    if mismatched {
+        self.report(token, code: diagnostic::Code.ExprOrBindings)
+    }
+    return typed
+} Body.arm_patterns
+
+/// Records that a binding of a later alternative of an arm stands for one of its first.
+fn Body.add_alternative(mut self, earlier: LocalId, later: LocalId) {
+    if self.usage.alternatives.contains(earlier) {
+        var listed = mut self.usage.alternatives.at_mut(earlier)
+        mut listed.push(later)
+        return
+    }
+    var listed = mem::List[LocalId].empty(self.ck.alloc())
+    mut listed.push(later)
+    discard mut self.usage.alternatives.insert(earlier, value: take listed)
+} Body.add_alternative
+
+/// Types a pattern against its scrutinee's type and declares the names it binds.
+fn Body.pattern(mut self, pattern: ast::Pattern, ty: ty::Ty, kind: LocalKind) -> TPattern {
+    let token = pattern.token
+    match pattern.kind {
+        ast::PatternKind.Wildcard => return TPattern(token: token, ty: ty, kind: TPatternKind.Wildcard)
+        ast::PatternKind.Literal(literal: literal, range: range) => {
+            let low = mut self.pattern_literal(token, literal, ty)
+            let Some(written) = range else {
+                let matched = match low {
+                    Some(value) => take value.equal()
+                    None => TPatternKind.Failed
+                }
+                return TPattern(token: token, ty: ty, kind: take matched)
+            }
+            return mut self.range_pattern(token, ty, take low, kind: written.kind, bound: written.bound)
+        }
+        ast::PatternKind.Named(path: path, member: member, fields: fields, range: range) => {
+            let name = path.segments[0]
+            let spelt = name.text.as_str()
+            let binding = path.segments.len() == 1 and member.is_none() and fields.is_none() and range.is_none() and spelt != "None" and spelt != "Unit" and not is_screaming(spelt)
+            if binding {
+                if self.bound_names.position(fn(known: text::String) => known.as_str() == spelt).is_some() {
+                    self.report(name.token, code: diagnostic::Code.PatternDuplicateBinding)
+                    return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+                }
+                mut self.bound_names.push(text::String.of(spelt, alloc: self.ck.alloc()))
+                let local = mut self.declare(name, ty, kind)
+                return TPattern(token: token, ty: ty, kind: TPatternKind.Binding(local))
+            }
+            match range {
+                Some(written) => {
+                    let low = mut self.constant_value(token, path, ty)
+                    return mut self.range_pattern(token, ty, take low, kind: written.kind, bound: written.bound)
+                }
+                None => {}
+            }
+            return mut self.named_pattern(token, path, member, fields, ty, kind)
+        }
+    }
+} Body.pattern
+
+/// The value a literal pattern matches and the literal, typed by the scrutinee's type.
+fn Body.pattern_literal(mut self, token: u32, literal: ast::PatternLiteral, ty: ty::Ty) -> Option[PatternValue] {
+    let written = literal.literal()
+    if written.kind == ast::LiteralKind.Float {
+        self.report(token, code: diagnostic::Code.ExprFloatPattern)
+        return None
+    }
+    let negative = match literal {
+        ast::PatternLiteral.Number(negative: held, literal: _) => held
+        ast::PatternLiteral.Other(_) => false
+    }
+    let typed = mut self.literal(token, literal: written, expected: Some(ty), negative)
+    if self.ck.types().has_error(typed.ty) {
+        return None
+    }
+    if typed.ty != ty and not self.ck.types().has_error(ty) {
+        self.report_mismatch(token, expected: ty, found: typed.ty)
+        return None
+    }
+    let TKind.Literal(value) = typed.kind else {
+        return None
+    }
+    let Some(space) = value.literal_space(self.ck.alloc()) else {
+        return None
+    }
+    return Some(PatternValue(space: take space, compared: Compared.Literal(take value)))
+} Body.pattern_literal
+
+/// The values a literal pattern matches: those equal to the literal; none for a float.
+fn Lit.literal_space(self, alloc: mem::Alloc) -> Option[ValueSpace] {
+    return match self {
+        Lit.Int(value) => Some(ValueSpace.Ints(low: value, high: value))
+        Lit.Char(c) => Some(ValueSpace.Ints(low: wide::Wide.of_u64(u64.widen(c.to_bits())), high: wide::Wide.of_u64(u64.widen(c.to_bits()))))
+        Lit.Bool(value) => Some(ValueSpace.Bool(value))
+        Lit.Text(written) => Some(ValueSpace.Bytes(copied_bytes(written.as_bytes(), alloc)))
+        Lit.Bytes(bytes) => Some(ValueSpace.Bytes(copied_bytes(bytes.view(), alloc)))
+        Lit.Float(_) => None
+    }
+} Lit.literal_space
+
+/// A copy of some bytes.
+fn copied_bytes(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copied_bytes
+
+/// A range pattern: both bounds of the scrutinee's integer or char type, matching some value.
+fn Body.range_pattern(
+    mut self,
+    token: u32,
+    ty: ty::Ty,
+    take low: Option[PatternValue],
+    kind: ast::RangeKind,
+    bound: ast::RangeBound,
+    ) -> TPattern {
+    let high = match bound {
+        ast::RangeBound.Literal(literal) => mut self.pattern_literal(token, literal, ty)
+        ast::RangeBound.Path(path) => mut self.constant_value(token, path, ty)
+    }
+    let valid = match self.ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => scalar.is_integer() or scalar == ty::Scalar.Char
+        ty::TyKind.Error => true
+        else => false
+    }
+    if not valid {
+        self.report(token, code: diagnostic::Code.PatternRangeKind)
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+    }
+    let Some(low_value) = low else {
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+    }
+    let Some(high_value) = high else {
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+    }
+    let exclusive = kind == ast::RangeKind.Exclusive
+    let PatternValue(space: low_space, compared: low_compared) = low_value
+    let PatternValue(space: high_space, compared: high_compared) = high_value
+    var space = ValueSpace.Unknown
+    match low_space {
+        ValueSpace.Ints(low: least, high: _) => {
+            match high_space {
+                ValueSpace.Ints(low: written_high, high: _) => {
+                    var greatest = written_high
+                    if exclusive {
+                        greatest = written_high.wrapping_sub(wide::Wide.one())
+                    }
+                    if least > greatest {
+                        self.report(token, code: diagnostic::Code.PatternEmptyRange)
+                        return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+                    }
+                    space = ValueSpace.Ints(low: least, high: greatest)
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return TPattern(token: token, ty: ty, kind: TPatternKind.Value(space: take space, compared: ValueTest.Range(low: take low_compared, high: take high_compared, exclusive: exclusive)))
+} Body.range_pattern
+
+/// The value of a constant written as a pattern or range bound, a path naming a const item,
+/// and the const.
+fn Body.constant_value(mut self, token: u32, path: ast::Path, ty: ty::Ty) -> Option[PatternValue] {
+    if path.segments.len() == 1 {
+        let local = mut self.lookup_local(path.segments[0].text.as_str())
+        if local.is_some() {
+            self.report(token, code: diagnostic::Code.PatternPathKind)
+            return None
+        }
+    }
+    var named = Named.Unit
+    match self.ck.resolve_use(self.item, module: self.module, path) {
+        Ok(found) => {
+            named = found
+        }
+        Err(error) => {
+            self.report_path(error)
+            return None
+        }
+    }
+    let Named.Item(item) = named else {
+        self.report(token, code: diagnostic::Code.PatternPathKind)
+        return None
+    }
+    let is_const = match self.ck.db().ast(item).kind {
+        ast::ItemKind.Const(_) => true
+        else => false
+    }
+    if not is_const {
+        self.report(token, code: diagnostic::Code.PatternPathKind)
+        return None
+    }
+    if not self.ck.db().visible(self.module, item) {
+        self.report(token, code: diagnostic::Code.NamePrivate)
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Const(ty: const_ty) = sig.contents().kind else {
+        return None
+    }
+    let kind_ok = match self.ck.types().kind(const_ty) {
+        ty::TyKind.Scalar(scalar) => scalar.is_integer() or scalar == ty::Scalar.Bool or scalar == ty::Scalar.Char
+        ty::TyKind.Error => true
+        else => self.ck.is_std(const_ty, path: "core::Str") or const_ty == self.ck.slice_ty(ty::Ty.scalar(ty::Scalar.Unsigned8))
+    }
+    if not kind_ok {
+        self.report(token, code: diagnostic::Code.PatternConstKind)
+        return None
+    }
+    if const_ty != ty and not self.ck.types().has_error(const_ty) and not self.ck.types().has_error(ty) {
+        self.report_mismatch(token, expected: ty, found: const_ty)
+        return None
+    }
+    var space = ValueSpace.Unknown
+    match self.ck.const_value(item) {
+        Some(value) => {
+            space = value.contents().value_space(self.ck.alloc())
+        }
+        None => {}
+    }
+    return Some(PatternValue(space: take space, compared: Compared.Const(item)))
+} Body.constant_value
+
+/// A variant, struct, layout, constant or `Unit` pattern.
+fn Body.named_pattern(
+    mut self,
+    token: u32,
+    path: ast::Path,
+    member: Option[ast::Name],
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    kind: LocalKind,
+    ) -> TPattern {
+    if member.is_none() and fields.is_none() and path.segments.len() == 1 and path.segments[0].text.as_str() == "Unit" {
+        if ty != ty::Ty.unit() and not self.ck.types().has_error(ty) {
+            self.report_mismatch(token, expected: ty, found: ty::Ty.unit())
+        }
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Fields(variant: None, fields: mem::List[TFieldPattern].empty(self.ck.alloc())))
+    }
+    var named = Named.Unit
+    match self.ck.resolve_use(self.item, module: self.module, path) {
+        Ok(found) => {
+            named = found
+        }
+        Err(error) => {
+            self.report_path(error)
+            return mut self.failed_pattern(token, ty, fields, kind)
+        }
+    }
+    match named {
+        Named.Variant(item: enumeration, index: variant) => {
+            if member.is_none() {
+                return mut self.item_pattern(token, item: enumeration, variant: Some(variant), fields, ty, kind)
+            }
+        }
+        Named.Item(item) => {
+            match member {
+                None => return mut self.plain_item_pattern(token, path, item, fields, ty, kind)
+                Some(written) => return mut self.member_pattern(token, item, member: written, fields, ty, kind)
+            }
+        }
+        else => {}
+    }
+    self.report(token, code: diagnostic::Code.PatternPathKind)
+    return mut self.failed_pattern(token, ty, fields, kind)
+} Body.named_pattern
+
+/// The failed pattern of a pattern that breaks a rule, its field patterns typed against a
+/// failed type.
+fn Body.failed_pattern(mut self, token: u32, ty: ty::Ty, fields: Option[mem::List[ast::FieldPattern]], kind: LocalKind) -> TPattern {
+    match fields {
+        Some(written) => {
+            for field in written {
+                discard mut self.pattern(field.pattern, ty: ty::Ty.error(), kind)
+            }
+        }
+        None => {}
+    }
+    return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+} Body.failed_pattern
+
+/// A pattern whose path names an item without a member: a constant, or a struct or layout
+/// with its fields.
+fn Body.plain_item_pattern(
+    mut self,
+    token: u32,
+    path: ast::Path,
+    item: ty::ItemId,
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    kind: LocalKind,
+    ) -> TPattern {
+    let declared = match self.ck.db().ast(item).kind {
+        ast::ItemKind.Const(_) => 1u8
+        ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) => 2
+        else => 0
+    }
+    if declared == 1 and fields.is_none() {
+        let value = mut self.constant_value(token, path, ty)
+        let matched = match value {
+            Some(held) => take held.equal()
+            None => TPatternKind.Failed
+        }
+        return TPattern(token: token, ty: ty, kind: take matched)
+    }
+    if declared == 2 and fields.is_some() {
+        return mut self.item_pattern(token, item, variant: None, fields, ty, kind)
+    }
+    self.report(token, code: diagnostic::Code.PatternPathKind)
+    return mut self.failed_pattern(token, ty, fields, kind)
+} Body.plain_item_pattern
+
+/// A pattern naming a member of an item: a variant of an enum, through a tombstone renaming
+/// it, or a tag of a layout.
+fn Body.member_pattern(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    member: ast::Name,
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    kind: LocalKind,
+    ) -> TPattern {
+    let alloc = self.ck.alloc()
+    if self.core_variant_qualified(item, name: member.text.as_str()) {
+        self.qualified_core_variant(token, name: member)
+        return mut self.failed_pattern(token, ty, fields, kind)
+    }
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Enum(variants: variants) => {
+            var written_name = text::String.of(member.text.as_str(), alloc)
+            var written_token = member.token
+            if variants.position(fn(variant: VariantSig) => variant.name == member.text).is_none() {
+                match self.ck.member_renaming(TypeKey.Item(item), name: member.text.as_str(), from: self.module) {
+                    Some(tombstone) => {
+                        let Some(renamed) = self.ck.forward_member(self.item, name: member, tombstone) else {
+                            return mut self.failed_pattern(token, ty, fields, kind)
+                        }
+                        let ast::Name(text: renamed_text, token: renamed_token) = renamed
+                        written_name = renamed_text
+                        written_token = renamed_token
+                    }
+                    None => {}
+                }
+            }
+            let Some(variant) = variants.position(fn(declared: VariantSig) => declared.name == written_name) else {
+                self.report(written_token, code: diagnostic::Code.NameUnknown)
+                return mut self.failed_pattern(token, ty, fields, kind)
+            }
+            self.name_member(written_token, member: Member.Variant(owner: item, name: take written_name))
+            return mut self.item_pattern(token, item, variant: Some(variant), fields, ty, kind)
+        }
+        SigKind.Layout(fields: _, tags: tags, bits: _) => {
+            match tags.position(fn(tag: text::String) => tag == member.text) {
+                Some(index) => {
+                    if fields.is_none() {
+                        discard self.expect_item(token, item, ty)
+                        return TPattern(token: token, ty: ty, kind: TPatternKind.Fields(variant: Some(index), fields: mem::List[TFieldPattern].empty(alloc)))
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    self.report(token, code: diagnostic::Code.PatternPathKind)
+    return mut self.failed_pattern(token, ty, fields, kind)
+} Body.member_pattern
+
+/// A pattern of a struct, layout or enum variant with its fields, against the fields the item
+/// declares.
+fn Body.item_pattern(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    kind: LocalKind,
+    ) -> TPattern {
+    if not self.ck.db().visible(self.module, item) {
+        self.report(token, code: diagnostic::Code.NamePrivate)
+    }
+    if not self.expect_item(token, item, ty) {
+        return mut self.failed_pattern(token, ty, fields, kind)
+    }
+    let Some(declared) = self.declared_fields(token, item, variant, fields, ty) else {
+        return mut self.failed_pattern(token, ty, fields, kind)
+    }
+    return mut self.field_patterns(token, item, variant, fields, ty, kind, shape: take declared)
+} Body.item_pattern
+
+/// The fields a pattern of an item names, with their types under the scrutinee's arguments;
+/// none when the pattern's form does not fit the item, which is reported.
+fn Body.declared_fields(
+    self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    ) -> Option[PatternFields] {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    let db = self.ck.db()
+    let sig = self.ck.sig(item)
+    let subst = self.ck.generics_subst(sig.contents().generics.view(), args: types.arg_list(types.args_of(ty)))
+    let consumer = db.package_of(item) != db.module(self.module).package_id
+    var declared = mem::List[LabelledTy].empty(alloc)
+    match sig.contents().kind {
+        SigKind.Enum(variants: variants) => {
+            let Some(index) = variant else {
+                self.report(token, code: diagnostic::Code.PatternPathKind)
+                return None
+            }
+            return self.variant_fields(token, payload: variants[index].payload, fields, subst)
+        }
+        SigKind.Struct(fields: struct_fields) => {
+            if variant.is_some() {
+                self.report(token, code: diagnostic::Code.PatternPathKind)
+                return None
+            }
+            if consumer and db.ast(item).has_modifier(ast::TypeModifier.Open) {
+                self.report(token, code: diagnostic::Code.PatternOpenStruct)
+                return None
+            }
+            for field in struct_fields {
+                if not db.field_visible(self.module, owner: item, visibility: field.visibility) {
+                    self.report(token, code: diagnostic::Code.TypeHiddenField)
+                    return None
+                }
+            }
+            for field in struct_fields {
+                mut declared.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+            }
+            return Some(PatternFields(declared: take declared, labelled: true))
+        }
+        SigKind.Layout(fields: layout_fields, tags: _, bits: _) => {
+            if variant.is_some() {
+                self.report(token, code: diagnostic::Code.PatternPathKind)
+                return None
+            }
+            for field in layout_fields {
+                mut declared.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+            }
+            return Some(PatternFields(declared: take declared, labelled: true))
+        }
+        else => {}
+    }
+    self.report(token, code: diagnostic::Code.PatternPathKind)
+    return None
+} Body.declared_fields
+
+/// The fields a variant pattern names, its payload's types under the scrutinee's arguments;
+/// none when the pattern's form does not fit the payload, which is reported.
+fn Body.variant_fields(self, token: u32, payload: Payload, fields: Option[mem::List[ast::FieldPattern]], subst: ty::Subst) -> Option[PatternFields] {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    var declared = mem::List[LabelledTy].empty(alloc)
+    match payload {
+        Payload.None => {
+            if fields.is_some() {
+                self.report(token, code: diagnostic::Code.TypePayloadShape)
+                return None
+            }
+            return Some(PatternFields(declared: take declared, labelled: false))
+        }
+        Payload.Single(single) => {
+            let written_single = match fields {
+                Some(written) => written.len() == 1 and written[0].label.is_none()
+                None => false
+            }
+            if not written_single {
+                self.report(token, code: diagnostic::Code.TypePayloadShape)
+                return None
+            }
+            mut declared.push(LabelledTy(name: text::String.empty(alloc), ty: subst.ty(types, ty: single)))
+            return Some(PatternFields(declared: take declared, labelled: false))
+        }
+        Payload.Labelled(labelled) => {
+            let unwritten = match fields {
+                Some(written) => written.len() == 0
+                None => true
+            }
+            if unwritten {
+                self.report(token, code: diagnostic::Code.TypePayloadShape)
+                return None
+            }
+            for field in labelled {
+                mut declared.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+            }
+            return Some(PatternFields(declared: take declared, labelled: true))
+        }
+    }
+} Body.variant_fields
+
+/// The field patterns of a pattern against the fields its item declares: each labelled one
+/// naming a field once, every field named, in declaration order.
+fn Body.field_patterns(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    fields: Option[mem::List[ast::FieldPattern]],
+    ty: ty::Ty,
+    kind: LocalKind,
+    take shape: PatternFields,
+    ) -> TPattern {
+    let alloc = self.ck.alloc()
+    let PatternFields(declared: declared, labelled: labelled) = shape
+    var typed_fields = mem::List[TFieldPattern].empty(alloc)
+    var seen = mem::List[text::String].empty(alloc)
+    var complete = true
+    let Some(written) = fields else {
+        if labelled and declared.len() > 0 {
+            self.report(token, code: diagnostic::Code.TypeMissingField)
+            return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+        }
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Fields(variant: variant, fields: take typed_fields))
+    }
+    for field in written {
+        if not labelled {
+            let typed = mut self.pattern(field.pattern, ty: declared[0].ty, kind)
+            mut typed_fields.push(TFieldPattern(name: text::String.empty(alloc), pattern: take typed))
+            continue
+        }
+        let Some(label) = field.label_name() else {
+            self.report(field.token, code: diagnostic::Code.TypeUnlabelledField)
+            discard mut self.pattern(field.pattern, ty: ty::Ty.error(), kind)
+            complete = false
+            continue
+        }
+        var owner: Option[ty::ItemId] = None
+        if variant.is_none() {
+            owner = Some(item)
+        }
+        let Some(position) = self.labelled_field(owner, label, fields: declared.view()) else {
+            discard mut self.pattern(field.pattern, ty: ty::Ty.error(), kind)
+            complete = false
+            continue
+        }
+        let name = declared[position].name.as_str()
+        if seen.position(fn(known: text::String) => known.as_str() == name).is_some() {
+            self.report(field.token, code: diagnostic::Code.TypeDuplicateLabel)
+            complete = false
+        }
+        if variant.is_none() {
+            self.name_member(label.token, member: Member.Field(owner: item, name: text::String.of(name, alloc)))
+            let wildcard = match field.pattern.kind {
+                ast::PatternKind.Wildcard => true
+                else => false
+            }
+            if not wildcard {
+                self.ck.record_read(item, field: name)
+            }
+            self.ck.record_label(item, field: name, label: FieldLabel(item: self.item, head: field.token, last: field.pattern.token, simple: wildcard))
+        }
+        mut seen.push(text::String.of(name, alloc))
+        let typed = mut self.pattern(field.pattern, ty: declared[position].ty, kind)
+        mut typed_fields.push(TFieldPattern(name: text::String.of(name, alloc), pattern: take typed))
+    }
+    if labelled and complete {
+        for field in declared {
+            if seen.position(fn(known: text::String) => known == field.name).is_none() {
+                self.report(token, code: diagnostic::Code.TypeMissingField)
+                complete = false
+                break
+            }
+        }
+    }
+    if not complete {
+        return TPattern(token: token, ty: ty, kind: TPatternKind.Failed)
+    }
+    if labelled {
+        mut typed_fields.sort_by(fn(left: TFieldPattern, right: TFieldPattern) => LabelledTy.position_in(declared.view(), name: left.name.as_str()).cmp(LabelledTy.position_in(declared.view(), name: right.name.as_str())))
+    }
+    return TPattern(token: token, ty: ty, kind: TPatternKind.Fields(variant: variant, fields: take typed_fields))
+} Body.field_patterns
+
+/// The index of the field of that name among some fields, past them for none.
+fn LabelledTy.position_in(fields: Slice[LabelledTy], name: Str) -> usize {
+    for index in 0..<fields.len() {
+        if fields[index].name.as_str() == name {
+            return index
+        }
+    }
+    return fields.len()
+} LabelledTy.position_in
+
+/// Reports a pattern naming an item of another type than its scrutinee's.
+fn Body.expect_item(self, token: u32, item: ty::ItemId, ty: ty::Ty) -> bool {
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Item(item: found, args: _) => {
+            if found == item {
+                return true
+            }
+        }
+        ty::TyKind.Error => return true
+        else => {}
+    }
+    let written = self.ck.own_type(item)
+    self.report_mismatch(token, expected: ty, found: written)
+    return false
+} Body.expect_item
+
+/// Whether a pattern is refutable: some value of its type does not match it; unknown when
+/// it names a const without a value.
+fn Body.refutable(self, pattern: TPattern) -> Option[bool] {
+    let alloc = self.ck.alloc()
+    let Some(pat) = self.pat(pattern) else {
+        return None
+    }
+    var row = mem::List[Pat].empty(alloc)
+    mut row.push(take pat)
+    var matrix = mem::List[mem::List[Pat]].empty(alloc)
+    mut matrix.push(take row)
+    var wild = mem::List[Pat].empty(alloc)
+    mut wild.push(Pat.Wild)
+    var types = mem::List[ty::Ty].empty(alloc)
+    mut types.push(pattern.ty)
+    return Some(self.useful(matrix.view(), vector: wild.view(), types: types.view()))
+} Body.refutable
+
+/// The disjointness and exhaustiveness of a match's arms, and the reachability of `match
+/// first`'s arms, `ordered` for `match first`.
+fn Body.check_arms(
+    self,
+    token: u32,
+    ordered: bool,
+    ty: ty::Ty,
+    arms: Slice[TArm],
+    written_arms: Slice[ast::Arm],
+    ) {
+    let alloc = self.ck.alloc()
+    var types = mem::List[ty::Ty].empty(alloc)
+    mut types.push(ty)
+    var rows = mem::List[mem::List[Pat]].empty(alloc)
+    var alternatives = mem::List[Pat].empty(alloc)
+    var else_arm: Option[usize] = None
+    var count = arms.len()
+    if written_arms.len() < count {
+        count = written_arms.len()
+    }
+    for index in 0..<count {
+        let arm = arms[index]
+        let written = written_arms[index]
+        let ast::ArmPatterns.Patterns(_) = written.patterns else {
+            else_arm = Some(index)
+            continue
+        }
+        for pattern in arm.patterns {
+            match pattern.kind {
+                TPatternKind.Failed => return
+                else => {}
+            }
+        }
+        var pats = mem::List[Pat].empty(alloc)
+        for pattern in arm.patterns {
+            let Some(pat) = self.pat(pattern) else {
+                return
+            }
+            mut pats.push(take pat)
+        }
+        if ordered {
+            if not self.arm_reachable(rows.view(), pats: pats.view(), types: types.view()) or else_arm.is_some() {
+                self.unreachable_arm(written)
+                return
+            }
+        } else {
+            for pat in pats {
+                if self.overlaps_any(alternatives.view(), pat, ty) {
+                    self.report_overlapping(arm, written, written_arms)
+                    return
+                }
+                mut alternatives.push(pat.copy(alloc))
+            }
+        }
+        if arm.guard.is_none() {
+            for pat in take pats {
+                var row = mem::List[Pat].empty(alloc)
+                mut row.push(take pat)
+                mut rows.push(take row)
+            }
+        }
+    }
+    var wild = mem::List[Pat].empty(alloc)
+    mut wild.push(Pat.Wild)
+    let open_rest = self.useful(rows.view(), vector: wild.view(), types: types.view())
+    let closed_rest = self.useful_closed(rows.view(), ty)
+    match else_arm {
+        Some(index) => {
+            if not ordered and not open_rest {
+                self.unreachable_arm(written_arms[index])
+            }
+        }
+        None => {
+            if open_rest and closed_rest {
+                var fixes = mem::List[diagnostic::Fix].empty(alloc)
+                match self.missing_arms(ty, rows: rows.view(), arms: written_arms) {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+                self.report_fixed(nir::Span.at(token), code: diagnostic::Code.ExprNonExhaustive, fixes: take fixes)
+            } else if open_rest {
+                self.report(token, code: diagnostic::Code.PatternOpenEnumNoElse)
+            }
+        }
+    }
+} Body.check_arms
+
+/// Whether some value matching one of an arm's patterns reaches it past the rows of the arms
+/// before it.
+fn Body.arm_reachable(self, rows: Slice[mem::List[Pat]], pats: Slice[Pat], types: Slice[ty::Ty]) -> bool {
+    for position in 0..<pats.len() {
+        let Some(parts) = pats.split_at(position) else {
+            continue
+        }
+        let Some(single) = parts.tail.prefix(1) else {
+            continue
+        }
+        if self.useful(rows, vector: single, types) {
+            return true
+        }
+    }
+    return false
+} Body.arm_reachable
+
+/// Whether some value of a type matches a pattern and one of the patterns of earlier arms.
+fn Body.overlaps_any(self, alternatives: Slice[Pat], pat: Pat, ty: ty::Ty) -> bool {
+    for earlier in alternatives {
+        if self.overlap(earlier, right: pat, ty) {
+            return true
+        }
+    }
+    return false
+} Body.overlaps_any
+
+/// Reports an arm of a plain match whose pattern overlaps an earlier arm's, with the fix
+/// writing `else` for a lone `_` when the match has no `else` arm.
+fn Body.report_overlapping(self, arm: TArm, written: ast::Arm, written_arms: Slice[ast::Arm]) {
+    var has_else = false
+    for other in written_arms {
+        match other.patterns {
+            ast::ArmPatterns.Else => {
+                has_else = true
+            }
+            ast::ArmPatterns.Patterns(_) => {}
+        }
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    match written.patterns {
+        ast::ArmPatterns.Patterns(patterns) => {
+            if not has_else and patterns.len() == 1 {
+                match patterns[0].kind {
+                    ast::PatternKind.Wildcard => {
+                        let wildcard = patterns[0].token
+                        mut fixes.push(self.ck.fix_replacing(self.item, head: wildcard, last: wildcard, text: "else"))
+                    }
+                    else => {}
+                }
+            }
+        }
+        ast::ArmPatterns.Else => {}
+    }
+    self.report_fixed(nir::Span.at(arm.token), code: diagnostic::Code.ExprOverlappingArms, fixes: take fixes)
+} Body.report_overlapping
+
+/// Reports an arm no value reaches, with the fix deleting it.
+fn Body.unreachable_arm(self, arm: ast::Arm) {
+    let last = match arm.body {
+        ast::ArmBody.Block(block) => block.end
+        ast::ArmBody.Expr(expr) => expr.last
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_deleting_lines(self.item, head: arm.token, last))
+    self.report_fixed(nir::Span(head: arm.token, last: last), code: diagnostic::Code.ExprUnreachableArm, fixes: take fixes)
+} Body.unreachable_arm
+
+/// The fix of a non-exhaustive match: after its last arm, an arm `P => todo "unhandled"` per
+/// variant no arm names when the values no arm matches all belong to those, and otherwise
+/// one arm `else => todo "unhandled"`.
+fn Body.missing_arms(self, ty: ty::Ty, rows: Slice[mem::List[Pat]], arms: Slice[ast::Arm]) -> Option[diagnostic::Fix] {
+    let alloc = self.ck.alloc()
+    if arms.len() == 0 {
+        return None
+    }
+    let last_arm = arms[arms.len() - 1]
+    let last = match last_arm.body {
+        ast::ArmBody.Block(block) => block.end
+        ast::ArmBody.Expr(expr) => expr.last
+    }
+    let indentation = self.ck.indentation(self.item, token: last_arm.token)
+    var named = mem::List[usize].empty(alloc)
+    for row in rows {
+        if row.len() == 0 {
+            continue
+        }
+        match row[0] {
+            Pat.Ctor(index: index, fields: _) => mut named.push(index)
+            else => {}
+        }
+    }
+    let patterns = self.unnamed_variants(ty, rows, named: named.view())
+    var added = text::String.empty(alloc)
+    for pattern in patterns {
+        mut added.append(indentation.as_str())
+        mut added.append(pattern.as_str())
+        mut added.append(" => todo \"unhandled\"\n")
+    }
+    let syntax = self.ck.db().syntax(self.item)
+    let line = usize.widen(syntax.tokens[usize.widen(last)].line)
+    var at = u32.fit(syntax.source.len())
+    if line < syntax.lines.len() {
+        at = syntax.lines[line].start
+    }
+    return Some(self.ck.fix_bytes(self.item, start: at, end: at, text: added.as_str()))
+} Body.missing_arms
+
+/// The patterns a non-exhaustive match's fix adds: a pattern per variant no row names when
+/// the values no row matches all belong to those, and otherwise `else`.
+fn Body.unnamed_variants(self, ty: ty::Ty, rows: Slice[mem::List[Pat]], named: Slice[usize]) -> mem::List[text::String] {
+    let Some(patterns) = self.variant_patterns(ty, rows, named) else {
+        var otherwise = mem::List[text::String].empty(self.ck.alloc())
+        mut otherwise.push(text::String.of("else", alloc: self.ck.alloc()))
+        return otherwise
+    }
+    return patterns
+} Body.unnamed_variants
+
+/// A pattern per variant no row names, when the scrutinee is an enum and the values no row
+/// matches all belong to those variants.
+fn Body.variant_patterns(self, ty: ty::Ty, rows: Slice[mem::List[Pat]], named: Slice[usize]) -> Option[mem::List[text::String]] {
+    let alloc = self.ck.alloc()
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        return None
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    var types = mem::List[ty::Ty].empty(alloc)
+    mut types.push(ty)
+    for index in named {
+        var wild = mem::List[Pat].empty(alloc)
+        for _ in 0..<self.payload_width(variants[index].payload) {
+            mut wild.push(Pat.Wild)
+        }
+        var vector = mem::List[Pat].empty(alloc)
+        mut vector.push(Pat.Ctor(index: index, fields: take wild))
+        if self.useful(rows, vector: vector.view(), types: types.view()) {
+            return None
+        }
+    }
+    var patterns = mem::List[text::String].empty(alloc)
+    for index in 0..<variants.len() {
+        if not holds_index(named, wanted: index) {
+            mut patterns.push(self.variant_pattern(item, variant: variants[index]))
+        }
+    }
+    return Some(take patterns)
+} Body.variant_patterns
+
+/// The number of payload values a variant's pattern matches.
+fn Body.payload_width(self, payload: Payload) -> usize {
+    return match payload {
+        Payload.None => 0
+        Payload.Single(_) => 1
+        Payload.Labelled(fields) => fields.len()
+    }
+} Body.payload_width
+
+/// A variant's pattern with `_` for each payload value, as the module writes it.
+fn Body.variant_pattern(self, enumeration: ty::ItemId, variant: VariantSig) -> text::String {
+    let alloc = self.ck.alloc()
+    let db = self.ck.db()
+    var core_variant = false
+    if db.is_std(enumeration) {
+        let path = db.canonical(enumeration)
+        core_variant = path.as_str() == "core::Option" or path.as_str() == "core::Result"
+    }
+    var written = text::String.empty(alloc)
+    if not core_variant {
+        written = self.ck.item_written(enumeration, from: self.module)
+        mut written.push('.')
+    }
+    mut written.append(variant.name.as_str())
+    match variant.payload {
+        Payload.None => {}
+        Payload.Single(_) => mut written.append("(_)")
+        Payload.Labelled(fields) => {
+            mut written.push('(')
+            for index in 0..<fields.len() {
+                if index > 0 {
+                    mut written.append(", ")
+                }
+                mut written.append(fields[index].name.as_str())
+                mut written.append(": _")
+            }
+            mut written.push(')')
+        }
+    }
+    return written
+} Body.variant_pattern
+
+/// Whether some value is matched by no row when every enum has only its declared variants.
+fn Body.useful_closed(self, rows: Slice[mem::List[Pat]], ty: ty::Ty) -> bool {
+    let alloc = self.ck.alloc()
+    let saved = self.closed.load()
+    self.closed.store(true)
+    var wild = mem::List[Pat].empty(alloc)
+    mut wild.push(Pat.Wild)
+    var types = mem::List[ty::Ty].empty(alloc)
+    mut types.push(ty)
+    let unmatched = self.useful(rows, vector: wild.view(), types: types.view())
+    self.closed.store(saved)
+    return unmatched
+} Body.useful_closed
+
+/// A pattern as exhaustiveness reads it; none when it names a const without a value.
+fn Body.pat(self, pattern: TPattern) -> Option[Pat] {
+    let alloc = self.ck.alloc()
+    match pattern.kind {
+        TPatternKind.Wildcard or TPatternKind.Binding(_) or TPatternKind.Failed => return Some(Pat.Wild)
+        TPatternKind.Value(space: space, compared: _) => {
+            return match space {
+                ValueSpace.Ints(low: low, high: high) => Some(Pat.Ints(low: low, high: high))
+                ValueSpace.Bool(value) => Some(Pat.Bool(value))
+                ValueSpace.Bytes(bytes) => Some(Pat.Bytes(copied_bytes(bytes.view(), alloc)))
+                ValueSpace.Unknown => None
+            }
+        }
+        TPatternKind.Fields(variant: variant, fields: fields) => {
+            var pats = mem::List[Pat].empty(alloc)
+            for field in fields {
+                let Some(pat) = self.pat(field.pattern) else {
+                    return None
+                }
+                mut pats.push(take pat)
+            }
+            let index = match variant {
+                Some(held) => held
+                None => 0
+            }
+            return Some(Pat.Ctor(index: index, fields: take pats))
+        }
+    }
+} Body.pat
+
+/// A copy of a pattern.
+fn Pat.copy(self, alloc: mem::Alloc) -> Pat {
+    return match self {
+        Pat.Wild => Pat.Wild
+        Pat.Ints(low: low, high: high) => Pat.Ints(low: low, high: high)
+        Pat.Bool(value) => Pat.Bool(value)
+        Pat.Bytes(bytes) => Pat.Bytes(copied_bytes(bytes.view(), alloc))
+        Pat.Ctor(index: index, fields: fields) => Pat.Ctor(index: index, fields: Pat.copied_row(fields.view(), alloc))
+    }
+} Pat.copy
+
+/// A copy of a row of patterns.
+fn Pat.copied_row(row: Slice[Pat], alloc: mem::Alloc) -> mem::List[Pat] {
+    var copy = mem::List[Pat].empty(alloc)
+    for pat in row {
+        mut copy.push(pat.copy(alloc))
+    }
+    return copy
+} Pat.copied_row
+
+/// The constructors of a type.
+fn Body.shape(self, ty: ty::Ty) -> Shape {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    match first types.kind(ty) {
+        ty::TyKind.Scalar(ty::Scalar.Bool) => return Shape.Bool
+        ty::TyKind.Scalar(ty::Scalar.Char) => {
+            var intervals = mem::List[Interval].empty(alloc)
+            mut intervals.push(Interval(low: wide::Wide.zero(), high: wide::Wide.of_u64(0xD7FF)))
+            mut intervals.push(Interval(low: wide::Wide.of_u64(0xE000), high: wide::Wide.of_u64(0x10_FFFF)))
+            return Shape.Ints(take intervals)
+        }
+        ty::TyKind.Scalar(scalar) if scalar.is_integer() => {
+            let range = scalar.range()
+            var intervals = mem::List[Interval].empty(alloc)
+            mut intervals.push(Interval(low: range.low, high: range.high))
+            return Shape.Ints(take intervals)
+        }
+        ty::TyKind.Unit => {
+            var fields = mem::List[mem::List[ty::Ty]].empty(alloc)
+            mut fields.push(mem::List[ty::Ty].empty(alloc))
+            return Shape.Ctors(fields: take fields, open: false)
+        }
+        ty::TyKind.Item(item: item, args: args) => return self.item_shape(item, args)
+        else => return Shape.Infinite
+    }
+} Body.shape
+
+/// The constructors of a struct, layout or enum instantiation.
+fn Body.item_shape(self, item: ty::ItemId, args: ty::Args) -> Shape {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    let db = self.ck.db()
+    let sig = self.ck.sig(item)
+    let subst = self.ck.generics_subst(sig.contents().generics.view(), args: types.arg_list(args))
+    var fields = mem::List[mem::List[ty::Ty]].empty(alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: struct_fields) => {
+            var row = mem::List[ty::Ty].empty(alloc)
+            for field in struct_fields {
+                mut row.push(subst.ty(types, ty: field.ty))
+            }
+            mut fields.push(take row)
+            return Shape.Ctors(fields: take fields, open: false)
+        }
+        SigKind.Layout(fields: layout_fields, tags: tags, bits: _) => {
+            if tags.len() == 0 {
+                var row = mem::List[ty::Ty].empty(alloc)
+                for field in layout_fields {
+                    mut row.push(field.ty)
+                }
+                mut fields.push(take row)
+            } else {
+                for _ in tags {
+                    mut fields.push(mem::List[ty::Ty].empty(alloc))
+                }
+            }
+            return Shape.Ctors(fields: take fields, open: false)
+        }
+        SigKind.Enum(variants: variants) => {
+            let open = not self.closed.load() and db.ast(item).has_modifier(ast::TypeModifier.Open) and db.package_of(item) != db.module(self.module).package_id
+            for variant in variants {
+                var row = mem::List[ty::Ty].empty(alloc)
+                match variant.payload {
+                    Payload.None => {}
+                    Payload.Single(single) => mut row.push(subst.ty(types, ty: single))
+                    Payload.Labelled(labelled) => {
+                        for field in labelled {
+                            mut row.push(subst.ty(types, ty: field.ty))
+                        }
+                    }
+                }
+                mut fields.push(take row)
+            }
+            return Shape.Ctors(fields: take fields, open: open)
+        }
+        else => return Shape.Infinite
+    }
+} Body.item_shape
+
+/// Whether `vector` matches a value no row of `matrix` matches. Every type being inhabited,
+/// when the first column misses a constructor of its type, the rows it starts with a wildcard
+/// decide alone.
+fn Body.useful(self, matrix: Slice[mem::List[Pat]], vector: Slice[Pat], types: Slice[ty::Ty]) -> bool {
+    let Some(vector_parts) = vector.split_at(1) else {
+        return matrix.len() == 0
+    }
+    let Some(type_parts) = types.split_at(1) else {
+        expect false
+        return false
+    }
+    let rest = vector_parts.tail
+    let ty = type_parts.head[0]
+    let rest_types = type_parts.tail
+    let alloc = self.ck.alloc()
+    match vector_parts.head[0] {
+        Pat.Ctor(index: index, fields: fields) => {
+            var next_types = self.ctor_fields(ty, index, count: fields.len())
+            let specialized = self.specialize(matrix, index, field_types: next_types.view())
+            var next = Pat.copied_row(fields.view(), alloc)
+            for pat in rest {
+                mut next.push(pat.copy(alloc))
+            }
+            for rest_ty in rest_types {
+                mut next_types.push(rest_ty)
+            }
+            return self.useful(specialized.view(), vector: next.view(), types: next_types.view())
+        }
+        Pat.Ints(low: low, high: high) => {
+            let pieces = self.split_ints(matrix, low, high)
+            for piece in pieces {
+                let rows = self.rows_covering_ints(matrix, low: piece.low, high: piece.high)
+                if self.useful(rows.view(), vector: rest, types: rest_types) {
+                    return true
+                }
+            }
+            return false
+        }
+        Pat.Bool(value) => {
+            let rows = self.rows_with(matrix, keep: fn(pattern: Pat) -> bool {
+                return match pattern {
+                    Pat.Wild => true
+                    Pat.Bool(held) => held == value
+                    else => false
+                }
+            })
+            return self.useful(rows.view(), vector: rest, types: rest_types)
+        }
+        Pat.Bytes(bytes) => {
+            let rows = self.rows_with(matrix, keep: fn(pattern: Pat) -> bool {
+                return match pattern {
+                    Pat.Wild => true
+                    Pat.Bytes(other) => other == bytes
+                    else => false
+                }
+            })
+            return self.useful(rows.view(), vector: rest, types: rest_types)
+        }
+        Pat.Wild => return self.useful_wild(matrix, rest, rest_types, ty)
+    }
+} Body.useful
+
+/// Whether a wildcard heading a vector matches a value no row of `matrix` matches, by the
+/// constructors of its type.
+fn Body.useful_wild(self, matrix: Slice[mem::List[Pat]], rest: Slice[Pat], rest_types: Slice[ty::Ty], ty: ty::Ty) -> bool {
+    let alloc = self.ck.alloc()
+    let shape = self.shape(ty)
+    match shape {
+        Shape.Bool => {
+            if not self.heads_hold_bool(matrix, value: true) or not self.heads_hold_bool(matrix, value: false) {
+                return self.useful_default(matrix, rest, rest_types)
+            }
+            return self.useful_bool(matrix, value: true, rest, rest_types) or self.useful_bool(matrix, value: false, rest, rest_types)
+        }
+        Shape.Ints(ranges) => {
+            var pieces = mem::List[Interval].empty(alloc)
+            for range in ranges {
+                for piece in self.split_ints(matrix, low: range.low, high: range.high) {
+                    mut pieces.push(piece)
+                }
+            }
+            for piece in pieces {
+                if not self.heads_cover(matrix, low: piece.low, high: piece.high) {
+                    return self.useful_default(matrix, rest, rest_types)
+                }
+            }
+            for piece in pieces {
+                let rows = self.rows_covering_ints(matrix, low: piece.low, high: piece.high)
+                if self.useful(rows.view(), vector: rest, types: rest_types) {
+                    return true
+                }
+            }
+            return false
+        }
+        Shape.Ctors(fields: fields, open: open) => {
+            if open {
+                return self.useful_default(matrix, rest, rest_types)
+            }
+            for index in 0..<fields.len() {
+                if not self.heads_hold_ctor(matrix, index) {
+                    return self.useful_default(matrix, rest, rest_types)
+                }
+            }
+            for index in 0..<fields.len() {
+                let field_types = fields[index]
+                let specialized = self.specialize(matrix, index, field_types: field_types.view())
+                var next = mem::List[Pat].empty(alloc)
+                var next_types = mem::List[ty::Ty].empty(alloc)
+                for field_ty in field_types {
+                    mut next.push(Pat.Wild)
+                    mut next_types.push(field_ty)
+                }
+                for pat in rest {
+                    mut next.push(pat.copy(alloc))
+                }
+                for rest_ty in rest_types {
+                    mut next_types.push(rest_ty)
+                }
+                if self.useful(specialized.view(), vector: next.view(), types: next_types.view()) {
+                    return true
+                }
+            }
+            return false
+        }
+        Shape.Infinite => return self.useful_default(matrix, rest, rest_types)
+    }
+} Body.useful_wild
+
+/// Whether the rest of a vector matches a value no row starting with a wildcard matches.
+fn Body.useful_default(self, matrix: Slice[mem::List[Pat]], rest: Slice[Pat], rest_types: Slice[ty::Ty]) -> bool {
+    let rows = self.rows_with(matrix, keep: fn(pattern: Pat) -> bool {
+        return match pattern {
+            Pat.Wild => true
+            else => false
+        }
+    })
+    return self.useful(rows.view(), vector: rest, types: rest_types)
+} Body.useful_default
+
+/// Whether the rest of a vector matches a value no row matching a bool value matches.
+fn Body.useful_bool(self, matrix: Slice[mem::List[Pat]], value: bool, rest: Slice[Pat], rest_types: Slice[ty::Ty]) -> bool {
+    let rows = self.rows_with(matrix, keep: fn(pattern: Pat) -> bool {
+        return match pattern {
+            Pat.Wild => true
+            Pat.Bool(held) => held == value
+            else => false
+        }
+    })
+    return self.useful(rows.view(), vector: rest, types: rest_types)
+} Body.useful_bool
+
+/// Whether a row of the matrix starts with a bool value.
+fn Body.heads_hold_bool(self, matrix: Slice[mem::List[Pat]], value: bool) -> bool {
+    for row in matrix {
+        if row.len() == 0 {
+            continue
+        }
+        match row[0] {
+            Pat.Bool(held) => {
+                if held == value {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} Body.heads_hold_bool
+
+/// Whether a row of the matrix starts with an interval holding every value of another.
+fn Body.heads_cover(self, matrix: Slice[mem::List[Pat]], low: wide::Wide, high: wide::Wide) -> bool {
+    for row in matrix {
+        if row.len() == 0 {
+            continue
+        }
+        match row[0] {
+            Pat.Ints(low: start, high: end) => {
+                if start <= low and high <= end {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} Body.heads_cover
+
+/// Whether a row of the matrix starts with constructor `index`.
+fn Body.heads_hold_ctor(self, matrix: Slice[mem::List[Pat]], index: usize) -> bool {
+    for row in matrix {
+        if row.len() == 0 {
+            continue
+        }
+        match row[0] {
+            Pat.Ctor(index: found, fields: _) => {
+                if found == index {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} Body.heads_hold_ctor
+
+/// The field types of a constructor of a type.
+fn Body.ctor_fields(self, ty: ty::Ty, index: usize, count: usize) -> mem::List[ty::Ty] {
+    let alloc = self.ck.alloc()
+    var field_types = mem::List[ty::Ty].empty(alloc)
+    let shape = self.shape(ty)
+    match shape {
+        Shape.Ctors(fields: fields, open: _) => {
+            if index < fields.len() {
+                for field_ty in fields[index] {
+                    mut field_types.push(field_ty)
+                }
+                return field_types
+            }
+        }
+        else => {}
+    }
+    for _ in 0..<count {
+        mut field_types.push(ty::Ty.error())
+    }
+    return field_types
+} Body.ctor_fields
+
+/// The rows of a matrix whose first pattern matches constructor `index`, its fields spread.
+fn Body.specialize(self, matrix: Slice[mem::List[Pat]], index: usize, field_types: Slice[ty::Ty]) -> mem::List[mem::List[Pat]] {
+    let alloc = self.ck.alloc()
+    var specialized = mem::List[mem::List[Pat]].empty(alloc)
+    for row in matrix {
+        let Some(parts) = row.view().split_at(1) else {
+            continue
+        }
+        var spread = mem::List[Pat].empty(alloc)
+        match parts.head[0] {
+            Pat.Wild => {
+                for _ in field_types {
+                    mut spread.push(Pat.Wild)
+                }
+            }
+            Pat.Ctor(index: found, fields: fields) => {
+                if found != index {
+                    continue
+                }
+                for field in fields {
+                    mut spread.push(field.copy(alloc))
+                }
+            }
+            else => continue
+        }
+        for pat in parts.tail {
+            mut spread.push(pat.copy(alloc))
+        }
+        mut specialized.push(take spread)
+    }
+    return specialized
+} Body.specialize
+
+fn Body.rows_with(self, matrix: Slice[mem::List[Pat]], keep: fn(pattern: Pat) -> bool) -> mem::List[mem::List[Pat]] {
+    let alloc = self.ck.alloc()
+    var kept = mem::List[mem::List[Pat]].empty(alloc)
+    for row in matrix {
+        let Some(parts) = row.view().split_at(1) else {
+            continue
+        }
+        if keep(parts.head[0]) {
+            mut kept.push(Pat.copied_row(parts.tail, alloc))
+        }
+    }
+    return kept
+} Body.rows_with
+
+/// The rows whose first pattern matches every value of an interval.
+fn Body.rows_covering_ints(self, matrix: Slice[mem::List[Pat]], low: wide::Wide, high: wide::Wide) -> mem::List[mem::List[Pat]] {
+    return self.rows_with(matrix, keep: fn(pattern: Pat) -> bool {
+        return match pattern {
+            Pat.Wild => true
+            Pat.Ints(low: start, high: end) => start <= low and high <= end
+            else => false
+        }
+    })
+} Body.rows_covering_ints
+
+/// An interval split at the bounds of the matrix's first-column intervals, so each part lies
+/// wholly inside or outside each of them.
+fn Body.split_ints(self, matrix: Slice[mem::List[Pat]], low: wide::Wide, high: wide::Wide) -> mem::List[Interval] {
+    let alloc = self.ck.alloc()
+    let one = wide::Wide.one()
+    var cuts = mem::List[wide::Wide].empty(alloc)
+    mut cuts.push(low)
+    mut cuts.push(high.wrapping_add(one))
+    for row in matrix {
+        if row.len() == 0 {
+            continue
+        }
+        match row[0] {
+            Pat.Ints(low: start, high: end) => {
+                let after = end.wrapping_add(one)
+                if start > low and start <= high {
+                    mut cuts.push(start)
+                }
+                if after > low and after <= high {
+                    mut cuts.push(after)
+                }
+            }
+            else => {}
+        }
+    }
+    mut cuts.sort_by(fn(left: wide::Wide, right: wide::Wide) => left.cmp(right))
+    var pieces = mem::List[Interval].empty(alloc)
+    var previous = cuts[0]
+    for index in 1..<cuts.len() {
+        let cut = cuts[index]
+        if cut == previous {
+            continue
+        }
+        mut pieces.push(Interval(low: previous, high: cut.wrapping_sub(one)))
+        previous = cut
+    }
+    return pieces
+} Body.split_ints
+
+/// Whether some value of `ty` matches both patterns.
+fn Body.overlap(self, left: Pat, right: Pat, ty: ty::Ty) -> bool {
+    match left {
+        Pat.Wild => return true
+        else => {}
+    }
+    match right {
+        Pat.Wild => return true
+        else => {}
+    }
+    match left {
+        Pat.Ints(low: a, high: b) => {
+            let Pat.Ints(low: c, high: d) = right else {
+                return false
+            }
+            return a <= d and c <= b
+        }
+        Pat.Bool(a) => {
+            let Pat.Bool(b) = right else {
+                return false
+            }
+            return a == b
+        }
+        Pat.Bytes(a) => {
+            let Pat.Bytes(b) = right else {
+                return false
+            }
+            return a == b
+        }
+        Pat.Ctor(index: a, fields: left_fields) => {
+            let Pat.Ctor(index: b, fields: right_fields) = right else {
+                return false
+            }
+            if a != b {
+                return false
+            }
+            let field_types = self.ctor_fields(ty, index: a, count: left_fields.len())
+            var count = left_fields.len()
+            if right_fields.len() < count {
+                count = right_fields.len()
+            }
+            if field_types.len() < count {
+                count = field_types.len()
+            }
+            for index in 0..<count {
+                if not self.overlap(left_fields[index], right: right_fields[index], ty: field_types[index]) {
+                    return false
+                }
+            }
+            return true
+        }
+        Pat.Wild => return true
+    }
+} Body.overlap
+
+/// The values a constant pattern matches: those equal to its const's value.
+fn ConstValue.value_space(self, alloc: mem::Alloc) -> ValueSpace {
+    match self.value {
+        Val.Int(value) => return ValueSpace.Ints(low: value, high: value)
+        Val.Char(c) => {
+            let code = wide::Wide.of_u64(u64.widen(c.to_bits()))
+            return ValueSpace.Ints(low: code, high: code)
+        }
+        Val.Bool(value) => return ValueSpace.Bool(value)
+        Val.View(view) => {
+            var bytes = mem::Bytes.empty(alloc)
+            for element in self.elements(view) {
+                mut bytes.push(u8.truncate(element.int_value().low_bits()))
+            }
+            return ValueSpace.Bytes(take bytes)
+        }
+        else => return ValueSpace.Unknown
+    }
+} ConstValue.value_space
+
+/// The pattern matching a value equal to a literal or const.
+fn PatternValue.equal(take self) -> TPatternKind {
+    let PatternValue(space: space, compared: compared) = self
+    return TPatternKind.Value(space: take space, compared: ValueTest.Eq(take compared))
+} PatternValue.equal
+
+fn is_screaming(name: Str) -> bool {
+    let bytes = name.as_bytes()
+    if bytes.len() < 2 or bytes[0] < b'A' or bytes[0] > b'Z' {
+        return false
+    }
+    for byte in bytes {
+        let upper = byte >= b'A' and byte <= b'Z'
+        let digit = byte >= b'0' and byte <= b'9'
+        if not upper and not digit and byte != b'_' {
+            return false
+        }
+    }
+    return true
+} is_screaming

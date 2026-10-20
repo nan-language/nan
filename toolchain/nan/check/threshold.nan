@@ -1,0 +1,252 @@
+//! Thresholds: the nesting depth and length of a function's block body, and the waivers accepting their excess.
+
+/// The deepest level a body may hold without a waiver.
+const DEPTH_THRESHOLD: usize = 4
+
+/// The most lines a body may hold without a waiver.
+const LENGTH_THRESHOLD: u32 = 80
+
+/// The thresholds of a function's or interface method's block body under its waivers.
+fn Checker.check_thresholds(self, item: ty::ItemId, clauses: Slice[ast::Clause], body: Option[ast::Block]) {
+    let db = self.db()
+    discard db.item(item)
+    var deep: Option[u32] = None
+    var long = false
+    match body {
+        Some(block) => {
+            deep = first_deep(block)
+            let end = db.line(item, token: block.end)
+            long = end.saturating_sub(db.line(item, token: block.token) + 1) > LENGTH_THRESHOLD
+        }
+        None => {}
+    }
+    var waived_depth = false
+    var waived_length = false
+    for clause in clauses {
+        let ast::ClauseKind.Waive(length: length, reason: reason) = clause.kind else {
+            continue
+        }
+        if spaces_only(reason.value.as_str()) {
+            self.report(item, token: reason.token, code: diagnostic::Code.ThresholdEmptyReason)
+        }
+        var exceeded = deep.is_some()
+        var waived = waived_depth
+        if length {
+            exceeded = long
+            waived = waived_length
+        }
+        if waived or not exceeded {
+            var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+            mut fixes.push(self.fix_deleting_lines(item, head: clause.token, last: reason.token))
+            self.report_fixed(item, construct: nir::Span(head: clause.token, last: reason.token), code: diagnostic::Code.ThresholdUnusedWaiver, fixes: take fixes, offer: diagnostic::Offer.Each)
+        }
+        if length {
+            waived_length = true
+        } else {
+            waived_depth = true
+        }
+    }
+    match deep {
+        Some(level) => {
+            if not waived_depth {
+                self.report(item, token: level, code: diagnostic::Code.ThresholdDepth)
+            }
+        }
+        None => {}
+    }
+    match body {
+        Some(block) => {
+            if long and not waived_length {
+                self.report(item, token: block.end, code: diagnostic::Code.ThresholdLength)
+            }
+        }
+        None => {}
+    }
+} Checker.check_thresholds
+
+/// Where the first level deeper than the threshold begins in a nesting root's block.
+fn first_deep(root: ast::Block) -> Option[u32] {
+    var found: Option[u32] = None
+    block_levels(root, depth: 0, found: mut found)
+    return found
+} first_deep
+
+/// The levels within a block standing at `depth`.
+fn block_levels(block: ast::Block, depth: usize, mut found: Option[u32]) {
+    for stmt in block.stmts {
+        match stmt.kind {
+            ast::StmtKind.Let(pattern: _, ty: _, value: value, otherwise: otherwise) => {
+                expr_levels(value, depth, found: mut found)
+                match otherwise {
+                    Some(other) => nested_level(other, depth, found: mut found)
+                    None => {}
+                }
+            }
+            ast::StmtKind.Var(name: _, ty: _, value: value) => expr_levels(value, depth, found: mut found)
+            ast::StmtKind.Discard(value) or ast::StmtKind.Defer(value) or ast::StmtKind.Undefer(value) => expr_levels(value, depth, found: mut found)
+            ast::StmtKind.Expect(value) or ast::StmtKind.Expr(value) => expr_levels(value, depth, found: mut found)
+            ast::StmtKind.Assume(condition: value, reason: _) => expr_levels(value, depth, found: mut found)
+            ast::StmtKind.While(condition: condition, body: loop_body) => {
+                expr_levels(condition, depth, found: mut found)
+                nested_level(loop_body.block, depth, found: mut found)
+            }
+            ast::StmtKind.For(pattern: _, iterated: iterated, body: loop_body) => {
+                expr_levels(iterated, depth, found: mut found)
+                nested_level(loop_body.block, depth, found: mut found)
+            }
+            ast::StmtKind.Loop(label: _, body: loop_body) => nested_level(loop_body.block, depth, found: mut found)
+            ast::StmtKind.Assign(target: target, op: _, op_token: _, value: value) => {
+                expr_levels(target, depth, found: mut found)
+                expr_levels(value, depth, found: mut found)
+            }
+        }
+    }
+} block_levels
+
+/// A block that is a level within one standing at `depth`.
+fn nested_level(block: ast::Block, depth: usize, mut found: Option[u32]) {
+    if depth + 1 > DEPTH_THRESHOLD and found.is_none() {
+        found = Some(block.token)
+    }
+    block_levels(block, depth: depth + 1, found: mut found)
+} nested_level
+
+/// The levels an expression holds at `depth`.
+fn expr_levels(expr: ast::Expr, depth: usize, mut found: Option[u32]) {
+    match expr.kind {
+        ast::ExprKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            expr_levels(condition.contents(), depth, found: mut found)
+            nested_level(then, depth, found: mut found)
+            match otherwise {
+                Some(other) => else_levels(other.contents(), depth, found: mut found)
+                None => {}
+            }
+        }
+        ast::ExprKind.Match(ordered: _, scrutinee: scrutinee, arms: arms) => {
+            expr_levels(scrutinee.contents(), depth, found: mut found)
+            for arm in arms {
+                arm_levels(arm, depth, found: mut found)
+            }
+        }
+        ast::ExprKind.Trusted(premise: _, body: trusted_body) => {
+            match trusted_body {
+                ast::TrustedBody.Block(block) => nested_level(block, depth, found: mut found)
+                ast::TrustedBody.Expr(inner) => expr_levels(inner.contents(), depth, found: mut found)
+            }
+        }
+        ast::ExprKind.When(accesses: _, body: when_body) => {
+            match when_body {
+                ast::WhenBody.Block(block) => nested_level(block, depth, found: mut found)
+                ast::WhenBody.Expr(inner) => expr_levels(inner.contents(), depth, found: mut found)
+            }
+        }
+        ast::ExprKind.Call(callee: callee, args: args) => {
+            expr_levels(callee.contents(), depth, found: mut found)
+            for index in 0..<args.len() {
+                arg_levels(args[index].value, last: index + 1 == args.len(), depth, found: mut found)
+            }
+        }
+        ast::ExprKind.Closure(closure) => closure_levels(closure.contents(), depth: Some(depth), found: mut found)
+        ast::ExprKind.Paren(inner) or ast::ExprKind.Dbg(inner) or ast::ExprKind.Fail(inner) => expr_levels(inner.contents(), depth, found: mut found)
+        ast::ExprKind.Field(base: inner, name: _) or ast::ExprKind.Unary(op: _, operand: inner) => expr_levels(inner.contents(), depth, found: mut found)
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) => expr_levels(inner.contents(), depth, found: mut found)
+        ast::ExprKind.Return(value) => {
+            match value {
+                Some(returned) => expr_levels(returned.contents(), depth, found: mut found)
+                None => {}
+            }
+        }
+        ast::ExprKind.Index(base: base, index: index) => {
+            expr_levels(base.contents(), depth, found: mut found)
+            expr_levels(index.contents(), depth, found: mut found)
+        }
+        ast::ExprKind.Binary(op: _, op_token: _, left: left, right: right) => {
+            expr_levels(left.contents(), depth, found: mut found)
+            expr_levels(right.contents(), depth, found: mut found)
+        }
+        ast::ExprKind.Quantifier(all: _, name: _, range: range, body: quantified) => {
+            expr_levels(range.contents(), depth, found: mut found)
+            expr_levels(quantified.contents(), depth, found: mut found)
+        }
+        else => {}
+    }
+} expr_levels
+
+/// A closure's levels: its block body a nesting root of its own when it is a call's last
+/// argument, a level at `depth` otherwise.
+fn closure_levels(closure: ast::Closure, depth: Option[usize], mut found: Option[u32]) {
+    match closure.body {
+        ast::ClosureBody.Block(block) => {
+            match depth {
+                None => block_levels(block, depth: 0, found: mut found)
+                Some(level) => nested_level(block, depth: level, found: mut found)
+            }
+        }
+        ast::ClosureBody.Short(short) => expr_levels(short.contents(), depth: depth.value_or(0), found: mut found)
+    }
+} closure_levels
+
+/// Whether an arm's expression body is one call with its markers.
+fn one_call(body: ast::Expr) -> bool {
+    return match body.kind {
+        ast::ExprKind.Call(callee: _, args: _) => true
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) => match inner.contents().kind {
+            ast::ExprKind.Call(callee: _, args: _) => true
+            else => false
+        }
+        else => false
+    }
+} one_call
+
+/// The levels of an `else`: a block is a level, an `else if` holds its own.
+fn else_levels(other: ast::Else, depth: usize, mut found: Option[u32]) {
+    match other {
+        ast::Else.Block(block) => nested_level(block, depth, found: mut found)
+        ast::Else.If(chained) => expr_levels(chained, depth, found: mut found)
+    }
+} else_levels
+
+/// The levels of a match arm: its guard's, and its body's, a level unless it is one call.
+fn arm_levels(arm: ast::Arm, depth: usize, mut found: Option[u32]) {
+    match arm.guard {
+        Some(guard) => expr_levels(guard, depth, found: mut found)
+        None => {}
+    }
+    match arm.body {
+        ast::ArmBody.Block(block) => nested_level(block, depth, found: mut found)
+        ast::ArmBody.Expr(arm_body) => {
+            if one_call(arm_body) {
+                expr_levels(arm_body, depth, found: mut found)
+                return
+            }
+            if depth + 1 > DEPTH_THRESHOLD and found.is_none() {
+                found = Some(arm_body.token)
+            }
+            expr_levels(arm_body, depth: depth + 1, found: mut found)
+        }
+    }
+} arm_levels
+
+/// The levels of a call argument: the last one, a closure, is a nesting root of its own.
+fn arg_levels(value: ast::Expr, last: bool, depth: usize, mut found: Option[u32]) {
+    match value.kind {
+        ast::ExprKind.Closure(closure) => {
+            if last {
+                closure_levels(closure.contents(), depth: None, found: mut found)
+                return
+            }
+        }
+        else => {}
+    }
+    expr_levels(value, depth, found: mut found)
+} arg_levels
+
+/// Whether a text holds only spaces.
+fn spaces_only(written: Str) -> bool {
+    for byte in written.as_bytes() {
+        if byte != b' ' {
+            return false
+        }
+    }
+    return true
+} spaces_only

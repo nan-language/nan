@@ -1,0 +1,294 @@
+//! Tests of writing and reading machine files.
+
+fn sample_lock(alloc: mem::Alloc) -> Lock {
+    var deps = mem::List[Locked].empty(alloc)
+    mut deps.push(Locked(package_name: text::String.of("meter", alloc), alias: Some(text::String.of("meter", alloc)), source: text::String.of("../meter", alloc), root: hashing::HashValue.of(b"meter"), line: 0))
+    mut deps.push(Locked(package_name: text::String.of("ring", alloc), alias: None, source: text::String.of("ring-store", alloc), root: hashing::HashValue.of(b"ring"), line: 0))
+    var approved = mem::List[Approval].empty(alloc)
+    mut approved.push(Approval(package_name: text::String.of("meter", alloc), entry: SummaryEntry.Alloc))
+    mut approved.push(Approval(package_name: text::String.of("meter", alloc), entry: SummaryEntry.Escape(kind: EscapeKind.Trusted, path: text::String.of("meter::read", alloc))))
+    var epochs = mem::List[ApprovedEpoch].empty(alloc)
+    mut epochs.push(ApprovedEpoch(path: text::String.of("meter::Total.add", alloc), epoch: 1))
+    return Lock(snapshot: 2, deps: take deps, approved: take approved, epochs: take epochs)
+} sample_lock
+
+/// The lines of a text, without their LF.
+fn lines_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    for index in 0..<bytes.len() {
+        if bytes[index] != b'\n' {
+            continue
+        }
+        let Some(line) = written.slice_bytes(start, end: index) else {
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = index + 1
+    }
+    if start < bytes.len() {
+        let Some(rest) = written.slice_bytes(start, end: bytes.len()) else {
+            return lines
+        }
+        mut lines.push(text::String.of(rest, alloc))
+    }
+    return lines
+} lines_of
+
+/// The lines of a machine file's bytes.
+fn file_lines(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[text::String] {
+    let Ok(written) = attempt text::String.try_from_utf8(bytes, alloc) else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    return lines_of(written.as_str(), alloc)
+} file_lines
+
+/// The bytes of a machine file with its line `line`, from 1, replaced and the check made to hold
+/// again.
+fn edited(bytes: Slice[u8], line: usize, replacement: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var lines = file_lines(bytes, alloc)
+    lines[line - 1] = text::String.of(replacement, alloc)
+    discard mut lines.pop()
+    var body = text::String.empty(alloc)
+    for held in lines {
+        mut body.append(held.as_str())
+        mut body.push('\n')
+    }
+    let check = hashing::HashValue.of(body.as_bytes()).full(alloc)
+    mut body.append("check \"")
+    mut body.append(check.as_str())
+    mut body.append("\"\n")
+    return take body.into_bytes()
+} edited
+
+/// The bytes with those at `at` replaced by `replacement`.
+fn replaced(bytes: Slice[u8], at: usize, replacement: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var changed = mem::Bytes.empty(alloc)
+    mut changed.append(bytes)
+    for index in 0..<replacement.len() {
+        changed[at + index] = replacement[index]
+    }
+    return changed
+} replaced
+
+test a_lock_reads_back_as_written for Lock.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var written = sample_lock(alloc)
+    let Some(bytes) = written.bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let expected = b"nan lock 1\nsnapshot 2\ndep meter alias meter \"../meter\" "
+    let Some(head) = bytes.view().prefix(expected.len()) else {
+        expect false
+        return
+    }
+    expect head == expected
+    let Ok(read_back) = Lock.read(bytes.view(), grammar, alloc) else {
+        expect false
+        return
+    }
+    for dep in mut written.deps {
+        for known in read_back.deps {
+            if known.package_name == dep.package_name {
+                dep.line = known.line
+            }
+        }
+    }
+    expect read_back == written
+} a_lock_reads_back_as_written
+
+test a_lock_line_with_a_wrong_checksum_is_invalid_on_its_line for Lock.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let Some(bytes) = sample_lock(alloc).bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let lines = file_lines(bytes.view(), alloc)
+    let line = lines[2].as_str()
+    let spelt = line.as_bytes()
+    var at = spelt.len() - 2
+    while spelt[at] != b' ' or spelt[at + 1] != b'"' {
+        at -= 1
+    }
+    let Some(kept) = line.slice_bytes(0, end: at) else {
+        expect false
+        return
+    }
+    var forged = text::String.of(kept, alloc)
+    mut forged.push(' ')
+    mut forged.append(escaped(hashing::HashValue.of(b"forged").full(alloc).as_str(), grammar, alloc).as_str())
+    let invalid = Lock.read(edited(bytes.view(), line: 3, replacement: forged.as_str(), alloc).view(), grammar, alloc)
+    expect invalid == Err(Invalid.at(3))
+} a_lock_line_with_a_wrong_checksum_is_invalid_on_its_line
+
+test reserved_lock_fields_and_versions_are_their_own_errors for Lock.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let Some(bytes) = sample_lock(alloc).bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let reserved = Lock.read(edited(bytes.view(), line: 4, replacement: "registry 1", alloc).view(), grammar, alloc)
+    expect reserved == Err(Invalid(code: diagnostic::Code.FormatReservedField, line: 4))
+    let version = Lock.read(edited(bytes.view(), line: 1, replacement: "nan lock 2", alloc).view(), grammar, alloc)
+    let Err(unsupported) = version else {
+        expect false
+        return
+    }
+    expect unsupported.code == diagnostic::Code.FormatMachineVersion
+} reserved_lock_fields_and_versions_are_their_own_errors
+
+test a_changed_byte_breaks_only_the_check for Lock.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let Some(bytes) = sample_lock(alloc).bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(bytes.view(), alloc) else {
+        expect false
+        return
+    }
+    let Some(at) = written.find("snapshot 2") else {
+        expect false
+        return
+    }
+    let changed = replaced(bytes.view(), at, replacement: b"snapshot 3", alloc)
+    let lines = file_lines(changed.view(), alloc)
+    let invalid = Lock.read(changed.view(), grammar, alloc)
+    expect invalid == Err(Invalid.at(u32.fit(lines.len())))
+} a_changed_byte_breaks_only_the_check
+
+test records_out_of_order_are_invalid for Lock.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var reordered = sample_lock(alloc)
+    let moved = mut reordered.deps.remove(0)
+    mut reordered.deps.push(take moved)
+    let Some(bytes) = reordered.bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let invalid = Lock.read(bytes.view(), grammar, alloc)
+    expect invalid == Err(Invalid.at(4))
+} records_out_of_order_are_invalid
+
+test a_history_reads_back_as_written for History.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    var tombstones = mem::List[text::String].empty(alloc)
+    mut tombstones.push(text::String.of("retired Counter.bump(mut self) => mut self.record() changes \"saturates\"", alloc))
+    var modules = mem::List[ModuleTombstones].empty(alloc)
+    mut modules.push(ModuleTombstones(module: text::String.of("meter", alloc), tombstones: take tombstones))
+    let history = History(name: text::String.of("meter", alloc), head: Some(hashing::HashValue.of(b"head")), modules: take modules)
+    let Some(bytes) = history.bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let Ok(read_back) = History.read(bytes.view(), grammar, alloc) else {
+        expect false
+        return
+    }
+    expect read_back == history
+    let Ok(written) = attempt text::String.try_from_utf8(bytes.view(), alloc) else {
+        expect false
+        return
+    }
+    let Some(at) = written.find("name") else {
+        expect false
+        return
+    }
+    let swapped = replaced(bytes.view(), at, replacement: b"head", alloc)
+    let Err(_) = History.read(swapped.view(), grammar, alloc) else {
+        expect false
+        return
+    }
+} a_history_reads_back_as_written
+
+fn sample_snapshot(alloc: mem::Alloc) -> Snapshot {
+    let hash = hashing::HashValue.of(b"interface")
+    var meter = ApiEntry.empty("example::Meter", alloc)
+    mut meter.text.push(text::String.of("pub open struct Meter {", alloc))
+    mut meter.text.push(text::String.of("} Meter", alloc))
+    mut meter.promises.push(Promise(property: text::String.of("Copy", alloc), params: mem::List[text::String].empty(alloc)))
+    var resting = mem::List[text::String].empty(alloc)
+    mut resting.push(text::String.of("T", alloc))
+    mut meter.promises.push(Promise(property: text::String.of("Send", alloc), params: take resting))
+    meter.interface_hash = Some(hash)
+    mut meter.docs.push(Doc(key: DocKey.Own, bound: hash, text: text::String.of("A count that stops at its limit.", alloc)))
+    var bump = ApiEntry.empty("example::Meter.bump", alloc)
+    mut bump.text.push(text::String.of("pub fn Meter.bump(mut self)", alloc))
+    bump.interface_hash = Some(hash)
+    mut bump.digests.push(TargetDigest(target: text::String.of("x86_64-host", alloc), digest: text::String.of("effects none | authority none | may-trap no | terminates", alloc)))
+    mut bump.docs.push(Doc(key: DocKey.Member(text::String.of("count", alloc)), bound: hash, text: text::String.of("Line one\nline \"two\"", alloc)))
+    bump.accepted.head = Some(text::String.of("pub fn Meter.bump(mut self)", alloc))
+    mut bump.accepted.clauses.push(text::String.of("ensures self.value() >= old(self.value())", alloc))
+    var expects = mem::List[hashing::HashValue].empty(alloc)
+    mut expects.push(hash)
+    mut bump.accepted.tests.push(AcceptedTest(path: text::String.of("example::bump_counts", alloc), params: text::String.empty(alloc), expects: take expects))
+    mut bump.pending.push(Pending(hash: hash, part: text::String.of("requires", alloc)))
+    var ordered = mem::Set[ClosureEntry].empty(alloc)
+    discard mut ordered.insert(ClosureEntry(path: text::String.of("hw::Ptr.read", alloc), body: false, hash: hash))
+    discard mut ordered.insert(ClosureEntry(path: text::String.of("hw::Ptr.read", alloc), body: true, hash: hash))
+    var sealed = mem::List[ClosureEntry].empty(alloc)
+    for entry in take ordered {
+        mut sealed.push(take entry)
+    }
+    mut bump.seals.push(Seal(principal: text::String.of("ana@example.org", alloc), item: hash, closure: hash, entries: take sealed, signature: None))
+    var scaled = ApiEntry.empty("example::Scaled", alloc)
+    var clauses = mem::List[text::String].empty(alloc)
+    mut clauses.push(text::String.of("ensures result > 0", alloc))
+    var weakened = mem::List[Pending].empty(alloc)
+    mut weakened.push(Pending(hash: hash, part: text::String.of("ensures result > 0", alloc)))
+    mut scaled.accepted.methods.push(Method(name: text::String.of("scale", alloc), head: text::String.of("fn scale(self) -> u32", alloc), clauses: take clauses, pending: take weakened))
+    var entries = mem::List[ApiEntry].empty(alloc)
+    mut entries.push(take meter)
+    mut entries.push(take bump)
+    mut entries.push(take scaled)
+    return Snapshot(entries: take entries)
+} sample_snapshot
+
+test an_api_snapshot_reads_back_as_written for Snapshot.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let snapshot = sample_snapshot(alloc)
+    let Some(bytes) = snapshot.bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let Ok(read_back) = Snapshot.read(bytes.view(), grammar, alloc) else {
+        expect false
+        return
+    }
+    expect read_back == snapshot
+} an_api_snapshot_reads_back_as_written
+
+test an_api_record_out_of_its_entry_order_is_invalid for Snapshot.read {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let Some(bytes) = sample_snapshot(alloc).bytes(grammar, alloc) else {
+        expect false
+        return
+    }
+    let lines = file_lines(bytes.view(), alloc)
+    var hashed: usize = 0
+    while not lines[hashed].starts_with("interface") {
+        hashed += 1
+    }
+    let once = edited(bytes.view(), line: hashed, replacement: lines[hashed].as_str(), alloc)
+    let swapped = edited(once.view(), line: hashed + 1, replacement: lines[hashed - 1].as_str(), alloc)
+    let invalid = Snapshot.read(swapped.view(), grammar, alloc)
+    expect invalid == Err(Invalid.at(u32.fit(hashed)))
+} an_api_record_out_of_its_entry_order_is_invalid
+
+test a_file_without_records_is_not_written for Snapshot.bytes {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let written = Snapshot.empty(alloc).bytes(grammar, alloc)
+    expect written.is_none()
+} a_file_without_records_is_not_written

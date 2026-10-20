@@ -1,8 +1,8 @@
 //! Storage whose elements never move, for the stores that give parts through a read receiver:
 //! segment k holds 4 × 2^k elements and is drawn through the allocator when first needed. Its
-//! header, in runtime memory, is its length, its allocator handle, each segment's address and
-//! the lock its insertions hold; reads take no lock, an element being written before the length
-//! grows past it.
+//! header, in runtime memory, is its length, its allocator handle, each segment's address, the
+//! lock its insertions hold, and for a once map its seed and its hash index's table record;
+//! reads by position take no lock, an element being written before the length grows past it.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -18,7 +18,9 @@ const ALLOC: u64 = 8;
 const SEGMENTS: u64 = 16;
 const COUNT: u64 = 58;
 pub const LOCK: u64 = SEGMENTS + 8 * COUNT;
-const SIZE: u64 = LOCK + 8;
+pub const SEED: u64 = LOCK + 8;
+pub const INDEX: u64 = SEED + 8;
+const SIZE: u64 = INDEX + 16;
 
 /// A new empty header drawing through an allocator handle.
 pub fn header(lo: &mut Lowering, fx: &mut Fx, alloc: Value) -> Value {

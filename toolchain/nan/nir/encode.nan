@@ -1,0 +1,866 @@
+//! The canonical NIR encoding of functions, types, literals and const values, naming items by canonical path and generic parameters by their position among the unit's.
+
+/// What the encoding writes for the items, members and generic parameters a unit names.
+pkg interface Names {
+    /// An item's canonical path, or a core vocabulary name's.
+    fn path(self, item: ty::ItemId) -> text::String
+    /// The name of an interface's method, by its index.
+    fn method(self, item: ty::ItemId, method: u32) -> text::String
+    /// The name of a register of a registers block, by its index.
+    fn register(self, block: ty::ItemId, register: u32) -> text::String
+    /// A generic parameter's position among the unit's.
+    fn param(self, param: ty::Param) -> u64
+    /// The types of the const parameters among the generic parameters a function reference or
+    /// an item's arguments bind, by position; none for a type parameter.
+    fn const_types(self, callable: Callable) -> mem::List[Option[ty::Scalar]]
+    /// Whether a read parameter of a type is passed by reference: the type is neither Copy nor
+    /// a view.
+    fn by_reference(self, ty: ty::Ty) -> bool
+} Names
+
+/// A scalar's position in the scalar table.
+pkg fn scalar_position(scalar: ty::Scalar) -> u64 {
+    return match scalar {
+        ty::Scalar.Unsigned8 => 0
+        ty::Scalar.Unsigned16 => 1
+        ty::Scalar.Unsigned32 => 2
+        ty::Scalar.Unsigned64 => 3
+        ty::Scalar.Signed8 => 4
+        ty::Scalar.Signed16 => 5
+        ty::Scalar.Signed32 => 6
+        ty::Scalar.Signed64 => 7
+        ty::Scalar.UnsignedSize => 8
+        ty::Scalar.SignedSize => 9
+        ty::Scalar.Float32 => 10
+        ty::Scalar.Float64 => 11
+        ty::Scalar.Bool => 12
+        ty::Scalar.Char => 13
+    }
+} scalar_position
+
+fn number(mut out: mem::Bytes, value: u64) {
+    encoding::uvar(mut out, value)
+} number
+
+fn text(mut out: mem::Bytes, value: Str) {
+    encoding::bytes(mut out, value: value.as_bytes())
+} text
+
+fn flag(mut out: mem::Bytes, value: bool) {
+    let bit: u64 = match value {
+        true => 1
+        false => 0
+    }
+    number(mut out, value: bit)
+} flag
+
+/// A list's count, which precedes its elements.
+fn count(mut out: mem::Bytes, len: usize) {
+    number(mut out, value: u64.widen(len))
+} count
+
+/// An integer of a scalar type: an svar for a signed type, a uvar otherwise.
+fn integer(mut out: mem::Bytes, value: wide::Wide, scalar: ty::Scalar) {
+    if scalar.is_signed() {
+        wide_svar(mut out, value)
+        return
+    }
+    wide_uvar(mut out, value)
+} integer
+
+/// The bits that a shift right by 7 keeps of a 128-bit value read as unsigned.
+const BELOW_121: wide::Wide = wide::Wide.max().shift_right(6)
+
+/// The 128 bits of a value, read as unsigned, as a uvar.
+fn wide_uvar(mut out: mem::Bytes, value: wide::Wide) {
+    var rest = value
+    loop {
+        let Some(small) = rest.to_u64() else {
+            mut out.push(u8.truncate(rest.low_bits() & 0x7F) | 0x80)
+            rest = rest.shift_right(7).bit_and(BELOW_121)
+            continue
+        }
+        encoding::uvar(mut out, value: small)
+        return
+    }
+} wide_uvar
+
+/// A signed 128-bit value as an svar: the uvar 2n when n is at least 0, and −2n − 1 otherwise.
+fn wide_svar(mut out: mem::Bytes, value: wide::Wide) {
+    let one = wide::Wide.one()
+    if value.is_negative() {
+        wide_uvar(mut out, value: value.wrapping_add(one).wrapping_neg().shift_left(1).bit_or(one))
+        return
+    }
+    wide_uvar(mut out, value: value.shift_left(1))
+} wide_svar
+
+/// A literal: its type, then its value.
+pkg fn literal(mut out: mem::Bytes, value: Literal) {
+    match value {
+        Literal.Int(value: _, scalar: scalar) or Literal.Float(bits: _, scalar: scalar) => scalar_type(mut out, scalar)
+        Literal.Bool(_) => scalar_type(mut out, scalar: ty::Scalar.Bool)
+        Literal.Char(_) => scalar_type(mut out, scalar: ty::Scalar.Char)
+        Literal.Text(_) => {
+            named_type(mut out, path: "core::Str")
+            number(mut out, value: 0)
+        }
+        Literal.Bytes(_) => {
+            named_type(mut out, path: "core::Slice")
+            number(mut out, value: 1)
+            scalar_type(mut out, scalar: ty::Scalar.Unsigned8)
+        }
+        Literal.Unit => number(mut out, value: 1)
+    }
+    literal_value(mut out, value)
+} literal
+
+/// A literal's value: an integer as an svar for a signed type and a uvar otherwise, a float as
+/// its bits least significant byte first, a `bool` or `char` as a uvar, text and bytes as bytes.
+pkg fn literal_value(mut out: mem::Bytes, value: Literal) {
+    match value {
+        Literal.Int(value: int, scalar: scalar) => integer(mut out, value: int, scalar)
+        Literal.Float(bits: bits, scalar: scalar) => {
+            var width: u32 = 8
+            if scalar == ty::Scalar.Float32 {
+                width = 4
+            }
+            for byte in 0..<width {
+                mut out.push(u8.truncate(bits >> (8 * byte)))
+            }
+        }
+        Literal.Bool(truth) => flag(mut out, value: truth)
+        Literal.Char(c) => number(mut out, value: u64.widen(c.to_bits()))
+        Literal.Text(written) => text(mut out, value: written.as_str())
+        Literal.Bytes(data) => encoding::bytes(mut out, value: data.view())
+        Literal.Unit => {}
+    }
+} literal_value
+
+fn scalar_type(mut out: mem::Bytes, scalar: ty::Scalar) {
+    number(mut out, value: 0)
+    number(mut out, value: scalar_position(scalar))
+} scalar_type
+
+fn named_type(mut out: mem::Bytes, path: Str) {
+    number(mut out, value: 3)
+    text(mut out, value: path)
+} named_type
+
+/// A word of a limits clause by its position in the `limit` rule, with `stack`'s size.
+struct LimitWord derives Copy {
+    word: u64
+    size: Option[u64]
+} LimitWord
+
+/// The position of each limit word in the `limit` rule, with `stack`'s size.
+fn limit_words(limit_set: ty::LimitSet, alloc: mem::Alloc) -> mem::List[LimitWord] {
+    var words = mem::List[LimitWord].empty(alloc)
+    if limit_set.pure {
+        mut words.push(LimitWord(word: 0, size: None))
+    }
+    if limit_set.notrap {
+        mut words.push(LimitWord(word: 1, size: None))
+    }
+    if limit_set.terminates {
+        mut words.push(LimitWord(word: 2, size: None))
+    }
+    if limit_set.noalloc {
+        mut words.push(LimitWord(word: 3, size: None))
+    }
+    let Some(size) = limit_set.stack else {
+        return words
+    }
+    mut words.push(LimitWord(word: 4, size: Some(size)))
+    return words
+} limit_words
+
+/// Writes NIR in the canonical encoding through what the unit names.
+pkg view struct Encoder {
+    pkg names: Dyn[Names]
+    pkg alloc: mem::Alloc
+} Encoder
+
+/// A limits clause: a list of its entries, each a record of its word and `stack`'s size.
+pkg fn Encoder.limits_clause(self, limit_set: ty::LimitSet) -> mem::Bytes {
+    var out = mem::Bytes.empty(self.alloc)
+    let words = limit_words(limit_set, alloc: self.alloc)
+    count(mut out, len: words.len())
+    for word in words {
+        var entry = encoding::Record.empty(self.alloc)
+        var content = mem::Bytes.empty(self.alloc)
+        number(mut content, value: word.word)
+        mut entry.field(1, content: take content)
+        match word.size {
+            Some(size) => {
+                var stack = mem::Bytes.empty(self.alloc)
+                number(mut stack, value: size)
+                mut entry.field(2, content: take stack)
+            }
+            None => {}
+        }
+        let finished = take entry.finish(self.alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Encoder.limits_clause
+
+/// The head of a function or function type as part 5 writes it, from key 3 on: its
+/// parameters, result, failure type, `uses wait`, limits and convention.
+pkg fn Encoder.fn_head(self, mut head: encoding::Record, types: ty::Types, fn_ty: ty::FnTy) {
+    var params = mem::Bytes.empty(self.alloc)
+    count(mut params, len: fn_ty.params.len())
+    for param in fn_ty.params {
+        var element = encoding::Record.empty(self.alloc)
+        var mode = mem::Bytes.empty(self.alloc)
+        number(mut mode, value: mode_position(param.mode))
+        mut element.field(1, content: take mode)
+        var name = mem::Bytes.empty(self.alloc)
+        text(mut name, value: param.name.as_str())
+        mut element.field(2, content: take name)
+        var param_type = mem::Bytes.empty(self.alloc)
+        self.param_ty(mut param_type, types, mode: param.mode, ty: param.ty)
+        mut element.field(3, content: take param_type)
+        let finished = take element.finish(self.alloc)
+        mut params.append(finished.view())
+    }
+    if fn_ty.params.len() > 0 {
+        mut head.field(3, content: take params)
+    }
+    var result = mem::Bytes.empty(self.alloc)
+    self.ty(mut result, types, ty: fn_ty.result)
+    mut head.field(4, content: take result)
+    match fn_ty.failure {
+        Some(failure) => {
+            var failed = mem::Bytes.empty(self.alloc)
+            self.ty(mut failed, types, ty: failure)
+            mut head.field(5, content: take failed)
+        }
+        None => {}
+    }
+    var wait = mem::Bytes.empty(self.alloc)
+    flag(mut wait, value: fn_ty.wait)
+    mut head.field(6, content: take wait)
+    if limit_words(fn_ty.limit_set, alloc: self.alloc).len() > 0 {
+        mut head.field(7, content: self.limits_clause(fn_ty.limit_set))
+    }
+    match fn_ty.convention {
+        Some(convention) => {
+            var content = mem::Bytes.empty(self.alloc)
+            text(mut content, value: convention.as_str())
+            mut head.field(8, content: take content)
+        }
+        None => {}
+    }
+} Encoder.fn_head
+
+/// A parameter's NIR type: its type, or a reference to it for a `mut` parameter and a read one
+/// of a type that is neither Copy nor a view.
+fn Encoder.param_ty(self, mut out: mem::Bytes, types: ty::Types, mode: ast::Mode, ty: ty::Ty) {
+    match first mode {
+        ast::Mode.Mut => number(mut out, value: 8)
+        ast::Mode.Read if self.names.by_reference(ty) => number(mut out, value: 7)
+        else => {}
+    }
+    self.ty(mut out, types, ty)
+} Encoder.param_ty
+
+pkg fn Encoder.ty(self, mut out: mem::Bytes, types: ty::Types, ty: ty::Ty) {
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => {
+            number(mut out, value: 0)
+            number(mut out, value: scalar_position(scalar))
+        }
+        ty::TyKind.Unit => number(mut out, value: 1)
+        ty::TyKind.Never => number(mut out, value: 2)
+        ty::TyKind.Item(item: item, args: args) => {
+            named_type(mut out, path: self.names.path(item).as_str())
+            let scalars = self.names.const_types(Callable.Item(item: item, role: Role.Body, index: 0))
+            self.args(mut out, types, args: types.arg_list(args), scalars: scalars.view())
+        }
+        ty::TyKind.Param(param) => {
+            number(mut out, value: 4)
+            number(mut out, value: self.names.param(param))
+        }
+        ty::TyKind.Fn(id) => {
+            let fn_ty = types.fn_of(id)
+            number(mut out, value: 6)
+            let kind: u64 = match fn_ty.kind {
+                ast::FnKind.Plain => 0
+                ast::FnKind.Interrupt => 1
+                ast::FnKind.Task => 2
+            }
+            number(mut out, value: kind)
+            var head = encoding::Record.empty(self.alloc)
+            self.fn_head(mut head, types, fn_ty)
+            let finished = take head.finish(self.alloc)
+            mut out.append(finished.view())
+        }
+        ty::TyKind.Dyn(bound) => {
+            named_type(mut out, path: "core::Dyn")
+            number(mut out, value: 1)
+            self.bound(mut out, types, bound)
+        }
+        ty::TyKind.Registers(block) => {
+            named_type(mut out, path: self.names.path(block).as_str())
+            number(mut out, value: 0)
+        }
+        ty::TyKind.Error => {
+            expect false
+        }
+    }
+} Encoder.ty
+
+pkg fn Encoder.nty(self, mut out: mem::Bytes, types: ty::Types, ty: NTy) {
+    match ty {
+        NTy.Owned(owned) => self.ty(mut out, types, ty: owned)
+        NTy.Ref(designated) => {
+            number(mut out, value: 7)
+            self.ty(mut out, types, ty: designated)
+        }
+        NTy.RefMut(designated) => {
+            number(mut out, value: 8)
+            self.ty(mut out, types, ty: designated)
+        }
+    }
+} Encoder.nty
+
+/// An interface with its arguments, as a named type.
+pkg fn Encoder.bound(self, mut out: mem::Bytes, types: ty::Types, bound: ty::Bound) {
+    named_type(mut out, path: self.names.path(bound.item).as_str())
+    let scalars = self.names.const_types(Callable.Item(item: bound.item, role: Role.Body, index: 0))
+    self.args(mut out, types, args: types.arg_list(bound.args), scalars: scalars.view())
+} Encoder.bound
+
+/// Generic arguments: a type, or a const argument as the literal of its parameter's type.
+fn Encoder.args(
+    self,
+    mut out: mem::Bytes,
+    types: ty::Types,
+    args: Slice[ty::Arg],
+    scalars: Slice[Option[ty::Scalar]],
+    ) {
+    count(mut out, len: args.len())
+    for position in 0..<args.len() {
+        match args[position] {
+            ty::Arg.Ty(arg) => self.ty(mut out, types, ty: arg)
+            ty::Arg.Const(constant) => {
+                var scalar: Option[ty::Scalar] = None
+                if position < scalars.len() {
+                    scalar = scalars[position]
+                }
+                self.const_arg(mut out, constant, scalar)
+            }
+        }
+    }
+} Encoder.args
+
+fn Encoder.const_arg(self, mut out: mem::Bytes, constant: ty::Const, scalar: Option[ty::Scalar]) {
+    match constant {
+        ty::Const.Param(param) => {
+            number(mut out, value: 4)
+            number(mut out, value: self.names.param(param))
+        }
+        ty::Const.Int(value) => {
+            let chosen = match scalar {
+                Some(known) => known
+                None => ty::Scalar.UnsignedSize
+            }
+            number(mut out, value: 5)
+            literal(mut out, value: Literal.Int(value: value, scalar: chosen))
+        }
+        ty::Const.Bool(value) => {
+            number(mut out, value: 5)
+            literal(mut out, value: Literal.Bool(value))
+        }
+        ty::Const.Error => {
+            expect false
+        }
+    }
+} Encoder.const_arg
+
+/// A function reference: its canonical path, role and index, and type arguments.
+pkg fn Encoder.fn_ref(self, mut out: mem::Bytes, types: ty::Types, callee: FnRef) {
+    var path = text::String.empty(self.alloc)
+    var role: u64 = 0
+    var index: u32 = 0
+    match callee.callable {
+        Callable.Item(item: item, role: item_role, index: item_index) => {
+            mut path.append(self.names.path(item).as_str())
+            role = role_position(item_role)
+            index = item_index
+        }
+        Callable.Method(item: item, method: method) => {
+            mut path.append(self.names.path(item).as_str())
+            mut path.push('.')
+            mut path.append(self.names.method(item, method).as_str())
+        }
+        Callable.Derived(owner: owner, method: method) => {
+            mut path.append(self.names.path(owner).as_str())
+            mut path.push('.')
+            mut path.append(method.as_str())
+        }
+        Callable.Builtin(Builtin.Conversion(conversion: conversion, scalar: scalar)) => {
+            mut path.append(scalar.name())
+            mut path.push('.')
+            mut path.append(conversion.word())
+        }
+        Callable.Builtin(Builtin.Bits(conversion: conversion, owner: owner)) => {
+            match owner {
+                BitsOwner.Scalar(scalar) => mut path.append(scalar.name())
+                BitsOwner.Layout(item) => mut path.append(self.names.path(item).as_str())
+            }
+            mut path.push('.')
+            mut path.append(conversion.word())
+        }
+        Callable.Builtin(Builtin.Intrinsic(intrinsic)) => mut path.append(intrinsic.as_str())
+    }
+    text(mut out, value: path.as_str())
+    number(mut out, value: role)
+    number(mut out, value: u64.widen(index))
+    let scalars = self.names.const_types(callee.callable)
+    self.args(mut out, types, args: types.arg_list(callee.args), scalars: scalars.view())
+} Encoder.fn_ref
+
+fn Encoder.place(self, mut out: mem::Bytes, place: Place) {
+    number(mut out, value: u64.widen(place.root.index))
+    count(mut out, len: place.steps.len())
+    for step in place.steps {
+        text(mut out, value: step.as_str())
+    }
+} Encoder.place
+
+fn Encoder.operand(self, mut out: mem::Bytes, operand: Operand) {
+    match operand {
+        Operand.Value(value) => {
+            number(mut out, value: 0)
+            number(mut out, value: u64.widen(value.index))
+        }
+        Operand.Literal(value) => {
+            number(mut out, value: 1)
+            literal(mut out, value)
+        }
+        Operand.Place(mode: mode, place: place) => {
+            number(mut out, value: 2)
+            number(mut out, value: mode_position(mode))
+            self.place(mut out, place)
+        }
+    }
+} Encoder.operand
+
+fn Encoder.operands(self, mut out: mem::Bytes, operands: Slice[Operand]) {
+    count(mut out, len: operands.len())
+    for operand in operands {
+        self.operand(mut out, operand)
+    }
+} Encoder.operands
+
+fn Encoder.region(self, mut out: mem::Bytes, region: Region) {
+    count(mut out, len: region.blocks.len())
+    for block in region.blocks {
+        number(mut out, value: u64.widen(block.index))
+    }
+} Encoder.region
+
+/// An instruction: its opcode, its premise marker, then its parts in notation order.
+fn Encoder.inst(self, mut out: mem::Bytes, types: ty::Types, inst: Inst)
+    waive length "one arm per operation"
+{
+    number(mut out, value: opcode(inst.op))
+    let marker: u64 = match inst.premise {
+        Some(premise) => u64.widen(premise) + 1
+        None => 0
+    }
+    number(mut out, value: marker)
+    match inst.op {
+        Op.Slot(name: _, ty: slot) => self.ty(mut out, types, ty: slot)
+        Op.Load(place) or Op.Move(place) or Op.Release(place) => self.place(mut out, place)
+        Op.Ref(place) => {
+            flag(mut out, value: false)
+            self.place(mut out, place)
+        }
+        Op.RefMut(place) => {
+            flag(mut out, value: true)
+            self.place(mut out, place)
+        }
+        Op.Init(place: place, operand: operand) or Op.Assign(place: place, operand: operand) => {
+            self.place(mut out, place)
+            self.operand(mut out, operand)
+        }
+        Op.FnRef(callee) => self.fn_ref(mut out, types, callee)
+        Op.Constant(constant) => match constant {
+            Constant.Item(item) => {
+                number(mut out, value: 0)
+                text(mut out, value: self.names.path(item).as_str())
+            }
+            Constant.Param(param) => {
+                number(mut out, value: 1)
+                number(mut out, value: self.names.param(param))
+            }
+            Constant.Register(block: block, register: register) => {
+                number(mut out, value: 0)
+                var path = self.names.path(block)
+                mut path.push('.')
+                mut path.append(self.names.register(block, register).as_str())
+                text(mut out, value: path.as_str())
+            }
+        }
+        Op.Construct(ty: construct, fields: fields) => {
+            self.ty(mut out, types, ty: construct)
+            count(mut out, len: fields.len())
+            for field in fields {
+                self.operand(mut out, operand: field.operand)
+            }
+        }
+        Op.Variant(ty: enum_ty, variant: variant, payload: payload) => {
+            self.ty(mut out, types, ty: enum_ty)
+            text(mut out, value: variant.as_str())
+            self.payload(mut out, payload)
+        }
+        Op.Is(place: place, ty: enum_ty, variant: variant) => {
+            self.place(mut out, place)
+            self.ty(mut out, types, ty: enum_ty)
+            text(mut out, value: variant.as_str())
+        }
+        Op.Closure(index: index, captures: captures) => {
+            number(mut out, value: u64.widen(index))
+            self.operands(mut out, operands: captures.view())
+        }
+        Op.Convert(value: value, to: to, via: via) => {
+            self.operand(mut out, operand: value)
+            self.ty(mut out, types, ty: to)
+            match via {
+                Some(variant) => {
+                    number(mut out, value: 1)
+                    text(mut out, value: variant.as_str())
+                }
+                None => number(mut out, value: 0)
+            }
+        }
+        Op.Unary(op: _, operand: operand) or Op.Assume(operand) or Op.Dbg(operand) => self.operand(mut out, operand)
+        Op.Binary(op: _, left: left, right: right) => {
+            self.operand(mut out, operand: left)
+            self.operand(mut out, operand: right)
+        }
+        Op.Call(call) => self.call_parts(mut out, types, call)
+        Op.Check(kind: kind, operand: operand, open: _) => {
+            number(mut out, value: check_position(kind))
+            self.operand(mut out, operand)
+        }
+        Op.Quantifier(all: _, low: low, high: high, inclusive: inclusive, region: region) => {
+            self.operand(mut out, operand: low)
+            flag(mut out, value: inclusive)
+            self.operand(mut out, operand: high)
+            self.region(mut out, region)
+        }
+        Op.When(attempted: attempted, accesses: accesses, region: region) => {
+            flag(mut out, value: attempted)
+            self.operands(mut out, operands: accesses.view())
+            self.region(mut out, region)
+        }
+    }
+} Encoder.inst
+
+fn Encoder.payload(self, mut out: mem::Bytes, payload: Payload) {
+    match payload {
+        Payload.None => number(mut out, value: 0)
+        Payload.Single(operand) => {
+            number(mut out, value: 1)
+            self.operand(mut out, operand)
+        }
+        Payload.Labelled(fields) => {
+            number(mut out, value: 2)
+            count(mut out, len: fields.len())
+            for field in fields {
+                self.operand(mut out, operand: field.operand)
+            }
+        }
+    }
+} Encoder.payload
+
+/// A call's parts after its opcode: `await`, its callee and its operands.
+fn Encoder.call_parts(self, mut out: mem::Bytes, types: ty::Types, call: Call) {
+    flag(mut out, value: call.awaited)
+    match call.callee {
+        Callee.Fn(callee) => self.fn_ref(mut out, types, callee)
+        Callee.Value(value) => number(mut out, value: u64.widen(value.index))
+        Callee.Dyn(place: place, item: item, method: method) => {
+            self.place(mut out, place)
+            text(mut out, value: self.names.path(item).as_str())
+            text(mut out, value: self.names.method(item, method).as_str())
+        }
+    }
+    self.operands(mut out, operands: call.args.view())
+} Encoder.call_parts
+
+fn Encoder.target(self, mut out: mem::Bytes, jump: Jump) {
+    number(mut out, value: u64.widen(jump.block.index))
+    self.operands(mut out, operands: jump.args.view())
+} Encoder.target
+
+fn Encoder.terminator(self, mut out: mem::Bytes, types: ty::Types, term: Terminator) {
+    match term {
+        Terminator.Jump(jump) => {
+            number(mut out, value: 42)
+            self.target(mut out, jump)
+        }
+        Terminator.Branch(operand: operand, then: then, otherwise: otherwise) => {
+            number(mut out, value: 43)
+            self.operand(mut out, operand)
+            self.target(mut out, jump: then)
+            self.target(mut out, jump: otherwise)
+        }
+        Terminator.Call(call: call, ok: ok, failure: failure) => {
+            number(mut out, value: 44)
+            number(mut out, value: call_opcode(call))
+            number(mut out, value: 0)
+            self.call_parts(mut out, types, call)
+            number(mut out, value: u64.widen(ok.index))
+            number(mut out, value: u64.widen(failure.index))
+        }
+        Terminator.Return(returned) => {
+            number(mut out, value: 45)
+            match returned {
+                Some(operand) => {
+                    number(mut out, value: 1)
+                    self.operand(mut out, operand)
+                }
+                None => number(mut out, value: 0)
+            }
+        }
+        Terminator.Fail(operand) => {
+            number(mut out, value: 46)
+            self.operand(mut out, operand)
+        }
+        Terminator.Todo(intent) => {
+            number(mut out, value: 47)
+            text(mut out, value: intent.as_str())
+        }
+        Terminator.Unreachable => number(mut out, value: 48)
+        Terminator.Yield(operand) => {
+            number(mut out, value: 49)
+            self.operand(mut out, operand)
+        }
+    }
+} Encoder.terminator
+
+fn Encoder.block(
+    self,
+    mut out: mem::Bytes,
+    types: ty::Types,
+    function: Function,
+    block: Block,
+    ) {
+    count(mut out, len: block.params.len())
+    for value in block.params {
+        self.nty(mut out, types, ty: function.ty(value))
+    }
+    count(mut out, len: block.insts.len())
+    for inst in block.insts {
+        self.inst(mut out, types, inst)
+    }
+    self.terminator(mut out, types, term: block.term)
+} Encoder.block
+
+/// A function: its role, index, parameters, result, failure type, wait flag and blocks, and
+/// for a closure its kind and limits.
+pkg fn Encoder.function(self, types: ty::Types, function: Function) -> mem::Bytes {
+    var record = encoding::Record.empty(self.alloc)
+    var role = mem::Bytes.empty(self.alloc)
+    number(mut role, value: role_position(function.role))
+    mut record.field(1, content: take role)
+    var index = mem::Bytes.empty(self.alloc)
+    number(mut index, value: u64.widen(function.index))
+    mut record.field(2, content: take index)
+    var params = mem::Bytes.empty(self.alloc)
+    count(mut params, len: function.params.len())
+    for param in function.params {
+        number(mut params, value: mode_position(param.mode))
+        self.nty(mut params, types, ty: function.ty(param.value))
+    }
+    mut record.field(3, content: take params)
+    var result = mem::Bytes.empty(self.alloc)
+    self.ty(mut result, types, ty: function.result)
+    mut record.field(4, content: take result)
+    match function.failure {
+        Some(failure) => {
+            var failed = mem::Bytes.empty(self.alloc)
+            self.ty(mut failed, types, ty: failure)
+            mut record.field(5, content: take failed)
+        }
+        None => {}
+    }
+    var wait = mem::Bytes.empty(self.alloc)
+    flag(mut wait, value: function.wait)
+    mut record.field(6, content: take wait)
+    var blocks = mem::Bytes.empty(self.alloc)
+    count(mut blocks, len: function.blocks.len())
+    for block in function.blocks {
+        self.block(mut blocks, types, function, block)
+    }
+    mut record.field(7, content: take blocks)
+    match function.closure {
+        Some(closure) => {
+            var head = encoding::Record.empty(self.alloc)
+            var kind = mem::Bytes.empty(self.alloc)
+            flag(mut kind, value: closure.task)
+            mut head.field(1, content: take kind)
+            if limit_words(closure.limit_set, alloc: self.alloc).len() > 0 {
+                mut head.field(2, content: self.limits_clause(closure.limit_set))
+            }
+            mut record.field(8, content: take head.finish(self.alloc))
+        }
+        None => {}
+    }
+    return take record.finish(self.alloc)
+} Encoder.function
+
+/// A role's position in the role table.
+fn role_position(role: Role) -> u64 {
+    return match role {
+        Role.Body => 0
+        Role.Entry => 1
+        Role.Closure => 2
+        Role.Requires => 3
+        Role.Ensures => 4
+        Role.Old => 5
+        Role.Example => 6
+        Role.Decreases => 7
+        Role.Invariant => 8
+        Role.Assume => 9
+        Role.Predicate => 10
+        Role.Where => 11
+        Role.Default => 12
+    }
+} role_position
+
+/// A mode's position among `read`, `mut` and `take`.
+fn mode_position(mode: ast::Mode) -> u64 {
+    return match mode {
+        ast::Mode.Read => 0
+        ast::Mode.Mut => 1
+        ast::Mode.Take => 2
+    }
+} mode_position
+
+fn check_position(kind: CheckKind) -> u64 {
+    return match kind {
+        CheckKind.Requires => 0
+        CheckKind.Ensures => 1
+        CheckKind.Predicate => 2
+        CheckKind.Expect => 3
+        CheckKind.Invariant => 4
+        CheckKind.Decreases => 5
+    }
+} check_position
+
+fn call_opcode(call: Call) -> u64 {
+    return match call.callee {
+        Callee.Fn(_) => 33
+        Callee.Value(_) => 34
+        Callee.Dyn(place: _, item: _, method: _) => 35
+    }
+} call_opcode
+
+/// An instruction's opcode: the names of the instruction list numbered from 0, each `call`
+/// entry once.
+fn opcode(op: Op) -> u64 {
+    return match op {
+        Op.Slot(name: _, ty: _) => 0
+        Op.Load(_) => 1
+        Op.Move(_) => 2
+        Op.Ref(_) or Op.RefMut(_) => 3
+        Op.Init(place: _, operand: _) => 4
+        Op.Assign(place: _, operand: _) => 5
+        Op.Release(_) => 6
+        Op.FnRef(_) => 7
+        Op.Constant(_) => 8
+        Op.Construct(ty: _, fields: _) => 9
+        Op.Variant(ty: _, variant: _, payload: _) => 10
+        Op.Is(place: _, ty: _, variant: _) => 11
+        Op.Closure(index: _, captures: _) => 12
+        Op.Convert(value: _, to: _, via: _) => 13
+        Op.Unary(op: UnaryOp.Neg, operand: _) => 14
+        Op.Binary(op: binary, left: _, right: _) => match binary {
+            BinaryOp.Add => 15
+            BinaryOp.Sub => 16
+            BinaryOp.Mul => 17
+            BinaryOp.Div => 18
+            BinaryOp.Rem => 19
+            BinaryOp.Shl => 20
+            BinaryOp.Shr => 21
+            BinaryOp.Band => 22
+            BinaryOp.Bor => 23
+            BinaryOp.Bxor => 24
+            BinaryOp.Eq => 26
+            BinaryOp.Ne => 27
+            BinaryOp.Lt => 28
+            BinaryOp.Le => 29
+            BinaryOp.Gt => 30
+            BinaryOp.Ge => 31
+        }
+        Op.Unary(op: UnaryOp.Inv, operand: _) => 25
+        Op.Unary(op: UnaryOp.Not, operand: _) => 32
+        Op.Call(call) => call_opcode(call)
+        Op.Check(kind: _, operand: _, open: _) => 36
+        Op.Assume(_) => 37
+        Op.Quantifier(all: true, low: _, high: _, inclusive: _, region: _) => 38
+        Op.Quantifier(all: false, low: _, high: _, inclusive: _, region: _) => 39
+        Op.When(attempted: _, accesses: _, region: _) => 40
+        Op.Dbg(_) => 41
+    }
+} opcode
+
+test a_literal_is_its_type_then_its_value for literal {
+    let alloc = testing::world().alloc
+    var out = mem::Bytes.empty(alloc)
+    literal(mut out, value: Literal.Int(value: wide::Wide.of_u64(300), scalar: ty::Scalar.Unsigned16))
+    expect out.view() == b"\x00\x01\xAC\x02"
+    mut out.truncate(0)
+    literal(mut out, value: Literal.Int(value: wide::Wide.of_i64(-2), scalar: ty::Scalar.Signed8))
+    expect out.view() == b"\x00\x04\x03"
+    mut out.truncate(0)
+    literal(mut out, value: Literal.Text(text::String.of("ok", alloc)))
+    expect out.view() == b"\x03\x09core::Str\x00\x02ok"
+} a_literal_is_its_type_then_its_value
+
+/// The names of a unit that names no item, member or generic parameter.
+struct Unnamed {
+    alloc: mem::Alloc
+} Unnamed
+
+impl Unnamed: Names
+
+fn Unnamed.path(self, item: ty::ItemId) -> text::String = text::String.empty(self.alloc)
+
+fn Unnamed.method(self, item: ty::ItemId, method: u32) -> text::String = text::String.empty(self.alloc)
+
+fn Unnamed.register(self, block: ty::ItemId, register: u32) -> text::String = text::String.empty(self.alloc)
+
+fn Unnamed.param(self, param: ty::Param) -> u64 = 0
+
+fn Unnamed.const_types(self, callable: Callable) -> mem::List[Option[ty::Scalar]] = mem::List[Option[ty::Scalar]].empty(self.alloc)
+
+fn Unnamed.by_reference(self, ty: ty::Ty) -> bool = false
+
+test a_function_is_a_record_of_its_parts for Encoder.function {
+    let alloc = testing::world().alloc
+    let names = Unnamed(alloc: alloc)
+    let encoder = Encoder(names: Dyn[Names].view(names), alloc: alloc)
+    let span = Span.at(0)
+    var params = mem::List[Param].empty(alloc)
+    mut params.push(Param(mode: ast::Mode.Read, value: Value(index: 0), name: text::String.of("value", alloc), span: span))
+    mut params.push(Param(mode: ast::Mode.Read, value: Value(index: 1), name: text::String.of("result", alloc), span: span))
+    let bound = Operand.Literal(Literal.Int(value: wide::Wide.of_u64(100), scalar: ty::Scalar.Unsigned8))
+    var insts = mem::List[Inst].empty(alloc)
+    mut insts.push(Inst(result: Some(Value(index: 2)), premise: None, op: Op.Binary(op: BinaryOp.Le, left: Operand.Value(Value(index: 1)), right: take bound), span: span))
+    var blocks = mem::List[Block].empty(alloc)
+    mut blocks.push(Block(params: mem::List[Value].empty(alloc), insts: take insts, term: Terminator.Return(Some(Operand.Value(Value(index: 2)))), term_span: span))
+    var values = mem::List[NTy].empty(alloc)
+    mut values.push(NTy.Owned(ty::Ty.scalar(ty::Scalar.Unsigned32)))
+    mut values.push(NTy.Owned(ty::Ty.scalar(ty::Scalar.Unsigned8)))
+    mut values.push(NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)))
+    let function = Function(role: Role.Ensures, index: 0, params: take params, result: ty::Ty.scalar(ty::Scalar.Bool), failure: None, wait: false, closure: None, blocks: take blocks, types: take values, span: span)
+    let encoded = encoder.function(ty::Types.empty(alloc), function)
+    expect encoded.view() == b"\x06\x01\x01\x04\x02\x01\x00\x03\x07\x02\x00\x00\x02\x00\x00\x00\x04\x02\x00\x0C\x06\x01\x00\x07\x0F\x01\x00\x01\x1D\x00\x00\x01\x01\x00\x00\x64\x2D\x01\x00\x02"
+} a_function_is_a_record_of_its_parts

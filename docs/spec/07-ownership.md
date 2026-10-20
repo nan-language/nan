@@ -264,7 +264,7 @@ At a call of a projection:
 
 - The call is a read access to the receiver for a read projection and a `mut` access for a mut projection. A non-Copy result keeps that access active as a [hold](#holds).
 - A result whose type is Copy at the call holds nothing and is copied when used as a value. The exception is a part written through [indexing](#indexing) or passed to a `mut` parameter: it is the place it projects, and its hold lasts until the end of its statement.
-- A part is never moved (`own.move-not-owned`). It is bound as a [view binding](#view-bindings), used within its statement as a receiver, the object of a field access, a read or `mut` argument or a matched value, discarded, returned from a projection, or wrapped, unmarked, in `Some`, `Ok` or `Err`, which builds a wrapped part.
+- A part is never moved (`own.move-not-owned`). It is bound as a [view binding](#view-bindings), used within its statement as a receiver, the object of a field access, a read or `mut` argument or a matched value, discarded, returned from a projection, wrapped, unmarked, in `Some`, `Ok` or `Err`, which builds a wrapped part, or yielded by a branch of a value-yielding `if` or `match`. Such an `if` or `match` whose branches each yield a part that is not Copy or diverge is a part; any other moves in the value each branch yields.
 - A wrapped part is bound as a view binding, used within its statement as a read receiver, a read argument or an operand of an operator, used as a matched value, discarded or returned from a projection; any other use is an error (`own.wrapped-part-use`). A pattern matching a part or a wrapped part is matching a scrutinee that is not owned, so the names it binds are view bindings ([pattern bindings](04-types.md#pattern-bindings)).
 - A view value is owned and moved like any value, and every value it moves into derives from it.
 - A part is **writable** when it is the result of a mut projection, a payload of a wrapped part that a mut projection returns, or a field of a writable part, except a part that the `next` of a [read cursor](#iteration) yields or that `core::Cursor.next` yields through a bound or `Dyn[I]`. Every other part is **read-only**. Assigning a read-only part or a field of one, or accessing either by `mut`, is an error (`own.read-only-view`).
@@ -300,6 +300,23 @@ pub fn newest_seq(inbox: Inbox) -> Option[u32] {
 } newest_seq
 ```
 
+A name bound to a part, by `let`, a pattern or a `for` over a read cursor, derives from what the part derives from, so a projection returns it:
+
+```nan
+pub closed struct Shelf {
+    pub labels: mem::List[text::String]
+} Shelf
+
+pub proj fn Shelf.first_long(self, min: usize) -> Option[text::String] {
+    for label in self.labels {
+        if label.byte_len() >= min {
+            return Some(label)
+        }
+    }
+    return None
+} Shelf.first_long
+```
+
 ```nan
 pub closed struct Frame {
     pub seq: u32
@@ -325,6 +342,21 @@ pub fn first_seq(alloc: mem::Alloc) -> u32 {
     let head = mem::List[Frame].empty(alloc).at(0) // error: own.temporary-source
     return head.seq
 } first_seq
+```
+
+```nan
+pub closed struct Frame {
+    pub seq: u32
+    pub payload: mem::List[u8]
+} Frame
+
+pub fn last_seq(frames: mem::List[Frame], alloc: mem::Alloc) -> u32 {
+    let newest = match frames.len() {
+        0 => Frame(seq: 0, payload: mem::List[u8].empty(alloc))
+        else => frames.at(frames.len() - 1) // error: own.move-not-owned
+    }
+    return newest.seq
+} last_seq
 ```
 
 ```nan
@@ -425,6 +457,22 @@ pub fn renumber_first(frames: mem::List[Frame], seq: u32) {
     var head = frames.at(0)
     head.seq = seq // error: own.read-only-view
 } renumber_first
+```
+
+```nan
+pub fn count(bytes: Option[mem::Bytes]) -> usize {
+    let Some(found) = bytes else {
+        return 0
+    }
+    return found.len()
+} count
+
+pub fn recount(bytes: Option[mem::Bytes]) -> usize {
+    let Some(found) = bytes else {
+        return 0
+    }
+    return count(Some(take found)) // error: own.move-not-owned
+} recount
 ```
 
 A payload of a writable wrapped part is written through a `var` view binding initialised from the name a pattern binds to it.

@@ -1,0 +1,351 @@
+//! The capabilities interpreter runs see: `testing::world()` and the sims, operated without a wait; the random streams of the seeded scheduler, the virtual clock, the path checks of file systems, attenuations, logs, whose test trace example runs discard, and revocation. A capability holds a reference to its capability table entry, which records whether it is live and the entry it derives from; a random stream also holds its seed and next byte.
+
+/// The stream of the seeded scheduler serving random bytes.
+const RANDOM_STREAM: u64 = 2
+
+/// The positions of a capability's parts: its entry, then a random stream's seed and the index
+/// of its next byte.
+const CAPABILITY_ENTRY: usize = 0
+
+const CAPABILITY_SEED: usize = 1
+
+const CAPABILITY_NEXT: usize = 2
+
+/// The positions of an entry's parts: whether it is live and the entry it derives from.
+const ENTRY_LIVE: usize = 0
+
+const ENTRY_SOURCE: usize = 1
+
+/// The positions of a revoker's parts: the capability and what revoking it ends, its entry or
+/// an allocator's cell.
+const REVOKER_REVOKED: usize = 0
+
+const REVOKER_HANDLE: usize = 1
+
+/// A capability operation an interpreter run can make, or `testing::world()`; none for another.
+fn Interpreter.sim_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    ) -> Option[InterpFlow] {
+    let alloc = self.alloc
+    if member == "" {
+        match owner {
+            "testing::world" => return Some(InterpFlow.Return(mut self.testing_world()))
+            "sys::sim::random" => return Some(InterpFlow.Return(mut self.random(seed: args[0].int_value().low_bits())))
+            "sys::sim::fs" => return Some(InterpFlow.Return(mut self.capability(path: "sys::Fs")))
+            "sys::sim::net" => return Some(InterpFlow.Return(mut self.capability(path: "sys::Net")))
+            "sys::sim::stdio" => return Some(InterpFlow.Return(mut self.capability(path: "sys::Stdio")))
+            "sys::revocable" => return Some(mut self.revocable(type_args, args))
+            else => {}
+        }
+    }
+    if owner == "sys::Random" and member == "fill" {
+        if self.stale(args[0]) {
+            return Some(InterpFlow.Fail(self.revoked()))
+        }
+        mut self.random_fill(args)
+        return Some(InterpFlow.Return(Val.Unit))
+    }
+    if owner == "sys::Clock" and member == "elapsed_ms" {
+        if self.stale(args[0]) {
+            return Some(InterpFlow.Fail(self.revoked()))
+        }
+        return Some(InterpFlow.Return(Val.Int(wide::Wide.zero())))
+    }
+    if owner == "sys::Fs" and member == "subdir" {
+        return Some(mut self.subdir(args))
+    }
+    if (owner == "sys::Fs" and member == "read_only") or (owner == "sys::Net" and member == "only_host") {
+        if self.stale(args[0]) {
+            return Some(InterpFlow.Fail(self.revoked()))
+        }
+        return Some(InterpFlow.Return(mut self.derived_capability(source: args[0])))
+    }
+    if owner == "sys::Log" and (member == "info" or member == "warn" or member == "error") {
+        return Some(InterpFlow.Return(Val.Unit))
+    }
+    if owner == "sys::Revoker" and member == "capability" {
+        return Some(InterpFlow.Return(self.deref(args[0]).fields()[REVOKER_REVOKED].copy(alloc)))
+    }
+    if owner == "sys::Revoker" and member == "revoke" {
+        let revoker = self.deref(args[0])
+        match revoker.fields()[REVOKER_HANDLE] {
+            Val.Ref(entry) => mut self.memory.set(entry.with(u32.fit(ENTRY_LIVE), alloc), stored: Val.Bool(false))
+            else => mut self.budgets.close(u32.truncate(revoker.fields()[REVOKER_HANDLE].int_value().low_bits()))
+        }
+        return Some(InterpFlow.Return(Val.Unit))
+    }
+    return None
+} Interpreter.sim_member
+
+/// `sys::Random.fill`: the next bytes of the random stream of its seed.
+fn Interpreter.random_fill(mut self, args: Slice[Val]) {
+    let alloc = self.alloc
+    let random = self.deref(args[0])
+    let seed = random.fields()[CAPABILITY_SEED].int_value().low_bits()
+    let next = random.fields()[CAPABILITY_NEXT].place()
+    let view = mut self.view(args[1])
+    let start = self.memory.get(next).int_value().low_bits()
+    var block: u64 = 0
+    var stream: u64 = 0
+    var known = false
+    for offset in 0..<u64.widen(view.len) {
+        let index = start + offset
+        if not known or block != index / 8 {
+            block = index / 8
+            stream = stream_value(seed, stream: RANDOM_STREAM, index: block)
+            known = true
+        }
+        let byte = (stream >> u32.truncate(8 * (index % 8))) & 0xFF
+        mut self.memory.set(view.array.with(u32.truncate(u64.widen(view.start) + offset), alloc), stored: Val.Int(wide::Wide.of_u64(byte)))
+    }
+    mut self.memory.set(next, stored: Val.Int(wide::Wide.of_u64(start + u64.widen(view.len))))
+} Interpreter.random_fill
+
+/// `sys::Fs.subdir`: a file system attenuated to a relative path whose segments are neither
+/// empty nor `.` or `..` and hold no NUL byte; a failure for a stale one or another path.
+fn Interpreter.subdir(mut self, args: Slice[Val]) -> InterpFlow {
+    let alloc = self.alloc
+    if self.stale(args[0]) {
+        let error = self.ty_item("sys::fs", name: "FsError")
+        let index = self.variant_index(error, name: "Revoked")
+        return InterpFlow.Fail(Val.Variant(item: error, index: index, fields: mem::Shared.of(Val.single(self.revoked(), alloc), alloc)))
+    }
+    let path = mut self.bytes(args[1])
+    if not is_relative_path(path.view()) {
+        let error = self.ty_item("sys::fs", name: "FsError")
+        let index = self.variant_index(error, name: "InvalidPath")
+        return InterpFlow.Fail(Val.Variant(item: error, index: index, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+    }
+    return InterpFlow.Return(mut self.derived_capability(source: args[0]))
+} Interpreter.subdir
+
+/// Whether each `/`-separated segment of a path is neither empty nor `.` or `..` and holds no
+/// NUL byte.
+fn is_relative_path(path: Slice[u8]) -> bool {
+    var start: usize = 0
+    var index: usize = 0
+    while index <= path.len() {
+        if index == path.len() or path[index] == b'/' {
+            let length = index - start
+            if length == 0 {
+                return false
+            }
+            if path[start] == b'.' and (length == 1 or (length == 2 and path[start + 1] == b'.')) {
+                return false
+            }
+            start = index + 1
+        } else if path[index] == 0 {
+            return false
+        }
+        index += 1
+    }
+    return true
+} is_relative_path
+
+/// `sys::revocable`: a capability or allocator with a revoker that ends it, an allocator's
+/// through a cell of its own.
+fn Interpreter.revocable(mut self, type_args: Slice[ty::Arg], args: Slice[Val]) -> InterpFlow {
+    let alloc = self.alloc
+    var allocator = false
+    if type_args.len() > 0 {
+        match type_args[0].ty() {
+            Some(capability_ty) => {
+                match self.ck.types().kind(capability_ty) {
+                    ty::TyKind.Item(item: item, args: _) => {
+                        allocator = self.ck.db().canonical(item).as_str() == "mem::Alloc"
+                    }
+                    else => {}
+                }
+            }
+            None => {}
+        }
+    }
+    var parts = mem::List[Val].empty(alloc)
+    if allocator {
+        let source = self.cell_of(args[0])
+        let cell = mut self.budgets.split(source, limit: wide::Wide.of_u64(~0u64))
+        mut parts.push(self.allocator(cell))
+        mut parts.push(Val.Int(wide::Wide.of_u64(u64.widen(cell))))
+    } else {
+        if self.stale(args[0]) {
+            return InterpFlow.Fail(self.revoked())
+        }
+        let capability = mut self.derived_capability(source: args[0])
+        let entry = capability.fields()[CAPABILITY_ENTRY].copy(alloc)
+        mut parts.push(take capability)
+        mut parts.push(take entry)
+    }
+    let item = self.ty_item("sys", name: "Revoker")
+    return InterpFlow.Return(Val.Struct(item: item, fields: mem::Shared.of(take parts, alloc)))
+} Interpreter.revocable
+
+/// The world `testing::world()` returns: its allocator names a new root cell, its random
+/// stream is that of seed 0, its arguments and environment are empty, and each other
+/// capability has an entry of its own.
+fn Interpreter.testing_world(mut self) -> Val {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let types = ck.types()
+    let world = self.ty_item("host", name: "World")
+    let sig = ck.sig(world)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        expect false
+        return Val.Absent
+    }
+    let cell = mut self.budgets.root(limit: WORLD_LIMIT)
+    var values = mem::List[Val].empty(alloc)
+    for field in fields {
+        let ty::TyKind.Item(item: item, args: args) = types.kind(field.ty) else {
+            expect false
+            return Val.Absent
+        }
+        let path = ck.db().canonical(item)
+        match path.as_str() {
+            "mem::Alloc" => mut values.push(self.allocator(cell))
+            "sys::Random" => mut values.push(mut self.random(seed: 0))
+            "core::Untrusted" => {
+                let held = self.contents_path(args)
+                let empty = mut self.container(path: held.as_str(), elements: mem::List[Val].empty(alloc), cell)
+                mut values.push(Val.Struct(item: item, fields: mem::Shared.of(Val.single(take empty, alloc), alloc)))
+            }
+            else => mut values.push(mut self.capability(path: path.as_str()))
+        }
+    }
+    return Val.Struct(item: world, fields: mem::Shared.of(take values, alloc))
+} Interpreter.testing_world
+
+/// The canonical path of the item an `Untrusted` type argument list holds.
+fn Interpreter.contents_path(self, args: ty::Args) -> text::String {
+    let types = self.ck.types()
+    let listed = types.arg_list(args)
+    if listed.len() > 0 {
+        let Some(contents_ty) = listed[0].ty() else {
+            expect false
+            return text::String.empty(self.alloc)
+        }
+        match types.kind(contents_ty) {
+            ty::TyKind.Item(item: contents, args: _) => return self.ck.db().canonical(contents)
+            else => {}
+        }
+    }
+    expect false
+    return text::String.empty(self.alloc)
+} Interpreter.contents_path
+
+/// A capability of the std type at `path` with a new entry.
+fn Interpreter.capability(mut self, path: Str) -> Val {
+    let alloc = self.alloc
+    let Some(split) = last_path_separator(path) else {
+        expect false
+        return Val.Absent
+    }
+    let Some(module) = path.slice_bytes(0, end: split) else {
+        expect false
+        return Val.Absent
+    }
+    let Some(name) = path.slice_bytes(split + 2, end: path.byte_len()) else {
+        expect false
+        return Val.Absent
+    }
+    let item = self.ty_item(module, name)
+    let entry = mut self.capability_entry(None)
+    return Val.Struct(item: item, fields: mem::Shared.of(Val.single(take entry, alloc), alloc))
+} Interpreter.capability
+
+/// Where the last `::` of a path starts.
+fn last_path_separator(path: Str) -> Option[usize] {
+    let bytes = path.as_bytes()
+    var at = bytes.len()
+    while at > 1 {
+        at -= 1
+        if bytes[at] == b':' and bytes[at - 1] == b':' {
+            return Some(at - 1)
+        }
+    }
+    return None
+} last_path_separator
+
+/// A capability like `source` with a new entry deriving from its entry.
+fn Interpreter.derived_capability(mut self, source: Val) -> Val {
+    let alloc = self.alloc
+    let capability = self.deref(source)
+    let Val.Struct(item: item, fields: fields) = capability else {
+        expect false
+        return Val.Absent
+    }
+    var parts = Val.copies(fields.contents().view(), alloc)
+    let entry = mut self.capability_entry(Some(parts[CAPABILITY_ENTRY].place().copy(alloc)))
+    parts[CAPABILITY_ENTRY] = entry
+    return Val.Struct(item: item, fields: mem::Shared.of(take parts, alloc))
+} Interpreter.derived_capability
+
+/// A new live entry, deriving from `source` when given.
+fn Interpreter.capability_entry(mut self, take source: Option[Loc]) -> Val {
+    let alloc = self.alloc
+    var parts = Val.single(Val.Bool(true), alloc)
+    match source {
+        Some(derived) => mut parts.push(Val.Ref(take derived))
+        None => mut parts.push(Val.Absent)
+    }
+    let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take parts, alloc)), writable: true, size: 0)
+    return Val.Ref(Loc(extent: extent, path: mem::List[u32].empty(alloc)))
+} Interpreter.capability_entry
+
+/// Whether a capability's entry, or one it derives from, is revoked.
+fn Interpreter.stale(self, capability: Val) -> bool {
+    let held = self.deref(capability)
+    let Val.Ref(first_entry) = held.fields()[CAPABILITY_ENTRY] else {
+        expect false
+        return false
+    }
+    var entry = first_entry.copy(self.alloc)
+    loop {
+        let parts = self.memory.get(entry).fields()
+        if not parts[ENTRY_LIVE].bool_value() {
+            return true
+        }
+        let Val.Ref(source) = parts[ENTRY_SOURCE] else {
+            return false
+        }
+        let next = source.copy(self.alloc)
+        entry = next
+    }
+} Interpreter.stale
+
+/// `sys::Revoked.Stale`.
+fn Interpreter.revoked(self) -> Val {
+    return Val.Variant(item: self.ty_item("sys", name: "Revoked"), index: 0, fields: mem::Shared.of(mem::List[Val].empty(self.alloc), alloc: self.alloc))
+} Interpreter.revoked
+
+/// A `sys::Random` yielding the random bytes of a seed, with a new entry.
+fn Interpreter.random(mut self, seed: u64) -> Val {
+    let alloc = self.alloc
+    let entry = mut self.capability_entry(None)
+    let next = mut self.memory.alloc(Val.Int(wide::Wide.zero()), writable: true, size: 0)
+    let item = self.ty_item("sys", name: "Random")
+    var parts = Val.single(take entry, alloc)
+    mut parts.push(Val.Int(wide::Wide.of_u64(seed)))
+    mut parts.push(Val.Ref(Loc(extent: next, path: mem::List[u32].empty(alloc))))
+    return Val.Struct(item: item, fields: mem::Shared.of(take parts, alloc))
+} Interpreter.random
+
+/// Value `index` of stream `stream` of a seed.
+fn stream_value(seed: u64, stream: u64, index: u64) -> u64 {
+    var input = Array[u8, 24].filled(0)
+    for byte in 0..<8usize {
+        let shift = u32.truncate(8 * byte)
+        input[byte] = u8.truncate(seed >> shift)
+        input[8 + byte] = u8.truncate(stream >> shift)
+        input[16 + byte] = u8.truncate(index >> shift)
+    }
+    let hash = hashing::blake3(input.view())
+    var value: u64 = 0
+    for byte in 0..<8usize {
+        value = value | (u64.widen(hash[byte]) << u32.truncate(8 * byte))
+    }
+    return value
+} stream_value

@@ -1,0 +1,1243 @@
+//! Conformance: whether a type implements an interface, through an impl line, a derive, a bound or a conformance the owning chapters declare for scalars and std types; and the candidates of method resolution.
+
+/// How a type implements an interface, with the interface's arguments for it.
+enum Conformance {
+    /// An impl line, with the substitution of its target's parameters for the type's arguments.
+    Impl(line: ty::ItemId, subst: ty::Subst)
+    /// A derive of the type's item.
+    Derive
+    /// A conformance an owning chapter declares.
+    Builtin
+    /// A bound of a generic parameter.
+    Bound
+} Conformance
+
+/// How a type implements an interface, and the interface's arguments for it.
+struct Conforming {
+    how: Conformance
+    args: ty::Args
+} Conforming
+
+/// A function item named after a type, with the substitution implementing it.
+struct Implementing {
+    item: ty::ItemId
+    subst: ty::Subst
+} Implementing
+
+/// A function a method call may name.
+enum Candidate {
+    /// A function item named after the type, with the type's arguments substituted.
+    Function(item: ty::ItemId, subst: ty::Subst)
+    /// A method of an interface the type implements or a bound names, with `Self` and the
+    /// interface's parameters substituted; `function` is the implementing function when the
+    /// type's impl provides one.
+    Method(bound: ty::Bound, method: usize, self_ty: ty::Ty, function: Option[Implementing], dynamic: bool)
+} Candidate
+
+/// What a candidate stands for: the function it names, or the interface method by its index.
+struct CandidateIdentity derives Copy, Eq {
+    function: Option[ty::ItemId]
+    method: Option[MethodKey]
+} CandidateIdentity
+
+/// The interfaces derives may name, beside `Copy` and the promises.
+const DERIVABLE_INTERFACES: Str = "Eq Ord Hash Default Render Encode Generate"
+
+/// The receivers a std member existing only for some instantiations admits, by its receiver's
+/// type argument.
+enum Receivers derives Copy, Eq {
+    Copy
+    Bytes
+    ByteContents
+    WritableByteContents
+    OwnedBytes
+    Clearable
+    Stepped
+} Receivers
+
+/// The core operator and cursor interfaces, which a type implements through std conformances.
+const OPERATOR_INTERFACES: Str = "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg BitNot Cursor"
+
+/// What the candidate stands for, so that two naming one function are one.
+fn Candidate.identity(self) -> CandidateIdentity {
+    return match self {
+        Candidate.Function(item: item, subst: _) => CandidateIdentity(function: Some(item), method: None)
+        Candidate.Method(bound: _, method: _, self_ty: _, function: Some(implementing), dynamic: _) => CandidateIdentity(function: Some(implementing.item), method: None)
+        Candidate.Method(bound: bound, method: method, self_ty: _, function: None, dynamic: _) => CandidateIdentity(function: None, method: Some(MethodKey(item: bound.item, method: method)))
+    }
+} Candidate.identity
+
+/// The impl lines of the database, by the type they target.
+fn Checker.impl_index(self) -> mem::Shared[mem::HashMap[TypeKey, mem::List[ty::ItemId]]] {
+    let state = self.state.contents()
+    match state.impls.get(0) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let db = self.db()
+    let alloc = self.alloc()
+    let index = db.about(None, compute: fn() -> mem::HashMap[TypeKey, mem::List[ty::ItemId]] {
+        var lines = mem::HashMap[TypeKey, mem::List[ty::ItemId]].empty(seed: 0, alloc)
+        for position in 0..<db.items.len() {
+            let line = ty::ItemId(index: u32.fit(position))
+            let ast::ItemKind.Impl(implementation) = db.declaration(line).kind else {
+                continue
+            }
+            let Some(key) = db.owner_key(db.items[position].module, owner: implementation.target) else {
+                continue
+            }
+            if lines.contains(key) {
+                var targeting = mut lines.at_mut(key)
+                mut targeting.push(line)
+            } else {
+                var targeting = mem::List[ty::ItemId].empty(alloc)
+                mut targeting.push(line)
+                discard mut lines.insert(key, value: take targeting)
+            }
+        }
+        return lines
+    })
+    return state.impls.insert(0, value: mem::Shared.of(take index, alloc)).share()
+} Checker.impl_index
+
+/// The impl lines targeting a type.
+fn Checker.impl_lines(self, key: TypeKey) -> mem::List[ty::ItemId] {
+    let index = self.impl_index()
+    var lines = mem::List[ty::ItemId].empty(self.alloc())
+    match index.contents().get(key) {
+        Some(targeting) => {
+            for line in targeting {
+                mut lines.push(line)
+            }
+        }
+        None => {}
+    }
+    let db = self.db()
+    for line in lines {
+        db.note(line)
+    }
+    return lines
+} Checker.impl_lines
+
+/// The canonical path of an interface without its package, for the core interfaces.
+fn Checker.core_interface(self, interface_item: ty::ItemId) -> Option[text::String] {
+    let path = self.db().canonical(interface_item)
+    if not path.starts_with("core::") {
+        return None
+    }
+    let Some(rest) = path.slice_bytes(6, end: path.byte_len()) else {
+        return None
+    }
+    return Some(text::String.of(rest, alloc: self.alloc()))
+} Checker.core_interface
+
+/// Whether an interface is the core interface of a name.
+fn Checker.is_core_interface(self, interface_item: ty::ItemId, name: Str) -> bool {
+    let Some(core) = self.core_interface(interface_item) else {
+        return false
+    }
+    return core.as_str() == name
+} Checker.is_core_interface
+
+/// The arguments of `interface_item` through which `ty` implements it, and how.
+fn Checker.conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Option[Conforming] {
+    let types = self.types()
+    if ty == ty::Ty.error() or ty == ty::Ty.never() {
+        return Some(Conforming(how: Conformance.Builtin, args: self.error_args(interface_item)))
+    }
+    match self.property_interface(interface_item) {
+        Some(property) => {
+            if self.has(ty, property) {
+                return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
+            }
+            return None
+        }
+        None => {}
+    }
+    if self.is_core_interface(interface_item, name: "Any") {
+        return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
+    }
+    match types.kind(ty) {
+        ty::TyKind.Param(param) => {
+            for bound in self.param_bounds(param) {
+                if bound.item == interface_item {
+                    return Some(Conforming(how: Conformance.Bound, args: bound.args))
+                }
+            }
+            return None
+        }
+        else => {}
+    }
+    match self.type_key(ty) {
+        Some(key) => {
+            match self.impl_conformance(ty, key, interface_item) {
+                Some(found) => return Some(take found)
+                None => {}
+            }
+            match key {
+                TypeKey.Item(item) => {
+                    if self.derives_interface(item, interface_item) {
+                        return self.derive_conformance(ty, interface_item)
+                    }
+                }
+                else => {}
+            }
+        }
+        None => {}
+    }
+    match types.kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            match self.db().ast(item).kind {
+                ast::ItemKind.Layout(_) => {
+                    if self.is_core_interface(interface_item, name: "Eq") or self.is_core_interface(interface_item, name: "Hash") {
+                        return Some(Conforming(how: Conformance.Builtin, args: ty::Args.none()))
+                    }
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let Some(args) = self.builtin_conformance(ty, interface_item) else {
+        return None
+    }
+    return Some(Conforming(how: Conformance.Builtin, args: args))
+} Checker.conformance
+
+/// The conformance of a struct or enum to an interface it derives: each of its type arguments
+/// conforms to it.
+fn Checker.derive_conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Option[Conforming] {
+    let types = self.types()
+    for arg in types.arg_list(types.args_of(ty)) {
+        let ty::Arg.Ty(arg_ty) = arg else {
+            continue
+        }
+        if self.conformance(arg_ty, interface_item).is_none() {
+            return None
+        }
+    }
+    return Some(Conforming(how: Conformance.Derive, args: ty::Args.none()))
+} Checker.derive_conformance
+
+/// The conformance of a type to an interface through the first impl line of its key that
+/// applies: the bounds of its parameters satisfied, droppable parameters given droppable
+/// arguments.
+fn Checker.impl_conformance(self, ty: ty::Ty, key: TypeKey, interface_item: ty::ItemId) -> Option[Conforming] {
+    let types = self.types()
+    let alloc = self.alloc()
+    let args = types.arg_list(types.args_of(ty))
+    for line in self.impl_lines(key) {
+        let held = self.sig(line)
+        let sig = held.contents()
+        let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.kind else {
+            continue
+        }
+        if bound.item != interface_item {
+            continue
+        }
+        var params = mem::List[ty::Param].empty(alloc)
+        for def in sig.generics {
+            mut params.push(def.param)
+        }
+        let subst = ty::Subst.of(params.view(), args, alloc)
+        var applies = true
+        for index in 0..<sig.generics.len() {
+            if not applies or index >= args.len() {
+                break
+            }
+            let ty::Arg.Ty(arg_ty) = args[index] else {
+                continue
+            }
+            for def_bound in sig.generics[index].bounds {
+                if not self.satisfies(arg_ty, bound: subst.bound(types, bound: def_bound)) {
+                    applies = false
+                    break
+                }
+            }
+        }
+        if applies and self.impl_droppable(line, ty) {
+            let line_args = subst.args(types, args: bound.args)
+            return Some(Conforming(how: Conformance.Impl(line: line, subst: take subst), args: line_args))
+        }
+    }
+    return None
+} Checker.impl_conformance
+
+/// Whether `ty` implements `bound`, its arguments included.
+fn Checker.satisfies(self, ty: ty::Ty, bound: ty::Bound) -> bool {
+    let types = self.types()
+    let Some(found) = self.conformance(ty, interface_item: bound.item) else {
+        return false
+    }
+    let wanted = types.arg_list(bound.args)
+    let held = types.arg_list(found.args)
+    if wanted.len() == 0 or held.len() != wanted.len() {
+        return true
+    }
+    for index in 0..<held.len() {
+        let same = held[index] == wanted[index] or arg_has_error(held[index], types) or arg_has_error(wanted[index], types)
+        if not same {
+            return false
+        }
+    }
+    return true
+} Checker.satisfies
+
+/// Whether an argument is a type mentioning `Error`.
+fn arg_has_error(arg: ty::Arg, types: ty::Types) -> bool {
+    return match arg {
+        ty::Arg.Ty(arg_ty) => types.has_error(arg_ty)
+        ty::Arg.Const(_) => false
+    }
+} arg_has_error
+
+fn Checker.implements(self, ty: ty::Ty, interface_item: ty::ItemId) -> bool {
+    return self.conformance(ty, interface_item).is_some()
+} Checker.implements
+
+/// The interface arguments a failed type implements an interface with: failed too.
+fn Checker.error_args(self, interface_item: ty::ItemId) -> ty::Args {
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    for _ in 0..<self.shapes(interface_item).contents().len() {
+        mut args.push(ty::Arg.Ty(ty::Ty.error()))
+    }
+    return self.types().args(take args)
+} Checker.error_args
+
+/// The structural property a property interface names.
+fn Checker.property_interface(self, interface_item: ty::ItemId) -> Option[Property] {
+    let Some(name) = self.core_interface(interface_item) else {
+        return None
+    }
+    return match name.as_str() {
+        "Copy" => Some(Property.Copy)
+        "Send" => Some(Property.Send)
+        "Inert" => Some(Property.Inert)
+        "AnyBits" => Some(Property.AnyBits)
+        else => None
+    }
+} Checker.property_interface
+
+/// Whether a struct or enum derives an interface.
+fn Checker.derives_interface(self, item: ty::ItemId, interface_item: ty::ItemId) -> bool {
+    let Some(name) = self.core_interface(interface_item) else {
+        return false
+    }
+    if not is_listed(DERIVABLE_INTERFACES, word: name.as_str()) {
+        return false
+    }
+    return self.derived_by(item, name: name.as_str())
+} Checker.derives_interface
+
+/// Whether an impl line applies to an instantiation as far as droppable parameters go: a
+/// parameter droppable for the line takes droppable arguments only.
+fn Checker.impl_droppable(self, line: ty::ItemId, ty: ty::Ty) -> bool {
+    let types = self.types()
+    let args = types.arg_list(types.args_of(ty))
+    let droppable = self.droppable_for_line(line)
+    for index in 0..<droppable.len() {
+        if index >= args.len() {
+            break
+        }
+        let ty::Arg.Ty(arg_ty) = args[index] else {
+            continue
+        }
+        if droppable[index] and self.has(arg_ty, property: Property.Linear) {
+            return false
+        }
+    }
+    return true
+} Checker.impl_droppable
+
+/// For each generic parameter of an impl line's target, whether it is droppable for the
+/// line: its target bounds it by `Any` and the line lists it without `Any`, or the line is a
+/// std impl line its owning chapter restricts to droppable instantiations.
+fn Checker.droppable_for_line(self, line: ty::ItemId) -> mem::List[bool] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var droppable = mem::List[bool].empty(alloc)
+    let ast::ItemKind.Impl(implementation) = db.ast(line).kind else {
+        return droppable
+    }
+    let held = self.sig(line)
+    let SigKind.Impl(target: Some(key), target_ty: _, bound: _) = held.contents().kind else {
+        return droppable
+    }
+    let target_bounds = self.type_generics(key)
+    var listed = mem::List[bool].empty(alloc)
+    match implementation.params {
+        Some(params) => {
+            for param in params {
+                var any = false
+                for bound in param.bounds {
+                    if bound.path.last().text.as_str() == "Any" {
+                        any = true
+                        break
+                    }
+                }
+                mut listed.push(any)
+            }
+        }
+        None => {
+            let restricted = db.is_std(line) and db.canonical_line_droppable(line)
+            for _ in 0..<target_bounds.len() {
+                mut listed.push(not restricted)
+            }
+        }
+    }
+    for index in 0..<target_bounds.len() {
+        if index >= listed.len() {
+            break
+        }
+        var bounded = false
+        for bound in target_bounds[index].bounds {
+            if self.is_core_interface(bound.item, name: "Any") {
+                bounded = true
+                break
+            }
+        }
+        mut droppable.push(not listed[index] and bounded)
+    }
+    return droppable
+} Checker.droppable_for_line
+
+/// The conformances the owning chapters declare for scalars, `Unit` and std types.
+fn Checker.builtin_conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Option[ty::Args] {
+    let Some(core) = self.core_interface(interface_item) else {
+        return None
+    }
+    let name = core.as_str()
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => return scalar_conformance(ty, scalar, name, types)
+        ty::TyKind.Unit => {
+            if is_listed("Eq Ord Hash Default Render Encode Generate", word: name) {
+                return Some(ty::Args.none())
+            }
+            return None
+        }
+        ty::TyKind.Item(item: item, args: _) => {
+            let db = self.db()
+            if not db.is_std(item) {
+                return None
+            }
+            return self.std_conformance(ty, path: db.canonical(item).as_str(), name, interface_item)
+        }
+        else => return None
+    }
+} Checker.builtin_conformance
+
+/// The conformances the owning chapters declare for a scalar.
+fn scalar_conformance(ty: ty::Ty, scalar: ty::Scalar, name: Str, types: ty::Types) -> Option[ty::Args] {
+    let integer = scalar.is_integer()
+    let float = scalar.is_float()
+    let unsigned = integer and not scalar.is_signed()
+    let shift = ty::Ty.scalar(ty::Scalar.Unsigned32)
+    let args = match first name {
+        "Eq" or "Ord" or "Hash" if not float => ty::Args.none()
+        "Default" or "Render" or "Encode" or "Generate" => ty::Args.none()
+        "Add" or "Sub" or "Mul" if integer or float => conform_pair_args(ty, second: Some(ty), types)
+        "Div" or "Rem" if float or unsigned => conform_pair_args(ty, second: Some(ty), types)
+        "BitAnd" or "BitOr" or "BitXor" if integer => conform_pair_args(ty, second: Some(ty), types)
+        "Shl" if integer => conform_pair_args(shift, second: Some(ty), types)
+        "Shr" if unsigned => conform_pair_args(shift, second: Some(ty), types)
+        "Neg" if float or scalar.is_signed() => conform_pair_args(ty, second: None, types)
+        "BitNot" if integer => conform_pair_args(ty, second: None, types)
+        else => return None
+    }
+    return Some(args)
+} scalar_conformance
+
+/// The interned arguments of one or two types.
+fn conform_pair_args(first_ty: ty::Ty, second: Option[ty::Ty], types: ty::Types) -> ty::Args {
+    var args = mem::List[ty::Arg].empty(types.allocator())
+    mut args.push(ty::Arg.Ty(first_ty))
+    match second {
+        Some(second_ty) => mut args.push(ty::Arg.Ty(second_ty))
+        None => {}
+    }
+    return types.args(take args)
+} conform_pair_args
+
+/// The conformances the owning chapters declare for a std type, by its canonical path.
+fn Checker.std_conformance(self, ty: ty::Ty, path: Str, name: Str, interface_item: ty::ItemId) -> Option[ty::Args] {
+    let types = self.types()
+    if path == "core::Range" {
+        if name != "Cursor" {
+            return None
+        }
+        let Some(element) = types.type_arg(ty, index: 0) else {
+            return None
+        }
+        let Some(scalar) = types.scalar_of(element) else {
+            return None
+        }
+        if not (scalar.is_integer() or scalar == ty::Scalar.Char) {
+            return None
+        }
+        return Some(conform_pair_args(element, second: None, types))
+    }
+    let holds = match first path {
+        "core::Str" => is_listed("Eq Ord Hash Render", word: name)
+        "text::String" => is_listed("Eq Ord Hash Render Encode Generate", word: name)
+        "text::Fixed" => is_listed("Eq Ord Hash Render Encode Generate Default", word: name)
+        "core::Slice" or "core::SliceMut" => is_listed("Eq Ord Hash Render", word: name) and self.args_implement(ty, interface_item)
+        "core::Array" if name == "Generate" => self.element_copy(ty) and self.args_implement(ty, interface_item)
+        "core::Array" => is_listed("Eq Ord Hash Default Render Encode", word: name) and self.args_implement(ty, interface_item)
+        "core::Untrusted" if name == "Generate" => self.untrusted_generated(ty, interface_item)
+        "core::Untrusted" => name == "Render"
+        "mem::List" or "mem::Set" or "mem::Bounded" or "mem::Map" or "mem::HashMap" => is_listed("Eq Hash Render Encode Generate", word: name) and self.args_implement(ty, interface_item)
+        "mem::Bytes" => is_listed("Eq Ord Hash Render Encode Generate", word: name)
+        "mem::Box" => is_listed("Render Encode Generate", word: name) and self.args_implement(ty, interface_item)
+        "mem::Shared" => is_listed("Render Encode", word: name) and self.args_implement(ty, interface_item)
+        "mem::Id" => is_listed("Eq Ord Hash Encode Generate", word: name)
+        "mem::Handle" or "hw::Ptr" => is_listed("Eq Hash", word: name)
+        else => false
+    }
+    if holds {
+        return Some(ty::Args.none())
+    }
+    return None
+} Checker.std_conformance
+
+/// Whether every type argument of a type implements an interface.
+fn Checker.args_implement(self, ty: ty::Ty, interface_item: ty::ItemId) -> bool {
+    let types = self.types()
+    for arg in types.arg_list(types.args_of(ty)) {
+        let ty::Arg.Ty(arg_ty) = arg else {
+            continue
+        }
+        if not self.implements(arg_ty, interface_item) {
+            return false
+        }
+    }
+    return true
+} Checker.args_implement
+
+/// Whether a type's first type argument is Copy.
+fn Checker.element_copy(self, ty: ty::Ty) -> bool {
+    let Some(element) = self.types().type_arg(ty, index: 0) else {
+        return false
+    }
+    return self.has(element, property: Property.Copy)
+} Checker.element_copy
+
+/// Whether an `Untrusted` type generates: its contents' type implements the interface and is
+/// Inert.
+fn Checker.untrusted_generated(self, ty: ty::Ty, interface_item: ty::ItemId) -> bool {
+    let Some(inner) = self.types().type_arg(ty, index: 0) else {
+        return false
+    }
+    return self.implements(inner, interface_item) and self.has(inner, property: Property.Inert)
+} Checker.untrusted_generated
+
+/// Whether a cursor type's `next` is a projection.
+fn Checker.next_projects(self, cursor: ty::Ty) -> bool {
+    for candidate in self.method_candidates(cursor, name: "next") {
+        let projects = match candidate {
+            Candidate.Function(item: item, subst: _) => match self.fn_sig(item) {
+                Some(sig) => sig.is_proj()
+                None => false
+            }
+            Candidate.Method(bound: bound, method: method, self_ty: _, function: _, dynamic: _) => self.method_projects(bound.item, method)
+        }
+        if projects {
+            return true
+        }
+    }
+    return false
+} Checker.next_projects
+
+/// Whether an interface's method is a projection.
+fn Checker.method_projects(self, interface_item: ty::ItemId, method: usize) -> bool {
+    let sig = self.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return false
+    }
+    return methods[method].sig.is_proj()
+} Checker.method_projects
+
+/// The candidates of method resolution for `name` on a value of type `ty`.
+fn Checker.method_candidates(self, ty: ty::Ty, name: Str) -> mem::List[Candidate] {
+    let types = self.types()
+    var candidates = mem::List[Candidate].empty(self.alloc())
+    match types.kind(ty) {
+        ty::TyKind.Param(param) => {
+            for bound in self.param_bounds(param) {
+                let Some(method) = self.interface_method(bound.item, name) else {
+                    continue
+                }
+                mut candidates.push(Candidate.Method(bound: bound, method: method, self_ty: ty, function: None, dynamic: false))
+            }
+        }
+        ty::TyKind.Dyn(bound) => {
+            match self.interface_method(bound.item, name) {
+                Some(method) => mut candidates.push(Candidate.Method(bound: bound, method: method, self_ty: ty, function: None, dynamic: true))
+                None => {}
+            }
+        }
+        else => {
+            match self.boxed_dyn(ty) {
+                Some(inner) => {
+                    let ty::TyKind.Dyn(bound) = types.kind(inner) else {
+                        return candidates
+                    }
+                    match self.interface_method(bound.item, name) {
+                        Some(method) => {
+                            mut candidates.push(Candidate.Method(bound: bound, method: method, self_ty: inner, function: None, dynamic: true))
+                            return candidates
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            let Some(key) = self.type_key(ty) else {
+                return candidates
+            }
+            self.conform_candidates(ty, key, name, mut candidates)
+        }
+    }
+    return distinct_candidates(take candidates, alloc: self.alloc())
+} Checker.method_candidates
+
+/// The candidates of a type's key: the functions of its home module named after it, then the
+/// methods of the interfaces it implements from its package or core.
+fn Checker.conform_candidates(self, ty: ty::Ty, key: TypeKey, name: Str, mut candidates: mem::List[Candidate]) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let home = match key {
+        TypeKey.Item(item) => Some(db.module_of(item))
+        else => db.package_data(db.core()).root
+    }
+    let subst = self.type_subst(key, ty)
+    for function in db.members(key, name) {
+        if Some(db.module_of(function)) == home and self.member_exists(function, ty) {
+            var copy = ty::Subst.empty(alloc)
+            mut copy.extend(subst)
+            mut candidates.push(Candidate.Function(item: function, subst: take copy))
+        }
+    }
+    let package_id = match key {
+        TypeKey.Item(item) => db.package_of(item)
+        else => db.core()
+    }
+    for interface_item in self.implemented_interfaces(ty, key) {
+        let interface_package = db.package_of(interface_item)
+        if interface_package != package_id and interface_package != db.core() {
+            continue
+        }
+        let Some(method) = self.interface_method(interface_item, name) else {
+            continue
+        }
+        let Some(found) = self.conformance(ty, interface_item) else {
+            continue
+        }
+        let Conforming(how: how, args: args) = found
+        var function: Option[Implementing] = None
+        match how {
+            Conformance.Impl(line: line, subst: line_subst) => {
+                match self.implementing_function(line, name) {
+                    Some(implementing) => {
+                        function = Some(Implementing(item: implementing, subst: take line_subst))
+                    }
+                    None => {}
+                }
+            }
+            else => {
+                let members = db.members(key, name)
+                if members.len() > 0 {
+                    function = Some(Implementing(item: members[0], subst: self.type_subst(key, ty)))
+                }
+            }
+        }
+        mut candidates.push(Candidate.Method(bound: ty::Bound(item: interface_item, args: args), method: method, self_ty: ty, function: take function, dynamic: false))
+    }
+} Checker.conform_candidates
+
+/// The candidates without those standing for an earlier one's function or method.
+fn distinct_candidates(take candidates: mem::List[Candidate], alloc: mem::Alloc) -> mem::List[Candidate] {
+    var distinct = mem::List[Candidate].empty(alloc)
+    var identities = mem::List[CandidateIdentity].empty(alloc)
+    for candidate in take candidates {
+        let identity = candidate.identity()
+        if identities.position(fn(known: CandidateIdentity) => known == identity).is_some() {
+            continue
+        }
+        mut identities.push(identity)
+        mut distinct.push(take candidate)
+    }
+    return distinct
+} distinct_candidates
+
+/// The `mem::Box[Dyn[I]]` contents type, when `ty` is one.
+fn Checker.boxed_dyn(self, ty: ty::Ty) -> Option[ty::Ty] {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return None
+    }
+    let db = self.db()
+    if not db.is_std(item) or db.canonical(item).as_str() != "mem::Box" {
+        return None
+    }
+    let listed = types.arg_list(args)
+    if listed.len() == 0 {
+        return None
+    }
+    let ty::Arg.Ty(inner) = listed[0] else {
+        return None
+    }
+    let ty::TyKind.Dyn(_) = types.kind(inner) else {
+        return None
+    }
+    return Some(inner)
+} Checker.boxed_dyn
+
+/// The substitution of a type item's parameters by a type's arguments.
+fn Checker.type_subst(self, key: TypeKey, ty: ty::Ty) -> ty::Subst {
+    let types = self.types()
+    let alloc = self.alloc()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in self.type_generics(key) {
+        mut params.push(def.param)
+    }
+    return ty::Subst.of(params.view(), args: types.arg_list(types.args_of(ty)), alloc)
+} Checker.type_subst
+
+/// The interfaces a type implements through impl lines, derives and std conformances.
+fn Checker.implemented_interfaces(self, ty: ty::Ty, key: TypeKey) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var interfaces = mem::List[ty::ItemId].empty(alloc)
+    for line in self.impl_lines(key) {
+        let sig = self.sig(line)
+        match sig.contents().kind {
+            SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) => mut interfaces.push(bound.item)
+            else => {}
+        }
+    }
+    for name in Words(list: DERIVABLE_INTERFACES, at: 0) {
+        match db.core_item(name) {
+            Some(interface_item) => mut interfaces.push(interface_item)
+            None => {}
+        }
+    }
+    for name in Words(list: OPERATOR_INTERFACES, at: 0) {
+        match db.std_item("core", name) {
+            Some(interface_item) => mut interfaces.push(interface_item)
+            None => {}
+        }
+    }
+    mut interfaces.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => left.cmp(right))
+    var implemented = mem::List[ty::ItemId].empty(alloc)
+    var previous: Option[ty::ItemId] = None
+    for interface_item in interfaces {
+        if previous == Some(interface_item) {
+            continue
+        }
+        previous = Some(interface_item)
+        if self.implements(ty, interface_item) {
+            mut implemented.push(interface_item)
+        }
+    }
+    return implemented
+} Checker.implemented_interfaces
+
+/// The index of an interface's method of that name.
+fn Checker.interface_method(self, interface_item: ty::ItemId, name: Str) -> Option[usize] {
+    let sig = self.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return None
+    }
+    for index in 0..<methods.len() {
+        if methods[index].name.as_str() == name {
+            return Some(index)
+        }
+    }
+    return None
+} Checker.interface_method
+
+/// The function `T.m` an impl line's module declares for the impl's target.
+fn Checker.implementing_function(self, line: ty::ItemId, name: Str) -> Option[ty::ItemId] {
+    let sig = self.sig(line)
+    let SigKind.Impl(target: Some(key), target_ty: _, bound: _) = sig.contents().kind else {
+        return None
+    }
+    let db = self.db()
+    let module = db.module_of(line)
+    for function in db.members(key, name) {
+        if db.module_of(function) == module {
+            return Some(function)
+        }
+    }
+    return None
+} Checker.implementing_function
+
+/// The head of an interface method with `Self` and the interface's parameters substituted.
+fn Checker.method_head(self, bound: ty::Bound, method: usize, self_ty: ty::Ty) -> Option[FnSig] {
+    let types = self.types()
+    let alloc = self.alloc()
+    let held = self.sig(bound.item)
+    let sig = held.contents()
+    let SigKind.Interface(methods: methods) = sig.kind else {
+        return None
+    }
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.generics {
+        if not def.param.is_self() {
+            mut params.push(def.param)
+        }
+    }
+    var subst = ty::Subst.of(params.view(), args: types.arg_list(bound.args), alloc)
+    mut subst.insert(ty::Param(owner: bound.item, index: ty::SELF_INDEX), arg: ty::Arg.Ty(self_ty))
+    let head = methods[method].sig
+    var head_params = mem::List[ParamSig].empty(alloc)
+    for param in head.params {
+        mut head_params.push(ParamSig(name: text::String.of(param.name.as_str(), alloc), mode: param.mode, ty: subst.ty(types, ty: param.ty), token: param.token, is_self: param.is_self))
+    }
+    var failure: Option[ty::Ty] = None
+    match head.failure {
+        Some(written) => {
+            failure = Some(subst.ty(types, ty: written))
+        }
+        None => {}
+    }
+    var convention: Option[text::String] = None
+    match head.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    return Some(FnSig(generics: GenericDef.copies(head.own_generics(), alloc), inherited: 0, params: take head_params, result: subst.ty(types, ty: head.result), failure: failure, wait: head.wait, limit_set: head.limit_set, modifier: head.modifier, convention: take convention))
+} Checker.method_head
+
+/// Whether a std member that exists only for some instantiations exists for `ty`. Typing a
+/// member of the same type that exists only for some instantiations, its receiver's type
+/// admits the members whose receivers include all of its own.
+fn Checker.member_exists(self, function: ty::ItemId, ty: ty::Ty) -> bool {
+    let db = self.db()
+    if not db.is_std(function) {
+        return true
+    }
+    let Some(receivers) = self.receivers(function) else {
+        return true
+    }
+    let types = self.types()
+    let element = types.type_arg(ty, index: 0)
+    match self.typed_member_of(element) {
+        Some(within) => {
+            return match self.receivers(within) {
+                Some(own) => receivers.include(own)
+                None => false
+            }
+        }
+        None => {}
+    }
+    return match receivers {
+        Receivers.Copy => match element {
+            Some(element_ty) => self.has(element_ty, property: Property.Copy)
+            None => false
+        }
+        Receivers.Bytes => element == Some(ty::Ty.scalar(ty::Scalar.Unsigned8))
+        Receivers.ByteContents => self.element_named(element, names: "core::Slice core::SliceMut core::Array mem::Bytes", bytes_only: true)
+        Receivers.WritableByteContents => self.element_named(element, names: "core::SliceMut core::Array mem::Bytes", bytes_only: true)
+        Receivers.OwnedBytes => self.element_named(element, names: "mem::Bytes", bytes_only: true)
+        Receivers.Clearable => self.element_named(element, names: "core::Array mem::Bytes", bytes_only: true) or self.element_named(element, names: "hw::Dma", bytes_only: false)
+        Receivers.Stepped => match element {
+            Some(element_ty) => match types.scalar_of(element_ty) {
+                Some(scalar) => scalar.is_integer() or scalar == ty::Scalar.Char
+                None => false
+            }
+            None => false
+        }
+    }
+} Checker.member_exists
+
+/// The function whose body or clauses are being typed, when it is named after the type a
+/// receiver's type argument is a parameter of.
+fn Checker.typed_member_of(self, element: Option[ty::Ty]) -> Option[ty::ItemId] {
+    let Some(element_ty) = element else {
+        return None
+    }
+    let ty::TyKind.Param(param) = self.types().kind(element_ty) else {
+        return None
+    }
+    let Some(within) = item_of_bits(self.state.contents().within.load()) else {
+        return None
+    }
+    if self.db().owners.get(within) != Some(TypeKey.Item(param.owner)) {
+        return None
+    }
+    return Some(within)
+} Checker.typed_member_of
+
+/// Whether a receiver's type argument is an instantiation of one of some std types, of bytes
+/// when `bytes_only`.
+fn Checker.element_named(self, element: Option[ty::Ty], names: Str, bytes_only: bool) -> bool {
+    let Some(inner) = element else {
+        return false
+    }
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(inner) else {
+        return false
+    }
+    let path = self.db().canonical(item)
+    if not is_listed(names, word: path.as_str()) {
+        return false
+    }
+    if not bytes_only or path.as_str() == "mem::Bytes" {
+        return true
+    }
+    let listed = types.arg_list(args)
+    return listed.len() > 0 and listed[0] == ty::Arg.Ty(ty::Ty.scalar(ty::Scalar.Unsigned8))
+} Checker.element_named
+
+/// The receivers of a std member that exists only for some instantiations.
+fn Checker.receivers(self, function: ty::ItemId) -> Option[Receivers] {
+    let path = self.db().canonical(function)
+    let written = path.as_str()
+    let start = member_start(written)
+    var owner_end = written.byte_len()
+    if start > 0 {
+        owner_end = start - 1
+    }
+    let Some(owner) = written.slice_bytes(0, end: owner_end) else {
+        return None
+    }
+    let Some(member) = written.slice_bytes(start, end: written.byte_len()) else {
+        return None
+    }
+    if start == 0 {
+        return receivers_of(owner, member: "")
+    }
+    return receivers_of(owner, member)
+} Checker.receivers
+
+/// The receivers a std member existing only for some instantiations admits, by its owner and
+/// member name.
+fn receivers_of(owner: Str, member: Str) -> Option[Receivers] {
+    let found = match first owner {
+        "core::Array" if member == "filled" => Receivers.Copy
+        "core::SliceMut" if member == "fill" or member == "copy_from" => Receivers.Copy
+        "core::Option" if member == "value_or" => Receivers.Copy
+        "core::Slice" or "core::SliceMut" if member.ends_with("_le") or member.ends_with("_be") => Receivers.Bytes
+        "core::Untrusted" if is_listed("byte_len view prefix split_at copy_prefix try_copy_prefix", word: member) => Receivers.ByteContents
+        "core::Untrusted" if member == "view_mut" => Receivers.WritableByteContents
+        "core::Untrusted" if member == "append" or member == "try_append" => Receivers.OwnedBytes
+        "core::Untrusted" if member == "into_cleared" => Receivers.Clearable
+        "core::Range" if member == "next" => Receivers.Stepped
+        else => return None
+    }
+    return Some(found)
+} receivers_of
+
+/// The type a struct or enum's item is, applied to its own parameters, for a type key.
+fn Checker.own_type(self, item: ty::ItemId) -> ty::Ty {
+    let sig = self.sig(item)
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    for def in sig.contents().generics {
+        mut args.push(def.param_arg(self.types()))
+    }
+    return self.types().item(item, take args)
+} Checker.own_type
+
+/// The key of the type a value of `ty` is, for member lookup.
+fn Checker.type_key(self, ty: ty::Ty) -> Option[TypeKey] {
+    return match self.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => Some(TypeKey.Scalar(scalar))
+        ty::TyKind.Unit => Some(TypeKey.Unit)
+        ty::TyKind.Item(item: item, args: _) => Some(TypeKey.Item(item))
+        else => None
+    }
+} Checker.type_key
+
+/// The rule a type argument breaks for its generic parameter: a linear argument for a
+/// parameter not bounded by `Any`, or a bound, implied ones included, it does not satisfy.
+fn Checker.argument_problem(self, def: GenericDef, arg: ty::Ty, subst: ty::Subst) -> Option[diagnostic::Code] {
+    let types = self.types()
+    let db = self.db()
+    if types.has_error(arg) or arg.is_never() {
+        return None
+    }
+    var any = false
+    for bound in def.bounds {
+        if db.canonical(bound.item).as_str() == "core::Any" {
+            any = true
+            break
+        }
+    }
+    if not any and self.has(arg, property: Property.Linear) {
+        return Some(diagnostic::Code.PropLinearArgument)
+    }
+    let accepts = self.accepts_views(def.param)
+    let boxed_dyn = match types.kind(arg) {
+        ty::TyKind.Dyn(_) => db.canonical(def.param.owner).as_str() == "mem::Box"
+        else => false
+    }
+    let std_function = db.is_std(def.param.owner) and is_fn_item(db.ast(def.param.owner))
+    if not accepts and not boxed_dyn and not std_function and self.has(arg, property: Property.View) {
+        return Some(diagnostic::Code.PropViewArgument)
+    }
+    let container = self.is_view_container(types.item(def.param.owner, args: mem::List[ty::Arg].empty(self.alloc())))
+    if accepts and not container and self.holds_token(arg) {
+        return Some(diagnostic::Code.PropTokenArgument)
+    }
+    let implied = self.implied(def.param)
+    for bound in def.bounds {
+        if not self.satisfies(arg, bound: subst.bound(types, bound)) {
+            return Some(diagnostic::Code.GenericUnsatisfiedBound)
+        }
+    }
+    if (implied.failure and not self.is_failure_type(arg)) or (implied.cancellable and not self.is_cancellable(arg)) {
+        return Some(diagnostic::Code.GenericUnsatisfiedBound)
+    }
+    return None
+} Checker.argument_problem
+
+/// Whether an item is a function item.
+fn is_fn_item(node: ast::Item) -> bool {
+    return match node.kind {
+        ast::ItemKind.Fn(_) => true
+        else => false
+    }
+} is_fn_item
+
+/// Reports, for an item, a `Dyn` type it writes whose interface is not Dyn-usable, or the
+/// first argument of an instantiation it writes that breaks its parameter's bounds.
+fn Checker.check_instantiation(self, item: ty::ItemId, instantiated: ty::Ty, token: u32) {
+    let types = self.types()
+    match types.kind(instantiated) {
+        ty::TyKind.Dyn(bound) => {
+            if not self.dyn_usable(bound.item) {
+                self.report(item, token, code: diagnostic::Code.InterfaceNotDynUsable)
+                return
+            }
+        }
+        ty::TyKind.Fn(id) => {
+            let fn_ty = types.fn_of(id)
+            let problem = match self.fn_type_problem(fn_ty) {
+                Some(code) => Some(code)
+                None => self.fails_problem(fn_ty)
+            }
+            match problem {
+                Some(code) => {
+                    self.report(item, token, code)
+                    return
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    match self.lowlevel_problem(instantiated) {
+        Some(code) => {
+            self.report(item, token, code)
+            return
+        }
+        None => {}
+    }
+    match types.kind(instantiated) {
+        ty::TyKind.Fn(id) => {
+            match types.fn_of(id).convention {
+                Some(convention) => self.check_convention(item, token, convention: convention.as_str())
+                None => {}
+            }
+        }
+        else => {}
+    }
+    if self.ambiguous(instantiated) or self.constituent_ambiguous(instantiated) {
+        self.report(item, token, code: diagnostic::Code.ErrorFromAmbiguous)
+        return
+    }
+    self.check_arguments(item, instantiated, token)
+} Checker.check_instantiation
+
+/// Whether a constituent of a struct or enum instantiation is ambiguous.
+fn Checker.constituent_ambiguous(self, instantiated: ty::Ty) -> bool {
+    for constituent in self.constituents_of(instantiated) {
+        if self.ambiguous(constituent) {
+            return true
+        }
+    }
+    return false
+} Checker.constituent_ambiguous
+
+/// Reports the first argument of an instantiation that breaks its parameter's bounds, and
+/// records an instantiation of an item with const parameters.
+fn Checker.check_arguments(self, item: ty::ItemId, instantiated: ty::Ty, token: u32) {
+    let types = self.types()
+    let alloc = self.alloc()
+    let ty::TyKind.Item(item: target, args: args) = types.kind(instantiated) else {
+        return
+    }
+    let held = self.sig(target)
+    let generics = held.contents().generics
+    let listed = types.arg_list(args)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: listed, alloc)
+    for index in 0..<generics.len() {
+        if index >= listed.len() {
+            break
+        }
+        let ty::Arg.Ty(arg_ty) = listed[index] else {
+            continue
+        }
+        match self.argument_problem(generics[index], arg: arg_ty, subst) {
+            Some(code) => {
+                self.report(item, token, code)
+                return
+            }
+            None => {}
+        }
+    }
+    for def in generics {
+        if def.constant.is_some() {
+            self.instantiated(item, token, target, args)
+            return
+        }
+    }
+} Checker.check_arguments
+
+/// The constituent types of a struct or enum instantiation, its arguments substituted.
+fn Checker.constituents_of(self, ty: ty::Ty) -> mem::List[ty::Ty] {
+    let types = self.types()
+    let alloc = self.alloc()
+    var found = mem::List[ty::Ty].empty(alloc)
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return found
+    }
+    let sig = self.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(args), alloc)
+    for constituent in self.constituents(item) {
+        mut found.push(subst.ty(types, ty: constituent))
+    }
+    return found
+} Checker.constituents_of
+
+/// Whether a std impl line without parameters covers droppable instantiations only, as its
+/// owning chapter restricts the owning cursors' and `ArrayCursor`'s.
+fn Db.canonical_line_droppable(self, line: ty::ItemId) -> bool {
+    let ast::ItemKind.Impl(implementation) = self.ast(line).kind else {
+        return false
+    }
+    return is_listed("ArrayCursor ListCursor BoundedCursor MapIntoCursor HashMapIntoCursor SetIntoCursor", word: implementation.target.last().text.as_str())
+} Db.canonical_line_droppable
+
+/// Records an instantiation of an item with const parameters that an item's code writes,
+/// whose `where` conditions are judged once the items are elaborated.
+fn Checker.instantiated(self, holder: ty::ItemId, token: u32, target: ty::ItemId, args: ty::Args) {
+    let state = self.state.contents()
+    if state.muted.load() == 0 and not self.db().is_std(holder) {
+        discard state.instantiations.push(Instantiation(item: holder, token: token, instantiated: target, args: args))
+    }
+} Checker.instantiated
+
+/// An item and one of its tokens.
+struct HolderToken derives Copy, Eq, Hash {
+    holder: ty::ItemId
+    token: u32
+} HolderToken
+
+/// Reports each instantiation whose arguments break a `where` condition of a const
+/// parameter: by const evaluation when every argument is a value, and otherwise unless the
+/// prover proves it from the `where` conditions in scope (`generic.where-unmet`).
+fn Checker.check_wheres(self) {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    var judged = mem::HashMap[HolderToken, Unit].empty(seed: 0, alloc)
+    let count = state.instantiations.len()
+    for position in 0..<count {
+        let written = state.instantiations.at(mem::Id[Instantiation].of(u32.fit(position)))
+        let at = HolderToken(holder: written.item, token: written.token)
+        if judged.contains(at) or self.rejected(written.item) {
+            continue
+        }
+        discard mut judged.insert(at, value: Unit)
+        if not self.where_met(written) {
+            self.report(written.item, token: written.token, code: diagnostic::Code.GenericWhereUnmet)
+        }
+    }
+} Checker.check_wheres
+
+/// Whether an instantiation meets the `where` conditions of the item it instantiates.
+fn Checker.where_met(self, written: Instantiation) -> bool {
+    let types = self.types()
+    let alloc = self.alloc()
+    let target = written.instantiated
+    let Some(unit) = self.unit(target) else {
+        return true
+    }
+    var conditions = mem::List[u32].empty(alloc)
+    for function in unit.contents().functions {
+        if function.role == nir::Role.Where {
+            mut conditions.push(function.index)
+        }
+    }
+    if conditions.len() == 0 {
+        return true
+    }
+    let held = self.sig(target)
+    let generics = held.contents().generics
+    let args = types.arg_list(written.args)
+    var consts = mem::List[ScalarArg].empty(alloc)
+    for index in 0..<generics.len() {
+        if index >= args.len() {
+            break
+        }
+        match generics[index].constant {
+            Some(scalar) => mut consts.push(ScalarArg(scalar: scalar, arg: args[index]))
+            None => {}
+        }
+    }
+    if const_vals(consts.view(), alloc).is_none() {
+        return self.wheres_entailed(written.item, target, unit, conditions: conditions.view(), args, consts: consts.view())
+    }
+    for index in conditions {
+        let Some(arguments) = const_vals(consts.view(), alloc) else {
+            expect false
+            return false
+        }
+        var interpreter = Interpreter.new(self.share())
+        let met = match mut interpreter.run(target, role: nir::Role.Where, index, args: take arguments, type_args: args) {
+            End.Value(Val.Bool(true)) => true
+            else => false
+        }
+        if not met {
+            return false
+        }
+    }
+    return true
+} Checker.where_met
+
+/// The values of const arguments, when every one is a value.
+fn const_vals(consts: Slice[ScalarArg], alloc: mem::Alloc) -> Option[mem::List[Val]] {
+    var values = mem::List[Val].empty(alloc)
+    for written in consts {
+        match first written.arg {
+            ty::Arg.Const(ty::Const.Int(value)) => mut values.push(Val.Int(value))
+            ty::Arg.Const(ty::Const.Bool(value)) => mut values.push(Val.Bool(value))
+            else => return None
+        }
+    }
+    return Some(take values)
+} const_vals
+
+/// Whether these receivers include all of `inner`'s.
+fn Receivers.include(self, inner: Receivers) -> bool {
+    if self == inner {
+        return true
+    }
+    return match self {
+        Receivers.ByteContents => inner == Receivers.WritableByteContents or inner == Receivers.OwnedBytes
+        Receivers.WritableByteContents => inner == Receivers.OwnedBytes
+        else => false
+    }
+} Receivers.include

@@ -1,0 +1,516 @@
+//! The numbers the interpreter supplies: the members core declares for scalars and the named and bit conversions.
+
+/// The members core declares for a scalar type without a body.
+fn Interpreter.scalar_member(mut self, scalar: ty::Scalar, member: Str, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    if scalar.is_float() {
+        return InterpFlow.Return(try self.float_member(member, args))
+    }
+    let a = self.deref(args[0]).int_value()
+    if member == "wrapping_add" or member == "wrapping_sub" or member == "wrapping_mul" {
+        let b = self.deref(args[1]).int_value()
+        let result = match member {
+            "wrapping_add" => a.wrapping_add(b)
+            "wrapping_sub" => a.wrapping_sub(b)
+            else => a.wrapping_mul(b)
+        }
+        return InterpFlow.Return(Val.Int(wrap_scalar(result, scalar)))
+    }
+    if member == "wrapping_shl" or member == "checked_shl" or member == "shr_arith" {
+        return InterpFlow.Return(try self.shifted(scalar, member, a, amount: self.deref(args[1]).int_value(), at))
+    }
+    if member == "div_trunc" or member == "rem_trunc" {
+        let divisor = self.deref(args[1]).int_value()
+        if divisor.is_zero() {
+            fail self.trap("trap.division-by-zero", at)
+        }
+        let Some(quotient) = a.checked_div_trunc(divisor) else {
+            fail self.trap("trap.overflow", at)
+        }
+        if member == "rem_trunc" {
+            return InterpFlow.Return(Val.Int(a.wrapping_sub(divisor.wrapping_mul(quotient))))
+        }
+        if not fits_scalar(quotient, scalar) {
+            fail self.trap("trap.overflow", at)
+        }
+        return InterpFlow.Return(Val.Int(quotient))
+    }
+    let bits = integer_bits(a, scalar)
+    if member == "count_ones" {
+        return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(bits.count_ones()))))
+    }
+    if member == "leading_zeros" {
+        return InterpFlow.Return(Val.Int(wide::Wide.of_i64(i64.widen(bits.leading_zeros()) - i64.widen(64 - scalar.bits()))))
+    }
+    if member == "trailing_zeros" {
+        var zeros = bits.trailing_zeros()
+        if zeros > scalar.bits() {
+            zeros = scalar.bits()
+        }
+        return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(zeros))))
+    }
+    if member == "wide_mul" {
+        let product = a.wrapping_mul(self.deref(args[1]).int_value())
+        let high = if scalar.is_signed() {
+            product.shift_right(64)
+        } else {
+            wide::Wide.of_u64(product.shift_right(64).low_bits())
+        }
+        var halves = mem::List[Val].empty(self.alloc)
+        mut halves.push(Val.Int(high))
+        mut halves.push(Val.Int(wide::Wide.of_u64(product.low_bits())))
+        return InterpFlow.Return(Val.Struct(item: self.ty_item("core", name: "WideProduct"), fields: mem::Shared.of(take halves, alloc: self.alloc)))
+    }
+    fail End.Missing
+} Interpreter.scalar_member
+
+/// The members core declares for a float type without a body.
+fn Interpreter.float_member(self, member: Str, args: Slice[Val]) -> Val fails End {
+    var values = mem::List[Val].empty(self.alloc)
+    for arg in args {
+        mut values.push(self.deref(arg))
+    }
+    if member == "sqrt" and values.len() == 1 {
+        match values[0] {
+            Val.Float32(a) => return Val.Float32(a.sqrt()).canonical_nan()
+            Val.Float64(a) => return Val.Float64(a.sqrt()).canonical_nan()
+            else => {}
+        }
+    }
+    if member == "fused_mul_add" and values.len() == 3 {
+        match values[0] {
+            Val.Float32(a) => match values[1] {
+                Val.Float32(b) => match values[2] {
+                    Val.Float32(c) => return Val.Float32(a.fused_mul_add(b, addend: c)).canonical_nan()
+                    else => {}
+                }
+                else => {}
+            }
+            Val.Float64(a) => match values[1] {
+                Val.Float64(b) => match values[2] {
+                    Val.Float64(c) => return Val.Float64(a.fused_mul_add(b, addend: c)).canonical_nan()
+                    else => {}
+                }
+                else => {}
+            }
+            else => {}
+        }
+    }
+    fail End.Missing
+} Interpreter.float_member
+
+/// A float with a NaN replaced by the canonical NaN of its type.
+fn Val.canonical_nan(take self) -> Val {
+    match nan_width(self) {
+        32 => return Val.Float32(f32.from_bits(0x7FC0_0000))
+        64 => return Val.Float64(f64.from_bits(0x7FF8_0000_0000_0000))
+        else => return self
+    }
+} Val.canonical_nan
+
+/// The bits of an integer of a scalar type, two's complement within its width.
+fn integer_bits(value: wide::Wide, scalar: ty::Scalar) -> u64 {
+    let bits = scalar.bits()
+    if bits >= 64 {
+        return value.low_bits()
+    }
+    return value.low_bits() & ((1u64 << bits) - 1)
+} integer_bits
+
+/// A named or bit conversion.
+fn Interpreter.numeric_builtin(mut self, builtin: nir::Builtin, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let value = self.deref(args[0])
+    let option_item = self.ty_item("core", name: "Option")
+    match builtin {
+        nir::Builtin.Conversion(conversion: conversion, scalar: target) => match conversion {
+            nir::Conversion.Widen => return InterpFlow.Return(value.widened(target))
+            nir::Conversion.Fit => match value.fitted(target) {
+                Some(fitted) => return InterpFlow.Return(take fitted)
+                None => fail self.conversion_trap(site, at)
+            }
+            nir::Conversion.CheckedFit => match value.fitted(target) {
+                Some(fitted) => return InterpFlow.Return(Val.some(option_item, value: take fitted, alloc))
+                None => return InterpFlow.Return(Val.none(option_item, alloc))
+            }
+            nir::Conversion.Truncate => return InterpFlow.Return(Val.Int(wrap_scalar(value.int_value(), scalar: target)))
+            nir::Conversion.Saturate => return InterpFlow.Return(saturated(value, target))
+            nir::Conversion.Nearest => return InterpFlow.Return(value.nearest(target))
+        }
+        nir::Builtin.Bits(conversion: conversion, owner: nir::BitsOwner.Scalar(scalar)) => match conversion {
+            nir::BitConversion.To => return InterpFlow.Return(Val.Int(wide::Wide.of_u64(value.scalar_bits(scalar))))
+            nir::BitConversion.From => match Val.from_scalar_bits(value.int_value().low_bits(), scalar) {
+                Some(found) => return InterpFlow.Return(take found)
+                None => {
+                    expect false
+                    fail End.Missing
+                }
+            }
+            nir::BitConversion.CheckedFrom => match Val.from_scalar_bits(value.int_value().low_bits(), scalar) {
+                Some(found) => return InterpFlow.Return(Val.some(option_item, value: take found, alloc))
+                None => return InterpFlow.Return(Val.none(option_item, alloc))
+            }
+        }
+        nir::Builtin.Bits(conversion: conversion, owner: nir::BitsOwner.Layout(layout_item)) => {
+            if self.ck.layout_shape(layout_item).is_none() {
+                fail End.Missing
+            }
+            match conversion {
+                nir::BitConversion.To => return InterpFlow.Return(Val.Int(wide::Wide.of_u64(self.layout_bits(layout_item, value))))
+                nir::BitConversion.From => match self.layout_value(layout_item, bits: value.int_value().low_bits()) {
+                    Some(found) => return InterpFlow.Return(take found)
+                    None => {
+                        expect false
+                        fail End.Missing
+                    }
+                }
+                nir::BitConversion.CheckedFrom => match self.layout_value(layout_item, bits: value.int_value().low_bits()) {
+                    Some(found) => return InterpFlow.Return(Val.some(option_item, value: take found, alloc))
+                    None => return InterpFlow.Return(Val.none(option_item, alloc))
+                }
+            }
+        }
+        nir::Builtin.Intrinsic(_) => {
+            expect false
+            fail End.Missing
+        }
+    }
+} Interpreter.numeric_builtin
+
+fn Val.float_value(self) -> f64 {
+    match self {
+        Val.Float32(value) => return f64.widen(value)
+        Val.Float64(value) => return value
+        Val.Int(value) => return value.to_f64()
+        else => {}
+    }
+    expect false
+    return 0.0
+} Val.float_value
+
+/// `T.widen(x)`: x as a value of T.
+fn Val.widened(self, target: ty::Scalar) -> Val {
+    match self {
+        Val.Int(value) => match target {
+            ty::Scalar.Float32 => return Val.Float32(wide_to_f32(value))
+            ty::Scalar.Float64 => return Val.Float64(value.to_f64())
+            else => return Val.Int(value)
+        }
+        Val.Float32(value) => {
+            if target == ty::Scalar.Float64 {
+                return Val.Float64(f64.widen(value))
+            }
+            return Val.Float32(value)
+        }
+        Val.Float64(value) => return Val.Float64(value)
+        else => {}
+    }
+    expect false
+    return Val.Unit
+} Val.widened
+
+/// `T.fit(x)`: x when exactly a value of T.
+fn Val.fitted(self, target: ty::Scalar) -> Option[Val] {
+    match self {
+        Val.Int(value) => match target {
+            ty::Scalar.Float32 => {
+                let float = wide_to_f32(value)
+                if wide::Wide.saturate_f64(f64.widen(float)) == value {
+                    return Some(Val.Float32(float))
+                }
+                return None
+            }
+            ty::Scalar.Float64 => {
+                let float = value.to_f64()
+                if wide::Wide.saturate_f64(float) == value {
+                    return Some(Val.Float64(float))
+                }
+                return None
+            }
+            else => {
+                if fits_scalar(value, scalar: target) {
+                    return Some(Val.Int(value))
+                }
+                return None
+            }
+        }
+        Val.Float64(value) => if target == ty::Scalar.Float32 {
+            let narrowed = f32.nearest(value)
+            if f64.widen(narrowed) == value or value.is_nan() {
+                return Some(Val.Float32(narrowed))
+            }
+            return None
+        }
+        Val.Float32(_) => {}
+        else => return None
+    }
+    let float = self.float_value()
+    let truncated = wide::Wide.saturate_f64(float)
+    if is_integral(float) and fits_scalar(truncated, scalar: target) {
+        return Some(Val.Int(truncated))
+    }
+    return None
+} Val.fitted
+
+/// `T.nearest(x)`: x rounded to T, ties to even, clamped for an integer T.
+fn Val.nearest(self, target: ty::Scalar) -> Val {
+    let float = self.float_value()
+    match target {
+        ty::Scalar.Float32 => return Val.Float32(f32.nearest(float))
+        ty::Scalar.Float64 => return Val.Float64(float)
+        else => {}
+    }
+    if float.is_nan() {
+        return Val.Int(wide::Wide.zero())
+    }
+    let rounded = if target.is_signed() {
+        wide::Wide.of_i64(i64.nearest(float))
+    } else {
+        wide::Wide.of_u64(u64.nearest(float))
+    }
+    return Val.Int(clamped(rounded, range: target.range()))
+} Val.nearest
+
+/// The bit pattern of a scalar value.
+fn Val.scalar_bits(self, scalar: ty::Scalar) -> u64 {
+    match self {
+        Val.Float32(value) => return u64.widen(value.to_bits())
+        Val.Float64(value) => return value.to_bits()
+        Val.Bool(value) => if value {
+            return 1
+        } else {
+            return 0
+        }
+        Val.Char(c) => return u64.widen(c.to_bits())
+        Val.Int(value) => return integer_bits(value, scalar)
+        else => {}
+    }
+    expect false
+    return 0
+} Val.scalar_bits
+
+/// The value of a scalar type with a bit pattern, none for a niche.
+fn Val.from_scalar_bits(bits: u64, scalar: ty::Scalar) -> Option[Val] {
+    match scalar {
+        ty::Scalar.Float32 => return Some(Val.Float32(f32.from_bits(u32.truncate(bits))))
+        ty::Scalar.Float64 => return Some(Val.Float64(f64.from_bits(bits)))
+        ty::Scalar.Bool => match bits {
+            0 => return Some(Val.Bool(false))
+            1 => return Some(Val.Bool(true))
+            else => return None
+        }
+        ty::Scalar.Char => match char.checked_from_bits(u32.truncate(bits)) {
+            Some(c) => return Some(Val.Char(c))
+            None => return None
+        }
+        else => return Some(Val.Int(wrap_scalar(wide::Wide.of_u64(bits), scalar)))
+    }
+} Val.from_scalar_bits
+
+/// The bits value of an integer layout's value.
+fn Interpreter.layout_bits(self, layout_item: ty::ItemId, value: Val) -> u64 {
+    let Some(shape) = self.ck.layout_shape(layout_item) else {
+        expect false
+        return 0
+    }
+    match shape {
+        LayoutShape.Tags(values) => match value {
+            Val.Variant(item: _, index: index, fields: _) => return values[usize.widen(index)]
+            else => {
+                expect false
+                return 0
+            }
+        }
+        LayoutShape.Fields(fields) => {
+            let types = self.layout_field_types(layout_item)
+            let parts = value.fields()
+            var all: u64 = 0
+            var index: usize = 0
+            while index < fields.len() and index < parts.len() and index < types.len() {
+                let field = fields[index]
+                var bits = parts[index].int_value().low_bits()
+                if field.kind == BitsKind.Typed {
+                    match self.ck.types().kind(types[index]) {
+                        ty::TyKind.Item(item: nested, args: _) => {
+                            bits = self.layout_bits(nested, value: parts[index])
+                        }
+                        else => {}
+                    }
+                }
+                if field.kind == BitsKind.Rest {
+                    all = all | bits
+                } else {
+                    all = all | (bits << field.low)
+                }
+                index += 1
+            }
+            return all
+        }
+    }
+} Interpreter.layout_bits
+
+/// The value of an integer layout with a bits value, none for a niche.
+fn Interpreter.layout_value(self, layout_item: ty::ItemId, bits: u64) -> Option[Val] {
+    let Some(shape) = self.ck.layout_shape(layout_item) else {
+        expect false
+        return None
+    }
+    let alloc = self.alloc
+    match shape {
+        LayoutShape.Tags(values) => {
+            let Some(index) = values.position(fn(value: u64) => value == bits) else {
+                return None
+            }
+            return Some(Val.Variant(item: layout_item, index: u32.fit(index), fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc)))
+        }
+        LayoutShape.Fields(fields) => {
+            let types = self.layout_field_types(layout_item)
+            var covered: u64 = 0
+            var values = mem::List[Val].empty(alloc)
+            var index: usize = 0
+            while index < fields.len() and index < types.len() {
+                let field = fields[index]
+                let mask = if field.width >= 64 {
+                    ~0u64
+                } else {
+                    (1u64 << field.width) - 1
+                }
+                if field.kind != BitsKind.Rest {
+                    covered = covered | (mask << field.low)
+                }
+                let Some(held) = self.field_value(field.kind, ty: types[index], raw: (bits >> field.low) & mask) else {
+                    return None
+                }
+                mut values.push(take held)
+                index += 1
+            }
+            for position in 0..<values.len() {
+                if position < fields.len() and fields[position].kind == BitsKind.Rest {
+                    values[position] = Val.Int(wide::Wide.of_u64(bits & ~covered))
+                }
+            }
+            return Some(Val.Struct(item: layout_item, fields: mem::Shared.of(take values, alloc)))
+        }
+    }
+} Interpreter.layout_value
+
+/// The types of a layout's fields, in declaration order.
+fn Interpreter.layout_field_types(self, layout_item: ty::ItemId) -> mem::List[ty::Ty] {
+    var types = mem::List[ty::Ty].empty(self.alloc)
+    let sig = self.ck.sig(layout_item)
+    match sig.contents().kind {
+        SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut types.push(field.ty)
+            }
+        }
+        else => {}
+    }
+    return types
+} Interpreter.layout_field_types
+
+/// The shift members: `checked_shl` gives none past the width or the range, the others trap
+/// past the width.
+fn Interpreter.shifted(self, scalar: ty::Scalar, member: Str, a: wide::Wide, amount: wide::Wide, at: ItemSpan) -> Val fails End {
+    let fits_width = amount.lt(wide::Wide.of_u64(u64.widen(scalar.bits())))
+    if member == "checked_shl" {
+        let option_item = self.ty_item("core", name: "Option")
+        var capped: u32 = 127
+        if amount.lt(wide::Wide.of_u64(127)) {
+            capped = u32.truncate(amount.low_bits())
+        }
+        let shifted = a.shift_left(capped)
+        if fits_width and fits_scalar(shifted, scalar) {
+            return Val.some(option_item, value: Val.Int(shifted), alloc: self.alloc)
+        }
+        return Val.none(option_item, alloc: self.alloc)
+    }
+    if not fits_width {
+        fail self.trap("trap.shift", at)
+    }
+    let shift = u32.truncate(amount.low_bits())
+    if member == "wrapping_shl" {
+        return Val.Int(wrap_scalar(a.shift_left(shift), scalar))
+    }
+    return Val.Int(a.shift_right(shift))
+} Interpreter.shifted
+
+/// The width of a float value that is a NaN, 0 for another value.
+fn nan_width(value: Val) -> u32 {
+    match value {
+        Val.Float32(float) => if float.is_nan() {
+            return 32
+        }
+        Val.Float64(float) => if float.is_nan() {
+            return 64
+        }
+        else => {}
+    }
+    return 0
+} nan_width
+
+/// An integer as the nearest `f32`, ties to even.
+fn wide_to_f32(value: wide::Wide) -> f32 {
+    match value.to_i64() {
+        Some(small) => return f32.nearest(small)
+        None => {}
+    }
+    match value.to_u64() {
+        Some(large) => return f32.nearest(large)
+        None => {}
+    }
+    return f32.nearest(value.to_f64())
+} wide_to_f32
+
+/// Whether a float is finite and integral.
+fn is_integral(float: f64) -> bool {
+    if float.is_nan() {
+        return false
+    }
+    let magnitude = float.abs()
+    if magnitude == f64.from_bits(0x7FF0_0000_0000_0000) {
+        return false
+    }
+    if magnitude >= 4_503_599_627_370_496.0 {
+        return true
+    }
+    return wide::Wide.saturate_f64(float).to_f64() == float
+} is_integral
+
+/// `T.saturate(x)`: x clamped to the range of an integer T, a float truncated first and NaN
+/// giving 0.
+fn saturated(value: Val, target: ty::Scalar) -> Val {
+    let range = target.range()
+    match value {
+        Val.Int(held) => return Val.Int(clamped(held, range))
+        Val.Float32(_) or Val.Float64(_) => {
+            let float = value.float_value()
+            if float.is_nan() {
+                return Val.Int(wide::Wide.zero())
+            }
+            return Val.Int(clamped(wide::Wide.saturate_f64(float), range))
+        }
+        else => {}
+    }
+    expect false
+    return Val.Int(wide::Wide.zero())
+} saturated
+
+/// An integer clamped to a range.
+fn clamped(value: wide::Wide, range: ty::Range) -> wide::Wide {
+    return value.max_of(range.low).min_of(range.high)
+} clamped
+
+/// The value of a field of an integer layout with its raw bits, none for a niche; a `rest`
+/// field's is filled in once the others are known.
+fn Interpreter.field_value(self, kind: BitsKind, ty: ty::Ty, raw: u64) -> Option[Val] {
+    match kind {
+        BitsKind.Bool => return Some(Val.Bool(raw == 1))
+        BitsKind.Rest => return Some(Val.Int(wide::Wide.zero()))
+        BitsKind.Typed => match self.ck.types().kind(ty) {
+            ty::TyKind.Item(item: nested, args: _) => return self.layout_value(nested, bits: raw)
+            else => {}
+        }
+        BitsKind.Ranged => {}
+    }
+    return Some(Val.Int(wide::Wide.of_u64(raw)))
+} Interpreter.field_value

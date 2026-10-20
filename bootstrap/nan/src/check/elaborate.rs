@@ -18,7 +18,9 @@ use super::Checker;
 use super::db::{ItemId, TypeKey};
 use super::props::Property;
 use super::sig::{FnSig, SigKind};
-use super::tir::{ClauseRole, LocalId, LocalKind, TBody, TClosure, TExpr, TKind, TStmtKind};
+use super::tir::{
+    ClauseRole, LocalId, LocalKind, TBlock, TBody, TClosure, TExpr, TKind, TStmtKind,
+};
 use super::ty::{Arg, Args, Const, Param as GenericParam, Scalar, Subst, Ty};
 use crate::nir::{
     Callable, ClosureHead, FnRef, Function, NTy, Op, Operand, Param, Place, Role, Span, Unit, Value,
@@ -184,6 +186,7 @@ impl Checker<'_> {
             elab.exits.inherited = inherited;
             elab.failure_ty = fails.clone();
             elab.exit_ty = Some(sig.result.clone());
+            elab.projection = role == Role::Body && sig.is_proj();
             elab.declare_params(&body.params, &sig.params_modes());
             elab.enter(&olds)?;
             elab.function_root(root)?;
@@ -1193,6 +1196,9 @@ pub struct Elab<'e, 'a> {
     /// The index the unit's functions of the typed body's closures start at: 0 but for an
     /// inlined rewrite's closures.
     pub closure_base: u32,
+    /// Whether the function is a projection, whose returned `if` or `match` returns the value of
+    /// each branch in the form its head gives.
+    pub projection: bool,
 }
 
 impl<'e, 'a> Elab<'e, 'a> {
@@ -1234,6 +1240,7 @@ impl<'e, 'a> Elab<'e, 'a> {
             when: None,
             forwarding: Vec::new(),
             closure_base: 0,
+            projection: false,
         }
     }
 
@@ -1563,24 +1570,39 @@ fn collect_conditions<'b>(expr: &'b TExpr, found: &mut Vec<(Role, &'b TExpr)>) {
 }
 
 fn walk_conditions<'b>(expr: &'b TExpr, found: &mut Vec<(Role, &'b TExpr)>) {
-    if let TKind::Block(block) = &expr.kind {
-        for stmt in &block.stmts {
-            match &stmt.kind {
-                TStmtKind::While { invariants, .. }
-                | TStmtKind::For { invariants, .. }
-                | TStmtKind::Loop { invariants, .. } => {
-                    found.extend(
-                        invariants
-                            .iter()
-                            .map(|invariant| (Role::Invariant, invariant)),
-                    );
-                }
-                TStmtKind::Assume(condition) => found.push((Role::Assume, condition)),
-                _ => {}
-            }
-        }
+    if let TKind::Block(block) | TKind::If { then: block, .. } = &expr.kind {
+        block_conditions(block, found);
     }
     expr.each_child(&mut |child| walk_conditions(child, found));
+}
+
+/// The loop invariants and `assume` conditions of a block's statements, those of the loop bodies
+/// and `else` blocks of `let` the statements hold included.
+fn block_conditions<'b>(block: &'b TBlock, found: &mut Vec<(Role, &'b TExpr)>) {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            TStmtKind::While {
+                invariants, body, ..
+            }
+            | TStmtKind::For {
+                invariants, body, ..
+            }
+            | TStmtKind::Loop { invariants, body } => {
+                found.extend(
+                    invariants
+                        .iter()
+                        .map(|invariant| (Role::Invariant, invariant)),
+                );
+                block_conditions(body, found);
+            }
+            TStmtKind::Let {
+                otherwise: Some(otherwise),
+                ..
+            } => block_conditions(otherwise, found),
+            TStmtKind::Assume(condition) => found.push((Role::Assume, condition)),
+            _ => {}
+        }
+    }
 }
 
 /// The bindings a condition names, by first mention, its quantifiers' own excepted.

@@ -233,7 +233,7 @@ A **VCS workspace** is a workspace inside a git working tree. In it, a seal meet
 An **API snapshot** is the machine file `.nan/api/<module>.nan` that `nan api update` writes for a module of a package, named by the module's last segment; [machine files](35-format.md#machine-files) gives its syntax. It holds:
 
 - for each `pub` item of the module and each impl line of it whose impl target and interface are both `pub`: its interface text, promised properties, interface hash, [digest](10-effects-digests.md#digests) under each declared target, and public docs with their [bound hashes](32-docs.md#doc-binding);
-- for each item of the module whose accepted spec is not empty: its accepted spec and its pending weakening, if any;
+- for each item of the module whose accepted spec is not empty or that has a pending weakening: its accepted spec and its pending weakening, if any;
 - the seals of the module's items.
 
 An item that target variants hold has one entry, whose text and docs are its first variant's in byte order of path ([API snapshot syntax](35-format.md#api-snapshots)).

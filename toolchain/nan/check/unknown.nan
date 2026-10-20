@@ -1,0 +1,395 @@
+//! Unknown names: the candidates a `name.unknown` diagnostic ranks, lists and offers as exact fixes, and the stub it offers for an unknown callee with no candidate near.
+
+/// The verbs of the controlled vocabulary with their synonyms, each written `verb=synonym,...`.
+const SYNONYMS: Str = "empty=new,init of=wrap,from_value filled=repeat zeroed=zero_bytes push=push_back,enqueue append=extend,concat insert=put,add_entry pop=pop_back,dequeue remove=delete,erase retain=filter,keep_if truncate=shorten clear=reset,wipe fill=set_all copy_from=assign,clone_from contains=has,includes position=find_index find=index_of,search at=item,element get=retrieve,get_or_none view=as_slice cursor=iter extract=replace,swap_out contents=deref,unbox,inner boxed=allocate,box_value share=clone,dup split=fork,divide merge=combine close=shutdown,dispose abandon=abort,drop,kill revoke=disable,withdraw spawn=go,launch cancel=stop send=emit,dispatch post=notify,deliver receive=recv drain=consume wait=block,park encode=serialize decode=deserialize render=to_string,format,display intern=symbol_of"
+
+/// How many candidates a diagnostic lists.
+const LISTED_CANDIDATES: usize = 5
+
+/// Reports an unknown name written over the tokens `construct` of an item: a path that a
+/// newer release of its alias's source names as such, otherwise with the candidates near it
+/// among `candidates` listed as notes and offered as exact fixes, or, when none is near,
+/// `stub` inserted after the item.
+fn Checker.report_unknown(
+    self,
+    item: ty::ItemId,
+    construct: nir::Span,
+    take candidates: mem::List[text::String],
+    take stub: Option[text::String],
+    ) {
+    let alloc = self.alloc()
+    let written = self.written(item, head: construct.head, last: construct.last)
+    if self.report_newer_release(item, construct, written: written.as_str()) {
+        return
+    }
+    let near = near_candidates(written.as_str(), candidates: take candidates, alloc)
+    var reported = self.on(item, construct, code: diagnostic::Code.NameUnknown)
+    for candidate in near {
+        mut reported.because.push(diagnostic::Reason(role: diagnostic::Role.Note, subject: text::String.of(candidate.as_str(), alloc), at: None))
+    }
+    if near.len() > 0 {
+        for candidate in near {
+            mut reported.fixes.push(self.fix_replacing(item, head: construct.head, last: construct.last, text: candidate.as_str()))
+        }
+    } else {
+        match stub {
+            Some(stub_text) => {
+                let db = self.db()
+                let data = db.item(item)
+                let syntax = db.syntax(item)
+                let end_line = usize.widen(syntax.tokens[syntax.items[data.index].end - 1].line)
+                var at = u32.fit(syntax.source.len())
+                if end_line < syntax.lines.len() {
+                    at = syntax.lines[end_line].start
+                }
+                var inserted = text::String.of("\n", alloc)
+                mut inserted.append(stub_text.as_str())
+                mut reported.fixes.push(self.fix_bytes(item, start: at, end: at, text: inserted.as_str()))
+            }
+            None => {}
+        }
+    }
+    reported.offer = diagnostic::Offer.Each
+    self.report_diagnostic(item, take reported)
+} Checker.report_unknown
+
+/// The tokens of the path holding `token`: its run of identifiers joined by `::`.
+fn Checker.path_span(self, item: ty::ItemId, token: u32) -> nir::Span {
+    let syntax = self.db().syntax(item)
+    var head = usize.widen(token)
+    while head >= 2 and joins_path(syntax, at: head - 1) and is_ident(syntax, at: head - 2) {
+        head -= 2
+    }
+    var last = usize.widen(token)
+    while joins_path(syntax, at: last + 1) and is_ident(syntax, at: last + 2) {
+        last += 2
+    }
+    return nir::Span(head: u32.fit(head), last: u32.fit(last))
+} Checker.path_span
+
+/// The paths code in a module may write for an item: the items it may name as it writes
+/// them, functions named after a type excepted.
+fn Checker.item_candidates(self, module: ty::ModuleId) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var found = mem::List[text::String].empty(alloc)
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        let declared = db.declaration(item)
+        if is_member(declared) or declared.name(alloc).is_none() {
+            continue
+        }
+        match declared.kind {
+            ast::ItemKind.Test(_) => continue
+            else => {}
+        }
+        if db.visible(module, item) {
+            mut found.push(self.item_written(item, from: module))
+        }
+    }
+    return found
+} Checker.item_candidates
+
+/// The types an item's type expressions may name: its generic parameters, the types its
+/// module may name and the core vocabulary's.
+fn Checker.type_candidates(self, item: ty::ItemId) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let module = db.module_of(item)
+    var found = mem::List[text::String].empty(alloc)
+    for def in self.shapes(item).contents() {
+        mut found.push(text::String.of(def.name.as_str(), alloc))
+    }
+    for index in 0..<db.items.len() {
+        let other = ty::ItemId(index: u32.fit(index))
+        let named = match db.declaration(other).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Interface(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => true
+            else => false
+        }
+        if named and db.visible(module, item: other) {
+            mut found.push(self.item_written(other, from: module))
+        }
+    }
+    for name in take core_vocabulary(alloc) {
+        let variant = name.as_str() == "Some" or name.as_str() == "None" or name.as_str() == "Ok" or name.as_str() == "Err"
+        if not variant {
+            mut found.push(take name)
+        }
+    }
+    return found
+} Checker.type_candidates
+
+/// The members of a type code in a module may name: its visible fields, its variants and the
+/// visible functions named after it.
+fn Checker.member_candidates(self, module: ty::ModuleId, ty: ty::Ty) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var found = mem::List[text::String].empty(alloc)
+    var key: Option[TypeKey] = None
+    match self.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            let sig = self.sig(item)
+            match sig.contents().kind {
+                SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+                    for field in fields {
+                        if db.field_visible(module, owner: item, visibility: field.visibility) {
+                            mut found.push(text::String.of(field.name.as_str(), alloc))
+                        }
+                    }
+                }
+                SigKind.Enum(variants: variants) => {
+                    for variant in variants {
+                        mut found.push(text::String.of(variant.name.as_str(), alloc))
+                    }
+                }
+                else => {}
+            }
+            key = Some(TypeKey.Item(item))
+        }
+        ty::TyKind.Scalar(scalar) => {
+            key = Some(TypeKey.Scalar(scalar))
+        }
+        ty::TyKind.Unit => {
+            key = Some(TypeKey.Unit)
+        }
+        else => {}
+    }
+    let Some(owner) = key else {
+        return found
+    }
+    let Some(members) = db.member_table.get(owner) else {
+        return found
+    }
+    for entry in members {
+        for function in entry.value() {
+            if db.visible(module, item: function) {
+                mut found.push(text::String.of(entry.key().as_str(), alloc))
+                break
+            }
+        }
+    }
+    return found
+} Checker.member_candidates
+
+/// The candidates near a written name, closest first: those within a third of the length of the
+/// longer folded form, at most as many as a diagnostic lists.
+fn near_candidates(written: Str, take candidates: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var near = mem::List[NearCandidate].empty(alloc)
+    let folded = fold_path(written, alloc).as_str().char_count()
+    for candidate in take candidates {
+        if candidate.as_str() == written {
+            continue
+        }
+        let distance = name_distance(written, candidate: candidate.as_str(), alloc)
+        var longer = fold_path(candidate.as_str(), alloc).as_str().char_count()
+        if folded > longer {
+            longer = folded
+        }
+        if distance <= (longer + 2) / 3 {
+            mut near.push(NearCandidate(distance: distance, candidate: take candidate))
+        }
+    }
+    mut near.sort_by(fn(left: NearCandidate, right: NearCandidate) => near_order(left, right))
+    var listed = mem::List[text::String].empty(alloc)
+    var last: Option[usize] = None
+    for index in 0..<near.len() {
+        match last {
+            Some(previous) => {
+                if near[previous].distance == near[index].distance and near[previous].candidate.as_str() == near[index].candidate.as_str() {
+                    continue
+                }
+            }
+            None => {}
+        }
+        last = Some(index)
+        if listed.len() < LISTED_CANDIDATES {
+            mut listed.push(text::String.of(near[index].candidate.as_str(), alloc))
+        }
+    }
+    return listed
+} near_candidates
+
+/// The folded form of a path: its segments' folded forms joined by `::`.
+fn fold_path(path: Str, alloc: mem::Alloc) -> text::String {
+    var folded = text::String.empty(alloc)
+    let bytes = path.as_bytes()
+    var start: usize = 0
+    var at: usize = 0
+    while at <= bytes.len() {
+        let boundary = at == bytes.len() or (at + 1 < bytes.len() and bytes[at] == b':' and bytes[at + 1] == b':')
+        if not boundary {
+            at += 1
+            continue
+        }
+        let Some(segment) = path.slice_bytes(start, end: at) else {
+            return folded
+        }
+        if start > 0 {
+            mut folded.append("::")
+        }
+        mut folded.append(fold(segment, alloc).as_str())
+        if at == bytes.len() {
+            break
+        }
+        at += 2
+        start = at
+    }
+    return folded
+} fold_path
+
+/// The distance between a use and a candidate: 0 when replacing a run of the use's words that
+/// the controlled vocabulary lists as a synonym by its verb gives the candidate, and otherwise the
+/// fewest insertions, deletions, substitutions and transpositions of adjacent characters turning
+/// one folded form into the other, no character edited twice.
+fn name_distance(written: Str, candidate: Str, alloc: mem::Alloc) -> usize {
+    if synonym_of(written, candidate, alloc) {
+        return 0
+    }
+    let left = chars_of(fold_path(written, alloc).as_str(), alloc)
+    let right = chars_of(fold_path(candidate, alloc).as_str(), alloc)
+    let width = right.len() + 1
+    var table = mem::List[usize].empty(alloc)
+    for at in 0..=left.len() {
+        for other in 0..=right.len() {
+            if at == 0 {
+                mut table.push(other)
+            } else if other == 0 {
+                mut table.push(at)
+            } else {
+                mut table.push(0)
+            }
+        }
+    }
+    for at in 1..=left.len() {
+        for other in 1..=right.len() {
+            var cost: usize = 1
+            if left[at - 1] == right[other - 1] {
+                cost = 0
+            }
+            var best = table[(at - 1) * width + other] + 1
+            if table[at * width + other - 1] + 1 < best {
+                best = table[at * width + other - 1] + 1
+            }
+            if table[(at - 1) * width + other - 1] + cost < best {
+                best = table[(at - 1) * width + other - 1] + cost
+            }
+            if at > 1 and other > 1 and left[at - 1] == right[other - 2] and left[at - 2] == right[other - 1] and table[(at - 2) * width + other - 2] + 1 < best {
+                best = table[(at - 2) * width + other - 2] + 1
+            }
+            table[at * width + other] = best
+        }
+    }
+    return table[left.len() * width + right.len()]
+} name_distance
+
+/// A candidate near a written name, with its distance.
+struct NearCandidate {
+    distance: usize
+    candidate: text::String
+} NearCandidate
+
+fn near_order(left: NearCandidate, right: NearCandidate) -> core::Ordering {
+    if left.distance != right.distance {
+        return left.distance.cmp(right.distance)
+    }
+    return left.candidate.as_str().cmp(right.candidate.as_str())
+} near_order
+
+/// Whether a token is `::`.
+fn joins_path(syntax: syntax::SourceFile, at: usize) -> bool {
+    return at < syntax.tokens.len() and syntax.tokens[at].kind == syntax::TokenKind.Punct(syntax::Punct.ColonColon)
+} joins_path
+
+/// Whether a token is an identifier.
+fn is_ident(syntax: syntax::SourceFile, at: usize) -> bool {
+    return at < syntax.tokens.len() and syntax.tokens[at].kind == syntax::TokenKind.Ident
+} is_ident
+
+/// The characters of a text.
+fn chars_of(written: Str, alloc: mem::Alloc) -> mem::List[char] {
+    var chars = mem::List[char].empty(alloc)
+    for c in written {
+        mut chars.push(c)
+    }
+    return chars
+} chars_of
+
+/// Whether replacing a run of a written name's `_`-separated words that the controlled
+/// vocabulary lists as a synonym by its verb gives the candidate.
+fn synonym_of(written: Str, candidate: Str, alloc: mem::Alloc) -> bool {
+    let bytes = written.as_bytes()
+    var starts = mem::List[usize].empty(alloc)
+    var ends = mem::List[usize].empty(alloc)
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at == bytes.len() or bytes[at] == b'_' {
+            mut starts.push(start)
+            mut ends.push(at)
+            start = at + 1
+        }
+    }
+    for head in 0..<starts.len() {
+        for last in head..<ends.len() {
+            let Some(run) = written.slice_bytes(starts[head], end: ends[last]) else {
+                continue
+            }
+            if synonym_replaced(written, run_start: starts[head], run_end: ends[last], run, candidate, alloc) {
+                return true
+            }
+        }
+    }
+    return false
+} synonym_of
+
+/// Whether replacing the run of a written name at `run_start..run_end` by the verb of the
+/// vocabulary entry listing it as a synonym gives the candidate.
+fn synonym_replaced(written: Str, run_start: usize, run_end: usize, run: Str, candidate: Str, alloc: mem::Alloc) -> bool {
+    for entry in Words(list: SYNONYMS, at: 0) {
+        let bytes = entry.as_bytes()
+        var equals: usize = 0
+        while equals < bytes.len() and bytes[equals] != b'=' {
+            equals += 1
+        }
+        let Some(verb) = entry.slice_bytes(0, end: equals) else {
+            continue
+        }
+        let Some(alternatives) = entry.slice_bytes(equals + 1, end: bytes.len()) else {
+            continue
+        }
+        if not lists_synonym(alternatives, wanted: run) {
+            continue
+        }
+        let Some(before) = written.slice_bytes(0, end: run_start) else {
+            continue
+        }
+        let Some(after) = written.slice_bytes(run_end, end: written.byte_len()) else {
+            continue
+        }
+        var replaced = text::String.of(before, alloc)
+        mut replaced.append(verb)
+        mut replaced.append(after)
+        if replaced.as_str() == candidate {
+            return true
+        }
+    }
+    return false
+} synonym_replaced
+
+/// Whether a comma-separated list of synonyms holds one.
+fn lists_synonym(alternatives: Str, wanted: Str) -> bool {
+    let bytes = alternatives.as_bytes()
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b',' {
+            continue
+        }
+        let Some(synonym) = alternatives.slice_bytes(start, end: at) else {
+            return false
+        }
+        if synonym == wanted {
+            return true
+        }
+        start = at + 1
+    }
+    return false
+} lists_synonym

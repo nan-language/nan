@@ -382,6 +382,21 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether a cursor type's `next` is a projection.
+    pub fn next_projects(&self, cursor: &Ty) -> bool {
+        self.method_candidates(cursor, "next")
+            .into_iter()
+            .any(|candidate| match candidate {
+                Candidate::Function { item, .. } => {
+                    self.fn_sig(item).is_some_and(|sig| sig.is_proj())
+                }
+                Candidate::Method { bound, method, .. } => match &self.sig(bound.interface).kind {
+                    SigKind::Interface { methods } => methods[method].sig.is_proj(),
+                    _ => false,
+                },
+            })
+    }
+
     /// The candidates of method resolution for `name` on a value of type `ty`.
     pub fn method_candidates(&self, ty: &Ty, name: &str) -> Vec<Candidate> {
         let mut candidates = Vec::new();

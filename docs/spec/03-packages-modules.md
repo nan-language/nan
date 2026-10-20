@@ -538,6 +538,8 @@ Every declared name follows the convention of its kind; a name that does not is 
 | PascalCase | an uppercase letter followed by letters and digits, holding a lowercase letter unless it is one letter | structs, enums, interfaces, layouts, registers blocks, variants, layout tags, generic parameters |
 | SCREAMING_SNAKE | uppercase letters and digits, starting with a letter, with single underscores between words, at least 2 characters | consts |
 
+The name of a [foreign fn](23-low-level.md#foreign-functions) is the external symbol it declares and follows no convention.
+
 For a name declared in source, the exact fix of `name.case` renames the declaration and its uses in the package. It splits the name into words at underscores and before each uppercase letter that follows a lowercase letter or a digit, drops empty words, and joins them lowercase with `_` for snake_case, each capitalised with the rest lowercase for PascalCase, or uppercase with `_` for SCREAMING_SNAKE. No fix is offered when the result breaks a naming rule.
 
 The **folded form** of a name is the name with each uppercase letter made lowercase and each underscore removed. Names in one namespace are distinct after folding:

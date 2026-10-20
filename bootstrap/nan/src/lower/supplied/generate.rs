@@ -1220,7 +1220,7 @@ pub fn derived(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, ty: &Ty) {
                         let at = generate(lo, fx, payload_ty, choices_value, alloc);
                         held.push(lo.held_at(fx, payload_ty, at));
                     }
-                    let value = lo.variant_value(fx, ty, &name, &held, false);
+                    let value = lo.variant_value(fx, ty, &name, &held, None);
                     lo.store_held(fx, slot, value, ty);
                 });
             }

@@ -1,0 +1,1391 @@
+//! Signatures: what each item declares to the code naming it, resolved from its head, fields, variants or methods, with the problems found resolving them.
+
+/// A diagnostic found resolving a signature, reported when its item is checked.
+struct Problem derives Copy, Eq {
+    code: diagnostic::Code
+    token: u32
+} Problem
+
+/// A type mismatch found resolving a signature: its token, and its expected and found texts.
+struct Mismatch {
+    token: u32
+    expected: text::String
+    found: text::String
+} Mismatch
+
+/// An instantiation, `Dyn` or function type a signature writes, with its token.
+struct Instantiated derives Copy {
+    ty: ty::Ty
+    token: u32
+} Instantiated
+
+/// A path naming nothing that matches the old form of a tombstone without an old head, by its
+/// first and last tokens, with the tombstone.
+struct RenamedPath derives Copy {
+    construct: nir::Span
+    tombstone: ty::ItemId
+} RenamedPath
+
+/// What resolving a signature finds: its diagnostics, the type mismatches with their expected
+/// and found texts, and the instantiations, `Dyn` and function types it writes, checked once
+/// every signature is known.
+struct Problems {
+    found: mem::List[Problem]
+    mismatches: mem::List[Mismatch]
+    instantiations: mem::List[Instantiated]
+    /// The paths naming nothing that match the old form of a tombstone without an old head, by
+    /// their first and last tokens, with the tombstone.
+    renamed: mem::List[RenamedPath]
+} Problems
+
+fn Problems.empty(alloc: mem::Alloc) -> Problems {
+    return Problems(found: mem::List[Problem].empty(alloc), mismatches: mem::List[Mismatch].empty(alloc), instantiations: mem::List[Instantiated].empty(alloc), renamed: mem::List[RenamedPath].empty(alloc))
+} Problems.empty
+
+struct GenericDef {
+    name: text::String
+    param: ty::Param
+    bounds: mem::List[ty::Bound]
+    /// The type of a const parameter.
+    constant: Option[ty::Scalar]
+} GenericDef
+
+/// Where a type expression is resolved: the item writing it, its module and the generic
+/// parameters in scope.
+view struct TypeCtx {
+    item: ty::ItemId
+    module: ty::ModuleId
+    generics: Slice[GenericDef]
+    /// The `Self` of an interface item.
+    self_param: Option[ty::Param]
+} TypeCtx
+
+struct ParamSig {
+    name: text::String
+    mode: ast::Mode
+    ty: ty::Ty
+    token: u32
+    is_self: bool
+} ParamSig
+
+struct FnSig {
+    /// The generic parameters in scope: the owner type's, then its own.
+    generics: mem::List[GenericDef]
+    /// How many of `generics` the owner type gives.
+    inherited: usize
+    params: mem::List[ParamSig]
+    result: ty::Ty
+    failure: Option[ty::Ty]
+    wait: bool
+    limit_set: ty::LimitSet
+    modifier: Option[ast::FnModifier]
+    convention: Option[text::String]
+} FnSig
+
+struct FieldSig {
+    name: text::String
+    ty: ty::Ty
+    visibility: ast::Visibility
+    token: u32
+} FieldSig
+
+/// A labelled payload field and its type.
+struct LabelledTy {
+    name: text::String
+    ty: ty::Ty
+} LabelledTy
+
+enum Payload {
+    None
+    Single(ty::Ty)
+    Labelled(mem::List[LabelledTy])
+} Payload
+
+struct VariantSig {
+    name: text::String
+    payload: Payload
+    from: bool
+    token: u32
+} VariantSig
+
+struct MethodSig {
+    name: text::String
+    sig: FnSig
+    default: bool
+} MethodSig
+
+struct RegisterSig {
+    name: text::String
+    ty: ty::Ty
+    access: ast::Access
+} RegisterSig
+
+enum SigKind {
+    Fn(FnSig)
+    Struct(fields: mem::List[FieldSig])
+    Enum(variants: mem::List[VariantSig])
+    Interface(methods: mem::List[MethodSig])
+    Impl(target: Option[TypeKey], target_ty: ty::Ty, bound: Option[ty::Bound])
+    Layout(fields: mem::List[FieldSig], tags: mem::List[text::String], bits: Option[ty::Ty])
+    Registers(members: mem::List[RegisterSig])
+    Const(ty: ty::Ty)
+    Registry(entry: ty::Ty)
+    Other
+} SigKind
+
+/// An item's signature: its generic parameters and what its kind declares.
+struct Sig {
+    generics: mem::List[GenericDef]
+    kind: SigKind
+    problems: Problems
+} Sig
+
+fn Problems.push(mut self, problem: Problem) {
+    mut self.found.push(problem)
+} Problems.push
+
+fn FnSig.is_proj(self) -> bool {
+    return self.modifier == Some(ast::FnModifier.Proj)
+} FnSig.is_proj
+
+fn FnSig.has_self(self) -> bool {
+    return self.params.len() > 0 and self.params[0].is_self
+} FnSig.has_self
+
+proj fn FnSig.own_generics(self) -> Slice[GenericDef] {
+    let Some(parts) = self.generics.view().split_at(self.inherited) else {
+        expect false
+        return self.generics.view()
+    }
+    return parts.tail
+} FnSig.own_generics
+
+/// The function type of the head.
+fn FnSig.fn_ty(self, alloc: mem::Alloc) -> ty::FnTy {
+    var kind = ast::FnKind.Plain
+    if self.modifier == Some(ast::FnModifier.Interrupt) {
+        kind = ast::FnKind.Interrupt
+    }
+    var params = mem::List[ty::FnParam].empty(alloc)
+    for param in self.params {
+        mut params.push(ty::FnParam(mode: param.mode, name: text::String.of(param.name.as_str(), alloc), ty: param.ty))
+    }
+    var convention: Option[text::String] = None
+    match self.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    return ty::FnTy(kind: kind, params: take params, result: self.result, failure: self.failure, wait: self.wait, limit_set: self.limit_set, convention: take convention)
+} FnSig.fn_ty
+
+/// The offset of an interface method's own generic parameters in their owner's numbering.
+fn method_param(index: usize, param: usize) -> u16 {
+    return u16.truncate(256 * (index + 1) + param)
+} method_param
+
+fn Checker.sig(self, item: ty::ItemId) -> mem::Shared[Sig] {
+    let db = self.db()
+    db.note(item)
+    let state = self.state.contents()
+    match state.sigs.get(item) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let head = db.head_line(item)
+    let computed = db.about(Some(item), compute: fn() => db.on_line(head, compute: fn() => self.compute_sig(item)))
+    return state.sigs.insert(item, value: mem::Shared.of(take computed, alloc: self.alloc())).share()
+} Checker.sig
+
+/// The generic parameters an item declares, without their bounds: what naming it needs.
+fn Checker.shapes(self, item: ty::ItemId) -> mem::Shared[mem::List[GenericDef]] {
+    let db = self.db()
+    db.note(item)
+    let state = self.state.contents()
+    match state.shapes.get(item) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let alloc = self.alloc()
+    let computed = match db.ast(item).kind {
+        ast::ItemKind.Struct(structure) => shape_defs(item, params: structure.generics.view(), alloc)
+        ast::ItemKind.Enum(enumeration) => shape_defs(item, params: enumeration.generics.view(), alloc)
+        ast::ItemKind.Interface(declared) => shape_defs(item, params: declared.generics.view(), alloc)
+        ast::ItemKind.Fn(function) => shape_defs(item, params: function.head.generics.view(), alloc)
+        else => mem::List[GenericDef].empty(alloc)
+    }
+    return state.shapes.insert(item, value: mem::Shared.of(take computed, alloc)).share()
+} Checker.shapes
+
+/// The generic parameters an item declares, numbered in order, without bounds.
+fn shape_defs(item: ty::ItemId, params: Slice[ast::GenericParam], alloc: mem::Alloc) -> mem::List[GenericDef] {
+    var defs = mem::List[GenericDef].empty(alloc)
+    for index in 0..<params.len() {
+        let param = params[index]
+        mut defs.push(GenericDef(name: text::String.of(param.name.text.as_str(), alloc), param: ty::Param(owner: item, index: u16.truncate(index)), bounds: mem::List[ty::Bound].empty(alloc), constant: const_type(param)))
+    }
+    return defs
+} shape_defs
+
+/// The signature of a function item.
+fn Checker.fn_sig(self, item: ty::ItemId) -> Option[FnSig] {
+    let sig = self.sig(item)
+    return match sig.contents().kind {
+        SigKind.Fn(head) => Some(head.copy(self.alloc()))
+        else => None
+    }
+} Checker.fn_sig
+
+/// The generic parameters of a type item, or of the type a function is named after.
+fn Checker.type_generics(self, key: TypeKey) -> mem::List[GenericDef] {
+    let alloc = self.alloc()
+    let TypeKey.Item(item) = key else {
+        return mem::List[GenericDef].empty(alloc)
+    }
+    let sig = self.sig(item)
+    return GenericDef.copies(sig.contents().generics.view(), alloc)
+} Checker.type_generics
+
+/// The type a type key names, applied to its own generic parameters.
+fn Checker.key_ty(self, key: TypeKey) -> ty::Ty {
+    return match key {
+        TypeKey.Scalar(scalar) => ty::Ty.scalar(scalar)
+        TypeKey.Unit => ty::Ty.unit()
+        TypeKey.Item(item) => self.own_args_ty(item)
+    }
+} Checker.key_ty
+
+/// A type item applied to its own generic parameters.
+fn Checker.own_args_ty(self, item: ty::ItemId) -> ty::Ty {
+    let types = self.types()
+    let sig = self.sig(item)
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    for def in sig.contents().generics {
+        mut args.push(def.param_arg(types))
+    }
+    return types.item(item, take args)
+} Checker.own_args_ty
+
+fn Checker.compute_sig(self, item: ty::ItemId) -> Sig {
+    let db = self.db()
+    let module = db.item(item).module
+    let alloc = self.alloc()
+    var problems = Problems.empty(alloc)
+    let none = mem::List[GenericDef].empty(alloc)
+    let node = db.ast(item)
+    match node.kind {
+        ast::ItemKind.Fn(function) => return self.function_item_sig(item, module, function, take problems)
+        ast::ItemKind.Retired(tombstone) => return self.retired_sig(item, module, tombstone, take problems)
+        ast::ItemKind.Struct(structure) => return self.struct_sig(item, module, structure, take problems)
+        ast::ItemKind.Enum(enumeration) => return self.enum_sig(item, module, enumeration, take problems)
+        ast::ItemKind.Interface(declared) => return self.interface_sig(item, module, declared, take problems)
+        ast::ItemKind.Impl(implementation) => return self.impl_sig(item, module, implementation, take problems)
+        ast::ItemKind.Layout(written) => return self.layout_sig(item, module, written, visibility: node.visibility, take problems)
+        ast::ItemKind.Registers(block) => {
+            var members = mem::List[RegisterSig].empty(alloc)
+            for register in block.members {
+                mut members.push(RegisterSig(name: text::String.of(register.name.text.as_str(), alloc), ty: self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: register.ty, mut problems), access: register.access))
+            }
+            return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Registers(members: take members), problems: take problems)
+        }
+        ast::ItemKind.Const(constant) => {
+            var const_ty = ty::Ty.error()
+            match constant.ty {
+                Some(written) => {
+                    const_ty = self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: written, mut problems)
+                }
+                None => {}
+            }
+            return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Const(ty: const_ty), problems: take problems)
+        }
+        ast::ItemKind.Registry(declared) => {
+            let entry = self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: declared.entry, mut problems)
+            return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Registry(entry: entry), problems: take problems)
+        }
+        else => return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Other, problems: take problems)
+    }
+} Checker.compute_sig
+
+/// The signature of a function item: its owner type's parameters, with the bounds of the impl
+/// lines it implements a method of, then its own.
+fn Checker.function_item_sig(self, item: ty::ItemId, module: ty::ModuleId, function: ast::FnItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let owner = self.db().owners.get(item)
+    var inherited = match owner {
+        Some(key) => self.type_generics(key)
+        None => mem::List[GenericDef].empty(alloc)
+    }
+    self.add_impl_bounds(item, mut inherited)
+    var self_ty: Option[ty::Ty] = None
+    match owner {
+        Some(key) => {
+            self_ty = Some(self.key_ty(key))
+        }
+        None => {}
+    }
+    var modifier: Option[ast::FnModifier] = None
+    match function.modifier {
+        Some(word) => {
+            modifier = Some(word.kind)
+        }
+        None => {}
+    }
+    var convention: Option[text::String] = None
+    match function.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.value.as_str(), alloc))
+        }
+        None => {}
+    }
+    let sig = self.head_sig(module, owner: item, method: 0, head: function.head, take inherited, self_ty, self_param: None, modifier, take convention, mut problems)
+    return Sig(generics: GenericDef.copies(sig.generics.view(), alloc), kind: SigKind.Fn(take sig), problems: take problems)
+} Checker.function_item_sig
+
+/// The signature of a tombstone: the head of its old form, if it states one.
+fn Checker.retired_sig(self, item: ty::ItemId, module: ty::ModuleId, tombstone: ast::RetiredItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let Some(head) = tombstone.head else {
+        return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Other, problems: take problems)
+    }
+    var owner: Option[TypeKey] = None
+    if tombstone.member.is_some() {
+        owner = self.db().owner_key(module, owner: tombstone.path)
+    }
+    let inherited = match owner {
+        Some(key) => self.type_generics(key)
+        None => mem::List[GenericDef].empty(alloc)
+    }
+    var self_ty: Option[ty::Ty] = None
+    match owner {
+        Some(key) => {
+            self_ty = Some(self.key_ty(key))
+        }
+        None => {}
+    }
+    let sig = self.head_sig(module, owner: item, method: 0, head, take inherited, self_ty, self_param: None, modifier: None, convention: None, mut problems)
+    return Sig(generics: GenericDef.copies(sig.generics.view(), alloc), kind: SigKind.Fn(take sig), problems: take problems)
+} Checker.retired_sig
+
+fn Checker.struct_sig(self, item: ty::ItemId, module: ty::ModuleId, structure: ast::StructItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let none = mem::List[GenericDef].empty(alloc)
+    let generics = self.generic_defs(module, owner: item, method: 0, params: structure.generics.view(), inherited: none.view(), self_param: None, mut problems)
+    var fields = mem::List[FieldSig].empty(alloc)
+    for field in structure.fields() {
+        mut fields.push(FieldSig(name: text::String.of(field.name.text.as_str(), alloc), ty: self.type_expr(TypeCtx(item: item, module: module, generics: generics.view(), self_param: None), ty: field.ty, mut problems), visibility: field.visibility, token: field.token))
+    }
+    return Sig(generics: take generics, kind: SigKind.Struct(fields: take fields), problems: take problems)
+} Checker.struct_sig
+
+fn Checker.enum_sig(self, item: ty::ItemId, module: ty::ModuleId, enumeration: ast::EnumItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let none = mem::List[GenericDef].empty(alloc)
+    let generics = self.generic_defs(module, owner: item, method: 0, params: enumeration.generics.view(), inherited: none.view(), self_param: None, mut problems)
+    var variants = mem::List[VariantSig].empty(alloc)
+    for variant in enumeration.variants {
+        let payload = self.payload_sig(TypeCtx(item: item, module: module, generics: generics.view(), self_param: None), written: variant.payload, mut problems)
+        mut variants.push(VariantSig(name: text::String.of(variant.name.text.as_str(), alloc), payload: take payload, from: variant.from, token: variant.name.token))
+    }
+    return Sig(generics: take generics, kind: SigKind.Enum(variants: take variants), problems: take problems)
+} Checker.enum_sig
+
+/// The payload a variant declares: none, a single unlabelled type, or labelled fields.
+fn Checker.payload_sig(self, ctx: TypeCtx, written: Option[mem::List[ast::PayloadField]], mut problems: Problems) -> Payload {
+    let alloc = self.alloc()
+    let Some(fields) = written else {
+        return Payload.None
+    }
+    if fields.len() == 1 and fields[0].label.is_none() {
+        return Payload.Single(self.type_expr(ctx, ty: fields[0].ty, mut problems))
+    }
+    var labelled = mem::List[LabelledTy].empty(alloc)
+    for field in fields {
+        var label = text::String.empty(alloc)
+        match field.label {
+            Some(written_label) => {
+                match single_name(written_label, alloc) {
+                    Some(name) => {
+                        label = name
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        mut labelled.push(LabelledTy(name: take label, ty: self.type_expr(ctx, ty: field.ty, mut problems)))
+    }
+    return Payload.Labelled(take labelled)
+} Checker.payload_sig
+
+fn Checker.interface_sig(self, item: ty::ItemId, module: ty::ModuleId, declared: ast::InterfaceItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let types = self.types()
+    let self_param = ty::Param(owner: item, index: ty::SELF_INDEX)
+    let none = mem::List[GenericDef].empty(alloc)
+    var generics = self.generic_defs(module, owner: item, method: 0, params: declared.generics.view(), inherited: none.view(), self_param: Some(self_param), mut problems)
+    var self_args = mem::List[ty::Arg].empty(alloc)
+    for def in generics {
+        mut self_args.push(def.param_arg(types))
+    }
+    var self_bounds = mem::List[ty::Bound].empty(alloc)
+    mut self_bounds.push(ty::Bound(item: item, args: types.args(take self_args)))
+    match self.db().core_item("Any") {
+        Some(any) => mut self_bounds.push(ty::Bound(item: any, args: ty::Args.none()))
+        None => {}
+    }
+    mut generics.push(GenericDef(name: text::String.of("Self", alloc), param: self_param, bounds: take self_bounds, constant: None))
+    var methods = mem::List[MethodSig].empty(alloc)
+    for index in 0..<declared.methods.len() {
+        let method = declared.methods[index]
+        var modifier: Option[ast::FnModifier] = None
+        if method.projection {
+            modifier = Some(ast::FnModifier.Proj)
+        }
+        let sig = self.head_sig(module, owner: item, method: index + 1, head: method.head, inherited: GenericDef.copies(generics.view(), alloc), self_ty: Some(types.intern(ty::TyKind.Param(self_param))), self_param: Some(self_param), modifier, convention: None, mut problems)
+        mut methods.push(MethodSig(name: text::String.of(method.name.text.as_str(), alloc), sig: take sig, default: method.body.is_some()))
+    }
+    return Sig(generics: take generics, kind: SigKind.Interface(methods: take methods), problems: take problems)
+} Checker.interface_sig
+
+fn Checker.impl_sig(self, item: ty::ItemId, module: ty::ModuleId, implementation: ast::ImplItem, take problems: Problems) -> Sig {
+    let alloc = self.alloc()
+    let target = self.db().owner_key(module, owner: implementation.target)
+    var generics = match target {
+        Some(key) => self.type_generics(key)
+        None => mem::List[GenericDef].empty(alloc)
+    }
+    match implementation.params {
+        Some(params) => {
+            var added = mem::List[mem::List[ty::Bound]].empty(alloc)
+            for param in params {
+                mut added.push(self.resolved_bounds(TypeCtx(item: item, module: module, generics: generics.view(), self_param: None), written: param.bounds.view(), mut problems))
+            }
+            for index in 0..<generics.len() {
+                if index >= added.len() {
+                    break
+                }
+                for bound in added[index] {
+                    mut (mut generics.at_mut(index)).bounds.push(bound)
+                }
+            }
+        }
+        None => {}
+    }
+    let interface_bound = self.bound(TypeCtx(item: item, module: module, generics: generics.view(), self_param: None), bound: implementation.bound, mut problems)
+    let target_ty = match target {
+        Some(key) => self.key_ty(key)
+        None => ty::Ty.error()
+    }
+    return Sig(generics: take generics, kind: SigKind.Impl(target: target, target_ty: target_ty, bound: interface_bound), problems: take problems)
+} Checker.impl_sig
+
+fn Checker.layout_sig(
+    self,
+    item: ty::ItemId,
+    module: ty::ModuleId,
+    written: ast::LayoutItem,
+    visibility: ast::Visibility,
+    take problems: Problems,
+    ) -> Sig {
+    let alloc = self.alloc()
+    let db = self.db()
+    let types = self.types()
+    let none = mem::List[GenericDef].empty(alloc)
+    var bits: Option[ty::Ty] = None
+    match written.repr {
+        ast::LayoutRepr.Integer(ty: name, order: _) => {
+            match ty::Scalar.from_name(name.text.as_str()) {
+                Some(scalar) => {
+                    bits = Some(ty::Ty.scalar(scalar))
+                }
+                None => {}
+            }
+        }
+        ast::LayoutRepr.Bytes(size: size, order: _) => {
+            let count = int_literal(db.text(item, token: size)).value_or(wide::Wide.zero())
+            match db.core_item("Array") {
+                Some(array) => {
+                    var args = mem::List[ty::Arg].empty(alloc)
+                    mut args.push(ty::Arg.Ty(ty::Ty.scalar(ty::Scalar.Unsigned8)))
+                    mut args.push(ty::Arg.Const(ty::Const.Int(count)))
+                    bits = Some(types.item(array, take args))
+                }
+                None => {}
+            }
+        }
+    }
+    var fields = mem::List[FieldSig].empty(alloc)
+    for field in written.fields {
+        var field_ty = ty::Ty.error()
+        match field.kind {
+            ast::LayoutFieldKind.Bit(low: _, high: None) => {
+                field_ty = ty::Ty.scalar(ty::Scalar.Bool)
+            }
+            ast::LayoutFieldKind.Bit(low: low, high: Some(high)) => {
+                let top = int_literal(db.text(item, token: high)).value_or(wide::Wide.zero())
+                let bottom = int_literal(db.text(item, token: low)).value_or(wide::Wide.zero())
+                field_ty = ty::Ty.scalar(smallest_unsigned(top.wrapping_sub(bottom).wrapping_add(wide::Wide.one())))
+            }
+            ast::LayoutFieldKind.Rest => {
+                field_ty = bits.value_or(ty::Ty.error())
+            }
+            ast::LayoutFieldKind.Typed(ty: typed, at: _) => {
+                field_ty = self.type_expr(TypeCtx(item: item, module: module, generics: none.view(), self_param: None), ty: typed, mut problems)
+            }
+        }
+        mut fields.push(FieldSig(name: text::String.of(field.name.text.as_str(), alloc), ty: field_ty, visibility: visibility, token: field.name.token))
+    }
+    var tags = mem::List[text::String].empty(alloc)
+    match written.tags {
+        Some(declared) => {
+            for tag in declared {
+                mut tags.push(text::String.of(tag.name.text.as_str(), alloc))
+            }
+        }
+        None => {}
+    }
+    return Sig(generics: mem::List[GenericDef].empty(alloc), kind: SigKind.Layout(fields: take fields, tags: take tags, bits: bits), problems: take problems)
+} Checker.layout_sig
+
+/// The impl lines a function `T.m` implements a method of: those of its module whose target is
+/// `T` and whose interface declares a method `m`.
+fn Checker.implemented_lines(self, function: ty::ItemId) -> mem::List[ty::ItemId] {
+    self.db().note(function)
+    let state = self.state.contents()
+    match state.implemented.get(function) {
+        Some(known) => return copied_items(known.view(), alloc: self.alloc())
+        None => {}
+    }
+    let lines = self.find_implemented_lines(function)
+    return copied_items(state.implemented.insert(function, value: take lines).view(), alloc: self.alloc())
+} Checker.implemented_lines
+
+fn Checker.find_implemented_lines(self, function: ty::ItemId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let ast::ItemKind.Fn(head) = db.ast(function).kind else {
+        return mem::List[ty::ItemId].empty(alloc)
+    }
+    let Some(key) = db.owners.get(function) else {
+        return mem::List[ty::ItemId].empty(alloc)
+    }
+    let module = db.module_of(function)
+    let name = head.label.name.text.as_str()
+    return db.about(Some(function), compute: fn() -> mem::List[ty::ItemId] {
+        var lines = mem::List[ty::ItemId].empty(alloc)
+        for line in db.module(module).items {
+            if self.line_declares(module, line, key, name) {
+                mut lines.push(line)
+            }
+        }
+        return lines
+    })
+} Checker.find_implemented_lines
+
+/// A copy of a list of items.
+fn copied_items(items: Slice[ty::ItemId], alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    var copied = mem::List[ty::ItemId].empty(alloc)
+    for item in items {
+        mut copied.push(item)
+    }
+    return copied
+} copied_items
+
+/// Whether an item of a module is an impl line whose target is the type `key` names and whose
+/// interface declares a method `name`.
+fn Checker.line_declares(self, module: ty::ModuleId, line: ty::ItemId, key: TypeKey, name: Str) -> bool {
+    let db = self.db()
+    let ast::ItemKind.Impl(implementation) = db.ast(line).kind else {
+        return false
+    }
+    if db.owner_key(module, owner: implementation.target) != Some(key) {
+        return false
+    }
+    let Ok(Named.Item(interface_item)) = db.resolve(module, path: implementation.bound.path) else {
+        return false
+    }
+    let ast::ItemKind.Interface(declared) = db.ast(interface_item).kind else {
+        return false
+    }
+    for method in declared.methods {
+        if method.name.text.as_str() == name {
+            return true
+        }
+    }
+    return false
+} Checker.line_declares
+
+/// Adds to a member function's inherited parameters the bounds of each impl line it implements
+/// a method of, and counts as droppable each parameter droppable for such a line.
+fn Checker.add_impl_bounds(self, function: ty::ItemId, mut inherited: mem::List[GenericDef]) {
+    let db = self.db()
+    for line in self.implemented_lines(function) {
+        let line_sig = self.sig(line)
+        let line_generics = line_sig.contents().generics
+        for index in 0..<inherited.len() {
+            if index >= line_generics.len() {
+                break
+            }
+            for bound in line_generics[index].bounds {
+                let present = inherited[index].bounds.position(fn(held: ty::Bound) => held == bound).is_some()
+                if not present {
+                    mut (mut inherited.at_mut(index)).bounds.push(bound)
+                }
+            }
+        }
+        let droppable = self.droppable_for_line(line)
+        for index in 0..<inherited.len() {
+            if index >= droppable.len() {
+                break
+            }
+            if droppable[index] {
+                mut (mut inherited.at_mut(index)).bounds.retain(fn(bound: ty::Bound) -> bool {
+                    let path = db.canonical(bound.item)
+                    return path.as_str() != "core::Any"
+                })
+            }
+        }
+    }
+} Checker.add_impl_bounds
+
+/// The signature of a function or interface method head, `method` being the method's index
+/// plus one or 0 for an item.
+fn Checker.head_sig(
+    self,
+    module: ty::ModuleId,
+    owner: ty::ItemId,
+    method: usize,
+    head: ast::Head,
+    take inherited: mem::List[GenericDef],
+    self_ty: Option[ty::Ty],
+    self_param: Option[ty::Param],
+    modifier: Option[ast::FnModifier],
+    take convention: Option[text::String],
+    mut problems: Problems,
+    ) -> FnSig {
+    let alloc = self.alloc()
+    let db = self.db()
+    let inherited_count = inherited.len()
+    let own = self.generic_defs(module, owner, method, params: head.generics.view(), inherited: inherited.view(), self_param, mut problems)
+    for def in take own {
+        mut inherited.push(take def)
+    }
+    var params = mem::List[ParamSig].empty(alloc)
+    for param in head.params {
+        match param.kind {
+            ast::ParamKind.Named(name: name, ty: written) => mut params.push(ParamSig(name: text::String.of(name.text.as_str(), alloc), mode: param.mode, ty: self.type_expr(TypeCtx(item: owner, module: module, generics: inherited.view(), self_param: self_param), ty: written, mut problems), token: param.token, is_self: false))
+            ast::ParamKind.SelfValue => mut params.push(ParamSig(name: text::String.of("self", alloc), mode: param.mode, ty: self_ty.value_or(ty::Ty.error()), token: param.token, is_self: true))
+        }
+    }
+    var result = ty::Ty.unit()
+    match head.result {
+        Some(written) => {
+            result = self.type_expr(TypeCtx(item: owner, module: module, generics: inherited.view(), self_param: self_param), ty: written, mut problems)
+        }
+        None => {}
+    }
+    var failure: Option[ty::Ty] = None
+    match head.failure {
+        Some(written) => {
+            failure = Some(self.type_expr(TypeCtx(item: owner, module: module, generics: inherited.view(), self_param: self_param), ty: written, mut problems))
+        }
+        None => {}
+    }
+    let wait = match head.usage {
+        Some(written) => written.is_wait()
+        None => false
+    }
+    let interrupt_fn = modifier == Some(ast::FnModifier.Interrupt)
+    match head.limit_set {
+        Some(written) => {
+            let found = limit_problems(written, wait, interrupt_fn, token_text: fn(token: u32) => text::String.of(db.text(owner, token), alloc), alloc)
+            for problem in found {
+                mut problems.found.push(problem)
+            }
+        }
+        None => {}
+    }
+    let demanded = limit_demands(head.limit_set, interrupt_fn, token_text: fn(token: u32) => text::String.of(db.text(owner, token), alloc))
+    return FnSig(generics: take inherited, inherited: inherited_count, params: take params, result: result, failure: failure, wait: wait, limit_set: demanded, modifier: modifier, convention: take convention)
+} Checker.head_sig
+
+/// The generic parameters an item or method declares, numbered from `method`'s offset, their
+/// bounds resolved with every parameter in scope.
+fn Checker.generic_defs(
+    self,
+    module: ty::ModuleId,
+    owner: ty::ItemId,
+    method: usize,
+    params: Slice[ast::GenericParam],
+    inherited: Slice[GenericDef],
+    self_param: Option[ty::Param],
+    mut problems: Problems,
+    ) -> mem::List[GenericDef] {
+    let alloc = self.alloc()
+    var defs = GenericDef.copies(inherited, alloc)
+    let start = defs.len()
+    for index in 0..<params.len() {
+        var number = u16.truncate(index)
+        if method > 0 {
+            number = method_param(method - 1, param: index)
+        }
+        let param = params[index]
+        mut defs.push(GenericDef(name: text::String.of(param.name.text.as_str(), alloc), param: ty::Param(owner: owner, index: number), bounds: mem::List[ty::Bound].empty(alloc), constant: const_type(param)))
+    }
+    for index in 0..<params.len() {
+        if defs[start + index].constant.is_some() {
+            continue
+        }
+        let bounds = self.resolved_bounds(TypeCtx(item: owner, module: module, generics: defs.view(), self_param: self_param), written: params[index].bounds.view(), mut problems)
+        defs[start + index].bounds = bounds
+    }
+    var own = mem::List[GenericDef].empty(alloc)
+    var position: usize = 0
+    for def in take defs {
+        if position >= start {
+            mut own.push(take def)
+        }
+        position += 1
+    }
+    return own
+} Checker.generic_defs
+
+/// The interfaces written bounds name, those that resolve.
+fn Checker.resolved_bounds(self, ctx: TypeCtx, written: Slice[ast::Bound], mut problems: Problems) -> mem::List[ty::Bound] {
+    var bounds = mem::List[ty::Bound].empty(self.alloc())
+    for bound in written {
+        match self.bound(ctx, bound, mut problems) {
+            Some(found) => mut bounds.push(found)
+            None => {}
+        }
+    }
+    return bounds
+} Checker.resolved_bounds
+
+/// What a path written in `module` names, forwarding a path that names nothing through a
+/// tombstone without an old head, which `problems` records.
+fn Checker.resolve_forwarded(self, module: ty::ModuleId, path: ast::Path, mut problems: Problems) -> Result[Named, PathError] {
+    let resolved = self.db().resolve(module, path)
+    let Err(error) = resolved else {
+        return resolved
+    }
+    if error.code != Some(diagnostic::Code.NameUnknown) {
+        return resolved
+    }
+    let Some(tombstone) = self.renamed_path(module, path) else {
+        return Err(error)
+    }
+    let last = path.segments[path.segments.len() - 1].token
+    mut problems.renamed.push(RenamedPath(construct: nir::Span(head: path.token(), last: last), tombstone: tombstone))
+    let Some(forwarded) = self.forwarding(tombstone) else {
+        return Err(PathError(code: None, token: error.token))
+    }
+    return Ok(forwarded)
+} Checker.resolve_forwarded
+
+/// The interface a bound names, with its arguments.
+fn Checker.bound(self, ctx: TypeCtx, bound: ast::Bound, mut problems: Problems) -> Option[ty::Bound] {
+    return self.path_bound(ctx, path: bound.path, args: bound.args, mut problems)
+} Checker.bound
+
+/// The interface a bound written as a path with arguments names, with its arguments.
+fn Checker.path_bound(self, ctx: TypeCtx, path: ast::Path, args: Option[mem::List[ast::GenericArg]], mut problems: Problems) -> Option[ty::Bound] {
+    let token = path.token()
+    let resolved = self.resolve_forwarded(ctx.module, path, mut problems)
+    let named = match resolved {
+        Ok(found) => found
+        Err(error) => {
+            match error.code {
+                Some(code) => mut problems.push(Problem(code: code, token: error.token))
+                None => {}
+            }
+            return None
+        }
+    }
+    let Named.Item(interface_item) = named else {
+        mut problems.push(Problem(code: diagnostic::Code.InterfaceNotInterface, token: token))
+        return None
+    }
+    let db = self.db()
+    let ast::ItemKind.Interface(_) = db.ast(interface_item).kind else {
+        mut problems.push(Problem(code: diagnostic::Code.InterfaceNotInterface, token: token))
+        return None
+    }
+    if not db.visible(ctx.module, item: interface_item) {
+        mut problems.push(Problem(code: diagnostic::Code.NamePrivate, token: token))
+    }
+    let params = self.shapes(interface_item)
+    let Some(written) = self.generic_args(ctx, params: params.contents().view(), args, token, mut problems) else {
+        return None
+    }
+    return Some(ty::Bound(item: interface_item, args: written))
+} Checker.path_bound
+
+/// The arguments a type, bound or `Dyn` writes for `params`, all of them (`generic.arity`).
+fn Checker.generic_args(
+    self,
+    ctx: TypeCtx,
+    params: Slice[GenericDef],
+    args: Option[mem::List[ast::GenericArg]],
+    token: u32,
+    mut problems: Problems,
+    ) -> Option[ty::Args] {
+    let count = match args {
+        Some(written) => written.len()
+        None => 0
+    }
+    if count != params.len() {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArity, token: token))
+        return None
+    }
+    var resolved = mem::List[ty::Arg].empty(self.alloc())
+    match args {
+        Some(written) => {
+            for index in 0..<count {
+                mut resolved.push(self.generic_arg(ctx, arg: written[index], param: params[index], mut problems))
+            }
+        }
+        None => {}
+    }
+    return Some(self.types().args(take resolved))
+} Checker.generic_args
+
+fn Checker.generic_arg(self, ctx: TypeCtx, arg: ast::GenericArg, param: GenericDef, mut problems: Problems) -> ty::Arg {
+    let alloc = self.alloc()
+    match arg {
+        ast::GenericArg.Int(negative: negative, token: token) => {
+            let Some(scalar) = param.constant else {
+                mut problems.push(Problem(code: diagnostic::Code.GenericArgumentKind, token: token))
+                return ty::Arg.Ty(ty::Ty.error())
+            }
+            let written = self.db().text(ctx.item, token)
+            let suffix = literal_suffix(written)
+            var mismatched = not scalar.is_integer()
+            match suffix {
+                Some(given) => {
+                    if given != scalar {
+                        mismatched = true
+                    }
+                }
+                None => {}
+            }
+            if mismatched {
+                let found = match suffix {
+                    Some(given) => text::String.of(given.name(), alloc)
+                    None => text::String.of("an integer type", alloc)
+                }
+                mut problems.mismatches.push(Mismatch(token: token, expected: text::String.of(scalar.name(), alloc), found: take found))
+                return ty::Arg.Const(ty::Const.Error)
+            }
+            var value = int_literal(written).value_or(wide::Wide.zero())
+            if negative {
+                value = value.wrapping_neg()
+            }
+            let range = scalar.range()
+            if value.lt(range.low) or range.high.lt(value) {
+                mut problems.push(Problem(code: diagnostic::Code.TypeLiteralRange, token: token))
+                return ty::Arg.Const(ty::Const.Error)
+            }
+            return ty::Arg.Const(ty::Const.Int(value))
+        }
+        ast::GenericArg.Bool(value: value, token: token) => {
+            let Some(scalar) = param.constant else {
+                mut problems.push(Problem(code: diagnostic::Code.GenericArgumentKind, token: token))
+                return ty::Arg.Ty(ty::Ty.error())
+            }
+            if scalar != ty::Scalar.Bool {
+                mut problems.mismatches.push(Mismatch(token: token, expected: text::String.of(scalar.name(), alloc), found: text::String.of(ty::Scalar.Bool.name(), alloc)))
+                return ty::Arg.Const(ty::Const.Error)
+            }
+            return ty::Arg.Const(ty::Const.Bool(value))
+        }
+        ast::GenericArg.Type(written) => {
+            return match param.constant {
+                Some(scalar) => ty::Arg.Const(self.const_arg(ctx, ty: written, scalar, mut problems))
+                None => ty::Arg.Ty(self.type_expr(ctx, ty: written, mut problems))
+            }
+        }
+    }
+} Checker.generic_arg
+
+/// A const argument of type `scalar` written as a type expression: a const item's value or a
+/// const parameter.
+fn Checker.const_arg(self, ctx: TypeCtx, ty: ast::TypeExpr, scalar: ty::Scalar, mut problems: Problems) -> ty::Const {
+    let alloc = self.alloc()
+    let ast::TypeKind.Path(path: path, args: None) = ty.kind else {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArgumentKind, token: ty.token))
+        return ty::Const.Error
+    }
+    if path.segments.len() == 1 {
+        let name = path.segments[0].text.as_str()
+        for def in ctx.generics {
+            if def.name.as_str() != name {
+                continue
+            }
+            let Some(written) = def.constant else {
+                mut problems.push(Problem(code: diagnostic::Code.GenericArgumentKind, token: ty.token))
+                return ty::Const.Error
+            }
+            if written != scalar {
+                mut problems.mismatches.push(Mismatch(token: ty.token, expected: text::String.of(scalar.name(), alloc), found: text::String.of(written.name(), alloc)))
+                return ty::Const.Error
+            }
+            return ty::Const.Param(def.param)
+        }
+    }
+    let resolved = self.resolve_forwarded(ctx.module, path, mut problems)
+    let named = match resolved {
+        Ok(found) => found
+        Err(error) => {
+            match error.code {
+                Some(code) => mut problems.push(Problem(code: code, token: error.token))
+                None => {}
+            }
+            return ty::Const.Error
+        }
+    }
+    let db = self.db()
+    var constant: Option[ty::ItemId] = None
+    match named {
+        Named.Item(item) => {
+            match db.ast(item).kind {
+                ast::ItemKind.Const(_) => {
+                    constant = Some(item)
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let Some(item) = constant else {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArgumentKind, token: ty.token))
+        return ty::Const.Error
+    }
+    let sig = self.sig(item)
+    match sig.contents().kind {
+        SigKind.Const(ty: written) => {
+            if written != ty::Ty.scalar(scalar) and not self.types().has_error(written) {
+                let shown = self.show(written, from: ctx.module)
+                mut problems.mismatches.push(Mismatch(token: ty.token, expected: text::String.of(scalar.name(), alloc), found: take shown))
+                return ty::Const.Error
+            }
+        }
+        else => {}
+    }
+    let Some(value) = self.const_value(item) else {
+        return ty::Const.Error
+    }
+    return match value.contents().value {
+        Val.Int(held) => ty::Const.Int(held)
+        Val.Bool(held) => ty::Const.Bool(held)
+        else => ty::Const.Error
+    }
+} Checker.const_arg
+
+/// The type a type expression denotes.
+fn Checker.type_expr(self, ctx: TypeCtx, ty: ast::TypeExpr, mut problems: Problems) -> ty::Ty {
+    match ty.kind {
+        ast::TypeKind.Fn(fn_type) => {
+            let types = self.types()
+            let written = self.fn_type(ctx, fn_type: fn_type.contents(), mut problems)
+            let typed = types.intern(ty::TyKind.Fn(types.fn_ty(take written)))
+            mut problems.instantiations.push(Instantiated(ty: typed, token: ty.token))
+            return typed
+        }
+        ast::TypeKind.Path(path: path, args: args) => return self.path_type(ctx, path, args, mut problems)
+    }
+} Checker.type_expr
+
+/// The type a path with generic arguments written as a type denotes.
+fn Checker.path_type(self, ctx: TypeCtx, path: ast::Path, args: Option[mem::List[ast::GenericArg]], mut problems: Problems) -> ty::Ty {
+    let types = self.types()
+    let token = path.token()
+    if path.segments.len() == 1 {
+        let name = path.segments[0].text.as_str()
+        if name == "Self" {
+            match ctx.self_param {
+                Some(param) => return types.intern(ty::TyKind.Param(param))
+                None => {}
+            }
+        }
+        for def in ctx.generics {
+            if def.name.as_str() != name {
+                continue
+            }
+            if args.is_some() or def.constant.is_some() {
+                mut problems.push(Problem(code: diagnostic::Code.TypeNotAType, token: token))
+                return ty::Ty.error()
+            }
+            return types.intern(ty::TyKind.Param(def.param))
+        }
+    }
+    let resolved = self.resolve_forwarded(ctx.module, path, mut problems)
+    let named = match resolved {
+        Ok(found) => found
+        Err(error) => {
+            match error.code {
+                Some(code) => mut problems.push(Problem(code: code, token: error.token))
+                None => {}
+            }
+            return ty::Ty.error()
+        }
+    }
+    match named {
+        Named.Scalar(scalar) => {
+            arity_problem(args, token, mut problems)
+            return ty::Ty.scalar(scalar)
+        }
+        Named.Unit => {
+            arity_problem(args, token, mut problems)
+            return ty::Ty.unit()
+        }
+        Named.Never => {
+            arity_problem(args, token, mut problems)
+            return ty::Ty.never()
+        }
+        Named.Dyn => return self.dyn_type(ctx, args, token, mut problems)
+        Named.Item(item) => {
+            let db = self.db()
+            if not db.visible(ctx.module, item) {
+                mut problems.push(Problem(code: diagnostic::Code.NamePrivate, token: token))
+            }
+            match db.ast(item).kind {
+                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+                    let params = self.shapes(item)
+                    let Some(written) = self.generic_args(ctx, params: params.contents().view(), args, token, mut problems) else {
+                        return ty::Ty.error()
+                    }
+                    let typed = types.intern(ty::TyKind.Item(item: item, args: written))
+                    if params.contents().len() > 0 {
+                        mut problems.instantiations.push(Instantiated(ty: typed, token: token))
+                    }
+                    return typed
+                }
+                ast::ItemKind.Registers(_) => {
+                    arity_problem(args, token, mut problems)
+                    return types.intern(ty::TyKind.Registers(item))
+                }
+                else => {
+                    mut problems.push(Problem(code: diagnostic::Code.TypeNotAType, token: token))
+                    return ty::Ty.error()
+                }
+            }
+        }
+        Named.Module(_) or Named.Variant(item: _, index: _) => {
+            mut problems.push(Problem(code: diagnostic::Code.TypeNotAType, token: token))
+            return ty::Ty.error()
+        }
+    }
+} Checker.path_type
+
+/// Reports generic arguments written for what takes none.
+fn arity_problem(args: Option[mem::List[ast::GenericArg]], token: u32, mut problems: Problems) {
+    if args.is_some() {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArity, token: token))
+    }
+} arity_problem
+
+/// `Dyn[I]` written with its arguments: the interface its one type argument names.
+fn Checker.dyn_type(self, ctx: TypeCtx, args: Option[mem::List[ast::GenericArg]], token: u32, mut problems: Problems) -> ty::Ty {
+    let types = self.types()
+    let Some(written) = args else {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArity, token: token))
+        return ty::Ty.error()
+    }
+    if written.len() != 1 {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArity, token: token))
+        return ty::Ty.error()
+    }
+    let ast::GenericArg.Type(argument) = written[0] else {
+        mut problems.push(Problem(code: diagnostic::Code.GenericArity, token: token))
+        return ty::Ty.error()
+    }
+    let ast::TypeKind.Path(path: interface_path, args: interface_args) = argument.kind else {
+        mut problems.push(Problem(code: diagnostic::Code.InterfaceNotInterface, token: argument.token))
+        return ty::Ty.error()
+    }
+    let Some(bound) = self.path_bound(ctx, path: interface_path, args: interface_args, mut problems) else {
+        return ty::Ty.error()
+    }
+    let typed = types.intern(ty::TyKind.Dyn(bound))
+    mut problems.instantiations.push(Instantiated(ty: typed, token: token))
+    return typed
+} Checker.dyn_type
+
+fn Checker.fn_type(self, ctx: TypeCtx, fn_type: ast::FnType, mut problems: Problems) -> ty::FnTy {
+    let alloc = self.alloc()
+    let db = self.db()
+    let wait = match fn_type.usage {
+        Some(written) => written.is_wait()
+        None => false
+    }
+    let interrupt_fn = fn_type.kind == ast::FnKind.Interrupt
+    match fn_type.limit_set {
+        Some(written) => {
+            let found = limit_problems(written, wait, interrupt_fn, token_text: fn(token: u32) => text::String.of(db.text(ctx.item, token), alloc), alloc)
+            for problem in found {
+                mut problems.found.push(problem)
+            }
+        }
+        None => {}
+    }
+    var params = mem::List[ty::FnParam].empty(alloc)
+    for param in fn_type.params {
+        mut params.push(ty::FnParam(mode: param.mode, name: text::String.of(param.name.text.as_str(), alloc), ty: self.type_expr(ctx, ty: param.ty, mut problems)))
+    }
+    var result = ty::Ty.unit()
+    match fn_type.result {
+        Some(written) => {
+            result = self.type_expr(ctx, ty: written, mut problems)
+        }
+        None => {}
+    }
+    var failure: Option[ty::Ty] = None
+    match fn_type.failure {
+        Some(written) => {
+            failure = Some(self.type_expr(ctx, ty: written, mut problems))
+        }
+        None => {}
+    }
+    let demanded = limit_demands(fn_type.limit_set, interrupt_fn, token_text: fn(token: u32) => text::String.of(db.text(ctx.item, token), alloc))
+    var convention: Option[text::String] = None
+    match fn_type.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.value.as_str(), alloc))
+        }
+        None => {}
+    }
+    return ty::FnTy(kind: fn_type.kind, params: take params, result: result, failure: failure, wait: wait, limit_set: demanded, convention: take convention)
+} Checker.fn_type
+
+/// The argument naming a generic parameter itself.
+fn GenericDef.param_arg(self, types: ty::Types) -> ty::Arg {
+    return match self.constant {
+        Some(_) => ty::Arg.Const(ty::Const.Param(self.param))
+        None => ty::Arg.Ty(types.intern(ty::TyKind.Param(self.param)))
+    }
+} GenericDef.param_arg
+
+/// The type of a const parameter: the scalar its first bound names.
+fn const_type(param: ast::GenericParam) -> Option[ty::Scalar] {
+    if param.bounds.len() == 0 {
+        return None
+    }
+    let bound = param.bounds[0]
+    if bound.path.segments.len() != 1 or bound.args.is_some() {
+        return None
+    }
+    return ty::Scalar.from_name(bound.path.segments[0].text.as_str())
+} const_type
+
+/// The name a payload or field label is, when it is one identifier.
+fn single_name(label: ast::TypeExpr, alloc: mem::Alloc) -> Option[text::String] {
+    return match first label.kind {
+        ast::TypeKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(text::String.of(path.segments[0].text.as_str(), alloc))
+        else => None
+    }
+} single_name
+
+/// The rules of a `limits` clause: only a stack size on an interrupt fn, each limit once,
+/// `noalloc` not beside `pure`, a stack size from 1 to 4,294,967,295 written without a suffix,
+/// and neither `pure` nor `terminates` beside `uses wait`.
+fn limit_problems(
+    written: ast::Limits,
+    wait: bool,
+    interrupt_fn: bool,
+    token_text: fn(token: u32) -> text::String,
+    alloc: mem::Alloc,
+    ) -> mem::List[Problem] {
+    var found = mem::List[Problem].empty(alloc)
+    var seen = mem::List[ast::LimitKind].empty(alloc)
+    var pure = false
+    for limit in written.entries {
+        if limit.kind == ast::LimitKind.Pure {
+            pure = true
+        }
+    }
+    for limit in written.entries {
+        var code: Option[diagnostic::Code] = None
+        if interrupt_fn and limit.kind != ast::LimitKind.Stack {
+            code = Some(diagnostic::Code.KernelIrqLimit)
+        } else if seen.position(fn(kind: ast::LimitKind) => kind == limit.kind).is_some() {
+            code = Some(diagnostic::Code.LimitDuplicate)
+        } else if limit.kind == ast::LimitKind.Noalloc and pure {
+            code = Some(diagnostic::Code.LimitRedundant)
+        } else if limit.kind == ast::LimitKind.Stack {
+            if not valid_stack_size(limit.size, token_text) {
+                code = Some(diagnostic::Code.LimitStackSize)
+            }
+        } else if wait and limit.kind == ast::LimitKind.Pure {
+            code = Some(diagnostic::Code.LimitImpure)
+        } else if wait and limit.kind == ast::LimitKind.Terminates {
+            code = Some(diagnostic::Code.LimitMayNotTerminate)
+        }
+        match code {
+            Some(reported) => mut found.push(Problem(code: reported, token: limit.token))
+            None => {}
+        }
+        mut seen.push(limit.kind)
+    }
+    return found
+} limit_problems
+
+/// Whether a `stack` limit's size is written without a suffix and lies from 1 to 4,294,967,295.
+fn valid_stack_size(size: Option[u32], token_text: fn(token: u32) -> text::String) -> bool {
+    let Some(token) = size else {
+        return false
+    }
+    let spelt = token_text(token)
+    if spelt.find("u").is_some() or spelt.find("i").is_some() {
+        return false
+    }
+    let Some(value) = int_literal(spelt.as_str()) else {
+        return false
+    }
+    return wide::Wide.one().le(value) and value.le(wide::Wide.of_u64(4_294_967_295))
+} valid_stack_size
+
+/// The demands of a `limits` clause, with the `notrap`, `terminates` and `noalloc` an interrupt
+/// fn implies.
+fn limit_demands(written: Option[ast::Limits], interrupt_fn: bool, token_text: fn(token: u32) -> text::String) -> ty::LimitSet {
+    var set = ty::LimitSet(pure: false, notrap: interrupt_fn, terminates: interrupt_fn, noalloc: interrupt_fn, stack: None)
+    let Some(clause) = written else {
+        return set
+    }
+    for limit in clause.entries {
+        match limit.kind {
+            ast::LimitKind.Pure => {
+                set.pure = true
+            }
+            ast::LimitKind.Notrap => {
+                set.notrap = true
+            }
+            ast::LimitKind.Terminates => {
+                set.terminates = true
+            }
+            ast::LimitKind.Noalloc => {
+                set.noalloc = true
+            }
+            ast::LimitKind.Stack => {
+                set.stack = stack_size(limit.size, token_text)
+            }
+        }
+    }
+    return set
+} limit_demands
+
+/// The size a `stack` limit writes, when it fits a `u64`.
+fn stack_size(size: Option[u32], token_text: fn(token: u32) -> text::String) -> Option[u64] {
+    let Some(token) = size else {
+        return None
+    }
+    let spelt = token_text(token)
+    let Some(value) = int_literal(spelt.as_str()) else {
+        return None
+    }
+    return value.to_u64()
+} stack_size
+
+/// The value of an `INT` token without its suffix, when it fits.
+fn int_literal(written: Str) -> Option[wide::Wide] {
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    var radix: u64 = 10
+    var lead: usize = 0
+    while lead < bytes.len() and bytes[lead] == b'_' {
+        lead += 1
+    }
+    if lead < bytes.len() and bytes[lead] == b'0' {
+        var marker = lead + 1
+        while marker < bytes.len() and bytes[marker] == b'_' {
+            marker += 1
+        }
+        if marker < bytes.len() and bytes[marker] == b'x' {
+            radix = 16
+            start = marker + 1
+        } else if marker < bytes.len() and bytes[marker] == b'b' {
+            radix = 2
+            start = marker + 1
+        }
+    }
+    let base = wide::Wide.of_u64(radix)
+    var value = wide::Wide.zero()
+    var any = false
+    for at in start..<bytes.len() {
+        let byte = bytes[at]
+        if byte == b'_' {
+            continue
+        }
+        let Some(digit) = radix_digit(byte, radix) else {
+            break
+        }
+        let Some(scaled) = value.checked_mul(base) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(wide::Wide.of_u64(digit)) else {
+            return None
+        }
+        value = next
+        any = true
+    }
+    if not any {
+        return None
+    }
+    return Some(value)
+} int_literal
+
+/// The value of a digit of a radix up to 16, either case.
+fn radix_digit(byte: u8, radix: u64) -> Option[u64] {
+    var digit: u64 = 16
+    if byte >= b'0' and byte <= b'9' {
+        digit = u64.widen(byte - b'0')
+    } else if byte >= b'a' and byte <= b'f' {
+        digit = u64.widen(byte - b'a') + 10
+    } else if byte >= b'A' and byte <= b'F' {
+        digit = u64.widen(byte - b'A') + 10
+    }
+    if digit >= radix {
+        return None
+    }
+    return Some(digit)
+} radix_digit
+
+/// The scalar a number literal's suffix names, if it has one.
+fn literal_suffix(written: Str) -> Option[ty::Scalar] {
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    var floats = true
+    if written.starts_with("0x") {
+        start = 2
+        floats = false
+    } else {
+        while start + 2 <= bytes.len() and bytes[start] == b'0' and bytes[start + 1] == b'b' {
+            start += 2
+        }
+    }
+    for at in start..<bytes.len() {
+        let byte = bytes[at]
+        if byte == b'u' or byte == b'i' or (floats and byte == b'f') {
+            let Some(suffix) = written.slice_bytes(at, end: bytes.len()) else {
+                return None
+            }
+            return ty::Scalar.from_name(suffix)
+        }
+    }
+    return None
+} literal_suffix
+
+/// The smallest unsigned integer type holding `width` bits.
+fn smallest_unsigned(width: wide::Wide) -> ty::Scalar {
+    if width.le(wide::Wide.of_u64(8)) {
+        return ty::Scalar.Unsigned8
+    }
+    if width.le(wide::Wide.of_u64(16)) {
+        return ty::Scalar.Unsigned16
+    }
+    if width.le(wide::Wide.of_u64(32)) {
+        return ty::Scalar.Unsigned32
+    }
+    return ty::Scalar.Unsigned64
+} smallest_unsigned

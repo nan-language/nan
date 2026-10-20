@@ -813,13 +813,19 @@ package procinfo {
 } procinfo
 
 // file: procinfo/procinfo.nan
-//! Reads the process id from the C library.
+//! Reads the process id and the last error number from the C library.
 
 foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn __errno_location() -> hw::Ptr[i32] limits notrap, terminates, noalloc convention "sysv"
 
 pub fn process_id() -> i32 {
     return getpid()
 } process_id
+
+pub fn last_error() -> i32 {
+    return trusted "the C library gives the calling thread's error number, which lives as long as the thread" { __errno_location().read() }
+} last_error
 ```
 
 ```nan

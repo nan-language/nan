@@ -507,7 +507,7 @@ pub fn when(
     if attempt {
         let err = body
             .lo
-            .variant_value(body.fx, &result_ty, "Err", &[Held::Empty], false);
+            .variant_value(body.fx, &result_ty, "Err", &[Held::Empty], None);
         let args: Vec<ir::BlockArg> = err.values().into_iter().map(Into::into).collect();
         body.fx.b.ins().jump(done, &args);
     } else {
@@ -544,7 +544,7 @@ pub fn when(
     let outcome = match attempt {
         true => body
             .lo
-            .variant_value(body.fx, &result_ty, "Ok", &[value], false),
+            .variant_value(body.fx, &result_ty, "Ok", &[value], None),
         false => value,
     };
     let args: Vec<ir::BlockArg> = outcome.values().into_iter().map(Into::into).collect();

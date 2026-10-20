@@ -1,0 +1,648 @@
+//! Types as the checker computes them, interned, with their generic arguments and substitution.
+
+/// An item of a checker's database, by its index.
+pkg struct ItemId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} ItemId
+
+/// A module of a checker's database, by its index.
+pkg struct ModuleId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} ModuleId
+
+/// A package of a checker's database, by its index.
+pkg struct PackageId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} PackageId
+
+pkg enum Scalar derives Copy, Eq, Ord, Hash {
+    Unsigned8
+    Unsigned16
+    Unsigned32
+    Unsigned64
+    UnsignedSize
+    Signed8
+    Signed16
+    Signed32
+    Signed64
+    SignedSize
+    Float32
+    Float64
+    Bool
+    Char
+} Scalar
+
+/// Every scalar, in declaration order.
+pkg fn Scalar.all(alloc: mem::Alloc) -> mem::List[Scalar] {
+    var all = mem::List[Scalar].empty(alloc)
+    for scalar in SCALARS {
+        mut all.push(scalar)
+    }
+    return all
+} Scalar.all
+
+const SCALARS: Array[Scalar, 14] = listed_scalars()
+
+fn listed_scalars() -> Array[Scalar, 14] {
+    var listed = Array[Scalar, 14].filled(Scalar.Unsigned8)
+    listed[1] = Scalar.Unsigned16
+    listed[2] = Scalar.Unsigned32
+    listed[3] = Scalar.Unsigned64
+    listed[4] = Scalar.UnsignedSize
+    listed[5] = Scalar.Signed8
+    listed[6] = Scalar.Signed16
+    listed[7] = Scalar.Signed32
+    listed[8] = Scalar.Signed64
+    listed[9] = Scalar.SignedSize
+    listed[10] = Scalar.Float32
+    listed[11] = Scalar.Float64
+    listed[12] = Scalar.Bool
+    listed[13] = Scalar.Char
+    return listed
+} listed_scalars
+
+pkg proj fn Scalar.name(self) -> Str {
+    return match self {
+        Scalar.Unsigned8 => "u8"
+        Scalar.Unsigned16 => "u16"
+        Scalar.Unsigned32 => "u32"
+        Scalar.Unsigned64 => "u64"
+        Scalar.UnsignedSize => "usize"
+        Scalar.Signed8 => "i8"
+        Scalar.Signed16 => "i16"
+        Scalar.Signed32 => "i32"
+        Scalar.Signed64 => "i64"
+        Scalar.SignedSize => "isize"
+        Scalar.Float32 => "f32"
+        Scalar.Float64 => "f64"
+        Scalar.Bool => "bool"
+        Scalar.Char => "char"
+    }
+} Scalar.name
+
+pkg fn Scalar.from_name(name: Str) -> Option[Scalar] {
+    for scalar in SCALARS {
+        if scalar.name() == name {
+            return Some(scalar)
+        }
+    }
+    return None
+} Scalar.from_name
+
+pkg fn Scalar.is_integer(self) -> bool {
+    return match self {
+        Scalar.Float32 or Scalar.Float64 or Scalar.Bool or Scalar.Char => false
+        else => true
+    }
+} Scalar.is_integer
+
+pkg fn Scalar.is_signed(self) -> bool {
+    return match self {
+        Scalar.Signed8 or Scalar.Signed16 or Scalar.Signed32 or Scalar.Signed64 or Scalar.SignedSize => true
+        else => false
+    }
+} Scalar.is_signed
+
+pkg fn Scalar.is_float(self) -> bool {
+    return match self {
+        Scalar.Float32 or Scalar.Float64 => true
+        else => false
+    }
+} Scalar.is_float
+
+pkg fn Scalar.is_number(self) -> bool = self.is_integer() or self.is_float()
+
+/// The width of its bit pattern.
+pkg fn Scalar.bits(self) -> u32 {
+    return match self {
+        Scalar.Unsigned8 or Scalar.Signed8 or Scalar.Bool => 8
+        Scalar.Unsigned16 or Scalar.Signed16 => 16
+        Scalar.Unsigned32 or Scalar.Signed32 or Scalar.Float32 or Scalar.Char => 32
+        else => 64
+    }
+} Scalar.bits
+
+/// The least and greatest values of an integer type.
+pkg struct Range derives Copy, Eq {
+    pkg low: wide::Wide
+    pkg high: wide::Wide
+} Range
+
+/// The least and greatest values of an integer type.
+pkg fn Scalar.range(self) -> Range {
+    let bits = self.bits()
+    let one = wide::Wide.one()
+    if self.is_signed() {
+        let half = one.shift_left(bits - 1)
+        return Range(low: half.wrapping_neg(), high: half.wrapping_sub(one))
+    }
+    return Range(low: wide::Wide.zero(), high: one.shift_left(bits).wrapping_sub(one))
+} Scalar.range
+
+/// Whether the scalar is an unsigned integer that is its own bits type.
+pkg fn Scalar.is_unsigned_bits(self) -> bool {
+    return match self {
+        Scalar.Unsigned8 or Scalar.Unsigned16 or Scalar.Unsigned32 or Scalar.Unsigned64 => true
+        else => false
+    }
+} Scalar.is_unsigned_bits
+
+/// The type `to_bits` returns.
+pkg fn Scalar.bits_type(self) -> Scalar {
+    return match self {
+        Scalar.Unsigned8 or Scalar.Signed8 or Scalar.Bool => Scalar.Unsigned8
+        Scalar.Unsigned16 or Scalar.Signed16 => Scalar.Unsigned16
+        Scalar.Unsigned32 or Scalar.Signed32 or Scalar.Float32 or Scalar.Char => Scalar.Unsigned32
+        Scalar.Unsigned64 or Scalar.Signed64 or Scalar.Float64 or Scalar.UnsignedSize or Scalar.SignedSize => Scalar.Unsigned64
+    }
+} Scalar.bits_type
+
+/// A generic parameter: the item declaring it and its index, `SELF_INDEX` for an interface's
+/// `Self`.
+pkg struct Param derives Copy, Eq, Ord, Hash {
+    pkg owner: ItemId
+    pkg index: u16
+} Param
+
+pkg const SELF_INDEX: u16 = 65_535
+
+pkg fn Param.is_self(self) -> bool = self.index == SELF_INDEX
+
+/// A const generic argument.
+pkg enum Const derives Copy, Eq, Hash {
+    Int(wide::Wide)
+    Bool(bool)
+    Param(Param)
+    Error
+} Const
+
+pkg enum Arg derives Copy, Eq, Hash {
+    Ty(Ty)
+    Const(Const)
+} Arg
+
+pkg fn Arg.ty(self) -> Option[Ty] {
+    return match self {
+        Arg.Ty(ty) => Some(ty)
+        Arg.Const(_) => None
+    }
+} Arg.ty
+
+/// An interned list of generic arguments.
+pkg struct Args derives Copy, Eq, Hash {
+    index: u32
+} Args
+
+/// The demands of a `limits` clause.
+pkg struct LimitSet derives Copy, Eq, Hash {
+    pkg pure: bool
+    pkg notrap: bool
+    pkg terminates: bool
+    pkg noalloc: bool
+    pkg stack: Option[u64]
+} LimitSet
+
+pkg fn LimitSet.none() -> LimitSet = LimitSet(pure: false, notrap: false, terminates: false, noalloc: false, stack: None)
+
+pkg struct FnParam derives Eq, Hash {
+    pkg mode: ast::Mode
+    pkg name: text::String
+    pkg ty: Ty
+} FnParam
+
+/// A function type: a full head without a name or generic parameters.
+pkg struct FnTy derives Eq, Hash {
+    pkg kind: ast::FnKind
+    pkg params: mem::List[FnParam]
+    pkg result: Ty
+    pkg failure: Option[Ty]
+    pkg wait: bool
+    pkg limit_set: LimitSet
+    pkg convention: Option[text::String]
+} FnTy
+
+/// An interned function type.
+pkg struct FnTyId derives Copy, Eq, Hash {
+    index: u32
+} FnTyId
+
+/// An interface with its arguments.
+pkg struct Bound derives Copy, Eq, Hash {
+    /// The interface.
+    pkg item: ItemId
+    pkg args: Args
+} Bound
+
+/// What a type is.
+pkg enum TyKind derives Copy, Eq, Hash {
+    Scalar(Scalar)
+    Unit
+    Never
+    /// A struct, enum or layout, std's core types included, with its arguments.
+    Item(item: ItemId, args: Args)
+    Param(Param)
+    Fn(FnTyId)
+    Dyn(Bound)
+    /// A registers block, which is a type only as the argument of a register window.
+    Registers(ItemId)
+    /// The type of a failed construct, which satisfies every rule checking it.
+    Error
+} TyKind
+
+/// An interned type: equal types are one value.
+pkg struct Ty derives Copy, Eq, Hash {
+    index: u32
+} Ty
+
+/// The interner of types, argument lists and function types, filled through a read access.
+pkg struct Types {
+    alloc: mem::Alloc
+    kinds: mem::Arena[TyKind]
+    kind_index: mem::OnceMap[TyKind, u32]
+    lists: mem::Arena[mem::List[Arg]]
+    list_index: mem::OnceMap[mem::List[Arg], u32]
+    fns: mem::Arena[FnTy]
+    fn_index: mem::OnceMap[FnTy, u32]
+} Types
+
+/// The kinds interned first, so that their types are known without the interner: `Unit`,
+/// `Never`, `Error`, then each scalar in declaration order.
+pkg fn Types.empty(alloc: mem::Alloc) -> Types {
+    let types = Types(alloc: alloc, kinds: mem::Arena[TyKind].empty(alloc), kind_index: mem::OnceMap[TyKind, u32].empty(seed: 0, alloc), lists: mem::Arena[mem::List[Arg]].empty(alloc), list_index: mem::OnceMap[mem::List[Arg], u32].empty(seed: 0, alloc), fns: mem::Arena[FnTy].empty(alloc), fn_index: mem::OnceMap[FnTy, u32].empty(seed: 0, alloc))
+    discard types.intern(TyKind.Unit)
+    discard types.intern(TyKind.Never)
+    discard types.intern(TyKind.Error)
+    for scalar in SCALARS {
+        discard types.intern(TyKind.Scalar(scalar))
+    }
+    discard types.args(mem::List[Arg].empty(alloc))
+    return types
+} Types.empty
+
+pkg fn Ty.unit() -> Ty = Ty(index: 0)
+
+pkg fn Ty.never() -> Ty = Ty(index: 1)
+
+pkg fn Ty.error() -> Ty = Ty(index: 2)
+
+pkg fn Ty.scalar(scalar: Scalar) -> Ty {
+    var index: u32 = 3
+    for listed in SCALARS {
+        if listed == scalar {
+            return Ty(index: index)
+        }
+        index += 1
+    }
+    return Ty.error()
+} Ty.scalar
+
+/// The empty argument list.
+pkg fn Args.none() -> Args = Args(index: 0)
+
+/// The type of a kind, interned once.
+pkg fn Types.intern(self, kind: TyKind) -> Ty {
+    let Some(index) = self.kind_index.get(kind) else {
+        let next = u32.fit(self.kinds.len())
+        discard self.kinds.push(kind)
+        discard self.kind_index.insert(kind, value: next)
+        return Ty(index: next)
+    }
+    return Ty(index: index)
+} Types.intern
+
+/// The argument list of the arguments, interned once.
+pkg fn Types.args(self, take list: mem::List[Arg]) -> Args {
+    let Some(index) = self.list_index.get(list) else {
+        let next = u32.fit(self.lists.len())
+        var copy = mem::List[Arg].empty(self.alloc)
+        for arg in list {
+            mut copy.push(arg)
+        }
+        discard self.lists.push(take copy)
+        discard self.list_index.insert(take list, value: next)
+        return Args(index: next)
+    }
+    return Args(index: index)
+} Types.args
+
+/// The function type, interned once.
+pkg fn Types.fn_ty(self, take fn_ty: FnTy) -> FnTyId {
+    let Some(index) = self.fn_index.get(fn_ty) else {
+        let next = u32.fit(self.fns.len())
+        discard self.fns.push(copy_fn_ty(fn_ty, alloc: self.alloc))
+        discard self.fn_index.insert(take fn_ty, value: next)
+        return FnTyId(index: next)
+    }
+    return FnTyId(index: index)
+} Types.fn_ty
+
+/// A copy of a function type, drawn through `alloc`.
+pkg fn copy_fn_ty(fn_ty: FnTy, alloc: mem::Alloc) -> FnTy {
+    var params = mem::List[FnParam].empty(alloc)
+    for param in fn_ty.params {
+        mut params.push(FnParam(mode: param.mode, name: text::String.of(param.name.as_str(), alloc), ty: param.ty))
+    }
+    var convention: Option[text::String] = None
+    match fn_ty.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    return FnTy(kind: fn_ty.kind, params: take params, result: fn_ty.result, failure: fn_ty.failure, wait: fn_ty.wait, limit_set: fn_ty.limit_set, convention: take convention)
+} copy_fn_ty
+
+/// What a type is.
+pkg fn Types.kind(self, ty: Ty) -> TyKind {
+    return self.kinds.at(mem::Id[TyKind].of(ty.index))
+} Types.kind
+
+/// The arguments of an argument list.
+pkg proj fn Types.arg_list(self, args: Args) -> Slice[Arg] {
+    return self.lists.at(mem::Id[mem::List[Arg]].of(args.index)).view()
+} Types.arg_list
+
+/// The function type of an interned one.
+pkg proj fn Types.fn_of(self, id: FnTyId) -> FnTy {
+    return self.fns.at(mem::Id[FnTy].of(id.index))
+} Types.fn_of
+
+/// The type of an item with its arguments.
+pkg fn Types.item(self, item: ItemId, take args: mem::List[Arg]) -> Ty {
+    let interned = self.args(take args)
+    return self.intern(TyKind.Item(item: item, args: interned))
+} Types.item
+
+pkg fn Ty.is_never(self) -> bool = self == Ty.never()
+
+pkg fn Types.scalar_of(self, ty: Ty) -> Option[Scalar] {
+    return match self.kind(ty) {
+        TyKind.Scalar(scalar) => Some(scalar)
+        else => None
+    }
+} Types.scalar_of
+
+/// The arguments of an item type, none for another type.
+pkg fn Types.args_of(self, ty: Ty) -> Args {
+    return match self.kind(ty) {
+        TyKind.Item(item: _, args: args) => args
+        else => Args.none()
+    }
+} Types.args_of
+
+pkg fn Types.type_arg(self, ty: Ty, index: usize) -> Option[Ty] {
+    let args = self.arg_list(self.args_of(ty))
+    if index >= args.len() {
+        return None
+    }
+    return args[index].ty()
+} Types.type_arg
+
+/// Whether the type mentions `Error` anywhere.
+pkg fn Types.has_error(self, ty: Ty) -> bool {
+    return match self.kind(ty) {
+        TyKind.Error => true
+        TyKind.Item(item: _, args: args) => self.args_have_error(args)
+        TyKind.Fn(id) => {
+            let fn_ty = self.fn_of(id)
+            for param in fn_ty.params {
+                if self.has_error(param.ty) {
+                    return true
+                }
+            }
+            if self.has_error(fn_ty.result) {
+                return true
+            }
+            let Some(failure) = fn_ty.failure else {
+                return false
+            }
+            return self.has_error(failure)
+        }
+        TyKind.Dyn(bound) => self.type_args_have_error(bound.args)
+        else => false
+    }
+} Types.has_error
+
+/// Whether one of the type arguments mentions `Error`.
+fn Types.type_args_have_error(self, args: Args) -> bool {
+    for arg in self.arg_list(args) {
+        let Arg.Ty(ty) = arg else {
+            continue
+        }
+        if self.has_error(ty) {
+            return true
+        }
+    }
+    return false
+} Types.type_args_have_error
+
+fn Types.args_have_error(self, args: Args) -> bool {
+    for arg in self.arg_list(args) {
+        let failed = match arg {
+            Arg.Ty(ty) => self.has_error(ty)
+            Arg.Const(constant) => constant == Const.Error
+        }
+        if failed {
+            return true
+        }
+    }
+    return false
+} Types.args_have_error
+
+/// Visits each function type the type holds, at any depth.
+pkg fn Types.visit_fns(self, ty: Ty, visit: fn(id: FnTyId)) {
+    match self.kind(ty) {
+        TyKind.Item(item: _, args: args) => self.visit_arg_fns(args, visit)
+        TyKind.Fn(id) => {
+            visit(id)
+            let fn_ty = self.fn_of(id)
+            for param in fn_ty.params {
+                self.visit_fns(param.ty, visit)
+            }
+            self.visit_fns(fn_ty.result, visit)
+            let Some(failure) = fn_ty.failure else {
+                return
+            }
+            self.visit_fns(failure, visit)
+        }
+        TyKind.Dyn(bound) => self.visit_arg_fns(bound.args, visit)
+        else => {}
+    }
+} Types.visit_fns
+
+fn Types.visit_arg_fns(self, args: Args, visit: fn(id: FnTyId)) {
+    for arg in self.arg_list(args) {
+        let Arg.Ty(ty) = arg else {
+            continue
+        }
+        self.visit_fns(ty, visit)
+    }
+} Types.visit_arg_fns
+
+/// Whether the type mentions one of the parameters `params` is given for.
+pkg fn Types.mentions(self, ty: Ty, params: fn(param: Param) -> bool) -> bool {
+    return match self.kind(ty) {
+        TyKind.Param(param) => params(param)
+        TyKind.Item(item: _, args: args) => self.args_mention(args, params)
+        TyKind.Fn(id) => {
+            let fn_ty = self.fn_of(id)
+            for param in fn_ty.params {
+                if self.mentions(param.ty, params) {
+                    return true
+                }
+            }
+            if self.mentions(fn_ty.result, params) {
+                return true
+            }
+            let Some(failure) = fn_ty.failure else {
+                return false
+            }
+            return self.mentions(failure, params)
+        }
+        TyKind.Dyn(bound) => self.args_mention(bound.args, params)
+        else => false
+    }
+} Types.mentions
+
+fn Types.args_mention(self, args: Args, params: fn(param: Param) -> bool) -> bool {
+    for arg in self.arg_list(args) {
+        let mentioned = match first arg {
+            Arg.Ty(ty) => self.mentions(ty, params)
+            Arg.Const(Const.Param(param)) => params(param)
+            Arg.Const(_) => false
+        }
+        if mentioned {
+            return true
+        }
+    }
+    return false
+} Types.args_mention
+
+/// A substitution of generic parameters by arguments.
+pkg struct Subst {
+    map: mem::HashMap[Param, Arg]
+} Subst
+
+pkg fn Subst.empty(alloc: mem::Alloc) -> Subst = Subst(map: mem::HashMap[Param, Arg].empty(seed: 0, alloc))
+
+/// The substitution of each parameter by the argument at its position.
+pkg fn Subst.of(params: Slice[Param], args: Slice[Arg], alloc: mem::Alloc) -> Subst {
+    var subst = Subst.empty(alloc)
+    for index in 0..<params.len() {
+        if index >= args.len() {
+            break
+        }
+        discard mut subst.map.insert(params[index], value: args[index])
+    }
+    return subst
+} Subst.of
+
+pkg fn Subst.insert(mut self, param: Param, arg: Arg) {
+    discard mut self.map.insert(param, value: arg)
+} Subst.insert
+
+pkg fn Subst.get(self, param: Param) -> Option[Arg] {
+    let Some(arg) = self.map.get(param) else {
+        return None
+    }
+    return Some(arg)
+} Subst.get
+
+pkg fn Subst.is_empty(self) -> bool = self.map.len() == 0
+
+pkg fn Subst.ty(self, types: Types, ty: Ty) -> Ty {
+    if self.is_empty() {
+        return ty
+    }
+    return match types.kind(ty) {
+        TyKind.Param(param) => match self.map.get(param) {
+            Some(Arg.Ty(replaced)) => replaced
+            else => ty
+        }
+        TyKind.Item(item: item, args: args) => types.intern(TyKind.Item(item: item, args: self.args(types, args)))
+        TyKind.Fn(id) => types.intern(TyKind.Fn(types.fn_ty(self.fn_ty(types, fn_ty: types.fn_of(id)))))
+        TyKind.Dyn(bound) => types.intern(TyKind.Dyn(self.bound(types, bound)))
+        else => ty
+    }
+} Subst.ty
+
+pkg fn Subst.args(self, types: Types, args: Args) -> Args {
+    var substituted = mem::List[Arg].empty(types.alloc)
+    for arg in types.arg_list(args) {
+        mut substituted.push(self.arg(types, arg))
+    }
+    return types.args(take substituted)
+} Subst.args
+
+pkg fn Subst.arg(self, types: Types, arg: Arg) -> Arg {
+    return match first arg {
+        Arg.Ty(ty) => Arg.Ty(self.ty(types, ty))
+        Arg.Const(Const.Param(param)) => match self.map.get(param) {
+            Some(Arg.Const(constant)) => Arg.Const(constant)
+            else => arg
+        }
+        Arg.Const(_) => arg
+    }
+} Subst.arg
+
+pkg fn Subst.fn_ty(self, types: Types, fn_ty: FnTy) -> FnTy {
+    let alloc = types.alloc
+    var params = mem::List[FnParam].empty(alloc)
+    for param in fn_ty.params {
+        mut params.push(FnParam(mode: param.mode, name: text::String.of(param.name.as_str(), alloc), ty: self.ty(types, ty: param.ty)))
+    }
+    var failure: Option[Ty] = None
+    if let_failure(fn_ty) {
+        failure = Some(self.ty(types, ty: failure_of(fn_ty)))
+    }
+    var convention: Option[text::String] = None
+    match fn_ty.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    return FnTy(kind: fn_ty.kind, params: take params, result: self.ty(types, ty: fn_ty.result), failure: failure, wait: fn_ty.wait, limit_set: fn_ty.limit_set, convention: take convention)
+} Subst.fn_ty
+
+fn let_failure(fn_ty: FnTy) -> bool {
+    return match fn_ty.failure {
+        Some(_) => true
+        None => false
+    }
+} let_failure
+
+fn failure_of(fn_ty: FnTy) -> Ty {
+    return match fn_ty.failure {
+        Some(failure) => failure
+        None => Ty.error()
+    }
+} failure_of
+
+pkg fn Subst.bound(self, types: Types, bound: Bound) -> Bound {
+    return Bound(item: bound.item, args: self.args(types, args: bound.args))
+} Subst.bound
+
+/// The allocator the interner draws through.
+pkg fn Types.allocator(self) -> mem::Alloc = self.alloc
+
+/// The scalar a type is, known without the interner, which interns the scalars' types first in
+/// declaration order.
+pkg fn Ty.interned_scalar(self) -> Option[Scalar] {
+    if self.index < 3 or self.index > 16 {
+        return None
+    }
+    return Some(SCALARS[usize.widen(self.index - 3)])
+} Ty.interned_scalar
+
+/// Removes a parameter's argument.
+pkg fn Subst.remove(mut self, param: Param) {
+    discard mut self.map.remove(param)
+} Subst.remove
+
+/// Adds each argument of another substitution, replacing this one's for the same parameter.
+pkg fn Subst.extend(mut self, other: Subst) {
+    for entry in other.map.cursor() {
+        discard mut self.map.insert(entry.key(), value: entry.value())
+    }
+} Subst.extend

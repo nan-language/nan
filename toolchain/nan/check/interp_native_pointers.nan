@@ -1,0 +1,224 @@
+//! `hw::Ptr` in interpreter runs: pointers with provenance into the run's extents, each access checked against the Ptr rules in their order.
+
+/// A member of `hw::Ptr[T]`; none for another member.
+fn Interpreter.pointer_member(mut self, member: Str, type_args: Slice[ty::Arg], args: Slice[Val], at: ItemSpan) -> Option[InterpFlow] fails End
+    waive length "one arm per member, as the Ptr rules state them"
+{
+    let alloc = self.alloc
+    var element = ty::Ty.unit()
+    if type_args.len() > 0 {
+        element = type_args[0].ty().value_or(ty::Ty.unit())
+    }
+    let placed = self.ck.interp_layout(element)
+    let size = placed.size
+    let align = placed.align
+    match member {
+        "of_addr" => return Some(InterpFlow.Return(Val.Ptr(Ptr(address: args[0].int_value().low_bits(), provenance: None))))
+        "of_view" or "of_view_mut" => {
+            let view = mut self.view(args[0])
+            let extent = self.memory.extent(view.array.extent)
+            let address = extent.address + u64.widen(view.start) * size
+            return Some(InterpFlow.Return(Val.Ptr(Ptr(address: address, provenance: Some(Provenance(extent: view.array.extent, read_only: member == "of_view"))))))
+        }
+        "of" or "of_mut" => {
+            var extent: u32 = 0
+            var whole = false
+            match args[0] {
+                Val.Ref(loc) => {
+                    if loc.path.len() == 0 {
+                        extent = loc.extent
+                        whole = true
+                    }
+                }
+                else => {}
+            }
+            if not whole {
+                let value = self.deref(args[0])
+                extent = mut self.memory.alloc(take value, writable: false, size)
+            }
+            let address = self.memory.extent(extent).address
+            return Some(InterpFlow.Return(Val.Ptr(Ptr(address: address, provenance: Some(Provenance(extent: extent, read_only: member == "of"))))))
+        }
+        "addr" => return Some(InterpFlow.Return(Val.Int(wide::Wide.of_u64(self.pointer(args[0]).address))))
+        "is_aligned" => {
+            var divisor = align
+            if divisor < 1 {
+                divisor = 1
+            }
+            return Some(InterpFlow.Return(Val.Bool(self.pointer(args[0]).address % divisor == 0)))
+        }
+        "offset" => {
+            let ptr = self.pointer(args[0])
+            let moved = wide::Wide.of_u64(ptr.address).wrapping_add(args[1].int_value().wrapping_mul(wide::Wide.of_u64(size)))
+            let address = moved.low_bits()
+            match ptr.provenance {
+                Some(provenance) => {
+                    let extent = self.memory.extent(provenance.extent)
+                    if address < extent.address or address > extent.address + extent.size {
+                        fail self.violation(rule: "bounds", at)
+                    }
+                }
+                None => {}
+            }
+            return Some(InterpFlow.Return(Val.Ptr(Ptr(address: address, provenance: ptr.provenance))))
+        }
+        "cast" => return Some(InterpFlow.Return(Val.Ptr(self.pointer(args[0]))))
+        "read" or "atomic_load" => return Some(InterpFlow.Return(try self.pointer_load(args[0], size, align, at)))
+        "write" or "atomic_store" => {
+            try mut self.pointer_store(args[0], value: args[1].copy(alloc), size, align, at)
+            return Some(InterpFlow.Return(Val.Unit))
+        }
+        "atomic_swap" or "atomic_compare_swap" or "atomic_wrapping_add" => return Some(InterpFlow.Return(try mut self.pointer_exchange(member, element, args, size, align, at)))
+        "copy" => {
+            let from = self.pointer(args[0])
+            let to = self.pointer(args[1])
+            var copied = mem::List[Val].empty(alloc)
+            for index in 0..<args[2].int_value().low_bits() {
+                let source = Val.Ptr(Ptr(address: from.address + index * size, provenance: from.provenance))
+                mut copied.push(try self.pointer_load(source, size, align, at))
+            }
+            var index: u64 = 0
+            for value in take copied {
+                let target = Val.Ptr(Ptr(address: to.address + index * size, provenance: to.provenance))
+                try mut self.pointer_store(target, take value, size, align, at)
+                index += 1
+            }
+            return Some(InterpFlow.Return(Val.Unit))
+        }
+        else => return None
+    }
+} Interpreter.pointer_member
+
+/// `atomic_swap`, `atomic_compare_swap` and `atomic_wrapping_add` through a pointer: the value
+/// it held, a compare-swap's as a `Result`, after the Ptr checks of its read and write.
+fn Interpreter.pointer_exchange(
+    mut self,
+    member: Str,
+    element: ty::Ty,
+    args: Slice[Val],
+    size: u64,
+    align: u64,
+    at: ItemSpan,
+    ) -> Val fails End {
+    let alloc = self.alloc
+    let previous = try self.pointer_load(args[0], size, align, at)
+    var stored: Option[Val] = None
+    var result = Val.Unit
+    if member == "atomic_swap" {
+        stored = Some(args[1].copy(alloc))
+        result = previous
+    } else if member == "atomic_wrapping_add" {
+        let Some(scalar) = element.interned_scalar() else {
+            expect false
+            return Val.Absent
+        }
+        let sum = wrap_scalar(previous.int_value().wrapping_add(self.deref(args[1]).int_value()), scalar)
+        stored = Some(Val.Int(sum))
+        result = previous
+    } else {
+        let outcome = self.ty_item("core", name: "Result")
+        if self.equal(previous, right: args[1]) {
+            stored = Some(args[2].copy(alloc))
+            result = Val.Variant(item: outcome, index: 0, fields: mem::Shared.of(Val.single(take previous, alloc), alloc))
+        } else {
+            result = Val.Variant(item: outcome, index: 1, fields: mem::Shared.of(Val.single(take previous, alloc), alloc))
+        }
+    }
+    match stored {
+        Some(value) => try mut self.pointer_store(args[0], take value, size, align, at)
+        None => {}
+    }
+    return result
+} Interpreter.pointer_exchange
+
+/// The value a pointer reads, after the Ptr checks and the initialisation rule.
+fn Interpreter.pointer_load(self, pointer_value: Val, size: u64, align: u64, at: ItemSpan) -> Val fails End {
+    let ptr = self.pointer(pointer_value)
+    let loc = try self.pointer_access(ptr, size, align, writing: false, at)
+    let value = self.memory.get(loc)
+    if value.is_absent() {
+        fail self.violation(rule: "initialisation", at)
+    }
+    return value.copy(self.alloc)
+} Interpreter.pointer_load
+
+/// Writes a value through a pointer, after the Ptr checks.
+fn Interpreter.pointer_store(
+    mut self,
+    pointer_value: Val,
+    take value: Val,
+    size: u64,
+    align: u64,
+    at: ItemSpan,
+    ) fails End {
+    let ptr = self.pointer(pointer_value)
+    let loc = try self.pointer_access(ptr, size, align, writing: true, at)
+    mut self.memory.set(loc, stored: take value)
+} Interpreter.pointer_store
+
+fn Interpreter.pointer(self, value: Val) -> Ptr {
+    match self.deref(value) {
+        Val.Ptr(ptr) => return ptr
+        else => {}
+    }
+    expect false
+    return Ptr(address: 0, provenance: None)
+} Interpreter.pointer
+
+fn Interpreter.violation(self, rule: Str, at: ItemSpan) -> End {
+    var word = text::String.of(rule, alloc: self.alloc)
+    mut word.append(" violation")
+    return End.Violation(self.report(word.as_str(), at))
+} Interpreter.violation
+
+/// The place an access of `size` bytes through a pointer reaches, after the provenance, bounds,
+/// alignment, read-only and layout rules in their order.
+fn Interpreter.pointer_access(
+    self,
+    ptr: Ptr,
+    size: u64,
+    align: u64,
+    writing: bool,
+    at: ItemSpan,
+    ) -> Loc fails End {
+    let alloc = self.alloc
+    let Some(provenance) = ptr.provenance else {
+        fail End.Uninterpretable(self.report("uninterpretable", at))
+    }
+    let extent = self.memory.extent(provenance.extent)
+    if not extent.live {
+        fail self.violation(rule: "provenance", at)
+    }
+    if ptr.address < extent.address or ptr.address + size > extent.address + extent.size {
+        fail self.violation(rule: "bounds", at)
+    }
+    var divisor = align
+    if divisor < 1 {
+        divisor = 1
+    }
+    if ptr.address % divisor != 0 {
+        fail self.violation(rule: "alignment", at)
+    }
+    if writing and (not extent.writable or provenance.read_only) {
+        fail self.violation(rule: "read-only", at)
+    }
+    let offset = ptr.address - extent.address
+    match extent.value {
+        Val.Array(elements) => {
+            if size > 0 and offset % size == 0 {
+                let index = offset / size
+                if index >= u64.widen(elements.contents().len()) {
+                    fail self.violation(rule: "layout", at)
+                }
+                var path = mem::List[u32].empty(alloc)
+                mut path.push(u32.truncate(index))
+                return Loc(extent: provenance.extent, path: take path)
+            }
+        }
+        else => {}
+    }
+    if offset == 0 {
+        return Loc(extent: provenance.extent, path: mem::List[u32].empty(alloc))
+    }
+    fail self.violation(rule: "layout", at)
+} Interpreter.pointer_access

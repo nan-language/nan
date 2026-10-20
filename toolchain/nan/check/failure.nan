@@ -1,0 +1,563 @@
+//! Failure types: which types a failure may have, which are cancellable, the bounds a generic parameter's use as a failure type implies, and failure conversion.
+
+/// The bounds a generic parameter carries from its uses as a failure type in its item.
+struct Implied derives Copy, Eq, Default {
+    /// Its argument is a failure type or `Never`.
+    failure: bool
+    /// Its argument is a cancellable type.
+    cancellable: bool
+} Implied
+
+/// Whether a type is a failure type: an enum that is neither a view nor linear, a generic
+/// parameter not bounded by `Any`, or `task::Cancelled`.
+fn Checker.is_failure_type(self, ty: ty::Ty) -> bool {
+    match self.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            let enumerated = match self.sig(item).contents().kind {
+                SigKind.Enum(variants: _) => true
+                else => false
+            }
+            if enumerated and not self.has(ty, property: Property.View) and not self.has(ty, property: Property.Linear) {
+                return true
+            }
+            return self.is_std(ty, path: "task::Cancelled")
+        }
+        ty::TyKind.Param(param) => {
+            for bound in self.param_bounds(param) {
+                if self.db().canonical(bound.item).as_str() == "core::Any" {
+                    return false
+                }
+            }
+            return true
+        }
+        ty::TyKind.Error => return true
+        else => return false
+    }
+} Checker.is_failure_type
+
+/// Whether a type is cancellable: `task::Cancelled`, an enum with a cancellation variant, or a
+/// generic parameter carrying the implied cancellable bound.
+fn Checker.is_cancellable(self, ty: ty::Ty) -> bool {
+    return match self.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => self.is_std(ty, path: "task::Cancelled") or self.cancellation_variant(item).is_some()
+        ty::TyKind.Param(param) => self.implied(param).cancellable
+        ty::TyKind.Error => true
+        else => false
+    }
+} Checker.is_cancellable
+
+/// The from variant of an enum whose declared payload type is `task::Cancelled`.
+fn Checker.cancellation_variant(self, item: ty::ItemId) -> Option[usize] {
+    let sig = self.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    for index in 0..<variants.len() {
+        let variant = variants[index]
+        if not variant.from {
+            continue
+        }
+        match variant.payload {
+            Payload.Single(payload) => {
+                if self.is_std(payload, path: "task::Cancelled") {
+                    return Some(index)
+                }
+            }
+            else => {}
+        }
+    }
+    return None
+} Checker.cancellation_variant
+
+/// The bounds a generic parameter's uses as a failure type in its item, or in the heads of the
+/// functions named after its type in the type's module, imply: a failure type in a `fails`
+/// clause or as the payload of a from variant, and a cancellable one as the failure type of a
+/// head or function type stating `uses wait`, or of a head with a parameter whose function
+/// type does.
+fn Checker.implied(self, param: ty::Param) -> Implied {
+    let alloc = self.alloc()
+    let types = self.types()
+    var implied = Implied(failure: false, cancellable: false)
+    let sig = self.sig(param.owner)
+    let held = sig.contents()
+    var method: Option[usize] = None
+    var stated = mem::List[ty::Ty].empty(alloc)
+    match held.kind {
+        SigKind.Fn(head) => {
+            stated = head.head_types(alloc)
+        }
+        SigKind.Interface(methods: methods) => {
+            method = generic_method(methods.view(), param)
+            match method {
+                Some(index) => {
+                    stated = methods[index].sig.head_types(alloc)
+                }
+                None => {}
+            }
+        }
+        else => {
+            stated = held.member_types(alloc)
+        }
+    }
+    for stated_ty in stated {
+        types.visit_fns(stated_ty, visit: fn[mut implied](id: ty::FnTyId) {
+            let fn_ty = types.fn_of(id)
+            if names_param(types, failure: fn_ty.failure, param) {
+                implied.failure = true
+                implied.cancellable = implied.cancellable or fn_ty.wait
+            }
+        })
+    }
+    let member_heads = self.type_member_heads(held, param)
+    match held.kind {
+        SigKind.Fn(head) => self.imply_by_head(mut implied, head, param)
+        SigKind.Interface(methods: methods) => {
+            match method {
+                Some(index) => self.imply_by_head(mut implied, head: methods[index].sig, param)
+                None => {}
+            }
+        }
+        else => {}
+    }
+    for member in member_heads {
+        self.imply_by_head(mut implied, head: member, param)
+    }
+    if from_param(held, param, types) {
+        implied.failure = true
+    }
+    return implied
+} Checker.implied
+
+/// Whether a head stating `uses wait`, or taking a function type that does, breaks the rule
+/// that its failure type is cancellable: one that is not, or a missing `fails` clause where
+/// `may_fail` does not already make the head miss it.
+fn Checker.cancel_unmapped(self, head: ty::FnTy, may_fail: bool) -> bool {
+    let types = self.types()
+    var waits = head.wait
+    if not waits {
+        for written in head.params {
+            match types.kind(written.ty) {
+                ty::TyKind.Fn(id) => {
+                    if types.fn_of(id).wait {
+                        waits = true
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+    if not waits {
+        return false
+    }
+    return match head.failure {
+        Some(failure) => not self.is_cancellable(failure)
+        None => head.wait and not may_fail
+    }
+} Checker.cancel_unmapped
+
+/// The rules of a `fails` clause's type and the cancellation rule of the head holding it,
+/// for a head without a body.
+fn Checker.fails_problem(self, head: ty::FnTy) -> Option[diagnostic::Code] {
+    match head.failure {
+        Some(failure) => {
+            if not self.is_failure_type(failure) {
+                return Some(diagnostic::Code.ErrorFailureType)
+            }
+        }
+        None => {}
+    }
+    if self.cancel_unmapped(head, may_fail: false) {
+        return Some(diagnostic::Code.ErrorCancelUnmapped)
+    }
+    return None
+} Checker.fails_problem
+
+/// The from variants of an enum: each with one unlabelled payload of a failure type, no two
+/// with equal declared payload types.
+fn Checker.check_from_variants(self, item: ty::ItemId) {
+    let sig = self.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return
+    }
+    var seen = mem::List[ty::Ty].empty(self.alloc())
+    for variant in variants {
+        if not variant.from {
+            continue
+        }
+        let Payload.Single(payload) = variant.payload else {
+            self.report(item, token: variant.token, code: diagnostic::Code.ErrorFromShape)
+            continue
+        }
+        if not self.is_failure_type(payload) {
+            self.report(item, token: variant.token, code: diagnostic::Code.ErrorFromShape)
+            continue
+        }
+        for earlier in seen {
+            if earlier == payload {
+                self.report(item, token: variant.token, code: diagnostic::Code.ErrorFromDuplicate)
+                break
+            }
+        }
+        mut seen.push(payload)
+    }
+} Checker.check_from_variants
+
+/// Whether an enum instantiation is ambiguous: its arguments make the payload types of two
+/// generic from variants equal while no concrete from variant has that payload type.
+fn Checker.ambiguous(self, ty: ty::Ty) -> bool {
+    let alloc = self.alloc()
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return false
+    }
+    let sig = self.sig(item)
+    let held = sig.contents()
+    let SigKind.Enum(variants: variants) = held.kind else {
+        return false
+    }
+    let subst = ty::Subst.of(generic_params(held.generics.view(), alloc).view(), args: types.arg_list(args), alloc)
+    var payloads = mem::List[FromPayload].empty(alloc)
+    for variant in variants {
+        if not variant.from {
+            continue
+        }
+        match variant.payload {
+            Payload.Single(payload) => {
+                let generic = types.mentions(payload, params: fn(declared: ty::Param) => declared.owner == item)
+                mut payloads.push(FromPayload(ty: subst.ty(types, ty: payload), generic: generic))
+            }
+            else => {}
+        }
+    }
+    for index in 0..<payloads.len() {
+        let current = payloads[index]
+        if not current.generic {
+            continue
+        }
+        var twin = false
+        for other in (index + 1)..<payloads.len() {
+            if payloads[other].generic and payloads[other].ty == current.ty {
+                twin = true
+            }
+        }
+        if not twin {
+            continue
+        }
+        var concrete = false
+        for other in payloads {
+            if not other.generic and other.ty == current.ty {
+                concrete = true
+            }
+        }
+        if not concrete {
+            return true
+        }
+    }
+    return false
+} Checker.ambiguous
+
+/// Whether a failure of type `from` converts to the failure type `to`: equal, through the
+/// from variant from resolution chooses, or a cancellation into a cancellable parameter.
+fn Checker.converts(self, from: ty::Ty, to: ty::Ty) -> bool {
+    let types = self.types()
+    if from == to or types.has_error(from) or types.has_error(to) or from.is_never() {
+        return true
+    }
+    match types.kind(to) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if self.chosen_from_variant(item, to, from).is_some() {
+                return true
+            }
+        }
+        else => {}
+    }
+    let parameter = match types.kind(to) {
+        ty::TyKind.Param(_) => true
+        else => false
+    }
+    return parameter and self.is_cancellable(to) and self.is_std(from, path: "task::Cancelled")
+} Checker.converts
+
+/// The name of the from variant failure conversion chooses for a failure of type `from` into
+/// the failure type `to`.
+fn Checker.conversion_variant(self, from: ty::Ty, to: ty::Ty) -> Option[text::String] {
+    let ty::TyKind.Item(item: item, args: _) = self.types().kind(to) else {
+        return None
+    }
+    let Some(index) = self.chosen_from_variant(item, to, from) else {
+        return None
+    }
+    let sig = self.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    return Some(text::String.of(variants[index].name.as_str(), alloc: self.alloc()))
+} Checker.conversion_variant
+
+/// The from variant of the enum `to` that from resolution chooses for a failure of type
+/// `from`: the one concrete candidate, else the one candidate.
+fn Checker.chosen_from_variant(self, item: ty::ItemId, to: ty::Ty, from: ty::Ty) -> Option[usize] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let sig = self.sig(item)
+    let held = sig.contents()
+    let SigKind.Enum(variants: variants) = held.kind else {
+        return None
+    }
+    let subst = ty::Subst.of(generic_params(held.generics.view(), alloc).view(), args: types.arg_list(types.args_of(to)), alloc)
+    var candidates = mem::List[FromCandidate].empty(alloc)
+    for index in 0..<variants.len() {
+        let variant = variants[index]
+        if not variant.from {
+            continue
+        }
+        match variant.payload {
+            Payload.Single(payload) => {
+                if subst.ty(types, ty: payload) == from {
+                    let concrete = not types.mentions(payload, params: fn(declared: ty::Param) => declared.owner == item)
+                    mut candidates.push(FromCandidate(index: index, concrete: concrete))
+                }
+            }
+            else => {}
+        }
+    }
+    var concrete: Option[usize] = None
+    var concrete_count: usize = 0
+    for candidate in candidates {
+        if candidate.concrete {
+            concrete_count += 1
+            concrete = Some(candidate.index)
+        }
+    }
+    if concrete_count == 1 {
+        return concrete
+    }
+    if concrete_count == 0 and candidates.len() == 1 {
+        return Some(candidates[0].index)
+    }
+    return None
+} Checker.chosen_from_variant
+
+/// The types a head states: its parameters', result and failure type.
+fn FnSig.head_types(self, alloc: mem::Alloc) -> mem::List[ty::Ty] {
+    var types = mem::List[ty::Ty].empty(alloc)
+    for param in self.params {
+        mut types.push(param.ty)
+    }
+    mut types.push(self.result)
+    match self.failure {
+        Some(failure) => mut types.push(failure)
+        None => {}
+    }
+    return types
+} FnSig.head_types
+
+/// The fix adding `Cancelled(task::Cancelled) from` to a failure type that is an enum of the
+/// package being checked without a variant named `Cancelled`.
+fn Checker.cancelled_variant_fix(self, failure: ty::Ty) -> Option[diagnostic::Fix] {
+    let Some(cancelled_item) = self.db().std_item("task", name: "Cancelled") else {
+        return None
+    }
+    let cancelled = self.types().item(cancelled_item, args: mem::List[ty::Arg].empty(self.alloc()))
+    return self.variant_added_fix(cancelled, to: failure)
+} Checker.cancelled_variant_fix
+
+/// The exact fix of `error.unconvertible` from `from` to `to`: the variant `Name(C) from`
+/// added to `to`, an enum of the package being checked, when `from` mentions no generic
+/// parameter, `Name` being the last segment of its path with a final `Error` removed, unless
+/// that leaves no name or names a variant of `to`.
+fn Checker.variant_added_fix(self, from: ty::Ty, to: ty::Ty) -> Option[diagnostic::Fix] {
+    let alloc = self.alloc()
+    let types = self.types()
+    let ty::TyKind.Item(item: source, args: _) = types.kind(from) else {
+        return None
+    }
+    let ty::TyKind.Item(item: target, args: _) = types.kind(to) else {
+        return None
+    }
+    let db = self.db()
+    let ast::ItemKind.Enum(enumeration) = db.ast(target).kind else {
+        return None
+    }
+    if Some(db.package_of(target)) != self.current_package() or types.mentions(from, params: fn(declared: ty::Param) => true) {
+        return None
+    }
+    let path = db.canonical(source)
+    let bytes = path.as_bytes()
+    var start = bytes.len()
+    while start > 0 and bytes[start - 1] != b':' and bytes[start - 1] != b'.' {
+        start -= 1
+    }
+    var end = bytes.len()
+    if path.ends_with("Error") and end - start >= 5 {
+        end -= 5
+    }
+    let Some(name) = path.as_str().slice_bytes(start, end: end) else {
+        return None
+    }
+    if name.is_empty() {
+        return None
+    }
+    for variant in enumeration.variants {
+        if variant.name.text.as_str() == name {
+            return None
+        }
+    }
+    let written = self.show(from, from: db.module_of(target))
+    var member = text::String.of(name, alloc)
+    mut member.push('(')
+    mut member.append(written.as_str())
+    mut member.append(") from")
+    return self.member_added(target, member: member.as_str())
+} Checker.variant_added_fix
+
+/// Whether a head's generic parameters include a parameter.
+fn declares_generic(head: FnSig, param: ty::Param) -> bool {
+    for def in head.generics {
+        if def.param == param {
+            return true
+        }
+    }
+    return false
+} declares_generic
+
+/// Whether a failure type is a generic parameter.
+fn names_param(types: ty::Types, failure: Option[ty::Ty], param: ty::Param) -> bool {
+    let Some(stated) = failure else {
+        return false
+    }
+    return types.kind(stated) == ty::TyKind.Param(param)
+} names_param
+
+/// What a head stating `param` as its failure type implies: a failure type, cancellable when the
+/// head or a function type of a parameter states `uses wait`.
+fn Checker.imply_by_head(self, mut implied: Implied, head: FnSig, param: ty::Param) {
+    let types = self.types()
+    if not names_param(types, failure: head.failure, param) {
+        return
+    }
+    implied.failure = true
+    var waits = head.wait
+    for candidate in head.params {
+        match types.kind(candidate.ty) {
+            ty::TyKind.Fn(id) => {
+                if types.fn_of(id).wait {
+                    waits = true
+                }
+            }
+            else => {}
+        }
+    }
+    implied.cancellable = implied.cancellable or waits
+} Checker.imply_by_head
+
+/// The parameters generic definitions declare, in order.
+fn generic_params(generics: Slice[GenericDef], alloc: mem::Alloc) -> mem::List[ty::Param] {
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in generics {
+        mut params.push(def.param)
+    }
+    return params
+} generic_params
+
+/// A from variant's payload type once the enum's arguments substitute it, and whether its
+/// declared type mentions the enum's generic parameters.
+struct FromPayload derives Copy {
+    ty: ty::Ty
+    generic: bool
+} FromPayload
+
+/// A from variant from resolution may choose, and whether its declared payload type is
+/// concrete.
+struct FromCandidate derives Copy {
+    index: usize
+    concrete: bool
+} FromCandidate
+
+/// The method of an interface whose generic parameters include a parameter.
+fn generic_method(methods: Slice[MethodSig], param: ty::Param) -> Option[usize] {
+    for index in 0..<methods.len() {
+        if declares_generic(methods[index].sig, param) {
+            return Some(index)
+        }
+    }
+    return None
+} generic_method
+
+/// The types a struct's fields or an enum's payloads state.
+fn Sig.member_types(self, alloc: mem::Alloc) -> mem::List[ty::Ty] {
+    var types = mem::List[ty::Ty].empty(alloc)
+    match self.kind {
+        SigKind.Struct(fields: fields) => {
+            for field in fields {
+                mut types.push(field.ty)
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                match variant.payload {
+                    Payload.None => {}
+                    Payload.Single(payload) => mut types.push(payload)
+                    Payload.Labelled(labelled) => {
+                        for field in labelled {
+                            mut types.push(field.ty)
+                        }
+                    }
+                }
+            }
+        }
+        else => {}
+    }
+    return types
+} Sig.member_types
+
+/// The heads of the functions named after a struct or enum, the owner of a parameter, in the
+/// type's module.
+fn Checker.type_member_heads(self, held: Sig, param: ty::Param) -> mem::List[FnSig] {
+    var heads = mem::List[FnSig].empty(self.alloc())
+    let typed = match held.kind {
+        SigKind.Struct(fields: _) or SigKind.Enum(variants: _) => true
+        else => false
+    }
+    if not typed {
+        return heads
+    }
+    let db = self.db()
+    let Some(by_name) = db.member_table.get(TypeKey.Item(param.owner)) else {
+        return heads
+    }
+    let module = db.module_of(param.owner)
+    for named in by_name {
+        for function in named.value() {
+            if db.module_of(function) != module {
+                continue
+            }
+            match self.fn_sig(function) {
+                Some(member) => mut heads.push(take member)
+                None => {}
+            }
+        }
+    }
+    return heads
+} Checker.type_member_heads
+
+/// Whether a from variant of an enum declares a parameter as its payload type.
+fn from_param(held: Sig, param: ty::Param, types: ty::Types) -> bool {
+    let SigKind.Enum(variants: variants) = held.kind else {
+        return false
+    }
+    for variant in variants {
+        if not variant.from {
+            continue
+        }
+        match variant.payload {
+            Payload.Single(payload) => {
+                if types.kind(payload) == ty::TyKind.Param(param) {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} from_param

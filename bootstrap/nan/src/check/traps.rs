@@ -1,7 +1,7 @@
 //! The may-trap digest fact, which the statuses of a function's obligations decide, and the
 //! rules it breaks: limits and fits demanding notrap, and the callees of contract terms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::Checker;
@@ -105,14 +105,18 @@ impl Checker<'_> {
     /// The functions of a function's cycle, itself included.
     fn cycle_of(&self, item: ItemId) -> Vec<ItemId> {
         let mut reachable = vec![item];
+        let mut listed = HashSet::from([item]);
         let mut index = 0;
         while index < reachable.len() {
             for dependency in self.dependencies(reachable[index]) {
-                if !reachable.contains(&dependency) {
+                if listed.insert(dependency) {
                     reachable.push(dependency);
                 }
             }
             index += 1;
+        }
+        if self.db.recording() {
+            return self.recorded_cycle(item, reachable);
         }
         reachable
             .into_iter()
@@ -343,7 +347,9 @@ impl Checker<'_> {
                     supplied.push((&arg.expr, param.ty.clone()));
                 }
             }
-            TKind::Construct { variant, values } => {
+            TKind::Construct {
+                variant, values, ..
+            } => {
                 let fields = self.construct_fields(&expr.ty, *variant);
                 for (name, value) in values {
                     if let Some(ty) = fields.get(name) {

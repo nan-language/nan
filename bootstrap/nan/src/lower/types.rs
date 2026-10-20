@@ -3,10 +3,18 @@
 
 use super::Lowering;
 use crate::check::db::ItemId;
+use crate::check::lowlevel::BitsKind;
 use crate::check::sig::{Payload, SigKind};
 use crate::check::ty::{Arg, FnParam, FnTy, Subst, Ty};
 use crate::nir::{Function, NTy, Op, Param, Role, Unit};
-use crate::syntax::ast::{FnKind, ItemKind, LayoutFieldKind};
+use crate::syntax::ast::{FnKind, ItemKind};
+
+/// How a wrapped part holds its payloads: a mut projection's results hold its Copy payloads as
+/// parts too, writable places of the receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wrap {
+    pub writable: bool,
+}
 
 impl Lowering<'_, '_> {
     /// A std type by its module path and name, with its arguments.
@@ -36,14 +44,14 @@ impl Lowering<'_, '_> {
 
     /// The type a wrapped part of an `Option` or `Result` is laid out as: each payload that is
     /// a part held as the part's address.
-    pub fn wrapped_type(&self, ty: &Ty) -> Ty {
+    pub fn wrapped_type(&self, ty: &Ty, wrap: Wrap) -> Ty {
         let Ty::Item(item, args) = ty else {
             return ty.clone();
         };
         let args = args
             .iter()
             .map(|arg| match arg {
-                Arg::Ty(payload) if self.is_part(payload) => {
+                Arg::Ty(payload) if self.is_part(payload, wrap) => {
                     Arg::Ty(self.std_ty("hw", "Ptr", vec![payload.clone()]))
                 }
                 other => other.clone(),
@@ -53,9 +61,9 @@ impl Lowering<'_, '_> {
     }
 
     /// Whether a payload of a wrapped part is a part, held by address: not a view, whose values
-    /// a projection builds.
-    pub fn is_part(&self, payload: &Ty) -> bool {
-        !self.ck.nir_view(payload)
+    /// a projection builds, nor Copy outside a mut projection's result, whose values are copied.
+    pub fn is_part(&self, payload: &Ty, wrap: Wrap) -> bool {
+        !self.ck.nir_view(payload) && (wrap.writable || !self.ck.nir_copy(payload))
     }
 
     /// The value of a layout's tag, or the index of an enum's variant held in a register.
@@ -81,8 +89,9 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The bits of a field of an integer layout: its first bit, its width and its type.
-    pub fn bit_field(&self, ty: &Ty, name: &str) -> (u32, u32, Ty) {
+    /// The bits of a field of an integer layout: its first bit, the mask of its bits from there
+    /// and its type. A `rest` field holds every bit no other field covers.
+    pub fn bit_field(&self, ty: &Ty, name: &str) -> (u32, u64, Ty) {
         let Ty::Item(item, _) = ty else {
             panic!("a bit field of {ty:?}");
         };
@@ -102,11 +111,16 @@ impl Lowering<'_, '_> {
             .position(|field| field.name.text == name)
             .unwrap_or_else(|| panic!("the field {name} of {ty:?}"));
         let field = &bits[index];
-        let width = match layout.fields[index].kind {
-            LayoutFieldKind::Rest => self.layout_width(ty),
-            _ => field.width,
-        };
-        (field.low, width, fields[index].ty.clone())
+        let field_ty = fields[index].ty.clone();
+        if field.kind != BitsKind::Rest {
+            return (field.low, width_mask(field.width), field_ty);
+        }
+        let covered = (bits.iter())
+            .filter(|other| other.kind != BitsKind::Rest)
+            .fold(0, |covered, other| {
+                covered | width_mask(other.width) << other.low
+            });
+        (0, width_mask(self.layout_width(ty)) & !covered, field_ty)
     }
 
     fn layout_width(&self, ty: &Ty) -> u32 {
@@ -228,5 +242,13 @@ impl Lowering<'_, '_> {
             .unit(item)
             .is_some_and(|unit| unit.function(Role::Entry, 0).is_some());
         if has_entry { Role::Entry } else { Role::Body }
+    }
+}
+
+/// The mask of the low `width` bits of a 64-bit integer.
+fn width_mask(width: u32) -> u64 {
+    match width {
+        64.. => u64::MAX,
+        width => (1 << width) - 1,
     }
 }

@@ -64,7 +64,7 @@ mod untrusted;
 mod unused;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 pub use approval::approvals;
@@ -79,7 +79,7 @@ pub use preserved::not_preserved;
 pub use published::summaries as publish_summaries;
 pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
 pub use references::Relocated;
-pub use root::package_files as package_sources;
+pub use root::{nir_streams, package_files as package_sources};
 use sig::{GenericDef, Sig};
 pub use snapshot::{Snapshots, Unsealed};
 pub use supplied::stated;
@@ -115,7 +115,13 @@ pub struct Checker<'a> {
     definitions: RefCell<HashMap<(ItemId, bool), Option<props::Props>>>,
     /// The typed bodies of function items, from their checks or typed for their digests.
     bodies: RefCell<HashMap<ItemId, Rc<tir::TBody>>>,
+    /// The functions each function calls directly or supplies as function arguments, in order;
+    /// none for an item without a typed body.
+    body_dependencies: RefCell<HashMap<ItemId, Option<Rc<Vec<ItemId>>>>>,
+    /// The impl lines each function implements a method of, once found.
+    implemented: RefCell<HashMap<ItemId, Vec<ItemId>>>,
     digests: RefCell<digest::Digests>,
+    cycles: RefCell<digest::Cycles>,
     /// The authorities each module performs directly, as far as checked.
     performed: RefCell<HashSet<(ModuleId, Authority)>>,
     /// The typed holes of the bodies checked.
@@ -164,6 +170,10 @@ pub struct Checker<'a> {
     quiet: RefCell<Vec<Diagnostic>>,
     /// The fields of structs the bodies checked read.
     fields_read: RefCell<HashSet<(ItemId, String)>>,
+    /// The functions named after a type, by member name, once gathered.
+    member_functions: OnceCell<HashMap<String, Vec<ItemId>>>,
+    /// The items each item names, once computed.
+    named: RefCell<HashMap<ItemId, Rc<BTreeSet<ItemId>>>>,
     /// The `label: value` of each construction and struct pattern the bodies checked write, by
     /// the struct and the field it names.
     field_labels: RefCell<HashMap<(ItemId, String), Vec<unused::FieldLabel>>>,
@@ -218,7 +228,10 @@ impl<'a> Checker<'a> {
             within: Cell::new(None),
             definitions: RefCell::new(HashMap::new()),
             bodies: RefCell::new(HashMap::new()),
+            body_dependencies: RefCell::new(HashMap::new()),
+            implemented: RefCell::new(HashMap::new()),
             digests: RefCell::new(digest::Digests::default()),
+            cycles: RefCell::new(digest::Cycles::default()),
             performed: RefCell::new(HashSet::new()),
             holes: RefCell::new(Vec::new()),
             members_named: RefCell::new(Vec::new()),
@@ -241,6 +254,8 @@ impl<'a> Checker<'a> {
             unused: RefCell::new(Vec::new()),
             quiet: RefCell::new(Vec::new()),
             fields_read: RefCell::new(HashSet::new()),
+            member_functions: OnceCell::new(),
+            named: RefCell::new(HashMap::new()),
             field_labels: RefCell::new(HashMap::new()),
             proof_cache: OnceCell::new(),
             store_entries: OnceCell::new(),

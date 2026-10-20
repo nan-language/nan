@@ -1,0 +1,280 @@
+//! The advisory lock on `.nan/write` and the journal `.nan/journal` through which commands write workspace files.
+
+/// The advisory lock a command holds while it reads or writes workspace files, until `release`.
+pkg linear struct Lock {
+    file: platform::File
+} Lock
+
+/// Locks the workspace at `root`, exclusively when the command writes, after performing the
+/// replacements of a complete journal and deleting an incomplete one.
+pkg fn Lock.acquire(root: Str, exclusive: bool, alloc: mem::Alloc) -> Lock fails platform::IoError {
+    let dir = platform::join(root, name: ".nan", alloc)
+    try platform::create_dir_all(dir.as_str(), alloc)
+    let path = platform::join(dir.as_str(), name: "write", alloc)
+    let file = try platform::File.open_or_create(path.as_str(), mode: 0b110_110_110)
+    defer take file.close()
+    try file.lock()
+    try recover(root, alloc)
+    if not exclusive {
+        try file.unlock()
+        try file.lock_shared()
+    }
+    undefer file
+    return Lock(file: take file)
+} Lock.acquire
+
+/// Releases the lock.
+pkg fn Lock.release(take self) {
+    let Lock(file: file) = self
+    take file.close()
+} Lock.release
+
+fn journal_path(root: Str, alloc: mem::Alloc) -> text::String {
+    let dir = platform::join(root, name: ".nan", alloc)
+    return platform::join(dir.as_str(), name: "journal", alloc)
+} journal_path
+
+const COMPLETE: Slice[u8] = b"complete\n"
+
+/// A file to write: its path relative to the workspace root and its content.
+pkg struct FileWrite {
+    pkg path: text::String
+    pkg content: mem::Bytes
+} FileWrite
+
+/// A change to a file: its path relative to the workspace root and its new content, or none to
+/// delete it.
+pkg struct Change {
+    pkg path: text::String
+    pkg content: Option[mem::Bytes]
+} Change
+
+/// Writes files, given by path relative to `root`, through the journal.
+pkg fn write(root: Str, files: Slice[FileWrite], alloc: mem::Alloc) fails platform::IoError {
+    var changes = mem::List[Change].empty(alloc)
+    for file in files {
+        var content = mem::Bytes.empty(alloc)
+        mut content.append(file.content.view())
+        mut changes.push(Change(path: text::String.of(file.path.as_str(), alloc), content: Some(take content)))
+    }
+    try apply(root, changes: changes.view(), alloc)
+} write
+
+/// Writes or deletes files, given by path relative to `root` with their new content or none,
+/// through the journal.
+pkg fn apply(root: Str, changes: Slice[Change], alloc: mem::Alloc) fails platform::IoError {
+    if changes.is_empty() {
+        return
+    }
+    var journal = mem::Bytes.empty(alloc)
+    for change in changes {
+        var header = text::String.empty(alloc)
+        match change.content {
+            Some(content) => {
+                mut header.write(text::fmt("write {length} {path}\n", length: content.len(), path: change.path.as_str()), budget: 1_000_000)
+                mut journal.append(header.as_bytes())
+                mut journal.append(content.view())
+            }
+            None => {
+                mut header.write(text::fmt("delete {path}\n", path: change.path.as_str()), budget: 1_000_000)
+                mut journal.append(header.as_bytes())
+            }
+        }
+    }
+    mut journal.append(COMPLETE)
+    let path = journal_path(root, alloc)
+    try write_synced(path.as_str(), content: journal.view())
+    try sync_directory(platform::join(root, name: ".nan", alloc).as_str())
+    try replace(root, journal: journal.view(), alloc)
+    try platform::remove_file(path.as_str())
+} apply
+
+/// Replaces one file outside the source and machine files, which a command holding the shared
+/// lock writes, by renaming a new file of this process into place.
+pkg fn replace_alone(root: Str, path: Str, content: Slice[u8], alloc: mem::Alloc) fails platform::IoError {
+    let target = platform::join(root, name: path, alloc)
+    let Some(directory) = platform::parent(target.as_str(), alloc) else {
+        fail platform::IoError.Other(0)
+    }
+    try platform::create_dir_all(directory.as_str(), alloc)
+    let Some(name) = platform::file_name(target.as_str(), alloc) else {
+        fail platform::IoError.Other(0)
+    }
+    var fresh = text::String.of(".", alloc)
+    mut fresh.append(name.as_str())
+    mut fresh.write(text::fmt(".{id}.new", id: platform::process_id()), budget: 32)
+    let new = platform::join(directory.as_str(), name: fresh.as_str(), alloc)
+    try write_synced(new.as_str(), content)
+    try platform::rename_path(new.as_str(), to: target.as_str())
+    try sync_directory(directory.as_str())
+} replace_alone
+
+fn write_synced(path: Str, content: Slice[u8]) fails platform::IoError {
+    let file = try platform::File.create(path, mode: 0b110_110_110)
+    defer take file.close()
+    try file.write_all(content)
+    try file.sync_all()
+} write_synced
+
+fn sync_directory(path: Str) fails platform::IoError {
+    let file = try platform::File.open(path)
+    defer take file.close()
+    try file.sync_all()
+} sync_directory
+
+/// Performs the replacements of a complete journal left by an interrupted command.
+fn recover(root: Str, alloc: mem::Alloc) fails platform::IoError {
+    let path = journal_path(root, alloc)
+    let journal = match first attempt platform::read_file(path.as_str(), alloc) {
+        Ok(journal) => journal
+        Err(platform::IoError.NotFound) => return
+        Err(error) => fail error
+    }
+    if ends_with(journal.view(), suffix: COMPLETE) {
+        try replace(root, journal: journal.view(), alloc)
+    }
+    try platform::remove_file(path.as_str())
+} recover
+
+fn ends_with(bytes: Slice[u8], suffix: Slice[u8]) -> bool {
+    if bytes.len() < suffix.len() {
+        return false
+    }
+    let Some(parts) = bytes.split_at(bytes.len() - suffix.len()) else {
+        return false
+    }
+    return parts.tail == suffix
+} ends_with
+
+/// A new file written next to the file it replaces.
+struct Rename {
+    new: text::String
+    target: text::String
+} Rename
+
+/// Replaces each file a complete journal records by renaming a new file into place, deletes each
+/// file it records deleted, and returns once the changes are on disk.
+fn replace(root: Str, journal: Slice[u8], alloc: mem::Alloc) fails platform::IoError {
+    let Some(recorded) = journal.prefix(journal.len() - COMPLETE.len()) else {
+        fail platform::IoError.InvalidData
+    }
+    var renames = mem::List[Rename].empty(alloc)
+    var deletions = mem::List[text::String].empty(alloc)
+    var directories = mem::Set[text::String].empty(alloc)
+    var at: usize = 0
+    while at < recorded.len() {
+        let Some(header_end) = line_end(recorded, at) else {
+            fail platform::IoError.InvalidData
+        }
+        let Some(parts) = recorded.split_at(at) else {
+            fail platform::IoError.InvalidData
+        }
+        let Some(line) = parts.tail.prefix(header_end - at) else {
+            fail platform::IoError.InvalidData
+        }
+        let Ok(header) = attempt text::String.try_from_utf8(line, alloc) else {
+            fail platform::IoError.InvalidData
+        }
+        if header.starts_with("delete ") {
+            let Some(path) = header.slice_bytes(7, end: header.byte_len()) else {
+                fail platform::IoError.InvalidData
+            }
+            let target = platform::join(root, name: path, alloc)
+            let Some(directory) = platform::parent(target.as_str(), alloc) else {
+                fail platform::IoError.InvalidData
+            }
+            discard mut directories.insert(take directory)
+            mut deletions.push(take target)
+            at = header_end + 1
+            continue
+        }
+        let written = try written_file(root, header: header.as_str(), alloc)
+        let Some(end) = (header_end + 1).checked_add(written.length) else {
+            fail platform::IoError.InvalidData
+        }
+        if end > recorded.len() {
+            fail platform::IoError.InvalidData
+        }
+        let Some(after) = recorded.split_at(header_end + 1) else {
+            fail platform::IoError.InvalidData
+        }
+        let Some(content) = after.tail.prefix(written.length) else {
+            fail platform::IoError.InvalidData
+        }
+        try platform::create_dir_all(written.directory.as_str(), alloc)
+        try write_synced(written.new.as_str(), content)
+        mut renames.push(Rename(new: take written.new, target: take written.target))
+        at = end
+    }
+    for rename in renames {
+        try platform::rename_path(rename.new.as_str(), to: rename.target.as_str())
+        let Some(directory) = platform::parent(rename.target.as_str(), alloc) else {
+            fail platform::IoError.InvalidData
+        }
+        discard mut directories.insert(take directory)
+    }
+    for target in deletions {
+        let removed = attempt platform::remove_file(target.as_str())
+        let Err(error) = removed else {
+            continue
+        }
+        if error != platform::IoError.NotFound {
+            fail error
+        }
+    }
+    for directory in directories {
+        try sync_directory(directory.as_str())
+    }
+} replace
+
+/// The position of the first LF of `bytes` from `at`.
+fn line_end(bytes: Slice[u8], at: usize) -> Option[usize] {
+    for index in at..<bytes.len() {
+        if bytes[index] == b'\n' {
+            return Some(index)
+        }
+    }
+    return None
+} line_end
+
+/// What a journal's `write <length> <path>` header records: the content's length, the file it
+/// replaces, the new file written next to it and their directory.
+struct Written {
+    length: usize
+    target: text::String
+    new: text::String
+    directory: text::String
+} Written
+
+fn written_file(root: Str, header: Str, alloc: mem::Alloc) -> Written fails platform::IoError {
+    if not header.starts_with("write ") {
+        fail platform::IoError.InvalidData
+    }
+    let Some(rest) = header.slice_bytes(6, end: header.byte_len()) else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(space) = rest.find(" ") else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(digits) = rest.slice_bytes(0, end: space) else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(path) = rest.slice_bytes(space + 1, end: rest.byte_len()) else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(length) = platform::parse_decimal(digits) else {
+        fail platform::IoError.InvalidData
+    }
+    let target = platform::join(root, name: path, alloc)
+    let Some(name) = platform::file_name(target.as_str(), alloc) else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(directory) = platform::parent(target.as_str(), alloc) else {
+        fail platform::IoError.InvalidData
+    }
+    var fresh = text::String.of(".", alloc)
+    mut fresh.append(name.as_str())
+    mut fresh.append(".new")
+    let new = platform::join(directory.as_str(), name: fresh.as_str(), alloc)
+    return Written(length: usize.widen(length), target: take target, new: take new, directory: take directory)
+} written_file

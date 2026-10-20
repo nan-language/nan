@@ -1,0 +1,165 @@
+//! Components: the state an impl line naming `sys::Component` declares a component of, and the uses of the runner `host::Runner`.
+
+/// The order of the entries of a `derives` clause in canonical format.
+const DERIVES_ORDER: Str = "Copy Eq Ord Hash Default Render Encode Generate Send Inert AnyBits"
+
+/// The component state of an impl line naming `sys::Component`: without generic parameters,
+/// Inert and implementing `Encode`, the first failing check reported on the line.
+fn Checker.check_component_impl(self, item: ty::ItemId) {
+    let db = self.db()
+    let held = self.sig(item)
+    let SigKind.Impl(target: Some(key), target_ty: target_ty, bound: Some(bound)) = held.contents().kind else {
+        return
+    }
+    if db.canonical(bound.item).as_str() != "sys::Component" {
+        return
+    }
+    let state_item = match key {
+        TypeKey.Item(found) => Some(found)
+        else => None
+    }
+    let encode = db.core_item("Encode")
+    var code = diagnostic::Code.ComponentStateGeneric
+    if not self.state_generic(state_item) {
+        if not self.has(target_ty, property: Property.Inert) {
+            code = diagnostic::Code.ComponentStateNotInert
+        } else {
+            let Some(encode_item) = encode else {
+                return
+            }
+            if self.implements(target_ty, interface_item: encode_item) {
+                return
+            }
+            code = diagnostic::Code.ComponentStateNotEncode
+        }
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    if code == diagnostic::Code.ComponentStateNotEncode {
+        match state_item {
+            Some(found) => {
+                match self.derive_added(found, entry: "Encode") {
+                    Some(fix) => mut fixes.push(take fix)
+                    None => {}
+                }
+            }
+            None => {}
+        }
+    }
+    self.report_fixed(item, construct: nir::Span.at(db.ast(item).token), code, take fixes, offer: diagnostic::Offer.Each)
+} Checker.check_component_impl
+
+/// Whether a component's state item has generic parameters.
+fn Checker.state_generic(self, state_item: Option[ty::ItemId]) -> bool {
+    let Some(found) = state_item else {
+        return false
+    }
+    let sig = self.sig(found)
+    return sig.contents().generics.len() > 0
+} Checker.state_generic
+
+/// The fix adding an entry to a struct's or enum's `derives` clause in canonical order,
+/// writing the clause when it has none.
+fn Checker.derive_added(self, item: ty::ItemId, entry: Str) -> Option[diagnostic::Fix] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let name_token = match db.ast(item).kind {
+        ast::ItemKind.Struct(structure) => structure.name.token
+        ast::ItemKind.Enum(enumeration) => enumeration.name.token
+        else => return None
+    }
+    let Some(derived) = self.derive_entries(item) else {
+        return None
+    }
+    let rank = derive_rank(entry)
+    for written in derived {
+        if derive_rank(written.text.as_str()) > rank {
+            var inserted = text::String.of(entry, alloc)
+            mut inserted.append(", ")
+            return Some(self.fix_inserting(item, before: written.token, text: inserted.as_str()))
+        }
+    }
+    if derived.len() > 0 {
+        var appended = text::String.of(", ", alloc)
+        mut appended.append(entry)
+        return Some(self.fix_appending(item, after: derived[derived.len() - 1].token, text: appended.as_str()))
+    }
+    let syntax = db.syntax(item)
+    var opener: Option[usize] = None
+    for at in usize.widen(name_token)..<syntax.tokens.len() {
+        if syntax.tokens[at].kind == syntax::TokenKind.Punct(syntax::Punct.LBrace) {
+            opener = Some(at)
+            break
+        }
+    }
+    let Some(brace) = opener else {
+        return None
+    }
+    let Some(before) = syntax.previous(brace) else {
+        return None
+    }
+    var clause = text::String.of(" derives ", alloc)
+    mut clause.append(entry)
+    return Some(self.fix_appending(item, after: u32.truncate(before), text: clause.as_str()))
+} Checker.derive_added
+
+/// The position of a `derives` entry in canonical order, past the known ones for another.
+fn derive_rank(written: Str) -> usize {
+    var rank: usize = 0
+    for known in Words(list: DERIVES_ORDER, at: 0) {
+        if known == written {
+            return rank
+        }
+        rank += 1
+    }
+    return rank
+} derive_rank
+
+/// The rule a use of `host::Runner.run` breaks: a state that is no component for the Env and
+/// messages the use fixes, then code checked for a machine target.
+fn Checker.runner_problem(self, head: FnSig, subst: ty::Subst) -> Option[diagnostic::Code] {
+    if self.runs_no_component(head, subst) {
+        return Some(diagnostic::Code.ComponentNotComponent)
+    }
+    let target = self.db().target
+    if target.is_machine() {
+        return Some(diagnostic::Code.ComponentUnavailable)
+    }
+    return None
+} Checker.runner_problem
+
+/// Whether a use of `host::Runner.run` fixes a state that is no component for the Env and
+/// messages it fixes.
+fn Checker.runs_no_component(self, head: FnSig, subst: ty::Subst) -> bool {
+    let types = self.types()
+    let component = self.db().std_item("sys", name: "Component")
+    let Some(state) = fixed_type(head, subst, index: 0, types) else {
+        return false
+    }
+    let Some(env) = fixed_type(head, subst, index: head.inherited, types) else {
+        return false
+    }
+    let Some(message) = fixed_type(head, subst, index: head.inherited + 1, types) else {
+        return false
+    }
+    let Some(component_item) = component else {
+        return false
+    }
+    var args = mem::List[ty::Arg].empty(self.alloc())
+    mut args.push(ty::Arg.Ty(env))
+    mut args.push(ty::Arg.Ty(message))
+    return not self.satisfies(state, bound: ty::Bound(item: component_item, args: types.args(take args)))
+} Checker.runs_no_component
+
+/// The type a substitution gives a head's generic parameter at an index, unless it failed.
+fn fixed_type(head: FnSig, subst: ty::Subst, index: usize, types: ty::Types) -> Option[ty::Ty] {
+    if index >= head.generics.len() {
+        return None
+    }
+    let Some(ty::Arg.Ty(fixed)) = subst.get(head.generics[index].param) else {
+        return None
+    }
+    if types.has_error(fixed) {
+        return None
+    }
+    return Some(fixed)
+} fixed_type

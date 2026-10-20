@@ -88,6 +88,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | --- | --- | --- | --- |
 | Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
+| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | none | none |
 | Stub call bound | 256 bytes | 256 bytes | 256 bytes |
 | Seam frame | none | 4 KiB | 4 KiB |
 | Boot heap ([anchor](24-kernel.md#anchor)) | none | 16 MiB | 16 MiB |

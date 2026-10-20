@@ -1,0 +1,270 @@
+//! Untrusted data: what `Untrusted.of` may wrap, where `inspect` appears, the rules of validators, parsing types, and the validator and decoder operations that need a `validate` grant.
+
+/// Whether a type is a parsing type: a scalar, `Unit`, `Never`, an Untrusted instantiation, a
+/// layout or a struct or enum other than a base type built only from parsing types.
+fn Checker.is_parsing(self, ty: ty::Ty) -> bool {
+    var seen = mem::List[ty::ItemId].empty(self.alloc())
+    return self.parsing(ty, counted: None, seen: mut seen)
+} Checker.is_parsing
+
+/// Whether a type is a parsing type, the type parameters of `counted` counted as parsing and
+/// the items of `seen` taken as parsing while their definitions are decided.
+fn Checker.parsing(self, ty: ty::Ty, counted: Option[ty::ItemId], mut seen: mem::List[ty::ItemId]) -> bool {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(_) or ty::TyKind.Unit or ty::TyKind.Never or ty::TyKind.Error => return true
+        ty::TyKind.Param(param) => return Some(param.owner) == counted
+        ty::TyKind.Item(item: item, args: args) => {
+            if self.is_std(ty, path: "core::Untrusted") {
+                return true
+            }
+            let core_enum = self.is_std(ty, path: "core::Option") or self.is_std(ty, path: "core::Result")
+            if self.is_base_type(item) and not core_enum {
+                return false
+            }
+            let kind_parses = match self.sig(item).contents().kind {
+                SigKind.Struct(fields: _) or SigKind.Enum(variants: _) or SigKind.Layout(fields: _, tags: _, bits: _) => true
+                else => false
+            }
+            if not kind_parses {
+                return false
+            }
+            for arg in types.arg_list(args) {
+                let Some(arg_ty) = arg.ty() else {
+                    continue
+                }
+                if not self.parsing(arg_ty, counted, seen: mut seen) {
+                    return false
+                }
+            }
+            return self.parsing_definition(item, seen: mut seen)
+        }
+        else => return false
+    }
+} Checker.parsing
+
+/// Whether a struct, enum or layout is a parsing type with its type parameters counted as
+/// parsing types.
+fn Checker.parsing_definition(self, item: ty::ItemId, mut seen: mem::List[ty::ItemId]) -> bool {
+    for earlier in seen {
+        if earlier == item {
+            return true
+        }
+    }
+    mut seen.push(item)
+    var parses = true
+    for constituent in self.constituents(item) {
+        if not self.parsing(constituent, counted: Some(item), seen: mut seen) {
+            parses = false
+            break
+        }
+    }
+    discard mut seen.pop()
+    return parses
+} Checker.parsing_definition
+
+/// Whether a type item's decoder is declassifying: that of a generic item, or of one that is
+/// no parsing type.
+fn Checker.declassifying_decoder(self, item: ty::ItemId) -> bool {
+    if self.sig(item).contents().generics.len() > 0 {
+        return true
+    }
+    let item_ty = self.types().item(item, args: mem::List[ty::Arg].empty(self.alloc()))
+    return not self.is_parsing(item_ty)
+} Checker.declassifying_decoder
+
+/// The rules of a function's `validator` modifier: an Untrusted input, no interface method,
+/// and the `validate` grant its declaration needs.
+fn Checker.check_validator(self, item: ty::ItemId, sig: FnSig) {
+    let token = self.db().ast(item).token
+    var inputs = false
+    for param in sig.params {
+        if self.is_std(param.ty, path: "core::Untrusted") {
+            inputs = true
+            break
+        }
+    }
+    var broken: Option[diagnostic::Code] = None
+    if self.implemented_lines(item).len() > 0 {
+        broken = Some(diagnostic::Code.UntrustedValidatorInterface)
+    } else if not inputs {
+        broken = Some(diagnostic::Code.UntrustedValidatorNoInput)
+    }
+    match broken {
+        Some(code) => {
+            self.report(item, token, code)
+            self.perform(item, authority: workspace::Authority.Validate)
+        }
+        None => self.require(item, token, authority: workspace::Authority.Validate)
+    }
+} Checker.check_validator
+
+/// The `validate` grant a type item deriving `Encode` with a declassifying decoder needs, on
+/// the line of its `derives` clause.
+fn Checker.check_decoder_derive(self, item: ty::ItemId) {
+    var token: Option[u32] = None
+    var encodes = false
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(structure) => {
+            token = structure.derives_token
+            encodes = names_encode(structure.derived.view())
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            token = enumeration.derives_token
+            encodes = names_encode(enumeration.derived.view())
+        }
+        else => return
+    }
+    let Some(at) = token else {
+        return
+    }
+    if encodes and self.derive_problem(item, name: "Encode").is_none() and self.declassifying_decoder(item) {
+        self.require(item, token: at, authority: workspace::Authority.Validate)
+    }
+} Checker.check_decoder_derive
+
+/// The `validate` grant an impl line naming `core::Decoder` needs.
+fn Checker.check_decoder_impl(self, item: ty::ItemId) {
+    if self.decoder_line(item) {
+        self.require(item, token: self.db().ast(item).token, authority: workspace::Authority.Validate)
+    }
+} Checker.check_decoder_impl
+
+/// Whether a function is a validator: declared `validator`, or implementing a method of
+/// `core::Decoder`.
+fn Checker.is_validator(self, function: ty::ItemId) -> bool {
+    let declared = match self.db().ast(function).kind {
+        ast::ItemKind.Fn(head) => match head.modifier {
+            Some(modifier) => modifier.kind == ast::FnModifier.Validator
+            None => false
+        }
+        else => false
+    }
+    if declared {
+        return true
+    }
+    for line in self.implemented_lines(function) {
+        if self.decoder_line(line) {
+            return true
+        }
+    }
+    return false
+} Checker.is_validator
+
+/// Reports the `validate` grant a use of a validator, or of the decoder of an instantiation
+/// that is no parsing type, needs.
+fn Checker.check_validator_use(self, item: ty::ItemId, token: u32, function: ty::ItemId) {
+    if self.is_validator(function) {
+        self.require(item, token, authority: workspace::Authority.Validate)
+    }
+} Checker.check_validator_use
+
+/// Reports the `validate` grant a use of the decoder of `decoded` needs.
+fn Checker.check_decoder_use(self, item: ty::ItemId, token: u32, decoded: ty::Ty) {
+    if not self.types().has_error(decoded) and not self.is_parsing(decoded) {
+        self.require(item, token, authority: workspace::Authority.Validate)
+    }
+} Checker.check_decoder_use
+
+/// Whether `Untrusted.of` may wrap a type: not one that is or contains `SliceMut`, `Dyn`, a
+/// type with interior mutability, `task::Sender` or `sys::Outbox`, nor holding a type parameter
+/// that is a view or has no bound naming `Inert`.
+fn Checker.wraps_untrusted(self, ty: ty::Ty) -> bool {
+    if self.any_part(ty, test_part: fn(part: ty::Ty) => self.aliasing_part(part) or self.open_param(part)) {
+        return false
+    }
+    return not self.has_interior(ty)
+} Checker.wraps_untrusted
+
+/// Whether a type, one of its type arguments at any depth, or a constituent of a struct or
+/// enum it instantiates satisfies `test_part`.
+fn Checker.any_part(self, ty: ty::Ty, test_part: fn(part: ty::Ty) -> bool) -> bool {
+    var seen = mem::List[ty::ItemId].empty(self.alloc())
+    return self.any_part_from(ty, test_part, seen: mut seen)
+} Checker.any_part
+
+fn Checker.any_part_from(self, ty: ty::Ty, test_part: fn(part: ty::Ty) -> bool, mut seen: mem::List[ty::ItemId]) -> bool {
+    if test_part(ty) {
+        return true
+    }
+    let alloc = self.alloc()
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return false
+    }
+    for arg in types.arg_list(args) {
+        let Some(arg_ty) = arg.ty() else {
+            continue
+        }
+        if self.any_part_from(arg_ty, test_part, seen: mut seen) {
+            return true
+        }
+    }
+    for earlier in seen {
+        if earlier == item {
+            return false
+        }
+    }
+    if self.is_base_type(item) {
+        return false
+    }
+    mut seen.push(item)
+    let subst = ty::Subst.of(generic_params(self.sig(item).contents().generics.view(), alloc).view(), args: types.arg_list(args), alloc)
+    var found = false
+    for constituent in self.constituents(item) {
+        if self.any_part_from(subst.ty(types, ty: constituent), test_part, seen: mut seen) {
+            found = true
+            break
+        }
+    }
+    discard mut seen.pop()
+    return found
+} Checker.any_part_from
+
+/// Whether derives name `Encode`.
+fn names_encode(derived: Slice[ast::Name]) -> bool {
+    for name in derived {
+        if name.text.as_str() == "Encode" {
+            return true
+        }
+    }
+    return false
+} names_encode
+
+/// Whether an item is an impl line naming `core::Decoder`.
+fn Checker.decoder_line(self, item: ty::ItemId) -> bool {
+    let sig = self.sig(item)
+    let SigKind.Impl(target: _, target_ty: _, bound: bound) = sig.contents().kind else {
+        return false
+    }
+    let Some(named) = bound else {
+        return false
+    }
+    return self.db().canonical(named.item).as_str() == "core::Decoder"
+} Checker.decoder_line
+
+/// Whether a type aliases what it is given: `Dyn`, `SliceMut`, `task::Sender` or
+/// `sys::Outbox`.
+fn Checker.aliasing_part(self, ty: ty::Ty) -> bool {
+    match self.types().kind(ty) {
+        ty::TyKind.Dyn(_) => return true
+        else => {}
+    }
+    return self.is_std(ty, path: "core::SliceMut") or self.is_std(ty, path: "task::Sender") or self.is_std(ty, path: "sys::Outbox")
+} Checker.aliasing_part
+
+/// Whether a type is a type parameter that is a view or has no bound naming `Inert`.
+fn Checker.open_param(self, ty: ty::Ty) -> bool {
+    let ty::TyKind.Param(param) = self.types().kind(ty) else {
+        return false
+    }
+    if self.has(ty, property: Property.View) {
+        return true
+    }
+    for bound in self.param_bounds(param) {
+        if self.db().canonical(bound.item).as_str() == "core::Inert" {
+            return false
+        }
+    }
+    return true
+} Checker.open_param

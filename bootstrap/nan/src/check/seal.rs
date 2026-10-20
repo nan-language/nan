@@ -11,15 +11,11 @@ use crate::machine::api::ClosureEntry;
 use crate::nir::{Callable, Callee, Constant, Op, Terminator, Unit};
 use crate::syntax::ast::{FnBody, ItemKind};
 
-/// The closure hash of closure entries: the hash of `closure`, LF and one line per entry, sorted
-/// by path, then kind, then hash: the kind, the path and the full form of the hash.
+/// The closure hash of closure entries: the hash of `closure`, LF and one line per entry, in
+/// their order: the kind, the path and the full form of the hash.
 pub fn closure_hash(entries: &BTreeSet<ClosureEntry>) -> Hash {
     let mut text = String::from("closure\n");
-    let mut sorted: Vec<&ClosureEntry> = entries.iter().collect();
-    sorted.sort_by(|left, right| {
-        (&left.path, left.kind(), left.hash.0).cmp(&(&right.path, right.kind(), right.hash.0))
-    });
-    for entry in sorted {
+    for entry in entries {
         text.push_str(&format!(
             "{} {} {}\n",
             entry.kind(),

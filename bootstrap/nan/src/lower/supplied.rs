@@ -21,10 +21,11 @@ pub mod text;
 use cranelift_codegen::ir::{InstBuilder, Value};
 
 use super::Lowering;
-use super::abi::{Abi, Repr, Returned};
+use super::abi::{Abi, Given, Repr, Returned};
 use super::body::{Body, Held};
 use super::call::Called;
 use super::fx::Fx;
+use super::types::Wrap;
 use crate::check::db::ItemId;
 use crate::check::ty::{Args, Ty};
 use crate::nir::{BlockId, Builtin, NTy, Operand, Value as NirValue};
@@ -39,6 +40,8 @@ pub struct Supply<'s> {
     pub sret: Option<Value>,
     pub failure: Option<Value>,
     pub params: Vec<Held>,
+    /// How its result holds a wrapped part, when it is a projection giving one.
+    pub wrap: Option<Wrap>,
 }
 
 impl Supply<'_> {
@@ -106,11 +109,11 @@ impl Supply<'_> {
         }
         let fails = self.abi.fails.clone().expect("a try_ form's failure type");
         let out_of_memory = lo.std_ty("mem", "OutOfMemory", Vec::new());
-        let exhausted = lo.variant_value(fx, &out_of_memory, "Exhausted", &[], false);
+        let exhausted = lo.variant_value(fx, &out_of_memory, "Exhausted", &[], None);
         let value = if fails == out_of_memory {
             exhausted
         } else {
-            lo.variant_value(fx, &fails, "OutOfMemory", &[exhausted], false)
+            lo.variant_value(fx, &fails, "OutOfMemory", &[exhausted], None)
         };
         let failure = self.failure.expect("a failure address");
         lo.store_held(fx, failure, value, &fails);
@@ -194,6 +197,10 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         Some(crate::check::db::TypeKey::Scalar(scalar)) => Some(Ty::Scalar(*scalar)),
         _ => None,
     };
+    let wrap = match lo.ck.fn_sig(item).and_then(|sig| lo.sig_given(&sig)) {
+        Some(Given::Wrapped(wrap)) => Some(wrap),
+        _ => None,
+    };
     let supply = Supply {
         abi,
         args: args.clone(),
@@ -202,6 +209,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, item: ItemId, args: &Arg
         sret,
         failure,
         params,
+        wrap,
     };
     let lowered = numbers::lower(lo, fx, &supply)
         || generate::lower(lo, fx, &supply)

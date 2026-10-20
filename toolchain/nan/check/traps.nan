@@ -1,0 +1,615 @@
+//! The may-trap digest fact, which the statuses of a function's obligations decide, and the rules it breaks: limits and fits demanding `notrap`, and the callees of contract terms.
+
+/// What brings the may-trap fact into a function's code.
+enum Source derives Copy {
+    /// An obligation keeping a run-time check, or an operation trapping without an obligation.
+    Own(span: nir::Span, obligation: bool)
+    /// A direct call, or a named function supplied as an argument, reached through its
+    /// checking entry when `entry` holds.
+    Callee(item: ty::ItemId, span: nir::Span, entry: bool)
+    /// A call through, or a value supplied of, a declared digest that lacks `notrap`.
+    Declared(nir::Span)
+} Source
+
+/// Whether a function's digest has may-trap: its own code holds a trap site, or a function
+/// it calls directly, a declared digest it calls through, or a function argument it
+/// supplies has may-trap; the members of a cycle share it. A std function without a body
+/// has its supplied digest's; any other function without a body or a unit has its declared
+/// digest's.
+fn Checker.may_trap(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    db.note(item)
+    match self.state.contents().may_traps.get(item) {
+        Some(known) => return known
+        None => {}
+    }
+    return db.about(Some(item), compute: fn() => self.compute_may_trap(item))
+} Checker.may_trap
+
+fn Checker.compute_may_trap(self, item: ty::ItemId) -> bool {
+    let members = self.cycle_of(item)
+    var traps = false
+    for member in members {
+        let bodiless = match self.db().ast(member).kind {
+            ast::ItemKind.Fn(function) => match function.body {
+                ast::FnBody.None => true
+                else => false
+            }
+            else => false
+        }
+        if bodiless and self.db().is_std(member) {
+            let supplied = self.supplied_traps(member)
+            traps = traps or supplied
+            continue
+        }
+        let unit = self.unit(member)
+        let Some(found) = unit else {
+            let declared = self.declared_traps(member)
+            traps = traps or declared
+            continue
+        }
+        if bodiless {
+            let declared = self.declared_traps(member)
+            traps = traps or declared
+            continue
+        }
+        let sources = self.trap_sources(member, unit: found.contents(), role: nir::Role.Body, index: 0)
+        for source in sources {
+            let brings = match source {
+                Source.Own(span: _, obligation: _) or Source.Declared(_) => true
+                Source.Callee(item: callee, span: _, entry: entry) => (entry and self.entry_traps(callee)) or (members.position(fn(value: ty::ItemId) => value == callee).is_none() and self.may_trap(callee))
+            }
+            traps = traps or brings
+        }
+    }
+    let known = self.state.contents().may_traps
+    for member in members {
+        discard known.insert(member, value: traps)
+    }
+    return traps
+} Checker.compute_may_trap
+
+/// Whether a function without a body or a unit has may-trap: its head's limits lack
+/// `notrap`.
+fn Checker.declared_traps(self, item: ty::ItemId) -> bool {
+    return match self.fn_sig(item) {
+        Some(sig) => not sig.limit_set.notrap
+        None => true
+    }
+} Checker.declared_traps
+
+/// Whether a body, closure or default function of an item's unit has may-trap: the item's
+/// own fact for its body, and otherwise whether its own code holds a trap site or reaches a
+/// function that has may-trap.
+fn Checker.function_may_trap(self, item: ty::ItemId, role: nir::Role, index: u32) -> bool {
+    if role == nir::Role.Body {
+        return self.may_trap(item)
+    }
+    let Some(unit) = self.unit(item) else {
+        return false
+    }
+    let sources = self.trap_sources(item, unit: unit.contents(), role, index)
+    for source in sources {
+        let brings = match source {
+            Source.Own(span: _, obligation: _) or Source.Declared(_) => true
+            Source.Callee(item: callee, span: _, entry: entry) => (entry and self.entry_traps(callee)) or self.may_trap(callee)
+        }
+        if brings {
+            return true
+        }
+    }
+    return false
+} Checker.function_may_trap
+
+/// Whether a function's checking entry keeps a check.
+fn Checker.entry_traps(self, item: ty::ItemId) -> bool {
+    let obligations = self.obligations(item)
+    for site in obligations.contents() {
+        if site.role == nir::Role.Entry and site.status == Status.Checked {
+            return true
+        }
+    }
+    return false
+} Checker.entry_traps
+
+/// Whether a named function, reached through its checking entry, has may-trap.
+fn Checker.traps_through_entry(self, item: ty::ItemId) -> bool {
+    return self.entry_traps(item) or self.may_trap(item)
+} Checker.traps_through_entry
+
+/// The functions of a function's cycle, itself included.
+fn Checker.cycle_of(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
+    let alloc = self.alloc()
+    var reachable = mem::List[ty::ItemId].empty(alloc)
+    var known = mem::Set[ty::ItemId].empty(alloc)
+    mut reachable.push(item)
+    discard mut known.insert(item)
+    var index: usize = 0
+    while index < reachable.len() {
+        let dependencies = self.dependencies(reachable[index])
+        for dependency in dependencies {
+            if not known.contains(dependency) {
+                discard mut known.insert(dependency)
+                mut reachable.push(dependency)
+            }
+        }
+        index += 1
+    }
+    if self.db().recording() {
+        return self.recorded_cycle(item, take reachable)
+    }
+    var members = mem::List[ty::ItemId].empty(alloc)
+    for member in reachable {
+        if member == item or self.same_cycle(item, other: member) {
+            mut members.push(member)
+        }
+    }
+    return members
+} Checker.cycle_of
+
+/// What brings may-trap into a body or closure function of a unit: its checked obligations
+/// and `when` operations, its calls, and the functions and closures it supplies as
+/// arguments, a closure's own sources included.
+fn Checker.trap_sources(self, item: ty::ItemId, unit: nir::NirUnit, role: nir::Role, index: u32) -> mem::List[Source] {
+    let alloc = self.alloc()
+    var sources = mem::List[Source].empty(alloc)
+    let Some(function) = unit.function(role, index) else {
+        return sources
+    }
+    let obligations = self.obligations(item)
+    for site in obligations.contents() {
+        if site.role == role and site.index == index and site.status == Status.Checked {
+            mut sources.push(Source.Own(span: site.span, obligation: true))
+        }
+    }
+    let defined = defining_insts(function, alloc)
+    for block in function.blocks {
+        var calls = mem::List[usize].empty(alloc)
+        for position in 0..<block.insts.len() {
+            match block.insts[position].op {
+                nir::Op.Call(_) => mut calls.push(position)
+                nir::Op.When(attempted: false, accesses: _, region: _) => mut sources.push(Source.Own(span: block.insts[position].span, obligation: false))
+                else => {}
+            }
+        }
+        for position in calls {
+            let inst = block.insts[position]
+            let nir::Op.Call(call) = inst.op else {
+                continue
+            }
+            self.call_trap_sources(item, unit, function, call, span: inst.span, defined, mut sources)
+        }
+        match block.term {
+            nir::Terminator.Call(call: call, ok: _, failure: _) => self.call_trap_sources(item, unit, function, call, span: block.term_span, defined, mut sources)
+            else => {}
+        }
+    }
+    return sources
+} Checker.trap_sources
+
+/// What brings may-trap into a function through one of its calls at `span`: its callee, and
+/// the functions and closures it supplies as arguments.
+fn Checker.call_trap_sources(
+    self,
+    item: ty::ItemId,
+    unit: nir::NirUnit,
+    function: nir::Function,
+    call: nir::Call,
+    span: nir::Span,
+    defined: mem::HashMap[nir::Value, InstAt],
+    mut sources: mem::List[Source],
+    ) {
+    match call.callee {
+        nir::Callee.Fn(fn_ref) => {
+            match fn_ref.callable {
+                nir::Callable.Item(item: callee, role: nir::Role.Body, index: _) => mut sources.push(Source.Callee(item: callee, span: span, entry: false))
+                nir::Callable.Method(item: interface_item, method: method) => {
+                    if not self.method_limits(interface_item, method).notrap {
+                        mut sources.push(Source.Declared(span))
+                    }
+                }
+                else => {}
+            }
+        }
+        nir::Callee.Value(value) => {
+            if not is_param_value(function, value) and not self.notrap_value(function, value) {
+                mut sources.push(Source.Declared(span))
+            }
+        }
+        nir::Callee.Dyn(place: _, item: interface_item, method: method) => {
+            if not self.method_limits(interface_item, method).notrap {
+                mut sources.push(Source.Declared(span))
+            }
+        }
+    }
+    for arg in call.args {
+        let nir::Operand.Value(value) = arg else {
+            continue
+        }
+        let Some(at) = defined.get(value) else {
+            continue
+        }
+        match function.block(at.block).insts[at.position].op {
+            nir::Op.FnRef(fn_ref) => {
+                match fn_ref.callable {
+                    nir::Callable.Item(item: supplied, role: nir::Role.Body, index: _) => mut sources.push(Source.Callee(item: supplied, span: span, entry: true))
+                    else => {}
+                }
+            }
+            nir::Op.Closure(index: closure, captures: _) => {
+                let inner = self.trap_sources(item, unit, role: nir::Role.Closure, index: closure)
+                for source in inner {
+                    mut sources.push(source)
+                }
+            }
+            else => {}
+        }
+    }
+} Checker.call_trap_sources
+
+/// Whether a value is a parameter of a function.
+fn is_param_value(function: nir::Function, value: nir::Value) -> bool {
+    for param in function.params {
+        if param.value == value {
+            return true
+        }
+    }
+    return false
+} is_param_value
+
+/// Whether a value of a function has a function type demanding `notrap`.
+fn Checker.notrap_value(self, function: nir::Function, value: nir::Value) -> bool {
+    let types = self.types()
+    return match types.kind(function.ty(value).ty()) {
+        ty::TyKind.Fn(id) => types.fn_of(id).limit_set.notrap
+        else => false
+    }
+} Checker.notrap_value
+
+fn Checker.method_limits(self, interface_item: ty::ItemId, method: u32) -> ty::LimitSet {
+    let sig = self.sig(interface_item)
+    return match sig.contents().kind {
+        SigKind.Interface(methods: methods) => methods[usize.widen(method)].sig.limit_set
+        else => ty::LimitSet.none()
+    }
+} Checker.method_limits
+
+/// The rules may-trap breaks in an item: each site of the text of a function or closure
+/// demanding `notrap` that brings may-trap, other than an obligation, which the prover's
+/// outcome reports (`limit.may-trap`); each named function or function value with may-trap
+/// supplied where a function type demands `notrap` (`limit.may-trap`); and each callee of a
+/// contract term with an effect, without `terminates` or with may-trap
+/// (`contract.ill-defined`).
+fn Checker.check_traps(self, item: ty::ItemId) {
+    let Some(unit) = self.unit(item) else {
+        return
+    }
+    let held = unit.contents()
+    var reported = mem::List[u32].empty(self.alloc())
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => self.report_function_traps(item, unit: held, mut reported)
+        else => {}
+    }
+    for function in held.functions {
+        if function.role.is_contract() {
+            self.check_contract_callees(item, function)
+        }
+    }
+    let Some(body) = self.typed(item) else {
+        return
+    }
+    match body.contents().root {
+        Some(root) => self.check_fit_traps(item, body: body.contents(), expr: root)
+        None => {}
+    }
+} Checker.check_traps
+
+/// The may-trap sites of a function item's text demanding `notrap`: of each closure written
+/// for a function type demanding it or demanding it itself, then of the whole text when the
+/// function demands it.
+fn Checker.report_function_traps(self, item: ty::ItemId, unit: nir::NirUnit, mut reported: mem::List[u32]) {
+    let body = self.typed_body(item)
+    var closures = mem::List[u32].empty(self.alloc())
+    for function in unit.functions {
+        if function.role == nir::Role.Closure {
+            mut closures.push(function.index)
+        }
+    }
+    match body {
+        Some(typed) => {
+            for index in closures {
+                if closure_demands_notrap(typed.contents(), index) {
+                    self.report_traps(item, unit, role: nir::Role.Closure, index, mut reported)
+                }
+            }
+        }
+        None => {}
+    }
+    if not self.demands_notrap(item) {
+        return
+    }
+    self.report_traps(item, unit, role: nir::Role.Body, index: 0, mut reported)
+    for function in unit.functions {
+        if function.role == nir::Role.Closure {
+            self.report_traps(item, unit, role: nir::Role.Closure, index: function.index, mut reported)
+        }
+    }
+} Checker.report_function_traps
+
+fn Checker.report_traps(
+    self,
+    item: ty::ItemId,
+    unit: nir::NirUnit,
+    role: nir::Role,
+    index: u32,
+    mut reported: mem::List[u32],
+    ) {
+    let alloc = self.alloc()
+    let sources = self.trap_sources(item, unit, role, index)
+    for source in sources {
+        var span = nir::Span.at(0)
+        var called: Option[ty::ItemId] = None
+        match source {
+            Source.Own(span: _, obligation: true) => continue
+            Source.Own(span: own, obligation: false) or Source.Declared(own) => {
+                span = own
+            }
+            Source.Callee(item: callee, span: at, entry: entry) => {
+                let traps = match entry {
+                    true => self.traps_through_entry(callee)
+                    false => self.may_trap(callee)
+                }
+                if not traps {
+                    continue
+                }
+                span = at
+                called = Some(callee)
+            }
+        }
+        if reported.position(fn(value: u32) => value == span.head).is_some() {
+            continue
+        }
+        mut reported.push(span.head)
+        var because = mem::List[diagnostic::Reason].empty(alloc)
+        match called {
+            Some(callee) => mut because.push(self.reason(item, token: span.head, role: diagnostic::Role.Called, subject: self.db().canonical(callee)))
+            None => {}
+        }
+        mut because.push(self.reason(item, token: span.head, role: diagnostic::Role.Raised, subject: text::String.of("may-trap", alloc)))
+        self.report_because(item, token: span.head, code: diagnostic::Code.LimitMayTrap, take because)
+    }
+} Checker.report_traps
+
+/// Reports each call of a contract function to a callee whose digest is not `pure`, lacks
+/// terminates or has may-trap.
+fn Checker.check_contract_callees(self, item: ty::ItemId, function: nir::Function) {
+    for block in function.blocks {
+        for inst in block.insts {
+            let nir::Op.Call(call) = inst.op else {
+                continue
+            }
+            let Some(callee) = body_callee(call) else {
+                continue
+            }
+            let digest = self.digest(callee)
+            let facts = digest.contents()
+            if not facts.pure() or not facts.terminates or self.may_trap(callee) {
+                self.report(item, token: inst.span.head, code: diagnostic::Code.ContractIllDefined)
+            }
+        }
+    }
+} Checker.check_contract_callees
+
+/// The function item whose body a call calls directly, if any.
+fn body_callee(call: nir::Call) -> Option[ty::ItemId] {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return None
+    }
+    return body_reference(fn_ref)
+} body_callee
+
+/// The function item whose body a function reference names, if any.
+fn body_reference(fn_ref: nir::FnRef) -> Option[ty::ItemId] {
+    return match fn_ref.callable {
+        nir::Callable.Item(item: callee, role: nir::Role.Body, index: _) => Some(callee)
+        else => None
+    }
+} body_reference
+
+/// Reports each named function or function value with may-trap that becomes a value of a
+/// function type demanding `notrap`: as an argument or a construction's value.
+fn Checker.check_fit_traps(self, item: ty::ItemId, body: TBody, expr: TExpr) {
+    match expr.kind {
+        TKind.Call(call) or TKind.Index(call) => {
+            let held = call.contents()
+            var count = held.args.len()
+            if held.head.params.len() < count {
+                count = held.head.params.len()
+            }
+            for position in 0..<count {
+                self.check_fit_trap(item, body, value: held.args[position].expr, wanted: held.head.params[position].ty)
+            }
+        }
+        TKind.Construct(variant: variant, values: values, wrapped: _) => {
+            let fields = self.construct_fields(expr.ty, variant)
+            for labelled in values {
+                match fields.get(labelled.name) {
+                    Some(wanted) => self.check_fit_trap(item, body, value: labelled.value, wanted)
+                    None => {}
+                }
+            }
+        }
+        else => {}
+    }
+    expr.each_child(fn(child: TExpr) => self.check_fit_traps(item, body, expr: child))
+} Checker.check_fit_traps
+
+/// Reports a named function or function value with may-trap supplied as a value of a type
+/// `wanted` demanding `notrap`.
+fn Checker.check_fit_trap(self, item: ty::ItemId, body: TBody, value: TExpr, wanted: ty::Ty) {
+    let types = self.types()
+    let ty::TyKind.Fn(wanted_id) = types.kind(wanted) else {
+        return
+    }
+    if not types.fn_of(wanted_id).limit_set.notrap {
+        return
+    }
+    let traps = match first value.kind {
+        TKind.FnValue(item: function, type_args: _) => self.traps_through_entry(function)
+        TKind.Local(local) if not is_param(body.local(local).kind) => match types.kind(value.ty) {
+            ty::TyKind.Fn(found) => not types.fn_of(found).limit_set.notrap
+            else => false
+        }
+        else => false
+    }
+    if traps {
+        self.report(item, token: value.token, code: diagnostic::Code.LimitMayTrap)
+    }
+} Checker.check_fit_trap
+
+/// The types of the fields or payload fields a construction of a type names, by name.
+fn Checker.construct_fields(self, ty: ty::Ty, variant: Option[usize]) -> mem::HashMap[text::String, ty::Ty] {
+    let alloc = self.alloc()
+    let types = self.types()
+    var fields = mem::HashMap[text::String, ty::Ty].empty(seed: 0, alloc)
+    let ty::TyKind.Item(item: owner, args: args) = types.kind(ty) else {
+        return fields
+    }
+    let sig = self.sig(owner)
+    let held = sig.contents()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in held.generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(args), alloc)
+    match held.kind {
+        SigKind.Struct(fields: declared) => {
+            if variant.is_some() {
+                return fields
+            }
+            for field in declared {
+                discard mut fields.insert(text::String.of(field.name.as_str(), alloc), value: subst.ty(types, ty: field.ty))
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            let Some(at) = variant else {
+                return fields
+            }
+            let Payload.Labelled(labelled) = variants[at].payload else {
+                return fields
+            }
+            for field in labelled {
+                discard mut fields.insert(text::String.of(field.name.as_str(), alloc), value: subst.ty(types, ty: field.ty))
+            }
+        }
+        else => {}
+    }
+    return fields
+} Checker.construct_fields
+
+/// Whether a function's limits demand `notrap`: through its own `limits` clause, the
+/// interface method it implements, or its body being transparent.
+fn Checker.demands_notrap(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    match function.body {
+        ast::FnBody.Expr(_) => return true
+        else => {}
+    }
+    let declared = match self.fn_sig(item) {
+        Some(sig) => sig.limit_set.notrap
+        None => false
+    }
+    if declared {
+        return true
+    }
+    let Some(implemented) = self.implemented_method(item) else {
+        return false
+    }
+    return self.method_limits(implemented.item, method: u32.fit(implemented.method)).notrap
+} Checker.demands_notrap
+
+/// The functions a function calls directly or supplies as function arguments.
+fn Checker.dependencies(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
+    let alloc = self.alloc()
+    var found = mem::List[ty::ItemId].empty(alloc)
+    let Some(unit) = self.unit(item) else {
+        return found
+    }
+    var known = mem::Set[ty::ItemId].empty(alloc)
+    for function in unit.contents().functions {
+        if function.role != nir::Role.Body and function.role != nir::Role.Closure {
+            continue
+        }
+        for block in function.blocks {
+            for inst in block.insts {
+                let callee = match inst.op {
+                    nir::Op.Call(call) => body_callee(call)
+                    nir::Op.FnRef(fn_ref) => body_reference(fn_ref)
+                    else => None
+                }
+                add_dependency(mut found, mut known, callee)
+            }
+            match block.term {
+                nir::Terminator.Call(call: call, ok: _, failure: _) => add_dependency(mut found, mut known, callee: body_callee(call))
+                else => {}
+            }
+        }
+    }
+    return found
+} Checker.dependencies
+
+/// Adds a callee to the dependencies found, once.
+fn add_dependency(mut found: mem::List[ty::ItemId], mut known: mem::Set[ty::ItemId], callee: Option[ty::ItemId]) {
+    let Some(function) = callee else {
+        return
+    }
+    if known.contains(function) {
+        return
+    }
+    discard mut known.insert(function)
+    mut found.push(function)
+} add_dependency
+
+/// The instruction defining each value of a function, by its position.
+fn defining_insts(function: nir::Function, alloc: mem::Alloc) -> mem::HashMap[nir::Value, InstAt] {
+    var defined = mem::HashMap[nir::Value, InstAt].empty(seed: 0, alloc)
+    for block in 0..<function.blocks.len() {
+        let insts = function.blocks[block].insts
+        for position in 0..<insts.len() {
+            match insts[position].result {
+                Some(result) => {
+                    discard mut defined.insert(result, value: InstAt(block: nir::BlockId(index: u32.fit(block)), position: position))
+                }
+                None => {}
+            }
+        }
+    }
+    return defined
+} defining_insts
+
+/// Whether the closure of a body numbered `index` is written for a function type demanding
+/// `notrap`, or demands it itself.
+fn closure_demands_notrap(body: TBody, index: u32) -> bool {
+    var demands = false
+    match body.root {
+        Some(root) => find_closure(root, index, mut demands)
+        None => {}
+    }
+    return demands
+} closure_demands_notrap
+
+fn find_closure(expr: TExpr, index: u32, mut demands: bool) {
+    match expr.kind {
+        TKind.Closure(closure) => {
+            let held = closure.contents()
+            if held.index == index {
+                demands = held.demanded.notrap or held.ty.limit_set.notrap
+                return
+            }
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut demands](child: TExpr) => find_closure(child, index, mut demands))
+} find_closure

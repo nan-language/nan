@@ -1,7 +1,7 @@
 //! The rules of declarations: names, their conventions, duplicates and clashes, and the shapes of
 //! heads that their names promise.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId, TypeKey};
@@ -203,6 +203,58 @@ impl Checker<'_> {
                 }
             }
         }
+        self.check_member_names(module);
+    }
+
+    /// The members a module declares that are named like an earlier member of their type in
+    /// the module, like one in another module when outside the type's module, or like a field or
+    /// variant of the type.
+    fn check_member_names(&self, module: ModuleId) {
+        let mut seen: HashSet<(TypeKey, &str)> = HashSet::new();
+        for &item in &self.db.module(module).items {
+            let ItemKind::Fn(function) = &self.db.ast(item).kind else {
+                continue;
+            };
+            let Some(&key) = self.db.owners.get(&item) else {
+                continue;
+            };
+            let name = &function.label.name;
+            let repeated = !seen.insert((key, name.text.as_str()));
+            let elsewhere = !self.declares_type(module, key)
+                && self
+                    .db
+                    .members(key, &name.text)
+                    .iter()
+                    .any(|other| self.db.module_of(*other) != module);
+            if repeated || elsewhere || self.names_part(key, &name.text) {
+                self.report(item, name.token, Code::ItemDuplicate);
+            }
+        }
+    }
+
+    /// Whether a module declares a type: a struct, enum or layout of it, or for the scalars and
+    /// `Unit`, the root module of core.
+    fn declares_type(&self, module: ModuleId, key: TypeKey) -> bool {
+        match key {
+            TypeKey::Item(target) => self.db.module_of(target) == module,
+            TypeKey::Scalar(_) | TypeKey::Unit => {
+                self.db.package(self.db.core()).root == Some(module)
+            }
+        }
+    }
+
+    /// Whether a member name is a field or variant of its type.
+    fn names_part(&self, key: TypeKey, name: &str) -> bool {
+        let TypeKey::Item(target) = key else {
+            return false;
+        };
+        match &self.sig(target).kind {
+            SigKind::Struct { fields } | SigKind::Layout { fields, .. } => {
+                fields.iter().any(|field| field.name == name)
+            }
+            SigKind::Enum { variants } => variants.iter().any(|variant| variant.name == name),
+            _ => false,
+        }
     }
 
     pub(super) fn check_item(&self, item: ItemId) {
@@ -217,7 +269,9 @@ impl Checker<'_> {
         let ast = &self.db.ast(item).clone();
         match &ast.kind {
             ItemKind::Fn(function) => {
-                self.check_case(item, &function.label.name, Case::Snake);
+                if !matches!(function.modifier, Some((FnModifier::Foreign, _))) {
+                    self.check_case(item, &function.label.name, Case::Snake);
+                }
                 if function.label.owner.is_none()
                     && !self.in_core(item)
                     && folds_to_core(&function.label.name.text, true)
@@ -619,13 +673,7 @@ impl Checker<'_> {
             }
             Ok(_) => self.db.owner_key(module, owner),
         };
-        let declared = match key {
-            Some(TypeKey::Item(target)) => self.db.module_of(target) == module,
-            Some(TypeKey::Scalar(_) | TypeKey::Unit) => {
-                self.db.package(self.db.core()).root == Some(module)
-            }
-            None => false,
-        };
+        let declared = key.is_some_and(|key| self.declares_type(module, key));
         let implemented = !self.implemented_lines(item).is_empty();
         if !declared && !implemented {
             self.report(item, self.db.ast(item).token, Code::ItemMethodMisplaced);

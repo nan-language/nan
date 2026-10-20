@@ -1,0 +1,456 @@
+//! The exact fixes of the syntax rules the parse reports: rejected alternatives, misplaced and unclosed delimiters, indented lines, closing labels and body openers.
+
+/// The fixes a rule names, and how a diagnostic offers them.
+struct Fixes {
+    fixes: mem::List[mem::List[diagnostic::Replacement]]
+    offer: diagnostic::Offer
+} Fixes
+
+/// The first and the last token of a run.
+struct TokenRun derives Copy {
+    head: usize
+    last: usize
+} TokenRun
+
+fn SourceFile.replacing(self, head: usize, last: usize, written: Str, alloc: mem::Alloc) -> diagnostic::Replacement {
+    return diagnostic::Replacement(start: self.tokens[head].start, end: self.tokens[last].end, text: text::String.of(written, alloc))
+} SourceFile.replacing
+
+fn SourceFile.inserting(self, at: u32, written: Str, alloc: mem::Alloc) -> diagnostic::Replacement {
+    return diagnostic::Replacement(start: at, end: at, text: text::String.of(written, alloc))
+} SourceFile.inserting
+
+/// The replacement deleting the tokens `head..=last` and the spaces before them.
+fn SourceFile.deleting(self, head: usize, last: usize, alloc: mem::Alloc) -> diagnostic::Replacement {
+    var start = self.tokens[head].start
+    match self.previous(head) {
+        Some(before) => {
+            if self.tokens[before].line == self.tokens[head].line {
+                start = self.tokens[before].end
+            }
+        }
+        None => {}
+    }
+    return diagnostic::Replacement(start: start, end: self.tokens[last].end, text: text::String.empty(alloc))
+} SourceFile.deleting
+
+/// The source text of the tokens `head..=last`.
+proj fn SourceFile.spelled(self, head: usize, last: usize) -> Str {
+    let Some(spelt) = self.readable.slice_bytes(usize.widen(self.tokens[head].start), end: usize.widen(self.tokens[last].end)) else {
+        expect false
+        return self.readable.as_str()
+    }
+    return spelt
+} SourceFile.spelled
+
+/// The byte at which the physical line of a token starts.
+fn SourceFile.line_start(self, token: usize) -> u32 {
+    return self.lines[usize.widen(self.tokens[token].line) - 1].start
+} SourceFile.line_start
+
+/// The byte at which the physical line after a token's starts, or the file's end.
+fn SourceFile.next_line_start(self, token: usize) -> u32 {
+    return self.line_start_at(self.tokens[token].line + 1)
+} SourceFile.next_line_start
+
+/// The fixes of a rejected alternative parsed from `start` to before `at`, `failed` being the
+/// parse that rejected it, and how they are offered.
+fn SourceFile.rejected(
+    self,
+    failed: State,
+    code: diagnostic::Code,
+    start: usize,
+    at: usize,
+    grammar: Grammar,
+    alloc: mem::Alloc,
+    ) -> Fixes {
+    var last = start
+    match self.previous(at) {
+        Some(previous) => {
+            if previous > start {
+                last = previous
+            }
+        }
+        None => {}
+    }
+    var fixes = mem::List[mem::List[diagnostic::Replacement]].empty(alloc)
+    match code {
+        diagnostic::Code.ItemSelfFieldSet => mut fixes.push(one_fix(self.replacing(start, last, written: "", alloc), alloc))
+        diagnostic::Code.EffectUsesUnknown => match self.previous(start) {
+            Some(uses_word) => mut fixes.push(one_fix(self.deleting(uses_word, last: start, alloc), alloc))
+            None => {}
+        }
+        diagnostic::Code.TaskWhenTake => mut fixes.push(one_fix(self.replacing(start, last: start, written: "mut", alloc), alloc))
+        diagnostic::Code.NameDotForPath => mut fixes.push(one_fix(self.replacing(start, last: start, written: "::", alloc), alloc))
+        diagnostic::Code.ExprMarkerOrder => match self.marker_order(failed, alloc) {
+            Some(fix) => mut fixes.push(one_fix(take fix, alloc))
+            None => {}
+        }
+        diagnostic::Code.ExprChainedComparison => match self.chained(failed, operator: start, alloc) {
+            Some(fix) => mut fixes.push(one_fix(take fix, alloc))
+            None => {}
+        }
+        diagnostic::Code.ExprParentheses => return Fixes(fixes: self.parenthesised(failed, operator: start, grammar, alloc), offer: diagnostic::Offer.Unique)
+        else => {}
+    }
+    return Fixes(fixes: take fixes, offer: diagnostic::Offer.Each)
+} SourceFile.rejected
+
+/// The first token of the operator expression the parse is reading.
+fn State.operator_start(self) -> Option[usize] {
+    var index = self.frames.len()
+    while index > 0 {
+        index -= 1
+        match self.frames[index].rule {
+            Some(Rule.Negation) or Some(Rule.LogicOperand) or Some(Rule.OperatorExpr) => return Some(self.frames[index].start)
+            else => {}
+        }
+    }
+    return None
+} State.operator_start
+
+/// The group of a marker in canonical order: `try` or `attempt`, then `await`, then a mode.
+fn SourceFile.marker_group(self, at: usize) -> Option[usize] {
+    return match self.tokens[at].kind {
+        TokenKind.Keyword(Keyword.Try) or TokenKind.Keyword(Keyword.Attempt) => Some(0)
+        TokenKind.Keyword(Keyword.Await) => Some(1)
+        TokenKind.Keyword(Keyword.Take) or TokenKind.Keyword(Keyword.Mut) => Some(2)
+        else => None
+    }
+} SourceFile.marker_group
+
+/// The first and last markers of the marked expression the parse is reading.
+fn SourceFile.marker_run(self, failed: State) -> Option[TokenRun] {
+    var found: Option[usize] = None
+    var index = failed.frames.len()
+    while index > 0 {
+        index -= 1
+        let frame = failed.frames[index]
+        match frame.rule {
+            None => {}
+            Some(Rule.MarkedExpr) or Some(Rule.AfterFailureMarker) or Some(Rule.AfterAwait) or Some(Rule.AfterMode) => {
+                found = Some(frame.start)
+            }
+            else => break
+        }
+    }
+    let Some(head) = found else {
+        return None
+    }
+    var last = head
+    var at = head
+    while self.marker_group(at).is_some() {
+        last = at
+        at = self.next(at + 1)
+    }
+    return Some(TokenRun(head: head, last: last))
+} SourceFile.marker_run
+
+/// The markers of the marked expression the parse is reading in canonical order, each once.
+fn SourceFile.marker_order(self, failed: State, alloc: mem::Alloc) -> Option[diagnostic::Replacement] {
+    let Some(run) = self.marker_run(failed) else {
+        return None
+    }
+    let unset = ~0usize
+    var found = Array[usize, 3].filled(unset)
+    for at in run.head..=run.last {
+        if self.comment[at] {
+            continue
+        }
+        let Some(group) = self.marker_group(at) else {
+            return None
+        }
+        let other = found[group]
+        if other != unset and self.text(other) != self.text(at) {
+            return None
+        }
+        found[group] = at
+    }
+    var ordered = text::String.empty(alloc)
+    for group in 0..<3usize {
+        if found[group] == unset {
+            continue
+        }
+        if not ordered.is_empty() {
+            mut ordered.push(' ')
+        }
+        mut ordered.append(self.text(found[group]))
+    }
+    return Some(self.replacing(run.head, last: run.last, written: ordered.as_str(), alloc))
+} SourceFile.marker_order
+
+/// `a < b < c` as `a < b and b < c`, when `b` is a name or a field path from one.
+fn SourceFile.chained(self, failed: State, operator: usize, alloc: mem::Alloc) -> Option[diagnostic::Replacement] {
+    let Some(operand) = failed.last_operand else {
+        return None
+    }
+    if operand.end != operator {
+        return None
+    }
+    let Some(last) = self.previous(operator) else {
+        return None
+    }
+    var position: usize = 0
+    for at in operand.start..=last {
+        if self.comment[at] {
+            continue
+        }
+        let fits = match self.tokens[at].kind {
+            TokenKind.Ident => position % 2 == 0
+            TokenKind.Keyword(Keyword.SelfValue) => position == 0
+            TokenKind.Punct(Punct.Dot) => position % 2 == 1
+            else => false
+        }
+        if not fits {
+            return None
+        }
+        position += 1
+    }
+    var written = text::String.of("and ", alloc)
+    mut written.append(self.spelled(operand.start, last))
+    mut written.push(' ')
+    return Some(self.inserting(self.tokens[operator].start, written: written.as_str(), alloc))
+} SourceFile.chained
+
+/// The fix enclosing the tokens `head..=last` in parentheses.
+fn SourceFile.enclosed_fix(self, head: usize, last: usize, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
+    var fix = mem::List[diagnostic::Replacement].empty(alloc)
+    mut fix.push(self.inserting(self.tokens[head].start, written: "(", alloc))
+    mut fix.push(self.inserting(self.tokens[last].end, written: ")", alloc))
+    return fix
+} SourceFile.enclosed_fix
+
+/// The two parenthesisings of an operator combined with the one the parse just read: the
+/// earlier with its operands, then the rejected one with its operands; an operand starting
+/// with the rejected token has only the second.
+fn SourceFile.parenthesised(
+    self,
+    failed: State,
+    operator: usize,
+    grammar: Grammar,
+    alloc: mem::Alloc,
+    ) -> mem::List[mem::List[diagnostic::Replacement]] {
+    var candidates = mem::List[mem::List[diagnostic::Replacement]].empty(alloc)
+    var left = operator
+    var follows_operand = false
+    match failed.last_operand {
+        Some(operand) => {
+            if operand.end == operator {
+                left = operand.start
+                follows_operand = true
+            }
+        }
+        None => {}
+    }
+    if not follows_operand {
+        var rule = Rule.QuantifierExpr
+        if self.tokens[operator].kind == TokenKind.Keyword(Keyword.Not) {
+            rule = Rule.Negation
+        }
+        let Some(end) = self.longest(rule, start: operator, grammar, alloc) else {
+            return candidates
+        }
+        let Some(last) = self.previous(end) else {
+            return candidates
+        }
+        mut candidates.push(self.enclosed_fix(operator, last, alloc))
+        return candidates
+    }
+    var right: Option[usize] = None
+    match self.longest(Rule.Operand, start: self.next(operator + 1), grammar, alloc) {
+        Some(end) => {
+            right = self.previous(end)
+        }
+        None => {}
+    }
+    match failed.operator_start() {
+        Some(start) => match self.previous(operator) {
+            Some(before) => mut candidates.push(self.enclosed_fix(start, last: before, alloc))
+            None => {}
+        }
+        None => {}
+    }
+    match right {
+        Some(last) => mut candidates.push(self.enclosed_fix(left, last, alloc))
+        None => {}
+    }
+    return candidates
+} SourceFile.parenthesised
+
+/// The fix of an unclosed delimiter: its closers, innermost first, after the last token of the
+/// logical line ending at `at`.
+fn SourceFile.closed(self, at: usize, closers: Slice[Punct], alloc: mem::Alloc) -> Option[diagnostic::Replacement] {
+    let Some(last) = self.previous(at) else {
+        return None
+    }
+    var written = text::String.empty(alloc)
+    for closer in closers {
+        mut written.append(closer.spelling())
+    }
+    return Some(self.inserting(self.tokens[last].end, written: written.as_str(), alloc))
+} SourceFile.closed
+
+/// The fix of a mismatched delimiter: the expected closer in place of the token at `at`.
+fn SourceFile.rematched(self, at: usize, closer: Punct, alloc: mem::Alloc) -> diagnostic::Replacement {
+    return self.replacing(at, last: at, written: closer.spelling(), alloc)
+} SourceFile.rematched
+
+/// The fix of an indented line: its indentation removed.
+fn SourceFile.unindented(self, at: usize, alloc: mem::Alloc) -> diagnostic::Replacement {
+    return diagnostic::Replacement(start: self.line_start(at), end: self.tokens[at].start, text: text::String.empty(alloc))
+} SourceFile.unindented
+
+/// The fix of a token at column 0 that its block holds: the line indented by the depth of the
+/// braces open before it in its item.
+fn SourceFile.reindented(self, item: usize, at: usize, alloc: mem::Alloc) -> diagnostic::Replacement {
+    var depth: i64 = 0
+    for index in item..<at {
+        if self.comment[index] {
+            continue
+        }
+        match self.tokens[index].kind {
+            TokenKind.Punct(Punct.LBrace) => {
+                depth += 1
+            }
+            TokenKind.Punct(Punct.RBrace) => {
+                depth -= 1
+            }
+            else => {}
+        }
+    }
+    var indentation = text::String.empty(alloc)
+    var spaces: i64 = 0
+    while spaces < 4 * depth {
+        mut indentation.push(' ')
+        spaces += 1
+    }
+    return diagnostic::Replacement(start: self.line_start(at), end: self.line_start(at), text: take indentation)
+} SourceFile.reindented
+
+/// The fix of a closing label: the name written after the `}` before `at`, in place of what
+/// stands there up to the line's end.
+fn SourceFile.relabelled(self, at: usize, name: Str, alloc: mem::Alloc) -> Option[diagnostic::Replacement] {
+    match self.tokens[at].kind {
+        TokenKind.Nl or TokenKind.Eof or TokenKind.Col0 => {
+            let Some(closer) = self.previous(at) else {
+                return None
+            }
+            var written = text::String.empty(alloc)
+            mut written.push(' ')
+            mut written.append(name)
+            return Some(self.inserting(self.tokens[closer].end, written: written.as_str(), alloc))
+        }
+        else => {}
+    }
+    let line = self.tokens[at].line
+    var last = at
+    var index = at
+    while index < self.tokens.len() and self.tokens[index].line == line and not self.tokens[index].kind.is_virtual() {
+        last = index
+        index += 1
+    }
+    if index == at {
+        return None
+    }
+    return Some(self.replacing(at, last, written: name, alloc))
+} SourceFile.relabelled
+
+/// The name the label of the item or interface method being read must spell: a function's
+/// label up to its parameters, or the identifier after the kind keyword.
+fn SourceFile.declared_name(self, item: usize, failed: State, alloc: mem::Alloc) -> Option[text::String] {
+    var head = item
+    match failed.innermost_of(Rule.InterfaceMember) {
+        Some(frame) => {
+            head = frame.start
+        }
+        None => {}
+    }
+    var at = self.next(head)
+    while not self.starts_kind(at) {
+        at = self.next(at + 1)
+    }
+    let name = self.next(at + 1)
+    if self.tokens[at].kind != TokenKind.Keyword(Keyword.Fn) {
+        if self.tokens[name].kind != TokenKind.Ident {
+            return None
+        }
+        return Some(text::String.of(self.text(name), alloc))
+    }
+    for end in name..<self.tokens.len() {
+        match self.tokens[end].kind {
+            TokenKind.Punct(Punct.LParen) or TokenKind.Punct(Punct.LBracket) or TokenKind.Nl or TokenKind.Eof => {
+                let Some(last) = self.previous(end) else {
+                    return None
+                }
+                return Some(text::String.of(self.spelled(name, last), alloc))
+            }
+            else => {}
+        }
+    }
+    return None
+} SourceFile.declared_name
+
+/// Whether the token at `at` is the kind keyword of an item with a closing label, or `EOF`.
+fn SourceFile.starts_kind(self, at: usize) -> bool {
+    match self.tokens[at].kind {
+        TokenKind.Keyword(Keyword.Fn) or TokenKind.Keyword(Keyword.Struct) or TokenKind.Keyword(Keyword.Enum) => return true
+        TokenKind.Keyword(Keyword.Interface) or TokenKind.Keyword(Keyword.Test) or TokenKind.Eof => return true
+        else => {}
+    }
+    return self.text(at) == "layout" or self.text(at) == "registers"
+} SourceFile.starts_kind
+
+/// The fix moving a body's `{` at column 0, after a head without clauses, to the end of the
+/// head's last line.
+fn SourceFile.opener_to_head(self, opener: usize, alloc: mem::Alloc) -> Option[mem::List[diagnostic::Replacement]] {
+    var index = opener
+    while index > 0 {
+        index -= 1
+        if not self.comment[index] and not self.tokens[index].kind.is_virtual() {
+            var fix = mem::List[diagnostic::Replacement].empty(alloc)
+            mut fix.push(self.inserting(self.tokens[index].end, written: " {", alloc))
+            mut fix.push(diagnostic::Replacement(start: self.line_start(opener), end: self.next_line_start(opener), text: text::String.empty(alloc)))
+            return Some(take fix)
+        }
+    }
+    return None
+} SourceFile.opener_to_head
+
+/// The fix moving a body's `{` ending a head or clause line to column 0 after the clause lines
+/// that follow it.
+fn SourceFile.opener_below(self, opener: usize, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
+    var line = usize.widen(self.tokens[opener].line)
+    while line < self.lines.len() {
+        let next = self.lines[line]
+        var clause = false
+        for at in 0..<self.tokens.len() {
+            let token = self.tokens[at]
+            if token.start >= next.start and usize.widen(token.line) == line + 1 and not token.kind.is_virtual() {
+                clause = self.starts_clause(at)
+                break
+            }
+        }
+        if not clause {
+            break
+        }
+        line += 1
+    }
+    var body = u32.truncate(self.source.len())
+    if line < self.lines.len() {
+        body = self.lines[line].start
+    }
+    var fix = mem::List[diagnostic::Replacement].empty(alloc)
+    mut fix.push(self.deleting(opener, last: opener, alloc))
+    mut fix.push(self.inserting(body, written: "{\n", alloc))
+    return fix
+} SourceFile.opener_below
+
+/// Whether the token starts a clause line.
+fn SourceFile.starts_clause(self, at: usize) -> bool {
+    return match self.tokens[at].kind {
+        TokenKind.Keyword(Keyword.Requires) or TokenKind.Keyword(Keyword.Ensures) or TokenKind.Keyword(Keyword.Decreases) => true
+        TokenKind.Keyword(Keyword.Waive) or TokenKind.Keyword(Keyword.Todo) => true
+        TokenKind.Ident => self.text(at) == "example"
+        else => false
+    }
+} SourceFile.starts_clause

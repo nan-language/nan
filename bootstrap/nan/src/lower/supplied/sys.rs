@@ -80,14 +80,14 @@ pub fn fail_with(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, variant: &str)
     let fails = supply.abi.fails.clone().expect("a failing operation");
     let value = if variant == "Revoked" {
         let revoked = lo.std_ty("sys", "Revoked", Vec::new());
-        let stale = lo.variant_value(fx, &revoked, "Stale", &[], false);
+        let stale = lo.variant_value(fx, &revoked, "Stale", &[], None);
         if fails == revoked {
             stale
         } else {
-            lo.variant_value(fx, &fails, "Revoked", &[stale], false)
+            lo.variant_value(fx, &fails, "Revoked", &[stale], None)
         }
     } else {
-        lo.variant_value(fx, &fails, variant, &[], false)
+        lo.variant_value(fx, &fails, variant, &[], None)
     };
     let failure = supply.failure.expect("a failure address");
     lo.store_held(fx, failure, value, &fails);

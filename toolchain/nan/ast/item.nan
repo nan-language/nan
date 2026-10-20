@@ -1,0 +1,882 @@
+//! Lowering items, heads, types and clauses from their trees.
+
+/// The abstract syntax of an item the parse completed.
+pkg fn lower(file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> Option[Item] {
+    let lowering = Lowering(alloc: alloc, heap: mem::Heap.of(alloc))
+    return lowering.item(file, tree)
+} lower
+
+/// The lowering of each rule of an item's tree, read with the tree's file.
+struct Lowering {
+    alloc: mem::Alloc
+    heap: mem::Heap
+} Lowering
+
+/// The result, `fails`, `uses` and `limits` clauses of a head.
+struct HeadTail {
+    result: Option[TypeExpr]
+    failure: Option[TypeExpr]
+    usage: Option[Uses]
+    limit_set: Option[Limits]
+} HeadTail
+
+/// The names a `derives` clause lists, and its first token.
+struct DerivesClause {
+    names: mem::List[Name]
+    token: Option[u32]
+} DerivesClause
+
+fn Lowering.kind(self, token: u32, file: syntax::SourceFile) -> syntax::TokenKind {
+    return file.tokens[usize.widen(token)].kind
+} Lowering.kind
+
+fn Lowering.spells(self, token: u32, word: Str, file: syntax::SourceFile) -> bool {
+    return file.text(usize.widen(token)) == word
+} Lowering.spells
+
+/// The child nodes of `node` expanding `rule`.
+fn Lowering.nodes_of(self, node: u32, rule: syntax::Rule, tree: syntax::Tree) -> mem::List[u32] {
+    var found = mem::List[u32].empty(self.alloc)
+    for child in tree.child_nodes(node) {
+        if tree.rule(child) == rule {
+            mut found.push(child)
+        }
+    }
+    return found
+} Lowering.nodes_of
+
+fn Lowering.tokens(self, node: u32, tree: syntax::Tree) -> mem::List[u32] {
+    var found = mem::List[u32].empty(self.alloc)
+    for token in tree.child_tokens(node) {
+        mut found.push(token)
+    }
+    return found
+} Lowering.tokens
+
+/// The first child of `node` expanding `rule`, which the grammar guarantees.
+fn Lowering.child(self, node: u32, rule: syntax::Rule, tree: syntax::Tree) -> u32 {
+    let Some(found) = tree.find(node, rule) else {
+        expect false
+        return node
+    }
+    return found
+} Lowering.child
+
+fn Lowering.first_node(self, node: u32, tree: syntax::Tree) -> u32 {
+    var nodes = tree.child_nodes(node)
+    let Some(found) = mut nodes.next() else {
+        expect false
+        return node
+    }
+    return found
+} Lowering.first_node
+
+fn Lowering.first_token(self, node: u32, tree: syntax::Tree) -> u32 {
+    let Some(span) = tree.span(node, alloc: self.alloc) else {
+        expect false
+        return 0
+    }
+    return span.head
+} Lowering.first_token
+
+fn Lowering.last(self, node: u32, tree: syntax::Tree) -> u32 {
+    let Some(span) = tree.span(node, alloc: self.alloc) else {
+        expect false
+        return 0
+    }
+    return span.last
+} Lowering.last
+
+fn Lowering.name(self, token: u32, file: syntax::SourceFile) -> Name {
+    return Name(text: text::String.of(file.text(usize.widen(token)), alloc: self.alloc), token: token)
+} Lowering.name
+
+fn Lowering.token_name(self, token: Option[u32], file: syntax::SourceFile) -> Option[Name] {
+    let Some(named) = token else {
+        return None
+    }
+    return Some(self.name(named, file))
+} Lowering.token_name
+
+/// The name of the first identifier directly under `node`.
+fn Lowering.name_of(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Name {
+    return self.name(self.idents(node, file, tree)[0], file)
+} Lowering.name_of
+
+/// The child tokens of `node` of the given kind.
+fn Lowering.tokens_of(
+    self,
+    node: u32,
+    kind: syntax::TokenKind,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> mem::List[u32] {
+    var found = mem::List[u32].empty(self.alloc)
+    for token in tree.child_tokens(node) {
+        if self.kind(token, file) == kind {
+            mut found.push(token)
+        }
+    }
+    return found
+} Lowering.tokens_of
+
+fn Lowering.idents(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[u32] {
+    return self.tokens_of(node, kind: syntax::TokenKind.Ident, file, tree)
+} Lowering.idents
+
+/// The names of the identifiers directly under `node`.
+fn Lowering.ident_names(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Name] {
+    var names = mem::List[Name].empty(self.alloc)
+    for token in self.idents(node, file, tree) {
+        mut names.push(self.name(token, file))
+    }
+    return names
+} Lowering.ident_names
+
+fn Lowering.first_of(
+    self,
+    node: u32,
+    kind: syntax::TokenKind,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> u32 {
+    return self.tokens_of(node, kind, file, tree)[0]
+} Lowering.first_of
+
+fn Lowering.last_of(
+    self,
+    node: u32,
+    kind: syntax::TokenKind,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> u32 {
+    let found = self.tokens_of(node, kind, file, tree)
+    return found[found.len() - 1]
+} Lowering.last_of
+
+fn Lowering.has_token(
+    self,
+    node: u32,
+    kind: syntax::TokenKind,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> bool {
+    for token in tree.child_tokens(node) {
+        if self.kind(token, file) == kind {
+            return true
+        }
+    }
+    return false
+} Lowering.has_token
+
+fn Lowering.has_word(
+    self,
+    node: u32,
+    word: Str,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> bool {
+    for token in tree.child_tokens(node) {
+        if self.kind(token, file) == syntax::TokenKind.Ident and self.spells(token, word, file) {
+            return true
+        }
+    }
+    return false
+} Lowering.has_word
+
+fn Lowering.text_of(self, token: u32, file: syntax::SourceFile) -> Text {
+    return Text(token: token, value: syntax::text_value(file.text(usize.widen(token)), alloc: self.alloc))
+} Lowering.text_of
+
+/// The first child expanding `rule` of `node`, when there is a node.
+fn Lowering.find_in(self, node: Option[u32], rule: syntax::Rule, tree: syntax::Tree) -> Option[u32] {
+    let Some(found) = node else {
+        return None
+    }
+    return tree.find(found, rule)
+} Lowering.find_in
+
+fn Lowering.optional_type(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[TypeExpr] {
+    let Some(found) = node else {
+        return None
+    }
+    return Some(self.type_expr(found, file, tree))
+} Lowering.optional_type
+
+fn Lowering.optional_expr(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[Expr] {
+    let Some(found) = node else {
+        return None
+    }
+    return Some(self.expr(found, file, tree))
+} Lowering.optional_expr
+
+fn Lowering.optional_args(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[mem::List[GenericArg]] {
+    let Some(found) = node else {
+        return None
+    }
+    return Some(self.generic_args(found, file, tree))
+} Lowering.optional_args
+
+/// The visibility a `pub` or `pkg` token writes.
+fn Lowering.visibility(self, token: u32, file: syntax::SourceFile) -> Visibility {
+    return match self.kind(token, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Pub) => Visibility.Pub
+        else => Visibility.Pkg
+    }
+} Lowering.visibility
+
+fn Lowering.item(self, file: syntax::SourceFile, tree: syntax::Tree) -> Option[Item] {
+    let Some(start) = tree.find(tree.root(), rule: syntax::Rule.ItemStart) else {
+        return None
+    }
+    var visibility = Visibility.Private
+    var visibility_token: Option[u32] = None
+    var type_modifiers = mem::List[Word[TypeModifier]].empty(self.alloc)
+    var fn_modifier: Option[Word[FnModifier]] = None
+    var kind_node: Option[u32] = None
+    for node in tree.child_nodes(start) {
+        match tree.rule(node) {
+            syntax::Rule.Visibility => {
+                let token = self.tokens(node, tree)[0]
+                visibility_token = Some(token)
+                visibility = self.visibility(token, file)
+            }
+            syntax::Rule.ItemModifier => {
+                let inner = self.first_node(node, tree)
+                let token = self.first_token(inner, tree)
+                match tree.rule(inner) {
+                    syntax::Rule.TypeModifier => mut type_modifiers.push(Word(kind: self.type_modifier(token, file), token: token))
+                    syntax::Rule.FnModifier => {
+                        fn_modifier = Some(fn_modifier.value_or(Word(kind: self.fn_modifier(token, file), token: token)))
+                    }
+                    else => {}
+                }
+            }
+            syntax::Rule.ItemKind => {
+                kind_node = Some(node)
+            }
+            else => {}
+        }
+    }
+    let Some(kind_found) = kind_node else {
+        return None
+    }
+    var kind_children = tree.child_nodes(kind_found)
+    let Some(node) = mut kind_children.next() else {
+        return None
+    }
+    let token = match first visibility_token {
+        Some(written) => written
+        None if type_modifiers.len() > 0 => type_modifiers[0].token
+        None => match fn_modifier {
+            Some(modifier) => modifier.token
+            None => self.first_token(kind_found, tree)
+        }
+    }
+    let Some(kind) = self.item_kind(node, fn_modifier, file, tree) else {
+        return None
+    }
+    return Some(Item(token: token, visibility: visibility, type_modifiers: take type_modifiers, kind: take kind))
+} Lowering.item
+
+fn Lowering.type_modifier(self, token: u32, file: syntax::SourceFile) -> TypeModifier {
+    return match file.text(usize.widen(token)) {
+        "closed" => TypeModifier.Closed
+        "open" => TypeModifier.Open
+        "linear" => TypeModifier.Linear
+        else => TypeModifier.View
+    }
+} Lowering.type_modifier
+
+fn Lowering.fn_modifier(self, token: u32, file: syntax::SourceFile) -> FnModifier {
+    return match self.kind(token, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Proj) => FnModifier.Proj
+        syntax::TokenKind.Keyword(syntax::Keyword.Interrupt) => FnModifier.Interrupt
+        syntax::TokenKind.Keyword(syntax::Keyword.Landing) => FnModifier.Landing
+        syntax::TokenKind.Keyword(syntax::Keyword.Foreign) => FnModifier.Foreign
+        else => FnModifier.Validator
+    }
+} Lowering.fn_modifier
+
+/// The kind of the item whose kind rule expands `node`, if the parse completed it.
+fn Lowering.item_kind(
+    self,
+    node: u32,
+    fn_modifier: Option[Word[FnModifier]],
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Option[ItemKind] {
+    match tree.rule(node) {
+        syntax::Rule.FnItem => {
+            let Some(function) = self.fn_item(node, modifier: fn_modifier, file, tree) else {
+                return None
+            }
+            return Some(ItemKind.Fn(take function))
+        }
+        syntax::Rule.StructItem => return Some(ItemKind.Struct(self.struct_item(node, file, tree)))
+        syntax::Rule.EnumItem => return Some(ItemKind.Enum(self.enum_item(node, file, tree)))
+        syntax::Rule.InterfaceItem => return Some(ItemKind.Interface(self.interface_item(node, file, tree)))
+        syntax::Rule.ImplItem => return Some(ItemKind.Impl(self.impl_item(node, file, tree)))
+        syntax::Rule.LayoutItem => return Some(ItemKind.Layout(self.layout_item(node, file, tree)))
+        syntax::Rule.RegistersItem => return Some(ItemKind.Registers(self.registers_item(node, file, tree)))
+        syntax::Rule.ConstItem => {
+            let Some(constant) = self.const_item(node, file, tree) else {
+                return None
+            }
+            return Some(ItemKind.Const(take constant))
+        }
+        syntax::Rule.ConstAssertItem => {
+            let Some(asserted) = tree.find(node, rule: syntax::Rule.Expr) else {
+                return None
+            }
+            return Some(ItemKind.ConstAssert(self.expr(asserted, file, tree)))
+        }
+        syntax::Rule.RegistryItem => return Some(ItemKind.Registry(self.registry_item(node, file, tree)))
+        syntax::Rule.ContributeItem => return Some(ItemKind.Contribute(self.contribute_item(node, file, tree)))
+        syntax::Rule.TestItem => return Some(ItemKind.Test(self.test_item(node, file, tree)))
+        syntax::Rule.RetiredItem => return Some(ItemKind.Retired(self.retired_item(node, file, tree)))
+        else => return Some(ItemKind.Package)
+    }
+} Lowering.item_kind
+
+fn Lowering.path(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Path {
+    return Path(segments: self.ident_names(node, file, tree))
+} Lowering.path
+
+fn Lowering.label(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Label {
+    let idents = self.idents(node, file, tree)
+    let dotted = self.has_token(node, kind: syntax::TokenKind.Punct(syntax::Punct.Dot), file, tree)
+    let name = self.name(idents[idents.len() - 1], file)
+    var owner: Option[Path] = None
+    if dotted {
+        var segments = mem::List[Name].empty(self.alloc)
+        for index in 0..<(idents.len() - 1) {
+            mut segments.push(self.name(idents[index], file))
+        }
+        owner = Some(Path(segments: take segments))
+    }
+    return Label(owner: take owner, name: take name)
+} Lowering.label
+
+fn Lowering.generic_params(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[GenericParam] {
+    var params = mem::List[GenericParam].empty(self.alloc)
+    let Some(list) = node else {
+        return params
+    }
+    for param in self.nodes_of(list, rule: syntax::Rule.GenericParam, tree) {
+        let where_clause = self.find_in(tree.find(param, rule: syntax::Rule.WhereClause), rule: syntax::Rule.Expr, tree)
+        mut params.push(GenericParam(name: self.name_of(param, file, tree), bounds: self.bounds(param, file, tree), where_clause: self.optional_expr(where_clause, file, tree)))
+    }
+    return params
+} Lowering.generic_params
+
+fn Lowering.bounds(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Bound] {
+    var bounds = mem::List[Bound].empty(self.alloc)
+    for bound in self.nodes_of(node, rule: syntax::Rule.Bound, tree) {
+        mut bounds.push(self.bound(bound, file, tree))
+    }
+    return bounds
+} Lowering.bounds
+
+fn Lowering.bound(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Bound {
+    return Bound(path: self.path(self.child(node, rule: syntax::Rule.Path, tree), file, tree), args: self.optional_args(tree.find(node, rule: syntax::Rule.GenericArgs), file, tree))
+} Lowering.bound
+
+fn Lowering.generic_args(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[GenericArg] {
+    var args = mem::List[GenericArg].empty(self.alloc)
+    for arg in self.nodes_of(node, rule: syntax::Rule.GenericArg, tree) {
+        mut args.push(self.generic_arg(arg, file, tree))
+    }
+    return args
+} Lowering.generic_args
+
+fn Lowering.generic_arg(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> GenericArg {
+    match tree.find(node, rule: syntax::Rule.TypeExpr) {
+        Some(ty) => return GenericArg.Type(self.type_expr(ty, file, tree))
+        None => {}
+    }
+    let tokens = self.tokens(node, tree)
+    let last = tokens[tokens.len() - 1]
+    return match self.kind(last, file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.True) => GenericArg.Bool(value: true, token: last)
+        syntax::TokenKind.Keyword(syntax::Keyword.False) => GenericArg.Bool(value: false, token: last)
+        else => GenericArg.Int(negative: tokens.len() > 1, token: last)
+    }
+} Lowering.generic_arg
+
+fn Lowering.type_expr(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> TypeExpr {
+    let token = self.first_token(node, tree)
+    let last = self.last(node, tree)
+    match tree.find(node, rule: syntax::Rule.FnType) {
+        Some(fn_type) => return TypeExpr(token: token, last: last, kind: TypeKind.Fn(self.heap.boxed(self.fn_type(fn_type, file, tree))))
+        None => {}
+    }
+    let path = self.path(self.child(node, rule: syntax::Rule.Path, tree), file, tree)
+    let args = self.optional_args(tree.find(node, rule: syntax::Rule.GenericArgs), file, tree)
+    return TypeExpr(token: token, last: last, kind: TypeKind.Path(path: take path, args: take args))
+} Lowering.type_expr
+
+/// The `)` closing the parameters among a node's tokens.
+fn Lowering.close(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> u32 {
+    return self.first_of(node, kind: syntax::TokenKind.Punct(syntax::Punct.RParen), file, tree)
+} Lowering.close
+
+fn Lowering.fn_type(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> FnType {
+    let kind = match first tree.find(node, rule: syntax::Rule.FnKind) {
+        Some(written) if self.has_token(written, kind: syntax::TokenKind.Keyword(syntax::Keyword.Interrupt), file, tree) => FnKind.Interrupt
+        Some(_) => FnKind.Task
+        None => FnKind.Plain
+    }
+    let head = self.child(node, rule: syntax::Rule.FnTypeHead, tree)
+    let HeadTail(result: result, failure: failure, usage: usage, limit_set: limit_set) = self.head_tail(head, file, tree)
+    return FnType(kind: kind, params: self.fn_type_params(tree.find(head, rule: syntax::Rule.FnTypeParamList), file, tree), result: take result, failure: take failure, usage: take usage, limit_set: take limit_set, convention: self.convention(node, file, tree))
+} Lowering.fn_type
+
+fn Lowering.fn_type_params(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[FnTypeParam] {
+    var params = mem::List[FnTypeParam].empty(self.alloc)
+    for param in tree.list_elements(list, element: syntax::Rule.FnTypeParam, alloc: self.alloc) {
+        mut params.push(FnTypeParam(mode: self.mode(param, file, tree), name: self.name_of(param, file, tree), ty: self.type_expr(self.child(param, rule: syntax::Rule.TypeExpr, tree), file, tree)))
+    }
+    return params
+} Lowering.fn_type_params
+
+/// The result, `fails`, `uses` and `limits` clauses directly under a head node.
+fn Lowering.head_tail(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> HeadTail {
+    let result = self.optional_type(self.find_in(tree.find(node, rule: syntax::Rule.FnResult), rule: syntax::Rule.TypeExpr, tree), file, tree)
+    let failure = self.optional_type(self.find_in(tree.find(node, rule: syntax::Rule.FailsClause), rule: syntax::Rule.TypeExpr, tree), file, tree)
+    var usage: Option[Uses] = None
+    match tree.find(node, rule: syntax::Rule.UsesClause) {
+        Some(clause) => {
+            let tokens = self.tokens(clause, tree)
+            usage = Some(Uses(token: tokens[0], word: self.name(tokens[1], file)))
+        }
+        None => {}
+    }
+    var limit_set: Option[Limits] = None
+    match tree.find(node, rule: syntax::Rule.LimitsClause) {
+        Some(clause) => {
+            limit_set = Some(self.limit_set(clause, file, tree))
+        }
+        None => {}
+    }
+    return HeadTail(result: take result, failure: take failure, usage: take usage, limit_set: take limit_set)
+} Lowering.head_tail
+
+fn Lowering.limit_set(self, clause: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Limits {
+    var entries = mem::List[Limit].empty(self.alloc)
+    for limit in self.nodes_of(clause, rule: syntax::Rule.Limit, tree) {
+        let tokens = self.tokens(limit, tree)
+        let kind = match file.text(usize.widen(tokens[0])) {
+            "pure" => LimitKind.Pure
+            "notrap" => LimitKind.Notrap
+            "terminates" => LimitKind.Terminates
+            "noalloc" => LimitKind.Noalloc
+            else => LimitKind.Stack
+        }
+        mut entries.push(Limit(kind: kind, token: tokens[0], size: tokens.get(1)))
+    }
+    return Limits(entries: take entries)
+} Lowering.limit_set
+
+fn Lowering.convention(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Option[Text] {
+    let Some(clause) = tree.find(node, rule: syntax::Rule.ConventionClause) else {
+        return None
+    }
+    return Some(self.text_of(self.first_of(clause, kind: syntax::TokenKind.Text, file, tree), file))
+} Lowering.convention
+
+fn Lowering.mode(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Mode {
+    let Some(written) = tree.find(node, rule: syntax::Rule.Mode) else {
+        return Mode.Read
+    }
+    return match self.kind(self.tokens(written, tree)[0], file) {
+        syntax::TokenKind.Keyword(syntax::Keyword.Mut) => Mode.Mut
+        else => Mode.Take
+    }
+} Lowering.mode
+
+fn Lowering.params(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Param] {
+    var params = mem::List[Param].empty(self.alloc)
+    for param in tree.list_elements(list, element: syntax::Rule.Param, alloc: self.alloc) {
+        let mode = self.mode(param, file, tree)
+        let kind = match tree.find(param, rule: syntax::Rule.TypeExpr) {
+            Some(ty) => ParamKind.Named(name: self.name_of(param, file, tree), ty: self.type_expr(ty, file, tree))
+            None => ParamKind.SelfValue
+        }
+        mut params.push(Param(token: self.first_token(param, tree), mode: mode, kind: take kind))
+    }
+    return params
+} Lowering.params
+
+fn Lowering.head(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Head {
+    let HeadTail(result: result, failure: failure, usage: usage, limit_set: limit_set) = self.head_tail(node, file, tree)
+    return Head(token: self.first_token(node, tree), generics: self.generic_params(tree.find(node, rule: syntax::Rule.GenericParams), file, tree), params: self.params(tree.find(node, rule: syntax::Rule.ParamList), file, tree), close: self.close(node, file, tree), result: take result, failure: take failure, usage: take usage, limit_set: take limit_set)
+} Lowering.head
+
+fn Lowering.fn_item(
+    self,
+    node: u32,
+    modifier: Option[Word[FnModifier]],
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Option[FnItem] {
+    let Some(head_node) = tree.find(node, rule: syntax::Rule.FnHead) else {
+        return None
+    }
+    let Some(end) = tree.find(node, rule: syntax::Rule.FnEnd) else {
+        return None
+    }
+    let Some(label_node) = tree.find(head_node, rule: syntax::Rule.ItemLabel) else {
+        return None
+    }
+    let label = self.label(label_node, file, tree)
+    let head = self.head(head_node, file, tree)
+    let clauses = self.clauses(tree.find(end, rule: syntax::Rule.ClauseRegion), file, tree)
+    let convention = self.convention(end, file, tree)
+    let body = match tree.find(end, rule: syntax::Rule.FnBody) {
+        Some(block) => FnBody.Block(self.fn_body(self.last_of(end, kind: syntax::TokenKind.Punct(syntax::Punct.LBrace), file, tree), body: block, file, tree))
+        None => match tree.find(end, rule: syntax::Rule.Expr) {
+            Some(expr) => FnBody.Expr(self.expr(expr, file, tree))
+            None => FnBody.None
+        }
+    }
+    return Some(FnItem(modifier: modifier, label: take label, head: take head, convention: take convention, clauses: take clauses, body: take body))
+} Lowering.fn_item
+
+/// The block of a `fn_body` opened by `opener`: its statements and the `}` closing it.
+fn Lowering.fn_body(
+    self,
+    opener: u32,
+    body: u32,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Block {
+    return Block(token: opener, end: self.first_of(body, kind: syntax::TokenKind.Punct(syntax::Punct.RBrace), file, tree), stmts: self.stmts(body, file, tree))
+} Lowering.fn_body
+
+fn Lowering.clauses(self, region: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Clause] {
+    var clauses = mem::List[Clause].empty(self.alloc)
+    let Some(lines) = region else {
+        return clauses
+    }
+    for line in tree.child_nodes(lines) {
+        var nodes = tree.child_nodes(line)
+        let Some(clause) = mut nodes.next() else {
+            continue
+        }
+        mut clauses.push(self.clause(clause, file, tree))
+    }
+    return clauses
+} Lowering.clauses
+
+fn Lowering.clause(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Clause {
+    let token = self.first_token(node, tree)
+    let kind = match tree.rule(node) {
+        syntax::Rule.RequiresClause => ClauseKind.Requires(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree))
+        syntax::Rule.EnsuresClause => ClauseKind.Ensures(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree))
+        syntax::Rule.ExampleClause => ClauseKind.Example(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree))
+        syntax::Rule.DecreasesClause => ClauseKind.Decreases(self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree))
+        syntax::Rule.WaiveClause => ClauseKind.Waive(length: self.has_word(node, word: "length", file, tree), reason: self.text_of(self.first_of(node, kind: syntax::TokenKind.Text, file, tree), file))
+        else => return self.todo_clause(node, token, file, tree)
+    }
+    return Clause(token: token, disputed: false, kind: take kind)
+} Lowering.clause
+
+/// A `todo TEXT` clause: the clause it marks, disputed, or a missing specification.
+fn Lowering.todo_clause(
+    self,
+    node: u32,
+    token: u32,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    ) -> Clause {
+    var nodes = tree.child_nodes(node)
+    let Some(marked) = mut nodes.next() else {
+        return Clause(token: token, disputed: false, kind: ClauseKind.Missing)
+    }
+    let Clause(token: _, disputed: _, kind: kind) = self.clause(marked, file, tree)
+    return Clause(token: token, disputed: true, kind: take kind)
+} Lowering.todo_clause
+
+fn Lowering.derives_clause(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> DerivesClause {
+    let Some(clause) = tree.find(node, rule: syntax::Rule.DerivesClause) else {
+        return DerivesClause(names: mem::List[Name].empty(self.alloc), token: None)
+    }
+    return DerivesClause(names: self.ident_names(clause, file, tree), token: Some(self.first_token(clause, tree)))
+} Lowering.derives_clause
+
+fn Lowering.struct_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> StructItem {
+    let DerivesClause(names: derived, token: derives_token) = self.derives_clause(node, file, tree)
+    var members = mem::List[StructMember].empty(self.alloc)
+    for member in self.nodes_of(node, rule: syntax::Rule.StructMember, tree) {
+        let Some(lowered) = self.struct_member(member, file, tree) else {
+            continue
+        }
+        mut members.push(take lowered)
+    }
+    return StructItem(name: self.name_of(node, file, tree), generics: self.generic_params(tree.find(node, rule: syntax::Rule.GenericParams), file, tree), derived: take derived, derives_token: derives_token, members: take members)
+} Lowering.struct_item
+
+fn Lowering.struct_member(self, member: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Option[StructMember] {
+    match tree.find(member, rule: syntax::Rule.Field) {
+        Some(field) => return self.field(field, file, tree)
+        None => {}
+    }
+    let Some(line) = tree.find(member, rule: syntax::Rule.InvariantLine) else {
+        return None
+    }
+    let Some(asserted) = tree.find(line, rule: syntax::Rule.Expr) else {
+        return None
+    }
+    return Some(StructMember.Invariant(self.expr(asserted, file, tree)))
+} Lowering.struct_member
+
+fn Lowering.field(self, field: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Option[StructMember] {
+    var visibility = Visibility.Private
+    match tree.find(field, rule: syntax::Rule.Visibility) {
+        Some(written) => {
+            visibility = self.visibility(self.tokens(written, tree)[0], file)
+        }
+        None => {}
+    }
+    let token = self.first_token(field, tree)
+    let name = self.name_of(field, file, tree)
+    let Some(ty) = tree.find(field, rule: syntax::Rule.TypeExpr) else {
+        return None
+    }
+    let where_clause = self.find_in(tree.find(field, rule: syntax::Rule.WhereClause), rule: syntax::Rule.Expr, tree)
+    return Some(StructMember.Field(Field(token: token, visibility: visibility, name: take name, ty: self.type_expr(ty, file, tree), where_clause: self.optional_expr(where_clause, file, tree))))
+} Lowering.field
+
+fn Lowering.enum_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> EnumItem {
+    let DerivesClause(names: derived, token: derives_token) = self.derives_clause(node, file, tree)
+    var variants = mem::List[Variant].empty(self.alloc)
+    for member in self.nodes_of(node, rule: syntax::Rule.EnumMember, tree) {
+        let Some(variant) = tree.find(member, rule: syntax::Rule.Variant) else {
+            continue
+        }
+        mut variants.push(self.variant(variant, file, tree))
+    }
+    return EnumItem(name: self.name_of(node, file, tree), generics: self.generic_params(tree.find(node, rule: syntax::Rule.GenericParams), file, tree), derived: take derived, derives_token: derives_token, variants: take variants)
+} Lowering.enum_item
+
+fn Lowering.variant(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Variant {
+    var payload: Option[mem::List[PayloadField]] = None
+    match tree.find(node, rule: syntax::Rule.VariantPayload) {
+        Some(written) => {
+            payload = Some(self.payload(written, file, tree))
+        }
+        None => {}
+    }
+    return Variant(name: self.name_of(node, file, tree), payload: take payload, from: self.has_word(node, word: "from", file, tree))
+} Lowering.variant
+
+fn Lowering.payload(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[PayloadField] {
+    var fields = mem::List[PayloadField].empty(self.alloc)
+    for field in tree.list_elements(tree.find(node, rule: syntax::Rule.PayloadList), element: syntax::Rule.PayloadField, alloc: self.alloc) {
+        var types = mem::List[TypeExpr].empty(self.alloc)
+        for ty in self.nodes_of(field, rule: syntax::Rule.TypeExpr, tree) {
+            mut types.push(self.type_expr(ty, file, tree))
+        }
+        var lowered = take types.into_cursor()
+        let Some(leading) = mut lowered.next() else {
+            expect false
+            continue
+        }
+        let token = leading.token
+        match mut lowered.next() {
+            Some(ty) => mut fields.push(PayloadField(token: token, label: Some(take leading), ty: take ty))
+            None => mut fields.push(PayloadField(token: token, label: None, ty: take leading))
+        }
+    }
+    return fields
+} Lowering.payload
+
+fn Lowering.interface_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> InterfaceItem {
+    var methods = mem::List[Method].empty(self.alloc)
+    for member in self.nodes_of(node, rule: syntax::Rule.InterfaceMember, tree) {
+        mut methods.push(self.method(member, file, tree))
+    }
+    return InterfaceItem(name: self.name_of(node, file, tree), generics: self.generic_params(tree.find(node, rule: syntax::Rule.GenericParams), file, tree), methods: take methods)
+} Lowering.interface_item
+
+fn Lowering.method(self, member: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Method {
+    let HeadTail(result: result, failure: failure, usage: usage, limit_set: limit_set) = self.head_tail(member, file, tree)
+    let end = tree.find(member, rule: syntax::Rule.MethodEnd)
+    let body = self.method_body(self.find_in(end, rule: syntax::Rule.MethodBody, tree), file, tree)
+    let fn_token = self.first_of(member, kind: syntax::TokenKind.Keyword(syntax::Keyword.Fn), file, tree)
+    let token = self.first_token(member, tree)
+    let projection = self.has_token(member, kind: syntax::TokenKind.Keyword(syntax::Keyword.Proj), file, tree)
+    let name = self.name_of(member, file, tree)
+    let head = Head(token: fn_token, generics: self.generic_params(tree.find(member, rule: syntax::Rule.GenericParams), file, tree), params: self.params(tree.find(member, rule: syntax::Rule.ParamList), file, tree), close: self.close(member, file, tree), result: take result, failure: take failure, usage: take usage, limit_set: take limit_set)
+    return Method(token: token, projection: projection, name: take name, head: take head, clauses: self.clauses(self.find_in(end, rule: syntax::Rule.ClauseRegion, tree), file, tree), body: take body)
+} Lowering.method
+
+/// The default body of an interface method, if it has one.
+fn Lowering.method_body(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[Block] {
+    let Some(body) = node else {
+        return None
+    }
+    let tokens = self.tokens(body, tree)
+    return Some(Block(token: tokens[0], end: self.last_of(body, kind: syntax::TokenKind.Punct(syntax::Punct.RBrace), file, tree), stmts: self.stmts(body, file, tree)))
+} Lowering.method_body
+
+fn Lowering.impl_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> ImplItem {
+    var params: Option[mem::List[ImplParam]] = None
+    match tree.find(node, rule: syntax::Rule.ImplParams) {
+        Some(written) => {
+            var listed = mem::List[ImplParam].empty(self.alloc)
+            for param in self.nodes_of(written, rule: syntax::Rule.ImplParam, tree) {
+                mut listed.push(ImplParam(name: self.name_of(param, file, tree), bounds: self.bounds(param, file, tree)))
+            }
+            params = Some(take listed)
+        }
+        None => {}
+    }
+    return ImplItem(target: self.path(self.child(node, rule: syntax::Rule.Path, tree), file, tree), params: take params, bound: self.bound(self.child(node, rule: syntax::Rule.Bound, tree), file, tree))
+} Lowering.impl_item
+
+fn Lowering.layout_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> LayoutItem {
+    let repr_node = self.child(node, rule: syntax::Rule.LayoutRepr, tree)
+    var order: Option[Name] = None
+    match tree.find(repr_node, rule: syntax::Rule.LayoutOrder) {
+        Some(written) => {
+            order = Some(self.name(self.tokens(written, tree)[0], file))
+        }
+        None => {}
+    }
+    let repr_tokens = self.tokens(repr_node, tree)
+    let sized = self.spells(repr_tokens[0], word: "bytes", file) and repr_tokens.len() > 1 and self.kind(repr_tokens[1], file) == syntax::TokenKind.Int
+    let repr = match sized {
+        true => LayoutRepr.Bytes(size: repr_tokens[1], order: take order)
+        false => LayoutRepr.Integer(ty: self.name(repr_tokens[0], file), order: take order)
+    }
+    var tags: Option[mem::List[Tag]] = None
+    if self.has_word(node, word: "tags", file, tree) {
+        var lines = mem::List[Tag].empty(self.alloc)
+        for line in self.nodes_of(node, rule: syntax::Rule.TagLine, tree) {
+            mut lines.push(Tag(name: self.name_of(line, file, tree), value: self.first_of(line, kind: syntax::TokenKind.Int, file, tree)))
+        }
+        tags = Some(take lines)
+    }
+    var fields = mem::List[LayoutField].empty(self.alloc)
+    for member in self.nodes_of(node, rule: syntax::Rule.LayoutMember, tree) {
+        mut fields.push(self.layout_field(member, file, tree))
+    }
+    return LayoutItem(name: self.name_of(node, file, tree), repr: take repr, tags: take tags, fields: take fields)
+} Lowering.layout_item
+
+fn Lowering.layout_field(self, member: u32, file: syntax::SourceFile, tree: syntax::Tree) -> LayoutField {
+    let field = self.child(member, rule: syntax::Rule.LayoutField, tree)
+    let ints = self.tokens_of(field, kind: syntax::TokenKind.Int, file, tree)
+    let kind = match first tree.find(field, rule: syntax::Rule.TypeExpr) {
+        Some(ty) => LayoutFieldKind.Typed(ty: self.type_expr(ty, file, tree), at: ints[0])
+        None if self.has_word(field, word: "rest", file, tree) => LayoutFieldKind.Rest
+        None => LayoutFieldKind.Bit(low: ints[0], high: ints.get(1))
+    }
+    return LayoutField(name: self.name_of(member, file, tree), kind: take kind)
+} Lowering.layout_field
+
+fn Lowering.registers_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> RegistersItem {
+    var members = mem::List[Register].empty(self.alloc)
+    for member in self.nodes_of(node, rule: syntax::Rule.RegisterMember, tree) {
+        let Some(line) = tree.find(member, rule: syntax::Rule.RegisterLine) else {
+            continue
+        }
+        let Some(register) = self.register(line, file, tree) else {
+            continue
+        }
+        mut members.push(take register)
+    }
+    return RegistersItem(name: self.name_of(node, file, tree), members: take members)
+} Lowering.registers_item
+
+fn Lowering.register(self, line: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Option[Register] {
+    let Some(tail) = tree.find(line, rule: syntax::Rule.RegisterTail) else {
+        return None
+    }
+    let ints = self.tokens_of(tail, kind: syntax::TokenKind.Int, file, tree)
+    let words = self.tokens(self.child(tail, rule: syntax::Rule.RegisterAccess, tree), tree)
+    var access = Access.WriteOneClear
+    if words.len() == 1 and self.spells(words[0], word: "read", file) {
+        access = Access.Read
+    } else if words.len() == 2 and self.spells(words[0], word: "read", file) and self.spells(words[1], word: "write", file) {
+        access = Access.ReadWrite
+    } else if words.len() == 1 and self.spells(words[0], word: "write", file) {
+        access = Access.Write
+    }
+    let name = self.name_of(line, file, tree)
+    let Some(ty) = tree.find(tail, rule: syntax::Rule.TypeExpr) else {
+        return None
+    }
+    return Some(Register(name: take name, ty: self.type_expr(ty, file, tree), at: ints[0], stride: ints.get(1), access: access))
+} Lowering.register
+
+fn Lowering.const_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> Option[ConstItem] {
+    let name = self.name_of(node, file, tree)
+    let ty = self.optional_type(tree.find(node, rule: syntax::Rule.TypeExpr), file, tree)
+    let Some(value) = tree.find(node, rule: syntax::Rule.Expr) else {
+        return None
+    }
+    return Some(ConstItem(name: take name, ty: take ty, value: self.expr(value, file, tree)))
+} Lowering.const_item
+
+fn Lowering.registry_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> RegistryItem {
+    let idents = self.idents(node, file, tree)
+    let key = idents[idents.len() - 1]
+    return RegistryItem(name: self.name(idents[0], file), entry: self.type_expr(self.child(node, rule: syntax::Rule.TypeExpr, tree), file, tree), key: self.name(key, file), unique: self.unique(tree.find(node, rule: syntax::Rule.UniqueList), file, tree))
+} Lowering.registry_item
+
+/// The fields a `unique` list names after its first word.
+fn Lowering.unique(self, list: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> mem::List[Name] {
+    var unique = mem::List[Name].empty(self.alloc)
+    let Some(written) = list else {
+        return unique
+    }
+    let idents = self.idents(written, file, tree)
+    expect idents.len() > 0
+    for index in 1..<idents.len() {
+        mut unique.push(self.name(idents[index], file))
+    }
+    return unique
+} Lowering.unique
+
+fn Lowering.contribute_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> ContributeItem {
+    return ContributeItem(registry_path: self.path(self.child(node, rule: syntax::Rule.Path, tree), file, tree), name: self.name_of(node, file, tree), value: self.expr(self.child(node, rule: syntax::Rule.Expr, tree), file, tree))
+} Lowering.contribute_item
+
+fn Lowering.test_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> TestItem {
+    let tokens = self.tokens(node, tree)
+    let opener = self.first_of(node, kind: syntax::TokenKind.Punct(syntax::Punct.LBrace), file, tree)
+    let target = self.child(node, rule: syntax::Rule.TestTarget, tree)
+    return TestItem(disputed: self.spells(tokens[0], word: "todo", file), name: self.name_of(node, file, tree), target: self.path(self.child(target, rule: syntax::Rule.Path, tree), file, tree), member: self.token_name(self.idents(target, file, tree).get(0), file), params: self.test_params(tree.find(node, rule: syntax::Rule.TestParams), file, tree), body: self.fn_body(opener, body: self.child(node, rule: syntax::Rule.FnBody, tree), file, tree))
+} Lowering.test_item
+
+/// The parameters of a property test, if it has them.
+fn Lowering.test_params(self, node: Option[u32], file: syntax::SourceFile, tree: syntax::Tree) -> Option[mem::List[Param]] {
+    let Some(written) = node else {
+        return None
+    }
+    return Some(self.params(tree.find(written, rule: syntax::Rule.ParamList), file, tree))
+} Lowering.test_params
+
+fn Lowering.retired_item(self, node: u32, file: syntax::SourceFile, tree: syntax::Tree) -> RetiredItem {
+    let old = self.child(node, rule: syntax::Rule.RetiredOld, tree)
+    var head: Option[Head] = None
+    match tree.find(old, rule: syntax::Rule.RetiredHead) {
+        Some(written) => {
+            head = Some(self.head(written, file, tree))
+        }
+        None => {}
+    }
+    let rewrite = self.child(node, rule: syntax::Rule.RetiredNew, tree)
+    var new = RetiredNew.Manual
+    match tree.find(rewrite, rule: syntax::Rule.Expr) {
+        Some(expr) => {
+            let class = self.child(rewrite, rule: syntax::Rule.RetiredClass, tree)
+            new = RetiredNew.Rewrite(expr: self.expr(expr, file, tree), preserves: self.tokens_of(class, kind: syntax::TokenKind.Text, file, tree).len() == 0)
+        }
+        None => {}
+    }
+    return RetiredItem(path: self.path(self.child(old, rule: syntax::Rule.Path, tree), file, tree), member: self.token_name(self.idents(old, file, tree).get(0), file), head: take head, new: take new)
+} Lowering.retired_item

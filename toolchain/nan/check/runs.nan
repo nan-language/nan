@@ -1,0 +1,203 @@
+//! The interpreter runs of check time: the const evaluation of consts, const asserts and contributions, and example runs, each reporting how it ended.
+
+/// The value of a const or contribution: its const evaluation's, none when that ends without
+/// one or needs the value it computes, as the evaluations then under way do.
+fn Checker.const_value(self, item: ty::ItemId) -> Option[mem::Shared[ConstValue]] {
+    let db = self.db()
+    let state = self.state.contents()
+    db.note(item)
+    let stack = state.evaluating.get()
+    if stack.len() > 0 {
+        let need = Need(needing: stack[stack.len() - 1], needed: item)
+        if state.needed.get(need).is_none() {
+            state.needed.insert(need, value: Unit)
+            discard state.needs.push(need)
+        }
+    }
+    match state.const_values.get(item) {
+        Some(known) => match known {
+            Some(shared) => return Some(shared.share())
+            None => return None
+        }
+        None => {}
+    }
+    match stack.position(fn(other: ty::ItemId) => other == item) {
+        Some(position) => {
+            for index in position..<stack.len() {
+                if state.cyclic.get(stack[index]).is_none() {
+                    state.cyclic.insert(stack[index], value: Unit)
+                }
+            }
+            return None
+        }
+        None => {}
+    }
+    var pushed = mem::List[ty::ItemId].empty(self.alloc())
+    for held in stack {
+        mut pushed.push(held)
+    }
+    mut pushed.push(item)
+    let restored = state.evaluating.replace(take pushed)
+    let muted = state.muted.swap(0)
+    let value = db.about(Some(item), compute: fn() => self.evaluate(item))
+    state.muted.store(muted)
+    state.evaluating.restore(restored)
+    match state.const_values.insert(item, value: take value) {
+        Some(shared) => return Some(shared.share())
+        None => return None
+    }
+} Checker.const_value
+
+/// Runs the const evaluation of a const, const assert or contribution and reports its end,
+/// unless it needs its own value.
+fn Checker.evaluate(self, item: ty::ItemId) -> Option[mem::Shared[ConstValue]] {
+    let db = self.db()
+    var interpreter = Interpreter.new(self.share())
+    let end = mut interpreter.run(item, role: nir::Role.Body, index: 0, args: mem::List[Val].empty(self.alloc()), type_args: mem::List[ty::Arg].empty(self.alloc()).view())
+    if self.state.contents().cyclic.get(item).is_some() {
+        return None
+    }
+    let token = db.ast(item).token
+    let is_assert = match db.ast(item).kind {
+        ast::ItemKind.ConstAssert(_) => true
+        else => false
+    }
+    match end {
+        End.Value(value) => {
+            match value {
+                Val.Bool(flag) => if is_assert and not flag {
+                    self.report(item, token, code: diagnostic::Code.ConstAssertFalse)
+                }
+                else => {}
+            }
+            match interpreter.export(value) {
+                Some(exported) => return Some(mem::Shared.of(take exported, alloc: self.alloc()))
+                None => self.report(item, token, code: diagnostic::Code.ConstViewNotStatic)
+            }
+        }
+        End.Trap(report) => self.report_run(item, token, code: diagnostic::Code.ConstTrapped, report)
+        else => self.report_end(item, token, end)
+    }
+    return None
+} Checker.evaluate
+
+/// Each set of consts and contributions whose evaluations need one another's values,
+/// reported once at its member whose canonical path sorts first.
+fn Checker.check_const_cycles(self) {
+    let state = self.state.contents()
+    let db = self.db()
+    let alloc = self.alloc()
+    var graph = mem::Map[ty::ItemId, mem::List[ty::ItemId]].empty(alloc)
+    for need in state.needs.cursor() {
+        if not graph.contains(need.needing) {
+            discard mut graph.insert(need.needing, value: mem::List[ty::ItemId].empty(alloc))
+        }
+        mut graph.at_mut(need.needing).push(need.needed)
+    }
+    var reported = mem::Set[ty::ItemId].empty(alloc)
+    for entry in graph.cursor() {
+        let item = entry.key()
+        if reported.contains(item) {
+            continue
+        }
+        let reached = needs_reached(graph, from: item, alloc)
+        if not reached.contains(item) {
+            continue
+        }
+        var cycle = mem::List[ty::ItemId].empty(alloc)
+        for other in reached.cursor() {
+            if needs_reached(graph, from: other, alloc).contains(item) {
+                mut cycle.push(other)
+            }
+        }
+        var chosen: Option[ty::ItemId] = None
+        var chosen_path = text::String.empty(alloc)
+        for member in cycle {
+            discard mut reported.insert(member)
+            let path = db.canonical(member)
+            if chosen.is_none() or path.as_str() < chosen_path.as_str() {
+                chosen = Some(member)
+                chosen_path = path
+            }
+        }
+        match chosen {
+            Some(found) => self.report(found, token: db.ast(found).token, code: diagnostic::Code.ItemConstCycle)
+            None => {}
+        }
+    }
+} Checker.check_const_cycles
+
+/// Runs every example of a function that is not disputed, reporting each that yields
+/// `false` or ends otherwise than with a value.
+fn Checker.run_examples(self, item: ty::ItemId) {
+    let Some(body) = self.typed(item) else {
+        return
+    }
+    let db = self.db()
+    let alloc = self.alloc()
+    let typed = body.contents()
+    for index in 0..<typed.examples.len() {
+        let example = typed.examples[index]
+        if example.disputed {
+            continue
+        }
+        var interpreter = Interpreter.new(self.share())
+        let end = db.about(Some(item), compute: fn[mut interpreter]() -> End {
+            return mut interpreter.run(item, role: nir::Role.Example, index: u32.fit(index), args: mem::List[Val].empty(alloc), type_args: mem::List[ty::Arg].empty(alloc).view())
+        })
+        match end {
+            End.Value(value) => match value {
+                Val.Bool(flag) => if not flag {
+                    self.report(item, token: example.token, code: diagnostic::Code.ExampleFailed)
+                }
+                else => {}
+            }
+            End.Trap(report) => self.report_run(item, token: example.token, code: diagnostic::Code.ExampleTrapped, report)
+            else => self.report_end(item, token: example.token, end)
+        }
+    }
+} Checker.run_examples
+
+/// Reports a run ending at its step limit, a violation or an uninterpretable operation; a
+/// run reaching what has no value reports nothing.
+fn Checker.report_end(self, item: ty::ItemId, token: u32, end: End) {
+    match end {
+        End.Exhausted(report) => self.report_run(item, token, code: diagnostic::Code.ConstStepsExhausted, report)
+        End.Violation(report) => self.report_run(item, token, code: diagnostic::Code.ConstTrustedViolation, report)
+        End.Uninterpretable(report) => self.report_run(item, token, code: diagnostic::Code.ConstUninterpretable, report)
+        else => {}
+    }
+} Checker.report_end
+
+/// Reports a run's end with its run report as the because-chain: the operation that
+/// ended it, then the calls in progress, innermost first.
+fn Checker.report_run(self, item: ty::ItemId, token: u32, code: diagnostic::Code, report: Report) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    mut because.push(self.reason(report.at.item, token: report.at.span.head, role: diagnostic::Role.Raised, subject: text::String.of(report.word.as_str(), alloc)))
+    for caller in report.callers {
+        mut because.push(self.reason(caller.item, token: caller.span.head, role: diagnostic::Role.Called, subject: db.canonical(caller.item)))
+    }
+    self.report_because(item, token, code, because: take because)
+} Checker.report_run
+
+/// The consts and contributions an evaluation's needs reach from one, through further needs.
+fn needs_reached(graph: mem::Map[ty::ItemId, mem::List[ty::ItemId]], from: ty::ItemId, alloc: mem::Alloc) -> mem::Set[ty::ItemId] {
+    var seen = mem::Set[ty::ItemId].empty(alloc)
+    var pending = mem::List[ty::ItemId].empty(alloc)
+    mut pending.push(from)
+    loop {
+        let Some(current) = mut pending.pop() else {
+            return seen
+        }
+        let Some(next_items) = graph.get(current) else {
+            continue
+        }
+        for next in next_items {
+            if mut seen.insert(next) {
+                mut pending.push(next)
+            }
+        }
+    }
+} needs_reached

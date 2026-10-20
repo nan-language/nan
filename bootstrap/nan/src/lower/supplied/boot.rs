@@ -61,7 +61,7 @@ fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let option = supply.abi.result.clone();
     let first = fx.b.ins().icmp_imm_s(IntCC::Equal, taken, 0);
     fx.when(first, |fx| {
-        let some = lo.variant_value(fx, &option, "Some", &[Held::Empty], false);
+        let some = lo.variant_value(fx, &option, "Some", &[Held::Empty], None);
         supply.ret(lo, fx, some);
     });
     let none = lo.none_value(fx, &option);

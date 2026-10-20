@@ -1,0 +1,154 @@
+//! The history `.nan/history.nan`: a package's store name, its history head and the tombstones publishing moved out of its source, by module.
+
+pkg struct History derives Eq {
+    pkg name: text::String
+    /// The code root of the release last published from the package, once one is.
+    pkg head: Option[hashing::HashValue]
+    /// Each module's tombstones, as their canonical format writes them, in byte order of module
+    /// and then of text.
+    pkg modules: mem::List[ModuleTombstones]
+} History
+
+/// The tombstones of a module that a history holds.
+pkg struct ModuleTombstones derives Eq {
+    pkg module: text::String
+    pkg tombstones: mem::List[text::String]
+} ModuleTombstones
+
+pkg fn History.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(keyed("name", value: escaped(self.name.as_str(), grammar, alloc).as_str(), alloc))
+    match self.head {
+        Some(head) => mut lines.push(keyed("head", value: escaped(head.full(alloc).as_str(), grammar, alloc).as_str(), alloc))
+        None => {}
+    }
+    for held in self.modules {
+        if held.tombstones.len() == 0 {
+            continue
+        }
+        mut lines.push(keyed("module", value: held.module.as_str(), alloc))
+        for tombstone in held.tombstones {
+            mut lines.push(text::String.of(tombstone.as_str(), alloc))
+        }
+    }
+    return write(Kind.History, lines: lines.view(), alloc)
+} History.bytes
+
+pkg fn History.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[History, Invalid] {
+    let parsed = match read(Kind.History, bytes, grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    let records = parsed.records.view()
+    var at: usize = 0
+    let named = match keyed_text(records, mut at, word: "name", alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    let Some(KeyedText(value: name, line: _)) = named else {
+        return Err(Invalid.at(2))
+    }
+    let headed = match keyed_text(records, mut at, word: "head", alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    var head: Option[hashing::HashValue] = None
+    match headed {
+        Some(KeyedText(value: written, line: line)) => {
+            let Some(hash) = hash_of(written.as_str(), alloc) else {
+                return Err(Invalid.at(line))
+            }
+            head = Some(hash)
+        }
+        None => {}
+    }
+    var history = History(name: take name, head: head, modules: mem::List[ModuleTombstones].empty(alloc))
+    for index in at..<records.len() {
+        let record = records[index]
+        match mut history.held_record(record, alloc) {
+            Some(invalid) => return Err(invalid)
+            None => {}
+        }
+    }
+    let count = history.modules.len()
+    if count > 0 and history.modules[count - 1].tombstones.len() == 0 {
+        var last: u32 = 1
+        if records.len() > 0 {
+            last = records[records.len() - 1].line
+        }
+        return Err(Invalid.at(last))
+    }
+    return parsed.checked(take history)
+} History.read
+
+/// Reads a record after a history's name and head into its modules: a `module` record, or a
+/// tombstone of the module last read; why it is not valid when it is neither.
+fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[Invalid] {
+    var cursor = record.cursor(alloc)
+    let invalid = Invalid.at(record.line)
+    let count = self.modules.len()
+    let opens = mut cursor.takes("module")
+    if opens {
+        let Some(module) = mut cursor.word() else {
+            return Some(invalid)
+        }
+        var after = true
+        if count > 0 {
+            let last = self.modules[count - 1]
+            after = last.module < module and last.tombstones.len() > 0
+        }
+        if not cursor.done() or not after {
+            return Some(invalid)
+        }
+        mut self.modules.push(ModuleTombstones(module: take module, tombstones: mem::List[text::String].empty(alloc)))
+        return None
+    }
+    if count == 0 {
+        return Some(invalid)
+    }
+    var ordered = true
+    let held = self.modules[count - 1].tombstones.view()
+    if not held.is_empty() {
+        ordered = held[held.len() - 1] < record.text
+    }
+    let tombstone = mut cursor.takes("retired")
+    if not tombstone or not ordered {
+        return Some(invalid)
+    }
+    mut (mut self.modules.at_mut(count - 1)).tombstones.push(text::String.of(record.text.as_str(), alloc))
+    return None
+} History.held_record
+
+/// The value of a record of a word and a text, and the record's line.
+struct KeyedText {
+    value: text::String
+    line: u32
+} KeyedText
+
+/// The text of the record at `at` when its text starts with `word` and a space, and then the
+/// record is read; why it is not valid when it is not that word and a text on one line.
+fn keyed_text(records: Slice[Record], mut at: usize, word: Str, alloc: mem::Alloc) -> Result[Option[KeyedText], Invalid] {
+    if at >= records.len() {
+        return Ok(None)
+    }
+    let record = records[at]
+    var prefix = text::String.of(word, alloc)
+    mut prefix.push(' ')
+    if not record.text.starts_with(prefix.as_str()) {
+        return Ok(None)
+    }
+    at += 1
+    let invalid = Invalid.at(record.line)
+    var cursor = record.cursor(alloc)
+    let taken = mut cursor.takes(word)
+    if not taken {
+        return Err(invalid)
+    }
+    let Some(value) = mut cursor.text() else {
+        return Err(invalid)
+    }
+    if not cursor.done() or record.line != record.last_line {
+        return Err(invalid)
+    }
+    return Ok(Some(KeyedText(value: take value, line: record.line)))
+} keyed_text

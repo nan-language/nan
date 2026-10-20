@@ -1,0 +1,2380 @@
+//! Ownership over a typed body: moves and the uses after them, the modes bindings allow, linear consumption, holds and exclusivity, view bindings and the captures of closures. One forward walk over the body's control flow carries what is moved, the holds projection results place on their sources and the accesses that conflict with a hold; such an access is reported once the hold's result is used on a path from it, which is when the result is live there.
+
+/// The first of the holder ids standing for loop cursors, one per loop depth.
+const CURSOR_HOLDERS: u32 = 0x7FFF_FFFF
+
+/// The holder of a projection result no local binds yet.
+const UNBOUND_HOLDER: LocalId = LocalId(index: 0xFFFF_FFFF)
+
+/// Whether a place was moved on every path reaching a point, or on some.
+enum MovedOn derives Copy, Eq {
+    Some
+    Every
+} MovedOn
+
+/// The restriction a live projection result places on its source.
+struct Hold derives Eq, Ord {
+    /// The local, or loop cursor, whose uses keep the result live.
+    holder: LocalId
+    source: Path
+    /// Whether a mut projection holds the source, rather than a read one freezing it.
+    held: bool
+    /// Where the hold began.
+    token: u32
+} Hold
+
+/// An access conflicting with a hold: an error once the hold's result is used on a path from it.
+struct Pending derives Eq, Ord {
+    hold: Hold
+    access: u32
+    /// The place accessed, written with the access's mode.
+    subject: text::String
+} Pending
+
+/// A deferred call pending at a point: the scope it was registered in and the places it names
+/// and takes.
+struct FlowDeferred derives Eq {
+    depth: usize
+    places: mem::List[Path]
+    taken: mem::List[Path]
+} FlowDeferred
+
+/// How surely a place path was moved, and where.
+struct MovedAt derives Copy, Eq {
+    moved: MovedOn
+    token: u32
+} MovedAt
+
+/// A local holding a state token, and a suspension point after which it is live once used
+/// again.
+struct Suspension derives Copy, Eq, Ord {
+    local: LocalId
+    token: u32
+} Suspension
+
+/// A deferred call pending at a point, and whether on every path.
+struct PendingDeferred derives Eq {
+    deferred: FlowDeferred
+    every: bool
+} PendingDeferred
+
+/// What the walk knows at one reachable point of the body.
+struct FlowState derives Eq {
+    /// Each moved place path, how surely, and where.
+    moved: mem::Map[Path, MovedAt]
+    holds: mem::Set[Hold]
+    pending: mem::Set[Pending]
+    /// Each local holding a state token, and a suspension point after which it is live once
+    /// used again.
+    suspended: mem::Set[Suspension]
+    /// The deferred calls pending, by their `defer` statement, and whether on every path.
+    deferred: mem::Map[u32, PendingDeferred]
+} FlowState
+
+/// How an access reaches a place.
+enum AccessKind derives Copy, Eq {
+    Read
+    Mut
+    Move
+    Assign
+} AccessKind
+
+/// An access a closure's capture makes while it is live: the place path, how and where.
+struct CaptureAccess {
+    path: Path
+    access: AccessKind
+    token: u32
+} CaptureAccess
+
+/// A value as ownership reads it once its expression is evaluated.
+struct FlowValue {
+    /// The place it names, when it is one.
+    place: Option[Path]
+    /// The holds of the projection results it derives from.
+    holds: mem::List[Hold]
+    /// The form of the projection result it is, or derives from as a field.
+    form: Option[Form]
+    /// Whether that part may be written.
+    writable: bool
+    /// Whether it derives from a projection result whose receiver was a temporary.
+    temporary: bool
+    /// Whether it is a temporary: the result of a call other than a projection, or a
+    /// construction.
+    fresh: bool
+    /// The locals it derives from, as a projection's result derives from its receiver.
+    roots: mem::List[LocalId]
+    /// The accesses a closure's captures make while it is live.
+    captures: mem::List[CaptureAccess]
+} FlowValue
+
+/// The value a branch of an `if` or `match` yields, and the token yielding it.
+struct FlowBranch {
+    value: FlowValue
+    token: u32
+} FlowBranch
+
+/// The states at the jumps out of one loop.
+struct LoopFlow {
+    breaks: Option[FlowState]
+    continues: Option[FlowState]
+    /// How many scopes enclose the loop.
+    scopes: usize
+    /// The token of a `for` loop whose cursor is linear.
+    linear_cursor: Option[u32]
+} LoopFlow
+
+/// A block's scope: the locals it declares.
+struct FlowScope {
+    locals: mem::List[LocalId]
+} FlowScope
+
+/// What a view binding names.
+struct FlowView {
+    writable: bool
+    wrapped: bool
+    /// The locals the part it names derives from.
+    roots: mem::List[LocalId]
+} FlowView
+
+/// A token and a code reported at it.
+struct ReportedAt derives Copy, Eq, Ord, Hash {
+    token: u32
+    code: diagnostic::Code
+} ReportedAt
+
+/// The receiver of a projection's body, and whether it is received by `mut`.
+struct ProjectionReceiver derives Copy {
+    receiver: LocalId
+    mutable: bool
+} ProjectionReceiver
+
+/// The walk of one function, test, const or closure body.
+struct Flow {
+    ck: Checker
+    item: ty::ItemId
+    body: mem::Shared[TBody]
+    alloc: mem::Alloc
+    state: Option[FlowState]
+    loops: mem::List[LoopFlow]
+    /// The loop indexes of the typed body that loops enclosing this closure's body take.
+    loop_base: usize
+    scopes: mem::List[FlowScope]
+    views: mem::HashMap[LocalId, FlowView]
+    /// The locals an owned binding's value derives from, as a view value derives from what its
+    /// projection's receiver derives from.
+    derived: mem::HashMap[LocalId, mem::List[LocalId]]
+    /// Where each local was bound.
+    bound: mem::HashMap[LocalId, u32]
+    /// The tokens and codes reported, shared with the walks of the closures of the body.
+    reported: mem::Shared[mem::OnceMap[ReportedAt, Unit]]
+    /// For a projection's body, the receiver and whether it is received by `mut`.
+    projection: Option[ProjectionReceiver]
+    /// For a closure's body, whether it is a task closure's.
+    task: Option[bool]
+    /// The locals assigned or accessed by `mut`, and those moved, in this body.
+    mutated: mem::Set[LocalId]
+    moved_locals: mem::Set[LocalId]
+    /// The closures whose bodies were walked, with the place paths each body reads through its
+    /// read captures, shared with the walks of the closures of the body.
+    walked: mem::Shared[mem::OnceMap[u32, mem::List[Path]]]
+    /// The place paths this body reads through its read captures.
+    capture_reads: mem::List[Path]
+    /// Where each local is first used.
+    first_use: mem::HashMap[LocalId, u32]
+    /// Whether the body holds a construct that failed a rule, whose effects are unknown: what
+    /// rests on an effect being absent is then not reported.
+    failed: bool
+    /// For a closure's body, the `fn` token opening the closure.
+    opener: Option[u32]
+    /// The first token of the statement being walked.
+    statement: Option[u32]
+    /// Whether the expression about to be walked gives the value a projection returns, which
+    /// the values of its branches then give in turn: such a branch value is returned, not moved.
+    returning: bool
+} Flow
+
+/// A state where nothing is moved, held or pending.
+fn FlowState.empty(alloc: mem::Alloc) -> FlowState {
+    return FlowState(moved: mem::Map[Path, MovedAt].empty(alloc), holds: mem::Set[Hold].empty(alloc), pending: mem::Set[Pending].empty(alloc), suspended: mem::Set[Suspension].empty(alloc), deferred: mem::Map[u32, PendingDeferred].empty(alloc))
+} FlowState.empty
+
+fn FlowState.copy(self, alloc: mem::Alloc) -> FlowState {
+    var moved = mem::Map[Path, MovedAt].empty(alloc)
+    for entry in self.moved {
+        discard mut moved.insert(entry.key().copy(alloc), value: entry.value())
+    }
+    var holds = mem::Set[Hold].empty(alloc)
+    for hold in self.holds {
+        discard mut holds.insert(hold.copy(alloc))
+    }
+    var pending = mem::Set[Pending].empty(alloc)
+    for held in self.pending {
+        discard mut pending.insert(held.copy(alloc))
+    }
+    var suspended = mem::Set[Suspension].empty(alloc)
+    for suspension in self.suspended {
+        discard mut suspended.insert(suspension)
+    }
+    var deferred = mem::Map[u32, PendingDeferred].empty(alloc)
+    for entry in self.deferred {
+        discard mut deferred.insert(entry.key(), value: entry.value().copy(alloc))
+    }
+    return FlowState(moved: take moved, holds: take holds, pending: take pending, suspended: take suspended, deferred: take deferred)
+} FlowState.copy
+
+/// The state where paths from two points meet.
+fn FlowState.join(mut self, other: FlowState, alloc: mem::Alloc) {
+    var moved = mem::Map[Path, MovedAt].empty(alloc)
+    for entry in self.moved {
+        let at = entry.value()
+        let both = match other.moved.get(entry.key()) {
+            Some(theirs) => theirs.moved == MovedOn.Every
+            None => false
+        }
+        var how = MovedOn.Some
+        if at.moved == MovedOn.Every and both {
+            how = MovedOn.Every
+        }
+        discard mut moved.insert(entry.key().copy(alloc), value: MovedAt(moved: how, token: at.token))
+    }
+    for entry in other.moved {
+        if not moved.contains(entry.key()) {
+            discard mut moved.insert(entry.key().copy(alloc), value: MovedAt(moved: MovedOn.Some, token: entry.value().token))
+        }
+    }
+    self.moved = moved
+    for hold in other.holds {
+        discard mut self.holds.insert(hold.copy(alloc))
+    }
+    for held in other.pending {
+        discard mut self.pending.insert(held.copy(alloc))
+    }
+    for suspension in other.suspended {
+        discard mut self.suspended.insert(suspension)
+    }
+    var deferred = mem::Map[u32, PendingDeferred].empty(alloc)
+    for entry in self.deferred {
+        let mine = entry.value()
+        match other.deferred.get(entry.key()) {
+            Some(theirs) => {
+                discard mut deferred.insert(entry.key(), value: PendingDeferred(deferred: theirs.deferred.copy(alloc), every: mine.every and theirs.every))
+            }
+            None => {
+                discard mut deferred.insert(entry.key(), value: PendingDeferred(deferred: mine.deferred.copy(alloc), every: false))
+            }
+        }
+    }
+    for entry in other.deferred {
+        if not deferred.contains(entry.key()) {
+            discard mut deferred.insert(entry.key(), value: PendingDeferred(deferred: entry.value().deferred.copy(alloc), every: false))
+        }
+    }
+    self.deferred = deferred
+} FlowState.join
+
+/// Forgets what a local declared anew held: its moves, the holds it keeps and their conflicts.
+fn FlowState.forget_local(mut self, local: LocalId) {
+    mut self.moved.retain(fn(path: Path, at: MovedAt) => path.root != local)
+    mut self.holds.retain(fn(hold: Hold) => hold.holder != local)
+    mut self.pending.retain(fn(held: Pending) => held.hold.holder != local)
+} FlowState.forget_local
+
+/// Ends the holds of the holders `ended` gives, and the conflicts they would report.
+fn FlowState.forget_holders(mut self, ended: fn(holder: LocalId) -> bool) {
+    mut self.holds.retain(fn(hold: Hold) => not ended(hold.holder))
+    mut self.pending.retain(fn(held: Pending) => not ended(held.hold.holder))
+} FlowState.forget_holders
+
+/// Each of `locals` holds a state token across the suspension point at `token`.
+fn FlowState.suspend(mut self, locals: Slice[LocalId], token: u32) {
+    for local in locals {
+        discard mut self.suspended.insert(Suspension(local: local, token: token))
+    }
+} FlowState.suspend
+
+/// The conflicts with each of `holds` an access at `access` to `subject` makes.
+fn FlowState.add_pending(mut self, holds: Slice[Hold], access: u32, subject: Str, alloc: mem::Alloc) {
+    for hold in holds {
+        discard mut self.pending.insert(Pending(hold: hold.copy(alloc), access: access, subject: text::String.of(subject, alloc)))
+    }
+} FlowState.add_pending
+
+/// A path moved on every path here, at `token`.
+fn FlowState.move_path(mut self, path: Path, token: u32, alloc: mem::Alloc) {
+    discard mut self.moved.insert(path.copy(alloc), value: MovedAt(moved: MovedOn.Every, token: token))
+} FlowState.move_path
+
+/// The end at `token` of the scope at `depth` declaring `locals`: their suspensions end, and
+/// each deferred call registered from that depth inward runs, consuming the places it takes.
+fn FlowState.end_scope(mut self, locals: Slice[LocalId], depth: usize, token: u32, alloc: mem::Alloc) {
+    mut self.suspended.retain(fn(suspension: Suspension) => not holds_local(locals, local: suspension.local))
+    var ran = mem::List[u32].empty(alloc)
+    for entry in self.deferred {
+        if entry.value().deferred.depth >= depth {
+            mut ran.push(entry.key())
+        }
+    }
+    for at in ran {
+        let Some(call) = mut self.deferred.remove(at) else {
+            continue
+        }
+        for taken in take call.deferred.taken {
+            discard mut self.moved.insert(take taken, value: MovedAt(moved: MovedOn.Every, token: token))
+        }
+    }
+} FlowState.end_scope
+
+fn Hold.copy(self, alloc: mem::Alloc) -> Hold {
+    return Hold(holder: self.holder, source: self.source.copy(alloc), held: self.held, token: self.token)
+} Hold.copy
+
+/// The same hold, kept by another holder.
+fn Hold.held_by(self, holder: LocalId, alloc: mem::Alloc) -> Hold {
+    return Hold(holder: holder, source: self.source.copy(alloc), held: self.held, token: self.token)
+} Hold.held_by
+
+fn Pending.copy(self, alloc: mem::Alloc) -> Pending {
+    return Pending(hold: self.hold.copy(alloc), access: self.access, subject: text::String.of(self.subject.as_str(), alloc))
+} Pending.copy
+
+fn FlowDeferred.copy(self, alloc: mem::Alloc) -> FlowDeferred {
+    return FlowDeferred(depth: self.depth, places: copied_paths(self.places.view(), alloc), taken: copied_paths(self.taken.view(), alloc))
+} FlowDeferred.copy
+
+fn PendingDeferred.copy(self, alloc: mem::Alloc) -> PendingDeferred {
+    return PendingDeferred(deferred: self.deferred.copy(alloc), every: self.every)
+} PendingDeferred.copy
+
+fn CaptureAccess.copy(self, alloc: mem::Alloc) -> CaptureAccess {
+    return CaptureAccess(path: self.path.copy(alloc), access: self.access, token: self.token)
+} CaptureAccess.copy
+
+fn copied_paths(paths: Slice[Path], alloc: mem::Alloc) -> mem::List[Path] {
+    var copy = mem::List[Path].empty(alloc)
+    for path in paths {
+        mut copy.push(path.copy(alloc))
+    }
+    return copy
+} copied_paths
+
+fn copied_locals(locals: Slice[LocalId], alloc: mem::Alloc) -> mem::List[LocalId] {
+    var copy = mem::List[LocalId].empty(alloc)
+    for local in locals {
+        mut copy.push(local)
+    }
+    return copy
+} copied_locals
+
+fn copied_state(state: Option[FlowState], alloc: mem::Alloc) -> Option[FlowState] {
+    let Some(held) = state else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} copied_state
+
+fn copied_views(views: mem::HashMap[LocalId, FlowView], alloc: mem::Alloc) -> mem::HashMap[LocalId, FlowView] {
+    var copy = mem::HashMap[LocalId, FlowView].empty(seed: 0, alloc)
+    for entry in views {
+        let view = entry.value()
+        discard mut copy.insert(entry.key(), value: FlowView(writable: view.writable, wrapped: view.wrapped, roots: copied_locals(view.roots.view(), alloc)))
+    }
+    return copy
+} copied_views
+
+/// Whether a list of locals holds one.
+fn holds_local(locals: Slice[LocalId], local: LocalId) -> bool {
+    for held in locals {
+        if held == local {
+            return true
+        }
+    }
+    return false
+} holds_local
+
+/// Whether a list of texts holds one.
+fn holds_text(texts: Slice[text::String], text: Str) -> bool {
+    for held in texts {
+        if held.as_str() == text {
+            return true
+        }
+    }
+    return false
+} holds_text
+
+/// Whether a place expression reaches its place through an index step.
+fn TExpr.through_index(self) -> bool {
+    return match self.kind {
+        TKind.Index(_) => true
+        TKind.Field(base: base, name: _) => base.contents().through_index()
+        else => false
+    }
+} TExpr.through_index
+
+/// Joins a state into an optional one, an absent state being an unreachable point.
+fn join_into(mut into: Option[FlowState], take from: Option[FlowState], alloc: mem::Alloc) {
+    let Some(joined) = from else {
+        return
+    }
+    let Some(held) = mut into.extract() else {
+        into = Some(take joined)
+        return
+    }
+    var state = held
+    mut state.join(joined, alloc)
+    into = Some(take state)
+} join_into
+
+/// The form of a part of a value of form `form`: a part of a part or wrapped part, and a value
+/// of a view value.
+fn part_of(form: Option[Form]) -> Option[Form] {
+    return match form {
+        Some(Form.Part) or Some(Form.Wrapped) => Some(Form.Part)
+        else => form
+    }
+} part_of
+
+proj fn AccessKind.word(self) -> Str {
+    return match self {
+        AccessKind.Read => ""
+        AccessKind.Mut => "mut "
+        AccessKind.Move => "take "
+        AccessKind.Assign => "assign "
+    }
+} AccessKind.word
+
+/// A value naming no place, holding nothing and deriving from nothing.
+fn FlowValue.empty(alloc: mem::Alloc) -> FlowValue {
+    return FlowValue(place: None, holds: mem::List[Hold].empty(alloc), form: None, writable: false, temporary: false, fresh: false, roots: mem::List[LocalId].empty(alloc), captures: mem::List[CaptureAccess].empty(alloc))
+} FlowValue.empty
+
+fn FlowValue.of_place(take path: Path, alloc: mem::Alloc) -> FlowValue {
+    var value = FlowValue.empty(alloc)
+    mut value.roots.push(path.root)
+    value.place = Some(take path)
+    return value
+} FlowValue.of_place
+
+/// The value of a field of this one.
+fn FlowValue.into_field(take self, name: Str, alloc: mem::Alloc) -> FlowValue {
+    match mut self.place.extract() {
+        Some(path) => {
+            self.place = Some(take path.into_field(name, alloc))
+        }
+        None => {}
+    }
+    self.form = part_of(self.form)
+    return self
+} FlowValue.into_field
+
+/// A copy of this value's part a field or payload key names.
+fn FlowValue.field_part(self, key: Str, alloc: mem::Alloc) -> FlowValue {
+    var place: Option[Path] = None
+    match self.place {
+        Some(path) => {
+            place = Some(path.field(key, alloc))
+        }
+        None => {}
+    }
+    var holds = mem::List[Hold].empty(alloc)
+    for hold in self.holds {
+        mut holds.push(hold.copy(alloc))
+    }
+    var captures = mem::List[CaptureAccess].empty(alloc)
+    for capture in self.captures {
+        mut captures.push(capture.copy(alloc))
+    }
+    return FlowValue(place: take place, holds: take holds, form: part_of(self.form), writable: self.writable, temporary: self.temporary, fresh: self.fresh, roots: copied_locals(self.roots.view(), alloc), captures: take captures)
+} FlowValue.field_part
+
+/// A scope declaring no local yet.
+fn FlowScope.empty(alloc: mem::Alloc) -> FlowScope {
+    return FlowScope(locals: mem::List[LocalId].empty(alloc))
+} FlowScope.empty
+
+/// The ownership rules of a typed body of an item, `projection` when it is a projection's.
+fn Checker.check_flow(self, item: ty::ItemId, body: mem::Shared[TBody], projection: bool) {
+    let held = body.contents()
+    var receiver: Option[ProjectionReceiver] = None
+    if projection and held.params.len() > 0 {
+        let received = held.params[0]
+        receiver = Some(ProjectionReceiver(receiver: received, mutable: held.local(received).kind == LocalKind.Param(ast::Mode.Mut)))
+    }
+    var flow = Flow.new(self, item, body)
+    flow.projection = receiver
+    mut flow.function()
+} Checker.check_flow
+
+fn Flow.new(ck: Checker, item: ty::ItemId, body: mem::Shared[TBody]) -> Flow {
+    let alloc = ck.alloc()
+    var scopes = mem::List[FlowScope].empty(alloc)
+    mut scopes.push(FlowScope.empty(alloc))
+    return Flow(
+        ck: ck.share(),
+        item: item,
+        body: body.share(),
+        alloc: alloc,
+        state: Some(FlowState.empty(alloc)),
+        loops: mem::List[LoopFlow].empty(alloc),
+        loop_base: 0,
+        scopes: take scopes,
+        views: mem::HashMap[LocalId, FlowView].empty(seed: 0, alloc),
+        derived: mem::HashMap[LocalId, mem::List[LocalId]].empty(seed: 0, alloc),
+        bound: mem::HashMap[LocalId, u32].empty(seed: 0, alloc),
+        reported: mem::Shared.of(mem::OnceMap[ReportedAt, Unit].empty(seed: 0, alloc), alloc),
+        projection: None,
+        task: None,
+        mutated: mem::Set[LocalId].empty(alloc),
+        moved_locals: mem::Set[LocalId].empty(alloc),
+        walked: mem::Shared.of(mem::OnceMap[u32, mem::List[Path]].empty(seed: 0, alloc), alloc),
+        capture_reads: mem::List[Path].empty(alloc),
+        first_use: mem::HashMap[LocalId, u32].empty(seed: 0, alloc),
+        failed: false,
+        opener: None,
+        statement: None,
+        returning: false,
+    )
+} Flow.new
+
+/// Changes the state at a reachable point.
+fn Flow.change_state(mut self, change: fn(mut state: FlowState)) {
+    let Some(found) = mut self.state.extract() else {
+        return
+    }
+    var state = found
+    change(mut state)
+    self.state = Some(take state)
+} Flow.change_state
+
+/// Whether a token and code are reported for the first time.
+fn Flow.newly_reported(self, token: u32, code: diagnostic::Code) -> bool {
+    let reported = self.reported.contents()
+    let key = ReportedAt(token: token, code: code)
+    if reported.get(key).is_some() {
+        return false
+    }
+    reported.insert(key, value: Unit)
+    return true
+} Flow.newly_reported
+
+/// Reports a diagnostic with the fixes its rule names, once per token and code.
+fn Flow.report_fixed(self, construct: nir::Span, code: diagnostic::Code, take fixes: mem::List[diagnostic::Fix]) {
+    if self.newly_reported(construct.head, code) {
+        self.ck.report_fixed(self.item, construct, code, take fixes, offer: diagnostic::Offer.Each)
+    }
+} Flow.report_fixed
+
+/// The fix listing a capture of the closure whose body is walked.
+fn Flow.listed(self, local: LocalId, mode: ast::Mode) -> mem::List[diagnostic::Fix] {
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc)
+    let Some(opener) = self.opener else {
+        return fixes
+    }
+    var capture = text::String.of(mode.word(), alloc: self.alloc)
+    mut capture.push(' ')
+    mut capture.append(self.body.contents().local(local).name.as_str())
+    mut fixes.push(self.ck.fix_capture_listed(self.item, opener, capture: capture.as_str()))
+    return fixes
+} Flow.listed
+
+fn Flow.function(mut self) {
+    let body = self.body.share()
+    let held = body.contents()
+    for param in held.params {
+        mut self.declare(param, token: held.local(param).token)
+    }
+    let Some(root) = held.root else {
+        return
+    }
+    var end = root.token
+    match root.kind {
+        TKind.Block(block) => {
+            discard mut self.block(block, returning: false)
+            end = block.end
+        }
+        else => {
+            self.returning = self.projection.is_some()
+            let value = mut self.expr(root)
+            mut self.returned(value, expr: root)
+        }
+    }
+    if self.state.is_some() {
+        self.exit_scopes(0, token: end)
+    }
+} Flow.function
+
+fn Flow.report(self, token: u32, code: diagnostic::Code) {
+    if self.newly_reported(token, code) {
+        self.ck.report(self.item, token, code)
+    }
+} Flow.report
+
+fn Flow.report_because(self, token: u32, code: diagnostic::Code, take because: mem::List[diagnostic::Reason]) {
+    if self.newly_reported(token, code) {
+        self.ck.report_because(self.item, token, code, take because)
+    }
+} Flow.report_because
+
+fn Flow.reason(self, token: u32, role: diagnostic::Role, take subject: text::String) -> diagnostic::Reason {
+    return self.ck.reason(self.item, token, role, take subject)
+} Flow.reason
+
+fn Flow.name(self, local: LocalId) -> text::String {
+    if local.index >= CURSOR_HOLDERS {
+        return text::String.of("cursor", alloc: self.alloc)
+    }
+    return text::String.of(self.body.contents().local(local).name.as_str(), alloc: self.alloc)
+} Flow.name
+
+fn Flow.written(self, path: Path) -> text::String {
+    return path.written(self.name(path.root).as_str(), alloc: self.alloc)
+} Flow.written
+
+fn Flow.local_kind(self, local: LocalId) -> LocalKind {
+    return self.body.contents().local(local).kind
+} Flow.local_kind
+
+fn Flow.local_ty(self, local: LocalId) -> ty::Ty {
+    return self.body.contents().local(local).ty
+} Flow.local_ty
+
+fn Flow.is_copy(self, ty: ty::Ty) -> bool {
+    return self.ck.types().has_error(ty) or ty.is_never() or self.ck.has(ty, property: Property.Copy)
+} Flow.is_copy
+
+fn Flow.is_linear(self, ty: ty::Ty) -> bool {
+    return not self.ck.types().has_error(ty) and self.ck.has(ty, property: Property.Linear)
+} Flow.is_linear
+
+/// Whether a local owns its value, so that it may be moved.
+fn Flow.owns(self, local: LocalId) -> bool {
+    if self.views.contains(local) {
+        return false
+    }
+    return match self.local_kind(local) {
+        LocalKind.Let or LocalKind.Var or LocalKind.Pattern => true
+        LocalKind.Param(mode) or LocalKind.Element(mode) => mode == ast::Mode.Take
+        LocalKind.Capture(mode) => mode == ast::Mode.Take and self.task == Some(true)
+        LocalKind.Quantified => false
+    }
+} Flow.owns
+
+fn Flow.declare(mut self, local: LocalId, token: u32) {
+    mut self.change_state(fn(mut state: FlowState) => mut state.forget_local(local))
+    discard mut self.views.remove(local)
+    discard mut self.bound.insert(local, value: token)
+    let innermost = self.scopes.len() - 1
+    mut (mut self.scopes.at_mut(innermost)).locals.push(local)
+} Flow.declare
+
+/// A suspension point: each local holding a state token becomes an error once used again.
+fn Flow.suspend(mut self, token: u32) {
+    var held = mem::List[LocalId].empty(self.alloc)
+    for scope in self.scopes {
+        for local in scope.locals {
+            if self.ck.holds_token(self.local_ty(local)) {
+                mut held.push(local)
+            }
+        }
+    }
+    mut self.change_state(fn(mut state: FlowState) => mut state.suspend(held.view(), token))
+} Flow.suspend
+
+/// The earliest suspension point after which a local holds a state token.
+fn Flow.suspension_point(self, holder: LocalId) -> Option[u32] {
+    let Some(state) = self.state else {
+        return None
+    }
+    for suspension in state.suspended {
+        if suspension.local == holder {
+            return Some(suspension.token)
+        }
+    }
+    return None
+} Flow.suspension_point
+
+/// A use of a local: each pending conflict of a hold it keeps becomes an error, and so does
+/// a state token it holds across a suspension point.
+fn Flow.use_holder(mut self, holder: LocalId, token: u32) {
+    if not self.first_use.contains(holder) {
+        discard mut self.first_use.insert(holder, value: token)
+    }
+    if self.state.is_none() {
+        return
+    }
+    match self.suspension_point(holder) {
+        Some(point) => {
+            mut self.change_state(fn(mut state: FlowState) => mut state.suspended.retain(fn(suspension: Suspension) => suspension.local != holder))
+            let bound = self.bound.get(holder).value_or(token)
+            var because = mem::List[diagnostic::Reason].empty(self.alloc)
+            mut because.push(self.reason(bound, role: diagnostic::Role.Bound, subject: self.name(holder)))
+            mut because.push(self.reason(token, role: diagnostic::Role.Used, subject: self.name(holder)))
+            self.report_because(point, code: diagnostic::Code.SuspendTokenAcrossAwait, take because)
+        }
+        None => {}
+    }
+    let Some(state) = self.state else {
+        return
+    }
+    for held in state.pending {
+        if held.hold.holder == holder {
+            self.report_conflict(held, holder, token)
+        }
+    }
+} Flow.use_holder
+
+/// Reports a pending conflict of a hold whose holder is used at `token`.
+fn Flow.report_conflict(self, held: Pending, holder: LocalId, token: u32) {
+    var role = diagnostic::Role.Frozen
+    if held.hold.held {
+        role = diagnostic::Role.Held
+    }
+    var because = mem::List[diagnostic::Reason].empty(self.alloc)
+    mut because.push(self.reason(held.hold.token, role, subject: self.written(held.hold.source)))
+    mut because.push(self.reason(token, role: diagnostic::Role.Used, subject: self.name(holder)))
+    mut because.push(self.reason(held.access, role: diagnostic::Role.Accessed, subject: text::String.of(held.subject.as_str(), alloc: self.alloc)))
+    self.report_because(held.access, code: diagnostic::Code.OwnConflict, take because)
+} Flow.report_conflict
+
+/// The checks every access to a place makes: the holds its root keeps, a move on a path to
+/// it, and the holds it conflicts with.
+fn Flow.access(mut self, path: Path, access: AccessKind, token: u32) {
+    let alloc = self.alloc
+    if self.local_kind(path.root) == LocalKind.Capture(ast::Mode.Read) {
+        mut self.capture_reads.push(path.copy(alloc))
+    }
+    mut self.use_holder(path.root, token)
+    let Some(state) = self.state else {
+        return
+    }
+    for entry in state.moved {
+        let moved = entry.key()
+        if moved.overlaps(path) and not (access == AccessKind.Assign and moved.starts_with(path)) {
+            var because = mem::List[diagnostic::Reason].empty(alloc)
+            mut because.push(self.reason(entry.value().token, role: diagnostic::Role.Moved, subject: self.written(moved)))
+            self.report_because(token, code: diagnostic::Code.OwnUseAfterMove, take because)
+            break
+        }
+    }
+    var conflicting = mem::List[Hold].empty(alloc)
+    for hold in state.holds {
+        if hold.source.overlaps(path) and (hold.held or access != AccessKind.Read) {
+            mut conflicting.push(hold.copy(alloc))
+        }
+    }
+    if conflicting.len() == 0 {
+        return
+    }
+    var subject = text::String.of(access.word(), alloc)
+    mut subject.append(self.written(path).as_str())
+    mut self.change_state(fn(mut changed: FlowState) => mut changed.add_pending(conflicting.view(), access: token, subject: subject.as_str(), alloc))
+} Flow.access
+
+/// A read of a value: its place, or the holders it derives from.
+fn Flow.read(mut self, value: FlowValue, token: u32) {
+    match value.place {
+        Some(path) => mut self.access(path, access: AccessKind.Read, token)
+        None => {}
+    }
+    for hold in value.holds {
+        mut self.use_holder(hold.holder, token)
+    }
+} Flow.read
+
+/// A `mut` access or assignment of a place: modes must allow it and a view must be writable.
+fn Flow.write(mut self, value: FlowValue, access: AccessKind, token: u32) {
+    let Some(path) = value.place else {
+        if value.form.is_some() and not value.writable {
+            self.report(token, code: diagnostic::Code.OwnReadOnlyView)
+        }
+        return
+    }
+    let root = path.root
+    if self.local_kind(root) == LocalKind.Capture(ast::Mode.Read) {
+        self.report_fixed(nir::Span.at(token), code: diagnostic::Code.ClosureCaptureMode, fixes: self.listed(root, mode: ast::Mode.Mut))
+    } else if not self.body.contents().local(root).assignable() {
+        self.immutable_binding(root, token)
+    } else if self.read_only_view(root) {
+        self.report(token, code: diagnostic::Code.OwnReadOnlyView)
+    } else if value.form.is_some() and not value.writable {
+        self.report(token, code: diagnostic::Code.OwnReadOnlyView)
+    }
+    discard mut self.mutated.insert(root)
+    self.check_outside_write(path, token)
+    mut self.access(path, access, token)
+} Flow.write
+
+/// Whether a local is a view binding of a read-only or wrapped part.
+fn Flow.read_only_view(self, local: LocalId) -> bool {
+    return match self.views.get(local) {
+        Some(view) => not view.writable or view.wrapped
+        None => false
+    }
+} Flow.read_only_view
+
+/// Reports an assignment or `mut` access at `token` of a binding modes forbid it for, with the
+/// fix writing `var` for its `let`.
+fn Flow.immutable_binding(self, root: LocalId, token: u32) {
+    let code = diagnostic::Code.ModeImmutableBinding
+    let source = self.ck.db().syntax(self.item)
+    let bound = self.body.contents().local(root).token
+    var keyword: Option[u32] = None
+    match source.previous(usize.widen(bound)) {
+        Some(previous) => {
+            if source.tokens[previous].kind == syntax::TokenKind.Keyword(syntax::Keyword.Let) {
+                keyword = Some(u32.fit(previous))
+            }
+        }
+        None => {}
+    }
+    let Some(written) = keyword else {
+        self.report(token, code)
+        return
+    }
+    if not self.newly_reported(token, code) {
+        return
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc)
+    mut fixes.push(self.ck.fix_replacing(self.item, head: written, last: written, text: "var"))
+    self.ck.report_fixed(self.item, construct: nir::Span.at(token), code, take fixes, offer: diagnostic::Offer.Each)
+} Flow.immutable_binding
+
+/// A write of a field a struct's predicates mention, or of a place within one, outside the
+/// struct's defining module.
+fn Flow.check_outside_write(self, path: Path, token: u32) {
+    if path.root.index >= CURSOR_HOLDERS {
+        return
+    }
+    let db = self.ck.db()
+    let module = db.module_of(self.item)
+    let types = self.ck.types()
+    var current = self.local_ty(path.root)
+    for field in path.fields {
+        match types.kind(current) {
+            ty::TyKind.Item(item: owner, args: _) => {
+                if db.module_of(owner) != module and holds_text(self.ck.mentioned_fields(owner).view(), text: field.as_str()) {
+                    self.report(token, code: diagnostic::Code.PredicateOutsideWrite)
+                    return
+                }
+            }
+            else => {}
+        }
+        let Some(next) = self.ck.field_type(current, name: field.as_str()) else {
+            return
+        }
+        current = next
+    }
+} Flow.check_outside_write
+
+/// A move of a value: an owned place becomes moved; a part, a wrapped part and a place that
+/// does not own its value are never moved.
+fn Flow.take_value(mut self, value: FlowValue, ty: ty::Ty, token: u32) {
+    let alloc = self.alloc
+    if self.is_copy(ty) {
+        mut self.read(value, token)
+        return
+    }
+    match value.form {
+        Some(Form.Wrapped) => {
+            self.report(token, code: diagnostic::Code.OwnWrappedPartUse)
+            return
+        }
+        Some(Form.Part) => {
+            self.report(token, code: diagnostic::Code.OwnMoveNotOwned)
+            return
+        }
+        else => {}
+    }
+    let Some(path) = value.place else {
+        for hold in value.holds {
+            mut self.use_holder(hold.holder, token)
+        }
+        return
+    }
+    let root = path.root
+    if not self.owns(root) {
+        if self.task == Some(true) and self.local_kind(root) == LocalKind.Capture(ast::Mode.Read) {
+            self.report_fixed(nir::Span.at(token), code: diagnostic::Code.ClosureCaptureMode, fixes: self.listed(root, mode: ast::Mode.Take))
+        } else {
+            self.report(token, code: diagnostic::Code.OwnMoveNotOwned)
+        }
+        return
+    }
+    self.check_outside_write(path, token)
+    match self.deferred_place(path) {
+        Some(place) => self.report_deferred_move(place, token)
+        None => {}
+    }
+    mut self.access(path, access: AccessKind.Move, token)
+    discard mut self.moved_locals.insert(root)
+    mut self.change_state(fn(mut state: FlowState) => mut state.move_path(path, token, alloc))
+} Flow.take_value
+
+/// The first place a pending deferred call names that overlaps a path.
+fn Flow.deferred_place(self, path: Path) -> Option[Path] {
+    let Some(state) = self.state else {
+        return None
+    }
+    for entry in state.deferred {
+        for named in entry.value().deferred.places {
+            if named.overlaps(path) {
+                return Some(named.copy(self.alloc))
+            }
+        }
+    }
+    return None
+} Flow.deferred_place
+
+/// Reports a move at `token` of a place a pending deferred call names, with the fix
+/// cancelling the call before the statement.
+fn Flow.report_deferred_move(self, place: Path, token: u32) {
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc)
+    match self.statement {
+        Some(statement) => {
+            let indentation = self.ck.indentation(self.item, token: statement)
+            var inserted = text::String.of("undefer ", alloc: self.alloc)
+            mut inserted.append(self.written(place).as_str())
+            mut inserted.push('\n')
+            mut inserted.append(indentation.as_str())
+            mut fixes.push(self.ck.fix_inserting(self.item, before: statement, text: inserted.as_str()))
+        }
+        None => {}
+    }
+    self.report_fixed(nir::Span.at(token), code: diagnostic::Code.DeferDeferredPlaceMoved, take fixes)
+} Flow.report_deferred_move
+
+/// Whether a place's value is consumed on every path here: moved, or taken by a deferred call
+/// pending on every path and registered in a scope from `depth` inward, which runs at an exit
+/// of those scopes.
+fn Flow.consumed(self, path: Path, depth: usize) -> bool {
+    let Some(state) = self.state else {
+        return true
+    }
+    for entry in state.moved {
+        if entry.value().moved == MovedOn.Every and path.starts_with(entry.key()) {
+            return true
+        }
+    }
+    for entry in state.deferred {
+        let pending = entry.value()
+        if pending.every and pending.deferred.depth >= depth {
+            for taken in pending.deferred.taken {
+                if path.starts_with(taken) {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+} Flow.consumed
+
+/// Whether a value is not a place consumed on every path here.
+fn Flow.unconsumed(self, value: FlowValue) -> bool {
+    return match value.place {
+        Some(path) => not self.consumed(path, depth: self.scopes.len())
+        None => true
+    }
+} Flow.unconsumed
+
+/// The exit of the scopes from `depth` inward: each linear value they own and have not
+/// consumed is dropped there.
+fn Flow.exit_scopes(self, depth: usize, token: u32) {
+    if self.state.is_none() or self.failed {
+        return
+    }
+    let body = self.body.contents()
+    for index in depth..<self.scopes.len() {
+        for local in self.scopes[index].locals {
+            let data = body.local(local)
+            if not self.owns(local) or not self.is_linear(data.ty) {
+                continue
+            }
+            if self.consumed(Path.of(local, alloc: self.alloc), depth) {
+                continue
+            }
+            let at = self.bound.get(local).value_or(data.token)
+            var because = mem::List[diagnostic::Reason].empty(self.alloc)
+            mut because.push(self.reason(at, role: diagnostic::Role.Bound, subject: text::String.of(data.name.as_str(), alloc: self.alloc)))
+            self.report_because(token, code: diagnostic::Code.OwnLinearDropped, take because)
+        }
+    }
+} Flow.exit_scopes
+
+/// An exit of every scope and loop of the body, by `return`, `fail` or a propagated failure.
+fn Flow.exit_body(self, token: u32) {
+    for loop_flow in self.loops {
+        if loop_flow.linear_cursor.is_some() {
+            self.report(token, code: diagnostic::Code.OwnLinearDropped)
+            break
+        }
+    }
+    self.exit_scopes(0, token)
+} Flow.exit_body
+
+/// A block, `returning` when the value it yields is a projection's returned value.
+fn Flow.block(mut self, block: TBlock, returning: bool) -> FlowValue {
+    mut self.scopes.push(FlowScope.empty(self.alloc))
+    var value = FlowValue.empty(self.alloc)
+    let count = block.stmts.len()
+    for index in 0..<count {
+        if self.state.is_none() {
+            break
+        }
+        let stmt = block.stmts[index]
+        let last = index + 1 == count
+        self.returning = returning and last and is_expr_stmt(stmt)
+        value = mut self.stmt(stmt, last)
+    }
+    mut self.pop_scope(block.end)
+    return value
+} Flow.block
+
+/// Whether a statement is an expression statement.
+fn is_expr_stmt(stmt: TStmt) -> bool {
+    return match stmt.kind {
+        TStmtKind.Expr(_) => true
+        else => false
+    }
+} is_expr_stmt
+
+/// The end of the innermost scope at `token`: its linear values are checked, and the holds
+/// its locals keep end.
+fn Flow.pop_scope(mut self, token: u32) {
+    let alloc = self.alloc
+    let depth = self.scopes.len() - 1
+    self.exit_scopes(depth, token)
+    let Some(scope) = mut self.scopes.pop() else {
+        return
+    }
+    mut self.forget(fn(holder: LocalId) => holds_local(scope.locals.view(), local: holder))
+    mut self.change_state(fn(mut state: FlowState) => mut state.end_scope(scope.locals.view(), depth, token, alloc))
+} Flow.pop_scope
+
+/// Ends the holds of the holders `ended` gives, and the conflicts they would report.
+fn Flow.forget(mut self, ended: fn(holder: LocalId) -> bool) {
+    mut self.change_state(fn(mut state: FlowState) => mut state.forget_holders(ended))
+} Flow.forget
+
+/// One statement; the value of a block's last expression statement is the block's.
+fn Flow.stmt(mut self, stmt: TStmt, last: bool) -> FlowValue {
+    let alloc = self.alloc
+    self.statement = Some(stmt.token)
+    match stmt.kind {
+        TStmtKind.Let(pattern: pattern, value: value, otherwise: otherwise) => {
+            let found = mut self.expr(value)
+            match otherwise {
+                Some(other) => {
+                    let matched = copied_state(self.state, alloc)
+                    discard mut self.block(other, returning: false)
+                    self.state = matched
+                }
+                None => {}
+            }
+            mut self.bind(pattern, value: found, expr: value, token: stmt.token)
+        }
+        TStmtKind.Var(local: local, value: value) => {
+            let found = mut self.expr(value)
+            mut self.bind_var(local, value: found, expr: value, token: stmt.token)
+        }
+        TStmtKind.Discard(expr) => {
+            let value = mut self.expr(expr)
+            mut self.drop_value(value, ty: expr.ty, token: expr.token)
+        }
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => mut self.looped(stmt.token, linear_cursor: None, body: fn(mut flow: Flow) -> Option[FlowState] {
+            mut flow.contract(invariants.view())
+            let value = mut flow.expr(condition)
+            mut flow.read(value, token: condition.token)
+            let exhausted = copied_state(flow.state, alloc)
+            discard mut flow.block(body, returning: false)
+            return exhausted
+        })
+        TStmtKind.For(pattern: pattern, mode: mode, iterated: iterated, cursor: cursor, invariants: invariants, body: body) => mut self.for_loop(stmt.token, pattern, mode, iterated, cursor, invariants: invariants.view(), body)
+        TStmtKind.Loop(invariants: invariants, body: body) => mut self.looped(stmt.token, linear_cursor: None, body: fn(mut flow: Flow) -> Option[FlowState] {
+            mut flow.contract(invariants.view())
+            discard mut flow.block(body, returning: false)
+            return None
+        })
+        TStmtKind.Defer(call) => mut self.defer_call(stmt.token, call)
+        TStmtKind.Undefer(place) => mut self.undefer_call(stmt.token, place)
+        TStmtKind.Expect(condition) or TStmtKind.Assume(condition) => {
+            let value = mut self.expr(condition)
+            mut self.read(value, token: condition.token)
+        }
+        TStmtKind.Expr(expr) => {
+            let value = mut self.expr(expr)
+            if last {
+                return value
+            }
+            mut self.read(value, token: expr.token)
+        }
+        TStmtKind.Assign(target: target, op: op, value: value) => mut self.assign(stmt.token, target, compound: op.is_some(), value)
+    }
+    return FlowValue.empty(alloc)
+} Flow.stmt
+
+/// Contract terms, which only read.
+fn Flow.contract(mut self, terms: Slice[TExpr]) {
+    for term in terms {
+        let value = mut self.expr(term)
+        mut self.read(value, token: term.token)
+    }
+} Flow.contract
+
+/// A deferred call: its operands are judged where it runs; the places it takes are consumed
+/// at each exit of its block while it is pending.
+fn Flow.defer_call(mut self, token: u32, call: TExpr) {
+    let TKind.Call(deferred_call) = call.kind else {
+        return
+    }
+    let held = deferred_call.contents()
+    var places = mem::List[Path].empty(self.alloc)
+    for arg in held.args {
+        match self.place_of(arg.expr) {
+            Some(path) => mut places.push(take path)
+            None => {}
+        }
+    }
+    var taken = mem::List[Path].empty(self.alloc)
+    for arg in held.args {
+        if arg.mode == ast::Mode.Take {
+            match self.place_of(arg.expr) {
+                Some(path) => mut taken.push(take path)
+                None => {}
+            }
+        }
+    }
+    let deferred = FlowDeferred(depth: self.scopes.len() - 1, places: take places, taken: take taken)
+    let Some(found) = mut self.state.extract() else {
+        return
+    }
+    var state = found
+    discard mut state.deferred.insert(token, value: PendingDeferred(deferred: take deferred, every: true))
+    self.state = Some(take state)
+} Flow.defer_call
+
+/// `undefer p`: cancels the deferred calls naming exactly `p`, one of which is pending on
+/// every path here.
+fn Flow.undefer_call(mut self, token: u32, place: TExpr) {
+    var path: Option[Path] = None
+    let named = self.place_of(place)
+    if not place.through_index() {
+        path = named
+    }
+    let Some(found) = mut self.state.extract() else {
+        return
+    }
+    var state = found
+    var matched = false
+    for entry in state.deferred {
+        let pending = entry.value()
+        if pending.every and names_place(pending.deferred, path) {
+            matched = true
+        }
+    }
+    mut state.deferred.retain(fn(at: u32, pending: PendingDeferred) => not names_place(pending.deferred, path))
+    self.state = Some(take state)
+    if matched {
+        return
+    }
+    let source = self.ck.db().syntax(self.item)
+    var last = token
+    var at = usize.widen(token)
+    while at < source.tokens.len() and not source.tokens[at].kind.is_virtual() {
+        last = u32.fit(at)
+        at += 1
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc)
+    mut fixes.push(self.ck.fix_deleting_lines(self.item, head: token, last))
+    self.report_fixed(nir::Span(head: token, last: last), code: diagnostic::Code.DeferUndeferUnmatched, take fixes)
+} Flow.undefer_call
+
+/// Whether a deferred call names a place path among its places.
+fn names_place(deferred: FlowDeferred, path: Option[Path]) -> bool {
+    let Some(named) = path else {
+        return false
+    }
+    for place in deferred.places {
+        if place == named {
+            return true
+        }
+    }
+    return false
+} names_place
+
+/// A loop: its body runs until the state at its head no longer grows. `body` walks one
+/// iteration from the head and gives the state where the loop ends without a `break`.
+fn Flow.looped(mut self, token: u32, linear_cursor: Option[u32], body: fn(mut flow: Flow) -> Option[FlowState]) {
+    let alloc = self.alloc
+    let entry = copied_state(self.state, alloc)
+    var head = copied_state(entry, alloc)
+    let depth = self.loops.len()
+    loop {
+        self.state = copied_state(head, alloc)
+        if self.state.is_some() {
+            mut self.use_holder(LocalId(index: CURSOR_HOLDERS + u32.fit(depth)), token)
+        }
+        mut self.loops.push(LoopFlow(breaks: None, continues: None, scopes: self.scopes.len(), linear_cursor: linear_cursor))
+        let ended = body(mut self)
+        let Some(flow) = mut self.loops.pop() else {
+            return
+        }
+        var next = copied_state(entry, alloc)
+        join_into(mut next, from: mut self.state.extract(), alloc)
+        join_into(mut next, from: take flow.continues, alloc)
+        if next == head {
+            var out = ended
+            join_into(mut out, from: take flow.breaks, alloc)
+            self.state = out
+            return
+        }
+        head = next
+    }
+} Flow.looped
+
+fn Flow.for_loop(
+    mut self,
+    token: u32,
+    pattern: TPattern,
+    mode: ast::Mode,
+    iterated: TExpr,
+    cursor: ty::Ty,
+    invariants: Slice[TExpr],
+    body: TBlock,
+    ) {
+    let alloc = self.alloc
+    let found = mut self.expr(iterated)
+    let holder = LocalId(index: CURSOR_HOLDERS + u32.fit(self.loops.len()))
+    let projecting = self.ck.next_projects(cursor)
+    var element = FlowValue.empty(alloc)
+    if projecting {
+        element.form = Some(Form.Part)
+        element.roots = copied_locals(found.roots.view(), alloc)
+    }
+    element.writable = mode == ast::Mode.Mut
+    match first mode {
+        ast::Mode.Take => mut self.take_value(found, ty: iterated.ty, token: iterated.token)
+        ast::Mode.Mut => {
+            mut self.write(found, access: AccessKind.Mut, token: iterated.token)
+            mut self.hold(found, holder, held: true, token: iterated.token, result: mut element)
+        }
+        ast::Mode.Read if iterated.ty == cursor => mut self.take_value(found, ty: iterated.ty, token: iterated.token)
+        ast::Mode.Read => {
+            mut self.read(found, token: iterated.token)
+            mut self.hold(found, holder, held: false, token: iterated.token, result: mut element)
+        }
+    }
+    var linear_cursor: Option[u32] = None
+    if self.is_linear(cursor) {
+        linear_cursor = Some(token)
+    }
+    let owned = not projecting
+    mut self.looped(token, linear_cursor, body: fn(mut flow: Flow) -> Option[FlowState] {
+        let exhausted = copied_state(flow.state, alloc)
+        mut flow.scopes.push(FlowScope.empty(alloc))
+        mut flow.match_part(pattern, part: element, owned)
+        mut flow.contract(invariants)
+        discard mut flow.block(body, returning: false)
+        mut flow.pop_scope(body.end)
+        return exhausted
+    })
+    mut self.forget(fn(kept: LocalId) => kept == holder)
+} Flow.for_loop
+
+/// Places on a projection's receiver the hold its result carries, kept by `holder`.
+fn Flow.hold(
+    mut self,
+    receiver: FlowValue,
+    holder: LocalId,
+    held: bool,
+    token: u32,
+    mut result: FlowValue,
+    ) {
+    let alloc = self.alloc
+    for kept in receiver.holds {
+        mut result.holds.push(kept.held_by(holder, alloc))
+    }
+    let Some(source) = receiver.place else {
+        return
+    }
+    let hold = Hold(holder: holder, source: source.copy(alloc), held: held, token: token)
+    match mut self.state.extract() {
+        Some(found) => {
+            var state = found
+            discard mut state.holds.insert(hold.copy(alloc))
+            self.state = Some(take state)
+        }
+        None => {}
+    }
+    mut result.holds.push(take hold)
+} Flow.hold
+
+/// A branch's value, as its `if` or `match` yields it: what a projection returns, a part, or
+/// else moved into what the `if` or `match` yields. One derived from a temporary the branch
+/// creates, which ends with the branch, is an error at `token`.
+fn Flow.branch_value(mut self, take value: FlowValue, token: u32, ty: ty::Ty, returning: bool) -> FlowValue {
+    if value.temporary and not self.is_copy(ty) {
+        self.report(token, code: diagnostic::Code.OwnTemporarySource)
+        value.temporary = false
+    }
+    if returning {
+        self.check_exposed(value, token)
+        return value
+    }
+    if value.form == Some(Form.Part) and not self.is_copy(ty) {
+        return value
+    }
+    mut self.take_value(value, ty, token)
+    return FlowValue(place: None, holds: take value.holds, form: None, writable: false, temporary: false, fresh: true, roots: take value.roots, captures: take value.captures)
+} Flow.branch_value
+
+/// What an `if` or `match` yields from the values its live branches yield: a part when each
+/// is a part that is not Copy, outside a value a projection returns; otherwise each part is
+/// moved, which is an error.
+fn Flow.branches_value(mut self, take branches: mem::List[FlowBranch], ty: ty::Ty, returning: bool) -> FlowValue {
+    var parts = not returning and branches.len() > 0
+    for branch in branches {
+        if branch.value.form != Some(Form.Part) {
+            parts = false
+        }
+    }
+    var writable = parts
+    for branch in branches {
+        if not branch.value.writable {
+            writable = false
+        }
+    }
+    var joined = FlowValue.empty(self.alloc)
+    joined.writable = writable
+    if parts {
+        joined.form = Some(Form.Part)
+    }
+    for branch in take branches {
+        if not returning and not parts and branch.value.form == Some(Form.Part) and not self.is_copy(ty) {
+            self.report(branch.token, code: diagnostic::Code.OwnMoveNotOwned)
+        }
+        for hold in take branch.value.holds {
+            mut joined.holds.push(take hold)
+        }
+        for root in branch.value.roots {
+            mut joined.roots.push(root)
+        }
+        for capture in take branch.value.captures {
+            mut joined.captures.push(take capture)
+        }
+    }
+    return joined
+} Flow.branches_value
+
+/// A `let` or `var` binding of a value to a pattern.
+fn Flow.bind(
+    mut self,
+    pattern: TPattern,
+    value: FlowValue,
+    expr: TExpr,
+    token: u32,
+    ) {
+    if value.temporary and not self.is_copy(expr.ty) {
+        self.report(token, code: diagnostic::Code.OwnTemporarySource)
+    }
+    let owned = self.owned_value(value)
+    mut self.match_part(pattern, part: value, owned)
+} Flow.bind
+
+/// Whether a value a pattern matches is owned: it is no part or wrapped part, and a place it
+/// names owns its value.
+fn Flow.owned_value(self, value: FlowValue) -> bool {
+    if value.form.is_some() and value.form != Some(Form.View) {
+        return false
+    }
+    return match value.place {
+        Some(path) => self.owns(path.root)
+        None => true
+    }
+} Flow.owned_value
+
+/// A `var` binding: of a part, or of a value derived from a view binding, it is a view binding
+/// of the same part; any other value moves in.
+fn Flow.bind_var(
+    mut self,
+    local: LocalId,
+    value: FlowValue,
+    expr: TExpr,
+    token: u32,
+    ) {
+    if value.temporary and not self.is_copy(expr.ty) {
+        self.report(token, code: diagnostic::Code.OwnTemporarySource)
+    }
+    let viewing = value.form == Some(Form.Part) or value.form == Some(Form.Wrapped)
+    if viewing and not self.is_copy(expr.ty) {
+        mut self.read(value, token)
+        mut self.declare(local, token)
+        discard mut self.views.insert(local, value: FlowView(writable: value.writable, wrapped: value.form == Some(Form.Wrapped), roots: copied_locals(value.roots.view(), alloc: self.alloc)))
+        mut self.keep_holds(local, value)
+        return
+    }
+    mut self.take_value(value, ty: expr.ty, token)
+    mut self.declare(local, token)
+    mut self.keep_holds(local, value)
+} Flow.bind_var
+
+/// Matches a part of a scrutinee, `owned` when the scrutinee owns its value.
+fn Flow.match_part(mut self, pattern: TPattern, part: FlowValue, owned: bool) {
+    match pattern.kind {
+        TPatternKind.Failed or TPatternKind.Value(space: _, compared: _) => {}
+        TPatternKind.Wildcard => {
+            if owned and self.is_linear(pattern.ty) and self.unconsumed(part) {
+                self.report(pattern.token, code: diagnostic::Code.OwnLinearDropped)
+            }
+        }
+        TPatternKind.Binding(local) => mut self.bind_pattern(local, pattern, part, owned)
+        TPatternKind.Fields(variant: variant, fields: fields) => mut self.match_fields(pattern, variant, fields: fields.view(), part, owned)
+    }
+} Flow.match_part
+
+/// A name a pattern binds to a part of a scrutinee: a copy of a Copy part, the owner of a
+/// part of an owned scrutinee, and otherwise a view binding of the part.
+fn Flow.bind_pattern(
+    mut self,
+    local: LocalId,
+    pattern: TPattern,
+    part: FlowValue,
+    owned: bool,
+    ) {
+    if self.is_copy(pattern.ty) {
+        mut self.read(part, token: pattern.token)
+        mut self.declare(local, token: pattern.token)
+        return
+    }
+    if owned {
+        mut self.take_value(part, ty: pattern.ty, token: pattern.token)
+        mut self.declare(local, token: pattern.token)
+        mut self.keep_holds(local, value: part)
+        if part.roots.len() > 0 {
+            discard mut self.derived.insert(local, value: copied_locals(part.roots.view(), alloc: self.alloc))
+        }
+        return
+    }
+    mut self.read(part, token: pattern.token)
+    mut self.declare(local, token: pattern.token)
+    discard mut self.views.insert(local, value: FlowView(writable: part.writable, wrapped: part.form == Some(Form.Wrapped), roots: copied_locals(part.roots.view(), alloc: self.alloc)))
+    if part.place.is_some() and part.form.is_none() {
+        var held = FlowValue.empty(self.alloc)
+        mut self.hold(part, holder: local, held: false, token: pattern.token, result: mut held)
+        return
+    }
+    mut self.keep_holds(local, value: part)
+} Flow.bind_pattern
+
+/// The fields a struct, layout, variant or `Unit` pattern matches, each a part of the
+/// scrutinee's part; matching a linear owned value consumes it.
+fn Flow.match_fields(
+    mut self,
+    pattern: TPattern,
+    variant: Option[usize],
+    fields: Slice[TFieldPattern],
+    part: FlowValue,
+    owned: bool,
+    ) {
+    let alloc = self.alloc
+    for field in fields {
+        var key = text::String.empty(alloc)
+        match variant {
+            Some(index) => mut key.write(text::fmt("{index}.", index), budget: 1_000_000)
+            None => {}
+        }
+        mut key.append(field.name.as_str())
+        let field_part = part.field_part(key.as_str(), alloc)
+        mut self.match_part(field.pattern, part: field_part, owned)
+    }
+    if not owned or not self.is_linear(pattern.ty) {
+        return
+    }
+    let Some(path) = part.place else {
+        return
+    }
+    mut self.change_state(fn(mut state: FlowState) => mut state.move_path(path, token: pattern.token, alloc))
+} Flow.match_fields
+
+/// Keeps, while a local is live, the holds of the value it binds.
+fn Flow.keep_holds(mut self, local: LocalId, value: FlowValue) {
+    let alloc = self.alloc
+    let Some(found) = mut self.state.extract() else {
+        return
+    }
+    var state = found
+    for hold in value.holds {
+        discard mut state.holds.insert(hold.held_by(local, alloc))
+    }
+    self.state = Some(take state)
+} Flow.keep_holds
+
+/// A value received by `discard`: a linear one is dropped, and a place owning its value
+/// ends it as a move does.
+fn Flow.drop_value(mut self, value: FlowValue, ty: ty::Ty, token: u32) {
+    let unowned = value.form.is_some()
+    var dropped = false
+    if not unowned and self.is_linear(ty) {
+        dropped = true
+        match value.place {
+            Some(path) => {
+                dropped = self.owns(path.root) and not self.consumed(path, depth: self.scopes.len())
+            }
+            None => {}
+        }
+    }
+    var ends = false
+    if not unowned and not self.is_copy(ty) {
+        match value.place {
+            Some(path) => {
+                ends = self.owns(path.root)
+            }
+            None => {}
+        }
+    }
+    if ends {
+        mut self.take_value(value, ty, token)
+    } else {
+        mut self.read(value, token)
+    }
+    if dropped {
+        self.report(token, code: diagnostic::Code.OwnLinearDropped)
+    }
+} Flow.drop_value
+
+/// An assignment: its value is moved in, then the old value is released.
+fn Flow.assign(
+    mut self,
+    token: u32,
+    target: TExpr,
+    compound: bool,
+    value: TExpr,
+    ) {
+    let found = mut self.expr(value)
+    if compound {
+        mut self.read(found, token: value.token)
+    } else {
+        mut self.take_value(found, ty: value.ty, token: value.token)
+    }
+    let place = mut self.expr(target)
+    mut self.assign_place(token, target, compound, value, found, place)
+} Flow.assign
+
+/// The store of an assignment's value, `found`, into the place its target names.
+fn Flow.assign_place(
+    mut self,
+    token: u32,
+    target: TExpr,
+    compound: bool,
+    value: TExpr,
+    found: FlowValue,
+    place: FlowValue,
+    ) {
+    let Some(path) = place.place else {
+        return
+    }
+    let kind = self.local_kind(path.root)
+    let escaping = kind == LocalKind.Param(ast::Mode.Mut) or kind == LocalKind.Capture(ast::Mode.Mut)
+    if escaping and found.holds.len() > 0 and not self.is_copy(value.ty) {
+        self.report(token, code: diagnostic::Code.OwnViewEscape)
+    }
+    if compound {
+        mut self.read(place, token)
+    }
+    let overwritten = not compound and place.form.is_none() and not self.views.contains(path.root) and self.is_linear(target.ty) and not self.consumed(path, depth: self.scopes.len())
+    if overwritten {
+        self.report(token, code: diagnostic::Code.OwnLinearDropped)
+    }
+    mut self.write(place, access: AccessKind.Assign, token)
+    mut self.change_state(fn(mut state: FlowState) => mut state.moved.retain(fn(moved: Path, at: MovedAt) => not moved.starts_with(path)))
+} Flow.assign_place
+
+/// The value a function or closure body returns: moved out, or in a projection derived from
+/// its receiver.
+fn Flow.returned(mut self, value: FlowValue, expr: TExpr) {
+    let Some(projection) = self.projection else {
+        mut self.take_value(value, ty: expr.ty, token: expr.token)
+        return
+    }
+    mut self.read(value, token: expr.token)
+    self.check_exposed(value, token: expr.token)
+    let derived = holds_local(value.roots.view(), local: projection.receiver)
+    if not self.is_copy(expr.ty) and not derived and holds_other(value.roots.view(), local: projection.receiver) {
+        self.report(expr.token, code: diagnostic::Code.OwnProjSource)
+    }
+} Flow.returned
+
+/// Whether a list of locals holds one other than `local`.
+fn holds_other(locals: Slice[LocalId], local: LocalId) -> bool {
+    for held in locals {
+        if held != local {
+            return true
+        }
+    }
+    return false
+} holds_other
+
+/// In a projection received by `mut`, a returned path from the receiver through a field its
+/// predicates mention is an error at `token`.
+fn Flow.check_exposed(self, value: FlowValue, token: u32) {
+    let Some(projection) = self.projection else {
+        return
+    }
+    if not projection.mutable {
+        return
+    }
+    let Some(path) = value.place else {
+        return
+    }
+    if path.root == projection.receiver and self.exposes_mentioned(path) {
+        self.report(token, code: diagnostic::Code.PredicateExposedField)
+    }
+} Flow.check_exposed
+
+/// Whether a path from the receiver of a boundary function of a struct's defining module
+/// passes through a field its predicates mention.
+fn Flow.exposes_mentioned(self, path: Path) -> bool {
+    let db = self.ck.db()
+    let boundary = db.ast(self.item).visibility != ast::Visibility.Private or self.ck.implemented_lines(self.item).len() > 0
+    let module = db.module_of(self.item)
+    let types = self.ck.types()
+    var current = self.local_ty(path.root)
+    for field in path.fields {
+        match types.kind(current) {
+            ty::TyKind.Item(item: owner, args: _) => {
+                if db.module_of(owner) == module and holds_text(self.ck.mentioned_fields(owner).view(), text: field.as_str()) {
+                    return boundary
+                }
+            }
+            else => {}
+        }
+        let Some(next) = self.ck.field_type(current, name: field.as_str()) else {
+            return false
+        }
+        current = next
+    }
+    return false
+} Flow.exposes_mentioned
+
+/// The place path an expression names: a local and its fields, up to an index step.
+fn Flow.place_of(self, expr: TExpr) -> Option[Path] {
+    match expr.kind {
+        TKind.Local(local) => return Some(Path.of(local, alloc: self.alloc))
+        TKind.Field(base: base, name: name) => {
+            let Some(path) = self.place_of(base.contents()) else {
+                return None
+            }
+            return Some(take path.into_field(name.as_str(), alloc: self.alloc))
+        }
+        TKind.Index(call) => {
+            let held = call.contents()
+            if held.args.len() == 0 {
+                return None
+            }
+            return self.place_of(held.args[0].expr)
+        }
+        else => {}
+    }
+    return None
+} Flow.place_of
+
+fn Flow.expr(mut self, expr: TExpr) -> FlowValue {
+    let alloc = self.alloc
+    let returning = self.returning
+    self.returning = false
+    if self.state.is_none() {
+        return FlowValue.empty(alloc)
+    }
+    match expr.kind {
+        TKind.Local(local) => return self.local_value(local)
+        TKind.Field(base: base, name: name) => {
+            let value = mut self.expr(base.contents())
+            return take value.into_field(name.as_str(), alloc)
+        }
+        TKind.Index(call) or TKind.Call(call) => {
+            let value = mut self.call(call.contents(), token: expr.token)
+            if expr.ty.is_never() {
+                self.state = None
+            }
+            return value
+        }
+        TKind.Construct(variant: _, values: values, wrapped: wrapped) => return mut self.construct(expr, values: values.view(), wrapped)
+        TKind.Unary(op: _, operand: operand) or TKind.Old(operand) => mut self.read_operand(operand.contents())
+        TKind.Binary(op: _, left: left, right: right) => {
+            mut self.read_operand(left.contents())
+            mut self.read_operand(right.contents())
+        }
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => return mut self.if_value(expr, condition: condition.contents(), then, otherwise, returning)
+        TKind.Block(block) => return mut self.block(block, returning)
+        TKind.Match(scrutinee: scrutinee, arms: arms) => return mut self.match_expr(scrutinee.contents(), arms: arms.view(), ty: expr.ty, returning)
+        TKind.Closure(closure) => return mut self.closure(expr.token, closure: closure.contents())
+        TKind.When(attempted: _, accesses: accesses, body: body) => mut self.when_value(expr, accesses: accesses.view(), body: body.contents())
+        TKind.Trusted(inner) or TKind.Dbg(inner) => return mut self.expr(inner.contents())
+        TKind.Quantifier(all: _, local: _, range: range, body: body) => {
+            mut self.read_operand(range.contents())
+            mut self.read_operand(body.contents())
+        }
+        TKind.Return(value) => mut self.return_value(expr, value)
+        TKind.Fail(value) => {
+            let held = value.contents()
+            let found = mut self.expr(held)
+            mut self.take_value(found, ty: held.ty, token: held.token)
+            self.exit_body(expr.token)
+            self.state = None
+        }
+        TKind.Break(index) => mut self.jump(index, breaks: true, token: expr.token)
+        TKind.Continue(index) => mut self.jump(index, breaks: false, token: expr.token)
+        TKind.Failed => {
+            self.failed = true
+        }
+        else => {}
+    }
+    return FlowValue.empty(alloc)
+} Flow.expr
+
+/// An operand that is only read.
+fn Flow.read_operand(mut self, operand: TExpr) {
+    let value = mut self.expr(operand)
+    mut self.read(value, token: operand.token)
+} Flow.read_operand
+
+/// The value a local names: its place, the part a view binding names, and the holds it keeps.
+fn Flow.local_value(self, local: LocalId) -> FlowValue {
+    let alloc = self.alloc
+    var value = FlowValue.of_place(Path.of(local, alloc), alloc)
+    match self.views.get(local) {
+        Some(view) => {
+            if view.wrapped {
+                value.form = Some(Form.Wrapped)
+            } else {
+                value.form = Some(Form.Part)
+            }
+            value.writable = view.writable
+            for root in view.roots {
+                mut value.roots.push(root)
+            }
+        }
+        None => {}
+    }
+    match self.derived.get(local) {
+        Some(roots) => {
+            for root in roots {
+                mut value.roots.push(root)
+            }
+        }
+        None => {}
+    }
+    let Some(state) = self.state else {
+        return value
+    }
+    for hold in state.holds {
+        if hold.holder == local {
+            mut value.holds.push(hold.copy(alloc))
+        }
+    }
+    return value
+} Flow.local_value
+
+/// An `if`, `returning` when the value it yields is a projection's returned value.
+fn Flow.if_value(
+    mut self,
+    expr: TExpr,
+    condition: TExpr,
+    then: TBlock,
+    otherwise: Option[mem::Box[TExpr]],
+    returning: bool,
+    ) -> FlowValue {
+    let alloc = self.alloc
+    mut self.read_operand(condition)
+    let entry = copied_state(self.state, alloc)
+    var branches = mem::List[FlowBranch].empty(alloc)
+    let value = mut self.block(then, returning)
+    let token = then.tail_token(expr.token)
+    let yielded = mut self.branch_value(take value, token, ty: expr.ty, returning)
+    if self.state.is_some() {
+        mut branches.push(FlowBranch(value: take yielded, token: token))
+    }
+    let after_then = mut self.state.extract()
+    self.state = entry
+    match otherwise {
+        Some(other) => {
+            let held = other.contents()
+            self.returning = returning
+            let other_value = mut self.expr(held)
+            let other_token = held.value_token()
+            let other_yielded = mut self.branch_value(take other_value, token: other_token, ty: expr.ty, returning)
+            if self.state.is_some() {
+                mut branches.push(FlowBranch(value: take other_yielded, token: other_token))
+            }
+        }
+        None => {}
+    }
+    join_into(mut self.state, from: take after_then, alloc)
+    return mut self.branches_value(take branches, ty: expr.ty, returning)
+} Flow.if_value
+
+/// `await when`: a suspension point, its accesses and its body, whose value may not derive from
+/// what it accesses.
+fn Flow.when_value(mut self, expr: TExpr, accesses: Slice[TAccess], body: TExpr) {
+    mut self.suspend(expr.token)
+    for access in accesses {
+        mut self.read_operand(access.place)
+        mut self.declare(access.local, token: access.place.token)
+    }
+    let value = mut self.expr(body)
+    mut self.read(value, token: body.token)
+    var escapes = false
+    for root in value.roots {
+        for access in accesses {
+            if access.local == root {
+                escapes = true
+            }
+        }
+    }
+    if escapes and not self.is_copy(body.ty) {
+        self.report(expr.token, code: diagnostic::Code.TaskWhenEscape)
+    }
+} Flow.when_value
+
+/// `return`, with the value it returns.
+fn Flow.return_value(mut self, expr: TExpr, value: Option[mem::Box[TExpr]]) {
+    match value {
+        Some(returned) => {
+            let held = returned.contents()
+            self.returning = self.projection.is_some()
+            let found = mut self.expr(held)
+            mut self.returned(found, expr: held)
+        }
+        None => {}
+    }
+    self.exit_body(expr.token)
+    self.state = None
+} Flow.return_value
+
+/// `break` or `continue` of the loop the typed body numbers `index`.
+fn Flow.jump(mut self, index: usize, breaks: bool, token: u32) {
+    if index < self.loop_base {
+        return
+    }
+    let position = index - self.loop_base
+    if position >= self.loops.len() {
+        return
+    }
+    let scopes = self.loops[position].scopes
+    var first_left = position + 1
+    if breaks {
+        first_left = position
+    }
+    for left in first_left..<self.loops.len() {
+        if self.loops[left].linear_cursor.is_some() {
+            self.report(token, code: diagnostic::Code.OwnLinearDropped)
+            break
+        }
+    }
+    self.exit_scopes(scopes, token)
+    let alloc = self.alloc
+    let state = mut self.state.extract()
+    var target = mut self.loops.at_mut(position)
+    if breaks {
+        join_into(mut target.breaks, from: take state, alloc)
+    } else {
+        join_into(mut target.continues, from: take state, alloc)
+    }
+} Flow.jump
+
+/// A `match`, `returning` when the value it yields is a projection's returned value.
+fn Flow.match_expr(
+    mut self,
+    scrutinee: TExpr,
+    arms: Slice[TArm],
+    ty: ty::Ty,
+    returning: bool,
+    ) -> FlowValue {
+    let alloc = self.alloc
+    let found = mut self.expr(scrutinee)
+    let owned = self.owned_value(found)
+    let entry = copied_state(self.state, alloc)
+    var out: Option[FlowState] = None
+    var branches = mem::List[FlowBranch].empty(alloc)
+    for arm in arms {
+        self.state = copied_state(entry, alloc)
+        mut self.scopes.push(FlowScope.empty(alloc))
+        if arm.patterns.len() == 0 and owned and self.is_linear(scrutinee.ty) and self.unconsumed(found) {
+            self.report(arm.token, code: diagnostic::Code.OwnLinearDropped)
+        }
+        for pattern in arm.patterns {
+            mut self.match_part(pattern, part: found, owned)
+        }
+        match arm.guard {
+            Some(guard) => mut self.read_operand(guard)
+            None => {}
+        }
+        self.returning = returning
+        let yielded = mut self.expr(arm.body)
+        let token = arm.body.value_token()
+        let value = mut self.branch_value(take yielded, token, ty, returning)
+        if self.state.is_some() {
+            mut branches.push(FlowBranch(value: take value, token: token))
+        }
+        mut self.pop_scope(arm.body.token)
+        join_into(mut out, from: mut self.state.extract(), alloc)
+    }
+    if arms.len() == 0 {
+        out = entry
+    }
+    self.state = out
+    return mut self.branches_value(take branches, ty, returning)
+} Flow.match_expr
+
+/// A construction: its values move in, except the part a wrapped part wraps.
+fn Flow.construct(mut self, expr: TExpr, values: Slice[TLabelled], wrapped: bool) -> FlowValue {
+    let alloc = self.alloc
+    var result = FlowValue.empty(alloc)
+    result.fresh = true
+    for labelled in values {
+        let value = labelled.value
+        let found = mut self.expr(value)
+        for root in found.roots {
+            mut result.roots.push(root)
+        }
+        if wrapped {
+            mut self.read(found, token: value.token)
+            result.form = Some(Form.Wrapped)
+            result.writable = found.writable
+            for hold in take found.holds {
+                mut result.holds.push(take hold)
+            }
+            continue
+        }
+        if self.ck.has(expr.ty, property: Property.View) {
+            for hold in found.holds {
+                mut result.holds.push(hold.copy(alloc))
+            }
+        }
+        mut self.take_value(found, ty: value.ty, token: value.token)
+    }
+    return result
+} Flow.construct
+
+/// A call: its receiver and arguments evaluate in order, then their accesses become active
+/// together, then the call's result derives from its receiver when it is a projection.
+fn Flow.call(mut self, call: Call, token: u32) -> FlowValue {
+    let alloc = self.alloc
+    var values = mem::List[FlowValue].empty(alloc)
+    for arg in call.args {
+        mut values.push(mut self.expr(arg.expr))
+    }
+    var accesses = mem::List[CaptureAccess].empty(alloc)
+    for index in 0..<call.args.len() {
+        self.collect_accesses(call.args[index], value: values[index], mut accesses)
+    }
+    self.check_accesses(accesses.view(), token)
+    for index in 0..<call.args.len() {
+        let arg = call.args[index]
+        match arg.mode {
+            ast::Mode.Read => mut self.read(values[index], token: arg.expr.token)
+            ast::Mode.Mut => mut self.write(values[index], access: AccessKind.Mut, token: arg.expr.token)
+            ast::Mode.Take => mut self.take_value(values[index], ty: arg.expr.ty, token: arg.expr.token)
+        }
+    }
+    if call.head.wait {
+        mut self.suspend(token)
+    }
+    if propagates(call) {
+        self.exit_body(token)
+    }
+    if not call.projection {
+        var fresh = FlowValue.empty(alloc)
+        fresh.fresh = true
+        return fresh
+    }
+    if values.len() == 0 {
+        return FlowValue.empty(alloc)
+    }
+    return self.projected(call, receiver: values[0], token)
+} Flow.call
+
+/// Whether a call passes a failure out of the body: it is marked `try` and its callee may fail.
+fn propagates(call: Call) -> bool {
+    let Some(marker) = call.failure else {
+        return false
+    }
+    if marker.kind != ast::FailureMarker.Try {
+        return false
+    }
+    let Some(failure) = call.head.failure else {
+        return false
+    }
+    return not failure.is_never()
+} propagates
+
+/// The result of a projection call: a part, wrapped part or view value of its receiver, held
+/// while live.
+fn Flow.projected(self, call: Call, receiver: FlowValue, token: u32) -> FlowValue {
+    let alloc = self.alloc
+    let held = call.args.len() > 0 and call.args[0].mode == ast::Mode.Mut
+    var result = FlowValue.empty(alloc)
+    result.form = Some(self.ck.projection_form(call))
+    result.writable = held and (receiver.form.is_none() or receiver.writable)
+    result.temporary = receiver.temporary or receiver.fresh
+    result.roots = copied_locals(receiver.roots.view(), alloc)
+    if result.form != Some(Form.View) {
+        match receiver.place {
+            Some(path) => {
+                result.place = Some(path.copy(alloc))
+            }
+            None => {}
+        }
+    }
+    for hold in receiver.holds {
+        mut result.holds.push(hold.copy(alloc))
+    }
+    let Some(source) = receiver.place else {
+        return result
+    }
+    if receiver.form.is_none() {
+        mut result.holds.push(Hold(holder: UNBOUND_HOLDER, source: source.copy(alloc), held: held, token: token))
+    }
+    return result
+} Flow.projected
+
+/// The accesses an argument makes when its call starts: to its place, to the sources of the
+/// holds it derives from, and those of the captures of a closure.
+fn Flow.collect_accesses(self, arg: TArg, value: FlowValue, mut accesses: mem::List[CaptureAccess]) {
+    let alloc = self.alloc
+    let copyable = self.is_copy(arg.expr.ty)
+    let access = match arg.mode {
+        ast::Mode.Read => AccessKind.Read
+        ast::Mode.Mut => AccessKind.Mut
+        ast::Mode.Take => match copyable {
+            true => AccessKind.Read
+            false => AccessKind.Move
+        }
+    }
+    let copied = copyable and access == AccessKind.Read
+    let through_part = value.form == Some(Form.Part) or value.form == Some(Form.Wrapped)
+    match value.place {
+        Some(path) => {
+            if not copied and not through_part {
+                mut accesses.push(CaptureAccess(path: path.copy(alloc), access: access, token: arg.expr.token))
+            }
+        }
+        None => {}
+    }
+    if not (copied and through_part) {
+        for hold in value.holds {
+            var hold_access = AccessKind.Read
+            if hold.held {
+                hold_access = AccessKind.Mut
+            }
+            mut accesses.push(CaptureAccess(path: hold.source.copy(alloc), access: hold_access, token: arg.expr.token))
+        }
+    }
+    for capture in value.captures {
+        mut accesses.push(capture.copy(alloc))
+    }
+} Flow.collect_accesses
+
+/// Reports each access of a call conflicting with an earlier one: overlapping paths, one of
+/// them not a read.
+fn Flow.check_accesses(self, accesses: Slice[CaptureAccess], token: u32) {
+    for later in 0..<accesses.len() {
+        let current = accesses[later]
+        for earlier in 0..<later {
+            let other = accesses[earlier]
+            if other.path.overlaps(current.path) and (current.access != AccessKind.Read or other.access != AccessKind.Read) {
+                var role = diagnostic::Role.Held
+                if other.access == AccessKind.Read {
+                    role = diagnostic::Role.Frozen
+                }
+                var because = mem::List[diagnostic::Reason].empty(self.alloc)
+                mut because.push(self.reason(other.token, role, subject: self.written(other.path)))
+                mut because.push(self.reason(token, role: diagnostic::Role.Used, subject: self.written(other.path)))
+                var subject = text::String.of(current.access.word(), alloc: self.alloc)
+                mut subject.append(self.written(current.path).as_str())
+                mut because.push(self.reason(current.token, role: diagnostic::Role.Accessed, take subject))
+                self.report_because(current.token, code: diagnostic::Code.OwnConflict, take because)
+                break
+            }
+        }
+    }
+} Flow.check_accesses
+
+/// Whether a capture of a task closure lends its place: it is listed `mut`, or unlisted and
+/// not Copy.
+fn Flow.lends(self, capture: TCapture) -> bool {
+    let Some(word) = capture.listed else {
+        return not self.is_copy(self.local_ty(capture.outer))
+    }
+    return word.kind == ast::Mode.Mut
+} Flow.lends
+
+/// The fix capturing by `take` each place a task closure opened at `token` lends, when modes
+/// allow moving each one's root.
+fn Flow.lent_by_take(self, token: u32, closure: TClosure) -> Option[diagnostic::Fix] {
+    let body = self.body.contents()
+    var lending = mem::List[LocalId].empty(self.alloc)
+    for capture in closure.captures {
+        if self.lends(capture) {
+            mut lending.push(capture.outer)
+        }
+    }
+    if lending.len() == 0 {
+        return None
+    }
+    for outer in lending {
+        if not body.local(outer).movable() {
+            return None
+        }
+    }
+    var list = text::String.of("[", alloc: self.alloc)
+    var entries: usize = 0
+    for capture in closure.captures {
+        if capture.listed.is_none() and not self.lends(capture) {
+            continue
+        }
+        var mode = ast::Mode.Take
+        match capture.listed {
+            Some(word) => {
+                if not self.lends(capture) {
+                    mode = word.kind
+                }
+            }
+            None => {}
+        }
+        if entries > 0 {
+            mut list.append(", ")
+        }
+        mut list.append(mode.word())
+        mut list.push(' ')
+        mut list.append(body.local(capture.outer).name.as_str())
+        entries += 1
+    }
+    mut list.push(']')
+    let source = self.ck.db().syntax(self.item)
+    let open = source.next(usize.widen(token) + 1)
+    if source.tokens[open].kind != syntax::TokenKind.Punct(syntax::Punct.LBracket) {
+        return Some(self.ck.fix_appending(self.item, after: token, text: list.as_str()))
+    }
+    var close = open
+    while close < source.tokens.len() and source.tokens[close].kind != syntax::TokenKind.Punct(syntax::Punct.RBracket) {
+        close += 1
+    }
+    if close >= source.tokens.len() {
+        return None
+    }
+    return Some(self.ck.fix_replacing(self.item, head: u32.fit(open), last: u32.fit(close), text: list.as_str()))
+} Flow.lent_by_take
+
+/// The captures of a task closure, this its body's walk: each of a Send type, a view only
+/// lent, and lending legal only in a lexical spawn, of a parameter or capture of its scope's
+/// body closure.
+fn Flow.check_task_captures(self, token: u32, closure: TClosure) {
+    let lent_by_take = self.lent_by_take(token, closure)
+    let body = self.body.contents()
+    let types = self.ck.types()
+    for capture in closure.captures {
+        let outer = body.local(capture.outer)
+        var at = token
+        var mode: Option[ast::Mode] = None
+        match capture.listed {
+            Some(word) => {
+                at = word.token
+                mode = Some(word.kind)
+            }
+            None => {
+                at = self.first_use.get(capture.local).value_or(token)
+            }
+        }
+        let lending = mode == Some(ast::Mode.Mut) or (mode.is_none() and not self.is_copy(outer.ty))
+        let sendable = self.ck.has(outer.ty, property: Property.Send) and (lending or not self.ck.has(outer.ty, property: Property.View))
+        if not types.has_error(outer.ty) and not sendable {
+            self.report(at, code: diagnostic::Code.TaskCaptureNotSend)
+            continue
+        }
+        if not lending {
+            continue
+        }
+        let Some(scope) = closure.lent else {
+            self.report_fixed(nir::Span.at(at), code: diagnostic::Code.TaskLendOutsideScope, fixes: optional_fixes(lent_by_take, alloc: self.alloc))
+            continue
+        }
+        if not self.of_scope(capture.outer, scope) {
+            self.report(at, code: diagnostic::Code.TaskLendLocal)
+        }
+    }
+} Flow.check_task_captures
+
+/// A copy of a fix, when there is one.
+fn optional_fixes(fix: Option[diagnostic::Fix], alloc: mem::Alloc) -> mem::List[diagnostic::Fix] {
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    let Some(held) = fix else {
+        return fixes
+    }
+    mut fixes.push(copied_fix(held, alloc))
+    return fixes
+} optional_fixes
+
+/// Whether the local a capture names is, through the captures between, a parameter or capture
+/// of the body closure numbered `scope`.
+fn Flow.of_scope(self, outer: LocalId, scope: u32) -> bool {
+    let body = self.body.contents()
+    var root = outer
+    loop {
+        let data = body.local(root)
+        if data.closure == scope {
+            break
+        }
+        let Some(captured) = data.captured else {
+            break
+        }
+        root = captured
+    }
+    let found = body.local(root)
+    if found.closure != scope {
+        return false
+    }
+    return match found.kind {
+        LocalKind.Param(_) or LocalKind.Capture(_) => true
+        else => false
+    }
+} Flow.of_scope
+
+/// A closure: its body is walked once on its own; at its creation `take` captures move in,
+/// and its other captures are accesses while it is live.
+fn Flow.closure(mut self, token: u32, closure: TClosure) -> FlowValue {
+    let alloc = self.alloc
+    if self.walked.contents().get(closure.index).is_none() {
+        mut self.walk_closure(token, closure)
+    }
+    var value = FlowValue.empty(alloc)
+    for capture in closure.captures {
+        let outer = Path.of(capture.outer, alloc)
+        let ty = self.local_ty(capture.outer)
+        let found = FlowValue.of_place(outer.copy(alloc), alloc)
+        var at = token
+        var mode: Option[ast::Mode] = None
+        match capture.listed {
+            Some(word) => {
+                at = word.token
+                mode = Some(word.kind)
+            }
+            None => {}
+        }
+        match mode {
+            Some(ast::Mode.Take) => mut self.take_value(found, ty, token: at)
+            Some(ast::Mode.Mut) => {
+                mut self.write(found, access: AccessKind.Mut, token: at)
+                mut value.captures.push(CaptureAccess(path: take outer, access: AccessKind.Mut, token: at))
+            }
+            else => {
+                if self.is_copy(ty) {
+                    mut self.read(found, token: at)
+                } else {
+                    mut self.read_captured(closure.index, capture, at, mut value)
+                }
+            }
+        }
+    }
+    return value
+} Flow.closure
+
+/// The read accesses of a read capture that is not Copy: to each place path the closure's body
+/// reads through it, while the closure is live.
+fn Flow.read_captured(mut self, index: u32, capture: TCapture, at: u32, mut value: FlowValue) {
+    let alloc = self.alloc
+    let walked = self.walked.share()
+    let Some(paths) = walked.contents().get(index) else {
+        return
+    }
+    var reads = mem::Set[Path].empty(alloc)
+    for path in paths {
+        if path.root == capture.local {
+            var fields = mem::List[text::String].empty(alloc)
+            for field in path.fields {
+                mut fields.push(text::String.of(field.as_str(), alloc))
+            }
+            discard mut reads.insert(Path(root: capture.outer, fields: take fields))
+        }
+    }
+    for path in take reads {
+        mut self.read(FlowValue.of_place(path.copy(alloc), alloc), token: at)
+        mut value.captures.push(CaptureAccess(path: take path, access: AccessKind.Read, token: at))
+    }
+} Flow.read_captured
+
+/// The walk of a closure's body on its own, which reports into this walk's diagnostics.
+fn Flow.walk_closure(mut self, token: u32, closure: TClosure) {
+    var inner = Flow.new(self.ck, item: self.item, body: self.body)
+    inner.task = Some(closure.task)
+    inner.opener = Some(token)
+    inner.loop_base = self.loop_base + self.loops.len()
+    inner.reported = self.reported.share()
+    inner.walked = self.walked.share()
+    inner.views = copied_views(self.views, alloc: self.alloc)
+    let body = self.body.share()
+    let held = body.contents()
+    for param in closure.params {
+        mut inner.declare(param, token: held.local(param).token)
+    }
+    for capture in closure.captures {
+        mut inner.declare(capture.local, token)
+    }
+    var end = closure.body.token
+    match closure.body.kind {
+        TKind.Block(block) => {
+            discard mut inner.block(block, returning: false)
+            end = block.end
+        }
+        else => {
+            let value = mut inner.expr(closure.body)
+            mut inner.returned(value, expr: closure.body)
+        }
+    }
+    inner.exit_scopes(0, token: end)
+    if closure.task {
+        inner.check_task_captures(token, closure)
+    }
+    if not inner.failed {
+        for capture in closure.captures {
+            inner.check_mut_capture(capture)
+        }
+    }
+    self.failed = self.failed or inner.failed
+    discard self.walked.contents().insert(closure.index, value: take inner.capture_reads)
+} Flow.walk_closure
+
+/// Reports a capture listed `mut` that the closure's body never assigns or accesses by `mut`,
+/// with the fix deleting it.
+fn Flow.check_mut_capture(self, capture: TCapture) {
+    let Some(word) = capture.listed else {
+        return
+    }
+    if word.kind != ast::Mode.Mut or self.mutated.contains(capture.local) {
+        return
+    }
+    let source = self.ck.db().syntax(self.item)
+    let name = u32.fit(source.next(usize.widen(word.token) + 1))
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc)
+    mut fixes.push(self.ck.fix_capture_deleted(self.item, head: word.token, last: name))
+    self.report_fixed(nir::Span(head: word.token, last: name), code: diagnostic::Code.ClosureCaptureMode, take fixes)
+} Flow.check_mut_capture
+
+/// The token of the expression yielding an expression's value: a block's last statement's.
+fn TExpr.value_token(self) -> u32 {
+    return match self.kind {
+        TKind.Block(block) => block.tail_token(self.token)
+        else => self.token
+    }
+} TExpr.value_token
+
+/// The token of the statement yielding a block's value, or `token` for an empty block.
+fn TBlock.tail_token(self, token: u32) -> u32 {
+    let count = self.stmts.len()
+    if count == 0 {
+        return token
+    }
+    let tail = self.stmts[count - 1]
+    return match tail.kind {
+        TStmtKind.Expr(value) => value.value_token()
+        else => tail.token
+    }
+} TBlock.tail_token

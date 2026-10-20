@@ -1,0 +1,2078 @@
+//! The codecs the interpreter supplies, `mem::wire::Codec` and `text::json::Codec`. A value encodes into the tree of kinds `core::Encoder` writes, which each format then writes out; decoding reads a format through the calls of `core::Decoder`, in the order the std encodings and derived decoders make them.
+
+/// The nesting of sequences, maps, records and variants past which decoding fails.
+const DECODE_DEPTH_LIMIT: usize = 128
+
+/// A key and value of an encoded map.
+struct TreeEntry {
+    key: Tree
+    value: Tree
+} TreeEntry
+
+/// A field of an encoded record: its key and value.
+struct TreeField {
+    key: mem::Bytes
+    value: Tree
+} TreeField
+
+/// An encoded value, as the kinds of `core::Encoder` write it.
+enum Tree {
+    Bool(bool)
+    Unsigned(u64)
+    Signed(i64)
+    Float(f64)
+    Char(char)
+    Text(mem::Bytes)
+    Bytes(mem::Bytes)
+    Sequence(mem::List[Tree])
+    Map(mem::List[TreeEntry])
+    /// Fields by key, in ascending byte order of keys.
+    Record(mem::List[TreeField])
+    Variant(key: mem::Bytes, payload: Option[mem::Box[Tree]])
+} Tree
+
+const BASE64_ALPHABET: Slice[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+/// Why decoding stopped: a decode error, by its variant of `core::DecodeError`, or an end of
+/// the run.
+enum Failure {
+    Decode(DecodeKind)
+    Run(End) from
+} Failure
+
+/// A variant of `core::DecodeError`, by which decoding fails.
+enum DecodeKind derives Copy, Eq {
+    DuplicateKey
+    Invalid
+    InvalidText
+    Malformed
+    MissingField
+    OutOfMemory
+    OutOfRange
+    TooDeep
+    Trailing
+    Truncated
+    UnknownKey
+    UnknownVariant
+} DecodeKind
+
+/// The decoding of one value: the cell containers draw through, and the nesting. The
+/// interpreter and the reader go beside it.
+struct Decoding derives Copy {
+    cell: u32
+    depth: usize
+    at: ItemSpan
+    site: RunSite
+} Decoding
+
+/// A position in the input with the bytes before it read, and the allocator the bytes it reads
+/// out draw on.
+struct CodecInput {
+    bytes: mem::Bytes
+    at: usize
+    alloc: mem::Alloc
+} CodecInput
+
+/// What the wire reader is inside: a sequence or map with its elements left, a record with
+/// its fields left, the end of the field value being read and the last key, or a variant
+/// payload's end.
+enum WireFrame {
+    Counted(u64)
+    Record(left: u64, value_end: Option[usize], last: Option[mem::Bytes])
+    Variant(payload_end: Option[usize])
+} WireFrame
+
+struct WireReader {
+    input: CodecInput
+    frames: mem::List[WireFrame]
+} WireReader
+
+/// What the JSON reader is inside: an array, an object, a map entry array, or a variant
+/// object; each with whether an element was read.
+enum JsonFrame derives Copy {
+    Array(started: bool)
+    Object(started: bool)
+    Map(started: bool)
+    Variant(payload: bool)
+} JsonFrame
+
+struct JsonReader {
+    input: CodecInput
+    frames: mem::List[JsonFrame]
+} JsonReader
+
+/// A format read through the calls of `core::Decoder`.
+interface Reader {
+    fn read_bool(mut self) -> bool fails Failure
+    fn read_unsigned(mut self) -> u64 fails Failure
+    fn read_signed(mut self) -> i64 fails Failure
+    fn read_float(mut self) -> f64 fails Failure
+    /// A char's scalar value, as written.
+    fn read_char(mut self) -> u32 fails Failure
+    fn read_text(mut self) -> mem::Bytes fails Failure
+    fn read_bytes(mut self) -> mem::Bytes fails Failure
+    fn begin_sequence(mut self) fails Failure
+    fn begin_map(mut self) fails Failure
+    fn begin_record(mut self) fails Failure
+    fn next_follows(mut self) -> bool fails Failure
+    /// Between a map entry's key and its value.
+    fn map_value(mut self) fails Failure
+    fn read_key(mut self) -> mem::Bytes fails Failure
+    fn read_variant(mut self) -> mem::Bytes fails Failure
+    fn payload_follows(mut self) -> bool fails Failure
+    /// Passes over the value of the field whose key was just read.
+    fn skip(mut self) fails Failure
+    fn end(mut self) fails Failure
+    /// Fails on what is left after the value.
+    fn finish(mut self) fails Failure
+} Reader
+
+impl WireReader: Reader
+
+impl JsonReader: Reader
+
+/// A variant key a decoding accepts, with its payload's type when it has one.
+struct VariantKey {
+    name: text::String
+    payload: Option[ty::Ty]
+} VariantKey
+
+/// The variant a decoding read, by its index among the keys, with its payload.
+struct DecodedVariant {
+    index: usize
+    payload: Option[Val]
+} DecodedVariant
+
+/// A codec operation; none for another member.
+fn Interpreter.codec_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    var json = false
+    match owner {
+        "mem::wire::Codec" => {}
+        "text::json::Codec" => {
+            json = true
+        }
+        else => return None
+    }
+    let ty = type_arg_or_unit(type_args, index: 0)
+    if member == "encode" or member == "try_encode" {
+        let tree = self.encoded(args[0], ty)
+        var out = mem::Bytes.empty(alloc)
+        if json {
+            tree.write_json(mut out, alloc)
+        } else {
+            tree.write_wire(mut out, alloc)
+        }
+        let bytes = byte_values(out.view(), alloc)
+        if mut self.append(place: args[1].place(), values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) {
+            return Some(InterpFlow.Return(Val.Unit))
+        }
+        return Some(try self.exhausted(fallible: member == "try_encode", at))
+    }
+    if member != "decode" {
+        return None
+    }
+    let raw = self.deref(args[0]).fields()[0].copy(alloc)
+    let input = mut self.bytes(raw)
+    let cell = self.cell_of(args[1])
+    let decoded = attempt mut self.decode_value(json, take input, cell, ty, at, site)
+    match decoded {
+        Ok(value) => return Some(InterpFlow.Return(take value))
+        Err(Failure.Decode(kind)) => {
+            let error = self.ty_item("core", name: "DecodeError")
+            let index = self.variant_index(error, name: kind.name())
+            return Some(InterpFlow.Fail(Val.Variant(item: error, index: index, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))))
+        }
+        Err(Failure.Run(end)) => fail end
+    }
+} Interpreter.codec_member
+
+/// The value of a type a codec's input holds, the decoding failing on what follows it.
+fn Interpreter.decode_value(
+    mut self,
+    json: bool,
+    take input: mem::Bytes,
+    cell: u32,
+    ty: ty::Ty,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails Failure {
+    var decoding = Decoding(cell: cell, depth: 0, at: at, site: site)
+    if json {
+        var json_reader = JsonReader.new(take input, alloc: self.alloc)
+        return try mut decoding.whole(mut self, reader: mut json_reader, ty)
+    }
+    var wire_reader = WireReader.new(take input, alloc: self.alloc)
+    return try mut decoding.whole(mut self, reader: mut wire_reader, ty)
+} Interpreter.decode_value
+
+/// The encoded tree of a value of a type.
+fn Interpreter.encoded(self, value: Val, ty: ty::Ty) -> Tree {
+    let held = self.deref(value)
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return encoded_scalar(held, scalar)
+        ty::TyKind.Unit => return Tree.Record(mem::List[TreeField].empty(self.alloc))
+        ty::TyKind.Item(item: item, args: args) => return self.encoded_item(held, item, args)
+        else => {}
+    }
+    expect false
+    return Tree.Bool(false)
+} Interpreter.encoded
+
+/// The encoded tree of a value of a scalar type.
+fn encoded_scalar(value: Val, scalar: ty::Scalar) -> Tree {
+    if scalar == ty::Scalar.Bool {
+        return Tree.Bool(value.bool_value())
+    }
+    match value {
+        Val.Char(c) => {
+            if scalar == ty::Scalar.Char {
+                return Tree.Char(c)
+            }
+        }
+        Val.Float32(float) => return Tree.Float(f64.widen(float))
+        Val.Float64(float) => return Tree.Float(float)
+        else => {}
+    }
+    if scalar.is_signed() {
+        return Tree.Signed(i64.from_bits(value.int_value().low_bits()))
+    }
+    return Tree.Unsigned(value.int_value().low_bits())
+} encoded_scalar
+
+/// The encoded tree of a value of an item type: a std type by the kinds its encoding writes,
+/// another by its derived encoding.
+fn Interpreter.encoded_item(self, value: Val, item: ty::ItemId, args: ty::Args) -> Tree {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let listed = ck.types().arg_list(args)
+    let element = type_arg_or_unit(listed, index: 0)
+    let path = ck.db().canonical(item)
+    match path.as_str() {
+        "core::Array" => return Tree.Sequence(self.encoded_all(value.fields(), ty: element))
+        "text::String" => {
+            let storage = self.storage(value)
+            return Tree.Text(value_bytes(self.memory.get(storage).fields(), alloc))
+        }
+        "text::Fixed" => {
+            let len = usize.widen(value.fields()[1].int_value().low_bits())
+            let Some(held) = value.fields()[0].fields().prefix(len) else {
+                expect false
+                return Tree.Text(mem::Bytes.empty(alloc))
+            }
+            return Tree.Text(value_bytes(held, alloc))
+        }
+        "mem::Bytes" => {
+            let storage = self.storage(value)
+            return Tree.Bytes(value_bytes(self.memory.get(storage).fields(), alloc))
+        }
+        "mem::List" or "mem::Set" => {
+            let storage = self.storage(value)
+            return Tree.Sequence(self.encoded_all(self.memory.get(storage).fields(), ty: element))
+        }
+        "mem::Bounded" => return Tree.Sequence(self.encoded_all(value.fields()[0].fields(), ty: element))
+        "mem::Map" => {
+            let value_ty = type_arg_or_unit(listed, index: 1)
+            let storage = self.storage(value)
+            var pairs = mem::List[TreeEntry].empty(alloc)
+            for entry in self.memory.get(storage).fields() {
+                let parts = entry.fields()
+                mut pairs.push(TreeEntry(key: self.encoded(parts[0], ty: element), value: self.encoded(parts[1], ty: value_ty)))
+            }
+            return Tree.Map(take pairs)
+        }
+        "mem::Box" or "mem::Shared" => return self.encoded(value.fields()[0], ty: element)
+        "mem::Id" => return Tree.Unsigned(value.fields()[0].int_value().low_bits())
+        else => return self.encoded_declared(value, item, args: listed)
+    }
+} Interpreter.encoded_item
+
+/// The encoded trees of values of one type, in order.
+fn Interpreter.encoded_all(self, values: Slice[Val], ty: ty::Ty) -> mem::List[Tree] {
+    var trees = mem::List[Tree].empty(self.alloc)
+    mut trees.reserve(values.len())
+    for value in values {
+        mut trees.push(self.encoded(value, ty))
+    }
+    return trees
+} Interpreter.encoded_all
+
+/// The encoded tree of a struct value, the record of its fields, or of an enum value, its
+/// variant's key with its payload, as the derive writes them.
+fn Interpreter.encoded_declared(self, value: Val, item: ty::ItemId, args: Slice[ty::Arg]) -> Tree {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let types = ck.types()
+    let sig = ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args, alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: declared) => {
+            let parts = value.fields()
+            var fields = mem::List[TreeField].empty(alloc)
+            var index: usize = 0
+            while index < declared.len() and index < parts.len() {
+                let field_ty = subst.ty(types, ty: declared[index].ty)
+                mut fields.push(TreeField(key: name_bytes(declared[index].name.as_str(), alloc), value: self.encoded(parts[index], ty: field_ty)))
+                index += 1
+            }
+            return sorted_record(take fields)
+        }
+        SigKind.Enum(variants: variants) => {
+            let Val.Variant(item: _, index: chosen, fields: payload) = value else {
+                expect false
+                return Tree.Bool(false)
+            }
+            let variant = variants[usize.widen(chosen)]
+            let key = name_bytes(variant.name.as_str(), alloc)
+            match variant.payload {
+                Payload.None => return Tree.Variant(key: take key, payload: None)
+                Payload.Single(single) => {
+                    let encoded_payload = self.encoded(payload.contents()[0], ty: subst.ty(types, ty: single))
+                    return Tree.Variant(key: take key, payload: Some(mem::Heap.of(alloc).boxed(take encoded_payload)))
+                }
+                Payload.Labelled(labels) => {
+                    let fields_tree = self.encoded_labelled(labels.view(), values: payload.contents().view(), subst)
+                    return Tree.Variant(key: take key, payload: Some(mem::Heap.of(alloc).boxed(take fields_tree)))
+                }
+            }
+        }
+        else => {}
+    }
+    expect false
+    return Tree.Bool(false)
+} Interpreter.encoded_declared
+
+/// The encoded record of a labelled payload's values.
+fn Interpreter.encoded_labelled(self, labels: Slice[LabelledTy], values: Slice[Val], subst: ty::Subst) -> Tree {
+    let alloc = self.alloc
+    let types = self.ck.types()
+    var fields = mem::List[TreeField].empty(alloc)
+    var index: usize = 0
+    while index < labels.len() and index < values.len() {
+        let label_ty = subst.ty(types, ty: labels[index].ty)
+        mut fields.push(TreeField(key: name_bytes(labels[index].name.as_str(), alloc), value: self.encoded(values[index], ty: label_ty)))
+        index += 1
+    }
+    return sorted_record(take fields)
+} Interpreter.encoded_labelled
+
+/// A record of fields in ascending byte order of their keys.
+fn sorted_record(take fields: mem::List[TreeField]) -> Tree {
+    mut fields.sort_by(fn(left: TreeField, right: TreeField) => left.key.view().cmp(right.key.view()))
+    return Tree.Record(take fields)
+} sorted_record
+
+/// The bytes of a name.
+fn name_bytes(name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(name.as_bytes())
+    return bytes
+} name_bytes
+
+fn value_bytes(values: Slice[Val], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.reserve(values.len())
+    for value in values {
+        mut bytes.push(u8.truncate(value.int_value().low_bits()))
+    }
+    return bytes
+} value_bytes
+
+/// Integer values of bytes, in order.
+fn byte_values(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Val] {
+    var values = mem::List[Val].empty(alloc)
+    mut values.reserve(bytes.len())
+    for byte in bytes {
+        mut values.push(Val.of_usize(usize.widen(byte)))
+    }
+    return values
+} byte_values
+
+/// Writes a uvar: LEB128, least significant group first.
+fn write_uvar(value: u64, mut out: mem::Bytes) {
+    var rest = value
+    loop {
+        let group = u8.truncate(rest & 0x7F)
+        rest = rest >> 7
+        if rest == 0 {
+            mut out.push(group)
+            return
+        }
+        mut out.push(group | 0x80)
+    }
+} write_uvar
+
+/// Writes bytes after their length as a uvar.
+fn write_framed(bytes: Slice[u8], mut out: mem::Bytes) {
+    write_uvar(u64.widen(bytes.len()), mut out)
+    mut out.append(bytes)
+} write_framed
+
+fn Tree.write_wire(self, mut out: mem::Bytes, alloc: mem::Alloc) {
+    match self {
+        Tree.Bool(value) => {
+            if value {
+                mut out.push(1)
+            } else {
+                mut out.push(0)
+            }
+        }
+        Tree.Unsigned(value) => write_uvar(value, mut out)
+        Tree.Signed(value) => write_uvar(value.wrapping_shl(1).to_bits() ^ value.shr_arith(63).to_bits(), mut out)
+        Tree.Float(value) => push_le_bytes(mut out, bits: value.to_bits(), width: 8)
+        Tree.Char(c) => write_uvar(u64.widen(c.to_bits()), mut out)
+        Tree.Text(bytes) or Tree.Bytes(bytes) => write_framed(bytes.view(), mut out)
+        Tree.Sequence(elements) => {
+            write_uvar(u64.widen(elements.len()), mut out)
+            for element in elements {
+                element.write_wire(mut out, alloc)
+            }
+        }
+        Tree.Map(pairs) => {
+            write_uvar(u64.widen(pairs.len()), mut out)
+            for pair in pairs {
+                pair.key.write_wire(mut out, alloc)
+                pair.value.write_wire(mut out, alloc)
+            }
+        }
+        Tree.Record(fields) => {
+            write_uvar(u64.widen(fields.len()), mut out)
+            for field in fields {
+                write_framed(field.key.view(), mut out)
+                var written = mem::Bytes.empty(alloc)
+                field.value.write_wire(mut written, alloc)
+                write_framed(written.view(), mut out)
+            }
+        }
+        Tree.Variant(key: key, payload: payload) => {
+            write_framed(key.view(), mut out)
+            match payload {
+                None => mut out.push(0)
+                Some(boxed) => {
+                    mut out.push(1)
+                    var written = mem::Bytes.empty(alloc)
+                    boxed.contents().write_wire(mut written, alloc)
+                    write_framed(written.view(), mut out)
+                }
+            }
+        }
+    }
+} Tree.write_wire
+
+fn Tree.write_json(self, mut out: mem::Bytes, alloc: mem::Alloc) {
+    match self {
+        Tree.Bool(value) => {
+            if value {
+                mut out.append(b"true")
+            } else {
+                mut out.append(b"false")
+            }
+        }
+        Tree.Unsigned(value) => write_decimal(value, mut out)
+        Tree.Signed(value) => {
+            var magnitude = value.to_bits()
+            if value < 0 {
+                mut out.push(b'-')
+                magnitude = (0i64).wrapping_sub(value).to_bits()
+            }
+            write_decimal(magnitude, mut out)
+        }
+        Tree.Float(value) => write_json_float(value, mut out, alloc)
+        Tree.Char(c) => {
+            var encoded_char = mem::Bytes.empty(alloc)
+            push_utf8(mut encoded_char, c)
+            write_json_string(encoded_char.view(), mut out, alloc)
+        }
+        Tree.Text(bytes) => write_json_string(bytes.view(), mut out, alloc)
+        Tree.Bytes(bytes) => {
+            let encoded_text = base64_text(bytes.view(), alloc)
+            write_json_string(encoded_text.as_bytes(), mut out, alloc)
+        }
+        Tree.Sequence(elements) => {
+            mut out.push(b'[')
+            for index in 0..<elements.len() {
+                if index > 0 {
+                    mut out.push(b',')
+                }
+                elements[index].write_json(mut out, alloc)
+            }
+            mut out.push(b']')
+        }
+        Tree.Map(pairs) => write_json_map(pairs.view(), mut out, alloc)
+        Tree.Record(fields) => write_json_record(fields.view(), mut out, alloc)
+        Tree.Variant(key: key, payload: payload) => {
+            match payload {
+                None => write_json_string(key.view(), mut out, alloc)
+                Some(boxed) => {
+                    mut out.push(b'{')
+                    write_json_string(key.view(), mut out, alloc)
+                    mut out.push(b':')
+                    boxed.contents().write_json(mut out, alloc)
+                    mut out.push(b'}')
+                }
+            }
+        }
+    }
+} Tree.write_json
+
+/// Writes a float as JSON encoding states: a string for `NaN` and the infinities, its
+/// rendering otherwise.
+fn write_json_float(value: f64, mut out: mem::Bytes, alloc: mem::Alloc) {
+    if value.is_nan() {
+        write_json_string(b"NaN", mut out, alloc)
+        return
+    }
+    if value.abs() == f64.from_bits(0x7FF0_0000_0000_0000) {
+        if value > 0.0 {
+            write_json_string(b"inf", mut out, alloc)
+        } else {
+            write_json_string(b"-inf", mut out, alloc)
+        }
+        return
+    }
+    let written = float_text(value, narrow: None, alloc)
+    mut out.append(written.as_bytes())
+} write_json_float
+
+/// Writes a map's entries as a JSON array of `[key,value]` arrays.
+fn write_json_map(pairs: Slice[TreeEntry], mut out: mem::Bytes, alloc: mem::Alloc) {
+    mut out.push(b'[')
+    for index in 0..<pairs.len() {
+        if index > 0 {
+            mut out.push(b',')
+        }
+        mut out.push(b'[')
+        pairs[index].key.write_json(mut out, alloc)
+        mut out.push(b',')
+        pairs[index].value.write_json(mut out, alloc)
+        mut out.push(b']')
+    }
+    mut out.push(b']')
+} write_json_map
+
+/// Writes a record's fields as a JSON object.
+fn write_json_record(fields: Slice[TreeField], mut out: mem::Bytes, alloc: mem::Alloc) {
+    mut out.push(b'{')
+    for index in 0..<fields.len() {
+        if index > 0 {
+            mut out.push(b',')
+        }
+        write_json_string(fields[index].key.view(), mut out, alloc)
+        mut out.push(b':')
+        fields[index].value.write_json(mut out, alloc)
+    }
+    mut out.push(b'}')
+} write_json_record
+
+/// Writes an unsigned integer in decimal.
+fn write_decimal(value: u64, mut out: mem::Bytes) {
+    if value >= 10 {
+        write_decimal(value / 10, mut out)
+    }
+    mut out.push(b'0' + u8.truncate(value % 10))
+} write_decimal
+
+/// Appends a char's UTF-8 encoding.
+fn push_utf8(mut out: mem::Bytes, c: char) {
+    let code = c.to_bits()
+    if code < 0x80 {
+        mut out.push(u8.truncate(code))
+        return
+    }
+    if code < 0x800 {
+        mut out.push(u8.truncate(0xC0 | (code >> 6)))
+        mut out.push(u8.truncate(0x80 | (code & 0x3F)))
+        return
+    }
+    if code < 0x1_0000 {
+        mut out.push(u8.truncate(0xE0 | (code >> 12)))
+        mut out.push(u8.truncate(0x80 | ((code >> 6) & 0x3F)))
+        mut out.push(u8.truncate(0x80 | (code & 0x3F)))
+        return
+    }
+    mut out.push(u8.truncate(0xF0 | (code >> 18)))
+    mut out.push(u8.truncate(0x80 | ((code >> 12) & 0x3F)))
+    mut out.push(u8.truncate(0x80 | ((code >> 6) & 0x3F)))
+    mut out.push(u8.truncate(0x80 | (code & 0x3F)))
+} push_utf8
+
+/// Writes bytes as a JSON string: their text, ill-formed UTF-8 replaced, escaped as JSON
+/// encoding states.
+fn write_json_string(bytes: Slice[u8], mut out: mem::Bytes, alloc: mem::Alloc) {
+    mut out.push(b'"')
+    let decoded = output::lossy(bytes, alloc)
+    for c in decoded.as_str() {
+        match c {
+            '"' => mut out.append(b"\\\"")
+            '\\' => mut out.append(b"\\\\")
+            '\n' => mut out.append(b"\\n")
+            '\r' => mut out.append(b"\\r")
+            '\t' => mut out.append(b"\\t")
+            '\u{8}' => mut out.append(b"\\b")
+            '\u{C}' => mut out.append(b"\\f")
+            else => {
+                let code = c.to_bits()
+                if code < 0x20 {
+                    mut out.append(b"\\u00")
+                    mut out.push(lower_hex_digit(code >> 4))
+                    mut out.push(lower_hex_digit(code & 0xF))
+                } else {
+                    push_utf8(mut out, c)
+                }
+            }
+        }
+    }
+    mut out.push(b'"')
+} write_json_string
+
+/// The lowercase hexadecimal digit of a value below 16.
+fn lower_hex_digit(nibble: u32) -> u8 {
+    if nibble < 10 {
+        return b'0' + u8.truncate(nibble)
+    }
+    return b'a' + u8.truncate(nibble - 10)
+} lower_hex_digit
+
+/// Bytes in base64 with padding.
+fn base64_text(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    var encoded = mem::Bytes.empty(alloc)
+    var start: usize = 0
+    while start < bytes.len() {
+        var count = bytes.len() - start
+        if count > 3 {
+            count = 3
+        }
+        var group: u32 = 0
+        for index in 0..<count {
+            group = group | (u32.widen(bytes[start + index]) << u32.truncate(16 - 8 * index))
+        }
+        for index in 0..<4usize {
+            if index <= count {
+                mut encoded.push(BASE64_ALPHABET[usize.widen((group >> u32.truncate(18 - 6 * index)) & 0x3F)])
+            } else {
+                mut encoded.push(b'=')
+            }
+        }
+        start += 3
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(encoded.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return written
+} base64_text
+
+/// The bytes base64 with padding encodes, none for any text `base64_text` does not write.
+fn base64_bytes(encoded: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    if encoded.len() % 4 != 0 {
+        return None
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    var start: usize = 0
+    while start < encoded.len() {
+        var padding: usize = 0
+        while padding < 4 and encoded[start + 3 - padding] == b'=' {
+            padding += 1
+        }
+        if padding > 2 {
+            return None
+        }
+        var group: u32 = 0
+        for index in 0..<(4 - padding) {
+            let Some(digit) = base64_digit(encoded[start + index]) else {
+                return None
+            }
+            group = group | (digit << u32.truncate(18 - 6 * index))
+        }
+        for index in 0..<(3 - padding) {
+            mut bytes.push(u8.truncate(group >> u32.truncate(16 - 8 * index)))
+        }
+        start += 4
+    }
+    let written = base64_text(bytes.view(), alloc)
+    if written.as_bytes() != encoded {
+        return None
+    }
+    return Some(take bytes)
+} base64_bytes
+
+/// The value of a base64 digit.
+fn base64_digit(byte: u8) -> Option[u32] {
+    for index in 0..<BASE64_ALPHABET.len() {
+        if BASE64_ALPHABET[index] == byte {
+            return Some(u32.truncate(index))
+        }
+    }
+    return None
+} base64_digit
+
+/// The name of the variant of `core::DecodeError`.
+proj fn DecodeKind.name(self) -> Str {
+    return match self {
+        DecodeKind.DuplicateKey => "DuplicateKey"
+        DecodeKind.Invalid => "Invalid"
+        DecodeKind.InvalidText => "InvalidText"
+        DecodeKind.Malformed => "Malformed"
+        DecodeKind.MissingField => "MissingField"
+        DecodeKind.OutOfMemory => "OutOfMemory"
+        DecodeKind.OutOfRange => "OutOfRange"
+        DecodeKind.TooDeep => "TooDeep"
+        DecodeKind.Trailing => "Trailing"
+        DecodeKind.Truncated => "Truncated"
+        DecodeKind.UnknownKey => "UnknownKey"
+        DecodeKind.UnknownVariant => "UnknownVariant"
+    }
+} DecodeKind.name
+
+/// Enters a sequence, map, record or variant.
+fn Decoding.nest(mut self) fails Failure {
+    self.depth += 1
+    if self.depth > DECODE_DEPTH_LIMIT {
+        fail Failure.Decode(DecodeKind.TooDeep)
+    }
+} Decoding.nest
+
+/// The value of a type a reader holds, failing on anything after it.
+fn Decoding.whole[R: Reader](mut self, mut interp: Interpreter, mut reader: R, ty: ty::Ty) -> Val fails Failure {
+    let value = try mut self.value(mut interp, mut reader, ty)
+    try mut reader.finish()
+    return value
+} Decoding.whole
+
+fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, ty: ty::Ty) -> Val fails Failure {
+    let ck = interp.ck.share()
+    match ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return try mut self.scalar(mut reader, scalar)
+        ty::TyKind.Unit => {
+            try mut self.nest()
+            try mut reader.begin_record()
+            if try mut reader.next_follows() {
+                discard try mut reader.read_key()
+                fail Failure.Decode(DecodeKind.UnknownKey)
+            }
+            try mut reader.end()
+            self.depth -= 1
+            return Val.Unit
+        }
+        ty::TyKind.Item(item: item, args: args) => return try mut self.item(mut interp, mut reader, item, args: ck.types().arg_list(args))
+        else => {}
+    }
+    expect false
+    fail Failure.Decode(DecodeKind.Malformed)
+} Decoding.value
+
+fn Decoding.scalar[R: Reader](mut self, mut reader: R, scalar: ty::Scalar) -> Val fails Failure {
+    match scalar {
+        ty::Scalar.Bool => return Val.Bool(try mut reader.read_bool())
+        ty::Scalar.Char => {
+            let code = try mut reader.read_char()
+            let Some(c) = char.checked_from_bits(code) else {
+                fail Failure.Decode(DecodeKind.Invalid)
+            }
+            return Val.Char(c)
+        }
+        ty::Scalar.Float64 => return Val.Float64(try mut reader.read_float())
+        ty::Scalar.Float32 => return Val.Float32(f32.nearest(try mut reader.read_float()))
+        else => {}
+    }
+    var value = wide::Wide.zero()
+    if scalar.is_signed() {
+        value = wide::Wide.of_i64(try mut reader.read_signed())
+    } else {
+        value = wide::Wide.of_u64(try mut reader.read_unsigned())
+    }
+    if not fits_scalar(value, scalar) {
+        fail Failure.Decode(DecodeKind.OutOfRange)
+    }
+    return Val.Int(value)
+} Decoding.scalar
+
+fn Decoding.item[R: Reader](mut self, mut interp: Interpreter, mut reader: R, item: ty::ItemId, args: Slice[ty::Arg]) -> Val fails Failure {
+    let alloc = interp.alloc
+    let ck = interp.ck.share()
+    let path = ck.db().canonical(item)
+    let option = interp.ty_item("core", name: "Option")
+    let result_item = interp.ty_item("core", name: "Result")
+    let element = type_arg_or_unit(args, index: 0)
+    match path.as_str() {
+        "core::Array" => {
+            let elements = try mut self.sequence(mut interp, mut reader, element)
+            if elements.len() != decode_count(args, index: 1) {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            return Val.Array(mem::Shared.of(take elements, alloc))
+        }
+        "core::Option" or "core::Result" => {
+            var keys = mem::List[VariantKey].empty(alloc)
+            var enumeration = result_item
+            if path.as_str() == "core::Option" {
+                enumeration = option
+                mut keys.push(VariantKey(name: text::String.of("Some", alloc), payload: Some(element)))
+                mut keys.push(VariantKey(name: text::String.of("None", alloc), payload: None))
+            } else {
+                mut keys.push(VariantKey(name: text::String.of("Ok", alloc), payload: Some(element)))
+                mut keys.push(VariantKey(name: text::String.of("Err", alloc), payload: Some(type_arg_or_unit(args, index: 1))))
+            }
+            let DecodedVariant(index: index, payload: payload) = try mut self.variant(mut interp, mut reader, keys: keys.view())
+            var fields = mem::List[Val].empty(alloc)
+            match payload {
+                Some(value) => mut fields.push(take value)
+                None => {}
+            }
+            return Val.Variant(item: enumeration, index: u32.truncate(index), fields: mem::Shared.of(take fields, alloc))
+        }
+        "text::String" or "mem::Bytes" or "text::Fixed" => return try mut self.text_item(mut interp, mut reader, item, path: path.as_str(), args)
+        else => return try mut self.collection_item(mut interp, mut reader, item, path: path.as_str(), args)
+    }
+} Decoding.item
+
+/// A `text::String`, `mem::Bytes` or `text::Fixed` value.
+fn Decoding.text_item[R: Reader](
+    mut self,
+    mut interp: Interpreter,
+    mut reader: R,
+    item: ty::ItemId,
+    path: Str,
+    args: Slice[ty::Arg],
+    ) -> Val fails Failure {
+    let alloc = interp.alloc
+    let byte = ty::Ty.scalar(ty::Scalar.Unsigned8)
+    if path == "mem::Bytes" {
+        let bytes = try mut reader.read_bytes()
+        return try mut self.held(mut interp, path, values: byte_values(bytes.view(), alloc), element: byte)
+    }
+    let written = try mut reader.read_text()
+    if not text::utf8::is_valid(written.view()) {
+        fail Failure.Decode(DecodeKind.InvalidText)
+    }
+    if path == "text::String" {
+        return try mut self.held(mut interp, path, values: byte_values(written.view(), alloc), element: byte)
+    }
+    let bound = decode_count(args, index: 0)
+    if written.len() > bound {
+        fail Failure.Decode(DecodeKind.OutOfRange)
+    }
+    var bytes = byte_values(written.view(), alloc)
+    while bytes.len() < bound {
+        mut bytes.push(Val.of_usize(0))
+    }
+    var fields = Val.single(Val.Array(mem::Shared.of(take bytes, alloc)), alloc)
+    mut fields.push(Val.of_usize(written.len()))
+    return Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc))
+} Decoding.text_item
+
+/// A value of a std collection, box or id type, or of a type that derives `Encode`.
+fn Decoding.collection_item[R: Reader](
+    mut self,
+    mut interp: Interpreter,
+    mut reader: R,
+    item: ty::ItemId,
+    path: Str,
+    args: Slice[ty::Arg],
+    ) -> Val fails Failure {
+    let alloc = interp.alloc
+    let element = type_arg_or_unit(args, index: 0)
+    match path {
+        "mem::List" or "mem::Set" => {
+            let elements = try mut self.sequence(mut interp, mut reader, element)
+            if path == "mem::Set" {
+                try mut self.ascending(mut interp, keys: elements.view(), ty: element)
+            }
+            return try mut self.held(mut interp, path, values: take elements, element)
+        }
+        "mem::Bounded" => {
+            let elements = try mut self.sequence(mut interp, mut reader, element)
+            if elements.len() > decode_count(args, index: 1) {
+                fail Failure.Decode(DecodeKind.OutOfRange)
+            }
+            return Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.Array(mem::Shared.of(take elements, alloc)), alloc), alloc))
+        }
+        "mem::Map" => return try mut self.map_entries(mut interp, mut reader, args)
+        "mem::Box" or "mem::Shared" => {
+            let contents = try mut self.value(mut interp, mut reader, ty: element)
+            var made: Option[Val] = None
+            if path == "mem::Box" {
+                made = mut interp.boxed(self.cell, value: take contents, ty: element)
+            } else {
+                made = mut interp.counted(path: "mem::Shared", cell: self.cell, value: take contents, ty: element)
+            }
+            let Some(boxed) = made else {
+                fail Failure.Decode(DecodeKind.OutOfMemory)
+            }
+            return boxed
+        }
+        "mem::Id" => {
+            let index = try mut self.scalar(mut reader, scalar: ty::Scalar.Unsigned32)
+            return Val.Struct(item: item, fields: mem::Shared.of(Val.single(take index, alloc), alloc))
+        }
+        else => return try mut self.declared(mut interp, mut reader, item, args)
+    }
+} Decoding.collection_item
+
+/// A `mem::Map` value: its entries, which must ascend strictly by key.
+fn Decoding.map_entries[R: Reader](mut self, mut interp: Interpreter, mut reader: R, args: Slice[ty::Arg]) -> Val fails Failure {
+    let alloc = interp.alloc
+    let key_ty = type_arg_or_unit(args, index: 0)
+    let value_ty = type_arg_or_unit(args, index: 1)
+    try mut self.nest()
+    try mut reader.begin_map()
+    var keys = mem::List[Val].empty(alloc)
+    var pairs = mem::List[Val].empty(alloc)
+    let key_value = interp.ty_item("mem", name: "KeyValue")
+    while try mut reader.next_follows() {
+        let key = try mut self.value(mut interp, mut reader, ty: key_ty)
+        try mut reader.map_value()
+        let value = try mut self.value(mut interp, mut reader, ty: value_ty)
+        mut keys.push(key.copy(alloc))
+        var parts = Val.single(take key, alloc)
+        mut parts.push(take value)
+        mut pairs.push(Val.Struct(item: key_value, fields: mem::Shared.of(take parts, alloc)))
+    }
+    try mut reader.end()
+    self.depth -= 1
+    try mut self.ascending(mut interp, keys: keys.view(), ty: key_ty)
+    let entry = interp.entry_ty(key_ty, value: value_ty)
+    return try mut self.held(mut interp, path: "mem::Map", values: take pairs, element: entry)
+} Decoding.map_entries
+
+/// The const integer argument at an index, as a count; the greatest count for none.
+fn decode_count(args: Slice[ty::Arg], index: usize) -> usize {
+    if index < args.len() {
+        match args[index] {
+            ty::Arg.Const(ty::Const.Int(count)) => return usize.widen(count.low_bits())
+            else => {}
+        }
+    }
+    return ~0usize
+} decode_count
+
+/// A struct or enum that derives `Encode`.
+fn Decoding.declared[R: Reader](mut self, mut interp: Interpreter, mut reader: R, item: ty::ItemId, args: Slice[ty::Arg]) -> Val fails Failure {
+    let alloc = interp.alloc
+    let ck = interp.ck.share()
+    let types = ck.types()
+    let sig = ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args, alloc)
+    let open = ck.db().ast(item).has_modifier(ast::TypeModifier.Open)
+    let aliases = ck.key_aliases(item)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            var named = mem::List[LabelledTy].empty(alloc)
+            for field in fields {
+                mut named.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+            }
+            let values = try mut self.record(mut interp, mut reader, named: named.view(), open, aliases)
+            let value = Val.Struct(item: item, fields: mem::Shared.of(take values, alloc))
+            var type_args = mem::List[ty::Arg].empty(alloc)
+            for arg in args {
+                mut type_args.push(arg)
+            }
+            let struct_ty = types.item(item, args: take type_args)
+            if mut interp.predicates_hold(item, boundary: true, value, ty: struct_ty) {
+                return value
+            }
+            fail Failure.Decode(DecodeKind.Invalid)
+        }
+        SigKind.Enum(variants: variants) => return try mut self.declared_variant(mut interp, mut reader, item, variants: variants.view(), subst, aliases)
+        else => {}
+    }
+    expect false
+    fail Failure.Decode(DecodeKind.Malformed)
+} Decoding.declared
+
+/// An enum value that derives `Encode`: the variant its key, or the key a tombstone's alias
+/// gives it, names, with its payload.
+fn Decoding.declared_variant[R: Reader](
+    mut self,
+    mut interp: Interpreter,
+    mut reader: R,
+    item: ty::ItemId,
+    variants: Slice[VariantSig],
+    subst: ty::Subst,
+    aliases: mem::HashMap[mem::Bytes, mem::Bytes],
+    ) -> Val fails Failure {
+    let alloc = interp.alloc
+    let ck = interp.ck.share()
+    try mut self.nest()
+    let read = try mut reader.read_variant()
+    let key = aliased_key(take read, aliases, alloc)
+    var found: Option[usize] = None
+    for index in 0..<variants.len() {
+        if variants[index].name.as_bytes() == key.view() {
+            found = Some(index)
+            break
+        }
+    }
+    let Some(chosen) = found else {
+        fail Failure.Decode(DecodeKind.UnknownVariant)
+    }
+    let follows = try mut reader.payload_follows()
+    var payload = mem::List[Val].empty(alloc)
+    match variants[chosen].payload {
+        Payload.None => {
+            if follows {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        Payload.Single(single) => {
+            if not follows {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            mut payload.push(try mut self.value(mut interp, mut reader, ty: subst.ty(ck.types(), ty: single)))
+        }
+        Payload.Labelled(labels) => {
+            if not follows {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            var named = mem::List[LabelledTy].empty(alloc)
+            for label in labels {
+                mut named.push(LabelledTy(name: text::String.of(label.name.as_str(), alloc), ty: subst.ty(ck.types(), ty: label.ty)))
+            }
+            payload = try mut self.record(mut interp, mut reader, named: named.view(), open: false, aliases: mem::HashMap[mem::Bytes, mem::Bytes].empty(seed: 0, alloc))
+        }
+    }
+    try mut reader.end()
+    self.depth -= 1
+    return Val.Variant(item: item, index: u32.truncate(chosen), fields: mem::Shared.of(take payload, alloc))
+} Decoding.declared_variant
+
+/// A key read, or the key a tombstone's alias gives it.
+fn aliased_key(take key: mem::Bytes, aliases: mem::HashMap[mem::Bytes, mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    let Some(alias) = aliases.get(key) else {
+        return key
+    }
+    return name_copy(alias.view(), alloc)
+} aliased_key
+
+/// A copy of bytes.
+fn name_copy(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(bytes)
+    return copied
+} name_copy
+
+/// The values of a record's named fields in order, as the decoding rules read them.
+fn Decoding.record[R: Reader](
+    mut self,
+    mut interp: Interpreter,
+    mut reader: R,
+    named: Slice[LabelledTy],
+    open: bool,
+    aliases: mem::HashMap[mem::Bytes, mem::Bytes],
+    ) -> mem::List[Val] fails Failure {
+    let alloc = interp.alloc
+    try mut self.nest()
+    try mut reader.begin_record()
+    var values = mem::List[Option[Val]].empty(alloc)
+    for _ in 0..<named.len() {
+        mut values.push(None)
+    }
+    while try mut reader.next_follows() {
+        let read = try mut reader.read_key()
+        let key = aliased_key(take read, aliases, alloc)
+        var found: Option[usize] = None
+        for index in 0..<named.len() {
+            if named[index].name.as_bytes() == key.view() {
+                found = Some(index)
+                break
+            }
+        }
+        match found {
+            Some(index) => {
+                if values[index].is_some() {
+                    fail Failure.Decode(DecodeKind.DuplicateKey)
+                }
+                values[index] = Some(try mut self.value(mut interp, mut reader, ty: named[index].ty))
+            }
+            None => {
+                if not open {
+                    fail Failure.Decode(DecodeKind.UnknownKey)
+                }
+                try mut reader.skip()
+            }
+        }
+    }
+    try mut reader.end()
+    self.depth -= 1
+    var decoded = mem::List[Val].empty(alloc)
+    var position: usize = 0
+    for value in take values {
+        match value {
+            Some(present) => mut decoded.push(take present)
+            None => {
+                if not open {
+                    fail Failure.Decode(DecodeKind.MissingField)
+                }
+                mut decoded.push(try mut self.default(mut interp, ty: named[position].ty))
+            }
+        }
+        position += 1
+    }
+    return decoded
+} Decoding.record
+
+/// The default of a missing field's type, when it implements `Default`.
+fn Decoding.default(mut self, mut interp: Interpreter, ty: ty::Ty) -> Val fails Failure {
+    let alloc = interp.alloc
+    let defaults = interp.ty_item("core", name: "Default")
+    if interp.ck.conformance(ty, interface_item: defaults).is_none() {
+        fail Failure.Decode(DecodeKind.MissingField)
+    }
+    return try mut interp.core_conformance(interface_name: "Default", method: "default", ty, args: mem::List[Val].empty(alloc), at: self.at, site: self.site)
+} Decoding.default
+
+/// The variant one of `keys` names, with its payload when its key has a type.
+fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R, keys: Slice[VariantKey]) -> DecodedVariant fails Failure {
+    try mut self.nest()
+    let key = try mut reader.read_variant()
+    var found: Option[usize] = None
+    for index in 0..<keys.len() {
+        if keys[index].name.as_bytes() == key.view() {
+            found = Some(index)
+            break
+        }
+    }
+    let Some(chosen) = found else {
+        fail Failure.Decode(DecodeKind.UnknownVariant)
+    }
+    let follows = try mut reader.payload_follows()
+    var payload: Option[Val] = None
+    match keys[chosen].payload {
+        Some(payload_ty) => {
+            if not follows {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            payload = Some(try mut self.value(mut interp, mut reader, ty: payload_ty))
+        }
+        None => {
+            if follows {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+    }
+    try mut reader.end()
+    self.depth -= 1
+    return DecodedVariant(index: chosen, payload: take payload)
+} Decoding.variant
+
+fn Decoding.sequence[R: Reader](mut self, mut interp: Interpreter, mut reader: R, element: ty::Ty) -> mem::List[Val] fails Failure {
+    try mut self.nest()
+    try mut reader.begin_sequence()
+    var elements = mem::List[Val].empty(interp.alloc)
+    while try mut reader.next_follows() {
+        mut elements.push(try mut self.value(mut interp, mut reader, ty: element))
+    }
+    try mut reader.end()
+    self.depth -= 1
+    return elements
+} Decoding.sequence
+
+/// Fails unless the keys of a set or map ascend strictly by `cmp`.
+fn Decoding.ascending(mut self, mut interp: Interpreter, keys: Slice[Val], ty: ty::Ty) fails Failure {
+    let alloc = interp.alloc
+    var index: usize = 1
+    while index < keys.len() {
+        var pair = Val.single(keys[index - 1].copy(alloc), alloc)
+        mut pair.push(keys[index].copy(alloc))
+        let compared = try mut interp.core_conformance(interface_name: "Ord", method: "cmp", ty, args: take pair, at: self.at, site: self.site)
+        match compared.ordering() {
+            core::Ordering.Equal => fail Failure.Decode(DecodeKind.DuplicateKey)
+            core::Ordering.Greater => fail Failure.Decode(DecodeKind.Malformed)
+            core::Ordering.Less => {}
+        }
+        index += 1
+    }
+} Decoding.ascending
+
+/// A growable container of the std type at `path` holding values.
+fn Decoding.held(mut self, mut interp: Interpreter, path: Str, take values: mem::List[Val], element: ty::Ty) -> Val fails Failure {
+    let Some(container) = mut interp.holding(path, elements: take values, cell: self.cell, element) else {
+        fail Failure.Decode(DecodeKind.OutOfMemory)
+    }
+    return container
+} Decoding.held
+
+fn CodecInput.byte(mut self) -> u8 fails Failure {
+    if self.at >= self.bytes.len() {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    let byte = self.bytes[self.at]
+    self.at += 1
+    return byte
+} CodecInput.byte
+
+fn CodecInput.next_bytes(mut self, count: usize) -> mem::Bytes fails Failure {
+    if count > self.bytes.len() - self.at {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    var taken = mem::Bytes.empty(self.alloc)
+    let Some(parts) = self.bytes.view().split_at(self.at) else {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    let Some(chosen) = parts.tail.prefix(count) else {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    mut taken.append(chosen)
+    self.at += count
+    return taken
+} CodecInput.next_bytes
+
+fn WireReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> WireReader {
+    return WireReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[WireFrame].empty(alloc))
+} WireReader.new
+
+fn WireReader.uvar(mut self) -> u64 fails Failure {
+    var value: u64 = 0
+    for index in 0..<10u32 {
+        let byte = try mut self.input.byte()
+        let group = u64.widen(byte & 0x7F)
+        if index == 9 and byte > 1 {
+            fail Failure.Decode(DecodeKind.Malformed)
+        }
+        value = value | (group << (7 * index))
+        if (byte & 0x80) == 0 {
+            if byte == 0 and index > 0 {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            return value
+        }
+    }
+    fail Failure.Decode(DecodeKind.Malformed)
+} WireReader.uvar
+
+fn WireReader.framed(mut self) -> mem::Bytes fails Failure {
+    let len = try mut self.uvar()
+    return try mut self.input.next_bytes(usize.widen(len))
+} WireReader.framed
+
+/// The end of a byte length read at the current position.
+fn WireReader.length_end(mut self) -> usize fails Failure {
+    let written = try mut self.uvar()
+    let len = usize.widen(written)
+    if len > self.input.bytes.len() - self.input.at {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    return self.input.at + len
+} WireReader.length_end
+
+/// Fails unless the field value read last filled exactly its length.
+fn WireReader.close_value(mut self) fails Failure {
+    let Some(frame) = mut self.frames.pop() else {
+        return
+    }
+    match frame {
+        WireFrame.Record(left: left, value_end: value_end, last: last) => {
+            mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: take last))
+            let Some(end) = value_end else {
+                return
+            }
+            if end != self.input.at {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        else => mut self.frames.push(take frame)
+    }
+} WireReader.close_value
+
+fn WireReader.read_bool(mut self) -> bool fails Failure {
+    let byte = try mut self.input.byte()
+    if byte == 0 {
+        return false
+    }
+    if byte == 1 {
+        return true
+    }
+    fail Failure.Decode(DecodeKind.Malformed)
+} WireReader.read_bool
+
+fn WireReader.read_unsigned(mut self) -> u64 fails Failure {
+    return try mut self.uvar()
+} WireReader.read_unsigned
+
+fn WireReader.read_signed(mut self) -> i64 fails Failure {
+    let zigzag = try mut self.uvar()
+    return i64.from_bits((zigzag >> 1) ^ (0u64).wrapping_sub(zigzag & 1))
+} WireReader.read_signed
+
+fn WireReader.read_float(mut self) -> f64 fails Failure {
+    let bytes = try mut self.input.next_bytes(8)
+    return f64.from_bits(bytes.view().u64_le(0))
+} WireReader.read_float
+
+fn WireReader.read_char(mut self) -> u32 fails Failure {
+    let value = try mut self.uvar()
+    return u32.checked_fit(value).value_or(~0u32)
+} WireReader.read_char
+
+fn WireReader.read_text(mut self) -> mem::Bytes fails Failure {
+    return try mut self.framed()
+} WireReader.read_text
+
+fn WireReader.read_bytes(mut self) -> mem::Bytes fails Failure {
+    return try mut self.framed()
+} WireReader.read_bytes
+
+fn WireReader.begin_sequence(mut self) fails Failure {
+    let count = try mut self.uvar()
+    if count > u64.widen(self.input.bytes.len() - self.input.at) {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    mut self.frames.push(WireFrame.Counted(count))
+} WireReader.begin_sequence
+
+fn WireReader.begin_map(mut self) fails Failure {
+    try mut self.begin_sequence()
+} WireReader.begin_map
+
+fn WireReader.begin_record(mut self) fails Failure {
+    let left = try mut self.uvar()
+    if left > u64.widen(self.input.bytes.len() - self.input.at) {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: None))
+} WireReader.begin_record
+
+fn WireReader.next_follows(mut self) -> bool fails Failure {
+    try mut self.close_value()
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    match frame {
+        WireFrame.Counted(left) => {
+            mut self.frames.push(WireFrame.Counted(left.saturating_sub(1)))
+            return left > 0
+        }
+        WireFrame.Record(left: left, value_end: value_end, last: last) => {
+            mut self.frames.push(WireFrame.Record(left: left.saturating_sub(1), value_end: value_end, last: take last))
+            return left > 0
+        }
+        WireFrame.Variant(payload_end: payload_end) => {
+            mut self.frames.push(WireFrame.Variant(payload_end: payload_end))
+            fail Failure.Decode(DecodeKind.Malformed)
+        }
+    }
+} WireReader.next_follows
+
+fn WireReader.map_value(mut self) {
+} WireReader.map_value
+
+fn WireReader.read_key(mut self) -> mem::Bytes fails Failure {
+    let key = try mut self.framed()
+    let end = try mut self.length_end()
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let WireFrame.Record(left: left, value_end: _, last: last) = frame else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    match last {
+        Some(previous) => {
+            let order = key.view().cmp(previous.view())
+            if order == core::Ordering.Equal {
+                fail Failure.Decode(DecodeKind.DuplicateKey)
+            }
+            if order == core::Ordering.Less {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        None => {}
+    }
+    mut self.frames.push(WireFrame.Record(left: left, value_end: Some(end), last: Some(name_copy(key.view(), alloc: self.input.alloc))))
+    return key
+} WireReader.read_key
+
+fn WireReader.read_variant(mut self) -> mem::Bytes fails Failure {
+    let key = try mut self.framed()
+    mut self.frames.push(WireFrame.Variant(payload_end: None))
+    return key
+} WireReader.read_variant
+
+fn WireReader.payload_follows(mut self) -> bool fails Failure {
+    let byte = try mut self.input.byte()
+    if byte == 0 {
+        return false
+    }
+    if byte != 1 {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let end = try mut self.length_end()
+    let Some(frame) = mut self.frames.pop() else {
+        return true
+    }
+    match frame {
+        WireFrame.Variant(payload_end: _) => mut self.frames.push(WireFrame.Variant(payload_end: Some(end)))
+        else => mut self.frames.push(take frame)
+    }
+    return true
+} WireReader.payload_follows
+
+fn WireReader.skip(mut self) fails Failure {
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    match frame {
+        WireFrame.Record(left: left, value_end: value_end, last: last) => {
+            mut self.frames.push(WireFrame.Record(left: left, value_end: None, last: take last))
+            let Some(end) = value_end else {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+            self.input.at = end
+        }
+        else => {
+            mut self.frames.push(take frame)
+            fail Failure.Decode(DecodeKind.Malformed)
+        }
+    }
+} WireReader.skip
+
+fn WireReader.end(mut self) fails Failure {
+    try mut self.close_value()
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    match frame {
+        WireFrame.Counted(left) => {
+            if left != 0 {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        WireFrame.Record(left: left, value_end: _, last: _) => {
+            if left != 0 {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        WireFrame.Variant(payload_end: payload_end) => {
+            let Some(end) = payload_end else {
+                return
+            }
+            if end != self.input.at {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+    }
+} WireReader.end
+
+fn WireReader.finish(mut self) fails Failure {
+    if self.input.at != self.input.bytes.len() {
+        fail Failure.Decode(DecodeKind.Trailing)
+    }
+} WireReader.finish
+
+fn JsonReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> JsonReader {
+    return JsonReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[JsonFrame].empty(alloc))
+} JsonReader.new
+
+fn JsonReader.space(mut self) {
+    while self.input.at < self.input.bytes.len() {
+        let byte = self.input.bytes[self.input.at]
+        if byte != b' ' and byte != b'\t' and byte != b'\n' and byte != b'\r' {
+            return
+        }
+        self.input.at += 1
+    }
+} JsonReader.space
+
+fn JsonReader.peek(mut self) -> u8 fails Failure {
+    mut self.space()
+    if self.input.at >= self.input.bytes.len() {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    return self.input.bytes[self.input.at]
+} JsonReader.peek
+
+fn JsonReader.expect_byte(mut self, byte: u8) fails Failure {
+    let next = try mut self.peek()
+    if next != byte {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    self.input.at += 1
+} JsonReader.expect_byte
+
+fn JsonReader.literal(mut self, word: Slice[u8]) -> bool {
+    mut self.space()
+    let start = self.input.at
+    if word.len() > self.input.bytes.len() - start {
+        return false
+    }
+    for index in 0..<word.len() {
+        if self.input.bytes[start + index] != word[index] {
+            return false
+        }
+    }
+    self.input.at = start + word.len()
+    return true
+} JsonReader.literal
+
+/// A JSON string's bytes, its escapes resolved.
+fn JsonReader.string(mut self) -> mem::Bytes fails Failure {
+    try mut self.expect_byte(b'"')
+    var decoded = mem::Bytes.empty(self.input.alloc)
+    loop {
+        let start = self.input.at
+        var len: usize = 0
+        while start + len < self.input.bytes.len() and self.input.bytes[start + len] != b'"' and self.input.bytes[start + len] != b'\\' {
+            len += 1
+        }
+        if start + len >= self.input.bytes.len() {
+            fail Failure.Decode(DecodeKind.Truncated)
+        }
+        let Some(parts) = self.input.bytes.view().split_at(start) else {
+            fail Failure.Decode(DecodeKind.Truncated)
+        }
+        let Some(plain) = parts.tail.prefix(len) else {
+            fail Failure.Decode(DecodeKind.Truncated)
+        }
+        if not text::utf8::is_valid(plain) {
+            fail Failure.Decode(DecodeKind.InvalidText)
+        }
+        for byte in plain {
+            if byte < 0x20 {
+                fail Failure.Decode(DecodeKind.Malformed)
+            }
+        }
+        mut decoded.append(plain)
+        self.input.at = start + len
+        let quote = try mut self.input.byte()
+        if quote == b'"' {
+            return decoded
+        }
+        let escaped = try mut self.escaped()
+        push_utf8(mut decoded, c: escaped)
+    }
+} JsonReader.string
+
+/// The char an escape of a JSON string writes, its backslash read.
+fn JsonReader.escaped(mut self) -> char fails Failure {
+    let escape = try mut self.input.byte()
+    return match escape {
+        b'"' => '"'
+        b'\\' => '\\'
+        b'/' => '/'
+        b'b' => '\u{8}'
+        b'f' => '\u{C}'
+        b'n' => '\n'
+        b'r' => '\r'
+        b't' => '\t'
+        b'u' => try mut self.escaped_unicode()
+        else => fail Failure.Decode(DecodeKind.Malformed)
+    }
+} JsonReader.escaped
+
+/// The char a `\u` escape writes, a surrogate pair's as one.
+fn JsonReader.escaped_unicode(mut self) -> char fails Failure {
+    let high = try mut self.hex4()
+    var scalar = high
+    if high >= 0xD800 and high <= 0xDBFF {
+        let marker = try mut self.input.next_bytes(2)
+        if marker.view() != b"\\u" {
+            fail Failure.Decode(DecodeKind.InvalidText)
+        }
+        let low = try mut self.hex4()
+        if low < 0xDC00 or low > 0xDFFF {
+            fail Failure.Decode(DecodeKind.InvalidText)
+        }
+        scalar = 0x1_0000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+    } else if high >= 0xDC00 and high <= 0xDFFF {
+        fail Failure.Decode(DecodeKind.InvalidText)
+    }
+    let Some(c) = char.checked_from_bits(scalar) else {
+        fail Failure.Decode(DecodeKind.InvalidText)
+    }
+    return c
+} JsonReader.escaped_unicode
+
+/// Four hexadecimal digits as `u32.from_str_radix` reads them, a leading `+` allowed.
+fn JsonReader.hex4(mut self) -> u32 fails Failure {
+    let digits = try mut self.input.next_bytes(4)
+    var start: usize = 0
+    if digits[0] == b'+' {
+        start = 1
+    }
+    var value: u32 = 0
+    for index in start..<4usize {
+        let Some(digit) = hex_value(digits[index]) else {
+            fail Failure.Decode(DecodeKind.Malformed)
+        }
+        value = value * 16 + digit
+    }
+    return value
+} JsonReader.hex4
+
+/// The value of a hexadecimal digit.
+fn hex_value(byte: u8) -> Option[u32] {
+    if byte >= b'0' and byte <= b'9' {
+        return Some(u32.widen(byte - b'0'))
+    }
+    if byte >= b'a' and byte <= b'f' {
+        return Some(u32.widen(byte - b'a') + 10)
+    }
+    if byte >= b'A' and byte <= b'F' {
+        return Some(u32.widen(byte - b'A') + 10)
+    }
+    return None
+} hex_value
+
+/// The text of a JSON number, checked against the RFC 8259 grammar.
+fn JsonReader.number(mut self) -> text::String fails Failure {
+    mut self.space()
+    let start = self.input.at
+    let Some(end) = number_end(self.input.bytes.view(), start) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    self.input.at = end
+    let Some(parts) = self.input.bytes.view().split_at(start) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let Some(digits) = parts.tail.prefix(end - start) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(digits, alloc: self.input.alloc) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    return written
+} JsonReader.number
+
+/// Where a JSON number starting at a position ends, by the RFC 8259 grammar; none when none
+/// starts there.
+fn number_end(bytes: Slice[u8], start: usize) -> Option[usize] {
+    var position = start
+    if position < bytes.len() and bytes[position] == b'-' {
+        position += 1
+    }
+    if position >= bytes.len() {
+        return None
+    }
+    if bytes[position] == b'0' {
+        position += 1
+    } else if bytes[position] >= b'1' and bytes[position] <= b'9' {
+        position = digits_end(bytes, start: position)
+    } else {
+        return None
+    }
+    if position < bytes.len() and bytes[position] == b'.' {
+        let fraction = digits_end(bytes, start: position + 1)
+        if fraction == position + 1 {
+            return None
+        }
+        position = fraction
+    }
+    if position < bytes.len() and (bytes[position] == b'e' or bytes[position] == b'E') {
+        position += 1
+        if position < bytes.len() and (bytes[position] == b'+' or bytes[position] == b'-') {
+            position += 1
+        }
+        let exponent = digits_end(bytes, start: position)
+        if exponent == position {
+            return None
+        }
+        position = exponent
+    }
+    return Some(position)
+} number_end
+
+/// The position past the ASCII digits from a position.
+fn digits_end(bytes: Slice[u8], start: usize) -> usize {
+    var position = start
+    while position < bytes.len() and bytes[position] >= b'0' and bytes[position] <= b'9' {
+        position += 1
+    }
+    return position
+} digits_end
+
+/// The f64 nearest the value of a JSON number's text, as Rust's parsing of floats gives it.
+fn json_float(number: Slice[u8], alloc: mem::Alloc) -> f64 {
+    var position: usize = 0
+    let negative = number.len() > 0 and number[0] == b'-'
+    if negative {
+        position = 1
+    }
+    var digits = mem::Bytes.empty(alloc)
+    while position < number.len() and number[position] >= b'0' and number[position] <= b'9' {
+        mut digits.push(number[position])
+        position += 1
+    }
+    let whole = i64.fit(digits.len())
+    if position < number.len() and number[position] == b'.' {
+        position += 1
+        while position < number.len() and number[position] >= b'0' and number[position] <= b'9' {
+            mut digits.push(number[position])
+            position += 1
+        }
+    }
+    let exponent = decimal_exponent(number, start: position)
+    var lead: usize = 0
+    while lead < digits.len() and digits[lead] == b'0' {
+        lead += 1
+    }
+    var bits: u64 = 0
+    if lead < digits.len() {
+        let scale = whole - i64.fit(lead) + exponent
+        if scale > 309 {
+            bits = 0x7FF0_0000_0000_0000
+        } else if scale >= -323 {
+            let Some(parts) = digits.view().split_at(lead) else {
+                return 0.0
+            }
+            let plain = plain_decimal(parts.tail, scale, alloc)
+            bits = format::float_bits(plain.view(), single: false, alloc)
+        }
+    }
+    if negative {
+        bits = bits | (1u64 << 63)
+    }
+    return f64.from_bits(bits)
+} json_float
+
+/// The exponent a JSON number's text writes from a position, `e` or `E` first, clamped to a
+/// magnitude no float distinguishes beyond; 0 for none.
+fn decimal_exponent(number: Slice[u8], start: usize) -> i64 {
+    var position = start
+    if position >= number.len() or (number[position] != b'e' and number[position] != b'E') {
+        return 0
+    }
+    position += 1
+    var negative = false
+    if position < number.len() and (number[position] == b'+' or number[position] == b'-') {
+        negative = number[position] == b'-'
+        position += 1
+    }
+    var exponent: i64 = 0
+    while position < number.len() and number[position] >= b'0' and number[position] <= b'9' {
+        if exponent < 100_000_000_000_000 {
+            exponent = exponent * 10 + i64.widen(number[position] - b'0')
+        }
+        position += 1
+    }
+    if negative {
+        return -exponent
+    }
+    return exponent
+} decimal_exponent
+
+/// Significant digits, the first not 0, as a decimal of value `0.digits * 10^scale`, with at
+/// most one `.`.
+fn plain_decimal(digits: Slice[u8], scale: i64, alloc: mem::Alloc) -> mem::Bytes {
+    var plain = mem::Bytes.empty(alloc)
+    let count = i64.fit(digits.len())
+    if scale <= 0 {
+        mut plain.append(b"0.")
+        for _ in 0..<(-scale) {
+            mut plain.push(b'0')
+        }
+        mut plain.append(digits)
+        return plain
+    }
+    if scale >= count {
+        mut plain.append(digits)
+        for _ in 0..<(scale - count) {
+            mut plain.push(b'0')
+        }
+        return plain
+    }
+    let Some(parts) = digits.split_at(usize.fit(scale)) else {
+        return plain
+    }
+    mut plain.append(parts.head)
+    mut plain.push(b'.')
+    mut plain.append(parts.tail)
+    return plain
+} plain_decimal
+
+/// An integer without fraction or exponent, `-0` being 0.
+fn JsonReader.integer(mut self) -> wide::Wide fails Failure {
+    let written = try mut self.number()
+    let digits = written.as_str()
+    if digits.find(".").is_some() or digits.find("e").is_some() or digits.find("E").is_some() {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    var start: usize = 0
+    let negative = digits.starts_with("-")
+    if negative {
+        start = 1
+    }
+    let Some(magnitude_text) = digits.slice_bytes(start, end: digits.byte_len()) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let Some(magnitude) = wide::Wide.parse(magnitude_text, radix: 10) else {
+        fail Failure.Decode(DecodeKind.OutOfRange)
+    }
+    if negative {
+        return magnitude.wrapping_neg()
+    }
+    return magnitude
+} JsonReader.integer
+
+/// Passes over any JSON value.
+fn JsonReader.skip_value(mut self) fails Failure {
+    let next = try mut self.peek()
+    if next == b'"' {
+        discard try mut self.string()
+        return
+    }
+    if next == b'{' or next == b'[' {
+        try mut self.skip_container(object: next == b'{')
+        return
+    }
+    if next == b't' {
+        if mut self.literal(b"true") {
+            return
+        }
+    } else if next == b'f' {
+        if mut self.literal(b"false") {
+            return
+        }
+    } else if next == b'n' {
+        if mut self.literal(b"null") {
+            return
+        }
+    }
+    discard try mut self.number()
+} JsonReader.skip_value
+
+/// Passes over a JSON object, or an array when not `object`, whose opening byte is next.
+fn JsonReader.skip_container(mut self, object: bool) fails Failure {
+    var close = b']'
+    if object {
+        close = b'}'
+    }
+    self.input.at += 1
+    let next = try mut self.peek()
+    if next == close {
+        self.input.at += 1
+        return
+    }
+    loop {
+        if object {
+            discard try mut self.string()
+            try mut self.expect_byte(b':')
+        }
+        try mut self.skip_value()
+        let after = try mut self.peek()
+        if after == b',' {
+            self.input.at += 1
+        } else if after == close {
+            self.input.at += 1
+            return
+        } else {
+            fail Failure.Decode(DecodeKind.Malformed)
+        }
+    }
+} JsonReader.skip_container
+
+/// Before the next element of the innermost array, object or map: whether one follows.
+fn JsonReader.element_follows(mut self, close: u8) -> bool fails Failure {
+    let count = self.frames.len()
+    if count == 0 {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let frame = self.frames[count - 1]
+    var started = false
+    match frame {
+        JsonFrame.Array(started: was) => {
+            started = was
+            self.frames[count - 1] = JsonFrame.Array(started: true)
+        }
+        JsonFrame.Object(started: was) => {
+            started = was
+            self.frames[count - 1] = JsonFrame.Object(started: true)
+        }
+        JsonFrame.Map(started: was) => {
+            started = was
+            self.frames[count - 1] = JsonFrame.Map(started: true)
+        }
+        JsonFrame.Variant(payload: _) => fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let next = try mut self.peek()
+    if next == close {
+        return false
+    }
+    if started {
+        try mut self.expect_byte(b',')
+    }
+    return true
+} JsonReader.element_follows
+
+fn JsonReader.read_bool(mut self) -> bool fails Failure {
+    if mut self.literal(b"true") {
+        return true
+    }
+    if mut self.literal(b"false") {
+        return false
+    }
+    fail Failure.Decode(DecodeKind.Malformed)
+} JsonReader.read_bool
+
+fn JsonReader.read_unsigned(mut self) -> u64 fails Failure {
+    let value = try mut self.integer()
+    let Some(unsigned) = value.to_u64() else {
+        fail Failure.Decode(DecodeKind.OutOfRange)
+    }
+    return unsigned
+} JsonReader.read_unsigned
+
+fn JsonReader.read_signed(mut self) -> i64 fails Failure {
+    let value = try mut self.integer()
+    let Some(signed) = value.to_i64() else {
+        fail Failure.Decode(DecodeKind.OutOfRange)
+    }
+    return signed
+} JsonReader.read_signed
+
+fn JsonReader.read_float(mut self) -> f64 fails Failure {
+    let next = try mut self.peek()
+    if next == b'"' {
+        let written = try mut self.string()
+        if written.view() == b"NaN" {
+            return f64.from_bits(0x7FF8_0000_0000_0000)
+        }
+        if written.view() == b"inf" {
+            return f64.from_bits(0x7FF0_0000_0000_0000)
+        }
+        if written.view() == b"-inf" {
+            return f64.from_bits(0xFFF0_0000_0000_0000)
+        }
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    let written = try mut self.number()
+    return json_float(written.as_bytes(), alloc: self.input.alloc)
+} JsonReader.read_float
+
+fn JsonReader.read_char(mut self) -> u32 fails Failure {
+    let written = try mut self.string()
+    if not text::utf8::is_valid(written.view()) {
+        fail Failure.Decode(DecodeKind.InvalidText)
+    }
+    let Some(c) = text::utf8::char_at(written.view(), at: 0) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    if c.utf8_len() != written.len() {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    return c.to_bits()
+} JsonReader.read_char
+
+fn JsonReader.read_text(mut self) -> mem::Bytes fails Failure {
+    return try mut self.string()
+} JsonReader.read_text
+
+fn JsonReader.read_bytes(mut self) -> mem::Bytes fails Failure {
+    let written = try mut self.string()
+    let Some(bytes) = base64_bytes(written.view(), alloc: self.input.alloc) else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    return bytes
+} JsonReader.read_bytes
+
+fn JsonReader.begin_sequence(mut self) fails Failure {
+    try mut self.expect_byte(b'[')
+    mut self.frames.push(JsonFrame.Array(started: false))
+} JsonReader.begin_sequence
+
+fn JsonReader.begin_map(mut self) fails Failure {
+    try mut self.expect_byte(b'[')
+    mut self.frames.push(JsonFrame.Map(started: false))
+} JsonReader.begin_map
+
+fn JsonReader.begin_record(mut self) fails Failure {
+    try mut self.expect_byte(b'{')
+    mut self.frames.push(JsonFrame.Object(started: false))
+} JsonReader.begin_record
+
+fn JsonReader.next_follows(mut self) -> bool fails Failure {
+    let count = self.frames.len()
+    if count > 0 {
+        let frame = self.frames[count - 1]
+        match frame {
+            JsonFrame.Object(started: _) => return try mut self.element_follows(close: b'}')
+            JsonFrame.Map(started: started) => {
+                if started {
+                    try mut self.expect_byte(b']')
+                }
+                let follows = try mut self.element_follows(close: b']')
+                if follows {
+                    try mut self.expect_byte(b'[')
+                }
+                return follows
+            }
+            else => {}
+        }
+    }
+    return try mut self.element_follows(close: b']')
+} JsonReader.next_follows
+
+fn JsonReader.map_value(mut self) fails Failure {
+    try mut self.expect_byte(b',')
+} JsonReader.map_value
+
+fn JsonReader.read_key(mut self) -> mem::Bytes fails Failure {
+    let key = try mut self.string()
+    try mut self.expect_byte(b':')
+    return key
+} JsonReader.read_key
+
+fn JsonReader.read_variant(mut self) -> mem::Bytes fails Failure {
+    let next = try mut self.peek()
+    if next == b'"' {
+        mut self.frames.push(JsonFrame.Variant(payload: false))
+        return try mut self.string()
+    }
+    try mut self.expect_byte(b'{')
+    let key = try mut self.string()
+    try mut self.expect_byte(b':')
+    mut self.frames.push(JsonFrame.Variant(payload: true))
+    return key
+} JsonReader.read_variant
+
+fn JsonReader.payload_follows(mut self) -> bool fails Failure {
+    let count = self.frames.len()
+    if count > 0 {
+        match self.frames[count - 1] {
+            JsonFrame.Variant(payload: payload) => return payload
+            else => {}
+        }
+    }
+    fail Failure.Decode(DecodeKind.Malformed)
+} JsonReader.payload_follows
+
+fn JsonReader.skip(mut self) fails Failure {
+    try mut self.skip_value()
+} JsonReader.skip
+
+fn JsonReader.end(mut self) fails Failure {
+    let Some(frame) = mut self.frames.pop() else {
+        fail Failure.Decode(DecodeKind.Malformed)
+    }
+    match frame {
+        JsonFrame.Array(started: _) => try mut self.expect_byte(b']')
+        JsonFrame.Object(started: _) => try mut self.expect_byte(b'}')
+        JsonFrame.Map(started: _) => try mut self.expect_byte(b']')
+        JsonFrame.Variant(payload: payload) => {
+            if payload {
+                try mut self.expect_byte(b'}')
+            }
+        }
+    }
+} JsonReader.end
+
+fn JsonReader.finish(mut self) fails Failure {
+    mut self.space()
+    if self.input.at != self.input.bytes.len() {
+        fail Failure.Decode(DecodeKind.Trailing)
+    }
+} JsonReader.finish

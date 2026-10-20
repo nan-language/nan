@@ -1,0 +1,379 @@
+//! The lock `.nan/lock.nan`: the snapshot of the local store, the locked release of each package of the dependency closure, and a final-link root's approvals.
+
+pkg struct Lock derives Eq {
+    pkg snapshot: u64
+    /// The lines of the closure's packages, in byte order of package name.
+    pkg deps: mem::List[Locked]
+    /// The approved pairs of the closure summary, in byte order of package, then entry.
+    pkg approved: mem::List[Approval]
+    /// The approved epochs, in byte order of canonical path, then by epoch.
+    pkg epochs: mem::List[ApprovedEpoch]
+} Lock
+
+pkg fn Lock.empty(alloc: mem::Alloc) -> Lock = Lock(snapshot: 0, deps: mem::List[Locked].empty(alloc), approved: mem::List[Approval].empty(alloc), epochs: mem::List[ApprovedEpoch].empty(alloc))
+
+/// The line of one package of the closure.
+pkg struct Locked derives Eq {
+    pkg package_name: text::String
+    /// Its alias, for a direct dependency.
+    pkg alias: Option[text::String]
+    /// Its source as its `dep` directive writes it, a path relative to the lock's package.
+    pkg source: text::String
+    /// The code root hash of its locked release.
+    pkg root: hashing::HashValue
+    /// The record's line in the file read, 0 for one not read.
+    pkg line: u32
+} Locked
+
+/// An approved pair of the closure summary: a package and an entry of its authority summary.
+pkg struct Approval derives Eq, Ord {
+    pkg package_name: text::String
+    pkg entry: SummaryEntry
+} Approval
+
+/// An approved epoch: a canonical path and a behaviour epoch.
+pkg struct ApprovedEpoch derives Eq, Ord {
+    pkg path: text::String
+    pkg epoch: u64
+} ApprovedEpoch
+
+/// An entry of an authority summary, as a lock's `approved` record writes it.
+pkg enum SummaryEntry derives Eq, Ord {
+    Capability(text::String)
+    Alloc
+    Device
+    Priv
+    Validator(text::String)
+    Escape(kind: EscapeKind, path: text::String)
+} SummaryEntry
+
+/// The ledger kinds of trust escapes, as `escape` entries write them, declared in byte order of
+/// their words.
+pkg enum EscapeKind derives Copy, Eq, Ord {
+    Assume
+    Decoder
+    Foreign
+    Grant
+    Landing
+    Trusted
+    Validator
+} EscapeKind
+
+pkg proj fn EscapeKind.word(self) -> Str {
+    return match self {
+        EscapeKind.Assume => "assume"
+        EscapeKind.Decoder => "decoder"
+        EscapeKind.Foreign => "foreign"
+        EscapeKind.Grant => "grant"
+        EscapeKind.Landing => "landing"
+        EscapeKind.Trusted => "trusted"
+        EscapeKind.Validator => "validator"
+    }
+} EscapeKind.word
+
+/// The escape kind a ledger kind's word names, none for a word naming none.
+pkg fn EscapeKind.from_word(word: Str) -> Option[EscapeKind] {
+    return match word {
+        "assume" => Some(EscapeKind.Assume)
+        "decoder" => Some(EscapeKind.Decoder)
+        "foreign" => Some(EscapeKind.Foreign)
+        "grant" => Some(EscapeKind.Grant)
+        "landing" => Some(EscapeKind.Landing)
+        "trusted" => Some(EscapeKind.Trusted)
+        "validator" => Some(EscapeKind.Validator)
+        else => None
+    }
+} EscapeKind.from_word
+
+pkg fn SummaryEntry.written(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    match self {
+        SummaryEntry.Capability(path) => return keyed("capability", value: escaped(path.as_str(), grammar, alloc).as_str(), alloc)
+        SummaryEntry.Alloc => return text::String.of("alloc", alloc)
+        SummaryEntry.Device => return text::String.of("device", alloc)
+        SummaryEntry.Priv => return text::String.of("priv", alloc)
+        SummaryEntry.Validator(path) => return keyed("validator", value: escaped(path.as_str(), grammar, alloc).as_str(), alloc)
+        SummaryEntry.Escape(kind: kind, path: path) => {
+            var written = keyed("escape", value: kind.word(), alloc)
+            mut written.push(' ')
+            mut written.append(escaped(path.as_str(), grammar, alloc).as_str())
+            return written
+        }
+    }
+} SummaryEntry.written
+
+fn SummaryEntry.read(mut cursor: Cursor) -> Option[SummaryEntry] {
+    let Some(word) = mut cursor.word() else {
+        return None
+    }
+    match word.as_str() {
+        "capability" => {
+            let Some(path) = mut cursor.text() else {
+                return None
+            }
+            return Some(SummaryEntry.Capability(take path))
+        }
+        "alloc" => return Some(SummaryEntry.Alloc)
+        "device" => return Some(SummaryEntry.Device)
+        "priv" => return Some(SummaryEntry.Priv)
+        "validator" => {
+            let Some(path) = mut cursor.text() else {
+                return None
+            }
+            return Some(SummaryEntry.Validator(take path))
+        }
+        "escape" => {
+            let Some(spelt) = mut cursor.word() else {
+                return None
+            }
+            let Some(kind) = EscapeKind.from_word(spelt.as_str()) else {
+                return None
+            }
+            let Some(path) = mut cursor.text() else {
+                return None
+            }
+            return Some(SummaryEntry.Escape(kind: kind, path: take path))
+        }
+        else => return None
+    }
+} SummaryEntry.read
+
+/// The record without its checksum.
+fn Locked.unchecked(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = keyed("dep", value: self.package_name.as_str(), alloc)
+    match self.alias {
+        Some(alias) => {
+            mut written.append(" alias ")
+            mut written.append(alias.as_str())
+        }
+        None => {}
+    }
+    mut written.push(' ')
+    mut written.append(escaped(self.source.as_str(), grammar, alloc).as_str())
+    mut written.push(' ')
+    mut written.append(escaped(self.root.full(alloc).as_str(), grammar, alloc).as_str())
+    return written
+} Locked.unchecked
+
+pkg fn Locked.record(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = self.unchecked(grammar, alloc)
+    let checksum = hashing::HashValue.of(written.as_bytes()).full(alloc)
+    mut written.push(' ')
+    mut written.append(escaped(checksum.as_str(), grammar, alloc).as_str())
+    return written
+} Locked.record
+
+pkg fn Approval.record(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = keyed("approved", value: self.package_name.as_str(), alloc)
+    mut written.push(' ')
+    mut written.append(self.entry.written(grammar, alloc).as_str())
+    return written
+} Approval.record
+
+pkg fn ApprovedEpoch.record(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = keyed("epoch", value: escaped(self.path.as_str(), grammar, alloc).as_str(), alloc)
+    mut written.write(text::fmt(" {epoch}", epoch: self.epoch), budget: 1_000_000)
+    return written
+} ApprovedEpoch.record
+
+/// A record of a word and a value: the word, a space and the value.
+fn keyed(word: Str, value: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(word, alloc)
+    mut written.push(' ')
+    mut written.append(value)
+    return written
+} keyed
+
+fn snapshot_record(snapshot: u64, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("snapshot {snapshot}", snapshot), budget: 1_000_000)
+    return written
+} snapshot_record
+
+/// The file's bytes; none for a lock holding no record, which is not written.
+pkg fn Lock.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(snapshot_record(self.snapshot, alloc))
+    for dep in self.deps {
+        mut lines.push(dep.record(grammar, alloc))
+    }
+    for pair in self.approved {
+        mut lines.push(pair.record(grammar, alloc))
+    }
+    for approved in self.epochs {
+        mut lines.push(approved.record(grammar, alloc))
+    }
+    return write(Kind.Lock, lines: lines.view(), alloc)
+} Lock.bytes
+
+/// Reads a lock, or why it is not valid.
+pkg fn Lock.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[Lock, Invalid] {
+    let parsed = match read(Kind.Lock, bytes, grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    let lock = match Lock.records(parsed, grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    return parsed.checked(take lock)
+} Lock.read
+
+/// The kinds of lock records, in their order in the file.
+enum LockRecord derives Copy, Eq, Ord {
+    Snapshot
+    Dep
+    Approved
+    Epoch
+} LockRecord
+
+fn Lock.records(parsed: Parsed, grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[Lock, Invalid] {
+    var lock = Lock.empty(alloc)
+    var stage = LockRecord.Snapshot
+    for index in 0..<parsed.records.len() {
+        let record = parsed.records[index]
+        let invalid = Invalid.at(record.line)
+        var cursor = record.cursor(alloc)
+        let Some(word) = mut cursor.word() else {
+            return Err(invalid)
+        }
+        if word.as_str() == "registry" or word.as_str() == "floor" {
+            return Err(Invalid(code: diagnostic::Code.FormatReservedField, line: record.line))
+        }
+        var next = LockRecord.Snapshot
+        if word.as_str() == "snapshot" and index == 0 {
+            let Some(snapshot) = mut cursor.int() else {
+                return Err(invalid)
+            }
+            lock.snapshot = snapshot
+        } else if word.as_str() == "dep" and index > 0 {
+            let Some(dep) = read_dep(record, mut cursor, grammar, alloc) else {
+                return Err(invalid)
+            }
+            mut lock.deps.push(take dep)
+            next = LockRecord.Dep
+        } else if word.as_str() == "approved" and index > 0 {
+            let Some(package_name) = mut cursor.word() else {
+                return Err(invalid)
+            }
+            let Some(entry) = SummaryEntry.read(mut cursor) else {
+                return Err(invalid)
+            }
+            mut lock.approved.push(Approval(package_name: take package_name, entry: take entry))
+            next = LockRecord.Approved
+        } else if word.as_str() == "epoch" and index > 0 {
+            let Some(path) = mut cursor.text() else {
+                return Err(invalid)
+            }
+            let Some(epoch) = mut cursor.int() else {
+                return Err(invalid)
+            }
+            mut lock.epochs.push(ApprovedEpoch(path: take path, epoch: epoch))
+            next = LockRecord.Epoch
+        } else {
+            return Err(invalid)
+        }
+        let canonical = lock.last_record(next, grammar, alloc)
+        if not cursor.done() or next < stage or canonical.as_str() != record.text.as_str() or not lock.ordered(next, grammar, alloc) {
+            return Err(invalid)
+        }
+        stage = next
+    }
+    if parsed.records.len() == 0 {
+        return Err(Invalid.at(1))
+    }
+    return Ok(take lock)
+} Lock.records
+
+/// The canonical text of the record of a kind last read.
+fn Lock.last_record(self, kind: LockRecord, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    match kind {
+        LockRecord.Snapshot => return snapshot_record(self.snapshot, alloc)
+        LockRecord.Dep => {
+            if self.deps.len() == 0 {
+                return text::String.empty(alloc)
+            }
+            return self.deps[self.deps.len() - 1].record(grammar, alloc)
+        }
+        LockRecord.Approved => {
+            if self.approved.len() == 0 {
+                return text::String.empty(alloc)
+            }
+            return self.approved[self.approved.len() - 1].record(grammar, alloc)
+        }
+        LockRecord.Epoch => {
+            if self.epochs.len() == 0 {
+                return text::String.empty(alloc)
+            }
+            return self.epochs[self.epochs.len() - 1].record(grammar, alloc)
+        }
+    }
+} Lock.last_record
+
+/// Whether the record of a kind last read follows the one before it in its kind's order, keys
+/// being distinct: dep records by package, approved records by package, then entry as written,
+/// and epoch records by path, then epoch.
+fn Lock.ordered(self, kind: LockRecord, grammar: syntax::Grammar, alloc: mem::Alloc) -> bool {
+    match kind {
+        LockRecord.Snapshot => return true
+        LockRecord.Dep => {
+            let count = self.deps.len()
+            if count < 2 {
+                return true
+            }
+            return self.deps[count - 2].package_name < self.deps[count - 1].package_name
+        }
+        LockRecord.Approved => {
+            let count = self.approved.len()
+            if count < 2 {
+                return true
+            }
+            let before = self.approved[count - 2]
+            let after = self.approved[count - 1]
+            if before.package_name != after.package_name {
+                return before.package_name < after.package_name
+            }
+            return before.entry.written(grammar, alloc) < after.entry.written(grammar, alloc)
+        }
+        LockRecord.Epoch => {
+            let count = self.epochs.len()
+            if count < 2 {
+                return true
+            }
+            let before = self.epochs[count - 2]
+            let after = self.epochs[count - 1]
+            if before.path != after.path {
+                return before.path < after.path
+            }
+            return before.epoch < after.epoch
+        }
+    }
+} Lock.ordered
+
+fn read_dep(record: Record, mut cursor: Cursor, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[Locked] {
+    let Some(package_name) = mut cursor.word() else {
+        return None
+    }
+    var alias: Option[text::String] = None
+    let aliased = mut cursor.takes("alias")
+    if aliased {
+        let Some(name) = mut cursor.word() else {
+            return None
+        }
+        alias = Some(take name)
+    }
+    let Some(source) = mut cursor.text() else {
+        return None
+    }
+    let Some(root) = mut cursor.hash() else {
+        return None
+    }
+    let Some(checksum) = mut cursor.hash() else {
+        return None
+    }
+    let locked = Locked(package_name: take package_name, alias: take alias, source: take source, root: root, line: record.line)
+    let unchecked = locked.unchecked(grammar, alloc)
+    if hashing::HashValue.of(unchecked.as_bytes()) != checksum {
+        return None
+    }
+    return Some(take locked)
+} read_dep

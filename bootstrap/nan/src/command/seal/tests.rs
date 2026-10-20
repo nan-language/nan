@@ -57,3 +57,23 @@ fn a_seal_needs_a_trust_escape_and_another_author_than_the_sealed_code() {
     assert!(verdict("seal procinfo::getpid --as ben-review").starts_with("ok seal"));
     assert!(verdict("verify").starts_with("ok verify"));
 }
+
+#[test]
+fn a_seal_accepts_the_first_requires_of_a_private_function() {
+    let scratch = Scratch::new(&[
+        (
+            "levels/package.nan",
+            "//! Levels.\n\npackage levels {\n    language 1\n    targets any\n} levels\n",
+        ),
+        (
+            "levels/levels.nan",
+            "//! Halves levels.\n\nfn halved(level: u32) -> u32\n    requires level > 0\n{\n    return level / 2\n} halved\n\npub fn level_of(level: u32) -> u32 {\n    if level == 0 {\n        return 0\n    }\n    return halved(level)\n} level_of\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    run_in(dir, "api update");
+    let verdict = |line: &str| run_in(dir, line).output;
+    assert!(verdict("verify").contains("\nincomplete api.weakening-pending levels/levels.nan:3 "));
+    assert!(verdict("seal levels::halved --as ana-review").starts_with("ok seal"));
+    assert!(verdict("verify").starts_with("ok verify"));
+}

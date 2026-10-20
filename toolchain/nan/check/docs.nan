@@ -1,0 +1,1005 @@
+//! Documentation: the doc comments of items and members and the summaries of files, with their code blocks, digest claims and doc references, and the docs the variants of a module share.
+
+/// The words starting a digest claim when a fact word follows them.
+const CLAIM_WORDS: Str = "never not cannot can't doesn't don't won't may might always neither nor without"
+
+/// The words naming a digest fact.
+const FACT_WORDS: Str = "wait waits waiting block blocks suspend suspends suspending allocate allocates allocating trap traps trapping panic panics panicking terminate terminates terminating halt halts halting"
+
+/// The words that are a digest claim alone.
+const CLAIM_TERMS: Str = "blocking non-blocking non-allocating allocation-free noalloc trap-free panic-free notrap non-terminating pure side-effect-free"
+
+/// Whether a rule is a member a doc comment may document beside items.
+fn is_doc_member_rule(rule: syntax::Rule) -> bool {
+    return match rule {
+        syntax::Rule.StructMember or syntax::Rule.EnumMember or syntax::Rule.InterfaceMember => true
+        syntax::Rule.TagLine or syntax::Rule.LayoutMember or syntax::Rule.RegisterMember => true
+        else => false
+    }
+} is_doc_member_rule
+
+/// A doc comment: the `DOC` tokens of its lines, the member it documents as variants compare
+/// docs, empty for its item, and the visibility of what it documents.
+struct DocComment {
+    lines: mem::List[usize]
+    member: text::String
+    visibility: ast::Visibility
+} DocComment
+
+/// A line of doc text: its line number, the byte of its file where its text starts, and the text,
+/// held as a copy.
+struct DocLine {
+    line: u32
+    start: u32
+    text: text::String
+} DocLine
+
+/// A code span or doc reference of a line of doc text: the bytes it spans, its delimiters
+/// included.
+enum Part derives Copy {
+    Code(core::Range[usize])
+    Reference(core::Range[usize])
+} Part
+
+/// What is wrong with a doc reference: the rule it breaks and the fixes that rule names.
+struct DocProblem {
+    code: diagnostic::Code
+    fixes: mem::List[diagnostic::Fix]
+} DocProblem
+
+/// The doc comments of an item a variant directory holds, by what each documents, with the path
+/// of the item's file and its first line.
+struct HeldDocs {
+    path: text::String
+    line: u32
+    docs: mem::Map[text::String, text::String]
+} HeldDocs
+
+/// What the doc comment of a member documents: the member's name, or an invariant line's text,
+/// and the visibility of what it documents.
+struct DocumentedMember {
+    name: text::String
+    visibility: ast::Visibility
+} DocumentedMember
+
+/// A doc reference's path and the member it names through that path.
+struct ReferencePath {
+    path: ast::Path
+    member: Option[text::String]
+} ReferencePath
+
+/// A public doc of an item: its key, its doc text and its first line.
+struct PublicDoc {
+    key: machine::DocKey
+    text: text::String
+    line: u32
+} PublicDoc
+
+/// The doc comments of an item's tree, its own first, the item's visibility given.
+fn doc_comments(source: syntax::SourceFile, tree: syntax::Tree, visibility: ast::Visibility, alloc: mem::Alloc) -> mem::List[DocComment] {
+    var found = mem::List[DocComment].empty(alloc)
+    for node in tree.descendants(tree.root(), alloc) {
+        let rule = tree.rule(node)
+        if rule != syntax::Rule.ItemStart and not is_doc_member_rule(rule) {
+            continue
+        }
+        var lines = mem::List[usize].empty(alloc)
+        for token in tree.child_tokens(node) {
+            if source.tokens[usize.widen(token)].kind == syntax::TokenKind.Doc {
+                mut lines.push(usize.widen(token))
+            }
+        }
+        if lines.len() == 0 {
+            continue
+        }
+        if rule == syntax::Rule.ItemStart {
+            mut found.push(DocComment(lines: take lines, member: text::String.empty(alloc), visibility: visibility))
+            continue
+        }
+        let documented = member_documented(source, tree, member: node, item_visibility: visibility, alloc)
+        mut found.push(DocComment(lines: take lines, member: text::String.of(documented.name.as_str(), alloc), visibility: documented.visibility))
+    }
+    return found
+} doc_comments
+
+/// What the doc comment of a member documents: the member's name, or an invariant line's text,
+/// and its visibility, a field's being the narrower of its own and its item's.
+fn member_documented(
+    source: syntax::SourceFile,
+    tree: syntax::Tree,
+    member: u32,
+    item_visibility: ast::Visibility,
+    alloc: mem::Alloc,
+    ) -> DocumentedMember {
+    var content = member
+    match tree.rule(member) {
+        syntax::Rule.StructMember or syntax::Rule.EnumMember or syntax::Rule.RegisterMember => {
+            var children = tree.child_nodes(member)
+            match mut children.next() {
+                Some(child) => {
+                    content = child
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    let span = match tree.span(content, alloc) {
+        Some(found) => found
+        None => syntax::TokenSpan(head: 0, last: 0)
+    }
+    if tree.rule(content) == syntax::Rule.InvariantLine {
+        var written = text::String.empty(alloc)
+        var any = false
+        for token in span.head..=span.last {
+            if is_line_token(source, token) {
+                continue
+            }
+            if any {
+                mut written.push(' ')
+            }
+            mut written.append(source.text(usize.widen(token)))
+            any = true
+        }
+        return DocumentedMember(name: take written, visibility: item_visibility)
+    }
+    var name = text::String.empty(alloc)
+    for token in span.head..=span.last {
+        if not is_line_token(source, token) and source.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+            mut name.append(source.text(usize.widen(token)))
+            break
+        }
+    }
+    if tree.rule(content) != syntax::Rule.Field {
+        return DocumentedMember(name: take name, visibility: item_visibility)
+    }
+    var own = ast::Visibility.Private
+    match tree.find(content, rule: syntax::Rule.Visibility) {
+        Some(node) => match tree.span(node, alloc) {
+            Some(written) => {
+                own = match source.tokens[usize.widen(written.head)].kind {
+                    syntax::TokenKind.Keyword(syntax::Keyword.Pub) => ast::Visibility.Pub
+                    else => ast::Visibility.Pkg
+                }
+            }
+            None => {}
+        }
+        None => {}
+    }
+    return DocumentedMember(name: take name, visibility: narrower_visibility(own, right: item_visibility))
+} member_documented
+
+/// Where the text of a `DOC` or `FILE_DOC` line starts in the line's token: after its opener and
+/// a space after it.
+fn line_text_offset(source: syntax::SourceFile, token: usize) -> usize {
+    let bytes = source.text(token).as_bytes()
+    if bytes.len() > 3 and bytes[3] == b' ' {
+        return 4
+    }
+    return 3
+} line_text_offset
+
+/// The code spans and doc references of a line of doc text, read left to right: a backtick opens
+/// a code span ending at the next backtick, a `[` a doc reference ending at the next `]`.
+fn text_parts(text: Str, alloc: mem::Alloc) -> mem::List[Part] {
+    let bytes = text.as_bytes()
+    var found = mem::List[Part].empty(alloc)
+    var at: usize = 0
+    while at < bytes.len() {
+        let opener = bytes[at]
+        if opener != b'`' and opener != b'[' {
+            at += 1
+            continue
+        }
+        let close = if opener == b'`' {
+            b'`'
+        } else {
+            b']'
+        }
+        var end = at + 1
+        while end < bytes.len() and bytes[end] != close {
+            end += 1
+        }
+        if end >= bytes.len() {
+            at += 1
+            continue
+        }
+        let range = at..<(end + 1)
+        at = end + 1
+        if close == b'`' {
+            mut found.push(Part.Code(range))
+        } else {
+            mut found.push(Part.Reference(range))
+        }
+    }
+    return found
+} text_parts
+
+/// The doc references of a line of doc text, by the bytes of their texts.
+fn reference_ranges(text: Str, alloc: mem::Alloc) -> mem::List[core::Range[usize]] {
+    var found = mem::List[core::Range[usize]].empty(alloc)
+    for part in text_parts(text, alloc) {
+        match part {
+            Part.Reference(range) => mut found.push((range.low + 1)..<(range.high - 1))
+            Part.Code(_) => {}
+        }
+    }
+    return found
+} reference_ranges
+
+/// The first line of a doc text whose text after leading spaces starts with three backticks.
+fn code_block(lines: Slice[DocLine]) -> Option[u32] {
+    for line in lines {
+        let bytes = line.text.as_bytes()
+        var at: usize = 0
+        while at < bytes.len() and bytes[at] == b' ' {
+            at += 1
+        }
+        let Some(rest) = line.text.slice_bytes(at, end: bytes.len()) else {
+            continue
+        }
+        if rest.starts_with("```") {
+            return Some(line.line)
+        }
+    }
+    return None
+} code_block
+
+/// The lines of a doc text on which a digest claim starts: a claim word followed by a fact word
+/// with only spaces and line ends between them, or a claim term, outside code spans.
+fn claim_lines(lines: Slice[DocLine], alloc: mem::Alloc) -> mem::Set[u32] {
+    var found = mem::Set[u32].empty(alloc)
+    var previous: Option[ClaimWord] = None
+    for line in lines {
+        var code = mem::List[core::Range[usize]].empty(alloc)
+        for part in text_parts(line.text.as_str(), alloc) {
+            match part {
+                Part.Code(range) => mut code.push(range)
+                Part.Reference(_) => {}
+            }
+        }
+        var word = text::String.empty(alloc)
+        var at: usize = 0
+        for written in line.text.as_str() {
+            let c = if written == '\u{2019}' {
+                '\''
+            } else {
+                written
+            }
+            let offset = at
+            at += written.utf8_len()
+            let prose = code.position(fn(range: core::Range[usize]) => range.contains(offset)).is_none()
+            if prose and (c.is_ascii_alphabetic() or c.is_ascii_digit() or c == '-' or c == '\'') {
+                mut word.push(c.to_ascii_lowercase())
+                continue
+            }
+            if not word.is_empty() {
+                judge_claim(word.as_str(), line: line.line, mut previous, mut found, alloc)
+                word = text::String.empty(alloc)
+            }
+            if not prose or c != ' ' {
+                previous = None
+            }
+        }
+        if not word.is_empty() {
+            judge_claim(word.as_str(), line: line.line, mut previous, mut found, alloc)
+        }
+    }
+    return found
+} claim_lines
+
+/// A doc reference's path and the member it names, when its text is a `doc_reference`.
+fn reference_path(text: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[ReferencePath] {
+    if text.find(" ").is_some() {
+        return None
+    }
+    var source = text::String.of(text, alloc)
+    mut source.push('\n')
+    let lexed = syntax::lex(source.as_bytes(), grammar, alloc)
+    if lexed.diagnostics.len() > 0 {
+        return None
+    }
+    var tokens = mem::List[syntax::Token].empty(alloc)
+    for token in lexed.tokens {
+        if not token.kind.is_virtual() {
+            mut tokens.push(token)
+        }
+    }
+    var segments = mem::List[ast::Name].empty(alloc)
+    var member: Option[text::String] = None
+    var at: usize = 0
+    loop {
+        if at >= tokens.len() or tokens[at].kind != syntax::TokenKind.Ident {
+            return None
+        }
+        mut segments.push(ast::Name(text: lexed_text(text, token: tokens[at], alloc), token: 0))
+        if at + 1 >= tokens.len() {
+            break
+        }
+        let next = tokens[at + 1].kind
+        if next == syntax::TokenKind.Punct(syntax::Punct.ColonColon) {
+            at += 2
+            continue
+        }
+        if next != syntax::TokenKind.Punct(syntax::Punct.Dot) {
+            return None
+        }
+        if at + 2 >= tokens.len() or tokens[at + 2].kind != syntax::TokenKind.Ident {
+            return None
+        }
+        member = Some(lexed_text(text, token: tokens[at + 2], alloc))
+        if tokens.len() != at + 3 {
+            return None
+        }
+        break
+    }
+    return Some(ReferencePath(path: ast::Path(segments: take segments), member: take member))
+} reference_path
+
+/// Reports an item whose public docs its module's API snapshot binds, with the same doc
+/// text, to another hash than its current interface hash, once, on the first such doc,
+/// listing each and the command confirming them.
+fn Checker.check_doc_binding(self, item: ty::ItemId) {
+    let docs = self.public_docs(item)
+    if docs.len() == 0 {
+        return
+    }
+    let db = self.db()
+    let alloc = self.alloc()
+    let data = db.item(item)
+    let source = db.source(db.package_of(item))
+    let Some(path) = self.canonical_path(item) else {
+        return
+    }
+    let Some(snapshot) = source.machine.snapshot(db.module(data.module).name.as_str()) else {
+        return
+    }
+    let Some(index) = snapshot.entries.position(fn(entry: machine::ApiEntry) => entry.path.as_str() == path.as_str()) else {
+        return
+    }
+    let entry = snapshot.entries[index]
+    let hashes = self.hashes(item)
+    let interface_hash = match hashes.interface_hash {
+        Some(found) => found
+        None => hashes.item
+    }
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    var line: Option[u32] = None
+    for doc in docs {
+        if entry.docs.position(fn(bound: machine::Doc) => bound.key == doc.key and bound.text.as_str() == doc.text.as_str() and bound.bound != interface_hash).is_none() {
+            continue
+        }
+        if line.is_none() {
+            line = Some(doc.line)
+        }
+        mut because.push(diagnostic::Reason.note(doc_key_note(doc.key, alloc).as_str(), alloc))
+    }
+    let Some(first_line) = line else {
+        return
+    }
+    var confirming = text::String.of("nan api update --confirm-docs ", alloc)
+    mut confirming.append(path.as_str())
+    mut because.push(diagnostic::Reason.note(confirming.as_str(), alloc))
+    var reported = diagnostic::Diagnostic.at(diagnostic::Code.DocStale, path: "", line: first_line, alloc)
+    reported.because = because
+    self.report_diagnostic(item, take reported)
+} Checker.check_doc_binding
+
+/// The public docs of an item consumers see, in source order: its own, keyed empty, and
+/// those of the members entering its interface form, keyed by name, an invariant line by its
+/// position among those; each with its doc text and first line.
+fn Checker.public_docs(self, item: ty::ItemId) -> mem::List[PublicDoc] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var docs = mem::List[PublicDoc].empty(alloc)
+    let data = db.item(item)
+    let source = db.file(data.file).syntax
+    let Some(tree) = source.items[data.index].tree else {
+        return docs
+    }
+    var interface_lines = mem::List[text::String].empty(alloc)
+    for line in self.interface_text(item, viewer: None) {
+        mut interface_lines.push(trimmed_line(line.as_str(), alloc))
+    }
+    var invariants: u64 = 0
+    for doc in doc_comments(source, tree, visibility: db.declaration(item).visibility, alloc) {
+        let is_invariant = not doc.member.is_empty() and doc.member.starts_with("invariant ")
+        if is_invariant {
+            if interface_lines.position(fn(written: text::String) => written.as_str() == doc.member.as_str()).is_none() {
+                continue
+            }
+            invariants += 1
+        }
+        let key = if doc.member.is_empty() {
+            machine::DocKey.Own
+        } else if is_invariant {
+            machine::DocKey.Invariant(invariants)
+        } else {
+            machine::DocKey.Member(text::String.of(doc.member.as_str(), alloc))
+        }
+        if doc.visibility != ast::Visibility.Pub {
+            continue
+        }
+        var joined = text::String.empty(alloc)
+        for index in 0..<doc.lines.len() {
+            if index > 0 {
+                mut joined.push('\n')
+            }
+            let token = doc.lines[index]
+            let Some(written) = source.text(token).slice_bytes(line_text_offset(source, token), end: source.text(token).byte_len()) else {
+                continue
+            }
+            mut joined.append(written)
+        }
+        mut docs.push(PublicDoc(key: take key, text: take joined, line: source.tokens[doc.lines[0]].line))
+    }
+    return docs
+} Checker.public_docs
+
+/// The rules of an item's doc comments and those of its members.
+fn Checker.check_docs(self, item: ty::ItemId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let data = db.item(item)
+    let file = db.file(data.file)
+    let source = file.syntax
+    let Some(tree) = source.items[data.index].tree else {
+        return
+    }
+    for doc in doc_comments(source, tree, visibility: db.declaration(item).visibility, alloc) {
+        var lines = mem::List[DocLine].empty(alloc)
+        for token in doc.lines {
+            mut lines.push(doc_line_of(source, token, alloc))
+        }
+        self.check_doc_text(path: file.path.as_str(), module: Some(data.module), documented: Some(doc.visibility), lines: lines.view(), report: fn(line: u32, span: Option[diagnostic::Span], take problem: DocProblem) {
+            var reported = diagnostic::Diagnostic.at(problem.code, path: "", line, alloc)
+            reported.span = span
+            reported.fixes = problem.fixes
+            self.report_diagnostic(item, take reported)
+        })
+    }
+} Checker.check_docs
+
+/// The rules of the summaries of a package's files the target selects, the summary of
+/// `package.nan` read in its root module.
+fn Checker.check_summaries(self, package_id: ty::PackageId) {
+    let db = self.db()
+    let data = db.package_data(package_id)
+    self.check_summary(db.source(package_id).files[0], module: data.root)
+    for module in data.modules {
+        for file in db.module(module).files {
+            self.check_summary(db.file(file), module: Some(module))
+        }
+    }
+} Checker.check_summaries
+
+/// The rules of one doc comment or file summary of a file: its code block, its digest claims
+/// and, read in its module when it has one, its doc references, the visibility of what it
+/// documents given for a doc comment.
+fn Checker.check_doc_text(
+    self,
+    path: Str,
+    module: Option[ty::ModuleId],
+    documented: Option[ast::Visibility],
+    lines: Slice[DocLine],
+    report: fn(line: u32, span: Option[diagnostic::Span], take problem: DocProblem),
+    ) {
+    let db = self.db()
+    let alloc = self.alloc()
+    match code_block(lines) {
+        Some(line) => report(line, span: None, problem: DocProblem(code: diagnostic::Code.DocCodeBlock, fixes: mem::List[diagnostic::Fix].empty(alloc)))
+        None => {}
+    }
+    for line in claim_lines(lines, alloc).cursor() {
+        report(line, span: None, problem: DocProblem(code: diagnostic::Code.DocDigestClaim, fixes: mem::List[diagnostic::Fix].empty(alloc)))
+    }
+    let Some(module_id) = module else {
+        return
+    }
+    for held in lines {
+        for range in reference_ranges(held.text.as_str(), alloc) {
+            let Some(written) = held.text.slice_bytes(range.low, end: range.high) else {
+                continue
+            }
+            let at = held.start + u32.fit(range.low)
+            let span = diagnostic::Span(start: at, end: at + u32.fit(written.byte_len()))
+            let problem = db.on_line(held.line, compute: fn() -> Option[DocProblem] {
+                return self.reference_problem(path, module: module_id, documented, written, span)
+            })
+            match problem {
+                Some(found) => report(held.line, span: Some(span), problem: take found)
+                None => {}
+            }
+        }
+    }
+} Checker.check_doc_text
+
+/// The rule a doc reference written in a module breaks: naming no live item or member
+/// visible there, with the fixes writing each candidate near it and a rename's new path, or,
+/// in the doc comment of something of visibility `documented`, naming something narrower.
+fn Checker.reference_problem(
+    self,
+    path: Str,
+    module: ty::ModuleId,
+    documented: Option[ast::Visibility],
+    written: Str,
+    span: diagnostic::Span,
+    ) -> Option[DocProblem] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let Some(reference) = reference_path(written, grammar: self.session().grammar.contents(), alloc) else {
+        return Some(DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: mem::List[diagnostic::Fix].empty(alloc)))
+    }
+    let member_at = span.end - u32.fit(optional_length(reference.member))
+    let path_end = if reference.member.is_some() {
+        member_at - 1
+    } else {
+        span.end
+    }
+    var named: Option[ty::ItemId] = None
+    var unresolved = false
+    match db.resolve(module, path: reference.path) {
+        Ok(Named.Item(found)) => if db.visible(module, item: found) {
+            named = Some(found)
+        } else {
+            unresolved = true
+        }
+        Ok(Named.Scalar(_)) or Ok(Named.Unit) or Ok(Named.Never) or Ok(Named.Dyn) or Ok(Named.Variant(item: _, index: _)) => {}
+        Err(failure) => if failure.code.is_none() {
+            return None
+        } else {
+            unresolved = true
+        }
+        else => {
+            unresolved = true
+        }
+    }
+    if unresolved {
+        return Some(self.unresolved_problem(path, module, reference, written, span, path_end))
+    }
+    let key = match named {
+        Some(found) => match db.ast(found).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => Some(TypeKey.Item(found))
+            else => None
+        }
+        None => if reference.path.segments.len() == 1 {
+            db.owner_key(module, owner: reference.path)
+        } else {
+            None
+        }
+    }
+    var visibility = ast::Visibility.Pub
+    match reference.member {
+        None => match named {
+            Some(found) => {
+                visibility = db.ast(found).visibility
+            }
+            None => {}
+        }
+        Some(member) => match self.member_visibility(module, named, key, member: member.as_str()) {
+            Some(found) => {
+                visibility = found
+            }
+            None => return Some(self.member_problem(path, module, reference: reference.path, member, key, span, member_at))
+        }
+    }
+    match documented {
+        Some(documented_visibility) => if openness(visibility) < openness(documented_visibility) {
+            return Some(DocProblem(code: diagnostic::Code.DocPrivateReference, fixes: mem::List[diagnostic::Fix].empty(alloc)))
+        }
+        None => {}
+    }
+    return None
+} Checker.reference_problem
+
+/// The visibility of the member `member` of what a doc reference's path names, when it is
+/// live and visible from a module: a field's the narrower of its own and its type's, a
+/// function's its own, and another member's its item's.
+fn Checker.member_visibility(
+    self,
+    module: ty::ModuleId,
+    named: Option[ty::ItemId],
+    key: Option[TypeKey],
+    member: Str,
+    ) -> Option[ast::Visibility] {
+    let db = self.db()
+    match key {
+        Some(found_key) => {
+            for function in db.members(found_key, name: member) {
+                if db.visible(module, item: function) {
+                    return Some(db.ast(function).visibility)
+                }
+            }
+        }
+        None => {}
+    }
+    let Some(item) = named else {
+        return None
+    }
+    let own = db.ast(item).visibility
+    let sig = self.sig(item)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                if field.name.as_str() == member {
+                    if db.field_visible(module, owner: item, visibility: field.visibility) {
+                        return Some(narrower_visibility(field.visibility, right: own))
+                    }
+                    return None
+                }
+            }
+            return None
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                if variant.name.as_str() == member {
+                    return Some(own)
+                }
+            }
+            return None
+        }
+        SigKind.Interface(methods: methods) => {
+            for method in methods {
+                if method.name.as_str() == member {
+                    return Some(own)
+                }
+            }
+            return None
+        }
+        else => return None
+    }
+} Checker.member_visibility
+
+/// The new path of a rename tombstone whose old path a doc reference written in a module
+/// spells.
+fn Checker.renamed(self, module: ty::ModuleId, path: ast::Path, member: Option[Str]) -> Option[text::String] {
+    let db = self.db()
+    var form = text::String.empty(self.alloc())
+    match member {
+        Some(member_name) => {
+            match db.owner_key(module, owner: path) {
+                Some(key) => mut form.append(db.type_path(key).as_str())
+                None => {
+                    let Some(spelled) = db.spelled(module, path) else {
+                        return None
+                    }
+                    mut form.append(spelled.as_str())
+                }
+            }
+            mut form.push('.')
+            mut form.append(member_name)
+        }
+        None => {
+            let Some(spelled) = db.spelled(module, path) else {
+                return None
+            }
+            mut form.append(spelled.as_str())
+        }
+    }
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form.as_str())) else {
+        return None
+    }
+    for tombstone in tombstones {
+        let ast::ItemKind.Retired(retired_item) = db.ast(tombstone).kind else {
+            continue
+        }
+        let ast::RetiredNew.Rewrite(expr: rewrite, preserves: preserves) = retired_item.new else {
+            continue
+        }
+        if preserves and retired_item.head.is_none() and is_path_or_field(rewrite) {
+            return Some(self.written(tombstone, head: rewrite.token, last: rewrite.last))
+        }
+    }
+    return None
+} Checker.renamed
+
+/// The module summaries of the variants of a package's modules, and the doc comments of the
+/// items each variant must hold and of their members, as the first variant in byte order of
+/// path holding them writes them: each difference reported once per module or item, in the
+/// first variant that differs.
+fn Checker.check_variant_docs(self, package_id: ty::PackageId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let source = db.source(package_id)
+    for index in 0..<source.modules.len() {
+        let module = source.modules[index]
+        if module.dirs.position(fn(dir: workspace::ModuleDir) => dir.selector.is_some()).is_none() {
+            continue
+        }
+        self.check_variant_summaries(source, module)
+        var docs = mem::Map[text::String, mem::List[HeldDocs]].empty(alloc)
+        for file in source.files {
+            if file.module != Some(index) {
+                continue
+            }
+            collect_held_docs(file, mut docs, alloc)
+        }
+        for entry in take docs {
+            var holders = entry.value
+            mut holders.sort_by(fn(left: HeldDocs, right: HeldDocs) => held_order(left, right))
+            if holders.len() == 0 {
+                continue
+            }
+            for at in 1..<holders.len() {
+                if not same_docs(holders[at].docs, right: holders[0].docs) {
+                    self.report_file(holders[at].path.as_str(), line: holders[at].line, code: diagnostic::Code.DocVariantMismatch)
+                    break
+                }
+            }
+        }
+    }
+} Checker.check_variant_docs
+
+/// Whether a token is the `DOC`, `NL` or `COL0` of a line rather than its text.
+fn is_line_token(source: syntax::SourceFile, token: u32) -> bool {
+    match source.tokens[usize.widen(token)].kind {
+        syntax::TokenKind.Doc or syntax::TokenKind.Nl or syntax::TokenKind.Col0 => return true
+        else => return false
+    }
+} is_line_token
+
+/// A word of doc text read before the current one, with its line.
+struct ClaimWord {
+    word: text::String
+    line: u32
+} ClaimWord
+
+/// Judges a word of doc text: a claim term claims on its line, and a fact word right after a
+/// claim word claims on that word's line.
+fn judge_claim(word: Str, line: u32, mut previous: Option[ClaimWord], mut found: mem::Set[u32], alloc: mem::Alloc) {
+    if is_listed(CLAIM_TERMS, word) {
+        discard mut found.insert(line)
+    }
+    match mut previous.extract() {
+        Some(earlier) => if is_listed(CLAIM_WORDS, word: earlier.word.as_str()) and is_listed(FACT_WORDS, word) {
+            discard mut found.insert(earlier.line)
+        }
+        None => {}
+    }
+    previous = Some(ClaimWord(word: text::String.of(word, alloc), line: line))
+} judge_claim
+
+/// The text of a token lexed from `text`.
+fn lexed_text(text: Str, token: syntax::Token, alloc: mem::Alloc) -> text::String {
+    let Some(spelt) = text.slice_bytes(usize.widen(token.start), end: usize.widen(token.end)) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(spelt, alloc)
+} lexed_text
+
+/// A line of doc text, from its `DOC` or `FILE_DOC` token.
+fn doc_line_of(source: syntax::SourceFile, token: usize, alloc: mem::Alloc) -> DocLine {
+    let offset = line_text_offset(source, token)
+    let whole = source.text(token)
+    var copied = text::String.empty(alloc)
+    match whole.slice_bytes(offset, end: whole.byte_len()) {
+        Some(written) => mut copied.append(written)
+        None => {}
+    }
+    return DocLine(line: source.tokens[token].line, start: source.tokens[token].start + u32.fit(offset), text: take copied)
+} doc_line_of
+
+/// A line of an interface text without its surrounding white space.
+fn trimmed_line(written: Str, alloc: mem::Alloc) -> text::String {
+    let run = platform::trimmed_run(written)
+    let Some(inner) = written.slice_bytes(run.start, end: run.end) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(inner, alloc)
+} trimmed_line
+
+/// The note a stale doc lists itself by.
+fn doc_key_note(key: machine::DocKey, alloc: mem::Alloc) -> text::String {
+    match key {
+        machine::DocKey.Own => return text::String.of("doc", alloc)
+        machine::DocKey.Member(name) => {
+            var note = text::String.of("doc ", alloc)
+            mut note.append(name.as_str())
+            return note
+        }
+        machine::DocKey.Invariant(position) => {
+            var note = text::String.of("doc invariant ", alloc)
+            mut note.write(text::fmt("{position}", position), budget: 32)
+            return note
+        }
+    }
+} doc_key_note
+
+/// The fix replacing the bytes `start..end` of a file with a text.
+fn doc_fix(path: Str, start: u32, end: u32, replaced: Str, alloc: mem::Alloc) -> diagnostic::Fix {
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    mut edits.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: start, end: end, text: text::String.of(replaced, alloc))))
+    return diagnostic::Fix(edits: take edits)
+} doc_fix
+
+/// The byte length of an optional text, 0 for none.
+fn optional_length(written: Option[text::String]) -> usize {
+    match written {
+        Some(held) => return held.byte_len()
+        None => return 0
+    }
+} optional_length
+
+/// The problem of a doc reference whose path names nothing live and visible: the fixes writing
+/// a rename's new path and each candidate near the path.
+fn Checker.unresolved_problem(
+    self,
+    path: Str,
+    module: ty::ModuleId,
+    reference: ReferencePath,
+    written: Str,
+    span: diagnostic::Span,
+    path_end: u32,
+    ) -> DocProblem {
+    let alloc = self.alloc()
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    let renamed = match reference.member {
+        Some(member) => self.renamed(module, path: reference.path, member: Some(member.as_str()))
+        None => self.renamed(module, path: reference.path, member: None)
+    }
+    match renamed {
+        Some(new_path) => mut fixes.push(doc_fix(path, start: span.start, end: span.end, replaced: new_path.as_str(), alloc))
+        None => {}
+    }
+    var candidates = self.item_candidates(module)
+    for word in take core_vocabulary(alloc) {
+        mut candidates.push(take word)
+    }
+    let Some(written_path) = written.slice_bytes(0, end: usize.widen(path_end - span.start)) else {
+        return DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: take fixes)
+    }
+    for candidate in take near_candidates(written_path, take candidates, alloc) {
+        mut fixes.push(doc_fix(path, start: span.start, end: path_end, replaced: candidate.as_str(), alloc))
+    }
+    return DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: take fixes)
+} Checker.unresolved_problem
+
+/// Whether a rewrite is a path or a field access.
+fn is_path_or_field(rewrite: ast::Expr) -> bool {
+    match rewrite.kind {
+        ast::ExprKind.Path(path: _, args: _) or ast::ExprKind.Field(base: _, name: _) => return true
+        else => return false
+    }
+} is_path_or_field
+
+/// The problem of a doc reference naming no live member of what its path names: the fixes
+/// writing a rename's new path and each candidate member near it.
+fn Checker.member_problem(
+    self,
+    path: Str,
+    module: ty::ModuleId,
+    reference: ast::Path,
+    member: text::String,
+    key: Option[TypeKey],
+    span: diagnostic::Span,
+    member_at: u32,
+    ) -> DocProblem {
+    let alloc = self.alloc()
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    match self.renamed(module, path: reference, member: Some(member.as_str())) {
+        Some(renamed) => mut fixes.push(doc_fix(path, start: span.start, end: span.end, replaced: renamed.as_str(), alloc))
+        None => {}
+    }
+    match key {
+        Some(found_key) => {
+            let candidates = self.member_candidates(module, ty: self.key_ty(found_key))
+            for candidate in take near_candidates(member.as_str(), take candidates, alloc) {
+                mut fixes.push(doc_fix(path, start: member_at, end: span.end, replaced: candidate.as_str(), alloc))
+            }
+        }
+        None => {}
+    }
+    return DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: take fixes)
+} Checker.member_problem
+
+/// The rules of the summary of one file, read in its module when it has one.
+fn Checker.check_summary(self, file: workspace::File, module: Option[ty::ModuleId]) {
+    let alloc = self.alloc()
+    let Some(summary) = file.syntax.summary else {
+        return
+    }
+    var lines = mem::List[DocLine].empty(alloc)
+    mut lines.push(doc_line_of(file.syntax, token: summary, alloc))
+    self.check_doc_text(path: file.path.as_str(), module, documented: None, lines: lines.view(), report: fn(line: u32, span: Option[diagnostic::Span], take problem: DocProblem) {
+        var reported = diagnostic::Diagnostic.at(problem.code, path: file.path.as_str(), line, alloc)
+        reported.span = span
+        reported.fixes = problem.fixes
+        self.push_found(take reported)
+    })
+} Checker.check_summary
+
+/// The summary of a module's variants, compared with the first variant's in byte order of
+/// directory path: the first differing reported.
+fn Checker.check_variant_summaries(self, source: workspace::Package, module: workspace::Module) {
+    let alloc = self.alloc()
+    var dirs = mem::List[text::String].empty(alloc)
+    for dir in module.dirs {
+        mut dirs.push(text::String.of(dir.path.as_str(), alloc))
+    }
+    mut dirs.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var first_text = text::String.empty(alloc)
+    var have_first = false
+    for dir in dirs {
+        var wanted = text::String.of(dir.as_str(), alloc)
+        mut wanted.push('/')
+        mut wanted.append(module.name.as_str())
+        mut wanted.append(".nan")
+        let Some(index) = source.files.position(fn(file: workspace::File) => file.path.as_str() == wanted.as_str()) else {
+            continue
+        }
+        let file = source.files[index]
+        let Some(summary) = file.syntax.summary else {
+            continue
+        }
+        let held = doc_line_of(file.syntax, token: summary, alloc)
+        if not have_first {
+            first_text = text::String.of(held.text.as_str(), alloc)
+            have_first = true
+            continue
+        }
+        if first_text.as_str() != held.text.as_str() {
+            self.report_file(file.path.as_str(), line: held.line, code: diagnostic::Code.DocVariantMismatch)
+            return
+        }
+    }
+} Checker.check_variant_summaries
+
+/// The doc comments of the exported items of a file, by their identities.
+fn collect_held_docs(file: workspace::File, mut docs: mem::Map[text::String, mem::List[HeldDocs]], alloc: mem::Alloc) {
+    let source = file.syntax
+    let lowered = file.lowered(alloc)
+    var index: usize = 0
+    while index < source.items.len() and index < lowered.len() {
+        let at = index
+        index += 1
+        let Some(tree) = source.items[at].tree else {
+            continue
+        }
+        let Some(item) = lowered[at] else {
+            continue
+        }
+        let Some(identity) = exported_identity(item, alloc) else {
+            continue
+        }
+        var comments = mem::Map[text::String, text::String].empty(alloc)
+        for doc in doc_comments(source, tree, visibility: item.visibility, alloc) {
+            var joined = text::String.empty(alloc)
+            for position in 0..<doc.lines.len() {
+                if position > 0 {
+                    mut joined.push('\n')
+                }
+                mut joined.append(doc_line_of(source, token: doc.lines[position], alloc).text.as_str())
+            }
+            discard mut comments.insert(text::String.of(doc.member.as_str(), alloc), value: take joined)
+        }
+        if not docs.contains(identity) {
+            discard mut docs.insert(text::String.of(identity.as_str(), alloc), value: mem::List[HeldDocs].empty(alloc))
+        }
+        mut docs.at_mut(identity).push(HeldDocs(path: text::String.of(file.path.as_str(), alloc), line: source.item_lines(source.items[at]).low, docs: take comments))
+    }
+} collect_held_docs
+
+/// Holders of an item's docs by file path, then line.
+fn held_order(left: HeldDocs, right: HeldDocs) -> core::Ordering {
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return left.line.cmp(right.line)
+} held_order
+
+/// Whether two holders write the same doc comments for the same members.
+fn same_docs(left: mem::Map[text::String, text::String], right: mem::Map[text::String, text::String]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for entry in left.cursor() {
+        let Some(other) = right.get(entry.key()) else {
+            return false
+        }
+        if other.as_str() != entry.value().as_str() {
+            return false
+        }
+    }
+    return true
+} same_docs

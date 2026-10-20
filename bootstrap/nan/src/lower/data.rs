@@ -400,14 +400,9 @@ impl Lowering<'_, '_> {
         let declared = declared.clone();
         let mut bits = 0u128;
         for (field, value) in declared.iter().zip(fields) {
-            let (low, width, field_ty) = self.bit_field(&ty, &field.name);
+            let (low, mask, field_ty) = self.bit_field(&ty, &field.name);
             let value = self.scalar_bits(&field_ty, value);
-            let mask = if width >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << width) - 1
-            };
-            bits |= (value & mask) << low;
+            bits |= (value & u128::from(mask)) << low;
         }
         bits
     }

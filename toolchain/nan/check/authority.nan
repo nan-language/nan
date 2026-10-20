@@ -1,0 +1,335 @@
+//! Authority: the manifest grants a module needs for the device, priv, trusted and validate operations it performs directly, the grants its dependencies need, the names grants and denials list, and denied dependencies.
+
+/// The authorities a manifest grant names that a dependency's grant must be relayed for.
+fn relayed_authorities(alloc: mem::Alloc) -> mem::List[workspace::Authority] {
+    var relayed = mem::List[workspace::Authority].empty(alloc)
+    mut relayed.push(workspace::Authority.Device)
+    mut relayed.push(workspace::Authority.Priv)
+    mut relayed.push(workspace::Authority.Trusted)
+    mut relayed.push(workspace::Authority.Validate)
+    return relayed
+} relayed_authorities
+
+/// A name a manifest grant lists that nothing uses, with the line of its directive.
+struct UnusedGrant {
+    line: u32
+    name: text::String
+} UnusedGrant
+
+/// Whether a grant of a module's package names the module for an authority; std modules
+/// need none.
+fn Checker.granted(self, module: ty::ModuleId, authority: workspace::Authority) -> bool {
+    let db = self.db()
+    let package_id = db.module(module).package_id
+    if db.package_data(package_id).std {
+        return true
+    }
+    let Some(manifest) = db.source(package_id).manifest else {
+        return false
+    }
+    for allow in manifest.allows {
+        if allow.authority != authority {
+            continue
+        }
+        for name in allow.names {
+            if db.module_named(package_id, name: name.as_str()) == Some(module) {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.granted
+
+/// Records an operation of an authority that an item's module performs directly, reporting
+/// it when no grant names the module for that authority.
+fn Checker.require(self, item: ty::ItemId, token: u32, take authority: workspace::Authority) {
+    let db = self.db()
+    let module = db.module_of(item)
+    if not self.granted(module, authority) {
+        var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+        match self.fix_granting(db.package_of(item), authority, name: db.module(module).name.as_str()) {
+            Some(fix) => mut fixes.push(take fix)
+            None => {}
+        }
+        self.report_fixed(item, construct: nir::Span(head: token, last: token), code: diagnostic::Code.AuthorityUngranted, fixes: take fixes, offer: diagnostic::Offer.Each)
+    }
+    self.perform(item, take authority)
+} Checker.require
+
+/// Records an operation of an authority that an item's module performs directly.
+fn Checker.perform(self, item: ty::ItemId, take authority: workspace::Authority) {
+    let key = Performed(module: self.db().module_of(item), authority: take authority)
+    self.state.contents().performed.insert(take key, value: Unit)
+} Checker.perform
+
+/// The names a package's manifest grants list that nothing uses under the target checked,
+/// with the lines of their directives: a module performing none of the authority's
+/// operations directly, the alias of a dependency not granted the authority, and in a
+/// `contribute` grant, the alias of a package declaring the registry or contributing nothing
+/// to it.
+fn Checker.unused_grants(self, package_id: ty::PackageId) -> mem::List[UnusedGrant] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let data = db.package_data(package_id)
+    var unused = mem::List[UnusedGrant].empty(alloc)
+    let Some(manifest) = db.source(package_id).manifest else {
+        return unused
+    }
+    for allow in manifest.allows {
+        var named_registry: Option[ty::ItemId] = None
+        match allow.authority {
+            workspace::Authority.Contribute(written) => {
+                match self.granted_registry(package_id, written: written.as_str()) {
+                    Ok(found) => {
+                        named_registry = Some(found)
+                    }
+                    Err(_) => continue
+                }
+            }
+            else => {}
+        }
+        for name in allow.names {
+            let module = db.module_named(package_id, name: name.as_str())
+            let dep = match data.deps.get(name) {
+                Some(found) => found
+                None => None
+            }
+            if not self.grant_used(named_registry, module, dep, authority: allow.authority) {
+                mut unused.push(UnusedGrant(line: allow.line, name: text::String.of(name.as_str(), alloc)))
+            }
+        }
+    }
+    return unused
+} Checker.unused_grants
+
+/// The authority a call of a std function performs: the device operations of register
+/// windows and DMA, and the privileged intrinsics.
+fn Checker.call_authority(self, function: ty::ItemId) -> Option[workspace::Authority] {
+    let db = self.db()
+    if not db.is_std(function) {
+        return None
+    }
+    let path = db.canonical(function)
+    let bytes = path.as_bytes()
+    var dot = bytes.len()
+    var at = bytes.len()
+    while at > 0 {
+        at -= 1
+        if bytes[at] == b'.' {
+            dot = at
+            break
+        }
+    }
+    let Some(owner) = path.as_str().slice_bytes(0, end: dot) else {
+        return None
+    }
+    var member = ""
+    if dot < bytes.len() {
+        let Some(after) = path.as_str().slice_bytes(dot + 1, end: bytes.len()) else {
+            return None
+        }
+        member = after
+    }
+    if owner == "hw::Mmio" or owner == "hw::Ports" or owner == "hw::Dma" or owner == "hw::DmaShared" or owner == "hw::dma_fence" {
+        return Some(workspace::Authority.Device)
+    }
+    if owner == "hw::IrqShared" and (member == "install" or member == "uninstall") {
+        return Some(workspace::Authority.Device)
+    }
+    if owner == "hw::Ring0" {
+        return Some(workspace::Authority.Priv)
+    }
+    return None
+} Checker.call_authority
+
+/// The rules of a package's manifest directives that read its modules and dependencies.
+fn Checker.check_manifest(self, package_id: ty::PackageId) {
+    let db = self.db()
+    let data = db.package_data(package_id)
+    let source = db.source(package_id)
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    let path = source.files[0].path.as_str()
+    for allow in manifest.allows {
+        match allow.authority {
+            workspace::Authority.Contribute(_) => continue
+            else => {}
+        }
+        for name in allow.names {
+            if db.module_named(package_id, name: name.as_str()).is_none() and not data.deps.contains(name) {
+                self.report_file(path, line: allow.line, code: diagnostic::Code.AuthorityUnknownName)
+                break
+            }
+        }
+    }
+    for deny in manifest.denies {
+        let known_to = db.module_named(package_id, name: deny.denied.as_str()).is_some() or data.deps.contains(deny.denied) or db.std.contains(deny.denied)
+        if db.module_named(package_id, name: deny.module.as_str()).is_none() or not known_to {
+            self.report_file(path, line: deny.line, code: diagnostic::Code.AuthorityUnknownName)
+        }
+    }
+    for dep in manifest.deps {
+        self.check_dependency_grants(package_id, dep, path)
+    }
+    for deny in manifest.denies {
+        match db.module_named(package_id, name: deny.module.as_str()) {
+            Some(module) => self.check_denied(module, denied: deny.denied.as_str())
+            None => {}
+        }
+    }
+} Checker.check_manifest
+
+/// The authorities granted to the package a `dep` alias of a package names that the
+/// package's manifest does not grant the alias.
+fn Checker.ungranted(self, package_id: ty::PackageId, alias: Str) -> mem::List[workspace::Authority] {
+    let alloc = self.alloc()
+    var missing = mem::List[workspace::Authority].empty(alloc)
+    let Some(found) = self.db().package_data(package_id).deps.get_by(fn(key: text::String) => key.as_str().cmp(alias)) else {
+        return missing
+    }
+    let Some(target) = found else {
+        return missing
+    }
+    for authority in relayed_authorities(alloc) {
+        if self.grants_any(target, authority) and not self.relayed(package_id, alias, authority) {
+            mut missing.push(copied_authority(authority, alloc))
+        }
+    }
+    return missing
+} Checker.ungranted
+
+/// Whether a package's manifest grants an authority to any name.
+fn Checker.grants_any(self, package_id: ty::PackageId, authority: workspace::Authority) -> bool {
+    let db = self.db()
+    if db.package_data(package_id).std {
+        return false
+    }
+    let Some(manifest) = db.source(package_id).manifest else {
+        return false
+    }
+    for allow in manifest.allows {
+        if allow.authority == authority {
+            return true
+        }
+    }
+    return false
+} Checker.grants_any
+
+/// Reports each line of a module's items holding a path whose first segment is `denied`.
+fn Checker.check_denied(self, module: ty::ModuleId, denied: Str) {
+    let db = self.db()
+    for item in db.module(module).items {
+        let data = db.item(item)
+        let syntax = db.syntax(item)
+        let span = syntax.items[data.index]
+        var reported: Option[u32] = None
+        for index in syntax.path_starts(span.head, end: span.end) {
+            let line = syntax.tokens[index].line
+            if syntax.text(index) == denied and reported != Some(line) {
+                self.report_line(item, line, code: diagnostic::Code.AuthorityDeniedDependency)
+                reported = Some(line)
+            }
+        }
+    }
+} Checker.check_denied
+
+/// An impl line naming `sys::Capability`, which only std writes.
+fn Checker.check_capability_impl(self, item: ty::ItemId) {
+    let db = self.db()
+    if db.is_std(item) {
+        return
+    }
+    let sig = self.sig(item)
+    let SigKind.Impl(target: _, target_ty: _, bound: bound) = sig.contents().kind else {
+        return
+    }
+    let Some(named) = bound else {
+        return
+    }
+    if db.canonical(named.item).as_str() == "sys::Capability" {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.AuthorityCapabilityImpl)
+    }
+} Checker.check_capability_impl
+
+/// Whether a name a grant lists is used: a dependency contributing to the registry a
+/// `contribute` grant names, a module performing the authority, or a dependency granted it.
+fn Checker.grant_used(self, named_registry: Option[ty::ItemId], module: Option[ty::ModuleId], dep: Option[ty::PackageId], authority: workspace::Authority) -> bool {
+    match named_registry {
+        Some(registry_item) => {
+            let Some(contributor) = dep else {
+                return true
+            }
+            return self.contributes(contributor, registry_item)
+        }
+        None => {}
+    }
+    match module {
+        Some(found) => {
+            let key = Performed(module: found, authority: copied_authority(authority, alloc: self.alloc()))
+            return self.state.contents().performed.get(key).is_some()
+        }
+        None => {}
+    }
+    let Some(target) = dep else {
+        return true
+    }
+    return self.grants_any(target, authority)
+} Checker.grant_used
+
+/// Reports a `dep` directive naming a package granted an authority the manifest does not grant
+/// the alias, with the fix granting each.
+fn Checker.check_dependency_grants(self, package_id: ty::PackageId, dep: workspace::Dep, path: Str) {
+    let missing = self.ungranted(package_id, alias: dep.alias.as_str())
+    if missing.len() == 0 {
+        return
+    }
+    var combined: Option[diagnostic::Fix] = None
+    for authority in missing {
+        let Some(found) = self.fix_granting(package_id, authority, name: dep.alias.as_str()) else {
+            continue
+        }
+        match mut combined.extract() {
+            Some(earlier) => {
+                combined = Some(take earlier.joined(take found))
+            }
+            None => {
+                combined = Some(take found)
+            }
+        }
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    match combined {
+        Some(fix) => mut fixes.push(take fix)
+        None => {}
+    }
+    self.report_file_fixed(path, line: dep.line, code: diagnostic::Code.AuthorityDependencyUngranted, fixes: take fixes)
+} Checker.check_dependency_grants
+
+/// Whether a package's manifest grants an authority to a `dep` alias.
+fn Checker.relayed(self, package_id: ty::PackageId, alias: Str, authority: workspace::Authority) -> bool {
+    let Some(manifest) = self.db().source(package_id).manifest else {
+        return false
+    }
+    for allow in manifest.allows {
+        if allow.authority != authority {
+            continue
+        }
+        for name in allow.names {
+            if name.as_str() == alias {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.relayed
+
+fn copied_authority(authority: workspace::Authority, alloc: mem::Alloc) -> workspace::Authority {
+    return match authority {
+        workspace::Authority.Device => workspace::Authority.Device
+        workspace::Authority.Priv => workspace::Authority.Priv
+        workspace::Authority.Trusted => workspace::Authority.Trusted
+        workspace::Authority.Validate => workspace::Authority.Validate
+        workspace::Authority.Contribute(written) => workspace::Authority.Contribute(text::String.of(written.as_str(), alloc))
+    }
+} copied_authority

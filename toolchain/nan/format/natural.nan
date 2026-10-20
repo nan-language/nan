@@ -1,0 +1,526 @@
+//! Natural numbers of any size, and the conversions between decimals and binary floats.
+
+/// A natural number: its 32-bit limbs, least significant first, the most significant not zero.
+struct Natural {
+    limbs: mem::List[u32]
+} Natural
+
+fn Natural.zero(alloc: mem::Alloc) -> Natural = Natural(limbs: mem::List[u32].empty(alloc))
+
+fn Natural.of_u64(value: u64, alloc: mem::Alloc) -> Natural {
+    var natural = Natural.zero(alloc)
+    mut natural.limbs.push(u32.truncate(value))
+    mut natural.limbs.push(u32.truncate(value >> 32))
+    mut natural.trim()
+    return natural
+} Natural.of_u64
+
+/// The number that digits spell in `radix`, each an ASCII digit or letter below it.
+fn Natural.of_digits(digits: Slice[u8], radix: u32, alloc: mem::Alloc) -> Natural {
+    var value = Natural.zero(alloc)
+    for byte in digits {
+        mut value.mul_add(radix, addend: digit_value(byte))
+    }
+    return value
+} Natural.of_digits
+
+/// The value of an ASCII digit or letter, the letters from 10.
+fn digit_value(byte: u8) -> u32 {
+    if byte >= b'a' {
+        return u32.widen(byte - b'a') + 10
+    }
+    if byte >= b'A' {
+        return u32.widen(byte - b'A') + 10
+    }
+    return u32.widen(byte - b'0')
+} digit_value
+
+fn Natural.is_zero(self) -> bool = self.limbs.len() == 0
+
+/// The number of bits up to the highest set one.
+fn Natural.bits(self) -> usize {
+    let count = self.limbs.len()
+    if count == 0 {
+        return 0
+    }
+    return (count - 1) * 32 + usize.widen(32 - self.limbs[count - 1].leading_zeros())
+} Natural.bits
+
+/// Multiplies the number by `factor` and adds `addend`.
+fn Natural.mul_add(mut self, factor: u32, addend: u32) {
+    var carry = u64.widen(addend)
+    for limb in mut self.limbs {
+        let product = u64.widen(limb) * u64.widen(factor) + carry
+        limb = u32.truncate(product)
+        carry = product >> 32
+    }
+    if carry > 0 {
+        mut self.limbs.push(u32.truncate(carry))
+    }
+    mut self.trim()
+} Natural.mul_add
+
+/// Multiplies the number by 10 to the power `power`.
+fn Natural.mul_pow10(mut self, power: u64) {
+    for _ in 0..<power {
+        mut self.mul_add(10, addend: 0)
+    }
+} Natural.mul_pow10
+
+/// The sum of two numbers.
+fn Natural.added(self, other: Natural, alloc: mem::Alloc) -> Natural {
+    var limbs = mem::List[u32].empty(alloc)
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < self.limbs.len() or index < other.limbs.len() {
+        var sum = carry
+        if index < self.limbs.len() {
+            sum += u64.widen(self.limbs[index])
+        }
+        if index < other.limbs.len() {
+            sum += u64.widen(other.limbs[index])
+        }
+        mut limbs.push(u32.truncate(sum))
+        carry = sum >> 32
+        index += 1
+    }
+    if carry > 0 {
+        mut limbs.push(u32.truncate(carry))
+    }
+    return Natural(limbs: take limbs)
+} Natural.added
+
+/// Drops the zero limbs at the high end.
+fn Natural.trim(mut self) {
+    while self.limbs.len() > 0 and self.limbs[self.limbs.len() - 1] == 0 {
+        discard mut self.limbs.pop()
+    }
+} Natural.trim
+
+/// The number moved `amount` bits toward the high end.
+fn Natural.shifted(self, amount: usize, alloc: mem::Alloc) -> Natural {
+    var limbs = mem::List[u32].empty(alloc)
+    if self.limbs.len() == 0 {
+        return Natural(limbs: take limbs)
+    }
+    for _ in 0..<(amount / 32) {
+        mut limbs.push(0)
+    }
+    let part = u32.truncate(amount % 32)
+    var carry: u32 = 0
+    for limb in self.limbs {
+        if part == 0 {
+            mut limbs.push(limb)
+        } else {
+            mut limbs.push((limb << part) | carry)
+            carry = limb >> (32 - part)
+        }
+    }
+    if carry > 0 {
+        mut limbs.push(carry)
+    }
+    return Natural(limbs: take limbs)
+} Natural.shifted
+
+fn Natural.compare(self, other: Natural) -> core::Ordering {
+    if self.limbs.len() != other.limbs.len() {
+        return self.limbs.len().cmp(other.limbs.len())
+    }
+    var index = self.limbs.len()
+    while index > 0 {
+        index -= 1
+        if self.limbs[index] != other.limbs[index] {
+            return self.limbs[index].cmp(other.limbs[index])
+        }
+    }
+    return core::Ordering.Equal
+} Natural.compare
+
+/// Subtracts a number no greater than this one.
+fn Natural.subtract(mut self, other: Natural) {
+    var borrow: u64 = 0
+    for index in 0..<self.limbs.len() {
+        var subtrahend = borrow
+        if index < other.limbs.len() {
+            subtrahend += u64.widen(other.limbs[index])
+        }
+        let minuend = u64.widen(self.limbs[index])
+        borrow = 0
+        if minuend < subtrahend {
+            borrow = 1
+        }
+        self.limbs[index] = u32.truncate((minuend + (borrow << 32)) - subtrahend)
+    }
+    expect borrow == 0
+    mut self.trim()
+} Natural.subtract
+
+/// Divides the number by `divisor` and returns the remainder.
+fn Natural.div_small(mut self, divisor: u32) -> u32 {
+    let wide = u64.widen(divisor)
+    var remainder: u64 = 0
+    var index = self.limbs.len()
+    while index > 0 {
+        index -= 1
+        let current = (remainder << 32) | u64.widen(self.limbs[index])
+        self.limbs[index] = u32.truncate(current / wide)
+        remainder = current % wide
+    }
+    mut self.trim()
+    return u32.truncate(remainder)
+} Natural.div_small
+
+/// The number in decimal digits.
+fn Natural.to_decimal(self, alloc: mem::Alloc) -> text::String {
+    var rest = self.shifted(0, alloc)
+    var reversed = mem::Bytes.empty(alloc)
+    loop {
+        mut reversed.push(b'0' + u8.truncate(mut rest.div_small(10)))
+        if rest.is_zero() {
+            break
+        }
+    }
+    var digits = mem::Bytes.empty(alloc)
+    var index = reversed.len()
+    while index > 0 {
+        index -= 1
+        mut digits.push(reversed[index])
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(digits.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return written
+} Natural.to_decimal
+
+/// The bits of the binary float nearest the value of decimal digits holding at most one `.`,
+/// ties to an even significand: a sign bit, then the exponent, then the significand of
+/// `precision` bits but its leading one, the normal exponents running from `1 - max_exponent`
+/// to `max_exponent`; infinity past the greatest finite value.
+fn nearest_float(number: Slice[u8], precision: u32, max_exponent: i64, alloc: mem::Alloc) -> u64 {
+    var digits = mem::Bytes.empty(alloc)
+    var fraction: usize = 0
+    var after_point = false
+    for byte in number {
+        if byte == b'.' {
+            after_point = true
+            continue
+        }
+        mut digits.push(byte)
+        if after_point {
+            fraction += 1
+        }
+    }
+    let numerator = Natural.of_digits(digits.view(), radix: 10, alloc)
+    if numerator.is_zero() {
+        return 0
+    }
+    var denominator = Natural.zero(alloc)
+    mut denominator.mul_add(1, addend: 1)
+    for _ in 0..<fraction {
+        mut denominator.mul_add(10, addend: 0)
+    }
+    let width = i64.widen(precision)
+    let least = 2 - max_exponent - width
+    var exponent = i64.fit(numerator.bits()) - i64.fit(denominator.bits()) - width
+    if exponent < least {
+        exponent = least
+    }
+    var quotient = scaled_quotient(numerator, denominator, exponent, precision, alloc)
+    if (quotient.value >> precision) != 0 {
+        exponent += 1
+        quotient = scaled_quotient(numerator, denominator, exponent, precision, alloc)
+    }
+    var significand = quotient.value
+    match quotient.rest {
+        core::Ordering.Greater => {
+            significand += 1
+        }
+        core::Ordering.Equal => {
+            significand += significand & 1
+        }
+        core::Ordering.Less => {
+        }
+    }
+    if (significand >> precision) != 0 {
+        significand = significand >> 1
+        exponent += 1
+    }
+    if exponent + width - 1 > max_exponent {
+        return u64.fit(2 * max_exponent + 1) << (precision - 1)
+    }
+    let hidden = 1u64 << (precision - 1)
+    if significand < hidden {
+        return significand
+    }
+    return (u64.fit(exponent + width - 1 + max_exponent) << (precision - 1)) | (significand - hidden)
+} nearest_float
+
+/// The integer part of a quotient, and how twice its remainder compares with the divisor.
+struct Quotient derives Copy {
+    value: u64
+    rest: core::Ordering
+} Quotient
+
+/// The quotient of `numerator / denominator / 2^exponent`, below `2^(precision + 2)`.
+fn scaled_quotient(
+    numerator: Natural,
+    denominator: Natural,
+    exponent: i64,
+    precision: u32,
+    alloc: mem::Alloc,
+    ) -> Quotient {
+    var numerator_shift: usize = 0
+    var denominator_shift: usize = 0
+    if exponent >= 0 {
+        denominator_shift = usize.fit(exponent)
+    } else {
+        numerator_shift = usize.fit(-exponent)
+    }
+    var dividend = numerator.shifted(numerator_shift, alloc)
+    let divisor = denominator.shifted(denominator_shift, alloc)
+    var value: u64 = 0
+    var bit = precision + 1
+    loop {
+        let candidate = divisor.shifted(usize.widen(bit), alloc)
+        if dividend.compare(candidate) != core::Ordering.Less {
+            mut dividend.subtract(candidate)
+            value = value | (1u64 << bit)
+        }
+        if bit == 0 {
+            break
+        }
+        bit -= 1
+    }
+    let twice = dividend.shifted(1, alloc)
+    return Quotient(value: value, rest: twice.compare(divisor))
+} scaled_quotient
+
+/// The text Rust's shortest float formatting writes for a float's bits in a binary format of
+/// `precision` significand bits and greatest exponent `max_exponent`, the sign aside: `inf`,
+/// `0`, or the shortest digits that read back as the value, positional, with a point only
+/// before a fraction.
+fn float_text(bits: u64, precision: u32, max_exponent: i64, alloc: mem::Alloc) -> text::String {
+    let fraction_bits = precision - 1
+    let biased = (bits >> fraction_bits) & u64.fit(2 * max_exponent + 1)
+    let fraction = bits & ((1u64 << fraction_bits) - 1)
+    if biased == u64.fit(2 * max_exponent + 1) {
+        return text::String.of("inf", alloc)
+    }
+    if biased == 0 and fraction == 0 {
+        return text::String.of("0", alloc)
+    }
+    return decimal_text(shortest_digits(decoded_float(bits, precision, max_exponent), alloc), alloc)
+} float_text
+
+/// A positive finite nonzero float's bits as a fraction of naturals, in a binary format of
+/// `precision` significand bits and greatest exponent `max_exponent`.
+fn decoded_float(bits: u64, precision: u32, max_exponent: i64) -> Decoded {
+    let fraction_bits = precision - 1
+    let biased = (bits >> fraction_bits) & u64.fit(2 * max_exponent + 1)
+    let fraction = bits & ((1u64 << fraction_bits) - 1)
+    let shift = max_exponent + i64.widen(fraction_bits)
+    if biased == 0 {
+        return Decoded(mant: fraction << 1, minus: 1, plus: 1, exp: 0 - shift, inclusive: true)
+    }
+    let mant = fraction | (1u64 << fraction_bits)
+    if fraction == 0 {
+        return Decoded(mant: mant << 2, minus: 1, plus: 2, exp: i64.fit(biased) - shift - 2, inclusive: true)
+    }
+    return Decoded(mant: mant << 1, minus: 1, plus: 1, exp: i64.fit(biased) - shift - 1, inclusive: (mant & 1) == 0)
+} decoded_float
+
+/// A positive finite float as a fraction of naturals: `mant * 2^exp`, with its neighbours
+/// `(mant - minus) * 2^exp` and `(mant + plus) * 2^exp` read back as it when `inclusive`.
+struct Decoded derives Copy {
+    mant: u64
+    minus: u64
+    plus: u64
+    exp: i64
+    inclusive: bool
+} Decoded
+
+/// Decimal digits, and the power of ten `k` with the value `0.d1d2... * 10^k`.
+struct Digits {
+    digits: mem::Bytes
+    exponent: i64
+} Digits
+
+/// Whether an order of `a` against `b` puts `a` below `b`, or at most `b` when `inclusive`.
+fn below(order: core::Ordering, inclusive: bool) -> bool {
+    if inclusive {
+        return order != core::Ordering.Greater
+    }
+    return order == core::Ordering.Less
+} below
+
+/// The shortest digits between a float's neighbours, the nearer of the last two candidates and
+/// the greater on a tie: the digits of Dragon4's free-format algorithm.
+fn shortest_digits(decoded: Decoded, alloc: mem::Alloc) -> Digits {
+    let high = decoded.mant + decoded.plus
+    let nbits = 64 - i64.widen((high - 1).leading_zeros())
+    var k = ((nbits + decoded.exp) * 1_292_913_986).shr_arith(32)
+    var mant = Natural.of_u64(decoded.mant, alloc)
+    var minus = Natural.of_u64(decoded.minus, alloc)
+    var plus = Natural.of_u64(decoded.plus, alloc)
+    var scale = Natural.of_u64(1, alloc)
+    if decoded.exp < 0 {
+        scale = scale.shifted(usize.fit(-decoded.exp), alloc)
+    } else {
+        mant = mant.shifted(usize.fit(decoded.exp), alloc)
+        minus = minus.shifted(usize.fit(decoded.exp), alloc)
+        plus = plus.shifted(usize.fit(decoded.exp), alloc)
+    }
+    if k >= 0 {
+        mut scale.mul_pow10(u64.fit(k))
+    } else {
+        mut mant.mul_pow10(u64.fit(-k))
+        mut minus.mul_pow10(u64.fit(-k))
+        mut plus.mul_pow10(u64.fit(-k))
+    }
+    if below(scale.compare(mant.added(plus, alloc)), inclusive: decoded.inclusive) {
+        k += 1
+    } else {
+        mut mant.mul_add(10, addend: 0)
+        mut minus.mul_add(10, addend: 0)
+        mut plus.mul_add(10, addend: 0)
+    }
+    let scale2 = scale.shifted(1, alloc)
+    let scale4 = scale.shifted(2, alloc)
+    let scale8 = scale.shifted(3, alloc)
+    var digits = mem::Bytes.empty(alloc)
+    var down = false
+    var up = false
+    loop {
+        var digit: u8 = 0
+        if mant.compare(scale8) != core::Ordering.Less {
+            mut mant.subtract(scale8)
+            digit += 8
+        }
+        if mant.compare(scale4) != core::Ordering.Less {
+            mut mant.subtract(scale4)
+            digit += 4
+        }
+        if mant.compare(scale2) != core::Ordering.Less {
+            mut mant.subtract(scale2)
+            digit += 2
+        }
+        if mant.compare(scale) != core::Ordering.Less {
+            mut mant.subtract(scale)
+            digit += 1
+        }
+        mut digits.push(b'0' + digit)
+        down = below(mant.compare(minus), inclusive: decoded.inclusive)
+        up = below(scale.compare(mant.added(plus, alloc)), inclusive: decoded.inclusive)
+        if down or up {
+            break
+        }
+        mut mant.mul_add(10, addend: 0)
+        mut minus.mul_add(10, addend: 0)
+        mut plus.mul_add(10, addend: 0)
+    }
+    if up and (not down or mant.shifted(1, alloc).compare(scale) != core::Ordering.Less) {
+        match rounded_up(mut digits) {
+            Some(extra) => {
+                mut digits.push(extra)
+                k += 1
+            }
+            None => {
+            }
+        }
+    }
+    return Digits(digits: take digits, exponent: k)
+} shortest_digits
+
+/// Adds one to the last of decimal digits; when they are all nines, they read `10...0` and the
+/// digit to append, a further `0`, comes back.
+fn rounded_up(mut digits: mem::Bytes) -> Option[u8] {
+    var index = digits.len()
+    while index > 0 {
+        index -= 1
+        if digits[index] != b'9' {
+            digits[index] = digits[index] + 1
+            for later in (index + 1)..<digits.len() {
+                digits[later] = b'0'
+            }
+            return None
+        }
+    }
+    if digits.len() == 0 {
+        return Some(b'1')
+    }
+    digits[0] = b'1'
+    for later in 1..<digits.len() {
+        digits[later] = b'0'
+    }
+    return Some(b'0')
+} rounded_up
+
+/// Digits written positionally: `0.` and zeros before them when the value is below one, a
+/// point inside them when it has a fraction, zeros after them otherwise.
+fn decimal_text(shortest: Digits, alloc: mem::Alloc) -> text::String {
+    let digits = shortest.digits.view()
+    let exponent = shortest.exponent
+    var written = mem::Bytes.empty(alloc)
+    if exponent <= 0 {
+        mut written.append(b"0.")
+        for _ in 0..<u64.fit(-exponent) {
+            mut written.push(b'0')
+        }
+        mut written.append(digits)
+    } else if u64.fit(exponent) < u64.widen(digits.len()) {
+        let point = usize.fit(exponent)
+        for at in 0..<digits.len() {
+            if at == point {
+                mut written.push(b'.')
+            }
+            mut written.push(digits[at])
+        }
+    } else {
+        mut written.append(digits)
+        for _ in 0..<(u64.fit(exponent) - u64.widen(digits.len())) {
+            mut written.push(b'0')
+        }
+    }
+    let Ok(text) = attempt text::String.try_from_utf8(written.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text
+} decimal_text
+
+/// The bits of the `f64`, or of the `f32` when `single`, nearest the value of decimal digits
+/// holding at most one `.`, as Rust's parsing of floats gives them.
+pkg fn float_bits(number: Slice[u8], single: bool, alloc: mem::Alloc) -> u64 {
+    if single {
+        return nearest_float(number, precision: 24, max_exponent: 127, alloc)
+    }
+    return nearest_float(number, precision: 53, max_exponent: 1_023, alloc)
+} float_bits
+
+/// Digits `d1d2...` and the exponent `e` of the scientific form `d1.d2... * 10^e`.
+pkg struct Scientific {
+    pkg digits: mem::Bytes
+    pkg exponent: i64
+} Scientific
+
+/// The shortest digits reading back as a finite float's magnitude, of the `f32` with those bits
+/// when `single` and of the `f64` otherwise, in the scientific form Rust's `{:e}` writes: `0`
+/// with exponent 0 for zero.
+pkg fn scientific(bits: u64, single: bool, alloc: mem::Alloc) -> Scientific {
+    var precision: u32 = 53
+    var max_exponent: i64 = 1_023
+    var magnitude = bits & 0x7FFF_FFFF_FFFF_FFFF
+    if single {
+        precision = 24
+        max_exponent = 127
+        magnitude = bits & 0x7FFF_FFFF
+    }
+    if magnitude == 0 {
+        var digits = mem::Bytes.empty(alloc)
+        mut digits.push(b'0')
+        return Scientific(digits: take digits, exponent: 0)
+    }
+    var shortest = shortest_digits(decoded_float(magnitude, precision, max_exponent), alloc)
+    return Scientific(digits: take shortest.digits, exponent: shortest.exponent - 1)
+} scientific

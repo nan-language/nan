@@ -1,0 +1,644 @@
+//! Refutation: the candidate an open state gives, its entry terms fixed in term order to the least values their classes allow, and the parameter values it builds for the interpreter's confirmation run.
+
+/// The `len` and `at` functions whose applications to inputs are inputs.
+const LENGTH_FUNCTIONS: Str = "core::Slice.len core::SliceMut.len core::Array.len"
+
+const ELEMENT_FUNCTIONS: Str = "core::Slice.at core::SliceMut.at core::Array.at"
+
+/// An element term of an input sequence, by its index term.
+struct ElementAt derives Copy {
+    index: u32
+    value: u32
+} ElementAt
+
+/// Builds the values of a candidate from a fixed state, which goes beside it.
+struct RefuteBuilder {
+    ck: Checker
+    /// The module of the code judged, which must be able to construct each struct built.
+    module: ty::ModuleId
+    lengths: mem::HashMap[u32, u32]
+    elements: mem::HashMap[u32, mem::List[ElementAt]]
+} RefuteBuilder
+
+/// Fixes the open state's entry terms, the integer and boolean inputs among its terms, each
+/// in term order to the least value its class allows, propagating after each; false when a
+/// fixing ends in a contradiction or the fuel runs out.
+fn Solver.fix(mut self, mut state: State) -> bool {
+    let alloc = state.terms.alloc
+    var inputs = mem::HashMap[u32, bool].empty(seed: 0, alloc)
+    var keyed = mem::List[KeyedNode].empty(alloc)
+    for index in 0..<state.terms.len() {
+        let term = u32.fit(index)
+        if not state.is_registered(term) {
+            continue
+        }
+        let sort = state.terms.sort(term)
+        if sort != Sort.Int and sort != Sort.Bool {
+            continue
+        }
+        if not self.ck.is_input(state, term, known: mut inputs) {
+            continue
+        }
+        let key = mut state.encodings.term(self.ck, terms: state.terms, id: term)
+        mut keyed.push(KeyedNode(key: take key, node: term))
+    }
+    mut keyed.sort_by(fn(left: KeyedNode, right: KeyedNode) => left.key.contents().view().cmp(right.key.contents().view()))
+    for entry in keyed {
+        let term = entry.node
+        let Ok(_) = attempt mut self.step() else {
+            return false
+        }
+        if state.terms.sort(term) == Sort.Bool {
+            let value = state.truth_of(term) == Some(true)
+            let Ok(_) = attempt mut self.assert_term(mut state, term, value) else {
+                return false
+            }
+        } else {
+            let Some(value) = state.least(term) else {
+                return false
+            }
+            let literal = Literal(negated: false, atom: Atom.Eq(Linear(terms: single_summand(wide::Wide.one(), term, alloc), constant: value)))
+            let Ok(_) = attempt mut self.assert_literal(mut state, literal) else {
+                return false
+            }
+        }
+        let Ok(_) = attempt mut self.propagate(mut state) else {
+            return false
+        }
+    }
+    return true
+} Solver.fix
+
+/// The least value of a term's interval that satisfies its congruence and that no
+/// disequality excludes.
+fn State.least(self, term: u32) -> Option[wide::Wide] {
+    let class = self.class(term)
+    var floor = wide::Wide.zero()
+    match self.terms.ty(term).interned_scalar() {
+        Some(scalar) => {
+            if scalar.is_integer() {
+                floor = scalar.range().low
+            }
+        }
+        None => {}
+    }
+    var value = class.low.value_or(floor)
+    if class.modulus >= wide::Wide.of_i64(2) {
+        value = value.wrapping_add(euclid_rem(class.residue.wrapping_sub(value), divisor: class.modulus))
+    }
+    while self.excluded(term, value) {
+        let Some(next) = value.checked_add(class.modulus) else {
+            return None
+        }
+        value = next
+    }
+    let Some(high) = class.high else {
+        return Some(value)
+    }
+    if high < value {
+        return None
+    }
+    return Some(value)
+} State.least
+
+/// Whether a term is an input: a parameter, the content of a parameter's place at entry, a
+/// const parameter, or a field, payload field, tag, length or element of an input.
+fn Checker.is_input(self, state: State, term: u32, mut known: mem::HashMap[u32, bool]) -> bool {
+    let held = known.get(term)
+    match held {
+        Some(input) => return input
+        None => {}
+    }
+    var input = false
+    match state.terms.get(term) {
+        Term.Param(_) or Term.Entry(_) => {
+            input = true
+        }
+        Term.App(op: Op.Constant(nir::Constant.Param(_)), args: _) => {
+            input = true
+        }
+        Term.Field(base: part, name: _) or Term.Tag(part) => {
+            input = self.is_input(state, term: part, mut known)
+        }
+        Term.Call(callee: callee, args: args) => {
+            input = self.call_input(state, callee, args: args.view(), mut known)
+        }
+        else => {}
+    }
+    discard mut known.insert(term, value: input)
+    return input
+} Checker.is_input
+
+/// Whether a call is an input: a length of an input, or an element of an input at a literal
+/// or input index.
+fn Checker.call_input(self, state: State, callee: nir::FnRef, args: Slice[u32], mut known: mem::HashMap[u32, bool]) -> bool {
+    let Some(path) = self.callee_name(callee) else {
+        return false
+    }
+    if is_listed(LENGTH_FUNCTIONS, word: path.as_str()) {
+        return self.is_input(state, term: args[0], mut known)
+    }
+    if not is_listed(ELEMENT_FUNCTIONS, word: path.as_str()) {
+        return false
+    }
+    if not self.is_input(state, term: args[0], mut known) {
+        return false
+    }
+    if state.terms.int_value(args[1]).is_some() {
+        return true
+    }
+    return self.is_input(state, term: args[1], mut known)
+} Checker.call_input
+
+fn Checker.callee_name(self, callee: nir::FnRef) -> Option[text::String] {
+    return match callee.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => Some(self.db().canonical(item))
+        else => None
+    }
+} Checker.callee_name
+
+fn RefuteBuilder.new(take ck: Checker, state: State, module: ty::ModuleId) -> RefuteBuilder {
+    let alloc = ck.alloc()
+    var lengths = mem::HashMap[u32, u32].empty(seed: 0, alloc)
+    var elements = mem::HashMap[u32, mem::List[ElementAt]].empty(seed: 0, alloc)
+    for index in 0..<state.terms.len() {
+        let term = u32.fit(index)
+        if not state.is_registered(term) {
+            continue
+        }
+        let Term.Call(callee: callee, args: args) = state.terms.get(term) else {
+            continue
+        }
+        let Some(path) = ck.callee_name(callee) else {
+            continue
+        }
+        if is_listed(LENGTH_FUNCTIONS, word: path.as_str()) {
+            discard mut lengths.insert(args[0], value: term)
+        } else if is_listed(ELEMENT_FUNCTIONS, word: path.as_str()) {
+            let base = args[0]
+            if not elements.contains(base) {
+                discard mut elements.insert(base, value: mem::List[ElementAt].empty(alloc))
+            }
+            var held = mut elements.at_mut(base)
+            mut held.push(ElementAt(index: args[1], value: term))
+        }
+    }
+    return RefuteBuilder(ck: take ck, module: module, lengths: take lengths, elements: take elements)
+} RefuteBuilder.new
+
+/// The value of a term of a type: from its fixed class and those of its parts, a part no
+/// fixed term determines taking the least value of its type; none for a type a candidate
+/// cannot hold.
+fn RefuteBuilder.value(self, state: State, term: Option[u32], ty: ty::Ty) -> Option[Input] {
+    var held: Option[u32] = None
+    match term {
+        Some(candidate) => {
+            if state.is_registered(candidate) {
+                held = Some(candidate)
+            }
+        }
+        None => {}
+    }
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return Some(Input.Value(self.scalar(state, term: held, scalar)))
+        ty::TyKind.Unit => return Some(Input.Value(Val.Unit))
+        ty::TyKind.Item(item: item, args: args) => return self.item_value(state, term: held, item, args)
+        else => return None
+    }
+} RefuteBuilder.value
+
+/// The value of a term of a struct or enum type, or of a slice or array of its elements.
+fn RefuteBuilder.item_value(self, state: State, term: Option[u32], item: ty::ItemId, args: ty::Args) -> Option[Input] {
+    let listed = self.ck.types().arg_list(args)
+    let path = self.ck.db().canonical(item)
+    if path.as_str() == "core::Slice" or path.as_str() == "core::SliceMut" {
+        var len = wide::Wide.zero()
+        match term {
+            Some(base) => {
+                match self.lengths.get(base) {
+                    Some(length) => {
+                        len = state.class(length).single().value_or(wide::Wide.zero())
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        let count = usize.widen(len.max_of(wide::Wide.zero()).low_bits())
+        let Some(element) = first_arg_ty(listed) else {
+            return None
+        }
+        let Some(elements) = self.elements_of(state, term, len: count, element) else {
+            return None
+        }
+        return Some(Input.Slice(elements: take elements, writable: path.as_str() == "core::SliceMut"))
+    }
+    if path.as_str() == "core::Array" {
+        if listed.len() < 2 {
+            return None
+        }
+        let ty::Arg.Const(ty::Const.Int(length)) = listed[1] else {
+            return None
+        }
+        let Some(element) = first_arg_ty(listed) else {
+            return None
+        }
+        let Some(elements) = self.elements_of(state, term, len: usize.widen(length.low_bits()), element) else {
+            return None
+        }
+        return Some(Input.Array(take elements))
+    }
+    return self.composite(state, term, item, args: listed)
+} RefuteBuilder.item_value
+
+/// The type of the first of a list of generic arguments, when it is a type.
+fn first_arg_ty(args: Slice[ty::Arg]) -> Option[ty::Ty] {
+    if args.len() == 0 {
+        return None
+    }
+    return args[0].ty()
+} first_arg_ty
+
+fn RefuteBuilder.scalar(self, state: State, term: Option[u32], scalar: ty::Scalar) -> Val {
+    var fixed: Option[wide::Wide] = None
+    match term {
+        Some(held) => {
+            fixed = state.class(held).single()
+        }
+        None => {}
+    }
+    match scalar {
+        ty::Scalar.Bool => {
+            var truth = false
+            match term {
+                Some(held) => {
+                    truth = state.truth_of(held) == Some(true)
+                }
+                None => {}
+            }
+            return Val.Bool(truth)
+        }
+        ty::Scalar.Char => return Val.Char(fixed_char(fixed))
+        ty::Scalar.Float32 => return Val.Float32(0.0)
+        ty::Scalar.Float64 => return Val.Float64(0.0)
+        else => return Val.Int(fixed.value_or(wide::Wide.zero()))
+    }
+} RefuteBuilder.scalar
+
+/// The `char` of a fixed value's low 32 bits, `'\0'` for none or for bits that are no code
+/// point.
+fn fixed_char(fixed: Option[wide::Wide]) -> char {
+    let Some(value) = fixed else {
+        return '\0'
+    }
+    return char.checked_from_bits(u32.truncate(value.low_bits())).value_or('\0')
+} fixed_char
+
+/// The elements below `len` of a slice or array term, each from the `at` application at
+/// its index.
+fn RefuteBuilder.elements_of(self, state: State, term: Option[u32], len: usize, element: ty::Ty) -> Option[mem::List[Input]] {
+    var elements = mem::List[Input].empty(self.ck.alloc())
+    for index in 0..<len {
+        var at: Option[u32] = None
+        match term {
+            Some(base) => {
+                match self.elements.get(base) {
+                    Some(applications) => {
+                        at = state.application_at(applications.view(), index)
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        let Some(value) = self.value(state, term: at, ty: element) else {
+            return None
+        }
+        mut elements.push(take value)
+    }
+    return Some(take elements)
+} RefuteBuilder.elements_of
+
+/// The element term, among a sequence's `at` applications, whose index term is fixed to an
+/// index.
+fn State.application_at(self, applications: Slice[ElementAt], index: usize) -> Option[u32] {
+    let wanted = wide::Wide.of_u64(u64.widen(index))
+    for application in applications {
+        if self.class(application.index).single() == Some(wanted) {
+            return Some(application.value)
+        }
+    }
+    return None
+} State.application_at
+
+/// A struct the judged module may construct, from its fields, or an enum value, its
+/// variant from its tag and its payload from its payload fields; none for a struct that is a
+/// base type, whose representation no field shows.
+fn RefuteBuilder.composite(self, state: State, term: Option[u32], item: ty::ItemId, args: Slice[ty::Arg]) -> Option[Input] {
+    let alloc = self.ck.alloc()
+    let sig = self.ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args, alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            if self.ck.is_base_type(item) {
+                return None
+            }
+            return self.struct_value(state, term, item, fields: fields.view(), subst)
+        }
+        SigKind.Enum(variants: variants) => return self.enum_value(state, term, item, variants: variants.view(), subst)
+        else => return None
+    }
+} RefuteBuilder.composite
+
+/// A struct value from the terms of its fields; none when the judged module cannot construct
+/// it.
+fn RefuteBuilder.struct_value(
+    self,
+    state: State,
+    term: Option[u32],
+    item: ty::ItemId,
+    fields: Slice[FieldSig],
+    subst: ty::Subst,
+    ) -> Option[Input] {
+    let alloc = self.ck.alloc()
+    let db = self.ck.db()
+    for field in fields {
+        if not db.field_visible(self.module, owner: item, visibility: field.visibility) {
+            return None
+        }
+    }
+    let types = self.ck.types()
+    var values = mem::List[Input].empty(alloc)
+    for declared in fields {
+        let part = state.field_term(term, name: declared.name.as_str(), alloc)
+        let Some(value) = self.value(state, term: part, ty: subst.ty(types, ty: declared.ty)) else {
+            return None
+        }
+        mut values.push(take value)
+    }
+    return Some(Input.Struct(item: item, fields: take values))
+} RefuteBuilder.struct_value
+
+/// An enum value: its variant from the fixed value of its tag term, its payload from the
+/// terms of its payload fields.
+fn RefuteBuilder.enum_value(
+    self,
+    state: State,
+    term: Option[u32],
+    item: ty::ItemId,
+    variants: Slice[VariantSig],
+    subst: ty::Subst,
+    ) -> Option[Input] {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    var tag: usize = 0
+    match state.tag_term(term) {
+        Some(tagged) => match state.class(tagged).single() {
+            Some(value) => {
+                if not value.is_negative() and value < wide::Wide.of_u64(u64.widen(variants.len())) {
+                    tag = usize.widen(value.low_bits())
+                }
+            }
+            None => {}
+        }
+        None => {}
+    }
+    let variant = variants[tag]
+    let payload_term = state.field_term(term, name: variant.name.as_str(), alloc)
+    var payload = mem::List[Input].empty(alloc)
+    match variant.payload {
+        Payload.None => {}
+        Payload.Single(payload_ty) => {
+            let Some(value) = self.value(state, term: payload_term, ty: subst.ty(types, ty: payload_ty)) else {
+                return None
+            }
+            mut payload.push(take value)
+        }
+        Payload.Labelled(labelled) => {
+            for field in labelled {
+                let part = state.field_term(payload_term, name: field.name.as_str(), alloc)
+                let Some(value) = self.value(state, term: part, ty: subst.ty(types, ty: field.ty)) else {
+                    return None
+                }
+                mut payload.push(take value)
+            }
+        }
+    }
+    return Some(Input.Variant(item: item, index: u32.fit(tag), fields: take payload))
+} RefuteBuilder.enum_value
+
+/// The term of a field of a term, if the store holds it.
+fn State.field_term(self, term: Option[u32], name: Str, alloc: mem::Alloc) -> Option[u32] {
+    let Some(base) = term else {
+        return None
+    }
+    return self.terms.lookup(Term.Field(base: base, name: text::String.of(name, alloc)))
+} State.field_term
+
+/// The tag term of a term, if the store holds it.
+fn State.tag_term(self, term: Option[u32]) -> Option[u32] {
+    let Some(base) = term else {
+        return None
+    }
+    return self.terms.lookup(Term.Tag(base))
+} State.tag_term
+
+/// A candidate value as a labelled NaN literal.
+fn Checker.input_literal(self, input: Input) -> text::String {
+    let alloc = self.alloc()
+    match input {
+        Input.Value(value) => return value_literal(value, alloc)
+        Input.Struct(item: item, fields: fields) => return self.struct_literal(item, fields: fields.view())
+        Input.Variant(item: item, index: index, fields: payload) => return self.variant_literal(item, index, payload: payload.view())
+        Input.Array(elements) or Input.Slice(elements: elements, writable: _) => {
+            var parts = mem::List[text::String].empty(alloc)
+            for element in elements {
+                mut parts.push(self.input_literal(element))
+            }
+            var written = text::String.of("[", alloc)
+            mut written.append(joined_texts(parts.view(), alloc).as_str())
+            mut written.push(']')
+            return written
+        }
+    }
+} Checker.input_literal
+
+/// A struct's candidate value: its type's name with its labelled fields.
+fn Checker.struct_literal(self, item: ty::ItemId, fields: Slice[Input]) -> text::String {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: declared) = sig.contents().kind else {
+        return text::String.empty(alloc)
+    }
+    var parts = mem::List[text::String].empty(alloc)
+    var index: usize = 0
+    while index < declared.len() and index < fields.len() {
+        var part = text::String.of(declared[index].name.as_str(), alloc)
+        mut part.append(": ")
+        mut part.append(self.input_literal(fields[index]).as_str())
+        mut parts.push(take part)
+        index += 1
+    }
+    var written = self.input_type_name(item)
+    mut written.push('(')
+    mut written.append(joined_texts(parts.view(), alloc).as_str())
+    mut written.push(')')
+    return written
+} Checker.struct_literal
+
+/// An enum's candidate value: its variant's name, qualified by its type's but for `Option`
+/// and `Result`, with its payload.
+fn Checker.variant_literal(self, item: ty::ItemId, index: u32, payload: Slice[Input]) -> text::String {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return text::String.empty(alloc)
+    }
+    let variant = variants[usize.widen(index)]
+    let path = self.db().canonical(item)
+    var written = text::String.empty(alloc)
+    if path.as_str() != "core::Option" and path.as_str() != "core::Result" {
+        written = self.input_type_name(item)
+        mut written.push('.')
+    }
+    mut written.append(variant.name.as_str())
+    var parts = mem::List[text::String].empty(alloc)
+    match variant.payload {
+        Payload.Labelled(labelled) => {
+            var position: usize = 0
+            while position < labelled.len() and position < payload.len() {
+                var part = text::String.of(labelled[position].name.as_str(), alloc)
+                mut part.append(": ")
+                mut part.append(self.input_literal(payload[position]).as_str())
+                mut parts.push(take part)
+                position += 1
+            }
+        }
+        else => {
+            for value in payload {
+                mut parts.push(self.input_literal(value))
+            }
+        }
+    }
+    if parts.len() == 0 {
+        return written
+    }
+    mut written.push('(')
+    mut written.append(joined_texts(parts.view(), alloc).as_str())
+    mut written.push(')')
+    return written
+} Checker.variant_literal
+
+/// Texts joined by `, `.
+fn joined_texts(parts: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    for index in 0..<parts.len() {
+        if index > 0 {
+            mut joined.append(", ")
+        }
+        mut joined.append(parts[index].as_str())
+    }
+    return joined
+} joined_texts
+
+/// A scalar or `Unit` candidate value as a literal.
+fn value_literal(value: Val, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    match value {
+        Val.Int(number) => mut written.write(text::fmt("{number}", number), budget: 64)
+        Val.Bool(truth) => {
+            if truth {
+                mut written.append("true")
+            } else {
+                mut written.append("false")
+            }
+        }
+        Val.Char(c) => {
+            mut written.push('\'')
+            push_char_literal(mut written, c)
+            mut written.push('\'')
+        }
+        Val.Float32(float) => push_float_literal(mut written, is_zero: float == 0.0, negative: (float.to_bits() >> 31) == 1)
+        Val.Float64(float) => push_float_literal(mut written, is_zero: float == 0.0, negative: (float.to_bits() >> 63) == 1)
+        Val.Unit => mut written.append("Unit")
+        else => {
+            expect false
+        }
+    }
+    return written
+} value_literal
+
+/// A float candidate value, which is always a zero, as a literal.
+fn push_float_literal(mut written: text::String, is_zero: bool, negative: bool) {
+    expect is_zero
+    if negative {
+        mut written.push('-')
+    }
+    mut written.append("0.0")
+} push_float_literal
+
+/// A character as a candidate literal writes it between quotes: `\0`, `\t`, `\r`, `\n`, `\\`
+/// and `\'` escaped, other controls, U+00A0, U+00AD and the combining marks below U+0370 as
+/// `\u{hex}`.
+fn push_char_literal(mut written: text::String, c: char) {
+    let code = c.to_bits()
+    match first c {
+        '\0' => mut written.append("\\0")
+        '\t' => mut written.append("\\t")
+        '\r' => mut written.append("\\r")
+        '\n' => mut written.append("\\n")
+        '\\' => mut written.append("\\\\")
+        '\'' => mut written.append("\\'")
+        else => {
+            if code < 0x20 or (code >= 0x7F and code <= 0xA0) or code == 0xAD or (code >= 0x300 and code <= 0x36F) {
+                mut written.append("\\u{")
+                push_lower_hex(mut written, value: code)
+                mut written.push('}')
+            } else {
+                mut written.push(c)
+            }
+        }
+    }
+} push_char_literal
+
+/// A value in lowercase hexadecimal without leading zeros.
+fn push_lower_hex(mut written: text::String, value: u32) {
+    var shift: u32 = 28
+    var started = false
+    loop {
+        let digit = (value >> shift) & 0xF
+        if digit != 0 or started or shift == 0 {
+            started = true
+            let Some(held) = "0123456789abcdef".slice_bytes(usize.widen(digit), end: usize.widen(digit) + 1) else {
+                return
+            }
+            mut written.append(held)
+        }
+        if shift == 0 {
+            return
+        }
+        shift -= 4
+    }
+} push_lower_hex
+
+fn Checker.input_type_name(self, item: ty::ItemId) -> text::String {
+    let alloc = self.alloc()
+    let path = self.db().canonical(item)
+    let bytes = path.as_bytes()
+    var start: usize = 0
+    var index: usize = 0
+    while index + 1 < bytes.len() {
+        if bytes[index] == b':' and bytes[index + 1] == b':' {
+            start = index + 2
+        }
+        index += 1
+    }
+    let Some(name) = path.slice_bytes(start, end: path.byte_len()) else {
+        return text::String.of(path.as_str(), alloc)
+    }
+    return text::String.of(name, alloc)
+} Checker.input_type_name

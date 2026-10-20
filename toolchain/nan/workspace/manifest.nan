@@ -1,0 +1,761 @@
+//! The manifest, the `package` item of `package.nan`, and the rules of its directives.
+
+pkg enum Target derives Copy, Eq, Ord, Hash {
+    Host
+    Uefi
+    Bare
+    Any
+} Target
+
+pkg proj fn Target.name(self) -> Str {
+    return match self {
+        Target.Host => "x86_64-host"
+        Target.Uefi => "x86_64-uefi"
+        Target.Bare => "x86_64-bare"
+        Target.Any => "any"
+    }
+} Target.name
+
+pkg fn Target.from_name(name: Str) -> Option[Target] {
+    return match name {
+        "x86_64-host" => Some(Target.Host)
+        "x86_64-uefi" => Some(Target.Uefi)
+        "x86_64-bare" => Some(Target.Bare)
+        "any" => Some(Target.Any)
+        else => None
+    }
+} Target.from_name
+
+/// Whether the target is a machine target, `x86_64-uefi` or `x86_64-bare`, whose image the
+/// implementation's own writer builds.
+pkg fn Target.is_machine(self) -> bool = self == Target.Uefi or self == Target.Bare
+
+/// The platform package a concrete target's descriptor names; `any` names none.
+pkg proj fn Target.platform_package(self) -> Option[Str] {
+    return match self {
+        Target.Host => Some("host_platform")
+        Target.Uefi => Some("uefi_platform")
+        Target.Bare => Some("bare_platform")
+        Target.Any => None
+    }
+} Target.platform_package
+
+/// The module and name of a root grant.
+pkg view struct RootGrant {
+    pkg module: Str
+    pkg name: Str
+} RootGrant
+
+/// The module and name of the root grant a concrete target's entry takes; `any` has none.
+pkg proj fn Target.root_grant(self) -> Option[RootGrant] {
+    return match self {
+        Target.Host => Some(RootGrant(module: "host", name: "World"))
+        Target.Uefi => Some(RootGrant(module: "boot", name: "Machine"))
+        Target.Bare => Some(RootGrant(module: "boot", name: "Kernel"))
+        Target.Any => None
+    }
+} Target.root_grant
+
+/// What an image of the target appends to its package's name.
+pkg proj fn Target.image_suffix(self) -> Str {
+    return match self {
+        Target.Uefi => ".efi"
+        Target.Bare => ".elf"
+        Target.Host or Target.Any => ""
+    }
+} Target.image_suffix
+
+pkg struct Manifest {
+    pkg name: text::String
+    /// The line of the `package` keyword.
+    pkg line: u32
+    /// The declared targets this implementation knows.
+    pkg targets: mem::List[Target]
+    pkg targets_line: Option[u32]
+    /// Whether the package's language version is one this implementation implements.
+    pkg supported: bool
+    /// The language version the `language` directive states, and its line.
+    pkg language: Option[Language]
+    /// The name the `entry` directive gives, and its line.
+    pkg entry: Option[ProgramEntry]
+    pkg deps: mem::List[Dep]
+    pkg allows: mem::List[Allow]
+    /// The module pairs of `deny a -> b` directives, and their lines.
+    pkg denies: mem::List[Deny]
+} Manifest
+
+/// A language version a `language` directive states, and its line.
+pkg struct Language derives Copy, Eq {
+    pkg version: wide::Wide
+    pkg line: u32
+} Language
+
+/// The name an `entry` directive gives, and its line.
+pkg struct ProgramEntry {
+    pkg name: text::String
+    pkg line: u32
+} ProgramEntry
+
+pkg struct Dep {
+    pkg alias: text::String
+    /// The workspace directory a relative source names, or the store name.
+    pkg source: Option[text::String]
+    /// The source as the directive writes it.
+    pkg written: text::String
+    pkg path: bool
+    pkg line: u32
+} Dep
+
+pkg enum Authority derives Eq, Hash {
+    Device
+    Priv
+    Trusted
+    Validate
+    /// The registry path of a `contribute` grant, as written.
+    Contribute(text::String)
+} Authority
+
+/// The authority as an `allow` directive writes it.
+pkg fn Authority.written(self, alloc: mem::Alloc) -> text::String {
+    match self {
+        Authority.Device => return text::String.of("device", alloc)
+        Authority.Priv => return text::String.of("priv", alloc)
+        Authority.Trusted => return text::String.of("trusted", alloc)
+        Authority.Validate => return text::String.of("validate", alloc)
+        Authority.Contribute(path_written) => {
+            var written = text::String.of("contribute ", alloc)
+            mut written.append(path_written.as_str())
+            return written
+        }
+    }
+} Authority.written
+
+pkg struct Allow {
+    pkg authority: Authority
+    pkg names: mem::List[text::String]
+    pkg line: u32
+} Allow
+
+/// A `deny a -> b` directive: the module `a`, the module `b` it may not depend on, and its line.
+pkg struct Deny {
+    pkg module: text::String
+    pkg denied: text::String
+    pkg line: u32
+} Deny
+
+/// The manifest's directives, read from its tree: where they lie and what they report.
+struct ManifestReader {
+    path: text::String
+    package_dir: text::String
+    found: mem::List[diagnostic::Diagnostic]
+    alloc: mem::Alloc
+} ManifestReader
+
+/// What the directives read so far declare, against which a later one is a duplicate.
+struct Declared {
+    language: bool
+    entry: bool
+    dep_aliases: mem::List[text::String]
+    dep_sources: mem::List[text::String]
+    authorities: mem::List[text::String]
+    denials: mem::List[Deny]
+} Declared
+
+/// Reads the manifest of `package.nan` at `path`, reporting its diagnostics. A file whose
+/// manifest the parse abandoned has none, reported by its syntax failure alone.
+fn Manifest.read(
+    file: syntax::SourceFile,
+    path: Str,
+    mut diagnostics: mem::List[diagnostic::Diagnostic],
+    alloc: mem::Alloc,
+    ) -> Option[Manifest] {
+    var found: Option[usize] = None
+    for index in 0..<file.items.len() {
+        let Some(tree) = file.items[index].tree else {
+            continue
+        }
+        let Some(kind) = tree.kind() else {
+            continue
+        }
+        if kind.rule == syntax::Rule.PackageItem {
+            found = Some(index)
+            break
+        }
+    }
+    let Some(index) = found else {
+        mut diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.ManifestMissing, path, line: 1, alloc))
+        return None
+    }
+    let item = file.items[index]
+    if item.abandoned {
+        return None
+    }
+    let Some(tree) = item.tree else {
+        expect false
+        return None
+    }
+    let Some(kind) = tree.kind() else {
+        expect false
+        return None
+    }
+    expect path.ends_with("/package.nan")
+    let Some(package_dir) = path.slice_bytes(0, end: path.byte_len() - 12) else {
+        expect false
+        return None
+    }
+    var reader = ManifestReader(path: text::String.of(path, alloc), package_dir: text::String.of(package_dir, alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), alloc: alloc)
+    let manifest = mut reader.read(file, tree, item_node: kind.node)
+    for reported in take reader.found {
+        mut diagnostics.push(take reported)
+    }
+    return Some(take manifest)
+} Manifest.read
+
+/// The line of a directive's first token.
+fn directive_line(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> u32 {
+    let Some(span) = tree.span(node, alloc) else {
+        expect false
+        return 0
+    }
+    return file.tokens[usize.widen(span.head)].line
+} directive_line
+
+fn ManifestReader.report(mut self, line: u32, code: diagnostic::Code) {
+    for known in self.found {
+        if known.code == code and known.line == Some(line) {
+            return
+        }
+    }
+    mut self.found.push(diagnostic::Diagnostic.at(code, path: self.path.as_str(), line, alloc: self.alloc))
+} ManifestReader.report
+
+/// The texts of the `IDENT` tokens directly under `node`, a directive's word included.
+fn idents(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    for token in tree.child_tokens(node) {
+        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+            mut found.push(text::String.of(file.text(usize.widen(token)), alloc))
+        }
+    }
+    return found
+} idents
+
+/// The text of a node's tokens, without spaces.
+fn joined(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    let Some(span) = tree.span(node, alloc) else {
+        expect false
+        return written
+    }
+    for token in span.head..=span.last {
+        mut written.append(file.text(usize.widen(token)))
+    }
+    return written
+} joined
+
+fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, item_node: u32) -> Manifest {
+    let alloc = self.alloc
+    var name_token: Option[u32] = None
+    for token in tree.child_tokens(item_node) {
+        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+            name_token = Some(token)
+            break
+        }
+    }
+    var name = text::String.empty(alloc)
+    match name_token {
+        Some(named) => mut name.append(file.text(usize.widen(named)))
+        None => {
+            expect false
+        }
+    }
+    var tokens = tree.child_tokens(item_node)
+    var keyword_line: u32 = 0
+    match mut tokens.next() {
+        Some(keyword) => {
+            keyword_line = file.tokens[usize.widen(keyword)].line
+        }
+        None => {
+            expect false
+        }
+    }
+    var manifest = Manifest(name: take name, line: keyword_line, targets: mem::List[Target].empty(alloc), targets_line: None, supported: true, language: None, entry: None, deps: mem::List[Dep].empty(alloc), allows: mem::List[Allow].empty(alloc), denies: mem::List[Deny].empty(alloc))
+    var declared = Declared(language: false, entry: false, dep_aliases: mem::List[text::String].empty(alloc), dep_sources: mem::List[text::String].empty(alloc), authorities: mem::List[text::String].empty(alloc), denials: mem::List[Deny].empty(alloc))
+    for directive in tree.child_nodes(item_node) {
+        if tree.rule(directive) != syntax::Rule.Directive {
+            continue
+        }
+        var inner = tree.child_nodes(directive)
+        let Some(node) = mut inner.next() else {
+            expect false
+            continue
+        }
+        let line = directive_line(file, tree, node, alloc)
+        match tree.rule(node) {
+            syntax::Rule.LanguageDirective => mut self.read_language(file, tree, node, line, manifest: mut manifest, declared: mut declared)
+            syntax::Rule.TargetsDirective => mut self.read_targets(file, tree, node, line, manifest: mut manifest)
+            syntax::Rule.EntryDirective => {
+                if declared.entry {
+                    mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+                    continue
+                }
+                declared.entry = true
+                var words = idents(file, tree, node, alloc)
+                manifest.entry = Some(ProgramEntry(name: mut words.remove(1), line: line))
+            }
+            syntax::Rule.DepDirective => mut self.read_dep(file, tree, node, line, manifest: mut manifest, declared: mut declared)
+            syntax::Rule.AllowDirective => mut self.read_allow(file, tree, node, line, manifest: mut manifest, declared: mut declared)
+            syntax::Rule.DenyDirective => mut self.read_deny(file, tree, node, line, manifest: mut manifest, declared: mut declared)
+            else => {
+                expect false
+            }
+        }
+    }
+    if not declared.language or manifest.targets_line.is_none() {
+        mut self.report(manifest.line, code: diagnostic::Code.ManifestMissingDirective)
+    }
+    return manifest
+} ManifestReader.read
+
+fn ManifestReader.read_language(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    mut declared: Declared,
+    ) {
+    if declared.language {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+        return
+    }
+    declared.language = true
+    var tokens = tree.child_tokens(node)
+    discard mut tokens.next()
+    let Some(version) = mut tokens.next() else {
+        expect false
+        return
+    }
+    let written = file.text(usize.widen(version))
+    var decimal = true
+    for byte in written.as_bytes() {
+        if (byte < b'0' or byte > b'9') and byte != b'_' {
+            decimal = false
+        }
+    }
+    let value = int_value(written, alloc: self.alloc)
+    manifest.supported = value == Some(wide::Wide.one())
+    match value {
+        Some(stated) => {
+            manifest.language = Some(Language(version: stated, line: line))
+        }
+        None => {
+            manifest.language = None
+        }
+    }
+    if not decimal {
+        mut self.report(line, code: diagnostic::Code.LanguageVersionForm)
+    }
+    if not manifest.supported and decimal {
+        mut self.report(line, code: diagnostic::Code.LanguageUnsupported)
+    }
+} ManifestReader.read_language
+
+fn ManifestReader.read_targets(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    ) {
+    let alloc = self.alloc
+    let earlier = manifest.targets_line
+    manifest.targets_line = Some(line)
+    if earlier.is_some() {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+        return
+    }
+    let Some(list) = tree.find(node, rule: syntax::Rule.TargetList) else {
+        expect false
+        return
+    }
+    var names = mem::List[text::String].empty(alloc)
+    for target in tree.child_nodes(list) {
+        mut names.push(joined(file, tree, node: target, alloc))
+    }
+    var has_any = false
+    for name in names {
+        match Target.from_name(name.as_str()) {
+            Some(target) => mut manifest.targets.push(target)
+            None => {
+                if name.as_str() == "x86_64-nanos" {
+                    mut self.report(line, code: diagnostic::Code.ManifestReservedTarget)
+                } else {
+                    mut self.report(line, code: diagnostic::Code.ManifestUnknownTarget)
+                }
+            }
+        }
+        if name.as_str() == "any" {
+            has_any = true
+        }
+    }
+    if has_any and names.len() > 1 {
+        mut self.report(line, code: diagnostic::Code.ManifestAnyNotAlone)
+    }
+    if has_repeat(names.view()) {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+    }
+} ManifestReader.read_targets
+
+fn ManifestReader.read_dep(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    mut declared: Declared,
+    ) {
+    let alloc = self.alloc
+    var words = idents(file, tree, node, alloc)
+    let alias = mut words.remove(1)
+    var text_token: Option[u32] = None
+    for token in tree.child_tokens(node) {
+        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Text {
+            text_token = Some(token)
+            break
+        }
+    }
+    let Some(quoted) = text_token else {
+        expect false
+        return
+    }
+    let source = syntax::text_value(file.text(usize.widen(quoted)), alloc)
+    let kind = source_kind(source.as_str())
+    var resolved: Option[text::String] = None
+    match kind {
+        Some(SourceKind.Path) => {
+            resolved = Some(resolve_source(self.package_dir.as_str(), source: source.as_str(), alloc))
+        }
+        Some(SourceKind.Store) => {
+            resolved = Some(text::String.of(source.as_str(), alloc))
+        }
+        None => mut self.report(line, code: diagnostic::Code.ManifestBadSource)
+    }
+    if holds_text(declared.dep_aliases.view(), wanted: alias.as_str()) or holds_some(declared.dep_sources.view(), wanted: resolved) {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+    }
+    mut declared.dep_aliases.push(text::String.of(alias.as_str(), alloc))
+    match copied_some(resolved, alloc) {
+        Some(key) => mut declared.dep_sources.push(take key)
+        None => {}
+    }
+    mut manifest.deps.push(Dep(alias: take alias, source: take resolved, written: take source, path: kind == Some(SourceKind.Path), line: line))
+} ManifestReader.read_dep
+
+fn ManifestReader.read_allow(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    mut declared: Declared,
+    ) {
+    let alloc = self.alloc
+    let Some(authority_node) = tree.find(node, rule: syntax::Rule.Authority) else {
+        expect false
+        return
+    }
+    let Some(list) = tree.find(node, rule: syntax::Rule.NameList) else {
+        expect false
+        return
+    }
+    let authority = joined(file, tree, node: authority_node, alloc)
+    let names = idents(file, tree, node: list, alloc)
+    if holds_text(declared.authorities.view(), wanted: authority.as_str()) or has_repeat(names.view()) {
+        mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+    }
+    let granted = match authority.as_str() {
+        "device" => Authority.Device
+        "priv" => Authority.Priv
+        "trusted" => Authority.Trusted
+        "validate" => Authority.Validate
+        else => Authority.Contribute(registry_of(authority.as_str(), alloc))
+    }
+    mut manifest.allows.push(Allow(authority: take granted, names: take names, line: line))
+    mut declared.authorities.push(take authority)
+} ManifestReader.read_allow
+
+/// The registry path a `contribute` authority names, as written after the word.
+fn registry_of(authority: Str, alloc: mem::Alloc) -> text::String {
+    let Some(path_written) = authority.slice_bytes(10, end: authority.byte_len()) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text::String.of(path_written, alloc)
+} registry_of
+
+fn ManifestReader.read_deny(
+    mut self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    line: u32,
+    mut manifest: Manifest,
+    mut declared: Declared,
+    ) {
+    let alloc = self.alloc
+    let modules = idents(file, tree, node, alloc)
+    let module = modules[1].as_str()
+    let denied = modules[2].as_str()
+    if module == denied {
+        mut self.report(line, code: diagnostic::Code.ManifestDenySelf)
+    }
+    for known in declared.denials {
+        if known.module.as_str() == module and known.denied.as_str() == denied {
+            mut self.report(line, code: diagnostic::Code.ManifestDuplicate)
+            break
+        }
+    }
+    mut manifest.denies.push(Deny(module: text::String.of(module, alloc), denied: text::String.of(denied, alloc), line: line))
+    mut declared.denials.push(Deny(module: text::String.of(module, alloc), denied: text::String.of(denied, alloc), line: line))
+} ManifestReader.read_deny
+
+/// Whether a text is among `texts`.
+fn holds_text(texts: Slice[text::String], wanted: Str) -> bool {
+    for held in texts {
+        if held.as_str() == wanted {
+            return true
+        }
+    }
+    return false
+} holds_text
+
+/// Whether an optional text is some text among `texts`.
+fn holds_some(texts: Slice[text::String], wanted: Option[text::String]) -> bool {
+    let Some(held) = wanted else {
+        return false
+    }
+    return holds_text(texts, wanted: held.as_str())
+} holds_some
+
+/// A copy of an optional text.
+fn copied_some(held: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(value) = held else {
+        return None
+    }
+    return Some(text::String.of(value.as_str(), alloc))
+} copied_some
+
+fn has_repeat(names: Slice[text::String]) -> bool {
+    for index in 0..<names.len() {
+        for earlier in 0..<index {
+            if names[earlier] == names[index] {
+                return true
+            }
+        }
+    }
+    return false
+} has_repeat
+
+enum SourceKind derives Copy, Eq {
+    Path
+    Store
+} SourceKind
+
+/// Whether a `dep` source is a relative path or a store name.
+fn source_kind(source: Str) -> Option[SourceKind] {
+    let bytes = source.as_bytes()
+    var end: usize = 0
+    while end < bytes.len() and bytes[end] != b'/' {
+        end += 1
+    }
+    let Some(head) = source.slice_bytes(0, end) else {
+        return None
+    }
+    if head == "." or head == ".." {
+        var start = end
+        while start < bytes.len() {
+            start += 1
+            var stop = start
+            while stop < bytes.len() and bytes[stop] != b'/' {
+                stop += 1
+            }
+            if stop == start {
+                return None
+            }
+            for at in start..<stop {
+                let byte = bytes[at]
+                let plain = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9')
+                if not plain and byte != b'.' and byte != b'-' and byte != b'_' {
+                    return None
+                }
+            }
+            start = stop
+        }
+        return Some(SourceKind.Path)
+    }
+    var start: usize = 0
+    loop {
+        var stop = start
+        while stop < bytes.len() and bytes[stop] != b'/' {
+            stop += 1
+        }
+        if not store_segment(bytes, start, stop) {
+            return None
+        }
+        if stop == bytes.len() {
+            return Some(SourceKind.Store)
+        }
+        start = stop + 1
+    }
+} source_kind
+
+/// Whether the bytes `start..<stop` are a segment of a store name: a lowercase letter or digit,
+/// then lowercase letters, digits, `.`, `-` and `_`.
+fn store_segment(bytes: Slice[u8], start: usize, stop: usize) -> bool {
+    if stop == start {
+        return false
+    }
+    let head = bytes[start]
+    if not ((head >= b'a' and head <= b'z') or (head >= b'0' and head <= b'9')) {
+        return false
+    }
+    for at in start..<stop {
+        let byte = bytes[at]
+        let plain = (byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9')
+        if not plain and byte != b'.' and byte != b'-' and byte != b'_' {
+            return false
+        }
+    }
+    return true
+} store_segment
+
+/// The workspace path a relative source names from the package directory, `.` and `..` resolved.
+pkg fn resolve_source(package_dir: Str, source: Str, alloc: mem::Alloc) -> text::String {
+    var parts = split_text(package_dir, separator: b'/', alloc)
+    let segments = split_text(source, separator: b'/', alloc)
+    for segment in take segments {
+        if segment.as_str() == "." {
+            continue
+        }
+        if segment.as_str() == ".." and parts.len() > 0 and parts[parts.len() - 1].as_str() != ".." {
+            discard mut parts.pop()
+            continue
+        }
+        mut parts.push(take segment)
+    }
+    return joined_parts(parts.view(), alloc)
+} resolve_source
+
+/// The parts of a text between the occurrences of a separator byte, each kept, empty ones
+/// included.
+fn split_text(written: Str, separator: u8, alloc: mem::Alloc) -> mem::List[text::String] {
+    var parts = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != separator {
+            continue
+        }
+        let Some(part) = written.slice_bytes(start, end: at) else {
+            expect false
+            return parts
+        }
+        mut parts.push(text::String.of(part, alloc))
+        start = at + 1
+    }
+    return parts
+} split_text
+
+/// Texts joined with `/` between them.
+fn joined_parts(parts: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for index in 0..<parts.len() {
+        if index > 0 {
+            mut written.push('/')
+        }
+        mut written.append(parts[index].as_str())
+    }
+    return written
+} joined_parts
+
+/// The value of an `INT` token, in any base, without separators and suffix.
+fn int_value(written: Str, alloc: mem::Alloc) -> Option[wide::Wide] {
+    var digits = text::String.empty(alloc)
+    for c in written.cursor() {
+        if c != '_' {
+            mut digits.push(c)
+        }
+    }
+    var radix: u32 = 10
+    var start: usize = 0
+    if digits.starts_with("0x") {
+        radix = 16
+        start = 2
+    } else if digits.starts_with("0b") {
+        radix = 2
+        start = 2
+    }
+    let bytes = digits.as_bytes()
+    var end = start
+    while end < bytes.len() and is_digit(bytes[end], radix) {
+        end += 1
+    }
+    let Some(valued) = digits.slice_bytes(start, end) else {
+        return None
+    }
+    return wide::Wide.parse(valued, radix)
+} int_value
+
+/// Whether a byte is a digit of `radix`, 2, 10 or 16.
+fn is_digit(byte: u8, radix: u32) -> bool {
+    if radix == 16 {
+        return (byte >= b'0' and byte <= b'9') or (byte >= b'a' and byte <= b'f') or (byte >= b'A' and byte <= b'F')
+    }
+    if radix == 2 {
+        return byte == b'0' or byte == b'1'
+    }
+    return byte >= b'0' and byte <= b'9'
+} is_digit
+
+/// The relative path source naming the directory `to` from the directory `from`, both relative
+/// to the workspace root.
+pkg fn relative_source(from: Str, to: Str, alloc: mem::Alloc) -> text::String {
+    let from_parts = nonempty_parts(from, alloc)
+    let to_parts = nonempty_parts(to, alloc)
+    var shared: usize = 0
+    while shared < from_parts.len() and shared < to_parts.len() and from_parts[shared] == to_parts[shared] {
+        shared += 1
+    }
+    var parts = mem::List[text::String].empty(alloc)
+    for _ in shared..<from_parts.len() {
+        mut parts.push(text::String.of("..", alloc))
+    }
+    for index in shared..<to_parts.len() {
+        mut parts.push(text::String.of(to_parts[index].as_str(), alloc))
+    }
+    if parts.len() > 0 and parts[0].as_str() == ".." {
+        return joined_parts(parts.view(), alloc)
+    }
+    var written = text::String.of(".", alloc)
+    for part in parts {
+        mut written.push('/')
+        mut written.append(part.as_str())
+    }
+    return written
+} relative_source
+
+/// The parts of a path between its `/`, empty ones left out.
+fn nonempty_parts(path: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var parts = mem::List[text::String].empty(alloc)
+    for part in take split_text(path, separator: b'/', alloc) {
+        if part.byte_len() > 0 {
+            mut parts.push(take part)
+        }
+    }
+    return parts
+} nonempty_parts

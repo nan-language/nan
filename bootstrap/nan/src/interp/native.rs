@@ -212,7 +212,7 @@ pub fn call(
             }
         }
         ("core::Option", "value_or") => match interp.deref(&args[0]) {
-            Val::Variant(_, 0, payload) => payload[0].clone(),
+            Val::Variant(_, 0, payload) => interp.deref(&payload[0]),
             _ => args[1].clone(),
         },
         ("core::Option", "extract") => {

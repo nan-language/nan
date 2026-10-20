@@ -1,0 +1,228 @@
+//! Tests: what a test's target names and whether it lies in the test's reach, and the paths to the items only tests and examples may name.
+
+/// The std modules whose items only tests and examples name.
+const TEST_ONLY: Str = "testing sys::sim hw::sim"
+
+/// The interfaces whose methods a derive writes.
+const DERIVED_INTERFACES: Str = "Eq Ord Hash Default Render Encode Generate"
+
+/// What a test's target names.
+enum TestTarget derives Copy, Eq {
+    Function(ty::ItemId)
+    /// A method a derive of this type writes.
+    Derived(ty::ItemId)
+} TestTarget
+
+/// What a test's target names: a function item, or a method a derive writes.
+fn Checker.test_target(self, item: ty::ItemId, tested: ast::TestItem) -> Option[TestTarget] {
+    let db = self.db()
+    let module = db.module_of(item)
+    let Some(member) = tested.member else {
+        let Ok(Named.Item(function)) = db.resolve(module, path: tested.target) else {
+            return None
+        }
+        return match db.ast(function).kind {
+            ast::ItemKind.Fn(_) => Some(TestTarget.Function(function))
+            else => None
+        }
+    }
+    let Some(key) = db.owner_key(module, owner: tested.target) else {
+        return None
+    }
+    let functions = db.members(key, name: member.text.as_str())
+    if functions.len() > 0 {
+        return Some(TestTarget.Function(functions[0]))
+    }
+    let TypeKey.Item(owner) = key else {
+        return None
+    }
+    for name in Words(list: DERIVED_INTERFACES, at: 0) {
+        let Some(interface_item) = db.core_item(name) else {
+            continue
+        }
+        if not self.derives_interface(owner, interface_item) {
+            continue
+        }
+        let sig = self.sig(interface_item)
+        let SigKind.Interface(methods: methods) = sig.contents().kind else {
+            continue
+        }
+        for method in methods {
+            if method.name == member.text {
+                return Some(TestTarget.Derived(owner))
+            }
+        }
+    }
+    return None
+} Checker.test_target
+
+/// A test's head: its target names a function item or a method a derive writes, and no
+/// parameter is `mut`.
+fn Checker.check_test_head(self, item: ty::ItemId, tested: ast::TestItem) {
+    if self.test_target(item, tested).is_none() and self.names_other(item, tested) {
+        self.report(item, token: tested.target.token(), code: diagnostic::Code.TestTargetKind)
+    }
+    let Some(params) = tested.params else {
+        return
+    }
+    for param in params {
+        if param.mode == ast::Mode.Mut {
+            self.report(item, token: param.token, code: diagnostic::Code.TestParameterForm)
+        }
+    }
+} Checker.check_test_head
+
+/// Whether a test's target names something other than a function or derived method: an item
+/// of another kind, or a field of its owner.
+fn Checker.names_other(self, item: ty::ItemId, tested: ast::TestItem) -> bool {
+    let db = self.db()
+    let module = db.module_of(item)
+    let Some(member) = tested.member else {
+        return match db.resolve(module, path: tested.target) {
+            Ok(Named.Item(_)) => true
+            else => false
+        }
+    }
+    let Some(TypeKey.Item(owner)) = db.owner_key(module, owner: tested.target) else {
+        return false
+    }
+    let sig = self.sig(owner)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return false
+    }
+    for field in fields {
+        if field.name == member.text {
+            return true
+        }
+    }
+    return false
+} Checker.names_other
+
+/// An impl line naming `Generate` outside std is an error; gives whether it is one.
+fn Checker.check_generate_impl(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    if db.is_std(item) {
+        return false
+    }
+    let sig = self.sig(item)
+    let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+        return false
+    }
+    let manual = db.core_item("Generate") == Some(bound.item)
+    if manual {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.TestGenerateManualImpl)
+    }
+    return manual
+} Checker.check_generate_impl
+
+/// A test's target lies in its reach.
+fn Checker.check_test_reach(self, item: ty::ItemId, tested: ast::TestItem) {
+    let Some(target) = self.test_target(item, tested) else {
+        return
+    }
+    let reach = self.test_reach(item)
+    let reached = match target {
+        TestTarget.Function(function) => reach.contains(function)
+        TestTarget.Derived(owner) => reach.contains(owner)
+    }
+    if not reached {
+        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.TestTargetUnreachable)
+    }
+} Checker.check_test_reach
+
+/// A test's reach: the test and, for each item of the reach, the items it names, the impl
+/// lines of each type and the contributions to each registry it names, its `for` clause
+/// naming nothing; an item of a carried package adds only itself.
+fn Checker.test_reach(self, item: ty::ItemId) -> mem::Set[ty::ItemId] {
+    let db = self.db()
+    return db.about(None, compute: fn() -> mem::Set[ty::ItemId] {
+        let alloc = self.alloc()
+        var reach = mem::Set[ty::ItemId].empty(alloc)
+        discard mut reach.insert(item)
+        var pending = mem::List[ty::ItemId].empty(alloc)
+        for named in self.names(item).contents() {
+            mut pending.push(named)
+        }
+        loop {
+            let Some(next) = mut pending.pop() else {
+                return reach
+            }
+            if not mut reach.insert(next) or db.is_carried(next) {
+                continue
+            }
+            for named in self.names(next).contents() {
+                mut pending.push(named)
+            }
+            self.extend_reach(next, mut pending)
+        }
+    })
+} Checker.test_reach
+
+/// Adds to a reach's pending items the impl lines of a type, or the contributions to a
+/// registry.
+fn Checker.extend_reach(self, next: ty::ItemId, mut pending: mem::List[ty::ItemId]) {
+    let db = self.db()
+    match db.declaration(next).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+            for line in self.impl_lines(TypeKey.Item(next)) {
+                mut pending.push(line)
+            }
+        }
+        ast::ItemKind.Registry(_) => {
+            for index in 0..<db.items.len() {
+                let other = ty::ItemId(index: u32.fit(index))
+                if self.contribution_registry(other) == Some(next) {
+                    mut pending.push(other)
+                }
+            }
+        }
+        else => {}
+    }
+} Checker.extend_reach
+
+/// Each path of an item other than a test or an item of those modules naming an item of
+/// `testing`, `sys::sim` or `hw::sim`, outside its example clauses.
+fn Checker.check_test_only(self, item: ty::ItemId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let own_module = db.module_path(db.module_of(item))
+    if db.is_std(item) and is_listed(TEST_ONLY, word: own_module.as_str()) {
+        return
+    }
+    var examples = mem::List[nir::Span].empty(alloc)
+    match db.ast(item).kind {
+        ast::ItemKind.Test(_) => return
+        ast::ItemKind.Fn(function) => example_spans(function.clauses.view(), found: mut examples)
+        ast::ItemKind.Interface(declared) => {
+            for method in declared.methods {
+                example_spans(method.clauses.view(), found: mut examples)
+            }
+        }
+        else => {}
+    }
+    let module = db.module_of(item)
+    for path in self.written_paths(item) {
+        let head = path.token()
+        let last = path.last().token
+        if examples.position(fn(example: nir::Span) => example.head <= head and head <= example.last).is_some() {
+            continue
+        }
+        let Ok(Named.Item(named)) = db.resolve(module, path) else {
+            continue
+        }
+        let named_module = db.module_path(db.module_of(named))
+        if db.is_std(named) and is_listed(TEST_ONLY, word: named_module.as_str()) {
+            self.report_fixed(item, construct: nir::Span(head: head, last: last), code: diagnostic::Code.TestTestOnlyItem, fixes: mem::List[diagnostic::Fix].empty(alloc), offer: diagnostic::Offer.Each)
+        }
+    }
+} Checker.check_test_only
+
+/// Adds the tokens each example clause spans, from its first token to its expression's last.
+fn example_spans(clauses: Slice[ast::Clause], mut found: mem::List[nir::Span]) {
+    for clause in clauses {
+        match clause.kind {
+            ast::ClauseKind.Example(example) => mut found.push(nir::Span(head: clause.token, last: example.last))
+            else => {}
+        }
+    }
+} example_spans

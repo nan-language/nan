@@ -729,6 +729,7 @@ impl Body<'_, '_> {
             kind: TKind::Construct {
                 variant: Some(variant),
                 values: Vec::new(),
+                wrapped: false,
             },
         }
     }
@@ -1018,6 +1019,7 @@ impl Body<'_, '_> {
                             kind: TKind::Construct {
                                 variant: Some(variant),
                                 values: Vec::new(),
+                                wrapped: false,
                             },
                         };
                     }
@@ -1030,6 +1032,7 @@ impl Body<'_, '_> {
                         kind: TKind::Construct {
                             variant: tags.iter().position(|tag| *tag == name.text),
                             values: Vec::new(),
+                            wrapped: false,
                         },
                     };
                 }
@@ -1596,7 +1599,11 @@ impl Body<'_, '_> {
             self.push_scope();
             let patterns = match &arm.patterns {
                 ast::ArmPatterns::Patterns(patterns) => {
-                    self.arm_patterns(arm.token, patterns, &scrutinee_ty)
+                    let typed = self.arm_patterns(arm.token, patterns, &scrutinee_ty);
+                    for pattern in &typed {
+                        self.bind_views(pattern, &scrutinee_typed);
+                    }
+                    typed
                 }
                 ast::ArmPatterns::Else => {
                     if else_seen {

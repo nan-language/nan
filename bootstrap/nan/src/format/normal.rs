@@ -779,8 +779,30 @@ fn integer(text: &str) -> String {
     let end = body
         .find(|c: char| !c.is_digit(radix))
         .unwrap_or(body.len());
-    let value = u128::from_str_radix(&body[..end], radix).expect("an integer literal's digits");
-    format!("{value}{}", &body[end..])
+    format!("{}{}", decimal(&body[..end], radix), &body[end..])
+}
+
+/// The decimal digits, without leading zeros, of the natural number that digits of a radix
+/// write, however large.
+fn decimal(digits: &str, radix: u32) -> String {
+    const LIMB: u64 = 1_000_000_000;
+    let mut limbs: Vec<u64> = vec![0];
+    for digit in digits.chars().filter_map(|c| c.to_digit(radix)) {
+        let mut carry = u64::from(digit);
+        for limb in &mut limbs {
+            let value = *limb * u64::from(radix) + carry;
+            *limb = value % LIMB;
+            carry = value / LIMB;
+        }
+        if carry > 0 {
+            limbs.push(carry);
+        }
+    }
+    let mut text = limbs.last().copied().unwrap_or(0).to_string();
+    for limb in limbs.iter().rev().skip(1) {
+        text.push_str(&format!("{limb:09}"));
+    }
+    text
 }
 
 /// A float literal as the shortest decimal that reads back as its value, keeping its suffix.

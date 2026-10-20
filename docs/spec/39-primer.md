@@ -618,7 +618,7 @@ pub fn tally_parts(parts: Slice[u64], totals: task::Cown[Totals], exec: task::Ex
 ### Deadlines and I/O
 
 - `fn task::within[T, E](clock: sys::Clock, ms: u64, body: fn() -> T fails E uses wait) -> Option[T] fails E uses wait` returns `None` when its own deadline cancels `body`, absorbing that cancellation; an outer cancellation still fails it. `task::race(exec, left: l, right: r)` runs two task closures and returns the result or failure of the first to end, cancelling the other.
-- Tasks are stackful, and every `await` is a [suspension point](17-suspension-io.md#stackful-tasks). Host tasks get 64 KiB guard-paged stacks unless `limits stack N` states a size; overflow traps (`trap.stack-overflow`).
+- Tasks are stackful, and every `await` is a [suspension point](17-suspension-io.md#stackful-tasks). Host tasks get 64 KiB guard-paged stacks, a program's entry task 64 MiB, unless `limits stack N` states a size; overflow traps (`trap.stack-overflow`).
 - A server listens with `var listener = try await world.net.listen(port: 4_100)` and accepts with `try await mut listener.accept()`, spawning one task per connection. Reads and writes lend views: `try await mut conn.read(mut buf.view_mut())`. DMA buffers are taken by the submission and returned, Untrusted, on every path in a `task::Completion[B, T, E]`.
 - Cancellation is [acknowledged](17-suspension-io.md#acknowledged-cancellation): an in-flight `await` returns only after the kernel or device confirms, and the task's next awaited call fails with `task::Cancelled`. Views into the task's own frames may live across `await`; state tokens and `await when` accesses may not.
 

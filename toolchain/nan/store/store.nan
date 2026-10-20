@@ -1,0 +1,805 @@
+//! The local store: the user's releases in `~/.nan/store`, one file per entry named by its publication index, each written whole under a new name and renamed into place under an exclusive lock on `store/write` and never removed or rewritten; an entry holds its release's artefact with the source tree its attestation hashes.
+
+/// A release class, in the order identical, additive, breaking.
+pkg enum Class derives Copy, Eq, Ord {
+    Identical
+    Additive
+    Breaking
+} Class
+
+pkg proj fn Class.word(self) -> Str {
+    return match self {
+        Class.Identical => "identical"
+        Class.Additive => "additive"
+        Class.Breaking => "breaking"
+    }
+} Class.word
+
+/// The class's position in the order of classes.
+fn Class.position(self) -> u64 {
+    return match self {
+        Class.Identical => 0
+        Class.Additive => 1
+        Class.Breaking => 2
+    }
+} Class.position
+
+fn Class.from_position(position: wide::Wide) -> Option[Class] {
+    let Some(value) = position.to_u64() else {
+        return None
+    }
+    return match value {
+        0 => Some(Class.Identical)
+        1 => Some(Class.Additive)
+        2 => Some(Class.Breaking)
+        else => None
+    }
+} Class.from_position
+
+/// The publish summary of a named release.
+pkg struct Summary {
+    pkg class: Class
+    pkg encode: Class
+    /// Each exported item's canonical path, class and behaviour epoch, by path.
+    pkg items: mem::List[ExportedItem]
+    /// Each epoch bump's item and reason.
+    pkg bumps: mem::List[EpochBump]
+    /// The entries of the release's authority summary as a lock writes them, from which those
+    /// gained and lost against another release follow.
+    pkg authority: mem::List[text::String]
+    /// For each exported function and target, the capability methods it reaches and its trap
+    /// sites, each a trap kind, file path and line.
+    pkg functions: mem::List[FunctionSummary]
+} Summary
+
+/// An exported item of a publish summary: its canonical path, class and behaviour epoch.
+pkg struct ExportedItem {
+    pkg path: text::String
+    pkg class: Class
+    pkg epoch: u64
+} ExportedItem
+
+/// An epoch bump of a publish summary: its item's canonical path and its reason.
+pkg struct EpochBump {
+    pkg path: text::String
+    pkg reason: text::String
+} EpochBump
+
+pkg struct FunctionSummary {
+    pkg path: text::String
+    pkg target: text::String
+    pkg methods: mem::List[text::String]
+    pkg traps: mem::List[TrapSite]
+} FunctionSummary
+
+/// A trap site: its trap kind, file path and line.
+pkg struct TrapSite {
+    pkg kind: text::String
+    pkg path: text::String
+    pkg line: u32
+} TrapSite
+
+/// The behaviour epoch of an exported item, 0 for one it does not list.
+pkg fn Summary.epoch(self, path: Str) -> u64 {
+    for item in self.items {
+        if item.path.as_str() == path {
+            return item.epoch
+        }
+    }
+    return 0
+} Summary.epoch
+
+/// An entry of the local store.
+pkg struct Entry {
+    pkg index: u64
+    pkg package_name: text::String
+    /// The store name of a named release; none for a path release.
+    pkg name: Option[text::String]
+    pkg parent: Option[hashing::HashValue]
+    pkg summary: Option[Summary]
+    pkg artefact: mem::Bytes
+    /// The package's source and machine files the artefact's attestation hashes, by path within
+    /// the package.
+    pkg sources: mem::List[artefact::SourceFile]
+} Entry
+
+/// The code root hash of its release.
+pkg fn Entry.root(self, alloc: mem::Alloc) -> hashing::HashValue {
+    let Ok(decoded) = artefact::decode(self.artefact.view(), alloc) else {
+        return hashing::HashValue(bytes: Array[u8, 33].filled(0))
+    }
+    return decoded.root_hash()
+} Entry.root
+
+fn Entry.encoded(self, alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    var index = mem::Bytes.empty(alloc)
+    encoding::uvar(mut index, value: self.index)
+    mut record.field(1, content: take index)
+    mut record.field(2, content: text_bytes(self.package_name.as_str(), alloc))
+    match self.name {
+        Some(name) => mut record.field(3, content: text_bytes(name.as_str(), alloc))
+        None => {}
+    }
+    match self.parent {
+        Some(parent) => {
+            var out = mem::Bytes.empty(alloc)
+            encoding::bytes(mut out, value: parent.bytes.view())
+            mut record.field(4, content: take out)
+        }
+        None => {}
+    }
+    match self.summary {
+        Some(summary) => mut record.field(5, content: summary.encoded(alloc))
+        None => {}
+    }
+    var held = mem::Bytes.empty(alloc)
+    encoding::bytes(mut held, value: self.artefact.view())
+    mut record.field(6, content: take held)
+    var sources = mem::Bytes.empty(alloc)
+    encoding::uvar(mut sources, value: u64.widen(self.sources.len()))
+    for file in self.sources {
+        encoding::bytes(mut sources, value: file.path.as_bytes())
+        encoding::bytes(mut sources, value: file.content.view())
+    }
+    mut record.field(7, content: take sources)
+    return take record.finish(alloc)
+} Entry.encoded
+
+/// A text as bytes: its length as a uvar, then its bytes.
+fn text_bytes(value: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: value.as_bytes())
+    return out
+} text_bytes
+
+fn Entry.decoded(encoded: Slice[u8], alloc: mem::Alloc) -> Option[Entry] {
+    let Some(found) = read_fields(encoded, alloc) else {
+        return None
+    }
+    let Some(whole) = encoded.prefix(encoded.len()) else {
+        return None
+    }
+    let fields = Fields(encoded: take whole, found: take found)
+    let Some(index_field) = fields.get(1) else {
+        return None
+    }
+    let Some(index) = artefact::read_uvar(index_field, at: 0) else {
+        return None
+    }
+    let Some(sources_field) = fields.get(7) else {
+        return None
+    }
+    let Some(sources) = read_sources(sources_field, alloc) else {
+        return None
+    }
+    let Some(number) = index.value.to_u64() else {
+        return None
+    }
+    let Some(package_name) = field_text(fields.get(2), alloc) else {
+        return None
+    }
+    var summary: Option[Summary] = None
+    match fields.get(5) {
+        Some(field) => {
+            summary = Summary.decoded(field, alloc)
+        }
+        None => {}
+    }
+    let Some(artefact_field) = fields.get(6) else {
+        return None
+    }
+    let Some(held) = artefact::read_bytes(artefact_field, at: 0) else {
+        return None
+    }
+    return Some(Entry(index: number, package_name: take package_name, name: field_text(fields.get(3), alloc), parent: field_hash(fields.get(4)), summary: take summary, artefact: held.copy(artefact_field, alloc), sources: take sources))
+} Entry.decoded
+
+/// The text a field holds as its only bytes.
+fn field_text(field: Option[Slice[u8]], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(content) = field else {
+        return None
+    }
+    let Some(value) = artefact::read_bytes(content, at: 0) else {
+        return None
+    }
+    if value.next != content.len() {
+        return None
+    }
+    let Some(parts) = content.split_at(value.start) else {
+        return None
+    }
+    let Ok(decoded) = attempt text::String.try_from_utf8(parts.tail, alloc) else {
+        return None
+    }
+    return Some(take decoded)
+} field_text
+
+/// The hash a field's first bytes hold.
+fn field_hash(field: Option[Slice[u8]]) -> Option[hashing::HashValue] {
+    let Some(content) = field else {
+        return None
+    }
+    let Some(value) = artefact::read_bytes(content, at: 0) else {
+        return None
+    }
+    if value.next - value.start != 33 {
+        return None
+    }
+    var held = Array[u8, 33].filled(0)
+    for index in 0..<33usize {
+        held[index] = content[value.start + index]
+    }
+    return Some(hashing::HashValue(bytes: held))
+} field_hash
+
+/// The sources a field holds: their count, then each one's path and content.
+fn read_sources(field: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[artefact::SourceFile]] {
+    let Some(count) = artefact::read_uvar(field, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var sources = mem::List[artefact::SourceFile].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(path) = artefact::read_bytes(field, at: rest) else {
+            return None
+        }
+        let Some(content) = artefact::read_bytes(field, at: path.next) else {
+            return None
+        }
+        let Some(parts) = field.split_at(path.start) else {
+            return None
+        }
+        let Some(spelt) = parts.tail.prefix(path.next - path.start) else {
+            return None
+        }
+        let Ok(decoded) = attempt text::String.try_from_utf8(spelt, alloc) else {
+            return None
+        }
+        mut sources.push(artefact::SourceFile(path: take decoded, content: content.copy(field, alloc)))
+        rest = content.next
+    }
+    return Some(take sources)
+} read_sources
+
+/// The fields of an encoded record, by key.
+view struct Fields {
+    encoded: Slice[u8]
+    found: mem::List[Field]
+} Fields
+
+/// A field of an encoded record: its key and where its content lies.
+struct Field derives Copy {
+    key: wide::Wide
+    content: artefact::Chunk
+} Field
+
+/// The fields of an encoded record: its count of fields, then each one's key and content.
+fn read_fields(encoded: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[Field]] {
+    let Some(count) = artefact::read_uvar(encoded, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var found = mem::List[Field].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(key) = artefact::read_uvar(encoded, at: rest) else {
+            return None
+        }
+        let Some(content) = artefact::read_bytes(encoded, at: key.next) else {
+            return None
+        }
+        mut found.push(Field(key: key.value, content: content))
+        rest = content.next
+    }
+    return Some(take found)
+} read_fields
+
+/// The content of the first field of a key.
+proj fn Fields.get(self, key: u64) -> Option[Slice[u8]] {
+    let wanted = wide::Wide.of_u64(key)
+    for field in self.found {
+        if field.key == wanted {
+            let Some(parts) = self.encoded.split_at(field.content.start) else {
+                return None
+            }
+            return parts.tail.prefix(field.content.next - field.content.start)
+        }
+    }
+    return None
+} Fields.get
+
+fn Summary.encoded(self, alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: class_bytes(self.class, alloc))
+    mut record.field(2, content: class_bytes(self.encode, alloc))
+    var items = mem::Bytes.empty(alloc)
+    encoding::uvar(mut items, value: u64.widen(self.items.len()))
+    for item in self.items {
+        encoding::bytes(mut items, value: item.path.as_bytes())
+        encoding::uvar(mut items, value: item.class.position())
+        encoding::uvar(mut items, value: item.epoch)
+    }
+    mut record.field(3, content: take items)
+    var bumps = mem::Bytes.empty(alloc)
+    encoding::uvar(mut bumps, value: u64.widen(self.bumps.len()))
+    for bump in self.bumps {
+        encoding::bytes(mut bumps, value: bump.path.as_bytes())
+        encoding::bytes(mut bumps, value: bump.reason.as_bytes())
+    }
+    mut record.field(4, content: take bumps)
+    var authority = mem::Bytes.empty(alloc)
+    encoding::uvar(mut authority, value: u64.widen(self.authority.len()))
+    for entry in self.authority {
+        encoding::bytes(mut authority, value: entry.as_bytes())
+    }
+    mut record.field(5, content: take authority)
+    var functions = mem::Bytes.empty(alloc)
+    encoding::uvar(mut functions, value: u64.widen(self.functions.len()))
+    for function in self.functions {
+        function.encode_into(mut functions)
+    }
+    mut record.field(6, content: take functions)
+    let finished = take record.finish(alloc)
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: finished.view())
+    return out
+} Summary.encoded
+
+fn class_bytes(class: Class, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::uvar(mut out, value: class.position())
+    return out
+} class_bytes
+
+/// Writes the function's path, target, methods and trap sites.
+fn FunctionSummary.encode_into(self, mut out: mem::Bytes) {
+    encoding::bytes(mut out, value: self.path.as_bytes())
+    encoding::bytes(mut out, value: self.target.as_bytes())
+    encoding::uvar(mut out, value: u64.widen(self.methods.len()))
+    for method in self.methods {
+        encoding::bytes(mut out, value: method.as_bytes())
+    }
+    encoding::uvar(mut out, value: u64.widen(self.traps.len()))
+    for site in self.traps {
+        encoding::bytes(mut out, value: site.kind.as_bytes())
+        encoding::bytes(mut out, value: site.path.as_bytes())
+        encoding::uvar(mut out, value: u64.widen(site.line))
+    }
+} FunctionSummary.encode_into
+
+fn Summary.decoded(field: Slice[u8], alloc: mem::Alloc) -> Option[Summary] {
+    let Some(chunk) = artefact::read_bytes(field, at: 0) else {
+        return None
+    }
+    let Some(parts) = field.split_at(chunk.start) else {
+        return None
+    }
+    let Some(encoded) = parts.tail.prefix(chunk.next - chunk.start) else {
+        return None
+    }
+    let Some(found) = read_fields(encoded, alloc) else {
+        return None
+    }
+    let Some(whole) = encoded.prefix(encoded.len()) else {
+        return None
+    }
+    let fields = Fields(encoded: take whole, found: take found)
+    let Some(items_field) = fields.get(3) else {
+        return None
+    }
+    let Some(items) = read_items(items_field, alloc) else {
+        return None
+    }
+    let Some(bumps_field) = fields.get(4) else {
+        return None
+    }
+    let Some(bumps) = read_bumps(bumps_field, alloc) else {
+        return None
+    }
+    let Some(functions_field) = fields.get(6) else {
+        return None
+    }
+    let Some(functions) = read_functions(functions_field, alloc) else {
+        return None
+    }
+    let Some(class) = class_of(fields.get(1)) else {
+        return None
+    }
+    let Some(encode) = class_of(fields.get(2)) else {
+        return None
+    }
+    let Some(authority_field) = fields.get(5) else {
+        return None
+    }
+    let Some(authority) = read_texts(authority_field, alloc) else {
+        return None
+    }
+    return Some(Summary(class: class, encode: encode, items: take items, bumps: take bumps, authority: take authority, functions: take functions))
+} Summary.decoded
+
+/// The class a field's uvar gives the position of.
+fn class_of(field: Option[Slice[u8]]) -> Option[Class] {
+    let Some(content) = field else {
+        return None
+    }
+    let Some(position) = artefact::read_uvar(content, at: 0) else {
+        return None
+    }
+    return Class.from_position(position.value)
+} class_of
+
+fn read_items(field: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[ExportedItem]] {
+    let Some(count) = artefact::read_uvar(field, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var items = mem::List[ExportedItem].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(path) = read_text(field, at: rest, alloc) else {
+            return None
+        }
+        let TextAt(value: item_path, next: after_path) = path
+        let Some(position) = artefact::read_uvar(field, at: after_path) else {
+            return None
+        }
+        let Some(epoch) = artefact::read_uvar(field, at: position.next) else {
+            return None
+        }
+        let Some(class) = Class.from_position(position.value) else {
+            return None
+        }
+        let Some(number) = epoch.value.to_u64() else {
+            return None
+        }
+        mut items.push(ExportedItem(path: take item_path, class: class, epoch: number))
+        rest = epoch.next
+    }
+    return Some(take items)
+} read_items
+
+fn read_bumps(field: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[EpochBump]] {
+    let Some(count) = artefact::read_uvar(field, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var bumps = mem::List[EpochBump].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(path) = read_text(field, at: rest, alloc) else {
+            return None
+        }
+        let TextAt(value: bumped, next: after_path) = path
+        let Some(reason) = read_text(field, at: after_path, alloc) else {
+            return None
+        }
+        let TextAt(value: why, next: after) = reason
+        mut bumps.push(EpochBump(path: take bumped, reason: take why))
+        rest = after
+    }
+    return Some(take bumps)
+} read_bumps
+
+/// The texts a list holds, from `at`, and the position after them.
+fn read_text_list(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[TextsAt] {
+    let Some(count) = artefact::read_uvar(bytes, at) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var found = mem::List[text::String].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(value) = read_text(bytes, at: rest, alloc) else {
+            return None
+        }
+        let TextAt(value: spelt, next: after) = value
+        mut found.push(take spelt)
+        rest = after
+    }
+    return Some(TextsAt(values: take found, next: rest))
+} read_text_list
+
+fn read_texts(field: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    let Some(read) = read_text_list(field, at: 0, alloc) else {
+        return None
+    }
+    let TextsAt(values: values, next: _) = read
+    return Some(take values)
+} read_texts
+
+fn read_functions(field: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[FunctionSummary]] {
+    let Some(count) = artefact::read_uvar(field, at: 0) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var functions = mem::List[FunctionSummary].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(path) = read_text(field, at: rest, alloc) else {
+            return None
+        }
+        let TextAt(value: function_path, next: after_path) = path
+        let Some(target) = read_text(field, at: after_path, alloc) else {
+            return None
+        }
+        let TextAt(value: function_target, next: after_target) = target
+        let Some(methods) = read_text_list(field, at: after_target, alloc) else {
+            return None
+        }
+        let TextsAt(values: reached, next: after_methods) = methods
+        let Some(traps) = read_traps(field, at: after_methods, alloc) else {
+            return None
+        }
+        let TrapsAt(sites: sites, next: after) = traps
+        mut functions.push(FunctionSummary(path: take function_path, target: take function_target, methods: take reached, traps: take sites))
+        rest = after
+    }
+    return Some(take functions)
+} read_functions
+
+/// The trap sites a list holds, from `at`, and the position after them.
+fn read_traps(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[TrapsAt] {
+    let Some(count) = artefact::read_uvar(bytes, at) else {
+        return None
+    }
+    let Some(total) = count.value.to_u64() else {
+        return None
+    }
+    var sites = mem::List[TrapSite].empty(alloc)
+    var rest = count.next
+    for _ in 0..<total {
+        let Some(kind) = read_text(bytes, at: rest, alloc) else {
+            return None
+        }
+        let TextAt(value: trap_kind, next: after_kind) = kind
+        let Some(path) = read_text(bytes, at: after_kind, alloc) else {
+            return None
+        }
+        let TextAt(value: trap_path, next: after_path) = path
+        let Some(line) = artefact::read_uvar(bytes, at: after_path) else {
+            return None
+        }
+        let Some(wide_line) = line.value.to_u64() else {
+            return None
+        }
+        let Some(number) = u32.checked_fit(wide_line) else {
+            return None
+        }
+        mut sites.push(TrapSite(kind: take trap_kind, path: take trap_path, line: number))
+        rest = line.next
+    }
+    return Some(TrapsAt(sites: take sites, next: rest))
+} read_traps
+
+/// A text read from bytes, and the position after it.
+struct TextAt {
+    value: text::String
+    next: usize
+} TextAt
+
+/// Texts read from bytes, and the position after them.
+struct TextsAt {
+    values: mem::List[text::String]
+    next: usize
+} TextsAt
+
+/// Trap sites read from bytes, and the position after them.
+struct TrapsAt {
+    sites: mem::List[TrapSite]
+    next: usize
+} TrapsAt
+
+/// A text at a position of `bytes`, and the position after it.
+fn read_text(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[TextAt] {
+    let Some(chunk) = artefact::read_bytes(bytes, at) else {
+        return None
+    }
+    let Some(parts) = bytes.split_at(chunk.start) else {
+        return None
+    }
+    let Some(spelt) = parts.tail.prefix(chunk.next - chunk.start) else {
+        return None
+    }
+    let Ok(decoded) = attempt text::String.try_from_utf8(spelt, alloc) else {
+        return None
+    }
+    return Some(TextAt(value: take decoded, next: chunk.next))
+} read_text
+
+/// The local store, read from the user directory.
+pkg struct Store {
+    dir: cache::StoreDir
+} Store
+
+/// An entry to append: everything but its publication index.
+pkg struct Append {
+    pkg package_name: text::String
+    pkg name: Option[text::String]
+    pkg parent: Option[hashing::HashValue]
+    pkg summary: Option[Summary]
+    pkg artefact: mem::Bytes
+    pkg sources: mem::List[artefact::SourceFile]
+} Append
+
+/// The publication index and code root hash of an entry, as its file's name gives them.
+pkg struct Published derives Copy, Eq, Ord {
+    pkg index: u64
+    pkg root: hashing::HashValue
+} Published
+
+pkg fn Store.new(take dir: cache::StoreDir) -> Store {
+    return Store(dir: take dir)
+} Store.new
+
+/// The publication index and code root hash of each entry, in index order, from the names of
+/// the store's files; or the part of the store that is exposed.
+pkg fn Store.index(self) -> Result[mem::List[Published], cache::Exposed] fails platform::IoError {
+    let alloc = self.dir.alloc
+    var found = mem::List[Published].empty(alloc)
+    let Some(dir) = self.dir.dir else {
+        return Ok(take found)
+    }
+    match try self.dir.exposed(dir.as_str()) {
+        Some(exposed) => return Err(take exposed)
+        None => {}
+    }
+    let names = match first attempt platform::list_dir(dir.as_str(), alloc) {
+        Ok(listed) => listed
+        Err(platform::IoError.NotFound) => return Ok(take found)
+        Err(error) => fail error
+    }
+    for held in names {
+        let name = output::lossy(held.name.view(), alloc)
+        let Some(published) = published_of(name.as_str(), alloc) else {
+            continue
+        }
+        mut found.push(published)
+    }
+    mut found.sort_by(fn(left: Published, right: Published) => left.cmp(right))
+    return Ok(take found)
+} Store.index
+
+/// The publication index and code root an entry's file name gives, none for another name.
+fn published_of(name: Str, alloc: mem::Alloc) -> Option[Published] {
+    if not name.ends_with(".entry") {
+        return None
+    }
+    let Some(stem) = name.slice_bytes(0, end: name.byte_len() - 6) else {
+        return None
+    }
+    let Some(dash) = stem.find("-") else {
+        return None
+    }
+    let Some(index_text) = stem.slice_bytes(0, end: dash) else {
+        return None
+    }
+    let Some(root_text) = stem.slice_bytes(dash + 1, end: stem.byte_len()) else {
+        return None
+    }
+    let Some(index) = platform::parse_decimal(index_text) else {
+        return None
+    }
+    let Some(root) = machine::hash_of(root_text, alloc) else {
+        return None
+    }
+    return Some(Published(index: index, root: root))
+} published_of
+
+/// The entry of a publication index, read from its file named with `root`; none when the
+/// file does not decode or its checksum does not match.
+pkg fn Store.read(self, index: u64, root: hashing::HashValue) -> Result[Option[Entry], cache::Exposed] fails platform::IoError {
+    let alloc = self.dir.alloc
+    let Some(dir) = self.dir.dir else {
+        return Ok(None)
+    }
+    let path = platform::join(dir.as_str(), name: entry_name(index, root, alloc).as_str(), alloc)
+    match try self.dir.exposed(path.as_str()) {
+        Some(exposed) => return Err(take exposed)
+        None => {}
+    }
+    let file = try platform::read_file(path.as_str(), alloc)
+    if file.len() < 32 {
+        return Ok(None)
+    }
+    let Some(parts) = file.view().split_at(file.len() - 32) else {
+        return Ok(None)
+    }
+    let digest = hashing::blake3(parts.head)
+    if digest.view() != parts.tail {
+        return Ok(None)
+    }
+    let Some(entry) = Entry.decoded(parts.head, alloc) else {
+        return Ok(None)
+    }
+    if entry.index != index {
+        return Ok(None)
+    }
+    return Ok(Some(take entry))
+} Store.read
+
+/// The store's entries in order of publication index, those that do not read left out.
+pkg fn Store.entries(self) -> Result[mem::List[Entry], cache::Exposed] fails platform::IoError {
+    let index = match try self.index() {
+        Ok(found) => found
+        Err(exposed) => return Err(take exposed)
+    }
+    var entries = mem::List[Entry].empty(self.dir.alloc)
+    for published in index {
+        match try self.read(published.index, root: published.root) {
+            Ok(Some(entry)) => mut entries.push(take entry)
+            Ok(None) => {}
+            Err(exposed) => return Err(take exposed)
+        }
+    }
+    return Ok(take entries)
+} Store.entries
+
+/// Appends an entry under the next publication index, unless the store holds its release:
+/// under its store name for a named release, at all for a path release. Returns the entry
+/// holding the release.
+pkg fn Store.append(self, take append: Append) -> Result[Entry, cache::Exposed] fails platform::IoError {
+    let alloc = self.dir.alloc
+    let Some(dir) = self.dir.dir else {
+        fail platform::IoError.Other(0)
+    }
+    let lock_path = platform::join(dir.as_str(), name: "write", alloc)
+    let locked = try platform::File.open_or_create(lock_path.as_str(), mode: 0b110_000_000)
+    defer take locked.close()
+    try locked.lock()
+    var entries = match try self.entries() {
+        Ok(found) => found
+        Err(exposed) => return Err(take exposed)
+    }
+    let root = match artefact::decode(append.artefact.view(), alloc) {
+        Ok(decoded) => decoded.root_hash()
+        Err(_) => fail platform::IoError.Other(0)
+    }
+    for at in 0..<entries.len() {
+        let entry = entries[at]
+        if entry.root(alloc) == root and (append.name.is_none() or entry.name == append.name) {
+            return Ok(mut entries.remove(at))
+        }
+    }
+    var next: u64 = 1
+    if entries.len() > 0 {
+        next = entries[entries.len() - 1].index + 1
+    }
+    let Append(package_name: package_name, name: name, parent: parent, summary: summary, artefact: artefact_bytes, sources: sources) = append
+    let entry = Entry(index: next, package_name: take package_name, name: take name, parent: parent, summary: take summary, artefact: take artefact_bytes, sources: take sources)
+    let contents = entry.encoded(alloc)
+    var fresh_name = text::String.empty(alloc)
+    mut fresh_name.write(text::fmt(".{index}.{id}", index: entry.index, id: platform::process_id()), budget: 1_000_000)
+    let fresh = platform::join(dir.as_str(), name: fresh_name.as_str(), alloc)
+    let file = try platform::File.create(fresh.as_str(), mode: 0b110_000_000)
+    defer take file.close()
+    try file.write_all(contents.view())
+    let digest = hashing::blake3(contents.view())
+    try file.write_all(digest.view())
+    try file.sync_all()
+    let target = platform::join(dir.as_str(), name: entry_name(entry.index, root, alloc).as_str(), alloc)
+    try platform::rename_path(fresh.as_str(), to: target.as_str())
+    return Ok(take entry)
+} Store.append
+
+/// The name of an entry's file: its publication index and its code root hash in full form.
+fn entry_name(index: u64, root: hashing::HashValue, alloc: mem::Alloc) -> text::String {
+    var name = text::String.empty(alloc)
+    mut name.write(text::fmt("{index}-", index), budget: 1_000_000)
+    mut name.append(root.full(alloc).as_str())
+    mut name.append(".entry")
+    return name
+} entry_name

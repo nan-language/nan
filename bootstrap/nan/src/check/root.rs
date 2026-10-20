@@ -101,6 +101,32 @@ fn assemble(package: &Package, coded: &Coded) -> Built {
     }
 }
 
+/// The canonical NIR stream of each workspace package's current state, by package name, as its
+/// code root holds it.
+pub fn nir_streams(workspace: &Workspace) -> Vec<(String, Vec<u8>)> {
+    let std = crate::stdlib::packages();
+    let mut streams = Vec::new();
+    for package in &workspace.packages {
+        let (Some(closure), Some(name)) = (workspace.closure_of(package), package.name()) else {
+            continue;
+        };
+        let checkers: Vec<(Target, Checker)> = check_targets(package)
+            .into_iter()
+            .map(|target| {
+                let checker = unchecked(workspace, closure, std, target);
+                if let Some(id) = checker.package_named(name) {
+                    checker.check_whole(id);
+                }
+                (target, checker)
+            })
+            .collect();
+        let views: Vec<(Target, &Checker)> =
+            checkers.iter().map(|(target, ck)| (*target, ck)).collect();
+        streams.push((name.to_owned(), super::units::stream(&views, name).bytes));
+    }
+    streams
+}
+
 /// The code root and seals of the current state of a closure's member.
 fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
     let std = crate::stdlib::packages();

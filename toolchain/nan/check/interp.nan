@@ -1,0 +1,1739 @@
+//! The reference interpreter: executes NIR functions at check time for const evaluation, example runs and refutation confirmation. Every obligation site with a trap kind that is not open is checked; a run ends at a trap, at its step limit, at an operation it cannot interpret, or at a const or function that has no value or unit.
+
+/// The steps every interpreter run may take.
+const STEP_LIMIT: u64 = 1_000_000
+
+/// The call depth past which a call traps.
+const DEPTH_LIMIT: usize = 4_096
+
+/// How an interpreter run ends.
+enum End {
+    Value(Val)
+    Failure
+    Trap(Report)
+    Exhausted(Report)
+    Violation(Report)
+    Uninterpretable(Report)
+    /// The run reached a const or contribution without a value, or a function without a unit.
+    Missing
+    /// A confirmation run reached its obligation's site with the condition false.
+    Confirmed
+} End
+
+/// An operation of an item's unit, by the item and the operation's span.
+struct ItemSpan derives Copy, Eq {
+    item: ty::ItemId
+    span: nir::Span
+} ItemSpan
+
+/// Where a run ended abnormally: the first word of its report, the operation and the calls in
+/// progress, innermost first.
+struct Report {
+    word: text::String
+    at: ItemSpan
+    callers: mem::List[ItemSpan]
+} Report
+
+/// An obligation site of a unit's function, by the function's role and index and the
+/// instruction's block and position; the terminator of a block is at its number of
+/// instructions.
+struct RunSite derives Copy, Eq, Hash {
+    role: nir::Role
+    index: u32
+    block: nir::BlockId
+    position: usize
+} RunSite
+
+/// A value a confirmation run receives: a value, or a struct, enum value, array or slice of
+/// inputs, a slice viewing all of a fresh extent holding its elements.
+enum Input {
+    Value(Val)
+    Struct(item: ty::ItemId, fields: mem::List[Input])
+    Variant(item: ty::ItemId, index: u32, fields: mem::List[Input])
+    Array(mem::List[Input])
+    /// Its elements, and whether it is writable.
+    Slice(elements: mem::List[Input], writable: bool)
+} Input
+
+/// How a function or region ends normally.
+enum InterpFlow {
+    Return(Val)
+    Fail(Val)
+    Yield(Val)
+} InterpFlow
+
+/// A call in progress: its unit and function, its values, its type arguments and its slots.
+struct InterpFrame {
+    unit: mem::Shared[nir::NirUnit]
+    function: usize
+    values: mem::List[Option[Val]]
+    subst: ty::Subst
+    slots: mem::List[u32]
+} InterpFrame
+
+struct Interpreter {
+    ck: Checker
+    /// The allocator of the checker, which the run's values draw on.
+    alloc: mem::Alloc
+    steps: u64
+    memory: Memory
+    /// The call sites in progress, outermost first.
+    calls: mem::List[ItemSpan]
+    /// The site a confirmation run stops at.
+    stop: Option[RunSite]
+    /// The values viewing the extents of literal data created so far, by literal.
+    literals: mem::HashMap[nir::Literal, Val]
+    budgets: Budgets
+} Interpreter
+
+/// The extents a value views, in order of first sight, with each one's position there.
+struct ExtentOrder {
+    extents: mem::List[u32]
+    positions: mem::HashMap[u32, u32]
+} ExtentOrder
+
+/// A value const evaluation computed, with the data its views refer to.
+struct ConstValue {
+    /// The arrays its views and references see, by index.
+    data: mem::List[Val]
+    /// The value, its views and references naming data by index as their extent.
+    value: Val
+} ConstValue
+
+/// The index a step takes in a value, none for a variant step, and whether the step after it
+/// reads a labelled payload.
+struct StepIndex derives Copy {
+    index: Option[u32]
+    labelled: bool
+} StepIndex
+
+proj fn InterpFrame.nir(self) -> nir::Function {
+    return self.unit.contents().functions[self.function]
+} InterpFrame.nir
+
+fn Interpreter.new(take ck: Checker) -> Interpreter {
+    let alloc = ck.alloc()
+    return Interpreter(ck: take ck, alloc: alloc, steps: 0, memory: Memory.empty(alloc), calls: mem::List[ItemSpan].empty(alloc), stop: None, literals: mem::HashMap[nir::Literal, Val].empty(seed: 0, alloc), budgets: Budgets.empty(alloc))
+} Interpreter.new
+
+/// Runs a function of an item's unit with arguments and type arguments.
+fn Interpreter.run(
+    mut self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    take args: mem::List[Val],
+    type_args: Slice[ty::Arg],
+    ) -> End {
+    let Some(unit) = self.ck.unit(item) else {
+        return End.Missing
+    }
+    let Some(function) = unit.contents().functions.position(fn(candidate: nir::Function) => candidate.role == role and candidate.index == index) else {
+        return End.Missing
+    }
+    let flow = attempt mut self.execute(take unit, function, take args, type_args)
+    match flow {
+        Ok(InterpFlow.Return(value)) => return End.Value(take value)
+        Ok(InterpFlow.Fail(_)) => return End.Failure
+        Ok(InterpFlow.Yield(_)) => {
+            expect false
+            return End.Missing
+        }
+        Err(end) => return end
+    }
+} Interpreter.run
+
+/// A confirmation run: binds the inputs to the parameters of the site's function, a
+/// reference parameter to a fresh extent holding its input, evaluates the entry facts, then
+/// runs the function until it reaches the site with its obligation's condition false.
+fn Interpreter.confirm(mut self, item: ty::ItemId, site: RunSite, take inputs: mem::List[Input], type_args: Slice[ty::Arg]) -> bool {
+    let Some(unit) = self.ck.unit(item) else {
+        return false
+    }
+    let Some(function) = unit.contents().function(site.role, index: site.index) else {
+        return false
+    }
+    var args = mem::List[Val].empty(self.alloc)
+    var position: usize = 0
+    for input in take inputs {
+        if position >= function.params.len() {
+            break
+        }
+        let value = mut self.input(take input)
+        match function.ty(function.params[position].value) {
+            nir::NTy.Owned(_) => mut args.push(take value)
+            nir::NTy.Ref(referenced) or nir::NTy.RefMut(referenced) => {
+                let size = self.ck.interp_layout(referenced).size
+                let extent = mut self.memory.alloc(take value, writable: true, size)
+                mut args.push(Val.Ref(Loc(extent: extent, path: mem::List[u32].empty(self.alloc))))
+            }
+        }
+        position += 1
+    }
+    if not mut self.entry_facts(item, function, args: args.view(), type_args) {
+        return false
+    }
+    self.stop = Some(site)
+    return match mut self.run(item, role: site.role, index: site.index, take args, type_args) {
+        End.Confirmed => true
+        else => false
+    }
+} Interpreter.confirm
+
+fn Interpreter.input(mut self, take input: Input) -> Val {
+    let alloc = self.alloc
+    match input {
+        Input.Value(value) => return value
+        Input.Struct(item: item, fields: fields) => return Val.Struct(item: item, fields: mem::Shared.of(mut self.inputs(take fields), alloc))
+        Input.Variant(item: item, index: index, fields: fields) => return Val.Variant(item: item, index: index, fields: mem::Shared.of(mut self.inputs(take fields), alloc))
+        Input.Array(elements) => return Val.Array(mem::Shared.of(mut self.inputs(take elements), alloc))
+        Input.Slice(elements: elements, writable: writable) => {
+            let values = mut self.inputs(take elements)
+            let len = values.len()
+            let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take values, alloc)), writable, size: u64.widen(len))
+            return Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: len))
+        }
+    }
+} Interpreter.input
+
+/// The values of inputs, in order.
+fn Interpreter.inputs(mut self, take inputs: mem::List[Input]) -> mem::List[Val] {
+    var values = mem::List[Val].empty(self.alloc)
+    for input in take inputs {
+        mut values.push(mut self.input(take input))
+    }
+    return values
+} Interpreter.inputs
+
+/// Whether a confirmation run's entry facts hold: the `where` conditions of the const
+/// parameters, the predicates that are facts at the item's entry, and the requires the
+/// function meets, those written before it for a `requires` function.
+fn Interpreter.entry_facts(mut self, item: ty::ItemId, function: nir::Function, args: Slice[Val], type_args: Slice[ty::Arg]) -> bool {
+    let ck = self.ck.share()
+    if ck.unit(item).is_none() {
+        return false
+    }
+    if not mut self.wheres_hold(item, type_args) {
+        return false
+    }
+    let types = ck.types()
+    let boundary = ck.is_boundary(item)
+    var position: usize = 0
+    for param in function.params {
+        if position >= args.len() {
+            break
+        }
+        let ty = ck.unit_subst(item, args: type_args).ty(types, ty: function.ty(param.value).ty())
+        let value = self.deref(args[position])
+        if not mut self.predicates_hold(item, boundary, value, ty) {
+            return false
+        }
+        position += 1
+    }
+    var before: u32 = 0xFFFF_FFFF
+    if function.role == nir::Role.Requires {
+        before = function.index
+    }
+    let entry = ck.entry_requires(item)
+    for clause in entry {
+        let nir::Callable.Item(item: holder, role: _, index: index) = clause.callable else {
+            continue
+        }
+        if holder == item and index >= before {
+            continue
+        }
+        if not mut self.requires_hold(item, holder, index, requires_args: clause.args, args, type_args) {
+            return false
+        }
+    }
+    return true
+} Interpreter.entry_facts
+
+/// Whether the `where` conditions of the const parameters of an item, and of the type it is a
+/// member of, hold for the type arguments of a confirmation run.
+fn Interpreter.wheres_hold(mut self, item: ty::ItemId, type_args: Slice[ty::Arg]) -> bool {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let sig = ck.sig(item)
+    let generics = sig.contents().generics
+    var values = mem::HashMap[ty::Param, Val].empty(seed: 0, alloc)
+    var position: usize = 0
+    while position < generics.len() and position < type_args.len() {
+        match first type_args[position] {
+            ty::Arg.Const(ty::Const.Int(value)) => {
+                discard mut values.insert(generics[position].param, value: Val.Int(value))
+            }
+            ty::Arg.Const(ty::Const.Bool(value)) => {
+                discard mut values.insert(generics[position].param, value: Val.Bool(value))
+            }
+            else => {}
+        }
+        position += 1
+    }
+    var holders = mem::List[ty::ItemId].empty(alloc)
+    mut holders.push(item)
+    match ck.db().owners.get(item) {
+        Some(TypeKey.Item(owner)) => mut holders.push(owner)
+        else => {}
+    }
+    for holder in holders {
+        let Some(unit) = ck.unit(holder) else {
+            continue
+        }
+        let holder_sig = ck.sig(holder)
+        var consts = mem::List[Val].empty(alloc)
+        var holder_args = mem::List[ty::Arg].empty(alloc)
+        for def in holder_sig.contents().generics {
+            if def.constant.is_some() {
+                match values.get(def.param) {
+                    Some(value) => mut consts.push(value.copy(alloc))
+                    None => {}
+                }
+            }
+            let param = def.param
+            match generics.position(fn(own: GenericDef) => own.param == param) {
+                Some(at_index) => mut holder_args.push(type_args[at_index])
+                None => mut holder_args.push(def.param_arg(ck.types()))
+            }
+        }
+        for condition in unit.contents().functions {
+            if condition.role != nir::Role.Where {
+                continue
+            }
+            if not mut self.holds(holder, role: nir::Role.Where, index: condition.index, args: Val.copies(consts.view(), alloc), type_args: holder_args.view()) {
+                return false
+            }
+        }
+    }
+    return true
+} Interpreter.wheres_hold
+
+/// Whether a requires clause a confirmation run's function meets at entry holds for its
+/// arguments, each passed by value where the clause's function takes it so.
+fn Interpreter.requires_hold(
+    mut self,
+    item: ty::ItemId,
+    holder: ty::ItemId,
+    index: u32,
+    requires_args: ty::Args,
+    args: Slice[Val],
+    type_args: Slice[ty::Arg],
+    ) -> bool {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let Some(target) = ck.unit(holder) else {
+        return false
+    }
+    let Some(checked) = target.contents().function(nir::Role.Requires, index) else {
+        return false
+    }
+    var passed = mem::List[Val].empty(self.alloc)
+    var position: usize = 0
+    for param in checked.params {
+        if position >= args.len() {
+            break
+        }
+        match checked.ty(param.value) {
+            nir::NTy.Owned(_) => mut passed.push(self.deref(args[position]))
+            else => mut passed.push(args[position].copy(self.alloc))
+        }
+        position += 1
+    }
+    let clause_args = ck.unit_subst(item, args: type_args).args(types, args: requires_args)
+    return mut self.holds(holder, role: nir::Role.Requires, index, args: take passed, type_args: types.arg_list(clause_args))
+} Interpreter.requires_hold
+
+/// Whether the predicates of the struct values reachable from a value hold, where they are
+/// facts at the entry of a function of `item`: outside their type's module, or at a
+/// boundary function's entry.
+fn Interpreter.predicates_hold(mut self, item: ty::ItemId, boundary: bool, value: Val, ty: ty::Ty) -> bool {
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let types = ck.types()
+    let ty::TyKind.Item(item: owner, args: owner_args) = types.kind(ty) else {
+        return true
+    }
+    let Val.Struct(item: _, fields: fields) = value else {
+        return true
+    }
+    let owner_sig = ck.sig(owner)
+    let SigKind.Struct(fields: declared) = owner_sig.contents().kind else {
+        return true
+    }
+    let db = ck.db()
+    if boundary or db.module_of(owner) != db.module_of(item) {
+        for index in 0..<ck.predicate_count(owner) {
+            var single = mem::List[Val].empty(alloc)
+            mut single.push(value.copy(alloc))
+            if not mut self.holds(owner, role: nir::Role.Predicate, index, args: take single, type_args: types.arg_list(owner_args)) {
+                return false
+            }
+        }
+    }
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in owner_sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(owner_args), alloc)
+    let parts = fields.contents()
+    var position: usize = 0
+    for field in declared {
+        if position >= parts.len() {
+            break
+        }
+        let part = self.deref(parts[position])
+        if not mut self.predicates_hold(item, boundary, value: part, ty: subst.ty(types, ty: field.ty)) {
+            return false
+        }
+        position += 1
+    }
+    return true
+} Interpreter.predicates_hold
+
+fn Interpreter.holds(
+    mut self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    take args: mem::List[Val],
+    type_args: Slice[ty::Arg],
+    ) -> bool {
+    return match mut self.run(item, role, index, take args, type_args) {
+        End.Value(Val.Bool(true)) => true
+        else => false
+    }
+} Interpreter.holds
+
+/// Whether a site of the run function's own code, at the call depth `depth` within it, is
+/// where a confirmation run stops.
+fn Interpreter.stops_at(self, site: RunSite, depth: usize) -> bool {
+    return self.calls.len() == depth and self.stop == Some(site)
+} Interpreter.stops_at
+
+/// Counts a step, ending the run past its step limit.
+fn Interpreter.step(mut self, at: ItemSpan) fails End {
+    self.steps += 1
+    if self.steps > STEP_LIMIT {
+        fail End.Exhausted(self.report("steps exhausted", at))
+    }
+} Interpreter.step
+
+fn Interpreter.report(self, word: Str, at: ItemSpan) -> Report {
+    var callers = mem::List[ItemSpan].empty(self.alloc)
+    var index = self.calls.len()
+    while index > 0 {
+        index -= 1
+        mut callers.push(self.calls[index])
+    }
+    return Report(word: text::String.of(word, alloc: self.alloc), at: at, callers: take callers)
+} Interpreter.report
+
+fn Interpreter.trap(self, kind: Str, at: ItemSpan) -> End {
+    return End.Trap(self.report(kind, at))
+} Interpreter.trap
+
+fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function: usize, take args: mem::List[Val], type_args: Slice[ty::Arg]) -> InterpFlow fails End {
+    let item = unit.contents().item
+    let code = unit.contents().functions[function]
+    var values = mem::List[Option[Val]].empty(self.alloc)
+    mut values.reserve(code.types.len())
+    for _ in 0..<code.types.len() {
+        mut values.push(None)
+    }
+    var frame = InterpFrame(unit: unit.share(), function: function, values: take values, subst: self.ck.unit_subst(item, args: type_args), slots: mem::List[u32].empty(self.alloc))
+    var position: usize = 0
+    for arg in take args {
+        if position >= code.params.len() {
+            break
+        }
+        let param = code.params[position].value
+        let referenced = match arg {
+            Val.Ref(_) => true
+            else => false
+        }
+        if referenced and not code.ty(param).is_reference() {
+            frame.values[usize.widen(param.index)] = Some(self.deref(arg))
+        } else {
+            frame.values[usize.widen(param.index)] = Some(take arg)
+        }
+        position += 1
+    }
+    let flow = attempt mut self.blocks(mut frame, start: nir::BlockId(index: 0))
+    for slot in frame.slots {
+        mut self.memory.kill(slot)
+    }
+    match flow {
+        Ok(ended) => return ended
+        Err(end) => fail end
+    }
+} Interpreter.execute
+
+/// Runs blocks from `start` until a return, a failure, or the `yield` ending a region.
+fn Interpreter.blocks(mut self, mut frame: InterpFrame, start: nir::BlockId) -> InterpFlow fails End {
+    let unit = frame.unit.share()
+    let item = unit.contents().item
+    let function = unit.contents().functions[frame.function]
+    var current = start
+    loop {
+        let block = function.block(current)
+        for position in 0..<block.insts.len() {
+            let inst = block.insts[position]
+            try mut self.step(ItemSpan(item: item, span: inst.span))
+            try mut self.inst(mut frame, inst, site: RunSite(role: function.role, index: function.index, block: current, position: position))
+        }
+        let at = ItemSpan(item: item, span: block.term_span)
+        try mut self.step(at)
+        var next = current
+        var args = mem::List[Val].empty(self.alloc)
+        match block.term {
+            nir::Terminator.Jump(jump) => {
+                next = jump.block
+                args = try mut self.jump_args(frame, jump, at)
+            }
+            nir::Terminator.Branch(operand: condition, then: then, otherwise: otherwise) => {
+                let decided = try mut self.operand(frame, operand: condition, at)
+                if decided.bool_value() {
+                    next = then.block
+                    args = try mut self.jump_args(frame, jump: then, at)
+                } else {
+                    next = otherwise.block
+                    args = try mut self.jump_args(frame, jump: otherwise, at)
+                }
+            }
+            nir::Terminator.Call(call: call, ok: ok, failure: failure) => {
+                let called_site = RunSite(role: function.role, index: function.index, block: current, position: block.insts.len())
+                match try mut self.call(frame, call, at, site: called_site) {
+                    InterpFlow.Return(value) => {
+                        next = ok
+                        mut args.push(take value)
+                    }
+                    InterpFlow.Fail(value) => {
+                        next = failure
+                        mut args.push(take value)
+                    }
+                    InterpFlow.Yield(_) => {
+                        expect false
+                    }
+                }
+            }
+            nir::Terminator.Return(value) => {
+                let Some(operand) = value else {
+                    return InterpFlow.Return(Val.Unit)
+                }
+                return InterpFlow.Return(try mut self.operand(frame, operand, at))
+            }
+            nir::Terminator.Fail(failure) => return InterpFlow.Fail(try mut self.operand(frame, operand: failure, at))
+            nir::Terminator.Todo(_) => fail self.trap("trap.todo", at)
+            nir::Terminator.Unreachable => {
+                expect false
+            }
+            nir::Terminator.Yield(value) => return InterpFlow.Yield(try mut self.operand(frame, operand: value, at))
+        }
+        let params = function.block(next).params
+        var position: usize = 0
+        for arg in take args {
+            if position >= params.len() {
+                break
+            }
+            frame.values[usize.widen(params[position].index)] = Some(take arg)
+            position += 1
+        }
+        current = next
+    }
+} Interpreter.blocks
+
+fn Interpreter.jump_args(mut self, frame: InterpFrame, jump: nir::Jump, at: ItemSpan) -> mem::List[Val] fails End {
+    var args = mem::List[Val].empty(self.alloc)
+    for operand in jump.args {
+        mut args.push(try mut self.operand(frame, operand, at))
+    }
+    return args
+} Interpreter.jump_args
+
+fn Interpreter.inst(mut self, mut frame: InterpFrame, inst: nir::Inst, site: RunSite) fails End
+    waive length "one arm per operation, as the run interprets them"
+{
+    let alloc = self.alloc
+    let at = ItemSpan(item: frame.unit.contents().item, span: inst.span)
+    var value: Option[Val] = None
+    match inst.op {
+        nir::Op.Slot(name: _, ty: slot_ty) => {
+            value = Some(mut self.new_slot(mut frame, slot_ty))
+        }
+        nir::Op.Load(place) => {
+            value = Some(try self.read(frame, place, at))
+        }
+        nir::Op.Move(place) => {
+            value = Some(try mut self.moved(frame, place, at))
+        }
+        nir::Op.Ref(place) or nir::Op.RefMut(place) => {
+            value = Some(Val.Ref(try mut self.reference(frame, place, at)))
+        }
+        nir::Op.Init(place: place, operand: operand) => try mut self.store_at(frame, place, operand, assigned: false, at)
+        nir::Op.Assign(place: place, operand: operand) => try mut self.store_at(frame, place, operand, assigned: true, at)
+        nir::Op.Release(place) => try mut self.release_at(frame, place, at)
+        nir::Op.FnRef(fn_ref) => {
+            value = Some(Val.Fn(mem::Shared.of(FnVal.Function(self.substituted(frame, fn_ref)), alloc)))
+        }
+        nir::Op.Constant(constant) => {
+            value = Some(try mut self.constant(frame, constant, at))
+        }
+        nir::Op.Construct(ty: built, fields: fields) => {
+            value = Some(try mut self.construct(frame, built, fields: fields.view(), at, site))
+        }
+        nir::Op.Variant(ty: built, variant: variant, payload: payload) => {
+            value = Some(try mut self.variant_value(frame, built, variant: variant.as_str(), payload, at))
+        }
+        nir::Op.Is(place: place, ty: _, variant: variant) => {
+            let tested = try self.read(frame, place, at)
+            let Val.Variant(item: tested_item, index: tested_index, fields: _) = tested else {
+                expect false
+                return
+            }
+            value = Some(Val.Bool(tested_index == self.variant_index(tested_item, name: variant.as_str())))
+        }
+        nir::Op.Closure(index: index, captures: captures) => {
+            value = Some(try mut self.closure_value(frame, index, captures: captures.view(), at))
+        }
+        nir::Op.Convert(value: converted, to: to, via: via) => {
+            value = Some(try mut self.converted(frame, operand: converted, to, via, at))
+        }
+        nir::Op.Unary(op: op, operand: operand) => {
+            let operand_value = try mut self.operand(frame, operand, at)
+            value = Some(try self.unary(op, value: take operand_value, ty: self.result_ty(frame, inst), at, site))
+        }
+        nir::Op.Binary(op: op, left: left, right: right) => {
+            let left_value = try mut self.operand(frame, operand: left, at)
+            let right_value = try mut self.operand(frame, operand: right, at)
+            let operand_ty = self.operand_ty(frame, operand: left)
+            value = Some(try self.binary(op, left: take left_value, right: take right_value, operand_ty, ty: self.result_ty(frame, inst), at, site))
+        }
+        nir::Op.Call(call) => {
+            match try mut self.call(frame, call, at, site) {
+                InterpFlow.Return(returned) => {
+                    value = Some(take returned)
+                }
+                else => {
+                    expect false
+                }
+            }
+        }
+        nir::Op.Check(kind: kind, operand: operand, open: open) => {
+            let condition = try mut self.operand(frame, operand, at)
+            if not condition.bool_value() and not open {
+                try self.obligation_fails(site, kind: check_trap(kind, alloc).as_str(), at)
+            }
+        }
+        nir::Op.Dbg(operand) => {
+            value = Some(try mut self.operand(frame, operand, at))
+        }
+        nir::Op.Assume(operand) => {
+            let assumed = try mut self.operand(frame, operand, at)
+            if not assumed.bool_value() {
+                fail End.Violation(self.report("assume violation", at))
+            }
+        }
+        nir::Op.Quantifier(all: all, low: low, high: high, inclusive: inclusive, region: region) => {
+            value = Some(try mut self.quantified(mut frame, all, low, high, inclusive, region, at))
+        }
+        nir::Op.When(attempted: _, accesses: _, region: _) => fail End.Uninterpretable(self.report("uninterpretable", at))
+    }
+    let Some(result) = inst.result else {
+        return
+    }
+    let Some(computed) = value else {
+        return
+    }
+    frame.values[usize.widen(result.index)] = Some(take computed)
+} Interpreter.inst
+
+/// The type of an instruction's result, its type arguments substituted.
+fn Interpreter.result_ty(self, frame: InterpFrame, inst: nir::Inst) -> ty::Ty {
+    let Some(result) = inst.result else {
+        expect false
+        return ty::Ty.error()
+    }
+    return frame.subst.ty(self.ck.types(), ty: frame.nir().ty(result).ty())
+} Interpreter.result_ty
+
+/// A new writable extent for a slot, killed when the frame's call ends.
+fn Interpreter.new_slot(mut self, mut frame: InterpFrame, slot_ty: ty::Ty) -> Val {
+    let size = self.ck.interp_layout(frame.subst.ty(self.ck.types(), ty: slot_ty)).size
+    let extent = mut self.memory.alloc(Val.Absent, writable: true, size)
+    mut frame.slots.push(extent)
+    return Val.Ref(Loc(extent: extent, path: mem::List[u32].empty(self.alloc)))
+} Interpreter.new_slot
+
+/// The value at a place, which then holds nothing when it lies in memory.
+fn Interpreter.moved(mut self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Val fails End {
+    let value = try self.read(frame, place, at)
+    let Some(loc) = try self.locate(frame, place, at) else {
+        return value
+    }
+    mut self.memory.set(loc, stored: Val.Absent)
+    return value
+} Interpreter.moved
+
+/// Stores an operand's value at a place, releasing what an assigned place held.
+fn Interpreter.store_at(mut self, frame: InterpFrame, place: nir::Place, operand: nir::Operand, assigned: bool, at: ItemSpan) fails End {
+    let value = try mut self.operand(frame, operand, at)
+    let Some(loc) = try self.locate(frame, place, at) else {
+        expect false
+        return
+    }
+    if assigned {
+        let old = self.memory.get(loc).copy(self.alloc)
+        mut self.release_value(old)
+    }
+    mut self.memory.set(loc, stored: take value)
+} Interpreter.store_at
+
+/// Releases what a place in memory holds, which then holds nothing.
+fn Interpreter.release_at(mut self, frame: InterpFrame, place: nir::Place, at: ItemSpan) fails End {
+    let Some(loc) = try self.locate(frame, place, at) else {
+        return
+    }
+    let old = self.memory.get(loc).copy(self.alloc)
+    mut self.release_value(old)
+    mut self.memory.set(loc, stored: Val.Absent)
+} Interpreter.release_at
+
+/// A struct or layout value of operands, a layout's checked to fit its fields.
+fn Interpreter.construct(
+    mut self,
+    frame: InterpFrame,
+    built: ty::Ty,
+    fields: Slice[nir::Labelled],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails End {
+    var values = mem::List[Val].empty(self.alloc)
+    for field in fields {
+        mut values.push(try mut self.operand(frame, operand: field.operand, at))
+    }
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(built) else {
+        expect false
+        return Val.Absent
+    }
+    if not self.layout_fits(item, values: values.view()) {
+        try self.obligation_fails(site, kind: "trap.conversion", at)
+    }
+    return Val.Struct(item: item, fields: mem::Shared.of(take values, alloc: self.alloc))
+} Interpreter.construct
+
+/// An enum value of a variant with operands as its payload.
+fn Interpreter.variant_value(
+    mut self,
+    frame: InterpFrame,
+    built: ty::Ty,
+    variant: Str,
+    payload: nir::Payload,
+    at: ItemSpan,
+    ) -> Val fails End {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(built) else {
+        expect false
+        return Val.Absent
+    }
+    var values = mem::List[Val].empty(self.alloc)
+    match payload {
+        nir::Payload.None => {}
+        nir::Payload.Single(operand) => mut values.push(try mut self.operand(frame, operand, at))
+        nir::Payload.Labelled(labelled) => {
+            for field in labelled {
+                mut values.push(try mut self.operand(frame, operand: field.operand, at))
+            }
+        }
+    }
+    return Val.Variant(item: item, index: self.variant_index(item, name: variant), fields: mem::Shared.of(take values, alloc: self.alloc))
+} Interpreter.variant_value
+
+/// A closure of the frame's unit with its captured values, its type arguments those of the
+/// frame's generic parameters.
+fn Interpreter.closure_value(mut self, frame: InterpFrame, index: u32, captures: Slice[nir::Operand], at: ItemSpan) -> Val fails End {
+    let alloc = self.alloc
+    var values = mem::List[Val].empty(alloc)
+    for capture in captures {
+        mut values.push(try mut self.operand(frame, operand: capture, at))
+    }
+    let item = frame.unit.contents().item
+    let ck = self.ck.share()
+    let types = ck.types()
+    let sig = ck.sig(item)
+    var args = mem::List[ty::Arg].empty(alloc)
+    for def in sig.contents().generics {
+        match frame.subst.get(def.param) {
+            Some(arg) => mut args.push(arg)
+            None => mut args.push(ty::Arg.Ty(types.intern(ty::TyKind.Param(def.param))))
+        }
+    }
+    let interned = types.args(take args)
+    return Val.Fn(mem::Shared.of(FnVal.Closure(item: item, index: index, args: interned, captures: take values), alloc))
+} Interpreter.closure_value
+
+/// An operand's value as a failure converted into `to`, through its from variant `via`.
+fn Interpreter.converted(
+    mut self,
+    frame: InterpFrame,
+    operand: nir::Operand,
+    to: ty::Ty,
+    via: Option[text::String],
+    at: ItemSpan,
+    ) -> Val fails End {
+    let value = try mut self.operand(frame, operand, at)
+    let Some(variant) = via else {
+        return value
+    }
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(to) else {
+        return value
+    }
+    let index = self.variant_index(item, name: variant.as_str())
+    return Val.Variant(item: item, index: index, fields: mem::Shared.of(Val.single(take value, alloc: self.alloc), alloc: self.alloc))
+} Interpreter.converted
+
+/// A quantifier's value: whether its region yields `all` for each integer of its range, the
+/// first one yielding otherwise deciding it.
+fn Interpreter.quantified(
+    mut self,
+    mut frame: InterpFrame,
+    all: bool,
+    low: nir::Operand,
+    high: nir::Operand,
+    inclusive: bool,
+    region: nir::Region,
+    at: ItemSpan,
+    ) -> Val fails End {
+    let low_value = try mut self.operand(frame, operand: low, at)
+    let high_value = try mut self.operand(frame, operand: high, at)
+    var end = high_value.int_value()
+    if inclusive {
+        end = end.wrapping_add(wide::Wide.one())
+    }
+    let entry = region.blocks[0]
+    let unit = frame.unit.share()
+    let param = unit.contents().functions[frame.function].block(entry).params[0]
+    var decided = all
+    var current = low_value.int_value()
+    while current.lt(end) {
+        frame.values[usize.widen(param.index)] = Some(Val.Int(current))
+        let flow = try mut self.blocks(mut frame, start: entry)
+        let InterpFlow.Yield(result) = flow else {
+            expect false
+            return Val.Absent
+        }
+        if result.bool_value() != all {
+            decided = not all
+            break
+        }
+        current = current.wrapping_add(wide::Wide.one())
+    }
+    return Val.Bool(decided)
+} Interpreter.quantified
+
+/// The end of a run at a site whose obligation fails: a stop for a confirmation run at its
+/// site, a trap otherwise.
+fn Interpreter.obligation_fails(self, site: RunSite, kind: Str, at: ItemSpan) fails End {
+    fail self.site_end(site, kind, at)
+} Interpreter.obligation_fails
+
+/// The end at a site of the run function's own code whose obligation fails: a stop for a
+/// confirmation run at its site, a trap of that kind otherwise.
+fn Interpreter.site_end(self, site: RunSite, kind: Str, at: ItemSpan) -> End {
+    if self.stops_at(site, depth: 0) {
+        return End.Confirmed
+    }
+    return self.trap(kind, at)
+} Interpreter.site_end
+
+/// Whether the values of a layout's fields fit them: each ranged `bit` field below 2 to its
+/// width, and a `rest` field without a covered bit; any other construction fits.
+fn Interpreter.layout_fits(self, item: ty::ItemId, values: Slice[Val]) -> bool {
+    let Some(shape) = self.ck.layout_shape(item) else {
+        return true
+    }
+    let LayoutShape.Fields(fields) = shape else {
+        return true
+    }
+    let one = wide::Wide.one()
+    var covered = wide::Wide.zero()
+    for field in fields {
+        covered = covered.bit_or(one.shift_left(field.width).wrapping_sub(one).shift_left(field.low))
+    }
+    var position: usize = 0
+    for field in fields {
+        if position >= values.len() {
+            break
+        }
+        match field.kind {
+            BitsKind.Ranged => {
+                if not values[position].int_value().lt(one.shift_left(field.width)) {
+                    return false
+                }
+            }
+            BitsKind.Rest => {
+                if not values[position].int_value().bit_and(covered).is_zero() {
+                    return false
+                }
+            }
+            else => {}
+        }
+        position += 1
+    }
+    return true
+} Interpreter.layout_fits
+
+fn Interpreter.operand_ty(self, frame: InterpFrame, operand: nir::Operand) -> ty::Ty {
+    return match operand {
+        nir::Operand.Value(value) => frame.subst.ty(self.ck.types(), ty: frame.nir().ty(value).ty())
+        nir::Operand.Literal(nir::Literal.Int(value: _, scalar: scalar)) => ty::Ty.scalar(scalar)
+        nir::Operand.Literal(nir::Literal.Float(bits: _, scalar: scalar)) => ty::Ty.scalar(scalar)
+        nir::Operand.Literal(nir::Literal.Bool(_)) => ty::Ty.scalar(ty::Scalar.Bool)
+        nir::Operand.Literal(nir::Literal.Char(_)) => ty::Ty.scalar(ty::Scalar.Char)
+        else => ty::Ty.unit()
+    }
+} Interpreter.operand_ty
+
+fn Interpreter.substituted(self, frame: InterpFrame, fn_ref: nir::FnRef) -> nir::FnRef {
+    return nir::FnRef(callable: fn_ref.callable.copy(self.alloc), args: frame.subst.args(self.ck.types(), args: fn_ref.args))
+} Interpreter.substituted
+
+fn Interpreter.variant_index(self, item: ty::ItemId, name: Str) -> u32 {
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Enum(variants: variants) => {
+            for index in 0..<variants.len() {
+                if variants[index].name.as_str() == name {
+                    return u32.fit(index)
+                }
+            }
+        }
+        SigKind.Layout(fields: _, tags: tags, bits: _) => {
+            for index in 0..<tags.len() {
+                if tags[index].as_str() == name {
+                    return u32.fit(index)
+                }
+            }
+        }
+        else => {}
+    }
+    expect false
+    return 0
+} Interpreter.variant_index
+
+fn Interpreter.constant(mut self, frame: InterpFrame, constant: nir::Constant, at: ItemSpan) -> Val fails End {
+    match constant {
+        nir::Constant.Item(item) => {
+            match self.ck.db().ast(item).kind {
+                ast::ItemKind.Registry(_) => fail End.Uninterpretable(self.report("uninterpretable", at))
+                else => {}
+            }
+            let Some(value) = self.ck.const_value(item) else {
+                fail End.Missing
+            }
+            return mut self.import(value.contents())
+        }
+        nir::Constant.Param(param) => {
+            match frame.subst.get(param) {
+                Some(ty::Arg.Const(ty::Const.Int(value))) => return Val.Int(value)
+                Some(ty::Arg.Const(ty::Const.Bool(value))) => return Val.Bool(value)
+                else => fail End.Missing
+            }
+        }
+        nir::Constant.Register(block: _, register: index) => return Val.Int(wide::Wide.of_u64(u64.widen(index)))
+    }
+} Interpreter.constant
+
+/// A value an earlier run computed, the data it views held in this run's memory.
+fn Interpreter.import(mut self, value: ConstValue) -> Val {
+    var extents = mem::List[u32].empty(self.alloc)
+    for data in value.data {
+        let size = u64.widen(data.fields().len())
+        mut extents.push(mut self.memory.alloc_data(data.copy(self.alloc), size))
+    }
+    return value.value.remap(map: fn(extent: u32) => extents[usize.widen(extent)], alloc: self.alloc)
+} Interpreter.import
+
+/// Whether the field at `index` of two const struct values compares `Equal` by `Ord.cmp`,
+/// or is equal by `Eq.eq` when `order` is false, as derived and built-in conformances
+/// compare them.
+fn Interpreter.same_field(mut self, left: ConstValue, right: ConstValue, index: usize, order: bool) -> bool {
+    if order {
+        return mut self.field_order(left, right, index) == core::Ordering.Equal
+    }
+    let left_value = mut self.import(left)
+    let right_value = mut self.import(right)
+    return self.equal(left_value.fields()[index], right: right_value.fields()[index])
+} Interpreter.same_field
+
+/// The order of two const struct values by the field at `index`.
+fn Interpreter.field_order(mut self, left: ConstValue, right: ConstValue, index: usize) -> core::Ordering {
+    let left_value = mut self.import(left)
+    let right_value = mut self.import(right)
+    return self.order(left_value.fields()[index], right: right_value.fields()[index])
+} Interpreter.field_order
+
+/// A run's value as a const's: the data it views copied out of the run's memory, or none
+/// when it views memory other than literal and const data.
+fn Interpreter.export(self, value: Val) -> Option[ConstValue] {
+    let alloc = self.alloc
+    var order = ExtentOrder(extents: mem::List[u32].empty(alloc), positions: mem::HashMap[u32, u32].empty(seed: 0, alloc))
+    self.collect_extents(value, mut order)
+    var index: usize = 0
+    while index < order.extents.len() {
+        let extent = order.extents[index]
+        self.collect_extents(self.memory.extent(extent).value, mut order)
+        index += 1
+    }
+    for extent in order.extents {
+        if not self.memory.extent(extent).data {
+            return None
+        }
+    }
+    var data = mem::List[Val].empty(alloc)
+    for extent in order.extents {
+        mut data.push(self.memory.extent(extent).value.remap(map: fn(known: u32) => order.positions.at(known), alloc))
+    }
+    return Some(ConstValue(data: take data, value: value.remap(map: fn(known: u32) => order.positions.at(known), alloc)))
+} Interpreter.export
+
+fn Interpreter.collect_extents(self, value: Val, mut order: ExtentOrder) {
+    match value {
+        Val.View(view) => mut order.add(view.array.extent)
+        Val.Ref(loc) => mut order.add(loc.extent)
+        Val.Struct(item: _, fields: fields) or Val.Variant(item: _, index: _, fields: fields) or Val.Array(fields) => {
+            for field in fields.contents() {
+                self.collect_extents(field, mut order)
+            }
+        }
+        else => {}
+    }
+} Interpreter.collect_extents
+
+/// Adds an extent not seen yet.
+fn ExtentOrder.add(mut self, extent: u32) {
+    if self.positions.contains(extent) {
+        return
+    }
+    discard mut self.positions.insert(extent, value: u32.fit(self.extents.len()))
+    mut self.extents.push(extent)
+} ExtentOrder.add
+
+/// The value of an operand: a value, a literal, or a place passed by its mode.
+fn Interpreter.operand(mut self, frame: InterpFrame, operand: nir::Operand, at: ItemSpan) -> Val fails End {
+    match first operand {
+        nir::Operand.Value(value) => {
+            let Some(held) = frame.values[usize.widen(value.index)] else {
+                expect false
+                return Val.Absent
+            }
+            return held.copy(self.alloc)
+        }
+        nir::Operand.Literal(literal) => return mut self.literal(literal)
+        nir::Operand.Place(mode: ast::Mode.Take, place: place) => return try mut self.moved(frame, place, at)
+        nir::Operand.Place(mode: _, place: place) => return Val.Ref(try mut self.reference(frame, place, at))
+    }
+} Interpreter.operand
+
+fn Interpreter.literal(mut self, literal: nir::Literal) -> Val {
+    let alloc = self.alloc
+    match first literal {
+        nir::Literal.Int(value: value, scalar: _) => return Val.Int(value)
+        nir::Literal.Float(bits: bits, scalar: ty::Scalar.Float32) => return Val.Float32(f32.from_bits(u32.truncate(bits)))
+        nir::Literal.Float(bits: bits, scalar: _) => return Val.Float64(f64.from_bits(bits))
+        nir::Literal.Bool(value) => return Val.Bool(value)
+        nir::Literal.Char(c) => return Val.Char(c)
+        nir::Literal.Unit => return Val.Unit
+        else => {}
+    }
+    match self.literals.get(literal) {
+        Some(known) => return known.copy(alloc)
+        None => {}
+    }
+    var elements = mem::List[Val].empty(alloc)
+    match literal {
+        nir::Literal.Text(written) => {
+            for byte in written.as_bytes() {
+                mut elements.push(Val.Int(wide::Wide.of_u64(u64.widen(byte))))
+            }
+        }
+        nir::Literal.Bytes(data) => {
+            for byte in data.view() {
+                mut elements.push(Val.Int(wide::Wide.of_u64(u64.widen(byte))))
+            }
+        }
+        else => {}
+    }
+    let len = elements.len()
+    let extent = mut self.memory.alloc_data(Val.Array(mem::Shared.of(take elements, alloc)), size: u64.widen(len))
+    let value = Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: len))
+    discard mut self.literals.insert(literal.copy(alloc), value: value.copy(alloc))
+    return value
+} Interpreter.literal
+
+/// Where a place lies in memory, or none when it lies within an owned value.
+fn Interpreter.locate(self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Option[Loc] fails End {
+    let Some(root) = frame.values[usize.widen(place.root.index)] else {
+        expect false
+        return None
+    }
+    match root {
+        Val.Ref(loc) => return try self.located(Some(loc.copy(self.alloc)), value: self.memory.get(loc), place, step: 0, labelled: false, at)
+        else => return try self.located(None, value: root, place, step: 0, labelled: false, at)
+    }
+} Interpreter.locate
+
+/// Where the part of `value` at `place`'s steps from `step` lies, `value` lying at `loc`, or
+/// within an owned value when none.
+fn Interpreter.located(
+    self,
+    take loc: Option[Loc],
+    value: Val,
+    place: nir::Place,
+    step: usize,
+    labelled: bool,
+    at: ItemSpan,
+    ) -> Option[Loc] fails End {
+    if step == place.steps.len() {
+        match value {
+            Val.Ref(held) => {
+                if step > 0 and nir::is_variant_step(place.steps[step - 1].as_str()) {
+                    return Some(held.copy(self.alloc))
+                }
+            }
+            else => {}
+        }
+        return loc
+    }
+    match value {
+        Val.Ref(held) => return try self.stepped(Some(held.copy(self.alloc)), value: self.memory.get(held), place, step, labelled, at)
+        else => return try self.stepped(take loc, value, place, step, labelled, at)
+    }
+} Interpreter.located
+
+/// Where the part of `value` at `place`'s steps from `step` lies, its first step taken in
+/// `value` itself.
+fn Interpreter.stepped(
+    self,
+    take loc: Option[Loc],
+    value: Val,
+    place: nir::Place,
+    step: usize,
+    labelled: bool,
+    at: ItemSpan,
+    ) -> Option[Loc] fails End {
+    let taken = self.step_index(value, step: place.steps[step].as_str(), labelled)
+    let Some(index) = taken.index else {
+        return try self.located(take loc, value, place, step: step + 1, labelled: taken.labelled, at)
+    }
+    var next: Option[Loc] = None
+    match loc {
+        Some(held) => {
+            next = Some(held.with(index, alloc: self.alloc))
+        }
+        None => {}
+    }
+    return try self.located(take next, value: value.fields()[usize.widen(index)], place, step: step + 1, labelled: taken.labelled, at)
+} Interpreter.stepped
+
+/// The index a step takes in a value: a field's, or a payload field's; a variant step takes
+/// none and is checked against the value's variant, a labelled payload taking the next step.
+fn Interpreter.step_index(self, value: Val, step: Str, labelled: bool) -> StepIndex {
+    match value {
+        Val.Struct(item: item, fields: _) => return StepIndex(index: Some(self.field_index(item, name: step)), labelled: false)
+        Val.Variant(item: item, index: variant, fields: _) => {
+            let sig = self.ck.sig(item)
+            let SigKind.Enum(variants: variants) = sig.contents().kind else {
+                expect false
+                return StepIndex(index: None, labelled: false)
+            }
+            let current = variants[usize.widen(variant)]
+            if labelled {
+                let Payload.Labelled(fields) = current.payload else {
+                    expect false
+                    return StepIndex(index: None, labelled: false)
+                }
+                for index in 0..<fields.len() {
+                    if fields[index].name.as_str() == step {
+                        return StepIndex(index: Some(u32.fit(index)), labelled: false)
+                    }
+                }
+                expect false
+                return StepIndex(index: None, labelled: false)
+            }
+            expect current.name.as_str() == step
+            return match current.payload {
+                Payload.Labelled(_) => StepIndex(index: None, labelled: true)
+                else => StepIndex(index: Some(0), labelled: false)
+            }
+        }
+        else => {}
+    }
+    expect false
+    return StepIndex(index: None, labelled: false)
+} Interpreter.step_index
+
+fn Interpreter.field_index(self, item: ty::ItemId, name: Str) -> u32 {
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for index in 0..<fields.len() {
+                if fields[index].name.as_str() == name {
+                    return u32.fit(index)
+                }
+            }
+        }
+        else => {}
+    }
+    expect false
+    return 0
+} Interpreter.field_index
+
+/// The value at a place.
+fn Interpreter.read(self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Val fails End {
+    let Some(root) = frame.values[usize.widen(place.root.index)] else {
+        expect false
+        return Val.Absent
+    }
+    match root {
+        Val.Ref(loc) => return try self.read_from(self.memory.get(loc), place, step: 0, labelled: false, at)
+        else => return try self.read_from(root, place, step: 0, labelled: false, at)
+    }
+} Interpreter.read
+
+/// The part of `value` at `place`'s steps from `step`, a reference taken through for each step
+/// and, after the last of them, read.
+fn Interpreter.read_from(self, value: Val, place: nir::Place, step: usize, labelled: bool, at: ItemSpan) -> Val fails End {
+    if step == place.steps.len() {
+        match value {
+            Val.Ref(loc) => {
+                if step > 0 {
+                    return self.memory.get(loc).copy(self.alloc)
+                }
+            }
+            else => {}
+        }
+        return value.copy(self.alloc)
+    }
+    match value {
+        Val.Ref(loc) => return try self.read_step(self.memory.get(loc), place, step, labelled, at)
+        else => return try self.read_step(value, place, step, labelled, at)
+    }
+} Interpreter.read_from
+
+/// The part of `value` at `place`'s steps from `step`, its first step taken in `value` itself.
+fn Interpreter.read_step(self, value: Val, place: nir::Place, step: usize, labelled: bool, at: ItemSpan) -> Val fails End {
+    let taken = self.step_index(value, step: place.steps[step].as_str(), labelled)
+    let Some(index) = taken.index else {
+        return try self.read_from(value, place, step: step + 1, labelled: taken.labelled, at)
+    }
+    return try self.read_from(value.fields()[usize.widen(index)], place, step: step + 1, labelled: taken.labelled, at)
+} Interpreter.read_step
+
+/// A reference to a place: its location, or a new read-only extent holding the value when
+/// it lies within an owned value.
+fn Interpreter.reference(mut self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Loc fails End {
+    match try self.locate(frame, place, at) {
+        Some(loc) => return loc
+        None => {}
+    }
+    let value = try self.read(frame, place, at)
+    match value {
+        Val.Ref(loc) => return loc.copy(self.alloc)
+        else => {}
+    }
+    let extent = mut self.memory.alloc(take value, writable: false, size: 0)
+    return Loc(extent: extent, path: mem::List[u32].empty(self.alloc))
+} Interpreter.reference
+
+/// Releases what a value owns: the memory of the std containers it holds.
+fn Interpreter.release_value(mut self, value: Val) {
+    mut self.native_release(value)
+} Interpreter.release_value
+
+fn Interpreter.unary(
+    self,
+    op: nir::UnaryOp,
+    take value: Val,
+    ty: ty::Ty,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails End {
+    match op {
+        nir::UnaryOp.Not => {
+            match value {
+                Val.Bool(truth) => return Val.Bool(not truth)
+                else => {}
+            }
+        }
+        nir::UnaryOp.Neg => {
+            match value {
+                Val.Int(number) => {
+                    let negated = number.wrapping_neg()
+                    let Some(scalar) = ty.interned_scalar() else {
+                        expect false
+                        return Val.Absent
+                    }
+                    if not fits_scalar(negated, scalar) {
+                        fail self.overflow_trap(site, at)
+                    }
+                    return Val.Int(negated)
+                }
+                Val.Float32(float) => return Val.Float32(-float)
+                Val.Float64(float) => return Val.Float64(-float)
+                else => {}
+            }
+        }
+        nir::UnaryOp.Inv => {
+            match value {
+                Val.Int(number) => {
+                    let Some(scalar) = ty.interned_scalar() else {
+                        expect false
+                        return Val.Absent
+                    }
+                    if scalar.is_signed() {
+                        return Val.Int(number.wrapping_neg().wrapping_sub(wide::Wide.one()))
+                    }
+                    return Val.Int(scalar.range().high.wrapping_sub(number))
+                }
+                Val.Bool(truth) => return Val.Bool(not truth)
+                else => {}
+            }
+        }
+    }
+    expect false
+    return Val.Absent
+} Interpreter.unary
+
+fn Interpreter.overflow_trap(self, site: RunSite, at: ItemSpan) -> End {
+    return self.site_end(site, kind: "trap.overflow", at)
+} Interpreter.overflow_trap
+
+fn Interpreter.binary(
+    self,
+    op: nir::BinaryOp,
+    take left: Val,
+    take right: Val,
+    operand_ty: ty::Ty,
+    ty: ty::Ty,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails End {
+    if op.is_comparison() {
+        return Val.Bool(self.compare(op, left, right))
+    }
+    match left {
+        Val.Int(a) => {
+            let Val.Int(b) = right else {
+                expect false
+                return Val.Absent
+            }
+            var typed = ty.interned_scalar()
+            if typed.is_none() {
+                typed = operand_ty.interned_scalar()
+            }
+            let Some(scalar) = typed else {
+                expect false
+                return Val.Absent
+            }
+            return try self.integer_binary(op, a, b, scalar, at, site)
+        }
+        Val.Bool(a) => {
+            let Val.Bool(b) = right else {
+                expect false
+                return Val.Absent
+            }
+            match op {
+                nir::BinaryOp.Band => return Val.Bool(a and b)
+                nir::BinaryOp.Bor => return Val.Bool(a or b)
+                nir::BinaryOp.Bxor => return Val.Bool(a != b)
+                else => {}
+            }
+        }
+        Val.Float32(a) => {
+            let Val.Float32(b) = right else {
+                expect false
+                return Val.Absent
+            }
+            match op {
+                nir::BinaryOp.Add => return Val.Float32(a + b).canonical_nan()
+                nir::BinaryOp.Sub => return Val.Float32(a - b).canonical_nan()
+                nir::BinaryOp.Mul => return Val.Float32(a * b).canonical_nan()
+                nir::BinaryOp.Div => return Val.Float32(a / b).canonical_nan()
+                nir::BinaryOp.Rem => return Val.Float32(a % b).canonical_nan()
+                else => {}
+            }
+        }
+        Val.Float64(a) => {
+            let Val.Float64(b) = right else {
+                expect false
+                return Val.Absent
+            }
+            match op {
+                nir::BinaryOp.Add => return Val.Float64(a + b).canonical_nan()
+                nir::BinaryOp.Sub => return Val.Float64(a - b).canonical_nan()
+                nir::BinaryOp.Mul => return Val.Float64(a * b).canonical_nan()
+                nir::BinaryOp.Div => return Val.Float64(a / b).canonical_nan()
+                nir::BinaryOp.Rem => return Val.Float64(a % b).canonical_nan()
+                else => {}
+            }
+        }
+        else => {}
+    }
+    expect false
+    return Val.Absent
+} Interpreter.binary
+
+/// An arithmetic or bitwise operation on two integers of a scalar type, trapping as the
+/// operation does.
+fn Interpreter.integer_binary(
+    self,
+    op: nir::BinaryOp,
+    a: wide::Wide,
+    b: wide::Wide,
+    scalar: ty::Scalar,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails End {
+    match op {
+        nir::BinaryOp.Add or nir::BinaryOp.Sub or nir::BinaryOp.Mul => {
+            let result = match op {
+                nir::BinaryOp.Add => a.checked_add(b)
+                nir::BinaryOp.Sub => a.checked_sub(b)
+                else => a.checked_mul(b)
+            }
+            let Some(exact) = result else {
+                fail self.site_end(site, kind: "trap.overflow", at)
+            }
+            if not fits_scalar(exact, scalar) {
+                fail self.site_end(site, kind: "trap.overflow", at)
+            }
+            return Val.Int(exact)
+        }
+        nir::BinaryOp.Div or nir::BinaryOp.Rem => {
+            if b.is_zero() {
+                fail self.site_end(site, kind: "trap.division-by-zero", at)
+            }
+            let quotient = match op {
+                nir::BinaryOp.Div => a.checked_div_trunc(b)
+                else => a.checked_rem_trunc(b)
+            }
+            let Some(exact) = quotient else {
+                expect false
+                return Val.Absent
+            }
+            return Val.Int(exact)
+        }
+        nir::BinaryOp.Shl or nir::BinaryOp.Shr => {
+            if b.is_negative() or not b.lt(wide::Wide.of_u64(u64.widen(scalar.bits()))) {
+                fail self.site_end(site, kind: "trap.shift", at)
+            }
+            let amount = u32.truncate(b.low_bits())
+            if op == nir::BinaryOp.Shr {
+                return Val.Int(a.shift_right(amount))
+            }
+            let shifted = a.shift_left(amount)
+            if not scalar.is_signed() {
+                return Val.Int(wrap_scalar(shifted, scalar))
+            }
+            if not fits_scalar(shifted, scalar) {
+                fail self.site_end(site, kind: "trap.overflow", at)
+            }
+            return Val.Int(shifted)
+        }
+        nir::BinaryOp.Band => return Val.Int(a.bit_and(b))
+        nir::BinaryOp.Bor => return Val.Int(a.bit_or(b))
+        nir::BinaryOp.Bxor => return Val.Int(a.bit_xor(b))
+        else => {}
+    }
+    expect false
+    return Val.Absent
+} Interpreter.integer_binary
+
+/// A comparison of two scalars of one type, or of two texts or byte strings by length and
+/// bytes.
+fn Interpreter.compare(self, op: nir::BinaryOp, left: Val, right: Val) -> bool {
+    match left {
+        Val.Float32(a) => {
+            match right {
+                Val.Float32(b) => return float_compared(op, a: f64.widen(a), b: f64.widen(b))
+                else => {}
+            }
+        }
+        Val.Float64(a) => {
+            match right {
+                Val.Float64(b) => return float_compared(op, a, b)
+                else => {}
+            }
+        }
+        Val.View(a) => {
+            match right {
+                Val.View(b) => {
+                    let equal = Val.all_equal(self.viewed(a), right: self.viewed(b))
+                    match op {
+                        nir::BinaryOp.Eq => return equal
+                        nir::BinaryOp.Ne => return not equal
+                        else => {}
+                    }
+                    expect false
+                    return false
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let order = left.int_value().cmp(right.int_value())
+    return match op {
+        nir::BinaryOp.Eq => order == core::Ordering.Equal
+        nir::BinaryOp.Ne => order != core::Ordering.Equal
+        nir::BinaryOp.Lt => order == core::Ordering.Less
+        nir::BinaryOp.Le => order != core::Ordering.Greater
+        nir::BinaryOp.Gt => order == core::Ordering.Greater
+        nir::BinaryOp.Ge => order != core::Ordering.Less
+        else => false
+    }
+} Interpreter.compare
+
+/// A comparison of two floats, false for every ordering when either is NaN.
+fn float_compared(op: nir::BinaryOp, a: f64, b: f64) -> bool {
+    return match op {
+        nir::BinaryOp.Eq => a == b
+        nir::BinaryOp.Ne => a != b
+        nir::BinaryOp.Lt => a < b
+        nir::BinaryOp.Le => a <= b
+        nir::BinaryOp.Gt => a > b
+        nir::BinaryOp.Ge => a >= b
+        else => false
+    }
+} float_compared
+
+/// The elements a view sees.
+fn Interpreter.view_values(self, view: View) -> mem::List[Val] {
+    return Val.copies(self.viewed(view), alloc: self.alloc)
+} Interpreter.view_values
+
+/// The elements a view sees, in place.
+proj fn Interpreter.viewed(self, view: View) -> Slice[Val] {
+    let elements = self.memory.get(view.array).fields()
+    let Some(parts) = elements.split_at(view.start) else {
+        expect false
+        loop {
+        }
+    }
+    let Some(seen) = parts.tail.prefix(view.len) else {
+        expect false
+        loop {
+        }
+    }
+    return seen
+} Interpreter.viewed
+
+fn Interpreter.call(mut self, frame: InterpFrame, call: nir::Call, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    var args = mem::List[Val].empty(self.alloc)
+    for operand in call.args {
+        mut args.push(try mut self.operand(frame, operand, at))
+    }
+    if call.awaited {
+        fail End.Uninterpretable(self.report("uninterpretable", at))
+    }
+    match call.callee {
+        nir::Callee.Fn(fn_ref) => {
+            let callee = FnVal.Function(self.substituted(frame, fn_ref))
+            return try mut self.called(callee, take args, at, site)
+        }
+        nir::Callee.Value(value) => {
+            match self.ck.types().kind(frame.nir().ty(value).ty()) {
+                ty::TyKind.Fn(function) => {
+                    if self.ck.types().fn_of(function).convention.is_some() {
+                        fail End.Uninterpretable(self.report("uninterpretable", at))
+                    }
+                }
+                else => {}
+            }
+            match frame.values[usize.widen(value.index)] {
+                Some(Val.Fn(function)) => return try mut self.called(function.contents(), take args, at, site)
+                else => {}
+            }
+            expect false
+            fail End.Missing
+        }
+        nir::Callee.Dyn(place: place, item: _, method: method) => {
+            let read_value = try self.read(frame, place, at)
+            let Val.Dyn(dynamic) = read_value else {
+                expect false
+                fail End.Missing
+            }
+            args[0] = dynamic.contents().value.copy(self.alloc)
+            let callee = FnVal.Function(dynamic.contents().methods[usize.widen(method)].copy(self.alloc))
+            return try mut self.called(callee, take args, at, site)
+        }
+    }
+} Interpreter.call
+
+/// Calls a function or closure value as a call in progress, past the call depth a trap.
+fn Interpreter.called(mut self, callee: FnVal, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    mut self.calls.push(at)
+    if self.calls.len() > DEPTH_LIMIT {
+        discard mut self.calls.pop()
+        fail self.trap("trap.stack-overflow", at)
+    }
+    let flow = attempt mut self.invoke(callee, take args, at, site)
+    discard mut self.calls.pop()
+    match flow {
+        Ok(ended) => return ended
+        Err(end) => fail end
+    }
+} Interpreter.called
+
+/// Calls a function or closure value with its arguments.
+fn Interpreter.invoke(mut self, callee: FnVal, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    match callee {
+        FnVal.Closure(item: item, index: index, args: type_args, captures: captures) => {
+            let Some(unit) = self.ck.unit(item) else {
+                fail End.Missing
+            }
+            let Some(function) = unit.contents().functions.position(fn(candidate: nir::Function) => candidate.role == nir::Role.Closure and candidate.index == index) else {
+                fail End.Missing
+            }
+            var all = Val.copies(captures.view(), alloc: self.alloc)
+            for arg in take args {
+                mut all.push(take arg)
+            }
+            let ck = self.ck.share()
+            return try mut self.execute(take unit, function, args: take all, type_args: ck.types().arg_list(type_args))
+        }
+        FnVal.Function(fn_ref) => return try mut self.call_function(fn_ref, take args, at, site)
+    }
+} Interpreter.invoke
+
+fn Interpreter.call_function(mut self, fn_ref: nir::FnRef, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let ck = self.ck.share()
+    let type_args = ck.types().arg_list(fn_ref.args)
+    match first fn_ref.callable {
+        nir::Callable.Item(item: item, role: role, index: index) => {
+            let Some(unit) = ck.unit(item) else {
+                fail End.Missing
+            }
+            match unit.contents().functions.position(fn(candidate: nir::Function) => candidate.role == role and candidate.index == index) {
+                Some(function) => return try mut self.execute(take unit, function, take args, type_args)
+                None => {}
+            }
+            if role == nir::Role.Body and ck.is_foreign(item) {
+                fail End.Uninterpretable(self.report("uninterpretable", at))
+            }
+            if role == nir::Role.Body and ck.db().is_std(item) {
+                return try mut self.native_call(item, type_args, take args, at, site)
+            }
+            fail End.Missing
+        }
+        nir::Callable.Method(item: interface_item, method: method) => return try mut self.method_call(interface_item, method, type_args, take args, at, site)
+        nir::Callable.Derived(owner: owner, method: method) => return try mut self.native_derived(owner, type_args, method: method.as_str(), take args, at, site)
+        nir::Callable.Builtin(nir::Builtin.Intrinsic(path)) => return try mut self.native_intrinsic(path.as_str(), type_args, take args, at, site)
+        nir::Callable.Builtin(builtin) => return try mut self.numeric_builtin(builtin, take args, at, site)
+    }
+} Interpreter.call_function
+
+/// Calls an interface method through a bound, its `Self` the first type argument: the function
+/// implementing it for that type, or a conformance the toolchain supplies.
+fn Interpreter.method_call(
+    mut self,
+    interface_item: ty::ItemId,
+    method: u32,
+    type_args: Slice[ty::Arg],
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let ck = self.ck.share()
+    if type_args.len() == 0 {
+        expect false
+        fail End.Missing
+    }
+    let Some(self_ty) = type_args[0].ty() else {
+        expect false
+        fail End.Missing
+    }
+    let sig = ck.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        fail End.Missing
+    }
+    let name = methods[usize.widen(method)].name.as_str()
+    match ck.types().kind(self_ty) {
+        ty::TyKind.Param(_) => {
+            expect false
+        }
+        else => {}
+    }
+    match ck.implementation(self_ty, interface_item, method: name) {
+        Some(implementation) => {
+            let through_bound = match implementation.callable {
+                nir::Callable.Method(item: _, method: _) => true
+                else => false
+            }
+            if not through_bound {
+                let implemented = ck.call_implementation(take implementation, interface_item, args: type_args)
+                return try mut self.call_function(implemented, take args, at, site)
+            }
+        }
+        None => {}
+    }
+    return try mut self.native_conformance(self_ty, method: name, type_args, take args, at, site)
+} Interpreter.method_call
+
+/// The trap kind of a kept check.
+fn check_trap(kind: nir::CheckKind, alloc: mem::Alloc) -> text::String {
+    let word = match kind {
+        nir::CheckKind.Requires => "trap.requires"
+        nir::CheckKind.Ensures => "trap.ensures"
+        nir::CheckKind.Predicate => "trap.predicate"
+        nir::CheckKind.Expect or nir::CheckKind.Invariant => "trap.expect"
+        nir::CheckKind.Decreases => "trap.decreases"
+    }
+    return text::String.of(word, alloc)
+} check_trap
+
+/// The elements a view of the value sees.
+proj fn ConstValue.elements(self, view: View) -> Slice[Val] {
+    let array = self.data[usize.widen(view.array.extent)].at_path(view.array.path.view())
+    let Some(parts) = array.fields().split_at(view.start) else {
+        expect false
+        loop {
+        }
+    }
+    let Some(seen) = parts.tail.prefix(view.len) else {
+        expect false
+        loop {
+        }
+    }
+    return seen
+} ConstValue.elements
+
+/// A value with the extent of each view and reference mapped.
+fn Val.remap(self, map: fn(extent: u32) -> u32, alloc: mem::Alloc) -> Val {
+    match self {
+        Val.View(view) => {
+            var array = view.array.copy(alloc)
+            array.extent = map(view.array.extent)
+            return Val.View(View(array: take array, start: view.start, len: view.len))
+        }
+        Val.Ref(loc) => {
+            var mapped = loc.copy(alloc)
+            mapped.extent = map(loc.extent)
+            return Val.Ref(take mapped)
+        }
+        Val.Struct(item: item, fields: fields) => return Val.Struct(item: item, fields: mem::Shared.of(Val.remapped(fields.contents().view(), map, alloc), alloc))
+        Val.Variant(item: item, index: index, fields: fields) => return Val.Variant(item: item, index: index, fields: mem::Shared.of(Val.remapped(fields.contents().view(), map, alloc), alloc))
+        Val.Array(elements) => return Val.Array(mem::Shared.of(Val.remapped(elements.contents().view(), map, alloc), alloc))
+        else => return self.copy(alloc)
+    }
+} Val.remap
+
+/// Each value with the extent of each view and reference mapped.
+fn Val.remapped(values: Slice[Val], map: fn(extent: u32) -> u32, alloc: mem::Alloc) -> mem::List[Val] {
+    var mapped = mem::List[Val].empty(alloc)
+    mut mapped.reserve(values.len())
+    for value in values {
+        mut mapped.push(value.remap(map, alloc))
+    }
+    return mapped
+} Val.remapped

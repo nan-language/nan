@@ -1,0 +1,534 @@
+//! NIR: the typed static single assignment form of checked source, which the prover and the interpreter read.
+
+/// The role of a NIR function in its unit, in the role table's order.
+pkg enum Role derives Copy, Eq, Ord, Hash {
+    Body
+    Entry
+    Closure
+    Requires
+    Ensures
+    Old
+    Example
+    Decreases
+    Invariant
+    Assume
+    Predicate
+    Where
+    Default
+} Role
+
+/// Whether its obligation sites are well-definedness obligations of contract terms.
+pkg fn Role.is_contract(self) -> bool {
+    return match self {
+        Role.Body or Role.Entry or Role.Closure or Role.Example or Role.Default => false
+        else => true
+    }
+} Role.is_contract
+
+pkg struct Value derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Value
+
+pkg struct BlockId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} BlockId
+
+/// A NIR type: a source type, or a reference designating a place of one.
+pkg enum NTy derives Copy, Eq, Hash {
+    Owned(ty::Ty)
+    Ref(ty::Ty)
+    RefMut(ty::Ty)
+} NTy
+
+/// The type of the value, or of the place a reference designates.
+pkg fn NTy.ty(self) -> ty::Ty {
+    return match self {
+        NTy.Owned(designated) or NTy.Ref(designated) or NTy.RefMut(designated) => designated
+    }
+} NTy.ty
+
+pkg fn NTy.is_reference(self) -> bool {
+    return match self {
+        NTy.Owned(_) => false
+        else => true
+    }
+} NTy.is_reference
+
+/// A value and the steps from it to a part: field names, and variant names before the payload
+/// they reach, told apart by their naming conventions.
+pkg struct Place derives Eq, Hash {
+    pkg root: Value
+    pkg steps: mem::List[text::String]
+} Place
+
+impl Place: Ord
+
+pkg fn Place.cmp(self, other: Place) -> core::Ordering {
+    let rooted = self.root.cmp(other.root)
+    if rooted != core::Ordering.Equal {
+        return rooted
+    }
+    return self.steps.view().cmp(other.steps.view())
+} Place.cmp
+
+pkg fn Place.of(root: Value, alloc: mem::Alloc) -> Place = Place(root: root, steps: mem::List[text::String].empty(alloc))
+
+pkg fn Place.step(self, name: Str, alloc: mem::Alloc) -> Place {
+    var steps = mem::List[text::String].empty(alloc)
+    for step in self.steps {
+        mut steps.push(text::String.of(step.as_str(), alloc))
+    }
+    mut steps.push(text::String.of(name, alloc))
+    return Place(root: self.root, steps: take steps)
+} Place.step
+
+/// Whether a step names a variant, by its PascalCase spelling.
+pkg fn is_variant_step(step: Str) -> bool {
+    let spelling = step.as_bytes()
+    return spelling.len() > 0 and spelling[0] >= b'A' and spelling[0] <= b'Z'
+} is_variant_step
+
+pkg enum Literal derives Eq, Hash {
+    Int(value: wide::Wide, scalar: ty::Scalar)
+    /// A float's bits, as wide as its type.
+    Float(bits: u64, scalar: ty::Scalar)
+    Bool(bool)
+    Char(char)
+    Text(text::String)
+    Bytes(mem::Bytes)
+    Unit
+} Literal
+
+pkg enum Operand derives Eq {
+    Value(Value)
+    Literal(Literal)
+    /// A place passed with a mode; `take` moves it when the call starts.
+    Place(mode: ast::Mode, place: Place)
+} Operand
+
+/// An operation the toolchain supplies that no item declares.
+pkg enum Builtin derives Eq, Hash {
+    /// A named conversion to a number type: `T.widen`, `T.fit` and the others.
+    Conversion(conversion: Conversion, scalar: ty::Scalar)
+    /// `T.to_bits`, `T.from_bits` or `T.checked_from_bits` of a scalar or layout type.
+    Bits(conversion: BitConversion, owner: BitsOwner)
+    /// An intrinsic the toolchain supplies, by its path: `text::fmt`, `Dyn.view`,
+    /// `hw::mint_root` or a DMA access.
+    Intrinsic(text::String)
+} Builtin
+
+pkg enum Conversion derives Copy, Eq, Hash {
+    Widen
+    Fit
+    CheckedFit
+    Truncate
+    Saturate
+    Nearest
+} Conversion
+
+pkg proj fn Conversion.word(self) -> Str {
+    return match self {
+        Conversion.Widen => "widen"
+        Conversion.Fit => "fit"
+        Conversion.CheckedFit => "checked_fit"
+        Conversion.Truncate => "truncate"
+        Conversion.Saturate => "saturate"
+        Conversion.Nearest => "nearest"
+    }
+} Conversion.word
+
+pkg fn Conversion.named(name: Str) -> Option[Conversion] {
+    return match name {
+        "widen" => Some(Conversion.Widen)
+        "fit" => Some(Conversion.Fit)
+        "checked_fit" => Some(Conversion.CheckedFit)
+        "truncate" => Some(Conversion.Truncate)
+        "saturate" => Some(Conversion.Saturate)
+        "nearest" => Some(Conversion.Nearest)
+        else => None
+    }
+} Conversion.named
+
+pkg enum BitConversion derives Copy, Eq, Hash {
+    To
+    From
+    CheckedFrom
+} BitConversion
+
+pkg proj fn BitConversion.word(self) -> Str {
+    return match self {
+        BitConversion.To => "to_bits"
+        BitConversion.From => "from_bits"
+        BitConversion.CheckedFrom => "checked_from_bits"
+    }
+} BitConversion.word
+
+pkg fn BitConversion.named(name: Str) -> Option[BitConversion] {
+    return match name {
+        "to_bits" => Some(BitConversion.To)
+        "from_bits" => Some(BitConversion.From)
+        "checked_from_bits" => Some(BitConversion.CheckedFrom)
+        else => None
+    }
+} BitConversion.named
+
+/// The type whose bit conversion is called.
+pkg enum BitsOwner derives Copy, Eq, Hash {
+    Scalar(ty::Scalar)
+    Layout(ty::ItemId)
+} BitsOwner
+
+/// What a function reference calls.
+pkg enum Callable derives Eq, Hash {
+    /// A NIR function of an item's unit; the body of a function item, or of a std function the
+    /// interpreter supplies.
+    Item(item: ty::ItemId, role: Role, index: u32)
+    /// An interface method called through a bound, its `Self` first among the arguments.
+    Method(item: ty::ItemId, method: u32)
+    /// The method a derive writes for a type.
+    Derived(owner: ty::ItemId, method: text::String)
+    Builtin(Builtin)
+} Callable
+
+/// A function with its type arguments in full.
+pkg struct FnRef derives Eq, Hash {
+    pkg callable: Callable
+    pkg args: ty::Args
+} FnRef
+
+pkg fn FnRef.item(item: ty::ItemId, args: ty::Args) -> FnRef = FnRef(callable: Callable.Item(item: item, role: Role.Body, index: 0), args: args)
+
+pkg enum Callee derives Eq {
+    Fn(FnRef)
+    /// An indirect call through a function value.
+    Value(Value)
+    /// Method `method` of the interface `item` on the `Dyn` at a place.
+    Dyn(place: Place, item: ty::ItemId, method: u32)
+} Callee
+
+pkg struct Call derives Eq {
+    pkg awaited: bool
+    pkg callee: Callee
+    pkg args: mem::List[Operand]
+} Call
+
+/// What a `constant` instruction names.
+pkg enum Constant derives Copy, Eq, Hash {
+    /// A const item or contribution.
+    Item(ty::ItemId)
+    /// A const parameter, by its position among the unit's generic parameters.
+    Param(ty::Param)
+    /// A register of a registers block, by its index there: an `hw::Register` value.
+    Register(block: ty::ItemId, register: u32)
+} Constant
+
+pkg enum UnaryOp derives Copy, Eq, Hash {
+    Neg
+    Inv
+    Not
+} UnaryOp
+
+pkg enum BinaryOp derives Copy, Eq, Hash {
+    Add
+    Sub
+    Mul
+    Div
+    Rem
+    Shl
+    Shr
+    Band
+    Bor
+    Bxor
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+} BinaryOp
+
+pkg proj fn BinaryOp.word(self) -> Str {
+    return match self {
+        BinaryOp.Add => "add"
+        BinaryOp.Sub => "sub"
+        BinaryOp.Mul => "mul"
+        BinaryOp.Div => "div"
+        BinaryOp.Rem => "rem"
+        BinaryOp.Shl => "shl"
+        BinaryOp.Shr => "shr"
+        BinaryOp.Band => "band"
+        BinaryOp.Bor => "bor"
+        BinaryOp.Bxor => "bxor"
+        BinaryOp.Eq => "eq"
+        BinaryOp.Ne => "ne"
+        BinaryOp.Lt => "lt"
+        BinaryOp.Le => "le"
+        BinaryOp.Gt => "gt"
+        BinaryOp.Ge => "ge"
+    }
+} BinaryOp.word
+
+pkg fn BinaryOp.is_comparison(self) -> bool {
+    return match self {
+        BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge => true
+        else => false
+    }
+} BinaryOp.is_comparison
+
+/// The kinds of `check`.
+pkg enum CheckKind derives Copy, Eq, Hash {
+    Requires
+    Ensures
+    Predicate
+    Expect
+    Invariant
+    Decreases
+} CheckKind
+
+pkg proj fn CheckKind.word(self) -> Str {
+    return match self {
+        CheckKind.Requires => "requires"
+        CheckKind.Ensures => "ensures"
+        CheckKind.Predicate => "predicate"
+        CheckKind.Expect => "expect"
+        CheckKind.Invariant => "invariant"
+        CheckKind.Decreases => "decreases"
+    }
+} CheckKind.word
+
+/// An operand with the label of the field or payload field it gives.
+pkg struct Labelled derives Eq {
+    pkg name: text::String
+    pkg operand: Operand
+} Labelled
+
+pkg enum Payload derives Eq {
+    None
+    Single(Operand)
+    Labelled(mem::List[Labelled])
+} Payload
+
+/// The blocks of a region, the first receiving its parameters.
+pkg struct Region derives Eq {
+    pkg blocks: mem::List[BlockId]
+} Region
+
+pkg enum Op derives Eq {
+    Slot(name: Option[text::String], ty: ty::Ty)
+    Load(Place)
+    Move(Place)
+    Ref(Place)
+    RefMut(Place)
+    Init(place: Place, operand: Operand)
+    Assign(place: Place, operand: Operand)
+    Release(Place)
+    FnRef(FnRef)
+    Constant(Constant)
+    Construct(ty: ty::Ty, fields: mem::List[Labelled])
+    Variant(ty: ty::Ty, variant: text::String, payload: Payload)
+    Is(place: Place, ty: ty::Ty, variant: text::String)
+    Closure(index: u32, captures: mem::List[Operand])
+    /// Failure conversion into `to`, through its from variant `via`.
+    Convert(value: Operand, to: ty::Ty, via: Option[text::String])
+    Unary(op: UnaryOp, operand: Operand)
+    Binary(op: BinaryOp, left: Operand, right: Operand)
+    Call(Call)
+    /// An obligation that the operand is `true`; an open one is never checked.
+    Check(kind: CheckKind, operand: Operand, open: bool)
+    Assume(Operand)
+    Quantifier(all: bool, low: Operand, high: Operand, inclusive: bool, region: Region)
+    When(attempted: bool, accesses: mem::List[Operand], region: Region)
+    /// Its operand, once a test run has written the `dbg` line showing it.
+    Dbg(Operand)
+} Op
+
+pkg struct Inst derives Eq {
+    pkg result: Option[Value]
+    /// The index of the premise of the trusted code it comes from.
+    pkg premise: Option[u32]
+    pkg op: Op
+    pkg span: Span
+} Inst
+
+/// A target block with the operands its parameters receive.
+pkg struct Jump derives Eq {
+    pkg block: BlockId
+    pkg args: mem::List[Operand]
+} Jump
+
+pkg fn Jump.to(block: BlockId, alloc: mem::Alloc) -> Jump = Jump(block: block, args: mem::List[Operand].empty(alloc))
+
+pkg enum Terminator derives Eq {
+    Jump(Jump)
+    /// Continues at the first target when the operand is `true`, else at the second.
+    Branch(operand: Operand, then: Jump, otherwise: Jump)
+    /// A call that may fail, continuing at `ok` with its result or at `failure` with its
+    /// failure, each that block's one parameter.
+    Call(call: Call, ok: BlockId, failure: BlockId)
+    Return(Option[Operand])
+    Fail(Operand)
+    Todo(text::String)
+    Unreachable
+    Yield(Operand)
+} Terminator
+
+pkg fn Terminator.successors(self, alloc: mem::Alloc) -> mem::List[BlockId] {
+    var successors = mem::List[BlockId].empty(alloc)
+    match self {
+        Terminator.Jump(jump) => mut successors.push(jump.block)
+        Terminator.Branch(operand: _, then: then, otherwise: otherwise) => {
+            mut successors.push(then.block)
+            mut successors.push(otherwise.block)
+        }
+        Terminator.Call(call: _, ok: ok, failure: failure) => {
+            mut successors.push(ok)
+            mut successors.push(failure)
+        }
+        else => {}
+    }
+    return successors
+} Terminator.successors
+
+pkg struct Block derives Eq {
+    pkg params: mem::List[Value]
+    pkg insts: mem::List[Inst]
+    pkg term: Terminator
+    pkg term_span: Span
+} Block
+
+/// The source range a part of a unit comes from, by the tokens of its item's file it spans.
+pkg struct Span derives Copy, Eq, Hash {
+    pkg head: u32
+    pkg last: u32
+} Span
+
+pkg fn Span.at(token: u32) -> Span = Span(head: token, last: token)
+
+pkg struct Param derives Eq {
+    pkg mode: ast::Mode
+    pkg value: Value
+    pkg name: text::String
+    pkg span: Span
+} Param
+
+/// The head of a closure function: whether it is a task closure, and its limits.
+pkg struct ClosureHead derives Copy, Eq {
+    pkg task: bool
+    pkg limit_set: ty::LimitSet
+} ClosureHead
+
+pkg struct Function derives Eq {
+    pkg role: Role
+    pkg index: u32
+    pkg params: mem::List[Param]
+    pkg result: ty::Ty
+    pkg failure: Option[ty::Ty]
+    pkg wait: bool
+    pkg closure: Option[ClosureHead]
+    /// Its blocks by number, the entry first.
+    pkg blocks: mem::List[Block]
+    /// The type of each value, by number.
+    pkg types: mem::List[NTy]
+    pkg span: Span
+} Function
+
+pkg proj fn Function.block(self, id: BlockId) -> Block {
+    return self.blocks[usize.widen(id.index)]
+} Function.block
+
+pkg fn Function.ty(self, value: Value) -> NTy {
+    return self.types[usize.widen(value.index)]
+} Function.ty
+
+/// The NIR of one item.
+pkg struct NirUnit derives Eq {
+    pkg item: ty::ItemId
+    /// Its functions by role, in the role table's order, then by index.
+    pkg functions: mem::List[Function]
+    /// The first token of each trusted block or expression, by premise index, in source order.
+    pkg premises: mem::List[u32]
+} NirUnit
+
+pkg proj fn NirUnit.function(self, role: Role, index: u32) -> Option[Function] {
+    let Some(position) = self.functions.position(fn(value: Function) => value.role == role and value.index == index) else {
+        return None
+    }
+    return self.functions.get(position)
+} NirUnit.function
+
+/// A copy of the literal.
+pkg fn Literal.copy(self, alloc: mem::Alloc) -> Literal {
+    return match self {
+        Literal.Int(value: value, scalar: scalar) => Literal.Int(value: value, scalar: scalar)
+        Literal.Float(bits: bits, scalar: scalar) => Literal.Float(bits: bits, scalar: scalar)
+        Literal.Bool(truth) => Literal.Bool(truth)
+        Literal.Char(c) => Literal.Char(c)
+        Literal.Text(written) => Literal.Text(text::String.of(written.as_str(), alloc))
+        Literal.Bytes(data) => {
+            var copied = mem::Bytes.empty(alloc)
+            mut copied.append(data.view())
+            return Literal.Bytes(take copied)
+        }
+        Literal.Unit => Literal.Unit
+    }
+} Literal.copy
+
+/// A copy of the place.
+pkg fn Place.copy(self, alloc: mem::Alloc) -> Place {
+    var steps = mem::List[text::String].empty(alloc)
+    for step in self.steps {
+        mut steps.push(text::String.of(step.as_str(), alloc))
+    }
+    return Place(root: self.root, steps: take steps)
+} Place.copy
+
+/// A copy of the operation.
+pkg fn Builtin.copy(self, alloc: mem::Alloc) -> Builtin {
+    return match self {
+        Builtin.Conversion(conversion: conversion, scalar: scalar) => Builtin.Conversion(conversion: conversion, scalar: scalar)
+        Builtin.Bits(conversion: conversion, owner: owner) => Builtin.Bits(conversion: conversion, owner: owner)
+        Builtin.Intrinsic(path) => Builtin.Intrinsic(text::String.of(path.as_str(), alloc))
+    }
+} Builtin.copy
+
+/// A copy of what a function reference calls.
+pkg fn Callable.copy(self, alloc: mem::Alloc) -> Callable {
+    return match self {
+        Callable.Item(item: item, role: role, index: index) => Callable.Item(item: item, role: role, index: index)
+        Callable.Method(item: item, method: method) => Callable.Method(item: item, method: method)
+        Callable.Derived(owner: owner, method: method) => Callable.Derived(owner: owner, method: text::String.of(method.as_str(), alloc))
+        Callable.Builtin(builtin) => Callable.Builtin(builtin.copy(alloc))
+    }
+} Callable.copy
+
+/// A copy of the function reference.
+pkg fn FnRef.copy(self, alloc: mem::Alloc) -> FnRef {
+    return FnRef(callable: self.callable.copy(alloc), args: self.args)
+} FnRef.copy
+
+/// A copy of the operand.
+pkg fn Operand.copy(self, alloc: mem::Alloc) -> Operand {
+    return match self {
+        Operand.Value(value) => Operand.Value(value)
+        Operand.Literal(held) => Operand.Literal(held.copy(alloc))
+        Operand.Place(mode: mode, place: place) => Operand.Place(mode: mode, place: place.copy(alloc))
+    }
+} Operand.copy
+
+/// A copy of each operand, in order.
+pkg fn Operand.copies(operands: Slice[Operand], alloc: mem::Alloc) -> mem::List[Operand] {
+    var copied = mem::List[Operand].empty(alloc)
+    for operand in operands {
+        mut copied.push(operand.copy(alloc))
+    }
+    return copied
+} Operand.copies
+
+/// A copy of a set of places.
+pkg fn Place.copies(places: mem::Set[Place], alloc: mem::Alloc) -> mem::Set[Place] {
+    var copied = mem::Set[Place].empty(alloc)
+    for place in places {
+        discard mut copied.insert(place.copy(alloc))
+    }
+    return copied
+} Place.copies

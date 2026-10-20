@@ -1,0 +1,291 @@
+//! The ledger: per item, its entries for trusted code, `assume`, foreign and landing fns, validators and declassifying decoders, `device` and `priv` grants, waivers, `todo` and `dbg`, each with its line and parts.
+
+pkg enum Kind derives Copy, Eq, Ord, Hash {
+    Trusted
+    Assume
+    Foreign
+    Landing
+    Validator
+    Decoder
+    Grant
+    Waiver
+    Todo
+    Dbg
+} Kind
+
+/// A ledger entry: its kind, the item holding it, its file and line, the texts of its parts and
+/// whether it is a trust escape.
+pkg struct Entry derives Eq {
+    pkg kind: Kind
+    pkg item: text::String
+    pkg path: text::String
+    pkg line: u32
+    pkg texts: mem::List[text::String]
+    pkg escape: bool
+} Entry
+
+pkg proj fn Kind.word(self) -> Str {
+    return match self {
+        Kind.Trusted => "trusted"
+        Kind.Assume => "assume"
+        Kind.Foreign => "foreign"
+        Kind.Landing => "landing"
+        Kind.Validator => "validator"
+        Kind.Decoder => "decoder"
+        Kind.Grant => "grant"
+        Kind.Waiver => "waiver"
+        Kind.Todo => "todo"
+        Kind.Dbg => "dbg"
+    }
+} Kind.word
+
+/// An item's ledger, in line order.
+fn Checker.ledger(self, item: ty::ItemId) -> mem::List[Entry] {
+    let alloc = self.alloc()
+    var entries = mem::List[Entry].empty(alloc)
+    let Some(holder) = self.canonical_path(item) else {
+        return entries
+    }
+    let db = self.db()
+    let data = db.item(item)
+    let file = db.file(data.file)
+    let at = LedgerAt(holder: holder.as_str(), path: file.path.as_str())
+    let syntax = file.syntax
+    let span = syntax.items[data.index]
+    for token in span.head..<span.end {
+        let line = syntax.tokens[token].line
+        match syntax.tokens[token].kind {
+            syntax::TokenKind.Keyword(syntax::Keyword.Trusted) => match next_text(syntax, token, alloc) {
+                Some(premise) => mut entries.push(at.entry(Kind.Trusted, line, texts: one_text(take premise, alloc), escape: true, alloc))
+                None => {}
+            }
+            syntax::TokenKind.Keyword(syntax::Keyword.Todo) => match next_text(syntax, token, alloc) {
+                Some(written) => mut entries.push(at.entry(Kind.Todo, line, texts: one_text(take written, alloc), escape: false, alloc))
+                None => {}
+            }
+            syntax::TokenKind.Keyword(syntax::Keyword.Dbg) => mut entries.push(at.entry(Kind.Dbg, line, texts: mem::List[text::String].empty(alloc), escape: false, alloc))
+            syntax::TokenKind.Keyword(syntax::Keyword.Assume) => mut entries.push(self.assume_entry(item, at, token, end: span.end))
+            else => {}
+        }
+    }
+    match db.ast(item).kind {
+        ast::ItemKind.Fn(function) => self.fn_ledger(item, function, at, mut entries)
+        ast::ItemKind.Struct(structure) => self.decoder_ledger(item, derived: structure.derived.view(), derives_token: structure.derives_token, at, mut entries)
+        ast::ItemKind.Enum(enumeration) => self.decoder_ledger(item, derived: enumeration.derived.view(), derives_token: enumeration.derives_token, at, mut entries)
+        else => {}
+    }
+    mut entries.sort_by(fn(left: Entry, right: Entry) => line_order(left, right))
+    return entries
+} Checker.ledger
+
+/// The ledger entries of a package's `package` item: one per `device` or `priv` grant.
+fn Checker.grant_ledger(self, package_id: ty::PackageId) -> mem::List[Entry] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var entries = mem::List[Entry].empty(alloc)
+    let source = db.source(package_id)
+    let Some(manifest) = source.manifest else {
+        return entries
+    }
+    var path = text::String.of(source.dir.as_str(), alloc)
+    mut path.append("/package.nan")
+    for allow in manifest.allows {
+        match allow.authority {
+            workspace::Authority.Device or workspace::Authority.Priv => {}
+            else => continue
+        }
+        var texts = mem::List[text::String].empty(alloc)
+        mut texts.push(allow.authority.written(alloc))
+        for name in allow.names {
+            mut texts.push(text::String.of(name.as_str(), alloc))
+        }
+        mut entries.push(Entry(kind: Kind.Grant, item: text::String.of(db.package_data(package_id).name.as_str(), alloc), path: text::String.of(path.as_str(), alloc), line: allow.line, texts: take texts, escape: true))
+    }
+    return entries
+} Checker.grant_ledger
+
+/// The ledger of a package: its `package` item's and its items', by path and line.
+fn Checker.package_ledger(self, package_id: ty::PackageId) -> mem::List[Entry] {
+    let db = self.db()
+    var entries = self.grant_ledger(package_id)
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            for entry in take self.ledger(item) {
+                mut entries.push(take entry)
+            }
+        }
+    }
+    mut entries.sort_by(fn(left: Entry, right: Entry) => path_order(left, right))
+    return entries
+} Checker.package_ledger
+
+/// Whether a validator is declassifying: it implements a method of `core::Decoder`, or one
+/// of its export types is no parsing type.
+fn Checker.declassifying_validator(self, function: ty::ItemId) -> bool {
+    let declared = match self.db().ast(function).kind {
+        ast::ItemKind.Fn(head) => match head.modifier {
+            Some(modifier) => modifier.kind == ast::FnModifier.Validator
+            None => false
+        }
+        else => false
+    }
+    let Some(head) = self.fn_sig(function) else {
+        return true
+    }
+    if not declared {
+        return true
+    }
+    var exports = mem::List[ty::Ty].empty(self.alloc())
+    mut exports.push(head.result)
+    match head.failure {
+        Some(failure) => mut exports.push(failure)
+        None => {}
+    }
+    for param in head.params {
+        if self.is_std(param.ty, path: "core::Untrusted") {
+            continue
+        }
+        if param.mode == ast::Mode.Mut or self.exposes(param.ty) {
+            mut exports.push(param.ty)
+        }
+    }
+    for export in exports {
+        if not self.is_parsing(export) {
+            return true
+        }
+    }
+    return false
+} Checker.declassifying_validator
+
+/// Whether a parameter's type makes it an export type of a validator: it is or contains a
+/// type parameter, a function type, `Dyn`, a type with interior mutability, `task::Sender` or
+/// `sys::Outbox`.
+fn Checker.exposes(self, ty: ty::Ty) -> bool {
+    let types = self.types()
+    let exposing = self.any_part(ty, test_part: fn(part: ty::Ty) -> bool {
+        match types.kind(part) {
+            ty::TyKind.Param(_) or ty::TyKind.Fn(_) or ty::TyKind.Dyn(_) => return true
+            else => {}
+        }
+        return self.is_std(part, path: "task::Sender") or self.is_std(part, path: "sys::Outbox")
+    })
+    return exposing or self.has_interior(ty)
+} Checker.exposes
+
+/// Where an item's entries are: the canonical path of the item holding them and its file's
+/// path.
+view struct LedgerAt {
+    holder: Str
+    path: Str
+} LedgerAt
+
+fn LedgerAt.entry(self, kind: Kind, line: u32, take texts: mem::List[text::String], escape: bool, alloc: mem::Alloc) -> Entry {
+    return Entry(kind: kind, item: text::String.of(self.holder, alloc), path: text::String.of(self.path, alloc), line: line, texts: take texts, escape: escape)
+} LedgerAt.entry
+
+fn one_text(take written: text::String, alloc: mem::Alloc) -> mem::List[text::String] {
+    var texts = mem::List[text::String].empty(alloc)
+    mut texts.push(take written)
+    return texts
+} one_text
+
+/// The value of the text literal following a token, if one does.
+fn next_text(syntax: syntax::SourceFile, token: usize, alloc: mem::Alloc) -> Option[text::String] {
+    if syntax.tokens[token + 1].kind != syntax::TokenKind.Text {
+        return None
+    }
+    return Some(syntax::text_value(syntax.text(token + 1), alloc))
+} next_text
+
+/// The entry of an `assume` at `token`: its condition up to its `because`, and its reason.
+fn Checker.assume_entry(self, item: ty::ItemId, at: LedgerAt, token: usize, end: usize) -> Entry {
+    let alloc = self.alloc()
+    let syntax = self.db().syntax(item)
+    var because = token + 1
+    while because < end and syntax.text(because) != "because" {
+        because += 1
+    }
+    expect because < end
+    let condition = nir::Span(head: u32.fit(token + 1), last: u32.fit(because - 1))
+    let reason = syntax::text_value(syntax.text(because + 1), alloc)
+    var texts = mem::List[text::String].empty(alloc)
+    mut texts.push(self.fragment(item, range: condition, numbering: format::Numbering.Introduced))
+    mut texts.push(take reason)
+    return at.entry(Kind.Assume, line: syntax.tokens[token].line, texts: take texts, escape: true, alloc)
+} Checker.assume_entry
+
+/// The entries of a function's head: foreign and landing fns, validators and waivers.
+fn Checker.fn_ledger(self, item: ty::ItemId, function: ast::FnItem, at: LedgerAt, mut entries: mem::List[Entry]) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let head_line = db.head_line(item)
+    match function.modifier {
+        Some(modifier) => match modifier.kind {
+            ast::FnModifier.Foreign => mut entries.push(at.entry(Kind.Foreign, line: head_line, texts: mem::List[text::String].empty(alloc), escape: true, alloc))
+            ast::FnModifier.Landing => mut entries.push(at.entry(Kind.Landing, line: head_line, texts: mem::List[text::String].empty(alloc), escape: true, alloc))
+            else => {}
+        }
+        None => {}
+    }
+    if self.is_validator(item) {
+        let declassifying = self.declassifying_validator(item)
+        let class = if declassifying {
+            "declassifying"
+        } else {
+            "parsing"
+        }
+        mut entries.push(at.entry(Kind.Validator, line: head_line, texts: one_text(text::String.of(class, alloc), alloc), escape: declassifying, alloc))
+    }
+    for clause in function.clauses {
+        match clause.kind {
+            ast::ClauseKind.Waive(length: length, reason: reason) => {
+                let threshold = if length {
+                    "length"
+                } else {
+                    "depth"
+                }
+                var texts = mem::List[text::String].empty(alloc)
+                mut texts.push(text::String.of(threshold, alloc))
+                mut texts.push(text::String.of(reason.value.as_str(), alloc))
+                mut entries.push(at.entry(Kind.Waiver, line: db.line(item, token: clause.token), texts: take texts, escape: false, alloc))
+            }
+            else => {}
+        }
+    }
+} Checker.fn_ledger
+
+/// The entry of a struct or enum deriving `Encode` with a declassifying decoder.
+fn Checker.decoder_ledger(self, item: ty::ItemId, derived: Slice[ast::Name], derives_token: Option[u32], at: LedgerAt, mut entries: mem::List[Entry]) {
+    var encode: Option[u32] = None
+    for name in derived {
+        if name.text.as_str() == "Encode" {
+            encode = Some(name.token)
+            break
+        }
+    }
+    let Some(token) = encode else {
+        return
+    }
+    if derives_token.is_none() or not self.declassifying_decoder(item) {
+        return
+    }
+    mut entries.push(at.entry(Kind.Decoder, line: self.db().line(item, token: token), texts: mem::List[text::String].empty(self.alloc()), escape: true, alloc: self.alloc()))
+} Checker.decoder_ledger
+
+/// Entries by line, then kind.
+fn line_order(left: Entry, right: Entry) -> core::Ordering {
+    let lines = left.line.cmp(right.line)
+    if lines != core::Ordering.Equal {
+        return lines
+    }
+    return left.kind.cmp(right.kind)
+} line_order
+
+/// Entries by path, then line, then kind.
+fn path_order(left: Entry, right: Entry) -> core::Ordering {
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return line_order(left, right)
+} path_order

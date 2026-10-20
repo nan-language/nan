@@ -7,8 +7,9 @@ use cranelift_codegen::ir::{InstBuilder, Type, Value as IrValue, types};
 
 use super::abi::Repr;
 use super::body::{Body, Held};
-use super::fx::{PTR, access};
+use super::fx::PTR;
 use super::layout::{Field, Shape};
+use super::types::Wrap;
 use super::{Instance, trap};
 use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Const, Ty};
@@ -28,15 +29,18 @@ pub enum Location {
         big: bool,
     },
     /// A wrapped part of type `ty` at an address, laid out as `ty`'s wrapped type.
-    Wrapped { address: IrValue, ty: Ty },
+    Wrapped {
+        address: IrValue,
+        ty: Ty,
+        wrap: Wrap,
+    },
     /// A value held in a register.
     Register { value: IrValue, ty: Ty },
-    /// The bits `bit..bit + width` of an integer layout held at `container`, a field of type
-    /// `ty`.
+    /// The bits `mask << bit` of an integer layout held at `container`, a field of type `ty`.
     Bits {
         container: Box<Location>,
         bit: u32,
-        width: u32,
+        mask: u64,
         ty: Ty,
     },
 }
@@ -63,18 +67,18 @@ impl Body<'_, '_, '_, '_> {
         let root = place.root;
         let held = self.held(root);
         let nty = self.nty(root).clone();
-        let wrapped = self.is_wrapped(root);
+        let wrapped = self.wrapping(root);
         let ty = nty.ty().clone();
-        let mut location = match held {
-            Held::Address(address) if wrapped => Location::Wrapped { address, ty },
-            Held::Address(address) => Location::Memory {
+        let mut location = match (held, wrapped) {
+            (Held::Address(address), Some(wrap)) => Location::Wrapped { address, ty, wrap },
+            (Held::Address(address), None) => Location::Memory {
                 address,
                 ty,
                 unaligned: false,
                 big: false,
             },
-            Held::Scalar(value) => Location::Register { value, ty },
-            Held::Empty => {
+            (Held::Scalar(value), _) => Location::Register { value, ty },
+            (Held::Empty, _) => {
                 let address = self.fx.slot(0, 1);
                 Location::Memory {
                     address,
@@ -124,19 +128,19 @@ impl Body<'_, '_, '_, '_> {
     /// that is a part is reached through the address the wrapped part holds.
     fn payload_step(&mut self, location: Location, variant: &str, label: &str) -> Location {
         let (address, ty, wrapped) = match location {
-            Location::Memory { address, ty, .. } => (address, ty, false),
-            Location::Wrapped { address, ty } => (address, ty, true),
+            Location::Memory { address, ty, .. } => (address, ty, None),
+            Location::Wrapped { address, ty, wrap } => (address, ty, Some(wrap)),
             other => panic!("a payload step into {other:?}"),
         };
         let field = self.lo.layouts.field(self.lo.ck, &ty, Some(variant), label);
-        if wrapped {
-            let held_as = self.lo.wrapped_type(&ty);
+        if let Some(wrap) = wrapped {
+            let held_as = self.lo.wrapped_type(&ty, wrap);
             let stored = self
                 .lo
                 .layouts
                 .field(self.lo.ck, &held_as, Some(variant), label);
             let at = self.fx.offset(address, stored.offset);
-            let address = match self.lo.is_part(&field.ty) {
+            let address = match self.lo.is_part(&field.ty, wrap) {
                 true => self.fx.load(PTR, at, 0),
                 false => at,
             };
@@ -160,7 +164,7 @@ impl Body<'_, '_, '_, '_> {
         let layout = self.lo.layout(&ty);
         match (&layout.shape, location) {
             (Shape::Scalar { .. }, container) => {
-                let (bit, width, field_ty) = self.lo.bit_field(&ty, name);
+                let (bit, mask, field_ty) = self.lo.bit_field(&ty, name);
                 match container {
                     Location::Bits {
                         container,
@@ -169,13 +173,13 @@ impl Body<'_, '_, '_, '_> {
                     } => Location::Bits {
                         container,
                         bit: outer + bit,
-                        width,
+                        mask,
                         ty: field_ty,
                     },
                     container => Location::Bits {
                         container: Box::new(container),
                         bit,
-                        width,
+                        mask,
                         ty: field_ty,
                     },
                 }
@@ -214,7 +218,7 @@ impl Body<'_, '_, '_, '_> {
     /// wrapped type.
     pub fn place_storage(&mut self, place: &Place) -> (IrValue, Ty) {
         match self.locate_place(place) {
-            Location::Wrapped { address, ty } => (address, self.lo.wrapped_type(&ty)),
+            Location::Wrapped { address, ty, wrap } => (address, self.lo.wrapped_type(&ty, wrap)),
             location => {
                 let ty = self.location_type(&location);
                 (self.location_address(&location), ty)
@@ -257,8 +261,8 @@ impl Body<'_, '_, '_, '_> {
     pub fn read_location(&mut self, location: &Location) -> Held {
         match location {
             Location::Register { value, .. } => Held::Scalar(*value),
-            Location::Wrapped { address, ty } => {
-                let layout = self.lo.layout(&self.lo.wrapped_type(ty));
+            Location::Wrapped { address, ty, wrap } => {
+                let layout = self.lo.layout(&self.lo.wrapped_type(ty, *wrap));
                 let slot = self.fx.slot(layout.size, layout.align);
                 self.lo
                     .copy(self.fx, slot, *address, layout.size, layout.align);
@@ -267,11 +271,11 @@ impl Body<'_, '_, '_, '_> {
             Location::Bits {
                 container,
                 bit,
-                width,
+                mask,
                 ty,
             } => {
                 let whole = self.read_location(container).scalar();
-                let field = self.extract_bits(whole, *bit, *width, ty);
+                let field = self.extract_bits(whole, *bit, *mask, ty);
                 match self.lo.owned_repr(ty) {
                     Repr::Scalar(_) => Held::Scalar(field),
                     _ => Held::Empty,
@@ -288,9 +292,13 @@ impl Body<'_, '_, '_, '_> {
                     Shape::Scalar {
                         ty: scalar,
                         big: own,
-                    } => {
-                        Held::Scalar(self.load_with(*scalar, *address, 0, *unaligned, *big || *own))
-                    }
+                    } => Held::Scalar(self.fx.load_ordered(
+                        *scalar,
+                        *address,
+                        0,
+                        *unaligned,
+                        *big || *own,
+                    )),
                     Shape::Empty => Held::Empty,
                     _ => {
                         let slot = self.fx.slot(layout.size, layout.align);
@@ -326,7 +334,7 @@ impl Body<'_, '_, '_, '_> {
                 match (&layout.shape, held) {
                     (Shape::Scalar { big: own, .. }, held) => {
                         let value = self.adapt(held, nty, Repr::Scalar(types::I64)).scalar();
-                        self.store_with(value, *address, 0, *unaligned, *big || *own);
+                        (self.fx).store_ordered(value, *address, 0, *unaligned, *big || *own);
                     }
                     (Shape::Empty, _) => {}
                     (_, held) => {
@@ -339,7 +347,7 @@ impl Body<'_, '_, '_, '_> {
             Location::Bits {
                 container,
                 bit,
-                width,
+                mask,
                 ..
             } => {
                 let value = match held {
@@ -347,7 +355,7 @@ impl Body<'_, '_, '_, '_> {
                     other => self.adapt(other, nty, Repr::Scalar(types::I64)).scalar(),
                 };
                 let whole = self.read_location(container).scalar();
-                let updated = self.insert_bits(whole, value, *bit, *width);
+                let updated = self.insert_bits(whole, value, *bit, *mask);
                 self.write_location(container, Held::Scalar(updated), nty);
             }
             Location::Register { .. } | Location::Wrapped { .. } => {
@@ -377,53 +385,27 @@ impl Body<'_, '_, '_, '_> {
         let Shape::Scalar { ty: scalar, big } = layout.shape else {
             panic!("a scalar load of {ty:?}");
         };
-        self.load_with(scalar, address, offset, false, big)
+        self.fx.load_ordered(scalar, address, offset, false, big)
     }
 
     pub fn store_scalar(&mut self, value: IrValue, address: IrValue, offset: u64, ty: &Ty) {
         let layout = self.lo.layout(ty);
         let big = matches!(layout.shape, Shape::Scalar { big: true, .. });
-        self.store_with(value, address, offset, false, big);
+        self.fx.store_ordered(value, address, offset, false, big);
     }
 
-    fn load_with(
-        &mut self,
-        ty: Type,
-        address: IrValue,
-        offset: u64,
-        unaligned_access: bool,
-        big: bool,
-    ) -> IrValue {
-        let flags = access(unaligned_access, big);
-        self.fx.b.ins().load(ty, flags, address, offset as i32)
-    }
-
-    fn store_with(
-        &mut self,
-        value: IrValue,
-        address: IrValue,
-        offset: u64,
-        unaligned_access: bool,
-        big: bool,
-    ) {
-        let flags = access(unaligned_access, big);
-        self.fx.b.ins().store(flags, value, address, offset as i32);
-    }
-
-    fn extract_bits(&mut self, whole: IrValue, bit: u32, width: u32, ty: &Ty) -> IrValue {
+    fn extract_bits(&mut self, whole: IrValue, bit: u32, mask: u64, ty: &Ty) -> IrValue {
         let container = self.fx.b.func.dfg.value_type(whole);
         let shifted = if bit == 0 {
             whole
         } else {
             self.fx.b.ins().ushr_imm_s(whole, i64::from(bit))
         };
-        let masked = if width >= container.bits() {
+        let full = u64::MAX >> (64 - container.bits());
+        let masked = if mask & full == full {
             shifted
         } else {
-            self.fx
-                .b
-                .ins()
-                .band_imm_s(shifted, ((1u128 << width) - 1) as i64)
+            self.fx.b.ins().band_imm_s(shifted, mask as i64)
         };
         let target = match self.lo.owned_repr(ty) {
             Repr::Scalar(target) => target,
@@ -432,14 +414,10 @@ impl Body<'_, '_, '_, '_> {
         resize(self.fx, masked, target)
     }
 
-    fn insert_bits(&mut self, whole: IrValue, value: IrValue, bit: u32, width: u32) -> IrValue {
+    fn insert_bits(&mut self, whole: IrValue, value: IrValue, bit: u32, mask: u64) -> IrValue {
         let container = self.fx.b.func.dfg.value_type(whole);
         let value = resize(self.fx, value, container);
-        let mask = if width >= container.bits() {
-            u128::MAX >> (128 - container.bits())
-        } else {
-            ((1u128 << width) - 1) << bit
-        };
+        let mask = mask << bit;
         let cleared = self.fx.b.ins().band_imm_s(whole, !(mask as i64));
         let shifted = if bit == 0 {
             value
@@ -453,15 +431,16 @@ impl Body<'_, '_, '_, '_> {
     /// Whether a value fits the ranged `bit` or `rest` field at a location, none for a field that
     /// takes every value of its type.
     pub fn bits_fit(&mut self, location: &Location, value: IrValue) -> Option<IrValue> {
-        let Location::Bits { width, .. } = location else {
+        let Location::Bits { mask, .. } = location else {
             return None;
         };
         let ty = self.fx.b.func.dfg.value_type(value);
-        if *width >= ty.bits() {
+        let outside = !mask & (u64::MAX >> (64 - ty.bits()));
+        if outside == 0 {
             return None;
         }
-        let high = self.fx.b.ins().ushr_imm_s(value, i64::from(*width));
-        Some(self.fx.b.ins().icmp_imm_s(IntCC::Equal, high, 0))
+        let stray = self.fx.b.ins().band_imm_s(value, outside as i64);
+        Some(self.fx.b.ins().icmp_imm_s(IntCC::Equal, stray, 0))
     }
 
     /// A struct or layout value from its fields' operands.
@@ -481,14 +460,14 @@ impl Body<'_, '_, '_, '_> {
                     Held::Scalar(value) => value,
                     _ => continue,
                 };
-                let (bit, width, _) = self.lo.bit_field(ty, name);
+                let (bit, mask, _) = self.lo.bit_field(ty, name);
                 let location = Location::Bits {
                     container: Box::new(Location::Register {
                         value: whole,
                         ty: ty.clone(),
                     }),
                     bit,
-                    width,
+                    mask,
                     ty: nty.ty().clone(),
                 };
                 if let Some(fits) = self.bits_fit(&location, value)
@@ -498,7 +477,7 @@ impl Body<'_, '_, '_, '_> {
                     let operands = trap::Operands::Values(trap::Form::Field(name.clone()), stored);
                     self.trap_unless(fits, "trap.conversion", operands);
                 }
-                whole = self.insert_bits(whole, value, bit, width);
+                whole = self.insert_bits(whole, value, bit, mask);
             }
             return Held::Scalar(whole);
         }
@@ -525,7 +504,13 @@ impl Body<'_, '_, '_, '_> {
 
     /// An enum value of a variant with its payload's operands; a wrapped part stores the address
     /// of each payload that is a part, which a place operand gives.
-    pub fn variant(&mut self, ty: &Ty, variant: &str, payload: &Payload, wrapped: bool) -> Held {
+    pub fn variant(
+        &mut self,
+        ty: &Ty,
+        variant: &str,
+        payload: &Payload,
+        wrapped: Option<Wrap>,
+    ) -> Held {
         let operands: Vec<&Operand> = match payload {
             Payload::None => Vec::new(),
             Payload::Single(operand) => vec![operand],
@@ -533,16 +518,16 @@ impl Body<'_, '_, '_, '_> {
         };
         let held: Vec<Held> = operands
             .into_iter()
-            .map(|operand| match operand {
-                Operand::Place(_, place) if wrapped => {
+            .map(|operand| match (operand, wrapped) {
+                (Operand::Place(_, place), Some(wrap)) => {
                     let part_ty = self.place_type(place);
-                    match self.lo.is_part(&part_ty) {
+                    match self.lo.is_part(&part_ty, wrap) {
                         true => Held::Address(self.place_address(place)),
                         false => self.operand(operand).0,
                     }
                 }
-                _ if wrapped => self.operand(operand).0,
-                _ => self.owned_operand(operand).0,
+                (_, Some(_)) => self.operand(operand).0,
+                (_, None) => self.owned_operand(operand).0,
             })
             .collect();
         self.lo.variant_value(self.fx, ty, variant, &held, wrapped)
@@ -670,10 +655,13 @@ impl Body<'_, '_, '_, '_> {
         Held::Address(slot)
     }
 
-    /// Whether a value holds a wrapped part.
-    pub fn is_wrapped(&self, value: Value) -> bool {
+    /// How a value holds a wrapped part, none when it holds none.
+    pub fn wrapping(&self, value: Value) -> Option<Wrap> {
         let nty = self.nty(value);
-        !nty.is_reference() && self.lo.wraps(nty.ty()) && self.wrapped_flag(value)
+        if nty.is_reference() || !self.lo.wraps(nty.ty()) {
+            return None;
+        }
+        self.wrapped_flag(value)
     }
 
     /// An operand as an owned value, as `plain` gives a wrapped part.
@@ -686,10 +674,10 @@ impl Body<'_, '_, '_, '_> {
     /// A value as an owned one: a wrapped part becomes a value whose payloads are copies of the
     /// parts it points at, as a read argument, which the callee only reads, or a Copy value.
     pub fn plain(&mut self, held: Held, value: Option<Value>, ty: &Ty) -> Held {
-        if !value.is_some_and(|value| self.is_wrapped(value)) {
+        let Some(wrap) = value.and_then(|value| self.wrapping(value)) else {
             return held;
-        }
-        let wrapped_ty = self.lo.wrapped_type(ty);
+        };
+        let wrapped_ty = self.lo.wrapped_type(ty, wrap);
         let layout = self.lo.layout(ty);
         let wrapped_layout = self.lo.layout(&wrapped_ty);
         let (Shape::Enum(shape), Shape::Enum(wrapped)) = (&layout.shape, &wrapped_layout.shape)
@@ -709,7 +697,7 @@ impl Body<'_, '_, '_, '_> {
                 for (field, wrapped_field) in variant.fields.iter().zip(&wrapped_variant.fields) {
                     let from = fx.offset(source, wrapped_field.offset);
                     let to = fx.offset(slot, field.offset);
-                    let origin = if lo.is_part(&field.ty) {
+                    let origin = if lo.is_part(&field.ty, wrap) {
                         fx.load(PTR, from, 0)
                     } else {
                         from

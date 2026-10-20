@@ -1,0 +1,423 @@
+//! Impl lines and conformance: what an impl line targets and lists, where it lies, coherence, the methods its target implements and their heads, collisions with derived methods, the clauses of interface methods, and the interfaces `Dyn` accepts.
+
+/// The property interfaces, which no impl line names.
+const PROPERTY_INTERFACES: Str = "core::Any core::Copy core::Send core::Inert core::AnyBits"
+
+/// How visible an item is, private least.
+fn openness(visibility: ast::Visibility) -> u8 {
+    return match visibility {
+        ast::Visibility.Private => 0
+        ast::Visibility.Pkg => 1
+        ast::Visibility.Pub => 2
+    }
+} openness
+
+/// The narrower of two visibilities.
+fn narrower_visibility(left: ast::Visibility, right: ast::Visibility) -> ast::Visibility {
+    if openness(left) < openness(right) {
+        return left
+    }
+    return right
+} narrower_visibility
+
+/// The rules of an impl line in order; a line failing where it lies or coherence is otherwise
+/// not checked.
+fn Checker.check_impl(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    let declared = db.ast(item)
+    let ast::ItemKind.Impl(implementation) = declared.kind else {
+        return false
+    }
+    let token = declared.token
+    let module = db.module_of(item)
+    let sig = self.sig(item)
+    let SigKind.Impl(target: target, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+        return false
+    }
+    let Some(key) = target else {
+        match db.resolve(module, path: implementation.target) {
+            Ok(_) => self.report(item, token, code: diagnostic::Code.InterfaceImplTarget)
+            Err(error) => {
+                match error.code {
+                    Some(code) => self.report_problem(item, token: error.token, code)
+                    None => {}
+                }
+            }
+        }
+        return false
+    }
+    match implementation.params {
+        Some(params) => {
+            let generics = self.type_generics(key)
+            var listed = params.len() == generics.len()
+            for index in 0..<params.len() {
+                if listed and params[index].name.text != generics[index].name {
+                    listed = false
+                }
+            }
+            if not listed {
+                self.report(item, token, code: diagnostic::Code.InterfaceImplParameters)
+                return false
+            }
+        }
+        None => {}
+    }
+    let target_module = match key {
+        TypeKey.Item(target_item) => Some(db.module_of(target_item))
+        else => None
+    }
+    let interface_path = db.canonical(bound.item)
+    if target_module != Some(module) and db.module_of(bound.item) != module {
+        self.report(item, token, code: diagnostic::Code.InterfaceImplMisplaced)
+        return false
+    }
+    if is_listed(PROPERTY_INTERFACES, word: interface_path.as_str()) {
+        self.report(item, token, code: diagnostic::Code.PropPropertyImpl)
+        return false
+    }
+    if interface_path.as_str() == "core::Encode" and not db.is_std(item) {
+        self.report(item, token, code: diagnostic::Code.EncodeManualImpl)
+        return false
+    }
+    if self.duplicate_impl(item, key, interface_item: bound.item) {
+        self.report(item, token, code: diagnostic::Code.InterfaceDuplicateImpl)
+        return false
+    }
+    let interface_sig = self.sig(bound.item)
+    let SigKind.Interface(methods: methods) = interface_sig.contents().kind else {
+        return false
+    }
+    for method in methods {
+        let implemented = self.implementing_function(item, name: method.name.as_str()).is_some() or method.default
+        if not implemented {
+            self.report(item, token, code: diagnostic::Code.InterfaceMissingMethod)
+            return true
+        }
+    }
+    if self.collides(module, key, target_module, interface_item: bound.item, methods: methods.view()) {
+        self.report(item, token, code: diagnostic::Code.InterfaceMethodCollision)
+    }
+    return true
+} Checker.check_impl
+
+/// Whether an impl line of `module` for a type of another module of the interface's package
+/// meets a method of that interface its target's module declares for the type.
+fn Checker.collides(
+    self,
+    module: ty::ModuleId,
+    key: TypeKey,
+    target_module: Option[ty::ModuleId],
+    interface_item: ty::ItemId,
+    methods: Slice[MethodSig],
+    ) -> bool {
+    let Some(target) = target_module else {
+        return false
+    }
+    let db = self.db()
+    if target == module or db.module(target).package_id != db.package_of(interface_item) {
+        return false
+    }
+    for method in methods {
+        for function in db.members(key, name: method.name.as_str()) {
+            if db.module_of(function) == target {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.collides
+
+/// Whether an impl line repeats the conformance of an earlier impl line or derive of its
+/// target to its interface, by file path then line.
+fn Checker.duplicate_impl(self, line: ty::ItemId, key: TypeKey, interface_item: ty::ItemId) -> bool {
+    let db = self.db()
+    let path = db.item_file(line).path.as_str()
+    let own = db.head_line(line)
+    let earlier_line = db.about(None, compute: fn() -> bool {
+        for index in 0..<db.items.len() {
+            let other = ty::ItemId(index: u32.fit(index))
+            if other == line {
+                continue
+            }
+            let ast::ItemKind.Impl(_) = db.declaration(other).kind else {
+                continue
+            }
+            let sig = self.sig(other)
+            let SigKind.Impl(target: Some(found), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+                continue
+            }
+            if found == key and bound.item == interface_item and self.lies_before(other, path, line: own) {
+                return true
+            }
+        }
+        return false
+    })
+    let derived = match key {
+        TypeKey.Item(target) => self.derived_before(target, interface_item, path, line: own)
+        else => false
+    }
+    return earlier_line or derived
+} Checker.duplicate_impl
+
+/// Whether a std interface is in the derives of a type item lying before a file path and line.
+fn Checker.derived_before(self, target: ty::ItemId, interface_item: ty::ItemId, path: Str, line: u32) -> bool {
+    let db = self.db()
+    let alloc = self.alloc()
+    let name = match db.ast(interface_item).name(alloc) {
+        Some(declared) => declared
+        None => text::String.empty(alloc)
+    }
+    if not db.is_std(interface_item) {
+        return false
+    }
+    let Some(entries) = self.derive_entries(target) else {
+        return false
+    }
+    var named = false
+    for entry in entries {
+        if entry.text == name {
+            named = true
+            break
+        }
+    }
+    return named and self.lies_before(target, path, line)
+} Checker.derived_before
+
+/// Whether an item lies before a file path and line, by path then line.
+fn Checker.lies_before(self, item: ty::ItemId, path: Str, line: u32) -> bool {
+    let db = self.db()
+    let order = db.item_file(item).path.as_str().cmp(path)
+    return order == core::Ordering.Less or (order == core::Ordering.Equal and db.head_line(item) < line)
+} Checker.lies_before
+
+/// The head and visibility of a function implementing a method of an impl line of its module.
+fn Checker.check_implementing(self, function: ty::ItemId, sig: FnSig) {
+    let db = self.db()
+    let token = db.ast(function).token
+    let ast::ItemKind.Fn(written) = db.ast(function).kind else {
+        return
+    }
+    for line in self.implemented_lines(function) {
+        let line_sig = self.sig(line)
+        let SigKind.Impl(target: _, target_ty: target_ty, bound: Some(bound)) = line_sig.contents().kind else {
+            continue
+        }
+        let Some(method) = self.interface_method(bound.item, name: written.label.name.text.as_str()) else {
+            continue
+        }
+        let Some(wanted) = self.method_head(bound, method, self_ty: target_ty) else {
+            continue
+        }
+        if not self.head_matches(written: sig, wanted) {
+            self.report(function, token, code: diagnostic::Code.InterfaceHeadMismatch)
+            return
+        }
+        let target_visibility = match db.owners.get(function) {
+            Some(TypeKey.Item(target)) => db.ast(target).visibility
+            else => ast::Visibility.Pub
+        }
+        let interface_visibility = db.ast(bound.item).visibility
+        var expected = openness(target_visibility)
+        if openness(interface_visibility) < expected {
+            expected = openness(interface_visibility)
+        }
+        let written_visibility = db.ast(function).visibility
+        if openness(written_visibility) != expected {
+            let word = match expected {
+                0 => ""
+                1 => "pkg"
+                else => "pub"
+            }
+            var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+            if written_visibility == ast::Visibility.Private {
+                var inserted = text::String.of(word, alloc: self.alloc())
+                mut inserted.push(' ')
+                mut fixes.push(self.fix_inserting(function, before: token, text: inserted.as_str()))
+            } else if expected == 0 {
+                mut fixes.push(self.fix_deleting_forward(function, head: token, last: token))
+            } else {
+                mut fixes.push(self.fix_replacing(function, head: token, last: token, text: word))
+            }
+            self.report_fixed(function, construct: nir::Span.at(token), code: diagnostic::Code.InterfaceImplVisibility, take fixes, offer: diagnostic::Offer.Each)
+            return
+        }
+    }
+} Checker.check_implementing
+
+/// Whether an implementing function's head matches its method's, `Self` and the interface's
+/// parameters substituted: its modifier, own generic parameters, parameters, result, failure
+/// type and waiting. The result's droppability is judged under the function's own bounds.
+fn Checker.head_matches(self, written: FnSig, wanted: FnSig) -> bool {
+    let state = self.state.contents()
+    let types = self.types()
+    let alloc = self.alloc()
+    let saved = state.scope.replace(GenericDef.copies(written.generics.view(), alloc))
+    let droppable_result = not self.has(written.result, property: Property.Linear)
+    state.scope.restore(saved)
+    let modifier = written.modifier == wanted.modifier or (wanted.is_proj() and written.modifier.is_none() and droppable_result)
+    let own = written.own_generics()
+    if not modifier or own.len() != wanted.generics.len() {
+        return false
+    }
+    var wanted_params = mem::List[ty::Param].empty(alloc)
+    for def in wanted.generics {
+        mut wanted_params.push(def.param)
+    }
+    var own_args = mem::List[ty::Arg].empty(alloc)
+    for def in own {
+        mut own_args.push(def.param_arg(self.types()))
+    }
+    let renamed = ty::Subst.of(wanted_params.view(), args: own_args.view(), alloc)
+    var bounds = true
+    for index in 0..<own.len() {
+        let def = wanted.generics[index]
+        var renamed_bounds = mem::List[ty::Bound].empty(alloc)
+        for bound in def.bounds {
+            mut renamed_bounds.push(renamed.bound(types, bound))
+        }
+        if own[index].bounds != renamed_bounds {
+            bounds = false
+            break
+        }
+    }
+    var params = written.params.len() == wanted.params.len()
+    for index in 0..<written.params.len() {
+        if not params {
+            break
+        }
+        let own_param = written.params[index]
+        let param = wanted.params[index]
+        params = own_param.name == param.name and own_param.mode == param.mode and own_param.ty == renamed.ty(types, ty: param.ty)
+    }
+    let failure = match written.failure {
+        None => true
+        Some(own_failure) => match wanted.failure {
+            Some(wanted_failure) => own_failure == renamed.ty(types, ty: wanted_failure)
+            None => false
+        }
+    }
+    return bounds and params and written.result == renamed.ty(types, ty: wanted.result) and failure and (not written.wait or wanted.wait)
+} Checker.head_matches
+
+/// Functions, fields and variants named like a method of an interface a struct or enum
+/// derives.
+fn Checker.check_derived_collisions(self, item: ty::ItemId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var methods = mem::List[text::String].empty(alloc)
+    match self.derive_entries(item) {
+        Some(entries) => {
+            for entry in entries {
+                let Some(interface_item) = db.core_item(entry.text.as_str()) else {
+                    continue
+                }
+                let interface_sig = self.sig(interface_item)
+                let SigKind.Interface(methods: declared) = interface_sig.contents().kind else {
+                    continue
+                }
+                for method in declared {
+                    mut methods.push(text::String.of(method.name.as_str(), alloc))
+                }
+            }
+        }
+        None => {}
+    }
+    if methods.len() == 0 {
+        return
+    }
+    let module = db.module_of(item)
+    for name in methods {
+        for function in db.members(TypeKey.Item(item), name: name.as_str()) {
+            if db.module_of(function) == module {
+                self.report(function, token: db.ast(function).token, code: diagnostic::Code.InterfaceMethodCollision)
+            }
+        }
+    }
+    match db.ast(item).kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                if holds_text(methods.view(), text: field.name.text.as_str()) {
+                    self.report(item, token: field.name.token, code: diagnostic::Code.InterfaceMethodCollision)
+                }
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                if holds_text(methods.view(), text: variant.name.text.as_str()) {
+                    self.report(item, token: variant.name.token, code: diagnostic::Code.InterfaceMethodCollision)
+                }
+            }
+        }
+        else => {}
+    }
+} Checker.check_derived_collisions
+
+/// The clauses of an interface's methods: requires, ensures and `todo`, with `decreases` and
+/// `waive` beside a default body.
+fn Checker.check_method_clauses(self, item: ty::ItemId, declared: ast::InterfaceItem) {
+    for method in declared.methods {
+        for clause in method.clauses {
+            let allowed = match clause.kind {
+                ast::ClauseKind.Requires(_) or ast::ClauseKind.Ensures(_) or ast::ClauseKind.Missing => true
+                ast::ClauseKind.Decreases(_) or ast::ClauseKind.Waive(length: _, reason: _) => method.body.is_some()
+                ast::ClauseKind.Example(_) => false
+            }
+            if not allowed {
+                self.report(item, token: clause.token, code: diagnostic::Code.InterfaceMethodClause)
+            }
+        }
+    }
+} Checker.check_method_clauses
+
+/// Whether `Dyn` accepts an interface: no property interface, each method taking `self` or
+/// `mut self` first, without generic parameters of its own and naming `Self` nowhere else.
+fn Checker.dyn_usable(self, interface_item: ty::ItemId) -> bool {
+    if is_listed(PROPERTY_INTERFACES, word: self.db().canonical(interface_item).as_str()) {
+        return false
+    }
+    let types = self.types()
+    let sig = self.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return false
+    }
+    for method in methods {
+        let head = method.sig
+        if head.params.len() == 0 or not head.params[0].is_self or head.params[0].mode == ast::Mode.Take {
+            return false
+        }
+        if head.own_generics().len() > 0 {
+            return false
+        }
+        for index in 1..<head.params.len() {
+            if names_self(head.params[index].ty, types) {
+                return false
+            }
+        }
+        if names_self(head.result, types) {
+            return false
+        }
+        match head.failure {
+            Some(failure) => {
+                if names_self(failure, types) {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    return true
+} Checker.dyn_usable
+
+/// Whether a type names an interface's `Self`.
+fn names_self(ty: ty::Ty, types: ty::Types) -> bool {
+    return types.mentions(ty, params: fn(param: ty::Param) => param.is_self())
+} names_self
+
+/// The entries of a struct's or enum's `derives` clause; none for another item.
+proj fn Checker.derive_entries(self, item: ty::ItemId) -> Option[Slice[ast::Name]] {
+    return match self.db().ast(item).kind {
+        ast::ItemKind.Struct(structure) => Some(structure.derived.view())
+        ast::ItemKind.Enum(enumeration) => Some(enumeration.derived.view())
+        else => None
+    }
+} Checker.derive_entries

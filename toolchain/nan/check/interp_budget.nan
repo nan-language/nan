@@ -1,0 +1,170 @@
+//! The cells, chunks and allocations of an interpreter run: draws charge whole chunks to every cell of a chain, and a chunk returns once no allocation in it is live.
+
+/// The bytes of a chunk.
+const CHUNK_BYTES: u64 = 65_536
+
+struct BudgetCell {
+    limit: wide::Wide
+    charge: wide::Wide
+    parent: Option[u32]
+    open: bool
+    /// The chunk last drawn through it, where its next small allocation goes when it fits.
+    last: Option[u32]
+} BudgetCell
+
+struct Chunk {
+    /// The cell it was drawn through.
+    cell: u32
+    used: u64
+    live: u32
+} Chunk
+
+struct Budgets {
+    /// The allocator the lists of chains and chunks it computes draw on.
+    alloc: mem::Alloc
+    cells: mem::List[BudgetCell]
+    chunks: mem::List[Chunk]
+    /// The chunks each allocation lies in.
+    allocations: mem::List[mem::List[u32]]
+} Budgets
+
+/// Budgets without cells, drawing on an allocator.
+fn Budgets.empty(alloc: mem::Alloc) -> Budgets {
+    return Budgets(alloc: alloc, cells: mem::List[BudgetCell].empty(alloc), chunks: mem::List[Chunk].empty(alloc), allocations: mem::List[mem::List[u32]].empty(alloc))
+} Budgets.empty
+
+/// A new root cell with a limit.
+fn Budgets.root(mut self, limit: wide::Wide) -> u32 {
+    return mut self.cell(limit, parent: None)
+} Budgets.root
+
+/// A new open cell with a limit, whose parent is `parent`.
+fn Budgets.split(mut self, parent: u32, limit: wide::Wide) -> u32 {
+    return mut self.cell(limit, parent: Some(parent))
+} Budgets.split
+
+fn Budgets.cell(mut self, limit: wide::Wide, parent: Option[u32]) -> u32 {
+    mut self.cells.push(BudgetCell(limit: limit, charge: wide::Wide.zero(), parent: parent, open: true, last: None))
+    return u32.fit(self.cells.len() - 1)
+} Budgets.cell
+
+fn Budgets.close(mut self, cell: u32) {
+    var closed = mut self.cells.at_mut(usize.widen(cell))
+    closed.open = false
+} Budgets.close
+
+fn Budgets.charged(self, cell: u32) -> wide::Wide {
+    return self.cells[usize.widen(cell)].charge
+} Budgets.charged
+
+fn Budgets.limit(self, cell: u32) -> wide::Wide {
+    return self.cells[usize.widen(cell)].limit
+} Budgets.limit
+
+/// The cell and its ancestors, to a root cell.
+fn Budgets.chain(self, cell: u32) -> mem::List[u32] {
+    var chain = mem::List[u32].empty(self.alloc)
+    mut chain.push(cell)
+    var link = cell
+    loop {
+        let Some(parent) = self.cells[usize.widen(link)].parent else {
+            return chain
+        }
+        mut chain.push(parent)
+        link = parent
+    }
+} Budgets.chain
+
+/// Draws chunks through a cell: none, and no charge, when a cell of its chain is closed or
+/// would pass its limit.
+fn Budgets.draw(mut self, cell: u32, count: u64) -> Option[mem::List[u32]] {
+    let bytes = wide::Wide.of_u64(count * CHUNK_BYTES)
+    let chain = self.chain(cell)
+    for link in chain {
+        let held = self.cells[usize.widen(link)]
+        if not held.open or not held.charge.wrapping_add(bytes).le(held.limit) {
+            return None
+        }
+    }
+    for link in chain {
+        var charged = mut self.cells.at_mut(usize.widen(link))
+        charged.charge = charged.charge.wrapping_add(bytes)
+    }
+    var drawn = mem::List[u32].empty(self.alloc)
+    for _ in 0..<count {
+        mut self.chunks.push(Chunk(cell: cell, used: 0, live: 0))
+        mut drawn.push(u32.fit(self.chunks.len() - 1))
+    }
+    return Some(take drawn)
+} Budgets.draw
+
+/// An allocation of `size` bytes through a cell: in the chunk last drawn through it when it
+/// fits after its earlier allocations, else in newly drawn chunks; none on exhaustion.
+fn Budgets.allocate(mut self, cell: u32, size: u64, align: u64) -> Option[u32] {
+    var aligned = align
+    if aligned < 1 {
+        aligned = 1
+    }
+    var chunks = mem::List[u32].empty(self.alloc)
+    match self.cells[usize.widen(cell)].last {
+        Some(last) => {
+            if size <= CHUNK_BYTES and rounded_up(self.chunks[usize.widen(last)].used, align: aligned) + size <= CHUNK_BYTES {
+                mut chunks.push(last)
+            }
+        }
+        None => {}
+    }
+    if chunks.len() == 0 {
+        var count = ceil_quotient(size, divisor: CHUNK_BYTES)
+        if count < 1 {
+            count = 1
+        }
+        let Some(drawn) = mut self.draw(cell, count) else {
+            return None
+        }
+        if size <= CHUNK_BYTES {
+            var drawn_through = mut self.cells.at_mut(usize.widen(cell))
+            drawn_through.last = Some(drawn[0])
+        }
+        chunks = drawn
+    }
+    var placed = size
+    if placed > CHUNK_BYTES {
+        placed = CHUNK_BYTES
+    }
+    var head = mut self.chunks.at_mut(usize.widen(chunks[0]))
+    head.used = rounded_up(head.used, align: aligned) + placed
+    for chunk in chunks {
+        var counted = mut self.chunks.at_mut(usize.widen(chunk))
+        counted.live += 1
+    }
+    mut self.allocations.push(take chunks)
+    return Some(u32.fit(self.allocations.len() - 1))
+} Budgets.allocate
+
+/// Frees an allocation, returning each of its chunks that holds no live allocation.
+fn Budgets.free(mut self, allocation: u32) {
+    var chunks = mem::List[u32].empty(self.alloc)
+    for chunk in self.allocations[usize.widen(allocation)] {
+        mut chunks.push(chunk)
+    }
+    self.allocations[usize.widen(allocation)] = mem::List[u32].empty(self.alloc)
+    for chunk in chunks {
+        var data = mut self.chunks.at_mut(usize.widen(chunk))
+        data.live -= 1
+        if data.live > 0 {
+            continue
+        }
+        let cell = data.cell
+        let chain = self.chain(cell)
+        for link in chain {
+            var returned = mut self.cells.at_mut(usize.widen(link))
+            if returned.open {
+                returned.charge = returned.charge.wrapping_sub(wide::Wide.of_u64(CHUNK_BYTES))
+            }
+            if returned.last == Some(chunk) {
+                returned.last = None
+            }
+        }
+    }
+} Budgets.free

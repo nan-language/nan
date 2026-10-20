@@ -1,0 +1,368 @@
+//! `nan fmt`: the canonical format of source files.
+
+/// The canonical format of one item of a file, its lines joined by LF.
+pkg fn item_text(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: mem::Alloc) -> text::String {
+    let lines = canonical_lines(file, item, alloc)
+    var written = text::String.empty(alloc)
+    for index in 0..<lines.len() {
+        if index > 0 {
+            mut written.push('\n')
+        }
+        mut written.append(lines[index].as_str())
+    }
+    return written
+} item_text
+
+/// A run of a file's lines between items, or an item.
+enum Part {
+    /// An item to format, by index.
+    Item(usize)
+    /// Lines kept as written: an abandoned item, or tokens outside every item, to the line
+    /// before the next parsed item.
+    Kept(core::Range[u32])
+    Summary
+    Comment(text::String)
+    Blank
+} Part
+
+/// The canonical format of a file, or the file with only its items overlapping the lines
+/// `only` in their canonical format.
+pkg fn source_file(file: syntax::SourceFile, only: Option[core::Range[u32]], alloc: mem::Alloc) -> mem::Bytes {
+    if not text::utf8::is_valid(file.source.view()) {
+        var copied = mem::Bytes.empty(alloc)
+        mut copied.append(file.source.view())
+        return copied
+    }
+    return match only {
+        Some(lines) => items_in(file, only: lines, alloc)
+        None => whole(file, alloc)
+    }
+} source_file
+
+fn items_in(file: syntax::SourceFile, only: core::Range[u32], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    var copied: usize = 0
+    for item in file.items {
+        if item.abandoned {
+            continue
+        }
+        let lines = file.item_lines(item)
+        if lines.low > only.high or only.low > lines.high {
+            continue
+        }
+        let start = usize.widen(file.lines[usize.widen(lines.low) - 1].start)
+        let end = usize.widen(file.lines[usize.widen(lines.high) - 1].end) + 1
+        append_source(mut out, file, from: copied, to: start)
+        for line in canonical_lines(file, item, alloc) {
+            mut out.append(line.as_bytes())
+            mut out.push(b'\n')
+        }
+        copied = end
+    }
+    append_source(mut out, file, from: copied, to: file.source.len())
+    return out
+} items_in
+
+/// Appends the bytes `from..<to` of a file's source.
+fn append_source(mut out: mem::Bytes, file: syntax::SourceFile, from: usize, to: usize) {
+    let Some(halves) = file.source.view().split_at(from) else {
+        expect false
+        return
+    }
+    expect to >= from
+    let Some(copied) = halves.tail.prefix(to - from) else {
+        expect false
+        return
+    }
+    mut out.append(copied)
+} append_source
+
+fn whole(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::List[text::String].empty(alloc)
+    var blank_due = false
+    var blank_seen = false
+    for part in take parts(file, alloc) {
+        let blank = match part {
+            Part.Blank => true
+            else => false
+        }
+        if blank {
+            blank_seen = true
+            continue
+        }
+        if (blank_due or blank_seen) and out.len() > 0 {
+            mut out.push(text::String.empty(alloc))
+        }
+        blank_seen = false
+        blank_due = match part {
+            Part.Item(_) or Part.Summary => true
+            else => false
+        }
+        match part {
+            Part.Summary => {
+                let Some(summary) = file.summary else {
+                    expect false
+                    continue
+                }
+                mut out.push(opener_spaced(file.text(summary), alloc))
+            }
+            Part.Comment(comment) => mut out.push(take comment)
+            Part.Kept(lines) => {
+                for line in lines {
+                    mut out.push(verbatim(file, line, alloc))
+                }
+            }
+            Part.Item(index) => {
+                for line in take canonical_lines(file, item: file.items[index], alloc) {
+                    mut out.push(take line)
+                }
+            }
+            Part.Blank => {
+                expect false
+            }
+        }
+    }
+    var written = mem::Bytes.empty(alloc)
+    for index in 0..<out.len() {
+        if index > 0 {
+            mut written.push(b'\n')
+        }
+        mut written.append(out[index].as_bytes())
+    }
+    mut written.push(b'\n')
+    return written
+} whole
+
+/// Splits a file after its summary into items, kept regions, comment lines and blank lines.
+fn parts(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::List[Part] {
+    var found = mem::List[Part].empty(alloc)
+    var summary: Option[u32] = None
+    match file.summary {
+        Some(token) => {
+            summary = Some(file.tokens[token].line)
+        }
+        None => {
+        }
+    }
+    var spans = mem::List[core::Range[u32]].empty(alloc)
+    for item in file.items {
+        mut spans.push(file.item_lines(item))
+    }
+    var misplaced_docs = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    for token in 0..<file.tokens.len() {
+        let kind = file.tokens[token].kind
+        if file.comment[token] and (kind == syntax::TokenKind.Doc or kind == syntax::TokenKind.FileDoc) {
+            discard mut misplaced_docs.insert(file.tokens[token].line, value: token)
+        }
+    }
+    var line: u32 = 1
+    var next_item: usize = 0
+    let last = u32.truncate(file.lines.len())
+    while line <= last {
+        if next_item < spans.len() and spans[next_item].low == line {
+            let index = next_item
+            next_item += 1
+            if not file.items[index].abandoned {
+                mut found.push(Part.Item(index))
+                line = spans[index].high + 1
+                continue
+            }
+            var end = last
+            for other in next_item..<spans.len() {
+                if not file.items[other].abandoned {
+                    end = spans[other].low - 1
+                    break
+                }
+            }
+            next_item = spans.len()
+            for position in 0..<spans.len() {
+                if spans[position].low > end {
+                    next_item = position
+                    break
+                }
+            }
+            mut found.push(Part.Kept(line..=end))
+            line = end + 1
+            continue
+        }
+        mut found.push(line_part(file, line, summary, misplaced_docs, alloc))
+        line += 1
+    }
+    return found
+} parts
+
+/// The part a line outside every item is.
+fn line_part(
+    file: syntax::SourceFile,
+    line: u32,
+    summary: Option[u32],
+    misplaced_docs: mem::HashMap[u32, usize],
+    alloc: mem::Alloc,
+    ) -> Part {
+    let physical = file.lines[usize.widen(line) - 1]
+    if physical.lexical_error {
+        return Part.Kept(line..=line)
+    }
+    if summary == Some(line) {
+        return Part.Summary
+    }
+    match misplaced_docs.get(line) {
+        Some(doc) => return Part.Comment(opener_spaced(file.text(doc), alloc))
+        None => {
+        }
+    }
+    let Some(comment) = physical.comment else {
+        return Part.Blank
+    }
+    return Part.Comment(comment_text(file, start: comment, end: physical.end, alloc))
+} line_part
+
+/// The comment in the source bytes `start..<end`, its opener spaced.
+fn comment_text(file: syntax::SourceFile, start: u32, end: u32, alloc: mem::Alloc) -> text::String {
+    var bytes = mem::Bytes.empty(alloc)
+    append_source(mut bytes, file, from: usize.widen(start), to: usize.widen(end))
+    let Ok(comment) = attempt text::String.try_from_utf8(bytes.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return opener_spaced(comment.as_str(), alloc)
+} comment_text
+
+fn verbatim(file: syntax::SourceFile, line: u32, alloc: mem::Alloc) -> text::String {
+    let Ok(kept) = attempt text::String.try_from_utf8(file.line_text(line), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return kept
+} verbatim
+
+/// A comment, doc comment or file summary line with one space after its opener when its text is
+/// not empty and does not start with one.
+fn opener_spaced(comment: Str, alloc: mem::Alloc) -> text::String {
+    var opener: usize = 2
+    if comment.starts_with("///") or comment.starts_with("//!") {
+        opener = 3
+    }
+    let Some(head) = comment.slice_bytes(0, end: opener) else {
+        expect false
+        return text::String.of(comment, alloc)
+    }
+    let Some(rest) = comment.slice_bytes(opener, end: comment.byte_len()) else {
+        expect false
+        return text::String.of(comment, alloc)
+    }
+    if rest.is_empty() or rest.starts_with(" ") {
+        return text::String.of(comment, alloc)
+    }
+    var spaced = text::String.of(head, alloc)
+    mut spaced.push(' ')
+    mut spaced.append(rest)
+    return spaced
+} opener_spaced
+
+/// A number literal with its digits grouped as the canonical format writes them.
+fn group_number(spelt: Str, alloc: mem::Alloc) -> text::String {
+    let bytes = spelt.as_bytes()
+    var start: usize = 0
+    var hex = false
+    if bytes.len() >= 2 and bytes[0] == b'0' and (bytes[1] == b'x' or bytes[1] == b'b') {
+        start = 2
+        hex = bytes[1] == b'x'
+    }
+    var body_end = bytes.len()
+    for at in start..<bytes.len() {
+        let byte = bytes[at]
+        var digit = is_decimal_digit(byte) or byte == b'.'
+        if hex {
+            digit = is_hex_digit(byte)
+        }
+        if not (digit or byte == b'_') {
+            body_end = at
+            break
+        }
+    }
+    var integer = mem::Bytes.empty(alloc)
+    var fraction = mem::Bytes.empty(alloc)
+    var dotted = false
+    for at in start..<body_end {
+        let byte = bytes[at]
+        if byte == b'_' {
+            continue
+        }
+        if dotted {
+            mut fraction.push(byte)
+        } else if byte == b'.' {
+            dotted = true
+        } else if hex and byte >= b'a' and byte <= b'z' {
+            mut integer.push(byte - 32)
+        } else {
+            mut integer.push(byte)
+        }
+    }
+    var group: usize = 3
+    var threshold: usize = 4
+    if start == 2 {
+        group = 4
+        threshold = 5
+    }
+    var grouped = mem::Bytes.empty(alloc)
+    for at in 0..<start {
+        mut grouped.push(bytes[at])
+    }
+    let count = integer.len()
+    for index in 0..<count {
+        let left = count - index
+        if index > 0 and count >= threshold and left % group == 0 {
+            mut grouped.push(b'_')
+        }
+        mut grouped.push(integer[index])
+    }
+    if dotted {
+        mut grouped.push(b'.')
+        mut grouped.append(fraction.view())
+    }
+    for at in body_end..<bytes.len() {
+        mut grouped.push(bytes[at])
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(grouped.view(), alloc) else {
+        expect false
+        return text::String.of(spelt, alloc)
+    }
+    return written
+} group_number
+
+fn is_decimal_digit(byte: u8) -> bool = byte >= b'0' and byte <= b'9'
+
+fn is_hex_digit(byte: u8) -> bool = is_decimal_digit(byte) or (byte >= b'a' and byte <= b'f') or (byte >= b'A' and byte <= b'F')
+
+fn is_ident(file: syntax::SourceFile, token: u32) -> bool {
+    return file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident
+} is_ident
+
+fn is_punct(file: syntax::SourceFile, token: u32, punct: syntax::Punct) -> bool {
+    return file.tokens[usize.widen(token)].kind == syntax::TokenKind.Punct(punct)
+} is_punct
+
+/// The first child of `node`, if any, that expands `rule`.
+fn find_in(tree: syntax::Tree, node: Option[u32], rule: syntax::Rule) -> Option[u32] {
+    let Some(parent) = node else {
+        return None
+    }
+    return tree.find(parent, rule)
+} find_in
+
+fn child_node_list(tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var nodes = mem::List[u32].empty(alloc)
+    for child in tree.child_nodes(node) {
+        mut nodes.push(child)
+    }
+    return nodes
+} child_node_list
+
+fn child_token_list(tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var tokens = mem::List[u32].empty(alloc)
+    for token in tree.child_tokens(node) {
+        mut tokens.push(token)
+    }
+    return tokens
+} child_token_list

@@ -56,7 +56,7 @@ pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             });
             let held = fx.slot(8, 8);
             fx.store(replaced, held, 0);
-            let some = lo.variant_value(fx, &option, "Some", &[Held::Address(held)], false);
+            let some = lo.variant_value(fx, &option, "Some", &[Held::Address(held)], None);
             supply.ret(lo, fx, some);
         }
         "invalidate_page" => {

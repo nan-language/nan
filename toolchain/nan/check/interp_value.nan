@@ -1,0 +1,374 @@
+//! Interpreter values: scalars, structs and enum values by their items, arrays, views into memory, references to places, function values and pointers.
+
+enum Val {
+    Int(wide::Wide)
+    Float32(f32)
+    Float64(f64)
+    Bool(bool)
+    Char(char)
+    Unit
+    /// A struct or layout value: its item and its fields in declaration order; a std type the
+    /// interpreter models keeps its own fields.
+    Struct(item: ty::ItemId, fields: mem::Shared[mem::List[Val]])
+    /// An enum value: its item, the index of its variant and its payload fields.
+    Variant(item: ty::ItemId, index: u32, fields: mem::Shared[mem::List[Val]])
+    Array(mem::Shared[mem::List[Val]])
+    /// A `Slice`, `SliceMut` or `Str`: elements of an array held in memory.
+    View(View)
+    /// A reference to a place held in memory.
+    Ref(Loc)
+    Fn(mem::Shared[FnVal])
+    Ptr(Ptr)
+    /// A `Dyn[I]`: the value with the function implementing each of the interface's methods
+    /// for its type, by method index.
+    Dyn(mem::Shared[DynVal])
+    /// What a place holds once moved, or before its first store.
+    Absent
+} Val
+
+/// A place in memory: an extent and the path of field, payload and element indexes in the value
+/// it holds.
+struct Loc derives Eq {
+    extent: u32
+    path: mem::List[u32]
+} Loc
+
+/// Elements `start..start + len` of the array at `array`.
+struct View derives Eq {
+    array: Loc
+    start: usize
+    len: usize
+} View
+
+/// A function value: a function with its type arguments, or a closure of a unit with its
+/// captured values.
+enum FnVal {
+    Function(nir::FnRef)
+    Closure(item: ty::ItemId, index: u32, args: ty::Args, captures: mem::List[Val])
+} FnVal
+
+/// A pointer: an address and, when made from a place or view, its provenance.
+struct Ptr derives Copy, Eq {
+    address: u64
+    provenance: Option[Provenance]
+} Ptr
+
+struct Provenance derives Copy, Eq {
+    extent: u32
+    /// Whether it was made through a read access.
+    read_only: bool
+} Provenance
+
+struct DynVal {
+    value: Val
+    methods: mem::List[nir::FnRef]
+} DynVal
+
+fn Loc.with(self, index: u32, alloc: mem::Alloc) -> Loc {
+    var path = mem::List[u32].empty(alloc)
+    mut path.reserve(self.path.len() + 1)
+    for step in self.path {
+        mut path.push(step)
+    }
+    mut path.push(index)
+    return Loc(extent: self.extent, path: take path)
+} Loc.with
+
+fn Val.int_value(self) -> wide::Wide {
+    match self {
+        Val.Int(value) => return value
+        Val.Char(c) => return wide::Wide.of_u64(u64.widen(c.to_bits()))
+        Val.Bool(value) => {
+            if value {
+                return wide::Wide.one()
+            }
+            return wide::Wide.zero()
+        }
+        else => {}
+    }
+    expect false
+    return wide::Wide.zero()
+} Val.int_value
+
+fn Val.bool_value(self) -> bool {
+    match self {
+        Val.Bool(value) => return value
+        else => {}
+    }
+    expect false
+    return false
+} Val.bool_value
+
+proj fn Val.fields(self) -> Slice[Val] {
+    match self {
+        Val.Struct(item: _, fields: fields) => return fields.contents().view()
+        Val.Variant(item: _, index: _, fields: fields) => return fields.contents().view()
+        Val.Array(elements) => return elements.contents().view()
+        else => {}
+    }
+    expect false
+    loop {
+    }
+} Val.fields
+
+/// The part at a path of field, payload and element indexes.
+proj fn Val.at_path(self, path: Slice[u32]) -> Val {
+    let Some(parts) = path.split_at(1) else {
+        return self
+    }
+    return self.fields()[usize.widen(parts.head[0])].at_path(parts.tail)
+} Val.at_path
+
+/// The value with the part at a non-empty path replaced, each list on the path cloned when
+/// another value shares it.
+fn Val.replaced(take self, path: Slice[u32], take stored: Val, alloc: mem::Alloc) -> Val {
+    let Some(parts) = path.split_at(1) else {
+        return stored
+    }
+    let index = parts.head[0]
+    match self {
+        Val.Struct(item: item, fields: fields) => return Val.Struct(item: item, fields: replaced_part(take fields, index, rest: parts.tail, take stored, alloc))
+        Val.Variant(item: item, index: variant, fields: fields) => return Val.Variant(item: item, index: variant, fields: replaced_part(take fields, index, rest: parts.tail, take stored, alloc))
+        Val.Array(elements) => return Val.Array(replaced_part(take elements, index, rest: parts.tail, take stored, alloc))
+        else => {}
+    }
+    expect false
+    return stored
+} Val.replaced
+
+/// The parts with the one at `index`, or a part within it at `rest`, replaced.
+fn replaced_part(
+    take parts: mem::Shared[mem::List[Val]],
+    index: u32,
+    rest: Slice[u32],
+    take stored: Val,
+    alloc: mem::Alloc,
+    ) -> mem::Shared[mem::List[Val]] {
+    var list = mut parts.make_mut(clone: Val.copies_of)
+    let position = usize.widen(index)
+    if rest.len() == 0 {
+        list[position] = stored
+    } else {
+        let inner = list[position].copy(alloc)
+        list[position] = Val.Absent
+        list[position] = take inner.replaced(rest, take stored, alloc)
+    }
+    return parts
+} replaced_part
+
+/// A copy of each value of a list.
+fn Val.copies_of(values: mem::List[Val], alloc: mem::Alloc) -> mem::List[Val] {
+    return Val.copies(values.view(), alloc)
+} Val.copies_of
+
+/// A copy of each value, in order.
+fn Val.copies(values: Slice[Val], alloc: mem::Alloc) -> mem::List[Val] {
+    var copied = mem::List[Val].empty(alloc)
+    mut copied.reserve(values.len())
+    for value in values {
+        mut copied.push(value.copy(alloc))
+    }
+    return copied
+} Val.copies
+
+fn Val.some(item: ty::ItemId, take value: Val, alloc: mem::Alloc) -> Val {
+    return Val.Variant(item: item, index: 0, fields: mem::Shared.of(Val.single(take value, alloc), alloc))
+} Val.some
+
+/// A list holding one value.
+fn Val.single(take value: Val, alloc: mem::Alloc) -> mem::List[Val] {
+    var list = mem::List[Val].empty(alloc)
+    mut list.push(take value)
+    return list
+} Val.single
+
+fn Val.none(item: ty::ItemId, alloc: mem::Alloc) -> Val {
+    return Val.Variant(item: item, index: 1, fields: mem::Shared.of(mem::List[Val].empty(alloc), alloc))
+} Val.none
+
+/// Whether an integer is a value of a scalar type.
+fn fits_scalar(value: wide::Wide, scalar: ty::Scalar) -> bool {
+    let range = scalar.range()
+    return range.low.le(value) and value.le(range.high)
+} fits_scalar
+
+/// The value of a scalar type congruent to an integer modulo 2^width.
+fn wrap_scalar(value: wide::Wide, scalar: ty::Scalar) -> wide::Wide {
+    let modulus = wide::Wide.one().shift_left(scalar.bits())
+    let low = value.bit_and(modulus.wrapping_sub(wide::Wide.one()))
+    if scalar.is_signed() and not low.lt(modulus.shift_right(1)) {
+        return low.wrapping_sub(modulus)
+    }
+    return low
+} wrap_scalar
+
+/// A copy of the value, its shared parts shared.
+fn Val.copy(self, alloc: mem::Alloc) -> Val {
+    return match self {
+        Val.Int(value) => Val.Int(value)
+        Val.Float32(value) => Val.Float32(value)
+        Val.Float64(value) => Val.Float64(value)
+        Val.Bool(value) => Val.Bool(value)
+        Val.Char(value) => Val.Char(value)
+        Val.Unit => Val.Unit
+        Val.Struct(item: item, fields: fields) => Val.Struct(item: item, fields: fields.share())
+        Val.Variant(item: item, index: index, fields: fields) => Val.Variant(item: item, index: index, fields: fields.share())
+        Val.Array(elements) => Val.Array(elements.share())
+        Val.View(view) => Val.View(view.copy(alloc))
+        Val.Ref(loc) => Val.Ref(loc.copy(alloc))
+        Val.Fn(function) => Val.Fn(function.share())
+        Val.Ptr(pointer) => Val.Ptr(pointer)
+        Val.Dyn(dynamic) => Val.Dyn(dynamic.share())
+        Val.Absent => Val.Absent
+    }
+} Val.copy
+
+/// A copy of the place.
+fn Loc.copy(self, alloc: mem::Alloc) -> Loc {
+    var path = mem::List[u32].empty(alloc)
+    mut path.reserve(self.path.len())
+    for step in self.path {
+        mut path.push(step)
+    }
+    return Loc(extent: self.extent, path: take path)
+} Loc.copy
+
+/// A copy of the view.
+fn View.copy(self, alloc: mem::Alloc) -> View {
+    return View(array: self.array.copy(alloc), start: self.start, len: self.len)
+} View.copy
+
+/// Whether two values are equal part by part: floats by IEEE equality, function values,
+/// pointers and `Dyn` values by what they hold.
+fn Val.equals(self, other: Val) -> bool
+    waive length "one comparison per variant, as the derive writes them"
+{
+    match self {
+        Val.Int(value) => {
+            let Val.Int(compared) = other else {
+                return false
+            }
+            return value == compared
+        }
+        Val.Float32(value) => {
+            let Val.Float32(compared) = other else {
+                return false
+            }
+            return value == compared
+        }
+        Val.Float64(value) => {
+            let Val.Float64(compared) = other else {
+                return false
+            }
+            return value == compared
+        }
+        Val.Bool(value) => {
+            let Val.Bool(compared) = other else {
+                return false
+            }
+            return value == compared
+        }
+        Val.Char(value) => {
+            let Val.Char(compared) = other else {
+                return false
+            }
+            return value == compared
+        }
+        Val.Struct(item: item, fields: fields) => {
+            let Val.Struct(item: compared, fields: compared_fields) = other else {
+                return false
+            }
+            return item == compared and Val.all_equal(fields.contents().view(), right: compared_fields.contents().view())
+        }
+        Val.Variant(item: item, index: index, fields: fields) => {
+            let Val.Variant(item: compared, index: compared_index, fields: compared_fields) = other else {
+                return false
+            }
+            return item == compared and index == compared_index and Val.all_equal(fields.contents().view(), right: compared_fields.contents().view())
+        }
+        Val.Array(elements) => {
+            let Val.Array(compared) = other else {
+                return false
+            }
+            return Val.all_equal(elements.contents().view(), right: compared.contents().view())
+        }
+        Val.View(view) => {
+            let Val.View(compared) = other else {
+                return false
+            }
+            return view == compared
+        }
+        Val.Ref(loc) => {
+            let Val.Ref(compared) = other else {
+                return false
+            }
+            return loc == compared
+        }
+        Val.Fn(function) => {
+            let Val.Fn(compared) = other else {
+                return false
+            }
+            return function.contents().equals(compared.contents())
+        }
+        Val.Ptr(pointer) => {
+            let Val.Ptr(compared) = other else {
+                return false
+            }
+            return pointer == compared
+        }
+        Val.Dyn(dynamic) => {
+            let Val.Dyn(compared) = other else {
+                return false
+            }
+            return dynamic.contents().value.equals(compared.contents().value) and dynamic.contents().methods == compared.contents().methods
+        }
+        Val.Unit => return other.is_unit()
+        Val.Absent => return other.is_absent()
+    }
+} Val.equals
+
+fn Val.is_unit(self) -> bool {
+    return match self {
+        Val.Unit => true
+        else => false
+    }
+} Val.is_unit
+
+/// Whether the value is what a place holds once moved or before its first store.
+fn Val.is_absent(self) -> bool {
+    return match self {
+        Val.Absent => true
+        else => false
+    }
+} Val.is_absent
+
+/// Whether two lists of values have equal lengths and equal values in order.
+fn Val.all_equal(left: Slice[Val], right: Slice[Val]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for index in 0..<left.len() {
+        if not left[index].equals(right[index]) {
+            return false
+        }
+    }
+    return true
+} Val.all_equal
+
+/// Whether two function values call one function with the same arguments and captures.
+fn FnVal.equals(self, other: FnVal) -> bool {
+    match self {
+        FnVal.Function(fn_ref) => {
+            let FnVal.Function(compared) = other else {
+                return false
+            }
+            return fn_ref == compared
+        }
+        FnVal.Closure(item: item, index: index, args: args, captures: captures) => {
+            let FnVal.Closure(item: compared, index: compared_index, args: compared_args, captures: compared_captures) = other else {
+                return false
+            }
+            return item == compared and index == compared_index and args == compared_args and Val.all_equal(captures.view(), right: compared_captures.view())
+        }
+    }
+} FnVal.equals

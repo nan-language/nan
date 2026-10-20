@@ -1,0 +1,980 @@
+//! Elaborating calls: the callee and arguments, the predicate, requires and decreases checks a call carries, failing calls with `try` and `attempt`, and checking entries.
+
+/// What elaborating a rewrite gives: its outermost call with the callee value and arguments
+/// evaluated, none when one diverges; or its value.
+enum RewriteResult {
+    Call(Option[Evaluated])
+    Value(Out)
+} RewriteResult
+
+/// A call's callee value, for a call through a function value, and its arguments evaluated; the
+/// call itself goes beside it.
+struct Evaluated {
+    function_value: Option[nir::Value]
+    args: mem::List[nir::Operand]
+} Evaluated
+
+/// A requires clause of a call's callee: its index, and whether it is disputed.
+struct RequiresClause derives Copy {
+    index: u32
+    disputed: bool
+} RequiresClause
+
+/// The requires clauses a call meets: the unit whose functions compute them, their indexes
+/// there, and whether each is disputed.
+struct Requires {
+    callee: nir::FnRef
+    clauses: mem::List[RequiresClause]
+} Requires
+
+fn Elab.call(mut self, call: Call, ty: ty::Ty, span: nir::Span) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(evaluated) = try mut self.function_value(call) else {
+        return Out.Never
+    }
+    var in_place = call.projection
+    match call.callee {
+        Callee.Function(item: item) => {
+            in_place = call.projection or self.ck.reads_in_place(item)
+        }
+        else => {}
+    }
+    var args = mem::List[nir::Operand].empty(alloc)
+    for index in 0..<call.args.len() {
+        let arg = call.args[index]
+        let operand = if in_place and index == 0 and arg.mode == ast::Mode.Read {
+            try mut self.borrowed(arg.expr)
+        } else {
+            try mut self.arg(arg.expr, mode: arg.mode)
+        }
+        let Some(passed) = operand else {
+            return Out.Never
+        }
+        mut args.push(take passed)
+    }
+    let Callee.Function(item: item) = call.callee else {
+        return try mut self.finish_call(call, function_value: evaluated.function_value, args: take args, ty, span, through: None)
+    }
+    match self.ck.db().ast(item).kind {
+        ast::ItemKind.Retired(_) => return try mut self.forwarded(call, tombstone: item, args: take args, ty, span)
+        else => return try mut self.finish_call(call, function_value: evaluated.function_value, args: take args, ty, span, through: None)
+    }
+} Elab.call
+
+/// The call's function value evaluated, without arguments yet, for a call through one; none
+/// when it diverges.
+fn Elab.function_value(mut self, call: Call) -> Option[Evaluated] fails Fault {
+    let alloc = self.ck.alloc()
+    let Callee.Value(value) = call.callee else {
+        return Some(Evaluated(function_value: None, args: mem::List[nir::Operand].empty(alloc)))
+    }
+    let Some(operand) = try mut self.operand(value.contents()) else {
+        return None
+    }
+    let nir::Operand.Value(held) = operand else {
+        fail Fault.Unsupported(text::String.of("a function value that is no value", alloc))
+    }
+    return Some(Evaluated(function_value: Some(held), args: mem::List[nir::Operand].empty(alloc)))
+} Elab.function_value
+
+/// A call forwarded through a tombstone's old head: its arguments, `args`, in the old head's
+/// parameters, then the tombstone's rewrite over them, the call's markers on the rewrite's
+/// outermost call, all with the call's span.
+fn Elab.forwarded(
+    mut self,
+    call: Call,
+    tombstone: ty::ItemId,
+    take args: mem::List[nir::Operand],
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    if holds_item(self.forwarding.view(), item: tombstone) {
+        fail Fault.Unsupported(text::String.of("a cycle of forwarded rewrites", alloc))
+    }
+    let sig = self.ck.fn_sig(tombstone)
+    let typed = self.ck.typed(tombstone)
+    let Some(head) = sig else {
+        fail Fault.Failed
+    }
+    let Some(body) = typed else {
+        fail Fault.Failed
+    }
+    let held_body = body.contents()
+    let Some(rewrite) = held_body.root else {
+        fail Fault.Failed
+    }
+    let subst = ty::Subst.of(generic_params(head.generics.view(), alloc).view(), args: self.ck.types().arg_list(call.type_args), alloc)
+    let mark = self.b.mark()
+    var held = mem::HashMap[LocalId, Held].empty(seed: 0, alloc)
+    var position: usize = 0
+    for arg in take args {
+        if position >= held_body.params.len() or position >= call.head.params.len() {
+            break
+        }
+        let binding = mut self.rewrite_binding(take arg, param: call.head.params[position], token: call.token, span)
+        discard mut held.insert(held_body.params[position], value: take binding)
+        position += 1
+    }
+    var closures = mem::List[u32].empty(alloc)
+    collect_closures(rewrite, found: mut closures)
+    var count: u32 = 0
+    for index in closures {
+        if index > count {
+            count = index
+        }
+    }
+    let outer_body = self.body.share()
+    let base = mut self.unit.inline_closures(outer_body.contents(), count, alloc)
+    let builder = mut self.b.extract()
+    let draft = mut self.unit.extract(alloc)
+    var nested = Elab.new(self.ck, unit: take draft, body, role: self.role)
+    nested.b = builder
+    nested.held = held
+    nested.premise = self.premise
+    nested.closure_base = base
+    var forwarding = mem::List[ty::ItemId].empty(alloc)
+    for item in self.forwarding {
+        mut forwarding.push(item)
+    }
+    mut forwarding.push(tombstone)
+    nested.forwarding = forwarding
+    let parts = attempt mut nested.rewrite_parts(rewrite)
+    mut self.merge(take nested)
+    if count > 0 {
+        var copied = ty::Subst.empty(alloc)
+        mut copied.extend(subst)
+        let inlined = Inlined(base: base, span: span, subst: take copied)
+        let inlining = mut self.unit.extract(alloc)
+        self.unit = try self.ck.closure_functions(take inlining, body, inlined: Some(take inlined))
+    }
+    let rewritten = match parts {
+        Ok(found) => found
+        Err(fault) => fail fault
+    }
+    let out = try mut self.forwarded_out(call, rewrite, take rewritten, subst, ty, span)
+    mut self.b.since(mark, span, subst, types: self.ck.types())
+    return out
+} Elab.forwarded
+
+/// Takes back the unit and builder a nested elaboration of an inlined rewrite continued, with
+/// the temporaries, slots of its outermost scope, moved places and wrapped parts it made.
+fn Elab.merge(mut self, take nested: Elab) {
+    self.unit = nested.unit
+    self.b = nested.b
+    for temp in nested.temps {
+        mut self.temps.push(temp)
+    }
+    let at = self.temp_scope
+    var scope = mut self.scopes.at_mut(at)
+    for slot in nested.scopes[0].slots {
+        mut scope.slots.push(slot)
+    }
+    for place in take nested.moved {
+        discard mut self.moved.insert(take place)
+    }
+    for value in nested.wrapped {
+        discard mut self.wrapped.insert(value)
+    }
+} Elab.merge
+
+/// The binding of a parameter of an inlined rewrite to the operand its argument passes.
+fn Elab.rewrite_binding(mut self, take arg: nir::Operand, param: ty::FnParam, token: u32, span: nir::Span) -> Held {
+    match arg {
+        nir::Operand.Literal(literal) => return Held.Literal(take literal)
+        nir::Operand.Place(mode: mode, place: place) => {
+            if mode == ast::Mode.Take {
+                let value = mut self.emit_value(nir::Op.Move(take place), ty: nir::NTy.Owned(param.ty), span)
+                return mut self.taken_binding(value, ty: param.ty, token)
+            }
+            return Held.Place(take place)
+        }
+        nir::Operand.Value(value) => {
+            if param.mode == ast::Mode.Take {
+                return mut self.taken_binding(value, ty: param.ty, token)
+            }
+            return Held.Value(value)
+        }
+    }
+} Elab.rewrite_binding
+
+/// What elaborating a rewrite gives: its outermost call with the callee value and arguments
+/// evaluated, or its value.
+fn Elab.rewrite_parts(mut self, rewrite: TExpr) -> RewriteResult fails Fault {
+    match rewrite.kind {
+        TKind.Call(inner) => return RewriteResult.Call(try mut self.callee_and_args(inner.contents()))
+        else => return RewriteResult.Value(try mut self.expr(rewrite))
+    }
+} Elab.rewrite_parts
+
+/// The value of a forwarded call from the parts its rewrite gave: the rewrite's outermost call
+/// with the call's markers and the tombstone's type arguments, or its value, wrapped in `Ok`
+/// for `attempt`.
+fn Elab.forwarded_out(
+    mut self,
+    call: Call,
+    rewrite: TExpr,
+    take rewritten: RewriteResult,
+    subst: ty::Subst,
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    match rewritten {
+        RewriteResult.Call(evaluated) => {
+            let Some(found) = evaluated else {
+                return Out.Never
+            }
+            let TKind.Call(inner) = rewrite.kind else {
+                return Out.Never
+            }
+            let held = inner.contents()
+            var outer = held.copy(alloc)
+            outer.token = call.token
+            outer.failure = call.failure
+            outer.awaited = call.awaited
+            outer.type_args = subst.args(self.ck.types(), args: held.type_args)
+            outer.head = subst.fn_ty(self.ck.types(), fn_ty: held.head)
+            outer.callee = take outer.callee.substituted(subst, types: self.ck.types())
+            if call.failure.is_none() and outer.head.failure.is_some() {
+                fail Fault.Unsupported(text::String.of("a forwarded rewrite failing where its use does not", alloc))
+            }
+            return try mut self.finish_call(outer, function_value: found.function_value, args: take found.args, ty, span, through: call.head.failure)
+        }
+        RewriteResult.Value(value) => {
+            match value {
+                Out.Never => return Out.Never
+                else => {}
+            }
+            let Some(marker) = call.failure else {
+                return value
+            }
+            if marker.kind != ast::FailureMarker.Attempt {
+                return value
+            }
+            match value {
+                Out.Place(place) => {
+                    let operand = mut self.take_place(take place, ty: call.head.result, span)
+                    return mut self.ok_value(take operand, ty, span)
+                }
+                Out.Operand(operand) => return mut self.ok_value(take operand, ty, span)
+                Out.Never => return Out.Never
+            }
+        }
+    }
+} Elab.forwarded_out
+
+/// A value wrapped in `Ok` of a `Result` type.
+fn Elab.ok_value(mut self, take operand: nir::Operand, ty: ty::Ty, span: nir::Span) -> Out {
+    let variant = text::String.of("Ok", alloc: self.ck.alloc())
+    let wrapped = mut self.emit_value(nir::Op.Variant(ty: ty, variant: take variant, payload: nir::Payload.Single(take operand)), ty: nir::NTy.Owned(ty), span)
+    return Out.Operand(nir::Operand.Value(wrapped))
+} Elab.ok_value
+
+/// The callee with the type arguments of an interface method's bound and its `Self` type
+/// substituted.
+fn Callee.substituted(take self, subst: ty::Subst, types: ty::Types) -> Callee {
+    match self {
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: dynamic) => return Callee.Method(bound: subst.bound(types, bound), method: method, self_ty: subst.ty(types, ty: self_ty), dynamic: dynamic)
+        else => return self
+    }
+} Callee.substituted
+
+/// The binding of a `take` parameter of an inlined rewrite to the value its argument moves:
+/// the value when Copy, else a temporary of the statement holding it.
+fn Elab.taken_binding(mut self, value: nir::Value, ty: ty::Ty, token: u32) -> Held {
+    let place = mut self.temporary(nir::Operand.Value(value), ty, token)
+    if place.root == value {
+        return Held.Value(value)
+    }
+    return Held.Slot(place.root)
+} Elab.taken_binding
+
+/// The callee value and the arguments of a call, evaluated; none when one diverges.
+fn Elab.callee_and_args(mut self, call: Call) -> Option[Evaluated] fails Fault {
+    let Some(evaluated) = try mut self.function_value(call) else {
+        return None
+    }
+    var args = mem::List[nir::Operand].empty(self.ck.alloc())
+    for arg in call.args {
+        let Some(operand) = try mut self.arg(arg.expr, mode: arg.mode) else {
+            return None
+        }
+        mut args.push(take operand)
+    }
+    return Some(Evaluated(function_value: evaluated.function_value, args: take args))
+} Elab.callee_and_args
+
+/// A call whose callee and arguments are evaluated: its checks, then the call, its failure
+/// converted first to `through` when given.
+fn Elab.finish_call(
+    mut self,
+    call: Call,
+    function_value: Option[nir::Value],
+    take args: mem::List[nir::Operand],
+    ty: ty::Ty,
+    span: nir::Span,
+    through: Option[ty::Ty],
+    ) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let callee = try self.nir_callee(call, function_value, args: args.view())
+    try mut self.callee_checks(call, callee, args: mut args, span)
+    let nir_call = nir::Call(awaited: call.awaited, callee: take callee, args: take args)
+    match call.head.failure {
+        Some(raised) => {
+            if raised != ty::Ty.never() {
+                return try mut self.failing_call(call, nir_call: take nir_call, ty, span, through)
+            }
+        }
+        None => {}
+    }
+    if call.head.result == ty::Ty.never() {
+        mut self.emit(nir::Op.Call(take nir_call), span)
+        mut self.end(nir::Terminator.Unreachable, span)
+        return Out.Never
+    }
+    if call.head.result == ty::Ty.unit() {
+        mut self.emit(nir::Op.Call(take nir_call), span)
+        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    }
+    let result_ty = self.result_nty(call)
+    let reference = result_ty.is_reference()
+    let value = mut self.emit_value(nir::Op.Call(take nir_call), ty: result_ty, span)
+    if call.projection and self.ck.projection_form(call) == Form.Wrapped {
+        discard mut self.wrapped.insert(value)
+    }
+    if reference {
+        return Out.Place(nir::Place.of(value, alloc))
+    }
+    return Out.Operand(nir::Operand.Value(value))
+} Elab.finish_call
+
+/// The NIR callee of a call: its function value, the `Dyn` its receiver passes for a dynamic
+/// method call, or the function it names.
+fn Elab.nir_callee(self, call: Call, function_value: Option[nir::Value], args: Slice[nir::Operand]) -> nir::Callee fails Fault {
+    let alloc = self.ck.alloc()
+    match function_value {
+        Some(value) => return nir::Callee.Value(value)
+        None => {}
+    }
+    match call.callee {
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: true) => {
+            if args.len() == 0 {
+                fail Fault.Unsupported(text::String.of("a dynamic call without receiver", alloc))
+            }
+            let place = match args[0] {
+                nir::Operand.Place(mode: _, place: place) => place.copy(alloc)
+                nir::Operand.Value(value) => nir::Place.of(value, alloc)
+                nir::Operand.Literal(_) => fail Fault.Unsupported(text::String.of("a dynamic call without receiver", alloc))
+            }
+            return nir::Callee.Dyn(place: take place, item: bound.item, method: u32.fit(method))
+        }
+        else => {}
+    }
+    return nir::Callee.Fn(try self.callee(call))
+} Elab.nir_callee
+
+/// The checks a call to a function carries before it runs.
+fn Elab.callee_checks(mut self, call: Call, callee: nir::Callee, mut args: mem::List[nir::Operand], span: nir::Span) fails Fault {
+    match callee {
+        nir::Callee.Fn(fn_ref) => try mut self.call_checks(call, callee: fn_ref, args: mut args, span)
+        else => {}
+    }
+} Elab.callee_checks
+
+/// The NIR type of a call's result: a projection's part is a reference, writable when the
+/// projection takes its receiver by `mut`.
+fn Elab.result_nty(self, call: Call) -> nir::NTy {
+    let result = call.head.result
+    if not call.projection or self.ck.projection_form(call) != Form.Part {
+        return nir::NTy.Owned(result)
+    }
+    var writable = false
+    if call.head.params.len() > 0 {
+        writable = call.head.params[0].mode == ast::Mode.Mut
+    }
+    if writable {
+        return nir::NTy.RefMut(result)
+    }
+    return nir::NTy.Ref(result)
+} Elab.result_nty
+
+/// The function a call names.
+fn Elab.callee(self, call: Call) -> nir::FnRef fails Fault {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    match call.callee {
+        Callee.Function(item: item) => return nir::FnRef.item(item, args: call.type_args)
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: _) => {
+            let name = try self.method_name(bound.item, method)
+            match types.kind(self_ty) {
+                ty::TyKind.Param(_) => return nir::FnRef(callable: nir::Callable.Method(item: bound.item, method: u32.fit(method)), args: call.type_args)
+                else => {}
+            }
+            let implementation = try self.implementation(self_ty, interface_item: bound.item, method: name.as_str())
+            return self.ck.call_implementation(take implementation, interface_item: bound.item, args: types.arg_list(call.type_args))
+        }
+        Callee.Builtin(builtin) => return self.builtin_callee(call, builtin)
+        Callee.Value(_) => {
+            expect false
+            fail Fault.Unsupported(text::String.of("an indirect call has a value callee", alloc))
+        }
+    }
+} Elab.callee
+
+/// The function a call of an operation the toolchain supplies names.
+fn Elab.builtin_callee(self, call: Call, builtin: Builtin) -> nir::FnRef {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    var args = mem::List[ty::Arg].empty(alloc)
+    match builtin {
+        Builtin.DynView => {
+            mut args.push(ty::Arg.Ty(call.head.result))
+            mut args.push(ty::Arg.Ty(call.args[0].expr.ty))
+            return nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Intrinsic(text::String.of("Dyn.view", alloc))), args: types.args(take args))
+        }
+        Builtin.Template => {
+            for arg in call.args {
+                mut args.push(ty::Arg.Ty(arg.expr.ty))
+            }
+            return nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Intrinsic(text::String.of("text::fmt", alloc))), args: types.args(take args))
+        }
+        Builtin.DmaAccess => return nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Intrinsic(text::String.of("hw::Dma.access", alloc))), args: call.type_args)
+        Builtin.Conversion(conversion) => return nir::FnRef(callable: nir::Callable.Builtin(conversion.copy(alloc)), args: ty::Args.none())
+        Builtin.MintRoot => return nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Intrinsic(text::String.of("hw::mint_root", alloc))), args: ty::Args.none())
+    }
+} Elab.builtin_callee
+
+fn Elab.method_name(self, interface_item: ty::ItemId, method: usize) -> text::String fails Fault {
+    let alloc = self.ck.alloc()
+    let sig = self.ck.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        fail Fault.Unsupported(text::String.of("a method of no interface", alloc))
+    }
+    return text::String.of(methods[method].name.as_str(), alloc)
+} Elab.method_name
+
+/// The checks a call carries before it runs: the predicates of its arguments, then each
+/// requires of its callee, then its decreases obligation within a cycle.
+fn Elab.call_checks(
+    mut self,
+    call: Call,
+    callee: nir::FnRef,
+    mut args: mem::List[nir::Operand],
+    span: nir::Span,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let count = if call.args.len() < args.len() {
+        call.args.len()
+    } else {
+        args.len()
+    }
+    if not self.callee_is_helper(callee) {
+        for index in 0..<count {
+            let Some(place) = operand_place(args[index], alloc) else {
+                continue
+            }
+            try mut self.predicate_checks(take place, ty: call.args[index].expr.ty, span)
+        }
+    }
+    let required = self.requires_of(call, callee)
+    let decreasing = self.decreases_of(callee)
+    if requires_some_clause(required) or decreasing.is_some() {
+        mut self.slot_taken_values(call, args: mut args)
+    }
+    var read = mem::List[nir::Operand].empty(alloc)
+    for index in 0..<count {
+        mut read.push(mut self.read_again(args[index], ty: call.args[index].expr.ty, span))
+    }
+    match required {
+        Some(found) => mut self.requires_checks(found, read: read.view(), span)
+        None => {}
+    }
+    let Some(measure_ty) = decreasing else {
+        return
+    }
+    let Some(measure) = self.measure else {
+        return
+    }
+    mut self.decreases_check(callee, measure_ty, measure, take read, span)
+} Elab.call_checks
+
+/// Whether a call meets some requires clause.
+fn requires_some_clause(required: Option[Requires]) -> bool {
+    let Some(found) = required else {
+        return false
+    }
+    return found.clauses.len() > 0
+} requires_some_clause
+
+/// The calls and checks of the requires clauses a call meets.
+fn Elab.requires_checks(mut self, required: Requires, read: Slice[nir::Operand], span: nir::Span) {
+    let alloc = self.ck.alloc()
+    for clause in required.clauses {
+        let callable = match required.callee.callable {
+            nir::Callable.Item(item: item, role: _, index: _) => nir::Callable.Item(item: item, role: nir::Role.Requires, index: clause.index)
+            else => required.callee.callable.copy(alloc)
+        }
+        let fn_ref = nir::FnRef(callable: take callable, args: required.callee.args)
+        let value = mut self.call_value(take fn_ref, args: nir::Operand.copies(read, alloc), ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+        mut self.emit(nir::Op.Check(kind: nir::CheckKind.Requires, operand: nir::Operand.Value(value), open: clause.disputed), span)
+    }
+} Elab.requires_checks
+
+/// The decreases obligation of a call within a cycle: the callee's measure below the entry's,
+/// both widened to `u64` unless of one type.
+fn Elab.decreases_check(
+    mut self,
+    callee: nir::FnRef,
+    measure_ty: ty::Ty,
+    measure: nir::Value,
+    take read: mem::List[nir::Operand],
+    span: nir::Span,
+    ) {
+    let alloc = self.ck.alloc()
+    let callable = match callee.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => nir::Callable.Item(item: item, role: nir::Role.Decreases, index: 0)
+        else => callee.callable.copy(alloc)
+    }
+    let fn_ref = nir::FnRef(callable: take callable, args: callee.args)
+    let value = mut self.call_value(take fn_ref, args: take read, ty: measure_ty, span)
+    let own_ty = self.measure_ty()
+    var callee_measure = nir::Operand.Value(value)
+    var entry_measure = nir::Operand.Value(measure)
+    if measure_ty != own_ty {
+        callee_measure = mut self.widened(nir::Operand.Value(value), ty: measure_ty, span)
+        entry_measure = mut self.widened(nir::Operand.Value(measure), ty: own_ty, span)
+    }
+    let less = mut self.emit_value(nir::Op.Binary(op: nir::BinaryOp.Lt, left: take callee_measure, right: take entry_measure), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
+    mut self.emit(nir::Op.Check(kind: nir::CheckKind.Decreases, operand: nir::Operand.Value(less), open: false), span)
+} Elab.decreases_check
+
+/// A measure widened to `u64` unless it is one.
+fn Elab.widened(mut self, take measure: nir::Operand, ty: ty::Ty, span: nir::Span) -> nir::Operand {
+    let u64_ty = ty::Ty.scalar(ty::Scalar.Unsigned64)
+    if ty == u64_ty {
+        return measure
+    }
+    let fn_ref = nir::FnRef(callable: nir::Callable.Builtin(nir::Builtin.Conversion(conversion: nir::Conversion.Widen, scalar: ty::Scalar.Unsigned64)), args: ty::Args.none())
+    var args = mem::List[nir::Operand].empty(self.ck.alloc())
+    mut args.push(take measure)
+    return nir::Operand.Value(mut self.call_value(take fn_ref, args: take args, ty: u64_ty, span))
+} Elab.widened
+
+/// The type of the function's own decreases measure.
+fn Elab.measure_ty(self) -> ty::Ty {
+    for clause in self.body.contents().clauses {
+        if clause.role == ClauseRole.Decreases {
+            return clause.expr.ty
+        }
+    }
+    return ty::Ty.scalar(ty::Scalar.Unsigned64)
+} Elab.measure_ty
+
+/// Moves each owned temporary a call takes into a slot, so that its checks read it first.
+fn Elab.slot_taken_values(mut self, call: Call, mut args: mem::List[nir::Operand]) {
+    let alloc = self.ck.alloc()
+    for index in 0..<call.args.len() {
+        if index >= args.len() {
+            break
+        }
+        let arg = call.args[index]
+        let arg_ty = arg.expr.ty
+        let held = match args[index] {
+            nir::Operand.Value(value) => Some(value)
+            else => None
+        }
+        let Some(value) = held else {
+            continue
+        }
+        if self.ck.nir_copy(arg_ty) or self.ck.nir_view(arg_ty) {
+            continue
+        }
+        let slot = mut self.slot_holding(nir::Operand.Value(value), ty: arg_ty, token: arg.expr.token)
+        let place = nir::Place.of(slot, alloc)
+        discard mut self.moved.insert(place.copy(alloc))
+        args[index] = nir::Operand.Place(mode: ast::Mode.Take, place: take place)
+    }
+} Elab.slot_taken_values
+
+/// An argument's operand passed again by read, to a contract function.
+fn Elab.read_again(mut self, operand: nir::Operand, ty: ty::Ty, span: nir::Span) -> nir::Operand {
+    let alloc = self.ck.alloc()
+    match operand {
+        nir::Operand.Place(mode: _, place: place) => return mut self.read_operand(place.copy(alloc), ty, span)
+        else => return operand.copy(alloc)
+    }
+} Elab.read_again
+
+/// Whether a callee is a helper of the module being elaborated: a function of it that is
+/// not a boundary function, so a call to it carries no predicate checks.
+fn Elab.callee_is_helper(self, callee: nir::FnRef) -> bool {
+    match callee.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => {
+            let db = self.ck.db()
+            return db.module_of(item) == db.module_of(self.item) and not self.ck.is_boundary(item)
+        }
+        else => return false
+    }
+} Elab.callee_is_helper
+
+/// The requires clauses a call meets: a direct callee's own, or the interface method's for
+/// a call through a bound, through `Dyn` or of an implementing function without its own.
+fn Elab.requires_of(self, call: Call, callee: nir::FnRef) -> Option[Requires] {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    match callee.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => {
+            let clauses = self.ck.requires_clauses(item)
+            var undisputed = false
+            for clause in clauses {
+                if not clause.disputed {
+                    undisputed = true
+                }
+            }
+            if undisputed {
+                return Some(Requires(callee: callee.copy(alloc), clauses: take clauses))
+            }
+        }
+        else => {}
+    }
+    match call.callee {
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: _) => {
+            let interface_args = self.ck.interface_args(bound.item, self_ty, args: types.arg_list(bound.args))
+            var listed = mem::List[ty::Arg].empty(alloc)
+            for arg in types.arg_list(interface_args) {
+                mut listed.push(arg)
+            }
+            let given = types.arg_list(call.type_args)
+            let start = types.arg_list(interface_args).len()
+            if start <= given.len() {
+                for position in start..<given.len() {
+                    mut listed.push(given[position])
+                }
+            }
+            return Some(self.method_requirements(bound.item, method, args: types.args(take listed)))
+        }
+        else => {}
+    }
+    let nir::Callable.Item(item: function, role: _, index: _) = callee.callable else {
+        return None
+    }
+    let Some(implemented) = self.ck.implemented_method(function) else {
+        return None
+    }
+    let sig = self.ck.sig(function)
+    let generics = sig.contents().generics
+    let given = types.arg_list(callee.args)
+    let subst = ty::Subst.of(generic_params(generics.view(), alloc).view(), args: given, alloc)
+    var listed = mem::List[ty::Arg].empty(alloc)
+    for arg in types.arg_list(subst.args(types, args: implemented.args)) {
+        mut listed.push(arg)
+    }
+    for position in 0..<generics.len() {
+        if position >= given.len() {
+            break
+        }
+        if generics[position].param.owner == function {
+            mut listed.push(given[position])
+        }
+    }
+    return Some(self.method_requirements(implemented.item, method: implemented.method, args: types.args(take listed)))
+} Elab.requires_of
+
+/// The requires clauses of an interface method, computed by the interface's unit for type
+/// arguments.
+fn Elab.method_requirements(self, interface_item: ty::ItemId, method: usize, args: ty::Args) -> Requires {
+    return Requires(callee: nir::FnRef(callable: nir::Callable.Item(item: interface_item, role: nir::Role.Requires, index: 0), args: args), clauses: self.ck.method_requires(interface_item, method))
+} Elab.method_requirements
+
+/// The measure type of a callee in the cycle of the function being elaborated, both with a
+/// decreases clause.
+fn Elab.decreases_of(self, callee: nir::FnRef) -> Option[ty::Ty] {
+    let nir::Callable.Item(item: item, role: _, index: _) = callee.callable else {
+        return None
+    }
+    if self.role != nir::Role.Body or self.measure.is_none() {
+        return None
+    }
+    let Some(body) = self.ck.typed(item) else {
+        return None
+    }
+    var measure: Option[ty::Ty] = None
+    for clause in body.contents().clauses {
+        if clause.role == ClauseRole.Decreases {
+            measure = Some(clause.expr.ty)
+            break
+        }
+    }
+    let Some(measured) = measure else {
+        return None
+    }
+    if not self.ck.same_cycle(self.item, other: item) {
+        return None
+    }
+    return Some(measured)
+} Elab.decreases_of
+
+/// A call that may fail: its terminator, then `try` converting and exiting with the
+/// failure, or `attempt` building a `Result`.
+fn Elab.failing_call(
+    mut self,
+    call: Call,
+    take nir_call: nir::Call,
+    ty: ty::Ty,
+    span: nir::Span,
+    through: Option[ty::Ty],
+    ) -> Out fails Fault {
+    let ok = mut self.b.block()
+    let fail_block = mut self.b.block()
+    let raised = call.head.failure.value_or(ty::Ty.never())
+    let result_ty = self.result_nty(call)
+    let result = mut self.b.block_param(ok, ty: result_ty)
+    let failure = mut self.b.block_param(fail_block, ty: nir::NTy.Owned(raised))
+    let failure_ty = through.value_or(raised)
+    mut self.end(nir::Terminator.Call(call: take nir_call, ok: ok, failure: fail_block), span)
+    match call.failure {
+        Some(marker) => {
+            if marker.kind == ast::FailureMarker.Attempt {
+                return mut self.attempted_call(ty, ok, fail_block, result, failure, raised, failure_ty, span)
+            }
+        }
+        None => {}
+    }
+    let moved = nir::Place.copies(self.moved, alloc: self.ck.alloc())
+    mut self.b.at(fail_block)
+    if raised == ty::Ty.never() {
+        mut self.end(nir::Terminator.Unreachable, span)
+    } else {
+        let converted_failure = mut self.converted_to(nir::Operand.Value(failure), from: raised, to: failure_ty, span)
+        let converted = mut self.converted(take converted_failure, ty: failure_ty, token: call.token)
+        try mut self.exit_fail(take converted, token: call.token)
+    }
+    self.moved = moved
+    mut self.b.at(ok)
+    if call.head.result == ty::Ty.unit() {
+        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    }
+    if self.b.ty(result).is_reference() {
+        return Out.Place(nir::Place.of(result, alloc: self.ck.alloc()))
+    }
+    return Out.Operand(nir::Operand.Value(result))
+} Elab.failing_call
+
+/// The `Result` of an `attempt` call: `Ok` of its result at `ok`, `Err` of its failure
+/// converted at `fail_block`, joined.
+fn Elab.attempted_call(
+    mut self,
+    ty: ty::Ty,
+    ok: nir::BlockId,
+    fail_block: nir::BlockId,
+    result: nir::Value,
+    failure: nir::Value,
+    raised: ty::Ty,
+    failure_ty: ty::Ty,
+    span: nir::Span,
+    ) -> Out {
+    let alloc = self.ck.alloc()
+    let join = mut self.b.block()
+    let joined = mut self.b.block_param(join, ty: nir::NTy.Owned(ty))
+    let moved = nir::Place.copies(self.moved, alloc)
+    mut self.b.at(ok)
+    let succeeded = mut self.emit_value(nir::Op.Variant(ty: ty, variant: text::String.of("Ok", alloc), payload: nir::Payload.Single(nir::Operand.Value(result))), ty: nir::NTy.Owned(ty), span)
+    var ok_args = mem::List[nir::Operand].empty(alloc)
+    mut ok_args.push(nir::Operand.Value(succeeded))
+    mut self.b.jump(join, args: take ok_args, span)
+    mut self.b.at(fail_block)
+    let converted = mut self.converted_to(nir::Operand.Value(failure), from: raised, to: failure_ty, span)
+    let failed = mut self.emit_value(nir::Op.Variant(ty: ty, variant: text::String.of("Err", alloc), payload: nir::Payload.Single(take converted)), ty: nir::NTy.Owned(ty), span)
+    var fail_args = mem::List[nir::Operand].empty(alloc)
+    mut fail_args.push(nir::Operand.Value(failed))
+    mut self.b.jump(join, args: take fail_args, span)
+    self.moved = moved
+    mut self.b.at(join)
+    return Out.Operand(nir::Operand.Value(joined))
+} Elab.attempted_call
+
+/// The predicate checks of a closure expression, for the values reachable from its
+/// captures.
+fn Elab.closure_predicate_checks(mut self, closure: TClosure, span: nir::Span) fails Fault {
+    for capture in closure_captures(closure, alloc: self.ck.alloc()) {
+        match self.held.get(capture.outer) {
+            Some(Held.Literal(_)) => continue
+            else => {}
+        }
+        let outer_ty = self.body.contents().local(capture.outer).ty
+        let place = try mut self.local_place(capture.outer)
+        try mut self.predicate_checks(take place, ty: outer_ty, span)
+    }
+} Elab.closure_predicate_checks
+
+/// The predicate checks at an exit of a boundary function, for the values reachable from
+/// its result or failure and its `mut` parameters.
+fn Elab.exit_predicate_checks(mut self, value: Option[nir::Operand], span: nir::Span) fails Fault {
+    let alloc = self.ck.alloc()
+    let boundary = match self.role {
+        nir::Role.Closure => true
+        nir::Role.Body or nir::Role.Default => self.ck.is_boundary(self.item)
+        else => false
+    }
+    if not boundary {
+        return
+    }
+    try mut self.exit_value_checks(value, span)
+    var params = mem::List[OwnParam].empty(alloc)
+    for param in self.own_params {
+        if param.mode == ast::Mode.Mut {
+            mut params.push(param)
+        }
+    }
+    for param in params {
+        let param_ty = self.body.contents().local(param.local).ty
+        let place = try mut self.local_place(param.local)
+        try mut self.predicate_checks(take place, ty: param_ty, span)
+    }
+} Elab.exit_predicate_checks
+
+/// The predicate checks of the values reachable from the value an exit passes, of the type the
+/// function's exits give.
+fn Elab.exit_value_checks(mut self, value: Option[nir::Operand], span: nir::Span) fails Fault {
+    let Some(operand) = value else {
+        return
+    }
+    let Some(exit_ty) = self.exit_ty else {
+        return
+    }
+    let Some(place) = operand_place(operand, alloc: self.ck.alloc()) else {
+        return
+    }
+    try mut self.predicate_checks(take place, ty: exit_ty, span)
+} Elab.exit_value_checks
+
+/// The predicate checks of the values reachable from a place whose type's defining module
+/// is the module being elaborated: each predicate's function called on the value, then
+/// `check predicate`, the value before its fields in declaration order.
+fn Elab.predicate_checks(mut self, take place: nir::Place, ty: ty::Ty, span: nir::Span) fails Fault {
+    let ty::TyKind.Item(item: item, args: args) = self.ck.types().kind(ty) else {
+        return
+    }
+    let db = self.ck.db()
+    if db.module_of(item) != db.module_of(self.item) {
+        return
+    }
+    let ast::ItemKind.Struct(_) = db.ast(item).kind else {
+        return
+    }
+    let count = self.ck.predicate_count(item)
+    if count > 0 {
+        let operand = mut self.read_operand(place.copy(self.ck.alloc()), ty, span)
+        mut self.predicate_calls(item, args, operand, count, span)
+    }
+    try mut self.field_predicate_checks(place, item, args, span)
+} Elab.predicate_checks
+
+/// The calls of a struct's predicate functions on a value, each followed by its check.
+fn Elab.predicate_calls(mut self, item: ty::ItemId, args: ty::Args, operand: nir::Operand, count: u32, span: nir::Span) {
+    let alloc = self.ck.alloc()
+    for index in 0..<count {
+        let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: item, role: nir::Role.Predicate, index: index), args: args)
+        var call_args = mem::List[nir::Operand].empty(alloc)
+        mut call_args.push(operand.copy(alloc))
+        let value = mut self.call_value(take fn_ref, args: take call_args, ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+        mut self.emit(nir::Op.Check(kind: nir::CheckKind.Predicate, operand: nir::Operand.Value(value), open: false), span)
+    }
+} Elab.predicate_calls
+
+/// The predicate checks of the fields of a struct value that reach structs with predicates.
+fn Elab.field_predicate_checks(mut self, place: nir::Place, item: ty::ItemId, args: ty::Args, span: nir::Span) fails Fault {
+    let alloc = self.ck.alloc()
+    let sig = self.ck.sig(item)
+    let held = sig.contents()
+    let SigKind.Struct(fields: fields) = held.kind else {
+        return
+    }
+    let subst = ty::Subst.of(generic_params(held.generics.view(), alloc).view(), args: self.ck.types().arg_list(args), alloc)
+    for field in fields {
+        let field_ty = subst.ty(self.ck.types(), ty: field.ty)
+        if self.ck.has_predicates_within(field_ty) {
+            try mut self.predicate_checks(place.step(field.name.as_str(), alloc), ty: field_ty, span)
+        }
+    }
+} Elab.field_predicate_checks
+
+/// The checking entry of a function with requires: the requires checks a direct call makes,
+/// then the call of its body, returning its result or failure. The draft of the unit comes
+/// back with it.
+fn Elab.entry_function(
+    ck: Checker,
+    take unit: UnitDraft,
+    body: mem::Shared[TBody],
+    sig: FnSig,
+    span: nir::Span,
+    ) -> FinishedFunction {
+    let alloc = ck.alloc()
+    var elab = Elab.new(ck, unit: take unit, body, role: nir::Role.Entry)
+    let held = body.contents()
+    let modes = sig.params_modes(alloc)
+    mut elab.declare_params(held.params.view(), modes: modes.view())
+    var args = mem::List[nir::Operand].empty(alloc)
+    var read = mem::List[nir::Operand].empty(alloc)
+    for param in elab.params {
+        match param.mode {
+            ast::Mode.Read => mut args.push(nir::Operand.Value(param.value))
+            else => mut args.push(nir::Operand.Place(mode: param.mode, place: nir::Place.of(param.value, alloc)))
+        }
+        match elab.b.ty(param.value) {
+            nir::NTy.RefMut(_) => mut read.push(nir::Operand.Place(mode: ast::Mode.Read, place: nir::Place.of(param.value, alloc)))
+            else => mut read.push(nir::Operand.Value(param.value))
+        }
+    }
+    let clauses_required = ck.requires_clauses(elab.item)
+    var position: usize = 0
+    for clause in held.clauses {
+        if clause.role != ClauseRole.Requires {
+            continue
+        }
+        if position >= clauses_required.len() {
+            break
+        }
+        let required = clauses_required[position]
+        position += 1
+        let at = nir::Span.at(clause.token)
+        let fn_ref = elab.own(nir::Role.Requires, index: required.index)
+        let value = mut elab.call_value(take fn_ref, args: nir::Operand.copies(read.view(), alloc), ty: ty::Ty.scalar(ty::Scalar.Bool), span: at)
+        mut elab.emit(nir::Op.Check(kind: nir::CheckKind.Requires, operand: nir::Operand.Value(value), open: required.disputed), span: at)
+    }
+    let call = nir::Call(awaited: sig.wait, callee: nir::Callee.Fn(elab.own(nir::Role.Body, index: 0)), args: take args)
+    let failure = inhabited_failure(sig.failure)
+    match failure {
+        Some(raised) => {
+            let ok = mut elab.b.block()
+            let fail_block = mut elab.b.block()
+            let result = mut elab.b.block_param(ok, ty: nir::NTy.Owned(sig.result))
+            let failed = mut elab.b.block_param(fail_block, ty: nir::NTy.Owned(raised))
+            mut elab.end(nir::Terminator.Call(call: take call, ok: ok, failure: fail_block), span)
+            mut elab.b.at(ok)
+            mut elab.end(nir::Terminator.Return(Some(nir::Operand.Value(result))), span)
+            mut elab.b.at(fail_block)
+            mut elab.end(nir::Terminator.Fail(nir::Operand.Value(failed)), span)
+        }
+        None => {
+            if sig.result == ty::Ty.unit() {
+                mut elab.emit(nir::Op.Call(take call), span)
+                mut elab.end(nir::Terminator.Return(None), span)
+            } else {
+                let result = mut elab.emit_value(nir::Op.Call(take call), ty: nir::NTy.Owned(sig.result), span)
+                mut elab.end(nir::Terminator.Return(Some(nir::Operand.Value(result))), span)
+            }
+        }
+    }
+    return take elab.finish(sig.result, failure, wait: sig.wait, closure: None, span)
+} Elab.entry_function
+
+/// The place an operand passes, when it passes one.
+fn operand_place(operand: nir::Operand, alloc: mem::Alloc) -> Option[nir::Place] {
+    return match operand {
+        nir::Operand.Place(mode: _, place: place) => Some(place.copy(alloc))
+        nir::Operand.Value(value) => Some(nir::Place.of(value, alloc))
+        nir::Operand.Literal(_) => None
+    }
+} operand_place

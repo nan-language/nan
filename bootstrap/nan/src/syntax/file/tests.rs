@@ -264,3 +264,12 @@ fn a_conflict_block_is_reported_once_with_fixes_keeping_either_side() {
             .all(|item| item.abandoned || item.tree.is_none())
     );
 }
+
+#[test]
+fn a_std_function_without_a_body_ends_before_the_docs_of_the_next_item() {
+    let file = parse_std(
+        b"//! Summary.\n\npub fn Store.len(self) -> usize\n    example true\n\n/// The next.\npub fn Store.next(self) -> usize\n\n/// The last.\npub closed struct Last {\n} Last\n".to_vec(),
+    );
+    assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
+    assert_eq!(file.items.len(), 3);
+}

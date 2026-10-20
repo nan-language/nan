@@ -1,0 +1,962 @@
+//! The idiom table: foreign spellings that make a syntax failure `syntax.foreign`, with the text each matches and the rewrites that fix it.
+
+/// How the first matching entry reports the failure.
+enum Idiom {
+    /// Expected is the entry's first rewrite, absent for a rewrite stated in words; found is the
+    /// matched text, whose bytes are `span`. Each fix is an alternative rewrite, in order.
+    Rewrite(expected: Option[text::String], found: text::String, span: diagnostic::Span, fixes: mem::List[diagnostic::Replacement])
+    /// An entry without rewrite: expected and found are those of `syntax.unexpected-token`.
+    Unrewritable
+} Idiom
+
+/// The failure the table is matched against: the parse where it failed, the terminals it
+/// expected there, and the failing token.
+struct Failed {
+    state: State
+    expected: TermSet
+    at: usize
+    alloc: mem::Alloc
+} Failed
+
+/// A placeholder of a template and the text it stands for.
+struct Hole {
+    name: char
+    value: text::String
+} Hole
+
+/// The tokens a foreign form matches, and the text each of its placeholders stands for.
+struct Matched {
+    head: usize
+    last: usize
+    holes: mem::List[Hole]
+} Matched
+
+/// A token and the text of the tokens it bounds.
+struct Spelt {
+    at: usize
+    written: text::String
+} Spelt
+
+/// A rewrite column of the table.
+enum Rewrite derives Copy {
+    /// "none".
+    Absent
+    /// A rewrite the table states in words, as the replacement it makes.
+    Words(Worded)
+    /// Alternatives in order, in each of which a `{placeholder}` stands for the text it matched.
+    Templates(Template)
+} Rewrite
+
+/// The rewrites the table states in words.
+enum Worded derives Copy {
+    SemicolonDeleted
+    SemicolonBroken
+    UnitResultDeleted
+} Worded
+
+/// The template rewrites of the table.
+enum Template derives Copy {
+    And
+    Or
+    Closure
+    Expect
+    ExpectEqual
+    ExpectNotEqual
+    Todo
+    Not
+    Equal
+    NotEqual
+    Try
+    Range
+    Var
+    Binding
+    Conversion
+    MutValue
+    Value
+    MutReceiver
+    Receiver
+    MutParam
+    Param
+    Await
+    Increment
+    Decrement
+    Member
+} Template
+
+/// The number of entries of the idiom table.
+const ENTRIES: usize = 34
+
+/// An entry of the table as it matches the failure: the tokens it matches, if any, and its
+/// rewrite column.
+struct Entry {
+    matched: Option[Matched]
+    rewrite: Rewrite
+} Entry
+
+fn Template.alternatives(self, alloc: mem::Alloc) -> mem::List[text::String] {
+    var written = mem::List[text::String].empty(alloc)
+    match self {
+        Template.And => mut written.push(text::String.of("{a} and {b}", alloc))
+        Template.Or => mut written.push(text::String.of("{a} or {b}", alloc))
+        Template.Closure => mut written.push(text::String.of("fn() => {e}", alloc))
+        Template.Expect => mut written.push(text::String.of("expect {e}", alloc))
+        Template.ExpectEqual => mut written.push(text::String.of("expect {a} == {b}", alloc))
+        Template.ExpectNotEqual => mut written.push(text::String.of("expect {a} != {b}", alloc))
+        Template.Todo => mut written.push(text::String.of("todo {t}", alloc))
+        Template.Not => {
+            mut written.push(text::String.of("not {e}", alloc))
+            mut written.push(text::String.of("(not {e})", alloc))
+            mut written.push(text::String.of("~{e}", alloc))
+        }
+        Template.Equal => mut written.push(text::String.of("{a} == {b}", alloc))
+        Template.NotEqual => mut written.push(text::String.of("{a} != {b}", alloc))
+        Template.Try => mut written.push(text::String.of("try {c}", alloc))
+        Template.Range => mut written.push(text::String.of("{a}..<{b}", alloc))
+        Template.Var => mut written.push(text::String.of("var {x}", alloc))
+        Template.Binding => {
+            mut written.push(text::String.of("let {x} = {e}", alloc))
+            mut written.push(text::String.of("var {x} = {e}", alloc))
+        }
+        Template.Conversion => {
+            mut written.push(text::String.of("{T}.widen({e})", alloc))
+            mut written.push(text::String.of("{T}.truncate({e})", alloc))
+            mut written.push(text::String.of("{T}.saturate({e})", alloc))
+            mut written.push(text::String.of("{T}.nearest({e})", alloc))
+            mut written.push(text::String.of("{e}", alloc))
+        }
+        Template.MutValue => mut written.push(text::String.of("mut {e}", alloc))
+        Template.Value => mut written.push(text::String.of("{e}", alloc))
+        Template.MutReceiver => mut written.push(text::String.of("mut self", alloc))
+        Template.Receiver => mut written.push(text::String.of("self", alloc))
+        Template.MutParam => mut written.push(text::String.of("mut {x}: {T}", alloc))
+        Template.Param => mut written.push(text::String.of("{x}: {T}", alloc))
+        Template.Await => mut written.push(text::String.of("{m}await {c}", alloc))
+        Template.Increment => mut written.push(text::String.of("{p} += 1", alloc))
+        Template.Decrement => mut written.push(text::String.of("{p} -= 1", alloc))
+        Template.Member => mut written.push(text::String.of("{p}.{x}", alloc))
+    }
+    return written
+} Template.alternatives
+
+/// The entry of the idiom table of language 1 at `row`, in table order, as it matches the
+/// failure.
+fn Failed.entry(self, row: usize, file: SourceFile, grammar: Grammar) -> Entry {
+    return match row {
+        0 => Entry(matched: self.between(Foreign.AmpAmp, file, grammar), rewrite: Rewrite.Templates(Template.And))
+        1 => Entry(matched: self.between(Foreign.PipePipe, file, grammar), rewrite: Rewrite.Templates(Template.Or))
+        2 => Entry(matched: self.empty_closure(file, grammar), rewrite: Rewrite.Templates(Template.Closure))
+        3 => Entry(matched: self.bar_closure(file, grammar), rewrite: Rewrite.Absent)
+        4 => Entry(matched: self.assert_macro(file, grammar), rewrite: Rewrite.Templates(Template.Expect))
+        5 => Entry(matched: self.assert_pair("assert_eq", file, grammar), rewrite: Rewrite.Templates(Template.ExpectEqual))
+        6 => Entry(matched: self.assert_pair("assert_ne", file, grammar), rewrite: Rewrite.Templates(Template.ExpectNotEqual))
+        7 => Entry(matched: self.todo_macro(true, file), rewrite: Rewrite.Templates(Template.Todo))
+        8 => Entry(matched: self.todo_macro(false, file), rewrite: Rewrite.Templates(Template.Todo))
+        9 => Entry(matched: self.macro_name(file), rewrite: Rewrite.Absent)
+        10 => Entry(matched: self.bang_operand(file, grammar), rewrite: Rewrite.Templates(Template.Not))
+        11 => Entry(matched: self.tripled(Punct.EqEq, file, grammar), rewrite: Rewrite.Templates(Template.Equal))
+        12 => Entry(matched: self.tripled(Punct.NotEq, file, grammar), rewrite: Rewrite.Templates(Template.NotEqual))
+        13 => Entry(matched: self.question_call(file, grammar), rewrite: Rewrite.Templates(Template.Try))
+        14 => Entry(matched: self.alone(Foreign.Question, file), rewrite: Rewrite.Absent)
+        15 => Entry(matched: self.semicolon(true, file), rewrite: Rewrite.Words(Worded.SemicolonDeleted))
+        16 => Entry(matched: self.semicolon(false, file), rewrite: Rewrite.Words(Worded.SemicolonBroken))
+        17 => Entry(matched: self.between(Foreign.DotDot, file, grammar), rewrite: Rewrite.Templates(Template.Range))
+        18 => Entry(matched: self.alone(Foreign.DotDot, file), rewrite: Rewrite.Absent)
+        19 => Entry(matched: self.let_mut(file), rewrite: Rewrite.Templates(Template.Var))
+        20 => Entry(matched: self.walrus(file, grammar), rewrite: Rewrite.Templates(Template.Binding))
+        21 => Entry(matched: self.cast(file, grammar), rewrite: Rewrite.Templates(Template.Conversion))
+        22 => Entry(matched: self.reference(true, file, grammar), rewrite: Rewrite.Templates(Template.MutValue))
+        23 => Entry(matched: self.reference(false, file, grammar), rewrite: Rewrite.Templates(Template.Value))
+        24 => Entry(matched: self.self_reference(true, file, grammar), rewrite: Rewrite.Templates(Template.MutReceiver))
+        25 => Entry(matched: self.self_reference(false, file, grammar), rewrite: Rewrite.Templates(Template.Receiver))
+        26 => Entry(matched: self.typed_reference(true, file, grammar), rewrite: Rewrite.Templates(Template.MutParam))
+        27 => Entry(matched: self.typed_reference(false, file, grammar), rewrite: Rewrite.Templates(Template.Param))
+        28 => Entry(matched: self.dereference(file, grammar), rewrite: Rewrite.Absent)
+        29 => Entry(matched: self.dot_await(file), rewrite: Rewrite.Templates(Template.Await))
+        30 => Entry(matched: self.increment(file, grammar), rewrite: Rewrite.Templates(Template.Increment))
+        31 => Entry(matched: self.decrement(file, grammar), rewrite: Rewrite.Templates(Template.Decrement))
+        32 => Entry(matched: self.arrow_member(file, grammar), rewrite: Rewrite.Templates(Template.Member))
+        33 => Entry(matched: self.unit_result(file, grammar), rewrite: Rewrite.Words(Worded.UnitResultDeleted))
+        else => Entry(matched: None, rewrite: Rewrite.Absent)
+    }
+} Failed.entry
+
+/// The first entry of the idiom table matching the failure, as it reports it.
+fn foreign_idiom(failed: Failed, file: SourceFile, grammar: Grammar) -> Option[Idiom] {
+    for row in 0..<ENTRIES {
+        let Entry(matched: matching, rewrite: rewrite) = failed.entry(row, file, grammar)
+        let Some(matched) = matching else {
+            continue
+        }
+        return Some(failed.reported(take matched, rewrite, file))
+    }
+    return None
+} foreign_idiom
+
+/// How the entry with the rewrite column `rewrite` reports the tokens it matched.
+fn Failed.reported(self, take matched: Matched, rewrite: Rewrite, file: SourceFile) -> Idiom {
+    let span = diagnostic::Span(start: file.tokens[matched.head].start, end: file.tokens[matched.last].end)
+    var fixes = mem::List[diagnostic::Replacement].empty(self.alloc)
+    var expected: Option[text::String] = None
+    match rewrite {
+        Rewrite.Absent => return Idiom.Unrewritable
+        Rewrite.Words(worded) => mut fixes.push(self.worded(worded, matched, file))
+        Rewrite.Templates(template) => {
+            let alternatives = template.alternatives(self.alloc)
+            for written in alternatives {
+                mut fixes.push(diagnostic::Replacement(start: span.start, end: span.end, text: filled(written.as_str(), holes: matched.holes, alloc: self.alloc)))
+            }
+            if fixes.len() > 0 {
+                expected = Some(text::String.of(fixes[0].text.as_str(), alloc: self.alloc))
+            }
+        }
+    }
+    return Idiom.Rewrite(expected: take expected, found: self.text(matched.head, last: matched.last, file), span: span, fixes: take fixes)
+} Failed.reported
+
+/// A template with each `{placeholder}` replaced by the text it stands for, placeholder by
+/// placeholder in order.
+fn filled(template: Str, holes: mem::List[Hole], alloc: mem::Alloc) -> text::String {
+    var current = text::String.of(template, alloc)
+    for hole in holes {
+        let next = hole_filled(current.as_str(), hole, alloc)
+        current = next
+    }
+    return current
+} filled
+
+/// A text with each `{name}` of a hole replaced by its value, from left to right.
+fn hole_filled(written: Str, hole: Hole, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    let bytes = written.as_bytes()
+    let name = hole.name.to_bits()
+    var copied: usize = 0
+    var at: usize = 0
+    while at + 3 <= bytes.len() {
+        if bytes[at] == b'{' and u32.widen(bytes[at + 1]) == name and bytes[at + 2] == b'}' {
+            let Some(before) = written.slice_bytes(copied, end: at) else {
+                expect false
+                return out
+            }
+            mut out.append(before)
+            mut out.append(hole.value.as_str())
+            at += 3
+            copied = at
+        } else {
+            at += 1
+        }
+    }
+    let Some(rest) = written.slice_bytes(copied, end: bytes.len()) else {
+        expect false
+        return out
+    }
+    mut out.append(rest)
+    return out
+} hole_filled
+
+fn SourceFile.is_kind(self, at: usize, kind: TokenKind) -> bool {
+    return self.tokens[at].kind == kind
+} SourceFile.is_kind
+
+fn SourceFile.is_punct(self, at: usize, punct: Punct) -> bool {
+    return self.tokens[at].kind == TokenKind.Punct(punct)
+} SourceFile.is_punct
+
+fn SourceFile.is_foreign(self, at: usize, spelt: Foreign) -> bool {
+    return self.tokens[at].kind == TokenKind.Foreign(spelt)
+} SourceFile.is_foreign
+
+fn SourceFile.is_keyword(self, at: usize, keyword: Keyword) -> bool {
+    return self.tokens[at].kind == TokenKind.Keyword(keyword)
+} SourceFile.is_keyword
+
+fn SourceFile.is_ident(self, at: usize, spelt: Str) -> bool {
+    return self.tokens[at].kind == TokenKind.Ident and self.text(at) == spelt
+} SourceFile.is_ident
+
+/// Whether the token at `at` directly follows the one before it, without a space.
+fn SourceFile.adjacent(self, at: usize) -> bool {
+    let Some(previous) = self.previous(at) else {
+        return false
+    }
+    return self.tokens[previous].end == self.tokens[at].start
+} SourceFile.adjacent
+
+/// The run of spaces ending at `end` on its line, as its first byte.
+fn SourceFile.spaces_before(self, end: u32) -> u32 {
+    var start = end
+    while start > 0 and self.source[usize.widen(start) - 1] == b' ' {
+        start -= 1
+    }
+    return start
+} SourceFile.spaces_before
+
+/// The token after the failing one.
+fn Failed.after(self, file: SourceFile) -> usize {
+    return file.next(self.at + 1)
+} Failed.after
+
+/// The source text of the tokens from `head` to `last`, its lines without comments and
+/// indentation joined by single spaces.
+fn Failed.text(self, head: usize, last: usize, file: SourceFile) -> text::String {
+    let first_token = file.tokens[head]
+    let last_token = file.tokens[last]
+    var joined = text::String.empty(self.alloc)
+    for index in (usize.widen(first_token.line) - 1)..<usize.widen(last_token.line) {
+        let line = file.lines[index]
+        var start = line.start
+        if first_token.start > start {
+            start = first_token.start
+        }
+        var end = line.end
+        match line.comment {
+            Some(comment) => {
+                end = comment
+            }
+            None => {}
+        }
+        if last_token.end < end {
+            end = last_token.end
+        }
+        let part = output::lossy(file.source_bytes(start, end), alloc: self.alloc)
+        let bounds = trim_bounds(part.as_str())
+        let Some(kept) = part.slice_bytes(bounds.start, end: bounds.end) else {
+            continue
+        }
+        if kept.is_empty() {
+            continue
+        }
+        if not joined.is_empty() {
+            mut joined.push(' ')
+        }
+        mut joined.append(kept)
+    }
+    return joined
+} Failed.text
+
+/// The bytes of a text without its leading and trailing whitespace.
+struct Trimmed derives Copy {
+    start: usize
+    end: usize
+} Trimmed
+
+fn trim_bounds(written: Str) -> Trimmed {
+    var start: usize = 0
+    var end: usize = 0
+    var at: usize = 0
+    var leading = true
+    for c in written {
+        let width = c.utf8_len()
+        if not is_whitespace(c) {
+            if leading {
+                start = at
+                leading = false
+            }
+            end = at + width
+        }
+        at += width
+    }
+    return Trimmed(start: start, end: end)
+} trim_bounds
+
+/// Whether the parse expects all that can start `rule` where it failed.
+fn Failed.expects(self, rule: Rule, grammar: Grammar) -> bool {
+    return self.expected.is_superset(grammar.analysis.choice(rule.choice(grammar)).ok)
+} Failed.expects
+
+/// The innermost rule of the parse, when it failed at a type that rule requires.
+fn Failed.type_expecting(self, grammar: Grammar) -> Option[Rule] {
+    if self.state.current_atom(grammar) != Some(Atom.Rule(Rule.TypeExpr)) {
+        return None
+    }
+    return self.state.innermost_rule()
+} Failed.type_expecting
+
+/// The first token of the prefix expression the parse completed just before `end`.
+fn Failed.operand_ending_at(self, end: usize) -> Option[usize] {
+    let Some(operand) = self.state.last_operand else {
+        return None
+    }
+    if operand.end != end {
+        return None
+    }
+    return Some(operand.start)
+} Failed.operand_ending_at
+
+/// The operand ending just before the failing token, as its first token and text.
+fn Failed.operand_before(self, file: SourceFile) -> Option[Spelt] {
+    let Some(head) = self.operand_ending_at(self.at) else {
+        return None
+    }
+    let Some(last) = file.previous(self.at) else {
+        return None
+    }
+    return Some(Spelt(at: head, written: self.text(head, last, file)))
+} Failed.operand_before
+
+fn Failed.longest(self, rule: Rule, start: usize, file: SourceFile, grammar: Grammar) -> Option[usize] {
+    return file.longest(rule, start, grammar, alloc: self.alloc)
+} Failed.longest
+
+/// The longest text that `rule` derives from `start`, as its last token and text.
+fn Failed.derived(self, rule: Rule, start: usize, file: SourceFile, grammar: Grammar) -> Option[Spelt] {
+    let Some(end) = self.longest(rule, start, file, grammar) else {
+        return None
+    }
+    let Some(last) = file.previous(end) else {
+        return None
+    }
+    return Some(Spelt(at: last, written: self.text(start, last, file)))
+} Failed.derived
+
+/// An expression between parentheses from `start`, followed by `closer`.
+fn Failed.enclosed(self, start: usize, closer: Punct, file: SourceFile, grammar: Grammar) -> Option[Spelt] {
+    let Some(end) = self.longest(Rule.Expr, start, file, grammar) else {
+        return None
+    }
+    let Some(last) = file.previous(end) else {
+        return None
+    }
+    if not file.is_punct(end, punct: closer) {
+        return None
+    }
+    return Some(Spelt(at: end, written: self.text(start, last, file)))
+} Failed.enclosed
+
+/// Whether the operand from `head` to `last` ends in the argument list of a call.
+fn Failed.ends_in_call(self, head: usize, last: usize, file: SourceFile) -> bool {
+    if not file.is_punct(last, punct: Punct.RParen) {
+        return false
+    }
+    var depth: i64 = 0
+    var at = last
+    loop {
+        match file.tokens[at].kind {
+            TokenKind.Punct(Punct.RParen) => {
+                depth += 1
+            }
+            TokenKind.Punct(Punct.LParen) => {
+                depth -= 1
+            }
+            else => {}
+        }
+        if depth == 0 {
+            break
+        }
+        let Some(previous) = file.previous(at) else {
+            return false
+        }
+        if previous < head {
+            return false
+        }
+        at = previous
+    }
+    if at <= head {
+        return false
+    }
+    let Some(callee) = file.previous(at) else {
+        return false
+    }
+    return match file.tokens[callee].kind {
+        TokenKind.Ident or TokenKind.Keyword(Keyword.SelfValue) => true
+        TokenKind.Punct(Punct.RParen) or TokenKind.Punct(Punct.RBracket) => true
+        else => false
+    }
+} Failed.ends_in_call
+
+/// Whether the tokens from `head` to before `end` form exactly a place.
+fn Failed.is_place(self, head: usize, end: usize, file: SourceFile, grammar: Grammar) -> bool {
+    return self.longest(Rule.Place, start: head, file, grammar) == Some(end)
+} Failed.is_place
+
+/// The identifier starting the statement the parse is reading, when the failing token directly
+/// follows it.
+fn Failed.statement_identifier(self, file: SourceFile) -> Option[usize] {
+    let Some(frame) = self.state.innermost_of(Rule.Stmt) else {
+        return None
+    }
+    let statement = frame.start
+    if file.previous(self.at) != Some(statement) or not file.is_kind(statement, kind: TokenKind.Ident) {
+        return None
+    }
+    return Some(statement)
+} Failed.statement_identifier
+
+/// The first token of the postfix expression the parse is reading, with the markers before it.
+fn Failed.marked_call_start(self) -> Option[usize] {
+    var postfix = self.state.frames.len()
+    var found = false
+    while postfix > 0 and not found {
+        postfix -= 1
+        found = self.state.frames[postfix].rule == Some(Rule.PostfixExpr)
+    }
+    if not found {
+        return None
+    }
+    var start = self.state.frames[postfix].start
+    var index = postfix
+    while index > 0 {
+        index -= 1
+        let frame = self.state.frames[index]
+        match frame.rule {
+            None => {}
+            Some(Rule.MarkedExpr) or Some(Rule.AfterFailureMarker) or Some(Rule.AfterAwait) or Some(Rule.AfterMode) => {
+                start = frame.start
+            }
+            else => break
+        }
+    }
+    return Some(start)
+} Failed.marked_call_start
+
+/// A match without holes.
+fn Failed.span(self, head: usize, last: usize) -> Matched {
+    return Matched(head: head, last: last, holes: mem::List[Hole].empty(self.alloc))
+} Failed.span
+
+/// A match with one hole.
+fn Failed.holding(self, head: usize, last: usize, take hole: Hole) -> Matched {
+    var holes = mem::List[Hole].empty(self.alloc)
+    mut holes.push(take hole)
+    return Matched(head: head, last: last, holes: take holes)
+} Failed.holding
+
+/// A match with two holes.
+fn Failed.holding_two(
+    self,
+    head: usize,
+    last: usize,
+    take hole: Hole,
+    take other: Hole,
+    ) -> Matched {
+    var holes = mem::List[Hole].empty(self.alloc)
+    mut holes.push(take hole)
+    mut holes.push(take other)
+    return Matched(head: head, last: last, holes: take holes)
+} Failed.holding_two
+
+/// `a && b`, `a || b` and `a..b`: the operator after an operand.
+fn Failed.between(self, operator: Foreign, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not file.is_foreign(self.at, spelt: operator) {
+        return None
+    }
+    let Some(left) = self.operand_before(file) else {
+        return None
+    }
+    let Some(right) = self.derived(Rule.PrefixExpr, start: self.after(file), file, grammar) else {
+        return None
+    }
+    let Spelt(at: head, written: a) = left
+    let Spelt(at: last, written: b) = right
+    return Some(self.holding_two(head, last, hole: Hole(name: 'a', value: take a), other: Hole(name: 'b', value: take b)))
+} Failed.between
+
+/// `|| e` where an operand is expected.
+fn Failed.empty_closure(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not (file.is_foreign(self.at, spelt: Foreign.PipePipe) and self.expects(Rule.PrefixExpr, grammar)) {
+        return None
+    }
+    let Some(operand) = self.derived(Rule.PrefixExpr, start: self.after(file), file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: e) = operand
+    return Some(self.holding(self.at, last, hole: Hole(name: 'e', value: take e)))
+} Failed.empty_closure
+
+/// `|x|` where an operand is expected.
+fn Failed.bar_closure(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let name = self.after(file)
+    let closing_bar = file.next(name + 1)
+    let found = file.is_punct(self.at, punct: Punct.Pipe) and self.expects(Rule.PrefixExpr, grammar) and file.is_kind(name, kind: TokenKind.Ident) and file.is_punct(closing_bar, punct: Punct.Pipe)
+    if not found {
+        return None
+    }
+    return Some(self.span(self.at, last: closing_bar))
+} Failed.bar_closure
+
+/// `assert!(e)` where a statement is expected.
+fn Failed.assert_macro(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let bang = self.after(file)
+    let open = file.next(bang + 1)
+    let found = file.is_keyword(self.at, keyword: Keyword.Assert) and self.expects(Rule.Stmt, grammar) and file.is_foreign(bang, spelt: Foreign.Bang) and file.is_punct(open, punct: Punct.LParen)
+    if not found {
+        return None
+    }
+    let Some(inner) = self.enclosed(file.next(open + 1), closer: Punct.RParen, file, grammar) else {
+        return None
+    }
+    let Spelt(at: close, written: e) = inner
+    return Some(self.holding(self.at, last: close, hole: Hole(name: 'e', value: take e)))
+} Failed.assert_macro
+
+/// `name!(a, b)` at the start of a statement.
+fn Failed.assert_pair(self, name: Str, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(statement) = self.statement_identifier(file) else {
+        return None
+    }
+    let open = self.after(file)
+    let found = file.is_ident(statement, spelt: name) and file.is_foreign(self.at, spelt: Foreign.Bang) and file.is_punct(open, punct: Punct.LParen)
+    if not found {
+        return None
+    }
+    let Some(left) = self.enclosed(file.next(open + 1), closer: Punct.Comma, file, grammar) else {
+        return None
+    }
+    let Spelt(at: comma, written: a) = left
+    let Some(right) = self.enclosed(file.next(comma + 1), closer: Punct.RParen, file, grammar) else {
+        return None
+    }
+    let Spelt(at: close, written: b) = right
+    return Some(self.holding_two(statement, last: close, hole: Hole(name: 'a', value: take a), other: Hole(name: 'b', value: take b)))
+} Failed.assert_pair
+
+/// `todo!(t)`, or with `keyword` false `unimplemented!(t)`.
+fn Failed.todo_macro(self, keyword: bool, file: SourceFile) -> Option[Matched] {
+    let Some(name) = file.previous(self.at) else {
+        return None
+    }
+    var named = file.is_ident(name, spelt: "unimplemented")
+    if keyword {
+        named = file.is_keyword(name, keyword: Keyword.Todo)
+    }
+    let open = self.after(file)
+    let message = file.next(open + 1)
+    let close = file.next(message + 1)
+    let found = named and file.is_foreign(self.at, spelt: Foreign.Bang) and file.is_punct(open, punct: Punct.LParen) and file.is_kind(message, kind: TokenKind.Text) and file.is_punct(close, punct: Punct.RParen)
+    if not found {
+        return None
+    }
+    return Some(self.holding(name, last: close, hole: Hole(name: 't', value: text::String.of(file.text(message), alloc: self.alloc))))
+} Failed.todo_macro
+
+/// `x!` after an identifier.
+fn Failed.macro_name(self, file: SourceFile) -> Option[Matched] {
+    let Some(name) = file.previous(self.at) else {
+        return None
+    }
+    if not file.is_kind(name, kind: TokenKind.Ident) or not file.is_foreign(self.at, spelt: Foreign.Bang) {
+        return None
+    }
+    return Some(self.span(name, last: self.at))
+} Failed.macro_name
+
+/// `!e` where an operand is expected.
+fn Failed.bang_operand(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not (file.is_foreign(self.at, spelt: Foreign.Bang) and self.expects(Rule.PrefixExpr, grammar)) {
+        return None
+    }
+    let Some(operand) = self.derived(Rule.PrefixExpr, start: self.after(file), file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: e) = operand
+    return Some(self.holding(self.at, last, hole: Hole(name: 'e', value: take e)))
+} Failed.bang_operand
+
+/// `a === b` and `a !== b`: an `=` directly after `operator`.
+fn Failed.tripled(self, operator: Punct, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(operator_at) = file.previous(self.at) else {
+        return None
+    }
+    let found = file.is_punct(self.at, punct: Punct.Eq) and file.is_punct(operator_at, punct: operator) and file.adjacent(self.at)
+    if not found {
+        return None
+    }
+    let Some(head) = self.operand_ending_at(operator_at) else {
+        return None
+    }
+    let Some(before) = file.previous(operator_at) else {
+        return None
+    }
+    let a = self.text(head, last: before, file)
+    let Some(right) = self.derived(Rule.PrefixExpr, start: self.after(file), file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: b) = right
+    return Some(self.holding_two(head, last, hole: Hole(name: 'a', value: take a), other: Hole(name: 'b', value: take b)))
+} Failed.tripled
+
+/// `c?` after an operand ending in a call, with no operand after it.
+fn Failed.question_call(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not file.is_foreign(self.at, spelt: Foreign.Question) {
+        return None
+    }
+    let Some(operand) = self.operand_before(file) else {
+        return None
+    }
+    let operand_after = self.longest(Rule.PrefixExpr, start: self.after(file), file, grammar).is_some()
+    let Some(before) = file.previous(self.at) else {
+        return None
+    }
+    let Spelt(at: head, written: c) = operand
+    if operand_after or not self.ends_in_call(head, last: before, file) {
+        return None
+    }
+    return Some(self.holding(head, last: self.at, hole: Hole(name: 'c', value: take c)))
+} Failed.question_call
+
+/// The foreign token alone, anywhere.
+fn Failed.alone(self, spelt: Foreign, file: SourceFile) -> Option[Matched] {
+    if not file.is_foreign(self.at, spelt) {
+        return None
+    }
+    return Some(self.span(self.at, last: self.at))
+} Failed.alone
+
+/// `;` ending its logical line, or with `ends_line` false followed by more of it.
+fn Failed.semicolon(self, ends_line: bool, file: SourceFile) -> Option[Matched] {
+    if not file.is_foreign(self.at, spelt: Foreign.Semi) or file.is_kind(self.after(file), kind: TokenKind.Nl) != ends_line {
+        return None
+    }
+    return Some(self.span(self.at, last: self.at))
+} Failed.semicolon
+
+/// `let mut x`.
+fn Failed.let_mut(self, file: SourceFile) -> Option[Matched] {
+    let Some(binding) = file.previous(self.at) else {
+        return None
+    }
+    if not file.is_keyword(binding, keyword: Keyword.Let) {
+        return None
+    }
+    let name = self.after(file)
+    if not file.is_keyword(self.at, keyword: Keyword.Mut) or not file.is_kind(name, kind: TokenKind.Ident) {
+        return None
+    }
+    return Some(self.holding(binding, last: name, hole: Hole(name: 'x', value: text::String.of(file.text(name), alloc: self.alloc))))
+} Failed.let_mut
+
+/// `x := e` at the start of a statement.
+fn Failed.walrus(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(statement) = self.statement_identifier(file) else {
+        return None
+    }
+    let equals = self.after(file)
+    if not (file.is_punct(self.at, punct: Punct.Colon) and file.is_punct(equals, punct: Punct.Eq)) {
+        return None
+    }
+    let Some(operand) = self.derived(Rule.PrefixExpr, start: file.next(equals + 1), file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: e) = operand
+    let x = text::String.of(file.text(statement), alloc: self.alloc)
+    return Some(self.holding_two(statement, last, hole: Hole(name: 'x', value: take x), other: Hole(name: 'e', value: take e)))
+} Failed.walrus
+
+/// `e as T` after an operand.
+fn Failed.cast(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not file.is_ident(self.at, spelt: "as") {
+        return None
+    }
+    let Some(operand) = self.operand_before(file) else {
+        return None
+    }
+    let Some(target) = self.derived(Rule.TypeExpr, start: self.after(file), file, grammar) else {
+        return None
+    }
+    let Spelt(at: head, written: e) = operand
+    let Spelt(at: last, written: written_type) = target
+    return Some(self.holding_two(head, last, hole: Hole(name: 'e', value: take e), other: Hole(name: 'T', value: take written_type)))
+} Failed.cast
+
+/// `&mut e`, or with `marked` false `&e`, where an operand is expected.
+fn Failed.reference(self, marked: bool, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let mutable = file.is_keyword(self.after(file), keyword: Keyword.Mut)
+    if not (file.is_punct(self.at, punct: Punct.Amp) and self.expects(Rule.PrefixExpr, grammar) and mutable == marked) {
+        return None
+    }
+    var start = self.after(file)
+    if marked {
+        start = file.next(self.after(file) + 1)
+    }
+    let Some(operand) = self.derived(Rule.PrefixExpr, start, file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: e) = operand
+    return Some(self.holding(self.at, last, hole: Hole(name: 'e', value: take e)))
+} Failed.reference
+
+/// `&mut self`, or with `marked` false `&self`, where a parameter is expected.
+fn Failed.self_reference(self, marked: bool, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let mutable = file.is_keyword(self.after(file), keyword: Keyword.Mut)
+    var receiver = self.after(file)
+    if mutable {
+        receiver = file.next(self.after(file) + 1)
+    }
+    let found = file.is_punct(self.at, punct: Punct.Amp) and self.expects(Rule.Param, grammar) and mutable == marked and file.is_keyword(receiver, keyword: Keyword.SelfValue)
+    if not found {
+        return None
+    }
+    return Some(self.span(self.at, last: receiver))
+} Failed.self_reference
+
+/// `x: &mut T`, or with `marked` false `x: &T`, where a parameter's type is expected.
+fn Failed.typed_reference(self, marked: bool, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(colon) = file.previous(self.at) else {
+        return None
+    }
+    let Some(name) = file.previous(colon) else {
+        return None
+    }
+    let mutable = file.is_keyword(self.after(file), keyword: Keyword.Mut)
+    let in_param = match self.type_expecting(grammar) {
+        Some(Rule.Param) or Some(Rule.FnTypeParam) => true
+        else => false
+    }
+    let found = file.is_punct(self.at, punct: Punct.Amp) and in_param and file.is_punct(colon, punct: Punct.Colon) and file.is_kind(name, kind: TokenKind.Ident) and mutable == marked
+    if not found {
+        return None
+    }
+    var start = self.after(file)
+    if marked {
+        start = file.next(self.after(file) + 1)
+    }
+    let Some(target) = self.derived(Rule.TypeExpr, start, file, grammar) else {
+        return None
+    }
+    let Spelt(at: last, written: written_type) = target
+    let x = text::String.of(file.text(name), alloc: self.alloc)
+    return Some(self.holding_two(name, last, hole: Hole(name: 'x', value: take x), other: Hole(name: 'T', value: take written_type)))
+} Failed.typed_reference
+
+/// `*e` where an operand is expected.
+fn Failed.dereference(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not (file.is_punct(self.at, punct: Punct.Star) and self.expects(Rule.PrefixExpr, grammar)) {
+        return None
+    }
+    return Some(self.span(self.at, last: self.at))
+} Failed.dereference
+
+/// `c.await` after a call; a failure marker before `c` stays before the rewrite's `await`.
+fn Failed.dot_await(self, file: SourceFile) -> Option[Matched] {
+    let Some(dot) = file.previous(self.at) else {
+        return None
+    }
+    if not file.is_punct(dot, punct: Punct.Dot) {
+        return None
+    }
+    let Some(head) = self.marked_call_start() else {
+        return None
+    }
+    let Some(call_end) = file.previous(dot) else {
+        return None
+    }
+    if not (file.is_keyword(self.at, keyword: Keyword.Await) and self.ends_in_call(head, last: call_end, file)) {
+        return None
+    }
+    let failure_marker = match file.tokens[head].kind {
+        TokenKind.Keyword(Keyword.Try) or TokenKind.Keyword(Keyword.Attempt) => true
+        else => false
+    }
+    var marker = text::String.empty(self.alloc)
+    var call = head
+    if failure_marker {
+        mut marker.append(file.text(head))
+        mut marker.push(' ')
+        call = file.next(head + 1)
+    }
+    let c = self.text(call, last: call_end, file)
+    return Some(self.holding_two(head, last: self.at, hole: Hole(name: 'm', value: take marker), other: Hole(name: 'c', value: take c)))
+} Failed.dot_await
+
+/// `p++`: a `+` directly after a `+` that follows a place.
+fn Failed.increment(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(plus) = file.previous(self.at) else {
+        return None
+    }
+    if not (file.is_punct(plus, punct: Punct.Plus) and file.adjacent(self.at)) {
+        return None
+    }
+    if not file.is_punct(self.at, punct: Punct.Plus) {
+        return None
+    }
+    return self.after_place(plus, file, grammar)
+} Failed.increment
+
+/// `p--` after a place.
+fn Failed.decrement(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not file.is_foreign(self.at, spelt: Foreign.MinusMinus) {
+        return None
+    }
+    return self.after_place(self.at, file, grammar)
+} Failed.decrement
+
+/// The place ending before `operator` and the tokens after it up to the failing one.
+fn Failed.after_place(self, operator: usize, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(head) = self.operand_ending_at(operator) else {
+        return None
+    }
+    let Some(last) = file.previous(operator) else {
+        return None
+    }
+    if not self.is_place(head, end: operator, file, grammar) {
+        return None
+    }
+    return Some(self.holding(head, last: self.at, hole: Hole(name: 'p', value: self.text(head, last, file))))
+} Failed.after_place
+
+/// `p->x` after a place.
+fn Failed.arrow_member(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    if not file.is_punct(self.at, punct: Punct.Arrow) {
+        return None
+    }
+    let Some(operand) = self.operand_before(file) else {
+        return None
+    }
+    let name = self.after(file)
+    let Spelt(at: head, written: p) = operand
+    if not self.is_place(head, end: self.at, file, grammar) or not file.is_kind(name, kind: TokenKind.Ident) {
+        return None
+    }
+    let x = text::String.of(file.text(name), alloc: self.alloc)
+    return Some(self.holding_two(head, last: name, hole: Hole(name: 'p', value: take p), other: Hole(name: 'x', value: take x)))
+} Failed.arrow_member
+
+/// The replacement a rewrite stated in words makes.
+fn Failed.worded(self, worded: Worded, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    return match worded {
+        Worded.SemicolonDeleted => self.semicolon_deleted(matched, file)
+        Worded.SemicolonBroken => self.semicolon_broken(matched, file)
+        Worded.UnitResultDeleted => self.unit_result_deleted(matched, file)
+    }
+} Failed.worded
+
+/// The rewrite of a `;` ending its logical line: it and the spaces before it deleted.
+fn Failed.semicolon_deleted(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    let token = file.tokens[matched.head]
+    return diagnostic::Replacement(start: file.spaces_before(token.start), end: token.end, text: text::String.empty(self.alloc))
+} Failed.semicolon_deleted
+
+/// The rewrite of a `;` followed by more of its logical line: it and the spaces after it
+/// replaced by a line break and the indentation of its line.
+fn Failed.semicolon_broken(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    let token = file.tokens[matched.head]
+    let line = file.lines[usize.widen(token.line) - 1]
+    var written = text::String.empty(self.alloc)
+    mut written.push('\n')
+    var at = usize.widen(line.start)
+    while at < file.source.len() and file.source[at] == b' ' {
+        mut written.push(' ')
+        at += 1
+    }
+    return diagnostic::Replacement(start: token.start, end: file.tokens[self.after(file)].start, text: take written)
+} Failed.semicolon_broken
+
+/// The rewrite of `-> ()`: the matched text and the space before it deleted.
+fn Failed.unit_result_deleted(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    return diagnostic::Replacement(start: file.spaces_before(file.tokens[matched.head].start), end: file.tokens[matched.last].end, text: text::String.empty(self.alloc))
+} Failed.unit_result_deleted
+
+/// `-> ()` where a function's result type is expected.
+fn Failed.unit_result(self, file: SourceFile, grammar: Grammar) -> Option[Matched] {
+    let Some(arrow) = file.previous(self.at) else {
+        return None
+    }
+    if not file.is_punct(arrow, punct: Punct.Arrow) {
+        return None
+    }
+    let close = self.after(file)
+    let found = file.is_punct(self.at, punct: Punct.LParen) and self.type_expecting(grammar) == Some(Rule.FnResult) and file.is_punct(close, punct: Punct.RParen)
+    if not found {
+        return None
+    }
+    return Some(self.span(arrow, last: close))
+} Failed.unit_result

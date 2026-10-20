@@ -12,6 +12,8 @@ use super::super::trap::{Form, Operands};
 use super::super::{Lowering, abi::Repr};
 use super::Supply;
 use crate::check::db::TypeKey;
+use crate::check::lowlevel::{BitsKind, LayoutShape};
+use crate::check::sig::SigKind;
 use crate::check::ty::{Scalar, Ty};
 use crate::nir::{
     BitConversion, BitsOwner, BlockId, Callable, Conversion, FnRef, NTy, Operand, Value as NirValue,
@@ -354,7 +356,10 @@ pub fn bits(
         .map(|result| body.nty(result).ty().clone())
         .unwrap_or(Ty::Unit);
     match conversion {
-        BitConversion::To => Held::Scalar(to_bits(body.fx, value.scalar())),
+        BitConversion::To => match value {
+            Held::Scalar(value) => Held::Scalar(to_bits(body.fx, value)),
+            _ => value,
+        },
         BitConversion::From => {
             let target = body.lo.owned_repr(&owner_ty);
             match target {
@@ -418,40 +423,46 @@ fn valid_bits(body: &mut Body, ty: &Ty, bits: Value) -> Value {
             let not_surrogate = body.fx.b.ins().bxor_imm_s(surrogate, 1);
             body.fx.b.ins().band(below, not_surrogate)
         }
-        Ty::Item(..) => {
-            let layout = body.lo.layout(ty);
-            match &layout.niche {
-                Some(niche) => {
-                    let mut valid = body.fx.int(types::I8, 1);
-                    if let super::super::layout::NicheKind::Except(values) = &niche.kind {
-                        let field = if niche.bit == 0 {
-                            bits
-                        } else {
-                            body.fx.b.ins().ushr_imm_s(bits, i64::from(niche.bit))
-                        };
-                        let field = if niche.width >= 64 {
-                            field
-                        } else {
-                            body.fx
-                                .b
-                                .ins()
-                                .band_imm_s(field, ((1u128 << niche.width) - 1) as i64)
-                        };
-                        valid = body.fx.int(types::I8, 0);
-                        for value in values.iter() {
-                            let same =
-                                body.fx
-                                    .b
-                                    .ins()
-                                    .icmp_imm_s(IntCC::Equal, field, *value as i64);
-                            valid = body.fx.b.ins().bor(valid, same);
-                        }
-                    }
-                    valid
+        Ty::Item(item, _) => match body.lo.ck.layout_shape(*item) {
+            Some(LayoutShape::Tags(values)) => {
+                let mut valid = body.fx.int(types::I8, 0);
+                for value in values {
+                    let same = body.fx.b.ins().icmp_imm_s(IntCC::Equal, bits, value as i64);
+                    valid = body.fx.b.ins().bor(valid, same);
                 }
-                None => body.fx.int(types::I8, 1),
+                valid
             }
-        }
+            Some(LayoutShape::Fields(fields)) => {
+                let types: Vec<Ty> = match &body.lo.ck.sig(*item).kind {
+                    SigKind::Layout { fields, .. } => {
+                        fields.iter().map(|field| field.ty.clone()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let mut valid = body.fx.int(types::I8, 1);
+                for (field, field_ty) in fields.iter().zip(&types) {
+                    if field.kind != BitsKind::Typed || !matches!(field_ty, Ty::Item(..)) {
+                        continue;
+                    }
+                    let shifted = match field.low {
+                        0 => bits,
+                        low => body.fx.b.ins().ushr_imm_s(bits, i64::from(low)),
+                    };
+                    let field_bits = match field.width {
+                        64.. => shifted,
+                        width => body
+                            .fx
+                            .b
+                            .ins()
+                            .band_imm_s(shifted, ((1u64 << width) - 1) as i64),
+                    };
+                    let held = valid_bits(body, field_ty, field_bits);
+                    valid = body.fx.b.ins().band(valid, held);
+                }
+                valid
+            }
+            None => body.fx.int(types::I8, 1),
+        },
         _ => body.fx.int(types::I8, 1),
     }
 }

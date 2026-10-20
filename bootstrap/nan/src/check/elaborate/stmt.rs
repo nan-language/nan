@@ -20,20 +20,26 @@ use crate::syntax::ast::{self, Mode, Tok};
 /// The state of one branch at its end: the open block, the value it yields and what it moved.
 pub struct ArmEnd {
     pub block: Option<BlockId>,
-    pub value: Option<Operand>,
+    pub value: Option<Yielded>,
     pub moved: BTreeSet<Place>,
+}
+
+/// What a branch yields: a value, or a part it names in place.
+pub enum Yielded {
+    Value(Operand),
+    Part(Place),
 }
 
 impl Elab<'_, '_> {
     /// The code of a function or test body, ending a `Unit` body with its exit.
     pub fn function_root(&mut self, root: &TExpr) -> Elaborated<()> {
+        if self.projection && branches(root) {
+            self.expr(&returned_in_branches(root))?;
+            return Ok(());
+        }
         let out = self.expr(root)?;
         if self.b.open() {
-            let value = match out {
-                Out::Operand(operand) => Some(operand),
-                Out::Place(place) => Some(self.take_place(place, &root.ty, Self::spanning(root))),
-                Out::Never => None,
-            };
+            let value = self.argument(out, root, Mode::Take);
             let end = match &root.kind {
                 TKind::Block(block) => block.end,
                 _ => root.token,
@@ -84,6 +90,9 @@ impl Elab<'_, '_> {
                     self.held.insert(*local, Held::Value(bound));
                 }
             }
+            TStmtKind::Var { local, value } if branches(value) => {
+                self.branch_binding(*local, value, span)?;
+            }
             TStmtKind::Var { local, value } => {
                 let ty = self.body.local(*local).ty.clone();
                 let slot = self.binding_slot(*local, &ty, span);
@@ -93,7 +102,16 @@ impl Elab<'_, '_> {
                 }
             }
             TStmtKind::Discard(value) => {
-                if let Some(operand) = self.operand(value)?
+                let operand = match self.expr(value)? {
+                    // A place reached through a reference, a part included, ends with its owner.
+                    Out::Place(place) if self.b.ty(place.root).is_reference() => None,
+                    Out::Place(place) => {
+                        Some(self.take_place(place, &value.ty, Self::spanning(value)))
+                    }
+                    Out::Operand(operand) => Some(operand),
+                    Out::Never => None,
+                };
+                if let Some(operand) = operand
                     && !self.ck.nir_copy(&value.ty)
                     && !self.ck.nir_view(&value.ty)
                     && let Operand::Value(discarded) = operand
@@ -223,23 +241,29 @@ impl Elab<'_, '_> {
         )
     }
 
-    /// Whether a `let` binding is a value: Copy, or bound to a part or wrapped part.
+    /// Whether a `let` binding is a value: Copy, or bound to a part, a wrapped part or a place
+    /// reached through a reference.
     fn binds_value(&self, local: LocalId, value: &TExpr) -> bool {
         let ty = &self.body.local(local).ty;
-        self.ck.nir_copy(ty) || is_part(value) || self.view_binding(value)
+        self.ck.nir_copy(ty) || is_part(value) || self.borrowed_path(value)
     }
 
-    /// Whether a `var` binding is a view binding, naming what its initialiser names: a part or
-    /// view binding that is not Copy.
+    /// Whether a `var` binding is a view binding, naming what its initialiser names: a part, or
+    /// a place reached through a reference, that is not Copy.
     fn views(&self, local: LocalId, value: &TExpr) -> bool {
         let ty = &self.body.local(local).ty;
-        !self.ck.nir_copy(ty) && (is_part(value) || self.view_binding(value))
+        !self.ck.nir_copy(ty) && (is_part(value) || self.borrowed_path(value))
     }
 
-    /// Whether an expression names a view binding: a local bound to a reference.
-    fn view_binding(&self, value: &TExpr) -> bool {
-        matches!(&value.kind, TKind::Local(local)
-            if matches!(self.held.get(local), Some(Held::Value(bound)) if self.b.ty(*bound).is_reference()))
+    /// Whether an expression names a place reached through a reference: a local bound to one,
+    /// or a field path from such a local.
+    fn borrowed_path(&self, value: &TExpr) -> bool {
+        match &value.kind {
+            TKind::Local(local) => matches!(self.held.get(local),
+                Some(Held::Value(bound)) if self.b.ty(*bound).is_reference()),
+            TKind::Field { base, .. } => self.borrowed_path(base),
+            _ => false,
+        }
     }
 
     fn let_stmt(
@@ -258,6 +282,9 @@ impl Elab<'_, '_> {
                     self.held.insert(local, Held::Value(bound));
                 }
                 return Ok(());
+            }
+            if branches(value) {
+                return self.branch_binding(local, value, span);
             }
             let ty = self.body.local(local).ty.clone();
             let slot = self.binding_slot(local, &ty, span);
@@ -680,6 +707,12 @@ impl Elab<'_, '_> {
 
     /// `return e`: its value, the exit of every scope, then the function's return exit.
     pub fn return_expr(&mut self, value: Option<&TExpr>, token: Tok) -> Elaborated<()> {
+        if self.projection
+            && let Some(value) = value.filter(|value| branches(value))
+        {
+            self.expr(&returned_in_branches(value))?;
+            return Ok(());
+        }
         let operand = match value {
             Some(value) => match self.arg(value, Mode::Take)? {
                 Some(operand) => Some(operand),
@@ -925,8 +958,13 @@ impl Elab<'_, '_> {
     /// `temps`, its open block and moved places.
     pub fn arm_end(&mut self, out: Out, ty: &Ty, token: Tok, temps: usize) -> Elaborated<ArmEnd> {
         let value = match out {
-            Out::Operand(operand) => Some(operand),
-            Out::Place(place) => Some(self.take_place(place, ty, Self::span(token))),
+            Out::Operand(operand) => Some(Yielded::Value(operand)),
+            Out::Place(place) if self.borrowed_part(&place, ty) => Some(Yielded::Part(place)),
+            Out::Place(place) => Some(Yielded::Value(self.take_place(
+                place,
+                ty,
+                Self::span(token),
+            ))),
             Out::Never => None,
         };
         self.release_temps(temps, token);
@@ -939,7 +977,8 @@ impl Elab<'_, '_> {
 
     /// Joins branches: each releases what it still holds of the parts of slots another moved,
     /// of the whole value of a variant payload part, then jumps to the join, passing its value
-    /// when the branches yield one.
+    /// when the branches yield one: a reference when each yields a part, which the join then
+    /// names in place.
     pub fn join(&mut self, arms: Vec<ArmEnd>, ty: &Ty, span: Span) -> Elaborated<Out> {
         let live: Vec<ArmEnd> = arms.into_iter().filter(|arm| arm.block.is_some()).collect();
         if live.is_empty() {
@@ -962,7 +1001,15 @@ impl Elab<'_, '_> {
             .collect();
         let join = self.b.block();
         let yields = !matches!(ty, Ty::Unit | Ty::Never);
-        let param = yields.then(|| self.b.block_param(join, NTy::Owned(ty.clone())));
+        let parts = yields
+            && live
+                .iter()
+                .all(|arm| matches!(arm.value, Some(Yielded::Part(_))));
+        let held = match parts {
+            true => NTy::Ref(ty.clone()),
+            false => NTy::Owned(ty.clone()),
+        };
+        let param = yields.then(|| self.b.block_param(join, held));
         for arm in live {
             self.b.at(arm.block.expect("a live branch"));
             self.moved = arm.moved.clone();
@@ -972,7 +1019,16 @@ impl Elab<'_, '_> {
                 self.moved.insert(place.clone());
             }
             let args = match (yields, arm.value) {
-                (true, Some(value)) => vec![value],
+                (true, Some(Yielded::Value(value))) => vec![value],
+                (true, Some(Yielded::Part(place))) if parts => {
+                    let reference = NTy::Ref(ty.clone());
+                    vec![Operand::Value(self.emit_value(
+                        Op::Ref(place),
+                        reference,
+                        span,
+                    ))]
+                }
+                (true, Some(Yielded::Part(place))) => vec![self.take_place(place, ty, span)],
                 _ => Vec::new(),
             };
             self.b.jump(join, args, span);
@@ -981,9 +1037,38 @@ impl Elab<'_, '_> {
         self.moved.extend(released);
         self.b.at(join);
         Ok(match param {
+            Some(param) if parts => Out::Place(Place::of(param)),
             Some(param) => Out::Operand(Operand::Value(param)),
             None => Out::Operand(Operand::Literal(Literal::Unit)),
         })
+    }
+
+    /// Whether a place a branch yields is a part it names in place: one that is not Copy, reached
+    /// through a reference.
+    pub fn borrowed_part(&self, place: &Place, ty: &Ty) -> bool {
+        !self.ck.nir_copy(ty) && self.b.ty(place.root).is_reference()
+    }
+
+    /// A `let` or `var` binding of an `if` or `match` value: a view binding of the part its
+    /// branches name, or else a binding owning the value they move in.
+    fn branch_binding(&mut self, local: LocalId, value: &TExpr, span: Span) -> Elaborated<()> {
+        match self.expr(value)? {
+            Out::Never => {}
+            Out::Place(place) if self.borrowed_part(&place, &value.ty) => {
+                let reference = NTy::Ref(value.ty.clone());
+                let bound = self.emit_value(Op::Ref(place), reference, span);
+                self.held.insert(local, Held::Value(bound));
+            }
+            out => {
+                let ty = self.body.local(local).ty.clone();
+                let slot = self.binding_slot(local, &ty, span);
+                if let Some(operand) = self.argument(out, value, Mode::Take) {
+                    self.emit(Op::Init(Place::of(slot), operand), span);
+                    self.hold(slot);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1012,14 +1097,66 @@ fn before_variant(place: &Place) -> Place {
     }
 }
 
-/// Whether an expression is a part or wrapped part: a projection's result or a path of fields
-/// from one.
+/// Whether an expression is a part or wrapped part: a projection's result, a path of fields
+/// from one, or a construction of a wrapped part.
 pub fn is_part(expr: &TExpr) -> bool {
     match &expr.kind {
         TKind::Index(_) => true,
         TKind::Call(call) => call.proj,
+        TKind::Construct { wrapped, .. } => *wrapped,
         TKind::Field { base, .. } => is_part(base),
         _ => false,
+    }
+}
+
+/// Whether a returned expression yields its value through branches: an `if` or a `match`.
+fn branches(value: &TExpr) -> bool {
+    matches!(value.kind, TKind::If { .. } | TKind::Match { .. })
+}
+
+/// A returned `if` or `match` whose branches each return their value, as a projection returns
+/// its result in the form its head gives.
+fn returned_in_branches(value: &TExpr) -> TExpr {
+    let mut returned = value.clone();
+    return_branches(&mut returned);
+    returned
+}
+
+/// Makes each branch of a value-yielding expression return its value.
+fn return_branches(expr: &mut TExpr) {
+    match &mut expr.kind {
+        TKind::If {
+            then, otherwise, ..
+        } => {
+            return_tail(then);
+            if let Some(otherwise) = otherwise {
+                return_branches(otherwise);
+            }
+        }
+        TKind::Match { arms, .. } => {
+            for arm in arms {
+                return_branches(&mut arm.body);
+            }
+        }
+        TKind::Block(block) => return_tail(block),
+        _ if expr.ty.is_never() => return,
+        _ => {
+            let value = std::mem::replace(expr, TExpr::failed(expr.token));
+            expr.last = value.last;
+            expr.kind = TKind::Return(Some(Box::new(value)));
+        }
+    }
+    expr.ty = Ty::Never;
+}
+
+/// Makes the value a block yields, its last statement's, return.
+fn return_tail(block: &mut TBlock) {
+    if let Some(TStmt {
+        kind: TStmtKind::Expr(tail),
+        ..
+    }) = block.stmts.last_mut()
+    {
+        return_branches(tail);
     }
 }
 

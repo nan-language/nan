@@ -1,0 +1,270 @@
+//! Hashing in interpreter runs: the bytes core hashing and derived hashes write to a hasher, each write a call of the hasher's `write`.
+
+/// What one hashing writes to: the hasher and its type.
+struct Hashing {
+    hasher: Val
+    ty: ty::Ty
+    at: ItemSpan
+    site: RunSite
+} Hashing
+
+/// The hash core writes for a value of a type, `args` holding the value and the hasher, whose
+/// type is `hasher` or, when not given, the type of its value.
+fn Interpreter.hash_builtin(
+    mut self,
+    ty: ty::Ty,
+    hasher: Option[ty::Ty],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) fails End {
+    let hasher_ty = match hasher {
+        Some(given) => given
+        None => self.hasher_type(args[1])
+    }
+    let hashing = Hashing(hasher: args[1].copy(self.alloc), ty: hasher_ty, at: at, site: site)
+    let value = self.deref(args[0])
+    try mut self.hash_core(value, ty, hashing)
+} Interpreter.hash_builtin
+
+/// The hash a derive writes: a struct's fields in byte order of their names, or an enum's
+/// variant name with its length, then its payload values, labelled ones in byte order of
+/// labels.
+fn Interpreter.hash_derived(
+    mut self,
+    owner: ty::ItemId,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) fails End {
+    let alloc = self.alloc
+    let hashing = Hashing(hasher: args[1].copy(alloc), ty: self.hasher_type(args[1]), at: at, site: site)
+    let value = self.deref(args[0])
+    let ck = self.ck.share()
+    let types = ck.types()
+    let sig = ck.sig(owner)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: type_args, alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            let parts = value.fields()
+            var order = mem::List[usize].empty(alloc)
+            for index in 0..<fields.len() {
+                if index < parts.len() {
+                    mut order.push(index)
+                }
+            }
+            mut order.sort_by(fn(left: usize, right: usize) => fields[left].name.as_str().cmp(fields[right].name.as_str()))
+            for index in order {
+                try mut self.hash_value(parts[index], ty: subst.ty(types, ty: fields[index].ty), hashing)
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            let Val.Variant(item: _, index: chosen, fields: payload) = value else {
+                expect false
+                return
+            }
+            let variant = variants[usize.widen(chosen)]
+            var name = mem::Bytes.empty(alloc)
+            push_le_bytes(mut name, bits: u64.widen(variant.name.byte_len()), width: 8)
+            mut name.append(variant.name.as_bytes())
+            try mut self.hash_write(hashing, bytes: name.view())
+            let parts = payload.contents()
+            match variant.payload {
+                Payload.None => {}
+                Payload.Single(single) => try mut self.hash_value(parts[0], ty: subst.ty(types, ty: single), hashing)
+                Payload.Labelled(labels) => {
+                    var order = mem::List[usize].empty(alloc)
+                    for index in 0..<labels.len() {
+                        if index < parts.len() {
+                            mut order.push(index)
+                        }
+                    }
+                    mut order.sort_by(fn(left: usize, right: usize) => labels[left].name.as_str().cmp(labels[right].name.as_str()))
+                    for index in order {
+                        try mut self.hash_value(parts[index], ty: subst.ty(types, ty: labels[index].ty), hashing)
+                    }
+                }
+            }
+        }
+        else => {
+            expect false
+        }
+    }
+} Interpreter.hash_derived
+
+/// Appends the low `width` bytes of bits, least significant first.
+fn push_le_bytes(mut out: mem::Bytes, bits: u64, width: usize) {
+    for index in 0..<width {
+        mut out.push(u8.truncate(bits >> u32.truncate(8 * index)))
+    }
+} push_le_bytes
+
+/// The hash core writes for a value of a type whose `Hash` the toolchain supplies.
+fn Interpreter.hash_core(mut self, value: Val, ty: ty::Ty, hashing: Hashing) fails End {
+    let ck = self.ck.share()
+    match ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => {
+            var bytes = mem::Bytes.empty(self.alloc)
+            match scalar {
+                ty::Scalar.Bool => {
+                    if value.bool_value() {
+                        mut bytes.push(1)
+                    } else {
+                        mut bytes.push(0)
+                    }
+                }
+                ty::Scalar.Char => push_le_bytes(mut bytes, bits: value.int_value().low_bits(), width: 4)
+                else => push_le_bytes(mut bytes, bits: value.int_value().low_bits(), width: usize.widen(scalar.bits() / 8))
+            }
+            try mut self.hash_write(hashing, bytes: bytes.view())
+        }
+        ty::TyKind.Unit => {}
+        ty::TyKind.Item(item: item, args: args) => try mut self.hash_item(value, item, args, hashing)
+        else => fail End.Missing
+    }
+} Interpreter.hash_core
+
+/// The hash core writes for a value of a std type whose `Hash` the toolchain supplies.
+fn Interpreter.hash_item(mut self, value: Val, item: ty::ItemId, args: ty::Args, hashing: Hashing) fails End
+    waive length "one arm per std type, as core hashes them"
+{
+    let alloc = self.alloc
+    let ck = self.ck.share()
+    let listed = ck.types().arg_list(args)
+    var element = ty::Ty.unit()
+    if listed.len() > 0 {
+        element = listed[0].ty().value_or(ty::Ty.unit())
+    }
+    let path = ck.db().canonical(item)
+    match path.as_str() {
+        "core::Str" or "text::String" or "text::Fixed" => {
+            var bytes = mem::Bytes.empty(alloc)
+            if path.as_str() == "text::Fixed" {
+                let len = usize.widen(value.fields()[1].int_value().low_bits())
+                let Some(held) = value.fields()[0].fields().prefix(len) else {
+                    expect false
+                    return
+                }
+                for byte in held {
+                    mut bytes.push(u8.truncate(byte.int_value().low_bits()))
+                }
+            } else if path.as_str() == "text::String" {
+                for byte in self.entries(value) {
+                    mut bytes.push(u8.truncate(byte.int_value().low_bits()))
+                }
+            } else {
+                bytes = mut self.bytes(value)
+            }
+            var length = mem::Bytes.empty(alloc)
+            push_le_bytes(mut length, bits: u64.widen(bytes.len()), width: 8)
+            try mut self.hash_write(hashing, bytes: length.view())
+            try mut self.hash_write(hashing, bytes: bytes.view())
+        }
+        "core::Array" => {
+            for part in value.fields() {
+                try mut self.hash_value(part, ty: element, hashing)
+            }
+        }
+        "core::Slice" or "core::SliceMut" or "mem::List" or "mem::Bytes" or "mem::Set" or "mem::Bounded" => {
+            var elements = mem::List[Val].empty(alloc)
+            if path.as_str() == "core::Slice" or path.as_str() == "core::SliceMut" {
+                let view = mut self.view(value)
+                elements = self.view_values(view)
+            } else if path.as_str() == "mem::Bounded" {
+                elements = Val.copies(value.fields()[0].fields(), alloc)
+            } else {
+                elements = self.entries(value)
+            }
+            if path.as_str() == "mem::Bytes" {
+                element = ty::Ty.scalar(ty::Scalar.Unsigned8)
+            }
+            var length = mem::Bytes.empty(alloc)
+            push_le_bytes(mut length, bits: u64.widen(elements.len()), width: 8)
+            try mut self.hash_write(hashing, bytes: length.view())
+            for part in elements {
+                try mut self.hash_value(part, ty: element, hashing)
+            }
+        }
+        "mem::Map" or "mem::HashMap" => {
+            var value_ty = ty::Ty.unit()
+            if listed.len() > 1 {
+                value_ty = listed[1].ty().value_or(ty::Ty.unit())
+            }
+            let held = self.entries(value)
+            var length = mem::Bytes.empty(alloc)
+            push_le_bytes(mut length, bits: u64.widen(held.len()), width: 8)
+            try mut self.hash_write(hashing, bytes: length.view())
+            for entry in held {
+                try mut self.hash_value(entry.fields()[0], ty: element, hashing)
+                try mut self.hash_value(entry.fields()[1], ty: value_ty, hashing)
+            }
+        }
+        "mem::Id" => {
+            var bytes = mem::Bytes.empty(alloc)
+            push_le_bytes(mut bytes, bits: value.fields()[0].int_value().low_bits(), width: 4)
+            try mut self.hash_write(hashing, bytes: bytes.view())
+        }
+        "mem::Handle" => {
+            var index_bytes = mem::Bytes.empty(alloc)
+            push_le_bytes(mut index_bytes, bits: value.fields()[0].int_value().low_bits(), width: 4)
+            try mut self.hash_write(hashing, bytes: index_bytes.view())
+            var generation_bytes = mem::Bytes.empty(alloc)
+            push_le_bytes(mut generation_bytes, bits: value.fields()[1].int_value().low_bits(), width: 4)
+            try mut self.hash_write(hashing, bytes: generation_bytes.view())
+        }
+        else => fail End.Missing
+    }
+} Interpreter.hash_item
+
+/// Hashes a value of a type through its `Hash`.
+fn Interpreter.hash_value(mut self, value: Val, ty: ty::Ty, hashing: Hashing) fails End {
+    let alloc = self.alloc
+    let interface_item = self.ty_item("core", name: "Hash")
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    mut type_args.push(ty::Arg.Ty(ty))
+    mut type_args.push(ty::Arg.Ty(hashing.ty))
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: 0), args: self.ck.types().args(take type_args))
+    var args = Val.single(value.copy(alloc), alloc)
+    mut args.push(hashing.hasher.copy(alloc))
+    discard try mut self.call_function(fn_ref, take args, at: hashing.at, site: hashing.site)
+} Interpreter.hash_value
+
+/// Writes bytes to the hasher through its `write`.
+fn Interpreter.hash_write(mut self, hashing: Hashing, bytes: Slice[u8]) fails End {
+    let alloc = self.alloc
+    var values = mem::List[Val].empty(alloc)
+    mut values.reserve(bytes.len())
+    for byte in bytes {
+        mut values.push(Val.Int(wide::Wide.of_u64(u64.widen(byte))))
+    }
+    let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take values, alloc)), writable: false, size: u64.widen(bytes.len()))
+    let view = Val.View(View(array: Loc(extent: extent, path: mem::List[u32].empty(alloc)), start: 0, len: bytes.len()))
+    let interface_item = self.ty_item("core", name: "Hasher")
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    mut type_args.push(ty::Arg.Ty(hashing.ty))
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: 0), args: self.ck.types().args(take type_args))
+    var args = Val.single(hashing.hasher.copy(alloc), alloc)
+    mut args.push(take view)
+    match try mut self.call_function(fn_ref, take args, at: hashing.at, site: hashing.site) {
+        InterpFlow.Return(_) => {}
+        else => {
+            expect false
+        }
+    }
+} Interpreter.hash_write
+
+/// The type of a hasher value: its struct or enum without type arguments.
+fn Interpreter.hasher_type(self, hasher: Val) -> ty::Ty {
+    let value = self.deref(hasher)
+    match value {
+        Val.Struct(item: item, fields: _) or Val.Variant(item: item, index: _, fields: _) => return self.ck.types().item(item, args: mem::List[ty::Arg].empty(self.alloc))
+        else => {}
+    }
+    expect false
+    return ty::Ty.error()
+} Interpreter.hasher_type

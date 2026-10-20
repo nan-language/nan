@@ -1,0 +1,975 @@
+//! Generation: the constraints a generation obeys, read from the predicates of the structs it builds and the `requires` of a property test's target with visible transparent functions unfolded, and its generator gaps: conjuncts naming generated values that are not constructive, and constructive conjuncts no values satisfy.
+
+/// How deep transparent functions unfold inside one another.
+const UNFOLDING_DEPTH: usize = 8
+
+/// A generated value a name stands for: its path from the generation's roots, and its type.
+struct GeneratedValue {
+    path: text::String
+    ty: ty::Ty
+} GeneratedValue
+
+/// A drawn integer: its path, and the bounds of its values.
+struct Drawn {
+    path: text::String
+    low: wide::Wide
+    high: wide::Wide
+} Drawn
+
+/// A term of a conjunct.
+enum GenerationTerm {
+    Drawn(Drawn)
+    /// Integer literals, consts and const generic parameters joined by `+` and `-`, with its
+    /// value when each part's is known.
+    Constant(Option[wide::Wide])
+    Other
+} GenerationTerm
+
+/// A constructive conjunct: `left op right + offset`, without `right` for `left op offset`.
+struct Constructive {
+    left: Drawn
+    op: ast::BinaryOp
+    right: Option[Drawn]
+    offset: Option[wide::Wide]
+} Constructive
+
+/// The argument a parameter of an unfolded transparent function stands for, held as a copy,
+/// with the scope that argument is read in.
+struct ScopeArgument {
+    argument: ast::Expr
+    scope: usize
+} ScopeArgument
+
+/// Where the names of an expression are read: the item holding it, and for the body of an
+/// unfolded transparent function, the argument each parameter stands for with the scope that
+/// argument is read in.
+struct GenerationScope {
+    item: ty::ItemId
+    params: mem::Map[text::String, ScopeArgument]
+} GenerationScope
+
+/// The reading of the conjuncts of one struct's predicates, or of one target's requires: the
+/// generated values and const generic parameters their names stand for in the first scope.
+struct GenerationReader {
+    ck: Checker
+    scopes: mem::List[GenerationScope]
+    values: mem::Map[text::String, GeneratedValue]
+    consts: mem::Map[text::String, Option[wide::Wide]]
+} GenerationReader
+
+/// An edge of the difference bounds: `x[to] - x[from]` is at most `weight`.
+struct BoundEdge derives Copy {
+    from: usize
+    to: usize
+    weight: wide::Wide
+} BoundEdge
+
+/// A value an `a != c` excludes from a drawn integer, by its node.
+struct Excluded derives Copy {
+    node: usize
+    value: wide::Wide
+} Excluded
+
+/// The constraints of a generation as difference bounds over its drawn integers, numbered from 1
+/// with node 0 standing for zero: each drawn integer's path and type bounds; edges, each bounding
+/// `x[to] - x[from]` by `weight`, each `b + c` kept within the type of `b`; and the values each
+/// `a != c` excludes from `a`.
+struct Constraints {
+    drawn: mem::List[Drawn]
+    edges: mem::List[BoundEdge]
+    excluded: mem::List[Excluded]
+} Constraints
+
+/// A conjunct of a condition, held as a copy, with the scope it is read in.
+struct Conjunct {
+    expr: ast::Expr
+    scope: usize
+} Conjunct
+
+/// A summand of an expression joined by `+` and `-`, held as a copy, with its sign and the scope
+/// it is read in.
+struct Summand {
+    sign: wide::Wide
+    expr: ast::Expr
+    scope: usize
+} Summand
+
+/// The receiver of a call of a member without arguments, held as a copy, and the member's name.
+struct MemberCall {
+    receiver: ast::Expr
+    name: text::String
+} MemberCall
+
+fn GenerationReader.new(
+    ck: Checker,
+    item: ty::ItemId,
+    take values: mem::Map[text::String, GeneratedValue],
+    take consts: mem::Map[text::String, Option[wide::Wide]],
+    ) -> GenerationReader {
+    let alloc = ck.alloc()
+    var scopes = mem::List[GenerationScope].empty(alloc)
+    mut scopes.push(GenerationScope(item: item, params: mem::Map[text::String, ScopeArgument].empty(alloc)))
+    return GenerationReader(ck: ck.share(), scopes: take scopes, values: take values, consts: take consts)
+} GenerationReader.new
+
+/// The constructive conjuncts of conditions, or none when one of them is a gap: a conjunct
+/// naming a generated value that is not constructive, an `a != c` among them included when
+/// another names `a` with another drawn integer.
+fn GenerationReader.read(mut self, conditions: Slice[ast::Expr]) -> Option[mem::List[Constructive]] {
+    let alloc = self.ck.alloc()
+    var conjuncts = mem::List[Conjunct].empty(alloc)
+    for condition in conditions {
+        mut self.conjuncts(condition, scope: 0, depth: 0, found: mut conjuncts)
+    }
+    var constructive = mem::List[Constructive].empty(alloc)
+    for conjunct in conjuncts {
+        if not self.names_value(conjunct.expr, scope: conjunct.scope) {
+            continue
+        }
+        let Some(read_conjunct) = self.constructive(conjunct.expr, scope: conjunct.scope) else {
+            return None
+        }
+        mut constructive.push(take read_conjunct)
+    }
+    for conjunct in constructive {
+        if conjunct.op == ast::BinaryOp.Ne and constructive.position(fn(other: Constructive) => other.links(conjunct.left.path.as_str())).is_some() {
+            return None
+        }
+    }
+    return Some(take constructive)
+} GenerationReader.read
+
+/// Whether a conjunct relating two drawn integers names `drawn` with another.
+fn Constructive.links(self, drawn: Str) -> bool {
+    let Some(right) = self.right else {
+        return false
+    }
+    return (self.left.path.as_str() == drawn) != (right.path.as_str() == drawn)
+} Constructive.links
+
+/// The conjuncts of a condition read in a scope: the operands of its top-level `and`, each
+/// call of a visible transparent function replaced by the conjuncts of its body.
+fn GenerationReader.conjuncts(
+    mut self,
+    expr: ast::Expr,
+    scope: usize,
+    depth: usize,
+    mut found: mem::List[Conjunct],
+    ) {
+    let alloc = self.ck.alloc()
+    match first expr.kind {
+        ast::ExprKind.Paren(inner) => mut self.conjuncts(inner.contents(), scope, depth, mut found)
+        ast::ExprKind.Binary(op: ast::BinaryOp.And, op_token: _, left: left, right: right) => {
+            mut self.conjuncts(left.contents(), scope, depth, mut found)
+            mut self.conjuncts(right.contents(), scope, depth, mut found)
+        }
+        ast::ExprKind.Call(callee: callee, args: args) if depth < UNFOLDING_DEPTH => {
+            let unfolded = mut self.unfolded(callee.contents(), args: args.view(), scope)
+            match unfolded {
+                Some(body) => mut self.conjuncts(body.expr, scope: body.scope, depth: depth + 1, mut found)
+                None => mut found.push(Conjunct(expr: expr.copy(alloc), scope: scope))
+            }
+        }
+        else => mut found.push(Conjunct(expr: expr.copy(alloc), scope: scope))
+    }
+} GenerationReader.conjuncts
+
+/// The body of the transparent function a call read in a scope names, when visible there,
+/// with the scope binding its parameters to the call's receiver and arguments.
+fn GenerationReader.unfolded(mut self, callee: ast::Expr, args: Slice[ast::Arg], scope: usize) -> Option[Conjunct] {
+    let ck = self.ck.share()
+    let db = ck.db()
+    let alloc = ck.alloc()
+    let module = db.module_of(self.scopes[scope].item)
+    var function = ty::ItemId(index: 0)
+    var receiver: Option[ast::Expr] = None
+    match callee.kind {
+        ast::ExprKind.Path(path: path, args: None) => {
+            let Ok(Named.Item(named)) = db.resolve(module, path) else {
+                return None
+            }
+            function = named
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            let Some(placed) = self.place(base.contents(), scope) else {
+                return None
+            }
+            let Some(key) = ck.type_key(placed.ty) else {
+                return None
+            }
+            let functions = db.members(key, name: name.text.as_str())
+            if functions.len() == 0 {
+                return None
+            }
+            function = functions[0]
+            receiver = Some(base.contents().copy(alloc))
+        }
+        else => return None
+    }
+    if not db.visible(module, item: function) {
+        return None
+    }
+    let ast::ItemKind.Fn(item) = db.ast(function).kind else {
+        return None
+    }
+    let ast::FnBody.Expr(body) = item.body else {
+        return None
+    }
+    var params = mem::Map[text::String, ScopeArgument].empty(alloc)
+    var next_value: usize = 0
+    for param in item.head.params {
+        let argument = match param.kind {
+            ast::ParamKind.SelfValue => ast::Expr.optional_copy(receiver, alloc)
+            ast::ParamKind.Named(name: _, ty: _) => GenerationReader.argument_at(args, index: next_value, alloc)
+        }
+        if not param.is_self() {
+            next_value += 1
+        }
+        let Some(value) = argument else {
+            return None
+        }
+        discard mut params.insert(text::String.of(param.name(), alloc), value: ScopeArgument(argument: take value, scope: scope))
+    }
+    mut self.scopes.push(GenerationScope(item: function, params: take params))
+    return Some(Conjunct(expr: body.copy(alloc), scope: self.scopes.len() - 1))
+} GenerationReader.unfolded
+
+/// A copy of the value of a call's argument at an index, none past the last.
+fn GenerationReader.argument_at(args: Slice[ast::Arg], index: usize, alloc: mem::Alloc) -> Option[ast::Expr] {
+    if index >= args.len() {
+        return None
+    }
+    return Some(args[index].value.copy(alloc))
+} GenerationReader.argument_at
+
+/// The generated value a place read in a scope names: a name or `self` standing for one,
+/// or a field of one.
+fn GenerationReader.place(self, expr: ast::Expr, scope: usize) -> Option[GeneratedValue] {
+    return match first expr.kind {
+        ast::ExprKind.Paren(inner) => self.place(inner.contents(), scope)
+        ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => self.named_place(path.segments[0].text.as_str(), scope)
+        ast::ExprKind.SelfValue => self.named_place("self", scope)
+        ast::ExprKind.Field(base: base, name: name) => self.field_place(base.contents(), name: name.text.as_str(), scope)
+        else => None
+    }
+} GenerationReader.place
+
+/// The generated value a name read in a scope stands for: a parameter's argument's, or in the
+/// first scope a generated value's.
+fn GenerationReader.named_place(self, name: Str, scope: usize) -> Option[GeneratedValue] {
+    match self.scopes[scope].params.get_by(fn(key: text::String) => key.as_str().cmp(name)) {
+        Some(argument) => return self.place(argument.argument, scope: argument.scope)
+        None => {}
+    }
+    let Some(value) = self.values.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return None
+    }
+    if scope != 0 {
+        return None
+    }
+    return Some(GeneratedValue(path: text::String.of(value.path.as_str(), alloc: self.ck.alloc()), ty: value.ty))
+} GenerationReader.named_place
+
+/// The generated value a field of a place read in a scope names.
+fn GenerationReader.field_place(self, base: ast::Expr, name: Str, scope: usize) -> Option[GeneratedValue] {
+    let Some(placed) = self.place(base, scope) else {
+        return None
+    }
+    let Some(field) = self.ck.field_type(placed.ty, name) else {
+        return None
+    }
+    var path = text::String.of(placed.path.as_str(), alloc: self.ck.alloc())
+    mut path.push('.')
+    mut path.append(name)
+    return Some(GeneratedValue(path: take path, ty: field))
+} GenerationReader.field_place
+
+/// Whether an expression read in a scope names a generated value.
+fn GenerationReader.names_value(self, expr: ast::Expr, scope: usize) -> bool {
+    let alloc = self.ck.alloc()
+    var names = mem::List[text::String].empty(alloc)
+    expr.visit(fn[mut names](inner: ast::Expr) {
+        match first inner.kind {
+            ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => mut names.push(text::String.of(path.segments[0].text.as_str(), alloc))
+            ast::ExprKind.SelfValue => mut names.push(text::String.of("self", alloc))
+            else => {}
+        }
+    })
+    for name in names {
+        match self.scopes[scope].params.get_by(fn(key: text::String) => key.as_str().cmp(name.as_str())) {
+            Some(argument) => {
+                if self.names_value(argument.argument, scope: argument.scope) {
+                    return true
+                }
+            }
+            None => {
+                if scope == 0 and self.values.get_by(fn(key: text::String) => key.as_str().cmp(name.as_str())).is_some() {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+} GenerationReader.names_value
+
+/// A term read in a scope.
+fn GenerationReader.term(self, expr: ast::Expr, scope: usize) -> GenerationTerm {
+    let item = self.scopes[scope].item
+    match first expr.kind {
+        ast::ExprKind.Paren(inner) => return self.term(inner.contents(), scope)
+        ast::ExprKind.Literal(literal) if literal.kind == ast::LiteralKind.Int => return GenerationTerm.Constant(int_literal(self.ck.db().text(item, token: literal.tokens[0])))
+        ast::ExprKind.Unary(op: ast::UnaryOp.Neg, operand: operand) => {
+            return match self.term(operand.contents(), scope) {
+                GenerationTerm.Constant(value) => GenerationTerm.Constant(negated_value(value))
+                else => GenerationTerm.Other
+            }
+        }
+        ast::ExprKind.Binary(op: op, op_token: _, left: left, right: right) if op == ast::BinaryOp.Add or op == ast::BinaryOp.Sub => {
+            let left_term = self.term(left.contents(), scope)
+            let right_term = self.term(right.contents(), scope)
+            let GenerationTerm.Constant(left_value) = left_term else {
+                return GenerationTerm.Other
+            }
+            let GenerationTerm.Constant(right_value) = right_term else {
+                return GenerationTerm.Other
+            }
+            return GenerationTerm.Constant(summed(left_value, right: right_value, subtracted: op == ast::BinaryOp.Sub))
+        }
+        else => {}
+    }
+    match self.place(expr, scope) {
+        Some(placed) => {
+            let ty::TyKind.Scalar(scalar) = self.ck.types().kind(placed.ty) else {
+                return GenerationTerm.Other
+            }
+            if not scalar.is_integer() {
+                return GenerationTerm.Other
+            }
+            let range = scalar.range()
+            return GenerationTerm.Drawn(Drawn(path: text::String.of(placed.path.as_str(), alloc: self.ck.alloc()), low: range.low, high: range.high))
+        }
+        None => {}
+    }
+    match self.length(expr, scope) {
+        Some(length) => return length
+        None => {}
+    }
+    return match self.constant(expr, scope) {
+        Some(constant) => constant
+        None => GenerationTerm.Other
+    }
+} GenerationReader.term
+
+/// The negation of a value when known.
+fn negated_value(value: Option[wide::Wide]) -> Option[wide::Wide] {
+    let Some(known) = value else {
+        return None
+    }
+    return Some(known.wrapping_neg())
+} negated_value
+
+/// The sum or difference of two values when both are known.
+fn summed(left: Option[wide::Wide], right: Option[wide::Wide], subtracted: bool) -> Option[wide::Wide] {
+    let Some(low) = left else {
+        return None
+    }
+    let Some(high) = right else {
+        return None
+    }
+    if subtracted {
+        return Some(low.wrapping_sub(high))
+    }
+    return Some(low.wrapping_add(high))
+} summed
+
+/// A length term read in a scope: `len()` of a `mem::List`, `mem::Bytes` or `mem::Bounded`,
+/// or `as_str().char_count()` of a `text::String`, generated.
+fn GenerationReader.length(self, expr: ast::Expr, scope: usize) -> Option[GenerationTerm] {
+    let alloc = self.ck.alloc()
+    let Some(call) = member_call(expr, alloc) else {
+        return None
+    }
+    var measured: Option[GeneratedValue] = None
+    if call.name.as_str() == "char_count" {
+        let Some(inner) = member_call(call.receiver, alloc) else {
+            return None
+        }
+        if inner.name.as_str() != "as_str" {
+            return None
+        }
+        let Some(placed) = self.place(inner.receiver, scope) else {
+            return None
+        }
+        if not self.ck.is_std(placed.ty, path: "text::String") {
+            return None
+        }
+        var path = text::String.of(placed.path.as_str(), alloc)
+        mut path.append(".as_str().char_count()")
+        measured = Some(GeneratedValue(path: take path, ty: placed.ty))
+    } else if call.name.as_str() == "len" {
+        let Some(placed) = self.place(call.receiver, scope) else {
+            return None
+        }
+        var path = text::String.of(placed.path.as_str(), alloc)
+        mut path.append(".len()")
+        measured = Some(GeneratedValue(path: take path, ty: placed.ty))
+    } else {
+        return None
+    }
+    let Some(value) = measured else {
+        return None
+    }
+    let Some(named) = self.ck.std_path(value.ty) else {
+        return None
+    }
+    var high = wide::Wide.of_u64(64)
+    if named.as_str() == "mem::Bounded" {
+        let types = self.ck.types()
+        let args = types.arg_list(types.args_of(value.ty))
+        high = wide::Wide.of_u64(~0u64)
+        if args.len() > 1 {
+            match args[1] {
+                ty::Arg.Const(ty::Const.Int(bound)) => {
+                    high = bound
+                }
+                else => {}
+            }
+        }
+    } else if named.as_str() != "mem::List" and named.as_str() != "mem::Bytes" and named.as_str() != "text::String" {
+        return None
+    }
+    return Some(GenerationTerm.Drawn(Drawn(path: text::String.of(value.path.as_str(), alloc), low: wide::Wide.zero(), high: high)))
+} GenerationReader.length
+
+/// A const or const generic parameter a path read in a scope names, with its value when it
+/// is an integer literal.
+fn GenerationReader.constant(self, expr: ast::Expr, scope: usize) -> Option[GenerationTerm] {
+    let ast::ExprKind.Path(path: path, args: None) = expr.kind else {
+        return None
+    }
+    if path.segments.len() == 1 and scope == 0 {
+        match self.consts.get_by(fn(key: text::String) => key.as_str().cmp(path.segments[0].text.as_str())) {
+            Some(value) => return Some(GenerationTerm.Constant(value))
+            None => {}
+        }
+    }
+    let ck = self.ck
+    let db = ck.db()
+    let module = db.module_of(self.scopes[scope].item)
+    let Ok(Named.Item(constant)) = db.resolve(module, path) else {
+        return None
+    }
+    let ast::ItemKind.Const(declared) = db.ast(constant).kind else {
+        return None
+    }
+    let alloc = ck.alloc()
+    let reader = GenerationReader.new(ck, item: constant, values: mem::Map[text::String, GeneratedValue].empty(alloc), consts: mem::Map[text::String, Option[wide::Wide]].empty(alloc))
+    return match reader.term(declared.value, scope: 0) {
+        GenerationTerm.Constant(value) => Some(GenerationTerm.Constant(value))
+        else => Some(GenerationTerm.Constant(None))
+    }
+} GenerationReader.constant
+
+/// A conjunct read in a scope as a constructive conjunct: `a op b`, `a op b + c`,
+/// `a op b - c`, `a op c` or `a != c`, with `a` and `b` drawn integers, `c` a constant and
+/// `op` a comparison.
+fn GenerationReader.constructive(self, expr: ast::Expr, scope: usize) -> Option[Constructive] {
+    let ast::ExprKind.Binary(op: op, op_token: _, left: left, right: right) = expr.kind else {
+        return match expr.kind {
+            ast::ExprKind.Paren(inner) => self.constructive(inner.contents(), scope)
+            else => None
+        }
+    }
+    let GenerationTerm.Drawn(drawn) = self.term(left.contents(), scope) else {
+        return None
+    }
+    if not op.is_comparison() {
+        return None
+    }
+    var summands = mem::List[Summand].empty(self.ck.alloc())
+    self.summands(right.contents(), scope, sign: wide::Wide.one(), found: mut summands)
+    var right_drawn: Option[Drawn] = None
+    var offset: Option[wide::Wide] = Some(wide::Wide.zero())
+    for index in 0..<summands.len() {
+        let summand = summands[index]
+        let takes_right = index == 0 and summand.sign == wide::Wide.one() and op != ast::BinaryOp.Ne
+        match first self.term(summand.expr, scope: summand.scope) {
+            GenerationTerm.Drawn(taken) if takes_right => {
+                right_drawn = Some(take taken)
+            }
+            GenerationTerm.Constant(value) => {
+                offset = offset_with(offset, sign: summand.sign, value)
+            }
+            else => return None
+        }
+    }
+    return Some(Constructive(left: take drawn, op: op, right: take right_drawn, offset: offset))
+} GenerationReader.constructive
+
+/// An offset plus a signed value, when both are known.
+fn offset_with(offset: Option[wide::Wide], sign: wide::Wide, value: Option[wide::Wide]) -> Option[wide::Wide] {
+    let Some(sum) = offset else {
+        return None
+    }
+    let Some(added) = value else {
+        return None
+    }
+    return Some(sum.wrapping_add(sign.wrapping_mul(added)))
+} offset_with
+
+/// The summands of an expression joined by `+` and `-`, each with its sign.
+fn GenerationReader.summands(
+    self,
+    expr: ast::Expr,
+    scope: usize,
+    sign: wide::Wide,
+    mut found: mem::List[Summand],
+    ) {
+    match first expr.kind {
+        ast::ExprKind.Paren(inner) => self.summands(inner.contents(), scope, sign, mut found)
+        ast::ExprKind.Binary(op: op, op_token: _, left: left, right: right) if op == ast::BinaryOp.Add or op == ast::BinaryOp.Sub => {
+            self.summands(left.contents(), scope, sign, mut found)
+            var right_sign = sign
+            if op == ast::BinaryOp.Sub {
+                right_sign = sign.wrapping_neg()
+            }
+            self.summands(right.contents(), scope, sign: right_sign, mut found)
+        }
+        else => mut found.push(Summand(sign: sign, expr: expr.copy(self.ck.alloc()), scope: scope))
+    }
+} GenerationReader.summands
+
+/// The receiver and member name of a call of a member without arguments.
+fn member_call(expr: ast::Expr, alloc: mem::Alloc) -> Option[MemberCall] {
+    let ast::ExprKind.Call(callee: callee, args: args) = expr.kind else {
+        return None
+    }
+    let ast::ExprKind.Field(base: base, name: name) = callee.contents().kind else {
+        return None
+    }
+    if args.len() > 0 {
+        return None
+    }
+    return Some(MemberCall(receiver: base.contents().copy(alloc), name: text::String.of(name.text.as_str(), alloc)))
+} member_call
+
+fn Constraints.of(conjuncts: Slice[Constructive], alloc: mem::Alloc) -> Constraints {
+    var built = Constraints(drawn: mem::List[Drawn].empty(alloc), edges: mem::List[BoundEdge].empty(alloc), excluded: mem::List[Excluded].empty(alloc))
+    for conjunct in conjuncts {
+        let left = mut built.node(conjunct.left, alloc)
+        let Some(offset) = conjunct.offset else {
+            match conjunct.right {
+                Some(right) => {
+                    discard mut built.node(right, alloc)
+                }
+                None => {}
+            }
+            continue
+        }
+        var right_node: usize = 0
+        match conjunct.right {
+            Some(right) => {
+                right_node = mut built.node(right, alloc)
+                mut built.edges.push(BoundEdge(from: 0, to: right_node, weight: right.high.wrapping_sub(offset)))
+                mut built.edges.push(BoundEdge(from: right_node, to: 0, weight: offset.wrapping_sub(right.low)))
+            }
+            None => {}
+        }
+        mut built.bound(conjunct.op, left, right: right_node, offset)
+    }
+    for index in 0..<built.drawn.len() {
+        let high = built.drawn[index].high
+        let low = built.drawn[index].low
+        mut built.edges.push(BoundEdge(from: 0, to: index + 1, weight: high))
+        mut built.edges.push(BoundEdge(from: index + 1, to: 0, weight: low.wrapping_neg()))
+    }
+    return built
+} Constraints.of
+
+/// The node of a drawn integer, numbered when first seen.
+fn Constraints.node(mut self, drawn: Drawn, alloc: mem::Alloc) -> usize {
+    match self.drawn.position(fn(known: Drawn) => known.path == drawn.path) {
+        Some(index) => return index + 1
+        None => {}
+    }
+    mut self.drawn.push(Drawn(path: text::String.of(drawn.path.as_str(), alloc), low: drawn.low, high: drawn.high))
+    return self.drawn.len()
+} Constraints.node
+
+/// The edges or exclusion a comparison of node `left` with node `right` plus `offset` adds.
+fn Constraints.bound(mut self, op: ast::BinaryOp, left: usize, right: usize, offset: wide::Wide) {
+    let one = wide::Wide.one()
+    match op {
+        ast::BinaryOp.Lt => mut self.edges.push(BoundEdge(from: right, to: left, weight: offset.wrapping_sub(one)))
+        ast::BinaryOp.Le => mut self.edges.push(BoundEdge(from: right, to: left, weight: offset))
+        ast::BinaryOp.Eq => {
+            mut self.edges.push(BoundEdge(from: right, to: left, weight: offset))
+            mut self.edges.push(BoundEdge(from: left, to: right, weight: offset.wrapping_neg()))
+        }
+        ast::BinaryOp.Ge => mut self.edges.push(BoundEdge(from: left, to: right, weight: offset.wrapping_neg()))
+        ast::BinaryOp.Gt => mut self.edges.push(BoundEdge(from: left, to: right, weight: offset.wrapping_neg().wrapping_sub(one)))
+        else => mut self.excluded.push(Excluded(node: left, value: offset))
+    }
+} Constraints.bound
+
+/// The shortest distances from node 0 to each node over `edges`, reversed when `inward`;
+/// none when a negative cycle leaves them unbounded.
+fn Constraints.distances(self, inward: bool, alloc: mem::Alloc) -> Option[mem::List[wide::Wide]] {
+    let unreached = wide::Wide.max().shift_right(2)
+    var distance = mem::List[wide::Wide].empty(alloc)
+    for _ in 0..<(self.drawn.len() + 1) {
+        mut distance.push(unreached)
+    }
+    distance[0] = wide::Wide.zero()
+    for _ in 0..=self.drawn.len() {
+        var settled = true
+        for edge in self.edges {
+            var from = edge.from
+            var to = edge.to
+            if inward {
+                from = edge.to
+                to = edge.from
+            }
+            let through = distance[from].wrapping_add(edge.weight)
+            if through.lt(distance[to]) {
+                distance[to] = through
+                settled = false
+            }
+        }
+        if settled {
+            return Some(take distance)
+        }
+    }
+    return None
+} Constraints.distances
+
+/// Whether the constraints have a solution: their difference bounds have no negative cycle,
+/// and each `a != c` leaves `a` a value within its bounds.
+fn Constraints.satisfiable(self, alloc: mem::Alloc) -> bool {
+    let upper = self.distances(inward: false, alloc)
+    let lower = self.distances(inward: true, alloc)
+    let Some(highs) = upper else {
+        return false
+    }
+    let Some(lows) = lower else {
+        return false
+    }
+    for node in 1..=self.drawn.len() {
+        let low = lows[node].wrapping_neg()
+        let high = highs[node]
+        var excluded = mem::Set[wide::Wide].empty(alloc)
+        for exclusion in self.excluded {
+            if exclusion.node == node and low.le(exclusion.value) and exclusion.value.le(high) {
+                discard mut excluded.insert(exclusion.value)
+            }
+        }
+        let room = high.wrapping_sub(low).wrapping_add(wide::Wide.one())
+        if not wide::Wide.of_u64(u64.widen(excluded.len())).lt(room) {
+            return false
+        }
+    }
+    return true
+} Constraints.satisfiable
+
+/// Whether a target's parameter types, its generic parameters fixed, are a test's.
+fn instantiates(types: ty::Types, pattern: ty::Ty, found: ty::Ty, mut fixed: mem::HashMap[ty::Param, ty::Ty]) -> bool {
+    match types.kind(pattern) {
+        ty::TyKind.Param(param) => {
+            match fixed.get(param) {
+                Some(held) => return held == found
+                None => {}
+            }
+            discard mut fixed.insert(param, value: found)
+            return true
+        }
+        ty::TyKind.Item(item: left, args: left_args) => {
+            let ty::TyKind.Item(item: right, args: right_args) = types.kind(found) else {
+                return pattern == found
+            }
+            if left != right {
+                return false
+            }
+            let lefts = types.arg_list(left_args)
+            let rights = types.arg_list(right_args)
+            if lefts.len() != rights.len() {
+                return false
+            }
+            for index in 0..<lefts.len() {
+                if not instantiates_arg(types, pattern: lefts[index], found: rights[index], mut fixed) {
+                    return false
+                }
+            }
+            return true
+        }
+        else => return pattern == found
+    }
+} instantiates
+
+/// Whether a target's generic argument, its generic parameters fixed, is a test's.
+fn instantiates_arg(types: ty::Types, pattern: ty::Arg, found: ty::Arg, mut fixed: mem::HashMap[ty::Param, ty::Ty]) -> bool {
+    match pattern {
+        ty::Arg.Ty(left) => match found {
+            ty::Arg.Ty(right) => return instantiates(types, pattern: left, found: right, mut fixed)
+            else => {}
+        }
+        else => {}
+    }
+    return match pattern {
+        ty::Arg.Const(ty::Const.Param(_)) => true
+        else => pattern == found
+    }
+} instantiates_arg
+
+/// The generator gaps of a struct deriving `Generate`, reported once on its first line.
+fn Checker.check_generated(self, item: ty::ItemId) {
+    let ty = self.own_type(item)
+    if self.struct_constraints(item, ty, path: "").is_some() {
+        return
+    }
+    let file = self.db().item_file(item)
+    let line = file.syntax.item_lines(file.syntax.items[self.db().item(item).index]).low
+    self.report_line(item, line, code: diagnostic::Code.TestGeneratorGap)
+} Checker.check_generated
+
+/// The parameters of a property test, whose types must implement `Generate`, and its
+/// generator gaps, reported on its head.
+fn Checker.check_property_test(self, item: ty::ItemId, tested: ast::TestItem, body: TBody) {
+    let Some(types) = self.param_types(body) else {
+        return
+    }
+    let Some(params) = tested.params else {
+        return
+    }
+    let generate = self.db().core_item("Generate")
+    var generated = true
+    var index: usize = 0
+    while index < params.len() and index < types.len() {
+        let implemented = match generate {
+            Some(interface_item) => self.implements(types[index], interface_item)
+            None => false
+        }
+        if not implemented {
+            self.report(item, token: params[index].token, code: diagnostic::Code.TestParameterType)
+            generated = false
+        }
+        index += 1
+    }
+    if generated and self.property_conjuncts(item, tested, body).is_none() {
+        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.TestGeneratorGap)
+    }
+} Checker.check_property_test
+
+/// The types of a test's parameters, none when one failed.
+fn Checker.param_types(self, body: TBody) -> Option[mem::List[ty::Ty]] {
+    let types = self.types()
+    var params = mem::List[ty::Ty].empty(self.alloc())
+    for id in body.params {
+        mut params.push(body.local(id).ty)
+    }
+    if params.position(fn(param: ty::Ty) => types.has_error(param)).is_some() {
+        return None
+    }
+    return Some(take params)
+} Checker.param_types
+
+/// The conjuncts of a property test's generation: those of its target's requires when the
+/// target takes the test's parameter types, then the constructive conjuncts of the
+/// predicates of the structs it generates; none for a gap: a conjunct of the requires that
+/// is not constructive, or conjuncts no values satisfy.
+fn Checker.property_conjuncts(self, item: ty::ItemId, tested: ast::TestItem, body: TBody) -> Option[mem::List[Constructive]] {
+    let Some(params) = self.param_types(body) else {
+        return None
+    }
+    let alloc = self.alloc()
+    var constructive = mem::List[Constructive].empty(alloc)
+    match self.test_target(item, tested) {
+        Some(TestTarget.Function(target)) => {
+            let Some(required) = self.target_constraints(target, params: params.view()) else {
+                return None
+            }
+            for conjunct in take required {
+                mut constructive.push(take conjunct)
+            }
+        }
+        else => {}
+    }
+    for index in 0..<params.len() {
+        var path = text::String.empty(alloc)
+        mut path.write(text::fmt("#{index}", index), budget: 1_000_000)
+        var open = mem::List[ty::ItemId].empty(alloc)
+        self.generated_constraints(path.as_str(), ty: params[index], open: mut open, found: mut constructive)
+    }
+    if not Constraints.of(constructive.view(), alloc).satisfiable(alloc) {
+        return None
+    }
+    return Some(take constructive)
+} Checker.property_conjuncts
+
+/// The constructive conjuncts of a target's requires when it takes parameters of the given
+/// types, its parameters naming them as `#i`: none for a gap, and no conjuncts for a function
+/// without a head or that takes other types.
+fn Checker.target_constraints(self, target: ty::ItemId, params: Slice[ty::Ty]) -> Option[mem::List[Constructive]] {
+    let alloc = self.alloc()
+    let none = mem::List[Constructive].empty(alloc)
+    let Some(sig) = self.fn_sig(target) else {
+        return Some(take none)
+    }
+    let db = self.db()
+    let ast::ItemKind.Fn(function) = db.ast(target).kind else {
+        return Some(take none)
+    }
+    let types = self.types()
+    var fixed = mem::HashMap[ty::Param, ty::Ty].empty(seed: 0, alloc)
+    if sig.params.len() != params.len() {
+        return Some(take none)
+    }
+    for index in 0..<params.len() {
+        if not instantiates(types, pattern: sig.params[index].ty, found: params[index], mut fixed) {
+            return Some(take none)
+        }
+    }
+    var conditions = mem::List[ast::Expr].empty(alloc)
+    for clause in function.clauses {
+        if db.text(target, token: clause.token) == "todo" {
+            continue
+        }
+        match clause.kind {
+            ast::ClauseKind.Requires(condition) => mut conditions.push(condition.copy(alloc))
+            else => {}
+        }
+    }
+    var values = mem::Map[text::String, GeneratedValue].empty(alloc)
+    for index in 0..<params.len() {
+        var path = text::String.empty(alloc)
+        mut path.write(text::fmt("#{index}", index), budget: 1_000_000)
+        discard mut values.insert(text::String.of(sig.params[index].name.as_str(), alloc), value: GeneratedValue(path: take path, ty: params[index]))
+    }
+    var reader = GenerationReader.new(self, item: target, values: take values, consts: mem::Map[text::String, Option[wide::Wide]].empty(alloc))
+    return mut reader.read(conditions.view())
+} Checker.target_constraints
+
+/// The constructive conjuncts of the predicates of the structs a value of a type generates
+/// holds, through the fields and type arguments of each, `path` naming the value.
+fn Checker.generated_constraints(
+    self,
+    path: Str,
+    ty: ty::Ty,
+    mut open: mem::List[ty::ItemId],
+    mut found: mem::List[Constructive],
+    ) {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return
+    }
+    if open.position(fn(held: ty::ItemId) => held == item).is_some() {
+        return
+    }
+    mut open.push(item)
+    let alloc = self.alloc()
+    let listed = types.arg_list(args)
+    for index in 0..<listed.len() {
+        match listed[index] {
+            ty::Arg.Ty(arg) => {
+                var arg_path = text::String.of(path, alloc)
+                mut arg_path.write(text::fmt("<{index}>", index), budget: 1_000_000)
+                self.generated_constraints(arg_path.as_str(), ty: arg, mut open, mut found)
+            }
+            ty::Arg.Const(_) => {}
+        }
+    }
+    let derived = match self.db().core_item("Generate") {
+        Some(generate) => self.derives_interface(item, interface_item: generate)
+        None => false
+    }
+    if derived {
+        self.generated_fields(item, ty, path, mut open, mut found)
+    }
+    discard mut open.pop()
+} Checker.generated_constraints
+
+/// The constructive conjuncts of a struct deriving `Generate` that a value of a type is, then
+/// those of its fields', `path` naming the value.
+fn Checker.generated_fields(
+    self,
+    item: ty::ItemId,
+    ty: ty::Ty,
+    path: Str,
+    mut open: mem::List[ty::ItemId],
+    mut found: mem::List[Constructive],
+    ) {
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return
+    }
+    match self.struct_constraints(item, ty, path) {
+        Some(conjuncts) => {
+            for conjunct in take conjuncts {
+                mut found.push(take conjunct)
+            }
+        }
+        None => {}
+    }
+    let alloc = self.alloc()
+    for field in fields {
+        let Some(field_ty) = self.field_type(ty, name: field.name.as_str()) else {
+            continue
+        }
+        var field_path = text::String.of(path, alloc)
+        mut field_path.push('.')
+        mut field_path.append(field.name.as_str())
+        self.generated_constraints(field_path.as_str(), ty: field_ty, mut open, mut found)
+    }
+} Checker.generated_fields
+
+/// The constructive conjuncts of a struct's predicates for an instantiation of it, its
+/// fields' drawn integers named under `path`; none when one is a gap.
+fn Checker.struct_constraints(self, item: ty::ItemId, ty: ty::Ty, path: Str) -> Option[mem::List[Constructive]] {
+    let alloc = self.alloc()
+    let ast::ItemKind.Struct(structure) = self.db().ast(item).kind else {
+        return Some(mem::List[Constructive].empty(alloc))
+    }
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return Some(mem::List[Constructive].empty(alloc))
+    }
+    let types = self.types()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(types.args_of(ty)), alloc)
+    var values = mem::Map[text::String, GeneratedValue].empty(alloc)
+    for field in fields {
+        var prefixed = text::String.of(path, alloc)
+        if path.byte_len() > 0 {
+            mut prefixed.push('.')
+        }
+        mut prefixed.append(field.name.as_str())
+        discard mut values.insert(text::String.of(field.name.as_str(), alloc), value: GeneratedValue(path: take prefixed, ty: subst.ty(types, ty: field.ty)))
+    }
+    var consts = mem::Map[text::String, Option[wide::Wide]].empty(alloc)
+    for def in sig.contents().generics {
+        if def.constant.is_none() {
+            continue
+        }
+        let value = match subst.get(def.param) {
+            Some(ty::Arg.Const(ty::Const.Int(known))) => Some(known)
+            else => None
+        }
+        discard mut consts.insert(text::String.of(def.name.as_str(), alloc), value: value)
+    }
+    var conditions = mem::List[ast::Expr].empty(alloc)
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                match field.where_clause {
+                    Some(condition) => mut conditions.push(condition.copy(alloc))
+                    None => {}
+                }
+            }
+            ast::StructMember.Invariant(condition) => mut conditions.push(condition.copy(alloc))
+        }
+    }
+    var reader = GenerationReader.new(self, item, values: take values, consts: take consts)
+    return mut reader.read(conditions.view())
+} Checker.struct_constraints

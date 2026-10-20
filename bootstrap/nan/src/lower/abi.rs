@@ -6,9 +6,10 @@
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 
 use super::layout::Shape;
+use super::types::Wrap;
 use super::{CALL_CONV, Instance, Lowering};
 use crate::check::ty::{FnTy, Subst, Ty};
-use crate::nir::{NTy, Role};
+use crate::nir::{Callable, NTy, Role};
 use crate::syntax::ast::{ItemKind, Mode};
 
 /// How a value is held: a scalar in a register, an address, or nothing for an empty type.
@@ -109,18 +110,14 @@ impl Lowering<'_, '_> {
         }
     }
 
-    /// The type a function returning a value of `ty` gives and how it gives it: a projection
-    /// gives a part, or an `Option` or `Result` wrapping its parts, unless the result is a view
-    /// value.
-    pub fn result_form(&mut self, ty: &Ty, projection: bool) -> (Ty, Returned) {
-        let given = if projection && self.wraps(ty) {
-            self.wrapped_type(ty)
-        } else {
-            ty.clone()
+    /// The type a function returning a value of `ty` gives and how it gives it, a projection's
+    /// result taking the form `given`.
+    pub fn result_form(&mut self, ty: &Ty, given: Option<Given>) -> (Ty, Returned) {
+        let given = match given {
+            Some(Given::Part) => return (ty.clone(), Returned::Part),
+            Some(Given::Wrapped(wrap)) => self.wrapped_type(ty, wrap),
+            Some(Given::View) | None => ty.clone(),
         };
-        if projection && !self.ck.nir_view(ty) && !self.wraps(ty) {
-            return (given, Returned::Part);
-        }
         let returned = match self.owned_repr(&given) {
             Repr::Scalar(scalar) => Returned::Scalar(scalar),
             Repr::Address => Returned::Indirect,
@@ -146,7 +143,7 @@ impl Lowering<'_, '_> {
                 (nty, repr)
             })
             .collect();
-        let (result, returned) = self.result_form(&fn_ty.result, false);
+        let (result, returned) = self.result_form(&fn_ty.result, None);
         Abi {
             env: true,
             params,
@@ -185,9 +182,12 @@ impl Lowering<'_, '_> {
                         (nty, repr)
                     })
                     .collect();
-                let projection = matches!(role, Role::Body | Role::Entry | Role::Default)
-                    && self.is_projection(*item, *role, *index);
-                let (result, returned) = self.result_form(&subst.ty(&function.result), projection);
+                let given = self.callable_given(&Callable::Item {
+                    item: *item,
+                    role: *role,
+                    index: *index,
+                });
+                let (result, returned) = self.result_form(&subst.ty(&function.result), given);
                 let fails = failure(&function.fails.as_ref().map(|ty| subst.ty(ty)));
                 let test = matches!(self.ck.db.ast(*item).kind, ItemKind::Test(_));
                 Abi {
@@ -202,7 +202,8 @@ impl Lowering<'_, '_> {
             Instance::Supplied { item, args } => {
                 let sig = self.ck.fn_sig(*item).expect("a supplied function's head");
                 let subst = Subst::of(sig.generics.iter().map(|def| def.param), args);
-                let mut abi = self.head_abi(&sig.fn_ty(), &subst, sig.is_proj());
+                let given = self.sig_given(&sig);
+                let mut abi = self.head_abi(&sig.fn_ty(), &subst, given);
                 if self.ck.reads_in_place(*item) {
                     let read = abi.params[0].0.ty().clone();
                     abi.params[0] = (NTy::Ref(read), Repr::Address);
@@ -214,12 +215,12 @@ impl Lowering<'_, '_> {
                 method,
                 args,
             } => {
-                let (fn_ty, projection) = self.derived_head(*owner, method, args);
-                self.head_abi(&fn_ty, &Subst::default(), projection)
+                let fn_ty = self.derived_head(*owner, method, args);
+                self.head_abi(&fn_ty, &Subst::default(), None)
             }
             Instance::Conformance { ty, method, args } => {
                 let fn_ty = self.conformance_head(ty, method, args);
-                self.head_abi(&fn_ty, &Subst::default(), false)
+                self.head_abi(&fn_ty, &Subst::default(), None)
             }
             Instance::Release(ty) => Abi {
                 env: false,
@@ -239,8 +240,8 @@ impl Lowering<'_, '_> {
                 args,
                 method,
             } => {
-                let (fn_ty, projection) = self.method_head(ty, *interface, args, *method);
-                let mut abi = self.head_abi(&fn_ty, &Subst::default(), projection);
+                let (fn_ty, given) = self.method_head(ty, *interface, args, *method);
+                let mut abi = self.head_abi(&fn_ty, &Subst::default(), given);
                 abi.params[0] = (NTy::Ref(ty.clone()), Repr::Address);
                 abi
             }
@@ -253,7 +254,7 @@ impl Lowering<'_, '_> {
     }
 
     /// The calling form of a function head whose types `subst` makes concrete.
-    fn head_abi(&mut self, fn_ty: &FnTy, subst: &Subst, projection: bool) -> Abi {
+    fn head_abi(&mut self, fn_ty: &FnTy, subst: &Subst, given: Option<Given>) -> Abi {
         let concrete = subst.fn_ty(fn_ty);
         let params = concrete
             .params
@@ -264,7 +265,7 @@ impl Lowering<'_, '_> {
                 (nty, repr)
             })
             .collect();
-        let (result, returned) = self.result_form(&concrete.result, projection);
+        let (result, returned) = self.result_form(&concrete.result, given);
         let fails = failure(&concrete.fails);
         Abi {
             env: false,
@@ -280,14 +281,14 @@ impl Lowering<'_, '_> {
     pub fn subst(&self, item: crate::check::db::ItemId, args: &[crate::check::ty::Arg]) -> Subst {
         self.ck.unit_subst(item, args)
     }
+}
 
-    /// Whether a function of an item's unit returns as a projection does.
-    fn is_projection(&self, item: crate::check::db::ItemId, role: Role, index: u32) -> bool {
-        match role {
-            Role::Default => self.interface_method_is_proj(item, index),
-            _ => self.ck.fn_sig(item).is_some_and(|sig| sig.is_proj()),
-        }
-    }
+/// How a projection gives its result: a part, a wrapped part or a view value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Given {
+    Part,
+    Wrapped(Wrap),
+    View,
 }
 
 /// The failure type of a head, none for one that cannot fail.

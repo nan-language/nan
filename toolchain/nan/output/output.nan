@@ -1,0 +1,479 @@
+//! The output contract: verdict lines around records, output budgets and JSON Lines.
+
+pkg enum Verdict derives Copy, Eq {
+    Ok
+    Failed
+    Invalid
+    InternalError
+} Verdict
+
+pkg proj fn Verdict.word(self) -> Str {
+    return match self {
+        Verdict.Ok => "ok"
+        Verdict.Failed => "failed"
+        Verdict.Invalid => "invalid"
+        Verdict.InternalError => "internal-error"
+    }
+} Verdict.word
+
+pkg fn Verdict.status(self) -> u8 {
+    return match self {
+        Verdict.Ok => 0
+        Verdict.Failed => 1
+        Verdict.Invalid => 2
+        Verdict.InternalError => 3
+    }
+} Verdict.status
+
+/// A header line of a record word and fields, and the continuation lines the record holds.
+pkg struct Record {
+    pkg word: text::String
+    pkg fields: mem::List[text::String]
+    pkg lines: mem::List[text::String]
+} Record
+
+fn Record.text(self, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of(self.word.as_str(), alloc)
+    for field in self.fields {
+        mut out.push(' ')
+        mut out.append(field.as_str())
+    }
+    mut out.push('\n')
+    for line in self.lines {
+        mut out.append("    ")
+        mut out.append(line.as_str())
+        mut out.push('\n')
+    }
+    return out
+} Record.text
+
+fn Record.json(self, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of("{\"fields\":", alloc)
+    json_list(mut out, items: self.fields.view())
+    mut out.append(",\"lines\":")
+    json_list(mut out, items: self.lines.view())
+    mut out.append(",\"record\":")
+    json_string(mut out, value: self.word.as_str())
+    mut out.append("}\n")
+    return out
+} Record.json
+
+/// How a command's output is printed: as JSON Lines or text, within a budget in units, after
+/// skipping records.
+pkg struct Format derives Copy {
+    pkg json: bool
+    pkg budget: Option[usize]
+    pkg skip: usize
+} Format
+
+pkg struct Output {
+    /// The command line without `nan`, as the verdict line writes it.
+    pkg command: text::String
+    /// The command line an elision line names, without its `--skip`.
+    pkg elision: text::String
+    pkg verdict: Verdict
+    pkg summary: mem::List[Count]
+    pkg records: mem::List[Record]
+} Output
+
+/// A count a verdict line's summary gives: its name and its value.
+pkg struct Count {
+    pkg name: text::String
+    pkg value: usize
+} Count
+
+const DEFAULT_BUDGET: usize = 4_000
+
+fn units(bytes: usize) -> usize {
+    if bytes % 4 == 0 {
+        return bytes / 4
+    }
+    return bytes / 4 + 1
+} units
+
+/// The size of records in units, as their text prints them.
+pkg fn units_of(records: Slice[Record], alloc: mem::Alloc) -> usize {
+    var bytes: usize = 0
+    for record in records {
+        bytes += record.text(alloc).byte_len()
+    }
+    return units(bytes)
+} units_of
+
+fn Output.verdict_text(self, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of(self.verdict.word(), alloc)
+    mut out.push(' ')
+    mut out.append(self.command.as_str())
+    mut out.append(": ")
+    for index in 0..<self.summary.len() {
+        if index > 0 {
+            mut out.append(", ")
+        }
+        let count = self.summary.at(index)
+        mut out.append(count.name.as_str())
+        mut out.push(' ')
+        decimal(mut out, value: count.value)
+    }
+    mut out.push('\n')
+    return out
+} Output.verdict_text
+
+fn Output.verdict_json(self, alloc: mem::Alloc) -> text::String {
+    var order = mem::List[usize].empty(alloc)
+    for index in 0..<self.summary.len() {
+        mut order.push(index)
+    }
+    mut order.sort_by(fn(left: usize, right: usize) => count_order(self.summary.at(left), right: self.summary.at(right)))
+    var out = text::String.of("{\"command\":", alloc)
+    json_string(mut out, value: self.command.as_str())
+    mut out.append(",\"record\":\"verdict\",\"summary\":{")
+    for position in 0..<order.len() {
+        if position > 0 {
+            mut out.push(',')
+        }
+        let count = self.summary.at(order[position])
+        json_string(mut out, value: count.name.as_str())
+        mut out.push(':')
+        decimal(mut out, value: count.value)
+    }
+    mut out.append("},\"verdict\":")
+    json_string(mut out, value: self.verdict.word())
+    mut out.append("}\n")
+    return out
+} Output.verdict_json
+
+/// Counts ordered by name, then by value.
+fn count_order(left: Count, right: Count) -> core::Ordering {
+    let names = left.name.as_str().cmp(right.name.as_str())
+    if names != core::Ordering.Equal {
+        return names
+    }
+    return left.value.cmp(right.value)
+} count_order
+
+fn Output.elision_command(self, skip: usize, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of("nan ", alloc)
+    mut out.append(self.elision.as_str())
+    mut out.append(" --skip ")
+    decimal(mut out, value: skip)
+    return out
+} Output.elision_command
+
+/// The elision line naming the command that shows the `left` records after the first `shown`.
+fn Output.elision_line(self, left: usize, shown: usize, alloc: mem::Alloc) -> text::String {
+    var out = text::String.of("elided ", alloc)
+    decimal(mut out, value: left)
+    mut out.append(" records: ")
+    mut out.append(self.elision_command(shown, alloc).as_str())
+    mut out.push('\n')
+    return out
+} Output.elision_line
+
+/// The output text: the verdict line, the most records after the skipped ones that fit the
+/// budget with the verdict lines and any elision line, at least one, and the verdict line.
+pkg fn Output.render(self, format: Format, alloc: mem::Alloc) -> text::String {
+    let budget = format.budget.value_or(DEFAULT_BUDGET)
+    var skip = format.skip
+    if skip > self.records.len() {
+        skip = self.records.len()
+    }
+    let remaining = self.records.len() - skip
+    var texts = mem::List[text::String].empty(alloc)
+    for index in skip..<self.records.len() {
+        mut texts.push(self.records.at(index).text(alloc))
+    }
+    let verdict = self.verdict_text(alloc)
+    var printed: usize = 0
+    var size = 2 * verdict.byte_len()
+    for count in 1..=texts.len() {
+        size += texts[count - 1].byte_len()
+        var elided: usize = 0
+        if count < remaining {
+            elided = self.elision_line(remaining - count, shown: skip + count, alloc).byte_len()
+        }
+        if units(size + elided) <= budget or count == 1 {
+            printed = count
+        }
+    }
+    if not format.json {
+        var out = text::String.of(verdict.as_str(), alloc)
+        for index in 0..<printed {
+            mut out.append(texts[index].as_str())
+        }
+        if printed < remaining {
+            mut out.append(self.elision_line(remaining - printed, shown: skip + printed, alloc).as_str())
+        }
+        mut out.append(verdict.as_str())
+        return out
+    }
+    let summary = self.verdict_json(alloc)
+    var out = text::String.of(summary.as_str(), alloc)
+    for index in skip..<(skip + printed) {
+        mut out.append(self.records.at(index).json(alloc).as_str())
+    }
+    if printed < remaining {
+        mut out.append("{\"command\":")
+        json_string(mut out, value: self.elision_command(skip + printed, alloc).as_str())
+        mut out.append(",\"count\":")
+        decimal(mut out, value: remaining - printed)
+        mut out.append(",\"record\":\"elided\"}\n")
+    }
+    mut out.append(summary.as_str())
+    return out
+} Output.render
+
+fn decimal(mut out: text::String, value: usize) {
+    mut out.write(text::fmt("{value}", value), budget: 32)
+} decimal
+
+/// A JSON string escaping only `"` and `\`.
+fn json_string(mut out: text::String, value: Str) {
+    mut out.push('"')
+    for c in value {
+        if c == '"' or c == '\\' {
+            mut out.push('\\')
+        }
+        mut out.push(c)
+    }
+    mut out.push('"')
+} json_string
+
+fn json_list(mut out: text::String, items: Slice[text::String]) {
+    mut out.push('[')
+    for index in 0..<items.len() {
+        if index > 0 {
+            mut out.push(',')
+        }
+        json_string(mut out, value: items[index].as_str())
+    }
+    mut out.push(']')
+} json_list
+
+/// A command-line argument as a verdict line writes it: as is, or as a text literal when it is
+/// empty or holds a space, `"` or `\`.
+pkg fn argument(arg: Str, alloc: mem::Alloc) -> text::String {
+    var plain = not arg.is_empty()
+    for c in arg {
+        if c == ' ' or c == '"' or c == '\\' {
+            plain = false
+        }
+    }
+    if plain {
+        return text::String.of(arg, alloc)
+    }
+    var out = text::String.of("\"", alloc)
+    for c in arg {
+        if c == '"' or c == '\\' {
+            mut out.push('\\')
+            mut out.push(c)
+        } else if is_control(c) {
+            escaped(mut out, c)
+        } else {
+            mut out.push(c)
+        }
+    }
+    mut out.push('"')
+    return out
+} argument
+
+/// Output text holds no control character but LF: other controls are written as `\u{H}` and bytes
+/// that are not well-formed UTF-8 as U+FFFD.
+pkg fn printable(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    var at: usize = 0
+    while at < bytes.len() {
+        let decoded = decode_at(bytes, at)
+        if is_control(decoded.c) {
+            escaped(mut out, c: decoded.c)
+        } else {
+            mut out.push(decoded.c)
+        }
+        at = decoded.next
+    }
+    return out
+} printable
+
+/// Bytes as text, each ill-formed sequence written as U+FFFD: a byte that starts no character,
+/// or a lead byte with the continuation bytes that may follow it.
+pkg fn lossy(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    var at: usize = 0
+    while at < bytes.len() {
+        let decoded = decode_at(bytes, at)
+        mut out.push(decoded.c)
+        at = decoded.next
+    }
+    return out
+} lossy
+
+/// A character read from bytes, U+FFFD for an ill-formed sequence, and the position after it.
+struct Decoded derives Copy {
+    c: char
+    next: usize
+} Decoded
+
+fn decode_at(bytes: Slice[u8], at: usize) -> Decoded {
+    let Some(c) = text::utf8::char_at(bytes, at) else {
+        return Decoded(c: '\u{FFFD}', next: at + ill_formed_length(bytes, at))
+    }
+    return Decoded(c: c, next: at + c.utf8_len())
+} decode_at
+
+/// The length of the ill-formed sequence at a position: its lead byte and the continuation bytes
+/// that may follow that lead before the first that may not, at least 1.
+fn ill_formed_length(bytes: Slice[u8], at: usize) -> usize {
+    let lead = bytes[at]
+    let width: usize = match lead {
+        0xC2..=0xDF => 2
+        0xE0..=0xEF => 3
+        0xF0..=0xF4 => 4
+        else => 1
+    }
+    var low: u8 = 0x80
+    var high: u8 = 0xBF
+    match lead {
+        0xE0 => {
+            low = 0xA0
+        }
+        0xED => {
+            high = 0x9F
+        }
+        0xF0 => {
+            low = 0x90
+        }
+        0xF4 => {
+            high = 0x8F
+        }
+        else => {}
+    }
+    var length: usize = 1
+    while length < width and at + length < bytes.len() {
+        let byte = bytes[at + length]
+        if byte < low or byte > high {
+            return length
+        }
+        low = 0x80
+        high = 0xBF
+        length += 1
+    }
+    return length
+} ill_formed_length
+
+/// Whether a character is a control character: U+0000 to U+001F or U+007F to U+009F.
+fn is_control(c: char) -> bool {
+    return c <= '\u{1F}' or (c >= '\u{7F}' and c <= '\u{9F}')
+} is_control
+
+const HEX_DIGITS: Str = "0123456789ABCDEF"
+
+/// Writes a character as `\u{H}`, its code point in uppercase hexadecimal.
+fn escaped(mut out: text::String, c: char) {
+    mut out.append("\\u{")
+    let value = c.to_bits()
+    var shift: u32 = 28
+    var started = false
+    loop {
+        let digit = usize.widen((value >> shift) & 0xF)
+        if digit != 0 or started or shift == 0 {
+            started = true
+            let Some(written) = HEX_DIGITS.slice_bytes(digit, end: digit + 1) else {
+                return
+            }
+            mut out.append(written)
+        }
+        if shift == 0 {
+            break
+        }
+        shift -= 4
+    }
+    mut out.push('}')
+} escaped
+
+/// Records of a check of `.` that failed with two errors, one per index.
+fn sample(records: usize, alloc: mem::Alloc) -> Output {
+    var held = mem::List[Record].empty(alloc)
+    for index in 0..<records {
+        var fields = mem::List[text::String].empty(alloc)
+        var location = text::String.of("lex.tab a/a.nan:", alloc)
+        decimal(mut location, value: index)
+        mut fields.push(take location)
+        mut fields.push(text::String.of("-", alloc))
+        var lines = mem::List[text::String].empty(alloc)
+        mut lines.push(text::String.of("quote", alloc))
+        mut held.push(Record(word: text::String.of("error", alloc), fields: take fields, lines: take lines))
+    }
+    var summary = mem::List[Count].empty(alloc)
+    mut summary.push(Count(name: text::String.of("errors", alloc), value: 2))
+    mut summary.push(Count(name: text::String.of("incomplete", alloc), value: 0))
+    return Output(command: text::String.of("check .", alloc), elision: text::String.of("check .", alloc), verdict: Verdict.Failed, summary: take summary, records: take held)
+} sample
+
+/// The number of lines of a text starting with `prefix`.
+fn lines_starting(written: Str, prefix: Str) -> usize {
+    var count: usize = 0
+    var start: usize = 0
+    let bytes = written.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] != b'\n' {
+            continue
+        }
+        let Some(line) = written.slice_bytes(start, end: at) else {
+            return count
+        }
+        if line.starts_with(prefix) {
+            count += 1
+        }
+        start = at + 1
+    }
+    return count
+} lines_starting
+
+test records_lie_between_two_verdict_lines for Output.render {
+    let alloc = testing::world().alloc
+    let rendered = sample(1, alloc).render(Format(json: false, budget: None, skip: 0), alloc)
+    expect rendered.as_str() == "failed check .: errors 2, incomplete 0\nerror lex.tab a/a.nan:0 -\n    quote\nfailed check .: errors 2, incomplete 0\n"
+} records_lie_between_two_verdict_lines
+
+test a_budget_elides_the_records_that_do_not_fit_and_names_the_command_showing_them for Output.render {
+    let alloc = testing::world().alloc
+    let rendered = sample(40, alloc).render(Format(json: false, budget: Some(100), skip: 0), alloc)
+    expect units(rendered.byte_len()) <= 100
+    let printed = lines_starting(rendered.as_str(), prefix: "error")
+    expect printed > 0 and printed < 40
+    var elision = text::String.of("\nelided ", alloc)
+    decimal(mut elision, value: 40 - printed)
+    mut elision.append(" records: nan check . --skip ")
+    decimal(mut elision, value: printed)
+    mut elision.push('\n')
+    expect rendered.find(elision.as_str()) != None
+    expect lines_starting(rendered.as_str(), prefix: "elided") == 1
+    let rest = sample(40, alloc).render(Format(json: false, budget: Some(100), skip: 39), alloc)
+    expect lines_starting(rest.as_str(), prefix: "error") == 1
+    expect rest.find("elided") == None
+} a_budget_elides_the_records_that_do_not_fit_and_names_the_command_showing_them
+
+test json_lines_join_back_into_the_text_form for Output.render {
+    let alloc = testing::world().alloc
+    let rendered = sample(1, alloc).render(Format(json: true, budget: None, skip: 0), alloc)
+    let verdict = "{\"command\":\"check .\",\"record\":\"verdict\",\"summary\":{\"errors\":2,\"incomplete\":0},\"verdict\":\"failed\"}\n"
+    var expected = text::String.of(verdict, alloc)
+    mut expected.append("{\"fields\":[\"lex.tab a/a.nan:0\",\"-\"],\"lines\":[\"quote\"],\"record\":\"error\"}\n")
+    mut expected.append(verdict)
+    expect rendered.as_str() == expected.as_str()
+} json_lines_join_back_into_the_text_form
+
+test arguments_needing_it_are_written_as_text_literals for argument {
+    let alloc = testing::world().alloc
+    let path = argument("example::Gauge", alloc)
+    expect path.as_str() == "example::Gauge"
+    let empty = argument("", alloc)
+    expect empty.as_str() == "\"\""
+    let quoted = argument("a b\"\\", alloc)
+    expect quoted.as_str() == "\"a b\\\"\\\\\""
+} arguments_needing_it_are_written_as_text_literals
+
+test output_holds_no_control_character_but_line_ends for printable {
+    let alloc = testing::world().alloc
+    let shown = printable(b"a\tb\rc\xFFd", alloc)
+    expect shown.as_str() == "a\\u{9}b\\u{D}c\u{FFFD}d"
+} output_holds_no_control_character_but_line_ends

@@ -1,0 +1,4066 @@
+//! Calls: what a call calls, the inference of its generic arguments, its arguments with their labels, modes and markers, its failure and waiting markers, and the call forms the toolchain supplies; constructions of structs, layouts and variants; indexing.
+
+/// The named conversions.
+const CONVERSIONS: Str = "widen fit checked_fit truncate saturate nearest"
+
+/// The inference of a call's generic arguments: each parameter fixed by the first part matching
+/// it.
+struct Infer {
+    params: mem::List[ty::Param]
+    subst: ty::Subst
+} Infer
+
+/// An operation the toolchain supplies under a std path, which no std item declares.
+enum Intrinsic derives Copy, Eq {
+    /// `text::fmt`.
+    Template
+    /// `hw::mint_root`.
+    MintRoot
+} Intrinsic
+
+/// The markers written before a call: its failure marker, `await` and the mode marking its
+/// receiver.
+struct Markers derives Copy {
+    failure: Option[ast::Word[ast::FailureMarker]]
+    awaited: Option[u32]
+    mode: Option[ast::Word[ast::Mode]]
+    /// Whether a call further out of a projection chain takes `mut self` of this call's result.
+    chain_mut: bool
+    /// Whether the mode marks the root of the projection chain that is the receiver, which it
+    /// covers, rather than the receiver.
+    chained: bool
+    /// The last token of the receiver a method call passes for `self`.
+    receiver: Option[u32]
+    /// The first and last tokens of the call they mark, its markers aside.
+    start: Option[u32]
+    last: Option[u32]
+} Markers
+
+/// No marker.
+fn Markers.none() -> Markers = Markers(failure: None, awaited: None, mode: None, chain_mut: false, chained: false, receiver: None, start: None, last: None)
+
+/// A head being called with what is known of its generic arguments.
+struct Callable {
+    callee: Callee
+    head: FnSig
+    infer: Infer
+    /// The parameters whose omitted arguments the expected type fixes first: a member path's
+    /// type parameters.
+    from_expected: bool
+    /// Whether the receiver is the first parenthesised argument rather than a value before `.`.
+    receiver_first: bool
+} Callable
+
+/// What the arguments of a call wait for: whether one waits other than as a task closure, and
+/// whether each that does is a parameter.
+struct ArgWaits derives Copy {
+    through_args: bool
+    all_own: bool
+} ArgWaits
+
+/// A call of a path naming nothing: what a forwarding tombstone names in its place, or the call
+/// typed.
+enum UnknownCall {
+    Forwarded(Named)
+    Typed(TExpr)
+} UnknownCall
+
+/// The fields a construction gives values to, and whether its values are labelled.
+struct ConstructionFields {
+    fields: mem::List[LabelledTy]
+    labelled: bool
+} ConstructionFields
+
+/// The field of a DMA buffer's bytes layout an access names: its index and type.
+struct DmaField derives Copy {
+    index: usize
+    ty: ty::Ty
+} DmaField
+
+/// The operands of a DMA access beside its buffer: the index of an indexed access and the
+/// value of a write.
+struct DmaOperands {
+    index: Option[TExpr]
+    value: Option[TExpr]
+} DmaOperands
+
+fn is_conversion(name: Str) -> bool {
+    return is_listed(CONVERSIONS, word: name) or name == "to_bits" or name == "from_bits" or name == "checked_from_bits"
+} is_conversion
+
+fn Infer.new(take params: mem::List[ty::Param], alloc: mem::Alloc) -> Infer {
+    return Infer(params: take params, subst: ty::Subst.empty(alloc))
+} Infer.new
+
+/// Whether a parameter is one the call's arguments fix.
+fn Infer.holds(self, param: ty::Param) -> bool {
+    return self.params.position(fn(value: ty::Param) => value == param).is_some()
+} Infer.holds
+
+fn Infer.unfixed(self, param: ty::Param) -> bool {
+    return self.holds(param) and self.subst.get(param).is_none()
+} Infer.unfixed
+
+/// Whether a type holds a parameter not fixed yet.
+fn Infer.open(self, ty: ty::Ty, types: ty::Types) -> bool {
+    return types.mentions(ty, params: fn(param: ty::Param) => self.unfixed(param))
+} Infer.open
+
+/// Matches a type holding the call's parameters against a found type, fixing each unfixed
+/// parameter to the part at its position, a failed part included; false when a part differs.
+fn Infer.unify(mut self, pattern: ty::Ty, found: ty::Ty, types: ty::Types) -> bool {
+    let pattern_kind = types.kind(pattern)
+    let found_kind = types.kind(found)
+    match pattern_kind {
+        ty::TyKind.Param(param) => {
+            if self.holds(param) {
+                match self.subst.get(param) {
+                    Some(ty::Arg.Ty(fixed)) => return fixed == found or found.is_never() or types.has_error(found) or types.has_error(fixed)
+                    Some(ty::Arg.Const(_)) => return false
+                    None => {
+                        mut self.subst.insert(param, arg: ty::Arg.Ty(found))
+                        return true
+                    }
+                }
+            }
+        }
+        else => {}
+    }
+    if found_kind == ty::TyKind.Error or pattern_kind == ty::TyKind.Error {
+        return true
+    }
+    match pattern_kind {
+        ty::TyKind.Item(item: left, args: left_args) => {
+            let ty::TyKind.Item(item: right, args: right_args) = found_kind else {
+                return same_or_failed(pattern, found, types)
+            }
+            return left == right and mut self.unify_args(left_args, right: right_args, exact: true, types)
+        }
+        ty::TyKind.Fn(left) => {
+            let ty::TyKind.Fn(right) = found_kind else {
+                return same_or_failed(pattern, found, types)
+            }
+            return mut self.unify_fns(left, right, types)
+        }
+        ty::TyKind.Dyn(left) => {
+            let ty::TyKind.Dyn(right) = found_kind else {
+                return same_or_failed(pattern, found, types)
+            }
+            return left.item == right.item and mut self.unify_args(left.args, right: right.args, exact: false, types)
+        }
+        else => return same_or_failed(pattern, found, types)
+    }
+} Infer.unify
+
+/// Whether a pattern type without parameters to fix matches a found type: equal, or failed or
+/// `Never` found.
+fn same_or_failed(pattern: ty::Ty, found: ty::Ty, types: ty::Types) -> bool {
+    return pattern == found or found.is_never() or types.has_error(found) or types.has_error(pattern)
+} same_or_failed
+
+/// Matches argument lists pairwise, of the same length when `exact`, up to the shorter's
+/// otherwise.
+fn Infer.unify_args(mut self, left: ty::Args, right: ty::Args, exact: bool, types: ty::Types) -> bool {
+    let left_list = types.arg_list(left)
+    let right_list = types.arg_list(right)
+    if exact and left_list.len() != right_list.len() {
+        return false
+    }
+    for index in 0..<left_list.len() {
+        if index >= right_list.len() {
+            break
+        }
+        let matched = mut self.unify_arg(left_list[index], found: right_list[index], types)
+        if not matched {
+            return false
+        }
+    }
+    return true
+} Infer.unify_args
+
+/// Matches function types: their parameters pairwise, their results, and their failure types
+/// when both have one, which never makes them differ.
+fn Infer.unify_fns(mut self, left: ty::FnTyId, right: ty::FnTyId, types: ty::Types) -> bool {
+    let left_fn = types.fn_of(left)
+    let right_fn = types.fn_of(right)
+    if left_fn.params.len() != right_fn.params.len() {
+        return false
+    }
+    var params = true
+    for index in 0..<left_fn.params.len() {
+        let matched = mut self.unify(left_fn.params[index].ty, found: right_fn.params[index].ty, types)
+        if not matched {
+            params = false
+            break
+        }
+    }
+    let result = mut self.unify(left_fn.result, found: right_fn.result, types)
+    match left_fn.failure {
+        Some(left_failure) => {
+            match right_fn.failure {
+                Some(right_failure) => {
+                    discard mut self.unify(left_failure, found: right_failure, types)
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    return params and result
+} Infer.unify_fns
+
+fn Infer.unify_arg(mut self, pattern: ty::Arg, found: ty::Arg, types: ty::Types) -> bool {
+    match pattern {
+        ty::Arg.Ty(pattern_ty) => {
+            let ty::Arg.Ty(found_ty) = found else {
+                return false
+            }
+            return mut self.unify(pattern_ty, found: found_ty, types)
+        }
+        ty::Arg.Const(left) => {
+            let ty::Arg.Const(right) = found else {
+                return false
+            }
+            match left {
+                ty::Const.Param(param) => {
+                    if self.holds(param) {
+                        match self.subst.get(param) {
+                            Some(ty::Arg.Const(fixed)) => return fixed == right or right == ty::Const.Error
+                            else => {
+                                mut self.subst.insert(param, arg: ty::Arg.Const(right))
+                                return true
+                            }
+                        }
+                    }
+                }
+                else => {}
+            }
+            return left == right or left == ty::Const.Error or right == ty::Const.Error
+        }
+    }
+} Infer.unify_arg
+
+/// A function called by its path.
+fn Callable.function(item: ty::ItemId, take head: FnSig, alloc: mem::Alloc) -> Callable {
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in head.generics {
+        mut params.push(def.param)
+    }
+    return Callable(callee: Callee.Function(item: item), head: take head, infer: Infer.new(take params, alloc), from_expected: false, receiver_first: false)
+} Callable.function
+
+/// Whether a callable, when there is one, takes a receiver.
+fn takes_receiver(live: Option[Callable]) -> bool {
+    return match live {
+        Some(callable) => callable.head.has_self()
+        None => false
+    }
+} takes_receiver
+
+/// An expression with markers before it: they apply to the call that ends the postfix
+/// expression, or precede `when`.
+fn Body.marked(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    let ast::ExprKind.Marked(failure: failure, awaited: awaited, mode: mode, inner: boxed) = expr.kind else {
+        return mut self.expr(expr, expected)
+    }
+    let inner = boxed.contents()
+    if self.cx.example {
+        var marker = awaited
+        match failure {
+            Some(word) => {
+                if word.kind == ast::FailureMarker.Try {
+                    marker = Some(word.token)
+                }
+            }
+            None => {}
+        }
+        match marker {
+            Some(at) => self.report(at, code: diagnostic::Code.ExampleForm)
+            None => {}
+        }
+    }
+    match inner.kind {
+        ast::ExprKind.When(accesses: _, body: _) => {
+            var attempted: Option[u32] = None
+            match failure {
+                Some(word) => {
+                    if word.kind == ast::FailureMarker.Try {
+                        self.unneeded_failure_marker(word)
+                    } else {
+                        attempted = Some(word.token)
+                    }
+                }
+                None => {}
+            }
+            return mut self.when_expr(inner, attempted, expected)
+        }
+        else => {}
+    }
+    let calls = mut self.is_call(inner)
+    if not calls {
+        self.report(expr.token, code: diagnostic::Code.ExprMarkerTarget)
+        var typed = mut self.expr(inner, expected)
+        typed.token = expr.token
+        typed.last = expr.last
+        return typed
+    }
+    var markers = Markers.none()
+    markers.failure = failure
+    markers.awaited = awaited
+    markers.mode = mode
+    var typed = mut self.call(inner, expected, markers: Some(markers))
+    typed.token = expr.token
+    typed.last = expr.last
+    return typed
+} Body.marked
+
+/// `old(e)`: the value of a Copy expression at entry, holding no `result` and no other `old`.
+fn Body.old(mut self, token: u32, value: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    if self.cx.old {
+        self.report(token, code: diagnostic::Code.ContractOldForm)
+    }
+    let saved = self.cx
+    self.cx.old = true
+    let typed = mut self.expr(value, expected)
+    self.cx = saved
+    let ck = self.ck.share()
+    let ty = typed.ty
+    if not ck.types().has_error(ty) and not ck.has(ty, property: Property.Copy) {
+        self.report(token, code: diagnostic::Code.ContractOldForm)
+    }
+    return TExpr(token: token, last: token, ty: ty, kind: TKind.Old(mem::Heap.of(ck.alloc()).boxed(take typed)))
+} Body.old
+
+/// Whether an expression is a call and not a construction.
+fn Body.is_call(mut self, expr: ast::Expr) -> bool {
+    let ast::ExprKind.Call(callee: callee, args: _) = expr.kind else {
+        return false
+    }
+    let construction = mut self.is_construction(callee.contents())
+    return not construction
+} Body.is_call
+
+/// Whether a callee names a struct, layout or variant, which makes its call a construction.
+fn Body.is_construction(mut self, callee: ast::Expr) -> bool {
+    match callee.kind {
+        ast::ExprKind.Path(path: path, args: _) => {
+            if path.segments.len() == 1 {
+                let local = mut self.lookup_local(path.segments[0].text.as_str())
+                if local.is_some() {
+                    return false
+                }
+            }
+            let ck = self.ck.share()
+            let db = ck.db()
+            var named: Option[Named] = None
+            match db.resolve(self.module, path) {
+                Ok(found) => {
+                    named = Some(found)
+                }
+                Err(_) => {
+                    match ck.renamed_path(self.module, path) {
+                        Some(tombstone) => {
+                            named = ck.forwarding(tombstone)
+                        }
+                        None => {}
+                    }
+                }
+            }
+            return match named {
+                Some(Named.Variant(item: _, index: _)) => true
+                Some(Named.Item(item)) => match db.ast(item).kind {
+                    ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) => true
+                    else => false
+                }
+                else => false
+            }
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            let target = mut self.type_target(base.contents())
+            let Some(TypeTarget.Type(found)) = target else {
+                return false
+            }
+            let ck = self.ck.share()
+            let ty::TyKind.Item(item: item, args: _) = ck.types().kind(found) else {
+                return false
+            }
+            return self.variant_named(item, name: name.text.as_str()).is_some()
+        }
+        else => return false
+    }
+} Body.is_construction
+
+/// The index of the variant of that name when an item is an enum.
+fn Body.variant_named(self, item: ty::ItemId, name: Str) -> Option[usize] {
+    let sig = self.ck.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    return variants.position(fn(value: VariantSig) => value.name.as_str() == name)
+} Body.variant_named
+
+/// A call expression, a construction included.
+fn Body.call(mut self, expr: ast::Expr, expected: Option[ty::Ty], markers: Option[Markers]) -> TExpr {
+    let ast::ExprKind.Call(callee: boxed, args: args) = expr.kind else {
+        return mut self.expr(expr, expected)
+    }
+    let callee = boxed.contents()
+    let token = expr.token
+    var marks = markers.value_or(Markers.none())
+    marks.start = Some(expr.token)
+    marks.last = Some(expr.last)
+    match callee.kind {
+        ast::ExprKind.Path(path: path, args: generic_args) => return mut self.path_call(token, callee, path, generic_args, args: args.view(), expected, markers: marks)
+        ast::ExprKind.Field(base: base, name: name) => {
+            let target = mut self.type_target(base.contents())
+            match target {
+                Some(found) => return mut self.member_call(token, target: found, base: base.contents(), name, args: args.view(), expected, markers: marks)
+                None => return mut self.method_call(token, base: base.contents(), name, args: args.view(), expected, markers: marks)
+            }
+        }
+        else => {
+            let value = mut self.expr(callee, expected: None)
+            return mut self.value_call(token, take value, args: args.view(), expected, markers: marks)
+        }
+    }
+} Body.call
+
+/// A call whose callee is a path: an intrinsic, `old` in an ensures clause, a local of function
+/// type, or the item or variant the path names.
+fn Body.path_call(
+    mut self,
+    token: u32,
+    callee: ast::Expr,
+    path: ast::Path,
+    generic_args: Option[mem::List[ast::GenericArg]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    match self.intrinsic(path) {
+        Some(Intrinsic.Template) => {
+            self.report(token, code: diagnostic::Code.TextTemplatePosition)
+            discard mut self.template(token, args)
+            return TExpr.failed(token)
+        }
+        Some(Intrinsic.MintRoot) => return mut self.mint_root(token, args, markers)
+        None => {}
+    }
+    if self.cx.ensures_clause and generic_args.is_none() and path.segments.len() == 1 and path.segments[0].text.as_str() == "old" and args.len() == 1 and args[0].label.is_none() and not is_marked(args[0].value) {
+        return mut self.old(token, value: args[0].value, expected)
+    }
+    if path.segments.len() == 1 and generic_args.is_none() {
+        let found = mut self.lookup_local(path.segments[0].text.as_str())
+        match found {
+            Some(local) => {
+                mut self.note_use(local)
+                let value = TExpr(token: callee.token, last: callee.last, ty: self.local(local).ty, kind: TKind.Local(local))
+                return mut self.value_call(token, take value, args, expected, markers)
+            }
+            None => {}
+        }
+    }
+    let ck = self.ck.share()
+    let resolved = ck.db().resolve(self.module, path)
+    let named = match first resolved {
+        Ok(found) => found
+        Err(error) if error.code == Some(diagnostic::Code.NameUnknown) => match mut self.unknown_call(token, callee, path, generic_args, args, expected, markers, error) {
+            UnknownCall.Forwarded(found) => found
+            UnknownCall.Typed(typed) => return typed
+        }
+        Err(error) => {
+            self.report_path(error)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+    }
+    return mut self.named_call(token, callee, named, generic_args, args, expected, markers)
+} Body.path_call
+
+/// Whether an expression has markers before it.
+fn is_marked(expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: _) => true
+        else => false
+    }
+} is_marked
+
+/// A call of a path naming nothing: a use of an old form, which a renaming tombstone may
+/// forward, or an unknown path reported with the stub of a function of that name.
+fn Body.unknown_call(
+    mut self,
+    token: u32,
+    callee: ast::Expr,
+    path: ast::Path,
+    generic_args: Option[mem::List[ast::GenericArg]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    error: PathError,
+    ) -> UnknownCall {
+    if generic_args.is_none() {
+        let ck = self.ck.share()
+        match ck.db().spelled(self.module, path) {
+            Some(form) => {
+                let Some(whole) = args.prefix(args.len()) else {
+                    expect false
+                    return UnknownCall.Typed(TExpr.failed(token))
+                }
+                let call = Use(token: token, args: take whole, expected: expected, markers: markers)
+                let matched = mut self.matched(form.as_str(), live: None, receiver: None, call, headed: fn(mut body: Body, tombstone: ty::ItemId) => mut body.retired_head(tombstone))
+                if matched.len() == 1 and ck.renaming(form.as_str(), from: self.module) == Some(matched[0]) {
+                    match ck.forward_path(self.item, module: self.module, path) {
+                        Some(found) => return UnknownCall.Forwarded(found)
+                        None => {
+                            mut self.skim_args(args)
+                            return UnknownCall.Typed(TExpr.failed(token))
+                        }
+                    }
+                }
+                if matched.len() > 0 {
+                    return UnknownCall.Typed(mut self.retired_call(callee, matched: matched.view(), call))
+                }
+            }
+            None => {}
+        }
+    }
+    var stub: Option[text::String] = None
+    if path.segments.len() == 1 and generic_args.is_none() {
+        stub = mut self.stub(path.segments[0].text.as_str(), receiver: None, args, expected, markers)
+    } else {
+        mut self.skim_args(args)
+    }
+    self.unknown_path(error.token, take stub)
+    return UnknownCall.Typed(TExpr.failed(token))
+} Body.unknown_call
+
+/// A call of what a path names: a function, a construction of a struct, layout or variant, or
+/// a value of function type.
+fn Body.named_call(
+    mut self,
+    token: u32,
+    callee: ast::Expr,
+    named: Named,
+    generic_args: Option[mem::List[ast::GenericArg]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let db = ck.db()
+    match named {
+        Named.Item(item) => {
+            if not db.visible(self.module, item) {
+                self.report(callee.token, code: diagnostic::Code.NamePrivate)
+            }
+            match db.ast(item).kind {
+                ast::ItemKind.Fn(_) => return mut self.function_call(token, callee, item, generic_args, args, expected, markers)
+                ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) => {
+                    self.no_markers(token, markers)
+                    return mut self.construct(token, item, variant: None, generic_args, args, expected)
+                }
+                else => {
+                    let value = mut self.expr(callee, expected: None)
+                    return mut self.value_call(token, take value, args, expected, markers)
+                }
+            }
+        }
+        Named.Variant(item: enumeration, index: variant) => {
+            self.no_markers(token, markers)
+            return mut self.construct(token, item: enumeration, variant: Some(variant), generic_args, args, expected)
+        }
+        else => {
+            self.report(callee.token, code: diagnostic::Code.NameUnknown)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+    }
+} Body.named_call
+
+/// A call of a function item by its path, unless it is an interrupt or landing fn, or a use of
+/// an old form of its path.
+fn Body.function_call(
+    mut self,
+    token: u32,
+    callee: ast::Expr,
+    item: ty::ItemId,
+    generic_args: Option[mem::List[ast::GenericArg]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let Some(head) = ck.fn_sig(item) else {
+        return TExpr.failed(token)
+    }
+    let forbidden = match head.modifier {
+        Some(ast::FnModifier.Interrupt) => Some(diagnostic::Code.KernelIrqCall)
+        Some(ast::FnModifier.Landing) => Some(diagnostic::Code.HwLandingCalled)
+        else => None
+    }
+    match forbidden {
+        Some(code) => {
+            self.report(token, code)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        None => {}
+    }
+    var live = Some(Callable.function(item, take head, alloc: ck.alloc()))
+    if generic_args.is_none() {
+        match ck.canonical_path(item) {
+            Some(form) => {
+                let Some(whole) = args.prefix(args.len()) else {
+                    expect false
+                    return TExpr.failed(token)
+                }
+                let call = Use(token: token, args: take whole, expected: expected, markers: markers)
+                let matched = mut self.matched(form.as_str(), live, receiver: None, call, headed: fn(mut body: Body, tombstone: ty::ItemId) => mut body.retired_head(tombstone))
+                if matched.len() > 0 {
+                    return mut self.retired_call(callee, matched: matched.view(), call)
+                }
+            }
+            None => {}
+        }
+    }
+    let Some(callable) = live else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return mut self.apply(token, take callable, receiver: None, args, expected, markers)
+} Body.function_call
+
+fn Body.no_markers(self, token: u32, markers: Markers) {
+    if markers.failure.is_some() or markers.awaited.is_some() or markers.mode.is_some() {
+        self.report(token, code: diagnostic::Code.ExprMarkerTarget)
+    }
+} Body.no_markers
+
+/// The stub a call of an unknown member `name` of a type declared in the body's module makes,
+/// `self` taking the receiver of a call on a value, when `receiver`; none for another type.
+fn Body.member_stub(
+    mut self,
+    ty: ty::Ty,
+    name: ast::Name,
+    receiver: bool,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> Option[text::String] {
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    var owner: Option[ty::ItemId] = None
+    match ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if ck.db().module_of(item) == self.module {
+                owner = Some(item)
+            }
+        }
+        else => {}
+    }
+    let Some(item) = owner else {
+        mut self.skim_args(args)
+        return None
+    }
+    var label = match ck.db().ast(item).name(alloc) {
+        Some(declared) => declared
+        None => text::String.empty(alloc)
+    }
+    mut label.push('.')
+    mut label.append(name.text.as_str())
+    var given: Option[Option[ast::Mode]] = None
+    if receiver {
+        let mode = match markers.mode {
+            Some(word) => Some(word.kind)
+            None => None
+        }
+        given = Some(mode)
+    }
+    return mut self.stub(label.as_str(), receiver: given, args, expected, markers)
+} Body.member_stub
+
+/// The stub a call of an unknown function named `label` makes: a private function whose
+/// parameters follow the arguments, `self` first in the mode given when there is a receiver,
+/// whose result is the type expected at the call unless it is an expression statement, failing
+/// and waiting as its markers state, with a `todo` body; none when an argument's type or the
+/// expected type is not fixed, or when two parameters share a name.
+fn Body.stub(
+    mut self,
+    label: Str,
+    receiver: Option[Option[ast::Mode]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> Option[text::String] {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    var names = mem::List[text::String].empty(alloc)
+    var params = mem::List[text::String].empty(alloc)
+    match receiver {
+        Some(mode) => {
+            mut names.push(text::String.of("self", alloc))
+            var param = text::String.of(self.mode_word(mode), alloc)
+            mut param.append("self")
+            mut params.push(take param)
+        }
+        None => {}
+    }
+    var fixed = true
+    for index in 0..<args.len() {
+        let arg = args[index]
+        let marker = self.marked_value(arg.value)
+        let value = match first arg.value.kind {
+            ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+            else => arg.value
+        }
+        let typed = mut self.skim(value)
+        let closure = match value.kind {
+            ast::ExprKind.Closure(_) => true
+            else => false
+        }
+        fixed = fixed and not types.has_error(typed.ty) and not closure
+        let Some(name) = mut self.stub_param_name(arg, value, index) else {
+            return None
+        }
+        let mode = match marker {
+            Some(word) => Some(word.kind)
+            None => None
+        }
+        var param = text::String.of(self.mode_word(mode), alloc)
+        mut param.append(name.as_str())
+        mut param.append(": ")
+        mut param.append(ck.show(typed.ty, from: self.module).as_str())
+        mut names.push(take name)
+        mut params.push(take param)
+    }
+    if not fixed or holds_duplicate(names.view()) {
+        return None
+    }
+    return self.stub_text(label, params: params.view(), expected, markers)
+} Body.stub
+
+/// The name a stub gives the parameter of an argument: its label, the binding it names, or
+/// `value` for the leading one; none for another.
+fn Body.stub_param_name(mut self, arg: ast::Arg, value: ast::Expr, index: usize) -> Option[text::String] {
+    let alloc = self.ck.alloc()
+    match arg.label_name() {
+        Some(label) => return Some(text::String.of(label.text.as_str(), alloc))
+        None => {}
+    }
+    match value.kind {
+        ast::ExprKind.Path(path: path, args: None) => {
+            if path.segments.len() == 1 {
+                let local = mut self.lookup_local(path.segments[0].text.as_str())
+                if local.is_some() {
+                    return Some(text::String.of(path.segments[0].text.as_str(), alloc))
+                }
+            }
+        }
+        else => {}
+    }
+    if index == 0 {
+        return Some(text::String.of("value", alloc))
+    }
+    return None
+} Body.stub_param_name
+
+/// Whether two names of a list are the same.
+fn holds_duplicate(names: Slice[text::String]) -> bool {
+    for index in 0..<names.len() {
+        for earlier in 0..<index {
+            if names[earlier] == names[index] {
+                return true
+            }
+        }
+    }
+    return false
+} holds_duplicate
+
+/// The text of a stub with its parameters, its result and failure types from the expected type
+/// and the markers, `uses wait` when awaited, and a `todo` body; none when the expected type
+/// does not fix them.
+fn Body.stub_text(self, label: Str, params: Slice[text::String], expected: Option[ty::Ty], markers: Markers) -> Option[text::String] {
+    let types = self.ck.types()
+    let marker = match markers.failure {
+        Some(word) => Some(word.kind)
+        None => None
+    }
+    var result: Option[ty::Ty] = None
+    var failure: Option[ty::Ty] = None
+    if self.marks_statement(markers) {
+        if marker == Some(ast::FailureMarker.Try) {
+            failure = self.frame().failure
+        }
+    } else {
+        let Some(wanted) = expected else {
+            return None
+        }
+        if types.has_error(wanted) {
+            return None
+        }
+        if marker == Some(ast::FailureMarker.Attempt) {
+            let wanted_args = types.arg_list(types.args_of(wanted))
+            if wanted_args.len() != 2 {
+                return None
+            }
+            let ty::Arg.Ty(value) = wanted_args[0] else {
+                return None
+            }
+            let ty::Arg.Ty(raised) = wanted_args[1] else {
+                return None
+            }
+            result = Some(value)
+            failure = Some(raised)
+        } else {
+            result = Some(wanted)
+            if marker == Some(ast::FailureMarker.Try) {
+                failure = self.frame().failure
+            }
+        }
+    }
+    return Some(self.stub_written(label, params, result, failure, awaited: markers.awaited.is_some()))
+} Body.stub_text
+
+/// Whether the call the markers mark, from its first marker or token to its last token, is the
+/// expression in statement position being typed.
+fn Body.marks_statement(self, markers: Markers) -> bool {
+    var opening: Option[u32] = None
+    match markers.failure {
+        Some(word) => {
+            opening = earlier_token(opening, token: word.token)
+        }
+        None => {}
+    }
+    match markers.awaited {
+        Some(awaited) => {
+            opening = earlier_token(opening, token: awaited)
+        }
+        None => {}
+    }
+    match markers.mode {
+        Some(word) => {
+            opening = earlier_token(opening, token: word.token)
+        }
+        None => {}
+    }
+    match markers.start {
+        Some(start) => {
+            opening = earlier_token(opening, token: start)
+        }
+        None => {}
+    }
+    let Some(span) = self.statement else {
+        return false
+    }
+    let Some(head) = opening else {
+        return false
+    }
+    let Some(last) = markers.last else {
+        return false
+    }
+    return span == nir::Span(head: head, last: last)
+} Body.marks_statement
+
+/// The earlier of a token and an optional one.
+fn earlier_token(current: Option[u32], token: u32) -> Option[u32] {
+    let Some(earlier) = current else {
+        return Some(token)
+    }
+    if earlier < token {
+        return Some(earlier)
+    }
+    return Some(token)
+} earlier_token
+
+/// The text of a stub: its head with its parameters, result, failure type and waiting, and a
+/// `todo` body.
+fn Body.stub_written(
+    self,
+    label: Str,
+    params: Slice[text::String],
+    result: Option[ty::Ty],
+    failure: Option[ty::Ty],
+    awaited: bool,
+    ) -> text::String {
+    let ck = self.ck
+    var stub = text::String.of("fn ", alloc: ck.alloc())
+    mut stub.append(label)
+    mut stub.push('(')
+    for index in 0..<params.len() {
+        if index > 0 {
+            mut stub.append(", ")
+        }
+        mut stub.append(params[index].as_str())
+    }
+    mut stub.push(')')
+    match result {
+        Some(found) => {
+            mut stub.append(" -> ")
+            mut stub.append(ck.show(found, from: self.module).as_str())
+        }
+        None => {}
+    }
+    match failure {
+        Some(found) => {
+            mut stub.append(" fails ")
+            mut stub.append(ck.show(found, from: self.module).as_str())
+        }
+        None => {}
+    }
+    if awaited {
+        mut stub.append(" uses wait")
+    }
+    mut stub.append(" {\n    ")
+    if result.is_some() {
+        mut stub.append("return ")
+    }
+    mut stub.append("todo \"")
+    mut stub.append(label)
+    mut stub.append("\"\n} ")
+    mut stub.append(label)
+    mut stub.push('\n')
+    return stub
+} Body.stub_written
+
+/// Types the arguments of a call that failed, so their own rules still apply.
+fn Body.skim_args(mut self, args: Slice[ast::Arg]) {
+    for arg in args {
+        match arg.value.kind {
+            ast::ExprKind.Closure(_) => continue
+            else => {}
+        }
+        let marker = self.marked_value(arg.value)
+        let value = match first arg.value.kind {
+            ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+            else => arg.value
+        }
+        discard mut self.skim(value)
+    }
+} Body.skim_args
+
+/// The mode written before a whole argument or construction value, which then marks the
+/// `inner` expression of its `Marked` value; none when there is none or when it precedes a
+/// method call, whose receiver it marks instead.
+fn Body.marked_value(self, value: ast::Expr) -> Option[ast::Word[ast::Mode]] {
+    return match first value.kind {
+        ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(mode), inner: inner) if not self.is_method_call(inner.contents()) => Some(mode)
+        else => None
+    }
+} Body.marked_value
+
+/// The intrinsic a path names through its std alias.
+fn Body.intrinsic(self, path: ast::Path) -> Option[Intrinsic] {
+    if path.segments.len() != 2 {
+        return None
+    }
+    let alias = path.segments[0].text.as_str()
+    let name = path.segments[1].text.as_str()
+    let db = self.ck.db()
+    let package_id = db.module(self.module).package_id
+    let std_package = db.std.get_by(fn(key: text::String) => key.as_str().cmp(alias))
+    let own = std_package == Some(package_id)
+    if not own and db.module_named(package_id, name: alias).is_some() {
+        return None
+    }
+    let Some(aliased) = db.alias(package_id, name: alias) else {
+        return None
+    }
+    var intrinsic = Intrinsic.Template
+    if alias == "hw" and name == "mint_root" {
+        intrinsic = Intrinsic.MintRoot
+    } else if not (alias == "text" and name == "fmt") {
+        return None
+    }
+    if std_package == Some(aliased) {
+        return Some(intrinsic)
+    }
+    return None
+} Body.intrinsic
+
+/// A whole argument or receiver of a call, the one position where a template call stands.
+fn Body.operand(mut self, value: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    match value.kind {
+        ast::ExprKind.Call(callee: callee, args: args) => {
+            match callee.contents().kind {
+                ast::ExprKind.Path(path: path, args: None) => {
+                    if self.intrinsic(path) == Some(Intrinsic.Template) {
+                        return mut self.template(value.token, args: args.view())
+                    }
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return mut self.expr(value, expected)
+} Body.operand
+
+/// A value written with `mut`: a place whose indexing calls `at_mut` when it writes through
+/// an index, as the place of a `mut` access, or else an operand.
+fn Body.mut_operand(mut self, value: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
+    if not is_indexed_path(value) {
+        return mut self.operand(value, expected)
+    }
+    let place = mut self.place(value, assigned: false)
+    let Some(found) = place else {
+        return TExpr.failed(value.token)
+    }
+    return found
+} Body.mut_operand
+
+/// `hw::mint_root()`: the target's root grant, minted once by its platform package's entry
+/// landing fn, outside every loop and closure.
+fn Body.mint_root(mut self, token: u32, args: Slice[ast::Arg], markers: Markers) -> TExpr {
+    self.builtin_markers(markers)
+    if args.len() > 0 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let ck = self.ck.share()
+    let db = ck.db()
+    let alloc = ck.alloc()
+    let entry_landing = match db.ast(self.item).kind {
+        ast::ItemKind.Fn(function) => match function.modifier {
+            Some(word) => word.kind == ast::FnModifier.Landing
+            None => false
+        }
+        else => false
+    }
+    var legal = entry_landing and db.is_std(self.item) and self.loops.len() == 0 and self.frames.len() == 1
+    if legal {
+        legal = not self.minted
+        self.minted = true
+    }
+    if not legal {
+        self.report(token, code: diagnostic::Code.HwMintRootMisplaced)
+    }
+    let target = db.target
+    var grant: Option[ty::ItemId] = None
+    match target.root_grant() {
+        Some(root) => {
+            grant = db.std_item(root.module, name: root.name)
+        }
+        None => {}
+    }
+    let ty = match grant {
+        Some(found) => ck.types().item(found, args: mem::List[ty::Arg].empty(alloc))
+        None => ty::Ty.error()
+    }
+    let made = Call(token: token, callee: Callee.Builtin(Builtin.MintRoot), type_args: ty::Args.none(), args: mem::List[TArg].empty(alloc), head: plain_head(ty, alloc), projection: false, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: ty, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.mint_root
+
+/// Reports a failure marker a call does not need, with the fix deleting a `try`.
+fn Body.unneeded_failure_marker(self, marker: ast::Word[ast::FailureMarker]) {
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    if marker.kind == ast::FailureMarker.Try {
+        mut fixes.push(self.ck.fix_deleting_forward(self.item, head: marker.token, last: marker.token))
+    }
+    self.report_fixed(construct: nir::Span.at(marker.token), code: diagnostic::Code.ErrorMarkerUnneeded, take fixes)
+} Body.unneeded_failure_marker
+
+/// Reports an `await` a call does not need, with the fix deleting it.
+fn Body.unneeded_await(self, token: u32) {
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_deleting_forward(self.item, head: token, last: token))
+    self.report_fixed(construct: nir::Span.at(token), code: diagnostic::Code.EffectAwaitUnneeded, take fixes)
+} Body.unneeded_await
+
+/// The markers before a call of a toolchain operation, which never fails, waits or takes a
+/// receiver.
+fn Body.builtin_markers(self, markers: Markers) {
+    match markers.failure {
+        Some(marker) => self.unneeded_failure_marker(marker)
+        None => {}
+    }
+    match markers.awaited {
+        Some(marker) => self.unneeded_await(marker)
+        None => {}
+    }
+    match markers.mode {
+        Some(marker) => self.report(marker.token, code: diagnostic::Code.ExprMarkerTarget)
+        None => {}
+    }
+} Body.builtin_markers
+
+/// A call through a function value.
+fn Body.value_call(
+    mut self,
+    token: u32,
+    take value: TExpr,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let fn_id = match types.kind(value.ty) {
+        ty::TyKind.Fn(id) => id
+        ty::TyKind.Error => {
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        else => {
+            self.report(token, code: diagnostic::Code.NameUnknown)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+    }
+    let fn_ty = types.fn_of(fn_id)
+    match fn_ty.kind {
+        ast::FnKind.Task => {
+            self.report(token, code: diagnostic::Code.TaskTaskFnCall)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        ast::FnKind.Interrupt => {
+            self.report(token, code: diagnostic::Code.KernelIrqCall)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        ast::FnKind.Plain => {}
+    }
+    let own_param = self.is_own_param(value)
+    var params = mem::List[ParamSig].empty(alloc)
+    for param in fn_ty.params {
+        mut params.push(ParamSig(name: text::String.of(param.name.as_str(), alloc), mode: param.mode, ty: param.ty, token: token, is_self: false))
+    }
+    var convention: Option[text::String] = None
+    match fn_ty.convention {
+        Some(written) => {
+            convention = Some(text::String.of(written.as_str(), alloc))
+        }
+        None => {}
+    }
+    let head = FnSig(generics: mem::List[GenericDef].empty(alloc), inherited: 0, params: take params, result: fn_ty.result, failure: fn_ty.failure, wait: fn_ty.wait, limit_set: fn_ty.limit_set, modifier: None, convention: take convention)
+    let callable = Callable(callee: Callee.Value(mem::Heap.of(alloc).boxed(take value)), head: take head, infer: Infer.new(mem::List[ty::Param].empty(alloc), alloc), from_expected: false, receiver_first: false)
+    return mut self.apply_with(token, take callable, receiver: None, args, expected, markers, own_param)
+} Body.value_call
+
+/// Whether a value is a parameter of the frame being typed.
+fn Body.is_own_param(self, value: TExpr) -> bool {
+    let TKind.Local(local) = value.kind else {
+        return false
+    }
+    let declared = self.local(local)
+    let LocalKind.Param(_) = declared.kind else {
+        return false
+    }
+    return declared.closure == self.frame().closure
+} Body.is_own_param
+
+/// `T.name(...)`, `I.name(...)` or `module.name(...)`: a construction, an associated function
+/// or method called through its type, a qualified interface call, or a built-in member.
+fn Body.member_call(
+    mut self,
+    token: u32,
+    target: TypeTarget,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ty = match target {
+        TypeTarget.Module => {
+            self.dot_for_path(name)
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        TypeTarget.Failed => {
+            mut self.skim_args(args)
+            return TExpr.failed(token)
+        }
+        TypeTarget.Interface(interface_item) => return mut self.qualified_call(token, interface_item, base, name, args, expected, markers)
+        TypeTarget.Type(found) => found
+    }
+    let written_args = match base.kind {
+        ast::ExprKind.Path(path: _, args: Some(_)) => true
+        else => false
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    if types.has_error(ty) {
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let member = name.text.as_str()
+    match types.kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if self.core_variant_qualified(item, name: member) {
+                self.qualified_core_variant(base.token, name)
+                mut self.skim_args(args)
+                return TExpr.failed(token)
+            }
+            match self.variant_named(item, name: member) {
+                Some(variant) => return mut self.variant_construction(token, item, variant, base, name, args, expected, markers)
+                None => {}
+            }
+        }
+        else => {}
+    }
+    match types.scalar_of(ty) {
+        Some(scalar) => {
+            if is_conversion(member) {
+                return mut self.conversion(token, target: scalar, name, args, markers)
+            }
+        }
+        None => {}
+    }
+    match types.kind(ty) {
+        ty::TyKind.Dyn(bound) => {
+            if member == "view" or member == "view_mut" {
+                return mut self.dyn_view(token, bound, written: name, args, markers)
+            }
+        }
+        else => {}
+    }
+    return mut self.type_member_call(token, ty, base, name, args, expected, markers, written_args)
+} Body.member_call
+
+/// A construction of a variant written as a member path `E.V(...)`.
+fn Body.variant_construction(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: usize,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    self.name_member(name.token, member: Member.Variant(owner: item, name: text::String.of(name.text.as_str(), alloc: self.ck.alloc())))
+    self.no_markers(token, markers)
+    return match base.kind {
+        ast::ExprKind.Path(path: _, args: generic_args) => mut self.construct(token, item, variant: Some(variant), generic_args, args, expected)
+        else => mut self.construct(token, item, variant: Some(variant), generic_args: None, args, expected)
+    }
+} Body.variant_construction
+
+/// A member call through a type that is no conversion or `Dyn` view: `from_box`, a layout's
+/// bit conversion, or a member method resolution finds.
+fn Body.type_member_call(
+    mut self,
+    token: u32,
+    ty: ty::Ty,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    written_args: bool,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let member = name.text.as_str()
+    match ck.boxed_dyn(ty) {
+        Some(contents) => {
+            match types.kind(contents) {
+                ty::TyKind.Dyn(_) => {
+                    if member == "from_box" {
+                        return mut self.boxed_dyn_call(token, boxed: ty, bound: contents, args, markers)
+                    }
+                }
+                else => {}
+            }
+        }
+        None => {}
+    }
+    match types.kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            match ck.db().ast(item).kind {
+                ast::ItemKind.Layout(_) => {
+                    if member == "to_bits" or member == "from_bits" or member == "checked_from_bits" {
+                        return mut self.layout_bits(token, layout_ty: ty, written: name, args, markers)
+                    }
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return mut self.member_candidates(token, ty, base, name, args, expected, markers, written_args)
+} Body.type_member_call
+
+/// A member call through a type, by the candidates method resolution finds: a use of an old form
+/// of the member, its one candidate called with the receiver first, or the failure to find one.
+fn Body.member_candidates(
+    mut self,
+    token: u32,
+    ty: ty::Ty,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    written_args: bool,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let member = name.text.as_str()
+    let candidates = ck.method_candidates(ty, name: member)
+    let Some(whole) = args.prefix(args.len()) else {
+        expect false
+        return TExpr.failed(token)
+    }
+    let call = Use(token: token, args: take whole, expected: expected, markers: markers)
+    if candidates.len() == 0 {
+        match self.member_form(ty, name: member) {
+            Some(form) => {
+                let matched = mut self.matched(form.as_str(), live: None, receiver: None, call, headed: fn(mut body: Body, tombstone: ty::ItemId) -> Option[Callable] {
+                    let candidate = body.retired_candidate(tombstone, ty)
+                    return mut body.member_callable(take candidate, ty, written_args)
+                })
+                if matched.len() > 0 {
+                    return mut self.retired_member(ty, base, name, written_args, matched: matched.view(), call)
+                }
+            }
+            None => {}
+        }
+        return mut self.no_member(token, ty, base, name, args, expected, markers)
+    }
+    if candidates.len() > 1 {
+        var interfaces = mem::List[ty::ItemId].empty(ck.alloc())
+        for candidate in candidates {
+            match self.candidate_interface(candidate) {
+                Some(found) => mut interfaces.push(found)
+                None => {}
+            }
+        }
+        let fixes = self.requalified(interfaces.view(), base)
+        self.report_fixed(construct: nir::Span.at(name.token), code: diagnostic::Code.InterfaceAmbiguousMethod, take fixes)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    var cursor = take candidates.into_cursor()
+    let Some(candidate) = mut cursor.next() else {
+        expect false
+        return TExpr.failed(token)
+    }
+    self.name_candidate(name.token, candidate, name: member)
+    var live = mut self.member_callable(take candidate, ty, written_args)
+    if live.is_none() {
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    match self.member_form(ty, name: member) {
+        Some(form) => {
+            let matched = mut self.matched(form.as_str(), live, receiver: None, call, headed: fn(mut body: Body, tombstone: ty::ItemId) -> Option[Callable] {
+                let former = body.retired_candidate(tombstone, ty)
+                return mut body.member_callable(take former, ty, written_args)
+            })
+            if matched.len() > 0 {
+                return mut self.retired_member(ty, base, name, written_args, matched: matched.view(), call)
+            }
+        }
+        None => {}
+    }
+    let Some(callable) = live else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return mut self.apply(token, take callable, receiver: None, args, expected, markers)
+} Body.member_candidates
+
+/// A member call through a type naming no such member: reported as one of a newer release, an
+/// unknown member with its stub, or an interface method to call qualified.
+fn Body.no_member(
+    mut self,
+    token: u32,
+    ty: ty::Ty,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let interfaces = self.unqualified(ty, name: name.text.as_str())
+    let construct = nir::Span(head: base.token, last: name.token)
+    let written = ck.written(self.item, head: base.token, last: name.token)
+    if interfaces.len() == 0 and ck.report_newer_release(self.item, construct, written: written.as_str()) {
+        mut self.skim_args(args)
+    } else if interfaces.len() == 0 {
+        let stub = mut self.member_stub(ty, name, receiver: false, args, expected, markers)
+        self.unknown_member(name, ty, take stub)
+    } else {
+        let fixes = self.requalified(interfaces.view(), base)
+        self.report_fixed(construct: nir::Span.at(name.token), code: diagnostic::Code.InterfaceUnqualifiedCall, take fixes)
+        mut self.skim_args(args)
+    }
+    return TExpr.failed(token)
+} Body.no_member
+
+/// The fixes writing each interface in place of the type a member path names.
+fn Body.requalified(self, interfaces: Slice[ty::ItemId], base: ast::Expr) -> mem::List[diagnostic::Fix] {
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    for interface_item in interfaces {
+        let written = self.ck.item_written(interface_item, from: self.module)
+        mut fixes.push(self.ck.fix_replacing(self.item, head: base.token, last: base.last, text: written.as_str()))
+    }
+    return fixes
+} Body.requalified
+
+/// The callable a candidate stands for in a call naming it through its type, the receiver
+/// passed first; `written_args` when the type path writes the type's arguments, which are
+/// otherwise inferred.
+fn Body.member_callable(mut self, take candidate: Candidate, ty: ty::Ty, written_args: bool) -> Option[Callable] {
+    let Some(found) = mut self.callable(take candidate, self_ty: ty) else {
+        return None
+    }
+    var callable = found
+    callable.receiver_first = true
+    if written_args {
+        return Some(take callable)
+    }
+    let Some(key) = self.ck.type_key(ty) else {
+        return Some(take callable)
+    }
+    let type_params = self.ck.type_generics(key)
+    for def in type_params {
+        mut callable.infer.params.push(def.param)
+    }
+    for def in type_params {
+        mut callable.infer.subst.remove(def.param)
+    }
+    callable.from_expected = true
+    return Some(take callable)
+} Body.member_callable
+
+/// The callable a method resolution candidate stands for, its type's arguments substituted.
+fn Body.callable(mut self, take candidate: Candidate, self_ty: ty::Ty) -> Option[Callable] {
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    match candidate {
+        Candidate.Function(item: item, subst: subst) => {
+            let Some(head) = ck.fn_sig(item) else {
+                return None
+            }
+            var own = mem::List[ty::Param].empty(alloc)
+            for def in head.own_generics() {
+                mut own.push(def.param)
+            }
+            var infer = Infer.new(take own, alloc)
+            infer.subst = subst
+            return Some(Callable(callee: Callee.Function(item: item), head: take head, infer: take infer, from_expected: false, receiver_first: false))
+        }
+        Candidate.Method(bound: bound, method: method, self_ty: method_self, function: function, dynamic: dynamic) => {
+            match function {
+                Some(implementing) => {
+                    if not dynamic {
+                        return mut self.implementing_callable(take implementing, self_ty)
+                    }
+                }
+                None => {}
+            }
+            let Some(head) = ck.method_head(bound, method, self_ty: method_self) else {
+                return None
+            }
+            var own = mem::List[ty::Param].empty(alloc)
+            for def in head.generics {
+                mut own.push(def.param)
+            }
+            return Some(Callable(callee: Callee.Method(bound: bound, method: method, self_ty: method_self, dynamic: dynamic), head: take head, infer: Infer.new(take own, alloc), from_expected: false, receiver_first: false))
+        }
+    }
+} Body.callable
+
+/// The callable of the function a type's impl provides for an interface method, the type's
+/// arguments substituted beside the impl's.
+fn Body.implementing_callable(mut self, take implementing: Implementing, self_ty: ty::Ty) -> Option[Callable] {
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    let Some(head) = ck.fn_sig(implementing.item) else {
+        return None
+    }
+    var own = mem::List[ty::Param].empty(alloc)
+    for def in head.own_generics() {
+        mut own.push(def.param)
+    }
+    var infer = Infer.new(take own, alloc)
+    var merged = ty::Subst.empty(alloc)
+    match ck.type_key(self_ty) {
+        Some(key) => {
+            merged = ck.type_subst(key, ty: self_ty)
+        }
+        None => {}
+    }
+    mut merged.extend(implementing.subst)
+    infer.subst = merged
+    return Some(Callable(callee: Callee.Function(item: implementing.item), head: take head, infer: take infer, from_expected: false, receiver_first: false))
+} Body.implementing_callable
+
+/// Whether a method of that name belongs to an interface the type implements but method
+/// resolution does not consider.
+fn Body.unqualified(self, ty: ty::Ty, name: Str) -> mem::List[ty::ItemId] {
+    let ck = self.ck
+    let alloc = ck.alloc()
+    var interfaces = mem::List[ty::ItemId].empty(alloc)
+    let Some(key) = ck.type_key(ty) else {
+        return interfaces
+    }
+    for interface_item in ck.implemented_interfaces(ty, key) {
+        if ck.interface_method(interface_item, name).is_some() {
+            mut interfaces.push(interface_item)
+        }
+    }
+    let db = ck.db()
+    let more = db.about(None, compute: fn() -> mem::List[ty::ItemId] {
+        var found = mem::List[ty::ItemId].empty(alloc)
+        for index in 0..<db.items.len() {
+            let interface_item = ty::ItemId(index: u32.fit(index))
+            let ast::ItemKind.Interface(_) = db.declaration(interface_item).kind else {
+                continue
+            }
+            if ck.interface_method(interface_item, name).is_some() and interfaces.position(fn(value: ty::ItemId) => value == interface_item).is_none() and ck.implements(ty, interface_item) {
+                mut found.push(interface_item)
+            }
+        }
+        return found
+    })
+    for interface_item in more {
+        mut interfaces.push(interface_item)
+    }
+    return interfaces
+} Body.unqualified
+
+/// The interface a method candidate's function belongs to.
+fn Body.candidate_interface(self, candidate: Candidate) -> Option[ty::ItemId] {
+    match candidate {
+        Candidate.Method(bound: bound, method: _, self_ty: _, function: _, dynamic: _) => return Some(bound.item)
+        Candidate.Function(item: item, subst: _) => {
+            for line in self.ck.implemented_lines(item) {
+                let sig = self.ck.sig(line)
+                match sig.contents().kind {
+                    SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) => return Some(bound.item)
+                    else => {}
+                }
+            }
+            return None
+        }
+    }
+} Body.candidate_interface
+
+/// The fixes writing a method call `x.f(...)`, its receiver starting at `receiver`, as the
+/// qualified call `I.f(x, ...)` of each interface, the receiver's mode marker kept on its
+/// argument.
+fn Body.qualified_calls(self, take interfaces: mem::List[ty::ItemId], receiver: u32, name: ast::Name, markers: Markers) -> mem::List[diagnostic::Fix] {
+    let ck = self.ck
+    let alloc = ck.alloc()
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    let Some(receiver_last) = markers.receiver else {
+        return fixes
+    }
+    let Some(last) = markers.last else {
+        return fixes
+    }
+    let syntax = ck.db().syntax(self.item)
+    let start = match markers.mode {
+        Some(marker) => marker.token
+        None => receiver
+    }
+    let written = ck.written(self.item, head: start, last: receiver_last)
+    let open = u32.fit(syntax.next_code(usize.widen(name.token) + 1))
+    var arguments = text::String.empty(alloc)
+    if open + 1 < last {
+        mut arguments.append(", ")
+        mut arguments.append(ck.written(self.item, head: open + 1, last: last - 1).as_str())
+    }
+    for interface_item in interfaces {
+        var call = ck.item_written(interface_item, from: self.module)
+        mut call.push('.')
+        mut call.append(name.text.as_str())
+        mut call.push('(')
+        mut call.append(written.as_str())
+        mut call.append(arguments.as_str())
+        mut call.push(')')
+        mut fixes.push(ck.fix_replacing(self.item, head: start, last, text: call.as_str()))
+    }
+    return fixes
+} Body.qualified_calls
+
+/// `x.name(...)`: a method call, the receiver passed for `self`.
+fn Body.method_call(
+    mut self,
+    token: u32,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    var chained = false
+    match base.kind {
+        ast::ExprKind.Call(callee: callee, args: _) => {
+            if markers.mode.is_some() {
+                match callee.contents().kind {
+                    ast::ExprKind.Field(base: _, name: _) => {
+                        let construction = mut self.is_construction(callee.contents())
+                        chained = not construction
+                    }
+                    else => {}
+                }
+            }
+        }
+        else => {}
+    }
+    var chain = Markers.none()
+    chain.mode = markers.mode
+    chain.chain_mut = true
+    let mutable = match markers.mode {
+        Some(word) => word.kind == ast::Mode.Mut
+        None => false
+    }
+    let receiver = if chained {
+        mut self.call(base, expected: None, markers: Some(chain))
+    } else if mutable {
+        mut self.mut_operand(base, expected: None)
+    } else {
+        mut self.operand(base, expected: None)
+    }
+    if self.ck.types().has_error(receiver.ty) {
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    return mut self.method_on(token, take receiver, name, args, expected, markers)
+} Body.method_call
+
+/// A method call on a typed receiver.
+fn Body.method_on(
+    mut self,
+    token: u32,
+    take receiver: TExpr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let syntax = ck.db().syntax(self.item)
+    let at = usize.widen(name.token)
+    let dot = syntax.previous_code(at).value_or(at)
+    var marks = markers
+    marks.receiver = match syntax.previous_code(dot) {
+        Some(last) => Some(u32.fit(last))
+        None => None
+    }
+    let member = name.text.as_str()
+    let text_type = ck.is_std(receiver.ty, path: "core::Str") or ck.is_std(receiver.ty, path: "text::String") or ck.is_std(receiver.ty, path: "text::Fixed")
+    if text_type and member == "len" {
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        mut fixes.push(ck.fix_replacing(self.item, head: name.token, last: name.token, text: "byte_len"))
+        self.report_fixed(construct: nir::Span.at(name.token), code: diagnostic::Code.TextBareLen, take fixes)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    if member == "to_bits" {
+        match self.bits_of(receiver.ty) {
+            Some(bits) => return mut self.bits_call(token, take receiver, bits, args, markers: marks)
+            None => {}
+        }
+    }
+    match self.dma_access(receiver.ty, name: member) {
+        Some(access) => return mut self.apply_dma(token, take receiver, name: take access, args, markers: marks)
+        None => {}
+    }
+    let candidates = ck.method_candidates(receiver.ty, name: member)
+    let form = self.member_form(receiver.ty, name: member)
+    if candidates.len() == 0 {
+        return mut self.no_method(token, take receiver, name, args, expected, markers: marks, form)
+    }
+    if candidates.len() > 1 {
+        var interfaces = mem::List[ty::ItemId].empty(ck.alloc())
+        for candidate in candidates {
+            match self.candidate_interface(candidate) {
+                Some(found) => mut interfaces.push(found)
+                None => {}
+            }
+        }
+        let fixes = self.qualified_calls(take interfaces, receiver: receiver.token, name, markers: marks)
+        let start = match marks.mode {
+            Some(word) => word.token
+            None => receiver.token
+        }
+        self.report_fixed(construct: nir::Span(head: start, last: marks.last.value_or(name.token)), code: diagnostic::Code.InterfaceAmbiguousMethod, take fixes)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    var cursor = take candidates.into_cursor()
+    let Some(candidate) = mut cursor.next() else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return mut self.resolved_method(token, take receiver, take candidate, name, args, expected, markers: marks, form)
+} Body.method_on
+
+/// A method call naming no method of its receiver's type: a use of an old form of the member,
+/// a field called, an interface method to call qualified, or an unknown member with its stub.
+fn Body.no_method(
+    mut self,
+    token: u32,
+    take receiver: TExpr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    form: Option[text::String],
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let ty = receiver.ty
+    match form {
+        Some(written) => {
+            let Some(whole) = args.prefix(args.len()) else {
+                expect false
+                return TExpr.failed(token)
+            }
+            let call = Use(token: token, args: take whole, expected: expected, markers: markers)
+            var held = Some(take receiver)
+            let matched = mut self.matched(written.as_str(), live: None, receiver: held, call, headed: fn(mut body: Body, tombstone: ty::ItemId) -> Option[Callable] {
+                let former = body.retired_candidate(tombstone, ty)
+                return mut body.callable(take former, self_ty: ty)
+            })
+            let Some(back) = held else {
+                expect false
+                return TExpr.failed(token)
+            }
+            if matched.len() > 0 {
+                return mut self.retired_method(take back, name, matched: matched.view(), call)
+            }
+            receiver = back
+        }
+        None => {}
+    }
+    var field = false
+    match ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            let sig = ck.sig(item)
+            match sig.contents().kind {
+                SigKind.Struct(fields: fields) => {
+                    field = fields.position(fn(value: FieldSig) => value.name == name.text).is_some()
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let interfaces = self.unqualified(ty, name: name.text.as_str())
+    let start = match markers.mode {
+        Some(word) => word.token
+        None => receiver.token
+    }
+    let construct = nir::Span(head: start, last: markers.last.value_or(name.token))
+    if field {
+        let opened = ck.fix_inserting(self.item, before: start, text: "(")
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        mut fixes.push(take opened.joined(ck.fix_appending(self.item, after: name.token, text: ")")))
+        self.report_fixed(construct, code: diagnostic::Code.ExprFieldCall, take fixes)
+    } else if interfaces.len() > 0 {
+        let fixes = self.qualified_calls(take interfaces, receiver: receiver.token, name, markers)
+        self.report_fixed(construct, code: diagnostic::Code.InterfaceUnqualifiedCall, take fixes)
+    } else {
+        let stub = mut self.member_stub(ty, name, receiver: true, args, expected, markers)
+        self.unknown_member(name, ty, take stub)
+        return TExpr.failed(token)
+    }
+    mut self.skim_args(args)
+    return TExpr.failed(token)
+} Body.no_method
+
+/// A method call on a value with its one candidate: a call of the candidate, the receiver passed
+/// for `self`, or a use of an old form of the member that the arguments match.
+fn Body.resolved_method(
+    mut self,
+    token: u32,
+    take receiver: TExpr,
+    take candidate: Candidate,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    form: Option[text::String],
+    ) -> TExpr {
+    self.name_candidate(name.token, candidate, name: name.text.as_str())
+    let ty = receiver.ty
+    var live = mut self.callable(take candidate, self_ty: ty)
+    if live.is_none() {
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    if not takes_receiver(live) {
+        self.report(name.token, code: diagnostic::Code.NameUnknown)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let projected = receiver.is_projection_call()
+    var marks = markers
+    if projected {
+        marks.mode = None
+    }
+    marks.chained = projected and markers.mode.is_some()
+    match form {
+        Some(written) => {
+            let Some(whole) = args.prefix(args.len()) else {
+                expect false
+                return TExpr.failed(token)
+            }
+            let call = Use(token: token, args: take whole, expected: expected, markers: marks)
+            var held = Some(take receiver)
+            let matched = mut self.matched(written.as_str(), live, receiver: held, call, headed: fn(mut body: Body, tombstone: ty::ItemId) -> Option[Callable] {
+                let former = body.retired_candidate(tombstone, ty)
+                return mut body.callable(take former, self_ty: ty)
+            })
+            let Some(back) = held else {
+                expect false
+                return TExpr.failed(token)
+            }
+            if matched.len() > 0 {
+                return mut self.retired_method(take back, name, matched: matched.view(), call)
+            }
+            receiver = back
+        }
+        None => {}
+    }
+    let Some(callable) = live else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return mut self.apply(token, take callable, receiver: Some(take receiver), args, expected, markers: marks)
+} Body.resolved_method
+
+/// Whether an expression is a call of a projection.
+fn TExpr.is_projection_call(self) -> bool {
+    return match self.kind {
+        TKind.Call(held) => held.contents().projection
+        else => false
+    }
+} TExpr.is_projection_call
+
+/// `I.name(x, ...)`: a qualified call of an interface's method.
+fn Body.qualified_call(
+    mut self,
+    token: u32,
+    interface_item: ty::ItemId,
+    base: ast::Expr,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let Some(method) = ck.interface_method(interface_item, name: name.text.as_str()) else {
+        self.report(name.token, code: diagnostic::Code.NameUnknown)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let sig = ck.sig(interface_item)
+    let has_self = match sig.contents().kind {
+        SigKind.Interface(methods: methods) => methods[method].sig.has_self()
+        else => false
+    }
+    var self_ty = ty::Ty.error()
+    if has_self {
+        if args.len() > 0 {
+            let typed = mut self.expr(args[0].value, expected: None)
+            self_ty = typed.ty
+        }
+    } else {
+        self_ty = expected.value_or(ty::Ty.error())
+    }
+    var interface_args = ty::Args.none()
+    match ck.conformance(self_ty, interface_item) {
+        Some(conforming) => {
+            interface_args = conforming.args
+        }
+        None => {
+            let dynamic = match types.kind(self_ty) {
+                ty::TyKind.Dyn(_) => true
+                else => false
+            }
+            if not dynamic and ck.boxed_dyn(self_ty).is_none() {
+                if not types.has_error(self_ty) {
+                    self.report(token, code: diagnostic::Code.InterfaceNotImplemented)
+                }
+                mut self.skim_args(args)
+                return TExpr.failed(token)
+            }
+        }
+    }
+    let bound = ty::Bound(item: interface_item, args: interface_args)
+    let Some(head) = ck.method_head(bound, method, self_ty) else {
+        return TExpr.failed(token)
+    }
+    var own = mem::List[ty::Param].empty(alloc)
+    for def in head.generics {
+        mut own.push(def.param)
+    }
+    let dynamic = match types.kind(self_ty) {
+        ty::TyKind.Dyn(_) => true
+        else => false
+    }
+    let callable = Callable(callee: Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: dynamic), head: take head, infer: Infer.new(take own, alloc), from_expected: false, receiver_first: true)
+    return mut self.apply(token, take callable, receiver: None, args, expected, markers)
+} Body.qualified_call
+
+fn Body.apply(
+    mut self,
+    token: u32,
+    take callable: Callable,
+    take receiver: Option[TExpr],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    ) -> TExpr {
+    return mut self.apply_with(token, take callable, take receiver, args, expected, markers, own_param: false)
+} Body.apply
+
+/// Checks a call's arguments against its head: their count, labels, inference, modes and
+/// markers; then its failure and waiting markers. `own_param` when the callee is the
+/// enclosing function's own parameter, through which it waits.
+fn Body.apply_with(
+    mut self,
+    token: u32,
+    take callable: Callable,
+    take receiver: Option[TExpr],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    markers: Markers,
+    own_param: bool,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    var offset: usize = 0
+    if receiver.is_some() {
+        offset = 1
+    }
+    if args.len() + offset != callable.head.params.len() {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let self_first = callable.receiver_first and callable.head.has_self()
+    let Some(parts) = callable.head.params.view().split_at(offset) else {
+        expect false
+        return TExpr.failed(token)
+    }
+    let params = parts.tail
+    self.check_labels(params, args, self_first)
+    if callable.from_expected {
+        match expected {
+            Some(wanted) => {
+                let head_result = callable.head.result
+                discard mut callable.infer.unify(head_result, found: wanted, types)
+            }
+            None => {}
+        }
+    }
+    var typed_args = mem::List[TArg].empty(alloc)
+    var waits = ArgWaits(through_args: false, all_own: true)
+    match receiver {
+        Some(given) => {
+            let param = callable.head.params[0]
+            let pattern = callable.infer.subst.ty(types, ty: param.ty)
+            let unified = mut callable.infer.unify(pattern, found: given.ty, types)
+            if not unified and not types.has_error(given.ty) {
+                self.report_mismatch(given.token, expected: callable.infer.subst.ty(types, ty: param.ty), found: given.ty)
+            }
+            if not markers.chained {
+                self.check_mode(construct: nir::Span(head: given.token, last: markers.receiver.value_or(given.token)), arg: given, mode: param.mode, marker: markers.mode, chain_mut: markers.chain_mut, receiver: true)
+            }
+            mut typed_args.push(TArg(expr: take given, mode: param.mode))
+        }
+        None => {}
+    }
+    for index in 0..<args.len() {
+        let param = params[index]
+        let typed = mut self.typed_arg(args[index], param, infer: mut callable.infer, callee: callable.callee, typed_args: typed_args.view(), mut waits)
+        mut typed_args.push(TArg(expr: take typed, mode: param.mode))
+    }
+    return mut self.finish_call(token, take callable, take typed_args, markers, own_param, waits)
+} Body.apply_with
+
+/// An argument of a call typed against its parameter, the inference extended by what it fixes
+/// and its waiting added to `waits`.
+fn Body.typed_arg(
+    mut self,
+    arg: ast::Arg,
+    param: ParamSig,
+    mut infer: Infer,
+    callee: Callee,
+    typed_args: Slice[TArg],
+    mut waits: ArgWaits,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let pattern = infer.subst.ty(types, ty: param.ty)
+    let written = arg.value
+    let marker = self.marked_value(written)
+    let value = match first written.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+        else => written
+    }
+    var typed = TExpr.failed(value.token)
+    match value.kind {
+        ast::ExprKind.Closure(closure) => {
+            match types.kind(pattern) {
+                ty::TyKind.Fn(wanted) => {
+                    typed = mut self.closure_arg(value.token, closure: closure.contents(), wanted, pattern, param, mut infer, callee, typed_args, mut waits)
+                }
+                else => self.report(value.token, code: diagnostic::Code.ClosureSecondClass)
+            }
+        }
+        else => {
+            typed = mut self.value_arg(value, marker, param, pattern, mut infer, mut waits)
+        }
+    }
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: param.mode, marker, chain_mut: false, receiver: false)
+    return typed
+} Body.typed_arg
+
+/// A closure argument typed for its parameter's function type `wanted`, in the role the call
+/// gives it.
+fn Body.closure_arg(
+    mut self,
+    token: u32,
+    closure: ast::Closure,
+    wanted: ty::FnTyId,
+    pattern: ty::Ty,
+    param: ParamSig,
+    mut infer: Infer,
+    callee: Callee,
+    typed_args: Slice[TArg],
+    mut waits: ArgWaits,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let written = self.written_as(callee, receiver: typed_args, param: param.name.as_str())
+    let typed = mut self.closure(token, closure, wanted: Some(wanted), written)
+    let ty::TyKind.Fn(found) = types.kind(typed.ty) else {
+        return typed
+    }
+    discard mut infer.unify(pattern, found: typed.ty, types)
+    let fixed = infer.subst.fn_ty(types, fn_ty: types.fn_of(wanted))
+    self.fit(types.fn_of(found), wanted: fixed, token)
+    if types.fn_of(found).wait and types.fn_of(wanted).kind != ast::FnKind.Task {
+        waits.through_args = true
+        waits.all_own = false
+    }
+    return typed
+} Body.closure_arg
+
+/// An argument other than a closure, typed with its parameter's type as the hint once no
+/// parameter it holds is left to fix.
+fn Body.value_arg(
+    mut self,
+    value: ast::Expr,
+    marker: Option[ast::Word[ast::Mode]],
+    param: ParamSig,
+    pattern: ty::Ty,
+    mut infer: Infer,
+    mut waits: ArgWaits,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    var hint: Option[ty::Ty] = None
+    if not infer.open(pattern, types) {
+        hint = Some(pattern)
+    }
+    let mutable = match marker {
+        Some(word) => word.kind == ast::Mode.Mut
+        None => false
+    }
+    let typed = if mutable {
+        mut self.mut_operand(value, expected: hint)
+    } else {
+        mut self.operand(value, expected: hint)
+    }
+    match types.kind(typed.ty) {
+        ty::TyKind.Fn(found) => {
+            match types.kind(pattern) {
+                ty::TyKind.Fn(wanted) => {
+                    mut self.fn_value_arg(value.token, typed, found, wanted, pattern, mut infer, mut waits)
+                    return typed
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let unified = mut infer.unify(pattern, found: typed.ty, types)
+    if not unified {
+        self.expect_type(typed, expected: infer.subst.ty(types, ty: param.ty), token: value.token)
+    }
+    return typed
+} Body.value_arg
+
+/// The rules of a function value passed for a parameter of function type: the stack bound of a
+/// task fn, the inference, the fit rule, and the waiting it adds.
+fn Body.fn_value_arg(
+    mut self,
+    token: u32,
+    typed: TExpr,
+    found: ty::FnTyId,
+    wanted: ty::FnTyId,
+    pattern: ty::Ty,
+    mut infer: Infer,
+    mut waits: ArgWaits,
+    ) {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let found_fn = types.fn_of(found)
+    let wanted_kind = types.fn_of(wanted).kind
+    match typed.kind {
+        TKind.FnValue(item: function, type_args: _) => {
+            if wanted_kind == ast::FnKind.Task {
+                ck.check_stack_bound(function, limit_set: found_fn.limit_set)
+            }
+        }
+        else => {}
+    }
+    discard mut infer.unify(pattern, found: typed.ty, types)
+    let fixed = infer.subst.fn_ty(types, fn_ty: types.fn_of(wanted))
+    self.fit(found_fn, wanted: fixed, token)
+    if found_fn.wait and wanted_kind != ast::FnKind.Task {
+        waits.through_args = true
+        waits.all_own = waits.all_own and self.is_param(typed)
+    }
+} Body.fn_value_arg
+
+/// Whether a value is a parameter.
+fn Body.is_param(self, value: TExpr) -> bool {
+    let TKind.Local(local) = value.kind else {
+        return false
+    }
+    return match self.local(local).kind {
+        LocalKind.Param(_) => true
+        else => false
+    }
+} Body.is_param
+
+/// The rest of a call once its arguments are typed: the failure parameters left free, the
+/// generic arguments it fixes, the rules of what it calls, its markers, and its typed form.
+fn Body.finish_call(
+    mut self,
+    token: u32,
+    take callable: Callable,
+    take typed_args: mem::List[TArg],
+    markers: Markers,
+    own_param: bool,
+    waits: ArgWaits,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    self.fix_failures(mut callable.infer)
+    for param in callable.infer.params {
+        if callable.infer.subst.get(param).is_none() {
+            self.report(token, code: diagnostic::Code.GenericUninferred)
+            return TExpr.failed(token)
+        }
+    }
+    self.check_call_bounds(token, callable, head: callable.head)
+    self.check_callee(token, callable)
+    self.check_volatile(token, callable, args: typed_args.view())
+    mut self.check_spawn(token, callable, args: typed_args.view())
+    mut self.check_lexical_spawns(callable, args: typed_args.view())
+    let instantiated = callable.infer.subst.fn_ty(types, fn_ty: callable.head.fn_ty(alloc))
+    var failure: Option[ty::Ty] = None
+    match instantiated.failure {
+        Some(raised) => {
+            if raised != ty::Ty.never() {
+                failure = Some(raised)
+            }
+        }
+        None => {}
+    }
+    let may_wait = instantiated.wait or waits.through_args
+    let only_own = own_param or (not instantiated.wait and waits.all_own)
+    let result = mut self.judge_markers(token, markers, may_wait, only_own, failure, result: instantiated.result)
+    let type_args = callable.callee.type_args(head: callable.head, subst: callable.infer.subst, types)
+    let projection = callable.head.is_proj()
+    let made = Call(token: token, callee: take callable.callee, type_args: type_args, args: take typed_args, head: take instantiated, projection: projection, failure: markers.failure, awaited: markers.awaited.is_some())
+    return TExpr(token: token, last: token, ty: result, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.finish_call
+
+/// Judges a call's `await` and failure markers, recording the waiting and the failure the call
+/// adds to its frame; returns the call's type, a `Result` for `attempt`.
+fn Body.judge_markers(
+    mut self,
+    token: u32,
+    markers: Markers,
+    may_wait: bool,
+    only_own: bool,
+    failure: Option[ty::Ty],
+    result: ty::Ty,
+    ) -> ty::Ty {
+    let ck = self.ck.share()
+    let first_marker = match markers.failure {
+        Some(word) => word.token
+        None => match markers.awaited {
+            Some(awaited) => awaited
+            None => match markers.mode {
+                Some(word) => word.token
+                None => token
+            }
+        }
+    }
+    let construct = nir::Span(head: first_marker, last: markers.last.value_or(token))
+    match markers.awaited {
+        Some(await_token) => {
+            if not may_wait {
+                self.unneeded_await(await_token)
+            }
+        }
+        None => {
+            if may_wait {
+                let before = match markers.mode {
+                    Some(word) => word.token
+                    None => token
+                }
+                var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+                mut fixes.push(ck.fix_inserting(self.item, before, text: "await "))
+                self.report_fixed(construct, code: diagnostic::Code.EffectAwaitMissing, take fixes)
+            }
+        }
+    }
+    let last = self.frames.len() - 1
+    if may_wait and not only_own {
+        self.frames[last].may_wait = true
+    }
+    if may_wait and self.cx.when_body {
+        self.report(token, code: diagnostic::Code.TaskWhenWait)
+    }
+    let typed = self.judge_failure(construct, markers, failure, result)
+    match failure {
+        Some(raised) => {
+            let attempted = match markers.failure {
+                Some(word) => word.kind == ast::FailureMarker.Attempt
+                None => false
+            }
+            if not attempted {
+                mut self.frames[last].raise(raised)
+            }
+        }
+        None => {}
+    }
+    return typed
+} Body.judge_markers
+
+/// Judges a call's failure marker by the failure it may raise: unneeded, missing, or a `try`
+/// whose failure does not convert; returns the call's type, a `Result` for `attempt`.
+fn Body.judge_failure(self, construct: nir::Span, markers: Markers, failure: Option[ty::Ty], result: ty::Ty) -> ty::Ty {
+    let ck = self.ck
+    let Some(raised) = failure else {
+        match markers.failure {
+            Some(marker) => self.unneeded_failure_marker(marker)
+            None => {}
+        }
+        return result
+    }
+    let Some(marker) = markers.failure else {
+        var converts = false
+        match self.frame().failure {
+            Some(frame_failure) => {
+                converts = ck.converts(raised, to: frame_failure)
+            }
+            None => {}
+        }
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        if converts {
+            mut fixes.push(ck.fix_inserting(self.item, before: construct.head, text: "try "))
+        }
+        self.report_fixed(construct, code: diagnostic::Code.ErrorUnhandled, take fixes)
+        return result
+    }
+    if marker.kind == ast::FailureMarker.Attempt {
+        return ck.result_ty(result, error: raised)
+    }
+    let Some(frame_failure) = self.frame().failure else {
+        return result
+    }
+    if not self.frame().tested and not ck.converts(raised, to: frame_failure) {
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        match ck.variant_added_fix(raised, to: frame_failure) {
+            Some(fix) => mut fixes.push(take fix)
+            None => {}
+        }
+        self.report_fixed(construct: nir::Span.at(marker.token), code: diagnostic::Code.ErrorUnconvertible, take fixes)
+    }
+    return result
+} Body.judge_failure
+
+/// Fixes the failure parameters no argument fixed: `Never`, or `task::Cancelled` for one the
+/// head requires cancellable.
+fn Body.fix_failures(self, mut infer: Infer) {
+    let ck = self.ck
+    let alloc = ck.alloc()
+    var failure_params = mem::List[ty::Param].empty(alloc)
+    for param in infer.params {
+        if infer.subst.get(param).is_none() and ck.implied(param).failure {
+            mut failure_params.push(param)
+        }
+    }
+    for param in failure_params {
+        var fixed = ty::Ty.never()
+        if ck.implied(param).cancellable {
+            match ck.db().std_item("task", name: "Cancelled") {
+                Some(cancelled) => {
+                    fixed = ck.types().item(cancelled, args: mem::List[ty::Arg].empty(alloc))
+                }
+                None => {}
+            }
+        }
+        mut infer.subst.insert(param, arg: ty::Arg.Ty(fixed))
+    }
+} Body.fix_failures
+
+/// The rules a call obeys for what it calls: the grant its operation needs, the uses of
+/// validators and decoders, and where `inspect` and `Untrusted.of` stand.
+fn Body.check_callee(self, token: u32, callable: Callable) {
+    let ck = self.ck
+    match callable.callee {
+        Callee.Function(item: item) => self.check_function_callee(token, item, callable)
+        Callee.Method(bound: bound, method: method, self_ty: self_ty, dynamic: false) => {
+            if ck.db().core_item("Encode") == Some(bound.item) and ck.interface_method(bound.item, name: "decode") == Some(method) {
+                ck.check_decoder_use(self.item, token, decoded: self_ty)
+            }
+        }
+        else => {}
+    }
+} Body.check_callee
+
+/// The rules a call of a function item obeys: trusted primitives, grants, validators, and the
+/// rules of std members.
+fn Body.check_function_callee(self, token: u32, item: ty::ItemId, callable: Callable) {
+    let ck = self.ck
+    let db = ck.db()
+    let subst = callable.infer.subst
+    if ck.is_trusted_primitive(item) and not self.cx.trusted_code {
+        self.report(token, code: diagnostic::Code.TrustedPrimitiveOutside)
+    }
+    match ck.call_authority(item) {
+        Some(authority) => ck.require(self.item, token, take authority)
+        None => {}
+    }
+    ck.check_validator_use(self.item, token, function: item)
+    if not db.is_std(item) {
+        return
+    }
+    let path = db.canonical(item)
+    var wrapped: Option[ty::Arg] = None
+    if callable.head.generics.len() > 0 {
+        wrapped = subst.get(callable.head.generics[0].param)
+    }
+    if path.starts_with("hw::Ptr.atomic_") {
+        var integer = false
+        var failed = false
+        match wrapped {
+            Some(ty::Arg.Ty(arg)) => {
+                failed = arg == ty::Ty.error()
+                integer = match ck.types().scalar_of(arg) {
+                    Some(ty::Scalar.Unsigned8) or Some(ty::Scalar.Unsigned16) or Some(ty::Scalar.Unsigned32) or Some(ty::Scalar.Unsigned64) or Some(ty::Scalar.UnsignedSize) => true
+                    else => false
+                }
+            }
+            else => {}
+        }
+        if not integer and not failed {
+            self.report(token, code: diagnostic::Code.HwAtomicType)
+        }
+    }
+    match first path.as_str() {
+        "hw::Anchor.with" if not ck.is_entry_context(self.item) => self.report(token, code: diagnostic::Code.KernelAnchorOutsideEntry)
+        "sys::Domain.run" if db.target == workspace::Target.Uefi or db.target == workspace::Target.Bare => self.report(token, code: diagnostic::Code.DomainUnavailable)
+        "host::Runner.run" => {
+            match ck.runner_problem(callable.head, subst) {
+                Some(code) => self.report(token, code)
+                None => {}
+            }
+        }
+        "core::Untrusted.inspect" if not self.inspecting() => self.report(token, code: diagnostic::Code.UntrustedInspectOutsideValidator)
+        "core::Untrusted.of" => {
+            match wrapped {
+                Some(ty::Arg.Ty(arg)) => {
+                    if not ck.wraps_untrusted(arg) {
+                        self.report(token, code: diagnostic::Code.UntrustedWrappedAlias)
+                    }
+                }
+                else => {}
+            }
+        }
+        else => {
+            if path.ends_with(".decode") or path.ends_with("::decode") {
+                self.check_decoders(token, callable)
+            }
+        }
+    }
+} Body.check_function_callee
+
+/// The uses of decoders a call of a std decode function makes: each generic argument for a
+/// parameter bounded by `Encode`.
+fn Body.check_decoders(self, token: u32, callable: Callable) {
+    let ck = self.ck
+    let encode = ck.db().core_item("Encode")
+    for def in callable.head.generics {
+        let bounded = def.bounds.position(fn(value: ty::Bound) => Some(value.item) == encode).is_some()
+        if bounded {
+            match callable.infer.subst.get(def.param) {
+                Some(ty::Arg.Ty(decoded)) => ck.check_decoder_use(self.item, token, decoded)
+                else => {}
+            }
+        }
+    }
+} Body.check_decoders
+
+/// The role of a closure written as the argument for a parameter of a call to `callee`: the
+/// body of a `task::scope` call, or the task closure of a lexical spawn.
+fn Body.written_as(self, callee: Callee, receiver: Slice[TArg], param: Str) -> Written {
+    let Callee.Function(item: item) = callee else {
+        return Written.Other
+    }
+    let db = self.ck.db()
+    if not db.is_std(item) {
+        return Written.Other
+    }
+    let path = db.canonical(item)
+    if path.as_str() == "task::scope" and param == "body" {
+        return Written.ScopeBody
+    }
+    if path.as_str() != "task::Scope.spawn" or receiver.len() == 0 {
+        return Written.Other
+    }
+    return match self.lexical_scope(receiver[0].expr) {
+        Some(scope) => Written.Lent(scope)
+        None => Written.Other
+    }
+} Body.written_as
+
+/// The body closure whose parameter a spawn's receiver is, when the spawn is lexical: written
+/// in that closure or in closures nested in it that are not task closures.
+fn Body.lexical_scope(self, receiver: TExpr) -> Option[u32] {
+    let TKind.Local(local) = receiver.kind else {
+        return None
+    }
+    let declared = self.local(self.binding(local))
+    let scope = declared.closure
+    let LocalKind.Param(_) = declared.kind else {
+        return None
+    }
+    if self.scope_bodies.position(fn(value: u32) => value == scope).is_none() {
+        return None
+    }
+    let Some(at) = self.frames.position(fn(value: Frame) => value.closure == scope) else {
+        return None
+    }
+    for index in (at + 1)..<self.frames.len() {
+        if self.frames[index].task {
+            return None
+        }
+    }
+    return Some(scope)
+} Body.lexical_scope
+
+/// The failure type of a spawned child: at a lexical spawn it converts to the failure type of
+/// its scope's `task::scope` call, checked once that call is typed; elsewhere it is
+/// `task::Cancelled`.
+fn Body.check_spawn(mut self, token: u32, callable: Callable, args: Slice[TArg]) {
+    let ck = self.ck.share()
+    let Callee.Function(item: item) = callable.callee else {
+        return
+    }
+    if not ck.db().is_std(item) or ck.db().canonical(item).as_str() != "task::Scope.spawn" {
+        return
+    }
+    let own = callable.head.own_generics()
+    if own.len() < 2 {
+        return
+    }
+    let Some(ty::Arg.Ty(failure)) = callable.infer.subst.get(own[1].param) else {
+        return
+    }
+    var scope: Option[u32] = None
+    if args.len() > 0 {
+        scope = self.lexical_scope(args[0].expr)
+    }
+    match scope {
+        Some(scope_body) => mut self.lexical_spawns.push(LexicalSpawn(body: scope_body, failure: failure, token: token))
+        None => {
+            if not ck.types().has_error(failure) and not failure.is_never() and not ck.is_std(failure, path: "task::Cancelled") {
+                self.report(token, code: diagnostic::Code.TaskUnscopedFailure)
+            }
+        }
+    }
+} Body.check_spawn
+
+/// At a `task::scope` call whose body is a closure, the lexical spawns on that closure: each
+/// child failure type converts to the call's failure type.
+fn Body.check_lexical_spawns(mut self, callable: Callable, args: Slice[TArg]) {
+    let ck = self.ck.share()
+    let Callee.Function(item: item) = callable.callee else {
+        return
+    }
+    if not ck.db().is_std(item) or ck.db().canonical(item).as_str() != "task::scope" {
+        return
+    }
+    if args.len() < 2 {
+        return
+    }
+    let TKind.Closure(closure) = args[1].expr.kind else {
+        return
+    }
+    let own = callable.head.own_generics()
+    if own.len() == 0 {
+        return
+    }
+    let Some(ty::Arg.Ty(scope_failure)) = callable.infer.subst.get(own[0].param) else {
+        return
+    }
+    let index = closure.contents().index
+    var spawns = mem::List[LexicalSpawn].empty(ck.alloc())
+    for spawn in self.lexical_spawns {
+        if spawn.body == index {
+            mut spawns.push(spawn)
+        }
+    }
+    mut self.lexical_spawns.retain(fn(value: LexicalSpawn) => value.body != index)
+    for spawn in spawns {
+        if not ck.converts(spawn.failure, to: scope_failure) {
+            var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+            match ck.variant_added_fix(spawn.failure, to: scope_failure) {
+                Some(fix) => mut fixes.push(take fix)
+                None => {}
+            }
+            self.report_fixed(construct: nir::Span.at(spawn.token), code: diagnostic::Code.ErrorUnconvertible, take fixes)
+        }
+    }
+} Body.check_lexical_spawns
+
+/// A volatile call of a register window: its register operand written as the member path
+/// `R.f`, readable for a read and writable for a write, an array register exactly for the
+/// `_at` forms.
+fn Body.check_volatile(self, token: u32, callable: Callable, args: Slice[TArg]) {
+    let ck = self.ck
+    let db = ck.db()
+    let Callee.Function(item: item) = callable.callee else {
+        return
+    }
+    let path = db.canonical(item)
+    var start: usize = 0
+    if path.starts_with("hw::Mmio.") {
+        start = 9
+    } else if path.starts_with("hw::Ports.") {
+        start = 10
+    } else {
+        return
+    }
+    let Some(member) = path.slice_bytes(start, end: path.byte_len()) else {
+        return
+    }
+    if not db.is_std(item) or not (member == "read" or member == "write" or member == "read_at" or member == "write_at") {
+        return
+    }
+    if args.len() < 2 {
+        return
+    }
+    let operand = args[1].expr
+    if ck.types().has_error(operand.ty) {
+        return
+    }
+    let TKind.Register(block: block, index: index) = operand.kind else {
+        self.report(operand.token, code: diagnostic::Code.RegisterOperand)
+        return
+    }
+    let sig = ck.sig(block)
+    let SigKind.Registers(members: window) = sig.contents().kind else {
+        return
+    }
+    let register = window[index]
+    let reads = member.starts_with("read")
+    let allowed = match register.access {
+        ast::Access.Read => reads
+        ast::Access.Write => not reads
+        ast::Access.ReadWrite or ast::Access.WriteOneClear => true
+    }
+    if not allowed {
+        if reads {
+            self.report(token, code: diagnostic::Code.RegisterNotReadable)
+        } else {
+            self.report(token, code: diagnostic::Code.RegisterNotWritable)
+        }
+        return
+    }
+    if ck.is_std(register.ty, path: "core::Array") != member.ends_with("_at") {
+        self.report(token, code: diagnostic::Code.RegisterArrayAccess)
+    }
+} Body.check_volatile
+
+/// Whether `inspect` may be called here: in the body or an ensures, example or decreases
+/// clause of a validator.
+fn Body.inspecting(self) -> bool {
+    return self.ck.is_validator(self.item) and not self.cx.requires_clause
+} Body.inspecting
+
+/// The bounds of the generic parameters a call fixes: each argument satisfies them; the
+/// `where` conditions of its const parameters are judged once elaborated.
+fn Body.check_call_bounds(self, token: u32, callable: Callable, head: FnSig) {
+    let ck = self.ck
+    for def in head.generics {
+        match callable.infer.subst.get(def.param) {
+            Some(ty::Arg.Ty(arg)) => {
+                match ck.argument_problem(def, arg, subst: callable.infer.subst) {
+                    Some(code) => {
+                        self.report(token, code)
+                        return
+                    }
+                    None => {}
+                }
+            }
+            else => {}
+        }
+    }
+    let Callee.Function(item: item) = callable.callee else {
+        return
+    }
+    if head.generics.position(fn(value: GenericDef) => value.constant.is_some()).is_none() {
+        return
+    }
+    var args = mem::List[ty::Arg].empty(ck.alloc())
+    for def in head.generics {
+        match callable.infer.subst.get(def.param) {
+            Some(arg) => mut args.push(arg)
+            None => mut args.push(def.param_arg(ck.types()))
+        }
+    }
+    ck.instantiated(self.item, token, target: item, args: ck.types().args(take args))
+} Body.check_call_bounds
+
+fn Body.is_method_call(self, expr: ast::Expr) -> bool {
+    let ast::ExprKind.Call(callee: callee, args: _) = expr.kind else {
+        return false
+    }
+    return match callee.contents().kind {
+        ast::ExprKind.Field(base: _, name: _) => true
+        else => false
+    }
+} Body.is_method_call
+
+/// The labels of a call's arguments after the receiver: the leading one optional, the others
+/// labelled or punned, each its parameter's name; reported once, at the first fault.
+fn Body.check_labels(self, params: Slice[ParamSig], args: Slice[ast::Arg], self_first: bool) {
+    var leading: usize = 0
+    if self_first {
+        leading = 1
+    }
+    var fault: Option[usize] = None
+    for index in 0..<args.len() {
+        if index >= params.len() {
+            break
+        }
+        let arg = args[index]
+        var faulty = false
+        if arg.label.is_some() {
+            faulty = (self_first and index == 0) or mislabelled(arg, param: params[index])
+        } else {
+            faulty = index > leading and not self.punned(arg.value, name: params[index].name.as_str())
+        }
+        if faulty {
+            fault = Some(index)
+            break
+        }
+    }
+    let Some(index) = fault else {
+        return
+    }
+    let arg = args[index]
+    let param = params[index]
+    var param_start = leading + 1
+    if param_start > params.len() {
+        param_start = params.len()
+    }
+    var arg_start = leading + 1
+    if arg_start > args.len() {
+        arg_start = args.len()
+    }
+    let Some(param_parts) = params.split_at(param_start) else {
+        return
+    }
+    let Some(arg_parts) = args.split_at(arg_start) else {
+        return
+    }
+    let fix = match self.reordered(param_parts.tail, args: arg_parts.tail) {
+        Some(reordered) => reordered
+        None => self.label_fix(arg, param, self_first, index)
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(take fix)
+    self.report_fixed(construct: nir::Span(head: arg.token, last: arg.value.last), code: diagnostic::Code.ExprArgumentLabel, take fixes)
+} Body.check_labels
+
+/// Whether a labelled argument's label is not its parameter's name.
+fn mislabelled(arg: ast::Arg, param: ParamSig) -> bool {
+    return match arg.label_name() {
+        Some(name) => name.text != param.name
+        None => true
+    }
+} mislabelled
+
+/// The fix of an argument's label at a call's first fault: deleting the label of a receiver
+/// passed first, writing its parameter's name as the label, or inserting it.
+fn Body.label_fix(self, arg: ast::Arg, param: ParamSig, self_first: bool, index: usize) -> diagnostic::Fix {
+    let ck = self.ck
+    let Some(label) = arg.label else {
+        var inserted = text::String.of(param.name.as_str(), alloc: ck.alloc())
+        mut inserted.append(": ")
+        return ck.fix_inserting(self.item, before: arg.value.token, text: inserted.as_str())
+    }
+    if self_first and index == 0 {
+        let syntax = ck.db().syntax(self.item)
+        let start = syntax.tokens[usize.widen(label.token)].start
+        let end = syntax.tokens[usize.widen(arg.value.token)].start
+        return ck.fix_bytes(self.item, start, end, text: "")
+    }
+    return ck.fix_replacing(self.item, head: label.token, last: label.last, text: param.name.as_str())
+} Body.label_fix
+
+/// The fix reordering the arguments after the leading one into parameter order, when each is
+/// labelled or punned and their names name each of `params` exactly once.
+fn Body.reordered(self, params: Slice[ParamSig], args: Slice[ast::Arg]) -> Option[diagnostic::Fix] {
+    if args.len() == 0 or params.len() != args.len() {
+        return None
+    }
+    let ck = self.ck
+    let alloc = ck.alloc()
+    var names = mem::List[u32].empty(alloc)
+    for arg in args {
+        match arg.label_name() {
+            Some(label) => mut names.push(label.token)
+            None => {
+                let Some(punned) = self.punned_name(arg.value) else {
+                    return None
+                }
+                mut names.push(punned)
+            }
+        }
+    }
+    var ordered = text::String.empty(alloc)
+    for index in 0..<params.len() {
+        var matching: Option[usize] = None
+        for at in 0..<args.len() {
+            if self.text(names[at]) == params[index].name.as_str() {
+                if matching.is_some() {
+                    return None
+                }
+                matching = Some(at)
+            }
+        }
+        let Some(at) = matching else {
+            return None
+        }
+        if index > 0 {
+            mut ordered.append(", ")
+        }
+        mut ordered.append(ck.written(self.item, head: args[at].token, last: args[at].value.last).as_str())
+    }
+    let opening = args[0]
+    let closing = args[args.len() - 1]
+    return Some(ck.fix_replacing(self.item, head: opening.token, last: closing.value.last, text: ordered.as_str()))
+} Body.reordered
+
+/// The token of the name of an argument that is a binding or parameter, alone or after a mode.
+fn Body.punned_name(self, value: ast::Expr) -> Option[u32] {
+    return match first value.kind {
+        ast::ExprKind.Marked(failure: None, awaited: None, mode: Some(_), inner: inner) => bare_name(inner.contents())
+        else => bare_name(value)
+    }
+} Body.punned_name
+
+/// The token of an expression that is one name, `self` included.
+fn bare_name(expr: ast::Expr) -> Option[u32] {
+    return match first expr.kind {
+        ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(path.segments[0].token)
+        ast::ExprKind.SelfValue => Some(expr.token)
+        else => None
+    }
+} bare_name
+
+/// Whether an argument is a binding or parameter, alone or after a mode, spelt like its
+/// parameter.
+fn Body.punned(self, value: ast::Expr, name: Str) -> bool {
+    let Some(token) = self.punned_name(value) else {
+        return false
+    }
+    return self.text(token) == name
+} Body.punned
+
+/// The marking rules: a place passed to a `mut` parameter is marked `mut`, a non-Copy place
+/// passed to a `take` parameter `take`, and nothing else is marked. `construct` is the
+/// argument's first and last tokens.
+fn Body.check_mode(
+    self,
+    construct: nir::Span,
+    arg: TExpr,
+    mode: ast::Mode,
+    marker: Option[ast::Word[ast::Mode]],
+    chain_mut: bool,
+    receiver: bool,
+    ) {
+    let ck = self.ck
+    if ck.types().has_error(arg.ty) {
+        return
+    }
+    let place = arg.is_place() or (receiver and self.is_part(arg))
+    var required: Option[ast::Mode] = None
+    if place {
+        required = match first mode {
+            ast::Mode.Mut => Some(ast::Mode.Mut)
+            ast::Mode.Take if not ck.has(arg.ty, property: Property.Copy) => Some(ast::Mode.Take)
+            ast::Mode.Take => None
+            ast::Mode.Read if chain_mut => Some(ast::Mode.Mut)
+            ast::Mode.Read => None
+        }
+    }
+    let written = match marker {
+        Some(word) => Some(word.kind)
+        None => None
+    }
+    if written == required {
+        return
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+    var head = construct.head
+    match marker {
+        Some(word) => {
+            head = word.token
+            match required {
+                Some(wanted) => mut fixes.push(ck.fix_replacing(self.item, head: word.token, last: word.token, text: wanted.word()))
+                None => mut fixes.push(ck.fix_deleting_forward(self.item, head: word.token, last: word.token))
+            }
+        }
+        None => {
+            let Some(wanted) = required else {
+                return
+            }
+            var inserted = text::String.of(wanted.word(), alloc: ck.alloc())
+            mut inserted.push(' ')
+            mut fixes.push(ck.fix_inserting(self.item, before: construct.head, text: inserted.as_str()))
+        }
+    }
+    var code = diagnostic::Code.ModeMismatch
+    if written.is_none() and required.is_some() {
+        code = diagnostic::Code.ModeUnmarked
+    } else if written == Some(ast::Mode.Take) and required.is_none() and place and mode == ast::Mode.Take {
+        code = diagnostic::Code.ModeCopyTaken
+    }
+    self.report_fixed(construct: nir::Span(head: head, last: construct.last), code, take fixes)
+} Body.check_mode
+
+/// Whether a typed expression is a part: the result of a projection call of that form, an
+/// indexing, a view binding of a part, or a field of one.
+fn Body.is_part(self, expr: TExpr) -> bool {
+    return match expr.kind {
+        TKind.Call(held) => held.contents().projection and self.ck.projection_form(held.contents()) == Form.Part
+        TKind.Index(_) => true
+        TKind.Local(local) => self.part_bindings.contains(local)
+        TKind.Field(base: base, name: _) => self.is_part(base.contents())
+        else => false
+    }
+} Body.is_part
+
+/// Whether a typed expression is a wrapped part: the result of a projection call of that
+/// form, or a view binding of one.
+fn Body.is_wrapped_part(self, expr: TExpr) -> bool {
+    return match expr.kind {
+        TKind.Call(held) => held.contents().projection and self.ck.projection_form(held.contents()) == Form.Wrapped
+        TKind.Local(local) => self.wrapped_bindings.contains(local)
+        else => false
+    }
+} Body.is_wrapped_part
+
+/// Whether an item is `Option` or `Result`, whose payloads wrap parts unmarked.
+fn Body.wraps(self, item: ty::ItemId) -> bool {
+    let db = self.ck.db()
+    let option = db.core_item("Option")
+    let result = db.core_item("Result")
+    return option == Some(item) or result == Some(item)
+} Body.wraps
+
+/// A construction of a struct or layout, or of a variant with a payload.
+fn Body.construct(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    generic_args: Option[mem::List[ast::GenericArg]],
+    args: Slice[ast::Arg],
+    expected: Option[ty::Ty],
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let sig = ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    var infer = Infer.new(take params, alloc)
+    match generic_args {
+        Some(_) => {
+            let written = mut self.enum_args(token, item, args: generic_args, expected: None)
+            let Some(found) = written else {
+                mut self.skim_args(args)
+                return TExpr.failed(token)
+            }
+            let ty::TyKind.Item(item: _, args: written_args) = types.kind(found) else {
+                mut self.skim_args(args)
+                return TExpr.failed(token)
+            }
+            infer.subst = ty::Subst.of(infer.params.view(), args: types.arg_list(written_args), alloc)
+        }
+        None => {
+            match expected {
+                Some(wanted) => {
+                    match types.kind(wanted) {
+                        ty::TyKind.Item(item: found, args: found_args) => {
+                            if found == item {
+                                infer.subst = ty::Subst.of(infer.params.view(), args: types.arg_list(found_args), alloc)
+                            }
+                        }
+                        else => {}
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    let Some(fields) = mut self.construction_fields(token, item, variant, sig: sig.contents(), args) else {
+        return TExpr.failed(token)
+    }
+    var wrapped = false
+    let values = mut self.construction_values(token, item, variant, fields, args, mut infer, mut wrapped)
+    for param in infer.params {
+        if infer.subst.get(param).is_none() {
+            self.report(token, code: diagnostic::Code.GenericUninferred)
+            return TExpr.failed(token)
+        }
+    }
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    for param in infer.params {
+        let Some(arg) = infer.subst.get(param) else {
+            expect false
+            return TExpr.failed(token)
+        }
+        mut type_args.push(arg)
+    }
+    let constructed = types.item(item, args: take type_args)
+    if infer.params.len() > 0 {
+        ck.check_instantiation(self.item, instantiated: constructed, token)
+    }
+    return TExpr(token: token, last: token, ty: constructed, kind: TKind.Construct(variant: variant, values: take values, wrapped: wrapped))
+} Body.construct
+
+/// The fields a construction gives values to: a struct's or layout's, or a variant's payload;
+/// none when the construction breaks a rule of its shape, which is reported.
+fn Body.construction_fields(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    sig: Sig,
+    args: Slice[ast::Arg],
+    ) -> Option[ConstructionFields] {
+    let ck = self.ck.share()
+    let db = ck.db()
+    let alloc = ck.alloc()
+    let consumer = db.package_of(item) != db.module(self.module).package_id
+    var fields = mem::List[LabelledTy].empty(alloc)
+    match sig.kind {
+        SigKind.Struct(fields: declared) => {
+            if variant.is_none() {
+                if consumer and db.ast(item).has_modifier(ast::TypeModifier.Open) {
+                    self.report(token, code: diagnostic::Code.TypeOpenConstruction)
+                    mut self.skim_args(args)
+                    return None
+                }
+                for field in declared {
+                    if not db.field_visible(self.module, owner: item, visibility: field.visibility) {
+                        self.report(token, code: diagnostic::Code.TypeHiddenField)
+                        mut self.skim_args(args)
+                        return None
+                    }
+                }
+                for field in declared {
+                    mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                }
+                return Some(ConstructionFields(fields: take fields, labelled: true))
+            }
+        }
+        SigKind.Layout(fields: declared, tags: _, bits: _) => {
+            if variant.is_none() {
+                for field in declared {
+                    mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+                }
+                return Some(ConstructionFields(fields: take fields, labelled: true))
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            match variant {
+                Some(index) => return mut self.construction_payload(token, payload: variants[index].payload, args)
+                None => {}
+            }
+        }
+        else => {}
+    }
+    self.report(token, code: diagnostic::Code.NameUnknown)
+    mut self.skim_args(args)
+    return None
+} Body.construction_fields
+
+/// The fields a variant's construction gives values to: its single or labelled payload; none
+/// when the arguments do not fit its shape, which is reported.
+fn Body.construction_payload(mut self, token: u32, payload: Payload, args: Slice[ast::Arg]) -> Option[ConstructionFields] {
+    let alloc = self.ck.alloc()
+    var fields = mem::List[LabelledTy].empty(alloc)
+    match payload {
+        Payload.None => {
+            self.report(token, code: diagnostic::Code.TypePayloadShape)
+            mut self.skim_args(args)
+            return None
+        }
+        Payload.Single(ty) => {
+            if args.len() != 1 or args[0].label.is_some() {
+                self.report(token, code: diagnostic::Code.TypePayloadShape)
+                mut self.skim_args(args)
+                return None
+            }
+            mut fields.push(LabelledTy(name: text::String.empty(alloc), ty: ty))
+            return Some(ConstructionFields(fields: take fields, labelled: false))
+        }
+        Payload.Labelled(labelled) => {
+            if args.len() == 0 {
+                self.report(token, code: diagnostic::Code.TypePayloadShape)
+                return None
+            }
+            for field in labelled {
+                mut fields.push(LabelledTy(name: text::String.of(field.name.as_str(), alloc), ty: field.ty))
+            }
+            return Some(ConstructionFields(fields: take fields, labelled: true))
+        }
+    }
+} Body.construction_payload
+
+/// The values of a construction, each typed against its field's type in the inference, with
+/// the rules on labels, duplicates and missing fields.
+fn Body.construction_values(
+    mut self,
+    token: u32,
+    item: ty::ItemId,
+    variant: Option[usize],
+    fields: ConstructionFields,
+    args: Slice[ast::Arg],
+    mut infer: Infer,
+    mut wrapped: bool,
+    ) -> mem::List[TLabelled] {
+    let alloc = self.ck.alloc()
+    var values = mem::List[TLabelled].empty(alloc)
+    var named = mem::List[text::String].empty(alloc)
+    var failed = false
+    for arg in args {
+        var field: usize = 0
+        if fields.labelled {
+            let Some(index) = mut self.labelled_value(item, variant, arg, args, fields: fields.fields.view()) else {
+                failed = true
+                continue
+            }
+            let name = fields.fields[index].name
+            if holds_text(named.view(), text: name.as_str()) {
+                self.report(arg.token, code: diagnostic::Code.TypeDuplicateLabel)
+                failed = true
+            }
+            mut named.push(text::String.of(name.as_str(), alloc))
+            field = index
+        }
+        let declared = fields.fields[field]
+        let typed = mut self.construction_value(item, arg, field_ty: declared.ty, mut infer, mut wrapped)
+        mut values.push(TLabelled(name: text::String.of(declared.name.as_str(), alloc), value: take typed))
+    }
+    if fields.labelled and not failed {
+        for declared in fields.fields {
+            if not holds_text(named.view(), text: declared.name.as_str()) {
+                self.report(token, code: diagnostic::Code.TypeMissingField)
+                break
+            }
+        }
+    }
+    return values
+} Body.construction_values
+
+/// The field a labelled construction value gives, by the index among `fields` of the field
+/// its label names, recording the label of a struct field; none when it has no label or names
+/// no field, which is reported, its value skimmed.
+fn Body.labelled_value(
+    mut self,
+    item: ty::ItemId,
+    variant: Option[usize],
+    arg: ast::Arg,
+    args: Slice[ast::Arg],
+    fields: Slice[LabelledTy],
+    ) -> Option[usize] {
+    let ck = self.ck.share()
+    let Some(label) = arg.label_name() else {
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        match arg.value.kind {
+            ast::ExprKind.Path(path: path, args: None) => {
+                if path.segments.len() == 1 {
+                    let name = path.segments[0].text.as_str()
+                    if names_field(fields, name) and not labelled_elsewhere(args, name) {
+                        var inserted = text::String.of(name, alloc: ck.alloc())
+                        mut inserted.append(": ")
+                        mut fixes.push(ck.fix_inserting(self.item, before: arg.value.token, text: inserted.as_str()))
+                    }
+                }
+            }
+            else => {}
+        }
+        self.report_fixed(construct: nir::Span(head: arg.token, last: arg.value.last), code: diagnostic::Code.TypeUnlabelledField, take fixes)
+        discard mut self.skim(arg.value)
+        return None
+    }
+    var owner: Option[ty::ItemId] = None
+    if variant.is_none() {
+        owner = Some(item)
+    }
+    let Some(index) = self.labelled_field(owner, label, fields) else {
+        discard mut self.skim(arg.value)
+        return None
+    }
+    if variant.is_none() {
+        let name = fields[index].name.as_str()
+        self.name_member(label.token, member: Member.Field(owner: item, name: text::String.of(name, alloc: ck.alloc())))
+        ck.record_label(item, field: name, label: FieldLabel(item: self.item, head: arg.token, last: arg.value.last, simple: place_or_literal(arg.value)))
+    }
+    return Some(index)
+} Body.labelled_value
+
+/// Whether one of a construction's fields has a name.
+fn names_field(fields: Slice[LabelledTy], name: Str) -> bool {
+    for field in fields {
+        if field.name.as_str() == name {
+            return true
+        }
+    }
+    return false
+} names_field
+
+/// Whether an argument of a call is labelled with a name.
+fn labelled_elsewhere(args: Slice[ast::Arg], name: Str) -> bool {
+    for other in args {
+        match other.label_name() {
+            Some(label) => {
+                if label.text.as_str() == name {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    return false
+} labelled_elsewhere
+
+/// A construction value typed against its field's type in the inference, its mode checked
+/// unless an `Option` or `Result` wraps a part unmarked.
+fn Body.construction_value(mut self, item: ty::ItemId, arg: ast::Arg, field_ty: ty::Ty, mut infer: Infer, mut wrapped: bool) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let written = arg.value
+    let marker = self.marked_value(written)
+    let value = match first written.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+        else => written
+    }
+    let pattern = infer.subst.ty(types, ty: field_ty)
+    var hint: Option[ty::Ty] = None
+    if not infer.open(pattern, types) {
+        hint = Some(pattern)
+    }
+    let typed = mut self.expr(value, expected: hint)
+    let unified = mut infer.unify(pattern, found: typed.ty, types)
+    if not unified {
+        self.expect_type(typed, expected: infer.subst.ty(types, ty: field_ty), token: value.token)
+    } else {
+        match types.kind(typed.ty) {
+            ty::TyKind.Fn(found) => {
+                match types.kind(pattern) {
+                    ty::TyKind.Fn(wanted) => self.fit(types.fn_of(found), wanted: types.fn_of(wanted), token: value.token)
+                    else => {}
+                }
+            }
+            else => {}
+        }
+    }
+    match typed.kind {
+        TKind.Closure(_) => self.report(value.token, code: diagnostic::Code.ClosureSecondClass)
+        else => {}
+    }
+    let wraps_part = self.wraps(item) and self.is_part(typed) and not self.ck.has(typed.ty, property: Property.Copy)
+    var mode = ast::Mode.Take
+    if wraps_part {
+        mode = ast::Mode.Read
+    }
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: mode, marker, chain_mut: false, receiver: false)
+    if wraps_part {
+        wrapped = true
+    }
+    return typed
+} Body.construction_value
+
+/// `x[i]`: a call of the `at`, or `at_mut` where the element is written, that method
+/// resolution finds on the type of `x`.
+fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bool) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    var base_typed = TExpr.failed(token)
+    if write {
+        match mut self.place(base, assigned: false) {
+            Some(place) => {
+                base_typed = place
+            }
+            None => {
+                base_typed = mut self.expr(base, expected: None)
+            }
+        }
+    } else {
+        base_typed = mut self.expr(base, expected: None)
+    }
+    if types.has_error(base_typed.ty) {
+        discard mut self.skim(index)
+        return TExpr.failed(token)
+    }
+    if ck.is_std(base_typed.ty, path: "core::Str") or ck.is_std(base_typed.ty, path: "text::String") or ck.is_std(base_typed.ty, path: "text::Fixed") {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        mut fixes.push(ck.fix_appending(self.item, after: base.last, text: ".as_bytes()"))
+        self.report_fixed(construct: nir::Span.at(token), code: diagnostic::Code.TextIntegerIndex, take fixes)
+        discard mut self.skim(index)
+        return TExpr.failed(token)
+    }
+    let name = if write {
+        "at_mut"
+    } else {
+        "at"
+    }
+    let candidates = ck.method_candidates(base_typed.ty, name)
+    var cursor = take candidates.into_cursor()
+    var callable: Option[Callable] = None
+    match mut cursor.next() {
+        Some(candidate) => {
+            callable = mut self.callable(take candidate, self_ty: base_typed.ty)
+        }
+        None => {}
+    }
+    if not is_indexing_head(callable) {
+        self.report(token, code: diagnostic::Code.OwnNotIndexable)
+        discard mut self.skim(index)
+        return TExpr.failed(token)
+    }
+    let Some(found) = callable else {
+        expect false
+        return TExpr.failed(token)
+    }
+    let index_ty = found.infer.subst.ty(types, ty: found.head.params[1].ty)
+    let index_typed = mut self.check(index, expected: index_ty)
+    let head = found.infer.subst.fn_ty(types, fn_ty: found.head.fn_ty(alloc))
+    let result = head.result
+    let type_args = found.callee.type_args(head: found.head, subst: found.infer.subst, types)
+    var call_args = mem::List[TArg].empty(alloc)
+    mut call_args.push(TArg(expr: take base_typed, mode: found.head.params[0].mode))
+    mut call_args.push(TArg(expr: take index_typed, mode: ast::Mode.Read))
+    let made = Call(token: token, callee: take found.callee, type_args: type_args, args: take call_args, head: take head, projection: true, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: result, kind: TKind.Index(mem::Heap.of(alloc).boxed(take made)))
+} Body.index
+
+/// Whether a callable indexes: a projection taking `self` and an index.
+fn is_indexing_head(callable: Option[Callable]) -> bool {
+    return match callable {
+        Some(found) => found.head.is_proj() and found.head.params.len() == 2 and found.head.has_self()
+        None => false
+    }
+} is_indexing_head
+
+/// A named conversion or bit conversion `T.name(x)`.
+fn Body.conversion(
+    mut self,
+    token: u32,
+    target: ty::Scalar,
+    name: ast::Name,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    self.builtin_markers(markers)
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    let written = name.text.as_str()
+    if args.len() != 1 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let arg = args[0]
+    let construct = nir::Span(head: token, last: markers.last.value_or(token))
+    if written == "to_bits" {
+        let source = mut self.check(arg.value, expected: ty::Ty.scalar(target))
+        if target.is_unsigned_bits() {
+            self.report_fixed(construct, code: diagnostic::Code.NumSameTypeConversion, fixes: self.unconverted(token, arg, markers))
+            return TExpr.failed(token)
+        }
+        return conversion_call(token, name: written, target, take source, result: ty::Ty.scalar(target.bits_type()), alloc)
+    }
+    if written == "from_bits" or written == "checked_from_bits" {
+        let source = mut self.check(arg.value, expected: ty::Ty.scalar(target.bits_type()))
+        if target.is_unsigned_bits() {
+            self.report_fixed(construct, code: diagnostic::Code.NumSameTypeConversion, fixes: self.unconverted(token, arg, markers))
+            return TExpr.failed(token)
+        }
+        if written == "from_bits" and not ck.has(ty::Ty.scalar(target), property: Property.AnyBits) {
+            self.report_fixed(construct: nir::Span.at(name.token), code: diagnostic::Code.NumFromBitsNotAnybits, fixes: self.renamed_conversion(name, to: "checked_from_bits"))
+            return TExpr.failed(token)
+        }
+        var result = ty::Ty.scalar(target)
+        if written == "checked_from_bits" {
+            result = ck.option_ty(ty::Ty.scalar(target))
+        }
+        return conversion_call(token, name: written, target, take source, result, alloc)
+    }
+    return mut self.number_conversion(token, target, name, arg, markers)
+} Body.conversion
+
+/// A named conversion between number types: defined for its source and target, lossless
+/// exactly for `widen`, and not to the same type.
+fn Body.number_conversion(mut self, token: u32, target: ty::Scalar, name: ast::Name, arg: ast::Arg, markers: Markers) -> TExpr {
+    let ck = self.ck.share()
+    let written = name.text.as_str()
+    let source = mut self.expr(arg.value, expected: None)
+    let Some(scalar) = ck.types().scalar_of(source.ty) else {
+        if not ck.types().has_error(source.ty) {
+            self.report(token, code: diagnostic::Code.NumConversionUndefined)
+        }
+        return TExpr.failed(token)
+    }
+    if not scalar.is_number() or not target.is_number() {
+        self.report(token, code: diagnostic::Code.NumConversionUndefined)
+        return TExpr.failed(token)
+    }
+    if scalar == target {
+        let construct = nir::Span(head: token, last: markers.last.value_or(token))
+        self.report_fixed(construct, code: diagnostic::Code.NumSameTypeConversion, fixes: self.unconverted(token, arg, markers))
+        return TExpr.failed(token)
+    }
+    let widening = widens(scalar, target)
+    let construct = nir::Span.at(name.token)
+    if written == "widen" and not widening {
+        self.report_fixed(construct, code: diagnostic::Code.NumWidenLossy, fixes: self.renamed_conversion(name, to: "fit"))
+        return TExpr.failed(token)
+    }
+    if written != "widen" and widening {
+        self.report_fixed(construct, code: diagnostic::Code.NumWidenApplies, fixes: self.renamed_conversion(name, to: "widen"))
+        return TExpr.failed(token)
+    }
+    let defined = match written {
+        "truncate" => scalar.is_integer() and target.is_integer()
+        "saturate" => target.is_integer()
+        "nearest" => scalar.is_float() or target.is_float()
+        else => true
+    }
+    if not defined {
+        self.report(token, code: diagnostic::Code.NumConversionUndefined)
+        return TExpr.failed(token)
+    }
+    var result = ty::Ty.scalar(target)
+    if written == "checked_fit" {
+        result = ck.option_ty(ty::Ty.scalar(target))
+    }
+    return conversion_call(token, name: written, target, take source, result, alloc: ck.alloc())
+} Body.number_conversion
+
+/// The fix renaming a conversion.
+fn Body.renamed_conversion(self, name: ast::Name, to: Str) -> mem::List[diagnostic::Fix] {
+    var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
+    mut fixes.push(self.ck.fix_replacing(self.item, head: name.token, last: name.token, text: to))
+    return fixes
+} Body.renamed_conversion
+
+/// The fix replacing a conversion call by its operand.
+fn Body.unconverted(self, token: u32, arg: ast::Arg, markers: Markers) -> mem::List[diagnostic::Fix] {
+    let ck = self.ck
+    let operand = ck.written(self.item, head: arg.value.token, last: arg.value.last)
+    var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+    mut fixes.push(ck.fix_replacing(self.item, head: token, last: markers.last.value_or(token), text: operand.as_str()))
+    return fixes
+} Body.unconverted
+
+/// The call of a scalar's conversion or bit conversion by its name.
+fn conversion_call(token: u32, name: Str, target: ty::Scalar, take source: TExpr, result: ty::Ty, alloc: mem::Alloc) -> TExpr {
+    match nir::Conversion.named(name) {
+        Some(conversion) => return builtin_call(token, builtin: Builtin.Conversion(nir::Builtin.Conversion(conversion: conversion, scalar: target)), take source, result, alloc)
+        None => {}
+    }
+    let Some(bits) = nir::BitConversion.named(name) else {
+        expect false
+        return TExpr.failed(token)
+    }
+    return builtin_call(token, builtin: Builtin.Conversion(nir::Builtin.Bits(conversion: bits, owner: nir::BitsOwner.Scalar(target))), take source, result, alloc)
+} conversion_call
+
+/// `L.from_bits(bits)` and `L.checked_from_bits(bits)` of a layout.
+fn Body.layout_bits(
+    mut self,
+    token: u32,
+    layout_ty: ty::Ty,
+    written: ast::Name,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    self.builtin_markers(markers)
+    let ck = self.ck.share()
+    let alloc = ck.alloc()
+    let name = written.text.as_str()
+    let bits = self.bits_of(layout_ty).value_or(ty::Ty.error())
+    if args.len() != 1 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let ty::TyKind.Item(item: item, args: _) = ck.types().kind(layout_ty) else {
+        return TExpr.failed(token)
+    }
+    let Some(conversion) = nir::BitConversion.named(name) else {
+        expect false
+        return TExpr.failed(token)
+    }
+    let builtin = Builtin.Conversion(nir::Builtin.Bits(conversion: conversion, owner: nir::BitsOwner.Layout(item)))
+    if name == "to_bits" {
+        let source = mut self.check(args[0].value, expected: layout_ty)
+        return builtin_call(token, take builtin, take source, result: bits, alloc)
+    }
+    let source = mut self.check(args[0].value, expected: bits)
+    if name == "from_bits" and not ck.has(layout_ty, property: Property.AnyBits) {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        mut fixes.push(ck.fix_replacing(self.item, head: written.token, last: written.token, text: "checked_from_bits"))
+        self.report_fixed(construct: nir::Span.at(written.token), code: diagnostic::Code.NumFromBitsNotAnybits, take fixes)
+        return TExpr.failed(token)
+    }
+    var result = layout_ty
+    if name != "from_bits" {
+        result = ck.option_ty(layout_ty)
+    }
+    return builtin_call(token, take builtin, take source, result, alloc)
+} Body.layout_bits
+
+/// The bits type of a scalar or layout.
+fn Body.bits_of(self, ty: ty::Ty) -> Option[ty::Ty] {
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return Some(ty::Ty.scalar(scalar.bits_type()))
+        ty::TyKind.Item(item: item, args: _) => {
+            let sig = self.ck.sig(item)
+            return match sig.contents().kind {
+                SigKind.Layout(fields: _, tags: _, bits: bits) => Some(bits.value_or(ty::Ty.error()))
+                else => None
+            }
+        }
+        else => return None
+    }
+} Body.bits_of
+
+/// `x.to_bits()`: the bit pattern of a scalar or layout as its bits type.
+fn Body.bits_call(
+    mut self,
+    token: u32,
+    take receiver: TExpr,
+    bits: ty::Ty,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    match markers.failure {
+        Some(marker) => self.unneeded_failure_marker(marker)
+        None => {}
+    }
+    match markers.awaited {
+        Some(marker) => self.unneeded_await(marker)
+        None => {}
+    }
+    self.check_mode(construct: nir::Span(head: receiver.token, last: markers.receiver.value_or(receiver.token)), arg: receiver, mode: ast::Mode.Read, marker: markers.mode, chain_mut: markers.chain_mut, receiver: true)
+    if args.len() > 0 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let ck = self.ck.share()
+    let types = ck.types()
+    let same = match types.scalar_of(receiver.ty) {
+        Some(scalar) => scalar.is_unsigned_bits()
+        None => false
+    }
+    if same {
+        let last = markers.last.value_or(token)
+        let operand = ck.written(self.item, head: receiver.token, last: markers.receiver.value_or(receiver.token))
+        var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
+        mut fixes.push(ck.fix_replacing(self.item, head: receiver.token, last, text: operand.as_str()))
+        self.report_fixed(construct: nir::Span(head: receiver.token, last: last), code: diagnostic::Code.NumSameTypeConversion, take fixes)
+        return TExpr.failed(token)
+    }
+    let owner = match types.kind(receiver.ty) {
+        ty::TyKind.Scalar(scalar) => nir::BitsOwner.Scalar(scalar)
+        ty::TyKind.Item(item: item, args: _) => nir::BitsOwner.Layout(item)
+        else => return TExpr.failed(token)
+    }
+    return builtin_call(token, builtin: Builtin.Conversion(nir::Builtin.Bits(conversion: nir::BitConversion.To, owner: owner)), source: take receiver, result: bits, alloc: ck.alloc())
+} Body.bits_call
+
+/// `Dyn[I].view(x)` and `Dyn[I].view_mut(mut x)`.
+fn Body.dyn_view(
+    mut self,
+    token: u32,
+    bound: ty::Bound,
+    written: ast::Name,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    let name = written.text.as_str()
+    if args.len() != 1 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        mut self.skim_args(args)
+        return TExpr.failed(token)
+    }
+    let arg = args[0]
+    let marker = self.marked_value(arg.value)
+    let value = match first arg.value.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+        else => arg.value
+    }
+    self.builtin_markers(markers)
+    let typed = mut self.expr(value, expected: None)
+    if not types.has_error(typed.ty) and not ck.implements(typed.ty, interface_item: bound.item) {
+        self.report(token, code: diagnostic::Code.InterfaceNotImplemented)
+        return TExpr.failed(token)
+    }
+    let takes_mut = self.takes_mut_self(bound.item)
+    let allowed = if takes_mut {
+        "view_mut"
+    } else {
+        "view"
+    }
+    if name != allowed {
+        let renamed = ck.fix_replacing(self.item, head: written.token, last: written.token, text: allowed)
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match first marker {
+            Some(word) if not takes_mut => mut fixes.push(take renamed.joined(ck.fix_deleting_forward(self.item, head: word.token, last: word.token)))
+            None if takes_mut => mut fixes.push(take renamed.joined(ck.fix_inserting(self.item, before: value.token, text: "mut ")))
+            else => mut fixes.push(take renamed)
+        }
+        self.report_fixed(construct: nir::Span.at(written.token), code: diagnostic::Code.InterfaceDynViewMode, take fixes)
+        return TExpr.failed(token)
+    }
+    var mode = ast::Mode.Read
+    if name == "view_mut" {
+        mode = ast::Mode.Mut
+    }
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode, marker, chain_mut: false, receiver: false)
+    let ty = types.intern(ty::TyKind.Dyn(bound))
+    var call_args = mem::List[TArg].empty(alloc)
+    mut call_args.push(TArg(expr: take typed, mode: mode))
+    let made = Call(token: token, callee: Callee.Builtin(Builtin.DynView), type_args: ty::Args.none(), args: take call_args, head: plain_head(ty, alloc), projection: true, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: ty, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.dyn_view
+
+/// Whether a method of an interface takes `mut self`.
+fn Body.takes_mut_self(self, interface_item: ty::ItemId) -> bool {
+    let sig = self.ck.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return false
+    }
+    for method in methods {
+        let params = method.sig.params
+        if params.len() > 0 and params[0].is_self and params[0].mode == ast::Mode.Mut {
+            return true
+        }
+    }
+    return false
+} Body.takes_mut_self
+
+/// `mem::Box[Dyn[I]].from_box(take b)`.
+fn Body.boxed_dyn_call(
+    mut self,
+    token: u32,
+    boxed: ty::Ty,
+    bound: ty::Ty,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    self.builtin_markers(markers)
+    if args.len() != 1 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        return TExpr.failed(token)
+    }
+    let arg = args[0]
+    let marker = self.marked_value(arg.value)
+    let value = match first arg.value.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+        else => arg.value
+    }
+    let typed = mut self.expr(value, expected: None)
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    match types.kind(bound) {
+        ty::TyKind.Dyn(interface_bound) => {
+            match types.type_arg(typed.ty, index: 0) {
+                Some(inner) => {
+                    if not ck.implements(inner, interface_item: interface_bound.item) {
+                        self.report(token, code: diagnostic::Code.InterfaceNotImplemented)
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: ast::Mode.Take, marker, chain_mut: false, receiver: false)
+    var call_args = mem::List[TArg].empty(alloc)
+    mut call_args.push(TArg(expr: take typed, mode: ast::Mode.Take))
+    let made = Call(token: token, callee: Callee.Builtin(Builtin.DynView), type_args: ty::Args.none(), args: take call_args, head: plain_head(boxed, alloc), projection: false, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: boxed, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.boxed_dyn_call
+
+/// `text::fmt("template", ...)`: holes filled by labelled or punned arguments.
+fn Body.template(mut self, token: u32, args: Slice[ast::Arg]) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    if args.len() == 0 {
+        self.report(token, code: diagnostic::Code.ExprArgumentCount)
+        return TExpr.failed(token)
+    }
+    let template = args[0]
+    let ast::ExprKind.Literal(literal) = template.value.kind else {
+        self.report(template.token, code: diagnostic::Code.TextTemplateNotLiteral)
+        return TExpr.failed(token)
+    }
+    if literal.kind != ast::LiteralKind.Text or template.label.is_some() {
+        self.report(template.token, code: diagnostic::Code.TextTemplateNotLiteral)
+        return TExpr.failed(token)
+    }
+    let value = syntax::text_value(self.text(literal.tokens[0]), alloc)
+    let Some(holes) = template_holes(value.as_str(), alloc) else {
+        self.report(template.token, code: diagnostic::Code.TextTemplateMalformed)
+        return TExpr.failed(token)
+    }
+    var names = mem::List[text::String].empty(alloc)
+    var typed_args = mem::List[TArg].empty(alloc)
+    mut typed_args.push(text_arg(template.token, written: take value, str_ty: ck.str_ty()))
+    let render = ck.db().core_item("Render")
+    for index in 1..<args.len() {
+        let arg = args[index]
+        let Some(name) = hole_argument_name(arg, alloc) else {
+            self.report(arg.token, code: diagnostic::Code.ExprArgumentLabel)
+            return TExpr.failed(token)
+        }
+        if holds_text(names.view(), text: name.as_str()) {
+            self.report(arg.token, code: diagnostic::Code.TextArgumentDuplicate)
+        }
+        if not holds_text(holes.view(), text: name.as_str()) {
+            self.report(arg.token, code: diagnostic::Code.TextArgumentUnused)
+        }
+        mut names.push(text::String.of(name.as_str(), alloc))
+        mut typed_args.push(text_arg(arg.token, written: take name, str_ty: ck.str_ty()))
+        let typed = mut self.hole_argument(arg, render)
+        mut typed_args.push(TArg(expr: take typed, mode: ast::Mode.Read))
+    }
+    for hole in holes {
+        if not holds_text(names.view(), text: hole.as_str()) {
+            self.report(template.token, code: diagnostic::Code.TextHoleUnbound)
+            break
+        }
+    }
+    let ty = match render {
+        Some(found) => types.intern(ty::TyKind.Dyn(ty::Bound(item: found, args: ty::Args.none())))
+        None => ty::Ty.error()
+    }
+    let made = Call(token: token, callee: Callee.Builtin(Builtin.Template), type_args: ty::Args.none(), args: take typed_args, head: plain_head(ty, alloc), projection: false, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: ty, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.template
+
+/// The hole a template argument fills: its label, or the binding it names alone.
+fn hole_argument_name(arg: ast::Arg, alloc: mem::Alloc) -> Option[text::String] {
+    match arg.label_name() {
+        Some(name) => return Some(text::String.of(name.text.as_str(), alloc))
+        None => {}
+    }
+    if arg.label.is_some() {
+        return None
+    }
+    return match first arg.value.kind {
+        ast::ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(text::String.of(path.segments[0].text.as_str(), alloc))
+        else => None
+    }
+} hole_argument_name
+
+/// The value of a template argument: an operand implementing `Render`, written without a mode.
+fn Body.hole_argument(mut self, arg: ast::Arg, render: Option[ty::ItemId]) -> TExpr {
+    let written = arg.value
+    let marker = self.marked_value(written)
+    let value = match first written.kind {
+        ast::ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) if marker.is_some() => inner.contents()
+        else => written
+    }
+    match marker {
+        Some(word) => self.report(word.token, code: diagnostic::Code.ModeMismatch)
+        None => {}
+    }
+    let typed = mut self.operand(value, expected: None)
+    let ck = self.ck.share()
+    let types = ck.types()
+    var renders = match types.kind(typed.ty) {
+        ty::TyKind.Dyn(bound) => Some(bound.item) == render
+        else => false
+    }
+    if not renders {
+        renders = match render {
+            Some(found) => ck.implements(typed.ty, interface_item: found)
+            None => false
+        }
+    }
+    if not renders and not types.has_error(typed.ty) {
+        self.report(arg.value.token, code: diagnostic::Code.GenericUnsatisfiedBound)
+    }
+    return typed
+} Body.hole_argument
+
+/// A text literal argument of a template call.
+fn text_arg(token: u32, take written: text::String, str_ty: ty::Ty) -> TArg {
+    return TArg(expr: TExpr(token: token, last: token, ty: str_ty, kind: TKind.Literal(Lit.Text(take written))), mode: ast::Mode.Read)
+} text_arg
+
+/// The head of a DMA access call on an `hw::DmaShared`.
+fn Body.dma_access(self, ty: ty::Ty, name: Str) -> Option[text::String] {
+    if self.ck.is_std(ty, path: "hw::DmaShared") and (name == "read_acquire" or name == "write_release" or name == "read_acquire_at" or name == "write_release_at") {
+        return Some(text::String.of(name, alloc: self.ck.alloc()))
+    }
+    return None
+} Body.dma_access
+
+/// A DMA access call: its field operand `T.f`, a field of the buffer's bytes layout.
+fn Body.apply_dma(
+    mut self,
+    token: u32,
+    take receiver: TExpr,
+    take name: text::String,
+    args: Slice[ast::Arg],
+    markers: Markers,
+    ) -> TExpr {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let alloc = ck.alloc()
+    ck.require(self.item, token, authority: workspace::Authority.Device)
+    let bytes_layout = types.type_arg(receiver.ty, index: 0).value_or(ty::Ty.error())
+    if args.len() == 0 {
+        self.report(token, code: diagnostic::Code.HwDmaOperand)
+        return TExpr.failed(token)
+    }
+    let Some(field) = mut self.dma_field(args[0].value, bytes_layout) else {
+        self.report(args[0].token, code: diagnostic::Code.HwDmaOperand)
+        return TExpr.failed(token)
+    }
+    var array_element: Option[ty::Ty] = None
+    if ck.is_std(field.ty, path: "core::Array") {
+        array_element = types.type_arg(field.ty, index: 0)
+    }
+    let indexed = name.ends_with("_at")
+    let element = match first array_element {
+        Some(found) if indexed => found
+        None if not indexed => field.ty
+        else => {
+            self.report(token, code: diagnostic::Code.HwDmaOperand)
+            return TExpr.failed(token)
+        }
+    }
+    let write = name.starts_with("write")
+    let Some(operands) = mut self.dma_operands(token, args, indexed, write, element) else {
+        return TExpr.failed(token)
+    }
+    self.check_mode(construct: nir::Span(head: receiver.token, last: markers.receiver.value_or(receiver.token)), arg: receiver, mode: ast::Mode.Mut, marker: markers.mode, chain_mut: false, receiver: true)
+    var result = element
+    if write {
+        result = ty::Ty.unit()
+    }
+    // The access carries, as type arguments, its field's bytes layout, the field's index in
+    // it and whether the access writes and is indexed; its operands are the buffer, then the
+    // index of an indexed access, then the value of a write.
+    var carried = mem::List[ty::Arg].empty(alloc)
+    mut carried.push(ty::Arg.Ty(bytes_layout))
+    mut carried.push(ty::Arg.Const(ty::Const.Int(wide::Wide.of_u64(u64.widen(field.index)))))
+    mut carried.push(ty::Arg.Const(ty::Const.Bool(write)))
+    mut carried.push(ty::Arg.Const(ty::Const.Bool(indexed)))
+    var call_args = mem::List[TArg].empty(alloc)
+    mut call_args.push(TArg(expr: take receiver, mode: ast::Mode.Mut))
+    match operands.index {
+        Some(indexing) => mut call_args.push(TArg(expr: take indexing, mode: ast::Mode.Read))
+        None => {}
+    }
+    match operands.value {
+        Some(written) => mut call_args.push(TArg(expr: take written, mode: ast::Mode.Take))
+        None => {}
+    }
+    let made = Call(token: token, callee: Callee.Builtin(Builtin.DmaAccess), type_args: types.args(take carried), args: take call_args, head: plain_head(result, alloc), projection: false, failure: markers.failure, awaited: markers.awaited.is_some())
+    return TExpr(token: token, last: token, ty: result, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} Body.apply_dma
+
+/// The operands of a DMA access after its field operand, labelled `index` exactly for an
+/// indexed access and `value` exactly for a write, each typed; none when one breaks that
+/// rule, which is reported.
+fn Body.dma_operands(
+    mut self,
+    token: u32,
+    args: Slice[ast::Arg],
+    indexed: bool,
+    write: bool,
+    element: ty::Ty,
+    ) -> Option[DmaOperands] {
+    var index_arg: Option[TExpr] = None
+    var value_arg: Option[TExpr] = None
+    for at in 1..<args.len() {
+        let arg = args[at]
+        let label = match arg.label_name() {
+            Some(found) => Some(found.text.as_str())
+            None => None
+        }
+        match first label {
+            Some("index") if indexed and index_arg.is_none() => {
+                index_arg = Some(mut self.check(arg.value, expected: ty::Ty.scalar(ty::Scalar.UnsignedSize)))
+            }
+            Some("value") if write and value_arg.is_none() => {
+                value_arg = Some(mut self.check(arg.value, expected: element))
+            }
+            Some("index") or Some("value") => {
+                self.report(arg.token, code: diagnostic::Code.HwDmaOperand)
+                return None
+            }
+            else => {
+                self.report(arg.token, code: diagnostic::Code.ExprArgumentLabel)
+                return None
+            }
+        }
+    }
+    if index_arg.is_some() != indexed or value_arg.is_some() != write {
+        self.report(token, code: diagnostic::Code.HwDmaOperand)
+        return None
+    }
+    return Some(DmaOperands(index: take index_arg, value: take value_arg))
+} Body.dma_operands
+
+/// The field of a DMA buffer's bytes layout an access's operand `T.f` names, `T` being that
+/// layout.
+fn Body.dma_field(mut self, operand: ast::Expr, bytes_layout: ty::Ty) -> Option[DmaField] {
+    let ck = self.ck.share()
+    let types = ck.types()
+    let ast::ExprKind.Field(base: base, name: field) = operand.kind else {
+        return None
+    }
+    let ty::TyKind.Item(item: item, args: _) = types.kind(bytes_layout) else {
+        return None
+    }
+    let target = mut self.type_target(base.contents())
+    let Some(TypeTarget.Type(written)) = target else {
+        return None
+    }
+    let ty::TyKind.Item(item: named, args: _) = types.kind(written) else {
+        return None
+    }
+    if named != item {
+        return None
+    }
+    let sig = ck.sig(item)
+    let SigKind.Layout(fields: fields, tags: _, bits: _) = sig.contents().kind else {
+        return None
+    }
+    let Some(index) = fields.position(fn(value: FieldSig) => value.name == field.text) else {
+        return None
+    }
+    return Some(DmaField(index: index, ty: fields[index].ty))
+} Body.dma_field
+
+/// Whether an expression is a place or a literal, whose value names no effect.
+fn place_or_literal(expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Literal(_) or ast::ExprKind.SelfValue => true
+        ast::ExprKind.Path(path: _, args: None) => true
+        ast::ExprKind.Field(base: inner, name: _) => place_or_literal(inner.contents())
+        ast::ExprKind.Paren(inner) => place_or_literal(inner.contents())
+        ast::ExprKind.Unary(op: ast::UnaryOp.Neg, operand: operand) => match operand.contents().kind {
+            ast::ExprKind.Literal(_) => true
+            else => false
+        }
+        else => false
+    }
+} place_or_literal
+
+/// The generic arguments of a call: for an interface method, `Self` and the interface's
+/// arguments before the method's own; otherwise those of the head's generic parameters.
+fn Callee.type_args(self, head: FnSig, subst: ty::Subst, types: ty::Types) -> ty::Args {
+    var args = mem::List[ty::Arg].empty(types.allocator())
+    match self {
+        Callee.Method(bound: bound, method: _, self_ty: self_ty, dynamic: _) => {
+            mut args.push(ty::Arg.Ty(self_ty))
+            for arg in types.arg_list(bound.args) {
+                mut args.push(arg)
+            }
+        }
+        else => {}
+    }
+    for def in head.generics {
+        match def.constant {
+            Some(_) => mut args.push(subst.arg(types, arg: ty::Arg.Const(ty::Const.Param(def.param))))
+            None => mut args.push(ty::Arg.Ty(subst.ty(types, ty: types.intern(ty::TyKind.Param(def.param)))))
+        }
+    }
+    return types.args(take args)
+} Callee.type_args
+
+/// The head of a toolchain operation: a plain function type with no `fails` and no `uses wait`.
+fn plain_head(result: ty::Ty, alloc: mem::Alloc) -> ty::FnTy {
+    return ty::FnTy(kind: ast::FnKind.Plain, params: mem::List[ty::FnParam].empty(alloc), result: result, failure: None, wait: false, limit_set: ty::LimitSet.none(), convention: None)
+} plain_head
+
+/// A call of a toolchain operation on one read argument.
+fn builtin_call(
+    token: u32,
+    take builtin: Builtin,
+    take source: TExpr,
+    result: ty::Ty,
+    alloc: mem::Alloc,
+    ) -> TExpr {
+    var args = mem::List[TArg].empty(alloc)
+    mut args.push(TArg(expr: take source, mode: ast::Mode.Read))
+    let made = Call(token: token, callee: Callee.Builtin(take builtin), type_args: ty::Args.none(), args: take args, head: plain_head(result, alloc), projection: false, failure: None, awaited: false)
+    return TExpr(token: token, last: token, ty: result, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
+} builtin_call
+
+/// Whether an expression is a field path through an index, whose `mut` access writes the
+/// element.
+fn is_indexed_path(expr: ast::Expr) -> bool {
+    return match expr.kind {
+        ast::ExprKind.Index(base: _, index: _) => true
+        ast::ExprKind.Field(base: base, name: _) => is_indexed_path(base.contents())
+        else => false
+    }
+} is_indexed_path
+
+/// Whether a typed expression is a place: a local, and a path of fields and indexes from one.
+fn TExpr.is_place(self) -> bool {
+    return match self.kind {
+        TKind.Local(_) => true
+        TKind.Field(base: base, name: _) => base.contents().is_place()
+        TKind.Index(held) => held.contents().args.len() > 0 and held.contents().args[0].expr.is_place()
+        else => false
+    }
+} TExpr.is_place
+
+/// Whether every value of `source` is exactly a value of `target`.
+fn widens(source: ty::Scalar, target: ty::Scalar) -> bool {
+    if source == target {
+        return false
+    }
+    if source.is_float() {
+        return target.is_float() and source == ty::Scalar.Float32 and target == ty::Scalar.Float64
+    }
+    if not source.is_integer() {
+        return false
+    }
+    let range = source.range()
+    if target.is_float() {
+        var mantissa: u32 = 53
+        if target == ty::Scalar.Float32 {
+            mantissa = 24
+        }
+        let limit = wide::Wide.one().shift_left(mantissa)
+        return range.high.lt(limit) and limit.wrapping_neg().lt(range.low)
+    }
+    if not target.is_integer() {
+        return false
+    }
+    let target_range = target.range()
+    return target_range.low.le(range.low) and range.high.le(target_range.high)
+} widens
+
+/// The hole names of a template's value, or none when it holds a stray brace.
+fn template_holes(value: Str, alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    var holes = mem::List[text::String].empty(alloc)
+    let bytes = value.as_bytes()
+    var index: usize = 0
+    while index < bytes.len() {
+        let byte = bytes[index]
+        let doubled = index + 1 < bytes.len() and bytes[index + 1] == byte
+        if (byte == b'{' or byte == b'}') and doubled {
+            index += 2
+        } else if byte == b'{' {
+            var end = index + 1
+            while end < bytes.len() and bytes[end] != b'}' {
+                end += 1
+            }
+            if end >= bytes.len() {
+                return None
+            }
+            let Some(name) = value.slice_bytes(index + 1, end: end) else {
+                return None
+            }
+            if not is_hole_name(name) {
+                return None
+            }
+            mut holes.push(text::String.of(name, alloc))
+            index = end + 1
+        } else if byte == b'}' {
+            return None
+        } else {
+            index += 1
+        }
+    }
+    return Some(take holes)
+} template_holes
+
+/// Whether a hole's name is an identifier and no keyword.
+fn is_hole_name(name: Str) -> bool {
+    let bytes = name.as_bytes()
+    if bytes.len() == 0 {
+        return false
+    }
+    let leading = bytes[0]
+    if not (is_ascii_letter(leading) or leading == b'_') {
+        return false
+    }
+    for byte in bytes {
+        if not (is_ascii_letter(byte) or (byte >= b'0' and byte <= b'9') or byte == b'_') {
+            return false
+        }
+    }
+    return syntax::Keyword.from_spelling(bytes).is_none()
+} is_hole_name
+
+/// Whether a byte is an ASCII letter.
+fn is_ascii_letter(byte: u8) -> bool {
+    return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z')
+} is_ascii_letter
+
+/// A mode as a parameter writes it before its name.
+proj fn Body.mode_word(self, mode: Option[ast::Mode]) -> Str {
+    return match mode {
+        Some(ast::Mode.Mut) => "mut "
+        Some(ast::Mode.Take) => "take "
+        else => ""
+    }
+} Body.mode_word

@@ -1,0 +1,743 @@
+//! The API snapshot `.nan/api/<module>.nan` of a module: per item, what consumers see of it with its public docs, its accepted spec and pending weakening, and its seals.
+
+pkg struct Snapshot derives Eq {
+    /// In byte order of canonical path.
+    pkg entries: mem::List[ApiEntry]
+} Snapshot
+
+pkg fn Snapshot.empty(alloc: mem::Alloc) -> Snapshot = Snapshot(entries: mem::List[ApiEntry].empty(alloc))
+
+/// The entry of an item in an API snapshot.
+pkg struct ApiEntry derives Eq {
+    pkg path: text::String
+    /// The lines of its interface text, for a `pub` item or impl line.
+    pkg text: mem::List[text::String]
+    /// The promised properties, each with the generic parameters it rests on.
+    pkg promises: mem::List[Promise]
+    pkg interface_hash: Option[hashing::HashValue]
+    /// Its digest line per declared target, in byte order of target.
+    pkg digests: mem::List[TargetDigest]
+    /// Its public docs and those of its members, in source order.
+    pkg docs: mem::List[Doc]
+    pkg accepted: Accepted
+    /// Its pending weakening: the item hash it is bound to and each weakened part, in byte order
+    /// of part; an interface's lie with the methods holding them.
+    pkg pending: mem::List[Pending]
+    /// In byte order of principal.
+    pkg seals: mem::List[Seal]
+} ApiEntry
+
+/// The entry of an item holding nothing but its path.
+pkg fn ApiEntry.empty(path: Str, alloc: mem::Alloc) -> ApiEntry {
+    return ApiEntry(
+        path: text::String.of(path, alloc),
+        text: mem::List[text::String].empty(alloc),
+        promises: mem::List[Promise].empty(alloc),
+        interface_hash: None,
+        digests: mem::List[TargetDigest].empty(alloc),
+        docs: mem::List[Doc].empty(alloc),
+        accepted: Accepted.empty(alloc),
+        pending: mem::List[Pending].empty(alloc),
+        seals: mem::List[Seal].empty(alloc),
+    )
+} ApiEntry.empty
+
+/// A promised property and the generic parameters it rests on.
+pkg struct Promise derives Eq {
+    pkg property: text::String
+    pkg params: mem::List[text::String]
+} Promise
+
+/// The digest line of a declared target.
+pkg struct TargetDigest derives Eq {
+    pkg target: text::String
+    pkg digest: text::String
+} TargetDigest
+
+/// A weakened part and the item hash its pending weakening is bound to.
+pkg struct Pending derives Eq {
+    pkg hash: hashing::HashValue
+    pkg part: text::String
+} Pending
+
+/// Whether its interface text declares a member named `member`: a field, variant or method.
+pkg fn ApiEntry.declares(self, member: Str) -> bool {
+    for index in 1..<self.text.len() {
+        let line = self.text[index].as_str()
+        let name = declared_name(line)
+        let Some(spelt) = line.slice_bytes(name.start, end: name.end) else {
+            continue
+        }
+        if spelt == member {
+            return true
+        }
+    }
+    return false
+} ApiEntry.declares
+
+/// Where a run of bytes lies in a text.
+struct TextRange derives Copy {
+    start: usize
+    end: usize
+} TextRange
+
+/// The name a line of interface text starts with: after its white space and then a `pub ` and a
+/// `fn ` prefix, up to its first character that is neither ASCII alphanumeric nor `_`, within the
+/// line without its leading and trailing white space.
+fn declared_name(line: Str) -> TextRange {
+    let trimmed = trimmed_range(line)
+    let bytes = line.as_bytes()
+    var start = trimmed.start
+    if has_prefix(bytes, at: start, end: trimmed.end, prefix: b"pub ") {
+        start += 4
+    }
+    if has_prefix(bytes, at: start, end: trimmed.end, prefix: b"fn ") {
+        start += 3
+    }
+    var end = start
+    while end < trimmed.end and is_name_byte(bytes[end]) {
+        end += 1
+    }
+    return TextRange(start: start, end: end)
+} declared_name
+
+/// The bytes of a line without its leading and trailing white space.
+fn trimmed_range(line: Str) -> TextRange {
+    var start: usize = 0
+    var end: usize = 0
+    var found = false
+    var at: usize = 0
+    for c in line {
+        let width = c.utf8_len()
+        if not platform::is_white_space(c) {
+            if not found {
+                start = at
+                found = true
+            }
+            end = at + width
+        }
+        at += width
+    }
+    return TextRange(start: start, end: end)
+} trimmed_range
+
+/// Whether the bytes from `at` to before `end` start with `prefix`.
+fn has_prefix(bytes: Slice[u8], at: usize, end: usize, prefix: Slice[u8]) -> bool {
+    if end < at or end - at < prefix.len() {
+        return false
+    }
+    let Some(parts) = bytes.split_at(at) else {
+        return false
+    }
+    let Some(head) = parts.tail.prefix(prefix.len()) else {
+        return false
+    }
+    return head == prefix
+} has_prefix
+
+fn is_name_byte(byte: u8) -> bool {
+    return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_'
+} is_name_byte
+
+pkg enum DocKey derives Eq {
+    Own
+    Member(text::String)
+    Invariant(u64)
+} DocKey
+
+pkg struct Doc derives Eq {
+    pkg key: DocKey
+    pkg bound: hashing::HashValue
+    pkg text: text::String
+} Doc
+
+/// An accepted spec: a function's head, clauses and targeting tests; a struct's field and
+/// invariant lines; an interface's methods.
+pkg struct Accepted derives Eq {
+    pkg head: Option[text::String]
+    pkg clauses: mem::List[text::String]
+    /// In byte order of canonical path.
+    pkg tests: mem::List[AcceptedTest]
+    /// In byte order of name.
+    pkg methods: mem::List[Method]
+} Accepted
+
+pkg fn Accepted.empty(alloc: mem::Alloc) -> Accepted = Accepted(head: None, clauses: mem::List[text::String].empty(alloc), tests: mem::List[AcceptedTest].empty(alloc), methods: mem::List[Method].empty(alloc))
+
+pkg fn Accepted.is_empty(self) -> bool = self.clauses.len() == 0 and self.tests.len() == 0 and self.methods.len() == 0
+
+pkg struct AcceptedTest derives Eq {
+    pkg path: text::String
+    /// Its parameter types joined by `, `.
+    pkg params: text::String
+    /// Its expect hashes in byte order, each as often as it occurs.
+    pkg expects: mem::List[hashing::HashValue]
+} AcceptedTest
+
+pkg struct Method derives Eq {
+    pkg name: text::String
+    pkg head: text::String
+    pkg clauses: mem::List[text::String]
+    pkg pending: mem::List[Pending]
+} Method
+
+pkg struct Seal derives Eq {
+    pkg principal: text::String
+    pkg item: hashing::HashValue
+    pkg closure: hashing::HashValue
+    /// In byte order of path, then kind, then hash.
+    pkg entries: mem::List[ClosureEntry]
+    /// The reserved signature field, which the toolchain never writes.
+    pkg signature: Option[text::String]
+} Seal
+
+pkg struct ClosureEntry derives Eq {
+    pkg path: text::String
+    pkg body: bool
+    pkg hash: hashing::HashValue
+} ClosureEntry
+
+pkg proj fn ClosureEntry.kind(self) -> Str {
+    if self.body {
+        return "body"
+    }
+    return "interface"
+} ClosureEntry.kind
+
+impl ClosureEntry: Ord
+
+/// Closure entries order by path, then kind, then hash.
+pkg fn ClosureEntry.cmp(self, other: ClosureEntry) -> core::Ordering limits pure, notrap, terminates {
+    if self.path != other.path {
+        return self.path.cmp(other.path)
+    }
+    if self.kind() != other.kind() {
+        return self.kind().cmp(other.kind())
+    }
+    return self.hash.cmp(other.hash)
+} ClosureEntry.cmp
+
+fn pending_line(pending: Pending, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = keyed("pending", value: escaped(pending.hash.full(alloc).as_str(), grammar, alloc).as_str(), alloc)
+    mut written.push(' ')
+    mut written.append(escaped(pending.part.as_str(), grammar, alloc).as_str())
+    return written
+} pending_line
+
+/// The entry's records, in their order.
+pkg fn ApiEntry.lines(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(keyed("item", value: escaped(self.path.as_str(), grammar, alloc).as_str(), alloc))
+    self.interface_lines(mut lines, grammar, alloc)
+    self.accepted.lines(mut lines, grammar, alloc)
+    for pending in self.pending {
+        mut lines.push(pending_line(pending, grammar, alloc))
+    }
+    for seal in self.seals {
+        seal.lines(mut lines, grammar, alloc)
+    }
+    return lines
+} ApiEntry.lines
+
+/// The records of what consumers see of the item: its interface text, promises, interface hash,
+/// digests and public docs.
+fn ApiEntry.interface_lines(self, mut lines: mem::List[text::String], grammar: syntax::Grammar, alloc: mem::Alloc) {
+    for line in self.text {
+        mut lines.push(keyed("text", value: escaped(line.as_str(), grammar, alloc).as_str(), alloc))
+    }
+    if self.promises.len() > 0 {
+        var promised = text::String.of("promises ", alloc)
+        for index in 0..<self.promises.len() {
+            if index > 0 {
+                mut promised.append(", ")
+            }
+            mut promised.append(self.promises[index].written(alloc).as_str())
+        }
+        mut lines.push(take promised)
+    }
+    match self.interface_hash {
+        Some(hash) => mut lines.push(keyed("interface", value: escaped(hash.full(alloc).as_str(), grammar, alloc).as_str(), alloc))
+        None => {}
+    }
+    for digest in self.digests {
+        var digest_line = keyed("digest", value: digest.target.as_str(), alloc)
+        mut digest_line.push(' ')
+        mut digest_line.append(escaped(digest.digest.as_str(), grammar, alloc).as_str())
+        mut lines.push(take digest_line)
+    }
+    for doc in self.docs {
+        mut lines.push(doc.line(grammar, alloc))
+    }
+} ApiEntry.interface_lines
+
+/// A promise as a `promises` record writes it: the property, then the generic parameters it rests
+/// on in brackets, if any.
+fn Promise.written(self, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(self.property.as_str(), alloc)
+    if self.params.len() > 0 {
+        mut written.push('[')
+        for index in 0..<self.params.len() {
+            if index > 0 {
+                mut written.append(", ")
+            }
+            mut written.append(self.params[index].as_str())
+        }
+        mut written.push(']')
+    }
+    return written
+} Promise.written
+
+fn Doc.line(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of("doc ", alloc)
+    match self.key {
+        DocKey.Own => {}
+        DocKey.Member(name) => {
+            mut written.append(name.as_str())
+            mut written.push(' ')
+        }
+        DocKey.Invariant(position) => mut written.write(text::fmt("{position} ", position), budget: 1_000_000)
+    }
+    mut written.append(escaped(self.bound.full(alloc).as_str(), grammar, alloc).as_str())
+    mut written.push(' ')
+    mut written.append(escaped(self.text.as_str(), grammar, alloc).as_str())
+    return written
+} Doc.line
+
+/// The records of an accepted spec: its head, its accepted clauses, its tests and its methods.
+fn Accepted.lines(self, mut lines: mem::List[text::String], grammar: syntax::Grammar, alloc: mem::Alloc) {
+    match self.head {
+        Some(head) => mut lines.push(keyed("head", value: escaped(head.as_str(), grammar, alloc).as_str(), alloc))
+        None => {}
+    }
+    for clause in self.clauses {
+        mut lines.push(keyed("accepted", value: escaped(clause.as_str(), grammar, alloc).as_str(), alloc))
+    }
+    for tested in self.tests {
+        var test_line = keyed("test", value: escaped(tested.path.as_str(), grammar, alloc).as_str(), alloc)
+        mut test_line.push(' ')
+        mut test_line.append(escaped(tested.params.as_str(), grammar, alloc).as_str())
+        for hash in tested.expects {
+            mut test_line.push(' ')
+            mut test_line.append(escaped(hash.full(alloc).as_str(), grammar, alloc).as_str())
+        }
+        mut lines.push(take test_line)
+    }
+    for method in self.methods {
+        mut lines.push(keyed("method", value: method.name.as_str(), alloc))
+        mut lines.push(keyed("head", value: escaped(method.head.as_str(), grammar, alloc).as_str(), alloc))
+        for method_clause in method.clauses {
+            mut lines.push(keyed("accepted", value: escaped(method_clause.as_str(), grammar, alloc).as_str(), alloc))
+        }
+        for pending in method.pending {
+            mut lines.push(pending_line(pending, grammar, alloc))
+        }
+    }
+} Accepted.lines
+
+/// The records of a seal: its `seal` record, its closure entries and its signature, if any.
+fn Seal.lines(self, mut lines: mem::List[text::String], grammar: syntax::Grammar, alloc: mem::Alloc) {
+    var seal_line = keyed("seal", value: escaped(self.principal.as_str(), grammar, alloc).as_str(), alloc)
+    mut seal_line.push(' ')
+    mut seal_line.append(escaped(self.item.full(alloc).as_str(), grammar, alloc).as_str())
+    mut seal_line.push(' ')
+    mut seal_line.append(escaped(self.closure.full(alloc).as_str(), grammar, alloc).as_str())
+    mut lines.push(take seal_line)
+    for entry in self.entries {
+        var closure_line = keyed("closure", value: entry.kind(), alloc)
+        mut closure_line.push(' ')
+        mut closure_line.append(escaped(entry.path.as_str(), grammar, alloc).as_str())
+        mut closure_line.push(' ')
+        mut closure_line.append(escaped(entry.hash.full(alloc).as_str(), grammar, alloc).as_str())
+        mut lines.push(take closure_line)
+    }
+    match self.signature {
+        Some(signature) => mut lines.push(keyed("signature", value: escaped(signature.as_str(), grammar, alloc).as_str(), alloc))
+        None => {}
+    }
+} Seal.lines
+
+/// Whether its keyed records are in strictly increasing order of their keys.
+fn ApiEntry.ordered(self) -> bool {
+    for index in 1..<self.digests.len() {
+        if self.digests[index - 1].target >= self.digests[index].target {
+            return false
+        }
+    }
+    for index in 1..<self.accepted.tests.len() {
+        if self.accepted.tests[index - 1].path >= self.accepted.tests[index].path {
+            return false
+        }
+    }
+    for index in 1..<self.accepted.methods.len() {
+        if self.accepted.methods[index - 1].name >= self.accepted.methods[index].name {
+            return false
+        }
+    }
+    for method in self.accepted.methods {
+        if not parts_increasing(method.pending.view()) {
+            return false
+        }
+    }
+    if not parts_increasing(self.pending.view()) {
+        return false
+    }
+    for index in 1..<self.seals.len() {
+        if self.seals[index - 1].principal >= self.seals[index].principal {
+            return false
+        }
+    }
+    for seal in self.seals {
+        for index in 1..<seal.entries.len() {
+            if seal.entries[index - 1].cmp(seal.entries[index]) != core::Ordering.Less {
+                return false
+            }
+        }
+    }
+    for tested in self.accepted.tests {
+        for index in 1..<tested.expects.len() {
+            if tested.expects[index - 1] > tested.expects[index] {
+                return false
+            }
+        }
+    }
+    return true
+} ApiEntry.ordered
+
+/// Whether the parts of pending weakening are in strictly increasing order.
+fn parts_increasing(pending: Slice[Pending]) -> bool {
+    for index in 1..<pending.len() {
+        if pending[index - 1].part >= pending[index].part {
+            return false
+        }
+    }
+    return true
+} parts_increasing
+
+pkg proj fn Snapshot.entry(self, path: Str) -> Option[ApiEntry] {
+    for entry in self.entries {
+        if entry.path.as_str() == path {
+            return Some(entry)
+        }
+    }
+    return None
+} Snapshot.entry
+
+pkg fn Snapshot.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var lines = mem::List[text::String].empty(alloc)
+    for entry in self.entries {
+        let entry_lines = entry.lines(grammar, alloc)
+        for line in take entry_lines {
+            mut lines.push(take line)
+        }
+    }
+    return write(Kind.Api, lines: lines.view(), alloc)
+} Snapshot.bytes
+
+pkg fn Snapshot.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[Snapshot, Invalid] {
+    let parsed = match read(Kind.Api, bytes, grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    var snapshot = Snapshot.empty(alloc)
+    let records = parsed.records.view()
+    var at: usize = 0
+    while at < records.len() {
+        let start = at
+        let record = records[start]
+        let invalid = Invalid.at(record.line)
+        var cursor = record.cursor(alloc)
+        let opened = mut cursor.takes("item")
+        if not opened {
+            return Err(invalid)
+        }
+        let Some(path) = mut cursor.text() else {
+            return Err(invalid)
+        }
+        if not cursor.done() {
+            return Err(invalid)
+        }
+        at += 1
+        while at < records.len() and not records[at].text.starts_with("item ") {
+            at += 1
+        }
+        let entry = match entry_of(path.as_str(), records, start, end: at, grammar, alloc) {
+            Ok(found) => found
+            Err(line) => return Err(Invalid.at(line))
+        }
+        let count = snapshot.entries.len()
+        if count > 0 and snapshot.entries[count - 1].path >= entry.path {
+            return Err(invalid)
+        }
+        mut snapshot.entries.push(take entry)
+    }
+    return parsed.checked(take snapshot)
+} Snapshot.read
+
+/// The entry the records from `start` to before `end` hold, its `item` record first; or the line
+/// of the first that does not read or is not as the entry writes it.
+fn entry_of(path: Str, records: Slice[Record], start: usize, end: usize, grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[ApiEntry, u32] {
+    let first_line = records[start].line
+    let Some(parts) = records.split_at(start + 1) else {
+        expect false
+        return Err(first_line)
+    }
+    let Some(held) = parts.tail.prefix(end - start - 1) else {
+        expect false
+        return Err(first_line)
+    }
+    let entry = match read_entry(path, records: held, alloc) {
+        Ok(found) => found
+        Err(line) => return Err(line)
+    }
+    let lines = entry.lines(grammar, alloc)
+    for index in 0..<(end - start) {
+        let expected = records[start + index]
+        if index >= lines.len() or lines[index] != expected.text {
+            let line = expected.line
+            return Err(line)
+        }
+    }
+    if lines.len() != end - start or not entry.ordered() {
+        return Err(first_line)
+    }
+    return Ok(take entry)
+} entry_of
+
+/// Reads an entry's records after its `item` record, or the line of the first that does not
+/// read.
+fn read_entry(path: Str, records: Slice[Record], alloc: mem::Alloc) -> Result[ApiEntry, u32] {
+    var entry = ApiEntry.empty(path, alloc)
+    var method: Option[usize] = None
+    for record in records {
+        let line = record.line
+        var cursor = record.cursor(alloc)
+        let Some(word) = mut cursor.word() else {
+            return Err(line)
+        }
+        let known = mut entry.read_record(word.as_str(), mut cursor, mut method, alloc)
+        if not known or not cursor.done() {
+            return Err(line)
+        }
+    }
+    return Ok(take entry)
+} read_entry
+
+/// Reads a record of the entry after its word; false when it does not read. `method` is the
+/// position of the method the records read belong to, if any.
+fn ApiEntry.read_record(mut self, word: Str, mut cursor: Cursor, mut method: Option[usize], alloc: mem::Alloc) -> bool
+    waive length "one arm per record of an entry, as the format lists them"
+{
+    match word {
+        "text" => {
+            let Some(line) = mut cursor.text() else {
+                return false
+            }
+            mut self.text.push(take line)
+        }
+        "promises" => {
+            let Some(promises) = read_promises(mut cursor) else {
+                return false
+            }
+            for promise in take promises {
+                mut self.promises.push(take promise)
+            }
+        }
+        "interface" => {
+            let Some(hash) = mut cursor.hash() else {
+                return false
+            }
+            self.interface_hash = Some(hash)
+        }
+        "digest" => {
+            let Some(target) = mut cursor.target() else {
+                return false
+            }
+            let Some(digest) = mut cursor.text() else {
+                return false
+            }
+            mut self.digests.push(TargetDigest(target: take target, digest: take digest))
+        }
+        "doc" => {
+            let Some(doc) = read_doc(mut cursor) else {
+                return false
+            }
+            mut self.docs.push(take doc)
+        }
+        "head" => {
+            let Some(head) = mut cursor.text() else {
+                return false
+            }
+            match method {
+                Some(index) => {
+                    self.accepted.methods[index].head = head
+                }
+                None => {
+                    self.accepted.head = Some(take head)
+                }
+            }
+        }
+        "accepted" => {
+            let Some(clause) = mut cursor.text() else {
+                return false
+            }
+            match method {
+                Some(index) => mut (mut self.accepted.methods.at_mut(index)).clauses.push(take clause)
+                None => mut self.accepted.clauses.push(take clause)
+            }
+        }
+        "test" => {
+            let Some(tested) = read_test(mut cursor) else {
+                return false
+            }
+            mut self.accepted.tests.push(take tested)
+        }
+        "method" => {
+            let Some(name) = mut cursor.word() else {
+                return false
+            }
+            mut self.accepted.methods.push(Method(name: take name, head: text::String.empty(alloc), clauses: mem::List[text::String].empty(alloc), pending: mem::List[Pending].empty(alloc)))
+            method = Some(self.accepted.methods.len() - 1)
+        }
+        "pending" => {
+            let Some(hash) = mut cursor.hash() else {
+                return false
+            }
+            let Some(part) = mut cursor.text() else {
+                return false
+            }
+            let weakened = Pending(hash: hash, part: take part)
+            match method {
+                Some(index) => mut (mut self.accepted.methods.at_mut(index)).pending.push(take weakened)
+                None => mut self.pending.push(take weakened)
+            }
+        }
+        "seal" => {
+            let Some(principal) = mut cursor.text() else {
+                return false
+            }
+            let Some(item) = mut cursor.hash() else {
+                return false
+            }
+            let Some(closure) = mut cursor.hash() else {
+                return false
+            }
+            mut self.seals.push(Seal(principal: take principal, item: item, closure: closure, entries: mem::List[ClosureEntry].empty(alloc), signature: None))
+            method = None
+        }
+        "closure" => {
+            let Some(entry) = read_closure_entry(mut cursor) else {
+                return false
+            }
+            let count = self.seals.len()
+            if count == 0 {
+                return false
+            }
+            mut (mut self.seals.at_mut(count - 1)).entries.push(take entry)
+        }
+        "signature" => {
+            let Some(signature) = mut cursor.text() else {
+                return false
+            }
+            let count = self.seals.len()
+            if count == 0 {
+                return false
+            }
+            self.seals[count - 1].signature = Some(take signature)
+        }
+        else => return false
+    }
+    return true
+} ApiEntry.read_record
+
+fn read_promises(mut cursor: Cursor) -> Option[mem::List[Promise]] {
+    var promises = mem::List[Promise].empty(cursor.alloc)
+    loop {
+        let Some(property) = mut cursor.word() else {
+            return None
+        }
+        var params = mem::List[text::String].empty(cursor.alloc)
+        let bracketed = mut cursor.punct("[")
+        if bracketed {
+            loop {
+                let Some(param) = mut cursor.word() else {
+                    return None
+                }
+                mut params.push(take param)
+                let listed = mut cursor.punct(",")
+                if not listed {
+                    break
+                }
+            }
+            let closed = mut cursor.punct("]")
+            if not closed {
+                return None
+            }
+        }
+        mut promises.push(Promise(property: take property, params: take params))
+        let continued = mut cursor.punct(",")
+        if not continued {
+            return Some(take promises)
+        }
+    }
+} read_promises
+
+fn read_doc(mut cursor: Cursor) -> Option[Doc] {
+    var key = DocKey.Own
+    let named = mut cursor.word()
+    match named {
+        Some(name) => {
+            key = DocKey.Member(take name)
+        }
+        None => {
+            if cursor.next_is_int() {
+                let Some(position) = mut cursor.int() else {
+                    return None
+                }
+                key = DocKey.Invariant(position)
+            }
+        }
+    }
+    let Some(bound) = mut cursor.hash() else {
+        return None
+    }
+    let Some(value) = mut cursor.text() else {
+        return None
+    }
+    return Some(Doc(key: take key, bound: bound, text: take value))
+} read_doc
+
+fn read_test(mut cursor: Cursor) -> Option[AcceptedTest] {
+    let Some(path) = mut cursor.text() else {
+        return None
+    }
+    let Some(params) = mut cursor.text() else {
+        return None
+    }
+    var expects = mem::List[hashing::HashValue].empty(cursor.alloc)
+    while not cursor.done() {
+        let Some(hash) = mut cursor.hash() else {
+            return None
+        }
+        mut expects.push(hash)
+    }
+    return Some(AcceptedTest(path: take path, params: take params, expects: take expects))
+} read_test
+
+fn read_closure_entry(mut cursor: Cursor) -> Option[ClosureEntry] {
+    let Some(kind) = mut cursor.word() else {
+        return None
+    }
+    var body = false
+    if kind.as_str() == "body" {
+        body = true
+    } else if kind.as_str() != "interface" {
+        return None
+    }
+    let Some(path) = mut cursor.text() else {
+        return None
+    }
+    let Some(hash) = mut cursor.hash() else {
+        return None
+    }
+    return Some(ClosureEntry(path: take path, body: body, hash: hash))
+} read_closure_entry

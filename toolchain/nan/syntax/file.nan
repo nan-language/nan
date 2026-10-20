@@ -1,0 +1,1323 @@
+//! Parsing a source file into items: its summary, each item's tree, the resynchronisation after a syntax failure, misplaced doc comments, and the code each syntax failure is reported with.
+
+/// A diagnostic of a file, before its path is known.
+pkg struct FileDiagnostic {
+    pkg line: u32
+    pkg code: diagnostic::Code
+    pkg expected: Option[text::String]
+    pkg found: Option[text::String]
+    /// The bytes of the reported construct, when narrower than its line.
+    pkg span: Option[diagnostic::Span]
+    /// For a syntax failure, the first byte of the token at which the parse failed.
+    pkg failing: Option[u32]
+    /// The fixes its rule names, each as replacements in this file.
+    pkg fixes: mem::List[mem::List[diagnostic::Replacement]]
+    pkg offer: diagnostic::Offer
+} FileDiagnostic
+
+fn FileDiagnostic.new(line: u32, code: diagnostic::Code, alloc: mem::Alloc) -> FileDiagnostic {
+    return FileDiagnostic(line: line, code: code, expected: None, found: None, span: None, failing: None, fixes: mem::List[mem::List[diagnostic::Replacement]].empty(alloc), offer: diagnostic::Offer.Each)
+} FileDiagnostic.new
+
+/// An item of a file, or a run of tokens between items that starts none.
+pkg struct ItemSyntax {
+    /// The index of its first token, the `COL0` starting an item.
+    pkg head: usize
+    /// The index of the first token after the item.
+    pkg end: usize
+    /// The tree the parse built, closed where an abandoned item failed; none for tokens between
+    /// items.
+    pkg tree: Option[Tree]
+    pkg abandoned: bool
+} ItemSyntax
+
+pkg struct SourceFile {
+    pkg source: mem::Bytes
+    /// The source with each byte of an ill-formed UTF-8 sequence read as `?`, which token texts
+    /// slice.
+    readable: text::String
+    pkg tokens: mem::List[Token]
+    pkg lines: mem::List[Line]
+    /// The `FILE_DOC` token of the file summary.
+    pkg summary: Option[usize]
+    pkg items: mem::List[ItemSyntax]
+    /// Whether each token is read as part of a plain comment: the `DOC` and `FILE_DOC` lines
+    /// that document nothing, with their `COL0` and `NL`.
+    pkg comment: mem::List[bool]
+    pkg diagnostics: mem::List[FileDiagnostic]
+} SourceFile
+
+pkg proj fn SourceFile.text(self, token: usize) -> Str {
+    let at = self.tokens[token]
+    let Some(spelt) = self.readable.slice_bytes(usize.widen(at.start), end: usize.widen(at.end)) else {
+        expect false
+        return self.readable.as_str()
+    }
+    return spelt
+} SourceFile.text
+
+/// The first token at or after `from` that is not read as a comment, or `EOF` past it.
+pkg fn SourceFile.next(self, from: usize) -> usize {
+    var at = from
+    while at < self.tokens.len() {
+        if not self.comment[at] {
+            return at
+        }
+        at += 1
+    }
+    return self.tokens.len() - 1
+} SourceFile.next
+
+/// The last token before `before` that is not read as a comment.
+pkg fn SourceFile.previous(self, before: usize) -> Option[usize] {
+    var at = before
+    while at > 0 {
+        at -= 1
+        if not self.comment[at] {
+            return Some(at)
+        }
+    }
+    return None
+} SourceFile.previous
+
+/// The identifiers among the tokens `start..<end` that start a path of two or more segments.
+pkg proj fn SourceFile.path_starts(self, start: usize, end: usize) -> PathStarts {
+    return PathStarts(tokens: self.tokens.view(), index: start, end: end)
+} SourceFile.path_starts
+
+/// The identifiers starting a path of two or more segments among a range of tokens, in order.
+pkg view struct PathStarts {
+    tokens: Slice[Token]
+    index: usize
+    end: usize
+} PathStarts
+
+pkg fn PathStarts.next(mut self) -> Option[usize] {
+    let separator = TokenKind.Punct(Punct.ColonColon)
+    while self.index < self.end {
+        let at = self.index
+        self.index += 1
+        let starts_path = at + 1 < self.tokens.len() and self.tokens[at + 1].kind == separator
+        if self.tokens[at].kind == TokenKind.Ident and starts_path and (at == 0 or self.tokens[at - 1].kind != separator) {
+            return Some(at)
+        }
+    }
+    return None
+} PathStarts.next
+
+/// The token at `at` read with the token after it as the parse reads it.
+fn SourceFile.lookahead(self, at: usize) -> Lookahead {
+    var next: Option[Token] = None
+    if at + 1 < self.tokens.len() {
+        next = Some(self.tokens[self.next(at + 1)])
+    }
+    return Lookahead(token: self.tokens[at], next: next, at: at)
+} SourceFile.lookahead
+
+/// The token after the longest text that `rule` derives from `start`.
+fn SourceFile.longest(
+    self,
+    rule: Rule,
+    start: usize,
+    grammar: Grammar,
+    alloc: mem::Alloc,
+    ) -> Option[usize] {
+    var state = State.new(rule, alloc)
+    var dry = Discard()
+    var at = start
+    loop {
+        match attempt mut state.feed(self.lookahead(at), source: self.source.view(), sink: mut dry, grammar) {
+            Ok(Fed.Consumed) => {
+                at = self.next(at + 1)
+            }
+            Ok(Fed.Done) => {
+                if at == start {
+                    return None
+                }
+                return Some(at)
+            }
+            Err(_) => return None
+        }
+    }
+} SourceFile.longest
+
+/// The physical lines of an item, from its first token's to its last token's.
+pkg fn SourceFile.item_lines(self, item: ItemSyntax) -> core::Range[u32] {
+    return self.tokens[item.head].line..=self.tokens[item.end - 1].line
+} SourceFile.item_lines
+
+/// The item holding a line, if the parse built its tree.
+pkg proj fn SourceFile.item_at(self, line: u32) -> Option[ItemSyntax] {
+    var low: usize = 0
+    var high = self.items.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if self.tokens[self.items[middle].head].line <= line {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    if low == 0 {
+        return None
+    }
+    let item = self.items[low - 1]
+    if item.tree.is_none() or not self.item_lines(item).contains(line) {
+        return None
+    }
+    return Some(item)
+} SourceFile.item_at
+
+/// The text of a physical line, numbered from 1, without its line end.
+pkg proj fn SourceFile.line_text(self, line: u32) -> Slice[u8] {
+    let held = self.lines[usize.widen(line) - 1]
+    return self.source_bytes(held.start, end: held.end)
+} SourceFile.line_text
+
+/// The bytes `start..<end` of the source.
+proj fn SourceFile.source_bytes(self, start: u32, end: u32) -> Slice[u8] {
+    let Some(parts) = self.source.view().split_at(usize.widen(start)) else {
+        expect false
+        return self.source.view()
+    }
+    let Some(bytes) = parts.tail.prefix(usize.widen(end - start)) else {
+        expect false
+        return parts.tail
+    }
+    return bytes
+} SourceFile.source_bytes
+
+pkg fn parse(take source: mem::Bytes, grammar: Grammar, alloc: mem::Alloc) -> SourceFile {
+    return parse_as(take source, std: false, grammar, alloc)
+} parse
+
+/// Parses a source file of a std package, where a function may end at its head line or clause
+/// region, without a body.
+pkg fn parse_std(take source: mem::Bytes, grammar: Grammar, alloc: mem::Alloc) -> SourceFile {
+    return parse_as(take source, std: true, grammar, alloc)
+} parse_std
+
+fn parse_as(take source: mem::Bytes, std: bool, grammar: Grammar, alloc: mem::Alloc) -> SourceFile {
+    let Lexed(tokens: tokens, lines: lines, diagnostics: lexical) = lex(source.view(), grammar, alloc)
+    var comment = mem::List[bool].empty(alloc)
+    for _ in 0..<tokens.len() {
+        mut comment.push(false)
+    }
+    let readable = source_text(source.view(), alloc)
+    let parsed = SourceFile(source: take source, readable: take readable, tokens: take tokens, lines: take lines, summary: None, items: mem::List[ItemSyntax].empty(alloc), comment: take comment, diagnostics: mem::List[FileDiagnostic].empty(alloc))
+    var parser = Parser(std: std, file: take parsed, alloc: alloc)
+    mut parser.run(grammar)
+    var file = parser.file
+    let blocks = conflict_blocks(file, alloc)
+    for item in mut file.items {
+        if in_blocks(blocks, line: file.tokens[item.head].line) {
+            item.abandoned = true
+        }
+    }
+    for item in file.items {
+        if item.abandoned {
+            continue
+        }
+        let Some(tree) = item.tree else {
+            continue
+        }
+        let checked = check_item(tree, file, alloc)
+        for found in take checked {
+            mut file.diagnostics.push(take found)
+        }
+    }
+    var unlexical = mem::List[FileDiagnostic].empty(alloc)
+    for reported in take file.diagnostics {
+        if not file.lines[usize.widen(reported.line) - 1].lexical_error {
+            mut unlexical.push(take reported)
+        }
+    }
+    file.diagnostics = unlexical
+    for lexed in take lexical {
+        let LexDiagnostic(line: line, code: code, span: span, fix: fix) = lexed
+        var reported = FileDiagnostic.new(line, code, alloc)
+        reported.span = Some(span)
+        reported.failing = Some(span.start)
+        match fix {
+            Some(replacements) => mut reported.fixes.push(take replacements)
+            None => {}
+        }
+        mut file.diagnostics.push(take reported)
+    }
+    var unblocked = mem::List[FileDiagnostic].empty(alloc)
+    for reported in take file.diagnostics {
+        if not in_blocks(blocks, line: reported.line) {
+            mut unblocked.push(take reported)
+        }
+    }
+    file.diagnostics = unblocked
+    for block in blocks {
+        var reported = FileDiagnostic.new(block.head, code: diagnostic::Code.MergeUnresolved, alloc)
+        mut reported.fixes.push(block.keeping(file, ours: true, alloc))
+        mut reported.fixes.push(block.keeping(file, ours: false, alloc))
+        mut file.diagnostics.push(take reported)
+    }
+    return file
+} parse_as
+
+/// A conflict block, by the numbers of its `<<<<<<< ours`, `=======` and `>>>>>>> theirs` lines.
+struct ConflictBlock derives Copy {
+    head: u32
+    middle: u32
+    last: u32
+} ConflictBlock
+
+fn ConflictBlock.lines(self) -> core::Range[u32] = self.head..=self.last
+
+/// The replacement of the block by ours' text or theirs'.
+fn ConflictBlock.keeping(self, file: SourceFile, ours: bool, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
+    var from = self.middle + 1
+    var to = self.last
+    if ours {
+        from = self.head + 1
+        to = self.middle
+    }
+    let kept = output::lossy(file.source_bytes(file.line_start_at(from), end: file.line_start_at(to)), alloc)
+    var replacements = mem::List[diagnostic::Replacement].empty(alloc)
+    mut replacements.push(diagnostic::Replacement(start: file.line_start_at(self.head), end: file.line_start_at(self.last + 1), text: take kept))
+    return replacements
+} ConflictBlock.keeping
+
+/// The byte at which a physical line starts, or the file's end past its last line.
+fn SourceFile.line_start_at(self, line: u32) -> u32 {
+    let index = usize.widen(line) - 1
+    if index < self.lines.len() {
+        return self.lines[index].start
+    }
+    return u32.truncate(self.source.len())
+} SourceFile.line_start_at
+
+/// Whether a line lies in one of the conflict blocks.
+fn in_blocks(blocks: mem::List[ConflictBlock], line: u32) -> bool {
+    for block in blocks {
+        if block.lines().contains(line) {
+            return true
+        }
+    }
+    return false
+} in_blocks
+
+/// The conflict blocks of a file, each marker line at column 0.
+fn conflict_blocks(file: SourceFile, alloc: mem::Alloc) -> mem::List[ConflictBlock] {
+    var blocks = mem::List[ConflictBlock].empty(alloc)
+    var from: u32 = 1
+    loop {
+        let Some(head) = file.marker_line(b"<<<<<<< ours", from) else {
+            return blocks
+        }
+        let Some(middle) = file.marker_line(b"=======", from: head + 1) else {
+            return blocks
+        }
+        let Some(last) = file.marker_line(b">>>>>>> theirs", from: middle + 1) else {
+            return blocks
+        }
+        mut blocks.push(ConflictBlock(head: head, middle: middle, last: last))
+        from = last + 1
+    }
+} conflict_blocks
+
+/// The first line at or after `from` whose text is `marker`.
+fn SourceFile.marker_line(self, marker: Slice[u8], from: u32) -> Option[u32] {
+    var line = from
+    while usize.widen(line) <= self.lines.len() {
+        if self.line_text(line) == marker {
+            return Some(line)
+        }
+        line += 1
+    }
+    return None
+} SourceFile.marker_line
+
+/// How a run of doc comment lines stands in the parse.
+enum DocRun derives Copy, Eq {
+    /// The item being read ends before the run.
+    ItemEnds
+    Admitted
+    Misplaced
+} DocRun
+
+/// The tokens of a run of doc comment lines, and the index after them.
+struct DocLines {
+    tokens: mem::List[usize]
+    after: usize
+} DocLines
+
+struct Parser {
+    std: bool
+    file: SourceFile
+    alloc: mem::Alloc
+} Parser
+
+fn Parser.kind(self, at: usize) -> TokenKind {
+    return self.file.tokens[at].kind
+} Parser.kind
+
+fn Parser.next(self, from: usize) -> usize {
+    return self.file.next(from)
+} Parser.next
+
+fn Parser.previous(self, before: usize) -> Option[usize] {
+    return self.file.previous(before)
+} Parser.previous
+
+/// Whether the token before `at` that is not read as a comment has the kind `kind`.
+fn Parser.previous_is(self, at: usize, kind: TokenKind) -> bool {
+    let Some(previous) = self.previous(at) else {
+        return false
+    }
+    return self.kind(previous) == kind
+} Parser.previous_is
+
+/// The `COL0` right before `at`, or `at`.
+fn Parser.column_zero_before(self, at: usize) -> usize {
+    let Some(previous) = self.previous(at) else {
+        return at
+    }
+    if self.kind(previous) == TokenKind.Col0 {
+        return previous
+    }
+    return at
+} Parser.column_zero_before
+
+fn Parser.report(mut self, line: u32, code: diagnostic::Code) {
+    mut self.file.diagnostics.push(FileDiagnostic.new(line, code, alloc: self.alloc))
+} Parser.report
+
+/// Reports a syntax failure at the token `head` on the tokens `head..=last`, with the fixes its
+/// rule names.
+fn Parser.report_fixed(
+    mut self,
+    head: usize,
+    last: usize,
+    code: diagnostic::Code,
+    take fixes: mem::List[mem::List[diagnostic::Replacement]],
+    offer: diagnostic::Offer,
+    ) {
+    let first_token = self.file.tokens[head]
+    let last_token = self.file.tokens[last]
+    var end = last_token.end
+    if end < first_token.start {
+        end = first_token.start
+    }
+    var reported = FileDiagnostic.new(first_token.line, code, alloc: self.alloc)
+    reported.span = Some(diagnostic::Span(start: first_token.start, end: end))
+    reported.failing = Some(first_token.start)
+    reported.fixes = fixes
+    reported.offer = offer
+    mut self.file.diagnostics.push(take reported)
+} Parser.report_fixed
+
+fn Parser.run(mut self, grammar: Grammar) {
+    var at = self.next(0)
+    let at_column_zero = self.kind(at) == TokenKind.Col0
+    var head = at
+    if at_column_zero {
+        head = self.next(at + 1)
+    }
+    if self.kind(head) == TokenKind.FileDoc {
+        self.file.summary = Some(head)
+        if not at_column_zero {
+            let line = self.file.tokens[head].line
+            mut self.report(line, code: diagnostic::Code.ItemIndented)
+        }
+        at = self.next(self.next(head + 1) + 1)
+    }
+    if not self.file.described() {
+        mut self.report(1, code: diagnostic::Code.DocSummaryMissing)
+    }
+    loop {
+        let kind = self.kind(at)
+        if kind == TokenKind.Eof {
+            return
+        }
+        if kind != TokenKind.Col0 {
+            at = mut self.stray(at, grammar)
+        } else if self.starts_misplaced_file_doc(at) {
+            at = mut self.misplace_file_doc(at)
+        } else if self.kind(self.next(at + 1)) == TokenKind.Doc and self.doc_run(State.new(Rule.Item, alloc: self.alloc), at, grammar) == DocRun.Misplaced {
+            at = mut self.misplace_doc_run(at)
+        } else {
+            at = mut self.item(at, grammar)
+        }
+    }
+} Parser.run
+
+/// Whether the file summary holds more than spaces after its `//!`.
+fn SourceFile.described(self) -> bool {
+    let Some(doc) = self.summary else {
+        return false
+    }
+    let spelt = self.text(doc).as_bytes()
+    for index in 3..<spelt.len() {
+        if spelt[index] != b' ' {
+            return true
+        }
+    }
+    return false
+} SourceFile.described
+
+/// Reports the token at `at`, which starts no item between items, and returns the index of the
+/// token after the run it starts.
+fn Parser.stray(mut self, at: usize, grammar: Grammar) -> usize {
+    var expected = TermSet.default()
+    mut expected.insert(Term.Class(Class.Col0))
+    mut expected.insert(Term.Class(Class.Eof))
+    let expecting = State.new(Rule.Item, alloc: self.alloc)
+    mut self.token_failure(None, failed: expecting, before: expecting, at, expected, grammar)
+    let end = self.resync(at, grammar)
+    mut self.file.items.push(ItemSyntax(head: at, end: end, tree: None, abandoned: true))
+    return end
+} Parser.stray
+
+/// Reads the item whose `COL0` is at `head`, and returns the index of the token after it.
+fn Parser.item(mut self, head: usize, grammar: Grammar) -> usize {
+    var builder = Builder.empty(self.alloc)
+    var state = State.new(Rule.Item, alloc: self.alloc)
+    var at = head
+    loop {
+        if self.starts_misplaced_file_doc(at) {
+            at = mut self.misplace_file_doc(at)
+            continue
+        }
+        let starts_doc = self.kind(at) == TokenKind.Doc or (self.kind(at) == TokenKind.Col0 and self.kind(self.next(at + 1)) == TokenKind.Doc)
+        if starts_doc and at != head and self.doc_run(state, at, grammar) == DocRun.Misplaced {
+            at = mut self.misplace_doc_run(at)
+            continue
+        }
+        match first attempt mut state.feed(self.file.lookahead(at), source: self.file.source.view(), sink: mut builder, grammar) {
+            Ok(Fed.Consumed) => {
+                at = self.next(at + 1)
+            }
+            Ok(Fed.Done) => {
+                mut self.file.items.push(ItemSyntax(head: head, end: at, tree: Some(take builder.finish()), abandoned: false))
+                return at
+            }
+            Err(Failure.Token(at: failing, expected: _)) if self.std and state.innermost_rule() == Some(Rule.FnEnd) => {
+                let end = self.column_zero_before(failing)
+                mut self.file.items.push(ItemSyntax(head: head, end: end, tree: Some(take builder.finish()), abandoned: false))
+                return end
+            }
+            Err(failure) => {
+                mut self.failed(take failure, state, head, at, grammar)
+                let end = self.resync(at, grammar)
+                mut self.file.items.push(ItemSyntax(head: head, end: end, tree: Some(take builder.finish()), abandoned: true))
+                return end
+            }
+        }
+    }
+} Parser.item
+
+/// Reports the failure of the parse `state` of the item at `head` at the token at `at`.
+fn Parser.failed(
+    mut self,
+    take failure: Failure,
+    state: State,
+    head: usize,
+    at: usize,
+    grammar: Grammar,
+    ) {
+    match failure {
+        Failure.Token(at: failing, expected: expected) => {
+            let before = self.replay(head, at: failing, grammar)
+            mut self.token_failure(Some(head), failed: state, before: before, at: failing, expected, grammar)
+        }
+        Failure.Rejected(code: code, start: start) => {
+            let named = self.file.rejected(state, code, start, at, grammar, alloc: self.alloc)
+            var last = start
+            match self.previous(at) {
+                Some(previous) => {
+                    if previous > start {
+                        last = previous
+                    }
+                }
+                None => {}
+            }
+            mut self.report_fixed(start, last, code, fixes: take named.fixes, offer: named.offer)
+        }
+        Failure.MultipleLines(at: _) => {
+            let line = self.file.tokens[head].line
+            mut self.report(line, code: diagnostic::Code.ItemMultipleLines)
+        }
+    }
+} Parser.failed
+
+/// The parse of the item at `head` just before the token at `at`.
+fn Parser.replay(self, head: usize, at: usize, grammar: Grammar) -> State {
+    var state = State.new(Rule.Item, alloc: self.alloc)
+    var dry = Discard()
+    var index = head
+    while index < at {
+        if self.file.comment[index] {
+            index += 1
+            continue
+        }
+        discard attempt mut state.feed(self.file.lookahead(index), source: self.file.source.view(), sink: mut dry, grammar)
+        index += 1
+    }
+    return state
+} Parser.replay
+
+/// Skips to the next item: from the failing token, or the `COL0` right before it, to `EOF` or a
+/// `COL0` followed by a token that can start an item.
+fn Parser.resync(self, failed_at: usize, grammar: Grammar) -> usize {
+    var at = self.column_zero_before(failed_at)
+    loop {
+        let kind = self.kind(at)
+        if kind == TokenKind.Eof {
+            return at
+        }
+        if kind == TokenKind.Col0 and self.starts_item(self.next(at + 1), grammar) {
+            return at
+        }
+        at = self.next(at + 1)
+    }
+} Parser.resync
+
+fn Parser.starts_item(self, at: usize, grammar: Grammar) -> bool {
+    return starts(Rule.ItemStart, lookahead: self.file.lookahead(at), source: self.file.source.view(), grammar)
+} Parser.starts_item
+
+fn Parser.starts_misplaced_file_doc(self, at: usize) -> bool {
+    return self.kind(at) == TokenKind.FileDoc or (self.kind(at) == TokenKind.Col0 and self.kind(self.next(at + 1)) == TokenKind.FileDoc)
+} Parser.starts_misplaced_file_doc
+
+/// Reads a `FILE_DOC` line other than the file summary as a plain comment.
+fn Parser.misplace_file_doc(mut self, at: usize) -> usize {
+    var doc = at
+    if self.kind(at) == TokenKind.Col0 {
+        doc = self.next(at + 1)
+    }
+    let nl = self.next(doc + 1)
+    self.file.comment[at] = true
+    self.file.comment[doc] = true
+    self.file.comment[nl] = true
+    let line = self.file.tokens[doc].line
+    mut self.report(line, code: diagnostic::Code.DocMisplaced)
+    return self.next(nl + 1)
+} Parser.misplace_file_doc
+
+/// The tokens of the run of doc comment lines starting at `at`, and the index after them.
+fn Parser.doc_run_tokens(self, at: usize) -> DocLines {
+    var tokens = mem::List[usize].empty(self.alloc)
+    var index = at
+    loop {
+        var doc = index
+        if self.kind(index) != TokenKind.Doc {
+            if self.kind(index) != TokenKind.Col0 or self.kind(self.next(index + 1)) != TokenKind.Doc {
+                return DocLines(tokens: take tokens, after: index)
+            }
+            doc = self.next(index + 1)
+        }
+        let nl = self.next(doc + 1)
+        if doc != index {
+            mut tokens.push(index)
+        }
+        mut tokens.push(doc)
+        mut tokens.push(nl)
+        index = self.next(nl + 1)
+    }
+} Parser.doc_run_tokens
+
+/// Whether the run of doc comment lines at `at` documents what the parse reads next: in a std
+/// file, the next item after a function that ends at its head or its clauses.
+fn Parser.doc_run(self, state: State, at: usize, grammar: Grammar) -> DocRun {
+    let run = self.doc_run_tokens(at)
+    var probe = mem::List[Token].empty(self.alloc)
+    for index in run.tokens {
+        mut probe.push(self.file.tokens[index])
+    }
+    mut probe.push(self.file.tokens[run.after])
+    if self.kind(run.after) == TokenKind.Col0 {
+        mut probe.push(self.file.tokens[self.next(run.after + 1)])
+    }
+    var dry = state.clone(self.alloc)
+    var sink = Discard()
+    var next: Option[Token] = None
+    if probe.len() > 1 {
+        next = Some(probe[1])
+    }
+    let source = self.file.source.view()
+    let fed = attempt mut dry.feed(Lookahead(token: probe[0], next: next, at: at), source, sink: mut sink, grammar)
+    match fed {
+        Ok(Fed.Done) => return DocRun.ItemEnds
+        Ok(Fed.Consumed) => {
+            let Some(parts) = probe.view().split_at(1) else {
+                return DocRun.Misplaced
+            }
+            if dry.accepts(parts.tail, source, grammar, alloc: self.alloc) {
+                return DocRun.Admitted
+            }
+        }
+        Err(_) => {}
+    }
+    if self.std and dry.innermost_rule() == Some(Rule.FnEnd) {
+        return DocRun.ItemEnds
+    }
+    return DocRun.Misplaced
+} Parser.doc_run
+
+/// Reads a run of doc comment lines that documents nothing as plain comments.
+fn Parser.misplace_doc_run(mut self, at: usize) -> usize {
+    let run = self.doc_run_tokens(at)
+    for index in run.tokens {
+        self.file.comment[index] = true
+    }
+    for index in run.tokens {
+        if self.kind(index) == TokenKind.Doc {
+            let line = self.file.tokens[index].line
+            mut self.report(line, code: diagnostic::Code.DocMisplaced)
+            return run.after
+        }
+    }
+    expect false
+    return run.after
+} Parser.misplace_doc_run
+
+/// Reports a token the parse does not accept. `failed` is the parse where it failed, `before`
+/// the parse just before the token, and `item` the first token of the item being read.
+fn Parser.token_failure(
+    mut self,
+    item: Option[usize],
+    failed: State,
+    before: State,
+    at: usize,
+    expected: TermSet,
+    grammar: Grammar,
+    ) {
+    let token = self.file.tokens[at]
+    if token.kind == TokenKind.LexError {
+        return
+    }
+    match self.item_rule(item, failed, at, grammar) {
+        Some(named) => {
+            mut self.file.diagnostics.push(take named)
+            return
+        }
+        None => {}
+    }
+    if token.kind == TokenKind.Col0 or self.previous_is(at, kind: TokenKind.Col0) {
+        mut self.stray_column_zero(item, before, at, grammar)
+        return
+    }
+    var first_on_line = true
+    match self.previous(at) {
+        Some(previous) => {
+            first_on_line = self.file.tokens[previous].line < token.line
+        }
+        None => {}
+    }
+    var pair = Array[Token, 2].filled(token)
+    pair[0] = Token(kind: TokenKind.Col0, start: token.start, end: token.end, line: token.line)
+    if first_on_line and not token.kind.is_virtual() and before.accepts(pair.view(), source: self.file.source.view(), grammar, alloc: self.alloc) {
+        var fixes = mem::List[mem::List[diagnostic::Replacement]].empty(self.alloc)
+        mut fixes.push(one_fix(self.file.unindented(at, alloc: self.alloc), alloc: self.alloc))
+        mut self.report_fixed(at, last: at, code: diagnostic::Code.ItemIndented, take fixes, offer: diagnostic::Offer.Each)
+        return
+    }
+    mut self.unaccepted(failed, at, expected, grammar)
+} Parser.token_failure
+
+/// Reports a token at column 0 that its block holds, with the fix indenting it by the depth of
+/// the braces open before it when the parse accepts it there.
+fn Parser.stray_column_zero(
+    mut self,
+    item: Option[usize],
+    before: State,
+    at: usize,
+    grammar: Grammar,
+    ) {
+    var col0 = at
+    var head = at
+    if self.kind(at) == TokenKind.Col0 {
+        head = self.next(at + 1)
+    } else {
+        let Some(previous) = self.previous(at) else {
+            expect false
+            return
+        }
+        col0 = previous
+    }
+    var fixes = mem::List[mem::List[diagnostic::Replacement]].empty(self.alloc)
+    match item {
+        Some(start) => {
+            let single = Array[Token, 1].filled(self.file.tokens[head])
+            let source = self.file.source.view()
+            var accepted = false
+            if col0 == at {
+                accepted = before.accepts(single.view(), source, grammar, alloc: self.alloc)
+            } else {
+                accepted = self.replay(start, at: col0, grammar).accepts(single.view(), source, grammar, alloc: self.alloc)
+            }
+            if accepted {
+                mut fixes.push(one_fix(self.file.reindented(start, at: head, alloc: self.alloc), alloc: self.alloc))
+            }
+        }
+        None => {}
+    }
+    mut self.report_fixed(at, last: at, code: diagnostic::Code.ItemStrayColumnZero, take fixes, offer: diagnostic::Offer.Each)
+} Parser.stray_column_zero
+
+/// Reports a token the parse does not accept that no rule of an item kind names: a foreign idiom,
+/// an unclosed or mismatched delimiter, or an unexpected token.
+fn Parser.unaccepted(
+    mut self,
+    failed: State,
+    at: usize,
+    expected: TermSet,
+    grammar: Grammar,
+    ) {
+    let token = self.file.tokens[at]
+    let written = token.written(self.alloc)
+    let matched = Failed(state: failed.clone(self.alloc), expected: expected, at: at, alloc: self.alloc)
+    var unrewritable = false
+    match foreign_idiom(matched, file: self.file, grammar) {
+        Some(Idiom.Rewrite(expected: rewritten, found: found, span: span, fixes: fixes)) => {
+            var reported = FileDiagnostic.new(token.line, code: diagnostic::Code.SyntaxForeign, alloc: self.alloc)
+            reported.expected = rewritten
+            reported.found = Some(take found)
+            reported.span = Some(span)
+            reported.failing = Some(token.start)
+            for replacement in take fixes {
+                mut reported.fixes.push(one_fix(take replacement, alloc: self.alloc))
+            }
+            reported.offer = diagnostic::Offer.First
+            mut self.file.diagnostics.push(take reported)
+            return
+        }
+        Some(Idiom.Unrewritable) => {
+            unrewritable = true
+        }
+        None => {}
+    }
+    let foreign_token = match token.kind {
+        TokenKind.Foreign(_) => true
+        else => false
+    }
+    var reported = FileDiagnostic.new(token.line, code: diagnostic::Code.SyntaxUnexpectedToken, alloc: self.alloc)
+    reported.expected = Some(written_set(expected, alloc: self.alloc))
+    if unrewritable or foreign_token {
+        reported.code = diagnostic::Code.SyntaxForeign
+    } else {
+        self.delimited(mut reported, at)
+    }
+    reported.found = Some(take written)
+    reported.span = Some(diagnostic::Span(start: token.start, end: token.end))
+    reported.failing = Some(token.start)
+    mut self.file.diagnostics.push(take reported)
+} Parser.unaccepted
+
+/// Names an unclosed or mismatched delimiter at `at` in a report of an unexpected token, with the
+/// fix closing or rematching it.
+fn Parser.delimited(self, mut reported: FileDiagnostic, at: usize) {
+    match self.unclosed(at) {
+        Some(closers) => {
+            var written = text::String.empty(self.alloc)
+            for closer in closers {
+                if not written.is_empty() {
+                    mut written.push(' ')
+                }
+                mut written.push('"')
+                mut written.append(closer.spelling())
+                mut written.push('"')
+            }
+            reported.code = diagnostic::Code.SyntaxUnclosedDelimiter
+            reported.expected = Some(take written)
+            match self.file.closed(at, closers: closers.view(), alloc: self.alloc) {
+                Some(appended) => mut reported.fixes.push(one_fix(take appended, alloc: self.alloc))
+                None => {}
+            }
+            return
+        }
+        None => {}
+    }
+    let Some(closer) = self.mismatched(at) else {
+        return
+    }
+    var written = text::String.empty(self.alloc)
+    mut written.push('"')
+    mut written.append(closer.spelling())
+    mut written.push('"')
+    reported.code = diagnostic::Code.SyntaxMismatchedDelimiter
+    reported.expected = Some(take written)
+    mut reported.fixes.push(one_fix(self.file.rematched(at, closer, alloc: self.alloc), alloc: self.alloc))
+} Parser.delimited
+
+/// A fix of one replacement.
+fn one_fix(take replacement: diagnostic::Replacement, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
+    var fix = mem::List[diagnostic::Replacement].empty(alloc)
+    mut fix.push(take replacement)
+    return fix
+} one_fix
+
+/// A diagnostic of a rule of an item kind on the token at which the parse failed.
+fn ruled(
+    code: diagnostic::Code,
+    line: u32,
+    token: Token,
+    take fix: Option[mem::List[diagnostic::Replacement]],
+    alloc: mem::Alloc,
+    ) -> FileDiagnostic {
+    var reported = FileDiagnostic.new(line, code, alloc)
+    reported.span = Some(diagnostic::Span(start: token.start, end: token.end))
+    reported.failing = Some(token.start)
+    match fix {
+        Some(replacements) => mut reported.fixes.push(take replacements)
+        None => {}
+    }
+    return reported
+} ruled
+
+/// The diagnostic a rule of an item kind names for a syntax failure, on its line, with the
+/// rule's fix.
+fn Parser.item_rule(
+    self,
+    item: Option[usize],
+    failed: State,
+    at: usize,
+    grammar: Grammar,
+    ) -> Option[FileDiagnostic] {
+    let Some(head) = item else {
+        return None
+    }
+    let alloc = self.alloc
+    let token = self.file.tokens[at]
+    let line = token.line
+    var opener = at
+    if token.kind == TokenKind.Col0 {
+        opener = self.next(at + 1)
+    }
+    let next_kind = self.kind(self.next(at + 1))
+    let opener_at_zero = token.kind == TokenKind.Col0 and next_kind == TokenKind.Punct(Punct.LBrace)
+    let is_opener = token.kind == TokenKind.Punct(Punct.LBrace) or opener_at_zero
+    let rule = failed.innermost_rule()
+    let atom = failed.current_atom(grammar)
+    let clause = match rule {
+        Some(Rule.RequiresClause) or Some(Rule.EnsuresClause) or Some(Rule.ExampleClause) => true
+        Some(Rule.DecreasesClause) or Some(Rule.TodoClause) or Some(Rule.WaiveClause) => true
+        else => false
+    }
+    let after_closer = self.previous_is(at, kind: TokenKind.Punct(Punct.RBrace))
+    let label = atom == Some(Atom.Rule(Rule.ItemLabel)) or (rule == Some(Rule.MethodBody) and atom == Some(Atom.Term(Term.Class(Class.Ident))))
+    if label and after_closer {
+        var fix: Option[mem::List[diagnostic::Replacement]] = None
+        match self.file.declared_name(head, failed, alloc) {
+            Some(name) => match self.file.relabelled(at, name: name.as_str(), alloc) {
+                Some(relabel) => {
+                    fix = Some(one_fix(take relabel, alloc))
+                }
+                None => {}
+            }
+            None => {}
+        }
+        return Some(ruled(diagnostic::Code.ItemLabelMismatch, line, token, take fix, alloc))
+    }
+    if clause and is_opener {
+        let fix = self.file.opener_below(opener, alloc)
+        return Some(ruled(diagnostic::Code.ItemBodyOpener, line, token, fix: Some(take fix), alloc))
+    }
+    if rule == Some(Rule.InterfaceItem) and is_opener {
+        return Some(ruled(diagnostic::Code.ItemBodyOpener, line, token, fix: None, alloc))
+    }
+    if rule == Some(Rule.FnEnd) {
+        let after_head = atom == Some(Atom.Rule(Rule.ClauseRegion))
+        let after_clauses = atom == Some(Atom.Term(Term.Class(Class.Col0)))
+        if after_head and opener_at_zero {
+            return Some(ruled(diagnostic::Code.ItemBodyOpener, line, token, fix: self.file.opener_to_head(opener, alloc), alloc))
+        }
+        if after_clauses and is_opener {
+            let fix = one_fix(self.file.unindented(opener, alloc), alloc)
+            return Some(ruled(diagnostic::Code.ItemBodyOpener, line, token, fix: Some(take fix), alloc))
+        }
+        if after_head or after_clauses or atom == Some(Atom.Term(Term.Punct(Punct.LBrace))) {
+            var code = diagnostic::Code.ItemMissingBody
+            if self.item_has_keyword(head, keyword: Keyword.Foreign) {
+                code = diagnostic::Code.ItemForeignForm
+            }
+            return Some(ruled(code, line: self.head_line(head), token, fix: None, alloc))
+        }
+    }
+    return self.clause_in_body(failed, at, atom, token)
+} Parser.item_rule
+
+/// The diagnostic of a clause line written as the first statement of a body whose `{` ends a
+/// head or clause line, with the fix moving the `{` below the clause lines.
+fn Parser.clause_in_body(
+    self,
+    failed: State,
+    at: usize,
+    atom: Option[Atom],
+    token: Token,
+    ) -> Option[FileDiagnostic] {
+    var opener = at
+    var found = false
+    var index = failed.frames.len()
+    while index > 0 and not found {
+        index -= 1
+        let frame = failed.frames[index]
+        if frame.rule == Some(Rule.MethodBody) {
+            opener = frame.start
+            found = true
+        } else if frame.rule == Some(Rule.FnBody) {
+            let Some(previous) = self.previous(frame.start) else {
+                return None
+            }
+            opener = previous
+            found = true
+        }
+    }
+    if not found {
+        if atom != Some(Atom.Rule(Rule.FnBody)) {
+            return None
+        }
+        let Some(previous) = self.previous(at) else {
+            return None
+        }
+        opener = previous
+    }
+    let first_statement = self.next(opener + 1)
+    var failing_statement = at
+    match failed.innermost_of(Rule.Stmt) {
+        Some(frame) => {
+            failing_statement = frame.start
+        }
+        None => {}
+    }
+    var opener_ends_head = false
+    match self.previous(opener) {
+        Some(previous) => {
+            opener_ends_head = self.kind(previous) != TokenKind.Col0
+        }
+        None => {}
+    }
+    if failing_statement != first_statement or not opener_ends_head or not self.file.starts_clause(first_statement) {
+        return None
+    }
+    let fix = self.file.opener_below(opener, alloc: self.alloc)
+    return Some(ruled(diagnostic::Code.ItemBodyOpener, line: self.file.tokens[first_statement].line, token, fix: Some(take fix), alloc: self.alloc))
+} Parser.clause_in_body
+
+/// The innermost frame of the parse expanding `rule`.
+fn State.innermost_of(self, rule: Rule) -> Option[Frame] {
+    var index = self.frames.len()
+    while index > 0 {
+        index -= 1
+        if self.frames[index].rule == Some(rule) {
+            return Some(self.frames[index])
+        }
+    }
+    return None
+} State.innermost_of
+
+fn Parser.item_has_keyword(self, item: usize, keyword: Keyword) -> bool {
+    var at = item
+    while at < self.file.tokens.len() and self.kind(at) != TokenKind.Keyword(Keyword.Fn) {
+        if self.kind(at) == TokenKind.Keyword(keyword) {
+            return true
+        }
+        at += 1
+    }
+    return false
+} Parser.item_has_keyword
+
+/// The line of an item's first token after its doc comment.
+fn Parser.head_line(self, item: usize) -> u32 {
+    for at in item..<self.file.tokens.len() {
+        let kind = self.kind(at)
+        if not self.file.comment[at] and kind != TokenKind.Col0 and kind != TokenKind.Doc and kind != TokenKind.Nl {
+            return self.file.tokens[at].line
+        }
+    }
+    expect false
+    return 0
+} Parser.head_line
+
+/// The delimiters of the logical line of `at` still open before it, outermost first.
+fn Parser.open_delimiters(self, at: usize) -> mem::List[Punct] {
+    var start: usize = 0
+    var back = at
+    while back > 0 {
+        back -= 1
+        if self.kind(back) == TokenKind.Nl {
+            start = back + 1
+            break
+        }
+    }
+    var open = mem::List[Punct].empty(self.alloc)
+    for index in start..<at {
+        if self.file.comment[index] {
+            continue
+        }
+        let TokenKind.Punct(punct) = self.kind(index) else {
+            continue
+        }
+        if punct == Punct.LParen or punct == Punct.LBracket or punct == Punct.LBrace {
+            mut open.push(punct)
+        } else if open.len() > 0 and closes(open[open.len() - 1]) == punct {
+            discard mut open.pop()
+        }
+    }
+    return open
+} Parser.open_delimiters
+
+/// The closers of the delimiters still open at an `NL` or `EOF`, innermost first, from the
+/// outermost `(` or `[`.
+fn Parser.unclosed(self, at: usize) -> Option[mem::List[Punct]] {
+    if self.kind(at) != TokenKind.Nl and self.kind(at) != TokenKind.Eof {
+        return None
+    }
+    let open = self.open_delimiters(at)
+    var outermost = open.len()
+    for index in 0..<open.len() {
+        if open[index] == Punct.LParen or open[index] == Punct.LBracket {
+            outermost = index
+            break
+        }
+    }
+    if outermost == open.len() {
+        return None
+    }
+    var closers = mem::List[Punct].empty(self.alloc)
+    var index = open.len()
+    while index > outermost {
+        index -= 1
+        mut closers.push(closes(open[index]))
+    }
+    return Some(take closers)
+} Parser.unclosed
+
+/// The closer a closing token stands in place of.
+fn Parser.mismatched(self, at: usize) -> Option[Punct] {
+    let TokenKind.Punct(closer) = self.kind(at) else {
+        return None
+    }
+    if closer != Punct.RParen and closer != Punct.RBracket and closer != Punct.RBrace {
+        return None
+    }
+    let at_column_zero = self.previous_is(at, kind: TokenKind.Col0)
+    let open = self.open_delimiters(at)
+    if open.len() == 0 {
+        return None
+    }
+    let innermost = open[open.len() - 1]
+    let delimiter = (innermost == Punct.LParen or innermost == Punct.LBracket) and closes(innermost) != closer
+    if at_column_zero or not delimiter {
+        return None
+    }
+    return Some(closes(innermost))
+} Parser.mismatched
+
+fn closes(opener: Punct) -> Punct {
+    return match opener {
+        Punct.LParen => Punct.RParen
+        Punct.LBracket => Punct.RBracket
+        else => Punct.RBrace
+    }
+} closes
+
+/// The terminals of a set as grammar notation writes them, in byte order, separated by `, `.
+fn written_set(set: TermSet, alloc: mem::Alloc) -> text::String {
+    var written = mem::List[text::String].empty(alloc)
+    let held = set.terms(alloc)
+    for term in held {
+        mut written.push(term.written(alloc))
+    }
+    mut written.sort_by(fn(left: text::String, right: text::String) => left.cmp(right))
+    var joined = text::String.empty(alloc)
+    for index in 0..<written.len() {
+        if index > 0 {
+            mut joined.append(", ")
+        }
+        mut joined.append(written[index].as_str())
+    }
+    return joined
+} written_set
+
+/// The parse of a file holding `body` after a summary line.
+fn summarized(body: Str, grammar: Grammar, alloc: mem::Alloc) -> SourceFile {
+    var source = mem::Bytes.empty(alloc)
+    mut source.append(b"//! Summary.\n")
+    mut source.append(body.as_bytes())
+    return parse(take source, grammar, alloc)
+} summarized
+
+/// The diagnostics of a file holding `body` after a summary line, each as its line and code,
+/// separated by `, `.
+fn codes(body: Str, grammar: Grammar, alloc: mem::Alloc) -> text::String {
+    let file = summarized(body, grammar, alloc)
+    var written = text::String.empty(alloc)
+    for reported in file.diagnostics {
+        if not written.is_empty() {
+            mut written.append(", ")
+        }
+        mut written.write(text::fmt("{line} ", line: reported.line), budget: 100)
+        mut written.append(reported.code.name())
+    }
+    return written
+} codes
+
+fn expect_codes(body: Str, expected: Str, grammar: Grammar, alloc: mem::Alloc) {
+    let found = codes(body, grammar, alloc)
+    expect found.as_str() == expected
+} expect_codes
+
+/// The one diagnostic of a file holding `body` after a summary line, as its line, code, expected
+/// and found, separated by ` | `.
+fn reported_once(body: Str, grammar: Grammar, alloc: mem::Alloc) -> text::String {
+    let file = summarized(body, grammar, alloc)
+    var written = text::String.empty(alloc)
+    if file.diagnostics.len() != 1 {
+        return written
+    }
+    let reported = file.diagnostics[0]
+    mut written.write(text::fmt("{line} ", line: reported.line), budget: 100)
+    mut written.append(reported.code.name())
+    mut written.append(" | ")
+    match reported.expected {
+        Some(expected) => mut written.append(expected.as_str())
+        None => mut written.push('-')
+    }
+    mut written.append(" | ")
+    match reported.found {
+        Some(found) => mut written.append(found.as_str())
+        None => mut written.push('-')
+    }
+    return written
+} reported_once
+
+fn expect_reported(body: Str, expected: Str, grammar: Grammar, alloc: mem::Alloc) {
+    let found = reported_once(body, grammar, alloc)
+    expect found.as_str() == expected
+} expect_reported
+
+test unexpected_tokens_and_delimiters_are_named for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_reported("pub fn larger(left: u32 right: u32) -> u32 = left\n", expected: "2 syntax.unexpected-token | \")\", \",\", \"::\", \"[\" | IDENT", grammar, alloc)
+    expect_reported("pub fn f(value: u32) -> u64 {\n    return u64.widen(value\n} f\n", expected: "3 syntax.unclosed-delimiter | \")\" | NL", grammar, alloc)
+    expect_reported("pub fn f(value: u32) -> u64 {\n    return u64.widen(value]\n} f\n", expected: "3 syntax.mismatched-delimiter | \")\" | \"]\"", grammar, alloc)
+} unexpected_tokens_and_delimiters_are_named
+
+test foreign_idioms_give_their_matched_text_and_first_rewrite for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_reported("fn f() {\n    return a && b\n} f\n", expected: "3 syntax.foreign | a and b | a && b", grammar, alloc)
+    expect_reported("fn f() {\n    return leading(values)?\n} f\n", expected: "3 syntax.foreign | try leading(values) | leading(values)?", grammar, alloc)
+    expect_reported("fn f() {\n    let mut x = 1\n} f\n", expected: "3 syntax.foreign | var x | let mut x", grammar, alloc)
+    expect_reported("fn f() {\n    total := count * 2\n} f\n", expected: "3 syntax.foreign | let total = count | total := count", grammar, alloc)
+    expect_reported("fn f() {\n    return word as u8\n} f\n", expected: "3 syntax.foreign | u8.widen(word) | word as u8", grammar, alloc)
+    expect_reported("fn f() {\n    return !ready\n} f\n", expected: "3 syntax.foreign | not ready | !ready", grammar, alloc)
+    expect_reported("fn f() {\n    return f(&mut x)\n} f\n", expected: "3 syntax.foreign | mut x | &mut x", grammar, alloc)
+    expect_reported("fn f() {\n    return a === b\n} f\n", expected: "3 syntax.foreign | a == b | a === b", grammar, alloc)
+    expect_reported("fn f() {\n    return try fetch().await\n} f\n", expected: "3 syntax.foreign | try await fetch() | try fetch().await", grammar, alloc)
+    expect_reported("fn f() {\n    count++\n} f\n", expected: "3 syntax.foreign | count += 1 | count++", grammar, alloc)
+    expect_reported("fn f() {\n    return 0..n\n} f\n", expected: "3 syntax.foreign | 0..<n | 0..n", grammar, alloc)
+    expect_reported("fn f() {\n    assert!(ready)\n} f\n", expected: "3 syntax.foreign | expect ready | assert!(ready)", grammar, alloc)
+    expect_reported("fn f(x: &T) {\n} f\n", expected: "2 syntax.foreign | x: T | x: &T", grammar, alloc)
+    expect_reported("fn f() -> () {\n} f\n", expected: "2 syntax.foreign | - | -> ()", grammar, alloc)
+} foreign_idioms_give_their_matched_text_and_first_rewrite
+
+test foreign_idioms_without_rewrites_report_as_unexpected_tokens_do for parse {
+    let alloc = testing::world().alloc
+    let file = summarized("fn f() {\n    return *x\n} f\n", grammar: Grammar.load(alloc), alloc)
+    expect file.diagnostics.len() == 1
+    let reported = file.diagnostics[0]
+    expect reported.code == diagnostic::Code.SyntaxForeign
+    let Some(found) = reported.found else {
+        expect false
+        return
+    }
+    expect found.as_str() == "\"*\""
+    let Some(expected) = reported.expected else {
+        expect false
+        return
+    }
+    expect expected.find("IDENT").is_some()
+} foreign_idioms_without_rewrites_report_as_unexpected_tokens_do
+
+test item_rules_name_their_own_syntax_failures for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("fn f() {\n    return 1\n    } f\n", expected: "4 item.indented", grammar, alloc)
+    expect_codes("fn f() {\nreturn 1\n} f\n", expected: "3 item.stray-column-zero", grammar, alloc)
+    expect_codes("fn f()\n{\n} f\n", expected: "3 item.body-opener", grammar, alloc)
+    expect_codes("fn f()\n    requires true {\n} f\n", expected: "3 item.body-opener", grammar, alloc)
+    expect_codes("fn f()\n    requires true\n    {\n} f\n", expected: "4 item.body-opener", grammar, alloc)
+    expect_codes("fn f() {\n    requires true\n} f\n", expected: "3 item.body-opener", grammar, alloc)
+    expect_codes("fn f()\n\nconst X: u32 = 1\n", expected: "2 item.missing-body", grammar, alloc)
+    expect_codes("foreign fn f()\n", expected: "2 item.foreign-form", grammar, alloc)
+    expect_codes("fn f() {\n}\n", expected: "3 item.label-mismatch", grammar, alloc)
+    expect_codes("pub fn f() -> bool = match x {\n", expected: "2 item.multiple-lines", grammar, alloc)
+    expect_codes("const F: u32 = g(fn() -> u32 {\n    return 1\n})\n", expected: "2 item.multiple-lines", grammar, alloc)
+} item_rules_name_their_own_syntax_failures
+
+test rejected_alternatives_report_their_first_token for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("fn f(a: bool, b: bool, c: bool) -> bool {\n    return a and\n        b or c\n} f\n", expected: "4 expr.parentheses", grammar, alloc)
+    expect_codes("const X = 1\n", expected: "2 item.const-untyped", grammar, alloc)
+    expect_codes("fn f() uses time {\n} f\n", expected: "2 effect.uses-unknown", grammar, alloc)
+    expect_codes("registers R {\n    bank: u32 at 0 read\n} R\n", expected: "3 register.bank-reserved", grammar, alloc)
+} rejected_alternatives_report_their_first_token
+
+test context_words_follow_the_lookahead_resolutions for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("fn f(op: task fn() -> u32) -> task::Cancelled = task::Cancelled.make()\n", expected: "", grammar, alloc)
+    expect_codes("fn f(values: Slice[u32]) -> bool = all value in values: value > 0\n", expected: "", grammar, alloc)
+    expect_codes("fn f(all: u32) -> u32 = all\n", expected: "", grammar, alloc)
+    expect_codes("fn f(op: fn() -> u32 limits pure, notrap, step: u32) -> u32 = step\n", expected: "", grammar, alloc)
+    expect_codes("retired old_name => manual \"gone\"\n", expected: "", grammar, alloc)
+} context_words_follow_the_lookahead_resolutions
+
+test summaries_doc_runs_and_abandoned_items_are_reported_alone for parse {
+    let alloc = testing::world().alloc
+    let grammar = Grammar.load(alloc)
+    expect_codes("fn f() {\n    return )\n} f\n\npub struct Point {\n    x: u32\n} Point\n", expected: "3 syntax.unexpected-token, 6 item.openness-missing", grammar, alloc)
+    expect_codes("fn f() {\n    /// Not here.\n    return\n} f\n", expected: "3 doc.misplaced", grammar, alloc)
+    expect_codes("struct S {\n    x: u32\n    /// Documents nothing.\n} S\n", expected: "4 doc.misplaced", grammar, alloc)
+    expect_codes("const X: u32 = 1\n\n/// Trailing.\n", expected: "4 doc.misplaced", grammar, alloc)
+    expect_codes("//! A second summary.\nconst X: u32 = 1\n", expected: "2 doc.misplaced", grammar, alloc)
+    expect_codes("/// Documented.\nconst X: u32 = 1\n", expected: "", grammar, alloc)
+    expect_codes("fn f() {\n    return )\t\n} f\n", expected: "3 lex.tab", grammar, alloc)
+    let missing = parse(text::String.of("//!\nconst X: u32 = 1\n", alloc).into_bytes(), grammar, alloc)
+    expect missing.diagnostics.len() == 1
+    expect missing.diagnostics[0].code == diagnostic::Code.DocSummaryMissing
+} summaries_doc_runs_and_abandoned_items_are_reported_alone
+
+test a_conflict_block_is_reported_once_with_fixes_keeping_either_side for parse {
+    let alloc = testing::world().alloc
+    let file = summarized("<<<<<<< ours\nfn f() -> u32 = 2\n=======\nfn f() -> u32 = 3\n>>>>>>> theirs\n", grammar: Grammar.load(alloc), alloc)
+    expect file.diagnostics.len() == 1
+    let reported = file.diagnostics[0]
+    expect reported.code == diagnostic::Code.MergeUnresolved
+    expect reported.line == 2
+    expect reported.fixes.len() == 2
+    expect reported.fixes[0][0].text.as_str() == "fn f() -> u32 = 2\n"
+    expect reported.fixes[1][0].text.as_str() == "fn f() -> u32 = 3\n"
+    for item in file.items {
+        expect item.abandoned or item.tree.is_none()
+    }
+} a_conflict_block_is_reported_once_with_fixes_keeping_either_side
+
+test a_std_function_without_a_body_ends_before_the_docs_of_the_next_item for parse_std {
+    let alloc = testing::world().alloc
+    let source = "//! Summary.\n\npub fn Store.len(self) -> usize\n    example true\n\n/// The next.\npub fn Store.next(self) -> usize\n\n/// The last.\npub closed struct Last {\n} Last\n"
+    let file = parse_std(text::String.of(source, alloc).into_bytes(), grammar: Grammar.load(alloc), alloc)
+    expect file.diagnostics.len() == 0
+    expect file.items.len() == 3
+} a_std_function_without_a_body_ends_before_the_docs_of_the_next_item
+
+/// The first token at or after `from` that is not read as a comment, or `EOF` past it.
+pkg fn SourceFile.next_code(self, from: usize) -> usize {
+    return self.next(from)
+} SourceFile.next_code
+
+/// The last token before `before` that is not read as a comment.
+pkg fn SourceFile.previous_code(self, before: usize) -> Option[usize] {
+    return self.previous(before)
+} SourceFile.previous_code

@@ -1,0 +1,818 @@
+//! The collections the interpreter supplies: lists, bytes, bounded lists, maps, hash maps, sets and once maps, with their entries and cursors. A map's and a set's storage holds its entries ordered by `cmp` of their keys, a hash map's and a once map's in insertion order; a bounded list holds its elements inline.
+
+/// Where a key lies in a container: the index of the element holding it, or where it would go.
+struct KeyPosition derives Copy {
+    index: usize
+    /// Whether an element holds the key.
+    held: bool
+} KeyPosition
+
+/// A member of a collection, of `mem::Entry` or of a collection's cursor; none for another
+/// member.
+fn Interpreter.collection_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    match owner {
+        "mem::List" => return try mut self.list_member(owner, member, element: type_arg_or_unit(type_args, index: 0), args, at, site)
+        "mem::Bytes" => return try mut self.list_member(owner, member, element: ty::Ty.scalar(ty::Scalar.Unsigned8), args, at, site)
+        "mem::Bounded" => return try mut self.bounded_member(member, type_args, args, at)
+        "mem::Map" or "mem::HashMap" or "mem::OnceMap" => {
+            let entry = self.entry_ty(type_arg_or_unit(type_args, index: 0), value: type_arg_or_unit(type_args, index: 1))
+            return try mut self.map_member(owner, member, key: type_arg_or_unit(type_args, index: 0), entry, args, at, site)
+        }
+        "mem::Set" => return try mut self.set_member(member, value: type_arg_or_unit(type_args, index: 0), args, at, site)
+        "mem::Entry" => {
+            var part: u32 = 0
+            match member {
+                "key" => {}
+                "value" or "value_mut" => {
+                    part = 1
+                }
+                else => return None
+            }
+            let entry = self.deref(args[0]).fields()[0].place().with(part, alloc: self.alloc)
+            return Some(InterpFlow.Return(Val.Ref(take entry)))
+        }
+        else => return mut self.cursor_member(owner, member, args)
+    }
+} Interpreter.collection_member
+
+/// The type argument at an index, `Unit` for none.
+fn type_arg_or_unit(type_args: Slice[ty::Arg], index: usize) -> ty::Ty {
+    if index >= type_args.len() {
+        return ty::Ty.unit()
+    }
+    return type_args[index].ty().value_or(ty::Ty.unit())
+} type_arg_or_unit
+
+/// A member of `mem::List` or `mem::Bytes`, whose elements have type `element`.
+fn Interpreter.list_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    element: ty::Ty,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    let option = self.ty_item("core", name: "Option")
+    match member {
+        "empty" => {
+            let cell = self.cell_of(args[0])
+            return Some(InterpFlow.Return(mut self.container(path: owner, elements: mem::List[Val].empty(alloc), cell)))
+        }
+        "zeroed" or "try_zeroed" => {
+            let cell = self.cell_of(args[1])
+            let zeros = zero_values(usize.widen(args[0].int_value().low_bits()), alloc)
+            let Some(bytes) = mut self.holding(path: owner, elements: take zeros, cell, element) else {
+                return Some(try self.exhausted(fallible: member.starts_with("try_"), at))
+            }
+            return Some(InterpFlow.Return(take bytes))
+        }
+        "len" => return Some(InterpFlow.Return(Val.of_usize(self.entry_count(args[0]))))
+        "capacity" => return Some(InterpFlow.Return(Val.of_usize(self.capacity(args[0]))))
+        "push" or "try_push" or "append" or "try_append" or "insert" or "try_insert" or "reserve" or "try_reserve" => return Some(try mut self.list_growth(member, element, args, at))
+        "pop" or "remove" or "truncate" => return Some(try mut self.list_removal(member, option, args, at))
+        "at" or "at_mut" => {
+            let storage = self.storage(args[0])
+            let index = args[1].int_value()
+            let len = self.memory.get(storage).fields().len()
+            if index.is_negative() or not index.lt(wide::Wide.of_u64(u64.widen(len))) {
+                fail self.bounds_trap(site, at)
+            }
+            return Some(InterpFlow.Return(Val.Ref(storage.with(u32.truncate(index.low_bits()), alloc))))
+        }
+        "view" or "view_mut" => return Some(InterpFlow.Return(Val.View(mut self.view_of(args[0]))))
+        "cursor_mut" => {
+            let cursor = self.ty_item("core", name: "SliceCursorMut")
+            let view = mut self.view_of(args[0])
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))))
+        }
+        "into_cursor" => {
+            let cursor = self.ty_item("mem", name: "ListCursor")
+            var fields = Val.single(self.deref(args[0]), alloc)
+            mut fields.push(Val.of_usize(0))
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc))))
+        }
+        "retain" => return Some(try mut self.retain(receiver: args[0], keep: args[1], parts: 1, at, site))
+        "sort_by" => return Some(try mut self.sort_by(receiver: args[0], order: args[1], at, site))
+        else => return None
+    }
+} Interpreter.list_member
+
+/// `push`, `append`, `insert` and `reserve` of a list or bytes, and their `try_` forms.
+fn Interpreter.list_growth(mut self, member: Str, element: ty::Ty, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let fallible = member.starts_with("try_")
+    if member == "push" or member == "try_push" {
+        let Some(parts) = args.split_at(1) else {
+            expect false
+            fail End.Missing
+        }
+        let Some(pushed) = parts.tail.prefix(1) else {
+            expect false
+            fail End.Missing
+        }
+        if not mut self.append(place: args[0].place(), values: pushed, element) {
+            return try self.exhausted(fallible, at)
+        }
+        return InterpFlow.Return(Val.Unit)
+    }
+    if member == "append" or member == "try_append" {
+        let data = mut self.view_of(args[1])
+        let values = self.view_values(data)
+        if not mut self.append(place: args[0].place(), values: values.view(), element) {
+            return try self.exhausted(fallible, at)
+        }
+        return InterpFlow.Return(Val.Unit)
+    }
+    let receiver = args[0].place()
+    let current = self.memory.get(receiver).copy(alloc)
+    if member == "insert" or member == "try_insert" {
+        var elements = self.entries(current)
+        let index = usize.widen(args[1].int_value().low_bits())
+        if index > elements.len() {
+            fail self.trap("trap.requires", at)
+        }
+        let Some(grown) = mut self.grow(current, needed: elements.len() + 1, element) else {
+            return try self.exhausted(fallible, at)
+        }
+        mut elements.insert(index, value: args[2].copy(alloc))
+        mut self.memory.set(receiver, stored: take grown)
+        mut self.store(place: receiver, take elements)
+        return InterpFlow.Return(Val.Unit)
+    }
+    let needed = self.entry_count(current).wrapping_add(usize.widen(args[1].int_value().low_bits()))
+    let Some(grown) = mut self.grow(current, needed, element) else {
+        return try self.exhausted(fallible, at)
+    }
+    mut self.memory.set(receiver, stored: take grown)
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.list_growth
+
+/// `pop`, `remove` and `truncate` of a list or bytes.
+fn Interpreter.list_removal(mut self, member: Str, option: ty::ItemId, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let receiver = args[0].place()
+    var elements = self.entries(args[0])
+    if member == "pop" {
+        let popped = mut elements.pop()
+        mut self.store(place: receiver, take elements)
+        match popped {
+            Some(value) => return InterpFlow.Return(Val.some(option, take value, alloc))
+            None => return InterpFlow.Return(Val.none(option, alloc))
+        }
+    }
+    if member == "remove" {
+        let index = usize.widen(args[1].int_value().low_bits())
+        if index >= elements.len() {
+            fail self.trap("trap.requires", at)
+        }
+        let removed = mut elements.remove(index)
+        mut self.store(place: receiver, take elements)
+        return InterpFlow.Return(take removed)
+    }
+    let len = usize.widen(args[1].int_value().low_bits())
+    if len < elements.len() {
+        for index in len..<elements.len() {
+            mut self.store_release(elements[index])
+        }
+        mut elements.truncate(len)
+        mut self.store(place: receiver, take elements)
+    }
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.list_removal
+
+/// A member of `mem::Bounded[T, N]`, which holds its elements inline as an array.
+fn Interpreter.bounded_member(mut self, member: Str, type_args: Slice[ty::Arg], args: Slice[Val], at: ItemSpan) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    let option = self.ty_item("core", name: "Option")
+    let bound = usize.widen(const_arg_bits(type_args, index: 1))
+    match member {
+        "empty" => {
+            let item = self.ty_item("mem", name: "Bounded")
+            let elements = Val.Array(mem::Shared.of(mem::List[Val].empty(alloc), alloc))
+            return Some(InterpFlow.Return(Val.Struct(item: item, fields: mem::Shared.of(Val.single(take elements, alloc), alloc))))
+        }
+        "len" => return Some(InterpFlow.Return(Val.of_usize(self.deref(args[0]).fields()[0].fields().len())))
+        "push" or "pop" => {
+            let array = args[0].place().with(0, alloc)
+            var held = Val.copies(self.deref(args[0]).fields()[0].fields(), alloc)
+            var result = Val.Unit
+            if member == "push" {
+                if held.len() >= bound {
+                    fail self.trap("trap.requires", at)
+                }
+                mut held.push(args[1].copy(alloc))
+            } else {
+                match mut held.pop() {
+                    Some(value) => {
+                        result = Val.some(option, take value, alloc)
+                    }
+                    None => {
+                        result = Val.none(option, alloc)
+                    }
+                }
+            }
+            mut self.memory.set(array, stored: Val.Array(mem::Shared.of(take held, alloc)))
+            return Some(InterpFlow.Return(take result))
+        }
+        "at" or "at_mut" => {
+            let view = mut self.inline_view(args[0])
+            let index = args[1].int_value()
+            if index.is_negative() or not index.lt(wide::Wide.of_u64(u64.widen(view.len))) {
+                fail self.trap("trap.bounds", at)
+            }
+            return Some(InterpFlow.Return(Val.Ref(view.array.with(u32.truncate(index.low_bits()), alloc))))
+        }
+        "view" or "view_mut" => return Some(InterpFlow.Return(Val.View(mut self.inline_view(args[0]))))
+        "cursor_mut" => {
+            let cursor = self.ty_item("core", name: "SliceCursorMut")
+            let view = mut self.inline_view(args[0])
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))))
+        }
+        "into_cursor" => {
+            let cursor = self.ty_item("mem", name: "BoundedCursor")
+            var fields = Val.single(self.deref(args[0]).fields()[0].copy(alloc), alloc)
+            mut fields.push(Val.of_usize(0))
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc))))
+        }
+        else => return None
+    }
+} Interpreter.bounded_member
+
+/// A member of `mem::Map`, `mem::HashMap` or `mem::OnceMap`, whose keys have type `key` and
+/// entries type `entry`.
+fn Interpreter.map_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    key: ty::Ty,
+    entry: ty::Ty,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    let option = self.ty_item("core", name: "Option")
+    let ordered = owner == "mem::Map"
+    let once = owner == "mem::OnceMap"
+    match member {
+        "empty" => {
+            let cell = self.cell_of(args[args.len() - 1])
+            let inner = mut self.container(path: owner, elements: mem::List[Val].empty(alloc), cell)
+            if once {
+                return Some(InterpFlow.Return(mut self.interior(path: owner, take inner)))
+            }
+            return Some(InterpFlow.Return(take inner))
+        }
+        "len" => {
+            let current = self.map_container(args[0], once)
+            return Some(InterpFlow.Return(Val.of_usize(self.entry_count(current))))
+        }
+        "insert" or "try_insert" => return Some(try mut self.map_insert(owner, member, key, entry, args, at, site))
+        "remove" => return Some(try mut self.map_remove(ordered, key, option, args, at, site))
+        "get" or "get_mut" or "at" or "at_mut" => {
+            let current = self.map_container(args[0], once)
+            let sought = self.deref(args[1])
+            let position = try mut self.find(current, key, sought, ordered, keyed: true, at, site)
+            let value = self.storage(current).with(u32.truncate(position.index), alloc).with(1, alloc)
+            if member == "get" or member == "get_mut" {
+                if position.held {
+                    return Some(InterpFlow.Return(Val.some(option, value: Val.Ref(take value), alloc)))
+                }
+                return Some(InterpFlow.Return(Val.none(option, alloc)))
+            }
+            if position.held {
+                return Some(InterpFlow.Return(Val.Ref(take value)))
+            }
+            fail self.trap("trap.requires", at)
+        }
+        "get_by" or "get_by_mut" => {
+            let current = self.deref(args[0])
+            let Some(index) = try mut self.search(current, order: args[1], keyed: true, at, site) else {
+                return Some(InterpFlow.Return(Val.none(option, alloc)))
+            }
+            let value = self.storage(current).with(u32.truncate(index), alloc).with(1, alloc)
+            return Some(InterpFlow.Return(Val.some(option, value: Val.Ref(take value), alloc)))
+        }
+        "cursor" or "cursor_mut" => {
+            var name = "HashMapCursorMut"
+            if ordered and member == "cursor" {
+                name = "MapCursor"
+            } else if ordered {
+                name = "MapCursorMut"
+            } else if member == "cursor" {
+                name = "HashMapCursor"
+            }
+            let cursor = self.ty_item("mem", name)
+            let view = mut self.view_of(args[0])
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))))
+        }
+        "into_cursor" => {
+            var name = "HashMapIntoCursor"
+            if ordered {
+                name = "MapIntoCursor"
+            }
+            let cursor = self.ty_item("mem", name)
+            var fields = Val.single(self.deref(args[0]), alloc)
+            mut fields.push(Val.of_usize(0))
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc))))
+        }
+        "retain" => return Some(try mut self.retain(receiver: args[0], keep: args[1], parts: 2, at, site))
+        else => return None
+    }
+} Interpreter.map_member
+
+/// The container a map operation reads: the one a once map holds, or the map itself.
+fn Interpreter.map_container(self, receiver: Val, once: bool) -> Val {
+    if once {
+        return self.held(receiver)
+    }
+    return self.deref(receiver)
+} Interpreter.map_container
+
+/// The place of the container a map operation changes: the one a once map holds, or the map's
+/// own.
+fn Interpreter.map_place(self, receiver: Val, once: bool) -> Loc {
+    if once {
+        return self.holder(receiver)
+    }
+    return receiver.place().copy(self.alloc)
+} Interpreter.map_place
+
+/// `insert` and `try_insert` of a map, hash map or once map: the value an entry held before,
+/// or for a once map a reference to the value its entry holds.
+fn Interpreter.map_insert(
+    mut self,
+    owner: Str,
+    member: Str,
+    key: ty::Ty,
+    entry: ty::Ty,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let option = self.ty_item("core", name: "Option")
+    let once = owner == "mem::OnceMap"
+    let receiver = self.map_place(args[0], once)
+    let current = self.memory.get(receiver).copy(alloc)
+    let sought = self.deref(args[1])
+    let position = try mut self.find(current, key, sought, ordered: owner == "mem::Map", keyed: true, at, site)
+    let slot = self.storage(current).with(u32.truncate(position.index), alloc)
+    if position.held {
+        mut self.store_release(args[1])
+        if once {
+            mut self.store_release(args[2])
+            return InterpFlow.Return(Val.Ref(slot.with(1, alloc)))
+        }
+        let held_value = slot.with(1, alloc)
+        let old = self.memory.get(held_value).copy(alloc)
+        mut self.memory.set(held_value, stored: args[2].copy(alloc))
+        return InterpFlow.Return(Val.some(option, value: take old, alloc))
+    }
+    var held = self.entries(current)
+    let Some(grown) = mut self.grow(current, needed: held.len() + 1, element: entry) else {
+        mut self.store_release(args[1])
+        mut self.store_release(args[2])
+        return try self.exhausted(fallible: member.starts_with("try_"), at)
+    }
+    mut held.insert(position.index, value: self.key_value(args[1].copy(alloc), value: args[2].copy(alloc)))
+    mut self.memory.set(receiver, stored: take grown)
+    mut self.store(place: receiver, elements: take held)
+    if once {
+        return InterpFlow.Return(Val.Ref(slot.with(1, alloc)))
+    }
+    return InterpFlow.Return(Val.none(option, alloc))
+} Interpreter.map_insert
+
+/// `remove` of a map or hash map: the value of the entry holding a key, which ends.
+fn Interpreter.map_remove(
+    mut self,
+    ordered: bool,
+    key: ty::Ty,
+    option: ty::ItemId,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let receiver = args[0].place()
+    let current = self.memory.get(receiver).copy(alloc)
+    let sought = self.deref(args[1])
+    let position = try mut self.find(current, key, sought, ordered, keyed: true, at, site)
+    if not position.held {
+        return InterpFlow.Return(Val.none(option, alloc))
+    }
+    var held = self.entries(current)
+    let removed = mut held.remove(position.index)
+    mut self.store(place: receiver, elements: take held)
+    mut self.store_release(removed.fields()[0])
+    return InterpFlow.Return(Val.some(option, value: removed.fields()[1].copy(alloc), alloc))
+} Interpreter.map_remove
+
+/// A member of `mem::Set[T]`, whose values have type `value`.
+fn Interpreter.set_member(
+    mut self,
+    member: Str,
+    value: ty::Ty,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    match member {
+        "empty" => {
+            let cell = self.cell_of(args[0])
+            return Some(InterpFlow.Return(mut self.container(path: "mem::Set", elements: mem::List[Val].empty(alloc), cell)))
+        }
+        "len" => return Some(InterpFlow.Return(Val.of_usize(self.entry_count(args[0]))))
+        "insert" or "try_insert" or "remove" => return Some(try mut self.set_change(member, value, args, at, site))
+        "contains_by" => {
+            let current = self.deref(args[0])
+            let found = try mut self.search(current, order: args[1], keyed: false, at, site)
+            return Some(InterpFlow.Return(Val.Bool(found.is_some())))
+        }
+        "cursor" => {
+            let cursor = self.ty_item("mem", name: "SetCursor")
+            let view = mut self.view_of(args[0])
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))))
+        }
+        "into_cursor" => {
+            let cursor = self.ty_item("mem", name: "SetIntoCursor")
+            var fields = Val.single(self.deref(args[0]), alloc)
+            mut fields.push(Val.of_usize(0))
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc))))
+        }
+        "retain" => return Some(try mut self.retain(receiver: args[0], keep: args[1], parts: 1, at, site))
+        else => return None
+    }
+} Interpreter.set_member
+
+/// `insert`, `try_insert` and `remove` of a set: whether the set changed.
+fn Interpreter.set_change(mut self, member: Str, value: ty::Ty, args: Slice[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let receiver = args[0].place()
+    let current = self.memory.get(receiver).copy(alloc)
+    let sought = self.deref(args[1])
+    let position = try mut self.find(current, key: value, sought, ordered: true, keyed: false, at, site)
+    if member == "remove" {
+        if not position.held {
+            return InterpFlow.Return(Val.Bool(false))
+        }
+        var held = self.entries(current)
+        let removed = mut held.remove(position.index)
+        mut self.store(place: receiver, elements: take held)
+        mut self.store_release(removed)
+        return InterpFlow.Return(Val.Bool(true))
+    }
+    if position.held {
+        mut self.store_release(args[1])
+        return InterpFlow.Return(Val.Bool(false))
+    }
+    var held = self.entries(current)
+    let Some(grown) = mut self.grow(current, needed: held.len() + 1, element: value) else {
+        mut self.store_release(args[1])
+        return try self.exhausted(fallible: member.starts_with("try_"), at)
+    }
+    mut held.insert(position.index, value: args[1].copy(alloc))
+    mut self.memory.set(receiver, stored: take grown)
+    mut self.store(place: receiver, elements: take held)
+    return InterpFlow.Return(Val.Bool(true))
+} Interpreter.set_change
+
+/// The `next` of a collection's cursor; none for another member.
+fn Interpreter.cursor_member(mut self, owner: Str, member: Str, args: Slice[Val]) -> Option[InterpFlow] {
+    if member != "next" {
+        return None
+    }
+    let alloc = self.alloc
+    match owner {
+        "mem::SetCursor" => return Some(InterpFlow.Return(mut self.slice_next(args[0])))
+        "mem::BoundedCursor" => return Some(InterpFlow.Return(mut self.array_next(args[0])))
+        "mem::MapCursor" or "mem::MapCursorMut" or "mem::HashMapCursor" or "mem::HashMapCursorMut" => {
+            let Val.Variant(item: option, index: variant, fields: payload) = mut self.slice_next(args[0]) else {
+                expect false
+                return None
+            }
+            if variant != 0 {
+                return Some(InterpFlow.Return(Val.none(option, alloc)))
+            }
+            let entry_item = self.ty_item("mem", name: "Entry")
+            let entry = Val.Struct(item: entry_item, fields: mem::Shared.of(Val.single(payload.contents()[0].copy(alloc), alloc), alloc))
+            return Some(InterpFlow.Return(Val.some(option, value: take entry, alloc)))
+        }
+        "mem::ListCursor" or "mem::MapIntoCursor" or "mem::HashMapIntoCursor" or "mem::SetIntoCursor" => return Some(InterpFlow.Return(mut self.owning_next(args[0])))
+        else => return None
+    }
+} Interpreter.cursor_member
+
+/// The `next` of a cursor owning a container's elements: the element at its position, which
+/// then moves past it.
+fn Interpreter.owning_next(mut self, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let cursor_place = cursor.place()
+    let state = self.memory.get(cursor_place).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = state else {
+        expect false
+        return Val.Absent
+    }
+    let parts = fields.contents()
+    let option = self.ty_item("core", name: "Option")
+    let position = usize.widen(parts[1].int_value().low_bits())
+    let storage = self.storage(parts[0])
+    let elements = self.memory.get(storage).fields()
+    if position >= elements.len() {
+        return Val.none(option, alloc)
+    }
+    let element = elements[position].copy(alloc)
+    var moved = Val.single(parts[0].copy(alloc), alloc)
+    mut moved.push(Val.of_usize(position + 1))
+    mut self.memory.set(cursor_place, stored: Val.Struct(item: item, fields: mem::Shared.of(take moved, alloc)))
+    return Val.some(option, value: take element, alloc)
+} Interpreter.owning_next
+
+/// `retain`: calls `keep` on each element in order, with its key and value for an entry of
+/// `parts` parts, and releases those it rejects.
+fn Interpreter.retain(
+    mut self,
+    receiver: Val,
+    keep: Val,
+    parts: usize,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let keep_value = self.deref(keep)
+    let Val.Fn(keeper) = keep_value else {
+        expect false
+        fail End.Missing
+    }
+    let receiver_place = receiver.place()
+    let current = self.memory.get(receiver_place).copy(alloc)
+    let elements = self.entries(current)
+    var kept = mem::List[Val].empty(alloc)
+    for element in take elements {
+        let keep_args = match parts == 1 {
+            true => Val.single(element.copy(alloc), alloc)
+            false => Val.copies(element.fields(), alloc)
+        }
+        let flow = try mut self.invoke(keeper.contents(), args: take keep_args, at, site)
+        var keeps = false
+        match flow {
+            InterpFlow.Return(value) => {
+                keeps = value.bool_value()
+            }
+            else => return flow
+        }
+        if keeps {
+            mut kept.push(take element)
+        } else {
+            mut self.store_release(element)
+        }
+    }
+    mut self.store(place: receiver_place, elements: take kept)
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.retain
+
+/// `sort_by`: the stable binary insertion sort its section states, calling `order` in its
+/// order.
+fn Interpreter.sort_by(mut self, receiver: Val, order: Val, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let order_value = self.deref(order)
+    let Val.Fn(orderer) = order_value else {
+        expect false
+        fail End.Missing
+    }
+    let receiver_place = receiver.place()
+    let current = self.memory.get(receiver_place).copy(alloc)
+    var elements = self.entries(current)
+    var index: usize = 1
+    while index < elements.len() {
+        let moved = elements[index].copy(alloc)
+        var low: usize = 0
+        var high = index
+        while low < high {
+            let middle = (low + high) / 2
+            var order_args = Val.single(moved.copy(alloc), alloc)
+            mut order_args.push(elements[middle].copy(alloc))
+            let flow = try mut self.invoke(orderer.contents(), args: take order_args, at, site)
+            let compared = take flow.returned()
+            if compared.ordering() == core::Ordering.Less {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        let element = mut elements.remove(index)
+        mut elements.insert(low, value: take element)
+        index += 1
+    }
+    mut self.store(place: receiver_place, take elements)
+    return InterpFlow.Return(Val.Unit)
+} Interpreter.sort_by
+
+/// The ordered lookup its section states: a binary search calling `order` on the keys, or on
+/// the values of a set, of a container; the index found, if any.
+fn Interpreter.search(
+    mut self,
+    container: Val,
+    order: Val,
+    keyed: bool,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[usize] fails End {
+    let alloc = self.alloc
+    let order_value = self.deref(order)
+    let Val.Fn(orderer) = order_value else {
+        expect false
+        fail End.Missing
+    }
+    let storage = self.storage(container)
+    var low: usize = 0
+    var high = self.memory.get(storage).fields().len()
+    while low < high {
+        let middle = (low + high) / 2
+        let flow = try mut self.invoke(orderer.contents(), args: Val.single(self.key_at(storage, index: middle, keyed), alloc), at, site)
+        let compared = take flow.returned()
+        match compared.ordering() {
+            core::Ordering.Less => {
+                low = middle + 1
+            }
+            core::Ordering.Greater => {
+                high = middle
+            }
+            core::Ordering.Equal => return Some(middle)
+        }
+    }
+    return None
+} Interpreter.search
+
+/// Where a key lies in a container of entries, or of values when not `keyed`: the index of the
+/// one holding it, or the index where it would go. An ordered container compares keys by
+/// `cmp`, another by `eq`.
+fn Interpreter.find(
+    mut self,
+    container: Val,
+    key: ty::Ty,
+    sought: Val,
+    ordered: bool,
+    keyed: bool,
+    at: ItemSpan,
+    site: RunSite,
+    ) -> KeyPosition fails End {
+    let alloc = self.alloc
+    let storage = self.storage(container)
+    let len = self.memory.get(storage).fields().len()
+    if not ordered {
+        for index in 0..<len {
+            var eq_args = Val.single(self.key_at(storage, index, keyed), alloc)
+            mut eq_args.push(sought.copy(alloc))
+            let equal = try mut self.core_conformance(interface_name: "Eq", method: "eq", ty: key, args: take eq_args, at, site)
+            if equal.bool_value() {
+                return KeyPosition(index: index, held: true)
+            }
+        }
+        return KeyPosition(index: len, held: false)
+    }
+    var low: usize = 0
+    var high = len
+    while low < high {
+        let middle = (low + high) / 2
+        var cmp_args = Val.single(self.key_at(storage, index: middle, keyed), alloc)
+        mut cmp_args.push(sought.copy(alloc))
+        let compared = try mut self.core_conformance(interface_name: "Ord", method: "cmp", ty: key, args: take cmp_args, at, site)
+        match compared.ordering() {
+            core::Ordering.Less => {
+                low = middle + 1
+            }
+            core::Ordering.Greater => {
+                high = middle
+            }
+            core::Ordering.Equal => return KeyPosition(index: middle, held: true)
+        }
+    }
+    return KeyPosition(index: low, held: false)
+} Interpreter.find
+
+/// A copy of the key of the entry at an index of a container's storage, or of the value there
+/// when not `keyed`.
+fn Interpreter.key_at(self, storage: Loc, index: usize, keyed: bool) -> Val {
+    let element = self.memory.get(storage).fields()[index]
+    if keyed {
+        return element.fields()[0].copy(self.alloc)
+    }
+    return element.copy(self.alloc)
+} Interpreter.key_at
+
+/// Calls a method of a core interface on values of a type, through its conformance.
+fn Interpreter.core_conformance(
+    mut self,
+    interface_name: Str,
+    method: Str,
+    ty: ty::Ty,
+    take args: mem::List[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Val fails End {
+    let interface_item = self.ty_item("core", name: interface_name)
+    let Some(index) = self.ck.interface_method(interface_item, name: method) else {
+        expect false
+        fail End.Missing
+    }
+    var type_args = mem::List[ty::Arg].empty(self.alloc)
+    mut type_args.push(ty::Arg.Ty(ty))
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: u32.truncate(index)), args: self.ck.types().args(take type_args))
+    let flow = try mut self.call_function(fn_ref, take args, at, site)
+    return take flow.returned()
+} Interpreter.core_conformance
+
+/// The value a call of a function that cannot fail returned.
+fn InterpFlow.returned(take self) -> Val {
+    match self {
+        InterpFlow.Return(value) => return value
+        else => {}
+    }
+    expect false
+    return Val.Absent
+} InterpFlow.returned
+
+/// The order a `core::Ordering` value states.
+fn Val.ordering(self) -> core::Ordering {
+    match self {
+        Val.Variant(item: _, index: index, fields: _) => {
+            match index {
+                0 => return core::Ordering.Less
+                1 => return core::Ordering.Equal
+                2 => return core::Ordering.Greater
+                else => {}
+            }
+        }
+        else => {}
+    }
+    expect false
+    return core::Ordering.Equal
+} Val.ordering
+
+/// The type of a map's entries, `mem::KeyValue[K, V]`.
+fn Interpreter.entry_ty(self, key: ty::Ty, value: ty::Ty) -> ty::Ty {
+    let item = self.ty_item("mem", name: "KeyValue")
+    var args = mem::List[ty::Arg].empty(self.alloc)
+    mut args.push(ty::Arg.Ty(key))
+    mut args.push(ty::Arg.Ty(value))
+    return self.ck.types().item(item, take args)
+} Interpreter.entry_ty
+
+/// A `mem::KeyValue` of a key and a value.
+fn Interpreter.key_value(self, take key: Val, take value: Val) -> Val {
+    let item = self.ty_item("mem", name: "KeyValue")
+    var fields = Val.single(take key, alloc: self.alloc)
+    mut fields.push(take value)
+    return Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc: self.alloc))
+} Interpreter.key_value
+
+/// The view of a container's elements, or of a slice's.
+fn Interpreter.view_of(mut self, value: Val) -> View {
+    let held = self.deref(value)
+    match held {
+        Val.Struct(item: _, fields: _) => {
+            let storage = self.storage(value)
+            let len = self.memory.get(storage).fields().len()
+            return View(array: take storage, start: 0, len: len)
+        }
+        else => {}
+    }
+    return mut self.view(value)
+} Interpreter.view_of
+
+/// The view of a bounded list's elements: in its place for a reference, else in a new
+/// read-only extent.
+fn Interpreter.inline_view(mut self, receiver: Val) -> View {
+    let alloc = self.alloc
+    match receiver {
+        Val.Ref(loc) => {
+            let array = loc.with(0, alloc)
+            let len = self.memory.get(array).fields().len()
+            return View(array: take array, start: 0, len: len)
+        }
+        else => {}
+    }
+    let extent = mut self.memory.alloc(receiver.fields()[0].copy(alloc), writable: false, size: 0)
+    let array = Loc(extent: extent, path: mem::List[u32].empty(alloc))
+    let len = self.memory.get(array).fields().len()
+    return View(array: take array, start: 0, len: len)
+} Interpreter.inline_view
+
+/// The number of a container's elements.
+fn Interpreter.entry_count(self, container: Val) -> usize {
+    let storage = self.storage(container)
+    return self.memory.get(storage).fields().len()
+} Interpreter.entry_count

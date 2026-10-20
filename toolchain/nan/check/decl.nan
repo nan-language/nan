@@ -1,0 +1,1075 @@
+//! The rules of declarations: names, their conventions, duplicates and clashes, and the shapes of heads that their names promise.
+
+/// The naming convention a declared name follows.
+enum Case derives Copy, Eq {
+    Snake
+    Pascal
+    Screaming
+} Case
+
+/// The scalar names, folded.
+const FOLDED_SCALARS: Str = "u8 u16 u32 u64 usize i8 i16 i32 i64 isize f32 f64 bool char"
+
+/// The core vocabulary names beside the scalars, folded.
+const FOLDED_CORE: Str = "unit never option some none result ok err array slice slicemut str untrusted dyn eq ord hash copy default render encode generate send inert anybits any"
+
+/// The name prefixes whose heads are checked, in the order they are judged.
+const NAME_PREFIXES: Str = "try_ checked_ is_ to_ as_ into_ with_"
+
+/// A name an item of a module declares.
+struct DeclaredName {
+    item: ty::ItemId
+    name: ast::Name
+} DeclaredName
+
+/// A member name of a type that a module declares.
+struct MemberName derives Eq, Hash {
+    key: TypeKey
+    name: text::String
+} MemberName
+
+fn is_snake(name: Str) -> bool {
+    let case = Case.Snake
+    return case.followed_by(name)
+} is_snake
+
+/// Whether an item's name belongs to its module's values namespace.
+fn in_values_namespace(item: ast::Item) -> bool {
+    return match item.kind {
+        ast::ItemKind.Const(_) or ast::ItemKind.Registry(_) or ast::ItemKind.Contribute(_) or ast::ItemKind.Test(_) => true
+        ast::ItemKind.Fn(function) => function.label.owner.is_none()
+        else => false
+    }
+} in_values_namespace
+
+/// A name written in the convention: split into words at underscores and before each uppercase
+/// letter following a lowercase letter or a digit, empty words dropped, then joined lowercase with
+/// `_`, capitalised, or uppercase with `_`.
+fn Case.converted(self, name: Str, alloc: mem::Alloc) -> text::String {
+    var words = mem::List[text::String].empty(alloc)
+    var previous: Option[char] = None
+    for c in name {
+        let after_lower = match previous {
+            Some(held) => (held >= 'a' and held <= 'z') or (held >= '0' and held <= '9')
+            None => false
+        }
+        let starts = c == '_' or (c >= 'A' and c <= 'Z' and after_lower)
+        if starts or words.len() == 0 {
+            mut words.push(text::String.empty(alloc))
+        }
+        if c != '_' {
+            var word = mut words.at_mut(words.len() - 1)
+            mut word.push(c)
+        }
+        previous = Some(c)
+    }
+    var converted = text::String.empty(alloc)
+    var joined = false
+    for word in words {
+        if word.byte_len() == 0 {
+            continue
+        }
+        if joined and self != Case.Pascal {
+            mut converted.push('_')
+        }
+        joined = true
+        var leading = true
+        for c in word.as_str() {
+            let written = match self {
+                Case.Snake => c.to_ascii_lowercase()
+                Case.Screaming => c.to_ascii_uppercase()
+                Case.Pascal => match leading {
+                    true => c.to_ascii_uppercase()
+                    false => c.to_ascii_lowercase()
+                }
+            }
+            mut converted.push(written)
+            leading = false
+        }
+    }
+    return converted
+} Case.converted
+
+fn Case.followed_by(self, name: Str) -> bool {
+    let bytes = name.as_bytes()
+    return match self {
+        Case.Snake => bytes.len() > 0 and bytes[0] >= b'a' and bytes[0] <= b'z' and words_follow(bytes, lower: true)
+        Case.Pascal => syntax::is_pascal(bytes)
+        Case.Screaming => bytes.len() >= 2 and bytes[0] >= b'A' and bytes[0] <= b'Z' and words_follow(bytes, lower: false)
+    }
+} Case.followed_by
+
+/// Whether each `_`-separated word of a name is non-empty and holds only digits and letters of
+/// one case.
+fn words_follow(bytes: Slice[u8], lower: bool) -> bool {
+    var empty = true
+    for byte in bytes {
+        if byte == b'_' {
+            if empty {
+                return false
+            }
+            empty = true
+            continue
+        }
+        let digit = byte >= b'0' and byte <= b'9'
+        let cased = match lower {
+            true => byte >= b'a' and byte <= b'z'
+            false => byte >= b'A' and byte <= b'Z'
+        }
+        if not (digit or cased) {
+            return false
+        }
+        empty = false
+    }
+    return not empty
+} words_follow
+
+/// A name with each uppercase letter made lowercase and each underscore removed.
+fn fold(name: Str, alloc: mem::Alloc) -> text::String {
+    var folded = text::String.empty(alloc)
+    for c in name {
+        if c != '_' {
+            mut folded.push(c.to_ascii_lowercase())
+        }
+    }
+    return folded
+} fold
+
+/// Whether a name folds to a word written lowercase without underscores.
+fn folds_equal(name: Str, word: Str) -> bool {
+    let wanted = word.as_bytes()
+    var at: usize = 0
+    for byte in name.as_bytes() {
+        if byte == b'_' {
+            continue
+        }
+        var lower = byte
+        if byte >= b'A' and byte <= b'Z' {
+            lower = byte + 32
+        }
+        if at >= wanted.len() or wanted[at] != lower {
+            return false
+        }
+        at += 1
+    }
+    return at == wanted.len()
+} folds_equal
+
+/// Whether a name folds to a core vocabulary name, or with `scalars_only` to a scalar's.
+fn folds_to_core(name: Str, scalars_only: bool) -> bool {
+    for word in Words(list: FOLDED_SCALARS, at: 0) {
+        if folds_equal(name, word) {
+            return true
+        }
+    }
+    if scalars_only {
+        return false
+    }
+    for word in Words(list: FOLDED_CORE, at: 0) {
+        if folds_equal(name, word) {
+            return true
+        }
+    }
+    return false
+} folds_to_core
+
+fn Checker.check_package(self, package_id: ty::PackageId) {
+    self.check_manifest(package_id)
+    self.check_program(package_id)
+    self.check_contributors(package_id)
+    let db = self.db()
+    for module in db.package_data(package_id).modules {
+        self.check_module_names(module)
+        for item in db.module(module).items {
+            self.judge_alone(item)
+        }
+    }
+    self.check_package_whole(package_id)
+} Checker.check_package
+
+fn Checker.check_case(self, item: ty::ItemId, name: ast::Name, case: Case) {
+    if not case.followed_by(name.text.as_str()) {
+        self.report(item, token: name.token, code: diagnostic::Code.NameCase)
+        discard self.state.contents().misnamed.push(Misnamed(item: item, token: name.token, case: case))
+    }
+} Checker.check_case
+
+/// The duplicate and folded clashes among the names a module declares.
+fn Checker.check_module_names(self, module: ty::ModuleId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var values = mem::List[DeclaredName].empty(alloc)
+    var types = mem::List[DeclaredName].empty(alloc)
+    var seen = mem::HashMap[text::String, ty::ItemId].empty(seed: 0, alloc)
+    for item in db.module(module).items {
+        let node = db.ast(item)
+        let Some(name) = declared_name(node, alloc) else {
+            continue
+        }
+        if is_member(node) {
+            continue
+        }
+        if seen.contains(name.text) {
+            self.report(item, token: name.token, code: diagnostic::Code.ItemDuplicate)
+            continue
+        }
+        discard mut seen.insert(text::String.of(name.text.as_str(), alloc), value: item)
+        match node.kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Interface(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => mut types.push(DeclaredName(item: item, name: take name))
+            else => mut values.push(DeclaredName(item: item, name: take name))
+        }
+    }
+    self.check_folded_names(values.view())
+    self.check_folded_names(types.view())
+    self.check_member_names(module)
+} Checker.check_module_names
+
+/// The names of one namespace of a module that fold equal to an earlier one's.
+fn Checker.check_folded_names(self, namespace: Slice[DeclaredName]) {
+    let alloc = self.alloc()
+    var folded = mem::HashMap[text::String, ty::ItemId].empty(seed: 0, alloc)
+    for declared in namespace {
+        let earlier = mut folded.insert(fold(declared.name.text.as_str(), alloc), value: declared.item)
+        if earlier.is_some() {
+            self.report(declared.item, token: declared.name.token, code: diagnostic::Code.NameClash)
+        }
+    }
+} Checker.check_folded_names
+
+/// The members a module declares that are named like an earlier member of their type in
+/// the module, like one in another module when outside the type's module, or like a field or
+/// variant of the type.
+fn Checker.check_member_names(self, module: ty::ModuleId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var seen = mem::HashMap[MemberName, Unit].empty(seed: 0, alloc)
+    for item in db.module(module).items {
+        let ast::ItemKind.Fn(function) = db.ast(item).kind else {
+            continue
+        }
+        let Some(key) = db.owners.get(item) else {
+            continue
+        }
+        let name = function.label.name
+        let earlier = mut seen.insert(MemberName(key: key, name: text::String.of(name.text.as_str(), alloc)), value: Unit)
+        let repeated = earlier.is_some()
+        var elsewhere = false
+        if not self.declares_type(module, key) {
+            for other in db.members(key, name: name.text.as_str()) {
+                if db.module_of(other) != module {
+                    elsewhere = true
+                    break
+                }
+            }
+        }
+        if repeated or elsewhere or self.names_part(key, name: name.text.as_str()) {
+            self.report(item, token: name.token, code: diagnostic::Code.ItemDuplicate)
+        }
+    }
+} Checker.check_member_names
+
+/// Whether a module declares a type: a struct, enum or layout of it, or for the scalars and
+/// `Unit`, the root module of core.
+fn Checker.declares_type(self, module: ty::ModuleId, key: TypeKey) -> bool {
+    let db = self.db()
+    return match key {
+        TypeKey.Item(target) => db.module_of(target) == module
+        TypeKey.Scalar(_) or TypeKey.Unit => db.package_data(db.core()).root == Some(module)
+    }
+} Checker.declares_type
+
+/// Whether a member name is a field or variant of its type.
+fn Checker.names_part(self, key: TypeKey, name: Str) -> bool {
+    let TypeKey.Item(target) = key else {
+        return false
+    }
+    let sig = self.sig(target)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => return holds_field(fields.view(), name)
+        SigKind.Layout(fields: fields, tags: _, bits: _) => return holds_field(fields.view(), name)
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                if variant.name.as_str() == name {
+                    return true
+                }
+            }
+            return false
+        }
+        else => return false
+    }
+} Checker.names_part
+
+/// Whether one of a type's fields has a name.
+fn holds_field(fields: Slice[FieldSig], name: Str) -> bool {
+    for field in fields {
+        if field.name.as_str() == name {
+            return true
+        }
+    }
+    return false
+} holds_field
+
+fn Checker.check_item(self, item: ty::ItemId) {
+    let held = self.sig(item)
+    let sig = held.contents()
+    self.report_problems(item, problems: sig.problems)
+    self.check_docs(item)
+    self.check_doc_binding(item)
+    self.check_test_only(item)
+    self.check_interface_names(item)
+    self.check_value_types(item)
+    self.check_history_forms(item)
+    let node = self.db().ast(item)
+    match node.kind {
+        ast::ItemKind.Fn(function) => self.check_function(item, node, function, sig)
+        ast::ItemKind.Struct(structure) => self.check_struct_item(item, structure)
+        ast::ItemKind.Enum(enumeration) => self.check_enum_item(item, enumeration)
+        ast::ItemKind.Interface(declared) => self.check_interface_item(item, declared, sig)
+        ast::ItemKind.Layout(layout_item) => self.check_layout_item(item, layout_item)
+        ast::ItemKind.Registers(register_block) => {
+            self.check_registers(item)
+            self.check_type_name(item, name: register_block.name)
+            for register in register_block.members {
+                self.check_case(item, name: register.name, case: Case.Snake)
+            }
+        }
+        ast::ItemKind.Const(constant) => self.check_const_item(item, constant, sig)
+        ast::ItemKind.Registry(declared_registry) => {
+            self.check_registry(item, declared: declared_registry)
+            self.check_case(item, name: declared_registry.name, case: Case.Snake)
+        }
+        ast::ItemKind.Contribute(contribution) => {
+            self.check_contribution(item, contribution)
+            self.check_case(item, name: contribution.name, case: Case.Snake)
+        }
+        ast::ItemKind.Test(tested) => {
+            if tested.disputed {
+                self.report(item, token: node.token, code: diagnostic::Code.TodoDisputed)
+            }
+            self.check_case(item, name: tested.name, case: Case.Snake)
+            self.check_test_head(item, tested)
+            self.check_test_reach(item, tested)
+        }
+        ast::ItemKind.Retired(_) => self.check_tombstone(item)
+        ast::ItemKind.Impl(_) => {
+            if not self.check_generate_impl(item) and self.check_impl(item) {
+                self.check_capability_impl(item)
+                self.check_decoder_impl(item)
+                self.check_component_impl(item)
+            }
+        }
+        ast::ItemKind.ConstAssert(_) or ast::ItemKind.Package => {}
+    }
+    match self.generic_params(item) {
+        Some(generics) => self.where_conditions(item, generics)
+        None => {}
+    }
+    self.check_item_body(item)
+    if self.is_entry(item) {
+        self.check_entry_head(item)
+    }
+} Checker.check_item
+
+/// The rules of a function item's name, head and modifier.
+fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast::FnItem, sig: Sig) {
+    let modifier = match function.modifier {
+        Some(written) => Some(written.kind)
+        None => None
+    }
+    if modifier != Some(ast::FnModifier.Foreign) {
+        self.check_case(item, name: function.label.name, case: Case.Snake)
+    }
+    if function.label.owner.is_none() and not self.in_core(item) and folds_to_core(function.label.name.text.as_str(), scalars_only: true) {
+        self.report(item, token: function.label.name.token, code: diagnostic::Code.NameCoreRedefined)
+    }
+    self.check_generic_names(item, generics: function.head.generics.view())
+    self.check_params(item, params: function.head.params.view())
+    let SigKind.Fn(fn_sig) = sig.kind else {
+        return
+    }
+    self.check_prefix(item, name: function.label.name, sig: fn_sig)
+    self.check_unused_generics(item, sig: fn_sig)
+    match self.fn_head_problem(fn_sig) {
+        Some(code) => {
+            var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+            match function.head.usage {
+                Some(usage) => {
+                    if code == diagnostic::Code.EffectForeignWait {
+                        mut fixes.push(self.fix_deleting(item, head: usage.token, last: usage.word.token))
+                    }
+                }
+                None => {}
+            }
+            self.report_fixed(item, construct: nir::Span.at(node.token), code, take fixes, offer: diagnostic::Offer.Each)
+        }
+        None => {
+            let bodiless = match function.body {
+                ast::FnBody.None => true
+                else => false
+            }
+            self.check_fails(item, sig: fn_sig, head: function.head, bodiless)
+        }
+    }
+    match function.label.owner {
+        Some(owner) => {
+            self.check_method_placement(item, owner)
+            self.check_implementing(item, sig: fn_sig)
+            if function.label.name.text.as_str() == "abandon" and not fn_sig.abandon_head() {
+                self.report(item, token: node.token, code: diagnostic::Code.DeferAbandonHead)
+            }
+        }
+        None => {}
+    }
+    if self.is_entry(item) or fn_sig.modifier == Some(ast::FnModifier.Interrupt) or fn_sig.modifier == Some(ast::FnModifier.Landing) {
+        self.check_stack_bound(item, limit_set: fn_sig.limit_set)
+    }
+    match function.body.as_part() {
+        ast::FnBody.Block(block) => self.check_thresholds(item, clauses: function.clauses.view(), body: Some(block))
+        else => self.check_thresholds(item, clauses: function.clauses.view(), body: None)
+    }
+    match modifier {
+        Some(ast::FnModifier.Validator) => self.check_validator(item, sig: fn_sig)
+        Some(ast::FnModifier.Landing) => {
+            self.check_landing(item, sig: fn_sig)
+            self.require(item, token: node.token, authority: workspace::Authority.Priv)
+        }
+        Some(ast::FnModifier.Foreign) => {
+            self.check_foreign(item, function, sig: fn_sig)
+            self.require(item, token: node.token, authority: workspace::Authority.Trusted)
+        }
+        else => {}
+    }
+    self.check_dma_completion(item, sig: fn_sig)
+} Checker.check_function
+
+/// The rules of a struct item's derives and names.
+fn Checker.check_struct_item(self, item: ty::ItemId, structure: ast::StructItem) {
+    self.check_type_item(item)
+    self.check_derived_collisions(item)
+    self.check_decoder_derive(item)
+    var generated = false
+    for entry in structure.derived {
+        if entry.text.as_str() == "Generate" {
+            generated = true
+            break
+        }
+    }
+    if generated and self.derive_problem(item, name: "Generate").is_none() {
+        self.check_generated(item)
+    }
+    self.check_type_name(item, name: structure.name)
+    self.check_generic_names(item, generics: structure.generics.view())
+    for field in structure.fields() {
+        self.check_case(item, name: field.name, case: Case.Snake)
+    }
+} Checker.check_struct_item
+
+/// The rules of an enum item's variants and names.
+fn Checker.check_enum_item(self, item: ty::ItemId, enumeration: ast::EnumItem) {
+    self.check_type_item(item)
+    self.check_from_variants(item)
+    self.check_derived_collisions(item)
+    self.check_decoder_derive(item)
+    self.check_type_name(item, name: enumeration.name)
+    self.check_generic_names(item, generics: enumeration.generics.view())
+    let alloc = self.alloc()
+    for variant in enumeration.variants {
+        self.check_case(item, name: variant.name, case: Case.Pascal)
+        let Some(payload) = variant.payload else {
+            continue
+        }
+        for field in payload {
+            let Some(written) = field.label else {
+                continue
+            }
+            let Some(label) = label_name(written, alloc) else {
+                continue
+            }
+            self.check_case(item, name: label, case: Case.Snake)
+        }
+    }
+} Checker.check_enum_item
+
+/// The rules of an interface item's names and method heads.
+fn Checker.check_interface_item(self, item: ty::ItemId, declared: ast::InterfaceItem, sig: Sig) {
+    self.check_type_name(item, name: declared.name)
+    self.check_generic_names(item, generics: declared.generics.view())
+    for method in declared.methods {
+        self.check_case(item, name: method.name, case: Case.Snake)
+        self.check_generic_names(item, generics: method.head.generics.view())
+        self.check_params(item, params: method.head.params.view())
+    }
+    match sig.kind {
+        SigKind.Interface(methods: methods) => {
+            for index in 0..<declared.methods.len() {
+                if index >= methods.len() {
+                    break
+                }
+                let method = declared.methods[index]
+                let method_sig = methods[index].sig
+                self.check_prefix(item, name: method.name, sig: method_sig)
+                self.check_unused_generics(item, sig: method_sig)
+                match self.fn_head_problem(method_sig) {
+                    Some(code) => self.report(item, token: method.token, code)
+                    None => self.check_fails(item, sig: method_sig, head: method.head, bodiless: method.body.is_none())
+                }
+                self.check_thresholds(item, clauses: method.clauses.view(), body: method.body)
+            }
+        }
+        else => {}
+    }
+    self.check_method_clauses(item, declared)
+} Checker.check_interface_item
+
+/// The rules of a layout item and its names.
+fn Checker.check_layout_item(self, item: ty::ItemId, layout_item: ast::LayoutItem) {
+    self.check_layout(item)
+    self.check_type_name(item, name: layout_item.name)
+    for field in layout_item.fields {
+        self.check_case(item, name: field.name, case: Case.Snake)
+    }
+    let Some(tags) = layout_item.tags else {
+        return
+    }
+    for tag in tags {
+        self.check_case(item, name: tag.name, case: Case.Pascal)
+    }
+} Checker.check_layout_item
+
+/// The rules of a const item's type and name.
+fn Checker.check_const_item(self, item: ty::ItemId, constant: ast::ConstItem, sig: Sig) {
+    match sig.kind {
+        SigKind.Const(ty: const_ty) => {
+            if not self.types().has_error(const_ty) and (not self.has(const_ty, property: Property.Inert) or self.has(const_ty, property: Property.Linear)) {
+                self.report(item, token: constant.name.token, code: diagnostic::Code.ItemConstType)
+            }
+        }
+        else => {}
+    }
+    self.check_case(item, name: constant.name, case: Case.Screaming)
+    if not self.in_core(item) and folds_to_core(constant.name.text.as_str(), scalars_only: true) {
+        self.report(item, token: constant.name.token, code: diagnostic::Code.NameCoreRedefined)
+    }
+} Checker.check_const_item
+
+/// The rules of an item's typed body: its flow, float use, limits, `expect` purity, decreases
+/// clauses and property test, the body kept for the digests.
+fn Checker.check_item_body(self, item: ty::ItemId) {
+    let Some(checked) = self.check_bodies(item) else {
+        return
+    }
+    let node = self.db().ast(item)
+    let typed = mem::Shared.of(take checked, alloc: self.alloc())
+    self.check_flow(item, body: typed, projection: is_proj_item(node))
+    match node.kind {
+        ast::ItemKind.Fn(_) or ast::ItemKind.Const(_) => self.check_float_use(item, body: typed.share())
+        else => {}
+    }
+    discard self.state.contents().bodies.insert(item, value: typed.share())
+    if node.kind.is_fn_with_body() {
+        self.check_limits(item, body: typed)
+    }
+    self.check_expect_purity(item, body: typed)
+    match node.kind {
+        ast::ItemKind.Fn(function) => self.check_decreases(item, function)
+        ast::ItemKind.Test(tested) => self.check_property_test(item, tested, body: typed.contents())
+        else => {}
+    }
+} Checker.check_item_body
+
+/// Whether an item is a `proj fn`.
+fn is_proj_item(node: ast::Item) -> bool {
+    let ast::ItemKind.Fn(function) = node.kind else {
+        return false
+    }
+    let Some(modifier) = function.modifier else {
+        return false
+    }
+    return modifier.kind == ast::FnModifier.Proj
+} is_proj_item
+
+/// The decreases clauses of a function: one is needed when it belongs to a cycle, and every
+/// other is unneeded, its fix deleting it.
+fn Checker.check_decreases(self, item: ty::ItemId, function: ast::FnItem) {
+    var needed: usize = 0
+    if self.in_cycle(item) {
+        needed = 1
+    }
+    var written: usize = 0
+    for clause in function.clauses {
+        let ast::ClauseKind.Decreases(measure) = clause.kind else {
+            continue
+        }
+        written += 1
+        if written <= needed {
+            continue
+        }
+        var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+        mut fixes.push(self.fix_deleting_lines(item, head: clause.token, last: measure.last))
+        self.report_fixed(item, construct: nir::Span(head: clause.token, last: measure.last), code: diagnostic::Code.ContractDecreasesUnneeded, take fixes, offer: diagnostic::Offer.Each)
+    }
+} Checker.check_decreases
+
+/// Whether an item belongs to `core`, which declares the core vocabulary.
+fn Checker.in_core(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    return db.package_of(item) == db.core()
+} Checker.in_core
+
+/// A type's name: PascalCase, and outside core no core vocabulary name.
+fn Checker.check_type_name(self, item: ty::ItemId, name: ast::Name) {
+    self.check_case(item, name, case: Case.Pascal)
+    if not self.in_core(item) and folds_to_core(name.text.as_str(), scalars_only: false) {
+        self.report(item, token: name.token, code: diagnostic::Code.NameCoreRedefined)
+    }
+} Checker.check_type_name
+
+/// The generic parameters an item or method declares: their names, the type of a const
+/// parameter and where a `where` clause stands.
+fn Checker.check_generic_names(self, item: ty::ItemId, generics: Slice[ast::GenericParam]) {
+    let alloc = self.alloc()
+    var seen = mem::List[text::String].empty(alloc)
+    for param in generics {
+        match const_type(param) {
+            Some(scalar) => {
+                if not (scalar.is_integer() or scalar == ty::Scalar.Bool) or param.bounds.len() > 1 {
+                    self.report(item, token: param.name.token, code: diagnostic::Code.GenericConstType)
+                }
+            }
+            None => {
+                if param.where_clause.is_some() {
+                    self.report(item, token: param.name.token, code: diagnostic::Code.GenericWhereMisplaced)
+                }
+            }
+        }
+        self.check_case(item, name: param.name, case: Case.Pascal)
+        if not self.in_core(item) and folds_to_core(param.name.text.as_str(), scalars_only: false) {
+            self.report(item, token: param.name.token, code: diagnostic::Code.NameCoreRedefined)
+        }
+        let folded = fold(param.name.text.as_str(), alloc)
+        if holds_text(seen.view(), text: folded.as_str()) {
+            self.report(item, token: param.name.token, code: diagnostic::Code.NameClash)
+        }
+        mut seen.push(take folded)
+    }
+} Checker.check_generic_names
+
+/// The items the interface parts of a `pub` or `pkg` item name are at least as visible: its
+/// generic bounds, head and owner type, field, payload, register and entry types. The paths are
+/// judged first, then the types, the last written first and each before the types it holds.
+fn Checker.check_interface_names(self, item: ty::ItemId) {
+    let db = self.db()
+    let node = db.ast(item)
+    let own = openness(node.visibility)
+    if own == 0 {
+        return
+    }
+    let module = db.module_of(item)
+    match node.kind {
+        ast::ItemKind.Fn(function) => {
+            match function.label.owner {
+                Some(owner) => self.check_named_visible(item, module, path: owner, required: own)
+                None => {}
+            }
+            self.check_bound_paths(item, module, generics: function.head.generics.view(), own)
+            self.check_bound_args(item, module, generics: function.head.generics.view(), own)
+            self.check_head_types(item, module, head: function.head, own)
+        }
+        ast::ItemKind.Struct(structure) => {
+            self.check_bound_paths(item, module, generics: structure.generics.view(), own)
+            self.check_bound_args(item, module, generics: structure.generics.view(), own)
+            var index = structure.members.len()
+            while index > 0 {
+                index -= 1
+                let ast::StructMember.Field(field) = structure.members[index] else {
+                    continue
+                }
+                var required = openness(field.visibility)
+                if own < required {
+                    required = own
+                }
+                self.check_type_visible(item, module, ty: field.ty, required)
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            self.check_bound_paths(item, module, generics: enumeration.generics.view(), own)
+            self.check_bound_args(item, module, generics: enumeration.generics.view(), own)
+            var index = enumeration.variants.len()
+            while index > 0 {
+                index -= 1
+                let Some(payload) = enumeration.variants[index].payload else {
+                    continue
+                }
+                var at = payload.len()
+                while at > 0 {
+                    at -= 1
+                    self.check_type_visible(item, module, ty: payload[at].ty, required: own)
+                }
+            }
+        }
+        ast::ItemKind.Interface(declared) => self.check_interface_types(item, module, declared, own)
+        else => self.check_value_types_visible(item, module, node, own)
+    }
+} Checker.check_interface_names
+
+/// The interface parts of an interface item: its and its methods' bounds, then its methods'
+/// head types.
+fn Checker.check_interface_types(self, item: ty::ItemId, module: ty::ModuleId, declared: ast::InterfaceItem, own: u8) {
+    self.check_bound_paths(item, module, generics: declared.generics.view(), own)
+    for method in declared.methods {
+        self.check_bound_paths(item, module, generics: method.head.generics.view(), own)
+    }
+    var index = declared.methods.len()
+    while index > 0 {
+        index -= 1
+        self.check_bound_args(item, module, generics: declared.methods[index].head.generics.view(), own)
+    }
+    self.check_bound_args(item, module, generics: declared.generics.view(), own)
+    index = declared.methods.len()
+    while index > 0 {
+        index -= 1
+        self.check_head_types(item, module, head: declared.methods[index].head, own)
+    }
+} Checker.check_interface_types
+
+/// The interface types of a layout, registers, const or registry item.
+fn Checker.check_value_types_visible(self, item: ty::ItemId, module: ty::ModuleId, node: ast::Item, own: u8) {
+    match node.kind {
+        ast::ItemKind.Layout(layout_item) => {
+            var index = layout_item.fields.len()
+            while index > 0 {
+                index -= 1
+                match layout_item.fields[index].kind {
+                    ast::LayoutFieldKind.Typed(ty: field_ty, at: _) => self.check_type_visible(item, module, ty: field_ty, required: own)
+                    else => {}
+                }
+            }
+        }
+        ast::ItemKind.Registers(register_block) => {
+            var index = register_block.members.len()
+            while index > 0 {
+                index -= 1
+                self.check_type_visible(item, module, ty: register_block.members[index].ty, required: own)
+            }
+        }
+        ast::ItemKind.Const(constant) => {
+            match constant.ty {
+                Some(const_ty) => self.check_type_visible(item, module, ty: const_ty, required: own)
+                None => {}
+            }
+        }
+        ast::ItemKind.Registry(declared_registry) => self.check_type_visible(item, module, ty: declared_registry.entry, required: own)
+        else => {}
+    }
+} Checker.check_value_types_visible
+
+/// Reports a path of an item's interface that names an item less visible than `required`.
+fn Checker.check_named_visible(self, item: ty::ItemId, module: ty::ModuleId, path: ast::Path, required: u8) {
+    let db = self.db()
+    let Ok(Named.Item(named_item)) = db.resolve(module, path) else {
+        return
+    }
+    if openness(db.ast(named_item).visibility) < required {
+        self.report(item, token: path.token(), code: diagnostic::Code.NamePrivateInInterface)
+    }
+} Checker.check_named_visible
+
+/// The paths of the bounds of generic parameters, in order.
+fn Checker.check_bound_paths(self, item: ty::ItemId, module: ty::ModuleId, generics: Slice[ast::GenericParam], own: u8) {
+    for param in generics {
+        for bound in param.bounds {
+            self.check_named_visible(item, module, path: bound.path, required: own)
+        }
+    }
+} Checker.check_bound_paths
+
+/// The types the bounds of generic parameters write as arguments, the last written first.
+fn Checker.check_bound_args(self, item: ty::ItemId, module: ty::ModuleId, generics: Slice[ast::GenericParam], own: u8) {
+    var index = generics.len()
+    while index > 0 {
+        index -= 1
+        let bounds = generics[index].bounds
+        var at = bounds.len()
+        while at > 0 {
+            at -= 1
+            let Some(args) = bounds[at].args else {
+                continue
+            }
+            self.check_arg_types(item, module, args: args.view(), required: own)
+        }
+    }
+} Checker.check_bound_args
+
+/// The type arguments of a list, the last written first.
+fn Checker.check_arg_types(self, item: ty::ItemId, module: ty::ModuleId, args: Slice[ast::GenericArg], required: u8) {
+    var index = args.len()
+    while index > 0 {
+        index -= 1
+        match args[index] {
+            ast::GenericArg.Type(arg_ty) => self.check_type_visible(item, module, ty: arg_ty, required)
+            else => {}
+        }
+    }
+} Checker.check_arg_types
+
+/// The parameter, result and failure types a head writes, the last written first.
+fn Checker.check_head_types(self, item: ty::ItemId, module: ty::ModuleId, head: ast::Head, own: u8) {
+    match head.failure {
+        Some(failure) => self.check_type_visible(item, module, ty: failure, required: own)
+        None => {}
+    }
+    match head.result {
+        Some(result) => self.check_type_visible(item, module, ty: result, required: own)
+        None => {}
+    }
+    var index = head.params.len()
+    while index > 0 {
+        index -= 1
+        match head.params[index].kind {
+            ast::ParamKind.Named(name: _, ty: param_ty) => self.check_type_visible(item, module, ty: param_ty, required: own)
+            ast::ParamKind.SelfValue => {}
+        }
+    }
+} Checker.check_head_types
+
+/// A type of an item's interface: its path, then the types it holds, the last written first.
+fn Checker.check_type_visible(self, item: ty::ItemId, module: ty::ModuleId, ty: ast::TypeExpr, required: u8) {
+    if required == 0 {
+        return
+    }
+    match ty.kind {
+        ast::TypeKind.Path(path: path, args: args) => {
+            self.check_named_visible(item, module, path, required)
+            match args {
+                Some(listed) => self.check_arg_types(item, module, args: listed.view(), required)
+                None => {}
+            }
+        }
+        ast::TypeKind.Fn(boxed) => {
+            let fn_type = boxed.contents()
+            match fn_type.failure {
+                Some(failure) => self.check_type_visible(item, module, ty: failure, required)
+                None => {}
+            }
+            match fn_type.result {
+                Some(result) => self.check_type_visible(item, module, ty: result, required)
+                None => {}
+            }
+            var index = fn_type.params.len()
+            while index > 0 {
+                index -= 1
+                self.check_type_visible(item, module, ty: fn_type.params[index].ty, required)
+            }
+        }
+    }
+} Checker.check_type_visible
+
+/// A function named `Type.name`: `Type` is declared in its module, the scalars and `Unit` in
+/// the root module of core, or an impl line of its module targets it with an interface
+/// declaring `name`.
+fn Checker.check_method_placement(self, item: ty::ItemId, owner: ast::Path) {
+    let db = self.db()
+    let module = db.module_of(item)
+    match db.resolve(module, path: owner) {
+        Err(error) => {
+            match error.code {
+                Some(code) => self.report_problem(item, token: error.token, code)
+                None => {}
+            }
+            return
+        }
+        Ok(_) => {}
+    }
+    let declared = match db.owner_key(module, owner) {
+        Some(key) => self.declares_type(module, key)
+        None => false
+    }
+    let implemented = self.implemented_lines(item).len() > 0
+    if not declared and not implemented {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.ItemMethodMisplaced)
+    }
+} Checker.check_method_placement
+
+/// A head's `fails` clause names a failure type, and beside waiting a cancellable one; a body
+/// judges the latter by its effects, so only a head without one is judged here.
+fn Checker.check_fails(self, item: ty::ItemId, sig: FnSig, head: ast::Head, bodiless: bool) {
+    match sig.failure {
+        Some(failure) => {
+            match head.failure {
+                Some(written) => {
+                    if not self.is_failure_type(failure) {
+                        self.report(item, token: written.token, code: diagnostic::Code.ErrorFailureType)
+                        return
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    if not bodiless or not self.cancel_unmapped(sig.fn_ty(self.alloc()), may_fail: false) {
+        return
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    match sig.failure {
+        None => {
+            let after = match head.result {
+                Some(result) => result.last
+                None => head.close
+            }
+            mut fixes.push(self.fix_appending(item, after, text: " fails task::Cancelled"))
+        }
+        Some(failure) => {
+            match self.cancelled_variant_fix(failure) {
+                Some(fix) => mut fixes.push(take fix)
+                None => {}
+            }
+        }
+    }
+    self.report_fixed(item, construct: nir::Span.at(head.token), code: diagnostic::Code.ErrorCancelUnmapped, take fixes, offer: diagnostic::Offer.Each)
+} Checker.check_fails
+
+/// The `limits stack N` an entry of a boot, task, interrupt or landing context states when
+/// checked for a machine target, reported on the entry's head.
+fn Checker.check_stack_bound(self, item: ty::ItemId, limit_set: ty::LimitSet) {
+    let db = self.db()
+    let target = db.target
+    if target.is_machine() and limit_set.stack.is_none() {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.SuspendStackMissing)
+    }
+} Checker.check_stack_bound
+
+/// Each generic parameter of a function's or method's own list occurs in a parameter's type.
+fn Checker.check_unused_generics(self, item: ty::ItemId, sig: FnSig) {
+    let types = self.types()
+    var unused = false
+    for def in sig.own_generics() {
+        let wanted = def.param
+        var used = false
+        for param in sig.params {
+            if types.mentions(param.ty, params: fn(mentioned: ty::Param) => mentioned == wanted) {
+                used = true
+                break
+            }
+        }
+        if not used {
+            unused = true
+            break
+        }
+    }
+    if unused {
+        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.GenericParameterUnused)
+    }
+} Checker.check_unused_generics
+
+/// The parameters of a head: their names' convention and distinctness.
+fn Checker.check_params(self, item: ty::ItemId, params: Slice[ast::Param]) {
+    let alloc = self.alloc()
+    var seen = mem::List[text::String].empty(alloc)
+    var folded = mem::List[text::String].empty(alloc)
+    for param in params {
+        let ast::ParamKind.Named(name: name, ty: _) = param.kind else {
+            continue
+        }
+        self.check_case(item, name, case: Case.Snake)
+        let written = name.text.as_str()
+        let folded_name = fold(written, alloc)
+        if holds_text(seen.view(), text: written) {
+            self.report(item, token: name.token, code: diagnostic::Code.ItemDuplicate)
+        } else if holds_text(folded.view(), text: folded_name.as_str()) {
+            self.report(item, token: name.token, code: diagnostic::Code.NameClash)
+        }
+        mut seen.push(text::String.of(written, alloc))
+        mut folded.push(take folded_name)
+    }
+} Checker.check_params
+
+/// The head shape a function's or interface method's name prefix promises.
+fn Checker.check_prefix(self, item: ty::ItemId, name: ast::Name, sig: FnSig) {
+    let types = self.types()
+    var first_mode: Option[ast::Mode] = None
+    if sig.params.len() > 0 and sig.params[0].is_self {
+        first_mode = Some(sig.params[0].mode)
+    }
+    let option = self.db().core_item("Option")
+    let written = name.text.as_str()
+    var broken = false
+    for prefix in Words(list: NAME_PREFIXES, at: 0) {
+        if not written.starts_with(prefix) or written.byte_len() == prefix.byte_len() {
+            continue
+        }
+        let holds = match prefix {
+            "try_" => sig.failure.is_some()
+            "checked_" => match types.kind(sig.result) {
+                ty::TyKind.Item(item: result_item, args: _) => Some(result_item) == option
+                else => false
+            }
+            "is_" => sig.result == ty::Ty.scalar(ty::Scalar.Bool)
+            "to_" => first_mode == Some(ast::Mode.Read) and not sig.is_proj() and not self.is_view(sig.result, params: false)
+            "as_" => sig.is_proj()
+            "into_" => first_mode == Some(ast::Mode.Take)
+            else => first_mode == Some(ast::Mode.Mut)
+        }
+        if not holds {
+            broken = true
+            break
+        }
+    }
+    if broken and not types.has_error(sig.result) {
+        self.report(item, token: name.token, code: diagnostic::Code.NamePrefixMismatch)
+    }
+} Checker.check_prefix
+
+/// Whether a type is a view; a type parameter counts as none.
+fn Checker.is_view(self, ty: ty::Ty, params: bool) -> bool {
+    let db = self.db()
+    return match self.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => is_listed("core::Slice core::SliceMut core::Str", word: db.canonical(item).as_str()) or db.ast(item).has_modifier(ast::TypeModifier.View)
+        ty::TyKind.Dyn(_) => true
+        else => false
+    }
+} Checker.is_view
+
+/// Whether a head is an abandon method's: `fn T.abandon(take self)` without modifier, own
+/// generic parameters, other parameters, result, `fails` or `uses wait`.
+fn FnSig.abandon_head(self) -> bool {
+    let receiver = self.params.len() == 1 and self.params[0].is_self and self.params[0].mode == ast::Mode.Take
+    return receiver and self.modifier.is_none() and self.own_generics().len() == 0 and self.result == ty::Ty.unit() and self.failure.is_none() and not self.wait
+} FnSig.abandon_head
+
+/// The name an item declares, a function named after a type giving its member name.
+fn declared_name(item: ast::Item, alloc: mem::Alloc) -> Option[ast::Name] {
+    let name = match item.kind {
+        ast::ItemKind.Fn(function) => function.label.name
+        ast::ItemKind.Struct(declared) => declared.name
+        ast::ItemKind.Enum(declared) => declared.name
+        ast::ItemKind.Interface(declared) => declared.name
+        ast::ItemKind.Layout(declared) => declared.name
+        ast::ItemKind.Registers(declared) => declared.name
+        ast::ItemKind.Const(declared) => declared.name
+        ast::ItemKind.Registry(declared) => declared.name
+        ast::ItemKind.Contribute(declared) => declared.name
+        ast::ItemKind.Test(declared) => declared.name
+        else => return None
+    }
+    return Some(ast::Name(text: text::String.of(name.text.as_str(), alloc), token: name.token))
+} declared_name
+
+/// The label of a payload field, when it is one identifier.
+fn label_name(label: ast::TypeExpr, alloc: mem::Alloc) -> Option[ast::Name] {
+    return match first label.kind {
+        ast::TypeKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(ast::Name(text: text::String.of(path.segments[0].text.as_str(), alloc), token: path.segments[0].token))
+        else => None
+    }
+} label_name
+
+/// The generic parameters an item declares.
+proj fn Checker.generic_params(self, item: ty::ItemId) -> Option[Slice[ast::GenericParam]] {
+    return match self.db().ast(item).kind {
+        ast::ItemKind.Fn(function) => Some(function.head.generics.view())
+        ast::ItemKind.Struct(structure) => Some(structure.generics.view())
+        ast::ItemKind.Enum(enumeration) => Some(enumeration.generics.view())
+        ast::ItemKind.Interface(declared) => Some(declared.generics.view())
+        else => None
+    }
+} Checker.generic_params

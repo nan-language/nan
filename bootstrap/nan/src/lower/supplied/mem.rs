@@ -2,6 +2,7 @@
 //! types holding memory, and the conformances the toolchain supplies to sequences and
 //! collections.
 
+mod index;
 pub mod lists;
 pub mod maps;
 mod segments;
@@ -37,7 +38,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "mem::BoundedCursor" => lists::bounded_next(lo, fx, supply),
         "mem::Map" => maps::map(lo, fx, supply, Order::Sorted),
-        "mem::HashMap" => maps::map(lo, fx, supply, Order::Scanned),
+        "mem::HashMap" => maps::map(lo, fx, supply, Order::Hashed),
         "mem::Set" => maps::set(lo, fx, supply),
         "mem::Entry" => maps::entry(lo, fx, supply),
         "mem::MapCursor" | "mem::MapCursorMut" | "mem::HashMapCursor" | "mem::HashMapCursorMut" => {
@@ -111,6 +112,9 @@ pub fn transfer(
         "mem::Map" | "mem::HashMap" => {
             let entry = entry(lo);
             vector::transfer(lo, fx, address, &entry, None, lift, owner);
+            if path == "mem::HashMap" {
+                maps::lift_index(lo, fx, address, lift);
+            }
         }
         "mem::ListCursor" | "mem::SetIntoCursor" => {
             let position = fx.load(PTR, address, 32);
@@ -152,6 +156,8 @@ pub fn transfer(
             let header = fx.load(PTR, address, 0);
             let entry = entry(lo);
             segments::transfer(lo, fx, header, &entry, lift, owner);
+            let record = fx.offset(header, segments::INDEX);
+            index::lift(lo, fx, record, lift);
         }
         "mem::Box" => {
             let contents = fx.load(PTR, address, 0);
@@ -225,6 +231,9 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, ty: &Ty, address: Val
         }
         "mem::Bytes" => vector::free_storage(lo, fx, address),
         "mem::Map" | "mem::HashMap" => {
+            if path == "mem::HashMap" {
+                maps::free_index(lo, fx, address);
+            }
             let entry = lo.std_ty("mem", "KeyValue", vec![arg(0), arg(1)]);
             let zero = fx.ptr(0);
             vector::release(lo, fx, address, &entry, zero);
@@ -262,6 +271,8 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, ty: &Ty, address: Val
         }
         "mem::OnceMap" => {
             let header = fx.load(PTR, address, 0);
+            let record = fx.offset(header, segments::INDEX);
+            index::free(lo, fx, record);
             let entry = lo.std_ty("mem", "KeyValue", vec![arg(0), arg(1)]);
             segments::release(lo, fx, header, &entry);
         }

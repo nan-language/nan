@@ -111,14 +111,8 @@ impl Checker<'_> {
                 let Some((dir, _)) = file.path.rsplit_once('/') else {
                     continue;
                 };
-                for syntax in &file.syntax.items {
-                    let Some(tree) = &syntax.tree else {
-                        continue;
-                    };
-                    let Some(item) = ast::lower(&file.syntax, tree) else {
-                        continue;
-                    };
-                    if let Some(identity) = exported_identity(&item) {
+                for item in file.lowered().iter().flatten() {
+                    if let Some(identity) = exported_identity(item) {
                         let line = file.syntax.tokens[item.token as usize].line;
                         exported
                             .entry(identity)

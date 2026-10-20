@@ -123,14 +123,13 @@ impl Checker<'_> {
     /// naming nothing; an item of a carried package adds only itself.
     pub fn test_reach(&self, item: ItemId) -> BTreeSet<ItemId> {
         self.db.about(None, || {
-            let functions = self.member_functions();
             let mut reach: BTreeSet<ItemId> = BTreeSet::from([item]);
-            let mut pending: Vec<ItemId> = self.names(item, &functions).into_iter().collect();
+            let mut pending: Vec<ItemId> = self.names(item).iter().copied().collect();
             while let Some(next) = pending.pop() {
                 if !reach.insert(next) || self.db.is_carried(next) {
                     continue;
                 }
-                pending.extend(self.names(next, &functions));
+                pending.extend(self.names(next).iter().copied());
                 match self.db.declaration(next).kind {
                     ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Layout(_) => {
                         pending.extend(self.impl_lines(TypeKey::Item(next)));

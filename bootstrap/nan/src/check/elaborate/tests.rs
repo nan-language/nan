@@ -111,6 +111,42 @@ fn temporaries_of_a_condition_or_branch_end_with_it() {
 }
 
 #[test]
+fn some_of_a_part_refers_to_the_part_and_releases_nothing() {
+    let text = unit_text(
+        "pub closed struct Frame {\n    pub seq: u32\n    pub payload: mem::List[u8]\n} Frame\n\npub fn seq_or_zero(frame: Option[Frame]) -> u32 {\n    let Some(found) = frame else {\n        return 0\n    }\n    return found.seq\n} seq_or_zero\n\npub fn first_seq(frames: mem::List[Frame]) -> u32 {\n    if frames.len() == 0 {\n        return 0\n    }\n    return seq_or_zero(Some(frames.at(0)))\n} first_seq\n",
+        "example::first_seq",
+    );
+    assert_eq!(
+        text,
+        "unit example::first_seq\n\nfn body (read %0: ref mem::List[example::Frame]) -> u32\n^0:\n    %1 = call mem::List.len[example::Frame](read %0)\n    %2 = eq %1, 0usize\n    branch %2, ^1, ^2\n^1:\n    return 0u32\n^2:\n    %3 = call mem::List.at[example::Frame](read %0, 0usize)\n    %4 = variant Option.Some(read %3)\n    %5 = call example::seq_or_zero(%4)\n    return %5\n"
+    );
+}
+
+#[test]
+fn a_discarded_part_stays_with_its_owner() {
+    let text = unit_text(
+        "pub fn first_len(lists: mem::List[mem::List[u8]]) -> usize {\n    if lists.len() == 0 {\n        return 0\n    }\n    discard lists.at(0)\n    return lists.len()\n} first_len\n",
+        "example::first_len",
+    );
+    assert_eq!(
+        text,
+        "unit example::first_len\n\nfn body (read %0: ref mem::List[mem::List[u8]]) -> usize\n^0:\n    %1 = call mem::List.len[mem::List[u8]](read %0)\n    %2 = eq %1, 0usize\n    branch %2, ^1, ^2\n^1:\n    return 0usize\n^2:\n    %3 = call mem::List.at[mem::List[u8]](read %0, 0usize)\n    %4 = call mem::List.len[mem::List[u8]](read %0)\n    return %4\n"
+    );
+}
+
+#[test]
+fn an_expression_body_gives_a_part_in_place() {
+    let text = unit_text(
+        "pub closed struct Frame {\n    pub seq: u32\n    pub payload: mem::List[u8]\n} Frame\n\n/// The frame itself.\npub proj fn Frame.as_part(self) -> Frame = self\n",
+        "example::Frame.as_part",
+    );
+    assert_eq!(
+        text,
+        "unit example::Frame.as_part\n\nfn body (read %0: ref example::Frame) -> example::Frame\n^0:\n    return take %0\n"
+    );
+}
+
+#[test]
 fn an_exit_releases_the_temporaries_of_the_statements_it_leaves() {
     let source = format!(
         "{LABELS}pub fn make(size: u32) -> Token = Token(size: size)\n\npub fn early(flag: bool) -> u32 {{\n    match Label.Short(make(3)) {{\n        Label.Short(token) => {{\n            if flag {{\n                return make(token.size).size\n            }}\n        }}\n        else => {{}}\n    }}\n    return 0\n}} early\n"
@@ -317,5 +353,17 @@ fn a_call_failing_with_never_has_no_failure_path() {
     assert_eq!(
         unit_text(source, "example::doubled"),
         "unit example::doubled\n\nfn body (read %0: u32) -> u32\n^0:\n    %1 = closure 0()\n    %2 = call example::checked[Never](%0, %1)\n    return %2\n\nfn closure 0 (read %0: u32) -> u32\n^0:\n    %1 = mul %0, 2u32\n    return %1\n"
+    );
+}
+
+#[test]
+fn an_invariant_of_a_loop_in_a_nested_block_is_numbered() {
+    let text = unit_text(
+        "pub fn bounded(limit: u32) -> u32 {\n    var inner: u32 = 0\n    if limit < 5 {\n        while inner < limit {\n            invariant inner <= limit\n            inner += 1\n        }\n    }\n    return inner\n} bounded\n",
+        "example::bounded",
+    );
+    assert_eq!(
+        text,
+        "unit example::bounded\n\nfn body (read %0: u32) -> u32\n^0:\n    %1 = slot inner: u32\n    init %1, 0u32\n    %2 = lt %0, 5u32\n    branch %2, ^1, ^5\n^1:\n    jump ^2\n^2:\n    %3 = load %1\n    %4 = lt %3, %0\n    branch %4, ^3, ^4\n^3:\n    %5 = load %1\n    %6 = call example::bounded invariant 0(%5, %0)\n    check invariant, %6\n    %7 = load %1\n    %8 = add %7, 1u32\n    assign %1, %8\n    jump ^2\n^4:\n    jump ^5\n^5:\n    %9 = load %1\n    return %9\n\nfn invariant 0 (read %0: u32, read %1: u32) -> bool\n^0:\n    %2 = le %0, %1\n    return %2\n"
     );
 }

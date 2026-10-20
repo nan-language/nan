@@ -358,6 +358,10 @@ pub mod state {
     pub const MEMORY_MAP: u64 = 304;
     pub const MAP_SIZE: u64 = 312;
     pub const MAP_STRIDE: u64 = 320;
+    /// The single chunks returned to the platform's supply and kept mapped for the next draws,
+    /// zeroed, linked through their first words, and their count.
+    pub const KEPT_CHUNKS: u64 = 328;
+    pub const KEPT_COUNT: u64 = 336;
     pub const SIZE: u64 = 384;
 }
 

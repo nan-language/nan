@@ -172,6 +172,172 @@ fn m6() {
     verified(&copied("m6"));
 }
 
+/// The NaN front end's files generated from the repository: the grammar text its parser's tables
+/// are built from, and the std sources it carries.
+const EBNF_FILE: &str = "toolchain/nan/syntax/ebnf.nan";
+const STD_FILE: &str = "toolchain/nan/stdlib/sources.nan";
+
+/// A line of a text run indented once: `\\` and the line, each backslash doubled.
+fn run_line(line: &str) -> String {
+    format!("    \\\\{}\n", line.replace('\\', "\\\\"))
+}
+
+/// The lines of a text run holding `text`, which ends with a line feed.
+fn text_run(text: &str) -> String {
+    let mut run: String = text.lines().map(run_line).collect();
+    run.push_str("    \\\\\n");
+    run
+}
+
+/// The source of the front end's grammar text: the lines of the ebnf blocks of the grammar
+/// chapter, each ending with a line feed.
+fn ebnf_source(repository: &Path) -> String {
+    let chapter =
+        fs::read_to_string(repository.join("docs/spec/41-grammar.md")).expect("the grammar");
+    let mut grammar = String::new();
+    let mut inside = false;
+    for line in chapter.lines() {
+        if line == "```ebnf" {
+            inside = true;
+        } else if line.starts_with("```") {
+            inside = false;
+        } else if inside {
+            grammar.push_str(line);
+            grammar.push('\n');
+        }
+    }
+    format!(
+        "//! The ebnf blocks of the published grammar, which the parser's tables are built from.\n\n\
+         /// The lines of the ebnf blocks of the grammar chapter of the specification, in order, each\n\
+         /// ending with a line feed.\n\
+         pkg const EBNF: Str =\n{}",
+        text_run(&grammar)
+    )
+}
+
+/// The std source files, by path relative to the std directory in byte order, skipping names
+/// starting with `.`.
+fn std_files(dir: &Path, prefix: &str, files: &mut Vec<(String, String)>) {
+    for entry in fs::read_dir(dir).expect("a std directory") {
+        let entry = entry.expect("a std directory entry");
+        let name = entry.file_name().into_string().expect("a UTF-8 file name");
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = format!("{prefix}{name}");
+        match entry.file_type().expect("a file type").is_dir() {
+            true => std_files(&entry.path(), &format!("{path}/"), files),
+            false => files.push((
+                path,
+                fs::read_to_string(entry.path()).expect("a UTF-8 std file"),
+            )),
+        }
+    }
+}
+
+/// The words of a std file's path, without its extension.
+fn path_words(path: &str) -> Vec<String> {
+    path.trim_end_matches(".nan")
+        .split(['/', '_'])
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The end of a function head whose body holds `lines` lines: a waiver and the opener on its own
+/// line beyond the length threshold, else the opener on the head line.
+fn opener(lines: usize) -> &'static str {
+    if lines > 80 {
+        "\n    waive length \"one line per std file\"\n{\n"
+    } else {
+        " {\n"
+    }
+}
+
+/// The source of the front end's std sources: an enum of the files with their paths and texts.
+fn std_source(repository: &Path) -> String {
+    let mut files = Vec::new();
+    std_files(&repository.join("std"), "", &mut files);
+    files.sort();
+    let variant = |path: &str| -> String {
+        path_words(path)
+            .iter()
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_ascii_uppercase().to_string() + chars.as_str()
+                })
+            })
+            .collect()
+    };
+    let constant = |path: &str| format!("TEXT_{}", path_words(path).join("_").to_uppercase());
+    let mut out = String::from(
+        "//! The std source files the toolchain carries, generated from the std directory.\n\n\
+         /// A std source file the toolchain carries.\n\
+         pkg enum StdFile derives Copy, Eq {\n",
+    );
+    for (path, _) in &files {
+        out.push_str(&format!("    {}\n", variant(path)));
+    }
+    out.push_str("} StdFile\n\n/// Every std source file, in byte order of path.\n");
+    out.push_str("pkg fn StdFile.all(alloc: mem::Alloc) -> mem::List[StdFile]");
+    out.push_str(opener(files.len() + 2));
+    out.push_str("    var files = mem::List[StdFile].empty(alloc)\n");
+    for (path, _) in &files {
+        out.push_str(&format!("    mut files.push(StdFile.{})\n", variant(path)));
+    }
+    out.push_str("    return files\n} StdFile.all\n\n");
+    for (name, doc, value) in [
+        (
+            "path",
+            "The file's path relative to the std directory.",
+            true,
+        ),
+        ("text", "The file's contents.", false),
+    ] {
+        out.push_str(&format!(
+            "/// {doc}\npkg proj fn StdFile.{name}(self) -> Str"
+        ));
+        out.push_str(opener(files.len() + 2));
+        out.push_str("    return match self {\n");
+        for (path, _) in &files {
+            let held = match value {
+                true => format!("\"{path}\""),
+                false => constant(path),
+            };
+            out.push_str(&format!("        StdFile.{} => {held}\n", variant(path)));
+        }
+        out.push_str(&format!("    }}\n}} StdFile.{name}\n\n"));
+    }
+    let texts: Vec<String> = files
+        .iter()
+        .map(|(path, text)| format!("const {}: Str =\n{}", constant(path), text_run(text)))
+        .collect();
+    out.push_str(&texts.join("\n"));
+    out
+}
+
+/// The front end carries the current grammar text and std sources. With `NAN_BLESS` set, the
+/// test writes them instead.
+#[test]
+fn m5_embedded_sources() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (file, source) in [
+        (EBNF_FILE, ebnf_source(&repository)),
+        (STD_FILE, std_source(&repository)),
+    ] {
+        let path = repository.join(file);
+        if std::env::var_os("NAN_BLESS").is_some() {
+            fs::write(&path, source).expect("the generated file written");
+            continue;
+        }
+        let held = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            held == source,
+            "{file} is not current; run this test with NAN_BLESS=1 to regenerate it"
+        );
+    }
+}
+
 /// How long a machine program may run before its serial output shows its behaviour.
 const BEHAVIOUR_WAIT: Duration = Duration::from_secs(60);
 

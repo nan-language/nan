@@ -224,7 +224,11 @@ impl Elab<'_, '_> {
             TKind::Call(call) | TKind::Index(call) => {
                 self.call(call, &expr.ty, Self::spanning(expr))?
             }
-            TKind::Construct { variant, values } => self.construct(expr, *variant, values)?,
+            TKind::Construct {
+                variant,
+                values,
+                wrapped,
+            } => self.construct(expr, *variant, values, *wrapped)?,
             TKind::Unary { op, operand } => self.unary(expr, *op, operand)?,
             TKind::Binary { op, left, right } => self.binary(expr, *op, left, right)?,
             TKind::If {
@@ -295,9 +299,11 @@ impl Elab<'_, '_> {
             }
             match (&stmt.kind, yields && index == last) {
                 (TStmtKind::Expr(value), true) => {
-                    out = match self.operand(value)? {
-                        Some(operand) => Out::Operand(operand),
-                        None => Out::Never,
+                    out = match self.expr(value)? {
+                        Out::Place(place) if !self.borrowed_part(&place, ty) => {
+                            Out::Operand(self.take_place(place, ty, Self::spanning(value)))
+                        }
+                        other => other,
                     };
                 }
                 _ => self.stmt(stmt)?,
@@ -315,11 +321,13 @@ impl Elab<'_, '_> {
         expr: &TExpr,
         variant: Option<usize>,
         values: &[(String, TExpr)],
+        wrapped: bool,
     ) -> Elaborated<Out> {
         let span = Self::spanning(expr);
         let mut operands: Vec<(String, Operand)> = Vec::new();
+        let mode = if wrapped { Mode::Read } else { Mode::Take };
         for (name, value) in values {
-            let Some(operand) = self.arg(value, Mode::Take)? else {
+            let Some(operand) = self.arg(value, mode)? else {
                 return Ok(Out::Never);
             };
             operands.push((name.clone(), operand));
@@ -382,6 +390,9 @@ impl Elab<'_, '_> {
             }
         };
         let value = self.emit_value(op, NTy::Owned(expr.ty.clone()), span);
+        if wrapped {
+            self.wrapped.insert(value);
+        }
         if variant.is_none() {
             self.predicate_checks(Place::of(value), &expr.ty, span)?;
         }
@@ -863,7 +874,7 @@ impl Elab<'_, '_> {
     }
 
     /// The operand passing an elaborated argument expression in a mode.
-    fn argument(&mut self, out: Out, expr: &TExpr, mode: Mode) -> Option<Operand> {
+    pub fn argument(&mut self, out: Out, expr: &TExpr, mode: Mode) -> Option<Operand> {
         let span = Self::spanning(expr);
         match (out, mode) {
             (Out::Never, _) => None,

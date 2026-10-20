@@ -1,0 +1,205 @@
+//! Interpreter memory: the extents of a run, each holding a value at an address, and the interpreter layout that sizes them.
+
+/// The address of a run's first extent.
+const FIRST_ADDRESS: u64 = 0x1_0000_0000
+
+/// The granule extent addresses are multiples of, and the least gap after an extent.
+const GRANULE: u64 = 65_536
+
+struct Extent {
+    value: Val
+    writable: bool
+    live: bool
+    /// Whether it holds literal data or the data of a const, which a const's value may view.
+    data: bool
+    address: u64
+    size: u64
+} Extent
+
+struct Memory {
+    extents: mem::List[Extent]
+    /// The allocator the values it stores draw on.
+    allocator: mem::Alloc
+} Memory
+
+/// The size and alignment of a type in the interpreter layout.
+struct Footprint derives Copy {
+    size: u64
+    align: u64
+} Footprint
+
+/// A memory without extents.
+fn Memory.empty(alloc: mem::Alloc) -> Memory {
+    return Memory(extents: mem::List[Extent].empty(alloc), allocator: alloc)
+} Memory.empty
+
+/// A new live extent holding a value, at the next address past the last extent.
+fn Memory.alloc(mut self, take value: Val, writable: bool, size: u64) -> u32 {
+    return mut self.add(take value, writable, data: false, size)
+} Memory.alloc
+
+/// A new read-only extent of literal or const data.
+fn Memory.alloc_data(mut self, take value: Val, size: u64) -> u32 {
+    return mut self.add(take value, writable: false, data: true, size)
+} Memory.alloc_data
+
+fn Memory.add(mut self, take value: Val, writable: bool, data: bool, size: u64) -> u32 {
+    var address = FIRST_ADDRESS
+    let count = self.extents.len()
+    if count > 0 {
+        let last = self.extents[count - 1]
+        address = rounded_up(last.address + last.size + GRANULE, align: GRANULE)
+    }
+    mut self.extents.push(Extent(value: take value, writable: writable, live: true, data: data, address: address, size: size))
+    return u32.fit(self.extents.len() - 1)
+} Memory.add
+
+proj fn Memory.extent(self, id: u32) -> Extent {
+    return self.extents[usize.widen(id)]
+} Memory.extent
+
+fn Memory.kill(mut self, id: u32) {
+    var extent = mut self.extents.at_mut(usize.widen(id))
+    extent.live = false
+} Memory.kill
+
+/// The value at a place.
+proj fn Memory.get(self, loc: Loc) -> Val {
+    return self.extents[usize.widen(loc.extent)].value.at_path(loc.path.view())
+} Memory.get
+
+/// Stores a value at a place.
+fn Memory.set(mut self, loc: Loc, take stored: Val) {
+    let alloc = self.allocator
+    var extent = mut self.extents.at_mut(usize.widen(loc.extent))
+    if loc.path.len() == 0 {
+        extent.value = stored
+        return
+    }
+    let held = extent.value.copy(alloc)
+    extent.value = Val.Absent
+    extent.value = take held.replaced(loc.path.view(), take stored, alloc)
+} Memory.set
+
+/// The size and alignment of a type in the interpreter layout.
+fn Checker.interp_layout(self, ty: ty::Ty) -> Footprint {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => {
+            let size: u64 = match scalar {
+                ty::Scalar.Bool or ty::Scalar.Unsigned8 or ty::Scalar.Signed8 => 1
+                ty::Scalar.Unsigned16 or ty::Scalar.Signed16 => 2
+                ty::Scalar.Unsigned32 or ty::Scalar.Signed32 or ty::Scalar.Float32 or ty::Scalar.Char => 4
+                else => 8
+            }
+            return Footprint(size: size, align: size)
+        }
+        ty::TyKind.Unit or ty::TyKind.Never or ty::TyKind.Error or ty::TyKind.Registers(_) or ty::TyKind.Param(_) => return Footprint(size: 0, align: 1)
+        ty::TyKind.Fn(_) or ty::TyKind.Dyn(_) => return Footprint(size: 16, align: 8)
+        ty::TyKind.Item(item: item, args: args) => {
+            let path = self.db().canonical(item)
+            match path.as_str() {
+                "core::Slice" or "core::SliceMut" or "core::Str" => return Footprint(size: 16, align: 8)
+                "core::Array" => {
+                    let listed = types.arg_list(args)
+                    var count: u64 = 0
+                    if listed.len() > 1 {
+                        match listed[1] {
+                            ty::Arg.Const(ty::Const.Int(written)) => {
+                                count = written.low_bits()
+                            }
+                            else => {}
+                        }
+                    }
+                    let Some(element) = types.type_arg(ty, index: 0) else {
+                        return Footprint(size: 0, align: 1)
+                    }
+                    let placed = self.interp_layout(element)
+                    return Footprint(size: placed.size * count, align: placed.align)
+                }
+                else => {}
+            }
+            return self.item_layout(item, args)
+        }
+    }
+} Checker.interp_layout
+
+/// The interpreter layout of a struct, layout or enum with arguments; an empty one for any other
+/// item.
+fn Checker.item_layout(self, item: ty::ItemId, args: ty::Args) -> Footprint {
+    let types = self.types()
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(args), alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            var field_types = mem::List[ty::Ty].empty(alloc)
+            for field in fields {
+                mut field_types.push(subst.ty(types, ty: field.ty))
+            }
+            return self.placed_fields(0, align: 1, types: field_types.view())
+        }
+        SigKind.Enum(variants: variants) => {
+            var end: u64 = 4
+            var align: u64 = 4
+            for variant in variants {
+                var payload_types = mem::List[ty::Ty].empty(alloc)
+                match variant.payload {
+                    Payload.None => {}
+                    Payload.Single(single) => mut payload_types.push(subst.ty(types, ty: single))
+                    Payload.Labelled(labelled) => {
+                        for field in labelled {
+                            mut payload_types.push(subst.ty(types, ty: field.ty))
+                        }
+                    }
+                }
+                let placed = self.placed_fields(4, align: 4, types: payload_types.view())
+                if placed.size > end {
+                    end = placed.size
+                }
+                if placed.align > align {
+                    align = placed.align
+                }
+            }
+            return Footprint(size: rounded_up(end, align), align: align)
+        }
+        else => return Footprint(size: 0, align: 1)
+    }
+} Checker.item_layout
+
+/// A byte count rounded up to a multiple of a non-zero alignment.
+fn rounded_up(bytes: u64, align: u64) -> u64 {
+    return ceil_quotient(bytes, divisor: align) * align
+} rounded_up
+
+/// The quotient of a byte count by a non-zero divisor, rounded up.
+fn ceil_quotient(bytes: u64, divisor: u64) -> u64 {
+    var quotient = bytes / divisor
+    if bytes % divisor != 0 {
+        quotient += 1
+    }
+    return quotient
+} ceil_quotient
+
+/// The size and alignment of fields placed in order from `start`, each at the lowest offset
+/// that is a multiple of its alignment.
+fn Checker.placed_fields(self, start: u64, align: u64, types: Slice[ty::Ty]) -> Footprint {
+    var end = start
+    var widest = align
+    for ty in types {
+        let placed = self.interp_layout(ty)
+        var field_align = placed.align
+        if field_align < 1 {
+            field_align = 1
+        }
+        end = rounded_up(end, align: field_align) + placed.size
+        if placed.align > widest {
+            widest = placed.align
+        }
+    }
+    return Footprint(size: rounded_up(end, align: widest), align: widest)
+} Checker.placed_fields

@@ -1066,7 +1066,7 @@ fn unreference(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 /// Fails a post with `SendError.Closed`.
 fn fail_closed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let fails = supply.abi.fails.clone().expect("a post's failure type");
-    let value = lo.variant_value(fx, &fails, "Closed", &[], false);
+    let value = lo.variant_value(fx, &fails, "Closed", &[], None);
     let failure = supply.failure.expect("a failure address");
     lo.store_held(fx, failure, value, &fails);
     supply.fail(fx);

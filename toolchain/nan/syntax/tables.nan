@@ -1,0 +1,579 @@
+//! Reading the grammar notation of the ebnf blocks, and building the grammar's tables from it.
+
+const START_RULE: Str = "item"
+
+/// An atom of grammar notation.
+enum Notation {
+    Name(text::String)
+    Quoted(text::String)
+    Context(text::String)
+    CodePoints(low: u32, high: u32)
+    Group(mem::List[Seq])
+} Notation
+
+struct Elem {
+    atom: Notation
+    repeat: Repeat
+} Elem
+
+struct Seq {
+    elems: mem::List[Elem]
+    rejection: Option[text::String]
+} Seq
+
+/// A token of grammar notation; `DotDot` is the symbol `..`, `Sym` each other symbol.
+enum Tok {
+    Name(text::String)
+    Quoted(text::String)
+    Context(text::String)
+    CodePoint(u32)
+    Rejection(text::String)
+    Sym(char)
+    DotDot
+} Tok
+
+/// Builds the grammar's tables from the ebnf blocks, trapping when the grammar names a terminal,
+/// a rule or a rejection code the enums of the syntax layer lack, or the enums hold one the
+/// grammar does not.
+pkg fn Grammar.load(alloc: mem::Alloc) -> Grammar {
+    let rules = parse_grammar(EBNF, alloc)
+    check_listed(spellings(rules, name: "HARD_KEYWORD", alloc), listed: keyword_spellings(alloc))
+    check_listed(spellings(rules, name: "PUNCT", alloc), listed: punct_spellings(alloc))
+    check_listed(spellings(rules, name: "FOREIGN", alloc), listed: foreign_spellings(alloc))
+    var reach = Reach(order: mem::List[text::String].empty(alloc), context_words: mem::Set[text::String].empty(alloc))
+    mut reach.reach(rules, name: text::String.of(START_RULE, alloc), alloc)
+    var reached_words = mem::List[text::String].empty(alloc)
+    for word in reach.context_words {
+        mut reached_words.push(text::String.of(word.as_str(), alloc))
+    }
+    check_listed(reached_words, listed: context_spellings(alloc))
+    var generator = Generator(rules: rule_ids(reach.order, alloc), choices: mem::List[mem::List[usize]].empty(alloc), seqs: mem::List[SeqDef].empty(alloc))
+    var rule_choices = mem::List[usize].empty(alloc)
+    for name in reach.order {
+        mut rule_choices.push(mut generator.choice(rules.at(name), alloc))
+    }
+    var grammar = Grammar(rule_choices: take rule_choices, choices: take generator.choices, seqs: take generator.seqs, rejected: sorted_ranges(rules, name: "REJECTED", alloc), rejected_space: sorted_ranges(rules, name: "REJECTED_SPACE", alloc), analysis: Analysis.empty(alloc))
+    let analysis = Analysis.compute(grammar, alloc)
+    grammar.analysis = analysis
+    return grammar
+} Grammar.load
+
+/// Traps unless an enum lists exactly the spellings a lexical rule or the reached rules list, in
+/// their order.
+fn check_listed(spelt: mem::List[text::String], listed: mem::List[text::String]) {
+    expect spelt.len() == listed.len()
+    for index in 0..<spelt.len() {
+        expect spelt[index].as_str() == listed[index].as_str()
+    }
+} check_listed
+
+fn keyword_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
+    var listed = mem::List[text::String].empty(alloc)
+    for index in 0..<KEYWORDS {
+        let Some(keyword) = Keyword.from_index(index) else {
+            expect false
+            return listed
+        }
+        mut listed.push(text::String.of(keyword.spelling(), alloc))
+    }
+    expect Keyword.from_index(KEYWORDS).is_none()
+    return listed
+} keyword_spellings
+
+fn punct_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
+    var listed = mem::List[text::String].empty(alloc)
+    for index in 0..<PUNCTS {
+        let Some(punct) = Punct.from_index(index) else {
+            expect false
+            return listed
+        }
+        mut listed.push(text::String.of(punct.spelling(), alloc))
+    }
+    expect Punct.from_index(PUNCTS).is_none()
+    return listed
+} punct_spellings
+
+fn foreign_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
+    var listed = mem::List[text::String].empty(alloc)
+    for index in 0..<FOREIGNS {
+        let Some(spelt) = Foreign.from_index(index) else {
+            expect false
+            return listed
+        }
+        mut listed.push(text::String.of(spelt.spelling(), alloc))
+    }
+    expect Foreign.from_index(FOREIGNS).is_none()
+    return listed
+} foreign_spellings
+
+fn context_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
+    var listed = mem::List[text::String].empty(alloc)
+    for index in 0..<CONTEXTS {
+        let Some(word) = ContextWord.from_index(index) else {
+            expect false
+            return listed
+        }
+        mut listed.push(text::String.of(word.spelling(), alloc))
+    }
+    expect ContextWord.from_index(CONTEXTS).is_none()
+    return listed
+} context_spellings
+
+/// Each reached rule by its name, trapping unless the rules of `Rule` are the reached ones, in
+/// order of first reach.
+fn rule_ids(order: mem::List[text::String], alloc: mem::Alloc) -> mem::HashMap[text::String, Rule] {
+    var ids = mem::HashMap[text::String, Rule].empty(seed: 0, alloc)
+    for index in 0..<order.len() {
+        let Some(rule) = Rule.from_index(index) else {
+            expect false
+            return ids
+        }
+        expect rule.name() == order[index].as_str()
+        discard mut ids.insert(text::String.of(rule.name(), alloc), value: rule)
+    }
+    expect Rule.from_index(order.len()).is_none()
+    return ids
+} rule_ids
+
+/// Parses every rule of the ebnf blocks, written in the grammar notation of the charter.
+fn parse_grammar(source: Str, alloc: mem::Alloc) -> mem::HashMap[text::String, mem::List[Seq]] {
+    var parser = EbnfParser(toks: tokenize(source, alloc), pos: 0)
+    var rules = mem::HashMap[text::String, mem::List[Seq]].empty(seed: 0, alloc)
+    while parser.pos < parser.toks.len() {
+        let Tok.Name(defined) = parser.toks[parser.pos] else {
+            expect false
+            return rules
+        }
+        let name = text::String.of(defined.as_str(), alloc)
+        parser.pos += 1
+        mut parser.expect_sym('=')
+        let body = mut parser.choice(alloc)
+        mut parser.expect_sym(';')
+        let previous = mut rules.insert(take name, value: take body)
+        expect previous.is_none()
+    }
+    return rules
+} parse_grammar
+
+/// Whether a character has the Unicode White_Space property.
+fn is_whitespace(c: char) -> bool {
+    return match c {
+        '\t'..='\r' or ' ' or '\u{85}' or '\u{A0}' or '\u{1680}' or '\u{2000}'..='\u{200A}' => true
+        '\u{2028}' or '\u{2029}' or '\u{202F}' or '\u{205F}' or '\u{3000}' => true
+        else => false
+    }
+} is_whitespace
+
+fn is_hex_digit(c: char) -> bool {
+    return match c {
+        '0'..='9' or 'a'..='f' or 'A'..='F' => true
+        else => false
+    }
+} is_hex_digit
+
+fn is_word_char(c: char) -> bool {
+    return c.is_ascii_alphabetic() or c.is_ascii_digit() or c == '_'
+} is_word_char
+
+fn tokenize(source: Str, alloc: mem::Alloc) -> mem::List[Tok] {
+    var chars = mem::List[char].empty(alloc)
+    for c in source {
+        mut chars.push(c)
+    }
+    var toks = mem::List[Tok].empty(alloc)
+    var i: usize = 0
+    while i < chars.len() {
+        let c = chars[i]
+        if is_whitespace(c) {
+            i += 1
+        } else if c == 'U' and chars.get(i + 1) == Some('+') {
+            i += 2
+            let from = i
+            while i < chars.len() and is_hex_digit(chars[i]) {
+                i += 1
+            }
+            let Some(value) = hex_value(collected(chars, from, to: i, alloc).as_bytes()) else {
+                expect false
+                return toks
+            }
+            mut toks.push(Tok.CodePoint(value))
+        } else if c.is_ascii_alphabetic() or c == '_' {
+            let from = i
+            while i < chars.len() and is_word_char(chars[i]) {
+                i += 1
+            }
+            mut toks.push(Tok.Name(collected(chars, from, to: i, alloc)))
+        } else if c == '"' or c == '\'' {
+            i += 1
+            let word = take_until(chars, mut i, end: c, alloc)
+            if c == '"' {
+                mut toks.push(Tok.Quoted(take word))
+            } else {
+                mut toks.push(Tok.Context(take word))
+            }
+        } else if c == '{' and chars.get(i + 1) == Some('!') {
+            i += 2
+            mut toks.push(Tok.Rejection(take_until(chars, mut i, end: '}', alloc)))
+        } else if c == '.' and chars.get(i + 1) == Some('.') {
+            mut toks.push(Tok.DotDot)
+            i += 2
+        } else {
+            let symbol = match c {
+                '=' or ';' or '|' or '?' or '*' or '+' or '-' or '(' or ')' => true
+                else => false
+            }
+            expect symbol
+            mut toks.push(Tok.Sym(c))
+            i += 1
+        }
+    }
+    return toks
+} tokenize
+
+/// The characters from `from` to before `to`.
+fn collected(chars: mem::List[char], from: usize, to: usize, alloc: mem::Alloc) -> text::String {
+    var run = text::String.empty(alloc)
+    for index in from..<to {
+        mut run.push(chars[index])
+    }
+    return run
+} collected
+
+/// The characters from `i` to before the next `end`, leaving `i` after that `end`.
+fn take_until(chars: mem::List[char], mut i: usize, end: char, alloc: mem::Alloc) -> text::String {
+    let from = i
+    while chars[i] != end {
+        i += 1
+    }
+    let run = collected(chars, from, to: i, alloc)
+    i += 1
+    return run
+} take_until
+
+struct EbnfParser {
+    toks: mem::List[Tok]
+    pos: usize
+} EbnfParser
+
+fn EbnfParser.at_sym(self, sym: char) -> bool {
+    return match self.toks.get(self.pos) {
+        Some(Tok.Sym(found)) => found == sym
+        else => false
+    }
+} EbnfParser.at_sym
+
+fn EbnfParser.at_dot_dot(self) -> bool {
+    return match self.toks.get(self.pos) {
+        Some(Tok.DotDot) => true
+        else => false
+    }
+} EbnfParser.at_dot_dot
+
+fn EbnfParser.expect_sym(mut self, sym: char) {
+    expect self.at_sym(sym)
+    self.pos += 1
+} EbnfParser.expect_sym
+
+fn EbnfParser.choice(mut self, alloc: mem::Alloc) -> mem::List[Seq] {
+    var alts = mem::List[Seq].empty(alloc)
+    mut alts.push(mut self.sequence(alloc))
+    while self.at_sym('|') {
+        self.pos += 1
+        mut alts.push(mut self.sequence(alloc))
+    }
+    return alts
+} EbnfParser.choice
+
+fn EbnfParser.sequence(mut self, alloc: mem::Alloc) -> Seq {
+    var elems = mem::List[Elem].empty(alloc)
+    while self.starts_atom() {
+        let atom = mut self.atom(alloc)
+        var repeat = Repeat.One
+        if self.at_sym('?') {
+            repeat = Repeat.Opt
+        } else if self.at_sym('*') {
+            repeat = Repeat.Star
+        } else if self.at_sym('+') {
+            repeat = Repeat.Plus
+        }
+        if repeat != Repeat.One {
+            self.pos += 1
+        } else if self.at_sym('-') {
+            self.pos += 1
+            discard mut self.atom(alloc)
+        }
+        mut elems.push(Elem(atom: take atom, repeat: repeat))
+    }
+    expect elems.len() > 0
+    var rejection: Option[text::String] = None
+    match self.toks.get(self.pos) {
+        Some(Tok.Rejection(code)) => {
+            rejection = Some(text::String.of(code.as_str(), alloc))
+        }
+        else => {}
+    }
+    if rejection.is_some() {
+        self.pos += 1
+    }
+    return Seq(elems: take elems, rejection: take rejection)
+} EbnfParser.sequence
+
+fn EbnfParser.starts_atom(self) -> bool {
+    return match self.toks.get(self.pos) {
+        Some(Tok.Name(_)) or Some(Tok.Quoted(_)) or Some(Tok.Context(_)) or Some(Tok.CodePoint(_)) => true
+        Some(Tok.Sym(sym)) => sym == '('
+        else => false
+    }
+} EbnfParser.starts_atom
+
+fn EbnfParser.atom(mut self, alloc: mem::Alloc) -> Notation {
+    if self.at_sym('(') {
+        self.pos += 1
+        let alts = mut self.choice(alloc)
+        mut self.expect_sym(')')
+        return Notation.Group(take alts)
+    }
+    let atom = self.single_atom(alloc)
+    self.pos += 1
+    if not self.at_dot_dot() {
+        return atom
+    }
+    self.pos += 1
+    let upper = mut self.atom(alloc)
+    let Notation.CodePoints(low: low, high: _) = atom else {
+        return atom
+    }
+    let Notation.CodePoints(low: _, high: high) = upper else {
+        return atom
+    }
+    return Notation.CodePoints(low: low, high: high)
+} EbnfParser.atom
+
+/// The atom the token at the position stands for, when it is no group.
+fn EbnfParser.single_atom(self, alloc: mem::Alloc) -> Notation {
+    match self.toks[self.pos] {
+        Tok.Name(name) => return Notation.Name(text::String.of(name.as_str(), alloc))
+        Tok.Quoted(quoted) => return Notation.Quoted(text::String.of(quoted.as_str(), alloc))
+        Tok.Context(word) => return Notation.Context(text::String.of(word.as_str(), alloc))
+        Tok.CodePoint(value) => return Notation.CodePoints(low: value, high: value)
+        else => {}
+    }
+    expect false
+    return Notation.CodePoints(low: 0, high: 0)
+} EbnfParser.single_atom
+
+/// The quoted alternatives of a lexical rule listing spellings, such as `PUNCT`.
+fn spellings(rules: mem::HashMap[text::String, mem::List[Seq]], name: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var listed = mem::List[text::String].empty(alloc)
+    for seq in rules.at(text::String.of(name, alloc)) {
+        expect seq.elems.len() == 1
+        let elem = seq.elems[0]
+        expect elem.repeat == Repeat.One
+        let Notation.Quoted(spelling) = elem.atom else {
+            expect false
+            return listed
+        }
+        mut listed.push(text::String.of(spelling.as_str(), alloc))
+    }
+    return listed
+} spellings
+
+/// The syntactic rules reachable from the start rule, in order of first reach, and the context
+/// words they name.
+struct Reach {
+    order: mem::List[text::String]
+    context_words: mem::Set[text::String]
+} Reach
+
+/// Lists the syntactic rules reachable from `name`, in order of first reach.
+fn Reach.reach(mut self, rules: mem::HashMap[text::String, mem::List[Seq]], name: text::String, alloc: mem::Alloc) {
+    for rule in self.order {
+        if rule.as_str() == name.as_str() {
+            return
+        }
+    }
+    mut self.order.push(text::String.of(name.as_str(), alloc))
+    let Some(body) = rules.get(name) else {
+        expect false
+        return
+    }
+    mut self.reach_seqs(rules, seqs: body, alloc)
+} Reach.reach
+
+fn Reach.reach_seqs(mut self, rules: mem::HashMap[text::String, mem::List[Seq]], seqs: mem::List[Seq], alloc: mem::Alloc) {
+    for seq in seqs {
+        for elem in seq.elems {
+            match elem.atom {
+                Notation.Name(name) => {
+                    if is_rule_name(name.as_str()) {
+                        mut self.reach(rules, name, alloc)
+                    }
+                }
+                Notation.Context(word) => {
+                    discard mut self.context_words.insert(text::String.of(word.as_str(), alloc))
+                }
+                Notation.Group(alts) => mut self.reach_seqs(rules, seqs: alts, alloc)
+                else => {}
+            }
+        }
+    }
+} Reach.reach_seqs
+
+/// The choices and sequences registered so far, by id, and each reached rule by its name.
+struct Generator {
+    rules: mem::HashMap[text::String, Rule]
+    choices: mem::List[mem::List[usize]]
+    seqs: mem::List[SeqDef]
+} Generator
+
+/// Registers a choice and its alternatives, returning its id.
+fn Generator.choice(mut self, alts: mem::List[Seq], alloc: mem::Alloc) -> usize {
+    let id = self.choices.len()
+    mut self.choices.push(mem::List[usize].empty(alloc))
+    var seq_ids = mem::List[usize].empty(alloc)
+    for seq in alts {
+        mut seq_ids.push(mut self.seq(seq, alloc))
+    }
+    self.choices[id] = seq_ids
+    return id
+} Generator.choice
+
+fn Generator.seq(mut self, seq: Seq, alloc: mem::Alloc) -> usize {
+    let id = self.seqs.len()
+    mut self.seqs.push(SeqDef(elems: mem::List[ElemDef].empty(alloc), rejection: None))
+    var elems = mem::List[ElemDef].empty(alloc)
+    for elem in seq.elems {
+        mut elems.push(mut self.elem(elem, alloc))
+    }
+    var rejection: Option[diagnostic::Code] = None
+    match seq.rejection {
+        Some(code) => {
+            let Some(named) = diagnostic::Code.from_name(code.as_str()) else {
+                expect false
+                return id
+            }
+            rejection = Some(named)
+        }
+        None => {}
+    }
+    self.seqs[id] = SeqDef(elems: take elems, rejection: rejection)
+    return id
+} Generator.seq
+
+fn Generator.elem(mut self, elem: Elem, alloc: mem::Alloc) -> ElemDef {
+    let atom = match elem.atom {
+        Notation.Name(name) => self.named(name)
+        Notation.Quoted(quoted) => quoted_term(quoted.as_str())
+        Notation.Context(word) => context_term(word.as_str())
+        Notation.Group(alts) => Atom.Group(mut self.choice(alts, alloc))
+        Notation.CodePoints(low: _, high: _) => code_points_term()
+    }
+    return ElemDef(atom: atom, repeat: elem.repeat)
+} Generator.elem
+
+/// The atom a name stands for: a reached rule, or a token class.
+fn Generator.named(self, name: text::String) -> Atom {
+    if is_rule_name(name.as_str()) {
+        let Some(rule) = self.rules.get(name) else {
+            expect false
+            return Atom.Rule(Rule.Item)
+        }
+        return Atom.Rule(rule)
+    }
+    for index in 0..<CLASSES {
+        let Some(class) = Class.from_index(index) else {
+            expect false
+            return Atom.Rule(Rule.Item)
+        }
+        if class.name() == name.as_str() {
+            return Atom.Term(Term.Class(class))
+        }
+    }
+    expect false
+    return Atom.Rule(Rule.Item)
+} Generator.named
+
+/// The terminal a quoted spelling stands for: a hard keyword, or a punctuation token.
+fn quoted_term(quoted: Str) -> Atom {
+    if is_word(quoted) {
+        let Some(keyword) = Keyword.from_spelling(quoted.as_bytes()) else {
+            expect false
+            return Atom.Rule(Rule.Item)
+        }
+        return Atom.Term(Term.Keyword(keyword))
+    }
+    for index in 0..<PUNCTS {
+        let Some(punct) = Punct.from_index(index) else {
+            expect false
+            return Atom.Rule(Rule.Item)
+        }
+        if punct.spelling() == quoted {
+            return Atom.Term(Term.Punct(punct))
+        }
+    }
+    expect false
+    return Atom.Rule(Rule.Item)
+} quoted_term
+
+fn context_term(word: Str) -> Atom {
+    let Some(context) = ContextWord.from_spelling(word.as_bytes()) else {
+        expect false
+        return Atom.Rule(Rule.Item)
+    }
+    return Atom.Term(Term.Context(context))
+} context_term
+
+/// Code points appear only in lexical rules.
+fn code_points_term() -> Atom {
+    expect false
+    return Atom.Rule(Rule.Item)
+} code_points_term
+
+/// The code point ranges a lexical rule matches, following the rules it names, sorted.
+fn sorted_ranges(rules: mem::HashMap[text::String, mem::List[Seq]], name: Str, alloc: mem::Alloc) -> mem::List[CodeRange] {
+    var ranges = mem::List[CodeRange].empty(alloc)
+    code_point_ranges(rules, name: text::String.of(name, alloc), mut ranges)
+    mut ranges.sort_by(fn(left: CodeRange, right: CodeRange) => left.cmp(right))
+    return ranges
+} sorted_ranges
+
+/// Adds the code point ranges a lexical rule matches, following the rules it names.
+fn code_point_ranges(rules: mem::HashMap[text::String, mem::List[Seq]], name: text::String, mut ranges: mem::List[CodeRange]) {
+    for seq in rules.at(name) {
+        for elem in seq.elems {
+            match elem.atom {
+                Notation.CodePoints(low: low, high: high) => mut ranges.push(CodeRange(low: low, high: high))
+                Notation.Name(inner) => code_point_ranges(rules, name: inner, mut ranges)
+                else => {
+                    expect false
+                }
+            }
+        }
+    }
+} code_point_ranges
+
+fn is_rule_name(name: Str) -> bool {
+    var cursor = name.cursor()
+    let Some(first_char) = mut cursor.next() else {
+        return false
+    }
+    return first_char >= 'a' and first_char <= 'z'
+} is_rule_name
+
+fn is_word(spelling: Str) -> bool {
+    var cursor = spelling.cursor()
+    let Some(first_char) = mut cursor.next() else {
+        return false
+    }
+    if not (first_char.is_ascii_alphabetic() or first_char == '_') {
+        return false
+    }
+    loop {
+        let Some(c) = mut cursor.next() else {
+            return true
+        }
+        if not is_word_char(c) {
+            return false
+        }
+    }
+} is_word

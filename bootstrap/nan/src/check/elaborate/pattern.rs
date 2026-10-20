@@ -84,7 +84,9 @@ impl Elab<'_, '_> {
             }
             let out = self.expr(&arm.body)?;
             let value = match out {
-                Out::Place(place) => Out::Operand(self.take_place(place, &expr.ty, span)),
+                Out::Place(place) if !self.borrowed_part(&place, &expr.ty) => {
+                    Out::Operand(self.take_place(place, &expr.ty, span))
+                }
                 other => other,
             };
             self.close_scope(arm.token)?;

@@ -1,0 +1,430 @@
+//! The bindings of an item: the names its parameters, patterns, statements, closures, quantifiers and loops introduce, and the tokens naming each.
+
+pkg struct Bindings {
+    /// The token of each binding's first introduction, by each token introducing or naming it.
+    pkg of: mem::HashMap[u32, u32]
+    /// The first introductions of the item's own parameters.
+    pkg parameters: mem::HashMap[u32, Unit]
+} Bindings
+
+/// The bindings of an item's tree.
+pkg fn Bindings.collect(file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> Bindings {
+    var walk = BindingWalk(scopes: mem::List[mem::List[u32]].empty(alloc), labels: mem::List[u32].empty(alloc), found: Bindings(of: mem::HashMap[u32, u32].empty(seed: 0, alloc), parameters: mem::HashMap[u32, Unit].empty(seed: 0, alloc)), alloc: alloc)
+    var steps = mem::List[Step].empty(alloc)
+    mut steps.push(Step.Node(tree.root()))
+    loop {
+        let Some(step) = mut steps.pop() else {
+            return walk.found
+        }
+        match step {
+            Step.Node(node) => {
+                var plan = mut walk.node(file, tree, node)
+                loop {
+                    let Some(planned) = mut plan.pop() else {
+                        break
+                    }
+                    mut steps.push(take planned)
+                }
+            }
+            Step.Push(tokens) => {
+                mut walk.scopes.push(mem::List[u32].empty(alloc))
+                mut walk.introduce(file, tokens)
+            }
+            Step.Pop => {
+                discard mut walk.scopes.pop()
+            }
+            Step.Bind(statement) => {
+                let tokens = walk.bound(file, tree, statement)
+                mut walk.introduce(file, tokens)
+            }
+            Step.Label(token) => {
+                discard mut walk.found.of.insert(token, value: token)
+                mut walk.labels.push(token)
+            }
+            Step.Unlabel => {
+                discard mut walk.labels.pop()
+            }
+        }
+    }
+} Bindings.collect
+
+/// A step of the walk, taken once the steps before it are done.
+enum Step {
+    Node(u32)
+    /// Opens a scope introducing the names of these tokens.
+    Push(mem::List[u32])
+    Pop
+    /// Introduces the names a statement binds into the innermost scope.
+    Bind(u32)
+    /// Opens the loop labelled by this token.
+    Label(u32)
+    Unlabel
+} Step
+
+/// The steps walking `nodes` in a scope introducing the names of `tokens`.
+fn scoped(take tokens: mem::List[u32], nodes: mem::List[u32], alloc: mem::Alloc) -> mem::List[Step] {
+    var steps = mem::List[Step].empty(alloc)
+    mut steps.push(Step.Push(take tokens))
+    for node in nodes {
+        mut steps.push(Step.Node(node))
+    }
+    mut steps.push(Step.Pop)
+    return steps
+} scoped
+
+/// The state of a walk over an item's tree.
+struct BindingWalk {
+    /// The first introductions of the names each open scope introduces, innermost last.
+    scopes: mem::List[mem::List[u32]]
+    /// The labels of the loops open, innermost last.
+    labels: mem::List[u32]
+    found: Bindings
+    alloc: mem::Alloc
+} BindingWalk
+
+/// Introduces names into the innermost scope; a name it already introduces, as the
+/// alternatives of a match arm do, stays one binding.
+fn BindingWalk.introduce(mut self, file: syntax::SourceFile, tokens: mem::List[u32]) {
+    for token in tokens {
+        let name = file.text(usize.widen(token))
+        let depth = self.scopes.len()
+        expect depth > 0
+        var introduced: Option[u32] = None
+        for bound in self.scopes[depth - 1] {
+            if file.text(usize.widen(bound)) == name {
+                introduced = Some(bound)
+                break
+            }
+        }
+        var origin = token
+        match introduced {
+            Some(bound) => {
+                origin = bound
+            }
+            None => mut (mut self.scopes.at_mut(depth - 1)).push(token)
+        }
+        discard mut self.found.of.insert(token, value: origin)
+    }
+} BindingWalk.introduce
+
+/// Records a token naming the binding of its name in scope, if any.
+fn BindingWalk.name(mut self, file: syntax::SourceFile, token: u32) {
+    let name = file.text(usize.widen(token))
+    var depth = self.scopes.len()
+    while depth > 0 {
+        depth -= 1
+        for bound in self.scopes[depth] {
+            if file.text(usize.widen(bound)) == name {
+                discard mut self.found.of.insert(token, value: bound)
+                return
+            }
+        }
+    }
+} BindingWalk.name
+
+/// The steps walking a node.
+fn BindingWalk.node(mut self, file: syntax::SourceFile, tree: syntax::Tree, node: u32) -> mem::List[Step] {
+    let alloc = self.alloc
+    let children = child_node_list(tree, node, alloc)
+    match first tree.rule(node) {
+        syntax::Rule.FnItem or syntax::Rule.TestItem or syntax::Rule.InterfaceMember or syntax::Rule.RetiredItem => {
+            let parameters = self.parameters(file, tree, node)
+            for parameter in parameters {
+                discard mut self.found.parameters.insert(parameter, value: Unit)
+            }
+            return scoped(take parameters, nodes: children, alloc)
+        }
+        syntax::Rule.ClosureExpr => return scoped(self.parameters(file, tree, node), nodes: children, alloc)
+        syntax::Rule.Block or syntax::Rule.LoopBlock or syntax::Rule.FnBody or syntax::Rule.MethodBody or syntax::Rule.TrustedBody => return block_steps(tree, children, alloc)
+        syntax::Rule.ForStmt => return self.for_steps(file, tree, node, children)
+        syntax::Rule.LoopStmt => return loop_steps(file, tree, node, children, alloc)
+        syntax::Rule.JumpExpr => {
+            mut self.jump(file, tree, node)
+            return node_steps(children, alloc)
+        }
+        syntax::Rule.MatchArm => {
+            var tokens = mem::List[u32].empty(alloc)
+            for child in children {
+                if tree.rule(child) == syntax::Rule.Pattern {
+                    for token in self.pattern_names(file, tree, pattern: child) {
+                        mut tokens.push(token)
+                    }
+                }
+            }
+            return scoped(take tokens, nodes: children, alloc)
+        }
+        syntax::Rule.QuantifierExpr => return quantifier_steps(tree, node, children, alloc)
+        syntax::Rule.Arg or syntax::Rule.FieldPattern if children.len() == 2 => {
+            var steps = mem::List[Step].empty(alloc)
+            mut steps.push(Step.Node(children[1]))
+            return steps
+        }
+        syntax::Rule.Path or syntax::Rule.PlaceRoot => {
+            let held = tree.children(node)
+            if held.len() == 1 {
+                match held[0] {
+                    syntax::Child.Token(token) => {
+                        if is_ident(file, token) {
+                            mut self.name(file, token)
+                        }
+                    }
+                    syntax::Child.Node(_) => {
+                    }
+                }
+            }
+            return mem::List[Step].empty(alloc)
+        }
+        else => return node_steps(children, alloc)
+    }
+} BindingWalk.node
+
+/// The steps walking each of `nodes`.
+fn node_steps(nodes: mem::List[u32], alloc: mem::Alloc) -> mem::List[Step] {
+    var steps = mem::List[Step].empty(alloc)
+    for node in nodes {
+        mut steps.push(Step.Node(node))
+    }
+    return steps
+} node_steps
+
+/// The steps walking a block: a scope in which each statement's bindings follow it.
+fn block_steps(tree: syntax::Tree, children: mem::List[u32], alloc: mem::Alloc) -> mem::List[Step] {
+    var steps = mem::List[Step].empty(alloc)
+    mut steps.push(Step.Push(mem::List[u32].empty(alloc)))
+    for child in children {
+        mut steps.push(Step.Node(child))
+        let rule = tree.rule(child)
+        if rule == syntax::Rule.Stmt or rule == syntax::Rule.TrustedLeadStmt {
+            var nodes = tree.child_nodes(child)
+            match mut nodes.next() {
+                Some(statement) => mut steps.push(Step.Bind(statement))
+                None => {
+                }
+            }
+        }
+    }
+    mut steps.push(Step.Pop)
+    return steps
+} block_steps
+
+/// The steps walking a `for` statement: its body in a scope introducing its pattern's names.
+fn BindingWalk.for_steps(
+    self,
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    children: mem::List[u32],
+    ) -> mem::List[Step] {
+    let alloc = self.alloc
+    var tokens = mem::List[u32].empty(alloc)
+    match tree.find(node, rule: syntax::Rule.Pattern) {
+        Some(pattern) => {
+            tokens = self.pattern_names(file, tree, pattern)
+        }
+        None => {
+        }
+    }
+    var body = mem::List[u32].empty(alloc)
+    var steps = mem::List[Step].empty(alloc)
+    for child in children {
+        if tree.rule(child) == syntax::Rule.LoopBlock {
+            mut body.push(child)
+        } else {
+            mut steps.push(Step.Node(child))
+        }
+    }
+    for step in take scoped(take tokens, nodes: body, alloc) {
+        mut steps.push(take step)
+    }
+    return steps
+} BindingWalk.for_steps
+
+/// The steps walking a `loop` statement, its label open while its body is walked.
+fn loop_steps(
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    children: mem::List[u32],
+    alloc: mem::Alloc,
+    ) -> mem::List[Step] {
+    var label: Option[u32] = None
+    var idents: usize = 0
+    for token in tree.child_tokens(node) {
+        if is_ident(file, token) {
+            if idents == 1 {
+                label = Some(token)
+                break
+            }
+            idents += 1
+        }
+    }
+    var steps = mem::List[Step].empty(alloc)
+    match label {
+        Some(token) => mut steps.push(Step.Label(token))
+        None => {
+        }
+    }
+    for child in children {
+        mut steps.push(Step.Node(child))
+    }
+    if label.is_some() {
+        mut steps.push(Step.Unlabel)
+    }
+    return steps
+} loop_steps
+
+/// Records the label a `break` or `continue` names as naming the loop open with that label.
+fn BindingWalk.jump(mut self, file: syntax::SourceFile, tree: syntax::Tree, node: u32) {
+    let tokens = child_token_list(tree, node, alloc: self.alloc)
+    let jump = match file.tokens[usize.widen(tokens[0])].kind {
+        syntax::TokenKind.Keyword(syntax::Keyword.Break) or syntax::TokenKind.Keyword(syntax::Keyword.Continue) => true
+        else => false
+    }
+    if not jump or tokens.len() < 2 {
+        return
+    }
+    let label = tokens[1]
+    var index = self.labels.len()
+    while index > 0 {
+        index -= 1
+        let open = self.labels[index]
+        if file.text(usize.widen(open)) == file.text(usize.widen(label)) {
+            discard mut self.found.of.insert(label, value: open)
+            return
+        }
+    }
+} BindingWalk.jump
+
+/// The steps walking a quantifier: its domain, then its condition in a scope introducing its
+/// variable.
+fn quantifier_steps(tree: syntax::Tree, node: u32, children: mem::List[u32], alloc: mem::Alloc) -> mem::List[Step] {
+    var steps = mem::List[Step].empty(alloc)
+    if children.len() != 2 {
+        return steps
+    }
+    var variable = mem::List[u32].empty(alloc)
+    var tokens = tree.child_tokens(node)
+    discard mut tokens.next()
+    match mut tokens.next() {
+        Some(token) => mut variable.push(token)
+        None => {
+        }
+    }
+    mut steps.push(Step.Node(children[0]))
+    var condition = mem::List[u32].empty(alloc)
+    mut condition.push(children[1])
+    for step in take scoped(take variable, nodes: condition, alloc) {
+        mut steps.push(take step)
+    }
+    return steps
+} quantifier_steps
+
+/// The name tokens of the parameters a function, test, interface method, tombstone or
+/// closure declares.
+fn BindingWalk.parameters(self, file: syntax::SourceFile, tree: syntax::Tree, node: u32) -> mem::List[u32] {
+    let alloc = self.alloc
+    let params = match tree.rule(node) {
+        syntax::Rule.FnItem => tree.list_elements(find_in(tree, node: tree.find(node, rule: syntax::Rule.FnHead), rule: syntax::Rule.ParamList), element: syntax::Rule.Param, alloc)
+        syntax::Rule.TestItem => tree.list_elements(find_in(tree, node: tree.find(node, rule: syntax::Rule.TestParams), rule: syntax::Rule.ParamList), element: syntax::Rule.Param, alloc)
+        syntax::Rule.InterfaceMember => tree.list_elements(tree.find(node, rule: syntax::Rule.ParamList), element: syntax::Rule.Param, alloc)
+        syntax::Rule.RetiredItem => tree.list_elements(find_in(tree, node: find_in(tree, node: tree.find(node, rule: syntax::Rule.RetiredOld), rule: syntax::Rule.RetiredHead), rule: syntax::Rule.ParamList), element: syntax::Rule.Param, alloc)
+        else => tree.list_elements(tree.find(node, rule: syntax::Rule.FnTypeParamList), element: syntax::Rule.FnTypeParam, alloc)
+    }
+    var names = mem::List[u32].empty(alloc)
+    for param in params {
+        for token in tree.child_tokens(param) {
+            if is_ident(file, token) {
+                mut names.push(token)
+                break
+            }
+        }
+    }
+    return names
+} BindingWalk.parameters
+
+/// The name tokens a `let` or `var` statement binds.
+fn BindingWalk.bound(self, file: syntax::SourceFile, tree: syntax::Tree, statement: u32) -> mem::List[u32] {
+    let alloc = self.alloc
+    var names = mem::List[u32].empty(alloc)
+    let rule = tree.rule(statement)
+    if rule == syntax::Rule.LetStmt {
+        match tree.find(statement, rule: syntax::Rule.Pattern) {
+            Some(pattern) => {
+                names = self.pattern_names(file, tree, pattern)
+            }
+            None => {
+            }
+        }
+    } else if rule == syntax::Rule.VarStmt {
+        for token in tree.child_tokens(statement) {
+            if is_ident(file, token) {
+                mut names.push(token)
+                break
+            }
+        }
+    }
+    return names
+} BindingWalk.bound
+
+/// The name tokens of the bindings a pattern introduces: a lone lowercase name, and those
+/// of its field patterns.
+fn BindingWalk.pattern_names(self, file: syntax::SourceFile, tree: syntax::Tree, pattern: u32) -> mem::List[u32] {
+    let alloc = self.alloc
+    var names = mem::List[u32].empty(alloc)
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(pattern)
+    loop {
+        let Some(current) = mut pending.pop() else {
+            return names
+        }
+        let Some(named) = tree.find(current, rule: syntax::Rule.NamedPattern) else {
+            continue
+        }
+        match lone_binding(file, tree, named) {
+            Some(token) => {
+                mut names.push(token)
+                continue
+            }
+            None => {
+            }
+        }
+        let fields = tree.list_elements(tree.find(named, rule: syntax::Rule.FieldPatternList), element: syntax::Rule.FieldPattern, alloc)
+        var index = fields.len()
+        while index > 0 {
+            index -= 1
+            var last: Option[u32] = None
+            for child in tree.child_nodes(fields[index]) {
+                last = Some(child)
+            }
+            let Some(inner) = last else {
+                expect false
+                return names
+            }
+            mut pending.push(inner)
+        }
+    }
+} BindingWalk.pattern_names
+
+/// The token of a named pattern that is a lone path of one token starting lowercase or with
+/// `_`.
+fn lone_binding(file: syntax::SourceFile, tree: syntax::Tree, named: u32) -> Option[u32] {
+    let held = tree.children(named)
+    if held.len() != 1 {
+        return None
+    }
+    let syntax::Child.Node(path) = held[0] else {
+        return None
+    }
+    let inner = tree.children(path)
+    if inner.len() != 1 {
+        return None
+    }
+    let syntax::Child.Token(token) = inner[0] else {
+        return None
+    }
+    let spelt = file.text(usize.widen(token)).as_bytes()
+    if spelt.len() > 0 and ((spelt[0] >= b'a' and spelt[0] <= b'z') or spelt[0] == b'_') {
+        return Some(token)
+    }
+    return None
+} lone_binding

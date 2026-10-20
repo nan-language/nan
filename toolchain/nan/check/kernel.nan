@@ -1,0 +1,82 @@
+//! Kernel rules: the anchor reached only from entry contexts, the forms of interrupt fns and `interrupt fn` types, and float use under a kernel target.
+
+/// The types of the information a trap frame carries.
+const FRAME_INFOS: Str = "hw::NoCode hw::ErrorCode hw::PageFault"
+
+/// Whether an item is an entry context: an interrupt or landing fn.
+fn Checker.is_entry_context(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    let Some(word) = function.modifier else {
+        return false
+    }
+    return word.kind == ast::FnModifier.Interrupt or word.kind == ast::FnModifier.Landing
+} Checker.is_entry_context
+
+/// Whether the head of an interrupt fn or an `interrupt fn` type has one of the interrupt,
+/// device and exception forms: no `fails` or `uses wait`, an `hw::IrqExit` result, and an
+/// `hw::IrqContext` taken after an optional `mut` device, or a `mut` trap frame alone.
+fn Checker.is_irq_form(self, head: ty::FnTy) -> bool {
+    if head.failure.is_some() or head.wait or not self.is_or_failed(head.result, path: "hw::IrqExit") {
+        return false
+    }
+    if head.params.len() == 1 {
+        return self.is_irq_context(head.params[0]) or self.is_trap_frame(head.params[0])
+    }
+    if head.params.len() == 2 {
+        return head.params[0].mode == ast::Mode.Mut and self.is_irq_context(head.params[1])
+    }
+    return false
+} Checker.is_irq_form
+
+/// Whether a type is failed or the std type of that path.
+fn Checker.is_or_failed(self, ty: ty::Ty, path: Str) -> bool {
+    return self.types().has_error(ty) or self.is_std(ty, path)
+} Checker.is_or_failed
+
+/// Whether a parameter takes an `hw::IrqContext`.
+fn Checker.is_irq_context(self, param: ty::FnParam) -> bool {
+    return param.mode == ast::Mode.Take and self.is_or_failed(param.ty, path: "hw::IrqContext")
+} Checker.is_irq_context
+
+/// Whether a parameter is a `mut` trap frame carrying one of the frame informations.
+fn Checker.is_trap_frame(self, param: ty::FnParam) -> bool {
+    if param.mode != ast::Mode.Mut {
+        return false
+    }
+    let types = self.types()
+    let ty::TyKind.Item(item: _, args: args) = types.kind(param.ty) else {
+        return types.has_error(param.ty)
+    }
+    if not self.is_or_failed(param.ty, path: "hw::TrapFrame") {
+        return types.has_error(param.ty)
+    }
+    let written = types.arg_list(args)
+    if written.len() != 1 {
+        return false
+    }
+    let ty::Arg.Ty(info) = written[0] else {
+        return false
+    }
+    for path in Words(list: FRAME_INFOS, at: 0) {
+        if self.is_or_failed(info, path) {
+            return true
+        }
+    }
+    return false
+} Checker.is_trap_frame
+
+/// Each float operation of a function's or const's text, closures included, under a kernel
+/// target.
+fn Checker.check_float_use(self, item: ty::ItemId, body: mem::Shared[TBody]) {
+    let target = self.db().target
+    if target != workspace::Target.Uefi and target != workspace::Target.Bare {
+        return
+    }
+    for site in self.text_sites(item, body) {
+        if site.brought == Brought.Operation and site.facts.float {
+            self.report(item, token: site.token, code: diagnostic::Code.KernelFloatUse)
+        }
+    }
+} Checker.check_float_use

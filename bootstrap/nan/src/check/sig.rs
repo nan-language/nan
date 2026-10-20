@@ -619,6 +619,17 @@ impl Checker<'_> {
     /// `T` and whose interface declares a method `m`.
     pub fn implemented_lines(&self, function: ItemId) -> Vec<ItemId> {
         self.db.note(function);
+        if let Some(known) = self.implemented.borrow().get(&function) {
+            return known.clone();
+        }
+        let lines = self.find_implemented_lines(function);
+        self.implemented
+            .borrow_mut()
+            .insert(function, lines.clone());
+        lines
+    }
+
+    fn find_implemented_lines(&self, function: ItemId) -> Vec<ItemId> {
         let ItemKind::Fn(head) = &self.db.ast(function).kind else {
             return Vec::new();
         };

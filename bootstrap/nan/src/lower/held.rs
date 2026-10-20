@@ -5,8 +5,9 @@ use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::Lowering;
 use super::body::Held;
-use super::fx::{Fx, access};
+use super::fx::Fx;
 use super::layout::{Niche, Shape, Tag};
+use super::types::Wrap;
 use crate::check::ty::Ty;
 
 impl Lowering<'_, '_> {
@@ -15,7 +16,7 @@ impl Lowering<'_, '_> {
         let layout = self.layout(ty);
         match layout.shape {
             Shape::Scalar { ty: scalar, big } => {
-                Held::Scalar(fx.b.ins().load(scalar, access(false, big), address, 0))
+                Held::Scalar(fx.load_ordered(scalar, address, 0, false, big))
             }
             Shape::Empty => Held::Empty,
             _ => Held::Address(address),
@@ -28,11 +29,11 @@ impl Lowering<'_, '_> {
         match (&layout.shape, held) {
             (Shape::Empty, _) | (_, Held::Empty) => {}
             (Shape::Scalar { big, .. }, Held::Scalar(value)) => {
-                fx.b.ins().store(access(false, *big), value, address, 0);
+                fx.store_ordered(value, address, 0, false, *big);
             }
-            (Shape::Scalar { ty: scalar, big }, Held::Address(source)) => {
-                let value = fx.b.ins().load(*scalar, access(false, *big), source, 0);
-                fx.b.ins().store(access(false, *big), value, address, 0);
+            (Shape::Scalar { ty: scalar, .. }, Held::Address(source)) => {
+                let value = fx.load(*scalar, source, 0);
+                fx.store(value, address, 0);
             }
             (_, Held::Address(source)) => {
                 if source != address {
@@ -51,12 +52,11 @@ impl Lowering<'_, '_> {
         ty: &Ty,
         variant: &str,
         payload: &[Held],
-        wrapped: bool,
+        wrapped: Option<Wrap>,
     ) -> Held {
-        let layout_ty = if wrapped {
-            self.wrapped_type(ty)
-        } else {
-            ty.clone()
+        let layout_ty = match wrapped {
+            Some(wrap) => self.wrapped_type(ty, wrap),
+            None => ty.clone(),
         };
         let layout = self.layout(&layout_ty);
         match &layout.shape {
@@ -75,7 +75,7 @@ impl Lowering<'_, '_> {
                         .layouts
                         .field(self.ck, ty, Some(variant), &field.name)
                         .ty;
-                    if wrapped && self.is_part(&real) {
+                    if wrapped.is_some_and(|wrap| self.is_part(&real, wrap)) {
                         fx.store(held.address(), at, 0);
                     } else {
                         self.store_held(fx, at, *held, &field.ty);
@@ -93,7 +93,7 @@ impl Lowering<'_, '_> {
         let layout = self.layout(ty);
         match &layout.shape {
             Shape::Scalar { ty: scalar, big } => {
-                let value = fx.b.ins().load(*scalar, access(false, *big), address, 0);
+                let value = fx.load_ordered(*scalar, address, 0, false, *big);
                 let expected = self.tag_value(ty, variant);
                 fx.b.ins().icmp_imm_s(IntCC::Equal, value, expected as i64)
             }
@@ -134,7 +134,7 @@ impl Lowering<'_, '_> {
         let layout = self.layout(ty);
         match &layout.shape {
             Shape::Scalar { ty: scalar, big } => {
-                let value = fx.b.ins().load(*scalar, access(false, *big), address, 0);
+                let value = fx.load_ordered(*scalar, address, 0, false, *big);
                 let value = super::body::widen(fx, value);
                 let Ty::Item(item, _) = ty else {
                     return value;
@@ -269,7 +269,7 @@ impl Lowering<'_, '_> {
         }
         let wrap = |lo: &mut Self, fx: &mut Fx, held: Held| -> Held {
             match via {
-                Some(variant) => lo.variant_value(fx, to, variant, &[held], false),
+                Some(variant) => lo.variant_value(fx, to, variant, &[held], None),
                 None => held,
             }
         };
@@ -306,7 +306,7 @@ impl Lowering<'_, '_> {
         fx.store(origin, cancelled, 0);
         match self.cancellation_variant(fails) {
             Some(Some(variant)) => {
-                self.variant_value(fx, fails, &variant, &[Held::Address(cancelled)], false)
+                self.variant_value(fx, fails, &variant, &[Held::Address(cancelled)], None)
             }
             _ => self.held_at(fx, &cancelled_ty, cancelled),
         }
@@ -348,7 +348,7 @@ impl Lowering<'_, '_> {
             Shape::Scalar { ty: scalar, big } => {
                 let value = self.tag_value(ty, variant);
                 let tag = fx.b.ins().iconst(*scalar, value as i64);
-                fx.b.ins().store(access(false, *big), tag, address, 0);
+                fx.store_ordered(tag, address, 0, false, *big);
             }
             Shape::Enum(shape) => {
                 let index = variant_position(shape, variant);
@@ -360,7 +360,7 @@ impl Lowering<'_, '_> {
 
     /// `None` of an option type.
     pub fn none_value(&mut self, fx: &mut Fx, option: &Ty) -> Held {
-        self.variant_value(fx, option, "None", &[], false)
+        self.variant_value(fx, option, "None", &[], None)
     }
 }
 
@@ -382,12 +382,7 @@ pub fn write_tag(fx: &mut Fx, address: Value, tag: &Tag, index: usize) {
         Tag::Packed { niche, .. } => {
             if let Some(value) = tag.value_of(index) {
                 let constant = fx.b.ins().iconst(niche.ty, (value << niche.bit) as i64);
-                fx.b.ins().store(
-                    access(false, niche.big),
-                    constant,
-                    address,
-                    niche.offset as i32,
-                );
+                fx.store_ordered(constant, address, niche.offset, false, niche.big);
             }
         }
     }
@@ -395,12 +390,7 @@ pub fn write_tag(fx: &mut Fx, address: Value, tag: &Tag, index: usize) {
 
 /// The bits of a niche in a value at an address, as their own integer.
 fn niche_bits(fx: &mut Fx, address: Value, niche: &Niche) -> Value {
-    let whole = fx.b.ins().load(
-        niche.ty,
-        access(false, niche.big),
-        address,
-        niche.offset as i32,
-    );
+    let whole = fx.load_ordered(niche.ty, address, niche.offset, false, niche.big);
     if niche.bit == 0 && niche.width == niche.ty.bits() {
         return whole;
     }

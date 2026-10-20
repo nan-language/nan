@@ -467,14 +467,15 @@ impl Checker<'_> {
     }
 
     /// The dependent parameters of a struct or enum, those of the items in `seen`, being decided
-    /// through a constituent reaching them again, counted as none.
+    /// through a constituent reaching them again, counted as none, as are those of an item
+    /// without parameters.
     fn dependent_params_from(
         &self,
         item: ItemId,
         property: Property,
         seen: &mut Vec<ItemId>,
     ) -> Vec<usize> {
-        if seen.contains(&item) {
+        if seen.contains(&item) || self.shapes(item).is_empty() {
             return Vec::new();
         }
         seen.push(item);

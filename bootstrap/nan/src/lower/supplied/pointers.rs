@@ -154,8 +154,8 @@ fn atomic_op(
             let slot = supply
                 .sret
                 .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-            let ok = lo.variant_value(fx, &result, "Ok", &[Held::Scalar(previous)], false);
-            let err = lo.variant_value(fx, &result, "Err", &[Held::Scalar(previous)], false);
+            let ok = lo.variant_value(fx, &result, "Ok", &[Held::Scalar(previous)], None);
+            let err = lo.variant_value(fx, &result, "Err", &[Held::Scalar(previous)], None);
             let chosen = fx.b.ins().select(swapped, ok.address(), err.address());
             lo.copy(fx, slot, chosen, layout.size, layout.align);
             lo.held_at(fx, &result, slot)

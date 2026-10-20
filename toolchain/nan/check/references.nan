@@ -1,0 +1,881 @@
+//! The references of an item or member across the workspace: its declaration and the labels, paths, member names and doc references writing its name, which renaming rewrites.
+
+/// The methods a `for` statement calls on what it iterates and on the cursor it obtains.
+const CURSOR_METHODS: Str = "cursor cursor_mut into_cursor next"
+
+/// What an edit renames: an item, or a field, variant or interface method by its owner and name.
+enum RenameTarget derives Eq {
+    Item(ty::ItemId)
+    Field(owner: ty::ItemId, name: text::String)
+    Variant(owner: ty::ItemId, name: text::String)
+    Method(owner: ty::ItemId, name: text::String)
+} RenameTarget
+
+/// A name written in a workspace file: the file's path and the name's bytes.
+struct Span derives Eq, Ord {
+    path: text::String
+    start: u32
+    end: u32
+} Span
+
+/// A parsed item of a workspace package, by its file and its index there, with the module its
+/// paths are read in.
+struct HolderItem derives Copy {
+    item: Option[ty::ItemId]
+    file: FileRef
+    index: usize
+    module: ty::ModuleId
+} HolderItem
+
+/// A test target's path with the member it names through it.
+struct WrittenTarget {
+    path: ast::Path
+    member: Option[ast::Name]
+} WrittenTarget
+
+/// What an item writes that may name an item or member: its paths outside labels, bindings, a
+/// tombstone's old form and a test's target; the member names it writes after `.` outside
+/// labels; its test target's path with the member it names through it; and whether a `for`
+/// statement iterates.
+struct WrittenNames {
+    paths: mem::List[ast::Path]
+    members: mem::List[text::String]
+    target: Option[WrittenTarget]
+    iterates: bool
+} WrittenNames
+
+/// The member a doc reference names through its path, with the offset of its name.
+struct DocMember {
+    offset: u32
+    name: text::String
+} DocMember
+
+/// A doc reference: its path, the bytes of its last segment, and the member it names through
+/// that path with the offset of its name.
+struct DocReference {
+    path: ast::Path
+    last: diagnostic::Span
+    member: Option[DocMember]
+} DocReference
+
+/// A copy of the target.
+fn RenameTarget.copy(self, alloc: mem::Alloc) -> RenameTarget {
+    return match self {
+        RenameTarget.Item(item) => RenameTarget.Item(item)
+        RenameTarget.Field(owner: owner, name: name) => RenameTarget.Field(owner: owner, name: text::String.of(name.as_str(), alloc))
+        RenameTarget.Variant(owner: owner, name: name) => RenameTarget.Variant(owner: owner, name: text::String.of(name.as_str(), alloc))
+        RenameTarget.Method(owner: owner, name: name) => RenameTarget.Method(owner: owner, name: text::String.of(name.as_str(), alloc))
+    }
+} RenameTarget.copy
+
+/// Whether a member a body names is the target.
+fn RenameTarget.names_member(self, member: Member) -> bool {
+    return match self {
+        RenameTarget.Item(function) => match member {
+            Member.Function(named) => function == named
+            else => false
+        }
+        RenameTarget.Field(owner: owner, name: field) => match member {
+            Member.Field(owner: named, name: name) => owner == named and field == name
+            else => false
+        }
+        RenameTarget.Variant(owner: owner, name: variant) => match member {
+            Member.Variant(owner: named, name: name) => owner == named and variant == name
+            else => false
+        }
+        RenameTarget.Method(owner: owner, name: method) => match member {
+            Member.Method(owner: named, name: name) => owner == named and method == name
+            else => false
+        }
+    }
+} RenameTarget.names_member
+
+/// The spans writing a target's name: its declaration, the labels naming it, and each path,
+/// member name and doc reference of the workspace naming it. Renaming an
+/// interface method renames the functions implementing it too.
+fn Checker.name_spans(self, target: RenameTarget) -> mem::Set[Span] {
+    let alloc = self.alloc()
+    var spans = mem::Set[Span].empty(alloc)
+    var targets = mem::List[RenameTarget].empty(alloc)
+    mut targets.push(target.copy(alloc))
+    match target {
+        RenameTarget.Method(owner: interface_item, name: name) => {
+            for function in self.implementing(interface_item, name: name.as_str()) {
+                mut targets.push(RenameTarget.Item(function))
+            }
+        }
+        else => {}
+    }
+    for renamed in targets {
+        for holder in self.holders() {
+            self.declarations(holder, target: renamed, mut spans)
+            self.paths(holder, target: renamed, mut spans)
+            self.doc_references(holder, target: renamed, mut spans)
+        }
+        for named in self.state.contents().members_named.cursor() {
+            if renamed.names_member(named.member) {
+                discard mut spans.insert(self.span(named.item, token: named.token))
+            }
+        }
+    }
+    return spans
+} Checker.name_spans
+
+/// The functions implementing an interface method: those named after each impl line's target
+/// with the method's name, in the impl line's module.
+fn Checker.implementing(self, interface_item: ty::ItemId, name: Str) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var found = mem::List[ty::ItemId].empty(self.alloc())
+    for index in 0..<db.items.len() {
+        let line = ty::ItemId(index: u32.fit(index))
+        let sig = self.sig(line)
+        let SigKind.Impl(target: Some(key), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+            continue
+        }
+        if bound.item != interface_item {
+            continue
+        }
+        for function in db.members(key, name) {
+            if db.module_of(function) == db.module_of(line) {
+                mut found.push(function)
+            }
+        }
+    }
+    return found
+} Checker.implementing
+
+fn Checker.span(self, item: ty::ItemId, token: u32) -> Span {
+    let file = self.db().item_file(item)
+    let written = file.syntax.tokens[usize.widen(token)]
+    return Span(path: text::String.of(file.path.as_str(), alloc: self.alloc()), start: written.start, end: written.end)
+} Checker.span
+
+/// An item with the module its paths are read in.
+fn Checker.holder(self, item: ty::ItemId) -> HolderItem {
+    let data = self.db().item(item)
+    return HolderItem(item: Some(item), file: data.file, index: data.index, module: data.module)
+} Checker.holder
+
+/// The parsed items of the workspace's packages, with the module their paths are read in.
+fn Checker.holders(self) -> mem::List[HolderItem] {
+    let db = self.db()
+    var holders = mem::List[HolderItem].empty(self.alloc())
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.is_reported(item) {
+            mut holders.push(self.holder(item))
+        }
+    }
+    for index in 0..<db.packages.len() {
+        let data = db.packages[index]
+        if data.carried or data.quiet {
+            continue
+        }
+        let Some(root) = data.root else {
+            continue
+        }
+        let source = db.source(ty::PackageId(index: u32.fit(index)))
+        if source.files.len() == 0 {
+            continue
+        }
+        let manifest = source.files[0].syntax
+        for position in 0..<manifest.items.len() {
+            let held = manifest.items[position]
+            if held.abandoned or held.tree.is_none() {
+                continue
+            }
+            mut holders.push(HolderItem(item: None, file: FileRef(source: data.source, history: false, index: 0), index: position, module: root))
+        }
+    }
+    return holders
+} Checker.holders
+
+/// The functions of the workspace named after a type, by their member names.
+proj fn Checker.member_functions(self) -> mem::Map[text::String, mem::List[ty::ItemId]] {
+    let state = self.state.contents()
+    let held = match state.member_functions.get(0) {
+        Some(known) => known
+        None => state.member_functions.insert(0, value: self.gathered_member_functions())
+    }
+    return held
+} Checker.member_functions
+
+/// The functions of the workspace named after a type, by their member names, gathered.
+fn Checker.gathered_member_functions(self) -> mem::Map[text::String, mem::List[ty::ItemId]] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var functions = mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc)
+    for owned in db.member_table {
+        for member in owned.value() {
+            let key = member.key()
+            if not functions.contains(key) {
+                discard mut functions.insert(text::String.of(key.as_str(), alloc), value: mem::List[ty::ItemId].empty(alloc))
+            }
+            var listed = mut functions.at_mut(key)
+            for function in member.value() {
+                if db.is_reported(function) {
+                    mut listed.push(function)
+                }
+            }
+        }
+    }
+    return functions
+} Checker.gathered_member_functions
+
+/// The items an item names: those its paths name, its test target aside; the functions
+/// named after a type under each member name it writes after `.` and each cursor method its
+/// `for` statements call; the type a function is named after; and the functions
+/// implementing the interface of an impl line. It reads no other item's facts as a subject's.
+fn Checker.names(self, item: ty::ItemId) -> mem::Shared[mem::Set[ty::ItemId]] {
+    let state = self.state.contents()
+    match state.named.get(item) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let computed = self.db().about(None, compute: fn() => self.compute_names(item))
+    let stored = state.named.insert(item, value: mem::Shared.of(take computed, alloc: self.alloc()))
+    return stored.share()
+} Checker.names
+
+fn Checker.compute_names(self, item: ty::ItemId) -> mem::Set[ty::ItemId] {
+    let db = self.db()
+    let functions = self.member_functions()
+    let holder = self.holder(item)
+    let written = holder.written(self)
+    var named = mem::Set[ty::ItemId].empty(self.alloc())
+    for path in written.paths {
+        match db.resolve(holder.module, path) {
+            Ok(Named.Item(found)) => {
+                discard mut named.insert(found)
+            }
+            else => {}
+        }
+    }
+    for member in written.members {
+        add_member_functions(functions, name: member.as_str(), mut named)
+    }
+    if written.iterates {
+        for method in Words(list: CURSOR_METHODS, at: 0) {
+            add_member_functions(functions, name: method, mut named)
+        }
+    }
+    match db.owners.get(item) {
+        Some(TypeKey.Item(owner)) => {
+            discard mut named.insert(owner)
+        }
+        else => {}
+    }
+    let sig = self.sig(item)
+    let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+        return named
+    }
+    let interface_sig = self.sig(bound.item)
+    let SigKind.Interface(methods: methods) = interface_sig.contents().kind else {
+        return named
+    }
+    for method in methods {
+        match self.implementing_function(item, name: method.name.as_str()) {
+            Some(function) => {
+                discard mut named.insert(function)
+            }
+            None => {}
+        }
+    }
+    return named
+} Checker.compute_names
+
+/// Adds the functions named after a type under a member name.
+fn add_member_functions(functions: mem::Map[text::String, mem::List[ty::ItemId]], name: Str, mut named: mem::Set[ty::ItemId]) {
+    let Some(listed) = functions.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return
+    }
+    for function in listed {
+        discard mut named.insert(function)
+    }
+} add_member_functions
+
+/// The paths of an item that may name an item, outside labels, bindings, a tombstone's old
+/// form and a test's target.
+fn Checker.written_paths(self, item: ty::ItemId) -> mem::List[ast::Path] {
+    let WrittenNames(paths: paths, members: _, target: _, iterates: _) = self.holder(item).written(self)
+    return paths
+} Checker.written_paths
+
+/// The declared names of an item, and the labels of its functions, naming a target.
+fn Checker.declarations(self, holder: HolderItem, target: RenameTarget, mut spans: mem::Set[Span]) {
+    let Some(item) = holder.item else {
+        return
+    }
+    let db = self.db()
+    let declared = db.ast(item)
+    match first target {
+        RenameTarget.Item(named) if named == item => {
+            match declared_name(declared, alloc: self.alloc()) {
+                Some(name) => {
+                    discard mut spans.insert(self.span(item, token: name.token))
+                }
+                None => {}
+            }
+            for label in holder.labels(self) {
+                discard mut spans.insert(self.span(item, token: label[label.len() - 1]))
+            }
+        }
+        RenameTarget.Item(named) => {
+            let ast::ItemKind.Fn(function) = declared.kind else {
+                return
+            }
+            if function.label.owner.is_none() or db.owners.get(item) != Some(TypeKey.Item(named)) {
+                return
+            }
+            for label in holder.labels(self) {
+                if label.len() >= 3 {
+                    discard mut spans.insert(self.span(item, token: label[label.len() - 3]))
+                }
+            }
+        }
+        RenameTarget.Field(owner: owner, name: name) if owner == item => {
+            let ast::ItemKind.Struct(structure) = declared.kind else {
+                return
+            }
+            for field in structure.fields() {
+                if field.name.text == name {
+                    discard mut spans.insert(self.span(item, token: field.name.token))
+                }
+            }
+            for token in holder.single_paths(self, name: name.as_str()) {
+                discard mut spans.insert(self.span(item, token))
+            }
+        }
+        RenameTarget.Variant(owner: owner, name: name) if owner == item => {
+            let ast::ItemKind.Enum(enumeration) = declared.kind else {
+                return
+            }
+            for variant in enumeration.variants {
+                if variant.name.text == name {
+                    discard mut spans.insert(self.span(item, token: variant.name.token))
+                }
+            }
+        }
+        RenameTarget.Method(owner: owner, name: name) if owner == item => {
+            let ast::ItemKind.Interface(declaring) = declared.kind else {
+                return
+            }
+            for method in declaring.methods {
+                if method.name.text == name {
+                    discard mut spans.insert(self.span(item, token: method.name.token))
+                }
+            }
+        }
+        else => {}
+    }
+} Checker.declarations
+
+/// The paths of an item naming a target item, by their last segments, and the members of
+/// test targets naming a target function.
+fn Checker.paths(self, holder: HolderItem, target: RenameTarget, mut spans: mem::Set[Span]) {
+    let RenameTarget.Item(renamed) = target else {
+        return
+    }
+    let db = self.db()
+    let file = db.file(holder.file)
+    for written in holder.paths(self) {
+        let Ok(Named.Item(named)) = db.resolve(holder.module, path: written.path) else {
+            continue
+        }
+        var token = written.path.last().token
+        match written.member {
+            None => {
+                if named != renamed {
+                    continue
+                }
+            }
+            Some(member) => {
+                if not holds_item(db.members(TypeKey.Item(named), name: member.text.as_str()), item: renamed) {
+                    continue
+                }
+                token = member.token
+            }
+        }
+        let at = file.syntax.tokens[usize.widen(token)]
+        discard mut spans.insert(Span(path: text::String.of(file.path.as_str(), alloc: self.alloc()), start: at.start, end: at.end))
+    }
+} Checker.paths
+
+/// The doc references of an item's doc comments naming a target, by the name they write it
+/// with.
+fn Checker.doc_references(self, holder: HolderItem, target: RenameTarget, mut spans: mem::Set[Span]) {
+    let db = self.db()
+    let file_path = db.file(holder.file).path.as_str()
+    for reference in holder.doc_references(self) {
+        let Ok(Named.Item(item)) = db.resolve(holder.module, path: reference.path) else {
+            continue
+        }
+        let path_named = match target {
+            RenameTarget.Item(named) => named == item
+            else => false
+        }
+        let member_named = match reference.member {
+            None => false
+            Some(member) => match target {
+                RenameTarget.Item(named) => holds_item(db.members(TypeKey.Item(item), name: member.name.as_str()), item: named)
+                RenameTarget.Field(owner: owner, name: name) or RenameTarget.Variant(owner: owner, name: name) or RenameTarget.Method(owner: owner, name: name) => owner == item and name == member.name
+            }
+        }
+        var start = reference.last.start
+        var end = reference.last.end
+        if not path_named {
+            let Some(member) = reference.member else {
+                continue
+            }
+            if not member_named {
+                continue
+            }
+            start = member.offset
+            end = member.offset + u32.fit(member.name.byte_len())
+        }
+        discard mut spans.insert(Span(path: text::String.of(file_path, alloc: self.alloc()), start: start, end: end))
+    }
+} Checker.doc_references
+
+/// Gives each `name.case` diagnostic its exact fix: the declaration and its uses in its package
+/// renamed to the name its convention writes, when that name follows the convention.
+fn Checker.fix_misnamed(self) {
+    let state = self.state.contents()
+    let db = self.db()
+    let alloc = self.alloc()
+    let taken = usize.widen(state.misnamed_taken.load())
+    let count = state.misnamed.len()
+    state.misnamed_taken.store(u32.fit(count))
+    for index in taken..<count {
+        let entry = state.misnamed.at(mem::Id[Misnamed].of(u32.fit(index)))
+        let new_name = entry.case.converted(db.text(entry.item, token: entry.token), alloc)
+        if not entry.case.followed_by(new_name.as_str()) {
+            continue
+        }
+        let Some(replacements) = self.misnamed_replacements(entry.item, token: entry.token, new: new_name.as_str()) else {
+            continue
+        }
+        let file = db.item_file(entry.item)
+        let start = file.syntax.tokens[usize.widen(entry.token)].start
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        mut fixes.push(diagnostic::Fix(edits: take replacements))
+        self.refix(matches: fn(reported: diagnostic::Diagnostic) -> bool {
+            if reported.code != diagnostic::Code.NameCase {
+                return false
+            }
+            let Some(path) = reported.path else {
+                return false
+            }
+            let Some(span) = reported.span else {
+                return false
+            }
+            return path.as_str() == file.path.as_str() and span.start == start
+        }, fixes: fixes.view())
+    }
+} Checker.fix_misnamed
+
+/// The replacements renaming the name an item declares at `token` to `new` in its package: an
+/// item, field, variant or interface method with its uses, a generic parameter or a local with
+/// those of its item, a punned argument keeping its label; none for another name.
+fn Checker.misnamed_replacements(self, item: ty::ItemId, token: u32, new: Str) -> Option[mem::List[diagnostic::Edit]] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let Some(target) = self.declared_target(item, token) else {
+        return self.local_replacements(item, token, new)
+    }
+    let source = db.source(db.package_of(item))
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    for span in self.name_spans(target) {
+        if source.files.position(fn(file: workspace::File) => file.path == span.path).is_none() {
+            continue
+        }
+        mut edits.push(diagnostic::Edit(path: text::String.of(span.path.as_str(), alloc), replacement: diagnostic::Replacement(start: span.start, end: span.end, text: text::String.of(new, alloc))))
+    }
+    return Some(take edits)
+} Checker.misnamed_replacements
+
+/// What an item declares at `token`: the item itself, or one of its fields, variants or
+/// interface methods.
+fn Checker.declared_target(self, item: ty::ItemId, token: u32) -> Option[RenameTarget] {
+    let alloc = self.alloc()
+    let declared = self.db().ast(item)
+    match declared_name(declared, alloc) {
+        Some(name) => {
+            if name.token == token {
+                return Some(RenameTarget.Item(item))
+            }
+        }
+        None => {}
+    }
+    match declared.kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                if field.name.token == token {
+                    return Some(RenameTarget.Field(owner: item, name: text::String.of(field.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                if variant.name.token == token {
+                    return Some(RenameTarget.Variant(owner: item, name: text::String.of(variant.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        ast::ItemKind.Interface(declaring) => {
+            for method in declaring.methods {
+                if method.name.token == token {
+                    return Some(RenameTarget.Method(owner: item, name: text::String.of(method.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        else => {}
+    }
+    return None
+} Checker.declared_target
+
+/// The replacements renaming a generic parameter or a local an item declares at `token` to
+/// `new` with its uses in the item, a punned argument keeping its label; none for another name.
+fn Checker.local_replacements(self, item: ty::ItemId, token: u32, new: Str) -> Option[mem::List[diagnostic::Edit]] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let holder = self.holder(item)
+    let source = self.holder_syntax(holder)
+    let Some(tree) = self.holder_tree(holder) else {
+        return None
+    }
+    let old = db.text(item, token)
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    if declares_generic_at(tree, token, alloc) {
+        var tokens = holder.single_paths(self, name: old)
+        mut tokens.push(token)
+        for renamed in tokens {
+            let at = self.span(item, token: renamed)
+            mut edits.push(diagnostic::Edit(path: take at.path, replacement: diagnostic::Replacement(start: at.start, end: at.end, text: text::String.of(new, alloc))))
+        }
+        return Some(take edits)
+    }
+    let bound = format::Bindings.collect(source, tree, alloc)
+    if bound.of.get(token) != Some(token) {
+        return None
+    }
+    let punned = format::Punning.collect(source, tree, bindings: bound, alloc)
+    let path = db.item_file(item).path.as_str()
+    for entry in bound.of {
+        if entry.value() != token {
+            continue
+        }
+        let used = entry.key()
+        let at = self.span(item, token: used)
+        mut edits.push(diagnostic::Edit(path: take at.path, replacement: diagnostic::Replacement(start: at.start, end: at.end, text: text::String.of(new, alloc))))
+        for value in punned.values {
+            if value.value() != used {
+                continue
+            }
+            let start = source.tokens[usize.widen(value.key())].start
+            var label = text::String.of(old, alloc)
+            mut label.append(": ")
+            mut edits.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: start, end: start, text: take label)))
+            break
+        }
+    }
+    mut edits.sort_by(fn(left: diagnostic::Edit, right: diagnostic::Edit) -> core::Ordering {
+        let starts = left.replacement.start.cmp(right.replacement.start)
+        if starts != core::Ordering.Equal {
+            return starts
+        }
+        return left.replacement.end.cmp(right.replacement.end)
+    })
+    return Some(take edits)
+} Checker.local_replacements
+
+/// Whether a tree's generic or impl parameter declares its name at `token`.
+fn declares_generic_at(tree: syntax::Tree, token: u32, alloc: mem::Alloc) -> bool {
+    for node in tree.descendants(tree.root(), alloc) {
+        let rule = tree.rule(node)
+        if rule != syntax::Rule.GenericParam and rule != syntax::Rule.ImplParam {
+            continue
+        }
+        var tokens = tree.child_tokens(node)
+        if mut tokens.next() == Some(token) {
+            return true
+        }
+    }
+    return false
+} declares_generic_at
+
+/// The syntax of a holder's file.
+proj fn Checker.holder_syntax(self, holder: HolderItem) -> syntax::SourceFile {
+    return self.db().file(holder.file).syntax
+} Checker.holder_syntax
+
+/// The tree of a holder's item; none for an item the parse left without one.
+proj fn Checker.holder_tree(self, holder: HolderItem) -> Option[syntax::Tree] {
+    let source = self.db().file(holder.file).syntax
+    let Some(tree) = source.items[holder.index].tree else {
+        return None
+    }
+    return Some(tree)
+} Checker.holder_tree
+
+/// The identifier tokens of each item label: a function's head and closing labels, or a
+/// type's closing label.
+fn HolderItem.labels(self, ck: Checker) -> mem::List[mem::List[u32]] {
+    let alloc = ck.alloc()
+    var labels = mem::List[mem::List[u32]].empty(alloc)
+    let source = ck.holder_syntax(self)
+    let Some(tree) = ck.holder_tree(self) else {
+        expect false
+        return labels
+    }
+    for node in tree.descendants(tree.root(), alloc) {
+        if tree.rule(node) != syntax::Rule.ItemLabel {
+            continue
+        }
+        var tokens = mem::List[u32].empty(alloc)
+        for token in tree.child_tokens(node) {
+            let kind = source.tokens[usize.widen(token)].kind
+            if kind == syntax::TokenKind.Ident or kind == syntax::TokenKind.Punct(syntax::Punct.Dot) {
+                mut tokens.push(token)
+            }
+        }
+        mut labels.push(take tokens)
+    }
+    return labels
+} HolderItem.labels
+
+/// The doc references of the item's doc comments.
+fn HolderItem.doc_references(self, ck: Checker) -> mem::List[DocReference] {
+    let alloc = ck.alloc()
+    var found = mem::List[DocReference].empty(alloc)
+    let source = ck.holder_syntax(self)
+    let Some(tree) = ck.holder_tree(self) else {
+        expect false
+        return found
+    }
+    let Some(span) = tree.span(tree.root(), alloc) else {
+        return found
+    }
+    for token in span.head..=span.last {
+        let at = source.tokens[usize.widen(token)]
+        if at.kind != syntax::TokenKind.Doc {
+            continue
+        }
+        let offset = line_text_offset(source, token: usize.widen(token))
+        let written = source.text(usize.widen(token))
+        let Some(doc_text) = written.slice_bytes(offset, end: written.byte_len()) else {
+            continue
+        }
+        let start = at.start + u32.fit(offset)
+        for range in reference_ranges(doc_text, alloc) {
+            let Some(reference) = doc_text.slice_bytes(range.low, end: range.high) else {
+                continue
+            }
+            mut found.push(doc_reference(reference, at: start + u32.fit(range.low), alloc))
+        }
+    }
+    return found
+} HolderItem.doc_references
+
+/// The doc reference written `reference` at byte `at` of its file: its path, split at `::`, the
+/// bytes of its last segment, and the member after its last `.`.
+fn doc_reference(reference: Str, at: u32, alloc: mem::Alloc) -> DocReference {
+    let bytes = reference.as_bytes()
+    var dot = bytes.len()
+    var index = bytes.len()
+    while index > 0 {
+        index -= 1
+        if bytes[index] == b'.' {
+            dot = index
+            break
+        }
+    }
+    var member: Option[DocMember] = None
+    if dot < bytes.len() {
+        match reference.slice_bytes(dot + 1, end: bytes.len()) {
+            Some(name) => {
+                member = Some(DocMember(offset: at + u32.fit(dot) + 1, name: text::String.of(name, alloc)))
+            }
+            None => {}
+        }
+    }
+    var segments = mem::List[ast::Name].empty(alloc)
+    var segment_start: usize = 0
+    var position: usize = 0
+    while position < dot {
+        if position + 1 < dot and bytes[position] == b':' and bytes[position + 1] == b':' {
+            mut segments.push(doc_segment(reference, start: segment_start, end: position, alloc))
+            position += 2
+            segment_start = position
+            continue
+        }
+        position += 1
+    }
+    mut segments.push(doc_segment(reference, start: segment_start, end: dot, alloc))
+    var last_segment: usize = 0
+    var back = dot
+    while back > 1 {
+        back -= 1
+        if bytes[back - 1] == b':' and bytes[back] == b':' {
+            last_segment = back + 1
+            break
+        }
+    }
+    let last = diagnostic::Span(start: at + u32.fit(last_segment), end: at + u32.fit(dot))
+    return DocReference(path: ast::Path(segments: take segments), last: last, member: take member)
+} doc_reference
+
+/// A segment of a doc reference's path, by its bytes, as a name without a token.
+fn doc_segment(reference: Str, start: usize, end: usize, alloc: mem::Alloc) -> ast::Name {
+    let written = match reference.slice_bytes(start, end: end) {
+        Some(segment) => text::String.of(segment, alloc)
+        None => text::String.empty(alloc)
+    }
+    return ast::Name(text: take written, token: 0)
+} doc_segment
+
+/// The tokens of the item's one-segment paths written `name` that name no binding.
+fn HolderItem.single_paths(self, ck: Checker, name: Str) -> mem::List[u32] {
+    let alloc = ck.alloc()
+    var found = mem::List[u32].empty(alloc)
+    let source = ck.holder_syntax(self)
+    let Some(tree) = ck.holder_tree(self) else {
+        expect false
+        return found
+    }
+    let bound = format::Bindings.collect(source, tree, alloc)
+    for node in tree.descendants(tree.root(), alloc) {
+        if tree.rule(node) != syntax::Rule.Path {
+            continue
+        }
+        let children = tree.children(node)
+        if children.len() != 1 {
+            continue
+        }
+        let syntax::Child.Token(token) = children[0] else {
+            continue
+        }
+        if source.text(usize.widen(token)) == name and not bound.of.contains(token) {
+            mut found.push(token)
+        }
+    }
+    return found
+} HolderItem.single_paths
+
+/// The paths of the item that may name an item, each with the member a test target names
+/// through it: not a label, a binding or a tombstone's old form.
+fn HolderItem.paths(self, ck: Checker) -> mem::List[WrittenTarget] {
+    let alloc = ck.alloc()
+    let WrittenNames(paths: paths, members: _, target: target, iterates: _) = self.written(ck)
+    var found = mem::List[WrittenTarget].empty(alloc)
+    for path in take paths {
+        mut found.push(WrittenTarget(path: take path, member: None))
+    }
+    match target {
+        Some(WrittenTarget(path: path, member: member)) => {
+            mut found.push(WrittenTarget(path: path.copy(alloc), member: None))
+            mut found.push(WrittenTarget(path: take path, member: take member))
+        }
+        None => {}
+    }
+    return found
+} HolderItem.paths
+
+/// What the item writes that may name an item or member.
+fn HolderItem.written(self, ck: Checker) -> WrittenNames {
+    let alloc = ck.alloc()
+    var written = WrittenNames(paths: mem::List[ast::Path].empty(alloc), members: mem::List[text::String].empty(alloc), target: None, iterates: false)
+    let source = ck.holder_syntax(self)
+    let Some(tree) = ck.holder_tree(self) else {
+        expect false
+        return written
+    }
+    let bound = format::Bindings.collect(source, tree, alloc)
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(tree.root())
+    loop {
+        let Some(node) = mut pending.pop() else {
+            return written
+        }
+        var children = mem::List[u32].empty(alloc)
+        for child in tree.child_nodes(node) {
+            mut children.push(child)
+        }
+        let rule = tree.rule(node)
+        let labelled = rule == syntax::Rule.Arg or rule == syntax::Rule.FieldPattern or rule == syntax::Rule.PayloadField
+        if labelled and children.len() == 2 {
+            mut pending.push(children[1])
+            continue
+        }
+        if rule == syntax::Rule.RetiredOld or rule == syntax::Rule.ItemLabel {
+            continue
+        }
+        if rule == syntax::Rule.TestTarget {
+            written.target = test_target_written(source, tree, node, alloc)
+            continue
+        }
+        if rule == syntax::Rule.Path {
+            let found = path_from_tree(source, tree, node, alloc)
+            let local = found.segments.len() == 1 and bound.of.contains(found.segments[0].token)
+            if found.segments.len() > 0 and not local {
+                mut written.paths.push(take found)
+            }
+            continue
+        }
+        if rule == syntax::Rule.ForStmt {
+            written.iterates = true
+        }
+        add_written_members(source, tree, node, members: mut written.members, alloc)
+        for child in children {
+            mut pending.push(child)
+        }
+    }
+} HolderItem.written
+
+/// The path a test target writes, with the member it names through it: its last identifier.
+fn test_target_written(source: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> Option[WrittenTarget] {
+    var member: Option[ast::Name] = None
+    for token in tree.child_tokens(node) {
+        if source.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+            member = Some(ast::Name(text: text::String.of(source.text(usize.widen(token)), alloc), token: token))
+        }
+    }
+    let Some(path) = tree.find(node, rule: syntax::Rule.Path) else {
+        return None
+    }
+    return Some(WrittenTarget(path: path_from_tree(source, tree, node: path, alloc), member: take member))
+} test_target_written
+
+/// The path of a tree's path node: its identifier tokens.
+fn path_from_tree(source: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> ast::Path {
+    var segments = mem::List[ast::Name].empty(alloc)
+    for token in tree.child_tokens(node) {
+        if source.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+            mut segments.push(ast::Name(text: text::String.of(source.text(usize.widen(token)), alloc), token: token))
+        }
+    }
+    return ast::Path(segments: take segments)
+} path_from_tree
+
+/// Adds the member names a node writes after `.` among its own tokens.
+fn add_written_members(
+    source: syntax::SourceFile,
+    tree: syntax::Tree,
+    node: u32,
+    mut members: mem::List[text::String],
+    alloc: mem::Alloc,
+    ) {
+    var previous: Option[u32] = None
+    for token in tree.child_tokens(node) {
+        match previous {
+            Some(before) => {
+                let dotted = source.tokens[usize.widen(before)].kind == syntax::TokenKind.Punct(syntax::Punct.Dot)
+                if dotted and source.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
+                    mut members.push(text::String.of(source.text(usize.widen(token)), alloc))
+                }
+            }
+            None => {}
+        }
+        previous = Some(token)
+    }
+} add_written_members

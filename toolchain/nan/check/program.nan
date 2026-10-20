@@ -1,0 +1,163 @@
+//! Targets and programs: the targets each dependency covers, dependencies on programs, the one concrete target a program declares and the head of its entry function.
+
+/// The rules of a package's `targets`, `entry` and `dep` directives: a program declares one
+/// concrete target and an entry function `main` of its root module, and each dependency in
+/// the workspace covers every target the package declares and is no program, unless its
+/// `dep` directive lacks a grant its package needs.
+fn Checker.check_program(self, package_id: ty::PackageId) {
+    let source = self.db().source(package_id)
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    let path = source.files[0].path.as_str()
+    match manifest.entry {
+        Some(entry) => self.check_program_entry(package_id, manifest, entry, path)
+        None => {}
+    }
+    for dep in manifest.deps {
+        self.check_dependency_targets(package_id, manifest, dep, path)
+    }
+} Checker.check_program
+
+/// The `entry` directive of a program: one concrete target declared, and `main` naming a
+/// function of its root module.
+fn Checker.check_program_entry(self, package_id: ty::PackageId, manifest: workspace::Manifest, entry: workspace::ProgramEntry, path: Str) {
+    let db = self.db()
+    let concrete = manifest.targets.len() == 1 and manifest.targets[0] != workspace::Target.Any
+    if manifest.targets_line.is_some() and not concrete {
+        self.report_file(path, line: entry.line, code: diagnostic::Code.TargetProgramTargets)
+    }
+    let Some(module) = db.package_data(package_id).root else {
+        return
+    }
+    if db.module(module).abandoned {
+        return
+    }
+    let main = match db.lookup(module, name: "main") {
+        Some(main_item) => is_fn_item(db.ast(main_item))
+        None => false
+    }
+    if entry.name.as_str() != "main" or not main {
+        self.report_file(path, line: entry.line, code: diagnostic::Code.TargetEntryMissing)
+    }
+} Checker.check_program_entry
+
+/// A `dep` directive naming a workspace package: the dependency covers every target the
+/// package declares and is no program, unless the directive lacks a grant its package needs.
+fn Checker.check_dependency_targets(self, package_id: ty::PackageId, manifest: workspace::Manifest, dep: workspace::Dep, path: Str) {
+    let db = self.db()
+    let Some(found) = db.package_data(package_id).deps.get(dep.alias) else {
+        return
+    }
+    let Some(dependency) = found else {
+        return
+    }
+    let Some(declared) = db.source(dependency).manifest else {
+        return
+    }
+    if declared.targets_line.is_none() or self.ungranted(package_id, alias: dep.alias.as_str()).len() > 0 {
+        return
+    }
+    var covers = true
+    for target in manifest.targets {
+        if not holds_target(declared.targets.view(), wanted: target) and not holds_target(declared.targets.view(), wanted: workspace::Target.Any) {
+            covers = false
+            break
+        }
+    }
+    if not covers {
+        self.report_file(path, line: dep.line, code: diagnostic::Code.TargetDependencyUncovered)
+    } else if declared.entry.is_some() {
+        self.report_file(path, line: dep.line, code: diagnostic::Code.TargetDepProgram)
+    }
+} Checker.check_dependency_targets
+
+/// Whether a list of targets holds one.
+fn holds_target(targets: Slice[workspace::Target], wanted: workspace::Target) -> bool {
+    for target in targets {
+        if target == wanted {
+            return true
+        }
+    }
+    return false
+} holds_target
+
+/// The head of a program's entry function: one of its target's forms, quoted as expected,
+/// unless a rule of heads reports it.
+fn Checker.check_entry_head(self, item: ty::ItemId) {
+    let db = self.db()
+    let types = self.types()
+    let node = db.ast(item)
+    let ast::ItemKind.Fn(function) = node.kind else {
+        return
+    }
+    let Some(sig) = self.fn_sig(item) else {
+        return
+    }
+    var failed = types.has_error(sig.result)
+    for param in sig.params {
+        if types.has_error(param.ty) {
+            failed = true
+        }
+    }
+    match sig.failure {
+        Some(failure_ty) => {
+            if types.has_error(failure_ty) {
+                failed = true
+            }
+        }
+        None => {}
+    }
+    if failed or self.reported_at(item, token: node.token) {
+        return
+    }
+    let target = db.target
+    let grant = match target {
+        workspace::Target.Host => "host::World"
+        workspace::Target.Uefi => "boot::Machine"
+        workspace::Target.Bare => "boot::Kernel"
+        workspace::Target.Any => return
+    }
+    let forms = match target {
+        workspace::Target.Host => "fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> u8 fails E uses wait"
+        workspace::Target.Uefi => "fn main(take P: boot::Machine) -> Never"
+        else => "fn main(take P: boot::Kernel) -> Never"
+    }
+    let parameter = sig.params.len() == 1 and sig.params[0].mode == ast::Mode.Take and not sig.params[0].is_self and self.is_std(sig.params[0].ty, path: grant)
+    let rest = match target {
+        workspace::Target.Host => (sig.result == ty::Ty.unit() or sig.result == ty::Ty.scalar(ty::Scalar.Unsigned8)) and self.entry_failure(sig.failure) and sig.wait
+        else => sig.result == ty::Ty.never() and sig.failure.is_none() and not sig.wait
+    }
+    let shaped = node.visibility == ast::Visibility.Private and function.modifier.is_none() and function.head.generics.len() == 0 and parameter and rest
+    if not shaped {
+        let last = Clauses.of(function.head, fixable: false).last
+        let found = self.written(item, head: node.token, last)
+        self.report_expected(item, token: node.token, code: diagnostic::Code.TargetEntryHead, expected: text::String.of(forms, alloc: self.alloc()), found: take found)
+    }
+} Checker.check_entry_head
+
+/// Whether an entry function's failure type is an enum implementing `Render`, or
+/// `task::Cancelled`.
+fn Checker.entry_failure(self, failure: Option[ty::Ty]) -> bool {
+    let Some(failure_ty) = failure else {
+        return false
+    }
+    let types = self.types()
+    let db = self.db()
+    var rendered_enum = false
+    match types.kind(failure_ty) {
+        ty::TyKind.Item(item: failure_item, args: _) => {
+            match db.ast(failure_item).kind {
+                ast::ItemKind.Enum(_) => {
+                    rendered_enum = match db.core_item("Render") {
+                        Some(render) => self.implements(failure_ty, interface_item: render)
+                        None => false
+                    }
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    return rendered_enum or self.is_std(failure_ty, path: "task::Cancelled")
+} Checker.entry_failure

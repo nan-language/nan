@@ -7,7 +7,7 @@ use super::expr::Out;
 use super::{Elab, Elaborated, Fault, Held};
 use crate::check::db::ItemId;
 use crate::check::sig::{FnSig, SigKind};
-use crate::check::tir::{self, ClauseRole, TBody, TClosure, TKind};
+use crate::check::tir::{self, ClauseRole, Form, TBody, TClosure, TKind};
 use crate::check::ty::{Arg, Args, Scalar, Subst, Ty};
 use crate::nir::{
     Builtin, Call, Callable, Callee, CheckKind, FnRef, Function, NTy, Op, Operand, Payload, Place,
@@ -320,7 +320,7 @@ impl Elab<'_, '_> {
         let result_ty = self.result_nty(call);
         let reference = result_ty.is_reference();
         let value = self.emit_value(Op::Call(nir_call), result_ty, span);
-        if call.proj && self.wraps(&call.head.result) {
+        if call.proj && self.ck.projection_form(call) == Form::Wrapped {
             self.wrapped.insert(value);
         }
         Ok(match reference {
@@ -333,7 +333,7 @@ impl Elab<'_, '_> {
     /// projection takes its receiver by `mut`.
     fn result_nty(&self, call: &tir::Call) -> NTy {
         let result = call.head.result.clone();
-        if !call.proj || self.ck.nir_view(&result) || self.wraps(&result) {
+        if !call.proj || self.ck.projection_form(call) != Form::Part {
             return NTy::Owned(result);
         }
         let writable = call
@@ -345,11 +345,6 @@ impl Elab<'_, '_> {
             true => NTy::RefMut(result),
             false => NTy::Ref(result),
         }
-    }
-
-    /// Whether a type is an `Option` or `Result`, which a projection returns as a wrapped part.
-    fn wraps(&self, ty: &Ty) -> bool {
-        self.ck.is_std(ty, "core::Option") || self.ck.is_std(ty, "core::Result")
     }
 
     /// The function a call names.

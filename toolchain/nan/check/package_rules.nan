@@ -1,0 +1,301 @@
+//! The rules over a package's modules and items taken together: the cycles its modules' paths form, the items its variant directories export, and the consts and contributions whose values reach themselves.
+
+/// A module of a package an item names by a path, with the path's line.
+struct ModuleLine derives Copy {
+    module: ty::ModuleId
+    line: u32
+} ModuleLine
+
+/// The rules over a package once each of its items is checked.
+fn Checker.check_package_whole(self, package_id: ty::PackageId) {
+    self.check_module_cycles(package_id)
+    self.check_variants(package_id)
+    self.check_summaries(package_id)
+    self.check_variant_docs(package_id)
+    self.check_unused(package_id)
+} Checker.check_package_whole
+
+/// Each set of two or more modules depending on one another, reported once on the first
+/// path from the set's first module, by name, to another module of the set; std's module
+/// graphs may hold cycles.
+fn Checker.check_module_cycles(self, package_id: ty::PackageId) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let data = db.package_data(package_id)
+    if data.std {
+        return
+    }
+    var edges = mem::Map[ty::ModuleId, mem::List[ModuleEdge]].empty(alloc)
+    for module in data.modules {
+        for item in db.module(module).items {
+            for path in self.module_paths(item, package_id) {
+                if path.module == module {
+                    continue
+                }
+                if not edges.contains(module) {
+                    discard mut edges.insert(module, value: mem::List[ModuleEdge].empty(alloc))
+                }
+                var from = mut edges.at_mut(module)
+                mut from.push(ModuleEdge(target: path.module, item: item, line: path.line))
+            }
+        }
+    }
+    var by_name = mem::List[ty::ModuleId].empty(alloc)
+    for module in data.modules {
+        mut by_name.push(module)
+    }
+    mut by_name.sort_by(fn(left: ty::ModuleId, right: ty::ModuleId) => db.module(left).name.as_str().cmp(db.module(right).name.as_str()))
+    var reported = mem::Set[ty::ModuleId].empty(alloc)
+    for head in by_name {
+        if reported.contains(head) {
+            continue
+        }
+        var cycle = mem::Set[ty::ModuleId].empty(alloc)
+        for other in reaches(edges, from: head, alloc) {
+            if other == head or reaches(edges, from: other, alloc).contains(head) {
+                discard mut cycle.insert(other)
+            }
+        }
+        if cycle.len() < 2 {
+            continue
+        }
+        for member in cycle {
+            discard mut reported.insert(member)
+        }
+        self.report_cycle(edges, head, cycle)
+    }
+} Checker.check_module_cycles
+
+/// The modules of a package an item names by a path, with each path's line: a first segment
+/// naming a module, or the package's name naming its root.
+fn Checker.module_paths(self, item: ty::ItemId, package_id: ty::PackageId) -> mem::List[ModuleLine] {
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    let span = syntax.items[data.index]
+    var paths = mem::List[ModuleLine].empty(self.alloc())
+    for index in syntax.path_starts(span.head, end: span.end) {
+        let Some(module) = db.module_named(package_id, name: syntax.text(index)) else {
+            continue
+        }
+        mut paths.push(ModuleLine(module: module, line: syntax.tokens[index].line))
+    }
+    return paths
+} Checker.module_paths
+
+/// The variant directories of each module export the same `pub` and `pkg` items, impl lines
+/// and tombstones; one missing from a variant is reported on it in the first directory, by
+/// path, holding it.
+fn Checker.check_variants(self, package_id: ty::PackageId) {
+    let alloc = self.alloc()
+    let source = self.db().source(package_id)
+    for index in 0..<source.modules.len() {
+        let module = source.modules[index]
+        var variant = false
+        var dirs = mem::List[text::String].empty(alloc)
+        for dir in module.dirs {
+            variant = variant or dir.selector.is_some()
+            mut dirs.push(text::String.of(dir.path.as_str(), alloc))
+        }
+        if not variant {
+            continue
+        }
+        mut dirs.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        let exported = exported_items(source, module_index: index, alloc)
+        for entry in exported {
+            let holders = entry.value()
+            if held_everywhere(holders.view(), dirs: dirs.view()) {
+                continue
+            }
+            let Some(earliest) = first_holder(holders.view()) else {
+                continue
+            }
+            self.report_file(holders[earliest].path.as_str(), line: holders[earliest].line, code: diagnostic::Code.ModuleVariantMismatch)
+        }
+    }
+} Checker.check_variants
+
+/// The identity under which a variant directory exports an item: a `pub` or `pkg` item's name,
+/// an impl line's target and interface, or a tombstone's old form.
+fn exported_identity(item: ast::Item, alloc: mem::Alloc) -> Option[text::String] {
+    match item.kind {
+        ast::ItemKind.Impl(implementation) => {
+            var identity = text::String.of("impl ", alloc)
+            mut identity.append(implementation.target.written(alloc).as_str())
+            mut identity.append(": ")
+            mut identity.append(implementation.bound.path.written(alloc).as_str())
+            return Some(take identity)
+        }
+        ast::ItemKind.Retired(tombstone) => {
+            var identity = text::String.of("retired ", alloc)
+            mut identity.append(tombstone.path.written(alloc).as_str())
+            match tombstone.member {
+                Some(member) => {
+                    mut identity.push('.')
+                    mut identity.append(member.text.as_str())
+                }
+                None => {}
+            }
+            return Some(take identity)
+        }
+        else => {}
+    }
+    if item.visibility != ast::Visibility.Private {
+        return item.name(alloc)
+    }
+    return None
+} exported_identity
+
+/// A path from one module of a package to another: the module named, the item naming it and
+/// the path's line.
+struct ModuleEdge derives Copy {
+    target: ty::ModuleId
+    item: ty::ItemId
+    line: u32
+} ModuleEdge
+
+/// The modules a module reaches through the edges of a package's paths, itself included.
+fn reaches(edges: mem::Map[ty::ModuleId, mem::List[ModuleEdge]], from: ty::ModuleId, alloc: mem::Alloc) -> mem::Set[ty::ModuleId] {
+    var seen = mem::Set[ty::ModuleId].empty(alloc)
+    discard mut seen.insert(from)
+    var pending = mem::List[ty::ModuleId].empty(alloc)
+    mut pending.push(from)
+    while pending.len() > 0 {
+        let Some(current) = mut pending.pop() else {
+            break
+        }
+        let Some(out) = edges.get(current) else {
+            continue
+        }
+        for edge in out {
+            if not seen.contains(edge.target) {
+                discard mut seen.insert(edge.target)
+                mut pending.push(edge.target)
+            }
+        }
+    }
+    return seen
+} reaches
+
+/// Reports a cycle on the first path from its first module to another of its modules, by file
+/// path and line.
+fn Checker.report_cycle(self, edges: mem::Map[ty::ModuleId, mem::List[ModuleEdge]], head: ty::ModuleId, cycle: mem::Set[ty::ModuleId]) {
+    let db = self.db()
+    let Some(out) = edges.get(head) else {
+        return
+    }
+    var best: Option[ModuleEdge] = None
+    for edge in out {
+        if not cycle.contains(edge.target) {
+            continue
+        }
+        discard db.item(edge.item)
+        match best {
+            Some(current) => {
+                let order = db.item_file(edge.item).path.as_str().cmp(db.item_file(current.item).path.as_str())
+                if order == core::Ordering.Less or (order == core::Ordering.Equal and edge.line < current.line) {
+                    best = Some(edge)
+                }
+            }
+            None => {
+                best = Some(edge)
+            }
+        }
+    }
+    match best {
+        Some(edge) => self.report_line(edge.item, line: edge.line, code: diagnostic::Code.ModuleCycle)
+        None => {}
+    }
+} Checker.report_cycle
+
+/// An item a variant directory exports: the directory, the file's path and the item's line.
+struct VariantHolder {
+    dir: text::String
+    path: text::String
+    line: u32
+} VariantHolder
+
+/// The items each variant directory of a module exports, by their identity.
+fn exported_items(source: workspace::Package, module_index: usize, alloc: mem::Alloc) -> mem::Map[text::String, mem::List[VariantHolder]] {
+    var exported = mem::Map[text::String, mem::List[VariantHolder]].empty(alloc)
+    for file in source.files {
+        if file.module != Some(module_index) {
+            continue
+        }
+        let path = file.path.as_str()
+        let bytes = path.as_bytes()
+        var slash: Option[usize] = None
+        for at in 0..<bytes.len() {
+            if bytes[at] == b'/' {
+                slash = Some(at)
+            }
+        }
+        let Some(end) = slash else {
+            continue
+        }
+        let Some(dir) = path.slice_bytes(0, end: end) else {
+            continue
+        }
+        for lowered in file.lowered(alloc) {
+            let Some(declared) = lowered else {
+                continue
+            }
+            let Some(identity) = exported_identity(declared, alloc) else {
+                continue
+            }
+            let holder = VariantHolder(dir: text::String.of(dir, alloc), path: text::String.of(path, alloc), line: file.syntax.tokens[usize.widen(declared.token)].line)
+            if not exported.contains(identity) {
+                discard mut exported.insert(text::String.of(identity.as_str(), alloc), value: mem::List[VariantHolder].empty(alloc))
+            }
+            var holders = mut exported.at_mut(identity)
+            mut holders.push(take holder)
+        }
+    }
+    return exported
+} exported_items
+
+/// Whether each directory holds one of an identity's holders.
+fn held_everywhere(holders: Slice[VariantHolder], dirs: Slice[text::String]) -> bool {
+    for dir in dirs {
+        var held = false
+        for holder in holders {
+            if holder.dir.as_str() == dir.as_str() {
+                held = true
+            }
+        }
+        if not held {
+            return false
+        }
+    }
+    return true
+} held_everywhere
+
+/// The first holder in order of directory, then path, then line.
+fn first_holder(holders: Slice[VariantHolder]) -> Option[usize] {
+    var best: Option[usize] = None
+    for index in 0..<holders.len() {
+        match best {
+            Some(current) => {
+                if holder_before(holders[index], right: holders[current]) {
+                    best = Some(index)
+                }
+            }
+            None => {
+                best = Some(index)
+            }
+        }
+    }
+    return best
+} first_holder
+
+fn holder_before(left: VariantHolder, right: VariantHolder) -> bool {
+    let dirs = left.dir.as_str().cmp(right.dir.as_str())
+    if dirs != core::Ordering.Equal {
+        return dirs == core::Ordering.Less
+    }
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths == core::Ordering.Less
+    }
+    return left.line < right.line
+} holder_before

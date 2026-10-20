@@ -4,7 +4,8 @@
 
 use super::Checker;
 use super::props::Property;
-use super::sig::FnSig;
+use super::sig::{FnSig, SigKind};
+use super::tir::{Call, Callee, Form};
 use super::ty::{FnTy, Ty};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{FnKind, FnModifier, Mode};
@@ -79,6 +80,37 @@ impl Checker<'_> {
         typed.or_else(|| {
             (fn_ty.convention.is_some() && fn_ty.wait).then_some(Code::EffectForeignWait)
         })
+    }
+
+    /// The form of a projection call's result, fixed by its head's declared result type with each
+    /// type parameter counted as no view.
+    pub fn projection_form(&self, call: &Call) -> Form {
+        let declared = match &call.callee {
+            Callee::Function { item, .. } => self.fn_sig(*item).map(|sig| sig.result),
+            Callee::Method {
+                interface, method, ..
+            } => match &self.sig(interface.interface).kind {
+                SigKind::Interface { methods } => Some(methods[*method].sig.result.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+        .unwrap_or_else(|| call.head.result.clone());
+        self.declared_form(&declared)
+    }
+
+    /// The form of a projection's result whose head declares the result type `declared`, each
+    /// type parameter counted as no view.
+    pub fn declared_form(&self, declared: &Ty) -> Form {
+        let view = self.counts_as_view(declared);
+        let wraps = ["core::Option", "core::Result"]
+            .iter()
+            .any(|path| self.is_std(declared, path));
+        match (view, wraps) {
+            (true, _) => Form::View,
+            (false, true) => Form::Wrapped,
+            (false, false) => Form::Part,
+        }
     }
 
     /// Whether a type is a view with each type parameter counted as none.

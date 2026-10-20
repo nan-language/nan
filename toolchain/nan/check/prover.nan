@@ -1,0 +1,1157 @@
+//! The normative prover: decides each obligation site of an item's NIR functions through a query over its weakest precondition, gives each site its status, and reports the sites whose proof is demanded and that it does not prove.
+
+/// The results the proof cache holds: a proved query, and one whose fuel ran out.
+const CACHED_PROVED: u8 = 0
+
+const CACHED_EXHAUSTED: u8 = 1
+
+/// How an obligation holds.
+enum Status derives Copy, Eq {
+    Proven
+    Assumed
+    Checked
+    Open
+} Status
+
+/// The prover's outcome for an obligation it does not prove: refuted with the labelled values
+/// of the counterexample's parameters, or unknown with the reasons.
+enum Unproved {
+    Refuted(mem::List[text::String])
+    Unknown(mem::List[text::String])
+} Unproved
+
+/// An obligation site of a unit, with its status and, where proof is demanded and it is not
+/// proved, the prover's outcome.
+struct Obligated {
+    role: nir::Role
+    index: u32
+    obligation: Obligation
+    span: nir::Span
+    status: Status
+    /// The index of the ensures clause a `check ensures` checks.
+    clause: Option[u32]
+    unproved: Option[Unproved]
+} Obligated
+
+/// A const argument of an instantiation with the type of its parameter.
+struct ScalarArg derives Copy {
+    scalar: ty::Scalar
+    arg: ty::Arg
+} ScalarArg
+
+/// The sites of a function walked, each with its query, and those of the statement functions
+/// it calls.
+struct WalkedFunction {
+    sites: mem::List[StatementSite]
+    statements: mem::List[Statement]
+} WalkedFunction
+
+/// The values of a candidate's parameters and const parameters.
+struct RefutationCandidate {
+    inputs: mem::List[Input]
+    type_args: mem::List[ty::Arg]
+} RefutationCandidate
+
+/// A clause that is not disputed, by its index among the clauses of its role, with its first
+/// token.
+struct ClauseToken derives Copy {
+    index: u32
+    token: u32
+} ClauseToken
+
+/// A requires clause's term, with its clause's first token.
+struct TokenTerm derives Copy {
+    term: u32
+    token: u32
+} TokenTerm
+
+/// The status as tools show it.
+proj fn Status.word(self) -> Str {
+    return match self {
+        Status.Proven => "proven"
+        Status.Assumed => "assumed"
+        Status.Checked => "checked"
+        Status.Open => "open"
+    }
+} Status.word
+
+/// The obligation sites of an item's unit with their statuses, by function and site order;
+/// examples have none.
+fn Checker.obligations(self, item: ty::ItemId) -> mem::Shared[mem::List[Obligated]] {
+    self.db().note(item)
+    let state = self.state.contents()
+    match state.obligations.get(item) {
+        Some(done) => return done.share()
+        None => {}
+    }
+    let sites = self.db().about(Some(item), compute: fn() => self.unit_obligations(item))
+    let decided = mem::Shared.of(take sites, alloc: self.alloc())
+    return state.obligations.insert(item, value: take decided).share()
+} Checker.obligations
+
+/// The obligation sites of an item's unit, none for a carried std item.
+fn Checker.unit_obligations(self, item: ty::ItemId) -> mem::List[Obligated] {
+    let Some(unit) = self.unit(item) else {
+        return mem::List[Obligated].empty(self.alloc())
+    }
+    if self.db().is_carried(item) {
+        return mem::List[Obligated].empty(self.alloc())
+    }
+    return self.decide_unit(item, unit)
+} Checker.unit_obligations
+
+/// Reports each obligation of an item whose proof is demanded and that the prover does not
+/// prove: a `decreases` one as unproven, any other with its outcome.
+fn Checker.check_proofs(self, item: ty::ItemId) {
+    let alloc = self.alloc()
+    let obligated = self.obligations(item)
+    for site in obligated.contents() {
+        let Some(unproved) = site.unproved else {
+            continue
+        }
+        var because = mem::List[diagnostic::Reason].empty(alloc)
+        var code = diagnostic::Code.ProofUnknown
+        match unproved {
+            Unproved.Refuted(notes) => {
+                code = diagnostic::Code.ProofRefuted
+                for note in notes {
+                    mut because.push(diagnostic::Reason.note(note.as_str(), alloc))
+                }
+            }
+            Unproved.Unknown(notes) => {
+                for note in notes {
+                    mut because.push(diagnostic::Reason.note(note.as_str(), alloc))
+                }
+            }
+        }
+        if site.obligation == Obligation.Check(nir::CheckKind.Decreases) {
+            code = diagnostic::Code.ContractDecreasesUnproven
+        }
+        self.report_because(item, token: site.span.head, code, take because)
+    }
+} Checker.check_proofs
+
+/// The rules entailment decides on a struct's predicates: predicates that no value
+/// satisfies (`contract.vacuous`), and, for a struct deriving `Default`, a default value
+/// the prover does not prove to meet them (`predicate.default-unproven`); each reported
+/// on the struct's first line.
+fn Checker.check_predicates(self, item: ty::ItemId) {
+    let alloc = self.alloc()
+    let ast::ItemKind.Struct(structure) = self.db().ast(item).kind else {
+        return
+    }
+    let count = self.predicate_count(item)
+    let Some(unit) = self.unit(item) else {
+        return
+    }
+    if count == 0 {
+        return
+    }
+    let Some(function) = unit.contents().functions.position(fn(value: nir::Function) => value.role == nir::Role.Predicate) else {
+        return
+    }
+    let package_id = self.db().package_of(item)
+    let sig = self.sig(item)
+    let type_args = self.types().args(identity_args(sig.contents().generics.view(), types: self.types(), alloc))
+    let ty = self.own_type(item)
+    var terms = Terms.empty(alloc)
+    let value = mut terms.fresh(ty)
+    let default = self.default_term(mut terms, ty)
+    var walk = Walk.new(self.share(), holder: item, unit: unit.share(), function, type_args, params: mem::List[u32].empty(alloc), entry: mem::List[Premise].empty(alloc))
+    var predicates = mem::List[u32].empty(alloc)
+    for index in 0..<count {
+        match mut walk.returned(mut terms, item, role: nir::Role.Predicate, index, type_args, params: single_term(value, alloc)) {
+            Some(predicate) => mut predicates.push(predicate)
+            None => {}
+        }
+    }
+    var defaults = mem::List[u32].empty(alloc)
+    for index in 0..<count {
+        match mut walk.returned(mut terms, item, role: nir::Role.Predicate, index, type_args, params: single_term(default, alloc)) {
+            Some(predicate) => mut defaults.push(predicate)
+            None => {}
+        }
+    }
+    let falsity = mut terms.boolean(false)
+    let token = self.db().ast(item).token
+    if self.entails(mut terms, package_id, premises: predicates.view(), goal: falsity) {
+        self.report(item, token, code: diagnostic::Code.ContractVacuous)
+        return
+    }
+    if not derives_default(structure.derived.view()) {
+        return
+    }
+    let no_premises = mem::List[u32].empty(alloc)
+    for goal in defaults {
+        if not self.entails(mut terms, package_id, premises: no_premises.view(), goal) {
+            self.report(item, token, code: diagnostic::Code.PredicateDefaultUnproven)
+            return
+        }
+    }
+} Checker.check_predicates
+
+/// Whether a `derives` list names `Default`.
+fn derives_default(derived: Slice[ast::Name]) -> bool {
+    for name in derived {
+        if name.text.as_str() == "Default" {
+            return true
+        }
+    }
+    return false
+} derives_default
+
+/// The rules entailment decides on a function's contract: requires that no input
+/// satisfies, or ensures that no result does (`contract.vacuous`, on the last clause), and
+/// each requires of an implementing function that the interface method's requires do not
+/// entail (`contract.impl-requires`).
+fn Checker.check_contracts(self, item: ty::ItemId) {
+    let unit = self.unit(item)
+    let typed = self.typed(item)
+    let head = self.fn_sig(item)
+    let Some(held_unit) = unit else {
+        return
+    }
+    let Some(body) = typed else {
+        return
+    }
+    let Some(sig) = head else {
+        return
+    }
+    let alloc = self.alloc()
+    let generics = self.sig(item)
+    let listed_args = identity_args(generics.contents().generics.view(), types: self.types(), alloc)
+    let subst = generics_subst(generics.contents().generics.view(), args: listed_args.view(), alloc)
+    let type_args = self.types().args(take listed_args)
+    let required = clause_tokens(body.contents(), role: ClauseRole.Requires, alloc)
+    self.check_requires_contract(item, unit: held_unit, sig, subst, type_args, required: required.view())
+    let ensured = clause_tokens(body.contents(), role: ClauseRole.Ensures, alloc)
+    if ensured.len() == 0 {
+        return
+    }
+    let last = ensured[ensured.len() - 1]
+    let Some(position) = held_unit.contents().functions.position(fn(value: nir::Function) => value.role == nir::Role.Ensures and value.index == last.index) else {
+        return
+    }
+    let function = held_unit.contents().functions[position]
+    var terms = Terms.empty(alloc)
+    var params = self.param_symbols(function, subst, mut terms)
+    var walk = Walk.new(self.share(), holder: item, unit: held_unit.share(), function: position, type_args, params: mem::List[u32].empty(alloc), entry: mem::List[Premise].empty(alloc))
+    var facts = self.ensures_premises(item, function, mut walk, mut terms, mut params, subst)
+    match mut walk.returned(mut terms, item, role: nir::Role.Ensures, index: last.index, type_args, take params) {
+        Some(fact) => mut facts.push(fact)
+        None => {}
+    }
+    let falsity = mut terms.boolean(false)
+    if self.entails(mut terms, package_id: self.db().package_of(item), premises: facts.view(), goal: falsity) {
+        self.report(item, token: last.token, code: diagnostic::Code.ContractVacuous)
+    }
+} Checker.check_contracts
+
+/// The rules on a function's requires clauses: those of an implementing function that the
+/// interface method's requires do not entail, and requires that no input satisfies.
+fn Checker.check_requires_contract(
+    self,
+    item: ty::ItemId,
+    unit: mem::Shared[nir::NirUnit],
+    sig: FnSig,
+    subst: ty::Subst,
+    type_args: ty::Args,
+    required: Slice[ClauseToken],
+    ) {
+    let Some(host) = unit.contents().functions.position(fn(value: nir::Function) => value.role == nir::Role.Requires) else {
+        return
+    }
+    let alloc = self.alloc()
+    let types = self.types()
+    let package_id = self.db().package_of(item)
+    var terms = Terms.empty(alloc)
+    let params = self.param_symbols(unit.contents().functions[host], subst, mut terms)
+    var walk = Walk.new(self.share(), holder: item, unit: unit.share(), function: host, type_args, params: mem::List[u32].empty(alloc), entry: mem::List[Premise].empty(alloc))
+    var facts = mem::List[u32].empty(alloc)
+    var position: usize = 0
+    while position < params.len() and position < sig.params.len() {
+        mut walk.predicate_facts(mut terms, term: params[position], ty: subst.ty(types, ty: sig.params[position].ty), inside: self.is_boundary(item), collected: mut facts)
+        position += 1
+    }
+    var own = mem::List[TokenTerm].empty(alloc)
+    for clause in required {
+        match mut walk.returned(mut terms, item, role: nir::Role.Requires, index: clause.index, type_args, params: listed_terms(params.view(), alloc)) {
+            Some(term) => mut own.push(TokenTerm(term: term, token: clause.token))
+            None => {}
+        }
+    }
+    let inherited = listed_terms(facts.view(), alloc)
+    match self.implemented_method(item) {
+        Some(implemented) => self.check_impl_requires(item, implemented, mut walk, mut terms, params: params.view(), inherited: take inherited, own: own.view())
+        None => {}
+    }
+    if own.len() == 0 {
+        return
+    }
+    for clause in own {
+        mut facts.push(clause.term)
+    }
+    let falsity = mut terms.boolean(false)
+    if self.entails(mut terms, package_id, premises: facts.view(), goal: falsity) {
+        self.report(item, token: own[own.len() - 1].token, code: diagnostic::Code.ContractVacuous)
+    }
+} Checker.check_requires_contract
+
+/// Reports each requires of an implementing function that the predicates of its parameters
+/// and the interface method's requires do not entail.
+fn Checker.check_impl_requires(
+    self,
+    item: ty::ItemId,
+    implemented: Implemented,
+    mut walk: Walk,
+    mut terms: Terms,
+    params: Slice[u32],
+    take inherited: mem::List[u32],
+    own: Slice[TokenTerm],
+    ) {
+    let alloc = self.alloc()
+    for clause in self.method_requires(implemented.item, method: implemented.method) {
+        if clause.disputed {
+            continue
+        }
+        match mut walk.returned(mut terms, item: implemented.item, role: nir::Role.Requires, index: clause.index, type_args: implemented.args, params: listed_terms(params, alloc)) {
+            Some(term) => mut inherited.push(term)
+            None => {}
+        }
+    }
+    let package_id = self.db().package_of(item)
+    for clause in own {
+        if not self.entails(mut terms, package_id, premises: inherited.view(), goal: clause.term) {
+            self.report(item, token: clause.token, code: diagnostic::Code.ContractImplRequires)
+        }
+    }
+} Checker.check_impl_requires
+
+/// The clauses of a role of a typed body that are not disputed, by their index among the
+/// clauses of that role.
+fn clause_tokens(body: TBody, role: ClauseRole, alloc: mem::Alloc) -> mem::List[ClauseToken] {
+    var tokens = mem::List[ClauseToken].empty(alloc)
+    var index: u32 = 0
+    for clause in body.clauses {
+        if clause.role != role {
+            continue
+        }
+        if not clause.disputed {
+            mut tokens.push(ClauseToken(index: index, token: clause.token))
+        }
+        index += 1
+    }
+    return tokens
+} clause_tokens
+
+/// Whether the `where` conditions of the item writing an instantiation entail those of the
+/// instantiated item for its const arguments.
+fn Checker.wheres_entailed(
+    self,
+    holder: ty::ItemId,
+    target: ty::ItemId,
+    unit: mem::Shared[nir::NirUnit],
+    conditions: Slice[u32],
+    args: Slice[ty::Arg],
+    consts: Slice[ScalarArg],
+    ) -> bool {
+    let Some(host) = unit.contents().functions.position(fn(value: nir::Function) => value.role == nir::Role.Where) else {
+        return true
+    }
+    let alloc = self.alloc()
+    let package_id = self.db().package_of(holder)
+    var terms = Terms.empty(alloc)
+    var params = mem::List[u32].empty(alloc)
+    for constant in consts {
+        mut params.push(constant_term(mut terms, scalar: constant.scalar, arg: constant.arg))
+    }
+    var listed = mem::List[ty::Arg].empty(alloc)
+    for arg in args {
+        mut listed.push(arg)
+    }
+    let type_args = self.types().args(take listed)
+    var walk = Walk.new(self.share(), holder, unit: unit.share(), function: host, type_args, params: mem::List[u32].empty(alloc), entry: mem::List[Premise].empty(alloc))
+    let premises = self.where_facts(holder, mut walk, mut terms)
+    var goals = mem::List[u32].empty(alloc)
+    for index in conditions {
+        match mut walk.returned(mut terms, item: target, role: nir::Role.Where, index, type_args, params: listed_terms(params.view(), alloc)) {
+            Some(goal) => mut goals.push(goal)
+            None => {}
+        }
+    }
+    for goal in goals {
+        if not self.entails(mut terms, package_id, premises: premises.view(), goal) {
+            return false
+        }
+    }
+    return true
+} Checker.wheres_entailed
+
+/// The term of a const argument of a scalar type: its value, a const parameter's
+/// application, or a fresh symbol.
+fn constant_term(mut terms: Terms, scalar: ty::Scalar, arg: ty::Arg) -> u32 {
+    let alloc = terms.alloc
+    return match first arg {
+        ty::Arg.Const(ty::Const.Int(value)) => mut terms.integer(value, scalar)
+        ty::Arg.Const(ty::Const.Bool(value)) => mut terms.boolean(value)
+        ty::Arg.Const(ty::Const.Param(param)) => mut terms.intern(Term.App(op: Op.Constant(nir::Constant.Param(param)), args: mem::List[u32].empty(alloc)), ty: ty::Ty.scalar(scalar))
+        else => mut terms.fresh(ty::Ty.scalar(scalar))
+    }
+} constant_term
+
+/// The facts the `where` conditions of the const parameters in scope in an item give: those
+/// of its own and of the type it is a member of.
+fn Checker.where_facts(self, item: ty::ItemId, mut walk: Walk, mut terms: Terms) -> mem::List[u32] {
+    let alloc = self.alloc()
+    var holders = mem::List[ty::ItemId].empty(alloc)
+    mut holders.push(item)
+    match self.db().owners.get(item) {
+        Some(TypeKey.Item(owner)) => mut holders.push(owner)
+        else => {}
+    }
+    var facts = mem::List[u32].empty(alloc)
+    for holder in holders {
+        let Some(unit) = self.unit(holder) else {
+            continue
+        }
+        let sig = self.sig(holder)
+        let generics = sig.contents().generics
+        let args = self.types().args(identity_args(generics.view(), types: self.types(), alloc))
+        var params = mem::List[u32].empty(alloc)
+        for def in generics {
+            let Some(scalar) = def.constant else {
+                continue
+            }
+            mut params.push(mut terms.intern(Term.App(op: Op.Constant(nir::Constant.Param(def.param)), args: mem::List[u32].empty(alloc)), ty: ty::Ty.scalar(scalar)))
+        }
+        for function in unit.contents().functions {
+            if function.role != nir::Role.Where {
+                continue
+            }
+            match mut walk.returned(mut terms, item: holder, role: nir::Role.Where, index: function.index, type_args: args, params: listed_terms(params.view(), alloc)) {
+                Some(fact) => mut facts.push(fact)
+                None => {}
+            }
+        }
+    }
+    return facts
+} Checker.where_facts
+
+/// Whether premises entail a goal: the procedure proves the query of the premises and goal.
+fn Checker.entails(self, mut terms: Terms, package_id: ty::PackageId, premises: Slice[u32], goal: u32) -> bool {
+    var listed = mem::List[Premise].empty(self.alloc())
+    for premise in premises {
+        mut listed.push(Premise(term: premise, origin: Origin.Fact))
+    }
+    let canonical = self.canonical_query(mut terms, package_id, premises: listed.view(), goal)
+    var solver = Solver.new(self.share(), package_id)
+    let decision = self.decided(mut solver, query: take canonical)
+    return match decision {
+        Decision.Proved => true
+        else => false
+    }
+} Checker.entails
+
+/// The procedure's decision of a canonical query, read from the proof cache when it holds
+/// the query's result and recorded there when the query is proved or the fuel runs out. While
+/// the prover is compared with the cache, the procedure decides every query, and a held result
+/// that differs is recorded as a mismatch.
+fn Checker.decided(self, mut solver: Solver, take query: CanonQuery) -> Decision {
+    let state = self.state.contents()
+    let alloc = state.session.alloc
+    let opened = match state.proof_cache.get(0) {
+        Some(known) => known
+        None => state.proof_cache.insert(0, value: open_proof_cache(state.session.home, alloc))
+    }
+    let language = self.language_of(solver.package_id)
+    var key: Option[hashing::HashValue] = None
+    match self.session().toolchain_tree() {
+        Some(tree) => {
+            var keyed = mem::Bytes.empty(alloc)
+            mut keyed.append(b"proof\n")
+            mut keyed.append(toolchain::hash(language, tree, alloc).bytes.view())
+            mut keyed.append(query.hash.bytes.view())
+            key = Some(hashing::HashValue.of(keyed.view()))
+        }
+        None => {}
+    }
+    let held = held_proof(opened, key)
+    let comparing = state.comparing.load()
+    if not comparing {
+        let cached = held_result(held)
+        if cached == Some(CACHED_PROVED) {
+            return Decision.Proved
+        }
+        if cached == Some(CACHED_EXHAUSTED) {
+            return Decision.Exhausted
+        }
+    }
+    let hash = query.hash
+    let decision = mut solver.decide(take query)
+    let result: Option[u8] = match decision {
+        Decision.Proved => Some(CACHED_PROVED)
+        Decision.Exhausted => Some(CACHED_EXHAUSTED)
+        else => None
+    }
+    if comparing {
+        match held {
+            Some(bytes) => {
+                if result.is_none() or bytes.len() != 1 or Some(bytes[0]) != result {
+                    discard state.compared.push(hash)
+                }
+            }
+            None => {}
+        }
+        return decision
+    }
+    let Some(cache) = opened else {
+        return decision
+    }
+    let Some(recorded) = result else {
+        return decision
+    }
+    let Some(entry) = key else {
+        return decision
+    }
+    if held.is_none() {
+        var contents = mem::Bytes.empty(alloc)
+        mut contents.push(recorded)
+        discard attempt cache.put(entry, contents: contents.view())
+    }
+    return decision
+} Checker.decided
+
+/// The proof cache of the running user; none without a usable one.
+fn open_proof_cache(home: Option[cache::HomeOverride], alloc: mem::Alloc) -> Option[cache::Cache] {
+    let Ok(opened) = attempt cache::Cache.open(cache::copied_override(home, alloc), alloc) else {
+        return None
+    }
+    let Ok(user) = opened else {
+        return None
+    }
+    return Some(take user)
+} open_proof_cache
+
+/// The entry the proof cache holds under a key; none without a cache, a key or an entry.
+fn held_proof(opened: Option[cache::Cache], key: Option[hashing::HashValue]) -> Option[mem::Bytes] {
+    let Some(user) = opened else {
+        return None
+    }
+    let Some(entry) = key else {
+        return None
+    }
+    let Ok(found) = attempt user.entry(entry) else {
+        return None
+    }
+    let Ok(contents) = found else {
+        return None
+    }
+    return contents
+} held_proof
+
+/// The one byte of a cache entry holding a result.
+fn held_result(held: Option[mem::Bytes]) -> Option[u8] {
+    let Some(bytes) = held else {
+        return None
+    }
+    if bytes.len() != 1 {
+        return None
+    }
+    return Some(bytes[0])
+} held_result
+
+/// The language version a package's manifest states, or the first this implementation
+/// implements.
+fn Checker.language_of(self, package_id: ty::PackageId) -> u64 {
+    let source = self.db().source(package_id)
+    let Some(manifest) = source.manifest else {
+        return toolchain::LANGUAGES[0]
+    }
+    let Some(language) = manifest.language else {
+        return toolchain::LANGUAGES[0]
+    }
+    let Some(version) = language.version.to_u64() else {
+        return toolchain::LANGUAGES[0]
+    }
+    return version
+} Checker.language_of
+
+/// The hash standing for the toolchain's source tree; none when the running executable cannot
+/// be read.
+fn Session.toolchain_tree(self) -> Option[hashing::HashValue] {
+    let computed = self.tree_hash.contents()
+    match computed.get(0) {
+        Some(held) => return held
+        None => {}
+    }
+    let Ok(tree) = attempt toolchain::source_tree(self.alloc) else {
+        return computed.insert(0, value: None)
+    }
+    return computed.insert(0, value: Some(tree))
+} Session.toolchain_tree
+
+/// The default of a type as a term: a scalar's zero, `false` or the `char` of value 0, the
+/// construction of the defaults of a struct's fields when it derives `Default`, and a fresh
+/// symbol for any other type.
+fn Checker.default_term(self, mut terms: Terms, ty: ty::Ty) -> u32 {
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => {
+            if scalar == ty::Scalar.Bool {
+                return mut terms.boolean(false)
+            }
+            if scalar == ty::Scalar.Char {
+                return mut terms.literal(nir::Literal.Char('\0'))
+            }
+            if scalar.is_float() {
+                return mut terms.literal(nir::Literal.Float(bits: 0, scalar: scalar))
+            }
+            return mut terms.integer(wide::Wide.zero(), scalar)
+        }
+        ty::TyKind.Item(item: item, args: args) => {
+            let defaulted = match self.db().ast(item).kind {
+                ast::ItemKind.Struct(structure) => derives_default(structure.derived.view())
+                else => false
+            }
+            let sig = self.sig(item)
+            let SigKind.Struct(fields: fields) = sig.contents().kind else {
+                return mut terms.fresh(ty)
+            }
+            if not defaulted {
+                return mut terms.fresh(ty)
+            }
+            let subst = generics_subst(sig.contents().generics.view(), args: types.arg_list(args), alloc: self.alloc())
+            var parts = mem::List[u32].empty(self.alloc())
+            for field in fields {
+                mut parts.push(self.default_term(mut terms, ty: subst.ty(types, ty: field.ty)))
+            }
+            return mut terms.intern(Term.App(op: Op.Construct(ty), args: take parts), ty)
+        }
+        else => return mut terms.fresh(ty)
+    }
+} Checker.default_term
+
+fn Checker.decide_unit(self, item: ty::ItemId, unit: mem::Shared[nir::NirUnit]) -> mem::List[Obligated] {
+    let alloc = self.alloc()
+    var decided = mem::List[Obligated].empty(alloc)
+    let functions = unit.contents().functions
+    for index in 0..<functions.len() {
+        let function = functions[index]
+        let role = function.role
+        if role == nir::Role.Example or role == nir::Role.Invariant or role == nir::Role.Assume or self.clause_disputed(item, role, index: function.index) {
+            continue
+        }
+        var terms = Terms.empty(alloc)
+        let walked = self.walk_function(item, unit, index, mut terms)
+        let demanded = self.demands_proof(item, function)
+        let WalkedFunction(sites: sites, statements: statements) = walked
+        for obligated in take self.decide_function(item, role, index: function.index, take sites, demanded, mut terms) {
+            mut decided.push(take obligated)
+        }
+        for statement in take statements {
+            for obligated in take self.decide_function(item, role: statement.role, index: statement.index, sites: take statement.sites, demanded: true, mut terms) {
+                mut decided.push(take obligated)
+            }
+        }
+    }
+    return decided
+} Checker.decide_unit
+
+/// Walks a function of a unit with its entry facts, returning its sites with their queries
+/// and those of the statement functions it calls.
+fn Checker.walk_function(self, item: ty::ItemId, unit: mem::Shared[nir::NirUnit], index: usize, mut terms: Terms) -> WalkedFunction {
+    let alloc = self.alloc()
+    let function = unit.contents().functions[index]
+    let sig = self.sig(item)
+    let generics = sig.contents().generics
+    let listed_args = identity_args(generics.view(), types: self.types(), alloc)
+    let subst = generics_subst(generics.view(), args: listed_args.view(), alloc)
+    var params = self.param_symbols(function, subst, mut terms)
+    let head = self.fn_sig(item)
+    let type_args = self.types().args(take listed_args)
+    var walk = Walk.new(self.share(), holder: item, unit: unit.share(), function: index, type_args, params: mem::List[u32].empty(alloc), entry: mem::List[Premise].empty(alloc))
+    let facts = mut walk.opaquely(fn[mut terms, mut params](mut inner: Walk) -> mem::List[u32] {
+        return self.entry_facts(item, function, walk: mut inner, mut terms, mut params, subst, head)
+    })
+    var entry = mem::List[Premise].empty(alloc)
+    for fact in facts {
+        mut entry.push(Premise(term: fact, origin: Origin.Fact))
+    }
+    mut walk.restart(take params, take entry)
+    mut walk.walk(mut terms)
+    let sites = walk.queries(mut terms)
+    return WalkedFunction(sites: take sites, statements: take walk.statements)
+} Checker.walk_function
+
+/// The entry facts of a function's walk: those of the `where` conditions in scope, then by its
+/// role those of its parameters' predicates and the requires holding at its entry, an ensures
+/// function's premises, or a closure's parameters' predicates.
+fn Checker.entry_facts(
+    self,
+    item: ty::ItemId,
+    function: nir::Function,
+    mut walk: Walk,
+    mut terms: Terms,
+    mut params: mem::List[u32],
+    subst: ty::Subst,
+    head: Option[FnSig],
+    ) -> mem::List[u32] {
+    let types = self.types()
+    var facts = self.where_facts(item, mut walk, mut terms)
+    match function.role {
+        nir::Role.Body or nir::Role.Default or nir::Role.Entry or nir::Role.Requires or nir::Role.Old or nir::Role.Decreases => {
+            let boundary = self.is_boundary(item)
+            match head {
+                Some(sig) => {
+                    var position: usize = 0
+                    while position < params.len() and position < sig.params.len() {
+                        mut walk.predicate_facts(mut terms, term: params[position], ty: subst.ty(types, ty: sig.params[position].ty), inside: boundary, collected: mut facts)
+                        position += 1
+                    }
+                }
+                None => {}
+            }
+            if function.role != nir::Role.Entry {
+                self.requires_facts(item, function, mut walk, mut terms, params: params.view(), subst, mut facts)
+            }
+        }
+        nir::Role.Ensures => {
+            for fact in take self.ensures_premises(item, function, mut walk, mut terms, mut params, subst) {
+                mut facts.push(fact)
+            }
+        }
+        nir::Role.Closure => {
+            var position: usize = 0
+            while position < params.len() and position < function.params.len() {
+                let ty = subst.ty(types, ty: function.ty(function.params[position].value).ty())
+                mut walk.predicate_facts(mut terms, term: params[position], ty, inside: false, collected: mut facts)
+                position += 1
+            }
+        }
+        else => {}
+    }
+    return facts
+} Checker.entry_facts
+
+/// The facts the requires holding at a function's entry give, but for a requires function the
+/// requires of its own clause and of those after it.
+fn Checker.requires_facts(
+    self,
+    item: ty::ItemId,
+    function: nir::Function,
+    mut walk: Walk,
+    mut terms: Terms,
+    params: Slice[u32],
+    subst: ty::Subst,
+    mut facts: mem::List[u32],
+    ) {
+    let alloc = self.alloc()
+    for required in self.entry_requires(item) {
+        let nir::Callable.Item(item: holder, role: _, index: index) = required.callable else {
+            continue
+        }
+        if function.role == nir::Role.Requires and holder == item and index >= function.index {
+            continue
+        }
+        let args = subst.args(self.types(), args: required.args)
+        match mut walk.returned(mut terms, item: holder, role: nir::Role.Requires, index, type_args: args, params: listed_terms(params, alloc)) {
+            Some(fact) => mut facts.push(fact)
+            None => {}
+        }
+    }
+} Checker.requires_facts
+
+/// The parameters and entry facts of an ensures function's walk: its kept parameters at
+/// return and `result` as symbols, its `old` values over the parameters at entry; the
+/// facts the requires clauses, the predicates at entry and exit and the earlier ensures
+/// clauses give.
+fn Checker.ensures_premises(
+    self,
+    item: ty::ItemId,
+    function: nir::Function,
+    mut walk: Walk,
+    mut terms: Terms,
+    mut params: mem::List[u32],
+    subst: ty::Subst,
+    ) -> mem::List[u32]
+    waive length "the premises of an ensures function follow the clause rules in order"
+{
+    let alloc = self.alloc()
+    var facts = mem::List[u32].empty(alloc)
+    let Some(sig) = self.fn_sig(item) else {
+        return facts
+    }
+    let types = self.types()
+    var entry = mem::List[u32].empty(alloc)
+    var kept: usize = 0
+    for param in sig.params {
+        match param.mode {
+            ast::Mode.Read => {
+                mut entry.push(params[kept])
+                kept += 1
+            }
+            ast::Mode.Mut => {
+                kept += 1
+                mut entry.push(mut terms.fresh(subst.ty(types, ty: param.ty)))
+            }
+            ast::Mode.Take => mut entry.push(mut terms.fresh(subst.ty(types, ty: param.ty)))
+        }
+    }
+    let kept_count = kept
+    let generics = self.sig(item)
+    let type_args = types.args(identity_args(generics.contents().generics.view(), types, alloc))
+    let clauses = self.ensures_clauses(item, method: None)
+    var position: usize = 0
+    while position < entry.len() and position < sig.params.len() {
+        mut walk.predicate_facts(mut terms, term: entry[position], ty: subst.ty(types, ty: sig.params[position].ty), inside: self.is_boundary(item), collected: mut facts)
+        position += 1
+    }
+    for required in self.entry_requires(item) {
+        let nir::Callable.Item(item: holder, role: _, index: index) = required.callable else {
+            continue
+        }
+        let args = subst.args(types, args: required.args)
+        match mut walk.returned(mut terms, item: holder, role: nir::Role.Requires, index, type_args: args, params: listed_terms(entry.view(), alloc)) {
+            Some(fact) => mut facts.push(fact)
+            None => {}
+        }
+    }
+    let result = params[kept_count]
+    var at_return = mem::List[u32].empty(alloc)
+    for slot in 0..<kept_count {
+        mut at_return.push(params[slot])
+    }
+    var olds = mem::List[u32].empty(alloc)
+    for clause in clauses {
+        if clause.index == function.index {
+            olds = listed_terms(clause.olds.view(), alloc)
+            break
+        }
+    }
+    var slot = kept_count + 1
+    for old in olds {
+        match mut walk.returned(mut terms, item, role: nir::Role.Old, index: old, type_args, params: listed_terms(entry.view(), alloc)) {
+            Some(term) => {
+                params[slot] = term
+            }
+            None => {}
+        }
+        slot += 1
+    }
+    mut walk.predicate_facts(mut terms, term: result, ty: subst.ty(types, ty: sig.result), inside: self.is_boundary(item), collected: mut facts)
+    var returned: usize = 0
+    for param in sig.params {
+        if param.mode == ast::Mode.Take {
+            continue
+        }
+        let term = at_return[returned]
+        returned += 1
+        if param.mode == ast::Mode.Mut {
+            mut walk.predicate_facts(mut terms, term, ty: subst.ty(types, ty: param.ty), inside: self.is_boundary(item), collected: mut facts)
+        }
+    }
+    for clause in clauses {
+        if clause.index >= function.index or clause.disputed {
+            continue
+        }
+        var earlier = listed_terms(at_return.view(), alloc)
+        mut earlier.push(result)
+        for old in clause.olds {
+            match mut walk.returned(mut terms, item, role: nir::Role.Old, index: old, type_args, params: listed_terms(entry.view(), alloc)) {
+                Some(term) => mut earlier.push(term)
+                None => mut earlier.push(mut terms.fresh(ty::Ty.unit()))
+            }
+        }
+        match mut walk.returned(mut terms, item, role: nir::Role.Ensures, index: clause.index, type_args, params: take earlier) {
+            Some(fact) => mut facts.push(fact)
+            None => {}
+        }
+    }
+    return facts
+} Checker.ensures_premises
+
+/// Whether a contract function belongs to a disputed clause, which has no well-definedness
+/// obligations.
+fn Checker.clause_disputed(self, item: ty::ItemId, role: nir::Role, index: u32) -> bool {
+    var clause_role = ClauseRole.Requires
+    match role {
+        nir::Role.Requires => {}
+        nir::Role.Ensures => {
+            clause_role = ClauseRole.Ensures
+        }
+        else => return false
+    }
+    var bodies = mem::List[mem::Shared[TBody]].empty(self.alloc())
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => {
+            match self.typed(item) {
+                Some(body) => mut bodies.push(take body)
+                None => {}
+            }
+        }
+        ast::ItemKind.Interface(_) => {
+            bodies = self.method_typed(item)
+        }
+        else => {}
+    }
+    var seen: u32 = 0
+    for body in bodies {
+        for clause in body.contents().clauses {
+            if clause.role != clause_role {
+                continue
+            }
+            if seen == index {
+                return clause.disputed
+            }
+            seen += 1
+        }
+    }
+    return false
+} Checker.clause_disputed
+
+/// Whether proof is demanded for the obligations of a function of an item's unit: those
+/// of a body, default body or closure whose limits demand `notrap` or of a transparent
+/// function, and the well-definedness obligations of contract terms.
+fn Checker.demands_proof(self, item: ty::ItemId, function: nir::Function) -> bool {
+    return match function.role {
+        nir::Role.Body or nir::Role.Default => self.demands_notrap(item)
+        nir::Role.Closure => {
+            if self.demands_notrap(item) {
+                return true
+            }
+            let Some(body) = self.typed_body(item) else {
+                return false
+            }
+            return closure_demands_notrap(body.contents(), index: function.index)
+        }
+        nir::Role.Entry or nir::Role.Example => false
+        else => true
+    }
+} Checker.demands_proof
+
+/// Decides the sites of one function in order, giving each its status, and, where proof
+/// is demanded and the procedure does not prove it, its outcome.
+fn Checker.decide_function(
+    self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    take sites: mem::List[StatementSite],
+    demanded: bool,
+    mut terms: Terms,
+    ) -> mem::List[Obligated] {
+    let alloc = self.alloc()
+    let package_id = self.db().package_of(item)
+    var statuses = mem::List[Status].empty(alloc)
+    var decided = mem::List[Obligated].empty(alloc)
+    for entry in take sites {
+        let StatementSite(site: site, query: query) = entry
+        let site_demanded = demanded or site.obligation == Obligation.Check(nir::CheckKind.Decreases)
+        var unproved: Option[Unproved] = None
+        var status = Status.Open
+        if not site.open {
+            let canonical = self.canonical_query(mut terms, package_id, premises: query.premises.view(), goal: query.goal)
+            let assumed = assumed_origins(canonical.origins.view(), statuses: statuses.view())
+            var solver = Solver.new(self.share(), package_id)
+            let decision = self.decided(mut solver, query: take canonical)
+            let proved = match decision {
+                Decision.Proved => true
+                else => false
+            }
+            if proved {
+                status = Status.Proven
+                if assumed {
+                    status = Status.Assumed
+                }
+            } else {
+                if site_demanded {
+                    unproved = Some(self.unproved(item, role, index, site, take decision, mut solver))
+                }
+                status = Status.Checked
+            }
+        }
+        mut statuses.push(status)
+        mut decided.push(Obligated(role: role, index: index, obligation: site.obligation, span: site.span, status: status, clause: site.clause, unproved: take unproved))
+    }
+    return decided
+} Checker.decide_function
+
+/// Whether a proof rests on an assumption: an `assume` premise, or the condition of an
+/// earlier site whose status is assumed.
+fn assumed_origins(origins: Slice[Origin], statuses: Slice[Status]) -> bool {
+    for origin in origins {
+        match origin {
+            Origin.Assume => return true
+            Origin.Site(earlier) => {
+                if statuses[earlier] == Status.Assumed {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} assumed_origins
+
+/// The outcome of a site the procedure does not prove: refuted when the open state gives a
+/// candidate the interpreter confirms, unknown otherwise.
+fn Checker.unproved(
+    self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    site: Site,
+    take decision: Decision,
+    mut solver: Solver,
+    ) -> Unproved {
+    let alloc = self.alloc()
+    let Decision.Open(state: boxed, at_depth: depth) = decision else {
+        return Unproved.Unknown(single_text("the fuel ran out", alloc))
+    }
+    var state = take boxed.into_contents()
+    var reason = text::String.of("the open state with nothing left to split on gave", alloc)
+    if depth {
+        reason = text::String.of("the open state at depth 2 gave", alloc)
+    }
+    let Some(candidate) = self.candidate(item, role, index, mut solver, mut state) else {
+        mut reason.append(" no candidate")
+        return Unproved.Unknown(single_text(reason.as_str(), alloc))
+    }
+    let RefutationCandidate(inputs: inputs, type_args: type_args) = candidate
+    let notes = self.candidate_notes(item, role, index, inputs: inputs.view())
+    let run_site = RunSite(role: role, index: index, block: site.block, position: site.position)
+    var interpreter = Interpreter.new(self.share())
+    if mut interpreter.confirm(item, site: run_site, take inputs, type_args: type_args.view()) {
+        return Unproved.Refuted(take notes)
+    }
+    mut reason.append(" a candidate that is not confirmed")
+    return Unproved.Unknown(single_text(reason.as_str(), alloc))
+} Checker.unproved
+
+/// The labelled values of a candidate's parameters, each as `name: literal`.
+fn Checker.candidate_notes(self, item: ty::ItemId, role: nir::Role, index: u32, inputs: Slice[Input]) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var notes = mem::List[text::String].empty(alloc)
+    let Some(unit) = self.unit(item) else {
+        return notes
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        return notes
+    }
+    var position: usize = 0
+    while position < function.params.len() and position < inputs.len() {
+        var note = text::String.of(function.params[position].name.as_str(), alloc)
+        mut note.append(": ")
+        mut note.append(self.input_literal(inputs[position]).as_str())
+        mut notes.push(take note)
+        position += 1
+    }
+    return notes
+} Checker.candidate_notes
+
+/// The candidate of an open state: the values of the function's parameters and const
+/// parameters once its entry terms are fixed; none for a function of a role other than
+/// `body`, `requires`, `old` and `decreases`, an item with generic type parameters, a
+/// parameter of a type no candidate holds, or a fixing that contradicts.
+fn Checker.candidate(
+    self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    mut solver: Solver,
+    mut state: State,
+    ) -> Option[RefutationCandidate] {
+    match role {
+        nir::Role.Body or nir::Role.Requires or nir::Role.Old or nir::Role.Decreases => {}
+        else => return None
+    }
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let generics = sig.contents().generics
+    for def in generics {
+        if def.constant.is_none() {
+            return None
+        }
+    }
+    if not mut solver.fix(mut state) {
+        return None
+    }
+    let Some(unit) = self.unit(item) else {
+        return None
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        return None
+    }
+    var type_args = mem::List[ty::Arg].empty(alloc)
+    for def in generics {
+        let constant = Term.App(op: Op.Constant(nir::Constant.Param(def.param)), args: mem::List[u32].empty(alloc))
+        var value = wide::Wide.zero()
+        match state.terms.lookup(constant) {
+            Some(term) => {
+                if state.is_registered(term) {
+                    value = state.class(term).single().value_or(wide::Wide.zero())
+                }
+            }
+            None => {}
+        }
+        mut type_args.push(ty::Arg.Const(ty::Const.Int(value)))
+    }
+    let subst = generics_subst(generics.view(), args: type_args.view(), alloc)
+    let types = self.types()
+    let builder = RefuteBuilder.new(self.share(), state, module: self.db().module_of(item))
+    var inputs = mem::List[Input].empty(alloc)
+    for param in function.params {
+        let nty = function.ty(param.value)
+        let symbol = symbol_of(param.value, reference: nty.is_reference())
+        let Some(input) = builder.value(state, term: state.terms.lookup(symbol), ty: subst.ty(types, ty: nty.ty())) else {
+            return None
+        }
+        mut inputs.push(take input)
+    }
+    return Some(RefutationCandidate(inputs: take inputs, type_args: take type_args))
+} Checker.candidate
+
+/// The symbol a parameter stands for: its own, or for a reference the content at entry of the
+/// place it designates.
+fn symbol_of(value: nir::Value, reference: bool) -> Term {
+    if reference {
+        return Term.Entry(value.index)
+    }
+    return Term.Param(value.index)
+} symbol_of
+
+/// The symbols a function's parameters stand for: each one's own, or for a reference the
+/// content at entry of the place it designates.
+fn Checker.param_symbols(self, function: nir::Function, subst: ty::Subst, mut terms: Terms) -> mem::List[u32] {
+    let types = self.types()
+    var symbols = mem::List[u32].empty(self.alloc())
+    for param in function.params {
+        let nty = function.ty(param.value)
+        let ty = subst.ty(types, ty: nty.ty())
+        mut symbols.push(mut terms.intern(symbol_of(param.value, reference: nty.is_reference()), ty))
+    }
+    return symbols
+} Checker.param_symbols
+
+/// The type arguments naming each generic parameter itself.
+fn identity_args(generics: Slice[GenericDef], types: ty::Types, alloc: mem::Alloc) -> mem::List[ty::Arg] {
+    var args = mem::List[ty::Arg].empty(alloc)
+    for def in generics {
+        mut args.push(def.param_arg(types))
+    }
+    return args
+} identity_args
+
+/// A list of one term.
+fn single_term(term: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var single = mem::List[u32].empty(alloc)
+    mut single.push(term)
+    return single
+} single_term
+
+/// A list of one text.
+fn single_text(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var single = mem::List[text::String].empty(alloc)
+    mut single.push(text::String.of(written, alloc))
+    return single
+} single_text

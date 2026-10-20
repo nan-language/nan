@@ -1,0 +1,560 @@
+//! The builder of one NIR function: blocks and values as elaboration creates them, numbered at the end in depth-first preorder from the entry, a region's blocks when the walk reaches its instruction, values along the walk.
+
+/// The terminator of a block being built, with its span.
+struct DraftTerm {
+    terminator: nir::Terminator
+    span: nir::Span
+} DraftTerm
+
+struct Draft {
+    params: mem::List[nir::Value]
+    insts: mem::List[nir::Inst]
+    term: Option[DraftTerm]
+} Draft
+
+/// A block and how many instructions it holds.
+struct MarkAt derives Copy {
+    block: nir::BlockId
+    insts: usize
+} MarkAt
+
+/// Where the code built so far ends: its blocks, its values, and the instructions of its current
+/// block.
+struct Mark derives Copy {
+    blocks: usize
+    values: usize
+    current: Option[MarkAt]
+} Mark
+
+struct Builder {
+    blocks: mem::List[Draft]
+    current: Option[nir::BlockId]
+    types: mem::List[nir::NTy]
+    slots: mem::Set[nir::Value]
+    /// The blocks created while each open region is elaborated, innermost last.
+    regions: mem::List[mem::List[nir::BlockId]]
+    alloc: mem::Alloc
+} Builder
+
+/// The numbering of a function's blocks and values in the order a walk from its entry reaches
+/// them, and the renumbering of what they hold.
+struct BuildWalk {
+    blocks: mem::HashMap[nir::BlockId, nir::BlockId]
+    order: mem::List[nir::BlockId]
+    values: mem::HashMap[nir::Value, nir::Value]
+    alloc: mem::Alloc
+} BuildWalk
+
+/// The finished blocks and value types of a function, renumbered, and its parameter values
+/// renumbered.
+struct BuiltBlocks {
+    blocks: mem::List[nir::Block]
+    types: mem::List[nir::NTy]
+    params: mem::List[nir::Value]
+} BuiltBlocks
+
+/// A builder whose current block is the entry.
+fn Builder.new(alloc: mem::Alloc) -> Builder {
+    var builder = Builder(blocks: mem::List[Draft].empty(alloc), current: None, types: mem::List[nir::NTy].empty(alloc), slots: mem::Set[nir::Value].empty(alloc), regions: mem::List[mem::List[nir::BlockId]].empty(alloc), alloc: alloc)
+    let entry = mut builder.block()
+    builder.current = Some(entry)
+    return builder
+} Builder.new
+
+fn Builder.value(mut self, ty: nir::NTy) -> nir::Value {
+    mut self.types.push(ty)
+    return nir::Value(index: u32.fit(self.types.len() - 1))
+} Builder.value
+
+fn Builder.ty(self, value: nir::Value) -> nir::NTy {
+    return self.types[usize.widen(value.index)]
+} Builder.ty
+
+fn Builder.is_slot(self, value: nir::Value) -> bool {
+    return self.slots.contains(value)
+} Builder.is_slot
+
+fn Builder.block(mut self) -> nir::BlockId {
+    mut self.blocks.push(Draft(params: mem::List[nir::Value].empty(self.alloc), insts: mem::List[nir::Inst].empty(self.alloc), term: None))
+    let id = nir::BlockId(index: u32.fit(self.blocks.len() - 1))
+    let open = self.regions.len()
+    if open > 0 {
+        var region = mut self.regions.at_mut(open - 1)
+        mut region.push(id)
+    }
+    return id
+} Builder.block
+
+fn Builder.block_param(mut self, block: nir::BlockId, ty: nir::NTy) -> nir::Value {
+    let value = mut self.value(ty)
+    var draft = mut self.blocks.at_mut(usize.widen(block.index))
+    mut draft.params.push(value)
+    return value
+} Builder.block_param
+
+fn Builder.current_block(self) -> Option[nir::BlockId] {
+    return self.current
+} Builder.current_block
+
+/// Whether code emitted now is reachable: a current block is open.
+fn Builder.open(self) -> bool {
+    return self.current.is_some()
+} Builder.open
+
+fn Builder.at(mut self, block: nir::BlockId) {
+    self.current = Some(block)
+} Builder.at
+
+fn Builder.mark(self) -> Mark {
+    var current: Option[MarkAt] = None
+    match self.current {
+        Some(block) => {
+            current = Some(MarkAt(block: block, insts: self.blocks[usize.widen(block.index)].insts.len()))
+        }
+        None => {}
+    }
+    return Mark(blocks: self.blocks.len(), values: self.types.len(), current: current)
+} Builder.mark
+
+/// Gives the instructions and terminators built since `mark` the span `span`, and replaces
+/// generic parameters by `subst` in the types of the values they make and of what they name.
+fn Builder.since(
+    mut self,
+    mark: Mark,
+    span: nir::Span,
+    subst: ty::Subst,
+    types: ty::Types,
+    ) {
+    let substituted = not subst.is_empty()
+    if substituted {
+        for index in mark.values..<self.types.len() {
+            self.types[index] = match self.types[index] {
+                nir::NTy.Owned(owned) => nir::NTy.Owned(subst.ty(types, ty: owned))
+                nir::NTy.Ref(referenced) => nir::NTy.Ref(subst.ty(types, ty: referenced))
+                nir::NTy.RefMut(referenced) => nir::NTy.RefMut(subst.ty(types, ty: referenced))
+            }
+        }
+    }
+    for index in 0..<self.blocks.len() {
+        var start: usize = 0
+        var reached = index >= mark.blocks
+        match mark.current {
+            Some(at) => {
+                if usize.widen(at.block.index) == index {
+                    start = at.insts
+                    reached = true
+                }
+            }
+            None => {}
+        }
+        if reached {
+            mut self.respan(index, start, span, subst, types)
+        }
+    }
+} Builder.since
+
+/// Gives the instructions of a block from `start` and its terminator the span `span`, and
+/// replaces generic parameters by `subst` in the types they name.
+fn Builder.respan(
+    mut self,
+    index: usize,
+    start: usize,
+    span: nir::Span,
+    subst: ty::Subst,
+    types: ty::Types,
+    ) {
+    let substituted = not subst.is_empty()
+    var draft = mut self.blocks.at_mut(index)
+    var tail = mem::List[nir::Inst].empty(self.alloc)
+    while draft.insts.len() > start {
+        let Some(inst) = mut draft.insts.pop() else {
+            break
+        }
+        mut tail.push(take inst)
+    }
+    while tail.len() > 0 {
+        let Some(popped) = mut tail.pop() else {
+            break
+        }
+        var inst = popped
+        inst.span = span
+        if substituted {
+            inst.op = substitute_op(take inst.op, subst, types)
+        }
+        mut draft.insts.push(take inst)
+    }
+    let Some(held) = mut draft.term.extract() else {
+        return
+    }
+    var term = held
+    term.span = span
+    if substituted {
+        term.terminator = substitute_term(take term.terminator, subst, types)
+    }
+    draft.term = Some(take term)
+} Builder.respan
+
+/// Emits an instruction into the current block, with a result of `result`'s type.
+fn Builder.emit(
+    mut self,
+    take op: nir::Op,
+    result: Option[nir::NTy],
+    span: nir::Span,
+    premise: Option[u32],
+    ) -> Option[nir::Value] {
+    let Some(current) = self.current else {
+        return None
+    }
+    let slot = match op {
+        nir::Op.Slot(name: _, ty: _) => true
+        else => false
+    }
+    var made: Option[nir::Value] = None
+    match result {
+        Some(ty) => {
+            made = Some(mut self.value(ty))
+        }
+        None => {}
+    }
+    match made {
+        Some(value) => {
+            if slot {
+                discard mut self.slots.insert(value)
+            }
+        }
+        None => {}
+    }
+    var draft = mut self.blocks.at_mut(usize.widen(current.index))
+    mut draft.insts.push(nir::Inst(result: made, premise: premise, op: take op, span: span))
+    return made
+} Builder.emit
+
+/// Ends the current block with a terminator; nothing is current afterwards.
+fn Builder.end(mut self, take term: nir::Terminator, span: nir::Span) {
+    let Some(current) = self.current else {
+        return
+    }
+    self.current = None
+    var draft = mut self.blocks.at_mut(usize.widen(current.index))
+    draft.term = Some(DraftTerm(terminator: take term, span: span))
+} Builder.end
+
+fn Builder.jump(mut self, block: nir::BlockId, take args: mem::List[nir::Operand], span: nir::Span) {
+    mut self.end(nir::Terminator.Jump(nir::Jump(block: block, args: take args)), span)
+} Builder.jump
+
+/// A block of the code enclosing the region being collected.
+fn Builder.outer_block(mut self) -> nir::BlockId {
+    let Some(region) = mut self.regions.pop() else {
+        expect false
+        return mut self.block()
+    }
+    let block = mut self.block()
+    mut self.regions.push(take region)
+    return block
+} Builder.outer_block
+
+/// The builder's blocks and values moved out into a builder of their own, leaving this one
+/// without any.
+fn Builder.extract(mut self) -> Builder {
+    let alloc = self.alloc
+    var types = mem::List[nir::NTy].empty(alloc)
+    for held in self.types {
+        mut types.push(held)
+    }
+    mut self.types.truncate(0)
+    var slots = mem::Set[nir::Value].empty(alloc)
+    for slot in self.slots {
+        discard mut slots.insert(slot)
+    }
+    self.slots = mem::Set[nir::Value].empty(alloc)
+    let current = self.current
+    self.current = None
+    return Builder(blocks: drained_list(mut self.blocks, alloc), current: current, types: take types, slots: take slots, regions: drained_list(mut self.regions, alloc), alloc: alloc)
+} Builder.extract
+
+/// The elements of a list moved out in order into another, leaving it empty.
+fn drained_list[T](mut list: mem::List[T], alloc: mem::Alloc) -> mem::List[T] {
+    var reversed = mem::List[T].empty(alloc)
+    loop {
+        let Some(element) = mut list.pop() else {
+            break
+        }
+        mut reversed.push(take element)
+    }
+    var drained = mem::List[T].empty(alloc)
+    loop {
+        let Some(element) = mut reversed.pop() else {
+            break
+        }
+        mut drained.push(take element)
+    }
+    return drained
+} drained_list
+
+/// Starts collecting the blocks of a region.
+fn Builder.open_region(mut self) {
+    mut self.regions.push(mem::List[nir::BlockId].empty(self.alloc))
+} Builder.open_region
+
+fn Builder.close_region(mut self) -> nir::Region {
+    let Some(region) = mut self.regions.pop() else {
+        expect false
+        return nir::Region(blocks: mem::List[nir::BlockId].empty(self.alloc))
+    }
+    return nir::Region(blocks: take region)
+} Builder.close_region
+
+/// The finished blocks and value types, renumbered; `params` are the function's parameter
+/// values, numbered first.
+fn Builder.finish(take self, params: Slice[nir::Value]) -> BuiltBlocks {
+    let alloc = self.alloc
+    var walk = BuildWalk(blocks: mem::HashMap[nir::BlockId, nir::BlockId].empty(seed: 0, alloc), order: mem::List[nir::BlockId].empty(alloc), values: mem::HashMap[nir::Value, nir::Value].empty(seed: 0, alloc), alloc: alloc)
+    for param in params {
+        mut walk.number(param)
+    }
+    mut walk.walk(self.blocks.view(), id: nir::BlockId(index: 0))
+    var types = mem::List[nir::NTy].empty(alloc)
+    for _ in 0..<walk.values.len() {
+        mut types.push(nir::NTy.Owned(ty::Ty.unit()))
+    }
+    for entry in walk.values {
+        types[usize.widen(entry.value().index)] = self.types[usize.widen(entry.key().index)]
+    }
+    var blocks = mem::List[nir::Block].empty(alloc)
+    for old in walk.order {
+        let draft = self.blocks[usize.widen(old.index)]
+        var block_params = mem::List[nir::Value].empty(alloc)
+        for value in draft.params {
+            mut block_params.push(walk.value(value))
+        }
+        var insts = mem::List[nir::Inst].empty(alloc)
+        for inst in draft.insts {
+            mut insts.push(walk.inst(inst))
+        }
+        let term = match draft.term {
+            Some(held) => walk.term(held.terminator)
+            None => nir::Terminator.Unreachable
+        }
+        let term_span = match draft.term {
+            Some(held) => held.span
+            None => nir::Span.at(0)
+        }
+        mut blocks.push(nir::Block(params: take block_params, insts: take insts, term: take term, term_span: term_span))
+    }
+    var renumbered = mem::List[nir::Value].empty(alloc)
+    for param in params {
+        mut renumbered.push(walk.value(param))
+    }
+    return BuiltBlocks(blocks: take blocks, types: take types, params: take renumbered)
+} Builder.finish
+
+fn BuildWalk.number(mut self, value: nir::Value) {
+    if self.values.contains(value) {
+        return
+    }
+    let next = nir::Value(index: u32.fit(self.values.len()))
+    discard mut self.values.insert(value, value: next)
+} BuildWalk.number
+
+/// Numbers a block, then the values and blocks it reaches, depth first.
+fn BuildWalk.walk(mut self, drafts: Slice[Draft], id: nir::BlockId) {
+    if self.blocks.contains(id) {
+        return
+    }
+    discard mut self.blocks.insert(id, value: nir::BlockId(index: u32.fit(self.order.len())))
+    mut self.order.push(id)
+    let draft = drafts[usize.widen(id.index)]
+    for param in draft.params {
+        mut self.number(param)
+    }
+    for inst in draft.insts {
+        match inst.result {
+            Some(result) => mut self.number(result)
+            None => {}
+        }
+        match inst.op {
+            nir::Op.Quantifier(all: _, low: _, high: _, inclusive: _, region: region) or nir::Op.When(attempted: _, accesses: _, region: region) => {
+                if region.blocks.len() > 0 {
+                    mut self.walk(drafts, id: region.blocks[0])
+                }
+            }
+            else => {}
+        }
+    }
+    let Some(held) = draft.term else {
+        return
+    }
+    for successor in held.terminator.successors(self.alloc) {
+        mut self.walk(drafts, id: successor)
+    }
+} BuildWalk.walk
+
+fn BuildWalk.value(self, value: nir::Value) -> nir::Value {
+    return self.values.at(value)
+} BuildWalk.value
+
+fn BuildWalk.block(self, block: nir::BlockId) -> nir::BlockId {
+    return self.blocks.at(block)
+} BuildWalk.block
+
+fn BuildWalk.place(self, place: nir::Place) -> nir::Place {
+    return nir::Place(root: self.value(place.root), steps: copied_steps(place.steps.view(), alloc: self.alloc))
+} BuildWalk.place
+
+fn BuildWalk.operand(self, operand: nir::Operand) -> nir::Operand {
+    return match operand {
+        nir::Operand.Value(value) => nir::Operand.Value(self.value(value))
+        nir::Operand.Literal(literal) => nir::Operand.Literal(literal.copy(self.alloc))
+        nir::Operand.Place(mode: mode, place: place) => nir::Operand.Place(mode: mode, place: self.place(place))
+    }
+} BuildWalk.operand
+
+fn BuildWalk.operands(self, operands: Slice[nir::Operand]) -> mem::List[nir::Operand] {
+    var renumbered = mem::List[nir::Operand].empty(self.alloc)
+    for operand in operands {
+        mut renumbered.push(self.operand(operand))
+    }
+    return renumbered
+} BuildWalk.operands
+
+fn BuildWalk.labelled(self, fields: Slice[nir::Labelled]) -> mem::List[nir::Labelled] {
+    var renumbered = mem::List[nir::Labelled].empty(self.alloc)
+    for field in fields {
+        mut renumbered.push(nir::Labelled(name: text::String.of(field.name.as_str(), alloc: self.alloc), operand: self.operand(field.operand)))
+    }
+    return renumbered
+} BuildWalk.labelled
+
+fn BuildWalk.payload(self, payload: nir::Payload) -> nir::Payload {
+    return match payload {
+        nir::Payload.None => nir::Payload.None
+        nir::Payload.Single(operand) => nir::Payload.Single(self.operand(operand))
+        nir::Payload.Labelled(fields) => nir::Payload.Labelled(self.labelled(fields.view()))
+    }
+} BuildWalk.payload
+
+fn BuildWalk.region(self, region: nir::Region) -> nir::Region {
+    var blocks = mem::List[nir::BlockId].empty(self.alloc)
+    for block in region.blocks {
+        match self.blocks.get(block) {
+            Some(renumbered) => mut blocks.push(renumbered)
+            None => {}
+        }
+    }
+    mut blocks.sort_by(fn(left: nir::BlockId, right: nir::BlockId) => left.cmp(right))
+    return nir::Region(blocks: take blocks)
+} BuildWalk.region
+
+fn BuildWalk.call(self, call: nir::Call) -> nir::Call {
+    let callee = match call.callee {
+        nir::Callee.Fn(fn_ref) => nir::Callee.Fn(fn_ref.copy(self.alloc))
+        nir::Callee.Value(value) => nir::Callee.Value(self.value(value))
+        nir::Callee.Dyn(place: place, item: item, method: method) => nir::Callee.Dyn(place: self.place(place), item: item, method: method)
+    }
+    return nir::Call(awaited: call.awaited, callee: take callee, args: self.operands(call.args.view()))
+} BuildWalk.call
+
+fn BuildWalk.inst(self, inst: nir::Inst) -> nir::Inst {
+    var result: Option[nir::Value] = None
+    match inst.result {
+        Some(value) => {
+            result = Some(self.value(value))
+        }
+        None => {}
+    }
+    return nir::Inst(result: result, premise: inst.premise, op: self.op(inst.op), span: inst.span)
+} BuildWalk.inst
+
+/// The operation with what it names renumbered.
+fn BuildWalk.op(self, op: nir::Op) -> nir::Op {
+    let alloc = self.alloc
+    return match op {
+        nir::Op.Slot(name: name, ty: slot_ty) => nir::Op.Slot(name: copied_text(name, alloc), ty: slot_ty)
+        nir::Op.Load(place) => nir::Op.Load(self.place(place))
+        nir::Op.Move(place) => nir::Op.Move(self.place(place))
+        nir::Op.Ref(place) => nir::Op.Ref(self.place(place))
+        nir::Op.RefMut(place) => nir::Op.RefMut(self.place(place))
+        nir::Op.Init(place: place, operand: operand) => nir::Op.Init(place: self.place(place), operand: self.operand(operand))
+        nir::Op.Assign(place: place, operand: operand) => nir::Op.Assign(place: self.place(place), operand: self.operand(operand))
+        nir::Op.Release(place) => nir::Op.Release(self.place(place))
+        nir::Op.FnRef(fn_ref) => nir::Op.FnRef(fn_ref.copy(alloc))
+        nir::Op.Constant(constant) => nir::Op.Constant(constant)
+        nir::Op.Construct(ty: constructed, fields: fields) => nir::Op.Construct(ty: constructed, fields: self.labelled(fields.view()))
+        nir::Op.Variant(ty: enum_ty, variant: variant, payload: payload) => nir::Op.Variant(ty: enum_ty, variant: text::String.of(variant.as_str(), alloc), payload: self.payload(payload))
+        nir::Op.Is(place: place, ty: tested, variant: variant) => nir::Op.Is(place: self.place(place), ty: tested, variant: text::String.of(variant.as_str(), alloc))
+        nir::Op.Closure(index: index, captures: captures) => nir::Op.Closure(index: index, captures: self.operands(captures.view()))
+        nir::Op.Convert(value: value, to: to, via: via) => nir::Op.Convert(value: self.operand(value), to: to, via: copied_text(via, alloc))
+        nir::Op.Unary(op: unary, operand: operand) => nir::Op.Unary(op: unary, operand: self.operand(operand))
+        nir::Op.Binary(op: binary, left: left, right: right) => nir::Op.Binary(op: binary, left: self.operand(left), right: self.operand(right))
+        nir::Op.Call(call) => nir::Op.Call(self.call(call))
+        nir::Op.Check(kind: kind, operand: operand, open: open) => nir::Op.Check(kind: kind, operand: self.operand(operand), open: open)
+        nir::Op.Assume(operand) => nir::Op.Assume(self.operand(operand))
+        nir::Op.Quantifier(all: all, low: low, high: high, inclusive: inclusive, region: region) => nir::Op.Quantifier(all: all, low: self.operand(low), high: self.operand(high), inclusive: inclusive, region: self.region(region))
+        nir::Op.When(attempted: attempted, accesses: accesses, region: region) => nir::Op.When(attempted: attempted, accesses: self.operands(accesses.view()), region: self.region(region))
+        nir::Op.Dbg(operand) => nir::Op.Dbg(self.operand(operand))
+    }
+} BuildWalk.op
+
+fn BuildWalk.jump(self, jump: nir::Jump) -> nir::Jump {
+    return nir::Jump(block: self.block(jump.block), args: self.operands(jump.args.view()))
+} BuildWalk.jump
+
+fn BuildWalk.term(self, term: nir::Terminator) -> nir::Terminator {
+    return match term {
+        nir::Terminator.Jump(jump) => nir::Terminator.Jump(self.jump(jump))
+        nir::Terminator.Branch(operand: operand, then: then, otherwise: otherwise) => nir::Terminator.Branch(operand: self.operand(operand), then: self.jump(then), otherwise: self.jump(otherwise))
+        nir::Terminator.Call(call: call, ok: ok, failure: failure) => nir::Terminator.Call(call: self.call(call), ok: self.block(ok), failure: self.block(failure))
+        nir::Terminator.Return(value) => nir::Terminator.Return(self.returned(value))
+        nir::Terminator.Fail(operand) => nir::Terminator.Fail(self.operand(operand))
+        nir::Terminator.Todo(intent) => nir::Terminator.Todo(text::String.of(intent.as_str(), alloc: self.alloc))
+        nir::Terminator.Unreachable => nir::Terminator.Unreachable
+        nir::Terminator.Yield(operand) => nir::Terminator.Yield(self.operand(operand))
+    }
+} BuildWalk.term
+
+/// The operand a return passes, renumbered.
+fn BuildWalk.returned(self, value: Option[nir::Operand]) -> Option[nir::Operand] {
+    let Some(operand) = value else {
+        return None
+    }
+    return Some(self.operand(operand))
+} BuildWalk.returned
+
+/// Replaces generic parameters by `subst` in the types an instruction names.
+fn substitute_op(take op: nir::Op, subst: ty::Subst, types: ty::Types) -> nir::Op {
+    match op {
+        nir::Op.Slot(name: name, ty: slot_ty) => return nir::Op.Slot(name: take name, ty: subst.ty(types, ty: slot_ty))
+        nir::Op.Construct(ty: constructed, fields: fields) => return nir::Op.Construct(ty: subst.ty(types, ty: constructed), fields: take fields)
+        nir::Op.Variant(ty: enum_ty, variant: variant, payload: payload) => return nir::Op.Variant(ty: subst.ty(types, ty: enum_ty), variant: take variant, payload: take payload)
+        nir::Op.Is(place: place, ty: tested, variant: variant) => return nir::Op.Is(place: take place, ty: subst.ty(types, ty: tested), variant: take variant)
+        nir::Op.Convert(value: value, to: to, via: via) => return nir::Op.Convert(value: take value, to: subst.ty(types, ty: to), via: take via)
+        nir::Op.FnRef(fn_ref) => return nir::Op.FnRef(substitute_fn_ref(take fn_ref, subst, types))
+        nir::Op.Call(call) => return nir::Op.Call(substitute_call(take call, subst, types))
+        else => return op
+    }
+} substitute_op
+
+fn substitute_call(take call: nir::Call, subst: ty::Subst, types: ty::Types) -> nir::Call {
+    let nir::Call(awaited: awaited, callee: callee, args: args) = call
+    let replaced = match callee {
+        nir::Callee.Fn(fn_ref) => nir::Callee.Fn(substitute_fn_ref(take fn_ref, subst, types))
+        else => callee
+    }
+    return nir::Call(awaited: awaited, callee: take replaced, args: take args)
+} substitute_call
+
+/// A function reference with its type arguments substituted.
+fn substitute_fn_ref(take fn_ref: nir::FnRef, subst: ty::Subst, types: ty::Types) -> nir::FnRef {
+    var substituted = fn_ref
+    substituted.args = subst.args(types, args: substituted.args)
+    return substituted
+} substitute_fn_ref
+
+/// The terminator with the type arguments of the function a call terminator calls substituted.
+fn substitute_term(take term: nir::Terminator, subst: ty::Subst, types: ty::Types) -> nir::Terminator {
+    match term {
+        nir::Terminator.Call(call: call, ok: ok, failure: failure) => return nir::Terminator.Call(call: substitute_call(take call, subst, types), ok: ok, failure: failure)
+        else => return term
+    }
+} substitute_term

@@ -1,0 +1,798 @@
+//! The stores the interpreter supplies: allocators and budgets over the run's cells, the storage of growable containers, and heaps, boxes, shared values, arenas and pools. A growable container holds its storage, the cell it draws through, its capacity and its allocation. A type with interior mutability holds a reference to an extent of its own holding such a container, which its operations replace through a read receiver.
+
+/// The limit of the root cell an interpreter run's `testing::world()` allocator names.
+const WORLD_LIMIT: wide::Wide = wide::Wide.of_u64(16_777_216)
+
+/// The positions of a container's parts.
+const CONTAINER_STORAGE: usize = 0
+
+const CONTAINER_CELL: usize = 1
+
+const CONTAINER_CAPACITY: usize = 2
+
+const CONTAINER_ALLOCATION: usize = 3
+
+/// The positions of a pool slot's parts: its generation and its occupant.
+const SLOT_GENERATION: usize = 0
+
+const SLOT_OCCUPANT: usize = 1
+
+/// The positions of a shared value's or cown's parts: its contents, its count, the cell its box
+/// was drawn through and the box's allocation.
+const SHARED_CONTENTS: usize = 0
+
+const SHARED_COUNT: usize = 1
+
+const SHARED_CELL: usize = 2
+
+const SHARED_ALLOCATION: usize = 3
+
+/// A member of `mem::Alloc`, `mem::Budget`, `mem::Heap`, `mem::Box`, `mem::Shared`,
+/// `mem::Arena`, `mem::Id` or `mem::Pool`, or of their cursors; none for another member.
+fn Interpreter.store_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    type_args: Slice[ty::Arg],
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    var element = ty::Ty.unit()
+    if type_args.len() > 0 {
+        element = type_args[0].ty().value_or(ty::Ty.unit())
+    }
+    let option = self.ty_item("core", name: "Option")
+    if (owner == "mem::Heap" or owner == "mem::Arena" or owner == "mem::Pool") and (member == "boxed" or member == "try_boxed") {
+        return Some(try mut self.store_boxed(owner, member, type_args, args, at))
+    }
+    return match owner {
+        "mem::Alloc" or "mem::Budget" or "mem::Heap" => mut self.budget_member(owner, member, args)
+        "mem::Box" => mut self.box_member(member, args)
+        "mem::Shared" or "task::Cown" => try mut self.shared_member(owner, member, element, args, at, site)
+        "mem::Arena" or "mem::ArenaCursor" or "mem::Id" => try mut self.arena_member(owner, member, element, option, args, at)
+        "mem::Pool" or "mem::PoolCursor" => try mut self.pool_member(owner, member, element, option, args, at)
+        else => None
+    }
+} Interpreter.store_member
+
+/// A member of `mem::Alloc`, `mem::Budget` or `mem::Heap` other than `boxed`; none for another.
+fn Interpreter.budget_member(mut self, owner: Str, member: Str, args: Slice[Val]) -> Option[InterpFlow] {
+    let alloc = self.alloc
+    if owner == "mem::Alloc" {
+        if member != "split" {
+            return None
+        }
+        let parent = self.cell_of(args[0])
+        let cell = mut self.budgets.split(parent, limit: args[1].int_value())
+        let budget = self.ty_item("mem", name: "Budget")
+        return Some(InterpFlow.Return(Val.Struct(item: budget, fields: mem::Shared.of(Val.single(Val.of_usize(usize.widen(cell)), alloc), alloc))))
+    }
+    if member == "alloc" {
+        return Some(InterpFlow.Return(self.allocator(self.cell_of(args[0]))))
+    }
+    if owner == "mem::Heap" {
+        if member != "of" {
+            return None
+        }
+        let heap = self.ty_item("mem", name: "Heap")
+        let cell = self.cell_of(args[0])
+        return Some(InterpFlow.Return(Val.Struct(item: heap, fields: mem::Shared.of(Val.single(Val.of_usize(usize.widen(cell)), alloc), alloc))))
+    }
+    match member {
+        "charged" => return Some(InterpFlow.Return(Val.Int(self.budgets.charged(self.cell_of(args[0])))))
+        "limit" => return Some(InterpFlow.Return(Val.Int(self.budgets.limit(self.cell_of(args[0])))))
+        "close" => {
+            let cell = self.cell_of(args[0])
+            mut self.budgets.close(cell)
+            return Some(InterpFlow.Return(Val.Unit))
+        }
+        else => return None
+    }
+} Interpreter.budget_member
+
+/// A member of `mem::Box`; none for another member.
+fn Interpreter.box_member(mut self, member: Str, args: Slice[Val]) -> Option[InterpFlow] {
+    match member {
+        "contents" or "contents_mut" => return Some(InterpFlow.Return(self.deref(args[0]).fields()[0].copy(self.alloc)))
+        "into_contents" => {
+            let boxed = self.deref(args[0])
+            let value = self.deref(boxed.fields()[0])
+            mut self.unbox(boxed)
+            return Some(InterpFlow.Return(take value))
+        }
+        else => return None
+    }
+} Interpreter.box_member
+
+/// A member of `mem::Shared` or `task::Cown`; none for another member.
+fn Interpreter.shared_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    element: ty::Ty,
+    args: Slice[Val],
+    at: ItemSpan,
+    site: RunSite,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if member == "of" or member == "try_of" {
+        let cell = self.cell_of(args[1])
+        let Some(shared) = mut self.counted(path: owner, cell, value: args[0].copy(alloc), ty: element) else {
+            return Some(try self.exhausted(fallible: member == "try_of", at))
+        }
+        return Some(InterpFlow.Return(take shared))
+    }
+    if member == "share" {
+        let shared = self.deref(args[0])
+        let count = shared.fields()[SHARED_COUNT].place()
+        let next = self.memory.get(count).int_value().wrapping_add(wide::Wide.one())
+        mut self.memory.set(count, stored: Val.Int(next))
+        return Some(InterpFlow.Return(take shared))
+    }
+    if owner != "mem::Shared" {
+        return None
+    }
+    match member {
+        "contents" => return Some(InterpFlow.Return(self.deref(args[0]).fields()[SHARED_CONTENTS].copy(alloc)))
+        "make_mut" => return Some(try mut self.make_mut(args, element, at, site))
+        else => return None
+    }
+} Interpreter.shared_member
+
+/// A member of `mem::Arena`, `mem::ArenaCursor` or `mem::Id` other than `boxed`; none for
+/// another member.
+fn Interpreter.arena_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    element: ty::Ty,
+    option: ty::ItemId,
+    args: Slice[Val],
+    at: ItemSpan,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if owner == "mem::ArenaCursor" {
+        if member != "next" {
+            return None
+        }
+        return Some(InterpFlow.Return(mut self.slice_next(args[0])))
+    }
+    if owner == "mem::Id" {
+        match member {
+            "of" => {
+                let id = self.ty_item("mem", name: "Id")
+                return Some(InterpFlow.Return(Val.Struct(item: id, fields: mem::Shared.of(Val.single(args[0].copy(alloc), alloc), alloc))))
+            }
+            "index" => return Some(InterpFlow.Return(self.deref(args[0]).fields()[0].copy(alloc)))
+            else => return None
+        }
+    }
+    match member {
+        "empty" => {
+            let cell = self.cell_of(args[0])
+            let inner = mut self.container(path: owner, elements: mem::List[Val].empty(alloc), cell)
+            return Some(InterpFlow.Return(mut self.interior(path: owner, take inner)))
+        }
+        "len" => {
+            let inner = self.held(args[0])
+            return Some(InterpFlow.Return(Val.of_usize(self.entry_count(inner))))
+        }
+        "push" or "try_push" => {
+            let holder = self.holder(args[0])
+            let storage = self.storage_of(holder)
+            let id = self.memory.get(storage).fields().len()
+            let Some(parts) = args.split_at(1) else {
+                expect false
+                return None
+            }
+            let Some(pushed) = parts.tail.prefix(1) else {
+                expect false
+                return None
+            }
+            if not mut self.append(place: holder, values: pushed, element) {
+                return Some(try self.exhausted(fallible: member == "try_push", at))
+            }
+            let item = self.ty_item("mem", name: "Id")
+            return Some(InterpFlow.Return(Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.of_usize(id), alloc), alloc))))
+        }
+        "at" or "at_mut" or "get" => {
+            let arena = self.held(args[0])
+            let index = usize.widen(self.deref(args[1]).fields()[0].int_value().low_bits())
+            let storage = self.storage(arena)
+            let found = index < self.memory.get(storage).fields().len()
+            let entry = storage.with(u32.truncate(index), alloc)
+            if member == "get" {
+                if found {
+                    return Some(InterpFlow.Return(Val.some(option, value: Val.Ref(take entry), alloc)))
+                }
+                return Some(InterpFlow.Return(Val.none(option, alloc)))
+            }
+            if found {
+                return Some(InterpFlow.Return(Val.Ref(take entry)))
+            }
+            fail self.trap("trap.bounds", at)
+        }
+        "cursor" => {
+            let arena = self.held(args[0])
+            let storage = self.storage(arena)
+            let len = self.memory.get(storage).fields().len()
+            let cursor = self.ty_item("mem", name: "ArenaCursor")
+            let view = View(array: take storage, start: 0, len: len)
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(Val.single(Val.View(take view), alloc), alloc))))
+        }
+        else => return None
+    }
+} Interpreter.arena_member
+
+/// A member of `mem::Pool` other than `boxed`, or of `mem::PoolCursor`; none for another member.
+fn Interpreter.pool_member(
+    mut self,
+    owner: Str,
+    member: Str,
+    element: ty::Ty,
+    option: ty::ItemId,
+    args: Slice[Val],
+    at: ItemSpan,
+    ) -> Option[InterpFlow] fails End {
+    let alloc = self.alloc
+    if owner == "mem::PoolCursor" {
+        if member != "next" {
+            return None
+        }
+        return Some(InterpFlow.Return(mut self.pool_next(option, cursor: args[0])))
+    }
+    match member {
+        "empty" => {
+            let cell = self.cell_of(args[0])
+            return Some(InterpFlow.Return(mut self.container(path: owner, elements: mem::List[Val].empty(alloc), cell)))
+        }
+        "len" => {
+            let storage = self.storage(args[0])
+            var count: usize = 0
+            for slot in self.memory.get(storage).fields() {
+                if slot.is_occupied() {
+                    count += 1
+                }
+            }
+            return Some(InterpFlow.Return(Val.of_usize(count)))
+        }
+        "insert" or "try_insert" => {
+            let Some(handle) = mut self.insert_slot(args[0].place(), value: args[1].copy(alloc), element) else {
+                return Some(try self.exhausted(fallible: member == "try_insert", at))
+            }
+            return Some(InterpFlow.Return(take handle))
+        }
+        "reserve" or "try_reserve" => {
+            let pool = args[0].place()
+            let current = self.memory.get(pool).copy(alloc)
+            let storage = self.storage(current)
+            let slots = self.memory.get(storage).fields()
+            var free: usize = 0
+            for slot in slots {
+                if not slot.is_occupied() {
+                    free += 1
+                }
+            }
+            let needed = slots.len().wrapping_add(usize.widen(args[1].int_value().low_bits()).saturating_sub(free))
+            let Some(grown) = mut self.grow(current, needed, element) else {
+                return Some(try self.exhausted(fallible: member == "try_reserve", at))
+            }
+            mut self.memory.set(pool, stored: take grown)
+            return Some(InterpFlow.Return(Val.Unit))
+        }
+        "contains" or "get" or "get_mut" or "at" or "at_mut" or "remove" => return Some(try mut self.pool_access(member, option, args, at))
+        "cursor" => {
+            let pool = self.deref(args[0])
+            let cursor = self.ty_item("mem", name: "PoolCursor")
+            var fields = Val.single(Val.Ref(self.storage(pool)), alloc)
+            mut fields.push(Val.of_usize(0))
+            return Some(InterpFlow.Return(Val.Struct(item: cursor, fields: mem::Shared.of(take fields, alloc))))
+        }
+        else => return None
+    }
+} Interpreter.pool_member
+
+/// `contains`, `get`, `get_mut`, `at`, `at_mut` and `remove` of a pool: the occupant of the
+/// slot a live handle names; a stale handle traps but for `contains`, `get` and `get_mut`.
+fn Interpreter.pool_access(mut self, member: Str, option: ty::ItemId, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let pool = self.deref(args[0])
+    let storage = self.storage(pool)
+    let handle = self.deref(args[1])
+    let index = usize.widen(handle.fields()[0].int_value().low_bits())
+    let generation = handle.fields()[1]
+    let slots = self.memory.get(storage).fields()
+    let live = index < slots.len() and slots[index].is_occupied() and slots[index].fields()[SLOT_GENERATION].equals(generation)
+    let occupant = storage.with(u32.truncate(index), alloc).with(u32.fit(SLOT_OCCUPANT), alloc)
+    if member == "contains" {
+        return InterpFlow.Return(Val.Bool(live))
+    }
+    if member == "get" or member == "get_mut" {
+        if live {
+            return InterpFlow.Return(Val.some(option, value: Val.Ref(take occupant), alloc))
+        }
+        return InterpFlow.Return(Val.none(option, alloc))
+    }
+    if not live {
+        fail self.trap("trap.stale-handle", at)
+    }
+    if member == "remove" {
+        let removed = self.memory.get(occupant).copy(alloc)
+        let next = Val.Int(generation.int_value().wrapping_add(wide::Wide.one()))
+        mut self.memory.set(storage.with(u32.truncate(index), alloc), stored: Val.slot(take next, occupant: Val.Absent, alloc))
+        return InterpFlow.Return(take removed)
+    }
+    return InterpFlow.Return(Val.Ref(take occupant))
+} Interpreter.pool_access
+
+/// The `next` of a pool's cursor: a reference to the occupant of its next occupied slot, past
+/// which it then moves.
+fn Interpreter.pool_next(mut self, option: ty::ItemId, cursor: Val) -> Val {
+    let alloc = self.alloc
+    let cursor_place = cursor.place()
+    let state = self.memory.get(cursor_place).copy(alloc)
+    let Val.Struct(item: item, fields: fields) = state else {
+        expect false
+        return Val.Absent
+    }
+    let parts = fields.contents()
+    let storage = parts[0].place()
+    let slots = self.memory.get(storage).fields()
+    let len = slots.len()
+    var next: Option[usize] = None
+    var index = usize.widen(parts[1].int_value().low_bits())
+    while index < len {
+        if slots[index].is_occupied() {
+            next = Some(index)
+            break
+        }
+        index += 1
+    }
+    var position = len
+    match next {
+        Some(found) => {
+            position = found + 1
+        }
+        None => {}
+    }
+    var moved = Val.single(parts[0].copy(alloc), alloc)
+    mut moved.push(Val.of_usize(position))
+    mut self.memory.set(cursor_place, stored: Val.Struct(item: item, fields: mem::Shared.of(take moved, alloc)))
+    let Some(found) = next else {
+        return Val.none(option, alloc)
+    }
+    return Val.some(option, value: Val.Ref(storage.with(u32.truncate(found), alloc).with(u32.fit(SLOT_OCCUPANT), alloc)), alloc)
+} Interpreter.pool_next
+
+/// `boxed` and `try_boxed` of a heap, arena or pool: a box drawn through the cell its store
+/// names.
+fn Interpreter.store_boxed(mut self, owner: Str, member: Str, type_args: Slice[ty::Arg], args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let source = self.deref(args[0])
+    var cell: u32 = 0
+    match owner {
+        "mem::Heap" => {
+            cell = self.cell_of(source)
+        }
+        "mem::Arena" => {
+            cell = u32.truncate(self.held(source).fields()[CONTAINER_CELL].int_value().low_bits())
+        }
+        else => {
+            cell = u32.truncate(source.fields()[CONTAINER_CELL].int_value().low_bits())
+        }
+    }
+    var boxed_ty = ty::Ty.unit()
+    if type_args.len() > 0 {
+        boxed_ty = type_args[type_args.len() - 1].ty().value_or(ty::Ty.unit())
+    }
+    let Some(made) = mut self.boxed(cell, value: args[1].copy(alloc), ty: boxed_ty) else {
+        return try self.exhausted(fallible: member == "try_boxed", at)
+    }
+    return InterpFlow.Return(take made)
+} Interpreter.store_boxed
+
+/// Places a value in the earliest freed slot of the pool at a place, or in a new slot, and
+/// returns its handle; none on exhaustion.
+fn Interpreter.insert_slot(mut self, pool: Loc, take value: Val, element: ty::Ty) -> Option[Val] {
+    let alloc = self.alloc
+    let current = self.memory.get(pool).copy(alloc)
+    var slots = self.entries(current)
+    var index = slots.len()
+    for position in 0..<slots.len() {
+        if not slots[position].is_occupied() {
+            index = position
+            break
+        }
+    }
+    if index == slots.len() {
+        let Some(grown) = mut self.grow(current, needed: slots.len() + 1, element) else {
+            return None
+        }
+        mut self.memory.set(pool, stored: take grown)
+        mut slots.push(Val.slot(Val.of_usize(0), occupant: Val.Absent, alloc))
+    }
+    let generation = slots[index].fields()[SLOT_GENERATION].copy(alloc)
+    slots[index] = Val.slot(generation.copy(alloc), occupant: take value, alloc)
+    mut self.store(place: pool, elements: take slots)
+    let handle = self.ty_item("mem", name: "Handle")
+    var fields = Val.single(Val.of_usize(index), alloc)
+    mut fields.push(take generation)
+    return Some(Val.Struct(item: handle, fields: mem::Shared.of(take fields, alloc)))
+} Interpreter.insert_slot
+
+fn Val.slot(take generation: Val, take occupant: Val, alloc: mem::Alloc) -> Val {
+    var parts = Val.single(take generation, alloc)
+    mut parts.push(take occupant)
+    return Val.Array(mem::Shared.of(take parts, alloc))
+} Val.slot
+
+fn Val.is_occupied(self) -> bool {
+    return not self.fields()[SLOT_OCCUPANT].is_absent()
+} Val.is_occupied
+
+/// An integer value of a count or index.
+fn Val.of_usize(value: usize) -> Val = Val.Int(wide::Wide.of_u64(u64.widen(value)))
+
+/// A new box holding a value, drawn through a cell; none on exhaustion.
+fn Interpreter.boxed(mut self, cell: u32, take value: Val, ty: ty::Ty) -> Option[Val] {
+    let alloc = self.alloc
+    let footprint = self.ck.interp_layout(ty)
+    var size = footprint.size
+    if size < 1 {
+        size = 1
+    }
+    let Some(allocation) = mut self.budgets.allocate(cell, size, align: footprint.align) else {
+        return None
+    }
+    let extent = mut self.memory.alloc(take value, writable: true, size: footprint.size)
+    let item = self.ty_item("mem", name: "Box")
+    var fields = Val.single(Val.extent_ref(extent, alloc), alloc)
+    mut fields.push(Val.of_usize(usize.widen(allocation)))
+    return Some(Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc)))
+} Interpreter.boxed
+
+/// Ends a box whose contents moved out or were released: its memory returns and its extent
+/// ends.
+fn Interpreter.unbox(mut self, boxed: Val) {
+    mut self.budgets.free(u32.truncate(boxed.fields()[1].int_value().low_bits()))
+    mut self.memory.kill(boxed.fields()[0].place().extent)
+} Interpreter.unbox
+
+/// A new shared value or cown, of the std type at `path`, holding a value with a count of 1,
+/// drawn through a cell; none on exhaustion.
+fn Interpreter.counted(mut self, path: Str, cell: u32, take value: Val, ty: ty::Ty) -> Option[Val] {
+    let alloc = self.alloc
+    let Some(contents) = mut self.boxed(cell, take value, ty) else {
+        return None
+    }
+    let count = mut self.memory.alloc(Val.of_usize(1), writable: true, size: 0)
+    let item = self.path_item(path)
+    let parts = contents.fields()
+    var fields = Val.single(parts[0].copy(alloc), alloc)
+    mut fields.push(Val.extent_ref(count, alloc))
+    mut fields.push(Val.of_usize(usize.widen(cell)))
+    mut fields.push(parts[1].copy(alloc))
+    return Some(Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc)))
+} Interpreter.counted
+
+/// The std type item at a path `module::Name`.
+fn Interpreter.path_item(self, path: Str) -> ty::ItemId {
+    let Some(split) = last_path_separator(path) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    let Some(module) = path.slice_bytes(0, end: split) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    let Some(name) = path.slice_bytes(split + 2, end: path.byte_len()) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    return self.ty_item(module, name)
+} Interpreter.path_item
+
+/// `make_mut`: a writable view of the contents, which a count above 1 first replaces with a
+/// clone in a new box of its own.
+fn Interpreter.make_mut(mut self, args: Slice[Val], element: ty::Ty, at: ItemSpan, site: RunSite) -> InterpFlow fails End {
+    let alloc = self.alloc
+    let receiver = args[0].place()
+    let current = self.memory.get(receiver).copy(alloc)
+    let count = current.fields()[SHARED_COUNT].place()
+    if wide::Wide.one().lt(self.memory.get(count).int_value()) {
+        let clone_value = self.deref(args[1])
+        let Val.Fn(cloner) = clone_value else {
+            expect false
+            fail End.Missing
+        }
+        let cell = u32.truncate(current.fields()[SHARED_CELL].int_value().low_bits())
+        var clone_args = Val.single(current.fields()[SHARED_CONTENTS].copy(alloc), alloc)
+        mut clone_args.push(self.allocator(cell))
+        let flow = try mut self.invoke(cloner.contents(), args: take clone_args, at, site)
+        var copied = Val.Absent
+        match flow {
+            InterpFlow.Return(value) => {
+                copied = value
+            }
+            else => return flow
+        }
+        let Some(replacement) = mut self.counted(path: "mem::Shared", cell, value: take copied, ty: element) else {
+            fail self.trap("trap.exhausted", at)
+        }
+        mut self.store_release(current)
+        mut self.memory.set(receiver, stored: take replacement)
+    }
+    return InterpFlow.Return(self.memory.get(receiver).fields()[SHARED_CONTENTS].copy(alloc))
+} Interpreter.make_mut
+
+/// The cell an allocator, budget or heap names.
+fn Interpreter.cell_of(self, value: Val) -> u32 {
+    return u32.truncate(self.deref(value).fields()[0].int_value().low_bits())
+} Interpreter.cell_of
+
+/// An allocator naming a cell.
+fn Interpreter.allocator(self, cell: u32) -> Val {
+    let item = self.ty_item("mem", name: "Alloc")
+    return Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.of_usize(usize.widen(cell)), alloc: self.alloc), alloc: self.alloc))
+} Interpreter.allocator
+
+/// The place a reference designates.
+proj fn Val.place(self) -> Loc {
+    match self {
+        Val.Ref(loc) => return loc
+        else => {}
+    }
+    expect false
+    loop {
+    }
+} Val.place
+
+/// A new container of the std type at `path`, drawing through a cell, holding elements
+/// without memory of its own.
+fn Interpreter.container(mut self, path: Str, take elements: mem::List[Val], cell: u32) -> Val {
+    let alloc = self.alloc
+    let item = self.path_item(path)
+    let extent = mut self.memory.alloc(Val.Array(mem::Shared.of(take elements, alloc)), writable: true, size: 0)
+    var fields = Val.single(Val.extent_ref(extent, alloc), alloc)
+    mut fields.push(Val.of_usize(usize.widen(cell)))
+    mut fields.push(Val.of_usize(0))
+    mut fields.push(Val.Int(wide::Wide.of_i64(-1)))
+    return Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc))
+} Interpreter.container
+
+/// A value of the std type at `path` with interior mutability, holding a container in an extent
+/// of its own.
+fn Interpreter.interior(mut self, path: Str, take inner: Val) -> Val {
+    let alloc = self.alloc
+    let item = self.path_item(path)
+    let extent = mut self.memory.alloc(take inner, writable: true, size: 0)
+    return Val.Struct(item: item, fields: mem::Shared.of(Val.single(Val.extent_ref(extent, alloc), alloc), alloc))
+} Interpreter.interior
+
+/// The place of the container a value with interior mutability holds.
+fn Interpreter.holder(self, value: Val) -> Loc {
+    return self.deref(value).fields()[0].place().copy(self.alloc)
+} Interpreter.holder
+
+/// The container a value with interior mutability holds.
+fn Interpreter.held(self, value: Val) -> Val {
+    let holder = self.holder(value)
+    return self.memory.get(holder).copy(self.alloc)
+} Interpreter.held
+
+/// The place of a container's storage.
+fn Interpreter.storage(self, container: Val) -> Loc {
+    return self.deref(container).fields()[CONTAINER_STORAGE].place().copy(self.alloc)
+} Interpreter.storage
+
+/// The place of the storage of the container at a place.
+fn Interpreter.storage_of(self, container: Loc) -> Loc {
+    return self.storage(self.memory.get(container))
+} Interpreter.storage_of
+
+/// A container's elements.
+fn Interpreter.entries(self, container: Val) -> mem::List[Val] {
+    let storage = self.storage(container)
+    return Val.copies(self.memory.get(storage).fields(), alloc: self.alloc)
+} Interpreter.entries
+
+/// A container's capacity.
+fn Interpreter.capacity(self, container: Val) -> usize {
+    return usize.widen(self.deref(container).fields()[CONTAINER_CAPACITY].int_value().low_bits())
+} Interpreter.capacity
+
+/// A new container of the std type at `path` holding elements, drawing through a cell, its
+/// capacity their number; none on exhaustion.
+fn Interpreter.holding(
+    mut self,
+    path: Str,
+    take elements: mem::List[Val],
+    cell: u32,
+    element: ty::Ty,
+    ) -> Option[Val] {
+    let alloc = self.alloc
+    let empty = mut self.container(path, elements: mem::List[Val].empty(alloc), cell)
+    let Some(sized) = mut self.resized(empty, capacity: elements.len(), element) else {
+        return None
+    }
+    let storage = self.storage(sized)
+    mut self.memory.set(storage, stored: Val.Array(mem::Shared.of(take elements, alloc)))
+    return Some(take sized)
+} Interpreter.holding
+
+/// Appends elements to the container at a place, growing it; false on exhaustion, which leaves
+/// it unchanged.
+fn Interpreter.append(mut self, place: Loc, values: Slice[Val], element: ty::Ty) -> bool {
+    let alloc = self.alloc
+    let current = self.memory.get(place).copy(alloc)
+    var elements = self.entries(current)
+    let Some(grown) = mut self.grow(current, needed: elements.len() + values.len(), element) else {
+        return false
+    }
+    mut elements.reserve(values.len())
+    for value in values {
+        mut elements.push(value.copy(alloc))
+    }
+    mut self.memory.set(place, stored: take grown)
+    mut self.store(place, take elements)
+    return true
+} Interpreter.append
+
+/// Replaces the elements of the container at a place.
+fn Interpreter.store(mut self, place: Loc, take elements: mem::List[Val]) {
+    let storage = self.storage_of(place)
+    mut self.memory.set(storage, stored: Val.Array(mem::Shared.of(take elements, alloc: self.alloc)))
+} Interpreter.store
+
+/// The end of a growing operation finding memory exhausted: a `try_` form fails with
+/// `mem::OutOfMemory.Exhausted`, another traps.
+fn Interpreter.exhausted(self, fallible: bool, at: ItemSpan) -> InterpFlow fails End {
+    if fallible {
+        let error = self.ty_item("mem", name: "OutOfMemory")
+        return InterpFlow.Fail(Val.Variant(item: error, index: 0, fields: mem::Shared.of(mem::List[Val].empty(self.alloc), alloc: self.alloc)))
+    }
+    fail self.trap("trap.exhausted", at)
+} Interpreter.exhausted
+
+/// The container with a capacity for `needed` elements: unchanged when it has one, otherwise
+/// grown to the largest of twice its capacity, the needed length and 4; none on exhaustion.
+fn Interpreter.grow(mut self, container: Val, needed: usize, element: ty::Ty) -> Option[Val] {
+    let capacity = self.capacity(container)
+    if needed <= capacity {
+        return Some(self.deref(container))
+    }
+    var grown = capacity.wrapping_mul(2)
+    if grown < needed {
+        grown = needed
+    }
+    if grown < 4 {
+        grown = 4
+    }
+    return mut self.resized(container, capacity: grown, element)
+} Interpreter.grow
+
+/// The container with a capacity, in a new allocation replacing its old one; none on
+/// exhaustion.
+fn Interpreter.resized(mut self, container: Val, capacity: usize, element: ty::Ty) -> Option[Val] {
+    let alloc = self.alloc
+    let value = self.deref(container)
+    let Val.Struct(item: item, fields: parts) = value else {
+        expect false
+        return None
+    }
+    let footprint = self.ck.interp_layout(element)
+    let held = parts.contents()
+    let cell = u32.truncate(held[CONTAINER_CELL].int_value().low_bits())
+    var bytes = footprint.size.saturating_mul(u64.widen(capacity))
+    if bytes < 1 {
+        bytes = 1
+    }
+    var allocation = wide::Wide.of_i64(-1)
+    if capacity != 0 {
+        let most = ~0u64 / CHUNK_BYTES
+        if bytes > most {
+            bytes = most
+        }
+        let Some(drawn) = mut self.budgets.allocate(cell, size: bytes, align: footprint.align) else {
+            return None
+        }
+        allocation = wide::Wide.of_u64(u64.widen(drawn))
+    }
+    let previous = held[CONTAINER_ALLOCATION].int_value()
+    if not previous.is_negative() {
+        mut self.budgets.free(u32.truncate(previous.low_bits()))
+    }
+    var fields = Val.copies(held.view(), alloc)
+    fields[CONTAINER_CAPACITY] = Val.of_usize(capacity)
+    fields[CONTAINER_ALLOCATION] = Val.Int(allocation)
+    return Some(Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc)))
+} Interpreter.resized
+
+/// Releases what a value owns: the elements and memory of the std containers, stores, boxes
+/// and shared values it holds, and what those elements own.
+fn Interpreter.store_release(mut self, value: Val) {
+    match value {
+        Val.Struct(item: item, fields: fields) => mut self.release_struct(value, item, fields: fields.contents().view())
+        Val.Variant(item: _, index: _, fields: fields) => {
+            for field in fields.contents() {
+                mut self.store_release(field)
+            }
+        }
+        Val.Array(fields) => {
+            for field in fields.contents() {
+                mut self.store_release(field)
+            }
+        }
+        else => {}
+    }
+} Interpreter.store_release
+
+/// Releases what a struct value owns, by the canonical path of its item.
+fn Interpreter.release_struct(mut self, value: Val, item: ty::ItemId, fields: Slice[Val]) {
+    let alloc = self.alloc
+    let path = self.ck.db().canonical(item)
+    match path.as_str() {
+        "mem::List" or "mem::Bytes" or "mem::Map" or "mem::HashMap" or "mem::Set" or "text::String" => mut self.release_container(value)
+        "mem::Pool" => {
+            for slot in self.entries(value) {
+                mut self.store_release(slot.fields()[SLOT_OCCUPANT])
+            }
+            mut self.release_container(value)
+        }
+        "mem::Arena" or "mem::OnceMap" or "text::Interner" => {
+            let inner = self.held(value)
+            if path.as_str() == "text::Interner" {
+                for entry in self.entries(inner) {
+                    mut self.budgets.free(u32.truncate(entry.fields()[1].int_value().low_bits()))
+                }
+            }
+            mut self.release_container(inner)
+            let extent = self.holder(value).extent
+            mut self.memory.kill(extent)
+        }
+        "mem::Box" => {
+            let contents = self.memory.get(fields[0].place()).copy(alloc)
+            mut self.store_release(contents)
+            mut self.unbox(value)
+        }
+        "mem::Shared" or "task::Cown" => {
+            let count = fields[SHARED_COUNT].place()
+            let left = self.memory.get(count).int_value().wrapping_sub(wide::Wide.one())
+            mut self.memory.set(count, stored: Val.Int(left))
+            if left.is_zero() {
+                let contents = self.memory.get(fields[SHARED_CONTENTS].place()).copy(alloc)
+                mut self.store_release(contents)
+                mut self.budgets.free(u32.truncate(fields[SHARED_ALLOCATION].int_value().low_bits()))
+            }
+        }
+        "task::Sender" or "task::Receiver" => mut self.task_release(value)
+        "mem::ListCursor" or "mem::MapIntoCursor" or "mem::HashMapIntoCursor" or "mem::SetIntoCursor" => {
+            let held = self.entries(fields[0])
+            var index = usize.widen(fields[1].int_value().low_bits())
+            while index < held.len() {
+                mut self.store_release(held[index])
+                index += 1
+            }
+            mut self.release_container(fields[0])
+        }
+        else => {
+            for field in fields {
+                mut self.store_release(field)
+            }
+        }
+    }
+} Interpreter.release_struct
+
+/// Releases a container's elements, frees its allocation and ends its storage.
+fn Interpreter.release_container(mut self, container: Val) {
+    for element in self.entries(container) {
+        mut self.store_release(element)
+    }
+    let parts = container.fields()
+    let allocation = parts[CONTAINER_ALLOCATION].int_value()
+    if not allocation.is_negative() {
+        mut self.budgets.free(u32.truncate(allocation.low_bits()))
+    }
+    mut self.memory.kill(parts[CONTAINER_STORAGE].place().extent)
+} Interpreter.release_container

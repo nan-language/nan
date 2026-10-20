@@ -1,0 +1,526 @@
+//! The identity of items: their normalised and interface forms, item hashes and interface hashes, from what the checker knows of the names, facts and bodies those forms write.
+
+/// An item's hashes; a const has no interface hash before its value is known.
+pkg struct Hashes derives Copy, Eq {
+    pkg item: hashing::HashValue
+    pkg interface_hash: Option[hashing::HashValue]
+} Hashes
+
+/// What a body names.
+enum Names {
+    Item(ty::ItemId)
+    Field(owner: ty::ItemId, name: text::String)
+} Names
+
+fn Hashes.of(take forms: format::Forms, alloc: mem::Alloc) -> Hashes {
+    var item_text = text::String.of("item\n", alloc)
+    mut item_text.append(forms.normalised.as_str())
+    let item_hash = hashing::HashValue.of(item_text.as_bytes())
+    var interface_hash: Option[hashing::HashValue] = None
+    match forms.interface_form {
+        Some(form) => {
+            var interface_text = text::String.of("interface\n", alloc)
+            mut interface_text.append(form.as_str())
+            interface_hash = Some(hashing::HashValue.of(interface_text.as_bytes()))
+        }
+        None => {}
+    }
+    return Hashes(item: item_hash, interface_hash: interface_hash)
+} Hashes.of
+
+/// An item's hashes, a const's interface hash from the value its evaluation gives.
+fn Checker.hashes(self, item: ty::ItemId) -> Hashes {
+    var forms = self.forms(item)
+    if forms.interface_form.is_none() {
+        match self.db().ast(item).kind {
+            ast::ItemKind.Const(_) => {
+                let computed = self.const_interface(item, normalised: forms.normalised.as_str())
+                forms.interface_form = computed
+            }
+            else => {}
+        }
+    }
+    return Hashes.of(take forms, alloc: self.alloc())
+} Checker.hashes
+
+/// The interface form of a const: its head, `=` and the lowercase hexadecimal of its value's
+/// canonical encoding, once per declared concrete target or once for `any`.
+fn Checker.const_interface(self, item: ty::ItemId, normalised: Str) -> Option[text::String] {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let SigKind.Const(ty: const_ty) = sig.contents().kind else {
+        return None
+    }
+    let Some(value) = self.const_value(item) else {
+        return None
+    }
+    let names = ItemNames.new(self, item)
+    let encoder = nir::Encoder(names: Dyn[nir::Names].view(names), alloc: alloc)
+    let encoded = self.value_bytes(const_ty, value: value.contents(), encoder)
+    var hex = text::String.empty(alloc)
+    for byte in encoded.view() {
+        mut hex.push(hex_digit(byte >> 4))
+        mut hex.push(hex_digit(byte & 15))
+    }
+    let kept = platform::trimmed_run(normalised)
+    let Some(trimmed) = normalised.slice_bytes(0, end: kept.end) else {
+        return None
+    }
+    let Some(at) = trimmed.find(" = ") else {
+        return None
+    }
+    let Some(head) = trimmed.slice_bytes(0, end: at) else {
+        return None
+    }
+    let db = self.db()
+    var targets: usize = 1
+    match db.source(db.package_of(item)).manifest {
+        Some(manifest) => {
+            if not declares_any(manifest.targets.view()) and manifest.targets.len() > 1 {
+                targets = manifest.targets.len()
+            }
+        }
+        None => {}
+    }
+    var line = text::String.of(head, alloc)
+    mut line.append(" =")
+    for _ in 0..<targets {
+        mut line.push(' ')
+        mut line.append(hex.as_str())
+    }
+    mut line.push('\n')
+    return Some(take line)
+} Checker.const_interface
+
+fn Checker.forms(self, item: ty::ItemId) -> format::Forms {
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    let module = data.module
+    return format::Forms.of(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), alloc: self.alloc())
+} Checker.forms
+
+/// The interface text of an item, as its canonical format writes it: what consumers see, or
+/// what code in the module `viewer` sees.
+fn Checker.interface_text(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> mem::List[text::String] {
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    return format::interface_text(syntax, item: syntax.items[data.index], known: self.known(item, viewer), alloc: self.alloc())
+} Checker.interface_text
+
+/// The tokens `range` of an item as its normalised form writes them, on one line, with its
+/// bindings numbered as `numbering` states.
+fn Checker.fragment(self, item: ty::ItemId, range: nir::Span, numbering: format::Numbering) -> text::String {
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    let module = data.module
+    return format::normalised_fragment(syntax, item: syntax.items[data.index], known: self.known(item, viewer: None), resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), range: syntax::TokenSpan(head: range.head, last: range.last), numbering, alloc: self.alloc())
+} Checker.fragment
+
+/// The flat text of the tokens `range` of an item.
+fn Checker.flat(self, item: ty::ItemId, range: nir::Span) -> text::String {
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    return format::flat_text(syntax, item: syntax.items[data.index], range: syntax::TokenSpan(head: range.head, last: range.last), alloc: self.alloc())
+} Checker.flat
+
+/// What the forms of an item write beyond its syntax and the paths it resolves; the fields and
+/// transparent body seen wherever the item is visible, or from the module `viewer`.
+fn Checker.known(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> format::Known {
+    let db = self.db()
+    let data = db.item(item)
+    var fields = format::Reach.Consumer
+    match viewer {
+        None => {
+            fields = match db.ast(item).visibility {
+                ast::Visibility.Private => format::Reach.Module
+                ast::Visibility.Pkg => format::Reach.Package
+                ast::Visibility.Pub => format::Reach.Consumer
+            }
+        }
+        Some(from) => {
+            if from == data.module {
+                fields = format::Reach.Module
+            } else if db.module(from).package_id == db.package_of(item) {
+                fields = format::Reach.Package
+            }
+        }
+    }
+    return format::Known(own: self.own_path(item), transparent: self.transparent_seen(item, viewer), fields: fields, facts: self.facts_line(item))
+} Checker.known
+
+/// The canonical path of the item a path written in a module names, or the core vocabulary
+/// name it names.
+fn Checker.canonically(self, module: ty::ModuleId, segments: Slice[text::String]) -> Option[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    if segments.len() == 0 {
+        return None
+    }
+    var names = mem::List[ast::Name].empty(alloc)
+    for segment in segments {
+        mut names.push(ast::Name(text: text::String.of(segment.as_str(), alloc), token: 0))
+    }
+    let last = segments[segments.len() - 1].as_str()
+    let path = ast::Path(segments: take names)
+    let Ok(named) = db.resolve(module, path) else {
+        return None
+    }
+    return match named {
+        Named.Item(found) => self.canonical_item(found, last)
+        Named.Module(_) => None
+        else => Some(text::String.of(last, alloc))
+    }
+} Checker.canonically
+
+/// The canonical path of an item; none for a tombstone.
+fn Checker.canonical_path(self, item: ty::ItemId) -> Option[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let data = db.item(item)
+    let module = db.module_path(data.module)
+    match db.ast(item).kind {
+        ast::ItemKind.Retired(_) => return None
+        ast::ItemKind.ConstAssert(_) => {
+            var path = text::String.of(module.as_str(), alloc)
+            mut path.append("::assert[")
+            mut path.append(self.hashes(item).item.short(alloc).as_str())
+            mut path.push(']')
+            return Some(take path)
+        }
+        ast::ItemKind.Impl(_) => return self.impl_path(item, module: module.as_str())
+        else => return self.own_path(item)
+    }
+} Checker.canonical_path
+
+/// The canonical path the item's declared name and closing label write, or a tombstone's
+/// old form's.
+fn Checker.own_path(self, item: ty::ItemId) -> Option[text::String] {
+    let db = self.db()
+    let data = db.item(item)
+    match db.ast(item).kind {
+        ast::ItemKind.Impl(_) or ast::ItemKind.ConstAssert(_) => return None
+        ast::ItemKind.Package => return Some(text::String.of(db.package_data(db.package_of(item)).name.as_str(), alloc: self.alloc()))
+        ast::ItemKind.Retired(tombstone) => return db.old_form(data.module, tombstone)
+        else => return Some(db.canonical(item))
+    }
+} Checker.own_path
+
+/// The facts line of a struct or enum: `facts`, then its interface facts in order, each
+/// resting on dependent parameters followed by their names in brackets.
+fn Checker.facts_line(self, item: ty::ItemId) -> Option[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let declared = db.ast(item)
+    let is_type = match declared.kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
+        else => false
+    }
+    if not is_type {
+        return None
+    }
+    let own = self.own_type(item)
+    let props = self.definition_props(item)
+    let public = declared.visibility == ast::Visibility.Pub
+    let seen = self.consumer_props(item)
+    let token = self.is_state_token(own)
+    let sig = self.sig(item)
+    let generics = sig.contents().generics.view()
+    let holding_token = not token and self.holds_token(own)
+    let send = public and seen.has(property: Property.Send)
+    let inert = public and seen.has(property: Property.Inert)
+    let any_bits = public and seen.has(property: Property.AnyBits)
+    let parsing = public and self.is_parsing(own)
+    var facts = mem::List[text::String].empty(alloc)
+    self.push_fact(mut facts, name: "linear", holds: props.is_linear, property: Some(Property.Linear), item, generics)
+    self.push_fact(mut facts, name: "view", holds: props.view, property: Some(Property.View), item, generics)
+    self.push_fact(mut facts, name: "token", holds: token, property: None, item, generics)
+    self.push_fact(mut facts, name: "holds-token", holds: holding_token, property: None, item, generics)
+    self.push_fact(mut facts, name: "Copy", holds: props.copy, property: Some(Property.Copy), item, generics)
+    self.push_fact(mut facts, name: "Send", holds: send, property: Some(Property.Send), item, generics)
+    self.push_fact(mut facts, name: "Inert", holds: inert, property: Some(Property.Inert), item, generics)
+    self.push_fact(mut facts, name: "AnyBits", holds: any_bits, property: Some(Property.AnyBits), item, generics)
+    self.push_fact(mut facts, name: "parsing", holds: parsing, property: None, item, generics)
+    var line = text::String.of("facts", alloc)
+    for index in 0..<facts.len() {
+        if index == 0 {
+            mut line.push(' ')
+        } else {
+            mut line.append(", ")
+        }
+        mut line.append(facts[index].as_str())
+    }
+    return Some(take line)
+} Checker.facts_line
+
+/// Whether code of `holder` unfolds calls to a transparent function: every field, item and
+/// member its body names is visible to it.
+fn Checker.unfolds(self, function: ty::ItemId, holder: ty::ItemId) -> bool {
+    return self.transparent_seen(function, viewer: Some(self.db().module_of(holder)))
+} Checker.unfolds
+
+/// Whether a transparent function's body is seen: from the module `viewer`, when every
+/// field, item and member it names is visible there; and otherwise in its interface form, when
+/// the function is not generic, no member of a generic type, and its body names only fields,
+/// items and members visible wherever the function is.
+fn Checker.transparent_seen(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> bool {
+    let db = self.db()
+    let ast::ItemKind.Fn(function) = db.ast(item).kind else {
+        return false
+    }
+    let expression = match function.body {
+        ast::FnBody.Expr(_) => true
+        else => false
+    }
+    if not expression {
+        return false
+    }
+    if viewer.is_none() {
+        let generic = match self.fn_sig(item) {
+            Some(sig) => sig.generics.len() > 0
+            None => true
+        }
+        if generic {
+            return false
+        }
+    }
+    let Some(body) = self.typed_body(item) else {
+        return false
+    }
+    let Some(root) = body.contents().root else {
+        return false
+    }
+    var seen = true
+    self.visit_names(root, visit: fn[mut seen](take named: Names) {
+        let visible = self.name_seen(named, viewer, function: item)
+        seen = seen and visible
+    })
+    return seen
+} Checker.transparent_seen
+
+/// Whether a field of a struct is visible from a module.
+fn Checker.field_visible(self, viewer: ty::ModuleId, owner: ty::ItemId, name: Str) -> bool {
+    let sig = self.sig(owner)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return true
+    }
+    for field in fields {
+        if field.name.as_str() == name {
+            return self.db().field_visible(viewer, owner, visibility: field.visibility)
+        }
+    }
+    return true
+} Checker.field_visible
+
+/// Whether an item is visible wherever a function is.
+fn Checker.seen_with(self, named: ty::ItemId, function: ty::ItemId) -> bool {
+    let db = self.db()
+    let named_visibility = db.ast(named).visibility
+    return match db.ast(function).visibility {
+        ast::Visibility.Private => true
+        ast::Visibility.Pkg => named_visibility != ast::Visibility.Private
+        ast::Visibility.Pub => named_visibility == ast::Visibility.Pub
+    }
+} Checker.seen_with
+
+/// Whether a field of a struct is visible wherever a function is.
+fn Checker.field_seen_with(self, owner: ty::ItemId, name: Str, function: ty::ItemId) -> bool {
+    let db = self.db()
+    let sig = self.sig(owner)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return true
+    }
+    var found: Option[ast::Visibility] = None
+    for field in fields {
+        if field.name.as_str() == name {
+            found = Some(field.visibility)
+            break
+        }
+    }
+    let Some(field_visibility) = found else {
+        return true
+    }
+    let owner_visibility = db.ast(owner).visibility
+    var narrowest = ast::Visibility.Pub
+    if owner_visibility == ast::Visibility.Private or field_visibility == ast::Visibility.Private {
+        narrowest = ast::Visibility.Private
+    } else if owner_visibility == ast::Visibility.Pkg or field_visibility == ast::Visibility.Pkg {
+        narrowest = ast::Visibility.Pkg
+    }
+    return match db.ast(function).visibility {
+        ast::Visibility.Private => true
+        ast::Visibility.Pkg => narrowest != ast::Visibility.Private
+        ast::Visibility.Pub => narrowest == ast::Visibility.Pub
+    }
+} Checker.field_seen_with
+
+/// Visits the items and fields an expression names.
+fn Checker.visit_names(self, expr: TExpr, visit: fn(take named: Names)) {
+    let alloc = self.alloc()
+    let types = self.types()
+    match expr.kind {
+        TKind.Value(item) => visit(Names.Item(item))
+        TKind.FnValue(item: item, type_args: _) => visit(Names.Item(item))
+        TKind.Call(call) or TKind.Index(call) => {
+            match call.contents().callee {
+                Callee.Function(item: item) => visit(Names.Item(item))
+                else => {}
+            }
+        }
+        TKind.Field(base: base, name: name) => {
+            match types.kind(base.contents().ty) {
+                ty::TyKind.Item(item: owner, args: _) => visit(Names.Field(owner: owner, name: text::String.of(name.as_str(), alloc)))
+                else => {}
+            }
+        }
+        TKind.Construct(variant: _, values: values, wrapped: _) => {
+            match types.kind(expr.ty) {
+                ty::TyKind.Item(item: owner, args: _) => {
+                    visit(Names.Item(owner))
+                    for value in values {
+                        visit(Names.Field(owner: owner, name: text::String.of(value.name.as_str(), alloc)))
+                    }
+                }
+                else => {}
+            }
+        }
+        TKind.Match(scrutinee: _, arms: arms) => {
+            for arm in arms {
+                for pattern in arm.patterns {
+                    self.visit_pattern_names(pattern, visit)
+                }
+            }
+        }
+        TKind.Block(block) => {
+            for stmt in block.stmts {
+                match stmt.kind {
+                    TStmtKind.Let(pattern: pattern, value: _, otherwise: _) => self.visit_pattern_names(pattern, visit)
+                    else => {}
+                }
+            }
+        }
+        else => {}
+    }
+    expr.each_child(fn(child: TExpr) => self.visit_names(child, visit))
+} Checker.visit_names
+
+fn Checker.visit_pattern_names(self, pattern: TPattern, visit: fn(take named: Names)) {
+    let TPatternKind.Fields(variant: _, fields: fields) = pattern.kind else {
+        return
+    }
+    let ty::TyKind.Item(item: owner, args: _) = self.types().kind(pattern.ty) else {
+        return
+    }
+    visit(Names.Item(owner))
+    for field in fields {
+        visit(Names.Field(owner: owner, name: text::String.of(field.name.as_str(), alloc: self.alloc())))
+        self.visit_pattern_names(field.pattern, visit)
+    }
+} Checker.visit_pattern_names
+
+/// The canonical path a path naming an item resolves to: a core vocabulary name of core as
+/// written, any other item's canonical path.
+fn Checker.canonical_item(self, found: ty::ItemId, last: Str) -> Option[text::String] {
+    let db = self.db()
+    if is_core_vocabulary(last) and db.package_of(found) == db.core() {
+        return Some(text::String.of(last, alloc: self.alloc()))
+    }
+    return Some(db.canonical(found))
+} Checker.canonical_item
+
+/// The canonical path of an impl line: its module's path, then `impl[` its target and
+/// interface `]`.
+fn Checker.impl_path(self, item: ty::ItemId, module: Str) -> Option[text::String] {
+    let db = self.db()
+    let sig = self.sig(item)
+    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+        return None
+    }
+    let Some(key) = target else {
+        return None
+    }
+    let written_target = db.type_path(key)
+    let Some(named) = bound else {
+        return None
+    }
+    var path = text::String.of(module, alloc: self.alloc())
+    mut path.append("::impl[")
+    mut path.append(written_target.as_str())
+    mut path.append(": ")
+    mut path.append(db.canonical(named.item).as_str())
+    mut path.push(']')
+    return Some(take path)
+} Checker.impl_path
+
+/// Adds a fact of a facts line when it holds, followed by the names of the parameters it rests
+/// on in brackets.
+fn Checker.push_fact(self, mut facts: mem::List[text::String], name: Str, holds: bool, property: Option[Property], item: ty::ItemId, generics: Slice[GenericDef]) {
+    if not holds {
+        return
+    }
+    var fact = text::String.of(name, alloc: self.alloc())
+    let Some(rested) = property else {
+        mut facts.push(take fact)
+        return
+    }
+    var resting: usize = 0
+    for index in self.dependent_params(item, property: rested) {
+        if index >= generics.len() {
+            continue
+        }
+        if resting == 0 {
+            mut fact.push('[')
+        } else {
+            mut fact.append(", ")
+        }
+        mut fact.append(generics[index].name.as_str())
+        resting += 1
+    }
+    if resting > 0 {
+        mut fact.push(']')
+    }
+    mut facts.push(take fact)
+} Checker.push_fact
+
+/// Whether a name a transparent body writes is seen: from the module `viewer`, or wherever the
+/// function is.
+fn Checker.name_seen(self, named: Names, viewer: Option[ty::ModuleId], function: ty::ItemId) -> bool {
+    match named {
+        Names.Item(item) => {
+            match viewer {
+                Some(from) => return self.db().visible(from, item)
+                None => return self.seen_with(named: item, function)
+            }
+        }
+        Names.Field(owner: owner, name: field) => {
+            match viewer {
+                Some(from) => return self.field_visible(viewer: from, owner, name: field.as_str())
+                None => return self.field_seen_with(owner, name: field.as_str(), function)
+            }
+        }
+    }
+} Checker.name_seen
+
+/// Whether targets include `any`.
+fn declares_any(targets: Slice[workspace::Target]) -> bool {
+    for target in targets {
+        if target == workspace::Target.Any {
+            return true
+        }
+    }
+    return false
+} declares_any
+
+/// The lowercase hexadecimal digit of a value below 16.
+fn hex_digit(value: u8) -> char {
+    let Some(digit) = "0123456789abcdef".slice_bytes(usize.widen(value), end: usize.widen(value) + 1) else {
+        return '0'
+    }
+    for c in digit {
+        return c
+    }
+    return '0'
+} hex_digit

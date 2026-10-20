@@ -1,0 +1,415 @@
+//! Artefacts: the code root of a package state, whose hash identifies its release, then its attestation file and the reserved sections.
+
+const MAGIC: Slice[u8] = b"NART"
+
+/// The artefact format version of language 1.
+const FORMAT: u64 = 1
+
+/// The parts of a code root, each list already in its order.
+pkg struct Parts {
+    pkg language: u64
+    /// The text of `package.nan` in canonical format.
+    pkg manifest: text::String
+    /// Each module's name with the text of its API snapshot, empty when it has none.
+    pkg snapshots: mem::List[Snapshot]
+    pkg nir: mem::Bytes
+    /// The encoded entries of the requires-set.
+    pkg required: mem::List[mem::Bytes]
+    /// The normalised forms of the tombstones in source.
+    pkg source_tombstones: mem::List[text::String]
+    /// The normalised forms of the tombstones of the history.
+    pkg history_tombstones: mem::List[text::String]
+    /// The encoded ledger records.
+    pkg ledger: mem::List[mem::Bytes]
+    /// Each file holding the first line of a span, by path as spans write it, with each such
+    /// line's number and text, in line order.
+    pkg lines: mem::List[FileLines]
+    /// Each component state's canonical path and schema hash.
+    pkg schemas: mem::List[Schema]
+} Parts
+
+/// A module's name and the text of its API snapshot.
+pkg struct Snapshot {
+    pkg module: text::String
+    pkg text: text::String
+} Snapshot
+
+/// A file by path, with lines of it by number and text.
+pkg struct FileLines {
+    pkg path: text::String
+    pkg lines: mem::List[Line]
+} FileLines
+
+pkg struct Line {
+    pkg number: u32
+    pkg text: text::String
+} Line
+
+/// A component state's canonical path and schema hash.
+pkg struct Schema {
+    pkg path: text::String
+    pkg hash: hashing::HashValue
+} Schema
+
+/// A list of elements sorted by the bytes of their encodings.
+fn sorted_list(take elements: mem::List[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    var sorted = elements
+    mut sorted.sort_by(fn(left: mem::Bytes, right: mem::Bytes) => left.cmp(right))
+    var out = mem::Bytes.empty(alloc)
+    encoding::uvar(mut out, value: u64.widen(sorted.len()))
+    for element in sorted {
+        mut out.append(element.view())
+    }
+    return out
+} sorted_list
+
+fn text_of(value: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: value.as_bytes())
+    return out
+} text_of
+
+/// Encodings of texts, a list of elements.
+fn texts(values: Slice[text::String], alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for value in values {
+        mut elements.push(text_of(value.as_str(), alloc))
+    }
+    return elements
+} texts
+
+/// Copies of encodings, a list of elements.
+fn copies(values: Slice[mem::Bytes], alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for value in values {
+        var copy = mem::Bytes.empty(alloc)
+        mut copy.append(value.view())
+        mut elements.push(take copy)
+    }
+    return elements
+} copies
+
+/// The bytes of a code root.
+pkg fn code_root(parts: Parts, alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    var language = mem::Bytes.empty(alloc)
+    encoding::uvar(mut language, value: parts.language)
+    mut record.field(1, content: take language)
+    mut record.field(2, content: text_of(parts.manifest.as_str(), alloc))
+    var pairs = mem::List[mem::Bytes].empty(alloc)
+    for snapshot in parts.snapshots {
+        var pair = text_of(snapshot.module.as_str(), alloc)
+        mut pair.append(text_of(snapshot.text.as_str(), alloc).view())
+        mut pairs.push(take pair)
+    }
+    mut record.field(3, content: sorted_list(take pairs, alloc))
+    var nir = mem::Bytes.empty(alloc)
+    encoding::bytes(mut nir, value: parts.nir.view())
+    mut record.field(4, content: take nir)
+    mut record.field(5, content: sorted_list(copies(parts.required.view(), alloc), alloc))
+    mut record.field(6, content: sorted_list(texts(parts.source_tombstones.view(), alloc), alloc))
+    mut record.field(7, content: sorted_list(texts(parts.history_tombstones.view(), alloc), alloc))
+    mut record.field(8, content: sorted_list(copies(parts.ledger.view(), alloc), alloc))
+    var files = mem::List[mem::Bytes].empty(alloc)
+    for file in parts.lines {
+        var out = text_of(file.path.as_str(), alloc)
+        encoding::uvar(mut out, value: u64.widen(file.lines.len()))
+        for line in file.lines {
+            encoding::uvar(mut out, value: u64.widen(line.number))
+            mut out.append(text_of(line.text.as_str(), alloc).view())
+        }
+        mut files.push(take out)
+    }
+    mut record.field(9, content: sorted_list(take files, alloc))
+    var schemas = mem::List[mem::Bytes].empty(alloc)
+    for schema in parts.schemas {
+        var out = text_of(schema.path.as_str(), alloc)
+        encoding::bytes(mut out, value: schema.hash.bytes.view())
+        mut schemas.push(take out)
+    }
+    mut record.field(10, content: sorted_list(take schemas, alloc))
+    return take record.finish(alloc)
+} code_root
+
+/// A seal an attestation file records: principal, item, sealed item hash, closure hash and closure
+/// entries.
+pkg struct AttestedSeal {
+    pkg principal: text::String
+    pkg item: text::String
+    pkg sealed: hashing::HashValue
+    pkg closure: hashing::HashValue
+    pkg entries: mem::List[SealEntry]
+} AttestedSeal
+
+/// An entry of a seal's closure: whether it covers a body, its canonical path and its hash.
+pkg struct SealEntry {
+    pkg body: bool
+    pkg path: text::String
+    pkg hash: hashing::HashValue
+} SealEntry
+
+/// A file of a package: its path within the package and its content.
+pkg struct SourceFile {
+    pkg path: text::String
+    pkg content: mem::Bytes
+} SourceFile
+
+/// The source tree hash of a package's files: the hash of the encoding of a list of pairs of
+/// each file's path within the package and its content.
+pkg fn source_tree_hash(files: Slice[SourceFile], alloc: mem::Alloc) -> hashing::HashValue {
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for file in files {
+        var out = text_of(file.path.as_str(), alloc)
+        encoding::bytes(mut out, value: file.content.view())
+        mut elements.push(take out)
+    }
+    return hashing::HashValue.of(sorted_list(take elements, alloc).view())
+} source_tree_hash
+
+/// The bytes of an attestation file, `seals` being its seals as `seal_list` encodes them.
+pkg fn attestation(toolchain: hashing::HashValue, source_tree: hashing::HashValue, seals: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: hash_bytes(toolchain, alloc))
+    mut record.field(2, content: hash_bytes(source_tree, alloc))
+    var held = mem::Bytes.empty(alloc)
+    mut held.append(seals)
+    mut record.field(3, content: take held)
+    return take record.finish(alloc)
+} attestation
+
+fn hash_bytes(hash: hashing::HashValue, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: hash.bytes.view())
+    return out
+} hash_bytes
+
+/// The encoding of the seals an attestation file records.
+pkg fn seal_list(seals: Slice[AttestedSeal], alloc: mem::Alloc) -> mem::Bytes {
+    var encoded = mem::List[mem::Bytes].empty(alloc)
+    for seal in seals {
+        var fields = encoding::Record.empty(alloc)
+        mut fields.field(1, content: text_of(seal.principal.as_str(), alloc))
+        mut fields.field(2, content: text_of(seal.item.as_str(), alloc))
+        mut fields.field(3, content: hash_bytes(seal.sealed, alloc))
+        mut fields.field(4, content: hash_bytes(seal.closure, alloc))
+        var entries = mem::List[mem::Bytes].empty(alloc)
+        for entry in seal.entries {
+            var entry_record = encoding::Record.empty(alloc)
+            var kind = mem::Bytes.empty(alloc)
+            var flag: u64 = 0
+            if entry.body {
+                flag = 1
+            }
+            encoding::uvar(mut kind, value: flag)
+            mut entry_record.field(1, content: take kind)
+            mut entry_record.field(2, content: text_of(entry.path.as_str(), alloc))
+            mut entry_record.field(3, content: hash_bytes(entry.hash, alloc))
+            mut entries.push(take entry_record.finish(alloc))
+        }
+        mut fields.field(5, content: sorted_list(take entries, alloc))
+        mut encoded.push(take fields.finish(alloc))
+    }
+    return sorted_list(take encoded, alloc)
+} seal_list
+
+/// An artefact's bytes: the magic, the format version, the code root, the attestation file and
+/// an empty reserved sections record.
+pkg fn artefact(root: Slice[u8], attested: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(MAGIC)
+    encoding::uvar(mut out, value: FORMAT)
+    encoding::bytes(mut out, value: root)
+    encoding::bytes(mut out, value: attested)
+    mut out.append(encoding::Record.empty(alloc).finish(alloc).view())
+    return out
+} artefact
+
+/// What an artefact decodes to: its code root.
+pkg struct Decoded {
+    pkg code_root: mem::Bytes
+} Decoded
+
+pkg fn Decoded.root_hash(self) -> hashing::HashValue {
+    return hashing::HashValue.of(self.code_root.view())
+} Decoded.root_hash
+
+/// Decodes an artefact, or the code of why it does not decode.
+pkg fn decode(encoded: Slice[u8], alloc: mem::Alloc) -> Result[Decoded, diagnostic::Code] {
+    let malformed = diagnostic::Code.ArtefactMalformed
+    let Some(head) = encoded.prefix(MAGIC.len()) else {
+        return Err(malformed)
+    }
+    if head != MAGIC {
+        return Err(malformed)
+    }
+    let Some(version) = read_uvar(encoded, at: MAGIC.len()) else {
+        return Err(malformed)
+    }
+    if version.value != wide::Wide.of_u64(FORMAT) {
+        return Err(diagnostic::Code.ArtefactVersionUnsupported)
+    }
+    let Some(root) = read_bytes(encoded, at: version.next) else {
+        return Err(malformed)
+    }
+    let Some(attested) = read_bytes(encoded, at: root.next) else {
+        return Err(malformed)
+    }
+    let Some(fields) = read_uvar(encoded, at: attested.next) else {
+        return Err(malformed)
+    }
+    if not fields.value.is_zero() {
+        return Err(diagnostic::Code.ArtefactReservedSection)
+    }
+    if fields.next != encoded.len() {
+        return Err(malformed)
+    }
+    return Ok(Decoded(code_root: root.copy(encoded, alloc)))
+} decode
+
+/// A uvar read from bytes: its value, as wide as 128 bits, and the position after it.
+pkg struct Uvar derives Copy, Eq {
+    pkg value: wide::Wide
+    pkg next: usize
+} Uvar
+
+/// Bytes read from bytes: where they start and the position after them.
+pkg struct Chunk derives Copy, Eq {
+    pkg start: usize
+    pkg next: usize
+} Chunk
+
+/// A copy of the bytes a chunk of `bytes` holds.
+pkg fn Chunk.copy(self, bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    let Some(parts) = bytes.split_at(self.start) else {
+        return out
+    }
+    let Some(held) = parts.tail.prefix(self.next - self.start) else {
+        return out
+    }
+    mut out.append(held)
+    return out
+} Chunk.copy
+
+/// The uvar at a position of `bytes`, without redundant trailing groups.
+pkg fn read_uvar(bytes: Slice[u8], at: usize) -> Option[Uvar] {
+    var value = wide::Wide.zero()
+    for index in 0..<19usize {
+        if at + index >= bytes.len() {
+            return None
+        }
+        let byte = bytes[at + index]
+        let group = wide::Wide.of_u64(u64.widen(byte & 0x7F))
+        value = value.bit_or(group.shift_left(u32.fit(7 * index)))
+        if (byte & 0x80) == 0 {
+            if index > 0 and byte == 0 {
+                return None
+            }
+            return Some(Uvar(value: value, next: at + index + 1))
+        }
+    }
+    return None
+} read_uvar
+
+/// The bytes at a position of `bytes`: a uvar length and the bytes.
+pkg fn read_bytes(bytes: Slice[u8], at: usize) -> Option[Chunk] {
+    let Some(length) = read_uvar(bytes, at) else {
+        return None
+    }
+    let Some(count) = length.value.to_u64() else {
+        return None
+    }
+    if u64.widen(bytes.len() - length.next) < count {
+        return None
+    }
+    return Some(Chunk(start: length.next, next: length.next + usize.widen(count)))
+} read_bytes
+
+/// The parts of a small package's code root.
+fn sample_parts(alloc: mem::Alloc) -> Parts {
+    var snapshots = mem::List[Snapshot].empty(alloc)
+    mut snapshots.push(Snapshot(module: text::String.of("meter", alloc), text: text::String.of("nan api 1\n", alloc)))
+    var nir = mem::Bytes.empty(alloc)
+    mut nir.append(b"NIR\x00\x01\x00")
+    var lines = mem::List[Line].empty(alloc)
+    mut lines.push(Line(number: 3, text: text::String.of("pub fn f() = 1", alloc)))
+    var files = mem::List[FileLines].empty(alloc)
+    mut files.push(FileLines(path: text::String.of("meter/meter.nan", alloc), lines: take lines))
+    return Parts(
+        language: 1,
+        manifest: text::String.of("package meter {\n}\n", alloc),
+        snapshots: take snapshots,
+        nir: take nir,
+        required: mem::List[mem::Bytes].empty(alloc),
+        source_tombstones: mem::List[text::String].empty(alloc),
+        history_tombstones: mem::List[text::String].empty(alloc),
+        ledger: mem::List[mem::Bytes].empty(alloc),
+        lines: take files,
+        schemas: mem::List[Schema].empty(alloc),
+    )
+} sample_parts
+
+/// The code of why an artefact does not decode.
+fn failure(outcome: Result[Decoded, diagnostic::Code]) -> Option[diagnostic::Code] {
+    let Err(code) = outcome else {
+        return None
+    }
+    return Some(code)
+} failure
+
+test an_artefact_decodes_to_its_code_root_and_attestation for decode {
+    let alloc = testing::world().alloc
+    let root = code_root(sample_parts(alloc), alloc)
+    let no_files = mem::List[SourceFile].empty(alloc)
+    let no_seals = mem::List[AttestedSeal].empty(alloc)
+    let seals = seal_list(no_seals.view(), alloc)
+    let attested = attestation(hashing::HashValue.of(b"toolchain"), source_tree: source_tree_hash(no_files.view(), alloc), seals: seals.view(), alloc)
+    let encoded = artefact(root.view(), attested: attested.view(), alloc)
+    let Ok(decoded) = decode(encoded.view(), alloc) else {
+        expect false
+        return
+    }
+    expect decoded.code_root.view() == root.view()
+    expect decoded.root_hash() == hashing::HashValue.of(root.view())
+    let known = artefact(b"ab", attested: b"", alloc)
+    expect known.view() == b"NART\x01\x02ab\x00\x00"
+} an_artefact_decodes_to_its_code_root_and_attestation
+
+test equal_parts_give_equal_code_roots_whatever_the_order_of_unordered_lists for code_root {
+    let alloc = testing::world().alloc
+    var reordered = sample_parts(alloc)
+    mut reordered.source_tombstones.push(text::String.of("b", alloc))
+    mut reordered.source_tombstones.push(text::String.of("a", alloc))
+    var ordered = sample_parts(alloc)
+    mut ordered.source_tombstones.push(text::String.of("a", alloc))
+    mut ordered.source_tombstones.push(text::String.of("b", alloc))
+    let left = code_root(reordered, alloc)
+    let right = code_root(ordered, alloc)
+    expect left.view() == right.view()
+} equal_parts_give_equal_code_roots_whatever_the_order_of_unordered_lists
+
+test a_reserved_section_or_another_format_is_its_own_error for decode {
+    let alloc = testing::world().alloc
+    let root = code_root(sample_parts(alloc), alloc)
+    var reserved = artefact(root.view(), attested: b"", alloc)
+    reserved[reserved.len() - 1] = 1
+    mut reserved.append(b"\x01\x00")
+    let reserved_code = failure(decode(reserved.view(), alloc))
+    expect reserved_code == Some(diagnostic::Code.ArtefactReservedSection)
+    var future = artefact(root.view(), attested: b"", alloc)
+    future[4] = 2
+    let future_code = failure(decode(future.view(), alloc))
+    expect future_code == Some(diagnostic::Code.ArtefactVersionUnsupported)
+    let wide_code = failure(decode(b"NART\x80\x80\x80\x80\x80\x80\x80\x80\x80\x02\x00\x00\x00", alloc))
+    expect wide_code == Some(diagnostic::Code.ArtefactVersionUnsupported)
+    let malformed = failure(decode(b"NARX", alloc))
+    expect malformed == Some(diagnostic::Code.ArtefactMalformed)
+} a_reserved_section_or_another_format_is_its_own_error
+
+test uvars_are_minimal_and_as_wide_as_128_bits for read_uvar {
+    expect read_uvar(b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x02", at: 0) == Some(Uvar(value: wide::Wide.of_u64(1).shift_left(64), next: 10))
+    expect read_uvar(b"\x81\x00", at: 0) == None
+    expect read_uvar(b"\x00", at: 0) == Some(Uvar(value: wide::Wide.zero(), next: 1))
+    expect read_bytes(b"\x03ab", at: 0) == None
+    expect read_bytes(b"\x02ab", at: 0) == Some(Chunk(start: 1, next: 3))
+} uvars_are_minimal_and_as_wide_as_128_bits

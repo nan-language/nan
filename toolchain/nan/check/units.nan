@@ -1,0 +1,1406 @@
+//! The units of a package in the canonical NIR encoding, as its code root's NIR stream holds them: each unit's path, kind, targets, visibility, head, declaration, properties, functions, digests under each target, premises, statuses and spans; and the encoding of const values.
+
+/// A package's NIR stream.
+struct NirStream {
+    bytes: mem::Bytes
+} NirStream
+
+/// A part of an encoded unit, by its key.
+struct EncodedPart derives Eq {
+    key: u64
+    bytes: mem::Bytes
+} EncodedPart
+
+/// A function of a unit, by its role and index.
+struct CoveredFunction derives Copy, Eq {
+    role: nir::Role
+    index: u32
+} CoveredFunction
+
+/// A unit encoded but for its targets and digests, with what those need.
+struct EncodedUnit {
+    path: text::String
+    /// Parts 1, 2, 4 to 8 and 10 to 12, by key.
+    parts: mem::List[EncodedPart]
+    /// The digest of each function part 9 covers, by its role and index.
+    covered: mem::List[CoveredFunction]
+} EncodedUnit
+
+/// The encoded functions of a unit under one target.
+struct TargetedFunctions {
+    target: workspace::Target
+    functions: mem::List[mem::Bytes]
+} TargetedFunctions
+
+/// A unit of a package's stream with the targets it is encoded alike under.
+struct StreamUnit {
+    encoded: EncodedUnit
+    targets: mem::List[TargetedFunctions]
+} StreamUnit
+
+/// How the encoding of an item's unit names what the item reaches.
+struct ItemNames {
+    ck: Checker
+    positions: mem::HashMap[ty::Param, u64]
+} ItemNames
+
+impl ItemNames: nir::Names
+
+/// The NIR stream of the package named `package_name` from its checkers, one per target it is
+/// checked under, in target order.
+fn package_stream(checkers: Slice[TargetChecker], package_name: Str, alloc: mem::Alloc) -> NirStream {
+    var units = mem::List[StreamUnit].empty(alloc)
+    var by_path = mem::HashMap[text::String, mem::List[usize]].empty(seed: 0, alloc)
+    for entry in checkers {
+        let ck = entry.checker
+        let Some(id) = ck.package_named(package_name) else {
+            continue
+        }
+        let items = ck.package_items(id)
+        for item in items {
+            let Some(encoded) = ck.encoded_unit(item) else {
+                continue
+            }
+            var digests = mem::List[mem::Bytes].empty(alloc)
+            for function in encoded.covered {
+                mut digests.push(ck.digest_record(item, role: function.role, index: function.index))
+            }
+            let targeted = TargetedFunctions(target: entry.target, functions: take digests)
+            match same_unit(units.view(), by_path, encoded) {
+                Some(at) => mut (mut units.at_mut(at)).targets.push(take targeted)
+                None => add_unit(mut units, mut by_path, take encoded, take targeted, alloc)
+            }
+        }
+    }
+    mut units.sort_by(fn(left: StreamUnit, right: StreamUnit) => unit_order(left, right))
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(b"NIR\x00")
+    encode_number(mut out, value: 1)
+    encode_number(mut out, value: u64.widen(units.len()))
+    for unit in take units {
+        let record = stream_record(take unit, alloc)
+        mut out.append(record.view())
+    }
+    return NirStream(bytes: take out)
+} package_stream
+
+/// The index of the unit already in the stream with an encoded unit's path and parts.
+fn same_unit(units: Slice[StreamUnit], by_path: mem::HashMap[text::String, mem::List[usize]], encoded: EncodedUnit) -> Option[usize] {
+    let Some(candidates) = by_path.get(encoded.path) else {
+        return None
+    }
+    for at in candidates {
+        if units[at].encoded.parts == encoded.parts {
+            return Some(at)
+        }
+    }
+    return None
+} same_unit
+
+/// Adds a unit to the stream, encoded alike under one target so far.
+fn add_unit(
+    mut units: mem::List[StreamUnit],
+    mut by_path: mem::HashMap[text::String, mem::List[usize]],
+    take encoded: EncodedUnit,
+    take targeted: TargetedFunctions,
+    alloc: mem::Alloc,
+    ) {
+    let at = units.len()
+    if by_path.contains(encoded.path) {
+        var known = mut by_path.at_mut(encoded.path)
+        mut known.push(at)
+    } else {
+        var indexed = mem::List[usize].empty(alloc)
+        mut indexed.push(at)
+        discard mut by_path.insert(text::String.of(encoded.path.as_str(), alloc), value: take indexed)
+    }
+    var targets = mem::List[TargetedFunctions].empty(alloc)
+    mut targets.push(take targeted)
+    mut units.push(StreamUnit(encoded: take encoded, targets: take targets))
+} add_unit
+
+/// The order of a stream's units: by path, then by the name of the first target each is
+/// encoded under.
+fn unit_order(left: StreamUnit, right: StreamUnit) -> core::Ordering {
+    let by_path = left.encoded.path.as_str().cmp(right.encoded.path.as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    let left_target = left.targets[0].target
+    let right_target = right.targets[0].target
+    return left_target.name().cmp(right_target.name())
+} unit_order
+
+/// A unit's record in the stream.
+fn stream_record(take unit: StreamUnit, alloc: mem::Alloc) -> mem::Bytes {
+    var targets = unit.targets
+    mut targets.sort_by(fn(left: TargetedFunctions, right: TargetedFunctions) => target_order(left, right))
+    var record = encoding::Record.empty(alloc)
+    var targets_written = false
+    var digests_written = false
+    for part in take unit.encoded.parts {
+        if part.key > 3 and not targets_written {
+            mut record.field(3, content: target_names(targets.view(), alloc))
+            targets_written = true
+        }
+        if part.key > 9 and not digests_written {
+            add_digests(mut record, targets: targets.view(), alloc)
+            digests_written = true
+        }
+        mut record.field(part.key, content: take part.bytes)
+    }
+    if not targets_written {
+        mut record.field(3, content: target_names(targets.view(), alloc))
+    }
+    if not digests_written {
+        add_digests(mut record, targets: targets.view(), alloc)
+    }
+    return take record.finish(alloc)
+} stream_record
+
+fn target_order(left: TargetedFunctions, right: TargetedFunctions) -> core::Ordering {
+    let left_target = left.target
+    let right_target = right.target
+    return left_target.name().cmp(right_target.name())
+} target_order
+
+/// Part 3: the names of the targets a unit is encoded under.
+fn target_names(targets: Slice[TargetedFunctions], alloc: mem::Alloc) -> mem::Bytes {
+    var content = mem::Bytes.empty(alloc)
+    encode_number(mut content, value: u64.widen(targets.len()))
+    for targeted in targets {
+        let target = targeted.target
+        encode_text(mut content, value: target.name())
+    }
+    return content
+} target_names
+
+/// Part 9, when the unit covers a function.
+fn add_digests(mut record: encoding::Record, targets: Slice[TargetedFunctions], alloc: mem::Alloc) {
+    if targets.len() > 0 and targets[0].functions.len() > 0 {
+        mut record.field(9, content: digest_pairs(targets, alloc))
+    }
+} add_digests
+
+/// Part 9: for each covered function, the pairs of a target name and its digest under it.
+fn digest_pairs(targets: Slice[TargetedFunctions], alloc: mem::Alloc) -> mem::Bytes {
+    var count: usize = 0
+    if targets.len() > 0 {
+        count = targets[0].functions.len()
+    }
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(count))
+    for function in 0..<count {
+        encode_number(mut out, value: u64.widen(targets.len()))
+        for targeted in targets {
+            let target = targeted.target
+            encode_text(mut out, value: target.name())
+            mut out.append(targeted.functions[function].view())
+        }
+    }
+    return out
+} digest_pairs
+
+fn encode_number(mut out: mem::Bytes, value: u64) {
+    encoding::uvar(mut out, value)
+} encode_number
+
+fn encode_text(mut out: mem::Bytes, value: Str) {
+    encoding::bytes(mut out, value: value.as_bytes())
+} encode_text
+
+fn encoded_content(write: fn(mut out: mem::Bytes), alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    write(mut out)
+    return out
+} encoded_content
+
+/// The number a flag is written as.
+fn flag_bit(value: bool) -> u64 {
+    return match value {
+        true => 1
+        false => 0
+    }
+} flag_bit
+
+/// A record of one field holding a number.
+fn add_number(mut record: encoding::Record, key: u64, value: u64, alloc: mem::Alloc) {
+    var content = mem::Bytes.empty(alloc)
+    encode_number(mut content, value)
+    mut record.field(key, content: take content)
+} add_number
+
+/// A field holding a text.
+fn add_text(mut record: encoding::Record, key: u64, value: Str, alloc: mem::Alloc) {
+    var content = mem::Bytes.empty(alloc)
+    encode_text(mut content, value)
+    mut record.field(key, content: take content)
+} add_text
+
+fn ItemNames.new(ck: Checker, item: ty::ItemId) -> ItemNames {
+    return ItemNames(ck: ck.share(), positions: ck.generic_positions(item))
+} ItemNames.new
+
+/// An item's canonical path, or a core vocabulary name's.
+fn ItemNames.path(self, item: ty::ItemId) -> text::String {
+    return match self.ck.canonical_path(item) {
+        Some(path) => path
+        None => self.ck.db().canonical(item)
+    }
+} ItemNames.path
+
+/// The name of an interface's method, by its index.
+fn ItemNames.method(self, item: ty::ItemId, method: u32) -> text::String {
+    let sig = self.ck.sig(item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        return text::String.empty(self.ck.alloc())
+    }
+    return text::String.of(methods[usize.widen(method)].name.as_str(), alloc: self.ck.alloc())
+} ItemNames.method
+
+/// The name of a register of a registers block, by its index.
+fn ItemNames.register(self, block: ty::ItemId, register: u32) -> text::String {
+    let sig = self.ck.sig(block)
+    let SigKind.Registers(members: members) = sig.contents().kind else {
+        expect false
+        return text::String.empty(self.ck.alloc())
+    }
+    return text::String.of(members[usize.widen(register)].name.as_str(), alloc: self.ck.alloc())
+} ItemNames.register
+
+/// A generic parameter's position among the unit's.
+fn ItemNames.param(self, param: ty::Param) -> u64 {
+    let Some(position) = self.positions.get(param) else {
+        expect false
+        return 0
+    }
+    return position
+} ItemNames.param
+
+/// The types of the const parameters among the generic parameters a function reference or
+/// an item's arguments bind, by position; none for a type parameter.
+fn ItemNames.const_types(self, callable: nir::Callable) -> mem::List[Option[ty::Scalar]] {
+    var constants = mem::List[Option[ty::Scalar]].empty(self.ck.alloc())
+    match callable {
+        nir::Callable.Item(item: item, role: _, index: _) => {
+            match self.ck.fn_sig(item) {
+                Some(head) => add_constants(mut constants, generics: head.generics.view())
+                None => {
+                    let sig = self.ck.sig(item)
+                    add_constants(mut constants, generics: sig.contents().generics.view())
+                }
+            }
+        }
+        nir::Callable.Method(item: interface_item, method: method) => {
+            let sig = self.ck.sig(interface_item)
+            match sig.contents().kind {
+                SigKind.Interface(methods: methods) => add_constants(mut constants, generics: methods[usize.widen(method)].sig.generics.view())
+                else => {}
+            }
+        }
+        nir::Callable.Derived(owner: owner, method: _) => {
+            let sig = self.ck.sig(owner)
+            add_constants(mut constants, generics: sig.contents().generics.view())
+        }
+        nir::Callable.Builtin(_) => {}
+    }
+    return constants
+} ItemNames.const_types
+
+fn add_constants(mut constants: mem::List[Option[ty::Scalar]], generics: Slice[GenericDef]) {
+    for def in generics {
+        mut constants.push(def.constant)
+    }
+} add_constants
+
+/// Whether a read parameter of a type is passed by reference: the type is neither Copy nor
+/// a view.
+fn ItemNames.by_reference(self, ty: ty::Ty) -> bool {
+    return not self.ck.nir_copy(ty) and not self.ck.nir_view(ty)
+} ItemNames.by_reference
+
+/// An item kind's position in the item kind list.
+fn kind_position(kind: ast::ItemKind) -> u64 {
+    return match kind {
+        ast::ItemKind.Fn(_) => 0
+        ast::ItemKind.Struct(_) => 1
+        ast::ItemKind.Enum(_) => 2
+        ast::ItemKind.Interface(_) => 3
+        ast::ItemKind.Impl(_) => 4
+        ast::ItemKind.Layout(_) => 5
+        ast::ItemKind.Registers(_) => 6
+        ast::ItemKind.Const(_) => 7
+        ast::ItemKind.ConstAssert(_) => 8
+        ast::ItemKind.Registry(_) => 9
+        ast::ItemKind.Contribute(_) => 10
+        ast::ItemKind.Test(_) => 11
+        ast::ItemKind.Retired(_) => 12
+        ast::ItemKind.Package => 13
+    }
+} kind_position
+
+/// A visibility as an optional word of the `visibility` rule.
+fn encode_visibility(mut out: mem::Bytes, visibility: ast::Visibility) {
+    match visibility {
+        ast::Visibility.Private => encode_number(mut out, value: 0)
+        ast::Visibility.Pub => {
+            encode_number(mut out, value: 1)
+            encode_number(mut out, value: 0)
+        }
+        ast::Visibility.Pkg => {
+            encode_number(mut out, value: 1)
+            encode_number(mut out, value: 1)
+        }
+    }
+} encode_visibility
+
+fn status_position(status: Status) -> u64 {
+    return match status {
+        Status.Proven => 0
+        Status.Assumed => 1
+        Status.Checked => 2
+        Status.Open => 3
+    }
+} status_position
+
+/// The workspace or release package of a name, other than the carried std.
+fn Checker.package_named(self, name: Str) -> Option[ty::PackageId] {
+    let packages = self.db().packages
+    for index in 0..<packages.len() {
+        if packages[index].name.as_str() == name and not packages[index].carried {
+            return Some(ty::PackageId(index: u32.fit(index)))
+        }
+    }
+    return None
+} Checker.package_named
+
+/// The items of a package whose units its NIR stream holds: all but tests whose target is
+/// an item of the package.
+fn Checker.package_items(self, package_id: ty::PackageId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var items = mem::List[ty::ItemId].empty(self.alloc())
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            if db.in_history(item) or self.tests_own_package(item, package_id) {
+                continue
+            }
+            mut items.push(item)
+        }
+    }
+    return items
+} Checker.package_items
+
+/// Whether an item is a test whose target is an item of its own package.
+fn Checker.tests_own_package(self, item: ty::ItemId, package_id: ty::PackageId) -> bool {
+    let ast::ItemKind.Test(tested) = self.db().ast(item).kind else {
+        return false
+    }
+    return match self.test_target(item, tested) {
+        Some(TestTarget.Function(target)) or Some(TestTarget.Derived(target)) => self.db().package_of(target) == package_id
+        None => false
+    }
+} Checker.tests_own_package
+
+/// The position of each generic parameter among a unit's: `Self` in an interface, those of
+/// the type or interface the item is a member of, then its own, an interface method's own
+/// after its interface's.
+fn Checker.generic_positions(self, item: ty::ItemId) -> mem::HashMap[ty::Param, u64] {
+    var positions = mem::HashMap[ty::Param, u64].empty(seed: 0, alloc: self.alloc())
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => {
+            match self.fn_sig(item) {
+                Some(head) => add_positions(mut positions, defs: head.generics.view(), from: 0)
+                None => {}
+            }
+        }
+        ast::ItemKind.Interface(_) => {
+            let sig = self.sig(item)
+            let held = sig.contents()
+            var own: u64 = 0
+            for def in held.generics {
+                if not def.param.is_self() {
+                    discard mut positions.insert(def.param, value: 1 + own)
+                    own += 1
+                }
+            }
+            match held.kind {
+                SigKind.Interface(methods: methods) => {
+                    for method in methods {
+                        add_positions(mut positions, defs: method.sig.own_generics(), from: 1 + own)
+                    }
+                }
+                else => {}
+            }
+            discard mut positions.insert(ty::Param(owner: item, index: ty::SELF_INDEX), value: 0)
+        }
+        else => {
+            let sig = self.sig(item)
+            add_positions(mut positions, defs: sig.contents().generics.view(), from: 0)
+        }
+    }
+    return positions
+} Checker.generic_positions
+
+/// Places generic parameters at positions from `from` on.
+fn add_positions(mut positions: mem::HashMap[ty::Param, u64], defs: Slice[GenericDef], from: u64) {
+    for offset in 0..<defs.len() {
+        discard mut positions.insert(defs[offset].param, value: from + u64.widen(offset))
+    }
+} add_positions
+
+/// An item's unit encoded but for its targets and digests; none for an item without one.
+fn Checker.encoded_unit(self, item: ty::ItemId) -> Option[EncodedUnit] {
+    let alloc = self.alloc()
+    let Some(unit) = self.unit(item) else {
+        return None
+    }
+    let Some(path) = self.canonical_path(item) else {
+        return None
+    }
+    let names = ItemNames.new(self, item)
+    let encoder = nir::Encoder(names: Dyn[nir::Names].view(names), alloc: alloc)
+    let written = self.db().ast(item)
+    var parts = mem::List[EncodedPart].empty(alloc)
+    mut parts.push(EncodedPart(key: 1, bytes: encoded_content(fn(mut content: mem::Bytes) => encode_text(mut content, value: path.as_str()), alloc)))
+    mut parts.push(EncodedPart(key: 2, bytes: encoded_content(fn(mut content: mem::Bytes) => encode_number(mut content, value: kind_position(written.kind)), alloc)))
+    mut parts.push(EncodedPart(key: 4, bytes: encoded_content(fn(mut content: mem::Bytes) => encode_visibility(mut content, visibility: written.visibility), alloc)))
+    add_part(mut parts, key: 5, bytes: self.head_record(item, encoder))
+    add_part(mut parts, key: 6, bytes: self.declaration_record(item, encoder))
+    add_part(mut parts, key: 7, bytes: self.properties_record(item))
+    let held = unit.contents()
+    if held.functions.len() > 0 {
+        var functions = mem::Bytes.empty(alloc)
+        encode_number(mut functions, value: u64.widen(held.functions.len()))
+        for function in held.functions {
+            let function_bytes = encoder.function(types: self.types(), function)
+            mut functions.append(function_bytes.view())
+        }
+        mut parts.push(EncodedPart(key: 8, bytes: take functions))
+    }
+    let premises = self.premise_texts(item, unit: held)
+    if premises.len() > 0 {
+        var content = mem::Bytes.empty(alloc)
+        encode_number(mut content, value: u64.widen(premises.len()))
+        for premise in premises {
+            encode_text(mut content, value: premise.as_str())
+        }
+        mut parts.push(EncodedPart(key: 10, bytes: take content))
+    }
+    let statuses = self.obligations(item)
+    if statuses.contents().len() > 0 {
+        var content = mem::Bytes.empty(alloc)
+        encode_number(mut content, value: u64.widen(statuses.contents().len()))
+        for site in statuses.contents() {
+            encode_number(mut content, value: status_position(site.status))
+        }
+        mut parts.push(EncodedPart(key: 11, bytes: take content))
+    }
+    if held.functions.len() > 0 {
+        mut parts.push(EncodedPart(key: 12, bytes: self.spans(item, unit: held)))
+    }
+    var covered = mem::List[CoveredFunction].empty(alloc)
+    for function in held.functions {
+        match function.role {
+            nir::Role.Body or nir::Role.Closure or nir::Role.Default => mut covered.push(CoveredFunction(role: function.role, index: function.index))
+            else => {}
+        }
+    }
+    return Some(EncodedUnit(path: take path, parts: take parts, covered: take covered))
+} Checker.encoded_unit
+
+/// Adds a part unless it is empty.
+fn add_part(mut parts: mem::List[EncodedPart], key: u64, take bytes: mem::Bytes) {
+    if bytes.len() > 0 {
+        mut parts.push(EncodedPart(key: key, bytes: take bytes))
+    }
+} add_part
+
+/// Part 5: the item's modifiers, its generic parameters with their bounds, and a function's
+/// head and whether consumers unfold its body.
+fn Checker.head_record(self, item: ty::ItemId, encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let written = self.db().ast(item)
+    var head = encoding::Record.empty(alloc)
+    var modifiers = mem::List[u64].empty(alloc)
+    for modifier in written.type_modifiers {
+        let position: u64 = match modifier.kind {
+            ast::TypeModifier.Closed => 0
+            ast::TypeModifier.Open => 1
+            ast::TypeModifier.Linear => 2
+            ast::TypeModifier.View => 3
+        }
+        mut modifiers.push(position)
+    }
+    match written.kind {
+        ast::ItemKind.Fn(function) => {
+            match function.modifier {
+                Some(modifier) => mut modifiers.push(modifier_position(modifier.kind))
+                None => {}
+            }
+        }
+        else => {}
+    }
+    if modifiers.len() > 0 {
+        var content = mem::Bytes.empty(alloc)
+        encode_number(mut content, value: u64.widen(modifiers.len()))
+        for modifier in modifiers {
+            encode_number(mut content, value: modifier)
+        }
+        mut head.field(1, content: take content)
+    }
+    match written.kind {
+        ast::ItemKind.Fn(_) => {
+            match self.fn_sig(item) {
+                Some(sig) => {
+                    if sig.own_generics().len() > 0 {
+                        mut head.field(2, content: self.generics_list(sig.own_generics(), encoder))
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {
+            let sig = self.sig(item)
+            let generics = sig.contents().generics.view()
+            if declared_generics(generics) > 0 {
+                mut head.field(2, content: self.generics_list(generics, encoder))
+            }
+        }
+    }
+    let ast::ItemKind.Fn(function) = written.kind else {
+        return finish_if_any(take head, alloc)
+    }
+    let Some(sig) = self.fn_sig(item) else {
+        return finish_if_any(take head, alloc)
+    }
+    encoder.fn_head(mut head, types: self.types(), fn_ty: sig.fn_ty(alloc))
+    let expression = match function.body {
+        ast::FnBody.Expr(_) => true
+        else => false
+    }
+    let transparent = expression and self.transparent_seen(item, viewer: None)
+    add_number(mut head, key: 9, value: flag_bit(transparent), alloc)
+    return finish_if_any(take head, alloc)
+} Checker.head_record
+
+fn modifier_position(modifier: ast::FnModifier) -> u64 {
+    return match modifier {
+        ast::FnModifier.Proj => 4
+        ast::FnModifier.Interrupt => 5
+        ast::FnModifier.Landing => 6
+        ast::FnModifier.Foreign => 7
+        ast::FnModifier.Validator => 8
+    }
+} modifier_position
+
+/// How many generic parameters are declared, `Self` aside.
+fn declared_generics(generics: Slice[GenericDef]) -> usize {
+    var count: usize = 0
+    for def in generics {
+        if not def.param.is_self() {
+            count += 1
+        }
+    }
+    return count
+} declared_generics
+
+/// Generic parameters, `Self` aside: each a record of its name, then its bounds, or a const
+/// parameter's type.
+fn Checker.generics_list(self, generics: Slice[GenericDef], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(declared_generics(generics)))
+    for def in generics {
+        if def.param.is_self() {
+            continue
+        }
+        var param = encoding::Record.empty(alloc)
+        add_text(mut param, key: 1, value: def.name.as_str(), alloc)
+        match def.constant {
+            Some(scalar) => mut param.field(3, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: ty::Ty.scalar(scalar)), alloc))
+            None => {
+                if def.bounds.len() > 0 {
+                    var content = mem::Bytes.empty(alloc)
+                    encode_number(mut content, value: u64.widen(def.bounds.len()))
+                    for bound in def.bounds {
+                        encoder.bound(mut content, types, bound)
+                    }
+                    mut param.field(2, content: take content)
+                }
+            }
+        }
+        let finished = take param.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.generics_list
+
+/// Part 6: what the item declares beyond its head.
+fn Checker.declaration_record(self, item: ty::ItemId, encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let written = self.db().ast(item)
+    let sig = self.sig(item)
+    let declared = sig.contents()
+    var declaration = encoding::Record.empty(alloc)
+    match written.kind {
+        ast::ItemKind.Struct(_) => match declared.kind {
+            SigKind.Struct(fields: fields) => mut declaration.field(1, content: self.fields_content(fields.view(), encoder))
+            else => {}
+        }
+        ast::ItemKind.Enum(_) => match declared.kind {
+            SigKind.Enum(variants: variants) => mut declaration.field(2, content: self.variants_content(variants.view(), encoder))
+            else => {}
+        }
+        ast::ItemKind.Layout(layout_item) => match declared.kind {
+            SigKind.Layout(fields: fields, tags: _, bits: _) => mut declaration.field(3, content: self.layout_record(layout_item, fields: fields.view(), encoder, item))
+            else => {}
+        }
+        ast::ItemKind.Registers(block) => match declared.kind {
+            SigKind.Registers(members: members) => mut declaration.field(4, content: self.registers_content(item, block, members: members.view(), encoder))
+            else => {}
+        }
+        ast::ItemKind.Interface(interface_item) => match declared.kind {
+            SigKind.Interface(methods: methods) => mut declaration.field(5, content: self.methods_content(interface_item, methods: methods.view(), encoder))
+            else => {}
+        }
+        ast::ItemKind.Impl(_) => match declared.kind {
+            SigKind.Impl(target: _, target_ty: target_ty, bound: bound) => mut declaration.field(6, content: self.impl_content(target_ty, bound, encoder))
+            else => {}
+        }
+        ast::ItemKind.Registry(registry_item) => match declared.kind {
+            SigKind.Registry(entry: entry) => mut declaration.field(7, content: self.registry_content(registry_item, entry, encoder))
+            else => {}
+        }
+        ast::ItemKind.Contribute(contribution) => mut declaration.field(8, content: self.contribution_content(item, contribution))
+        ast::ItemKind.Const(_) => match declared.kind {
+            SigKind.Const(ty: const_ty) => mut declaration.field(9, content: self.const_content(item, const_ty, encoder))
+            else => {}
+        }
+        ast::ItemKind.Test(tested) => {
+            match self.test_target_path(item, tested) {
+                Some(target) => add_text(mut declaration, key: 10, value: target.as_str(), alloc)
+                None => {}
+            }
+        }
+        else => {}
+    }
+    return finish_if_any(take declaration, alloc)
+} Checker.declaration_record
+
+/// A struct's fields: each a record of its visibility, name and type.
+fn Checker.fields_content(self, fields: Slice[FieldSig], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(fields.len()))
+    for field in fields {
+        var element = encoding::Record.empty(alloc)
+        mut element.field(1, content: encoded_content(fn(mut content: mem::Bytes) => encode_visibility(mut content, visibility: field.visibility), alloc))
+        add_text(mut element, key: 2, value: field.name.as_str(), alloc)
+        mut element.field(3, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: field.ty), alloc))
+        let finished = take element.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.fields_content
+
+/// An enum's variants: each a record of its name, its payload and whether it converts.
+fn Checker.variants_content(self, variants: Slice[VariantSig], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(variants.len()))
+    for variant in variants {
+        var element = encoding::Record.empty(alloc)
+        add_text(mut element, key: 1, value: variant.name.as_str(), alloc)
+        var payload = mem::Bytes.empty(alloc)
+        match variant.payload {
+            Payload.None => encode_number(mut payload, value: 0)
+            Payload.Single(single) => {
+                encode_number(mut payload, value: 1)
+                encoder.ty(mut payload, types, ty: single)
+            }
+            Payload.Labelled(labelled) => {
+                encode_number(mut payload, value: 2)
+                encode_number(mut payload, value: u64.widen(labelled.len()))
+                for field in labelled {
+                    encode_text(mut payload, value: field.name.as_str())
+                    encoder.ty(mut payload, types, ty: field.ty)
+                }
+            }
+        }
+        mut element.field(2, content: take payload)
+        if variant.from {
+            add_number(mut element, key: 3, value: 1, alloc)
+        }
+        let finished = take element.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.variants_content
+
+/// A registers block's registers: each a record of its name, type, offset, stride and
+/// access.
+fn Checker.registers_content(self, item: ty::ItemId, block: ast::RegistersItem, members: Slice[RegisterSig], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var count = block.members.len()
+    if members.len() < count {
+        count = members.len()
+    }
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(count))
+    for at in 0..<count {
+        let register = block.members[at]
+        let declared = members[at]
+        var element = encoding::Record.empty(alloc)
+        add_text(mut element, key: 1, value: declared.name.as_str(), alloc)
+        mut element.field(2, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: declared.ty), alloc))
+        add_number(mut element, key: 3, value: self.int(item, token: register.at), alloc)
+        match register.stride {
+            Some(stride) => add_number(mut element, key: 4, value: self.int(item, token: stride), alloc)
+            None => {}
+        }
+        let access: u64 = match declared.access {
+            ast::Access.Read => 0
+            ast::Access.ReadWrite => 1
+            ast::Access.Write => 2
+            ast::Access.WriteOneClear => 3
+        }
+        add_number(mut element, key: 5, value: access, alloc)
+        let finished = take element.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.registers_content
+
+/// An interface's methods: each a record of its name, its head and whether it has a default
+/// body.
+fn Checker.methods_content(self, written: ast::InterfaceItem, methods: Slice[MethodSig], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    var count = written.methods.len()
+    if methods.len() < count {
+        count = methods.len()
+    }
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(count))
+    for at in 0..<count {
+        let method = methods[at]
+        var element = encoding::Record.empty(alloc)
+        add_text(mut element, key: 1, value: method.name.as_str(), alloc)
+        mut element.field(2, content: self.method_head_record(written.methods[at].projection, sig: method.sig, encoder))
+        add_number(mut element, key: 3, value: flag_bit(method.default), alloc)
+        let finished = take element.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.methods_content
+
+/// An impl line: the type it targets and the interface it names.
+fn Checker.impl_content(self, target_ty: ty::Ty, bound: Option[ty::Bound], encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var line = encoding::Record.empty(alloc)
+    mut line.field(1, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: target_ty), alloc))
+    match bound {
+        Some(named) => mut line.field(2, content: encoded_content(fn(mut content: mem::Bytes) => encoder.bound(mut content, types, bound: named), alloc))
+        None => {}
+    }
+    return take line.finish(alloc)
+} Checker.impl_content
+
+/// A registry: its entry type, key and unique fields.
+fn Checker.registry_content(self, written: ast::RegistryItem, entry: ty::Ty, encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: entry), alloc))
+    add_text(mut record, key: 2, value: written.key.text.as_str(), alloc)
+    if written.unique.len() > 0 {
+        var content = mem::Bytes.empty(alloc)
+        encode_number(mut content, value: u64.widen(written.unique.len()))
+        for name in written.unique {
+            encode_text(mut content, value: name.text.as_str())
+        }
+        mut record.field(3, content: take content)
+    }
+    return take record.finish(alloc)
+} Checker.registry_content
+
+/// A contribution: the canonical path of its registry and its name.
+fn Checker.contribution_content(self, item: ty::ItemId, contribution: ast::ContributeItem) -> mem::Bytes {
+    let alloc = self.alloc()
+    var segments = mem::List[text::String].empty(alloc)
+    for name in contribution.registry_path.segments {
+        mut segments.push(text::String.of(name.text.as_str(), alloc))
+    }
+    let registry_path = match self.canonically(self.db().module_of(item), segments: segments.view()) {
+        Some(path) => path
+        None => contribution.registry_path.written(alloc)
+    }
+    var record = encoding::Record.empty(alloc)
+    add_text(mut record, key: 1, value: registry_path.as_str(), alloc)
+    add_text(mut record, key: 2, value: contribution.name.text.as_str(), alloc)
+    return take record.finish(alloc)
+} Checker.contribution_content
+
+/// A const: its type and value.
+fn Checker.const_content(self, item: ty::ItemId, const_ty: ty::Ty, encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var record = encoding::Record.empty(alloc)
+    mut record.field(1, content: encoded_content(fn(mut content: mem::Bytes) => encoder.ty(mut content, types, ty: const_ty), alloc))
+    match self.const_value(item) {
+        Some(value) => mut record.field(2, content: self.value_bytes(const_ty, value: value.contents(), encoder))
+        None => {}
+    }
+    return take record.finish(alloc)
+} Checker.const_content
+
+/// The canonical path of what a test targets.
+fn Checker.test_target_path(self, item: ty::ItemId, tested: ast::TestItem) -> Option[text::String] {
+    return match self.test_target(item, tested) {
+        Some(TestTarget.Function(function)) => self.canonical_path(function)
+        Some(TestTarget.Derived(owner)) => match tested.member {
+            Some(member) => Some(self.member_path(owner, member: member.text.as_str()))
+            None => None
+        }
+        None => None
+    }
+} Checker.test_target_path
+
+/// The path `T.member` of a member of a type.
+fn Checker.member_path(self, owner: ty::ItemId, member: Str) -> text::String {
+    var path = self.db().canonical(owner)
+    mut path.push('.')
+    mut path.append(member)
+    return path
+} Checker.member_path
+
+fn Checker.layout_record(
+    self,
+    layout_item: ast::LayoutItem,
+    fields: Slice[FieldSig],
+    encoder: nir::Encoder,
+    item: ty::ItemId,
+    ) -> mem::Bytes {
+    let alloc = self.alloc()
+    var record = encoding::Record.empty(alloc)
+    var repr = mem::Bytes.empty(alloc)
+    match layout_item.repr {
+        ast::LayoutRepr.Bytes(size: size, order: order) => {
+            encode_number(mut repr, value: 0)
+            encode_number(mut repr, value: self.int(item, token: size))
+            order_word(mut repr, order)
+        }
+        ast::LayoutRepr.Integer(ty: integer, order: order) => {
+            encode_number(mut repr, value: 1)
+            encode_text(mut repr, value: integer.text.as_str())
+            order_word(mut repr, order)
+        }
+    }
+    mut record.field(1, content: take repr)
+    if layout_item.fields.len() > 0 {
+        mut record.field(2, content: self.layout_fields(layout_item.fields.view(), fields, encoder, item))
+    }
+    match layout_item.tags {
+        Some(tags) => {
+            var content = mem::Bytes.empty(alloc)
+            encode_number(mut content, value: u64.widen(tags.len()))
+            for tag in tags {
+                encode_text(mut content, value: tag.name.text.as_str())
+                encode_number(mut content, value: self.int(item, token: tag.value))
+            }
+            mut record.field(3, content: take content)
+        }
+        None => {}
+    }
+    return take record.finish(alloc)
+} Checker.layout_record
+
+/// A layout's fields: each a record of its name and its kind.
+fn Checker.layout_fields(self, written: Slice[ast::LayoutField], fields: Slice[FieldSig], encoder: nir::Encoder, item: ty::ItemId) -> mem::Bytes {
+    let alloc = self.alloc()
+    let types = self.types()
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(written.len()))
+    for field in written {
+        var element = encoding::Record.empty(alloc)
+        add_text(mut element, key: 1, value: field.name.text.as_str(), alloc)
+        var kind = mem::Bytes.empty(alloc)
+        match field.kind {
+            ast::LayoutFieldKind.Bit(low: low, high: high) => {
+                encode_number(mut kind, value: 0)
+                encode_number(mut kind, value: self.int(item, token: low))
+                match high {
+                    Some(last) => {
+                        encode_number(mut kind, value: 1)
+                        encode_number(mut kind, value: self.int(item, token: last))
+                    }
+                    None => encode_number(mut kind, value: 0)
+                }
+            }
+            ast::LayoutFieldKind.Rest => encode_number(mut kind, value: 1)
+            ast::LayoutFieldKind.Typed(ty: _, at: at) => {
+                encode_number(mut kind, value: 2)
+                encoder.ty(mut kind, types, ty: layout_field_ty(fields, name: field.name.text.as_str()))
+                encode_number(mut kind, value: self.int(item, token: at))
+            }
+        }
+        mut element.field(2, content: take kind)
+        let finished = take element.finish(alloc)
+        mut out.append(finished.view())
+    }
+    return out
+} Checker.layout_fields
+
+/// The type of a layout's field of a name, `Error` for none.
+fn layout_field_ty(fields: Slice[FieldSig], name: Str) -> ty::Ty {
+    for field in fields {
+        if field.name.as_str() == name {
+            return field.ty
+        }
+    }
+    return ty::Ty.error()
+} layout_field_ty
+
+/// The head of an interface method, as part 5 writes a function's.
+fn Checker.method_head_record(self, projection: bool, sig: FnSig, encoder: nir::Encoder) -> mem::Bytes {
+    let alloc = self.alloc()
+    var head = encoding::Record.empty(alloc)
+    if projection {
+        var content = mem::Bytes.empty(alloc)
+        encode_number(mut content, value: 1)
+        encode_number(mut content, value: 4)
+        mut head.field(1, content: take content)
+    }
+    if sig.own_generics().len() > 0 {
+        mut head.field(2, content: self.generics_list(sig.own_generics(), encoder))
+    }
+    encoder.fn_head(mut head, types: self.types(), fn_ty: sig.fn_ty(alloc))
+    return take head.finish(alloc)
+} Checker.method_head_record
+
+/// Part 7: a declared type's structural properties, or an interface's Dyn-usability.
+fn Checker.properties_record(self, item: ty::ItemId) -> mem::Bytes {
+    let alloc = self.alloc()
+    var record = encoding::Record.empty(alloc)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => {
+            let props = self.definition_props(item)
+            add_number(mut record, key: 1, value: flag_bit(props.is_linear), alloc)
+            add_number(mut record, key: 2, value: flag_bit(props.view), alloc)
+            add_number(mut record, key: 3, value: flag_bit(props.copy), alloc)
+            add_number(mut record, key: 4, value: flag_bit(props.send), alloc)
+            add_number(mut record, key: 5, value: flag_bit(props.inert), alloc)
+            add_number(mut record, key: 6, value: flag_bit(props.any_bits), alloc)
+        }
+        ast::ItemKind.Interface(_) => add_number(mut record, key: 7, value: flag_bit(self.dyn_usable(item)), alloc)
+        else => {}
+    }
+    return finish_if_any(take record, alloc)
+} Checker.properties_record
+
+/// The premise of each trusted block or expression of the item, by premise index.
+fn Checker.premise_texts(self, item: ty::ItemId, unit: nir::NirUnit) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var premises = mem::HashMap[u32, text::String].empty(seed: 0, alloc)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Fn(function) => match function.body {
+            ast::FnBody.Block(block) => block.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+            ast::FnBody.Expr(expr) => expr.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+            ast::FnBody.None => {}
+        }
+        ast::ItemKind.Test(tested) => tested.body.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+        ast::ItemKind.Const(constant) => constant.value.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+        ast::ItemKind.ConstAssert(condition) => condition.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+        ast::ItemKind.Contribute(contribution) => contribution.value.visit(fn[mut premises](visited: ast::Expr) => add_premise(mut premises, expr: visited, alloc))
+        else => {}
+    }
+    var texts = mem::List[text::String].empty(alloc)
+    for token in unit.premises {
+        match premises.get(token) {
+            Some(premise) => mut texts.push(text::String.of(premise.as_str(), alloc))
+            None => mut texts.push(text::String.empty(alloc))
+        }
+    }
+    return texts
+} Checker.premise_texts
+
+/// Keeps the premise of a trusted expression, by its first token.
+fn add_premise(mut premises: mem::HashMap[u32, text::String], expr: ast::Expr, alloc: mem::Alloc) {
+    match expr.kind {
+        ast::ExprKind.Trusted(premise: premise, body: _) => {
+            discard mut premises.insert(expr.token, value: text::String.of(premise.value.as_str(), alloc))
+        }
+        else => {}
+    }
+} add_premise
+
+/// Part 12: for each function, its span, its parameters' spans with their names, then each
+/// block's instructions' spans, a slot's with its name, and its terminator's span.
+fn Checker.spans(self, item: ty::ItemId, unit: nir::NirUnit) -> mem::Bytes {
+    let alloc = self.alloc()
+    let db = self.db()
+    let file = db.item_file(item)
+    let package_id = db.package_of(item)
+    var path = text::String.of(db.package_data(package_id).name.as_str(), alloc)
+    mut path.push('/')
+    var prefix = text::String.of(db.source(package_id).dir.as_str(), alloc)
+    mut prefix.push('/')
+    let within = match file.path.starts_with(prefix.as_str()) {
+        true => file.path.slice_bytes(prefix.byte_len(), end: file.path.byte_len())
+        false => None
+    }
+    match within {
+        Some(rest) => mut path.append(rest)
+        None => mut path.append(file.path.as_str())
+    }
+    let syntax = file.syntax
+    var out = mem::Bytes.empty(alloc)
+    encode_number(mut out, value: u64.widen(unit.functions.len()))
+    for function in unit.functions {
+        write_span(mut out, syntax, path: path.as_str(), span: function.span)
+        encode_number(mut out, value: u64.widen(function.params.len()))
+        for param in function.params {
+            write_span(mut out, syntax, path: path.as_str(), span: param.span)
+            encode_text(mut out, value: param.name.as_str())
+        }
+        encode_number(mut out, value: u64.widen(function.blocks.len()))
+        for block in function.blocks {
+            write_block_spans(mut out, syntax, path: path.as_str(), block)
+        }
+    }
+    return out
+} Checker.spans
+
+/// The spans of a block's instructions, a slot's with its name, and its terminator's span.
+fn write_block_spans(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, block: nir::Block) {
+    encode_number(mut out, value: u64.widen(block.insts.len()))
+    for inst in block.insts {
+        write_span(mut out, syntax, path, span: inst.span)
+        match inst.op {
+            nir::Op.Slot(name: Some(name), ty: _) => encode_text(mut out, value: name.as_str())
+            else => {}
+        }
+    }
+    write_span(mut out, syntax, path, span: block.term_span)
+} write_block_spans
+
+/// A span: its file path, then the line and column of its first token's start and of its
+/// last token's end.
+fn write_span(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, span: nir::Span) {
+    let head = syntax.tokens[usize.widen(span.head)]
+    let last = syntax.tokens[usize.widen(span.last)]
+    encode_text(mut out, value: path)
+    encode_number(mut out, value: u64.widen(head.line))
+    encode_number(mut out, value: u64.widen(head.start - syntax.lines[usize.widen(head.line) - 1].start))
+    encode_number(mut out, value: u64.widen(last.line))
+    encode_number(mut out, value: u64.widen(last.end - syntax.lines[usize.widen(last.line) - 1].start))
+} write_span
+
+/// The digest of a covered function under this checker's target, as part 9 writes it.
+fn Checker.digest_record(self, item: ty::ItemId, role: nir::Role, index: u32) -> mem::Bytes {
+    let alloc = self.alloc()
+    let digest = self.function_digest(item, role, index)
+    let may_trap = self.function_may_trap(item, role, index)
+    var record = encoding::Record.empty(alloc)
+    add_number(mut record, key: 1, value: flag_bit(digest.wait), alloc)
+    add_number(mut record, key: 2, value: flag_bit(digest.alloc), alloc)
+    add_number(mut record, key: 3, value: flag_bit(digest.device), alloc)
+    add_number(mut record, key: 4, value: flag_bit(digest.privileged), alloc)
+    add_number(mut record, key: 5, value: flag_bit(digest.sync), alloc)
+    add_number(mut record, key: 6, value: flag_bit(may_trap), alloc)
+    add_number(mut record, key: 7, value: flag_bit(digest.terminates), alloc)
+    add_number(mut record, key: 8, value: flag_bit(digest.float), alloc)
+    mut record.field(9, content: self.item_set_content(digest.capabilities))
+    mut record.field(10, content: self.item_set_content(digest.validators))
+    return take record.finish(alloc)
+} Checker.digest_record
+
+/// A digest's set of items: 0 and their sorted canonical paths, or 1 for the unbounded set.
+fn Checker.item_set_content(self, set: Option[mem::Set[ty::ItemId]]) -> mem::Bytes {
+    let alloc = self.alloc()
+    var out = mem::Bytes.empty(alloc)
+    let Some(held) = set else {
+        encode_number(mut out, value: 1)
+        return out
+    }
+    encode_number(mut out, value: 0)
+    var paths = mem::List[text::String].empty(alloc)
+    for item in held {
+        mut paths.push(self.db().canonical(item))
+    }
+    mut paths.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    encode_number(mut out, value: u64.widen(paths.len()))
+    for path in paths {
+        encode_text(mut out, value: path.as_str())
+    }
+    return out
+} Checker.item_set_content
+
+/// The value of an `INT` token of an item's file.
+fn Checker.int(self, item: ty::ItemId, token: u32) -> u64 {
+    var digits = mem::Bytes.empty(self.alloc())
+    for byte in self.db().text(item, token).as_bytes() {
+        if byte != b'_' {
+            mut digits.push(byte)
+        }
+    }
+    var radix: u64 = 10
+    var start: usize = 0
+    if digits.len() >= 2 and digits[0] == b'0' and digits[1] == b'x' {
+        radix = 16
+        start = 2
+    } else if digits.len() >= 2 and digits[0] == b'0' and digits[1] == b'b' {
+        radix = 2
+        start = 2
+    }
+    var value: u64 = 0
+    var read = false
+    for index in start..<digits.len() {
+        let Some(digit) = digit_value(digits[index], radix) else {
+            break
+        }
+        let Some(scaled) = value.checked_mul(radix) else {
+            return 0
+        }
+        let Some(next) = scaled.checked_add(digit) else {
+            return 0
+        }
+        value = next
+        read = true
+    }
+    if not read {
+        return 0
+    }
+    return value
+} Checker.int
+
+/// The value of a digit in a radix, none for a byte that is none.
+fn digit_value(byte: u8, radix: u64) -> Option[u64] {
+    var value: u64 = radix
+    if byte >= b'0' and byte <= b'9' {
+        value = u64.widen(byte - b'0')
+    } else if byte >= b'a' and byte <= b'f' {
+        value = u64.widen(byte - b'a') + 10
+    } else if byte >= b'A' and byte <= b'F' {
+        value = u64.widen(byte - b'A') + 10
+    }
+    if value >= radix {
+        return None
+    }
+    return Some(value)
+} digit_value
+
+/// A const value in the canonical encoding, following its type.
+fn Checker.value_bytes(self, ty: ty::Ty, value: ConstValue, encoder: nir::Encoder) -> mem::Bytes {
+    var out = mem::Bytes.empty(self.alloc())
+    self.write_value(mut out, ty, value: value.value, whole: value, encoder)
+    return out
+} Checker.value_bytes
+
+fn Checker.write_value(
+    self,
+    mut out: mem::Bytes,
+    ty: ty::Ty,
+    value: Val,
+    whole: ConstValue,
+    encoder: nir::Encoder,
+    ) {
+    let types = self.types()
+    let kind = types.kind(ty)
+    match value {
+        Val.Int(int) => match kind {
+            ty::TyKind.Scalar(scalar) => nir::literal_value(mut out, value: nir::Literal.Int(value: int, scalar: scalar))
+            else => {
+                expect false
+            }
+        }
+        Val.Float32(float) => nir::literal_value(mut out, value: nir::Literal.Float(bits: u64.widen(float.to_bits()), scalar: ty::Scalar.Float32))
+        Val.Float64(float) => nir::literal_value(mut out, value: nir::Literal.Float(bits: float.to_bits(), scalar: ty::Scalar.Float64))
+        Val.Bool(flag) => encode_number(mut out, value: flag_bit(flag))
+        Val.Char(c) => encode_number(mut out, value: u64.widen(c.to_bits()))
+        Val.Unit => {}
+        Val.Struct(item: _, fields: fields) => match kind {
+            ty::TyKind.Item(item: owner, args: args) => self.write_fields(mut out, field_types: self.struct_field_types(owner, args), values: fields.contents().view(), whole, encoder)
+            else => {
+                expect false
+            }
+        }
+        Val.Variant(item: _, index: variant, fields: payload) => match kind {
+            ty::TyKind.Item(item: owner, args: args) => {
+                encode_number(mut out, value: u64.widen(variant))
+                self.write_fields(mut out, field_types: self.payload_types(owner, args, variant: usize.widen(variant)), values: payload.contents().view(), whole, encoder)
+            }
+            else => {
+                expect false
+            }
+        }
+        Val.Array(elements) => match kind {
+            ty::TyKind.Item(item: _, args: args) => self.write_elements(mut out, element: first_type_arg(types, args), values: elements.contents().view(), whole, encoder)
+            else => {
+                expect false
+            }
+        }
+        Val.View(view) => match kind {
+            ty::TyKind.Item(item: _, args: args) => self.write_view(mut out, args, values: whole.elements(view), whole, encoder)
+            else => {
+                expect false
+            }
+        }
+        Val.Fn(function) => match function.contents() {
+            FnVal.Function(callee) => encoder.fn_ref(mut out, types, callee)
+            FnVal.Closure(item: _, index: _, args: _, captures: _) => {
+                expect false
+            }
+        }
+        else => {
+            expect false
+        }
+    }
+} Checker.write_value
+
+/// The values of a struct's or payload's fields, each following its type, `Unit` past the
+/// types known.
+fn Checker.write_fields(
+    self,
+    mut out: mem::Bytes,
+    field_types: mem::List[ty::Ty],
+    values: Slice[Val],
+    whole: ConstValue,
+    encoder: nir::Encoder,
+    ) {
+    for at in 0..<values.len() {
+        var field_ty = ty::Ty.unit()
+        if at < field_types.len() {
+            field_ty = field_types[at]
+        }
+        self.write_value(mut out, ty: field_ty, value: values[at], whole, encoder)
+    }
+} Checker.write_fields
+
+/// The values of an array's elements, a list of values of its element type.
+fn Checker.write_elements(
+    self,
+    mut out: mem::Bytes,
+    element: ty::Ty,
+    values: Slice[Val],
+    whole: ConstValue,
+    encoder: nir::Encoder,
+    ) {
+    encode_number(mut out, value: u64.widen(values.len()))
+    for value in values {
+        self.write_value(mut out, ty: element, value, whole, encoder)
+    }
+} Checker.write_elements
+
+/// The values a view sees: a list of values of its element type, or the bytes of a text.
+fn Checker.write_view(
+    self,
+    mut out: mem::Bytes,
+    args: ty::Args,
+    values: Slice[Val],
+    whole: ConstValue,
+    encoder: nir::Encoder,
+    ) {
+    let types = self.types()
+    let listed = types.arg_list(args)
+    if listed.len() > 0 {
+        match listed[0].ty() {
+            Some(element) => {
+                self.write_elements(mut out, element, values, whole, encoder)
+                return
+            }
+            None => {}
+        }
+    }
+    var text = mem::Bytes.empty(self.alloc())
+    for value in values {
+        mut text.push(u8.truncate(value.int_value().low_bits()))
+    }
+    encoding::bytes(mut out, value: text.view())
+} Checker.write_view
+
+/// The first type argument of an argument list, `Unit` for none.
+fn first_type_arg(types: ty::Types, args: ty::Args) -> ty::Ty {
+    let listed = types.arg_list(args)
+    if listed.len() == 0 {
+        return ty::Ty.unit()
+    }
+    return listed[0].ty().value_or(ty::Ty.unit())
+} first_type_arg
+
+/// The types of a struct's or layout's fields, substituted with its arguments.
+fn Checker.struct_field_types(self, owner: ty::ItemId, args: ty::Args) -> mem::List[ty::Ty] {
+    let types = self.types()
+    var field_types = mem::List[ty::Ty].empty(self.alloc())
+    let sig = self.sig(owner)
+    let held = sig.contents()
+    let subst = self.sig_subst(held.generics.view(), args)
+    match held.kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut field_types.push(subst.ty(types, ty: field.ty))
+            }
+        }
+        else => {}
+    }
+    return field_types
+} Checker.struct_field_types
+
+/// The types of a variant's payload fields, substituted with its enum's arguments.
+fn Checker.payload_types(self, owner: ty::ItemId, args: ty::Args, variant: usize) -> mem::List[ty::Ty] {
+    let types = self.types()
+    var field_types = mem::List[ty::Ty].empty(self.alloc())
+    let sig = self.sig(owner)
+    let held = sig.contents()
+    let subst = self.sig_subst(held.generics.view(), args)
+    let SigKind.Enum(variants: variants) = held.kind else {
+        return field_types
+    }
+    match variants[variant].payload {
+        Payload.None => {}
+        Payload.Single(single) => mut field_types.push(subst.ty(types, ty: single))
+        Payload.Labelled(labelled) => {
+            for field in labelled {
+                mut field_types.push(subst.ty(types, ty: field.ty))
+            }
+        }
+    }
+    return field_types
+} Checker.payload_types
+
+/// The substitution of an item's generic parameters by its arguments.
+fn Checker.sig_subst(self, generics: Slice[GenericDef], args: ty::Args) -> ty::Subst {
+    let alloc = self.alloc()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in generics {
+        mut params.push(def.param)
+    }
+    return ty::Subst.of(params.view(), args: self.types().arg_list(args), alloc)
+} Checker.sig_subst
+
+fn order_word(mut out: mem::Bytes, order: Option[ast::Name]) {
+    let Some(name) = order else {
+        encode_number(mut out, value: 0)
+        return
+    }
+    encode_number(mut out, value: 1)
+    if name.text.as_str() == "le" {
+        encode_number(mut out, value: 0)
+    } else {
+        encode_number(mut out, value: 1)
+    }
+} order_word
+
+/// The record's bytes, or nothing for a record without fields.
+fn finish_if_any(take record: encoding::Record, alloc: mem::Alloc) -> mem::Bytes {
+    let finished = take record.finish(alloc)
+    if finished.len() == 1 and finished[0] == 0 {
+        return mem::Bytes.empty(alloc)
+    }
+    return finished
+} finish_if_any

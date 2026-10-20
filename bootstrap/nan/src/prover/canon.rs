@@ -90,6 +90,8 @@ pub enum Formula {
     /// A comparison or boolean term, holding or negated.
     Leaf(TermId, bool),
     Lit(Literal),
+    /// A boolean term holding or negated, expanded only where a clause reaches it.
+    Term(TermId, bool),
 }
 
 /// A leaf as a literal, or the truth value it folds to.
@@ -109,6 +111,8 @@ pub struct Canon<'a, 'c> {
     conditions: HashMap<TermId, TermId>,
     /// The symbols standing for conditions whose defining clauses are not yet emitted.
     defined: Vec<(TermId, TermId)>,
+    /// The fresh boolean symbol standing for each conjunction a term gives in a polarity.
+    shared: HashMap<(TermId, bool), TermId>,
     /// The divisions whose facts are given, by dividend and divisor.
     divided: HashSet<(TermId, TermId)>,
     pub clauses: Vec<(Clause, Origin)>,
@@ -124,6 +128,7 @@ impl<'a, 'c> Canon<'a, 'c> {
             normal: HashMap::new(),
             conditions: HashMap::new(),
             defined: Vec::new(),
+            shared: HashMap::new(),
             clauses: Vec::new(),
         }
     }
@@ -138,8 +143,9 @@ impl<'a, 'c> Canon<'a, 'c> {
         self.emit(formula, Origin::Goal);
     }
 
-    /// A formula as negation normal form: guards and boolean ites as disjunctions, `not`
-    /// pushed onto atoms, and each `any` within no `all` as its body for a skolem symbol.
+    /// A formula as negation normal form, one connective deep, its operands terms: guards and
+    /// boolean ites as disjunctions, `not` pushed onto atoms, and each `any` within no `all` as
+    /// its body for a skolem symbol.
     pub fn formula(&mut self, term: TermId, positive: bool) -> Formula {
         match self.terms.get(term).clone() {
             Term::Lit(crate::nir::Literal::Bool(value)) => match value == positive {
@@ -150,7 +156,7 @@ impl<'a, 'c> Canon<'a, 'c> {
                 let conjunction = matches!(self.terms.get(term), Term::And(_)) == positive;
                 let parts = parts
                     .iter()
-                    .map(|part| self.formula(*part, positive))
+                    .map(|part| Formula::Term(*part, positive))
                     .collect();
                 match conjunction {
                     true => Formula::And(parts),
@@ -161,12 +167,12 @@ impl<'a, 'c> Canon<'a, 'c> {
             Term::Ite(condition, then, otherwise) if self.terms.sort(term) == Sort::Bool => {
                 Formula::And(vec![
                     Formula::Or(vec![
-                        self.formula(condition, false),
-                        self.formula(then, positive),
+                        Formula::Term(condition, false),
+                        Formula::Term(then, positive),
                     ]),
                     Formula::Or(vec![
-                        self.formula(condition, true),
-                        self.formula(otherwise, positive),
+                        Formula::Term(condition, true),
+                        Formula::Term(otherwise, positive),
                     ]),
                 ])
             }
@@ -214,10 +220,18 @@ impl<'a, 'c> Canon<'a, 'c> {
         };
         let below = self.terms.compare(op, skolem, any.high);
         Formula::And(vec![
-            self.formula(body, true),
+            Formula::Term(body, true),
             Formula::Leaf(above, true),
             Formula::Leaf(below, true),
         ])
+    }
+
+    /// The term, following `not`, and the polarity at which it gives its formula's shape.
+    fn stripped(&self, term: TermId, positive: bool) -> (TermId, bool) {
+        match self.terms.get(term) {
+            Term::Not(inner) => self.stripped(*inner, !positive),
+            _ => (term, positive),
+        }
     }
 
     fn negate(&mut self, formula: Formula) -> Formula {
@@ -231,6 +245,7 @@ impl<'a, 'c> Canon<'a, 'c> {
                 Formula::And(parts.into_iter().map(|part| self.negate(part)).collect())
             }
             Formula::Leaf(term, positive) => Formula::Leaf(term, !positive),
+            Formula::Term(term, positive) => Formula::Term(term, !positive),
             Formula::Lit(literal) => match &literal.atom {
                 Atom::All(forall) if !literal.negated => {
                     let body = self.terms.not(forall.body);
@@ -252,6 +267,10 @@ impl<'a, 'c> Canon<'a, 'c> {
                 for part in parts {
                     self.emit(part, origin);
                 }
+            }
+            Formula::Term(term, positive) => {
+                let formula = self.formula(term, positive);
+                self.emit(formula, origin);
             }
             other => self.clause(other, origin),
         }
@@ -319,6 +338,22 @@ impl<'a, 'c> Canon<'a, 'c> {
                 leaves.push(Formula::Leaf(symbol, true));
                 conjunctions.push((symbol, parts));
             }
+            Formula::Term(term, positive) => {
+                let shape = self.stripped(term, positive);
+                if let Some(symbol) = self.shared.get(&shape) {
+                    leaves.push(Formula::Leaf(*symbol, true));
+                    return;
+                }
+                match self.formula(term, positive) {
+                    Formula::And(parts) => {
+                        let symbol = self.terms.fresh(Ty::Scalar(Scalar::Bool));
+                        self.shared.insert(shape, symbol);
+                        leaves.push(Formula::Leaf(symbol, true));
+                        conjunctions.push((symbol, parts));
+                    }
+                    other => self.disjuncts(other, leaves, conjunctions),
+                }
+            }
             other => leaves.push(other),
         }
     }
@@ -344,7 +379,7 @@ impl<'a, 'c> Canon<'a, 'c> {
                     }),
                 }
             }
-            Formula::And(_) | Formula::Or(_) => {
+            Formula::And(_) | Formula::Or(_) | Formula::Term(..) => {
                 unreachable!("a connective among a clause's leaves")
             }
         }

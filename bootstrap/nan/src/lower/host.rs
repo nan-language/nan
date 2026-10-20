@@ -109,7 +109,7 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         .ck
         .fn_sig(program.entry)
         .and_then(|sig| sig.limits.stack)
-        .unwrap_or(tasks::STACK);
+        .unwrap_or(tasks::ENTRY_STACK);
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(types::I32));
     signature.params.push(AbiParam::new(PTR));

@@ -1,0 +1,143 @@
+//! Walks over expressions: each expression an expression holds, through its blocks and statements, in source order.
+
+/// Visits this expression and each one it holds, before the ones they hold.
+pkg fn Expr.visit(self, visit: fn(expr: Expr)) {
+    visit(self)
+    match self.kind {
+        ExprKind.Paren(inner) or ExprKind.Dbg(inner) or ExprKind.Fail(inner) or ExprKind.Field(base: inner, name: _) or ExprKind.Unary(op: _, operand: inner) or ExprKind.Marked(failure: _, awaited: _, mode: _, inner: inner) => inner.contents().visit(visit)
+        ExprKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            condition.contents().visit(visit)
+            then.visit(visit)
+            match otherwise {
+                Some(chained) => match chained.contents() {
+                    Else.Block(block) => block.visit(visit)
+                    Else.If(chained_if) => chained_if.visit(visit)
+                }
+                None => {}
+            }
+        }
+        ExprKind.Match(ordered: _, scrutinee: scrutinee, arms: arms) => {
+            scrutinee.contents().visit(visit)
+            for arm in arms {
+                match arm.guard {
+                    Some(guard) => guard.visit(visit)
+                    None => {}
+                }
+                match arm.body {
+                    ArmBody.Block(block) => block.visit(visit)
+                    ArmBody.Expr(body) => body.visit(visit)
+                }
+            }
+        }
+        ExprKind.Closure(closure) => match closure.contents().body {
+            ClosureBody.Short(body) => body.contents().visit(visit)
+            ClosureBody.Block(block) => block.visit(visit)
+        }
+        ExprKind.Trusted(premise: _, body: body) => match body {
+            TrustedBody.Expr(inner) => inner.contents().visit(visit)
+            TrustedBody.Block(block) => block.visit(visit)
+        }
+        ExprKind.When(accesses: _, body: body) => match body {
+            WhenBody.Expr(inner) => inner.contents().visit(visit)
+            WhenBody.Block(block) => block.visit(visit)
+        }
+        ExprKind.Quantifier(all: _, name: _, range: range, body: body) => {
+            range.contents().visit(visit)
+            body.contents().visit(visit)
+        }
+        ExprKind.Call(callee: callee, args: args) => {
+            callee.contents().visit(visit)
+            for arg in args {
+                arg.value.visit(visit)
+            }
+        }
+        ExprKind.Index(base: base, index: index) => {
+            base.contents().visit(visit)
+            index.contents().visit(visit)
+        }
+        ExprKind.Binary(op: _, op_token: _, left: left, right: right) => {
+            left.contents().visit(visit)
+            right.contents().visit(visit)
+        }
+        ExprKind.Return(value) => match value {
+            Some(returned) => returned.contents().visit(visit)
+            None => {}
+        }
+        ExprKind.Literal(_) or ExprKind.Path(path: _, args: _) or ExprKind.SelfValue or ExprKind.Todo(_) or ExprKind.Break(_) or ExprKind.Continue(_) => {}
+    }
+} Expr.visit
+
+/// Visits each path this expression and the ones it holds write.
+pkg fn Expr.visit_paths(self, visit: fn(path: Path)) {
+    self.visit(fn(expr: Expr) {
+        match expr.kind {
+            ExprKind.Path(path: path, args: _) => visit(path)
+            else => {}
+        }
+    })
+} Expr.visit_paths
+
+/// Visits each expression the block's statements hold.
+pkg fn Block.visit(self, visit: fn(expr: Expr)) {
+    for stmt in self.stmts {
+        match stmt.kind {
+            StmtKind.Let(pattern: _, ty: _, value: value, otherwise: otherwise) => {
+                value.visit(visit)
+                match otherwise {
+                    Some(diverging) => diverging.visit(visit)
+                    None => {}
+                }
+            }
+            StmtKind.Var(name: _, ty: _, value: value) or StmtKind.Discard(value) or StmtKind.Defer(value) or StmtKind.Undefer(value) or StmtKind.Expect(value) or StmtKind.Assume(condition: value, reason: _) or StmtKind.Expr(value) => value.visit(visit)
+            StmtKind.While(condition: condition, body: body) => {
+                condition.visit(visit)
+                for assertion in body.invariants {
+                    assertion.visit(visit)
+                }
+                body.block.visit(visit)
+            }
+            StmtKind.For(pattern: _, iterated: iterated, body: body) => {
+                iterated.visit(visit)
+                for assertion in body.invariants {
+                    assertion.visit(visit)
+                }
+                body.block.visit(visit)
+            }
+            StmtKind.Loop(label: _, body: body) => {
+                for assertion in body.invariants {
+                    assertion.visit(visit)
+                }
+                body.block.visit(visit)
+            }
+            StmtKind.Assign(target: target, op: _, op_token: _, value: value) => {
+                target.visit(visit)
+                value.visit(visit)
+            }
+        }
+    }
+} Block.visit
+
+fn path_expr(written: Str, token: u32, alloc: mem::Alloc) -> Expr {
+    var segments = mem::List[Name].empty(alloc)
+    mut segments.push(Name(text: text::String.of(written, alloc), token: token))
+    return Expr(token: token, last: token, kind: ExprKind.Path(path: Path(segments: take segments), args: None))
+} path_expr
+
+test walks_visit_each_expression_before_the_ones_it_holds_in_source_order for Block.visit {
+    let alloc = testing::world().alloc
+    let heap = mem::Heap.of(alloc)
+    let sum = Expr(token: 10, last: 12, kind: ExprKind.Binary(op: BinaryOp.Add, op_token: 13, left: heap.boxed(path_expr("a", token: 11, alloc)), right: heap.boxed(path_expr("b", token: 12, alloc))))
+    var args = mem::List[Arg].empty(alloc)
+    mut args.push(Arg(token: 23, label: None, value: path_expr("c", token: 23, alloc)))
+    mut args.push(Arg(token: 24, label: Some(path_expr("d", token: 24, alloc)), value: path_expr("e", token: 25, alloc)))
+    let call = Expr(token: 21, last: 26, kind: ExprKind.Call(callee: heap.boxed(path_expr("f", token: 22, alloc)), args: take args))
+    var stmts = mem::List[Stmt].empty(alloc)
+    mut stmts.push(Stmt(token: 1, kind: StmtKind.Let(pattern: Pattern(token: 2, kind: PatternKind.Wildcard), ty: None, value: take sum, otherwise: None)))
+    mut stmts.push(Stmt(token: 20, kind: StmtKind.Expr(Expr(token: 20, last: 26, kind: ExprKind.Return(Some(heap.boxed(take call)))))))
+    let block = Block(token: 0, end: 27, stmts: take stmts)
+    var visited: u64 = 0
+    block.visit(fn[mut visited](expr: Expr) {
+        visited = visited * 100 + u64.widen(expr.token)
+    })
+    expect visited == 10_11_12_20_21_22_23_25
+} walks_visit_each_expression_before_the_ones_it_holds_in_source_order

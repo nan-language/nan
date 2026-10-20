@@ -21,6 +21,9 @@ use super::{Routine, state, system, tasks};
 
 pub const CHUNK: u64 = 65_536;
 
+/// The most returned single chunks the runtime keeps mapped for the next draws.
+const KEPT: u64 = 64;
+
 /// The cell table's capacity.
 pub const CELLS: u64 = 65_536;
 pub const CELL_RECORD: u64 = 40;
@@ -331,7 +334,7 @@ fn draw(lo: &mut Lowering, fx: &mut Fx, handle: Value, count: Value) -> Value {
                 lo,
                 platform,
                 &[PTR],
-                |lo, fx| vec![system::map_chunks(lo, fx, count)],
+                |lo, fx| vec![platform_chunks(lo, fx, count)],
                 |lo, fx| {
                     let supply = region_supply(fx, region);
                     let base = heap::take_chunks(fx, supply, count);
@@ -695,7 +698,8 @@ pub fn return_chunk(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         platform,
         &[],
         |lo, fx| {
-            system::unmap_chunks(lo, fx, base, count);
+            let used = fx.load(PTR, record, chunk::USED);
+            give_platform_chunks(lo, fx, base, count, used);
             Vec::new()
         },
         |_, fx| {
@@ -705,6 +709,64 @@ pub fn return_chunk(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         },
     );
     lo.record_free(fx, record);
+}
+
+/// Draws `count` zeroed chunks from the platform: a kept single chunk when one is wanted and
+/// kept, otherwise newly mapped ones; zero when the system refuses. The caller holds the lock.
+fn platform_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
+    let state = lo.state(fx);
+    let kept = fx.load(PTR, state, state::KEPT_CHUNKS);
+    let single = fx.b.ins().icmp_imm_s(IntCC::Equal, count, 1);
+    let held = fx.b.ins().icmp_imm_s(IntCC::NotEqual, kept, 0);
+    let reuse = fx.b.ins().band(single, held);
+    fx.choose_in(
+        lo,
+        reuse,
+        &[PTR],
+        |_, fx| {
+            let next = fx.load(PTR, kept, 0);
+            fx.store(next, state, state::KEPT_CHUNKS);
+            let left = fx.load(PTR, state, state::KEPT_COUNT);
+            let left = fx.b.ins().iadd_imm_s(left, -1);
+            fx.store(left, state, state::KEPT_COUNT);
+            let zero = fx.ptr(0);
+            fx.store(zero, kept, 0);
+            vec![kept]
+        },
+        |lo, fx| vec![system::map_chunks(lo, fx, count)],
+    )[0]
+}
+
+/// Returns `count` chunks from `base`, of which the first `used` bytes were written, to the
+/// platform: a single chunk is zeroed and kept for the next draws while fewer than `KEPT` are,
+/// any other run unmapped. The caller holds the lock.
+fn give_platform_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value, used: Value) {
+    let state = lo.state(fx);
+    let kept = fx.load(PTR, state, state::KEPT_COUNT);
+    let single = fx.b.ins().icmp_imm_s(IntCC::Equal, count, 1);
+    let room =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedLessThan, kept, KEPT as i64);
+    let keep = fx.b.ins().band(single, room);
+    fx.choose_in(
+        lo,
+        keep,
+        &[],
+        |lo, fx| {
+            let zero = fx.ptr(0);
+            lo.call_routine(fx, Routine::Fill, &[base, zero, used]);
+            let head = fx.load(PTR, state, state::KEPT_CHUNKS);
+            fx.store(head, base, 0);
+            fx.store(base, state, state::KEPT_CHUNKS);
+            let more = fx.b.ins().iadd_imm_s(kept, 1);
+            fx.store(more, state, state::KEPT_COUNT);
+            Vec::new()
+        },
+        |lo, fx| {
+            system::unmap_chunks(lo, fx, base, count);
+            Vec::new()
+        },
+    );
 }
 
 /// Takes a run of chunks out of its domain's list and out of the pool carving it.

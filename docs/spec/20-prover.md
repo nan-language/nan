@@ -225,14 +225,14 @@ Canonicalisation takes the premises in their order, the negated goal last, and k
 1. The goal is negated and added as a premise.
 2. A guarded premise `g` ⇒ `P` becomes `not g or P`. A boolean ite(c, p, q) becomes `(not c or p) and (c or q)`. `not` is pushed onto atoms, a negated comparison becoming its complement, turning a negated `all` into `any` of the negated body and a negated `any` into `all`.
 3. Each `any x in a..<b: P` that lies within no `all` becomes P with x replaced by a fresh skolem symbol k, and the atoms a ≤ k and k < b, or k ≤ b for `..=`.
-4. Conjunctions split into separate premises. A disjunction is a clause, whose disjuncts are its literals; an `all` is a literal. A conjunction inside a clause, and an ite condition that is not an atom, is replaced by a fresh boolean symbol, with clauses defining the symbol as that formula.
+4. Conjunctions split into separate premises. A disjunction is a clause, whose disjuncts are its literals; an `all` is a literal. A conjunction inside a clause, and an ite condition that is not an atom, is replaced by a fresh boolean symbol, with clauses defining the symbol as that formula. A conjunction that one term gives in one polarity has one symbol: where it occurs again, that symbol replaces it and its defining clauses are not repeated.
 5. Each integer comparison becomes an atom Σ ci × ti ≤ c or Σ ci × ti = c: like terms combined and coefficients divided by their greatest common divisor, c being rounded toward negative infinity for ≤. An equality whose c the divisor does not divide is false. `<` becomes ≤ c − 1, `>` and `>=` negate the coefficients, and `!=` is a negated equality.
 6. Literals are folded. An atom without terms is `true` or `false`. A clause with a `true` literal is dropped, and `false` literals are removed.
 7. Identical terms are one term.
 
 [Relevance](#relevance) then applies. The fresh, skolem and bound symbols are numbered from 0 in order of first occurrence, reading the relevant premises in order and each from left to right; symbols the procedure creates later continue the numbering in the order of creation. Last, the terms of each atom, the literals of each clause and the premises are sorted into term order, and an equality whose first coefficient is negative has its coefficients and constant negated.
 
-The **term order** compares terms, atoms and clauses by their [canonical encoding](#determinism), byte by byte; every choice of a first item follows it.
+The **term order** compares terms by their [term keys](#determinism), and atoms and clauses by their [canonical encoding](#determinism), byte by byte; every choice of a first item follows it.
 
 ### Propagation
 
@@ -326,7 +326,8 @@ The outcome of a query depends only on its canonical encoding and the prover of 
 
 The **canonical encoding** of a query is the concatenation of its relevant premises in term order after canonicalisation, the negated goal included, written with the forms of the [NIR encoding](19-nir.md#encoding):
 
-- A term is a uvar kind and its content: 0, a parameter, by its value number; 1, the content of a place at entry, by the place; 2, a literal, as NIR encodes it; 3, an application of an instruction, by its opcode and argument terms; 4, an application of a function, by the `call` opcode, the callee's function reference and the argument terms; 5, a field step, by its term and the step as a text; 6, an ite, quotient, remainder or tag, by its query opcode and its parts; 7, a fresh, skolem or bound symbol, by its query opcode and its number.
+- A term is written as its **term key**: the 32 bytes of the BLAKE3-256 digest of its own encoding, in which each argument term is itself written as its term key.
+- A term's own encoding is a uvar kind and its content: 0, a parameter, by its value number; 1, the content of a place at entry, by the place; 2, a literal, as NIR encodes it; 3, an application of an instruction, by its opcode and argument terms; 4, an application of a function, by the `call` opcode, the callee's function reference and the argument terms; 5, a field step, by its term and the step as a text; 6, an ite, quotient, remainder or tag, by its query opcode and its parts; 7, a fresh, skolem or bound symbol, by its query opcode and its number.
 - An integer atom is a uvar 0 for ≤ or 1 for =, the list of its coefficients as svars paired with its terms, and its constant as an svar. A boolean atom is a uvar 2 and its term. An `all` literal is a uvar 3, its bounds, a uvar 0 for `..<` or 1 for `..=`, its bound symbol and its body's clauses.
 - A literal is a uvar 0 when positive or 1 when negated, then its atom. A premise is the list of its clause's literals.
 

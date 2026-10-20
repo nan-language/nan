@@ -1,6 +1,6 @@
 //! Maps and sets over vectors of their entries: a map's `mem::KeyValue` entries sorted by key,
-//! a hash map's in insertion order found by `eq`, a set's values sorted; their entries and
-//! cursors. A viewing cursor is the address of its next entry and the count left.
+//! a hash map's in insertion order found through its hash index, a set's values sorted; their
+//! entries and cursors. A viewing cursor is the address of its next entry and the count left.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -8,6 +8,7 @@ use super::super::super::Lowering;
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
 use super::super::Supply;
+use super::index;
 use super::lists::fn_param;
 use super::vector::{self, Element};
 use crate::check::ty::{FnTy, Ty};
@@ -17,9 +18,13 @@ use crate::check::ty::{FnTy, Ty};
 pub enum Order {
     /// By binary search through `cmp`.
     Sorted,
-    /// By scanning through `eq`.
-    Scanned,
+    /// Through its hash index, comparing by `eq`.
+    Hashed,
 }
+
+/// Where a hash map holds its seed and its index's table record, after its vector.
+const SEED: u64 = 32;
+const INDEX: u64 = 40;
 
 /// The entries of a container: their type, the type of the key each holds and where.
 pub struct Entries {
@@ -61,45 +66,38 @@ impl Entries {
     }
 }
 
-/// Where a key held at an address lies among the entries from `data`: the index of the entry
-/// holding it and 1, or the index where it would go and 0.
-pub fn find(
+/// Where a key held at an address lies among a container's entries: the index of the entry
+/// holding it and 1, or the index where it would go and 0, with the key's hash fragment for a
+/// hash map.
+fn find(
     lo: &mut Lowering,
     fx: &mut Fx,
     entries: &Entries,
     order: Order,
-    data: Value,
-    len: Value,
+    address: Value,
     key: Value,
-) -> (Value, Value) {
+) -> (Value, Value, Option<Value>) {
+    let data = fx.load(PTR, address, vector::DATA);
+    let len = fx.load(PTR, address, vector::LEN);
     match order {
-        Order::Scanned => {
-            let zero = fx.ptr(0);
-            let found = fx.repeat(&[zero], |fx, state| {
-                let index = state[0];
-                let more = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-                let next = fx.choose(
-                    more,
-                    &[PTR, types::I8],
-                    |fx| {
-                        let at = entries.shape.at(fx, data, index);
-                        let stored = fx.offset(at, entries.key_at);
-                        let equal = lo.equal(fx, &entries.key, stored, key);
-                        let next = fx.b.ins().iadd_imm_s(index, 1);
-                        let next = fx.b.ins().select(equal, index, next);
-                        let again = fx.b.ins().bxor_imm_s(equal, 1);
-                        vec![next, again]
-                    },
-                    |fx| vec![index, fx.int(types::I8, 0)],
-                );
-                (next[1], vec![next[0]])
-            })[0];
-            let present = fx.b.ins().icmp(IntCC::UnsignedLessThan, found, len);
-            (found, present)
+        Order::Hashed => {
+            let seed = fx.load(types::I64, address, SEED);
+            let fragment = index::fragment(lo, fx, &entries.key, key, seed);
+            let record = fx.offset(address, INDEX);
+            let (at, found) = index::find(lo, fx, record, fragment, |lo, fx, index| {
+                let entry = entries.shape.at(fx, data, index);
+                let stored = fx.offset(entry, entries.key_at);
+                lo.equal(fx, &entries.key, stored, key)
+            });
+            let index = fx.b.ins().select(found, at, len);
+            (index, found, Some(fragment))
         }
-        Order::Sorted => search(lo, fx, entries, data, len, |lo, fx, stored| {
-            lo.order(fx, &entries.key, stored, key)
-        }),
+        Order::Sorted => {
+            let (index, found) = search(lo, fx, entries, data, len, |lo, fx, stored| {
+                lo.order(fx, &entries.key, stored, key)
+            });
+            (index, found, None)
+        }
     }
 }
 
@@ -155,9 +153,12 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
             let alloc = supply.params.last().expect("an allocator").address();
             let alloc = fx.load(PTR, alloc, 0);
             vector::empty(fx, sret, alloc, entries.shape);
-            if order == Order::Scanned {
+            if order == Order::Hashed {
                 let seed = supply.param(0).scalar();
-                fx.store(seed, sret, 32);
+                fx.store(seed, sret, SEED);
+                let zero = fx.ptr(0);
+                fx.store(zero, sret, INDEX);
+                fx.store(zero, sret, INDEX + 8);
             }
             supply.done(lo, fx);
         }
@@ -169,9 +170,9 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
             let address = supply.param(0).address();
             let (key_held, value_held) = (supply.param(1), supply.param(2));
             let sought = held_address(lo, fx, &key, key_held);
+            let (index, found, fragment) = find(lo, fx, &entries, order, address, sought);
             let data = fx.load(PTR, address, vector::DATA);
             let len = fx.load(PTR, address, vector::LEN);
-            let (index, found) = find(lo, fx, &entries, order, data, len, sought);
             let option = supply.abi.result.clone();
             let layout = lo.layout(&option);
             let result = supply
@@ -197,6 +198,14 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
                     let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
                     let taken = [(key_held, key.clone()), (value_held, value.clone())];
                     fx.when(failed, |fx| supply.exhausted(lo, fx, &taken));
+                    if let Some(fragment) = fragment {
+                        let record = fx.offset(address, INDEX);
+                        let alloc = fx.load(PTR, address, vector::ALLOC);
+                        let room = index::reserve(lo, fx, record, alloc, needed);
+                        let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, room, 0);
+                        fx.when(failed, |fx| supply.exhausted(lo, fx, &taken));
+                        index::insert(fx, record, fragment, index);
+                    }
                     let at = vector::open_gap(lo, fx, address, index, entries.shape);
                     let key_slot = fx.offset(at, entries.key_at);
                     lo.store_held(fx, key_slot, key_held, &key);
@@ -213,9 +222,8 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
         "remove" => {
             let address = supply.param(0).address();
             let sought = held_address(lo, fx, &key, supply.param(1));
+            let (index, found, fragment) = find(lo, fx, &entries, order, address, sought);
             let data = fx.load(PTR, address, vector::DATA);
-            let len = fx.load(PTR, address, vector::LEN);
-            let (index, found) = find(lo, fx, &entries, order, data, len, sought);
             let option = supply.abi.result.clone();
             let layout = lo.layout(&option);
             let result = supply
@@ -229,6 +237,10 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
                 let stored_key = fx.offset(at, entries.key_at);
                 lo.release(fx, &key, stored_key);
                 vector::close_gap(lo, fx, address, index, entries.shape);
+                if let Some(fragment) = fragment {
+                    let record = fx.offset(address, INDEX);
+                    index::remove(fx, record, fragment, index);
+                }
             });
             let held = lo.held_at(fx, &option, result);
             supply.ret(lo, fx, held);
@@ -236,9 +248,8 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
         "at" | "at_mut" | "get" | "get_mut" => {
             let address = supply.param(0).address();
             let sought = held_address(lo, fx, &key, supply.param(1));
+            let (index, found, _) = find(lo, fx, &entries, order, address, sought);
             let data = fx.load(PTR, address, vector::DATA);
-            let len = fx.load(PTR, address, vector::LEN);
-            let (index, found) = find(lo, fx, &entries, order, data, len, sought);
             let at = entries.shape.at(fx, data, index);
             let stored = fx.offset(at, value_at);
             match supply.member() {
@@ -263,6 +274,10 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
             supply.done(lo, fx);
         }
         "into_cursor" => {
+            if order == Order::Hashed {
+                let record = fx.offset(supply.param(0).address(), INDEX);
+                index::free(lo, fx, record);
+            }
             into_cursor(lo, fx, supply);
         }
         "retain" => {
@@ -279,10 +294,41 @@ pub fn map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, order: Order) {
                     .result
                     .scalar()
             });
+            if order == Order::Hashed {
+                reindex(lo, fx, &entries, address);
+            }
             supply.done(lo, fx);
         }
         member => panic!("no lowering of {}.{member}", supply.path),
     }
+}
+
+/// Records each entry of a hash map afresh in its index, after entries were dropped.
+fn reindex(lo: &mut Lowering, fx: &mut Fx, entries: &Entries, address: Value) {
+    let record = fx.offset(address, INDEX);
+    index::clear(lo, fx, record);
+    let seed = fx.load(types::I64, address, SEED);
+    let data = fx.load(PTR, address, vector::DATA);
+    let len = fx.load(PTR, address, vector::LEN);
+    let zero = fx.ptr(0);
+    fx.each(zero, len, |fx, position| {
+        let entry = entries.shape.at(fx, data, position);
+        let stored = fx.offset(entry, entries.key_at);
+        let fragment = index::fragment(lo, fx, &entries.key, stored, seed);
+        index::insert(fx, record, fragment, position);
+    });
+}
+
+/// Frees a hash map's index, before its vector is released.
+pub fn free_index(lo: &mut Lowering, fx: &mut Fx, address: Value) {
+    let record = fx.offset(address, INDEX);
+    index::free(lo, fx, record);
+}
+
+/// Moves a hash map's index into another domain's reach.
+pub fn lift_index(lo: &mut Lowering, fx: &mut Fx, address: Value, lift: Value) {
+    let record = fx.offset(address, INDEX);
+    index::lift(lo, fx, record, lift);
 }
 
 /// A binary search calling a function value with each key it visits, which gives the key's
@@ -319,7 +365,7 @@ fn projected_option(
     let result = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let part = lo.is_part(value);
+    let part = supply.wrap.is_some_and(|wrap| lo.is_part(value, wrap));
     let value = value.clone();
     lo.write_option_with(fx, &layout_ty, result, found, |lo, fx, payload| {
         if part {
@@ -375,9 +421,9 @@ pub fn set(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let address = supply.param(0).address();
             let held = supply.param(1);
             let sought = held_address(lo, fx, &value, held);
+            let (index, found, _) = find(lo, fx, &entries, Order::Sorted, address, sought);
             let data = fx.load(PTR, address, vector::DATA);
             let len = fx.load(PTR, address, vector::LEN);
-            let (index, found) = find(lo, fx, &entries, Order::Sorted, data, len, sought);
             let changed = if supply.member() == "remove" {
                 fx.when(found, |fx| {
                     let at = entries.shape.at(fx, data, index);
@@ -463,7 +509,7 @@ pub fn view_next(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, entries: &Entr
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
     let value = entries.value.clone();
     let element = entries.entry.clone();
-    let part = lo.is_part(&element);
+    let part = supply.wrap.is_some_and(|wrap| lo.is_part(&element, wrap));
     let shape = entries.shape;
     lo.write_option_with(fx, &layout_ty, result, present, |lo, fx, payload| {
         match &value {

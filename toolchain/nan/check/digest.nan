@@ -1,0 +1,1226 @@
+//! Digests: the facts the checker computes from the code of a function or closure and from the digests of what it reaches, and the limits that demand them, judged at each site of the code that brings a fact.
+
+/// The facts code holds, or what it reaches holds.
+struct Digest derives Eq {
+    wait: bool
+    alloc: bool
+    device: bool
+    privileged: bool
+    sync: bool
+    terminates: bool
+    float: bool
+    /// The primitive capabilities whose functions it calls; none for the unbounded set.
+    capabilities: Option[mem::Set[ty::ItemId]]
+    /// The validators and decoders it calls; none for the unbounded set.
+    validators: Option[mem::Set[ty::ItemId]]
+} Digest
+
+/// A site of code: where it brings facts, and what brings them.
+struct DigestSite {
+    token: u32
+    facts: Digest
+    brought: Brought
+} DigestSite
+
+/// What brings the facts of a site.
+enum Brought derives Copy, Eq {
+    /// An operation of the code itself.
+    Operation
+    /// A call, or a function supplied as an argument: the function with a body it names, if any.
+    Call(Option[ty::ItemId])
+    /// A closure supplied as a function argument, whose own sites are judged.
+    Charged
+} Brought
+
+/// The digests computed in one check, by item.
+struct Digests {
+    done: mem::OnceMap[ty::ItemId, mem::Shared[Digest]]
+    /// The items whose digests are being computed, outermost first.
+    computing: cell::Swap[mem::List[ty::ItemId]]
+} Digests
+
+fn Digests.empty(alloc: mem::Alloc) -> Digests {
+    return Digests(done: mem::OnceMap[ty::ItemId, mem::Shared[Digest]].empty(seed: 0, alloc), computing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc))
+} Digests.empty
+
+/// The sites of an `expect` condition, by the condition's first token.
+struct ExpectSites {
+    token: u32
+    sites: mem::List[DigestSite]
+} ExpectSites
+
+/// The walk collecting the sites of one body's code.
+struct DigestWalk {
+    ck: Checker
+    item: ty::ItemId
+    body: mem::Shared[TBody]
+    /// The closure whose code is walked, 0 for the item's own body.
+    closure: u32
+    sites: mem::List[DigestSite]
+    /// The sites of each `expect` condition, by the condition's first token.
+    expects: mem::List[ExpectSites]
+} DigestWalk
+
+/// The digest of code that does nothing.
+fn Digest.none(alloc: mem::Alloc) -> Digest {
+    return Digest(wait: false, alloc: false, device: false, privileged: false, sync: false, terminates: true, float: false, capabilities: Some(mem::Set[ty::ItemId].empty(alloc)), validators: Some(mem::Set[ty::ItemId].empty(alloc)))
+} Digest.none
+
+/// The declared digest of a function type or head: the worst digest, waiting as it states
+/// and with the facts its limits set.
+fn Digest.declared(wait: bool, limit_set: ty::LimitSet, alloc: mem::Alloc) -> Digest {
+    var digest = Digest(wait: wait, alloc: not limit_set.pure and not limit_set.noalloc, device: not limit_set.pure, privileged: not limit_set.pure, sync: not limit_set.pure, terminates: limit_set.terminates, float: false, capabilities: None, validators: None)
+    if limit_set.pure {
+        digest.capabilities = Some(mem::Set[ty::ItemId].empty(alloc))
+        digest.validators = Some(mem::Set[ty::ItemId].empty(alloc))
+    }
+    return digest
+} Digest.declared
+
+fn Digest.copy(self, alloc: mem::Alloc) -> Digest {
+    return Digest(wait: self.wait, alloc: self.alloc, device: self.device, privileged: self.privileged, sync: self.sync, terminates: self.terminates, float: self.float, capabilities: copied_set(self.capabilities, alloc), validators: copied_set(self.validators, alloc))
+} Digest.copy
+
+fn Digest.join(mut self, other: Digest) {
+    self.wait = self.wait or other.wait
+    self.alloc = self.alloc or other.alloc
+    self.device = self.device or other.device
+    self.privileged = self.privileged or other.privileged
+    self.sync = self.sync or other.sync
+    self.terminates = self.terminates and other.terminates
+    self.float = self.float or other.float
+    join_set(mut self.capabilities, other: other.capabilities)
+    join_set(mut self.validators, other: other.validators)
+} Digest.join
+
+/// Whether it holds no effect fact, the wait fact excepted, and empty sets.
+fn Digest.pure(self) -> bool {
+    if self.alloc or self.device or self.privileged or self.sync {
+        return false
+    }
+    let Some(capabilities) = self.capabilities else {
+        return false
+    }
+    let Some(validators) = self.validators else {
+        return false
+    }
+    return capabilities.len() == 0 and validators.len() == 0
+} Digest.pure
+
+/// The code of the rule a limit demanding facts this digest lacks breaks.
+fn Digest.broken(self, limit_set: ty::LimitSet) -> Option[diagnostic::Code] {
+    if limit_set.pure and not self.pure() {
+        return Some(diagnostic::Code.LimitImpure)
+    }
+    if limit_set.terminates and not self.terminates {
+        return Some(diagnostic::Code.LimitMayNotTerminate)
+    }
+    if limit_set.noalloc and self.alloc {
+        return Some(diagnostic::Code.LimitAllocates)
+    }
+    return None
+} Digest.broken
+
+/// Joins a set into another, an absent set holding every element.
+fn join_set(mut into: Option[mem::Set[ty::ItemId]], other: Option[mem::Set[ty::ItemId]]) {
+    if into.is_none() {
+        return
+    }
+    let Some(added) = other else {
+        into = None
+        return
+    }
+    let Some(held) = mut into.extract() else {
+        return
+    }
+    var joined = held
+    for item in added {
+        discard mut joined.insert(item)
+    }
+    into = Some(take joined)
+} join_set
+
+fn copied_set(set: Option[mem::Set[ty::ItemId]], alloc: mem::Alloc) -> Option[mem::Set[ty::ItemId]] {
+    let Some(held) = set else {
+        return None
+    }
+    var copy = mem::Set[ty::ItemId].empty(alloc)
+    for item in held {
+        discard mut copy.insert(item)
+    }
+    return Some(take copy)
+} copied_set
+
+/// A set's elements and one more, an absent set holding none.
+fn extended_set(set: Option[mem::Set[ty::ItemId]], item: ty::ItemId, alloc: mem::Alloc) -> mem::Set[ty::ItemId] {
+    var extended = mem::Set[ty::ItemId].empty(alloc)
+    match set {
+        Some(held) => {
+            for element in held {
+                discard mut extended.insert(element)
+            }
+        }
+        None => {}
+    }
+    discard mut extended.insert(item)
+    return extended
+} extended_set
+
+/// The digest of a function item: computed from its body, supplied for a std function
+/// without one, and otherwise declared.
+fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
+    let db = self.db()
+    db.note(item)
+    match self.state.contents().digests.done.get(item) {
+        Some(digest) => return digest.share()
+        None => {}
+    }
+    return db.about(Some(item), compute: fn() => self.compute_digest(item))
+} Checker.digest
+
+fn Checker.compute_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
+    let alloc = self.alloc()
+    let head = self.fn_sig(item)
+    var wait = false
+    var limit_set = ty::LimitSet.none()
+    match head {
+        Some(sig) => {
+            wait = sig.wait
+            limit_set = sig.limit_set
+        }
+        None => {}
+    }
+    let digests = self.state.contents().digests
+    if digests.computing.get().position(fn(value: ty::ItemId) => value == item).is_some() {
+        return mem::Shared.of(self.cycle_digest(item), alloc)
+    }
+    let Some(body) = self.typed_body(item) else {
+        let found = match self.db().is_std(item) {
+            true => self.supplied(item)
+            false => Digest.declared(wait, limit_set, alloc)
+        }
+        return digests.done.insert(item, value: mem::Shared.of(take found, alloc)).share()
+    }
+    var computing = mem::List[ty::ItemId].empty(alloc)
+    for held in digests.computing.get() {
+        mut computing.push(held)
+    }
+    mut computing.push(item)
+    let outer = digests.computing.replace(take computing)
+    var digest = Digest.none(alloc)
+    let sites = self.sites(item, body, closure: 0)
+    for site in sites {
+        mut digest.join(site.facts)
+    }
+    digest.wait = wait
+    let cyclic = self.in_cycle(item)
+    let terminates = not wait and (not cyclic or self.has_decreases(item))
+    digest.terminates = digest.terminates and terminates
+    digests.computing.restore(outer)
+    return digests.done.insert(item, value: mem::Shared.of(take digest, alloc)).share()
+} Checker.compute_digest
+
+/// The digest of a body, closure or default function of an item's unit: the item's own for
+/// its body; for a closure or a default body, the join of its own code's sites, waiting as
+/// its head states.
+fn Checker.function_digest(self, item: ty::ItemId, role: nir::Role, index: u32) -> Digest {
+    let alloc = self.alloc()
+    match role {
+        nir::Role.Closure => {
+            let Some(body) = self.typed(item) else {
+                return Digest.none(alloc)
+            }
+            let held = body.contents()
+            let Some(root) = held.root else {
+                return Digest.none(alloc)
+            }
+            let Some(closure) = root.closure_numbered(index) else {
+                return Digest.none(alloc)
+            }
+            let sites = self.closure_sites(item, body, closure)
+            return joined_digest(sites.view(), wait: closure.ty.wait, alloc)
+        }
+        nir::Role.Default => return self.default_digest(item, index)
+        else => {}
+    }
+    return self.digest(item).contents().copy(alloc)
+} Checker.function_digest
+
+/// The digest of the default body of an interface's method that is `index`th among those with
+/// one.
+fn Checker.default_digest(self, item: ty::ItemId, index: u32) -> Digest {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return Digest.none(alloc)
+    }
+    var defaults: u32 = 0
+    var found: Option[usize] = None
+    for position in 0..<methods.len() {
+        if methods[position].default {
+            if defaults == index {
+                found = Some(position)
+                break
+            }
+            defaults += 1
+        }
+    }
+    let Some(method) = found else {
+        return Digest.none(alloc)
+    }
+    let Some(method_body) = self.state.contents().method_bodies.get(MethodKey(item: item, method: method)) else {
+        return Digest.none(alloc)
+    }
+    let sites = self.sites(item, body: method_body.share(), closure: 0)
+    return joined_digest(sites.view(), wait: methods[method].sig.wait, alloc)
+} Checker.default_digest
+
+/// The join of a function's own sites, waiting as `wait` states.
+fn joined_digest(sites: Slice[DigestSite], wait: bool, alloc: mem::Alloc) -> Digest {
+    var digest = Digest.none(alloc)
+    for site in sites {
+        mut digest.join(site.facts)
+    }
+    digest.wait = wait
+    digest.terminates = digest.terminates and not wait
+    return digest
+} joined_digest
+
+/// The facts a function reaching itself is taken to hold while its digest is computed: no
+/// fact, the others of its cycle joining theirs.
+fn Checker.cycle_digest(self, item: ty::ItemId) -> Digest {
+    var digest = Digest.none(self.alloc())
+    digest.terminates = self.has_decreases(item)
+    return digest
+} Checker.cycle_digest
+
+/// Whether two functions belong to one cycle: each reaches the other through dependencies.
+/// While reads are recorded, the search reads each function it reaches.
+fn Checker.same_cycle(self, item: ty::ItemId, other: ty::ItemId) -> bool {
+    if self.db().recording() or self.state.contents().finding_cycles.load() {
+        let alloc = self.alloc()
+        var seen = mem::Set[ty::ItemId].empty(alloc)
+        if not self.reaches(item, target: other, mut seen) {
+            return false
+        }
+        var seen_back = mem::Set[ty::ItemId].empty(alloc)
+        return self.reaches(other, target: item, seen: mut seen_back)
+    }
+    if item == other {
+        return self.in_cycle(item)
+    }
+    return self.cycle_component(item) == self.cycle_component(other)
+} Checker.same_cycle
+
+/// Whether a function belongs to a cycle: it reaches itself through its dependencies.
+/// While reads are recorded, the search reads each function it reaches.
+fn Checker.in_cycle(self, item: ty::ItemId) -> bool {
+    let state = self.state.contents()
+    if self.db().recording() or state.finding_cycles.load() {
+        var seen = mem::Set[ty::ItemId].empty(self.alloc())
+        return self.reaches(item, target: item, mut seen)
+    }
+    let component = self.cycle_component(item)
+    return state.cycle_flags.at(mem::Id[bool].of(component))
+} Checker.in_cycle
+
+/// A full search of the dependencies from a function: the functions it visits, in order, and
+/// for each function checked as a dependency, how many were visited when it was first checked.
+struct FullSearch {
+    visited: mem::List[ty::ItemId]
+    checked: mem::HashMap[ty::ItemId, usize]
+} FullSearch
+
+/// The members of a function's cycle among `reachable`, recording what testing each member
+/// after the function itself with `same_cycle` reads, in the same order: the search from the
+/// function runs once, and a search from a member not in its cycle, which visits every function
+/// the member reaches, skips the functions whose reachable functions it has all read.
+fn Checker.recorded_cycle(self, item: ty::ItemId, take reachable: mem::List[ty::ItemId]) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var search = FullSearch(visited: mem::List[ty::ItemId].empty(alloc), checked: mem::HashMap[ty::ItemId, usize].empty(seed: 0, alloc))
+    var seen = mem::Set[ty::ItemId].empty(alloc)
+    db.about(None, compute: fn[mut search, mut seen]() {
+        self.search_from(item, mut seen, mut search)
+    })
+    var noted: usize = 0
+    var closed = mem::Set[ty::ItemId].empty(alloc)
+    var members = mem::List[ty::ItemId].empty(alloc)
+    for member in reachable {
+        if member == item {
+            mut members.push(member)
+            continue
+        }
+        let found = search.checked.get(member).is_some()
+        var end = search.visited.len()
+        match search.checked.get(member) {
+            Some(stop) => {
+                end = stop
+            }
+            None => {}
+        }
+        if end > noted {
+            for index in noted..<end {
+                db.note(search.visited[index])
+            }
+            noted = end
+        }
+        if not found {
+            continue
+        }
+        let together = db.about(None, compute: fn() -> bool {
+            return self.cycle_component(member) == self.cycle_component(item)
+        })
+        if together {
+            var fresh = mem::Set[ty::ItemId].empty(alloc)
+            if self.reaches(member, target: item, seen: mut fresh) {
+                mut members.push(member)
+            }
+            continue
+        }
+        var visited = mem::List[ty::ItemId].empty(alloc)
+        var member_seen = mem::Set[ty::ItemId].empty(alloc)
+        self.note_reached(member, closed, seen: mut member_seen, visited: mut visited)
+        for done in visited {
+            discard mut closed.insert(done)
+        }
+    }
+    return members
+} Checker.recorded_cycle
+
+/// Visits the functions a function reaches as `reaches` does with no target, in order.
+fn Checker.search_from(self, from: ty::ItemId, mut seen: mem::Set[ty::ItemId], mut search: FullSearch) {
+    if not mut seen.insert(from) {
+        return
+    }
+    mut search.visited.push(from)
+    let Some(dependencies) = self.body_dependencies(from) else {
+        return
+    }
+    for dependency in dependencies.contents() {
+        let count = search.visited.len()
+        if not search.checked.contains(dependency) {
+            discard mut search.checked.insert(dependency, value: count)
+        }
+        self.search_from(dependency, mut seen, mut search)
+    }
+} Checker.search_from
+
+/// Reads the functions a function reaches as `reaches` does with a target it never finds,
+/// skipping the `closed` functions, whose reachable functions are all read, and lists those it
+/// visits.
+fn Checker.note_reached(self, from: ty::ItemId, closed: mem::Set[ty::ItemId], mut seen: mem::Set[ty::ItemId], mut visited: mem::List[ty::ItemId]) {
+    if closed.contains(from) {
+        return
+    }
+    if not mut seen.insert(from) {
+        return
+    }
+    mut visited.push(from)
+    let Some(dependencies) = self.body_dependencies(from) else {
+        return
+    }
+    for dependency in dependencies.contents() {
+        self.note_reached(dependency, closed, mut seen, mut visited)
+    }
+} Checker.note_reached
+
+/// The strongly connected component of the dependencies holding a function.
+fn Checker.cycle_component(self, item: ty::ItemId) -> u32 {
+    let state = self.state.contents()
+    match state.cycle_components.get(item) {
+        Some(found) => return found
+        None => {}
+    }
+    state.finding_cycles.store(true)
+    self.find_components(item)
+    state.finding_cycles.store(false)
+    let Some(found) = state.cycle_components.get(item) else {
+        expect false
+        return 0
+    }
+    return found
+} Checker.cycle_component
+
+/// The state of Tarjan's algorithm: each function entered with its number and low link, the
+/// functions not yet in a component, and the functions whose dependencies are being walked.
+struct TarjanSearch {
+    numbered: mem::HashMap[ty::ItemId, Numbered]
+    stack: mem::List[ty::ItemId]
+    on_stack: mem::Set[ty::ItemId]
+    frames: mem::List[SearchFrame]
+} TarjanSearch
+
+struct Numbered derives Copy {
+    number: u32
+    low: u32
+} Numbered
+
+/// A function whose dependencies are being walked, with them and the next to walk.
+struct SearchFrame {
+    item: ty::ItemId
+    dependencies: mem::Shared[mem::List[ty::ItemId]]
+    next: usize
+} SearchFrame
+
+/// Tarjan's algorithm from a function over the functions it reaches outside the components
+/// already found.
+fn Checker.find_components(self, root: ty::ItemId) {
+    let alloc = self.alloc()
+    let state = self.state.contents()
+    var search = TarjanSearch(numbered: mem::HashMap[ty::ItemId, Numbered].empty(seed: 0, alloc), stack: mem::List[ty::ItemId].empty(alloc), on_stack: mem::Set[ty::ItemId].empty(alloc), frames: mem::List[SearchFrame].empty(alloc))
+    self.enter_search(mut search, item: root)
+    while search.frames.len() > 0 {
+        let top = search.frames.len() - 1
+        let item = search.frames[top].item
+        let next = search.frames[top].next
+        if next < search.frames[top].dependencies.contents().len() {
+            let dependency = search.frames[top].dependencies.contents()[next]
+            search.frames[top].next = next + 1
+            if state.cycle_components.get(dependency).is_some() {
+                continue
+            }
+            match search.numbered.get(dependency) {
+                Some(numbered) => if search.on_stack.contains(dependency) {
+                    mut search.lower(item, number: numbered.number)
+                }
+                None => self.enter_search(mut search, item: dependency)
+            }
+            continue
+        }
+        let Some(frame) = mut search.frames.pop() else {
+            return
+        }
+        let Some(numbered) = search.numbered.get(item) else {
+            expect false
+            return
+        }
+        let number = numbered.number
+        let low = numbered.low
+        if search.frames.len() > 0 {
+            let parent = search.frames[search.frames.len() - 1].item
+            mut search.lower(parent, number: low)
+        }
+        if low != number {
+            continue
+        }
+        var members = mem::List[ty::ItemId].empty(alloc)
+        loop {
+            let Some(member) = mut search.stack.pop() else {
+                break
+            }
+            discard mut search.on_stack.remove(member)
+            mut members.push(member)
+            if member == item {
+                break
+            }
+        }
+        let self_loop = frame.dependencies.contents().position(fn(dependency: ty::ItemId) => dependency == item).is_some()
+        let component = state.cycle_flags.push(members.len() > 1 or self_loop)
+        for member in members {
+            discard state.cycle_components.insert(member, value: component.index())
+        }
+    }
+} Checker.find_components
+
+fn Checker.enter_search(self, mut search: TarjanSearch, item: ty::ItemId) {
+    let number = u32.fit(search.numbered.len())
+    discard mut search.numbered.insert(item, value: Numbered(number: number, low: number))
+    mut search.stack.push(item)
+    discard mut search.on_stack.insert(item)
+    let dependencies = match self.body_dependencies(item) {
+        Some(found) => found
+        None => mem::Shared.of(mem::List[ty::ItemId].empty(self.alloc()), alloc: self.alloc())
+    }
+    mut search.frames.push(SearchFrame(item: item, dependencies: take dependencies, next: 0))
+} Checker.enter_search
+
+/// Lowers a function's low link to `number`.
+fn TarjanSearch.lower(mut self, item: ty::ItemId, number: u32) {
+    let Some(current) = self.numbered.get(item) else {
+        return
+    }
+    if number < current.low {
+        let lowered = Numbered(number: current.number, low: number)
+        discard mut self.numbered.insert(item, value: lowered)
+    }
+} TarjanSearch.lower
+
+/// Whether a function reaches `target` through its dependencies: the functions it calls
+/// directly and those it supplies as function arguments.
+fn Checker.reaches(self, from: ty::ItemId, target: ty::ItemId, mut seen: mem::Set[ty::ItemId]) -> bool {
+    if not mut seen.insert(from) {
+        return false
+    }
+    let Some(dependencies) = self.body_dependencies(from) else {
+        return false
+    }
+    for dependency in dependencies.contents() {
+        if dependency == target or self.reaches(dependency, target, mut seen) {
+            return true
+        }
+    }
+    return false
+} Checker.reaches
+
+/// The dependencies of a function with a body, in order of occurrence; reading them reads the
+/// function as `typed_body` does.
+fn Checker.body_dependencies(self, item: ty::ItemId) -> Option[mem::Shared[mem::List[ty::ItemId]]] {
+    let state = self.state.contents()
+    match state.body_dependencies.get(item) {
+        Some(known) => {
+            self.db().note(item)
+            return shared_items(known)
+        }
+        None => {}
+    }
+    var found: Option[mem::Shared[mem::List[ty::ItemId]]] = None
+    match self.typed_body(item) {
+        Some(body) => {
+            var listed = mem::List[ty::ItemId].empty(self.alloc())
+            match body.contents().root {
+                Some(root) => collect_dependencies(root, found: mut listed)
+                None => {}
+            }
+            found = Some(mem::Shared.of(take listed, alloc: self.alloc()))
+        }
+        None => {}
+    }
+    return shared_items(state.body_dependencies.insert(item, value: take found))
+} Checker.body_dependencies
+
+/// Another handle of an optional shared list.
+fn shared_items(held: Option[mem::Shared[mem::List[ty::ItemId]]]) -> Option[mem::Shared[mem::List[ty::ItemId]]] {
+    match held {
+        Some(shared) => return Some(shared.share())
+        None => return None
+    }
+} shared_items
+
+fn Checker.has_decreases(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    for clause in function.clauses {
+        match clause.kind {
+            ast::ClauseKind.Decreases(_) => return true
+            else => {}
+        }
+    }
+    return false
+} Checker.has_decreases
+
+/// The sites of a body's code outside the closures it holds, `closure` numbering the closure
+/// whose body is walked when it is one, 0 otherwise; a closure's code is charged to the call it
+/// is supplied to.
+fn Checker.sites(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> mem::List[DigestSite] {
+    let walk = self.walk(item, body, closure)
+    return walk.sites
+} Checker.sites
+
+/// The sites of the code of a closure of a body.
+fn Checker.closure_sites(self, item: ty::ItemId, body: mem::Shared[TBody], closure: TClosure) -> mem::List[DigestSite] {
+    var walk = self.walker(item, body, closure: closure.index)
+    mut walk.expr(closure.body)
+    return walk.sites
+} Checker.closure_sites
+
+/// A walk of a body's code, or of the closure of it numbered `closure`, that has walked
+/// nothing yet.
+fn Checker.walker(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> DigestWalk {
+    let alloc = self.alloc()
+    return DigestWalk(ck: self.share(), item: item, body: body.share(), closure: closure, sites: mem::List[DigestSite].empty(alloc), expects: mem::List[ExpectSites].empty(alloc))
+} Checker.walker
+
+/// The walk of a body's own code, or of the closure it numbers `closure`.
+fn Checker.walk(self, item: ty::ItemId, body: mem::Shared[TBody], closure: u32) -> DigestWalk {
+    var walk = self.walker(item, body, closure)
+    let held = body.contents()
+    let Some(root) = held.root else {
+        return walk
+    }
+    if closure == 0 {
+        mut walk.expr(root)
+        return walk
+    }
+    let Some(found) = root.closure_numbered(closure) else {
+        return walk
+    }
+    mut walk.expr(found.body)
+    return walk
+} Checker.walk
+
+/// Reports each `expect` of a body, its closures' included, whose condition is not `pure`.
+fn Checker.check_expect_purity(self, item: ty::ItemId, body: mem::Shared[TBody]) {
+    let alloc = self.alloc()
+    var pending = mem::List[u32].empty(alloc)
+    mut pending.push(0)
+    loop {
+        let Some(closure) = mut pending.pop() else {
+            break
+        }
+        let walk = self.walk(item, body, closure)
+        for condition in walk.expects {
+            if not all_pure(condition.sites.view()) {
+                self.report(item, token: condition.token, code: diagnostic::Code.ContractImpureCondition)
+            }
+        }
+        let inner = closures_of(body.contents(), within: closure, alloc)
+        for nested in inner {
+            mut pending.push(nested)
+        }
+    }
+} Checker.check_expect_purity
+
+/// Whether every site's facts are `pure`.
+fn all_pure(sites: Slice[DigestSite]) -> bool {
+    for site in sites {
+        if not site.facts.pure() {
+            return false
+        }
+    }
+    return true
+} all_pure
+
+/// The sites of a body's whole text: its own code and that of each closure it holds.
+fn Checker.text_sites(self, item: ty::ItemId, body: mem::Shared[TBody]) -> mem::List[DigestSite] {
+    let alloc = self.alloc()
+    var sites = self.sites(item, body, closure: 0)
+    var pending = closures_of(body.contents(), within: 0, alloc)
+    loop {
+        let Some(closure) = mut pending.pop() else {
+            break
+        }
+        let more = self.sites(item, body, closure)
+        for site in take more {
+            mut sites.push(take site)
+        }
+        let inner = closures_of(body.contents(), within: closure, alloc)
+        for nested in inner {
+            mut pending.push(nested)
+        }
+    }
+    return sites
+} Checker.text_sites
+
+/// The limits a function's code meets: its own and those of the interface methods it
+/// implements, judged at each site of its text, closure bodies included, that breaks one.
+fn Checker.check_limits(self, item: ty::ItemId, body: mem::Shared[TBody]) {
+    let Some(head) = self.fn_sig(item) else {
+        return
+    }
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return
+    }
+    var limit_set = head.limit_set
+    match function.body {
+        ast::FnBody.Expr(_) => {
+            limit_set.pure = true
+            limit_set.notrap = true
+            limit_set.terminates = true
+        }
+        else => {}
+    }
+    for line in self.implemented_lines(item) {
+        let sig = self.sig(line)
+        let SigKind.Impl(target: _, target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+            continue
+        }
+        let Some(method) = self.interface_method(bound.item, name: function.label.name.text.as_str()) else {
+            continue
+        }
+        let interface_sig = self.sig(bound.item)
+        let SigKind.Interface(methods: methods) = interface_sig.contents().kind else {
+            continue
+        }
+        let demanded = methods[method].sig.limit_set
+        limit_set.pure = limit_set.pure or demanded.pure
+        limit_set.terminates = limit_set.terminates or demanded.terminates
+        limit_set.noalloc = limit_set.noalloc or demanded.noalloc
+    }
+    var reported = mem::List[u32].empty(self.alloc())
+    self.judge(item, body, closure: 0, limit_set, mut reported)
+    match body.contents().root {
+        Some(root) => self.check_fit_limits(item, body: body.contents(), expr: root)
+        None => {}
+    }
+} Checker.check_limits
+
+/// The limits a function type demands of each named function or function value supplied
+/// for it, reported at the use; a closure is judged as if they were its own.
+fn Checker.check_fit_limits(self, item: ty::ItemId, body: TBody, expr: TExpr) {
+    match expr.kind {
+        TKind.Call(call) or TKind.Index(call) => self.check_fit_call(item, body, call: call.contents())
+        else => {}
+    }
+    expr.each_child(fn(child: TExpr) => self.check_fit_limits(item, body, expr: child))
+} Checker.check_fit_limits
+
+/// The limits each function-typed parameter of a call demands of the argument it is given.
+fn Checker.check_fit_call(self, item: ty::ItemId, body: TBody, call: Call) {
+    let alloc = self.alloc()
+    let types = self.types()
+    var count = call.args.len()
+    if call.head.params.len() < count {
+        count = call.head.params.len()
+    }
+    for position in 0..<count {
+        let ty::TyKind.Fn(wanted_id) = types.kind(call.head.params[position].ty) else {
+            continue
+        }
+        let wanted = types.fn_of(wanted_id).limit_set
+        let arg = call.args[position].expr
+        let broken = match first arg.kind {
+            TKind.FnValue(item: function, type_args: _) => self.digest(function).contents().broken(wanted)
+            TKind.Local(local) if not is_param(body.local(local).kind) => match types.kind(arg.ty) {
+                ty::TyKind.Fn(found_id) => Digest.declared(types.fn_of(found_id).wait, limit_set: types.fn_of(found_id).limit_set, alloc).broken(wanted)
+                else => None
+            }
+            else => None
+        }
+        let Some(code) = broken else {
+            continue
+        }
+        self.report(item, token: arg.token, code)
+    }
+} Checker.check_fit_call
+
+/// Whether a local is a parameter.
+fn is_param(kind: LocalKind) -> bool {
+    return match kind {
+        LocalKind.Param(_) => true
+        else => false
+    }
+} is_param
+
+/// Judges the sites of a body, or of the closure of it numbered `closure`, against limits; the
+/// closures it holds are judged against their own limits first, each site reported once, for
+/// the innermost.
+fn Checker.judge(
+    self,
+    item: ty::ItemId,
+    body: mem::Shared[TBody],
+    closure: u32,
+    limit_set: ty::LimitSet,
+    mut reported: mem::List[u32],
+    ) {
+    let alloc = self.alloc()
+    let held = body.contents()
+    let inner = closures_of(held, within: closure, alloc)
+    for nested in inner {
+        let Some(root) = held.root else {
+            break
+        }
+        let Some(found) = root.closure_numbered(nested) else {
+            continue
+        }
+        var own = found.ty.limit_set
+        own.pure = own.pure or found.demanded.pure
+        own.terminates = own.terminates or found.demanded.terminates
+        own.noalloc = own.noalloc or found.demanded.noalloc
+        self.judge(item, body, closure: nested, limit_set: own, mut reported)
+        if limit_set.pure or limit_set.terminates or limit_set.noalloc {
+            self.judge(item, body, closure: nested, limit_set, mut reported)
+        }
+    }
+    let sites = self.sites(item, body, closure)
+    for site in sites {
+        if site.brought == Brought.Charged or reported.position(fn(value: u32) => value == site.token).is_some() {
+            continue
+        }
+        let Some(code) = site.facts.broken(limit_set) else {
+            continue
+        }
+        mut reported.push(site.token)
+        self.report_because(item, token: site.token, code, because: self.trace(item, site, code))
+    }
+} Checker.judge
+
+/// The because-chain of a site breaking a limit: a `called` reason per call down to the
+/// operation carrying the fact, and a `raised` reason for that operation.
+fn Checker.trace(self, item: ty::ItemId, site: DigestSite, code: diagnostic::Code) -> mem::List[diagnostic::Reason] {
+    let alloc = self.alloc()
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    var current = item
+    var token = site.token
+    var brought = site.brought
+    var seen = mem::List[ty::ItemId].empty(alloc)
+    loop {
+        let Brought.Call(Some(callee)) = brought else {
+            break
+        }
+        mut because.push(self.reason(current, token, role: diagnostic::Role.Called, subject: self.db().canonical(callee)))
+        if seen.position(fn(value: ty::ItemId) => value == callee).is_some() {
+            return because
+        }
+        mut seen.push(callee)
+        let Some(body) = self.typed_body(callee) else {
+            return because
+        }
+        let sites = self.sites(callee, body, closure: 0)
+        let Some(next) = sites.position(fn(inner: DigestSite) => inner.facts.broken(limits_of(code)).is_some()) else {
+            return because
+        }
+        current = callee
+        token = sites[next].token
+        brought = sites[next].brought
+    }
+    mut because.push(self.reason(current, token, role: diagnostic::Role.Raised, subject: raised_fact(code, alloc)))
+    return because
+} Checker.trace
+
+/// The limits demanding the fact a code reports missing.
+fn limits_of(code: diagnostic::Code) -> ty::LimitSet {
+    return ty::LimitSet(pure: code == diagnostic::Code.LimitImpure, notrap: false, terminates: code == diagnostic::Code.LimitMayNotTerminate, noalloc: code == diagnostic::Code.LimitAllocates, stack: None)
+} limits_of
+
+/// The fact an operation raising a limit's code carries.
+fn raised_fact(code: diagnostic::Code, alloc: mem::Alloc) -> text::String {
+    let fact = match code {
+        diagnostic::Code.LimitImpure => "effect"
+        diagnostic::Code.LimitMayNotTerminate => "may-not-terminate"
+        else => "alloc"
+    }
+    return text::String.of(fact, alloc)
+} raised_fact
+
+/// The indexes of the closures a body holds directly, or of those the closure of it numbered
+/// `within` holds; 0 names the body itself.
+fn closures_of(body: TBody, within: u32, alloc: mem::Alloc) -> mem::List[u32] {
+    var found = mem::List[u32].empty(alloc)
+    let Some(root) = body.root else {
+        return found
+    }
+    if within == 0 {
+        direct_closures(root, mut found)
+        return found
+    }
+    let Some(closure) = root.closure_numbered(within) else {
+        return found
+    }
+    direct_closures(closure.body, mut found)
+    return found
+} closures_of
+
+/// The functions an expression calls directly or supplies as function arguments, at any depth.
+fn collect_dependencies(expr: TExpr, mut found: mem::List[ty::ItemId]) {
+    match expr.kind {
+        TKind.Call(call) or TKind.Index(call) => {
+            match call.contents().callee {
+                Callee.Function(item: function) => mut found.push(function)
+                else => {}
+            }
+        }
+        TKind.FnValue(item: function, type_args: _) => mut found.push(function)
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => collect_dependencies(child, mut found))
+} collect_dependencies
+
+/// The indexes of the closures an expression holds outside closures.
+fn direct_closures(expr: TExpr, mut found: mem::List[u32]) {
+    match expr.kind {
+        TKind.Closure(closure) => {
+            mut found.push(closure.contents().index)
+            return
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => direct_closures(child, mut found))
+} direct_closures
+
+fn DigestWalk.site(mut self, token: u32, take digest: Digest, brought: Brought) {
+    mut self.sites.push(DigestSite(token: token, facts: take digest, brought: brought))
+} DigestWalk.site
+
+fn DigestWalk.expr(mut self, expr: TExpr) {
+    match expr.kind {
+        TKind.Call(call) or TKind.Index(call) => mut self.call(call.contents())
+        TKind.Closure(_) => return
+        TKind.When(attempted: _, accesses: _, body: _) => {
+            var facts = Digest.none(self.ck.alloc())
+            facts.wait = true
+            facts.sync = true
+            mut self.site(expr.token, digest: take facts, brought: Brought.Operation)
+        }
+        TKind.Unary(op: _, operand: operand) => mut self.float(expr.token, ty: operand.contents().ty)
+        TKind.Binary(op: _, left: left, right: _) => mut self.float(expr.token, ty: left.contents().ty)
+        TKind.Block(block) => {
+            mut self.block(block)
+            return
+        }
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            mut self.expr(condition.contents())
+            mut self.block(then)
+            match otherwise {
+                Some(other) => mut self.expr(other.contents())
+                None => {}
+            }
+            return
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut self](child: TExpr) => mut self.expr(child))
+} DigestWalk.expr
+
+fn DigestWalk.block(mut self, block: TBlock) {
+    for stmt in block.stmts {
+        if mut self.stmt_sites(stmt) {
+            mut self.stmt(stmt)
+        }
+    }
+} DigestWalk.block
+
+/// The sites a statement brings itself; whether the walk goes on into the statement, which it
+/// does not for an `expect` or `assume`.
+fn DigestWalk.stmt_sites(mut self, stmt: TStmt) -> bool {
+    let alloc = self.ck.alloc()
+    match stmt.kind {
+        TStmtKind.While(condition: _, invariants: _, body: _) or TStmtKind.Loop(invariants: _, body: _) => {
+            var facts = Digest.none(alloc)
+            facts.terminates = false
+            mut self.site(stmt.token, digest: take facts, brought: Brought.Operation)
+        }
+        TStmtKind.For(pattern: _, mode: _, iterated: _, cursor: cursor, invariants: _, body: _) => {
+            if not self.finite(cursor) {
+                var facts = Digest.none(alloc)
+                facts.terminates = false
+                mut self.site(stmt.token, digest: take facts, brought: Brought.Operation)
+            }
+        }
+        TStmtKind.Assign(target: target, op: Some(_), value: _) => mut self.float(stmt.token, ty: target.ty)
+        TStmtKind.Expect(condition) => {
+            var condition_walk = self.ck.walker(self.item, body: self.body, closure: self.closure)
+            mut condition_walk.expr(condition)
+            mut self.expects.push(ExpectSites(token: condition.token, sites: take condition_walk.sites))
+            return false
+        }
+        TStmtKind.Assume(_) => return false
+        else => {}
+    }
+    return true
+} DigestWalk.stmt_sites
+
+/// Whether a `for` loop over a cursor of a type ends: the cursor is of a std type or a scalar.
+fn DigestWalk.finite(self, cursor: ty::Ty) -> bool {
+    return match self.ck.types().kind(cursor) {
+        ty::TyKind.Item(item: owner, args: _) => self.ck.db().is_std(owner)
+        ty::TyKind.Scalar(_) => true
+        else => false
+    }
+} DigestWalk.finite
+
+/// The sites of what a statement holds.
+fn DigestWalk.stmt(mut self, stmt: TStmt) {
+    match stmt.kind {
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => {
+            mut self.expr(condition)
+            mut self.exprs(invariants.view())
+            mut self.block(body)
+        }
+        TStmtKind.For(pattern: _, mode: _, iterated: iterated, cursor: _, invariants: invariants, body: body) => {
+            mut self.expr(iterated)
+            mut self.exprs(invariants.view())
+            mut self.block(body)
+        }
+        TStmtKind.Loop(invariants: invariants, body: body) => {
+            mut self.exprs(invariants.view())
+            mut self.block(body)
+        }
+        TStmtKind.Let(pattern: _, value: value, otherwise: otherwise) => {
+            mut self.expr(value)
+            match otherwise {
+                Some(other) => mut self.block(other)
+                None => {}
+            }
+        }
+        else => stmt.each_child(fn[mut self](child: TExpr) => mut self.expr(child))
+    }
+} DigestWalk.stmt
+
+fn DigestWalk.exprs(mut self, exprs: Slice[TExpr]) {
+    for expr in exprs {
+        mut self.expr(expr)
+    }
+} DigestWalk.exprs
+
+/// Whether a type is a float scalar.
+fn DigestWalk.is_float(self, ty: ty::Ty) -> bool {
+    let Some(scalar) = self.ck.types().scalar_of(ty) else {
+        return false
+    }
+    return scalar.is_float()
+} DigestWalk.is_float
+
+/// The float use of an operation on a value of `ty`.
+fn DigestWalk.float(mut self, token: u32, ty: ty::Ty) {
+    if self.is_float(ty) {
+        var facts = Digest.none(self.ck.alloc())
+        facts.float = true
+        mut self.site(token, digest: take facts, brought: Brought.Operation)
+    }
+} DigestWalk.float
+
+/// A call: the facts of what it calls, and of each function argument it supplies.
+fn DigestWalk.call(mut self, call: Call) {
+    let token = call.token
+    let alloc = self.ck.alloc()
+    match call.callee {
+        Callee.Function(item: function) => mut self.function_site(token, function)
+        Callee.Method(bound: bound, method: method, self_ty: _, dynamic: _) => {
+            let sig = self.ck.sig(bound.item)
+            match sig.contents().kind {
+                SigKind.Interface(methods: methods) => {
+                    let head = methods[method].sig
+                    mut self.site(token, digest: Digest.declared(head.wait, limit_set: head.limit_set, alloc), brought: Brought.Call(None))
+                }
+                else => {}
+            }
+        }
+        Callee.Value(value) => {
+            let callee = value.contents()
+            if not self.own_parameter(callee) {
+                let ck = self.ck.share()
+                let types = ck.types()
+                match types.kind(callee.ty) {
+                    ty::TyKind.Fn(id) => mut self.site(token, digest: Digest.declared(types.fn_of(id).wait, limit_set: types.fn_of(id).limit_set, alloc), brought: Brought.Call(None))
+                    else => {}
+                }
+            }
+        }
+        Callee.Builtin(builtin) => mut self.builtin_sites(token, builtin, call)
+    }
+    for arg in call.args {
+        mut self.argument(token, arg: arg.expr)
+    }
+} DigestWalk.call
+
+/// The site of a call of a function item: its digest, with the primitive capability a std
+/// member of one adds, and the validator it is.
+fn DigestWalk.function_site(mut self, token: u32, function: ty::ItemId) {
+    let alloc = self.ck.alloc()
+    var facts = self.ck.digest(function).contents().copy(alloc)
+    if self.ck.db().is_std(function) and self.ck.is_primitive_capability_member(function) {
+        facts.capabilities = Some(extended_set(facts.capabilities, item: self.ck.owner_item(function), alloc))
+    }
+    if self.ck.is_validator(function) {
+        facts.validators = Some(extended_set(facts.validators, item: function, alloc))
+    }
+    let brought = match self.ck.db().ast(function).kind.is_fn_with_body() {
+        true => Brought.Call(Some(function))
+        false => Brought.Call(None)
+    }
+    mut self.site(token, digest: take facts, brought: brought)
+} DigestWalk.function_site
+
+/// The sites of a builtin call: a conversion from or to a float, and a DMA access.
+fn DigestWalk.builtin_sites(mut self, token: u32, builtin: Builtin, call: Call) {
+    let alloc = self.ck.alloc()
+    match builtin {
+        Builtin.Conversion(_) => {
+            var floats = call.args.len() > 0 and self.is_float(call.args[0].expr.ty)
+            floats = floats or self.is_float(call.head.result)
+            if floats {
+                var facts = Digest.none(alloc)
+                facts.float = true
+                mut self.site(token, digest: take facts, brought: Brought.Operation)
+            }
+        }
+        else => {}
+    }
+    if builtin == Builtin.DmaAccess {
+        var facts = Digest.none(alloc)
+        facts.device = true
+        mut self.site(token, digest: take facts, brought: Brought.Operation)
+    }
+} DigestWalk.builtin_sites
+
+/// A function argument supplied at a call: a closure's digest, a named function's, or the
+/// declared digest of a function value's type, a parameter of the code walked adding none;
+/// supplied to a `task fn` parameter, without its waiting.
+fn DigestWalk.argument(mut self, token: u32, arg: TExpr) {
+    let alloc = self.ck.alloc()
+    let ck = self.ck.share()
+    let types = ck.types()
+    let ty::TyKind.Fn(id) = types.kind(arg.ty) else {
+        return
+    }
+    let fn_ty = types.fn_of(id)
+    var facts = Digest.none(alloc)
+    var charged = false
+    match arg.kind {
+        TKind.Closure(closure) => {
+            let held = closure.contents()
+            let sites = ck.closure_sites(self.item, body: self.body, closure: held)
+            for site in sites {
+                mut facts.join(site.facts)
+            }
+            facts.wait = held.ty.wait
+            charged = true
+        }
+        TKind.FnValue(item: function, type_args: _) => {
+            mut self.site(token, digest: ck.digest(function).contents().copy(alloc), brought: Brought.Call(Some(function)))
+            return
+        }
+        else => {
+            if self.own_parameter(arg) {
+                return
+            }
+            facts = Digest.declared(fn_ty.wait, limit_set: fn_ty.limit_set, alloc)
+        }
+    }
+    if fn_ty.kind == ast::FnKind.Task {
+        facts.wait = false
+    }
+    let brought = match charged {
+        true => Brought.Charged
+        false => Brought.Call(None)
+    }
+    mut self.site(token, digest: take facts, brought: brought)
+} DigestWalk.argument
+
+/// Whether an expression is a function-typed parameter of the code walked.
+fn DigestWalk.own_parameter(self, value: TExpr) -> bool {
+    let TKind.Local(local) = value.kind else {
+        return false
+    }
+    let held = self.body.contents().local(local)
+    return is_param(held.kind) and held.closure == self.closure
+} DigestWalk.own_parameter
+
+/// The typed body of a function item with a body.
+fn Checker.typed_body(self, item: ty::ItemId) -> Option[mem::Shared[TBody]] {
+    let db = self.db()
+    db.note(item)
+    let kind = db.ast(item).kind
+    let tombstone = match kind {
+        ast::ItemKind.Retired(_) => true
+        else => false
+    }
+    if not kind.is_fn_with_body() and not tombstone {
+        return None
+    }
+    return self.typed(item)
+} Checker.typed_body
+
+/// Whether a std function is a member of a primitive capability.
+fn Checker.is_primitive_capability_member(self, function: ty::ItemId) -> bool {
+    let Some(TypeKey.Item(owner)) = self.db().owners.get(function) else {
+        return false
+    }
+    if not self.is_primitive_capability(owner) {
+        return false
+    }
+    let Some(sig) = self.fn_sig(function) else {
+        return true
+    }
+    return not sig.limit_set.pure
+} Checker.is_primitive_capability_member
+
+/// The type a member function is named after.
+fn Checker.owner_item(self, function: ty::ItemId) -> ty::ItemId {
+    return match self.db().owners.get(function) {
+        Some(TypeKey.Item(owner)) => owner
+        else => function
+    }
+} Checker.owner_item

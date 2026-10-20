@@ -1,0 +1,678 @@
+//! Registries: their entry types and key and unique fields, the registries contributions and `allow contribute` grants name, the contributions a judging root admits, the duplicates of its tables, and the platform registries' contributors, targets and entries.
+
+/// A contribution as a judging root sees it.
+struct Contribution derives Copy {
+    item: ty::ItemId
+    registry_item: ty::ItemId
+    contributor: ty::PackageId
+    admitted: bool
+} Contribution
+
+/// A registry an `allow contribute` grant of a judging root names, with the grant's index.
+struct Grant derives Copy {
+    registry_item: ty::ItemId
+    allow: usize
+} Grant
+
+/// A registry and a package contributing to it.
+struct RegistryContributor derives Copy, Eq, Hash {
+    registry_item: ty::ItemId
+    contributor: ty::PackageId
+} RegistryContributor
+
+/// An admitted contribution of a judging root's tables, with its canonical path.
+struct TableEntry {
+    path: text::String
+    contribution: Contribution
+} TableEntry
+
+/// A contribution of a table, with its value.
+struct TableMember {
+    contribution: Contribution
+    value: mem::Shared[ConstValue]
+} TableMember
+
+/// The rules of a registry item: a struct entry type that a const may have, and key and
+/// unique fields naming distinct fields of it, visible here, whose types implement `Ord` and
+/// `Eq`.
+fn Checker.check_registry(self, item: ty::ItemId, declared: ast::RegistryItem) {
+    let types = self.types()
+    let db = self.db()
+    let alloc = self.alloc()
+    let held = self.sig(item)
+    let SigKind.Registry(entry: entry) = held.contents().kind else {
+        return
+    }
+    if types.has_error(entry) {
+        return
+    }
+    var structure: Option[ty::ItemId] = None
+    match types.kind(entry) {
+        ty::TyKind.Item(item: target, args: _) => {
+            match db.ast(target).kind {
+                ast::ItemKind.Struct(_) => {
+                    structure = Some(target)
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let Some(target) = structure else {
+        self.report(item, token: declared.entry.token, code: diagnostic::Code.RegistryEntryType)
+        return
+    }
+    if not self.has(entry, property: Property.Inert) or self.has(entry, property: Property.Linear) {
+        self.report(item, token: declared.entry.token, code: diagnostic::Code.RegistryEntryType)
+        return
+    }
+    let target_sig = self.sig(target)
+    let SigKind.Struct(fields: fields) = target_sig.contents().kind else {
+        return
+    }
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in target_sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(types.args_of(entry)), alloc)
+    let module = db.module_of(item)
+    var named = mem::List[text::String].empty(alloc)
+    self.check_registry_name(
+        item,
+        structure: target,
+        fields: fields.view(),
+        name: declared.key,
+        keyed: true,
+        subst,
+        module,
+        mut named,
+    )
+    for name in declared.unique {
+        self.check_registry_name(
+            item,
+            structure: target,
+            fields: fields.view(),
+            name,
+            keyed: false,
+            subst,
+            module,
+            mut named,
+        )
+    }
+} Checker.check_registry
+
+/// A key or unique field a registry names: named once, a field of its entry type visible here,
+/// whose type implements `Ord` for the key and `Eq` for a unique field.
+fn Checker.check_registry_name(
+    self,
+    item: ty::ItemId,
+    structure: ty::ItemId,
+    fields: Slice[FieldSig],
+    name: ast::Name,
+    keyed: bool,
+    subst: ty::Subst,
+    module: ty::ModuleId,
+    mut named: mem::List[text::String],
+    ) {
+    let types = self.types()
+    let db = self.db()
+    let alloc = self.alloc()
+    if holds_text(named.view(), text: name.text.as_str()) {
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match self.fix_element_deleted(item, head: name.token, last: name.token) {
+            Some(fix) => mut fixes.push(take fix)
+            None => {
+                let keyword = db.syntax(item).previous(usize.widen(name.token)).value_or(usize.widen(name.token))
+                mut fixes.push(self.fix_deleting(item, head: u32.truncate(keyword), last: name.token))
+            }
+        }
+        self.report_fixed(item, construct: nir::Span.at(name.token), code: diagnostic::Code.RegistryUniqueRepeated, take fixes, offer: diagnostic::Offer.Each)
+        return
+    }
+    mut named.push(text::String.of(name.text.as_str(), alloc))
+    let Some(index) = field_position(fields, name: name.text.as_str()) else {
+        self.report(item, token: name.token, code: diagnostic::Code.RegistryUnknownField)
+        return
+    }
+    let field = fields[index]
+    if not db.field_visible(module, owner: structure, visibility: field.visibility) {
+        self.report(item, token: name.token, code: diagnostic::Code.NamePrivate)
+        return
+    }
+    let interface_name = match keyed {
+        true => "Ord"
+        false => "Eq"
+    }
+    let code = match keyed {
+        true => diagnostic::Code.RegistryKeyType
+        false => diagnostic::Code.RegistryUniqueType
+    }
+    let field_ty = subst.ty(types, ty: field.ty)
+    let implemented = match db.core_item(interface_name) {
+        Some(interface_item) => types.has_error(field_ty) or self.implements(field_ty, interface_item)
+        None => true
+    }
+    if not implemented {
+        self.report(item, token: name.token, code)
+    }
+} Checker.check_registry_name
+
+/// The index of a struct's field of that name.
+fn field_position(fields: Slice[FieldSig], name: Str) -> Option[usize] {
+    for index in 0..<fields.len() {
+        if fields[index].name.as_str() == name {
+            return Some(index)
+        }
+    }
+    return None
+} field_position
+
+/// The registry a path written in a module names, or the code of the rule it breaks.
+fn Checker.registry_named(self, module: ty::ModuleId, path: ast::Path) -> Result[ty::ItemId, Option[diagnostic::Code]] {
+    let db = self.db()
+    let outcome = db.resolve(module, path)
+    let named_item = match first outcome {
+        Ok(Named.Item(found)) => found
+        Ok(_) => return Err(Some(diagnostic::Code.RegistryNotRegistry))
+        Err(error) => return Err(error.code)
+    }
+    let ast::ItemKind.Registry(_) = db.ast(named_item).kind else {
+        return Err(Some(diagnostic::Code.RegistryNotRegistry))
+    }
+    if db.visible(module, item: named_item) {
+        return Ok(named_item)
+    }
+    return Err(Some(diagnostic::Code.NamePrivate))
+} Checker.registry_named
+
+/// The registry a contribution adds to, when its path names one.
+fn Checker.contribution_registry(self, item: ty::ItemId) -> Option[ty::ItemId] {
+    let db = self.db()
+    let ast::ItemKind.Contribute(contribution) = db.ast(item).kind else {
+        return None
+    }
+    return match self.registry_named(db.module_of(item), path: contribution.registry_path) {
+        Ok(registry_item) => Some(registry_item)
+        Err(_) => None
+    }
+} Checker.contribution_registry
+
+/// Whether an item is a contribution to a platform registry.
+fn Checker.is_platform_contribution(self, item: ty::ItemId) -> bool {
+    let Some(registry_item) = self.contribution_registry(item) else {
+        return false
+    }
+    let db = self.db()
+    return db.is_std(registry_item) and is_listed("hw::vectors hw::syscall_entry hw::preempt", word: db.canonical(registry_item).as_str())
+} Checker.is_platform_contribution
+
+/// The rules of a contribution's path: a visible registry, and for a platform registry, a
+/// target with the seams it binds and, for `hw::preempt`, a platform package.
+fn Checker.check_contribution(self, item: ty::ItemId, contribution: ast::ContributeItem) {
+    let db = self.db()
+    let token = contribution.registry_path.token()
+    let outcome = self.registry_named(db.module_of(item), path: contribution.registry_path)
+    let Ok(registry_item) = outcome else {
+        match outcome {
+            Err(Some(code)) => self.report(item, token, code)
+            else => {}
+        }
+        return
+    }
+    if not db.is_std(registry_item) {
+        return
+    }
+    let vectors = db.target.is_machine()
+    let path = db.canonical(registry_item)
+    if path.as_str() == "hw::preempt" and not is_platform_name(db.package_data(db.package_of(item)).name.as_str()) {
+        self.report(item, token, code: diagnostic::Code.RegistryPlatformEntry)
+    }
+    let seams = match path.as_str() {
+        "hw::vectors" or "hw::preempt" => vectors
+        "hw::syscall_entry" => db.target == workspace::Target.Bare
+        else => true
+    }
+    if not seams {
+        self.report(item, token, code: diagnostic::Code.RegistryPlatformTarget)
+    }
+} Checker.check_contribution
+
+/// Whether a package name is a platform package's.
+fn is_platform_name(name: Str) -> bool {
+    for platform in stdlib::PLATFORMS {
+        if platform.name() == name {
+            return true
+        }
+    }
+    return false
+} is_platform_name
+
+/// The rules of a package as a judging root: the registries and aliases its `allow
+/// contribute` grants name, and each contribution of its dependency closure it does not
+/// admit, reported once per registry and contributing package.
+fn Checker.check_contributors(self, package_id: ty::PackageId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let data = db.package_data(package_id)
+    let source = db.source(package_id)
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    let path = source.files[0].path.as_str()
+    for allow in manifest.allows {
+        let workspace::Authority.Contribute(written) = allow.authority else {
+            continue
+        }
+        match self.granted_registry(package_id, written: written.as_str()) {
+            Err(Some(code)) => self.report_file(path, line: allow.line, code)
+            else => {}
+        }
+        var unaliased = false
+        for name in allow.names {
+            if not data.deps.contains(name) {
+                unaliased = true
+                break
+            }
+        }
+        if unaliased {
+            self.report_file(path, line: allow.line, code: diagnostic::Code.RegistryGrantNotAlias)
+        }
+    }
+    var reported = mem::HashMap[RegistryContributor, Unit].empty(seed: 0, alloc)
+    for contribution in self.contributions(package_id) {
+        if contribution.admitted {
+            continue
+        }
+        let earlier = mut reported.insert(RegistryContributor(registry_item: contribution.registry_item, contributor: contribution.contributor), value: Unit)
+        if earlier.is_some() {
+            continue
+        }
+        var line = manifest.line
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        match self.dep_of(package_id, contributor: contribution.contributor) {
+            Some(index) => {
+                line = manifest.deps[index].line
+                match data.root {
+                    Some(root) => {
+                        let granted = workspace::Authority.Contribute(self.item_written(contribution.registry_item, from: root))
+                        match self.fix_granting(package_id, authority: granted, name: manifest.deps[index].alias.as_str()) {
+                            Some(fix) => mut fixes.push(take fix)
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        self.report_file_fixed(path, line, code: diagnostic::Code.RegistryUngranted, take fixes)
+    }
+} Checker.check_contributors
+
+/// The index of the first `dep` directive of a judging root naming a package.
+fn Checker.dep_of(self, root: ty::PackageId, contributor: ty::PackageId) -> Option[usize] {
+    let db = self.db()
+    let data = db.package_data(root)
+    let Some(manifest) = db.source(root).manifest else {
+        return None
+    }
+    for index in 0..<manifest.deps.len() {
+        if data.deps.get(manifest.deps[index].alias) == Some(Some(contributor)) {
+            return Some(index)
+        }
+    }
+    return None
+} Checker.dep_of
+
+/// The contributions of a judging root's dependency closure, each with whether the root
+/// admits it: its package declares its registry, or an `allow contribute` grant of the root
+/// names it by an alias of the root's.
+fn Checker.contributions(self, root: ty::PackageId) -> mem::List[Contribution] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var grants = mem::List[Grant].empty(alloc)
+    match db.source(root).manifest {
+        Some(manifest) => {
+            for index in 0..<manifest.allows.len() {
+                let workspace::Authority.Contribute(written) = manifest.allows[index].authority else {
+                    continue
+                }
+                match self.granted_registry(root, written: written.as_str()) {
+                    Ok(registry_item) => mut grants.push(Grant(registry_item: registry_item, allow: index))
+                    Err(_) => {}
+                }
+            }
+        }
+        None => {}
+    }
+    let platform = self.platform_contributor(root)
+    var contributors = mem::List[ty::PackageId].empty(alloc)
+    mut contributors.push(root)
+    for dependency in self.dependency_closure(root) {
+        mut contributors.push(dependency)
+    }
+    match platform {
+        Some(platform_id) => mut contributors.push(platform_id)
+        None => {}
+    }
+    var found = mem::List[Contribution].empty(alloc)
+    for contributor in contributors {
+        for module in db.package_data(contributor).modules {
+            for item in db.module(module).items {
+                let Some(registry_item) = self.contribution_registry(item) else {
+                    continue
+                }
+                let admitted = contributor == root or Some(contributor) == platform or db.package_of(registry_item) == contributor or self.granted_to(root, grants: grants.view(), registry_item, contributor)
+                mut found.push(Contribution(item: item, registry_item: registry_item, contributor: contributor, admitted: admitted))
+            }
+        }
+    }
+    return found
+} Checker.contributions
+
+/// Whether a grant of a judging root names a registry by an alias of the root's naming a
+/// contributor.
+fn Checker.granted_to(self, root: ty::PackageId, grants: Slice[Grant], registry_item: ty::ItemId, contributor: ty::PackageId) -> bool {
+    let db = self.db()
+    let Some(manifest) = db.source(root).manifest else {
+        return false
+    }
+    let data = db.package_data(root)
+    for grant in grants {
+        if grant.registry_item != registry_item {
+            continue
+        }
+        for alias in manifest.allows[grant.allow].names {
+            if data.deps.get(alias) == Some(Some(contributor)) {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.granted_to
+
+/// The platform package of the target checked, when the database holds it and it is not the
+/// judging root.
+fn Checker.platform_contributor(self, root: ty::PackageId) -> Option[ty::PackageId] {
+    let db = self.db()
+    let target = db.target
+    let Some(platform_name) = target.platform_package() else {
+        return None
+    }
+    for index in 0..<db.packages.len() {
+        if db.packages[index].name.as_str() == platform_name {
+            let platform_id = ty::PackageId(index: u32.fit(index))
+            if platform_id == root {
+                return None
+            }
+            return Some(platform_id)
+        }
+    }
+    return None
+} Checker.platform_contributor
+
+/// The registry the path of a package's `allow contribute` grant names, resolved in its root
+/// module, or the code of the rule it breaks.
+fn Checker.granted_registry(self, package_id: ty::PackageId, written: Str) -> Result[ty::ItemId, Option[diagnostic::Code]] {
+    let alloc = self.alloc()
+    let Some(root) = self.db().package_data(package_id).root else {
+        return Err(None)
+    }
+    var segments = mem::List[ast::Name].empty(alloc)
+    let bytes = written.as_bytes()
+    let length = bytes.len()
+    var start: usize = 0
+    var index: usize = 0
+    while index + 1 < length {
+        if bytes[index] == b':' and bytes[index + 1] == b':' {
+            let Some(segment) = written.slice_bytes(start, end: index) else {
+                return Err(None)
+            }
+            mut segments.push(ast::Name(text: text::String.of(segment, alloc), token: 0))
+            index += 2
+            start = index
+        } else {
+            index += 1
+        }
+    }
+    let Some(segment) = written.slice_bytes(start, end: length) else {
+        return Err(None)
+    }
+    mut segments.push(ast::Name(text: text::String.of(segment, alloc), token: 0))
+    return self.registry_named(root, path: ast::Path(segments: take segments))
+} Checker.granted_registry
+
+/// Whether a package contributes to a registry it does not declare, under the target
+/// checked.
+fn Checker.contributes(self, contributor: ty::PackageId, registry_item: ty::ItemId) -> bool {
+    let db = self.db()
+    if db.package_of(registry_item) == contributor {
+        return false
+    }
+    for module in db.package_data(contributor).modules {
+        for item in db.module(module).items {
+            if self.contribution_registry(item) == Some(registry_item) {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.contributes
+
+/// The rules of the tables of a judging root's registries: two admitted contributions to
+/// one registry whose key fields compare `Equal` (`registry.duplicate-key`), or whose values
+/// of a unique field are equal (`registry.duplicate-unique`), each reported for every
+/// contribution of the set but the one whose canonical path sorts first.
+fn Checker.check_tables(self, root: ty::PackageId) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var admitted = mem::List[TableEntry].empty(alloc)
+    for contribution in self.contributions(root) {
+        if contribution.admitted {
+            mut admitted.push(TableEntry(path: db.canonical(contribution.item), contribution: contribution))
+        }
+    }
+    mut admitted.sort_by(fn(left: TableEntry, right: TableEntry) => left.path.as_str().cmp(right.path.as_str()))
+    var registries = mem::Set[ty::ItemId].empty(alloc)
+    for entry in admitted {
+        discard mut registries.insert(entry.contribution.registry_item)
+    }
+    var interpreter = Interpreter.new(self.share())
+    for registry_item in registries.cursor() {
+        self.check_table(root, registry_item, admitted: admitted.view(), mut interpreter)
+    }
+} Checker.check_tables
+
+/// The duplicates of the key and unique fields among a registry's admitted contributions.
+fn Checker.check_table(self, root: ty::PackageId, registry_item: ty::ItemId, admitted: Slice[TableEntry], mut interpreter: Interpreter) {
+    let types = self.types()
+    let db = self.db()
+    let ast::ItemKind.Registry(declared) = db.ast(registry_item).kind else {
+        return
+    }
+    let registry_sig = self.sig(registry_item)
+    let SigKind.Registry(entry: entry) = registry_sig.contents().kind else {
+        return
+    }
+    let ty::TyKind.Item(item: entry_item, args: _) = types.kind(entry) else {
+        return
+    }
+    let entry_sig = self.sig(entry_item)
+    let SigKind.Struct(fields: fields) = entry_sig.contents().kind else {
+        return
+    }
+    var members = mem::List[TableMember].empty(self.alloc())
+    for held in admitted {
+        if held.contribution.registry_item != registry_item {
+            continue
+        }
+        let Some(value) = self.const_value(held.contribution.item) else {
+            continue
+        }
+        mut members.push(TableMember(contribution: held.contribution, value: take value))
+    }
+    match field_position(fields.view(), name: declared.key.text.as_str()) {
+        Some(index) => self.check_table_field(root, members: members.view(), index, order: true, code: diagnostic::Code.RegistryDuplicateKey, mut interpreter)
+        None => {}
+    }
+    for name in declared.unique {
+        match field_position(fields.view(), name: name.text.as_str()) {
+            Some(index) => self.check_table_field(root, members: members.view(), index, order: false, code: diagnostic::Code.RegistryDuplicateUnique, mut interpreter)
+            None => {}
+        }
+    }
+} Checker.check_table
+
+/// Reports each member of a table whose field at `index` compares `Equal`, or is equal when
+/// not `order`, to an earlier member's.
+fn Checker.check_table_field(
+    self,
+    root: ty::PackageId,
+    members: Slice[TableMember],
+    index: usize,
+    order: bool,
+    code: diagnostic::Code,
+    mut interpreter: Interpreter,
+    ) {
+    for at in 0..<members.len() {
+        var duplicate = false
+        for earlier in 0..<at {
+            if mut interpreter.same_field(members[earlier].value.contents(), right: members[at].value.contents(), index, order) {
+                duplicate = true
+                break
+            }
+        }
+        if duplicate {
+            self.report_table(root, contribution: members[at].contribution, code)
+        }
+    }
+} Checker.check_table_field
+
+/// Reports a rule of a table on a contribution: on it when it lies in the judging root,
+/// otherwise on the root's `dep` directive for its package, or its `package` line.
+fn Checker.report_table(self, root: ty::PackageId, contribution: Contribution, code: diagnostic::Code) {
+    let db = self.db()
+    if contribution.contributor == root {
+        self.report(contribution.item, token: db.ast(contribution.item).token, code)
+        return
+    }
+    let source = db.source(root)
+    let Some(manifest) = source.manifest else {
+        return
+    }
+    var line = manifest.line
+    match self.dep_of(root, contributor: contribution.contributor) {
+        Some(index) => {
+            line = manifest.deps[index].line
+        }
+        None => {}
+    }
+    self.report_file(source.files[0].path.as_str(), line, code)
+} Checker.report_table
+
+/// The rules of a contribution to `hw::vectors` against the target's vector classes, and of
+/// a landing field holding a function that is not a landing fn (`registry.platform-entry`).
+fn Checker.check_platform_entry(self, item: ty::ItemId) {
+    if not self.is_platform_contribution(item) {
+        return
+    }
+    let Some(held) = self.const_value(item) else {
+        return
+    }
+    let Val.Struct(item: _, fields: shared_fields) = held.contents().value else {
+        return
+    }
+    let fields = shared_fields.contents()
+    let db = self.db()
+    let registry_path = match self.contribution_registry(item) {
+        Some(registry_item) => db.canonical(registry_item)
+        None => text::String.empty(self.alloc())
+    }
+    let broken = match registry_path.as_str() {
+        "hw::vectors" => self.vectors_entry_broken(fields.view())
+        "hw::syscall_entry" => not self.is_landing(fields[1])
+        else => false
+    }
+    if broken {
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.RegistryPlatformEntry)
+    }
+} Checker.check_platform_entry
+
+/// Whether the fields of a contribution to `hw::vectors` break the target's vector classes:
+/// a handler of another class, an NMI, double fault or machine check without its own stack, or
+/// a user landing fn on an interrupt vector or naming a function that is not a landing fn.
+fn Checker.vectors_entry_broken(self, fields: Slice[Val]) -> bool {
+    let vector = fields[0].int_value()
+    let Val.Variant(item: _, index: handler, fields: _) = fields[2] else {
+        return false
+    }
+    let class = vector_class(vector)
+    let user_landing = match fields[3] {
+        Val.Variant(item: _, index: 0, fields: _) => true
+        else => false
+    }
+    let stackless = vector == wide::Wide.of_u64(2) or vector == wide::Wide.of_u64(8) or vector == wide::Wide.of_u64(18)
+    return class != Some(handler) or (fields[1].int_value().is_zero() and stackless) or (user_landing and class == Some(0)) or self.landing_broken(fields[3])
+} Checker.vectors_entry_broken
+
+/// Whether a vector's user field names a function that is not a landing fn.
+fn Checker.landing_broken(self, user: Val) -> bool {
+    return match user {
+        Val.Variant(item: _, index: 0, fields: payload) => not self.is_landing(payload.contents()[0])
+        else => false
+    }
+} Checker.landing_broken
+
+/// Whether a function value is a landing fn.
+fn Checker.is_landing(self, value: Val) -> bool {
+    let Val.Fn(function) = value else {
+        return false
+    }
+    let FnVal.Function(fn_ref) = function.contents() else {
+        return false
+    }
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return false
+    }
+    let Some(sig) = self.fn_sig(item) else {
+        return false
+    }
+    return sig.modifier == Some(ast::FnModifier.Landing)
+} Checker.is_landing
+
+/// The workspace packages a package depends on, directly or through others, itself excluded.
+fn Checker.dependency_closure(self, package_id: ty::PackageId) -> mem::List[ty::PackageId] {
+    let db = self.db()
+    var closure = mem::List[ty::PackageId].empty(self.alloc())
+    mut closure.push(package_id)
+    var next: usize = 0
+    while next < closure.len() {
+        let current = closure[next]
+        next += 1
+        for entry in db.package_data(current).deps.cursor() {
+            let Some(dependency) = entry.value() else {
+                continue
+            }
+            if closure.position(fn(held: ty::PackageId) => held == dependency).is_none() {
+                mut closure.push(dependency)
+            }
+        }
+    }
+    discard mut closure.remove(0)
+    return closure
+} Checker.dependency_closure
+
+/// The class the descriptors of `x86_64-uefi` and `x86_64-bare` give a vector, as the index of
+/// the `hw::VectorHandler` variant it names: `Irq`, `Trap`, `TrapWithCode`, `PageFault`.
+fn vector_class(vector: wide::Wide) -> Option[u32] {
+    let Some(small) = vector.to_u64() else {
+        return None
+    }
+    return match small {
+        0..=7 or 16 or 18..=20 or 28 => Some(1)
+        8 or 10..=13 or 17 or 21 or 29 or 30 => Some(2)
+        14 => Some(3)
+        32..=255 => Some(0)
+        else => None
+    }
+} vector_class

@@ -1,0 +1,726 @@
+//! Elaborating patterns: the tests of match arms and `let ... else`, the bindings a matched pattern makes, and the cursor and element bindings of `for` loops.
+
+/// A place being matched and whether its parts are owned, so that bindings move them.
+struct Scrutinee {
+    place: nir::Place
+    owned: bool
+} Scrutinee
+
+/// A name a matched pattern binds: its local, its part, and whether the part is moved out of an
+/// owned scrutinee.
+struct PatternBinding {
+    local: LocalId
+    place: nir::Place
+    moved: bool
+} PatternBinding
+
+/// The slot of a name an arm's alternatives bind and the first moves.
+struct NameSlot derives Copy {
+    local: LocalId
+    slot: nir::Value
+} NameSlot
+
+/// The `next` of a cursor type, its element type, and whether it is a projection.
+struct CursorNext {
+    next: nir::FnRef
+    element: ty::Ty
+    projects: bool
+} CursorNext
+
+/// The scrutinee of a match or `let`: a place, a Copy value, part or wrapped part as its own
+/// root, or a temporary in a slot.
+fn Elab.scrutinee(mut self, value: TExpr) -> Option[Scrutinee] fails Fault {
+    let out = try mut self.expr(value)
+    match out {
+        Out.Never => return None
+        Out.Place(place) => {
+            let owned = self.b.is_slot(place.root)
+            return Some(Scrutinee(place: take place, owned: owned))
+        }
+        Out.Operand(operand) => {
+            let owned = not self.ck.nir_copy(value.ty) and not value.is_part()
+            var own_root = false
+            match operand_root(operand) {
+                Some(root) => {
+                    own_root = not owned or self.b.ty(root).is_reference()
+                }
+                None => {}
+            }
+            let place = match first operand_root(operand) {
+                Some(root) if own_root => nir::Place.of(root, alloc: self.ck.alloc())
+                else => mut self.temporary(take operand, ty: value.ty, token: value.token)
+            }
+            let slot_owned = owned and self.b.is_slot(place.root)
+            return Some(Scrutinee(place: take place, owned: slot_owned))
+        }
+    }
+} Elab.scrutinee
+
+/// The value an operand is, none for a literal or a place.
+fn operand_root(operand: nir::Operand) -> Option[nir::Value] {
+    return match operand {
+        nir::Operand.Value(root) => Some(root)
+        else => None
+    }
+} operand_root
+
+fn Elab.match_expr(mut self, expr: TExpr, scrutinee: TExpr, arms: Slice[TArm]) -> Out fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(expr)
+    let Some(matched) = try mut self.scrutinee(scrutinee) else {
+        return Out.Never
+    }
+    var slots = mem::List[mem::List[NameSlot]].empty(alloc)
+    for arm in arms {
+        mut slots.push(try mut self.alternative_slots(arm, matched, span))
+    }
+    let entry_moved = nir::Place.copies(self.moved, alloc)
+    var ends = mem::List[ArmEnd].empty(alloc)
+    var last: usize = 0
+    if arms.len() > 0 {
+        last = arms.len() - 1
+    }
+    for index in 0..<arms.len() {
+        if not self.b.open() {
+            break
+        }
+        let arm = arms[index]
+        self.moved = nir::Place.copies(entry_moved, alloc)
+        let temps = self.temps.len()
+        var next: Option[nir::BlockId] = None
+        if index < last {
+            next = Some(mut self.b.block())
+        }
+        mut self.scopes.push(ElabScope.empty(alloc))
+        if binds_in_alternatives(arm) {
+            try mut self.alternatives(arm, matched, slots: slots[index].view(), next, span)
+        } else {
+            match next {
+                Some(following) => {
+                    if arm.patterns.len() > 0 {
+                        try mut self.arm_tests(arm, matched, next: following, span)
+                    }
+                }
+                None => {}
+            }
+            if arm.patterns.len() > 0 {
+                try mut self.bind_arm(arm.patterns[0], matched, guard: arm.guard, next, span)
+            }
+        }
+        let out = try mut self.expr(arm.body)
+        let value = mut self.arm_value(take out, ty: expr.ty, span)
+        try mut self.close_scope(arm.token)
+        mut ends.push(mut self.arm_end(take value, ty: expr.ty, token: arm.token, temps))
+        match next {
+            Some(following) => mut self.b.at(following)
+            None => {}
+        }
+    }
+    return mut self.join(take ends, ty: expr.ty, span)
+} Elab.match_expr
+
+/// The value an arm's body or a block's last expression yields: a place it names in place when
+/// it is a part reached through a reference, otherwise the value at it.
+fn Elab.arm_value(mut self, take out: Out, ty: ty::Ty, span: nir::Span) -> Out {
+    match out {
+        Out.Place(place) => {
+            if self.borrowed_part(place, ty) {
+                return Out.Place(take place)
+            }
+            return Out.Operand(mut self.take_place(take place, ty, span))
+        }
+        Out.Operand(operand) => return Out.Operand(take operand)
+        Out.Never => return Out.Never
+    }
+} Elab.arm_value
+
+/// The tests of an arm's patterns, continuing when one matches, at a block joining the
+/// alternatives when there are several, and at `next` when none does.
+fn Elab.arm_tests(
+    mut self,
+    arm: TArm,
+    matched: Scrutinee,
+    next: nir::BlockId,
+    span: nir::Span,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let count = arm.patterns.len()
+    if count == 1 {
+        try mut self.tests(arm.patterns[0], place: matched.place, otherwise: next, span)
+        return
+    }
+    let pass = mut self.b.block()
+    for index in 0..<count {
+        var otherwise = next
+        if index + 1 < count {
+            otherwise = mut self.b.block()
+        }
+        try mut self.tests(arm.patterns[index], place: matched.place, otherwise, span)
+        if self.b.open() {
+            mut self.b.jump(pass, args: mem::List[nir::Operand].empty(alloc), span)
+        }
+        mut self.b.at(otherwise)
+        if index + 1 == count {
+            mut self.b.at(pass)
+        }
+    }
+} Elab.arm_tests
+
+/// The slots of an arm whose alternatives bind names, one per name the first moves.
+fn Elab.alternative_slots(mut self, arm: TArm, matched: Scrutinee, span: nir::Span) -> mem::List[NameSlot] fails Fault {
+    let alloc = self.ck.alloc()
+    var slots = mem::List[NameSlot].empty(alloc)
+    if not binds_in_alternatives(arm) {
+        return slots
+    }
+    var bound = mem::List[PatternBinding].empty(alloc)
+    try self.bound(arm.patterns[0], matched, found: mut bound)
+    for name in bound {
+        if not name.moved {
+            continue
+        }
+        let ty = self.body.contents().local(name.local).ty
+        mut slots.push(NameSlot(local: name.local, slot: mut self.named_slot(name.local, ty, span)))
+    }
+    return slots
+} Elab.alternative_slots
+
+/// The tests, bindings and guard of an arm whose alternatives bind names, in the arm's scope.
+/// Each alternative that matches binds its names, tests the guard, if any, with the names it
+/// moves bound by `ref`, moves them into `slots`, and passes its other bindings to the arm's
+/// block in the first alternative's order. A failed test continues with the next
+/// alternative, the last one's and a false guard at `next`; without `next`, the last
+/// alternative is untested.
+fn Elab.alternatives(
+    mut self,
+    arm: TArm,
+    matched: Scrutinee,
+    slots: Slice[NameSlot],
+    next: Option[nir::BlockId],
+    span: nir::Span,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let body = self.body.share()
+    for held in slots {
+        mut self.hold(held.slot)
+    }
+    var first_bound = mem::List[PatternBinding].empty(alloc)
+    try self.bound(arm.patterns[0], matched, found: mut first_bound)
+    var local_named = mem::Map[text::String, LocalId].empty(alloc)
+    for name in first_bound {
+        discard mut local_named.insert(text::String.of(body.contents().local(name.local).name.as_str(), alloc), value: name.local)
+    }
+    let pass = mut self.b.block()
+    var params = mem::List[NameSlot].empty(alloc)
+    var declared = false
+    let count = arm.patterns.len()
+    for index in 0..<count {
+        let pattern = arm.patterns[index]
+        var otherwise = next
+        if index + 1 < count {
+            otherwise = Some(mut self.b.block())
+        }
+        match otherwise {
+            Some(failing) => try mut self.tests(pattern, place: matched.place, otherwise: failing, span)
+            None => {}
+        }
+        var bound = mem::List[PatternBinding].empty(alloc)
+        try self.bound(pattern, matched, found: mut bound)
+        var values = mem::List[NameSlot].empty(alloc)
+        for name in bound {
+            let local = named_local(local_named, name: body.contents().local(name.local).name.as_str())
+            if name.moved and arm.guard.is_none() {
+                mut self.move_bound(name, slot: slot_of(slots, local), span)
+                continue
+            }
+            let value = try mut self.binding_value(name, span)
+            discard mut self.held.insert(local, value: Held.Value(value))
+            if not name.moved {
+                mut values.push(NameSlot(local: local, slot: value))
+            }
+        }
+        try mut self.alternative_guard(arm, bound: bound.view(), local_named, slots, body: body.contents(), next, span)
+        if self.b.open() {
+            if not declared {
+                for held in values {
+                    let param_ty = self.b.ty(held.slot)
+                    mut params.push(NameSlot(local: held.local, slot: mut self.b.block_param(pass, ty: param_ty)))
+                }
+                declared = true
+            }
+            mut self.b.jump(pass, args: alternative_args(params.view(), values: values.view(), alloc), span)
+        }
+        if index + 1 < count {
+            match otherwise {
+                Some(failing) => mut self.b.at(failing)
+                None => {}
+            }
+        }
+    }
+    if not declared {
+        return
+    }
+    mut self.b.at(pass)
+    for param in params {
+        discard mut self.held.insert(param.local, value: Held.Value(param.slot))
+    }
+    for held in slots {
+        discard mut self.held.insert(held.local, value: Held.Slot(held.slot))
+    }
+} Elab.alternatives
+
+/// Tests the guard of an arm whose alternatives bind names, if it has one, after an
+/// alternative's bindings, and when it holds moves the names that alternative moves into
+/// `slots`.
+fn Elab.alternative_guard(
+    mut self,
+    arm: TArm,
+    bound: Slice[PatternBinding],
+    local_named: mem::Map[text::String, LocalId],
+    slots: Slice[NameSlot],
+    body: TBody,
+    next: Option[nir::BlockId],
+    span: nir::Span,
+    ) fails Fault {
+    let Some(guard) = arm.guard else {
+        return
+    }
+    if not try mut self.guard(guard, next, span) {
+        return
+    }
+    for name in bound {
+        if name.moved {
+            let local = named_local(local_named, name: body.local(name.local).name.as_str())
+            mut self.move_bound(name, slot: slot_of(slots, local), span)
+        }
+    }
+} Elab.alternative_guard
+
+/// The local the first alternative binds under a name.
+fn named_local(local_named: mem::Map[text::String, LocalId], name: Str) -> LocalId {
+    let Some(local) = local_named.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        expect false
+        return LocalId(index: 0)
+    }
+    return local
+} named_local
+
+/// The slot of a name the first alternative moves.
+fn slot_of(slots: Slice[NameSlot], local: LocalId) -> nir::Value {
+    for held in slots {
+        if held.local == local {
+            return held.slot
+        }
+    }
+    expect false
+    return nir::Value(index: 0)
+} slot_of
+
+/// The operands passing an alternative's bindings to the arm's block, in the order of its
+/// parameters.
+fn alternative_args(params: Slice[NameSlot], values: Slice[NameSlot], alloc: mem::Alloc) -> mem::List[nir::Operand] {
+    var args = mem::List[nir::Operand].empty(alloc)
+    for param in params {
+        var found = false
+        for value in values {
+            if value.local == param.local {
+                mut args.push(nir::Operand.Value(value.slot))
+                found = true
+                break
+            }
+        }
+        expect found
+    }
+    return args
+} alternative_args
+
+/// Binds an arm's matched pattern and tests its guard, if any, continuing at `next` when it
+/// is false; the names the pattern moves are bound by `ref` while the guard runs and moved
+/// after it.
+fn Elab.bind_arm(
+    mut self,
+    pattern: TPattern,
+    matched: Scrutinee,
+    guard: Option[TExpr],
+    next: Option[nir::BlockId],
+    span: nir::Span,
+    ) fails Fault {
+    let Some(tested) = guard else {
+        try mut self.bind(pattern, matched, span)
+        return
+    }
+    var bound = mem::List[PatternBinding].empty(self.ck.alloc())
+    try self.bound(pattern, matched, found: mut bound)
+    for name in bound {
+        let value = try mut self.binding_value(name, span)
+        discard mut self.held.insert(name.local, value: Held.Value(value))
+    }
+    if not try mut self.guard(tested, next, span) {
+        return
+    }
+    for name in bound {
+        if not name.moved {
+            continue
+        }
+        let ty = self.body.contents().local(name.local).ty
+        let slot = mut self.binding_slot(name.local, ty, span)
+        mut self.move_bound(name, slot, span)
+        mut self.hold(slot)
+    }
+} Elab.bind_arm
+
+/// Tests a guard, continuing when it is true and at `next` when false; whether execution
+/// continues.
+fn Elab.guard(mut self, guard: TExpr, next: Option[nir::BlockId], span: nir::Span) -> bool fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(passed) = try mut self.releasing_temps(guard.token, elaborate: fn(mut elab: Elab) -> Option[nir::Operand] fails Fault {
+        return try mut elab.operand(guard)
+    }) else {
+        return false
+    }
+    let Some(failing) = next else {
+        fail Fault.Unsupported(text::String.of("a guard on the last arm", alloc))
+    }
+    let pass = mut self.b.block()
+    mut self.end(nir::Terminator.Branch(operand: take passed, then: nir::Jump.to(pass, alloc), otherwise: nir::Jump.to(failing, alloc)), span)
+    mut self.b.at(pass)
+    return true
+} Elab.guard
+
+/// The tests of one pattern at a place, depth-first and left to right, branching to
+/// `otherwise` at the first that fails.
+fn Elab.tests(
+    mut self,
+    pattern: TPattern,
+    place: nir::Place,
+    otherwise: nir::BlockId,
+    span: nir::Span,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    match pattern.kind {
+        TPatternKind.Wildcard or TPatternKind.Binding(_) => {}
+        TPatternKind.Failed => fail Fault.Failed
+        TPatternKind.Value(space: _, compared: value_test) => {
+            let value = mut self.read_operand(place.copy(alloc), ty: pattern.ty, span)
+            match value_test {
+                ValueTest.Eq(compared) => {
+                    let literal = try mut self.compared(compared, ty: pattern.ty, span)
+                    mut self.test_value(nir::BinaryOp.Eq, take value, take literal, otherwise, span)
+                }
+                ValueTest.Range(low: low, high: high, exclusive: exclusive) => {
+                    let lowest = try mut self.compared(low, ty: pattern.ty, span)
+                    mut self.test_value(nir::BinaryOp.Ge, value: value.copy(alloc), literal: take lowest, otherwise, span)
+                    let highest = try mut self.compared(high, ty: pattern.ty, span)
+                    var op = nir::BinaryOp.Le
+                    if exclusive {
+                        op = nir::BinaryOp.Lt
+                    }
+                    mut self.test_value(op, take value, literal: take highest, otherwise, span)
+                }
+            }
+        }
+        TPatternKind.Fields(variant: variant, fields: fields) => {
+            var base = place.copy(alloc)
+            match variant {
+                Some(index) => {
+                    let name = try self.variant_name(pattern.ty, index)
+                    let is_variant = mut self.emit_value(nir::Op.Is(place: place.copy(alloc), ty: pattern.ty, variant: text::String.of(name.as_str(), alloc)), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
+                    let pass = mut self.b.block()
+                    mut self.end(nir::Terminator.Branch(operand: nir::Operand.Value(is_variant), then: nir::Jump.to(pass, alloc), otherwise: nir::Jump.to(otherwise, alloc)), span)
+                    mut self.b.at(pass)
+                    base = base.step(name.as_str(), alloc)
+                }
+                None => {}
+            }
+            for field in fields {
+                var at = base.copy(alloc)
+                if field.name.byte_len() > 0 {
+                    at = base.step(field.name.as_str(), alloc)
+                }
+                try mut self.tests(field.pattern, place: at, otherwise, span)
+            }
+        }
+    }
+} Elab.tests
+
+/// The operand of a value a pattern compares with: a literal, or a const's `constant`.
+fn Elab.compared(mut self, compared: Compared, ty: ty::Ty, span: nir::Span) -> nir::Operand fails Fault {
+    return match compared {
+        Compared.Literal(lit) => nir::Operand.Literal(try self.literal(lit, ty))
+        Compared.Const(item) => nir::Operand.Value(mut self.emit_value(nir::Op.Constant(nir::Constant.Item(item)), ty: nir::NTy.Owned(ty), span))
+    }
+} Elab.compared
+
+/// A comparison of a value with another, continuing when true and at `otherwise` when
+/// false.
+fn Elab.test_value(
+    mut self,
+    op: nir::BinaryOp,
+    take value: nir::Operand,
+    take literal: nir::Operand,
+    otherwise: nir::BlockId,
+    span: nir::Span,
+    ) {
+    let alloc = self.ck.alloc()
+    let compared = mut self.emit_value(nir::Op.Binary(op: op, left: take value, right: take literal), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
+    let pass = mut self.b.block()
+    mut self.end(nir::Terminator.Branch(operand: nir::Operand.Value(compared), then: nir::Jump.to(pass, alloc), otherwise: nir::Jump.to(otherwise, alloc)), span)
+    mut self.b.at(pass)
+} Elab.test_value
+
+fn Elab.variant_name(self, ty: ty::Ty, index: usize) -> text::String fails Fault {
+    let alloc = self.ck.alloc()
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        fail Fault.Unsupported(text::String.of("a variant pattern of no enum", alloc))
+    }
+    let sig = self.ck.sig(item)
+    return match sig.contents().kind {
+        SigKind.Enum(variants: variants) => text::String.of(variants[index].name.as_str(), alloc)
+        SigKind.Layout(fields: _, tags: tags, bits: _) => text::String.of(tags[index].as_str(), alloc)
+        else => fail Fault.Unsupported(text::String.of("a variant pattern of no enum", alloc))
+    }
+} Elab.variant_name
+
+/// The bindings a matched pattern makes in written order: a Copy part by `load`, a part of
+/// an owned scrutinee by `move` into a slot, any other part by `ref`.
+fn Elab.bind(mut self, pattern: TPattern, matched: Scrutinee, span: nir::Span) fails Fault {
+    var bound = mem::List[PatternBinding].empty(self.ck.alloc())
+    try self.bound(pattern, matched, found: mut bound)
+    for name in bound {
+        if name.moved {
+            let ty = self.body.contents().local(name.local).ty
+            let slot = mut self.binding_slot(name.local, ty, span)
+            mut self.move_bound(name, slot, span)
+            mut self.hold(slot)
+        } else {
+            let value = try mut self.binding_value(name, span)
+            discard mut self.held.insert(name.local, value: Held.Value(value))
+        }
+    }
+} Elab.bind
+
+/// The names a matched pattern binds, in written order.
+fn Elab.bound(self, pattern: TPattern, matched: Scrutinee, mut found: mem::List[PatternBinding]) fails Fault {
+    let alloc = self.ck.alloc()
+    match pattern.kind {
+        TPatternKind.Binding(local) => {
+            let moved = matched.owned and not self.ck.nir_copy(self.body.contents().local(local).ty)
+            mut found.push(PatternBinding(local: local, place: matched.place.copy(alloc), moved: moved))
+        }
+        TPatternKind.Fields(variant: variant, fields: fields) => {
+            var base = matched.place.copy(alloc)
+            match variant {
+                Some(index) => {
+                    let name = try self.variant_name(pattern.ty, index)
+                    base = base.step(name.as_str(), alloc)
+                }
+                None => {}
+            }
+            for field in fields {
+                var place = base.copy(alloc)
+                if field.name.byte_len() > 0 {
+                    place = base.step(field.name.as_str(), alloc)
+                }
+                let part = Scrutinee(place: take place, owned: matched.owned)
+                try self.bound(field.pattern, matched: part, mut found)
+            }
+        }
+        TPatternKind.Wildcard or TPatternKind.Value(space: _, compared: _) or TPatternKind.Failed => {}
+    }
+} Elab.bound
+
+/// The value binding a name without moving its part: a Copy part's `load`, a reference
+/// scrutinee itself, or the part's `ref`.
+fn Elab.binding_value(mut self, name: PatternBinding, span: nir::Span) -> nir::Value fails Fault {
+    let alloc = self.ck.alloc()
+    let ty = self.body.contents().local(name.local).ty
+    if self.ck.nir_copy(ty) {
+        let read = mut self.read_operand(name.place.copy(alloc), ty, span)
+        let Some(value) = operand_root(read) else {
+            fail Fault.Unsupported(text::String.of("a Copy part read as a place", alloc))
+        }
+        return value
+    }
+    if name.place.steps.len() == 0 and not self.b.is_slot(name.place.root) {
+        return name.place.root
+    }
+    return mut self.emit_value(nir::Op.Ref(name.place.copy(alloc)), ty: nir::NTy.Ref(ty), span)
+} Elab.binding_value
+
+/// Moves a bound part into a slot.
+fn Elab.move_bound(mut self, name: PatternBinding, slot: nir::Value, span: nir::Span) {
+    let alloc = self.ck.alloc()
+    let ty = self.body.contents().local(name.local).ty
+    let value = mut self.take_place(name.place.copy(alloc), ty, span)
+    mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc), operand: take value), span)
+} Elab.move_bound
+
+/// `let P = e`, or `let P = e else { B }` as a match with one arm and B.
+fn Elab.let_pattern(
+    mut self,
+    token: u32,
+    pattern: TPattern,
+    take matched: Scrutinee,
+    otherwise: Option[TBlock],
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.span(token)
+    match otherwise {
+        Some(block) => {
+            let failing = mut self.b.block()
+            let moved = nir::Place.copies(self.moved, alloc)
+            try mut self.tests(pattern, place: matched.place, otherwise: failing, span)
+            let pass = self.b.current_block()
+            mut self.b.at(failing)
+            discard try mut self.block_expr(block, ty: ty::Ty.never())
+            if self.b.open() {
+                mut self.end(nir::Terminator.Unreachable, span)
+            }
+            self.moved = moved
+            let Some(passing) = pass else {
+                return
+            }
+            mut self.b.at(passing)
+        }
+        None => {}
+    }
+    try mut self.bind(pattern, matched, span)
+} Elab.let_pattern
+
+/// The cursor a `for` loop obtains from its iterated expression in its form.
+fn Elab.cursor(mut self, iterated: TExpr, mode: ast::Mode, cursor: ty::Ty) -> Option[nir::Operand] fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.spanning(iterated)
+    if mode == ast::Mode.Read and iterated.ty == cursor {
+        return try mut self.arg(iterated, mode: ast::Mode.Take)
+    }
+    let name = match mode {
+        ast::Mode.Read => "cursor"
+        ast::Mode.Mut => "cursor_mut"
+        ast::Mode.Take => "into_cursor"
+    }
+    let fn_ref = try self.member_function(iterated.ty, name)
+    let Some(receiver) = try mut self.arg(iterated, mode) else {
+        return None
+    }
+    var args = mem::List[nir::Operand].empty(alloc)
+    mut args.push(take receiver)
+    return Some(nir::Operand.Value(mut self.call_value(take fn_ref, take args, ty: cursor, span)))
+} Elab.cursor
+
+/// The `next` of a cursor type, its element type and whether it is a projection.
+fn Elab.cursor_next(self, cursor: ty::Ty) -> CursorNext fails Fault {
+    let alloc = self.ck.alloc()
+    let fn_ref = try self.member_function(cursor, name: "next")
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        fail Fault.Unsupported(text::String.of("a cursor without next", alloc))
+    }
+    let Some(sig) = self.ck.fn_sig(item) else {
+        fail Fault.Unsupported(text::String.of("a cursor's next without head", alloc))
+    }
+    let types = self.ck.types()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(fn_ref.args), alloc)
+    let option = subst.ty(types, ty: sig.result)
+    let Some(element) = types.type_arg(option, index: 0) else {
+        fail Fault.Unsupported(text::String.of("a cursor's next not returning an Option", alloc))
+    }
+    return CursorNext(next: take fn_ref, element: element, projects: sig.is_proj())
+} Elab.cursor_next
+
+/// The function named after a type that method resolution finds for a member name.
+fn Elab.member_function(self, ty: ty::Ty, name: Str) -> nir::FnRef fails Fault {
+    let alloc = self.ck.alloc()
+    for candidate in self.ck.method_candidates(ty, name) {
+        match candidate {
+            Candidate.Function(item: item, subst: subst) => return self.member_ref(ty, item, subst)
+            Candidate.Method(bound: _, method: _, self_ty: _, function: Some(implementing), dynamic: _) => return self.member_ref(ty, item: implementing.item, subst: implementing.subst)
+            else => {}
+        }
+    }
+    var message = text::String.of("no function ", alloc)
+    mut message.append(name)
+    mut message.append(" for a cursor")
+    fail Fault.Unsupported(take message)
+} Elab.member_function
+
+/// A reference to a function named after a type, its generic parameters given by `subst`,
+/// then by the type's arguments, and otherwise standing for themselves.
+fn Elab.member_ref(self, ty: ty::Ty, item: ty::ItemId, subst: ty::Subst) -> nir::FnRef {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    let type_subst = match self.ck.type_key(ty) {
+        Some(key) => self.ck.type_subst(key, ty)
+        None => ty::Subst.empty(alloc)
+    }
+    var args = mem::List[ty::Arg].empty(alloc)
+    for def in self.ck.sig(item).contents().generics {
+        let arg = match subst.get(def.param) {
+            Some(given) => given
+            None => match type_subst.get(def.param) {
+                Some(given) => given
+                None => ty::Arg.Ty(types.intern(ty::TyKind.Param(def.param)))
+            }
+        }
+        mut args.push(arg)
+    }
+    return nir::FnRef.item(item, args: types.args(take args))
+} Elab.member_ref
+
+/// Binds a `for` pattern to the payload of the element `next` yielded: writable places in
+/// the `mut` form; copies of Copy parts and read-only view bindings of other parts when
+/// `next` is a projection; and owned parts moved into slots otherwise.
+fn Elab.bind_element(
+    mut self,
+    pattern: TPattern,
+    take part: nir::Place,
+    element: ty::Ty,
+    mode: ast::Mode,
+    projects: bool,
+    span: nir::Span,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    match pattern.kind {
+        TPatternKind.Binding(local) => {
+            if mode == ast::Mode.Mut {
+                let value = mut self.emit_value(nir::Op.RefMut(take part), ty: nir::NTy.RefMut(element), span)
+                discard mut self.held.insert(local, value: Held.Value(value))
+                return
+            }
+            if not projects and not self.ck.nir_copy(element) {
+                let slot = mut self.binding_slot(local, ty: element, span)
+                let value = mut self.take_place(take part, ty: element, span)
+                mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc), operand: take value), span)
+                mut self.hold(slot)
+                return
+            }
+        }
+        else => {}
+    }
+    let matched = Scrutinee(place: take part, owned: not projects)
+    try mut self.bind(pattern, matched, span)
+} Elab.bind_element
+
+/// Whether an arm has several alternatives binding names.
+fn binds_in_alternatives(arm: TArm) -> bool {
+    if arm.patterns.len() <= 1 {
+        return false
+    }
+    for pattern in arm.patterns {
+        if binds_names(pattern) {
+            return true
+        }
+    }
+    return false
+} binds_in_alternatives
+
+fn binds_names(pattern: TPattern) -> bool {
+    return match pattern.kind {
+        TPatternKind.Binding(_) => true
+        TPatternKind.Fields(variant: _, fields: fields) => fields.position(fn(field: TFieldPattern) => binds_names(field.pattern)).is_some()
+        else => false
+    }
+} binds_names

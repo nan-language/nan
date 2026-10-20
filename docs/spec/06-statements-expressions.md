@@ -148,7 +148,7 @@ discard_stmt = "discard" expr NL ;
 ```
 
 - An expression in statement position has type `Unit` or `Never`. A value of any other type is used, as an operand, initialiser, argument, assigned or returned value, or dropped with `discard`; an expression in statement position of another type is an error (`stmt.unused-result`), whose exact fix inserts `discard` before it.
-- `discard e` evaluates `e` and ends its value at once, as at [end of scope](07-ownership.md#ownership). `discard` before an expression of type `Unit` or `Never` is an error (`stmt.discard-unit`), whose exact fix deletes `discard`. Discarding a linear value is an error (`own.linear-dropped`, [linear consumption](07-ownership.md#linear-consumption)).
+- `discard e` evaluates `e` and ends its value at once, as at [end of scope](07-ownership.md#ownership): a place owning its value is moved, and a part or any other place not owning its value is read. `discard` before an expression of type `Unit` or `Never` is an error (`stmt.discard-unit`), whose exact fix deletes `discard`. Discarding a linear value is an error (`own.linear-dropped`, [linear consumption](07-ownership.md#linear-consumption)).
 - An `if` or `match` in statement position yields no value: its blocks hold statements, its arms' expression bodies are in statement position, and its type is `Never` when it diverges and `Unit` otherwise.
 
 ```nan
@@ -181,6 +181,14 @@ pub fn advance_twice(mut counter: Counter) -> u32 {
     mut counter.advance() // error: stmt.unused-result
     return mut counter.advance()
 } advance_twice
+```
+
+```nan
+pub fn reopened(alloc: mem::Alloc) -> usize {
+    let bytes = mem::Bytes.empty(alloc)
+    discard bytes
+    return bytes.len() // error: own.use-after-move
+} reopened
 ```
 
 ## Control flow
@@ -723,6 +731,20 @@ pub fn clamp_reading(reading: u32, limit: u32) -> u32 {
     let low: u32 = 10
     return clamp_to(reading, high: limit, low) // error: expr.argument-label
 } clamp_reading
+```
+
+```nan
+pub closed struct Gauge {
+    pub level: u32
+} Gauge
+
+pub fn Gauge.read(self) -> u32 {
+    return self.level
+} Gauge.read
+
+pub fn level_of(gauge: Gauge) -> u32 {
+    return Gauge.read(value: gauge) // error: expr.argument-label
+} level_of
 ```
 
 ### Markers

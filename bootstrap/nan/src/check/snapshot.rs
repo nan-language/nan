@@ -434,7 +434,10 @@ fn entry(
         }
     }
     entry.seals = kept_seals(items, path, old, pending.is_some());
-    let kept = ck.consumers_see(item) || !entry.accepted.is_empty() || !entry.seals.is_empty();
+    let kept = ck.consumers_see(item)
+        || !entry.accepted.is_empty()
+        || pending.is_some()
+        || !entry.seals.is_empty();
     (kept.then_some(entry), pending)
 }
 

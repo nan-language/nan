@@ -1,0 +1,548 @@
+//! Files, directories and their metadata.
+
+const O_RDONLY: i32 = 0
+
+const O_WRONLY: i32 = 1
+
+const O_CREAT: i32 = 0x40
+
+const O_EXCL: i32 = 0x80
+
+const O_TRUNC: i32 = 0x200
+
+const O_DIRECTORY: i32 = 0x1_0000
+
+const O_NOFOLLOW: i32 = 0x2_0000
+
+const O_CLOEXEC: i32 = 0x8_0000
+
+/// The directory `openat` and `unlinkat` resolve relative paths in when given no descriptor.
+const AT_FDCWD: i32 = -100
+
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100
+
+const AT_REMOVEDIR: i32 = 0x200
+
+const LOCK_SH: i32 = 1
+
+const LOCK_EX: i32 = 2
+
+const LOCK_UN: i32 = 8
+
+const S_IFMT: u32 = 0xF000
+
+const S_IFDIR: u32 = 0x4000
+
+const S_IFREG: u32 = 0x8000
+
+const S_IFLNK: u32 = 0xA000
+
+const DT_UNKNOWN: u8 = 0
+
+const DT_DIR: u8 = 4
+
+const DT_REG: u8 = 8
+
+const DT_LNK: u8 = 10
+
+const STDOUT: i32 = 1
+
+/// The bytes a read asks for at least, before the file's size is known.
+const READ_CHUNK: usize = 8_192
+
+/// glibc's `struct stat` on x86_64.
+layout Stat: bytes 144 le {
+    dev: u64 at 0
+    ino: u64 at 8
+    nlink: u64 at 16
+    mode: u32 at 24
+    uid: u32 at 28
+    gid: u32 at 32
+    pad: u32 at 36
+    rdev: u64 at 40
+    size: i64 at 48
+    blksize: i64 at 56
+    blocks: i64 at 64
+    times: Array[u64, 6] at 72
+    reserved: Array[u64, 3] at 120
+} Stat
+
+/// The fixed part of glibc's `struct dirent` on x86_64, which its NUL-terminated name follows.
+layout Dirent: bytes 19 le {
+    ino: u64 at 0
+    off: u64 at 8
+    reclen: u16 at 16
+    kind: u8 at 18
+} Dirent
+
+const DIRENT_NAME: isize = 19
+
+foreign fn open(path: hw::Ptr[u8], flags: i32, mode: u32) -> i32 convention "sysv"
+
+foreign fn openat(dir: i32, path: hw::Ptr[u8], flags: i32, mode: u32) -> i32 convention "sysv"
+
+foreign fn close(fd: i32) -> i32 convention "sysv"
+
+foreign fn read(fd: i32, buf: hw::Ptr[u8], count: usize) -> isize convention "sysv"
+
+foreign fn write(fd: i32, buf: hw::Ptr[u8], count: usize) -> isize convention "sysv"
+
+foreign fn fsync(fd: i32) -> i32 convention "sysv"
+
+foreign fn flock(fd: i32, operation: i32) -> i32 convention "sysv"
+
+foreign fn fstat(fd: i32, buf: hw::Ptr[Stat]) -> i32 convention "sysv"
+
+foreign fn stat(path: hw::Ptr[u8], buf: hw::Ptr[Stat]) -> i32 convention "sysv"
+
+foreign fn lstat(path: hw::Ptr[u8], buf: hw::Ptr[Stat]) -> i32 convention "sysv"
+
+foreign fn fstatat(dir: i32, path: hw::Ptr[u8], buf: hw::Ptr[Stat], flags: i32) -> i32 convention "sysv"
+
+foreign fn rename(from: hw::Ptr[u8], to: hw::Ptr[u8]) -> i32 convention "sysv"
+
+foreign fn unlink(path: hw::Ptr[u8]) -> i32 convention "sysv"
+
+foreign fn unlinkat(dir: i32, path: hw::Ptr[u8], flags: i32) -> i32 convention "sysv"
+
+foreign fn mkdir(path: hw::Ptr[u8], mode: u32) -> i32 convention "sysv"
+
+foreign fn opendir(path: hw::Ptr[u8]) -> hw::Ptr[u8] convention "sysv"
+
+foreign fn fdopendir(fd: i32) -> hw::Ptr[u8] convention "sysv"
+
+foreign fn dirfd(dir: hw::Ptr[u8]) -> i32 convention "sysv"
+
+foreign fn readdir(dir: hw::Ptr[u8]) -> hw::Ptr[Dirent] convention "sysv"
+
+foreign fn closedir(dir: hw::Ptr[u8]) -> i32 convention "sysv"
+
+foreign fn getcwd(buf: hw::Ptr[u8], size: usize) -> hw::Ptr[u8] convention "sysv"
+
+/// What kind of file a path names.
+pkg enum FileKind derives Copy, Eq {
+    Regular
+    Directory
+    Symlink
+    Other
+} FileKind
+
+/// What the system records of a file: its kind, its owner and its mode, the permission bits
+/// with the file type bits.
+pkg struct Metadata derives Copy {
+    pkg kind: FileKind
+    pkg uid: u32
+    pkg mode: u32
+} Metadata
+
+pkg fn Metadata.is_file(self) -> bool = self.kind == FileKind.Regular
+
+pkg fn Metadata.is_dir(self) -> bool = self.kind == FileKind.Directory
+
+pkg fn Metadata.is_symlink(self) -> bool = self.kind == FileKind.Symlink
+
+/// An entry of a directory: its name, as the system's bytes, and what kind of file it is.
+pkg struct DirEntry {
+    pkg name: mem::Bytes
+    pkg kind: FileKind
+} DirEntry
+
+/// A file this process holds open, until `close`.
+pkg linear struct File {
+    fd: i32
+} File
+
+/// Opens a file for reading.
+pkg fn File.open(path: Str) -> File fails IoError {
+    return try open_file(path, flags: O_RDONLY, mode: 0)
+} File.open
+
+/// Opens a file for writing, creating it with `mode` when it is missing and emptying it otherwise.
+pkg fn File.create(path: Str, mode: u32) -> File fails IoError {
+    return try open_file(path, flags: O_WRONLY | O_CREAT | O_TRUNC, mode)
+} File.create
+
+/// Creates a file with `mode` and opens it for writing; `AlreadyExists` when the path names one.
+pkg fn File.create_new(path: Str, mode: u32) -> File fails IoError {
+    return try open_file(path, flags: O_WRONLY | O_CREAT | O_EXCL, mode)
+} File.create_new
+
+/// Opens a file for writing without changing it, creating it with `mode` when it is missing.
+pkg fn File.open_or_create(path: Str, mode: u32) -> File fails IoError {
+    return try open_file(path, flags: O_WRONLY | O_CREAT, mode)
+} File.open_or_create
+
+fn open_file(path: Str, flags: i32, mode: u32) -> File fails IoError {
+    let name = try c_text(path.as_bytes())
+    loop {
+        let fd = trusted "name holds a NUL-terminated path" { open(hw::Ptr.of_view(name.bytes.view()), flags: flags | O_CLOEXEC, mode) }
+        if fd >= 0 {
+            return File(fd: fd)
+        }
+        let code = last_code()
+        if code != EINTR {
+            fail error_of(code)
+        }
+    }
+} open_file
+
+pkg fn File.close(take self) {
+    let File(fd: fd) = self
+    discard close(fd)
+} File.close
+
+/// Writes all of `data` at the file's position.
+pkg fn File.write_all(self, data: Slice[u8]) fails IoError {
+    try write_fd(self.fd, data)
+} File.write_all
+
+/// Returns once the file's contents and metadata are on disk.
+pkg fn File.sync_all(self) fails IoError {
+    loop {
+        if fsync(self.fd) == 0 {
+            return
+        }
+        let code = last_code()
+        if code != EINTR {
+            fail error_of(code)
+        }
+    }
+} File.sync_all
+
+/// Waits for the exclusive advisory lock of the file.
+pkg fn File.lock(self) fails IoError {
+    try checked(flock(self.fd, operation: LOCK_EX))
+} File.lock
+
+/// Waits for a shared advisory lock of the file.
+pkg fn File.lock_shared(self) fails IoError {
+    try checked(flock(self.fd, operation: LOCK_SH))
+} File.lock_shared
+
+/// Releases the advisory lock the file holds.
+pkg fn File.unlock(self) fails IoError {
+    try checked(flock(self.fd, operation: LOCK_UN))
+} File.unlock
+
+/// The rest of the file from its position.
+pkg fn File.read_to_end(self, alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    var room = READ_CHUNK
+    let held = fd_status(self.fd)
+    if held.size > 0 {
+        room = usize.fit(held.size) + 1
+    }
+    var data = mem::Bytes.zeroed(room, alloc)
+    var filled: usize = 0
+    loop {
+        if filled == data.len() {
+            let extra = mem::Bytes.zeroed(data.len(), alloc)
+            mut data.append(extra.view())
+        }
+        let start = hw::Ptr.of_view_mut(mut data.view_mut())
+        let count = trusted "start addresses the len bytes of data, of which filled are behind" { read(self.fd, buf: start.offset(isize.fit(filled)), count: data.len() - filled) }
+        if count == 0 {
+            mut data.truncate(filled)
+            return data
+        }
+        if count > 0 {
+            filled += usize.fit(count)
+            continue
+        }
+        let code = last_code()
+        if code != EINTR {
+            fail error_of(code)
+        }
+    }
+} File.read_to_end
+
+/// The status of an open file, all zero when the system gives none.
+fn fd_status(fd: i32) -> Stat {
+    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    let done = trusted "buffer addresses a struct stat" { fstat(fd, buf: buffer) }
+    if done != 0 {
+        return raw
+    }
+    return trusted "fstat wrote a struct stat at buffer" { buffer.read() }
+} fd_status
+
+/// Writes all of `data` to an open descriptor.
+fn write_fd(fd: i32, data: Slice[u8]) fails IoError {
+    var written: usize = 0
+    while written < data.len() {
+        let start = hw::Ptr.of_view(data)
+        let count = trusted "start addresses the len bytes of data, of which written are behind" { write(fd, buf: start.offset(isize.fit(written)), count: data.len() - written) }
+        if count > 0 {
+            written += usize.fit(count)
+            continue
+        }
+        if count == 0 {
+            fail IoError.Other(0)
+        }
+        let code = last_code()
+        if code != EINTR {
+            fail error_of(code)
+        }
+    }
+} write_fd
+
+/// Fails with the last error when a call of the C library reported failure with -1.
+fn checked(status: i32) fails IoError {
+    if status == -1 {
+        fail last_error()
+    }
+} checked
+
+/// Writes all of `data` to standard output.
+pkg fn write_stdout(data: Slice[u8]) fails IoError {
+    try write_fd(STDOUT, data)
+} write_stdout
+
+/// The contents of a file.
+pkg fn read_file(path: Str, alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    let file = try File.open(path)
+    defer take file.close()
+    return try file.read_to_end(alloc)
+} read_file
+
+/// The contents of a file, which hold text; `InvalidData` when they are not well-formed UTF-8.
+pkg fn read_text(path: Str, alloc: mem::Alloc) -> text::String fails IoError {
+    let data = try read_file(path, alloc)
+    let Ok(decoded) = attempt text::String.try_from_utf8(data.view(), alloc) else {
+        fail IoError.InvalidData
+    }
+    return decoded
+} read_text
+
+/// Writes a file whole, creating it with mode rw-rw-rw- when it is missing.
+pkg fn write_file(path: Str, contents: Slice[u8]) fails IoError {
+    let file = try File.create(path, mode: 0b110_110_110)
+    defer take file.close()
+    try file.write_all(contents)
+} write_file
+
+/// Renames a file or directory, replacing what `to` names.
+pkg fn rename_path(from: Str, to: Str) fails IoError {
+    let old = try c_text(from.as_bytes())
+    let new = try c_text(to.as_bytes())
+    try checked(trusted "old and new hold NUL-terminated paths" { rename(hw::Ptr.of_view(old.bytes.view()), to: hw::Ptr.of_view(new.bytes.view())) })
+} rename_path
+
+pkg fn remove_file(path: Str) fails IoError {
+    let name = try c_text(path.as_bytes())
+    try checked(trusted "name holds a NUL-terminated path" { unlink(hw::Ptr.of_view(name.bytes.view())) })
+} remove_file
+
+/// Creates a directory with `mode`, its parent existing.
+pkg fn create_dir(path: Str, mode: u32) fails IoError {
+    let name = try c_text(path.as_bytes())
+    try checked(trusted "name holds a NUL-terminated path" { mkdir(hw::Ptr.of_view(name.bytes.view()), mode) })
+} create_dir
+
+/// Creates a directory and every missing parent, with mode rwxrwxrwx; succeeds when the path names
+/// a directory.
+pkg fn create_dir_all(path: Str, alloc: mem::Alloc) fails IoError {
+    if path.is_empty() {
+        return
+    }
+    let made = attempt create_dir(path, mode: 0b111_111_111)
+    match first made {
+        Ok(_) => return
+        Err(IoError.NotFound) => {}
+        Err(error) => {
+            if is_dir(path) {
+                return
+            }
+            fail error
+        }
+    }
+    let Some(above) = parent(path, alloc) else {
+        fail IoError.Other(0)
+    }
+    try create_dir_all(above.as_str(), alloc)
+    let Err(error) = attempt create_dir(path, mode: 0b111_111_111) else {
+        return
+    }
+    if is_dir(path) {
+        return
+    }
+    fail error
+} create_dir_all
+
+/// The metadata of what a path names, a symbolic link followed.
+pkg fn metadata(path: Str) -> Metadata fails IoError {
+    let name = try c_text(path.as_bytes())
+    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    try checked(trusted "name holds a NUL-terminated path and buffer addresses a struct stat" { stat(hw::Ptr.of_view(name.bytes.view()), buf: buffer) })
+    return metadata_of(trusted "stat wrote a struct stat at buffer" { buffer.read() })
+} metadata
+
+/// The metadata of what a path names, a symbolic link itself.
+pkg fn symlink_metadata(path: Str) -> Metadata fails IoError {
+    let name = try c_text(path.as_bytes())
+    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    try checked(trusted "name holds a NUL-terminated path and buffer addresses a struct stat" { lstat(hw::Ptr.of_view(name.bytes.view()), buf: buffer) })
+    return metadata_of(trusted "lstat wrote a struct stat at buffer" { buffer.read() })
+} symlink_metadata
+
+fn metadata_of(held: Stat) -> Metadata {
+    let kind = match held.mode & S_IFMT {
+        S_IFREG => FileKind.Regular
+        S_IFDIR => FileKind.Directory
+        S_IFLNK => FileKind.Symlink
+        else => FileKind.Other
+    }
+    return Metadata(kind: kind, uid: held.uid, mode: held.mode)
+} metadata_of
+
+/// Whether a path names something, a symbolic link followed.
+pkg fn exists(path: Str) -> bool {
+    let Ok(_) = attempt metadata(path) else {
+        return false
+    }
+    return true
+} exists
+
+/// Whether a path names a directory, a symbolic link followed.
+pkg fn is_dir(path: Str) -> bool {
+    let Ok(held) = attempt metadata(path) else {
+        return false
+    }
+    return held.is_dir()
+} is_dir
+
+/// The entries of a directory but `.` and `..`, in the order the system gives them.
+pkg fn list_dir(path: Str, alloc: mem::Alloc) -> mem::List[DirEntry] fails IoError {
+    let name = try c_text(path.as_bytes())
+    let stream = trusted "name holds a NUL-terminated path" { opendir(hw::Ptr.of_view(name.bytes.view())) }
+    if stream.addr() == 0 {
+        fail last_error()
+    }
+    defer close_stream(stream)
+    return try stream_entries(stream, alloc)
+} list_dir
+
+fn close_stream(stream: hw::Ptr[u8]) {
+    discard trusted "stream is a directory stream this process opened and closes once" { closedir(stream) }
+} close_stream
+
+/// The entries a directory stream gives but `.` and `..`, each entry whose type the stream does
+/// not give read with `fstatat`.
+fn stream_entries(stream: hw::Ptr[u8], alloc: mem::Alloc) -> mem::List[DirEntry] fails IoError {
+    var found = mem::List[DirEntry].empty(alloc)
+    loop {
+        clear_code()
+        let entry = trusted "stream is an open directory stream" { readdir(stream) }
+        if entry.addr() == 0 {
+            let code = last_code()
+            if code != 0 {
+                fail error_of(code)
+            }
+            return found
+        }
+        let fixed = trusted "readdir returned a struct dirent that lives until the next readdir of stream" { entry.read() }
+        let start = trusted "a cast accesses no memory" { hw::Ptr[u8].cast(entry).offset(DIRENT_NAME) }
+        let name = copied_text(start, alloc)
+        if name.view() == b"." or name.view() == b".." {
+            continue
+        }
+        var kind = match fixed.kind {
+            DT_REG => FileKind.Regular
+            DT_DIR => FileKind.Directory
+            DT_LNK => FileKind.Symlink
+            else => FileKind.Other
+        }
+        if fixed.kind == DT_UNKNOWN {
+            kind = try entry_kind(stream, start)
+        }
+        mut found.push(DirEntry(name: take name, kind: kind))
+    }
+} stream_entries
+
+/// The kind of the file a directory stream's entry names, its name at `start`.
+fn entry_kind(stream: hw::Ptr[u8], start: hw::Ptr[u8]) -> FileKind fails IoError {
+    let dir = trusted "stream is an open directory stream" { dirfd(stream) }
+    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    try checked(trusted "start addresses the NUL-terminated name of an entry of dir and buffer a struct stat" { fstatat(dir, path: start, buf: buffer, flags: AT_SYMLINK_NOFOLLOW) })
+    return metadata_of(trusted "fstatat wrote a struct stat at buffer" { buffer.read() }).kind
+} entry_kind
+
+/// Removes a directory with everything in it, or a symbolic link itself; a symbolic link inside
+/// is removed, never followed.
+pkg fn remove_dir_all(path: Str, alloc: mem::Alloc) fails IoError {
+    let held = try symlink_metadata(path)
+    if held.is_symlink() {
+        try remove_file(path)
+        return
+    }
+    let name = try c_text(path.as_bytes())
+    try remove_tree(AT_FDCWD, name, alloc)
+} remove_dir_all
+
+/// Removes the directory `name` of the directory open as `dir`, after what it holds; `name`
+/// itself when it is not a directory and lies in a removed directory.
+fn remove_tree(dir: i32, name: CText, alloc: mem::Alloc) fails IoError {
+    let fd = trusted "name holds a NUL-terminated path" { openat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC, mode: 0) }
+    if fd < 0 {
+        let code = last_code()
+        if (code == ENOTDIR or code == ELOOP) and dir != AT_FDCWD {
+            try checked(trusted "name holds a NUL-terminated path" { unlinkat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: 0) })
+            return
+        }
+        fail error_of(code)
+    }
+    let stream = trusted "fd is a directory this process opened" { fdopendir(fd) }
+    if stream.addr() == 0 {
+        let error = last_error()
+        discard close(fd)
+        fail error
+    }
+    defer close_stream(stream)
+    let inner = trusted "stream is an open directory stream" { dirfd(stream) }
+    for entry in try stream_entries(stream, alloc) {
+        let child = try c_text(entry.name.view())
+        let removed = attempt remove_child(inner, name: child, kind: entry.kind, alloc)
+        let Err(error) = removed else {
+            continue
+        }
+        if error != IoError.NotFound {
+            fail error
+        }
+    }
+    let gone = trusted "name holds a NUL-terminated path" { unlinkat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: AT_REMOVEDIR) }
+    if gone == -1 {
+        let error = last_error()
+        if error != IoError.NotFound {
+            fail error
+        }
+    }
+} remove_tree
+
+fn remove_child(dir: i32, name: CText, kind: FileKind, alloc: mem::Alloc) fails IoError {
+    if kind == FileKind.Directory {
+        try remove_tree(dir, name, alloc)
+        return
+    }
+    try checked(trusted "name holds a NUL-terminated path" { unlinkat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: 0) })
+} remove_child
+
+/// The current directory of this process, as the system's bytes.
+pkg fn current_dir(alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    var size: usize = 512
+    loop {
+        var buffer = mem::Bytes.zeroed(size, alloc)
+        let start = hw::Ptr.of_view_mut(mut buffer.view_mut())
+        let found = trusted "start addresses the size bytes of buffer" { getcwd(start, size) }
+        if found.addr() != 0 {
+            return copied_text(start, alloc)
+        }
+        let code = last_code()
+        if code != ERANGE {
+            fail error_of(code)
+        }
+        size = size * 2
+    }
+} current_dir

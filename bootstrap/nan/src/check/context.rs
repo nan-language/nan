@@ -313,7 +313,9 @@ pub fn greens(workspace: &Workspace, scope: Option<&Scope>, lines: &[(String, u3
     let mut listed: HashSet<(String, u32)> = HashSet::new();
     for (_, checker) in &checkers {
         let db = &checker.db;
-        db.record();
+        if !lines.is_empty() {
+            db.record();
+        }
         let mut items: Vec<ItemId> = Vec::new();
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);

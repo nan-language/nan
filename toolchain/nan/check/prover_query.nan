@@ -1,0 +1,2916 @@
+//! Queries: the weakest precondition of each obligation site of a NIR function over its control-flow graph with back edges removed. The walk gives a term to each value and to the content of each place at each point, a reach condition to each block, and records the facts and obligation sites of each point.
+
+/// What an obligation site requires, by the rule defining it.
+enum Obligation derives Copy, Eq {
+    Check(nir::CheckKind)
+    Overflow
+    DivisionByZero
+    Shift
+    Conversion
+    Bounds
+} Obligation
+
+/// An obligation site of the function walked: its point, what it requires and its goal.
+struct Site derives Copy {
+    block: nir::BlockId
+    /// Its instruction's position, or the block's number of instructions for its terminator.
+    position: usize
+    obligation: Obligation
+    goal: u32
+    open: bool
+    span: nir::Span
+    /// The index of the ensures clause a `check ensures` checks.
+    clause: Option[u32]
+} Site
+
+/// A premise of a query, with its origin.
+struct Premise derives Copy {
+    term: u32
+    origin: Origin
+} Premise
+
+/// A query: its premises with their origins, then its goal.
+struct Query {
+    premises: mem::List[Premise]
+    goal: u32
+} Query
+
+/// An obligation site of a statement, with its query.
+struct StatementSite {
+    site: Site
+    query: Query
+} StatementSite
+
+/// The sites of a function walked within another, an invariant or assume function, each with
+/// its query.
+struct Statement {
+    role: nir::Role
+    index: u32
+    sites: mem::List[StatementSite]
+} Statement
+
+/// A fact of a block, holding from the point before its instruction at `from`.
+struct Fact derives Copy {
+    block: nir::BlockId
+    from: usize
+    term: u32
+    origin: Origin
+} Fact
+
+/// The root of a place: a slot, or the place a reference designates.
+enum Root derives Copy, Eq, Ord, Hash {
+    Slot(nir::Value)
+    /// The place a reference parameter or a reference-returning call designates.
+    Referent(nir::Value)
+} Root
+
+/// A place the walk tracks: its root and the steps from it, or a part of an owned value.
+enum Located {
+    Place(root: Root, steps: mem::List[text::String])
+    Owned(u32)
+} Located
+
+/// An edge of the walk: its target, condition, the arguments it passes and the contents on it.
+struct Edge {
+    target: nir::BlockId
+    condition: u32
+    args: mem::List[u32]
+    contents: mem::HashMap[Root, u32]
+} Edge
+
+/// An instruction of a block, by its position.
+struct InstAt derives Copy {
+    block: nir::BlockId
+    position: usize
+} InstAt
+
+/// A back edge of the control-flow graph.
+struct BackEdge derives Copy, Eq, Ord {
+    from: nir::BlockId
+    to: nir::BlockId
+} BackEdge
+
+/// A term a function walked for its value returns, with its reach condition.
+struct Returned derives Copy {
+    reach: u32
+    term: u32
+} Returned
+
+/// The contents at a `yield` of the region being walked, with its reach condition.
+struct Yielded {
+    reach: u32
+    contents: mem::HashMap[Root, u32]
+} Yielded
+
+/// The walk of one NIR function; the term store it extends goes beside it.
+struct Walk {
+    ck: Checker
+    /// The item whose code is judged, whose visibility decides unfolding.
+    holder: ty::ItemId
+    unit: mem::Shared[nir::NirUnit]
+    function: usize
+    subst: ty::Subst
+    /// The entry facts, the first premises of each query.
+    entry: mem::List[Premise]
+    values: mem::List[Option[u32]]
+    /// The place each reference value designates.
+    referents: mem::HashMap[nir::Value, Located]
+    /// The places each closure value captures by `mut` or `take`.
+    captured: mem::HashMap[nir::Value, mem::List[Located]]
+    /// The receiver place of each `mut` projection's result, which a write through the result
+    /// changes.
+    projected: mem::HashMap[Root, Located]
+    reach: mem::List[Option[u32]]
+    edges: mem::List[mem::List[Edge]]
+    /// The forward predecessors of each block.
+    preds: mem::List[mem::List[nir::BlockId]]
+    /// The block and position of the instruction whose region each region's first block
+    /// starts.
+    region_parent: mem::HashMap[nir::BlockId, InstAt]
+    /// The block holding the instruction of each region block's region.
+    region_holder: mem::HashMap[nir::BlockId, nir::BlockId]
+    /// The blocks of the enclosing code that the regions of each block's instructions jump to.
+    region_exits: mem::HashMap[nir::BlockId, mem::List[nir::BlockId]]
+    back: mem::Set[BackEdge]
+    dominators: mem::List[mem::List[bool]]
+    /// The content each root had when the loop whose header last gave it a fresh symbol
+    /// started.
+    loop_start: mem::HashMap[Root, u32]
+    facts: mem::List[Fact]
+    sites: mem::List[Site]
+    /// The invariant and assume functions walked at their calls.
+    statements: mem::List[Statement]
+    /// The returned terms of a function walked for its value, with their reach conditions.
+    returns: mem::List[Returned]
+    /// The contents at each `yield` of the region being walked, with its reach condition.
+    yields: mem::List[Yielded]
+    /// Whether the walk is of a function unfolded or called for its term, recording nothing.
+    nested: bool
+    /// The functions being unfolded, outermost first, which no call within unfolds again.
+    unfolding: mem::List[ty::ItemId]
+    /// The index of the unit's own ensures function each value is the result of a call to.
+    ensures_calls: mem::HashMap[nir::Value, u32]
+    /// Within the facts of one call, one requires site or the entry facts, the fresh symbol
+    /// standing for each opaque subterm: one naming a field or item the holder cannot see.
+    opaque: Option[mem::HashMap[u32, u32]]
+} Walk
+
+/// The point of a call: its block and position, and the block a call that may fail continues
+/// at when it returns.
+struct CallPoint derives Copy {
+    block: nir::BlockId
+    position: usize
+    ok: Option[nir::BlockId]
+} CallPoint
+
+/// What walking a region gives: the term it yields, if it yields, and the contents after it.
+struct RegionWalked {
+    yielded: Option[u32]
+    contents: mem::HashMap[Root, u32]
+} RegionWalked
+
+/// An interface method a call reaches through a bound or `Dyn`, with the type arguments of the
+/// interface's unit.
+struct Through derives Copy {
+    item: ty::ItemId
+    method: u32
+    unit_args: ty::Args
+} Through
+
+/// The value whose largest steps mark a block's facts as all holding on the way.
+const WHOLE_BLOCK: usize = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The owners of the `at` and `at_mut` that carry a bounds obligation.
+const INDEXED_OWNERS: Str = "core::Array core::Slice core::SliceMut mem::List mem::Bytes mem::Bounded"
+
+/// Walks a function of a unit, its parameters having the given terms: for a reference
+/// parameter, the content of the place it designates.
+fn Walk.new(
+    take ck: Checker,
+    holder: ty::ItemId,
+    take unit: mem::Shared[nir::NirUnit],
+    function: usize,
+    type_args: ty::Args,
+    take params: mem::List[u32],
+    take entry: mem::List[Premise],
+    ) -> Walk {
+    let alloc = ck.alloc()
+    let blocks = unit.contents().functions[function].blocks.len()
+    let values = unit.contents().functions[function].types.len()
+    let subst = ck.unit_subst(unit.contents().item, args: ck.types().arg_list(type_args))
+    var walk = Walk(
+        ck: take ck,
+        holder: holder,
+        unit: take unit,
+        function: function,
+        subst: take subst,
+        entry: mem::List[Premise].empty(alloc),
+        values: absent_terms(values, alloc),
+        referents: mem::HashMap[nir::Value, Located].empty(seed: 0, alloc),
+        captured: mem::HashMap[nir::Value, mem::List[Located]].empty(seed: 0, alloc),
+        projected: mem::HashMap[Root, Located].empty(seed: 0, alloc),
+        reach: absent_terms(blocks, alloc),
+        edges: empty_edges(blocks, alloc),
+        preds: block_lists(blocks, alloc),
+        region_parent: mem::HashMap[nir::BlockId, InstAt].empty(seed: 0, alloc),
+        region_holder: mem::HashMap[nir::BlockId, nir::BlockId].empty(seed: 0, alloc),
+        region_exits: mem::HashMap[nir::BlockId, mem::List[nir::BlockId]].empty(seed: 0, alloc),
+        back: mem::Set[BackEdge].empty(alloc),
+        dominators: mem::List[mem::List[bool]].empty(alloc),
+        loop_start: mem::HashMap[Root, u32].empty(seed: 0, alloc),
+        facts: mem::List[Fact].empty(alloc),
+        sites: mem::List[Site].empty(alloc),
+        statements: mem::List[Statement].empty(alloc),
+        returns: mem::List[Returned].empty(alloc),
+        yields: mem::List[Yielded].empty(alloc),
+        nested: false,
+        unfolding: mem::List[ty::ItemId].empty(alloc),
+        ensures_calls: mem::HashMap[nir::Value, u32].empty(seed: 0, alloc),
+        opaque: None,
+    )
+    let shared = walk.unit.share()
+    let walked = shared.contents().functions[function]
+    for param in walked.params {
+        if walked.ty(param.value).is_reference() {
+            discard mut walk.referents.insert(param.value, value: Located.Place(root: Root.Referent(param.value), steps: mem::List[text::String].empty(alloc)))
+        }
+    }
+    mut walk.restart(take params, take entry)
+    mut walk.shape()
+    return walk
+} Walk.new
+
+/// Gives the parameters their terms and the walk its entry facts, before it walks.
+fn Walk.restart(mut self, take params: mem::List[u32], take entry: mem::List[Premise]) {
+    let shared = self.unit.share()
+    let declared = shared.contents().functions[self.function].params
+    var index: usize = 0
+    while index < declared.len() and index < params.len() {
+        self.values[usize.widen(declared[index].value.index)] = Some(params[index])
+        index += 1
+    }
+    self.entry = entry
+} Walk.restart
+
+proj fn Walk.nir(self) -> nir::Function {
+    return self.unit.contents().functions[self.function]
+} Walk.nir
+
+/// The forward graph: predecessors, back edges and dominators, each region's first block
+/// dominated by its instruction's block, and the region blocks and exits of each block.
+fn Walk.shape(mut self) {
+    let alloc = self.ck.alloc()
+    let shared = self.unit.share()
+    let function = shared.contents().functions[self.function]
+    let count = function.blocks.len()
+    var all_preds = block_lists(count, alloc)
+    for index in 0..<count {
+        for target in function.blocks[index].term.successors(alloc) {
+            mut all_preds[usize.widen(target.index)].push(nir::BlockId(index: u32.fit(index)))
+        }
+    }
+    var dominating = copied_block_lists(all_preds.view(), alloc)
+    for index in 0..<count {
+        let holder = nir::BlockId(index: u32.fit(index))
+        let insts = function.blocks[index].insts
+        for position in 0..<insts.len() {
+            match insts[position].op {
+                nir::Op.Quantifier(all: _, low: _, high: _, inclusive: _, region: region) or nir::Op.When(attempted: _, accesses: _, region: region) => {
+                    mut self.note_region(holder, position, region, function, mut dominating)
+                }
+                else => {}
+            }
+        }
+    }
+    let dominators = dominator_sets(dominating.view(), count, alloc)
+    for index in 0..<count {
+        let target = nir::BlockId(index: u32.fit(index))
+        for pred in all_preds[index] {
+            if dominators[usize.widen(pred.index)][index] {
+                discard mut self.back.insert(BackEdge(from: pred, to: target))
+            } else if not holds_block(self.preds[index].view(), block: pred) {
+                mut self.preds[index].push(pred)
+            }
+        }
+        mut self.preds[index].sort_by(fn(left: nir::BlockId, right: nir::BlockId) => left.cmp(right))
+    }
+    self.dominators = dominators
+} Walk.shape
+
+/// Records the region of an instruction: its first block's parent, which dominates that block,
+/// the holder of each of its blocks, and the blocks outside it they jump to.
+fn Walk.note_region(
+    mut self,
+    holder: nir::BlockId,
+    position: usize,
+    region: nir::Region,
+    function: nir::Function,
+    mut dominating: mem::List[mem::List[nir::BlockId]],
+    ) {
+    let alloc = self.ck.alloc()
+    let entry = region.blocks[0]
+    discard mut self.region_parent.insert(entry, value: InstAt(block: holder, position: position))
+    mut dominating[usize.widen(entry.index)].push(holder)
+    for inner in region.blocks {
+        discard mut self.region_holder.insert(inner, value: holder)
+        for target in function.block(inner).term.successors(alloc) {
+            if not holds_block(region.blocks.view(), block: target) {
+                mut self.add_region_exit(holder, target)
+            }
+        }
+    }
+} Walk.note_region
+
+/// Records a block outside a region that a block of the region jumps to.
+fn Walk.add_region_exit(mut self, holder: nir::BlockId, target: nir::BlockId) {
+    if self.region_exits.contains(holder) {
+        var exits = mut self.region_exits.at_mut(holder)
+        mut exits.push(target)
+        return
+    }
+    var exits = mem::List[nir::BlockId].empty(self.ck.alloc())
+    mut exits.push(target)
+    discard mut self.region_exits.insert(holder, value: take exits)
+} Walk.add_region_exit
+
+/// The blocks dominating each block, as the fixed point over the given predecessors.
+fn dominator_sets(dominating: Slice[mem::List[nir::BlockId]], count: usize, alloc: mem::Alloc) -> mem::List[mem::List[bool]] {
+    var dominators = mem::List[mem::List[bool]].empty(alloc)
+    for index in 0..<count {
+        var row = flags_of(count, value: true, alloc)
+        if index == 0 {
+            for other in 0..<count {
+                row[other] = other == 0
+            }
+        }
+        mut dominators.push(take row)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for block in 1..<count {
+            var next = flags_of(count, value: dominating[block].len() > 0, alloc)
+            for pred in dominating[block] {
+                let held = dominators[usize.widen(pred.index)]
+                for index in 0..<count {
+                    next[index] = next[index] and held[index]
+                }
+            }
+            next[block] = true
+            if next != dominators[block] {
+                dominators[block] = next
+                changed = true
+            }
+        }
+    }
+    return dominators
+} dominator_sets
+
+/// Walks every block reachable from the entry, each after its forward predecessors.
+fn Walk.walk(mut self, mut terms: Terms) {
+    let shared = self.unit.share()
+    let function = shared.contents().functions[self.function]
+    let order = self.order(nir::BlockId(index: 0), within: None)
+    for index in 0..<order.len() {
+        let block = order[index]
+        let data = function.block(block)
+        let contents = match index {
+            0 => mut self.start(mut terms)
+            else => mut self.block_entry(mut terms, block, data)
+        }
+        mut self.block(mut terms, block, data, take contents)
+    }
+} Walk.walk
+
+/// The contents at the function's entry: each reference parameter's place holds its term.
+fn Walk.start(mut self, mut terms: Terms) -> mem::HashMap[Root, u32] {
+    self.reach[0] = Some(mut terms.boolean(true))
+    var contents = mem::HashMap[Root, u32].empty(seed: 0, alloc: self.ck.alloc())
+    let shared = self.unit.share()
+    let function = shared.contents().functions[self.function]
+    for param in function.params {
+        if function.ty(param.value).is_reference() {
+            discard mut contents.insert(Root.Referent(param.value), value: self.value(param.value))
+        }
+    }
+    return contents
+} Walk.start
+
+/// The blocks reachable from `start` along forward edges, within a region's blocks when
+/// given, in an order where each follows its forward predecessors; a block a region jumps
+/// to is reached from, and follows, the block holding the region's instruction.
+fn Walk.order(self, start: nir::BlockId, within: Option[Slice[nir::BlockId]]) -> mem::List[nir::BlockId] {
+    let alloc = self.ck.alloc()
+    let function = self.nir()
+    var seen = mem::Set[nir::BlockId].empty(alloc)
+    discard mut seen.insert(start)
+    var pending = mem::List[nir::BlockId].empty(alloc)
+    mut pending.push(start)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        var successors = function.block(block).term.successors(alloc)
+        match self.region_exits.get(block) {
+            Some(exits) => {
+                for exit in exits {
+                    mut successors.push(exit)
+                }
+            }
+            None => {}
+        }
+        for successor in successors {
+            if self.back.contains(BackEdge(from: block, to: successor)) or not within_blocks(within, block: successor) {
+                continue
+            }
+            if mut seen.insert(successor) {
+                mut pending.push(successor)
+            }
+        }
+    }
+    var order = mem::List[nir::BlockId].empty(alloc)
+    mut order.push(start)
+    var done = mem::Set[nir::BlockId].empty(alloc)
+    discard mut done.insert(start)
+    while order.len() < seen.len() {
+        let Some(next) = self.next_in_order(seen, done) else {
+            expect false
+            return order
+        }
+        discard mut done.insert(next)
+        mut order.push(next)
+    }
+    return order
+} Walk.order
+
+/// The first block seen and not done whose forward predecessors seen, each taken outside the
+/// regions not seen, are all done.
+fn Walk.next_in_order(self, seen: mem::Set[nir::BlockId], done: mem::Set[nir::BlockId]) -> Option[nir::BlockId] {
+    for block in seen {
+        if done.contains(block) {
+            continue
+        }
+        var ready = true
+        for pred in self.preds[usize.widen(block.index)] {
+            let outer = self.outside(pred, seen)
+            if seen.contains(outer) and not done.contains(outer) {
+                ready = false
+                break
+            }
+        }
+        if ready {
+            return Some(block)
+        }
+    }
+    return None
+} Walk.next_in_order
+
+/// A block, or the block holding the instruction of its region when it is not seen, repeated
+/// until one is seen or holds no region's instruction.
+fn Walk.outside(self, block: nir::BlockId, seen: mem::Set[nir::BlockId]) -> nir::BlockId {
+    var current = block
+    while not seen.contains(current) {
+        let Some(holder) = self.region_holder.get(current) else {
+            return current
+        }
+        current = holder
+    }
+    return current
+} Walk.outside
+
+/// The term of a value.
+fn Walk.value(self, value: nir::Value) -> u32 {
+    let Some(term) = self.values[usize.widen(value.index)] else {
+        expect false
+        return 0
+    }
+    return term
+} Walk.value
+
+fn Walk.ty(self, value: nir::Value) -> ty::Ty {
+    return self.subst.ty(self.ck.types(), ty: self.nir().ty(value).ty())
+} Walk.ty
+
+/// Walks a block's instructions from its entry contents, then records its edges.
+fn Walk.block(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block, take contents: mem::HashMap[Root, u32]) {
+    for position in 0..<data.insts.len() {
+        mut self.inst(mut terms, block, position, inst: data.insts[position], mut contents)
+    }
+    let edges = mut self.terminator(mut terms, block, data, take contents)
+    self.edges[usize.widen(block.index)] = edges
+} Walk.block
+
+/// The contents at a block's entry, its reach condition and parameters, merged from its
+/// incoming forward edges; at a loop's header, each place the loop changes, and each
+/// parameter, has a fresh symbol instead.
+fn Walk.block_entry(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block) -> mem::HashMap[Root, u32] {
+    let alloc = self.ck.alloc()
+    var conditions = mem::List[u32].empty(alloc)
+    var incoming = mem::List[Edge].empty(alloc)
+    for pred in self.preds[usize.widen(block.index)] {
+        for edge in self.edges[usize.widen(pred.index)] {
+            if edge.target == block {
+                mut conditions.push(edge.condition)
+                mut incoming.push(edge.copy(alloc))
+            }
+        }
+    }
+    self.reach[usize.widen(block.index)] = Some(mut terms.disjunction(listed_terms(conditions.view(), alloc)))
+    var contents = mem::HashMap[Root, u32].empty(seed: 0, alloc)
+    if incoming.len() > 0 {
+        for root in sorted_roots(incoming[0].contents, alloc) {
+            let Some(arms) = incoming_arms(incoming.view(), root, alloc) else {
+                continue
+            }
+            let merged = self.ites(mut terms, conditions: conditions.view(), arms: arms.view())
+            discard mut contents.insert(root, value: merged)
+        }
+    }
+    let header = self.is_header(block)
+    for index in 0..<data.params.len() {
+        let param = data.params[index]
+        var term: u32 = 0
+        if header or incoming.len() == 0 {
+            let ty = self.ty(param)
+            term = mut terms.fresh(ty)
+        } else {
+            var arms = mem::List[u32].empty(alloc)
+            for edge in incoming {
+                mut arms.push(edge.args[index])
+            }
+            term = self.ites(mut terms, conditions: conditions.view(), arms: arms.view())
+        }
+        self.values[usize.widen(param.index)] = Some(term)
+    }
+    if header {
+        for root in self.changed_in_loop(block) {
+            let Some(old) = contents.get(root) else {
+                continue
+            }
+            discard mut self.loop_start.insert(root, value: old)
+            let ty = terms.ty(old)
+            let fresh = mut terms.fresh(ty)
+            discard mut contents.insert(root, value: fresh)
+        }
+    }
+    return contents
+} Walk.block_entry
+
+/// Whether a block is the target of a back edge: a loop's header.
+fn Walk.is_header(self, block: nir::BlockId) -> bool {
+    for edge in self.back {
+        if edge.to == block {
+            return true
+        }
+    }
+    return false
+} Walk.is_header
+
+/// `ite(c1, a1, ite(c2, a2, ... an))`, or the one term all arms are.
+fn Walk.ites(self, mut terms: Terms, conditions: Slice[u32], arms: Slice[u32]) -> u32 {
+    var term = arms[arms.len() - 1]
+    var index = arms.len() - 1
+    while index > 0 {
+        index -= 1
+        term = mut terms.ite(conditions[index], then: arms[index], otherwise: term)
+    }
+    return term
+} Walk.ites
+
+/// The roots whose content an instruction or call of a loop's blocks, or of the regions
+/// they hold, changes.
+fn Walk.changed_in_loop(self, header: nir::BlockId) -> mem::List[Root] {
+    let alloc = self.ck.alloc()
+    let function = self.nir()
+    var blocks = mem::Set[nir::BlockId].empty(alloc)
+    discard mut blocks.insert(header)
+    var pending = mem::List[nir::BlockId].empty(alloc)
+    for edge in self.back {
+        if edge.to == header {
+            mut pending.push(edge.from)
+        }
+    }
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        if mut blocks.insert(block) {
+            for pred in self.preds[usize.widen(block.index)] {
+                mut pending.push(pred)
+            }
+            match self.region_parent.get(block) {
+                Some(parent) => mut pending.push(parent.block)
+                None => {}
+            }
+        }
+    }
+    var held = mem::List[nir::BlockId].empty(alloc)
+    for entry in self.region_holder {
+        if self.held_by(entry.key(), blocks) {
+            mut held.push(entry.key())
+        }
+    }
+    for block in held {
+        discard mut blocks.insert(block)
+    }
+    var roots = mem::List[Root].empty(alloc)
+    for block in blocks {
+        let data = function.block(block)
+        for inst in data.insts {
+            for place in written_places(inst.op, alloc) {
+                self.add_root(mut roots, place)
+            }
+        }
+        match data.term {
+            nir::Terminator.Call(call: call, ok: _, failure: _) => {
+                for place in changed_places(call, alloc) {
+                    self.add_root(mut roots, place)
+                }
+            }
+            else => {}
+        }
+    }
+    mut roots.sort_by(fn(left: Root, right: Root) => left.cmp(right))
+    var distinct = mem::List[Root].empty(alloc)
+    for root in roots {
+        let count = distinct.len()
+        if count == 0 or distinct[count - 1] != root {
+            mut distinct.push(root)
+        }
+    }
+    return distinct
+} Walk.changed_in_loop
+
+/// Adds the root of a place to a list, when the walk knows it.
+fn Walk.add_root(self, mut roots: mem::List[Root], place: nir::Place) {
+    match self.root_of(place) {
+        Some(root) => mut roots.push(root)
+        None => {}
+    }
+} Walk.add_root
+
+/// The root a NIR place lies in, as far as the walk knows it.
+fn Walk.root_of(self, place: nir::Place) -> Option[Root] {
+    match self.referents.get(place.root) {
+        Some(Located.Place(root: root, steps: _)) => return Some(root)
+        else => {}
+    }
+    if self.is_slot(place.root) {
+        return Some(Root.Slot(place.root))
+    }
+    return None
+} Walk.root_of
+
+fn Walk.is_slot(self, value: nir::Value) -> bool {
+    for block in self.nir().blocks {
+        for inst in block.insts {
+            if inst.result != Some(value) {
+                continue
+            }
+            match inst.op {
+                nir::Op.Slot(name: _, ty: _) => return true
+                else => {}
+            }
+        }
+    }
+    return false
+} Walk.is_slot
+
+/// Where a NIR place lies: a root and steps, or a part of an owned value.
+fn Walk.locate(mut self, mut terms: Terms, place: nir::Place) -> Located {
+    let alloc = self.ck.alloc()
+    let base = match self.referents.get(place.root) {
+        Some(located) => located.copy(alloc)
+        None => self.unreferenced(place.root)
+    }
+    return match base {
+        Located.Place(root: root, steps: steps) => Located.Place(root: root, steps: joined_steps(steps.view(), more: place.steps.view(), alloc))
+        Located.Owned(term) => Located.Owned(mut self.field_path(mut terms, term, steps: place.steps.view()))
+    }
+} Walk.locate
+
+/// Where a value that designates no place lies: the slot it is, or the owned value.
+fn Walk.unreferenced(self, value: nir::Value) -> Located {
+    if self.is_slot(value) {
+        return Located.Place(root: Root.Slot(value), steps: mem::List[text::String].empty(self.ck.alloc()))
+    }
+    return Located.Owned(self.value(value))
+} Walk.unreferenced
+
+/// The term a path of steps takes of a term.
+fn Walk.field_path(mut self, mut terms: Terms, term: u32, steps: Slice[text::String]) -> u32 {
+    var current = term
+    for step in steps {
+        current = mut self.field(mut terms, term: current, step: step.as_str())
+    }
+    return current
+} Walk.field_path
+
+/// The content of a place at a point.
+fn Walk.content(mut self, mut terms: Terms, located: Located, contents: mem::HashMap[Root, u32]) -> u32 {
+    match located {
+        Located.Owned(term) => return term
+        Located.Place(root: root, steps: steps) => {
+            var term: u32 = 0
+            match contents.get(root) {
+                Some(held) => {
+                    term = held
+                }
+                None => {
+                    term = mut terms.fresh(ty::Ty.unit())
+                }
+            }
+            return mut self.field_path(mut terms, term, steps: steps.view())
+        }
+    }
+} Walk.content
+
+/// The field or payload a step takes of a term: the operand of a construction or variant,
+/// the ite of the arms' fields for an ite, otherwise the field step application.
+fn Walk.field(mut self, mut terms: Terms, term: u32, step: Str) -> u32 {
+    match first terms.get(term) {
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            let left = mut self.field(mut terms, term: then, step)
+            let right = mut self.field(mut terms, term: otherwise, step)
+            return mut terms.ite(condition, then: left, otherwise: right)
+        }
+        Term.App(op: Op.Construct(constructed), args: operands) => {
+            match self.field_index(ty: constructed, name: step) {
+                Some(index) => return operands[index]
+                None => {}
+            }
+        }
+        Term.App(op: Op.Variant(ty: _, index: _), args: operands) if nir::is_variant_step(step) and operands.len() == 1 => return operands[0]
+        else => {}
+    }
+    let ty = self.step_ty(terms, term, step)
+    let field = mut terms.intern(Term.Field(base: term, name: text::String.of(step, alloc: self.ck.alloc())), ty)
+    let hidden = self.hidden_field(terms, term, step)
+    return mut self.opaque_term(mut terms, term: field, hidden)
+} Walk.field
+
+/// Whether a field a step takes of a term is one the code judged cannot see.
+fn Walk.hidden_field(self, terms: Terms, term: u32, step: Str) -> bool {
+    let ty::TyKind.Item(item: owner, args: _) = self.ck.types().kind(terms.ty(term)) else {
+        return false
+    }
+    let sig = self.ck.sig(owner)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for declared in fields {
+                if declared.name.as_str() == step {
+                    return not self.ck.db().field_visible(self.module(), owner, visibility: declared.visibility)
+                }
+            }
+            return false
+        }
+        else => return false
+    }
+} Walk.hidden_field
+
+/// The module of the code judged.
+fn Walk.module(self) -> ty::ModuleId {
+    return self.ck.db().module_of(self.holder)
+} Walk.module
+
+/// A subterm, or within a scope of opacity the fresh symbol standing for it when `hidden`.
+fn Walk.opaque_term(mut self, mut terms: Terms, term: u32, hidden: bool) -> u32 {
+    if not hidden {
+        return term
+    }
+    let Some(held) = mut self.opaque.extract() else {
+        return term
+    }
+    let known = held.get(term)
+    match known {
+        Some(symbol) => {
+            self.opaque = Some(take held)
+            return symbol
+        }
+        None => {}
+    }
+    let ty = terms.ty(term)
+    let symbol = mut terms.fresh(ty)
+    self.opaque = Some(symbol_added(take held, term, symbol))
+    return symbol
+} Walk.opaque_term
+
+/// A map of opaque subterms with one more symbol.
+fn symbol_added(take opaque: mem::HashMap[u32, u32], term: u32, symbol: u32) -> mem::HashMap[u32, u32] {
+    discard mut opaque.insert(term, value: symbol)
+    return opaque
+} symbol_added
+
+/// Computes within its own scope of opacity.
+fn Walk.opaquely[T](mut self, compute: fn(mut walk: Walk) -> T) -> T {
+    let outer = mut self.opaque.extract()
+    self.opaque = Some(mem::HashMap[u32, u32].empty(seed: 0, alloc: self.ck.alloc()))
+    let computed = compute(mut self)
+    self.opaque = outer
+    return computed
+} Walk.opaquely
+
+fn Walk.field_index(self, ty: ty::Ty, name: Str) -> Option[usize] {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        return None
+    }
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for index in 0..<fields.len() {
+                if fields[index].name.as_str() == name {
+                    return Some(index)
+                }
+            }
+            return None
+        }
+        else => return None
+    }
+} Walk.field_index
+
+/// The type of a field or payload step of a term.
+fn Walk.step_ty(self, terms: Terms, term: u32, step: Str) -> ty::Ty {
+    let types = self.ck.types()
+    let ty = terms.ty(term)
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return ty::Ty.error()
+    }
+    let sig = self.ck.sig(item)
+    let held = sig.contents()
+    let subst = generics_subst(held.generics.view(), args: types.arg_list(args), alloc: self.ck.alloc())
+    match held.kind {
+        SigKind.Struct(fields: fields) or SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                if field.name.as_str() == step {
+                    return subst.ty(types, ty: field.ty)
+                }
+            }
+            return ty::Ty.error()
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                if variant.name.as_str() == step {
+                    return match variant.payload {
+                        Payload.Single(single) => subst.ty(types, ty: single)
+                        else => ty
+                    }
+                }
+            }
+            for variant in variants {
+                let Payload.Labelled(fields) = variant.payload else {
+                    continue
+                }
+                for field in fields {
+                    if field.name.as_str() == step {
+                        return subst.ty(types, ty: field.ty)
+                    }
+                }
+            }
+            return ty::Ty.error()
+        }
+        else => return ty::Ty.error()
+    }
+} Walk.step_ty
+
+/// Stores a term into a place: its root's content becomes the term, or the root's former
+/// content with the place's field replaced. A store through a `mut` projection's result
+/// gives its receiver a fresh symbol.
+fn Walk.store(mut self, mut terms: Terms, located: Located, term: u32, mut contents: mem::HashMap[Root, u32]) {
+    let Located.Place(root: root, steps: steps) = located else {
+        return
+    }
+    var updated = term
+    match contents.get(root) {
+        Some(old) => {
+            updated = mut self.replace(mut terms, term: old, steps: steps.view(), new: term)
+        }
+        None => {
+            if steps.len() > 0 {
+                let ty = terms.ty(term)
+                updated = mut terms.fresh(ty)
+            }
+        }
+    }
+    discard mut contents.insert(root, value: updated)
+    let alloc = self.ck.alloc()
+    let receiver = match self.projected.get(root) {
+        Some(found) => Some(found.copy(alloc))
+        None => None
+    }
+    let Some(changed) = receiver else {
+        return
+    }
+    mut self.havoc(mut terms, located: changed, mut contents)
+} Walk.store
+
+/// A term with the part at a path replaced: a struct's construction of its fields with the
+/// replaced one new; a fresh symbol for a path through another kind of value.
+fn Walk.replace(mut self, mut terms: Terms, term: u32, steps: Slice[text::String], new: u32) -> u32 {
+    let Some(parts) = steps.split_at(1) else {
+        return new
+    }
+    let head_step = parts.head[0].as_str()
+    let ty = terms.ty(term)
+    let names = self.struct_field_names(ty)
+    if not names.position(fn(name: text::String) => name.as_str() == head_step).is_some() {
+        return mut terms.fresh(ty)
+    }
+    var operands = mem::List[u32].empty(self.ck.alloc())
+    for name in names {
+        let part = mut self.field(mut terms, term, step: name.as_str())
+        if name.as_str() == head_step {
+            mut operands.push(mut self.replace(mut terms, term: part, steps: parts.tail, new))
+        } else {
+            mut operands.push(part)
+        }
+    }
+    return mut terms.intern(Term.App(op: Op.Construct(ty), args: take operands), ty)
+} Walk.replace
+
+/// The names of a struct type's fields, in declaration order; none for another type.
+fn Walk.struct_field_names(self, ty: ty::Ty) -> mem::List[text::String] {
+    let alloc = self.ck.alloc()
+    var names = mem::List[text::String].empty(alloc)
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        return names
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return names
+    }
+    for field in fields {
+        mut names.push(text::String.of(field.name.as_str(), alloc))
+    }
+    return names
+} Walk.struct_field_names
+
+/// Gives a place a fresh symbol as content, as the frame rule does for a place a call may
+/// change.
+fn Walk.havoc(mut self, mut terms: Terms, located: Located, mut contents: mem::HashMap[Root, u32]) {
+    let current = mut self.content(mut terms, located, contents)
+    let ty = terms.ty(current)
+    let fresh = mut terms.fresh(ty)
+    mut self.store(mut terms, located, term: fresh, mut contents)
+} Walk.havoc
+
+/// The term of an operand; a reference stands for the content of the place it designates.
+fn Walk.operand(mut self, mut terms: Terms, operand: nir::Operand, contents: mem::HashMap[Root, u32]) -> u32 {
+    let alloc = self.ck.alloc()
+    match operand {
+        nir::Operand.Value(value) => {
+            let referent = match self.referents.get(value) {
+                Some(found) => Some(found.copy(alloc))
+                None => None
+            }
+            let Some(located) = referent else {
+                return self.value(value)
+            }
+            return mut self.content(mut terms, located, contents)
+        }
+        nir::Operand.Literal(literal) => return mut terms.literal(literal.copy(alloc))
+        nir::Operand.Place(mode: _, place: place) => {
+            let located = mut self.locate(mut terms, place)
+            return mut self.content(mut terms, located, contents)
+        }
+    }
+} Walk.operand
+
+/// The terms of operands, in order.
+fn Walk.operands(mut self, mut terms: Terms, operands: Slice[nir::Operand], contents: mem::HashMap[Root, u32]) -> mem::List[u32] {
+    var listed = mem::List[u32].empty(self.ck.alloc())
+    for operand in operands {
+        mut listed.push(mut self.operand(mut terms, operand, contents))
+    }
+    return listed
+} Walk.operands
+
+/// Records a fact holding after the instruction at `position` of a block.
+fn Walk.fact(mut self, block: nir::BlockId, position: usize, term: u32, origin: Origin) {
+    mut self.fact_from(block, from: position + 1, term, origin)
+} Walk.fact
+
+fn Walk.fact_from(mut self, block: nir::BlockId, from: usize, term: u32, origin: Origin) {
+    if not self.nested {
+        mut self.facts.push(Fact(block: block, from: from, term: term, origin: origin))
+    }
+} Walk.fact_from
+
+fn Walk.site(
+    mut self,
+    block: nir::BlockId,
+    position: usize,
+    obligation: Obligation,
+    goal: u32,
+    open: bool,
+    span: nir::Span,
+    ) {
+    mut self.clause_site(block, position, obligation, goal, open, span, clause: None)
+} Walk.site
+
+fn Walk.clause_site(
+    mut self,
+    block: nir::BlockId,
+    position: usize,
+    obligation: Obligation,
+    goal: u32,
+    open: bool,
+    span: nir::Span,
+    clause: Option[u32],
+    ) {
+    if self.nested {
+        return
+    }
+    mut self.sites.push(Site(block: block, position: position, obligation: obligation, goal: goal, open: open, span: span, clause: clause))
+    if not open {
+        mut self.fact(block, position, term: goal, origin: Origin.Site(self.sites.len() - 1))
+    }
+} Walk.clause_site
+
+fn Walk.inst(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    inst: nir::Inst,
+    mut contents: mem::HashMap[Root, u32],
+    ) {
+    let term = mut self.inst_term(mut terms, block, position, inst, mut contents)
+    let Some(result) = inst.result else {
+        return
+    }
+    let Some(value) = term else {
+        return
+    }
+    self.values[usize.widen(result.index)] = Some(value)
+} Walk.inst
+
+/// The term an instruction gives its result, after the facts, sites and stores it makes.
+fn Walk.inst_term(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    inst: nir::Inst,
+    mut contents: mem::HashMap[Root, u32],
+    ) -> Option[u32]
+    waive length "one arm per NIR instruction, as the walk's rules list them"
+{
+    let alloc = self.ck.alloc()
+    let result_ty = match inst.result {
+        Some(value) => Some(self.ty(value))
+        None => None
+    }
+    match inst.op {
+        nir::Op.Slot(name: _, ty: _) or nir::Op.Release(_) => return None
+        nir::Op.Load(place) or nir::Op.Move(place) => {
+            let located = mut self.locate(mut terms, place)
+            return Some(mut self.content(mut terms, located, contents))
+        }
+        nir::Op.Ref(place) or nir::Op.RefMut(place) => {
+            let located = mut self.locate(mut terms, place)
+            match inst.result {
+                Some(result) => {
+                    discard mut self.referents.insert(result, value: take located)
+                }
+                None => {}
+            }
+            return None
+        }
+        nir::Op.Init(place: place, operand: operand) or nir::Op.Assign(place: place, operand: operand) => {
+            let value = mut self.operand(mut terms, operand, contents)
+            let located = mut self.locate(mut terms, place)
+            mut self.store(mut terms, located, term: value, mut contents)
+            return None
+        }
+        nir::Op.FnRef(fn_ref) => {
+            let substituted = self.substituted(fn_ref)
+            let ty = result_ty.value_or(ty::Ty.error())
+            return Some(mut terms.intern(Term.App(op: Op.FnRef(take substituted), args: mem::List[u32].empty(alloc)), ty))
+        }
+        nir::Op.Constant(constant) => return Some(mut self.constant(mut terms, constant, ty: result_ty.value_or(ty::Ty.error())))
+        nir::Op.Construct(ty: constructed, fields: fields) => {
+            var operands = mem::List[u32].empty(alloc)
+            for field in fields {
+                mut operands.push(mut self.operand(mut terms, operand: field.operand, contents))
+            }
+            let ty = self.subst.ty(self.ck.types(), ty: constructed)
+            return Some(mut terms.intern(Term.App(op: Op.Construct(ty), args: take operands), ty))
+        }
+        nir::Op.Variant(ty: variant_ty, variant: variant, payload: payload) => return Some(mut self.variant_term(mut terms, variant_ty, variant: variant.as_str(), payload, contents))
+        nir::Op.Is(place: place, ty: tested, variant: variant) => {
+            let located = mut self.locate(mut terms, place)
+            let scrutinee = mut self.content(mut terms, located, contents)
+            let ty = self.subst.ty(self.ck.types(), ty: tested)
+            let index = self.variant_index(ty, name: variant.as_str())
+            return Some(self.tag_is(mut terms, scrutinee, index))
+        }
+        nir::Op.Closure(index: index, captures: captures) => return Some(mut self.closure_term(mut terms, index, captures: captures.view(), result: inst.result, result_ty, contents))
+        nir::Op.Convert(value: value, to: to, via: via) => {
+            let operand = mut self.operand(mut terms, operand: value, contents)
+            let target = self.subst.ty(self.ck.types(), ty: to)
+            var operands = mem::List[u32].empty(alloc)
+            mut operands.push(operand)
+            return Some(mut terms.intern(Term.App(op: Op.Convert(to: target, via: copied_word(via, alloc)), args: take operands), ty: target))
+        }
+        nir::Op.Unary(op: op, operand: operand) => {
+            let value = mut self.operand(mut terms, operand, contents)
+            return Some(mut self.unary(mut terms, block, position, op, operand: value, ty: result_ty.value_or(ty::Ty.error()), span: inst.span))
+        }
+        nir::Op.Binary(op: op, left: left, right: right) => {
+            let left_term = mut self.operand(mut terms, operand: left, contents)
+            let right_term = mut self.operand(mut terms, operand: right, contents)
+            return Some(mut self.binary(mut terms, block, position, op, left: left_term, right: right_term, ty: result_ty.value_or(ty::Ty.error()), span: inst.span))
+        }
+        nir::Op.Call(call) => {
+            mut self.note_ensures_call(call, result: inst.result)
+            return mut self.call(mut terms, block, position, ok: None, call, result_ty, result: inst.result, span: inst.span, mut contents)
+        }
+        nir::Op.Check(kind: kind, operand: operand, open: open) => {
+            let goal = mut self.operand(mut terms, operand, contents)
+            let clause = match operand {
+                nir::Operand.Value(value) => self.ensures_calls.get(value)
+                else => None
+            }
+            mut self.clause_site(block, position, obligation: Obligation.Check(kind), goal, open, span: inst.span, clause)
+            return None
+        }
+        nir::Op.Dbg(operand) => return Some(mut self.operand(mut terms, operand, contents))
+        nir::Op.Assume(operand) => {
+            let fact = mut self.operand(mut terms, operand, contents)
+            mut self.fact(block, position, term: fact, origin: Origin.Assume)
+            return None
+        }
+        nir::Op.Quantifier(all: all, low: low, high: high, inclusive: inclusive, region: region) => {
+            let low_term = mut self.operand(mut terms, operand: low, contents)
+            let high_term = mut self.operand(mut terms, operand: high, contents)
+            return Some(mut self.quantifier(mut terms, block, all, low: low_term, high: high_term, inclusive, region, contents))
+        }
+        nir::Op.When(attempted: attempted, accesses: _, region: region) => return mut self.when_term(mut terms, block, attempted, region, result_ty, mut contents)
+    }
+} Walk.inst_term
+
+/// Records which ensures function of the unit's own a call's result is the result of.
+fn Walk.note_ensures_call(mut self, call: nir::Call, result: Option[nir::Value]) {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return
+    }
+    let Some(value) = result else {
+        return
+    }
+    let nir::Callable.Item(item: item, role: nir::Role.Ensures, index: index) = fn_ref.callable else {
+        return
+    }
+    if item == self.unit.contents().item {
+        discard mut self.ensures_calls.insert(value, value: index)
+    }
+} Walk.note_ensures_call
+
+/// The term of a variant construction.
+fn Walk.variant_term(
+    mut self,
+    mut terms: Terms,
+    variant_ty: ty::Ty,
+    variant: Str,
+    payload: nir::Payload,
+    contents: mem::HashMap[Root, u32],
+    ) -> u32 {
+    var operands = mem::List[u32].empty(self.ck.alloc())
+    match payload {
+        nir::Payload.None => {}
+        nir::Payload.Single(single) => mut operands.push(mut self.operand(mut terms, operand: single, contents))
+        nir::Payload.Labelled(fields) => {
+            for field in fields {
+                mut operands.push(mut self.operand(mut terms, operand: field.operand, contents))
+            }
+        }
+    }
+    let ty = self.subst.ty(self.ck.types(), ty: variant_ty)
+    let index = self.variant_index(ty, name: variant)
+    return mut terms.intern(Term.App(op: Op.Variant(ty: ty, index: index), args: take operands), ty)
+} Walk.variant_term
+
+/// The term of a closure value, with the places it captures by `mut` or `take`.
+fn Walk.closure_term(
+    mut self,
+    mut terms: Terms,
+    index: u32,
+    captures: Slice[nir::Operand],
+    result: Option[nir::Value],
+    result_ty: Option[ty::Ty],
+    contents: mem::HashMap[Root, u32],
+    ) -> u32 {
+    let alloc = self.ck.alloc()
+    let operands = mut self.operands(mut terms, operands: captures, contents)
+    match result {
+        Some(closure) => {
+            var places = mem::List[Located].empty(alloc)
+            for capture in captures {
+                match capture {
+                    nir::Operand.Place(mode: mode, place: place) => {
+                        if mode == ast::Mode.Mut or mode == ast::Mode.Take {
+                            mut places.push(mut self.locate(mut terms, place))
+                        }
+                    }
+                    else => {}
+                }
+            }
+            discard mut self.captured.insert(closure, value: take places)
+        }
+        None => {}
+    }
+    return mut terms.intern(Term.App(op: Op.Closure(index), args: take operands), ty: result_ty.value_or(ty::Ty.error()))
+} Walk.closure_term
+
+/// The term of an `await when`: its region walked with fresh symbols for the places it
+/// acquires, the contents after it, and the value it yields unless attempted.
+fn Walk.when_term(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    attempted: bool,
+    region: nir::Region,
+    result_ty: Option[ty::Ty],
+    mut contents: mem::HashMap[Root, u32],
+    ) -> Option[u32] {
+    let alloc = self.ck.alloc()
+    let shared = self.unit.share()
+    var acquired = copied_contents(contents, alloc)
+    var params = mem::List[u32].empty(alloc)
+    for param in shared.contents().functions[self.function].block(region.blocks[0]).params {
+        let ty = self.ty(param)
+        let value = mut terms.fresh(ty)
+        discard mut acquired.insert(Root.Referent(param), value: value)
+        discard mut self.referents.insert(param, value: Located.Place(root: Root.Referent(param), steps: mem::List[text::String].empty(alloc)))
+        mut params.push(value)
+    }
+    let walked = mut self.region(mut terms, block, region, params: take params, contents: acquired)
+    for entry in walked.contents {
+        if contents.contains(entry.key()) {
+            discard mut contents.insert(entry.key(), value: entry.value())
+        }
+    }
+    let Some(ty) = result_ty else {
+        return None
+    }
+    if not attempted {
+        match walked.yielded {
+            Some(yielded) => return Some(yielded)
+            None => {}
+        }
+    }
+    return Some(mut terms.fresh(ty))
+} Walk.when_term
+
+/// A function reference under the walk's type arguments, a call through a bound whose
+/// `Self` they fix calling the implementing function.
+fn Walk.substituted(self, fn_ref: nir::FnRef) -> nir::FnRef {
+    let types = self.ck.types()
+    let substituted = nir::FnRef(callable: fn_ref.callable.copy(self.ck.alloc()), args: self.subst.args(types, args: fn_ref.args))
+    let nir::Callable.Method(item: interface_item, method: method) = fn_ref.callable else {
+        return substituted
+    }
+    let sig = self.ck.sig(interface_item)
+    let listed = types.arg_list(substituted.args)
+    if listed.len() == 0 {
+        return substituted
+    }
+    let ty::Arg.Ty(self_ty) = listed[0] else {
+        return substituted
+    }
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return substituted
+    }
+    match types.kind(self_ty) {
+        ty::TyKind.Param(_) => return substituted
+        else => {}
+    }
+    let Some(implementation) = self.ck.implementation(self_ty, interface_item, method: methods[usize.widen(method)].name.as_str()) else {
+        return substituted
+    }
+    match implementation.callable {
+        nir::Callable.Method(item: _, method: _) => return substituted
+        else => {}
+    }
+    return implementation
+} Walk.substituted
+
+fn Walk.variant_index(self, ty: ty::Ty, name: Str) -> u32 {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        return 0
+    }
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        SigKind.Enum(variants: variants) => {
+            for index in 0..<variants.len() {
+                if variants[index].name.as_str() == name {
+                    return u32.fit(index)
+                }
+            }
+            return 0
+        }
+        SigKind.Layout(fields: _, tags: tags, bits: _) => {
+            for index in 0..<tags.len() {
+                if tags[index].as_str() == name {
+                    return u32.fit(index)
+                }
+            }
+            return 0
+        }
+        else => return 0
+    }
+} Walk.variant_index
+
+/// The atom that the tag of a term equals a variant's index, the ite of the arms' atoms
+/// for an ite.
+fn Walk.tag_is(self, mut terms: Terms, scrutinee: u32, index: u32) -> u32 {
+    match terms.get(scrutinee) {
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            let left = self.tag_is(mut terms, scrutinee: then, index)
+            let right = self.tag_is(mut terms, scrutinee: otherwise, index)
+            return mut terms.ite(condition, then: left, otherwise: right)
+        }
+        else => {}
+    }
+    var tag: u32 = 0
+    match terms.get(scrutinee) {
+        Term.App(op: Op.Variant(ty: _, index: variant), args: _) => {
+            tag = mut terms.integer(wide::Wide.of_u64(u64.widen(variant)), scalar: ty::Scalar.Unsigned32)
+        }
+        else => {
+            tag = mut terms.intern(Term.Tag(scrutinee), ty: ty::Ty.scalar(ty::Scalar.Unsigned32))
+        }
+    }
+    let wanted = mut terms.integer(wide::Wide.of_u64(u64.widen(index)), scalar: ty::Scalar.Unsigned32)
+    return mut terms.compare(nir::BinaryOp.Eq, left: tag, right: wanted)
+} Walk.tag_is
+
+/// The term of a const or const parameter: its value for an integer, `bool` or `char`
+/// const, its application otherwise.
+fn Walk.constant(mut self, mut terms: Terms, constant: nir::Constant, ty: ty::Ty) -> u32 {
+    let alloc = self.ck.alloc()
+    match constant {
+        nir::Constant.Item(item) => {
+            if not self.ck.db().visible(self.module(), item) {
+                let term = mut terms.intern(Term.App(op: Op.Constant(constant), args: mem::List[u32].empty(alloc)), ty)
+                return mut self.opaque_term(mut terms, term, hidden: true)
+            }
+        }
+        else => {}
+    }
+    var literal: Option[nir::Literal] = None
+    match constant {
+        nir::Constant.Item(item) => {
+            if sort_of(ty) != Sort.Other {
+                match self.ck.const_value(item) {
+                    Some(value) => {
+                        literal = self.constant_literal(value.contents().value, ty)
+                    }
+                    None => {}
+                }
+            }
+        }
+        nir::Constant.Param(param) => {
+            match self.subst.get(param) {
+                Some(ty::Arg.Const(ty::Const.Int(value))) => {
+                    literal = self.constant_literal(Val.Int(value), ty)
+                }
+                Some(ty::Arg.Const(ty::Const.Bool(value))) => {
+                    literal = Some(nir::Literal.Bool(value))
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let Some(known) = literal else {
+        return mut terms.intern(Term.App(op: Op.Constant(constant), args: mem::List[u32].empty(alloc)), ty)
+    }
+    return mut terms.literal(take known)
+} Walk.constant
+
+/// The literal of an integer, `bool` or `char` value of a type; none for another value, or an
+/// integer of a type that is not a scalar.
+fn Walk.constant_literal(self, value: Val, ty: ty::Ty) -> Option[nir::Literal] {
+    return match value {
+        Val.Int(number) => match self.ck.types().kind(ty) {
+            ty::TyKind.Scalar(scalar) => Some(nir::Literal.Int(value: number, scalar: scalar))
+            else => None
+        }
+        Val.Bool(truth) => Some(nir::Literal.Bool(truth))
+        Val.Char(c) => Some(nir::Literal.Char(c))
+        else => None
+    }
+} Walk.constant_literal
+
+fn Walk.unary(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    op: nir::UnaryOp,
+    operand: u32,
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> u32 {
+    let sort = sort_of(ty)
+    if op == nir::UnaryOp.Not and sort == Sort.Bool {
+        return mut terms.negation(operand)
+    }
+    var operands = mem::List[u32].empty(self.ck.alloc())
+    mut operands.push(operand)
+    let term = mut terms.intern(Term.App(op: Op.Unary(op), args: take operands), ty)
+    if op == nir::UnaryOp.Neg and sort == Sort.Int {
+        let goal = self.in_range(mut terms, term, ty)
+        mut self.site(block, position, obligation: Obligation.Overflow, goal, open: false, span)
+    }
+    return term
+} Walk.unary
+
+/// The condition that a term is a value of an integer type.
+fn Walk.in_range(self, mut terms: Terms, term: u32, ty: ty::Ty) -> u32 {
+    let Some(scalar) = self.ck.types().scalar_of(ty) else {
+        return mut terms.boolean(true)
+    }
+    if not scalar.is_integer() {
+        return mut terms.boolean(true)
+    }
+    let bounds = scalar.range()
+    let low = mut terms.integer(bounds.low, scalar)
+    let high = mut terms.integer(bounds.high, scalar)
+    let above = mut terms.compare(nir::BinaryOp.Le, left: low, right: term)
+    let below = mut terms.compare(nir::BinaryOp.Le, left: term, right: high)
+    return mut terms.conjunction(term_pair(above, right: below, alloc: self.ck.alloc()))
+} Walk.in_range
+
+fn Walk.binary(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    op: nir::BinaryOp,
+    left: u32,
+    right: u32,
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> u32 {
+    let sort = terms.sort(left)
+    if op.is_comparison() {
+        if sort == Sort.Bool and (op == nir::BinaryOp.Eq or op == nir::BinaryOp.Ne) {
+            let negated = mut terms.negation(right)
+            let equal = mut terms.ite(left, then: right, otherwise: negated)
+            if op == nir::BinaryOp.Eq {
+                return equal
+            }
+            return mut terms.negation(equal)
+        }
+        return mut terms.compare(op, left, right)
+    }
+    let term = mut terms.intern(Term.App(op: Op.Binary(op), args: term_pair(left, right, alloc: self.ck.alloc())), ty)
+    let Some(scalar) = self.ck.types().scalar_of(ty) else {
+        return term
+    }
+    if not (scalar.is_integer() and sort == Sort.Int) {
+        return term
+    }
+    let interpreted = match op {
+        nir::BinaryOp.Add or nir::BinaryOp.Sub or nir::BinaryOp.Mul => {
+            let goal = self.in_range(mut terms, term, ty)
+            mut self.site(block, position, obligation: Obligation.Overflow, goal, open: false, span)
+            return term
+        }
+        nir::BinaryOp.Div or nir::BinaryOp.Rem => mut self.division_sites(mut terms, block, position, op, left, right, ty, span, term)
+        nir::BinaryOp.Shl or nir::BinaryOp.Shr => mut self.shift_sites(mut terms, block, position, op, left, right, ty, span, term)
+        nir::BinaryOp.Band => self.masked(mut terms, scalar, left, right, ty)
+        else => None
+    }
+    return interpreted.value_or(term)
+} Walk.binary
+
+/// The sites of a division or remainder, and its term when the prover interprets it: an
+/// unsigned one by a literal of at least 1.
+fn Walk.division_sites(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    op: nir::BinaryOp,
+    left: u32,
+    right: u32,
+    ty: ty::Ty,
+    span: nir::Span,
+    term: u32,
+    ) -> Option[u32] {
+    let Some(scalar) = self.ck.types().scalar_of(ty) else {
+        return None
+    }
+    let zero = mut terms.integer(wide::Wide.zero(), scalar)
+    let goal = mut terms.compare(nir::BinaryOp.Ne, left: right, right: zero)
+    mut self.site(block, position, obligation: Obligation.DivisionByZero, goal, open: false, span)
+    if scalar.is_signed() and op == nir::BinaryOp.Div {
+        let overflow = self.in_range(mut terms, term, ty)
+        mut self.site(block, position, obligation: Obligation.Overflow, goal: overflow, open: false, span)
+    }
+    if scalar.is_signed() {
+        return None
+    }
+    let Some(divisor) = terms.int_value(right) else {
+        return None
+    }
+    if divisor.lt(wide::Wide.one()) {
+        return None
+    }
+    return Some(self.division(mut terms, op, dividend: left, divisor: right, ty))
+} Walk.division_sites
+
+/// The sites of a shift, and its term when the prover interprets it: an unsigned right shift
+/// by a literal as a quotient, a signed left shift by a literal as a product.
+fn Walk.shift_sites(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    op: nir::BinaryOp,
+    left: u32,
+    right: u32,
+    ty: ty::Ty,
+    span: nir::Span,
+    term: u32,
+    ) -> Option[u32] {
+    let Some(scalar) = self.ck.types().scalar_of(ty) else {
+        return None
+    }
+    let width = mut terms.integer(wide::Wide.of_u64(u64.widen(scalar.bits())), scalar: ty::Scalar.Unsigned32)
+    let goal = mut terms.compare(nir::BinaryOp.Lt, left: right, right: width)
+    mut self.site(block, position, obligation: Obligation.Shift, goal, open: false, span)
+    if op == nir::BinaryOp.Shl and scalar.is_signed() {
+        let overflow = self.in_range(mut terms, term, ty)
+        mut self.site(block, position, obligation: Obligation.Overflow, goal: overflow, open: false, span)
+    }
+    let Some(amount) = terms.int_value(right) else {
+        return None
+    }
+    if amount.is_negative() or not amount.lt(wide::Wide.of_u64(u64.widen(scalar.bits()))) {
+        return None
+    }
+    let power = mut terms.integer(wide::Wide.one().shift_left(u32.truncate(amount.low_bits())), scalar)
+    if op == nir::BinaryOp.Shr and not scalar.is_signed() {
+        return Some(self.division(mut terms, op: nir::BinaryOp.Div, dividend: left, divisor: power, ty))
+    }
+    if op == nir::BinaryOp.Shl and scalar.is_signed() {
+        return Some(mut terms.intern(Term.App(op: Op.Binary(nir::BinaryOp.Mul), args: term_pair(left, right: power, alloc: self.ck.alloc())), ty))
+    }
+    return None
+} Walk.shift_sites
+
+/// The term of an unsigned bitwise and with a literal one less than a power of two: the
+/// remainder by that power.
+fn Walk.masked(self, mut terms: Terms, scalar: ty::Scalar, left: u32, right: u32, ty: ty::Ty) -> Option[u32] {
+    if scalar.is_signed() {
+        return None
+    }
+    match self.low_mask(terms, mask: right) {
+        Some(power) => {
+            let divisor = mut terms.integer(power, scalar)
+            return Some(self.division(mut terms, op: nir::BinaryOp.Rem, dividend: left, divisor, ty))
+        }
+        None => {}
+    }
+    match self.low_mask(terms, mask: left) {
+        Some(power) => {
+            let divisor = mut terms.integer(power, scalar)
+            return Some(self.division(mut terms, op: nir::BinaryOp.Rem, dividend: right, divisor, ty))
+        }
+        None => {}
+    }
+    return None
+} Walk.masked
+
+/// The power of two one more than a literal mask term is, when it is one.
+fn Walk.low_mask(self, terms: Terms, mask: u32) -> Option[wide::Wide] {
+    let Some(value) = terms.int_value(mask) else {
+        return None
+    }
+    if value.is_negative() {
+        return None
+    }
+    let power = value.wrapping_add(wide::Wide.one())
+    if power.is_zero() or not power.bit_and(power.wrapping_sub(wide::Wide.one())).is_zero() {
+        return None
+    }
+    return Some(power)
+} Walk.low_mask
+
+/// The quotient or remainder of an unsigned division by a literal of at least 1.
+fn Walk.division(
+    self,
+    mut terms: Terms,
+    op: nir::BinaryOp,
+    dividend: u32,
+    divisor: u32,
+    ty: ty::Ty,
+    ) -> u32 {
+    if op == nir::BinaryOp.Div {
+        return mut terms.intern(Term.Quot(dividend: dividend, divisor: divisor), ty)
+    }
+    return mut terms.intern(Term.Rem(dividend: dividend, divisor: divisor), ty)
+} Walk.division
+
+/// A call: the obligation of a built-in callee, its term, the frame rule on what it may
+/// change, and the facts it gives, those of a normal return holding from `ok` for a call
+/// that may fail.
+fn Walk.call(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    ok: Option[nir::BlockId],
+    call: nir::Call,
+    result_ty: Option[ty::Ty],
+    result: Option[nir::Value],
+    span: nir::Span,
+    mut contents: mem::HashMap[Root, u32],
+    ) -> Option[u32] {
+    let alloc = self.ck.alloc()
+    let args = mut self.operands(mut terms, operands: call.args.view(), contents)
+    let callee = match call.callee {
+        nir::Callee.Fn(fn_ref) => Some(self.substituted(fn_ref))
+        else => None
+    }
+    match mut self.known_call(mut terms, block, position, callee, args: args.view(), result_ty, span) {
+        Some(term) => return Some(term)
+        None => {}
+    }
+    let before = copied_contents(contents, alloc)
+    for operand in call.args {
+        match operand {
+            nir::Operand.Place(mode: mode, place: place) => {
+                if mode == ast::Mode.Mut or mode == ast::Mode.Take {
+                    let located = mut self.locate(mut terms, place)
+                    mut self.havoc(mut terms, located, mut contents)
+                }
+            }
+            nir::Operand.Value(value) => {
+                for located in self.captured_places(value) {
+                    mut self.havoc(mut terms, located, mut contents)
+                }
+            }
+            else => {}
+        }
+    }
+    var term: Option[u32] = None
+    match result_ty {
+        Some(ty) => {
+            if ty != ty::Ty.unit() and ty != ty::Ty.never() {
+                term = Some(mut self.callee_term(mut terms, call, callee, args: args.view(), ty))
+            }
+        }
+        None => {}
+    }
+    match term {
+        Some(value) => {
+            match result {
+                Some(designating) => mut self.note_referent(mut terms, call, result: designating, term: value, mut contents)
+                None => {}
+            }
+        }
+        None => {}
+    }
+    if not self.nested {
+        let point = CallPoint(block: block, position: position, ok: ok)
+        mut self.opaquely(fn[mut terms](mut walk: Walk) {
+            mut walk.call_facts(mut terms, point, call, callee, args: args.view(), result: term, before, after: contents)
+        })
+    }
+    return term
+} Walk.call
+
+/// The term a call has by its callee alone, after the site of a built-in callee: its argument
+/// for an interpreted conversion, the term of a contract function's call.
+fn Walk.known_call(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    callee: Option[nir::FnRef],
+    args: Slice[u32],
+    result_ty: Option[ty::Ty],
+    span: nir::Span,
+    ) -> Option[u32] {
+    let Some(fn_ref) = callee else {
+        return None
+    }
+    match self.ck.builtin_obligation(fn_ref) {
+        Some(obligation) => {
+            let goal = mut self.builtin_goal(mut terms, fn_ref, args, obligation)
+            mut self.site(block, position, obligation, goal, open: false, span)
+        }
+        None => {}
+    }
+    match self.interpreted(terms, fn_ref, args) {
+        Some(term) => return Some(term)
+        None => {}
+    }
+    let nir::Callable.Item(item: item, role: role, index: index) = fn_ref.callable else {
+        return None
+    }
+    if not role.is_contract() {
+        return None
+    }
+    return Some(mut self.contract_call(mut terms, block, position, item, role, index, type_args: fn_ref.args, args, result_ty))
+} Walk.known_call
+
+/// The term of a call of a contract function, walking an invariant or assume function of the
+/// unit's own at its call.
+fn Walk.contract_call(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    type_args: ty::Args,
+    args: Slice[u32],
+    result_ty: Option[ty::Ty],
+    ) -> u32 {
+    let alloc = self.ck.alloc()
+    if (role == nir::Role.Invariant or role == nir::Role.Assume) and item == self.unit.contents().item and not self.nested {
+        mut self.statement(mut terms, block, position, role, index, args)
+    }
+    let ty = result_ty.value_or(ty::Ty.unit())
+    var returned: Option[u32] = None
+    if role == nir::Role.Requires {
+        returned = mut self.opaquely(fn[mut terms](mut walk: Walk) -> Option[u32] {
+            return mut walk.returned(mut terms, item, role, index, type_args, params: listed_terms(args, alloc))
+        })
+    } else {
+        returned = mut self.returned(mut terms, item, role, index, type_args, params: listed_terms(args, alloc))
+    }
+    let Some(term) = returned else {
+        return mut terms.fresh(ty)
+    }
+    return term
+} Walk.contract_call
+
+/// The places a closure value captures by `mut` or `take`, copied.
+fn Walk.captured_places(self, value: nir::Value) -> mem::List[Located] {
+    let alloc = self.ck.alloc()
+    var places = mem::List[Located].empty(alloc)
+    let Some(captured) = self.captured.get(value) else {
+        return places
+    }
+    for located in captured {
+        mut places.push(located.copy(alloc))
+    }
+    return places
+} Walk.captured_places
+
+/// Records the place a reference-returning call's result designates, holding its term, and
+/// for a `mut` projection the receiver place a write through it changes.
+fn Walk.note_referent(mut self, mut terms: Terms, call: nir::Call, result: nir::Value, term: u32, mut contents: mem::HashMap[Root, u32]) {
+    let designated = self.nir().ty(result)
+    if not designated.is_reference() {
+        return
+    }
+    discard mut contents.insert(Root.Referent(result), value: term)
+    discard mut self.referents.insert(result, value: Located.Place(root: Root.Referent(result), steps: mem::List[text::String].empty(self.ck.alloc())))
+    let nir::NTy.RefMut(_) = designated else {
+        return
+    }
+    if call.args.len() == 0 {
+        return
+    }
+    let nir::Operand.Place(mode: ast::Mode.Mut, place: receiver) = call.args[0] else {
+        return
+    }
+    let located = mut self.locate(mut terms, place: receiver)
+    discard mut self.projected.insert(Root.Referent(result), value: take located)
+} Walk.note_referent
+
+/// The term of a call by callee knowledge: the transparent body the holder unfolds, the
+/// application of a `pure` callee, or a fresh symbol.
+fn Walk.callee_term(
+    mut self,
+    mut terms: Terms,
+    call: nir::Call,
+    callee: Option[nir::FnRef],
+    args: Slice[u32],
+    ty: ty::Ty,
+    ) -> u32 {
+    let alloc = self.ck.alloc()
+    let resolved = match callee {
+        Some(known) => Some(known.copy(alloc))
+        None => dyn_method(call)
+    }
+    let Some(fn_ref) = resolved else {
+        return mut terms.fresh(ty)
+    }
+    match fn_ref.callable {
+        nir::Callable.Item(item: item, role: nir::Role.Body, index: _) => {
+            if not holds_item(self.unfolding.view(), item) and self.ck.unfolds(item, holder: self.holder) {
+                mut self.unfolding.push(item)
+                let unfolded = mut self.returned(mut terms, item, role: nir::Role.Body, index: 0, type_args: fn_ref.args, params: listed_terms(args, alloc))
+                discard mut self.unfolding.pop()
+                match unfolded {
+                    Some(term) => return term
+                    None => {}
+                }
+            }
+        }
+        else => {}
+    }
+    if not self.pure_call(terms, fn_ref, args) {
+        return mut terms.fresh(ty)
+    }
+    let hidden = match fn_ref.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => not self.ck.db().visible(self.module(), item)
+        else => false
+    }
+    let application = mut terms.intern(Term.Call(callee: take fn_ref, args: listed_terms(args, alloc)), ty)
+    return mut self.opaque_term(mut terms, term: application, hidden)
+} Walk.callee_term
+
+/// The method a call through a `Dyn` calls, without type arguments.
+fn dyn_method(call: nir::Call) -> Option[nir::FnRef] {
+    let nir::Callee.Dyn(place: _, item: interface_item, method: method) = call.callee else {
+        return None
+    }
+    return Some(nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: method), args: ty::Args.none()))
+} dyn_method
+
+/// Whether the prover knows a call as the application of its callee: a direct call of a
+/// `pure` function, or a call through a bound or `Dyn` whose method head demands `pure`, with
+/// no function-typed argument that is impure and no argument with interior mutability.
+fn Walk.pure_call(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> bool {
+    var pure = true
+    match fn_ref.callable {
+        nir::Callable.Item(item: item, role: _, index: _) => {
+            let digest = self.ck.digest(item)
+            pure = digest.contents().pure()
+        }
+        nir::Callable.Method(item: interface_item, method: method) => {
+            let sig = self.ck.sig(interface_item)
+            pure = match sig.contents().kind {
+                SigKind.Interface(methods: methods) => methods[usize.widen(method)].sig.limit_set.pure
+                else => false
+            }
+        }
+        else => {}
+    }
+    if not pure {
+        return false
+    }
+    for arg in args {
+        let ty = terms.ty(arg)
+        if self.ck.has_interior(ty) {
+            return false
+        }
+        match self.ck.types().kind(ty) {
+            ty::TyKind.Fn(id) => {
+                if not self.ck.types().fn_of(id).limit_set.pure {
+                    return false
+                }
+            }
+            else => {}
+        }
+    }
+    return true
+} Walk.pure_call
+
+/// The term a NIR function of a unit returns for parameter terms, walked without recording
+/// facts or sites; none when the unit or function is missing.
+fn Walk.returned(
+    mut self,
+    mut terms: Terms,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    type_args: ty::Args,
+    take params: mem::List[u32],
+    ) -> Option[u32] {
+    let Some(unit) = self.ck.unit(item) else {
+        return None
+    }
+    let Some(function) = unit.contents().functions.position(fn(value: nir::Function) => value.role == role and value.index == index) else {
+        return None
+    }
+    let alloc = self.ck.alloc()
+    var nested = Walk.new(self.ck.share(), holder: self.holder, unit: take unit, function, type_args, take params, entry: mem::List[Premise].empty(alloc))
+    nested.nested = true
+    nested.unfolding = listed_items(self.unfolding.view(), alloc)
+    nested.opaque = mut self.opaque.extract()
+    mut nested.walk(mut terms)
+    let result = mut nested.result(mut terms)
+    self.opaque = mut nested.opaque.extract()
+    return result
+} Walk.returned
+
+/// The returned term of a function walked for its value: ite over its returns by their
+/// reach conditions.
+fn Walk.result(mut self, mut terms: Terms) -> Option[u32] {
+    let alloc = self.ck.alloc()
+    var conditions = mem::List[u32].empty(alloc)
+    var arms = mem::List[u32].empty(alloc)
+    for returned in self.returns {
+        mut conditions.push(returned.reach)
+        mut arms.push(returned.term)
+    }
+    self.returns = mem::List[Returned].empty(alloc)
+    if arms.len() == 0 {
+        return None
+    }
+    return Some(self.ites(mut terms, conditions: conditions.view(), arms: arms.view()))
+} Walk.result
+
+/// Walks an invariant or assume function at its call, its queries having the premises of
+/// the call's point as entry facts.
+fn Walk.statement(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    role: nir::Role,
+    index: u32,
+    args: Slice[u32],
+    ) {
+    let alloc = self.ck.alloc()
+    let Some(function) = self.unit.contents().functions.position(fn(value: nir::Function) => value.role == role and value.index == index) else {
+        return
+    }
+    var entry = mem::List[Premise].empty(alloc)
+    for premise in self.premises_at(mut terms, target: block, position) {
+        let origin = match premise.origin {
+            Origin.Assume => Origin.Assume
+            else => Origin.Fact
+        }
+        mut entry.push(Premise(term: premise.term, origin: origin))
+    }
+    let type_args = self.ck.types().args(self.subst_args())
+    var walk = Walk.new(self.ck.share(), holder: self.holder, unit: self.unit.share(), function, type_args, params: listed_terms(args, alloc), take entry)
+    mut walk.walk(mut terms)
+    let sites = walk.queries(mut terms)
+    mut self.statements.push(Statement(role: role, index: index, sites: take sites))
+} Walk.statement
+
+/// The type arguments the walk's substitution gives the unit's generic parameters.
+fn Walk.subst_args(self) -> mem::List[ty::Arg] {
+    var args = mem::List[ty::Arg].empty(self.ck.alloc())
+    let sig = self.ck.sig(self.unit.contents().item)
+    for def in sig.contents().generics {
+        let arg = match self.subst.get(def.param) {
+            Some(given) => given
+            None => def.param_arg(self.ck.types())
+        }
+        mut args.push(arg)
+    }
+    return args
+} Walk.subst_args
+
+/// The term of a call the decidable fragment interprets: a widening or fitting conversion
+/// between integer types, which is its argument.
+fn Walk.interpreted(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> Option[u32] {
+    let nir::Callable.Builtin(nir::Builtin.Conversion(conversion: conversion, scalar: target)) = fn_ref.callable else {
+        return None
+    }
+    if args.len() == 0 {
+        return None
+    }
+    let Some(source) = self.ck.types().scalar_of(terms.ty(args[0])) else {
+        return None
+    }
+    let integers = target.is_integer() and source.is_integer()
+    if integers and (conversion == nir::Conversion.Widen or conversion == nir::Conversion.Fit) {
+        return Some(args[0])
+    }
+    return None
+} Walk.interpreted
+
+/// The condition a built-in operation's obligation demands.
+fn Walk.builtin_goal(mut self, mut terms: Terms, fn_ref: nir::FnRef, args: Slice[u32], obligation: Obligation) -> u32 {
+    let alloc = self.ck.alloc()
+    if obligation == Obligation.Conversion {
+        match fn_ref.callable {
+            nir::Callable.Builtin(nir::Builtin.Conversion(conversion: _, scalar: target)) => {
+                let source = self.ck.types().scalar_of(terms.ty(args[0]))
+                let integer_source = match source {
+                    Some(scalar) => scalar.is_integer()
+                    None => false
+                }
+                if target.is_integer() and integer_source {
+                    return self.in_range(mut terms, term: args[0], ty: ty::Ty.scalar(target))
+                }
+                return mut terms.intern(Term.Call(callee: fn_ref.copy(alloc), args: listed_terms(args, alloc)), ty: ty::Ty.scalar(ty::Scalar.Bool))
+            }
+            else => {}
+        }
+    }
+    if obligation == Obligation.Bounds {
+        let len = mut self.len_of(mut terms, indexed: args[0])
+        return mut terms.compare(nir::BinaryOp.Lt, left: args[1], right: len)
+    }
+    return mut terms.boolean(true)
+} Walk.builtin_goal
+
+/// The `len` application of an indexed value's type.
+fn Walk.len_of(mut self, mut terms: Terms, indexed: u32) -> u32 {
+    let alloc = self.ck.alloc()
+    let usize_ty = ty::Ty.scalar(ty::Scalar.UnsignedSize)
+    let ty::TyKind.Item(item: item, args: args) = self.ck.types().kind(terms.ty(indexed)) else {
+        return mut terms.fresh(usize_ty)
+    }
+    let members = self.ck.db().members(TypeKey.Item(item), name: "len")
+    if members.len() == 0 {
+        return mut terms.fresh(usize_ty)
+    }
+    let fn_ref = nir::FnRef.item(members[0], args)
+    let call = nir::Call(awaited: false, callee: nir::Callee.Fn(fn_ref.copy(alloc)), args: mem::List[nir::Operand].empty(alloc))
+    var operands = mem::List[u32].empty(alloc)
+    mut operands.push(indexed)
+    return mut self.callee_term(mut terms, call, callee: Some(take fn_ref), args: operands.view(), ty: usize_ty)
+} Walk.len_of
+
+/// The facts after a call at a point: the ensures of a direct callee, from the `ok` block of
+/// a call that may fail; the predicates of the values reachable from its result and `mut`
+/// arguments where they are facts; and the element range a range cursor yields.
+fn Walk.call_facts(
+    mut self,
+    mut terms: Terms,
+    point: CallPoint,
+    call: nir::Call,
+    callee: Option[nir::FnRef],
+    args: Slice[u32],
+    result: Option[u32],
+    before: mem::HashMap[Root, u32],
+    after: mem::HashMap[Root, u32],
+    ) {
+    let alloc = self.ck.alloc()
+    var after_args = mem::List[u32].empty(alloc)
+    var position: usize = 0
+    while position < call.args.len() and position < args.len() {
+        match call.args[position] {
+            nir::Operand.Place(mode: ast::Mode.Mut, place: place) => {
+                let located = mut self.locate(mut terms, place)
+                mut after_args.push(mut self.content(mut terms, located, contents: after))
+            }
+            else => mut after_args.push(args[position])
+        }
+        position += 1
+    }
+    match self.through(terms, call, callee, args) {
+        Some(through) => {
+            let clauses = self.ck.ensures_clauses(through.item, method: Some(usize.widen(through.method)))
+            let modes = self.method_modes(interface_item: through.item, method: usize.widen(through.method))
+            let ensured = mut self.ensures_facts(mut terms, unit: through.item, clauses: clauses.view(), modes: modes.view(), unit_args: through.unit_args, args, after_args: after_args.view(), result)
+            for fact in ensured {
+                mut self.fact_after(point.block, position: point.position, ok: point.ok, fact)
+            }
+            return
+        }
+        None => {}
+    }
+    let Some(fn_ref) = callee else {
+        return
+    }
+    let nir::Callable.Item(item: item, role: nir::Role.Body, index: _) = fn_ref.callable else {
+        return
+    }
+    mut self.direct_facts(mut terms, point, call, fn_ref, item, args, result, before, after_args: after_args.view())
+} Walk.call_facts
+
+/// The interface method a call reaches through a bound or `Dyn`, with its unit's type
+/// arguments.
+fn Walk.through(self, terms: Terms, call: nir::Call, callee: Option[nir::FnRef], args: Slice[u32]) -> Option[Through] {
+    let types = self.ck.types()
+    match callee {
+        Some(fn_ref) => {
+            match fn_ref.callable {
+                nir::Callable.Method(item: interface_item, method: method) => {
+                    let listed = types.arg_list(fn_ref.args)
+                    let Some(parts) = listed.split_at(1) else {
+                        return None
+                    }
+                    let Some(self_ty) = parts.head[0].ty() else {
+                        return None
+                    }
+                    let unit_args = self.ck.interface_args(interface_item, self_ty, args: parts.tail)
+                    return Some(Through(item: interface_item, method: method, unit_args: unit_args))
+                }
+                else => {}
+            }
+        }
+        None => {}
+    }
+    let nir::Callee.Dyn(place: _, item: interface_item, method: method) = call.callee else {
+        return None
+    }
+    let self_ty = terms.ty(args[0])
+    let bound_args = match types.kind(self_ty) {
+        ty::TyKind.Dyn(bound) => bound.args
+        else => ty::Args.none()
+    }
+    let unit_args = self.ck.interface_args(interface_item, self_ty, args: types.arg_list(bound_args))
+    return Some(Through(item: interface_item, method: method, unit_args: unit_args))
+} Walk.through
+
+/// The facts after a direct call of a function's body: those of a range cursor's element, its
+/// own and inherited ensures, and the predicates of its result and `mut` arguments.
+fn Walk.direct_facts(
+    mut self,
+    mut terms: Terms,
+    point: CallPoint,
+    call: nir::Call,
+    fn_ref: nir::FnRef,
+    item: ty::ItemId,
+    args: Slice[u32],
+    result: Option[u32],
+    before: mem::HashMap[Root, u32],
+    after_args: Slice[u32],
+    ) {
+    if self.ck.db().canonical(item).as_str() == "core::Range.next" {
+        match result {
+            Some(yielded) => {
+                if call.args.len() > 0 {
+                    match call.args[0] {
+                        nir::Operand.Place(mode: _, place: place) => mut self.range_fact(mut terms, block: point.block, position: point.position, place, yielded, before)
+                        else => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    let clauses = self.ck.ensures_clauses(item, method: None)
+    let modes = self.param_modes(fn_ref)
+    let ensured = mut self.ensures_facts(mut terms, unit: item, clauses: clauses.view(), modes: modes.view(), unit_args: fn_ref.args, args, after_args, result)
+    for fact in ensured {
+        mut self.fact_after(point.block, position: point.position, ok: point.ok, fact)
+    }
+    match self.ck.implemented_method(item) {
+        Some(implemented) => mut self.inherited_facts(mut terms, point, fn_ref, item, implemented, modes: modes.view(), args, after_args, result)
+        None => {}
+    }
+    let helper = not self.ck.is_boundary(item) and self.ck.db().module_of(item) == self.ck.db().module_of(self.unit.contents().item)
+    var facts = mem::List[u32].empty(self.ck.alloc())
+    let returned_ty = self.result_ty(fn_ref)
+    match result {
+        Some(returned) => {
+            match returned_ty {
+                Some(ty) => mut self.predicate_facts(mut terms, term: returned, ty, inside: not helper, collected: mut facts)
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let param_types = self.param_types(fn_ref)
+    var position: usize = 0
+    while position < call.args.len() and position < after_args.len() and position < param_types.len() {
+        match call.args[position] {
+            nir::Operand.Place(mode: ast::Mode.Mut, place: _) => mut self.predicate_facts(mut terms, term: after_args[position], ty: param_types[position], inside: not helper, collected: mut facts)
+            else => {}
+        }
+        position += 1
+    }
+    for fact in facts {
+        mut self.fact(point.block, position: point.position, term: fact, origin: Origin.Fact)
+    }
+} Walk.direct_facts
+
+/// The ensures an implementing function's call inherits from the interface method it
+/// implements, each guarded by that method's requires.
+fn Walk.inherited_facts(
+    mut self,
+    mut terms: Terms,
+    point: CallPoint,
+    fn_ref: nir::FnRef,
+    item: ty::ItemId,
+    implemented: Implemented,
+    modes: Slice[ast::Mode],
+    args: Slice[u32],
+    after_args: Slice[u32],
+    result: Option[u32],
+    ) {
+    let alloc = self.ck.alloc()
+    let types = self.ck.session().types.share()
+    let sig = self.ck.sig(item)
+    let subst = generics_subst(sig.contents().generics.view(), args: types.contents().arg_list(fn_ref.args), alloc)
+    let unit_args = subst.args(types.contents(), args: implemented.args)
+    var held = mem::List[u32].empty(alloc)
+    for clause in self.ck.method_requires(implemented.item, method: implemented.method) {
+        if clause.disputed {
+            continue
+        }
+        match mut self.returned(mut terms, item: implemented.item, role: nir::Role.Requires, index: clause.index, type_args: unit_args, params: listed_terms(args, alloc)) {
+            Some(term) => mut held.push(term)
+            None => {}
+        }
+    }
+    let guard = mut terms.conjunction(take held)
+    let clauses = self.ck.ensures_clauses(implemented.item, method: Some(implemented.method))
+    let inherited = mut self.ensures_facts(mut terms, unit: implemented.item, clauses: clauses.view(), modes, unit_args, args, after_args, result)
+    for fact in inherited {
+        let guarded = mut terms.implies(guard, part: fact)
+        mut self.fact_after(point.block, position: point.position, ok: point.ok, fact: guarded)
+    }
+} Walk.inherited_facts
+
+/// Records a fact of a call's normal return: from its `ok` block for a call that may fail.
+fn Walk.fact_after(mut self, block: nir::BlockId, position: usize, ok: Option[nir::BlockId], fact: u32) {
+    match ok {
+        Some(continued) => mut self.fact_from(continued, from: 0, term: fact, origin: Origin.Fact)
+        None => mut self.fact(block, position, term: fact, origin: Origin.Fact)
+    }
+} Walk.fact_after
+
+fn Walk.result_ty(self, fn_ref: nir::FnRef) -> Option[ty::Ty] {
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return None
+    }
+    let Some(sig) = self.ck.fn_sig(item) else {
+        return None
+    }
+    let types = self.ck.types()
+    let subst = generics_subst(sig.generics.view(), args: types.arg_list(fn_ref.args), alloc: self.ck.alloc())
+    return Some(subst.ty(types, ty: sig.result))
+} Walk.result_ty
+
+/// The modes of a direct callee's parameters, as its head declares them.
+fn Walk.param_modes(self, fn_ref: nir::FnRef) -> mem::List[ast::Mode] {
+    var modes = mem::List[ast::Mode].empty(self.ck.alloc())
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return modes
+    }
+    let Some(sig) = self.ck.fn_sig(item) else {
+        return modes
+    }
+    for param in sig.params {
+        mut modes.push(param.mode)
+    }
+    return modes
+} Walk.param_modes
+
+/// The modes of an interface method's parameters.
+fn Walk.method_modes(self, interface_item: ty::ItemId, method: usize) -> mem::List[ast::Mode] {
+    var modes = mem::List[ast::Mode].empty(self.ck.alloc())
+    let sig = self.ck.sig(interface_item)
+    let SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return modes
+    }
+    for param in methods[method].sig.params {
+        mut modes.push(param.mode)
+    }
+    return modes
+} Walk.method_modes
+
+fn Walk.param_types(self, fn_ref: nir::FnRef) -> mem::List[ty::Ty] {
+    let alloc = self.ck.alloc()
+    var types_of = mem::List[ty::Ty].empty(alloc)
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return types_of
+    }
+    let Some(sig) = self.ck.fn_sig(item) else {
+        return types_of
+    }
+    let types = self.ck.types()
+    let subst = generics_subst(sig.generics.view(), args: types.arg_list(fn_ref.args), alloc)
+    for param in sig.params {
+        mut types_of.push(subst.ty(types, ty: param.ty))
+    }
+    return types_of
+} Walk.param_types
+
+/// The ensures of a callee after it returns, computed by the functions of `unit`'s unit:
+/// each read or `take` parameter its argument's term at the call, each `mut` parameter its
+/// place's content after the call, each `old(e)` the term of e over the arguments at the
+/// call, and `result` the call's term.
+fn Walk.ensures_facts(
+    mut self,
+    mut terms: Terms,
+    unit: ty::ItemId,
+    clauses: Slice[EnsuresClause],
+    modes: Slice[ast::Mode],
+    unit_args: ty::Args,
+    args: Slice[u32],
+    after_args: Slice[u32],
+    result: Option[u32],
+    ) -> mem::List[u32] {
+    let alloc = self.ck.alloc()
+    var kept = mem::List[u32].empty(alloc)
+    var position: usize = 0
+    while position < modes.len() and position < after_args.len() {
+        if modes[position] != ast::Mode.Take {
+            mut kept.push(after_args[position])
+        }
+        position += 1
+    }
+    let returned = match result {
+        Some(term) => term
+        None => mut terms.literal(nir::Literal.Unit)
+    }
+    var facts = mem::List[u32].empty(alloc)
+    for clause in clauses {
+        if clause.disputed {
+            continue
+        }
+        var params = listed_terms(kept.view(), alloc)
+        mut params.push(returned)
+        for old in clause.olds {
+            let term = mut self.returned(mut terms, item: unit, role: nir::Role.Old, index: old, type_args: unit_args, params: listed_terms(args, alloc))
+            match term {
+                Some(value) => mut params.push(value)
+                None => mut params.push(mut terms.fresh(ty::Ty.unit()))
+            }
+        }
+        match mut self.returned(mut terms, item: unit, role: nir::Role.Ensures, index: clause.index, type_args: unit_args, take params) {
+            Some(fact) => mut facts.push(fact)
+            None => {}
+        }
+    }
+    return facts
+} Walk.ensures_facts
+
+/// The predicates of the struct values reachable from a term of a type, as facts where
+/// they are: outside their type's module always, and inside it when `inside` says so.
+fn Walk.predicate_facts(
+    mut self,
+    mut terms: Terms,
+    term: u32,
+    ty: ty::Ty,
+    inside: bool,
+    mut collected: mem::List[u32],
+    ) {
+    let alloc = self.ck.alloc()
+    let types = self.ck.session().types.share()
+    let ty::TyKind.Item(item: item, args: args) = types.contents().kind(ty) else {
+        return
+    }
+    if not self.ck.has_predicates_within(ty) {
+        return
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return
+    }
+    if inside or self.ck.db().module_of(item) != self.ck.db().module_of(self.holder) {
+        for index in 0..<self.ck.predicate_count(item) {
+            var params = mem::List[u32].empty(alloc)
+            mut params.push(term)
+            match mut self.returned(mut terms, item, role: nir::Role.Predicate, index, type_args: args, take params) {
+                Some(fact) => mut collected.push(fact)
+                None => {}
+            }
+        }
+    }
+    let subst = generics_subst(sig.contents().generics.view(), args: types.contents().arg_list(args), alloc)
+    for field in fields {
+        let field_ty = subst.ty(types.contents(), ty: field.ty)
+        if self.ck.has_predicates_within(field_ty) {
+            let part = mut self.field(mut terms, term, step: field.name.as_str())
+            mut self.predicate_facts(mut terms, term: part, ty: field_ty, inside, mut collected)
+        }
+    }
+} Walk.predicate_facts
+
+/// The fact that the element a range cursor yields lies within the bounds the range had
+/// when its loop started.
+fn Walk.range_fact(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    position: usize,
+    place: nir::Place,
+    yielded: u32,
+    before: mem::HashMap[Root, u32],
+    ) {
+    let located = mut self.locate(mut terms, place)
+    let Located.Place(root: root, steps: steps) = located else {
+        return
+    }
+    if steps.len() > 0 {
+        return
+    }
+    let range = match self.loop_start.get(root) {
+        Some(started) => Some(started)
+        None => before.get(root)
+    }
+    let Some(cursor) = range else {
+        return
+    }
+    let low = mut self.field(mut terms, term: cursor, step: "low")
+    let high = mut self.field(mut terms, term: cursor, step: "high")
+    let inclusive = mut self.field(mut terms, term: cursor, step: "inclusive")
+    let some = self.tag_is(mut terms, scrutinee: yielded, index: 0)
+    let element = mut self.field(mut terms, term: yielded, step: "Some")
+    let above = mut terms.compare(nir::BinaryOp.Le, left: low, right: element)
+    let le = mut terms.compare(nir::BinaryOp.Le, left: element, right: high)
+    let lt = mut terms.compare(nir::BinaryOp.Lt, left: element, right: high)
+    let below = mut terms.ite(inclusive, then: le, otherwise: lt)
+    let within = mut terms.conjunction(term_pair(above, right: below, alloc: self.ck.alloc()))
+    let fact = mut terms.implies(some, part: within)
+    mut self.fact(block, position, term: fact, origin: Origin.Fact)
+} Walk.range_fact
+
+/// A quantifier's term: its region walked with a bound symbol for its element, which lies
+/// within the range there.
+fn Walk.quantifier(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    all: bool,
+    low: u32,
+    high: u32,
+    inclusive: bool,
+    region: nir::Region,
+    contents: mem::HashMap[Root, u32],
+    ) -> u32 {
+    let alloc = self.ck.alloc()
+    let element = terms.ty(low)
+    let bound = mut terms.bound(element)
+    let above = mut terms.compare(nir::BinaryOp.Le, left: low, right: bound)
+    var op = nir::BinaryOp.Lt
+    if inclusive {
+        op = nir::BinaryOp.Le
+    }
+    let below = mut terms.compare(op, left: bound, right: high)
+    let within = mut terms.conjunction(term_pair(above, right: below, alloc))
+    mut self.fact_from(region.blocks[0], from: 0, term: within, origin: Origin.Fact)
+    var params = mem::List[u32].empty(alloc)
+    mut params.push(bound)
+    let walked = mut self.region(mut terms, block, region, take params, contents)
+    let body = match walked.yielded {
+        Some(yielded) => yielded
+        None => mut terms.boolean(true)
+    }
+    return mut terms.intern(Term.Quant(all: all, low: low, high: high, inclusive: inclusive, bound: bound, body: body), ty: ty::Ty.scalar(ty::Scalar.Bool))
+} Walk.quantifier
+
+/// Walks a region from its first block, which receives `params` and the reach condition of
+/// its instruction's block; returns the term it yields, if it yields, and the contents of
+/// `contents`' roots after it yields, the ite of theirs at each `yield`.
+fn Walk.region(
+    mut self,
+    mut terms: Terms,
+    block: nir::BlockId,
+    region: nir::Region,
+    take params: mem::List[u32],
+    contents: mem::HashMap[Root, u32],
+    ) -> RegionWalked {
+    let alloc = self.ck.alloc()
+    let entry = region.blocks[0]
+    self.reach[usize.widen(entry.index)] = self.reach[usize.widen(block.index)]
+    let shared = self.unit.share()
+    let function = shared.contents().functions[self.function]
+    let entry_params = function.block(entry).params
+    var index: usize = 0
+    while index < entry_params.len() and index < params.len() {
+        self.values[usize.widen(entry_params[index].index)] = Some(params[index])
+        index += 1
+    }
+    var saved_returns = mem::List[Returned].empty(alloc)
+    for returned in self.returns {
+        mut saved_returns.push(returned)
+    }
+    self.returns = mem::List[Returned].empty(alloc)
+    let saved_yields = copied_yields(self.yields.view(), alloc)
+    self.yields = mem::List[Yielded].empty(alloc)
+    let order = self.order(entry, within: Some(region.blocks.view()))
+    for position in 0..<order.len() {
+        let current = order[position]
+        let data = function.block(current)
+        let current_contents = match position {
+            0 => copied_contents(contents, alloc)
+            else => mut self.block_entry(mut terms, block: current, data)
+        }
+        mut self.block(mut terms, block: current, data, contents: take current_contents)
+    }
+    let yielded = mut self.result(mut terms)
+    self.returns = saved_returns
+    var conditions = mem::List[u32].empty(alloc)
+    for at in self.yields {
+        mut conditions.push(at.reach)
+    }
+    var after = mem::HashMap[Root, u32].empty(seed: 0, alloc)
+    for root in sorted_roots(contents, alloc) {
+        let Some(arms) = yield_arms(self.yields.view(), root, alloc) else {
+            continue
+        }
+        if arms.len() == 0 {
+            continue
+        }
+        let merged = self.ites(mut terms, conditions: conditions.view(), arms: arms.view())
+        discard mut after.insert(root, value: merged)
+    }
+    self.yields = saved_yields
+    return RegionWalked(yielded: yielded, contents: take after)
+} Walk.region
+
+/// The edges a terminator leaves by, with their conditions; a return or yield records its
+/// term with the block's reach condition.
+fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block, take contents: mem::HashMap[Root, u32]) -> mem::List[Edge] {
+    let alloc = self.ck.alloc()
+    var edges = mem::List[Edge].empty(alloc)
+    let Some(reach) = self.reach[usize.widen(block.index)] else {
+        expect false
+        return edges
+    }
+    match data.term {
+        nir::Terminator.Jump(jump) => {
+            let args = mut self.operands(mut terms, operands: jump.args.view(), contents)
+            let truth = mut terms.boolean(true)
+            mut edges.push(Edge.joined(mut terms, reach, target: jump.block, condition: truth, take args, take contents))
+        }
+        nir::Terminator.Branch(operand: operand, then: then, otherwise: otherwise) => {
+            let tested = mut self.operand(mut terms, operand, contents)
+            let negated = mut terms.negation(tested)
+            let then_args = mut self.operands(mut terms, operands: then.args.view(), contents)
+            let else_args = mut self.operands(mut terms, operands: otherwise.args.view(), contents)
+            let copied = copied_contents(contents, alloc)
+            mut edges.push(Edge.joined(mut terms, reach, target: then.block, condition: tested, args: take then_args, contents: take copied))
+            mut edges.push(Edge.joined(mut terms, reach, target: otherwise.block, condition: negated, args: take else_args, take contents))
+        }
+        nir::Terminator.Call(call: call, ok: ok, failure: failure) => {
+            let ok_ty = self.ty(self.nir().block(ok).params[0])
+            let term = mut self.call(mut terms, block, position: data.insts.len(), ok: Some(ok), call, result_ty: Some(ok_ty), result: None, span: data.term_span, mut contents)
+            let result = match term {
+                Some(value) => value
+                None => mut terms.fresh(ok_ty)
+            }
+            let succeeded = mut terms.fresh(ty::Ty.scalar(ty::Scalar.Bool))
+            let failed = mut terms.negation(succeeded)
+            let fail_ty = self.ty(self.nir().block(failure).params[0])
+            let failure_term = mut terms.fresh(fail_ty)
+            let copied = copied_contents(contents, alloc)
+            var ok_args = mem::List[u32].empty(alloc)
+            mut ok_args.push(result)
+            var fail_args = mem::List[u32].empty(alloc)
+            mut fail_args.push(failure_term)
+            mut edges.push(Edge.joined(mut terms, reach, target: ok, condition: succeeded, args: take ok_args, contents: take copied))
+            mut edges.push(Edge.joined(mut terms, reach, target: failure, condition: failed, args: take fail_args, take contents))
+        }
+        nir::Terminator.Return(value) => {
+            let term = match value {
+                Some(operand) => mut self.operand(mut terms, operand, contents)
+                None => mut terms.literal(nir::Literal.Unit)
+            }
+            mut self.returns.push(Returned(reach: reach, term: term))
+        }
+        nir::Terminator.Yield(value) => {
+            let term = mut self.operand(mut terms, operand: value, contents)
+            mut self.returns.push(Returned(reach: reach, term: term))
+            mut self.yields.push(Yielded(reach: reach, contents: take contents))
+        }
+        else => {}
+    }
+    return edges
+} Walk.terminator
+
+/// An edge whose condition is the block's reach condition and the branch's own.
+fn Edge.joined(
+    mut terms: Terms,
+    reach: u32,
+    target: nir::BlockId,
+    condition: u32,
+    take args: mem::List[u32],
+    take contents: mem::HashMap[Root, u32],
+    ) -> Edge {
+    let alloc = terms.alloc
+    let joined = mut terms.conjunction(term_pair(reach, right: condition, alloc))
+    return Edge(target: target, condition: joined, args: take args, contents: take contents)
+} Edge.joined
+
+/// The queries of the function's sites, in site order.
+fn Walk.queries(self, mut terms: Terms) -> mem::List[StatementSite] {
+    var queries = mem::List[StatementSite].empty(self.ck.alloc())
+    for site in self.sites {
+        let premises = self.premises_at(mut terms, target: site.block, position: site.position)
+        mut queries.push(StatementSite(site: site, query: Query(premises: take premises, goal: site.goal)))
+    }
+    return queries
+} Walk.queries
+
+/// The premises at a point: the entry facts, the reach condition of its block, then the
+/// facts of each block from which it is reachable, in block order, those holding on the way
+/// to the point, guarded by their block's reach condition unless that block dominates its
+/// block.
+fn Walk.premises_at(self, mut terms: Terms, target: nir::BlockId, position: usize) -> mem::List[Premise] {
+    var premises = mem::List[Premise].empty(self.ck.alloc())
+    let Some(reach) = self.reach[usize.widen(target.index)] else {
+        expect false
+        return premises
+    }
+    for premise in self.entry {
+        mut premises.push(premise)
+    }
+    mut premises.push(Premise(term: reach, origin: Origin.Fact))
+    var reaching = self.reaching(target)
+    discard mut reaching.insert(target, value: position)
+    for entry in reaching {
+        let block = entry.key()
+        let before = entry.value()
+        let dominates = self.dominators[usize.widen(target.index)][usize.widen(block.index)]
+        for fact in self.facts {
+            if fact.block != block or fact.from > before {
+                continue
+            }
+            var term = fact.term
+            if not dominates {
+                let Some(guard) = self.reach[usize.widen(block.index)] else {
+                    expect false
+                    return premises
+                }
+                term = mut terms.implies(guard, part: fact.term)
+            }
+            mut premises.push(Premise(term: term, origin: fact.origin))
+        }
+    }
+    return premises
+} Walk.premises_at
+
+/// The blocks from which a block is reachable, each with the last position of its own whose
+/// facts hold on the way: all of them through a forward edge, and those before a region's
+/// instruction on the way from its block to the region's first block.
+fn Walk.reaching(self, target: nir::BlockId) -> mem::Map[nir::BlockId, usize] {
+    let alloc = self.ck.alloc()
+    var seen = mem::Map[nir::BlockId, usize].empty(alloc)
+    var pending = mem::List[nir::BlockId].empty(alloc)
+    mut pending.push(target)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        for pred in self.preds[usize.widen(block.index)] {
+            note_reaching(mut seen, mut pending, pred, before: WHOLE_BLOCK)
+        }
+        match self.region_parent.get(block) {
+            Some(parent) => note_reaching(mut seen, mut pending, pred: parent.block, before: parent.position)
+            None => {}
+        }
+    }
+    return seen
+} Walk.reaching
+
+/// Records that facts of a block hold on the way up to a position, unless a later one is
+/// known, and queues a block newly seen.
+fn note_reaching(mut seen: mem::Map[nir::BlockId, usize], mut pending: mem::List[nir::BlockId], pred: nir::BlockId, before: usize) {
+    let known = seen.get(pred)
+    let raised = match known {
+        Some(held) => held < before
+        None => true
+    }
+    if not raised {
+        return
+    }
+    discard mut seen.insert(pred, value: before)
+    if known.is_none() {
+        mut pending.push(pred)
+    }
+} note_reaching
+
+/// Whether a region block lies, through the blocks holding the instructions of its region
+/// and of those enclosing it, in one of `blocks`.
+fn Walk.held_by(self, block: nir::BlockId, blocks: mem::Set[nir::BlockId]) -> bool {
+    var current = block
+    loop {
+        let Some(holder) = self.region_holder.get(current) else {
+            return false
+        }
+        if blocks.contains(holder) {
+            return true
+        }
+        current = holder
+    }
+} Walk.held_by
+
+/// The places an instruction writes: by `init`, `assign`, `ref mut` or a call's `mut` or
+/// `take` operands.
+fn written_places(op: nir::Op, alloc: mem::Alloc) -> mem::List[nir::Place] {
+    var places = mem::List[nir::Place].empty(alloc)
+    match op {
+        nir::Op.Init(place: place, operand: _) or nir::Op.Assign(place: place, operand: _) or nir::Op.RefMut(place) => mut places.push(place.copy(alloc))
+        nir::Op.Call(call) => return changed_places(call, alloc)
+        else => {}
+    }
+    return places
+} written_places
+
+/// The places a call receives by `mut` or `take`.
+fn changed_places(call: nir::Call, alloc: mem::Alloc) -> mem::List[nir::Place] {
+    var places = mem::List[nir::Place].empty(alloc)
+    for operand in call.args {
+        match operand {
+            nir::Operand.Place(mode: mode, place: place) => {
+                if mode == ast::Mode.Mut or mode == ast::Mode.Take {
+                    mut places.push(place.copy(alloc))
+                }
+            }
+            else => {}
+        }
+    }
+    return places
+} changed_places
+
+/// The obligation a call of a built-in operation carries: `fit`, and the `at` and `at_mut` of
+/// an array, slice, list, bytes or bounded list.
+fn Checker.builtin_obligation(self, fn_ref: nir::FnRef) -> Option[Obligation] {
+    match fn_ref.callable {
+        nir::Callable.Builtin(nir::Builtin.Conversion(conversion: nir::Conversion.Fit, scalar: _)) => return Some(Obligation.Conversion)
+        nir::Callable.Item(item: item, role: nir::Role.Body, index: _) => {
+            let path = self.db().canonical(item)
+            let start = member_start(path.as_str())
+            if start == 0 {
+                return None
+            }
+            let Some(owner) = path.slice_bytes(0, end: start - 1) else {
+                return None
+            }
+            let Some(member) = path.slice_bytes(start, end: path.byte_len()) else {
+                return None
+            }
+            if is_listed(INDEXED_OWNERS, word: owner) and (member == "at" or member == "at_mut") {
+                return Some(Obligation.Bounds)
+            }
+            return None
+        }
+        else => return None
+    }
+} Checker.builtin_obligation
+
+/// A copy of the place.
+fn Located.copy(self, alloc: mem::Alloc) -> Located {
+    return match self {
+        Located.Place(root: root, steps: steps) => Located.Place(root: root, steps: copied_steps(steps.view(), alloc))
+        Located.Owned(term) => Located.Owned(term)
+    }
+} Located.copy
+
+/// A copy of the edge.
+fn Edge.copy(self, alloc: mem::Alloc) -> Edge {
+    return Edge(target: self.target, condition: self.condition, args: listed_terms(self.args.view(), alloc), contents: copied_contents(self.contents, alloc))
+} Edge.copy
+
+/// A copy of the steps of a place.
+fn copied_steps(steps: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copied = mem::List[text::String].empty(alloc)
+    for step in steps {
+        mut copied.push(text::String.of(step.as_str(), alloc))
+    }
+    return copied
+} copied_steps
+
+/// The steps of a place followed by more steps, copied.
+fn joined_steps(steps: Slice[text::String], more: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var joined = mem::List[text::String].empty(alloc)
+    for step in steps {
+        mut joined.push(text::String.of(step.as_str(), alloc))
+    }
+    for step in more {
+        mut joined.push(text::String.of(step.as_str(), alloc))
+    }
+    return joined
+} joined_steps
+
+/// A copy of contents.
+fn copied_contents(contents: mem::HashMap[Root, u32], alloc: mem::Alloc) -> mem::HashMap[Root, u32] {
+    var copied = mem::HashMap[Root, u32].empty(seed: 0, alloc)
+    for entry in contents {
+        discard mut copied.insert(entry.key(), value: entry.value())
+    }
+    return copied
+} copied_contents
+
+/// A copy of the contents at yields.
+fn copied_yields(yields: Slice[Yielded], alloc: mem::Alloc) -> mem::List[Yielded] {
+    var copied = mem::List[Yielded].empty(alloc)
+    for at in yields {
+        mut copied.push(Yielded(reach: at.reach, contents: copied_contents(at.contents, alloc)))
+    }
+    return copied
+} copied_yields
+
+/// The roots of contents, in root order.
+fn sorted_roots(contents: mem::HashMap[Root, u32], alloc: mem::Alloc) -> mem::List[Root] {
+    var roots = mem::List[Root].empty(alloc)
+    for entry in contents {
+        mut roots.push(entry.key())
+    }
+    mut roots.sort_by(fn(left: Root, right: Root) => left.cmp(right))
+    return roots
+} sorted_roots
+
+/// The content of a root on each incoming edge; none when an edge lacks it.
+fn incoming_arms(incoming: Slice[Edge], root: Root, alloc: mem::Alloc) -> Option[mem::List[u32]] {
+    var arms = mem::List[u32].empty(alloc)
+    for edge in incoming {
+        let Some(held) = edge.contents.get(root) else {
+            return None
+        }
+        mut arms.push(held)
+    }
+    return Some(take arms)
+} incoming_arms
+
+/// The content of a root at each yield; none when a yield lacks it.
+fn yield_arms(yields: Slice[Yielded], root: Root, alloc: mem::Alloc) -> Option[mem::List[u32]] {
+    var arms = mem::List[u32].empty(alloc)
+    for at in yields {
+        let Some(held) = at.contents.get(root) else {
+            return None
+        }
+        mut arms.push(held)
+    }
+    return Some(take arms)
+} yield_arms
+
+/// Whether a block is among some blocks.
+fn holds_block(blocks: Slice[nir::BlockId], block: nir::BlockId) -> bool {
+    for held in blocks {
+        if held == block {
+            return true
+        }
+    }
+    return false
+} holds_block
+
+/// Whether a block lies within the blocks given, every block when none are.
+fn within_blocks(within: Option[Slice[nir::BlockId]], block: nir::BlockId) -> bool {
+    let Some(blocks) = within else {
+        return true
+    }
+    return holds_block(blocks, block)
+} within_blocks
+
+/// Whether an item is among some items.
+fn holds_item(items: Slice[ty::ItemId], item: ty::ItemId) -> bool {
+    for held in items {
+        if held == item {
+            return true
+        }
+    }
+    return false
+} holds_item
+
+/// A list of the items of a slice.
+fn listed_items(items: Slice[ty::ItemId], alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    var listed = mem::List[ty::ItemId].empty(alloc)
+    for item in items {
+        mut listed.push(item)
+    }
+    return listed
+} listed_items
+
+/// A list of `count` absent terms.
+fn absent_terms(count: usize, alloc: mem::Alloc) -> mem::List[Option[u32]] {
+    var absent = mem::List[Option[u32]].empty(alloc)
+    for _ in 0..<count {
+        mut absent.push(None)
+    }
+    return absent
+} absent_terms
+
+/// A list of `count` empty edge lists.
+fn empty_edges(count: usize, alloc: mem::Alloc) -> mem::List[mem::List[Edge]] {
+    var edges = mem::List[mem::List[Edge]].empty(alloc)
+    for _ in 0..<count {
+        mut edges.push(mem::List[Edge].empty(alloc))
+    }
+    return edges
+} empty_edges
+
+/// A list of `count` empty block lists.
+fn block_lists(count: usize, alloc: mem::Alloc) -> mem::List[mem::List[nir::BlockId]] {
+    var lists = mem::List[mem::List[nir::BlockId]].empty(alloc)
+    for _ in 0..<count {
+        mut lists.push(mem::List[nir::BlockId].empty(alloc))
+    }
+    return lists
+} block_lists
+
+/// A copy of block lists.
+fn copied_block_lists(lists: Slice[mem::List[nir::BlockId]], alloc: mem::Alloc) -> mem::List[mem::List[nir::BlockId]] {
+    var copied = mem::List[mem::List[nir::BlockId]].empty(alloc)
+    for list in lists {
+        var blocks = mem::List[nir::BlockId].empty(alloc)
+        for block in list {
+            mut blocks.push(block)
+        }
+        mut copied.push(take blocks)
+    }
+    return copied
+} copied_block_lists
+
+/// A list of `count` flags of one value.
+fn flags_of(count: usize, value: bool, alloc: mem::Alloc) -> mem::List[bool] {
+    var flags = mem::List[bool].empty(alloc)
+    for _ in 0..<count {
+        mut flags.push(value)
+    }
+    return flags
+} flags_of
+
+/// The substitution of generic parameters by arguments, by position.
+fn generics_subst(generics: Slice[GenericDef], args: Slice[ty::Arg], alloc: mem::Alloc) -> ty::Subst {
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in generics {
+        mut params.push(def.param)
+    }
+    return ty::Subst.of(params.view(), args, alloc)
+} generics_subst

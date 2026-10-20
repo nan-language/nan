@@ -1,0 +1,230 @@
+//! Newer releases: the release of a `dep` directive's source, newer than the locked one, that names what a path through the directive's alias names nothing by.
+
+/// Reports a path of an item, written `alias::rest` on the tokens of `construct`, that names
+/// nothing while a newer release of the source of the `dep` directive declaring `alias`
+/// names it; whether it does.
+fn Checker.report_newer_release(self, item: ty::ItemId, construct: nir::Span, written: Str) -> bool {
+    let alloc = self.alloc()
+    let Some(separator) = written.find("::") else {
+        return false
+    }
+    let Some(alias) = written.slice_bytes(0, end: separator) else {
+        return false
+    }
+    let Some(rest) = written.slice_bytes(separator + 2, end: written.byte_len()) else {
+        return false
+    }
+    let Some(release) = self.newer_release(item, alias, rest) else {
+        return false
+    }
+    var because = mem::List[diagnostic::Reason].empty(alloc)
+    mut because.push(diagnostic::Reason.note(release.as_str(), alloc))
+    mut because.push(diagnostic::Reason(role: diagnostic::Role.Command, subject: text::String.of("nan dep sync", alloc), at: None))
+    var reported = self.on(item, construct, code: diagnostic::Code.NameNewerRelease)
+    reported.because = because
+    self.report_diagnostic(item, take reported)
+    return true
+} Checker.report_newer_release
+
+/// The newer release of the source of the `dep` directive of an item's package declaring
+/// `alias` that names `rest` as a `pub` item or member, as a diagnostic names it: the current
+/// state of a path source whose code root differs from the locked release's, by its source,
+/// or else the earliest named release under the store name with a greater publication index
+/// than the locked one, by its store name and code root.
+fn Checker.newer_release(self, item: ty::ItemId, alias: Str, rest: Str) -> Option[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let package_id = db.package_of(item)
+    let source = db.source(package_id)
+    let Some(manifest) = source.manifest else {
+        return None
+    }
+    let Some(position) = manifest.deps.position(fn(value: workspace::Dep) => value.alias.as_str() == alias) else {
+        return None
+    }
+    let dep = manifest.deps[position]
+    let Some(locked_id) = db.alias(package_id, name: alias) else {
+        return None
+    }
+    let locked = db.package_data(locked_id)
+    var path = text::String.of(locked.name.as_str(), alloc)
+    mut path.append("::")
+    mut path.append(rest)
+    let Some(named) = dep.source else {
+        return None
+    }
+    if dep.path {
+        let session = db.session
+        let Some(current) = session.workspace.contents().packages.position(fn(value: workspace::Package) => value.dir.as_str() == named.as_str()) else {
+            return None
+        }
+        let differs = match locked.member {
+            Some(workspace::Member.Release(_)) => true
+            else => false
+        }
+        if differs and session.names_now(current, path: path.as_str()) {
+            return Some(text::String.of(dep.written.as_str(), alloc))
+        }
+        return None
+    }
+    let Some(lock) = source.machine.lock() else {
+        return None
+    }
+    let Some(line) = lock.deps.position(fn(value: machine::Locked) => alias_is(value.alias, alias)) else {
+        return None
+    }
+    return self.store_release(named.as_str(), root: lock.deps[line].root, path: path.as_str())
+} Checker.newer_release
+
+/// Whether a locked line's alias is a given one.
+fn alias_is(written: Option[text::String], alias: Str) -> bool {
+    let Some(held) = written else {
+        return false
+    }
+    return held.as_str() == alias
+} alias_is
+
+/// The earliest named release of the local store under a store name, with a greater
+/// publication index than that of the release of a code root, whose exports name a
+/// canonical path, by its store name and code root.
+fn Checker.store_release(self, named: Str, root: hashing::HashValue, path: Str) -> Option[text::String] {
+    let alloc = self.alloc()
+    let Some(entries) = self.store_entries() else {
+        return None
+    }
+    var held: Option[u64] = None
+    for entry in entries {
+        if entry.root(alloc) == root {
+            held = Some(entry.index)
+            break
+        }
+    }
+    let Some(index) = held else {
+        return None
+    }
+    var newer = mem::List[usize].empty(alloc)
+    for position in 0..<entries.len() {
+        if entries[position].index > index and alias_is(entries[position].name, alias: named) {
+            mut newer.push(position)
+        }
+    }
+    mut newer.sort_by(fn(left: usize, right: usize) => entries[left].index.cmp(entries[right].index))
+    let grammar = self.session().grammar.contents()
+    for position in newer {
+        let entry = entries[position]
+        if names_exported(release_exports(entry.artefact.view(), grammar, alloc), path) {
+            var written = text::String.of(named, alloc)
+            mut written.push(' ')
+            mut written.append(entry.root(alloc).short(alloc).as_str())
+            return Some(take written)
+        }
+    }
+    return None
+} Checker.store_release
+
+/// Whether a release's exports name a canonical path as an item, or as a member its owner's
+/// entry declares.
+fn names_exported(exported: mem::Map[text::String, machine::ApiEntry], path: Str) -> bool {
+    if exported.get_by(fn(key: text::String) => key.as_str().cmp(path)).is_some() {
+        return true
+    }
+    let Some(dot) = last_dot(path) else {
+        return false
+    }
+    let Some(owner) = path.slice_bytes(0, end: dot) else {
+        return false
+    }
+    let Some(member) = path.slice_bytes(dot + 1, end: path.byte_len()) else {
+        return false
+    }
+    let Some(entry) = exported.get_by(fn(key: text::String) => key.as_str().cmp(owner)) else {
+        return false
+    }
+    return entry.declares(member)
+} names_exported
+
+/// The byte position of the last `.` of a path.
+fn last_dot(path: Str) -> Option[usize] {
+    let bytes = path.as_bytes()
+    var index = bytes.len()
+    while index > 0 {
+        index -= 1
+        if bytes[index] == b'.' {
+            return Some(index)
+        }
+    }
+    return None
+} last_dot
+
+/// Whether a package of the checker names a canonical path as a `pub` item, or as a variant
+/// of a `pub` enum.
+fn Checker.names_pub(self, package_id: ty::PackageId, path: Str) -> bool {
+    let db = self.db()
+    let dot = last_dot(path)
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            if db.ast(item).visibility != ast::Visibility.Pub {
+                continue
+            }
+            let Some(found) = self.canonical_path(item) else {
+                continue
+            }
+            if found.as_str() == path {
+                return true
+            }
+            let Some(at) = dot else {
+                continue
+            }
+            if names_variant(db.ast(item), found: found.as_str(), path, dot: at) {
+                return true
+            }
+        }
+    }
+    return false
+} Checker.names_pub
+
+/// Whether an enum item at a canonical path is the owner, before the dot at `dot`, of a path
+/// whose member after it is one of its variants.
+fn names_variant(declared: ast::Item, found: Str, path: Str, dot: usize) -> bool {
+    let Some(owner) = path.slice_bytes(0, end: dot) else {
+        return false
+    }
+    let Some(member) = path.slice_bytes(dot + 1, end: path.byte_len()) else {
+        return false
+    }
+    if found != owner {
+        return false
+    }
+    let ast::ItemKind.Enum(enumeration) = declared.kind else {
+        return false
+    }
+    for variant in enumeration.variants {
+        if variant.name.text.as_str() == member {
+            return true
+        }
+    }
+    return false
+} names_variant
+
+/// Whether the current state of a workspace package, by its index, names a canonical path as
+/// a `pub` item or member.
+fn Session.names_now(self, current: usize, path: Str) -> bool {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let current_package = held.packages[current]
+    let Some(closure) = held.closure_of(current) else {
+        return false
+    }
+    let targets = check_targets(current_package, alloc)
+    if targets.len() == 0 {
+        return false
+    }
+    let checker = self.unchecked(closure, target: targets[0])
+    let Some(name) = current_package.name() else {
+        return false
+    }
+    let Some(id) = checker.package_named(name) else {
+        return false
+    }
+    return checker.names_pub(id, path)
+} Session.names_now

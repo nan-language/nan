@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
+use std::rc::Rc;
 
 use super::db::{ItemId, ModuleId, TypeKey};
 use super::resolve::Named;
@@ -196,25 +197,37 @@ impl Checker<'_> {
     }
 
     /// The functions of the workspace named after a type, by their member names.
-    pub fn member_functions(&self) -> HashMap<&str, Vec<ItemId>> {
-        let mut functions: HashMap<&str, Vec<ItemId>> = HashMap::new();
-        for members in self.db.members.values() {
-            for (name, named) in members {
-                functions.entry(name.as_str()).or_default().extend(
-                    named
-                        .iter()
-                        .filter(|function| self.db.is_reported(**function)),
-                );
+    pub fn member_functions(&self) -> &HashMap<String, Vec<ItemId>> {
+        self.member_functions.get_or_init(|| {
+            let mut functions: HashMap<String, Vec<ItemId>> = HashMap::new();
+            for members in self.db.members.values() {
+                for (name, named) in members {
+                    functions.entry(name.clone()).or_default().extend(
+                        named
+                            .iter()
+                            .filter(|function| self.db.is_reported(**function)),
+                    );
+                }
             }
-        }
-        functions
+            functions
+        })
     }
 
     /// The items an item names: those its paths name, its test target aside; the functions
-    /// `functions` lists under each member name it writes after `.` and each cursor method its
+    /// named after a type under each member name it writes after `.` and each cursor method its
     /// `for` statements call; the type a function is named after; and the functions
-    /// implementing the interface of an impl line.
-    pub fn names(&self, item: ItemId, functions: &HashMap<&str, Vec<ItemId>>) -> BTreeSet<ItemId> {
+    /// implementing the interface of an impl line. It reads no other item's facts as a subject's.
+    pub fn names(&self, item: ItemId) -> Rc<BTreeSet<ItemId>> {
+        if let Some(named) = self.named.borrow().get(&item) {
+            return named.clone();
+        }
+        let named = Rc::new(self.db.about(None, || self.compute_names(item)));
+        self.named.borrow_mut().insert(item, named.clone());
+        named
+    }
+
+    fn compute_names(&self, item: ItemId) -> BTreeSet<ItemId> {
+        let functions = self.member_functions();
         let holder = self.holder(item);
         let written = holder.written();
         let mut named: BTreeSet<ItemId> = written

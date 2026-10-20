@@ -1,0 +1,1285 @@
+//! The workspace a command runs in: its packages, their manifests, modules and source files.
+
+pkg struct Workspace {
+    pkg root: text::String
+    pkg packages: mem::List[Package]
+    /// The releases of the local store that the packages' locks read.
+    pkg releases: mem::List[Release]
+    /// The store entries confirming that path sources' current states are the releases their
+    /// locks name.
+    confirmed: mem::List[mem::Shared[store::Entry]]
+    /// The dependency closures the packages share, each checking some of them.
+    pkg closures: mem::List[Closure]
+    /// The diagnostics of reading the locks.
+    locked: mem::List[diagnostic::Diagnostic]
+    /// Source files that no package holds, with their contents.
+    stray: mem::List[StrayFile]
+    /// The package and file indexes of each file, by path.
+    paths: mem::Map[text::String, FileAt]
+    /// The package directories and files the walk found.
+    walked: mem::List[Found]
+} Workspace
+
+/// A source file that no package holds, with its contents.
+struct StrayFile {
+    path: text::String
+    bytes: mem::Bytes
+} StrayFile
+
+/// Where a file of a workspace lies: the index of its package, and its index among the
+/// package's files.
+pkg struct FileAt derives Copy, Eq {
+    pkg package_index: usize
+    pkg file_index: usize
+} FileAt
+
+pkg struct Package {
+    /// The package directory, relative to the workspace root.
+    pkg dir: text::String
+    pkg manifest: Option[Manifest]
+    /// `package.nan` first, then the source files in byte order of path.
+    pkg files: mem::List[File]
+    pkg modules: mem::List[Module]
+    pkg machine: Machine
+    /// The tombstones of a valid history, one file per module holding some.
+    pkg history: mem::List[File]
+    /// The names of the structs, enums and layouts each module declares, by module index.
+    types: mem::List[mem::Set[text::String]]
+    pkg diagnostics: mem::List[diagnostic::Diagnostic]
+} Package
+
+pkg struct File {
+    /// The path relative to the workspace root.
+    pkg path: text::String
+    /// The index of the file's module, none for `package.nan`.
+    pkg module: Option[usize]
+    pkg syntax: syntax::SourceFile
+    /// Its items lowered, by index, once a check has read them; none for an item without one.
+    lowering: mem::OnceMap[u8, mem::List[Option[ast::Item]]]
+} File
+
+fn File.new(take path: text::String, module: Option[usize], take parsed: syntax::SourceFile, alloc: mem::Alloc) -> File {
+    return File(path: take path, module: module, syntax: take parsed, lowering: mem::OnceMap[u8, mem::List[Option[ast::Item]]].empty(seed: 0, alloc))
+} File.new
+
+/// Its items lowered, by index: none for an abandoned item or one that lowers to nothing.
+pkg proj fn File.lowered(self, alloc: mem::Alloc) -> Slice[Option[ast::Item]] {
+    match self.lowering.get(0) {
+        Some(items) => return items.view()
+        None => {}
+    }
+    var items = mem::List[Option[ast::Item]].empty(alloc)
+    for item in self.syntax.items {
+        match item.tree {
+            Some(tree) => {
+                if item.abandoned {
+                    mut items.push(None)
+                } else {
+                    mut items.push(ast::lower(self.syntax, tree, alloc))
+                }
+            }
+            None => mut items.push(None)
+        }
+    }
+    let stored = self.lowering.insert(0, value: take items)
+    return stored.view()
+} File.lowered
+
+/// The workspace root of a command run in `current`: the parent of the outermost directory at or
+/// above it holding a `package.nan`, or else `current`.
+pkg fn root_of(current: Str, alloc: mem::Alloc) -> text::String {
+    var outermost: Option[text::String] = None
+    var dir = text::String.of(current, alloc)
+    loop {
+        let manifest = platform::join(dir.as_str(), name: "package.nan", alloc)
+        if is_manifest_file(manifest.as_str()) {
+            outermost = Some(text::String.of(dir.as_str(), alloc))
+        }
+        let Some(above) = platform::parent(dir.as_str(), alloc) else {
+            break
+        }
+        dir = above
+    }
+    let Some(found) = outermost else {
+        return text::String.of(current, alloc)
+    }
+    let Some(above) = platform::parent(found.as_str(), alloc) else {
+        return found
+    }
+    return above
+} root_of
+
+/// Whether a directory under `root`, outside every name starting with `.`, holds a `package.nan`.
+pkg fn holds_package(root: Str, alloc: mem::Alloc) -> bool fails platform::IoError {
+    for entry in try platform::list_dir(root, alloc) {
+        let name = output::lossy(entry.name.view(), alloc)
+        let path = platform::join(root, name: name.as_str(), alloc)
+        if name.starts_with(".") {
+            continue
+        }
+        let held = try platform::symlink_metadata(path.as_str())
+        if not held.is_dir() {
+            continue
+        }
+        let manifest = platform::join(path.as_str(), name: "package.nan", alloc)
+        if is_manifest_file(manifest.as_str()) {
+            return true
+        }
+        if try holds_package(path.as_str(), alloc) {
+            return true
+        }
+    }
+    return false
+} holds_package
+
+fn is_manifest_file(path: Str) -> bool {
+    let Ok(held) = attempt platform::symlink_metadata(path) else {
+        return false
+    }
+    return held.is_file()
+} is_manifest_file
+
+/// The files of one package directory found by the walk.
+struct Found {
+    dir: text::String
+    sources: mem::List[text::String]
+    links: mem::List[text::String]
+    /// Its machine files.
+    machine: mem::List[text::String]
+} Found
+
+fn Found.empty(dir: Str, alloc: mem::Alloc) -> Found {
+    return Found(dir: text::String.of(dir, alloc), sources: mem::List[text::String].empty(alloc), links: mem::List[text::String].empty(alloc), machine: mem::List[text::String].empty(alloc))
+} Found.empty
+
+fn Found.copied(self, alloc: mem::Alloc) -> Found {
+    return Found(dir: text::String.of(self.dir.as_str(), alloc), sources: copied_texts(self.sources.view(), alloc), links: copied_texts(self.links.view(), alloc), machine: copied_texts(self.machine.view(), alloc))
+} Found.copied
+
+fn copied_texts(texts: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copies = mem::List[text::String].empty(alloc)
+    for held in texts {
+        mut copies.push(text::String.of(held.as_str(), alloc))
+    }
+    return copies
+} copied_texts
+
+/// A copy of bytes.
+fn copied_bytes(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copied_bytes
+
+/// Loads the workspace at `root`, recording in `read` each file it reads; its locks read
+/// releases from the local store of the user directory, the one `given` replaces when a harness
+/// gives one.
+pkg fn Workspace.load(
+    root: Str,
+    mut read: mem::List[text::String],
+    given: Option[cache::HomeOverride],
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    var walked = mem::List[Found].empty(alloc)
+    var stray = mem::List[text::String].empty(alloc)
+    try walk(root, dir: "", enclosing: None, found: mut walked, stray: mut stray, alloc)
+    var user = UserStore(opened: None, alloc: alloc)
+    return try Workspace.build(text::String.of(root, alloc), walked: take walked, stray: take stray, source: fn[mut read](path: Str) -> mem::Bytes fails platform::IoError {
+        mut read.push(text::String.of(path, alloc))
+        let absolute = platform::join(root, name: path, alloc)
+        return try platform::read_file(absolute.as_str(), alloc)
+    }, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+        return try mut user.entry(held, given)
+    }, grammar, alloc)
+} Workspace.load
+
+/// The workspace with the files of `changed` holding their new sources, read from memory.
+pkg fn Workspace.overlaid(self, changed: mem::Map[text::String, mem::Bytes], grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
+    let built = attempt Workspace.build(text::String.of(self.root.as_str(), alloc), walked: self.layout_with(changed, alloc), stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
+        return self.changed_source(changed, path, alloc)
+    }, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+        return held_entry(self.releases.view(), confirmed: self.confirmed.view(), root: held, alloc)
+    }, grammar, alloc)
+    let Ok(workspace) = built else {
+        expect false
+        return Workspace.empty(self.root.as_str(), alloc)
+    }
+    return workspace
+} Workspace.overlaid
+
+/// The bytes of a file of a changed workspace: its new bytes when `changed` holds it, else the
+/// workspace's.
+fn Workspace.changed_source(self, changed: mem::Map[text::String, mem::Bytes], path: Str, alloc: mem::Alloc) -> mem::Bytes {
+    match changed.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(bytes) => return copied_bytes(bytes.view(), alloc)
+        None => {}
+    }
+    let Some(held) = self.bytes(path) else {
+        expect false
+        return mem::Bytes.empty(alloc)
+    }
+    return copied_bytes(held, alloc)
+} Workspace.changed_source
+
+/// A workspace without packages, for a load that cannot fail.
+fn Workspace.empty(root: Str, alloc: mem::Alloc) -> Workspace {
+    return Workspace(root: text::String.of(root, alloc), packages: mem::List[Package].empty(alloc), releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), closures: mem::List[Closure].empty(alloc), locked: mem::List[diagnostic::Diagnostic].empty(alloc), stray: mem::List[StrayFile].empty(alloc), paths: mem::Map[text::String, FileAt].empty(alloc), walked: mem::List[Found].empty(alloc))
+} Workspace.empty
+
+/// The layout with the files of `changed` the workspace does not hold added to their
+/// packages, source or machine.
+fn Workspace.layout_with(self, changed: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::List[Found] {
+    var walked = mem::List[Found].empty(alloc)
+    for found in self.walked {
+        mut walked.push(found.copied(alloc))
+    }
+    for entry in changed {
+        let path = entry.key().as_str()
+        let Some(index) = holder_of(walked.view(), path, alloc) else {
+            continue
+        }
+        var machine_prefix = text::String.of(walked[index].dir.as_str(), alloc)
+        mut machine_prefix.append("/.nan/")
+        var holder = mut walked.at_mut(index)
+        if path.starts_with(machine_prefix.as_str()) {
+            if not holds_text(holder.machine.view(), wanted: path) and path.ends_with(".nan") {
+                mut holder.machine.push(text::String.of(path, alloc))
+            }
+        } else if not holds_text(holder.sources.view(), wanted: path) and path.ends_with(".nan") {
+            mut holder.sources.push(text::String.of(path, alloc))
+        }
+    }
+    return walked
+} Workspace.layout_with
+
+/// The package directory of the layout nearest above a path: the last of the longest.
+fn holder_of(walked: Slice[Found], path: Str, alloc: mem::Alloc) -> Option[usize] {
+    var holder: Option[usize] = None
+    var longest: usize = 0
+    for index in 0..<walked.len() {
+        var prefix = text::String.of(walked[index].dir.as_str(), alloc)
+        mut prefix.push('/')
+        if not path.starts_with(prefix.as_str()) {
+            continue
+        }
+        let length = walked[index].dir.byte_len()
+        if holder.is_none() or length >= longest {
+            holder = Some(index)
+            longest = length
+        }
+    }
+    return holder
+} holder_of
+
+/// The workspace with the files of `changed`, source or machine, holding their new contents,
+/// its locks reading releases through `store_entry`.
+pkg fn Workspace.rebuilt(
+    self,
+    changed: mem::Map[text::String, mem::Bytes],
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    let walked = self.layout_with(changed, alloc)
+    return try Workspace.build(text::String.of(self.root.as_str(), alloc), walked: take walked, stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
+        return self.changed_source(changed, path, alloc)
+    }, store_entry, grammar, alloc)
+} Workspace.rebuilt
+
+/// The workspace of in-memory files, each given by its path relative to `root`: each file
+/// belongs to the package of the nearest directory at or above it holding a `package.nan`.
+pkg fn Workspace.of_files(root: Str, files: Slice[artefact::SourceFile], grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
+    let releases = mem::List[Release].empty(alloc)
+    let confirmed = mem::List[mem::Shared[store::Entry]].empty(alloc)
+    let built = attempt Workspace.from_files(root, files, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+        return held_entry(releases.view(), confirmed: confirmed.view(), root: held, alloc)
+    }, grammar, alloc)
+    let Ok(workspace) = built else {
+        expect false
+        return Workspace.empty(root, alloc)
+    }
+    return workspace
+} Workspace.of_files
+
+/// The workspace of in-memory files as `of_files` places them, its locks reading releases
+/// from the local store of the user directory, the one `given` replaces when a harness gives one.
+pkg fn Workspace.of_stored_files(
+    root: Str,
+    files: Slice[artefact::SourceFile],
+    given: Option[cache::HomeOverride],
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    var user = UserStore(opened: None, alloc: alloc)
+    return try Workspace.from_files(root, files, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+        return try mut user.entry(held, given)
+    }, grammar, alloc)
+} Workspace.of_stored_files
+
+/// The std packages as a workspace of their own, whose files the locations of std items name.
+pkg fn Workspace.of_std(grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    for file in stdlib::StdFile.all(alloc) {
+        mut files.push(artefact::SourceFile(path: text::String.of(file.path(), alloc), content: copied_bytes(file.text().as_bytes(), alloc)))
+    }
+    return Workspace.of_files("std", files: files.view(), grammar, alloc)
+} Workspace.of_std
+
+fn Workspace.from_files(
+    root: Str,
+    files: Slice[artefact::SourceFile],
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    var walked = mem::List[Found].empty(alloc)
+    for file in files {
+        if file.path.ends_with("/package.nan") {
+            let Some(dir) = file.path.slice_bytes(0, end: file.path.byte_len() - 12) else {
+                continue
+            }
+            mut walked.push(Found.empty(dir, alloc))
+        }
+    }
+    var stray = mem::List[text::String].empty(alloc)
+    for file in files {
+        let path = file.path.as_str()
+        let Some(index) = holder_of(walked.view(), path, alloc) else {
+            mut stray.push(text::String.of(path, alloc))
+            continue
+        }
+        var machine_prefix = text::String.of(walked[index].dir.as_str(), alloc)
+        mut machine_prefix.append("/.nan/")
+        var manifest = text::String.of(walked[index].dir.as_str(), alloc)
+        mut manifest.append("/package.nan")
+        var holder = mut walked.at_mut(index)
+        if path.starts_with(machine_prefix.as_str()) {
+            mut holder.machine.push(text::String.of(path, alloc))
+        } else if path != manifest.as_str() {
+            mut holder.sources.push(text::String.of(path, alloc))
+        }
+    }
+    return try Workspace.build(text::String.of(root, alloc), walked: take walked, stray: take stray, source: fn(path: Str) -> mem::Bytes {
+        for file in files {
+            if file.path.as_str() == path {
+                return copied_bytes(file.content.view(), alloc)
+            }
+        }
+        expect false
+        return mem::Bytes.empty(alloc)
+    }, store_entry, grammar, alloc)
+} Workspace.from_files
+
+fn Workspace.build(
+    take root: text::String,
+    take walked: mem::List[Found],
+    take stray: mem::List[text::String],
+    source: fn(path: Str) -> mem::Bytes fails platform::IoError,
+    store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    var packages = mem::List[Package].empty(alloc)
+    for found in walked {
+        let loaded = try Package.load(found.copied(alloc), source, grammar, alloc)
+        mut packages.push(take loaded)
+    }
+    let read = try read_closures(packages.view(), store_entry, grammar, alloc)
+    var strays = mem::List[StrayFile].empty(alloc)
+    for path in take stray {
+        let bytes = try source(path.as_str())
+        mut strays.push(StrayFile(path: take path, bytes: take bytes))
+    }
+    var paths = mem::Map[text::String, FileAt].empty(alloc)
+    for package_index in 0..<packages.len() {
+        for file_index in 0..<packages[package_index].files.len() {
+            let path = text::String.of(packages[package_index].files[file_index].path.as_str(), alloc)
+            discard mut paths.insert(take path, value: FileAt(package_index: package_index, file_index: file_index))
+        }
+    }
+    let Read(closures: closures, releases: releases, confirmed: confirmed, found: found) = read
+    return Workspace(root: take root, packages: take packages, releases: take releases, confirmed: take confirmed, closures: take closures, locked: take found, stray: take strays, paths: take paths, walked: take walked)
+} Workspace.build
+
+/// The package of a closure's member.
+pkg proj fn Workspace.member(self, member: Member) -> Package {
+    return match member {
+        Member.Source(index) => self.packages[index]
+        Member.Release(index) => self.releases[index].pack
+    }
+} Workspace.member
+
+/// The closure checking a workspace package, by its index.
+pkg proj fn Workspace.closure_of(self, package_index: usize) -> Option[Closure] {
+    for closure in self.closures {
+        if holds_index(closure.checked.view(), wanted: package_index) {
+            return Some(closure)
+        }
+    }
+    return None
+} Workspace.closure_of
+
+/// The paths of the source files that no package holds.
+fn Workspace.stray_paths(self, alloc: mem::Alloc) -> mem::List[text::String] {
+    var paths = mem::List[text::String].empty(alloc)
+    for held in self.stray {
+        mut paths.push(text::String.of(held.path.as_str(), alloc))
+    }
+    return paths
+} Workspace.stray_paths
+
+/// The loading diagnostics: a stray file's, every package's and those of their locks.
+pkg fn Workspace.diagnostics(self, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for held in self.stray {
+        mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ManifestMissing, path: held.path.as_str(), line: 1, alloc))
+    }
+    for pack in self.packages {
+        for reported in pack.diagnostics {
+            mut found.push(reported.copy(alloc))
+        }
+    }
+    for reported in self.locked {
+        mut found.push(reported.copy(alloc))
+    }
+    return found
+} Workspace.diagnostics
+
+/// Where each file of the workspace lies, package by package.
+pkg proj fn Workspace.files(self) -> WorkspaceFiles {
+    return WorkspaceFiles(packages: self.packages.view(), package_index: 0, file_index: 0)
+} Workspace.files
+
+/// The files of a workspace's packages, in order.
+pkg view struct WorkspaceFiles {
+    packages: Slice[Package]
+    package_index: usize
+    file_index: usize
+} WorkspaceFiles
+
+pkg fn WorkspaceFiles.next(mut self) -> Option[FileAt] {
+    while self.package_index < self.packages.len() {
+        if self.file_index < self.packages[self.package_index].files.len() {
+            let at = FileAt(package_index: self.package_index, file_index: self.file_index)
+            self.file_index += 1
+            return Some(at)
+        }
+        self.package_index += 1
+        self.file_index = 0
+    }
+    return None
+} WorkspaceFiles.next
+
+/// The file at a location of the workspace.
+pkg proj fn Workspace.file_at(self, at: FileAt) -> File {
+    return self.packages[at.package_index].files[at.file_index]
+} Workspace.file_at
+
+pkg fn Workspace.file(self, path: Str) -> Option[FileAt] {
+    let Some(at) = self.paths.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return None
+    }
+    return Some(at)
+} Workspace.file
+
+/// The bytes of a source or machine file of the workspace, by path.
+pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
+    match self.file(path) {
+        Some(at) => return Some(self.packages[at.package_index].files[at.file_index].syntax.source.view())
+        None => {}
+    }
+    for held in self.stray {
+        if held.path.as_str() == path {
+            return Some(held.bytes.view())
+        }
+    }
+    for pack in self.packages {
+        match pack.machine.bytes(path) {
+            Some(bytes) => return Some(take bytes)
+            None => {}
+        }
+    }
+    return None
+} Workspace.bytes
+
+/// The text of a line of a source or machine file of the workspace, without its line end.
+pkg proj fn Workspace.line_text(self, path: Str, line: u32) -> Option[Slice[u8]] {
+    match self.file(path) {
+        Some(at) => return Some(self.packages[at.package_index].files[at.file_index].syntax.line_text(line))
+        None => {}
+    }
+    let Some(bytes) = self.bytes(path) else {
+        return None
+    }
+    if line == 0 {
+        return None
+    }
+    var remaining = usize.widen(line) - 1
+    var start: usize = 0
+    var end = bytes.len()
+    for at in 0..<bytes.len() {
+        if bytes[at] != b'\n' {
+            continue
+        }
+        if remaining == 0 {
+            end = at
+            break
+        }
+        remaining -= 1
+        start = at + 1
+    }
+    if remaining > 0 {
+        return None
+    }
+    let Some(parts) = bytes.split_at(start) else {
+        return None
+    }
+    return parts.tail.prefix(end - start)
+} Workspace.line_text
+
+/// The file and head line of the item with a canonical path.
+pkg fn Workspace.item_location(self, canonical: Str, alloc: mem::Alloc) -> Option[diagnostic::At] {
+    for at in self.files() {
+        let file = self.file_at(at)
+        for item in file.syntax.items {
+            var head: Option[u32] = None
+            for line in file.syntax.item_lines(item) {
+                if not is_comment_line(file.syntax.line_text(line)) {
+                    head = Some(line)
+                    break
+                }
+            }
+            let Some(line) = head else {
+                continue
+            }
+            let Some(path) = self.item_at(file.path.as_str(), line, alloc) else {
+                continue
+            }
+            if path.canonical(alloc).as_str() == canonical {
+                return Some(diagnostic::At(path: text::String.of(file.path.as_str(), alloc), line: line))
+            }
+        }
+    }
+    return None
+} Workspace.item_location
+
+/// Whether a line's text starts with `//`.
+fn is_comment_line(line_bytes: Slice[u8]) -> bool {
+    return line_bytes.len() >= 2 and line_bytes[0] == b'/' and line_bytes[1] == b'/'
+} is_comment_line
+
+/// The path of the item holding a line of a file, if that item has one this implementation
+/// computes.
+pkg fn Workspace.item_at(self, path: Str, line: u32, alloc: mem::Alloc) -> Option[ItemPath] {
+    let Some(at) = self.file(path) else {
+        return None
+    }
+    let pack = self.packages[at.package_index]
+    let file = pack.files[at.file_index]
+    let Some(item) = file.syntax.item_at(line) else {
+        return None
+    }
+    let Some(tree) = item.tree else {
+        return None
+    }
+    return pack.item_path(file, tree, alloc)
+} Workspace.item_at
+
+/// A `dep` directive's alias, its source as written and whether that is a path.
+pkg struct DepSource {
+    pkg alias: text::String
+    pkg written: text::String
+    pkg path: bool
+} DepSource
+
+/// The alias, source as written and whether it is a path, of each `dep` directive of a package
+/// whose source is valid.
+pkg fn manifest_deps(pack: Package, alloc: mem::Alloc) -> mem::List[DepSource] {
+    var deps = mem::List[DepSource].empty(alloc)
+    let Some(manifest) = pack.manifest else {
+        return deps
+    }
+    for dep in manifest.deps {
+        if dep.source.is_some() {
+            mut deps.push(DepSource(alias: text::String.of(dep.alias.as_str(), alloc), written: text::String.of(dep.written.as_str(), alloc), path: dep.path))
+        }
+    }
+    return deps
+} manifest_deps
+
+/// The `dep` directives of a manifest file read as the manifest of the package directory `dir`.
+pkg fn read_deps(file: syntax::SourceFile, dir: Str, alloc: mem::Alloc) -> mem::List[DepSource] {
+    var deps = mem::List[DepSource].empty(alloc)
+    var path = text::String.of(dir, alloc)
+    mut path.append("/package.nan")
+    var ignored = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let Some(manifest) = Manifest.read(file, path: path.as_str(), diagnostics: mut ignored, alloc) else {
+        return deps
+    }
+    for dep in take manifest.deps {
+        if dep.source.is_some() {
+            mut deps.push(DepSource(alias: take dep.alias, written: take dep.written, path: dep.path))
+        }
+    }
+    return deps
+} read_deps
+
+/// The local store of the user directory, opened when a lock first needs a release.
+struct UserStore {
+    opened: Option[OpenedStore]
+    alloc: mem::Alloc
+} UserStore
+
+/// An opened local store and the publication index and code root of each of its entries.
+struct OpenedStore {
+    local: store::Store
+    index: mem::List[store::Published]
+} OpenedStore
+
+/// The store entry holding a release, by its code root; none when the store is exposed.
+fn UserStore.entry(mut self, root: hashing::HashValue, given: Option[cache::HomeOverride]) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+    let alloc = self.alloc
+    if self.opened.is_none() {
+        let user_cache = match try cache::Cache.open(given, alloc) {
+            Ok(opened) => opened
+            Err(_) => return None
+        }
+        let local = store::Store.new(user_cache.store())
+        let index = match try local.index() {
+            Ok(published) => published
+            Err(_) => return None
+        }
+        self.opened = Some(OpenedStore(local: take local, index: take index))
+    }
+    let Some(opened) = self.opened else {
+        expect false
+        return None
+    }
+    for published in opened.index {
+        if published.root != root {
+            continue
+        }
+        let read = try opened.local.read(published.index, root)
+        let Ok(Some(entry)) = read else {
+            return None
+        }
+        return Some(mem::Shared.of(take entry, alloc))
+    }
+    return None
+} UserStore.entry
+
+/// The entry of a release a workspace already read, by its code root, read again for a changed
+/// workspace.
+fn held_entry(releases: Slice[Release], confirmed: Slice[mem::Shared[store::Entry]], root: hashing::HashValue, alloc: mem::Alloc) -> Option[mem::Shared[store::Entry]] {
+    for release in releases {
+        if release.root == root {
+            return Some(release.entry.share())
+        }
+    }
+    for entry in confirmed {
+        if entry.contents().root(alloc) == root {
+            return Some(entry.share())
+        }
+    }
+    return None
+} held_entry
+
+/// The canonical path of an item: its package, its module unless it is the root module, and its
+/// name, which a member's type precedes.
+pkg struct ItemPath derives Eq {
+    pkg package_name: text::String
+    pkg module: Option[text::String]
+    pkg name: Option[text::String]
+} ItemPath
+
+pkg fn ItemPath.canonical(self, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(self.package_name.as_str(), alloc)
+    match self.module {
+        Some(module) => {
+            mut written.append("::")
+            mut written.append(module.as_str())
+        }
+        None => {}
+    }
+    match self.name {
+        Some(name) => {
+            mut written.append("::")
+            mut written.append(name.as_str())
+        }
+        None => {}
+    }
+    return written
+} ItemPath.canonical
+
+/// Collects the package directories and source files under `dir`, skipping names that start with
+/// `.`. `enclosing` is the index in `found` of the package holding `dir`.
+fn walk(
+    root: Str,
+    dir: Str,
+    enclosing: Option[usize],
+    mut found: mem::List[Found],
+    mut stray: mem::List[text::String],
+    alloc: mem::Alloc,
+    ) fails platform::IoError {
+    let absolute = platform::join(root, name: dir, alloc)
+    var holder = enclosing
+    if not dir.is_empty() {
+        let manifest = platform::join(absolute.as_str(), name: "package.nan", alloc)
+        if is_manifest_file(manifest.as_str()) {
+            mut found.push(Found.empty(dir, alloc))
+            holder = Some(found.len() - 1)
+        }
+    }
+    for name in try sorted_names(absolute.as_str(), alloc) {
+        var path = text::String.of(dir, alloc)
+        if not dir.is_empty() {
+            mut path.push('/')
+        }
+        mut path.append(name.as_str())
+        let held = try platform::symlink_metadata(platform::join(root, name: path.as_str(), alloc).as_str())
+        match holder {
+            Some(index) => {
+                let Some(in_package) = path.slice_bytes(found[index].dir.byte_len() + 1, end: path.byte_len()) else {
+                    expect false
+                    continue
+                }
+                if held.is_symlink() and not name.starts_with(".") {
+                    mut found[index].links.push(text::String.of(in_package, alloc))
+                    continue
+                }
+                if in_package == ".nan" {
+                    try links_in_machine_dir(root, path: path.as_str(), in_package, links: mut found[index].links, alloc)
+                    try machine_files(root, path: path.as_str(), files: mut found[index].machine, alloc)
+                }
+            }
+            None => {}
+        }
+        if name.starts_with(".") or held.is_symlink() {
+            continue
+        }
+        if held.is_dir() {
+            try walk(root, dir: path.as_str(), enclosing: holder, found: mut found, stray: mut stray, alloc)
+            continue
+        }
+        if not name.ends_with(".nan") {
+            continue
+        }
+        match holder {
+            Some(index) => {
+                if name.as_str() != "package.nan" or found[index].dir.as_str() != dir {
+                    mut (mut found.at_mut(index)).sources.push(take path)
+                }
+            }
+            None => mut stray.push(take path)
+        }
+    }
+} walk
+
+/// The names of a directory's entries, in byte order.
+fn sorted_names(dir: Str, alloc: mem::Alloc) -> mem::List[text::String] fails platform::IoError {
+    var names = mem::List[text::String].empty(alloc)
+    for entry in try platform::list_dir(dir, alloc) {
+        mut names.push(output::lossy(entry.name.view(), alloc))
+    }
+    mut names.sort_by(fn(left: text::String, right: text::String) => left.cmp(right))
+    return names
+} sorted_names
+
+/// The files of a valid history's tombstones: per module holding some, the history with every
+/// line but that module's tombstones blank.
+fn history_files(held_machine: Machine, modules: Slice[Module], grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::List[File] {
+    var files = mem::List[File].empty(alloc)
+    let Some(loaded) = held_machine.history_file else {
+        return files
+    }
+    if loaded.valid().is_none() {
+        return files
+    }
+    let lossy_text = output::lossy(loaded.bytes.view(), alloc)
+    let lines = text_lines(lossy_text.as_str(), alloc)
+    var kept = mem::List[Kept].empty(alloc)
+    var module: Option[usize] = None
+    for number in 0..<lines.len() {
+        let line = lines[number].as_str()
+        if line.starts_with("module ") {
+            let Some(name) = line.slice_bytes(7, end: line.byte_len()) else {
+                continue
+            }
+            module = None
+            for index in 0..<modules.len() {
+                if modules[index].name.as_str() == name {
+                    module = Some(index)
+                    break
+                }
+            }
+            continue
+        }
+        let Some(index) = module else {
+            continue
+        }
+        if not line.starts_with("retired ") {
+            continue
+        }
+        let count = kept.len()
+        if count == 0 or kept[count - 1].module != index {
+            mut kept.push(Kept(module: index, lines: mem::List[usize].empty(alloc)))
+        }
+        let last = kept.len() - 1
+        mut (mut kept.at_mut(last)).lines.push(number)
+    }
+    for held in kept {
+        var written = text::String.empty(alloc)
+        var next: usize = 0
+        for number in 0..<lines.len() {
+            if number > 0 {
+                mut written.push('\n')
+            }
+            if next < held.lines.len() and held.lines[next] == number {
+                mut written.append(lines[number].as_str())
+                next += 1
+            }
+        }
+        mut written.push('\n')
+        mut files.push(File.new(text::String.of(loaded.path.as_str(), alloc), module: Some(held.module), parsed: syntax::parse(take written.into_bytes(), grammar, alloc), alloc))
+    }
+    return files
+} history_files
+
+/// A module whose tombstones a history file keeps, and the numbers of their lines, from 0.
+struct Kept {
+    module: usize
+    lines: mem::List[usize]
+} Kept
+
+/// The lines of a text: split at each LF, a CR before it dropped, with no line after a final
+/// LF.
+fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        var stop = end
+        if end < bytes.len() and stop > start and bytes[stop - 1] == b'\r' {
+            stop -= 1
+        }
+        let Some(line) = written.slice_bytes(start, end: stop) else {
+            expect false
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = end + 1
+    }
+    return lines
+} text_lines
+
+/// The machine files a package's `.nan` directory holds as regular files: its lock, its history
+/// and its API snapshots.
+fn machine_files(root: Str, path: Str, mut files: mem::List[text::String], alloc: mem::Alloc) fails platform::IoError {
+    if not is_dir_at(root, path, alloc) {
+        return
+    }
+    add_file(root, dir: path, name: "lock.nan", files: mut files, alloc)
+    add_file(root, dir: path, name: "history.nan", files: mut files, alloc)
+    var api = text::String.of(path, alloc)
+    mut api.append("/api")
+    if not is_dir_at(root, path: api.as_str(), alloc) {
+        return
+    }
+    for name in try sorted_names(platform::join(root, name: api.as_str(), alloc).as_str(), alloc) {
+        if name.ends_with(".nan") {
+            add_file(root, dir: api.as_str(), name: name.as_str(), files: mut files, alloc)
+        }
+    }
+} machine_files
+
+/// Adds the path `dir/name` to `files` when it names a regular file.
+fn add_file(root: Str, dir: Str, name: Str, mut files: mem::List[text::String], alloc: mem::Alloc) {
+    var file = text::String.of(dir, alloc)
+    mut file.push('/')
+    mut file.append(name)
+    let absolute = platform::join(root, name: file.as_str(), alloc)
+    let Ok(held) = attempt platform::symlink_metadata(absolute.as_str()) else {
+        return
+    }
+    if held.is_file() {
+        mut files.push(take file)
+    }
+} add_file
+
+/// Whether a path under `root` names a directory, a symbolic link itself.
+fn is_dir_at(root: Str, path: Str, alloc: mem::Alloc) -> bool {
+    let absolute = platform::join(root, name: path, alloc)
+    let Ok(held) = attempt platform::symlink_metadata(absolute.as_str()) else {
+        return false
+    }
+    return held.is_dir()
+} is_dir_at
+
+/// Whether a path under `root` names a symbolic link.
+fn is_link_at(root: Str, path: Str, alloc: mem::Alloc) -> bool {
+    let absolute = platform::join(root, name: path, alloc)
+    let Ok(held) = attempt platform::symlink_metadata(absolute.as_str()) else {
+        return false
+    }
+    return held.is_symlink()
+} is_link_at
+
+/// The symbolic links among `.nan`, `.nan/api` and the machine files of a package.
+fn links_in_machine_dir(
+    root: Str,
+    path: Str,
+    in_package: Str,
+    mut links: mem::List[text::String],
+    alloc: mem::Alloc,
+    ) fails platform::IoError {
+    if is_link_at(root, path, alloc) {
+        mut links.push(text::String.of(in_package, alloc))
+        return
+    }
+    let absolute = platform::join(root, name: path, alloc)
+    if not platform::is_dir(absolute.as_str()) {
+        return
+    }
+    add_link(root, path, in_package, name: "lock.nan", links: mut links, alloc)
+    add_link(root, path, in_package, name: "history.nan", links: mut links, alloc)
+    add_link(root, path, in_package, name: "api", links: mut links, alloc)
+    var api = text::String.of(path, alloc)
+    mut api.append("/api")
+    let api_absolute = platform::join(absolute.as_str(), name: "api", alloc)
+    if not platform::is_dir(api_absolute.as_str()) or is_link_at(root, path: api.as_str(), alloc) {
+        return
+    }
+    var within = text::String.of(in_package, alloc)
+    mut within.append("/api")
+    for name in try sorted_names(api_absolute.as_str(), alloc) {
+        if name.ends_with(".nan") {
+            add_link(root, path: api.as_str(), in_package: within.as_str(), name: name.as_str(), links: mut links, alloc)
+        }
+    }
+} links_in_machine_dir
+
+/// Adds `in_package/name` to `links` when `path/name` is a symbolic link.
+fn add_link(root: Str, path: Str, in_package: Str, name: Str, mut links: mem::List[text::String], alloc: mem::Alloc) {
+    var file = text::String.of(path, alloc)
+    mut file.push('/')
+    mut file.append(name)
+    if not is_link_at(root, path: file.as_str(), alloc) {
+        return
+    }
+    var link = text::String.of(in_package, alloc)
+    mut link.push('/')
+    mut link.append(name)
+    mut links.push(take link)
+} add_link
+
+pkg proj fn Package.name(self) -> Option[Str] {
+    let Some(manifest) = self.manifest else {
+        return None
+    }
+    return Some(manifest.name.as_str())
+} Package.name
+
+/// The target a program's image is built for: the one concrete target it declares.
+pkg fn Package.program_target(self) -> Target {
+    let Some(manifest) = self.manifest else {
+        return Target.Host
+    }
+    if manifest.targets.len() == 0 {
+        return Target.Host
+    }
+    return manifest.targets[0]
+} Package.program_target
+
+/// The canonical path of a module of the package, its name absent for the root module.
+pkg fn Package.module_path(self, module: usize, alloc: mem::Alloc) -> Option[ItemPath] {
+    let Some(package_name) = self.name() else {
+        return None
+    }
+    let held = self.modules[module]
+    var root_module = false
+    for dir in held.dirs {
+        if dir.path == self.dir {
+            root_module = true
+        }
+    }
+    var name: Option[text::String] = None
+    if not root_module {
+        name = Some(text::String.of(held.name.as_str(), alloc))
+    }
+    return Some(ItemPath(package_name: text::String.of(package_name, alloc), module: take name, name: None))
+} Package.module_path
+
+/// The canonical path of an item of `file`, when it is named and the path of a function named
+/// after a type follows from the package's own modules.
+fn Package.item_path(self, file: File, tree: syntax::Tree, alloc: mem::Alloc) -> Option[ItemPath] {
+    let Some(module) = file.module else {
+        let Some(package_name) = self.name() else {
+            return None
+        }
+        let Some(kind) = tree.kind() else {
+            return None
+        }
+        if kind.rule != syntax::Rule.PackageItem {
+            return None
+        }
+        return Some(ItemPath(package_name: text::String.of(package_name, alloc), module: None, name: None))
+    }
+    let Some(path) = self.module_path(module, alloc) else {
+        return None
+    }
+    let Some(name) = tree.name(file.syntax, alloc) else {
+        return None
+    }
+    let Some(dot) = last_dot(name.as_str()) else {
+        var named = path
+        named.name = Some(take name)
+        return Some(take named)
+    }
+    let Some(owner) = name.slice_bytes(0, end: dot) else {
+        return None
+    }
+    let Some(separator) = owner.find("::") else {
+        if not self.types[module].contains_by(fn(value: text::String) => value.as_str().cmp(owner)) {
+            return None
+        }
+        var named = path
+        named.name = Some(text::String.of(name.as_str(), alloc))
+        return Some(take named)
+    }
+    let Some(owner_module) = owner.slice_bytes(0, end: separator) else {
+        return None
+    }
+    var index: Option[usize] = None
+    for candidate in 0..<self.modules.len() {
+        if self.modules[candidate].name.as_str() == owner_module {
+            index = Some(candidate)
+            break
+        }
+    }
+    let Some(found) = index else {
+        return None
+    }
+    let Some(moved) = self.module_path(found, alloc) else {
+        return None
+    }
+    let Some(member) = name.slice_bytes(separator + 2, end: name.byte_len()) else {
+        return None
+    }
+    var named = moved
+    named.name = Some(text::String.of(member, alloc))
+    return Some(take named)
+} Package.item_path
+
+/// The position of the last `.` of a name.
+fn last_dot(name: Str) -> Option[usize] {
+    let bytes = name.as_bytes()
+    var at = bytes.len()
+    while at > 0 {
+        at -= 1
+        if bytes[at] == b'.' {
+            return Some(at)
+        }
+    }
+    return None
+} last_dot
+
+fn Package.load(
+    take found: Found,
+    source: fn(path: Str) -> mem::Bytes fails platform::IoError,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Package fails platform::IoError {
+    var sources = found.sources
+    mut sources.sort_by(fn(left: text::String, right: text::String) => left.cmp(right))
+    var manifest_path = text::String.of(found.dir.as_str(), alloc)
+    mut manifest_path.append("/package.nan")
+    let parsed = syntax::parse(try source(manifest_path.as_str()), grammar, alloc)
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let manifest = Manifest.read(parsed, path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
+    var files = mem::List[File].empty(alloc)
+    mut files.push(File.new(text::String.of(manifest_path.as_str(), alloc), module: None, parsed: take parsed, alloc))
+    report_links(manifest, links: found.links.view(), manifest_path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
+    let package_name = manifest_name(manifest, alloc)
+    let std = named_std(manifest)
+    let Assigned(modules: modules, assigned: assigned) = assign_modules(found.dir.as_str(), package_name, sources: sources.view(), alloc)
+    if language_supported(manifest) {
+        for index in 0..<sources.len() {
+            let bytes = try source(sources[index].as_str())
+            let parsed_source = match std {
+                true => syntax::parse_std(take bytes, grammar, alloc)
+                false => syntax::parse(take bytes, grammar, alloc)
+            }
+            mut files.push(File.new(text::String.of(sources[index].as_str(), alloc), module: Some(assigned[index]), parsed: take parsed_source, alloc))
+        }
+    }
+    let types = type_names(files.view(), modules: modules.len(), alloc)
+    let loaded_machine = try Machine.load(found.dir.as_str(), paths: found.machine.view(), source, grammar, alloc)
+    let invalid = loaded_machine.diagnostics(alloc)
+    for reported in take invalid {
+        mut diagnostics.push(take reported)
+    }
+    let history = history_files(loaded_machine, modules: modules.view(), grammar, alloc)
+    var pack = Package(dir: take found.dir, manifest: take manifest, files: take files, modules: take modules, machine: take loaded_machine, history: take history, types: take types, diagnostics: take diagnostics)
+    mut pack.check_misplaced_manifests(alloc)
+    let reported = module_diagnostics(pack, alloc)
+    for held in take reported {
+        mut pack.diagnostics.push(take held)
+    }
+    return pack
+} Package.load
+
+/// Reports each symbolic link of a package with a manifest.
+fn report_links(
+    manifest: Option[Manifest],
+    links: Slice[text::String],
+    manifest_path: Str,
+    mut diagnostics: mem::List[diagnostic::Diagnostic],
+    alloc: mem::Alloc,
+    ) {
+    let Some(read) = manifest else {
+        return
+    }
+    for link in links {
+        var linked = diagnostic::Diagnostic.at(diagnostic::Code.BuildSymbolicLink, path: manifest_path, line: read.line, alloc)
+        mut linked.because.push(diagnostic::Reason.note(link.as_str(), alloc))
+        mut diagnostics.push(take linked)
+    }
+} report_links
+
+/// The name a manifest gives its package.
+fn manifest_name(manifest: Option[Manifest], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(read) = manifest else {
+        return None
+    }
+    return Some(text::String.of(read.name.as_str(), alloc))
+} manifest_name
+
+/// Whether a manifest names a std package.
+fn named_std(manifest: Option[Manifest]) -> bool {
+    let Some(read) = manifest else {
+        return false
+    }
+    return stdlib::is_std(read.name.as_str())
+} named_std
+
+/// Whether a package's source files are read: unless its manifest states a language version
+/// this implementation does not implement.
+fn language_supported(manifest: Option[Manifest]) -> bool {
+    let Some(read) = manifest else {
+        return true
+    }
+    return read.supported
+} language_supported
+
+/// The diagnostics of the modules of a package whose manifest is supported.
+fn module_diagnostics(pack: Package, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    let Some(read) = pack.manifest else {
+        return mem::List[diagnostic::Diagnostic].empty(alloc)
+    }
+    if not read.supported {
+        return mem::List[diagnostic::Diagnostic].empty(alloc)
+    }
+    return check_modules(pack, manifest: read, alloc)
+} module_diagnostics
+
+/// A release's package, loaded from its store entry's files into a directory.
+fn Package.from_entry(entry: store::Entry, dir: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> Package fails platform::IoError {
+    var manifest = text::String.of(dir, alloc)
+    mut manifest.append("/package.nan")
+    var machine_prefix = text::String.of(dir, alloc)
+    mut machine_prefix.append("/.nan/")
+    var paths = mem::List[text::String].empty(alloc)
+    for file in entry.sources {
+        var path = text::String.of(dir, alloc)
+        mut path.push('/')
+        mut path.append(file.path.as_str())
+        mut paths.push(take path)
+    }
+    var found = Found.empty(dir, alloc)
+    for path in paths {
+        if path.starts_with(machine_prefix.as_str()) {
+            mut found.machine.push(text::String.of(path.as_str(), alloc))
+        } else if path != manifest and path.ends_with(".nan") {
+            mut found.sources.push(text::String.of(path.as_str(), alloc))
+        }
+    }
+    return try Package.load(take found, source: fn(path: Str) -> mem::Bytes fails platform::IoError {
+        for index in 0..<paths.len() {
+            if paths[index].as_str() == path {
+                return copied_bytes(entry.sources[index].content.view(), alloc)
+            }
+        }
+        fail platform::IoError.Other(0)
+    }, grammar, alloc)
+} Package.from_entry
+
+/// Reports every `package` item outside `package.nan`, and every item of `package.nan` but
+/// its manifest when it has one.
+fn Package.check_misplaced_manifests(mut self, alloc: mem::Alloc) {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for file in self.files {
+        let manifest_file = file.module.is_none()
+        if manifest_file and self.manifest.is_none() {
+            continue
+        }
+        var manifest_seen = false
+        for item in file.syntax.items {
+            if item.abandoned {
+                continue
+            }
+            let Some(tree) = item.tree else {
+                continue
+            }
+            let manifest_item = match tree.kind() {
+                Some(kind) => kind.rule == syntax::Rule.PackageItem
+                None => false
+            }
+            if manifest_file and manifest_item and not manifest_seen {
+                manifest_seen = true
+            } else if manifest_file or manifest_item {
+                let Some(line) = tree.head_line(file.syntax, alloc) else {
+                    expect false
+                    continue
+                }
+                mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ManifestMisplaced, path: file.path.as_str(), line, alloc))
+            }
+        }
+    }
+    for reported in take found {
+        mut self.diagnostics.push(take reported)
+    }
+} Package.check_misplaced_manifests
+
+/// The names of the structs, enums and layouts each module of `files` declares.
+fn type_names(files: Slice[File], modules: usize, alloc: mem::Alloc) -> mem::List[mem::Set[text::String]] {
+    var types = mem::List[mem::Set[text::String]].empty(alloc)
+    for _ in 0..<modules {
+        mut types.push(mem::Set[text::String].empty(alloc))
+    }
+    for file in files {
+        let Some(module) = file.module else {
+            continue
+        }
+        for item in file.syntax.items {
+            let Some(tree) = item.tree else {
+                continue
+            }
+            let Some(kind) = tree.kind() else {
+                continue
+            }
+            if kind.rule != syntax::Rule.StructItem and kind.rule != syntax::Rule.EnumItem and kind.rule != syntax::Rule.LayoutItem {
+                continue
+            }
+            let Some(name) = tree.name(file.syntax, alloc) else {
+                continue
+            }
+            discard mut (mut types.at_mut(module)).insert(take name)
+        }
+    }
+    return types
+} type_names

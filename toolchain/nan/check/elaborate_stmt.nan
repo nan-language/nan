@@ -1,0 +1,1345 @@
+//! Elaborating statements: bindings, assignments, loops, deferred calls, conditions, and the exits that run deferred calls, release slots and check contracts before leaving.
+
+/// The state of one branch at its end: the open block, the value it yields and what it moved.
+struct ArmEnd {
+    block: Option[nir::BlockId]
+    value: Option[BranchValue]
+    moved: mem::Set[nir::Place]
+} ArmEnd
+
+/// What a branch yields: a value, or a part it names in place.
+enum BranchValue {
+    Value(nir::Operand)
+    Part(nir::Place)
+} BranchValue
+
+/// An assignment target with its operands evaluated: a place, or an indexing call, which goes
+/// beside it, with its span, arguments and the steps after it.
+enum AssignTarget {
+    Place(nir::Place)
+    Indexed(span: nir::Span, args: mem::List[nir::Operand], steps: mem::List[text::String])
+} AssignTarget
+
+/// A part of a struct value or variant payload at a place, with its type.
+struct PlacePart {
+    place: nir::Place
+    ty: ty::Ty
+} PlacePart
+
+/// The value an exit carries out of an `await when` body, with its type.
+struct Carried {
+    operand: nir::Operand
+    ty: ty::Ty
+} Carried
+
+/// The code of a function or test body, ending a `Unit` body with its exit.
+fn Elab.function_root(mut self, root: TExpr) fails Fault {
+    if self.projection and yields_by_branches(root) {
+        let returned = returned_in_branches(root, alloc: self.ck.alloc())
+        discard try mut self.expr(returned)
+        return
+    }
+    let out = try mut self.expr(root)
+    if not self.b.open() {
+        return
+    }
+    var value = mut self.argument(take out, expr: root, mode: ast::Mode.Take)
+    let end = match root.kind {
+        TKind.Block(block) => block.end
+        else => root.token
+    }
+    if value == Some(nir::Operand.Literal(nir::Literal.Unit)) {
+        value = None
+    }
+    try mut self.exit_return(take value, token: end)
+} Elab.function_root
+
+/// The code of a function returning its root expression's value: a const, a clause, an
+/// example or a transparent body.
+fn Elab.function_root_value(mut self, root: TExpr) fails Fault {
+    let Some(value) = try mut self.operand(root) else {
+        return
+    }
+    mut self.release_temps(0, token: root.token)
+    try mut self.exit_return(Some(take value), token: root.token)
+} Elab.function_root_value
+
+/// The code of a closure's body, whose loops the typed body numbers after the enclosing
+/// code's.
+fn Elab.closure_root(mut self, closure: TClosure) fails Fault {
+    self.loop_base = closure.loops
+    match closure.body.kind {
+        TKind.Block(_) => try mut self.function_root(closure.body)
+        else => try mut self.function_root_value(closure.body)
+    }
+} Elab.closure_root
+
+fn Elab.stmt(mut self, stmt: TStmt) fails Fault {
+    if not self.b.open() {
+        return
+    }
+    try mut self.releasing_temps(stmt.token, elaborate: fn(mut elab: Elab) fails Fault {
+        try mut elab.stmt_kind(stmt)
+    })
+} Elab.stmt
+
+fn Elab.stmt_kind(mut self, stmt: TStmt) fails Fault {
+    let span = Elab.span(stmt.token)
+    match stmt.as_part().kind {
+        TStmtKind.Let(pattern: pattern, value: value, otherwise: otherwise) => try mut self.let_stmt(stmt.token, pattern, value, otherwise)
+        TStmtKind.Var(local: local, value: value) => try mut self.var_stmt(local, value, span)
+        TStmtKind.Discard(value) => try mut self.discard_stmt(value, token: stmt.token, span)
+        TStmtKind.While(condition: condition, invariants: invariants, body: body) => try mut self.while_stmt(stmt.token, condition: Some(condition), invariants: invariants.view(), body)
+        TStmtKind.Loop(invariants: invariants, body: body) => try mut self.while_stmt(stmt.token, condition: None, invariants: invariants.view(), body)
+        TStmtKind.For(pattern: pattern, mode: mode, iterated: iterated, cursor: cursor, invariants: invariants, body: body) => try mut self.for_stmt(stmt.token, pattern, mode, iterated, cursor, invariants: invariants.view(), body)
+        TStmtKind.Defer(call) => {
+            let places = try mut self.deferred_places(call)
+            let last = self.scopes.len() - 1
+            var scope = mut self.scopes.at_mut(last)
+            mut scope.deferred.push(Deferred(token: stmt.token, call: call.copy(self.ck.alloc()), places: take places))
+        }
+        TStmtKind.Undefer(target) => try mut self.undefer_stmt(target)
+        TStmtKind.Expect(condition) => {
+            let Some(operand) = try mut self.operand(condition) else {
+                return
+            }
+            mut self.emit(nir::Op.Check(kind: nir::CheckKind.Expect, operand: take operand, open: false), span)
+        }
+        TStmtKind.Assume(condition) => try mut self.assume_stmt(condition, span)
+        TStmtKind.Expr(value) => {
+            discard try mut self.expr(value)
+        }
+        TStmtKind.Assign(target: target, op: op, value: value) => try mut self.assign(stmt.token, target, op, value)
+    }
+} Elab.stmt_kind
+
+/// `var x = e`: a view binding of what a part or a place reached through a reference names, a
+/// binding of the value an `if` or `match` yields, or a slot holding the value.
+fn Elab.var_stmt(mut self, local: LocalId, value: TExpr, span: nir::Span) fails Fault {
+    if self.views(local, value) {
+        let Some(bound) = try mut self.bound_value(value) else {
+            return
+        }
+        discard mut self.held.insert(local, value: Held.Value(bound))
+        return
+    }
+    if yields_by_branches(value) {
+        try mut self.branch_binding(local, value, span)
+        return
+    }
+    let ty = self.body.contents().local(local).ty
+    let slot = mut self.binding_slot(local, ty, span)
+    let Some(operand) = try mut self.arg(value, mode: ast::Mode.Take) else {
+        return
+    }
+    mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc: self.ck.alloc()), operand: take operand), span)
+    mut self.hold(slot)
+} Elab.var_stmt
+
+/// `discard e`: the release of what its value holds, unless it is Copy, a view or a wrapped part.
+fn Elab.discard_stmt(mut self, value: TExpr, token: u32, span: nir::Span) fails Fault {
+    var found: Option[nir::Operand] = None
+    match try mut self.expr(value) {
+        Out.Place(place) => {
+            // A place reached through a reference, a part included, ends with its owner.
+            if not self.b.ty(place.root).is_reference() {
+                found = Some(mut self.take_place(take place, ty: value.ty, span: Elab.spanning(value)))
+            }
+        }
+        Out.Operand(operand) => {
+            found = Some(take operand)
+        }
+        Out.Never => {}
+    }
+    let Some(operand) = found else {
+        return
+    }
+    if self.ck.nir_copy(value.ty) or self.ck.nir_view(value.ty) {
+        return
+    }
+    let Some(discarded) = operand_root(operand) else {
+        return
+    }
+    if self.wrapped.contains(discarded) {
+        return
+    }
+    let slot = mut self.slot_holding(take operand, ty: value.ty, token)
+    mut self.emit(nir::Op.Release(nir::Place.of(slot, alloc: self.ck.alloc())), span)
+} Elab.discard_stmt
+
+/// `undefer x`: the deferred calls naming the place it names are dropped from every scope.
+fn Elab.undefer_stmt(mut self, target: TExpr) fails Fault {
+    let Some(place) = try mut self.place(target) else {
+        return
+    }
+    for scope in mut self.scopes {
+        mut scope.deferred.retain(fn(deferred: Deferred) => deferred.places.position(fn(held: nir::Place) => held == place).is_none())
+    }
+} Elab.undefer_stmt
+
+/// `assume c`: the call of its assume function, and its assumption.
+fn Elab.assume_stmt(mut self, condition: TExpr, span: nir::Span) fails Fault {
+    let Some(index) = self.unit.conditions.get(ConditionKey(role: nir::Role.Assume, token: condition.token)) else {
+        expect false
+        return
+    }
+    let args = try mut self.named_operands(condition, span)
+    let fn_ref = self.own(nir::Role.Assume, index)
+    let value = mut self.call_value(take fn_ref, take args, ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+    mut self.emit(nir::Op.Assume(nir::Operand.Value(value)), span)
+} Elab.assume_stmt
+
+/// Elaborates a statement, or an operand whose temporaries are released once it is
+/// computed, with temporaries of its own, released at its end.
+fn Elab.releasing_temps[T](mut self, token: u32, elaborate: fn(mut elab: Elab) -> T fails Fault) -> T fails Fault {
+    var outer = mem::List[nir::Value].empty(self.ck.alloc())
+    for temp in self.temps {
+        mut outer.push(temp)
+    }
+    mut self.temps.truncate(0)
+    let scope = self.temp_scope
+    self.temp_scope = self.scopes.len() - 1
+    let elaborated = try elaborate(mut self)
+    mut self.release_temps(0, token)
+    self.temps = outer
+    self.temp_scope = scope
+    return elaborated
+} Elab.releasing_temps
+
+/// Releases what the temporaries created since the first `from` of the statement still
+/// hold, in reverse order of creation; past this point no place within them counts as moved.
+fn Elab.release_temps(mut self, from: usize, token: u32) {
+    var released = mem::List[nir::Value].empty(self.ck.alloc())
+    while self.temps.len() > from {
+        let Some(temp) = mut self.temps.pop() else {
+            break
+        }
+        mut released.push(temp)
+    }
+    let scope_index = self.temp_scope
+    var scope = mut self.scopes.at_mut(scope_index)
+    mut scope.slots.retain(fn(slot: nir::Value) => released.position(fn(temp: nir::Value) => temp == slot).is_none())
+    for temp in released {
+        mut self.release_slot(temp, span: Elab.span(token))
+    }
+    mut self.moved.retain(fn(place: nir::Place) => released.position(fn(temp: nir::Value) => temp == place.root).is_none())
+} Elab.release_temps
+
+/// A slot for a binding of the current scope, created before its initialiser's code; the
+/// scope releases it once `hold` records that it holds a value.
+fn Elab.binding_slot(mut self, local: LocalId, ty: ty::Ty, span: nir::Span) -> nir::Value {
+    let slot = mut self.named_slot(local, ty, span)
+    discard mut self.held.insert(local, value: Held.Slot(slot))
+    return slot
+} Elab.binding_slot
+
+/// Records that a slot of the current scope holds a value, which the scope's exits release.
+fn Elab.hold(mut self, slot: nir::Value) {
+    let last = self.scopes.len() - 1
+    var scope = mut self.scopes.at_mut(last)
+    mut scope.slots.push(slot)
+} Elab.hold
+
+/// A slot named after a binding.
+fn Elab.named_slot(mut self, local: LocalId, ty: ty::Ty, span: nir::Span) -> nir::Value {
+    let name = text::String.of(self.body.contents().local(local).name.as_str(), alloc: self.ck.alloc())
+    return mut self.emit_value(nir::Op.Slot(name: Some(take name), ty: ty), ty: nir::NTy.Owned(ty), span)
+} Elab.named_slot
+
+/// Whether a `let` binding is a value: Copy, or bound to a part, a wrapped part or a place
+/// reached through a reference.
+fn Elab.binds_value(self, local: LocalId, value: TExpr) -> bool {
+    let ty = self.body.contents().local(local).ty
+    return self.ck.nir_copy(ty) or value.is_part() or self.borrowed_path(value)
+} Elab.binds_value
+
+/// Whether a `var` binding is a view binding, naming what its initialiser names: a part, or
+/// a place reached through a reference, that is not Copy.
+fn Elab.views(self, local: LocalId, value: TExpr) -> bool {
+    let ty = self.body.contents().local(local).ty
+    return not self.ck.nir_copy(ty) and (value.is_part() or self.borrowed_path(value))
+} Elab.views
+
+/// Whether an expression names a place reached through a reference: a local bound to one,
+/// or a field path from such a local.
+fn Elab.borrowed_path(self, value: TExpr) -> bool {
+    return match value.kind {
+        TKind.Local(local) => match self.held.get(local) {
+            Some(Held.Value(bound)) => self.b.ty(bound).is_reference()
+            else => false
+        }
+        TKind.Field(base: base, name: _) => self.borrowed_path(base.contents())
+        else => false
+    }
+} Elab.borrowed_path
+
+fn Elab.let_stmt(
+    mut self,
+    token: u32,
+    pattern: TPattern,
+    value: TExpr,
+    otherwise: Option[TBlock],
+    ) fails Fault {
+    let span = Elab.span(token)
+    match pattern.kind {
+        TPatternKind.Binding(local) => {
+            if otherwise.is_none() {
+                try mut self.let_binding(local, value, span)
+                return
+            }
+        }
+        else => {}
+    }
+    let Some(scrutinee) = try mut self.scrutinee(value) else {
+        return
+    }
+    try mut self.let_pattern(token, pattern, matched: take scrutinee, otherwise)
+} Elab.let_stmt
+
+/// `let x = e`: a value binding of a Copy value, a part or a place reached through a reference,
+/// a binding of the value an `if` or `match` yields, or a slot holding the value.
+fn Elab.let_binding(mut self, local: LocalId, value: TExpr, span: nir::Span) fails Fault {
+    if self.binds_value(local, value) {
+        let Some(bound) = try mut self.bound_value(value) else {
+            return
+        }
+        discard mut self.held.insert(local, value: Held.Value(bound))
+        return
+    }
+    if yields_by_branches(value) {
+        try mut self.branch_binding(local, value, span)
+        return
+    }
+    let ty = self.body.contents().local(local).ty
+    let slot = mut self.binding_slot(local, ty, span)
+    let Some(operand) = try mut self.arg(value, mode: ast::Mode.Take) else {
+        return
+    }
+    mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc: self.ck.alloc()), operand: take operand), span)
+    mut self.hold(slot)
+} Elab.let_binding
+
+/// The value a `let` binding of a value takes: a Copy value, or a projection's reference.
+fn Elab.bound_value(mut self, value: TExpr) -> Option[nir::Value] fails Fault {
+    let span = Elab.spanning(value)
+    let out = try mut self.expr(value)
+    match out {
+        Out.Never => return None
+        Out.Operand(operand) => {
+            match operand_root(operand) {
+                Some(bound) => return Some(bound)
+                None => {}
+            }
+            let place = mut self.temporary(take operand, ty: value.ty, token: value.token)
+            return Some(mut self.emit_value(nir::Op.Load(take place), ty: nir::NTy.Owned(value.ty), span))
+        }
+        Out.Place(place) => {
+            if self.ck.nir_copy(value.ty) {
+                let taken = mut self.take_place(take place, ty: value.ty, span)
+                return operand_root(taken)
+            }
+            return Some(mut self.emit_value(nir::Op.Ref(take place), ty: nir::NTy.Ref(value.ty), span))
+        }
+    }
+} Elab.bound_value
+
+/// `P = e` and `P op= e`: P's operands, then e, then the `at_mut` call of an indexed P, then
+/// for `op=` the operator on P's value and e's, then `init` where P holds no value and
+/// `assign` where it holds one.
+fn Elab.assign(
+    mut self,
+    token: u32,
+    target: TExpr,
+    op: Option[ast::BinaryOp],
+    value: TExpr,
+    ) fails Fault {
+    let span = nir::Span(head: token, last: value.last)
+    let Some(pending) = try mut self.target_operands(target) else {
+        return
+    }
+    let Some(right) = try mut self.arg(value, mode: ast::Mode.Take) else {
+        return
+    }
+    let Some(place) = try mut self.reach_target(take pending, target) else {
+        return
+    }
+    let Some(operand) = try mut self.compound_operand(op, take right, place, ty: target.ty, span) else {
+        return
+    }
+    var holds = true
+    for moved in self.moved {
+        if is_prefix(moved, place) {
+            holds = false
+            break
+        }
+    }
+    mut self.moved.retain(fn(moved: nir::Place) => not is_prefix(place, place: moved))
+    if holds {
+        mut self.emit(nir::Op.Assign(place: take place, operand: take operand), span)
+    } else {
+        mut self.emit(nir::Op.Init(place: take place, operand: take operand), span)
+    }
+} Elab.assign
+
+/// The value an assignment stores: the right side, or for `op=` the operator on the place's
+/// value and the right side's.
+fn Elab.compound_operand(
+    mut self,
+    op: Option[ast::BinaryOp],
+    take right: nir::Operand,
+    place: nir::Place,
+    ty: ty::Ty,
+    span: nir::Span,
+    ) -> Option[nir::Operand] fails Fault {
+    let Some(operator) = op else {
+        return Some(take right)
+    }
+    let current = mut self.read_operand(place.copy(self.ck.alloc()), ty, span)
+    return try mut self.operator_values(operator, left: take current, take right, operand_ty: ty, result_ty: ty, span)
+} Elab.compound_operand
+
+/// The operands of an assignment target, evaluated before its right side: its place, or the
+/// object and index of an indexed place, whose `at_mut` call follows the right side.
+fn Elab.target_operands(mut self, target: TExpr) -> Option[AssignTarget] fails Fault {
+    let alloc = self.ck.alloc()
+    match target.kind {
+        TKind.Index(call) => {
+            var args = mem::List[nir::Operand].empty(alloc)
+            for arg in call.contents().args {
+                let Some(operand) = try mut self.arg(arg.expr, mode: arg.mode) else {
+                    return None
+                }
+                mut args.push(take operand)
+            }
+            return Some(AssignTarget.Indexed(span: Elab.spanning(target), args: take args, steps: mem::List[text::String].empty(alloc)))
+        }
+        TKind.Field(base: base, name: name) => {
+            let Some(operands) = try mut self.target_operands(base.contents()) else {
+                return None
+            }
+            match operands {
+                AssignTarget.Place(place) => return Some(AssignTarget.Place(place.step(name.as_str(), alloc)))
+                AssignTarget.Indexed(span: span, args: args, steps: steps) => {
+                    var extended = mem::List[text::String].empty(alloc)
+                    for step in steps {
+                        mut extended.push(text::String.of(step.as_str(), alloc))
+                    }
+                    mut extended.push(text::String.of(name.as_str(), alloc))
+                    return Some(AssignTarget.Indexed(span: span, args: take args, steps: take extended))
+                }
+            }
+        }
+        else => {
+            let Some(place) = try mut self.place(target) else {
+                return None
+            }
+            return Some(AssignTarget.Place(take place))
+        }
+    }
+} Elab.target_operands
+
+/// The place an assignment target reaches, through its `at_mut` call when indexed: the
+/// indexing call `target`, the target expression its operands were evaluated from, holds.
+fn Elab.reach_target(mut self, take operands: AssignTarget, target: TExpr) -> Option[nir::Place] fails Fault {
+    let alloc = self.ck.alloc()
+    match operands {
+        AssignTarget.Place(place) => return Some(take place)
+        AssignTarget.Indexed(span: span, args: args, steps: steps) => {
+            let Some(call) = target.indexed_call() else {
+                fail Fault.Unsupported(text::String.of("an indexed target without its call", alloc))
+            }
+            let out = try mut self.finish_call(call, function_value: None, take args, ty: call.head.result, span, through: None)
+            match out {
+                Out.Place(place) => return Some(nir::Place(root: place.root, steps: joined_steps(place.steps.view(), more: steps.view(), alloc)))
+                Out.Never => return None
+                Out.Operand(_) => fail Fault.Unsupported(text::String.of("an indexed target without place", alloc))
+            }
+        }
+    }
+} Elab.reach_target
+
+/// The indexing call an assignment target reaches through its fields.
+proj fn TExpr.indexed_call(self) -> Option[Call] {
+    match self.kind {
+        TKind.Index(call) => {
+            let held = call.contents()
+            return Some(held)
+        }
+        TKind.Field(base: base, name: _) => {
+            let inner = base.contents()
+            return inner.indexed_call()
+        }
+        else => return None
+    }
+} TExpr.indexed_call
+
+fn Elab.while_stmt(
+    mut self,
+    token: u32,
+    condition: Option[TExpr],
+    invariants: Slice[TExpr],
+    body: TBlock,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.span(token)
+    let header = mut self.b.block()
+    let exit = mut self.b.block()
+    mut self.b.jump(header, args: mem::List[nir::Operand].empty(alloc), span)
+    mut self.b.at(header)
+    match condition {
+        Some(tested) => {
+            let Some(passed) = try mut self.releasing_temps(tested.token, elaborate: fn(mut elab: Elab) -> Option[nir::Operand] fails Fault {
+                return try mut elab.operand(tested)
+            }) else {
+                return
+            }
+            let start = mut self.b.block()
+            mut self.end(nir::Terminator.Branch(operand: take passed, then: nir::Jump.to(start, alloc), otherwise: nir::Jump.to(exit, alloc)), span)
+            mut self.b.at(start)
+        }
+        None => {}
+    }
+    let moved = nir::Place.copies(self.moved, alloc)
+    mut self.loops.push(ElabLoop(header: header, exit: exit, depth: self.scopes.len()))
+    mut self.scopes.push(ElabScope.empty(alloc))
+    try mut self.invariants(invariants, span)
+    for stmt in body.stmts {
+        try mut self.stmt(stmt)
+    }
+    try mut self.close_scope(body.end)
+    if self.b.open() {
+        mut self.b.jump(header, args: mem::List[nir::Operand].empty(alloc), span: Elab.span(body.end))
+    }
+    discard mut self.loops.pop()
+    self.moved = moved
+    mut self.b.at(exit)
+} Elab.while_stmt
+
+fn Elab.for_stmt(
+    mut self,
+    token: u32,
+    pattern: TPattern,
+    mode: ast::Mode,
+    iterated: TExpr,
+    cursor: ty::Ty,
+    invariants: Slice[TExpr],
+    body: TBlock,
+    ) fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.span(token)
+    mut self.scopes.push(ElabScope.empty(alloc))
+    let slot = mut self.emit_value(nir::Op.Slot(name: None, ty: cursor), ty: nir::NTy.Owned(cursor), span)
+    let Some(obtained) = try mut self.cursor(iterated, mode, cursor) else {
+        return
+    }
+    mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc), operand: take obtained), span)
+    mut self.hold(slot)
+    let header = mut self.b.block()
+    let exit = mut self.b.block()
+    mut self.b.jump(header, args: mem::List[nir::Operand].empty(alloc), span)
+    mut self.b.at(header)
+    let next = try self.cursor_next(cursor)
+    let option = self.ck.option_ty(next.element)
+    var args = mem::List[nir::Operand].empty(alloc)
+    mut args.push(nir::Operand.Place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc)))
+    let yielded = mut self.call_value(next.next.copy(alloc), take args, ty: option, span)
+    let some = mut self.emit_value(nir::Op.Is(place: nir::Place.of(yielded, alloc), ty: option, variant: text::String.of("Some", alloc)), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
+    let start = mut self.b.block()
+    mut self.end(nir::Terminator.Branch(operand: nir::Operand.Value(some), then: nir::Jump.to(start, alloc), otherwise: nir::Jump.to(exit, alloc)), span)
+    mut self.b.at(start)
+    let moved = nir::Place.copies(self.moved, alloc)
+    mut self.loops.push(ElabLoop(header: header, exit: exit, depth: self.scopes.len()))
+    mut self.scopes.push(ElabScope.empty(alloc))
+    let part = nir::Place.of(yielded, alloc).step("Some", alloc)
+    try mut self.bind_element(pattern, take part, element: next.element, mode, projects: next.projects, span)
+    try mut self.invariants(invariants, span)
+    for stmt in body.stmts {
+        try mut self.stmt(stmt)
+    }
+    try mut self.close_scope(body.end)
+    if self.b.open() {
+        mut self.b.jump(header, args: mem::List[nir::Operand].empty(alloc), span: Elab.span(body.end))
+    }
+    discard mut self.loops.pop()
+    self.moved = moved
+    mut self.b.at(exit)
+    try mut self.close_scope(token)
+} Elab.for_stmt
+
+/// The calls and checks of a loop's invariants, at the start of its body.
+fn Elab.invariants(mut self, invariants: Slice[TExpr], span: nir::Span) fails Fault {
+    for clause in invariants {
+        let Some(index) = self.unit.conditions.get(ConditionKey(role: nir::Role.Invariant, token: clause.token)) else {
+            expect false
+            return
+        }
+        let args = try mut self.named_operands(clause, span)
+        let fn_ref = self.own(nir::Role.Invariant, index)
+        let value = mut self.call_value(take fn_ref, take args, ty: ty::Ty.scalar(ty::Scalar.Bool), span: Elab.span(clause.token))
+        mut self.emit(nir::Op.Check(kind: nir::CheckKind.Invariant, operand: nir::Operand.Value(value), open: false), span: Elab.span(clause.token))
+    }
+} Elab.invariants
+
+/// The operands passing the bindings a condition names, by read, by first mention.
+fn Elab.named_operands(mut self, condition: TExpr, span: nir::Span) -> mem::List[nir::Operand] fails Fault {
+    let alloc = self.ck.alloc()
+    var operands = mem::List[nir::Operand].empty(alloc)
+    for local in named_bindings(condition, alloc) {
+        let ty = self.body.contents().local(local).ty
+        let place = try mut self.local_place(local)
+        mut operands.push(mut self.read_operand(take place, ty, span))
+    }
+    return operands
+} Elab.named_operands
+
+/// Closes the innermost scope at its end: its deferred calls, then its slots' releases; the
+/// places of its slots no longer count as moved, as no later code reaches them.
+fn Elab.close_scope(mut self, end: u32) fails Fault {
+    let depth = self.scopes.len() - 1
+    if self.b.open() {
+        try mut self.leave_scopes(depth, token: end)
+    }
+    let Some(scope) = mut self.scopes.pop() else {
+        expect false
+        return
+    }
+    mut self.moved.retain(fn(place: nir::Place) => scope.slots.position(fn(slot: nir::Value) => slot == place.root).is_none())
+} Elab.close_scope
+
+/// The deferred calls pending in the scopes from `depth` inward, innermost first in reverse
+/// order of registration, then the releases of their slots still holding values.
+fn Elab.leave_scopes(mut self, depth: usize, token: u32) fails Fault {
+    let alloc = self.ck.alloc()
+    let span = Elab.span(token)
+    var tokens = mem::List[u32].empty(alloc)
+    var calls = mem::List[TExpr].empty(alloc)
+    var index = self.scopes.len()
+    while index > depth {
+        index -= 1
+        let scope = self.scopes[index]
+        var position = scope.deferred.len()
+        while position > 0 {
+            position -= 1
+            mut tokens.push(scope.deferred[position].token)
+            mut calls.push(scope.deferred[position].call.copy(alloc))
+        }
+    }
+    for position in 0..<calls.len() {
+        let call = calls[position]
+        discard try mut self.releasing_temps(tokens[position], elaborate: fn(mut elab: Elab) -> Out fails Fault {
+            return try mut elab.expr(call)
+        })
+    }
+    var slots = mem::List[nir::Value].empty(alloc)
+    index = self.scopes.len()
+    while index > depth {
+        index -= 1
+        let held = self.scopes[index].slots
+        var position = held.len()
+        while position > 0 {
+            position -= 1
+            mut slots.push(held[position])
+        }
+    }
+    for slot in slots {
+        mut self.release_slot(slot, span)
+    }
+} Elab.leave_scopes
+
+/// The type of the value at a place of struct fields.
+fn Elab.place_ty(self, place: nir::Place) -> ty::Ty {
+    var ty = self.b.ty(place.root).ty()
+    for step in place.steps {
+        let Some(field) = self.ck.field_type(ty, name: step.as_str()) else {
+            expect false
+            return ty
+        }
+        ty = field
+    }
+    return ty
+} Elab.place_ty
+
+/// Releases a slot unless it holds nothing or a Copy or view value; of a slot with parts
+/// moved out, only the parts left.
+fn Elab.release_slot(mut self, slot: nir::Value, span: nir::Span) {
+    let ty = self.b.ty(slot).ty()
+    mut self.release_left(nir::Place.of(slot, alloc: self.ck.alloc()), ty, span)
+} Elab.release_slot
+
+/// Releases what a place still holds unless that is nothing or a Copy or view value: of a
+/// struct or variant payload with parts moved out, the parts left.
+fn Elab.release_left(mut self, take place: nir::Place, ty: ty::Ty, span: nir::Span) {
+    let alloc = self.ck.alloc()
+    for moved in self.moved {
+        if is_prefix(moved, place) {
+            return
+        }
+    }
+    if self.ck.nir_copy(ty) or self.ck.nir_view(ty) {
+        return
+    }
+    var inner: Option[nir::Place] = None
+    for moved in self.moved {
+        if is_prefix(place, place: moved) {
+            inner = Some(moved.copy(alloc))
+            break
+        }
+    }
+    var parts: Option[mem::List[PlacePart]] = None
+    match inner {
+        Some(moved) => match self.ck.types().kind(ty) {
+            ty::TyKind.Item(item: item, args: args) => {
+                parts = self.parts(place, moved, item, args)
+            }
+            else => {}
+        }
+        None => {}
+    }
+    let Some(left) = parts else {
+        mut self.emit(nir::Op.Release(take place), span)
+        return
+    }
+    for part in take left {
+        let PlacePart(place: part_place, ty: part_ty) = part
+        mut self.release_left(take part_place, ty: part_ty, span)
+    }
+} Elab.release_left
+
+/// The parts of a struct value at a place, or of the payload of the variant a moved part
+/// lies in, with their types.
+fn Elab.parts(
+    self,
+    place: nir::Place,
+    moved: nir::Place,
+    item: ty::ItemId,
+    args: ty::Args,
+    ) -> Option[mem::List[PlacePart]] {
+    let alloc = self.ck.alloc()
+    let types = self.ck.types()
+    let sig = self.ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: types.arg_list(args), alloc)
+    var found = mem::List[PlacePart].empty(alloc)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            for field in fields {
+                mut found.push(PlacePart(place: place.step(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+            }
+            return Some(take found)
+        }
+        SigKind.Enum(variants: variants) => {
+            let step = moved.steps[place.steps.len()]
+            let Some(position) = variants.position(fn(variant: VariantSig) => variant.name == step) else {
+                return None
+            }
+            let payload = place.step(step.as_str(), alloc)
+            match variants[position].payload {
+                Payload.None => {}
+                Payload.Single(single) => mut found.push(PlacePart(place: take payload, ty: subst.ty(types, ty: single)))
+                Payload.Labelled(labelled) => {
+                    for field in labelled {
+                        mut found.push(PlacePart(place: payload.step(field.name.as_str(), alloc), ty: subst.ty(types, ty: field.ty)))
+                    }
+                }
+            }
+            return Some(take found)
+        }
+        else => return None
+    }
+} Elab.parts
+
+/// `return e`: its value, the exit of every scope, then the function's return exit.
+fn Elab.return_expr(mut self, value: Option[TExpr], token: u32) fails Fault {
+    let Some(returned) = value else {
+        try mut self.exit_return(None, token)
+        return
+    }
+    if self.projection and yields_by_branches(returned) {
+        let branched = returned_in_branches(returned, alloc: self.ck.alloc())
+        discard try mut self.expr(branched)
+        return
+    }
+    let Some(operand) = try mut self.arg(returned, mode: ast::Mode.Take) else {
+        return
+    }
+    if operand == nir::Operand.Literal(nir::Literal.Unit) {
+        try mut self.exit_return(None, token)
+        return
+    }
+    try mut self.exit_return(Some(take operand), token)
+} Elab.return_expr
+
+/// The return exit: deferred calls and releases of every scope, the exit's predicate checks,
+/// the ensures checks, the release of `take` parameter slots, and the terminator.
+fn Elab.exit_return(mut self, take value: Option[nir::Operand], token: u32) fails Fault {
+    let alloc = self.ck.alloc()
+    if try mut self.leave_when(Exit.Return, carried: carried_out(value, ty: self.exit_ty, alloc), token) {
+        return
+    }
+    let span = Elab.span(token)
+    try mut self.leave_scopes(0, token)
+    try mut self.exit_predicate_checks(value, span)
+    for position in 0..<self.exits.ensures_clauses.len() {
+        let index = self.exits.ensures_clauses[position].index
+        var olds = mem::List[nir::Value].empty(alloc)
+        for old in self.exits.ensures_clauses[position].olds {
+            let Some(held) = self.old_values.get(old) else {
+                expect false
+                return
+            }
+            mut olds.push(held)
+        }
+        var args = try mut self.param_operands_except_taken()
+        mut args.push(returned_operand(value, alloc))
+        for held in olds {
+            mut args.push(nir::Operand.Value(held))
+        }
+        let fn_ref = self.own(nir::Role.Ensures, index)
+        let checked = mut self.call_value(take fn_ref, take args, ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+        mut self.emit(nir::Op.Check(kind: nir::CheckKind.Ensures, operand: nir::Operand.Value(checked), open: false), span)
+    }
+    try mut self.inherited_checks(value, span)
+    mut self.release_take_slots(span)
+    mut self.end(nir::Terminator.Return(take value), span)
+} Elab.exit_return
+
+/// The value an exit carries out of an `await when` body: a copy of its operand, when it has
+/// one and a type.
+fn carried_out(value: Option[nir::Operand], ty: Option[ty::Ty], alloc: mem::Alloc) -> Option[Carried] {
+    let Some(operand) = value else {
+        return None
+    }
+    let Some(carried_ty) = ty else {
+        return None
+    }
+    return Some(Carried(operand: operand.copy(alloc), ty: carried_ty))
+} carried_out
+
+/// The operand an ensures check takes for the returned value: a copy of it, or `Unit`.
+fn returned_operand(value: Option[nir::Operand], alloc: mem::Alloc) -> nir::Operand {
+    return match value {
+        Some(operand) => operand.copy(alloc)
+        None => nir::Operand.Literal(nir::Literal.Unit)
+    }
+} returned_operand
+
+/// The checks of the ensures a function inherits from the interface method it implements,
+/// reached when each requires of that method held at entry.
+fn Elab.inherited_checks(mut self, value: Option[nir::Operand], span: nir::Span) fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(inherited) = mut self.exits.inherited.extract() else {
+        return
+    }
+    let join = mut self.b.block()
+    for held in inherited.requires_values {
+        let next = mut self.b.block()
+        mut self.end(nir::Terminator.Branch(operand: nir::Operand.Value(held), then: nir::Jump.to(next, alloc), otherwise: nir::Jump.to(join, alloc)), span)
+        mut self.b.at(next)
+    }
+    for clause in inherited.ensures_clauses {
+        var args = try mut self.param_operands_except_taken()
+        mut args.push(returned_operand(value, alloc))
+        for old in clause.olds {
+            let Some(held) = inherited.old_values.get(old) else {
+                expect false
+                return
+            }
+            mut args.push(nir::Operand.Value(held))
+        }
+        let fn_ref = nir::FnRef(callable: nir::Callable.Item(item: inherited.implemented.item, role: nir::Role.Ensures, index: clause.index), args: inherited.implemented.args)
+        let checked = mut self.call_value(take fn_ref, take args, ty: ty::Ty.scalar(ty::Scalar.Bool), span)
+        mut self.emit(nir::Op.Check(kind: nir::CheckKind.Ensures, operand: nir::Operand.Value(checked), open: false), span)
+    }
+    mut self.end(nir::Terminator.Jump(nir::Jump.to(join, alloc)), span)
+    mut self.b.at(join)
+    self.exits.inherited = Some(take inherited)
+} Elab.inherited_checks
+
+/// The operands passing the parameters other than `take` ones by read, as ensures take them.
+fn Elab.param_operands_except_taken(mut self) -> mem::List[nir::Operand] fails Fault {
+    let alloc = self.ck.alloc()
+    let body = self.body.share()
+    var operands = mem::List[nir::Operand].empty(alloc)
+    for local in body.contents().params {
+        let data = body.contents().local(local)
+        if data.kind == LocalKind.Param(ast::Mode.Take) {
+            continue
+        }
+        let place = try mut self.local_place(local)
+        mut operands.push(mut self.read_operand(take place, ty: data.ty, span: Elab.span(data.token)))
+    }
+    return operands
+} Elab.param_operands_except_taken
+
+fn Elab.release_take_slots(mut self, span: nir::Span) {
+    var slots = mem::List[nir::Value].empty(self.ck.alloc())
+    for slot in self.take_slots {
+        mut slots.push(slot)
+    }
+    while slots.len() > 0 {
+        let Some(slot) = mut slots.pop() else {
+            break
+        }
+        mut self.release_slot(slot, span)
+    }
+} Elab.release_take_slots
+
+/// `fail e`: its value converted to the failure type, then the failure exit.
+fn Elab.fail_expr(mut self, value: TExpr, token: u32) fails Fault {
+    let Some(operand) = try mut self.arg(value, mode: ast::Mode.Take) else {
+        return
+    }
+    let failure = mut self.converted(take operand, ty: value.ty, token)
+    try mut self.exit_fail(take failure, token)
+} Elab.fail_expr
+
+/// A failure converted into the function's failure type when its type differs.
+fn Elab.converted(mut self, take failure: nir::Operand, ty: ty::Ty, token: u32) -> nir::Operand {
+    let Some(target) = self.failure_ty else {
+        return failure
+    }
+    return mut self.converted_to(take failure, from: ty, to: target, span: Elab.span(token))
+} Elab.converted
+
+/// A failure of type `from` converted into `to`.
+fn Elab.converted_to(
+    mut self,
+    take failure: nir::Operand,
+    from: ty::Ty,
+    to: ty::Ty,
+    span: nir::Span,
+    ) -> nir::Operand {
+    if from == to {
+        return failure
+    }
+    let via = self.ck.conversion_variant(from, to)
+    let value = mut self.emit_value(nir::Op.Convert(value: take failure, to: to, via: take via), ty: nir::NTy.Owned(to), span)
+    return nir::Operand.Value(value)
+} Elab.converted_to
+
+/// The failure exit: deferred calls and releases of every scope, the exit's predicate
+/// checks, the release of `take` parameter slots, and the terminator.
+fn Elab.exit_fail(mut self, take failure: nir::Operand, token: u32) fails Fault {
+    let alloc = self.ck.alloc()
+    if try mut self.leave_when(Exit.Fail, carried: carried_out(Some(failure.copy(alloc)), ty: self.failure_ty, alloc), token) {
+        return
+    }
+    let span = Elab.span(token)
+    try mut self.leave_scopes(0, token)
+    try mut self.exit_predicate_checks(Some(failure.copy(alloc)), span)
+    mut self.release_take_slots(span)
+    mut self.end(nir::Terminator.Fail(take failure), span)
+} Elab.exit_fail
+
+/// `break` or `continue`: the exits of the scopes left, then the jump.
+fn Elab.leave_loop(mut self, index: usize, breaks: bool, token: u32) fails Fault {
+    let alloc = self.ck.alloc()
+    if index < self.loop_base or index - self.loop_base >= self.loops.len() {
+        fail Fault.Unsupported(text::String.of("a jump to no loop", alloc))
+    }
+    let target = self.loops[index - self.loop_base]
+    var block = target.header
+    if breaks {
+        block = target.exit
+    }
+    let depth = target.depth
+    var outside = false
+    match self.when_depth() {
+        Some(enclosing) => {
+            outside = depth < enclosing
+        }
+        None => {}
+    }
+    if outside and try mut self.leave_when(Exit.Loop(index: index, breaks: breaks), carried: None, token) {
+        return
+    }
+    try mut self.leave_scopes(depth, token)
+    mut self.b.jump(block, args: mem::List[nir::Operand].empty(alloc), span: Elab.span(token))
+} Elab.leave_loop
+
+/// The scope depth outside the `await when` body being elaborated, if any.
+fn Elab.when_depth(self) -> Option[usize] {
+    let Some(enclosing) = self.when_body else {
+        return None
+    }
+    return Some(enclosing.depth)
+} Elab.when_depth
+
+/// Within an `await when` body, an exit's part inside its region: the exits of the body's
+/// scopes, then the jump to a block of the enclosing code that continues the exit with the
+/// value it carries, of its type. Whether the exit leaves such a body.
+fn Elab.leave_when(mut self, exit: Exit, take carried: Option[Carried], token: u32) -> bool fails Fault {
+    let alloc = self.ck.alloc()
+    let Some(depth) = self.when_depth() else {
+        return false
+    }
+    try mut self.leave_scopes(depth, token)
+    let block = mut self.b.outer_block()
+    var value: Option[nir::Value] = None
+    var args = mem::List[nir::Operand].empty(alloc)
+    match carried {
+        Some(Carried(operand: operand, ty: carried_ty)) => {
+            value = Some(mut self.b.block_param(block, ty: nir::NTy.Owned(carried_ty)))
+            mut args.push(take operand)
+        }
+        None => {}
+    }
+    mut self.b.jump(block, take args, span: Elab.span(token))
+    let leave = Leave(block: block, value: value, moved: nir::Place.copies(self.moved, alloc), exit: exit, token: token)
+    let Some(held) = mut self.when_body.extract() else {
+        expect false
+        return true
+    }
+    var enclosing = held
+    mut enclosing.leaves.push(take leave)
+    self.when_body = Some(take enclosing)
+    return true
+} Elab.leave_when
+
+/// Continues the exits that left an `await when` body, in the enclosing code.
+fn Elab.continue_leaves(mut self, take leaves: mem::List[Leave]) fails Fault {
+    let alloc = self.ck.alloc()
+    let current = self.b.current_block()
+    let moved = nir::Place.copies(self.moved, alloc)
+    for leave in take leaves {
+        let Leave(block: block, value: value, moved: left_moved, exit: exit, token: token) = leave
+        mut self.b.at(block)
+        self.moved = left_moved
+        var carried: Option[nir::Operand] = None
+        match value {
+            Some(held) => {
+                carried = Some(nir::Operand.Value(held))
+            }
+            None => {}
+        }
+        match exit {
+            Exit.Return => try mut self.exit_return(take carried, token)
+            Exit.Fail => {
+                let Some(failure) = carried else {
+                    expect false
+                    return
+                }
+                try mut self.exit_fail(take failure, token)
+            }
+            Exit.Loop(index: index, breaks: breaks) => try mut self.leave_loop(index, breaks, token)
+        }
+    }
+    self.moved = moved
+    match current {
+        Some(block) => mut self.b.at(block)
+        None => {}
+    }
+} Elab.continue_leaves
+
+/// The end of a branch: its value, the release of the temporaries created since the first
+/// `temps`, its open block and moved places.
+fn Elab.arm_end(
+    mut self,
+    take out: Out,
+    ty: ty::Ty,
+    token: u32,
+    temps: usize,
+    ) -> ArmEnd {
+    var value: Option[BranchValue] = None
+    match out {
+        Out.Operand(operand) => {
+            value = Some(BranchValue.Value(take operand))
+        }
+        Out.Place(place) => {
+            if self.borrowed_part(place, ty) {
+                value = Some(BranchValue.Part(take place))
+            } else {
+                value = Some(BranchValue.Value(mut self.take_place(take place, ty, span: Elab.span(token))))
+            }
+        }
+        Out.Never => {}
+    }
+    mut self.release_temps(temps, token)
+    return ArmEnd(block: self.b.current_block(), value: take value, moved: nir::Place.copies(self.moved, alloc: self.ck.alloc()))
+} Elab.arm_end
+
+/// Joins branches: each releases what it still holds of the parts of slots another moved,
+/// of the whole value of a variant payload part, then jumps to the join, passing its value
+/// when the branches yield one: a reference when each yields a part, which the join then
+/// names in place.
+fn Elab.join(mut self, take arms: mem::List[ArmEnd], ty: ty::Ty, span: nir::Span) -> Out {
+    let alloc = self.ck.alloc()
+    var live = mem::List[ArmEnd].empty(alloc)
+    for arm in take arms {
+        if arm.block.is_some() {
+            mut live.push(take arm)
+        }
+    }
+    if live.len() == 0 {
+        mut self.b.end(nir::Terminator.Unreachable, span)
+        return Out.Never
+    }
+    var union = mem::Set[nir::Place].empty(alloc)
+    for arm in live {
+        for moved in arm.moved {
+            discard mut union.insert(moved.copy(alloc))
+        }
+    }
+    let released = self.released_parts(union, live: live.view())
+    let join = mut self.b.block()
+    let yields = ty != ty::Ty.unit() and ty != ty::Ty.never()
+    var parts = yields
+    for arm in live {
+        if not yields_part(arm.value) {
+            parts = false
+        }
+    }
+    var held = nir::NTy.Owned(ty)
+    if parts {
+        held = nir::NTy.Ref(ty)
+    }
+    var param: Option[nir::Value] = None
+    if yields {
+        param = Some(mut self.b.block_param(join, ty: held))
+    }
+    for arm in take live {
+        let ArmEnd(block: block, value: value, moved: arm_moved) = arm
+        let Some(open) = block else {
+            expect false
+            return Out.Never
+        }
+        mut self.b.at(open)
+        self.moved = arm_moved
+        for place in released {
+            let place_ty = self.place_ty(place)
+            mut self.release_left(place.copy(alloc), ty: place_ty, span)
+            discard mut self.moved.insert(place.copy(alloc))
+        }
+        var args = mem::List[nir::Operand].empty(alloc)
+        if yields {
+            match value {
+                Some(BranchValue.Value(operand)) => mut args.push(take operand)
+                Some(BranchValue.Part(place)) => {
+                    if parts {
+                        mut args.push(nir::Operand.Value(mut self.emit_value(nir::Op.Ref(take place), ty: nir::NTy.Ref(ty), span)))
+                    } else {
+                        mut args.push(mut self.take_place(take place, ty, span))
+                    }
+                }
+                None => {}
+            }
+        }
+        mut self.b.jump(join, take args, span)
+    }
+    self.moved = union
+    for place in released {
+        discard mut self.moved.insert(place.copy(alloc))
+    }
+    mut self.b.at(join)
+    let Some(joined) = param else {
+        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    }
+    if parts {
+        return Out.Place(nir::Place.of(joined, alloc))
+    }
+    return Out.Operand(nir::Operand.Value(joined))
+} Elab.join
+
+/// The parts of slots some branch moved that another live branch still holds, each up to its
+/// first variant step.
+fn Elab.released_parts(self, union: mem::Set[nir::Place], live: Slice[ArmEnd]) -> mem::Set[nir::Place] {
+    let alloc = self.ck.alloc()
+    var released = mem::Set[nir::Place].empty(alloc)
+    for place in union {
+        if not self.b.is_slot(place.root) {
+            continue
+        }
+        var held = false
+        for arm in live {
+            var holds = true
+            for moved in arm.moved {
+                if is_prefix(moved, place) {
+                    holds = false
+                    break
+                }
+            }
+            if holds {
+                held = true
+                break
+            }
+        }
+        if held {
+            discard mut released.insert(before_variant(place, alloc))
+        }
+    }
+    return released
+} Elab.released_parts
+
+/// Whether a branch yields a part it names in place.
+fn yields_part(value: Option[BranchValue]) -> bool {
+    return match value {
+        Some(BranchValue.Part(_)) => true
+        else => false
+    }
+} yields_part
+
+/// Whether a place a branch yields is a part it names in place: one that is not Copy, reached
+/// through a reference.
+fn Elab.borrowed_part(self, place: nir::Place, ty: ty::Ty) -> bool {
+    return not self.ck.nir_copy(ty) and self.b.ty(place.root).is_reference()
+} Elab.borrowed_part
+
+/// A `let` or `var` binding of an `if` or `match` value: a view binding of the part its
+/// branches name, or else a binding owning the value they move in.
+fn Elab.branch_binding(mut self, local: LocalId, value: TExpr, span: nir::Span) fails Fault {
+    let out = try mut self.expr(value)
+    match out {
+        Out.Never => return
+        Out.Place(place) => {
+            if self.borrowed_part(place, ty: value.ty) {
+                let bound = mut self.emit_value(nir::Op.Ref(take place), ty: nir::NTy.Ref(value.ty), span)
+                discard mut self.held.insert(local, value: Held.Value(bound))
+                return
+            }
+            mut self.owned_branch_binding(local, value, out: Out.Place(take place), span)
+        }
+        Out.Operand(operand) => mut self.owned_branch_binding(local, value, out: Out.Operand(take operand), span)
+    }
+} Elab.branch_binding
+
+/// A binding owning the value an `if` or `match` moves in, in a slot.
+fn Elab.owned_branch_binding(mut self, local: LocalId, value: TExpr, take out: Out, span: nir::Span) {
+    let ty = self.body.contents().local(local).ty
+    let slot = mut self.binding_slot(local, ty, span)
+    let Some(operand) = mut self.argument(take out, expr: value, mode: ast::Mode.Take) else {
+        return
+    }
+    mut self.emit(nir::Op.Init(place: nir::Place.of(slot, alloc: self.ck.alloc()), operand: take operand), span)
+    mut self.hold(slot)
+} Elab.owned_branch_binding
+
+/// Whether `prefix` is a place `place` lies within.
+fn is_prefix(prefix: nir::Place, place: nir::Place) -> bool {
+    if prefix.root != place.root or prefix.steps.len() > place.steps.len() {
+        return false
+    }
+    for index in 0..<prefix.steps.len() {
+        if prefix.steps[index] != place.steps[index] {
+            return false
+        }
+    }
+    return true
+} is_prefix
+
+/// A place up to its first variant step: the enum value holding a payload part.
+fn before_variant(place: nir::Place, alloc: mem::Alloc) -> nir::Place {
+    var steps = mem::List[text::String].empty(alloc)
+    for step in place.steps {
+        if nir::is_variant_step(step.as_str()) {
+            break
+        }
+        mut steps.push(text::String.of(step.as_str(), alloc))
+    }
+    return nir::Place(root: place.root, steps: take steps)
+} before_variant
+
+/// Whether an expression is a part or wrapped part: a projection's result, a path of fields
+/// from one, or a construction of a wrapped part.
+fn TExpr.is_part(self) -> bool {
+    return match self.kind {
+        TKind.Index(_) => true
+        TKind.Call(call) => call.contents().projection
+        TKind.Construct(variant: _, values: _, wrapped: wrapped) => wrapped
+        TKind.Field(base: base, name: _) => base.contents().is_part()
+        else => false
+    }
+} TExpr.is_part
+
+/// Whether a returned expression yields its value through branches: an `if` or a `match`.
+fn yields_by_branches(value: TExpr) -> bool {
+    return match value.kind {
+        TKind.If(condition: _, then: _, otherwise: _) or TKind.Match(scrutinee: _, arms: _) => true
+        else => false
+    }
+} yields_by_branches
+
+/// A copy of a returned value-yielding expression whose branches each return their value, as a
+/// projection returns its result in the form its head gives.
+fn returned_in_branches(value: TExpr, alloc: mem::Alloc) -> TExpr {
+    let heap = mem::Heap.of(alloc)
+    match value.kind {
+        TKind.If(condition: condition, then: then, otherwise: otherwise) => {
+            var branch: Option[mem::Box[TExpr]] = None
+            match otherwise {
+                Some(other) => {
+                    branch = Some(heap.boxed(returned_in_branches(other.contents(), alloc)))
+                }
+                None => {}
+            }
+            return TExpr(token: value.token, last: value.last, ty: ty::Ty.never(), kind: TKind.If(condition: TExpr.boxed_copy(condition, alloc), then: return_tail(then, alloc), otherwise: take branch))
+        }
+        TKind.Match(scrutinee: scrutinee, arms: arms) => {
+            var returned = mem::List[TArm].empty(alloc)
+            for arm in arms {
+                var patterns = mem::List[TPattern].empty(alloc)
+                for pattern in arm.patterns {
+                    mut patterns.push(pattern.copy(alloc))
+                }
+                mut returned.push(TArm(token: arm.token, patterns: take patterns, guard: TExpr.optional_copy(arm.guard, alloc), body: returned_in_branches(arm.body, alloc)))
+            }
+            return TExpr(token: value.token, last: value.last, ty: ty::Ty.never(), kind: TKind.Match(scrutinee: TExpr.boxed_copy(scrutinee, alloc), arms: take returned))
+        }
+        TKind.Block(block) => return TExpr(token: value.token, last: value.last, ty: ty::Ty.never(), kind: TKind.Block(return_tail(block, alloc)))
+        else => {}
+    }
+    if value.ty.is_never() {
+        return value.copy(alloc)
+    }
+    let copied = value.copy(alloc)
+    return TExpr(token: value.token, last: value.last, ty: ty::Ty.never(), kind: TKind.Return(Some(heap.boxed(take copied))))
+} returned_in_branches
+
+/// A copy of a block whose yielded value, its last statement's, is returned.
+fn return_tail(block: TBlock, alloc: mem::Alloc) -> TBlock {
+    var stmts = mem::List[TStmt].empty(alloc)
+    let count = block.stmts.len()
+    for index in 0..<count {
+        let stmt = block.stmts[index]
+        if index + 1 == count {
+            match stmt.kind {
+                TStmtKind.Expr(tail) => {
+                    mut stmts.push(TStmt(token: stmt.token, kind: TStmtKind.Expr(returned_in_branches(tail, alloc))))
+                    continue
+                }
+                else => {}
+            }
+        }
+        mut stmts.push(TStmt(token: stmt.token, kind: stmt.kind.copy(alloc)))
+    }
+    return TBlock(end: block.end, stmts: take stmts)
+} return_tail
+
+/// The places a deferred call passes as its receiver and arguments.
+fn Elab.deferred_places(mut self, call: TExpr) -> mem::List[nir::Place] fails Fault {
+    var places = mem::List[nir::Place].empty(self.ck.alloc())
+    let TKind.Call(called) = call.kind else {
+        return places
+    }
+    for arg in called.contents().args {
+        let Some(place) = try mut self.place_path(arg.expr) else {
+            continue
+        }
+        mut places.push(take place)
+    }
+    return places
+} Elab.deferred_places
+
+/// The place a place expression names, without elaborating code.
+fn Elab.place_path(mut self, expr: TExpr) -> Option[nir::Place] fails Fault {
+    return match expr.kind {
+        TKind.Local(local) => Some(try mut self.local_place(local))
+        TKind.Field(base: base, name: name) => match try mut self.place_path(base.contents()) {
+            Some(place) => Some(place.step(name.as_str(), alloc: self.ck.alloc()))
+            None => None
+        }
+        else => None
+    }
+} Elab.place_path

@@ -106,7 +106,7 @@ pub struct Seal {
     pub signature: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClosureEntry {
     pub path: String,
     pub body: bool,
@@ -119,6 +119,23 @@ impl ClosureEntry {
             true => "body",
             false => "interface",
         }
+    }
+
+    fn key(&self) -> (&str, &'static str, [u8; 33]) {
+        (&self.path, self.kind(), self.hash.0)
+    }
+}
+
+/// Closure entries order in byte order of path, then kind, then hash.
+impl Ord for ClosureEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for ClosureEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -259,15 +276,7 @@ impl Entry {
                     .map(|seal| &seal.principal)
                     .collect::<Vec<_>>(),
             )
-            && self.seals.iter().all(|seal| {
-                increasing(
-                    &seal
-                        .entries
-                        .iter()
-                        .map(|entry| (&entry.path, entry.kind(), entry.hash.0))
-                        .collect::<Vec<_>>(),
-                )
-            })
+            && self.seals.iter().all(|seal| increasing(&seal.entries))
             && self
                 .accepted
                 .tests

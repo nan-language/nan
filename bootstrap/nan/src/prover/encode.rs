@@ -9,6 +9,7 @@ use crate::check::Checker;
 use crate::check::sig::SigKind;
 use crate::check::ty::{Arg, Const, Scalar, Ty};
 use crate::encoding::bytes;
+use crate::hash::blake3;
 use crate::nir::{BinaryOp, Builtin, Callable, Constant, FnRef, Literal as Value, UnaryOp};
 
 /// The opcodes of the query forms, after those of NIR's instructions and terminators.
@@ -23,7 +24,8 @@ const BOUND: u64 = 56;
 const AND: u64 = 57;
 const OR: u64 = 58;
 
-/// The encodings of a store's terms, each computed once.
+/// The keys of a store's terms, each computed once: the BLAKE3-256 digest of the term's
+/// encoding, in which each argument term is written as its key.
 #[derive(Clone, Default)]
 pub struct Encodings(Vec<Option<Rc<[u8]>>>);
 
@@ -34,7 +36,7 @@ impl Encodings {
         }
         let mut out = Vec::new();
         self.write_term(ck, terms, id, &mut out);
-        let done: Rc<[u8]> = out.into();
+        let done: Rc<[u8]> = blake3(&out).into();
         if self.0.len() <= id as usize {
             self.0.resize(id as usize + 1, None);
         }

@@ -1,0 +1,1145 @@
+//! The abstract syntax of items, lowered from their trees: what the checker reads. Every node keeps the index of its first token in its file, from which its line and text are found.
+
+pkg struct Name derives Eq {
+    pkg text: text::String
+    pkg token: u32
+} Name
+
+/// A `::`-separated path.
+pkg struct Path derives Eq {
+    pkg segments: mem::List[Name]
+} Path
+
+pkg fn Path.token(self) -> u32 {
+    return self.segments[0].token
+} Path.token
+
+pkg proj fn Path.last(self) -> Name {
+    return self.segments[self.segments.len() - 1]
+} Path.last
+
+pkg fn Path.written(self, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for i in 0..<self.segments.len() {
+        if i > 0 {
+            mut written.append("::")
+        }
+        mut written.append(self.segments[i].text.as_str())
+    }
+    return written
+} Path.written
+
+pkg enum Visibility derives Copy, Eq {
+    Private
+    Pkg
+    Pub
+} Visibility
+
+pkg enum Mode derives Copy, Eq, Ord, Hash {
+    Read
+    Mut
+    Take
+} Mode
+
+pkg proj fn Mode.word(self) -> Str {
+    return match self {
+        Mode.Read => ""
+        Mode.Mut => "mut"
+        Mode.Take => "take"
+    }
+} Mode.word
+
+pkg struct TypeExpr {
+    pkg token: u32
+    pkg last: u32
+    pkg kind: TypeKind
+} TypeExpr
+
+pkg enum TypeKind {
+    Path(path: Path, args: Option[mem::List[GenericArg]])
+    Fn(mem::Box[FnType])
+} TypeKind
+
+pkg enum GenericArg {
+    Type(TypeExpr)
+    Int(negative: bool, token: u32)
+    Bool(value: bool, token: u32)
+} GenericArg
+
+pkg enum FnKind derives Copy, Eq, Hash {
+    Plain
+    Task
+    Interrupt
+} FnKind
+
+pkg struct FnType {
+    pkg kind: FnKind
+    pkg params: mem::List[FnTypeParam]
+    pkg result: Option[TypeExpr]
+    pkg failure: Option[TypeExpr]
+    pkg usage: Option[Uses]
+    pkg limit_set: Option[Limits]
+    pkg convention: Option[Text]
+} FnType
+
+pkg struct FnTypeParam {
+    pkg mode: Mode
+    pkg name: Name
+    pkg ty: TypeExpr
+} FnTypeParam
+
+/// A `uses` clause: `wait`, or the unknown word written.
+pkg struct Uses {
+    pkg token: u32
+    pkg word: Name
+} Uses
+
+pkg fn Uses.is_wait(self) -> bool = self.word.text.as_str() == "wait"
+
+pkg enum LimitKind derives Copy, Eq, Ord, Hash {
+    Pure
+    Notrap
+    Terminates
+    Noalloc
+    Stack
+} LimitKind
+
+pkg struct Limit {
+    pkg kind: LimitKind
+    pkg token: u32
+    /// The `INT` of `stack N`.
+    pkg size: Option[u32]
+} Limit
+
+pkg struct Limits {
+    pkg entries: mem::List[Limit]
+} Limits
+
+/// A `TEXT` token and its value.
+pkg struct Text {
+    pkg token: u32
+    pkg value: text::String
+} Text
+
+pkg struct GenericParam {
+    pkg name: Name
+    pkg bounds: mem::List[Bound]
+    pkg where_clause: Option[Expr]
+} GenericParam
+
+pkg struct Bound {
+    pkg path: Path
+    pkg args: Option[mem::List[GenericArg]]
+} Bound
+
+pkg struct Param {
+    pkg token: u32
+    pkg mode: Mode
+    pkg kind: ParamKind
+} Param
+
+pkg enum ParamKind {
+    Named(name: Name, ty: TypeExpr)
+    SelfValue
+} ParamKind
+
+pkg proj fn Param.name(self) -> Str {
+    return match self.kind {
+        ParamKind.Named(name: name, ty: _) => name.text.as_str()
+        ParamKind.SelfValue => "self"
+    }
+} Param.name
+
+pkg fn Param.is_self(self) -> bool {
+    return match self.kind {
+        ParamKind.Named(name: _, ty: _) => false
+        ParamKind.SelfValue => true
+    }
+} Param.is_self
+
+/// The name of a function: `name`, or `Type.name` with the type's path.
+pkg struct Label {
+    pkg owner: Option[Path]
+    pkg name: Name
+} Label
+
+pkg fn Label.written(self, alloc: mem::Alloc) -> text::String {
+    let Some(owner) = self.owner else {
+        return text::String.of(self.name.text.as_str(), alloc)
+    }
+    var written = owner.written(alloc)
+    mut written.push('.')
+    mut written.append(self.name.text.as_str())
+    return written
+} Label.written
+
+pkg struct Head {
+    pkg token: u32
+    pkg generics: mem::List[GenericParam]
+    pkg params: mem::List[Param]
+    /// The `)` closing the parameters.
+    pkg close: u32
+    pkg result: Option[TypeExpr]
+    pkg failure: Option[TypeExpr]
+    pkg usage: Option[Uses]
+    pkg limit_set: Option[Limits]
+} Head
+
+pkg enum FnModifier derives Copy, Eq {
+    Proj
+    Interrupt
+    Landing
+    Foreign
+    Validator
+} FnModifier
+
+/// A word of a closed set, a modifier, marker or mode, and its token.
+pkg struct Word[T: Copy] derives Copy {
+    pkg kind: T
+    pkg token: u32
+} Word
+
+pkg enum ClauseKind {
+    Requires(Expr)
+    Ensures(Expr)
+    Example(Expr)
+    Decreases(Expr)
+    /// `todo "question"` without a clause: a missing specification.
+    Missing
+    Waive(length: bool, reason: Text)
+} ClauseKind
+
+pkg struct Clause {
+    pkg token: u32
+    /// Whether `todo TEXT` precedes the clause it marks.
+    pkg disputed: bool
+    pkg kind: ClauseKind
+} Clause
+
+pkg enum FnBody {
+    Block(Block)
+    Expr(Expr)
+    /// A foreign fn's convention, or a std declaration's missing body.
+    None
+} FnBody
+
+/// The body itself, as a part, so that what a pattern binds from it are parts.
+pkg proj fn FnBody.as_part(self) -> FnBody = self
+
+pkg struct FnItem {
+    pkg modifier: Option[Word[FnModifier]]
+    pkg label: Label
+    pkg head: Head
+    pkg convention: Option[Text]
+    pkg clauses: mem::List[Clause]
+    pkg body: FnBody
+} FnItem
+
+pkg enum TypeModifier derives Copy, Eq {
+    Closed
+    Open
+    Linear
+    View
+} TypeModifier
+
+pkg struct Field {
+    pkg token: u32
+    pkg visibility: Visibility
+    pkg name: Name
+    pkg ty: TypeExpr
+    pkg where_clause: Option[Expr]
+} Field
+
+pkg enum StructMember {
+    Field(Field)
+    Invariant(Expr)
+} StructMember
+
+pkg struct StructItem {
+    pkg name: Name
+    pkg generics: mem::List[GenericParam]
+    pkg derived: mem::List[Name]
+    pkg derives_token: Option[u32]
+    pkg members: mem::List[StructMember]
+} StructItem
+
+pkg proj fn StructItem.fields(self) -> FieldCursor {
+    return FieldCursor(members: self.members.view(), index: 0)
+} StructItem.fields
+
+/// The fields among a struct's members, in order.
+pkg view struct FieldCursor {
+    members: Slice[StructMember]
+    index: usize
+} FieldCursor
+
+pkg proj fn FieldCursor.next(mut self) -> Option[Field] {
+    while self.index < self.members.len() {
+        let member = self.members[self.index]
+        self.index += 1
+        match member {
+            StructMember.Field(field) => return Some(field)
+            StructMember.Invariant(_) => {}
+        }
+    }
+    return None
+} FieldCursor.next
+
+pkg struct PayloadField {
+    pkg token: u32
+    /// The type expression before `:`, which must be one identifier.
+    pkg label: Option[TypeExpr]
+    pkg ty: TypeExpr
+} PayloadField
+
+pkg struct Variant {
+    pkg name: Name
+    pkg payload: Option[mem::List[PayloadField]]
+    pkg from: bool
+} Variant
+
+pkg struct EnumItem {
+    pkg name: Name
+    pkg generics: mem::List[GenericParam]
+    pkg derived: mem::List[Name]
+    pkg derives_token: Option[u32]
+    pkg variants: mem::List[Variant]
+} EnumItem
+
+pkg struct Method {
+    pkg token: u32
+    pkg projection: bool
+    pkg name: Name
+    pkg head: Head
+    pkg clauses: mem::List[Clause]
+    pkg body: Option[Block]
+} Method
+
+pkg struct InterfaceItem {
+    pkg name: Name
+    pkg generics: mem::List[GenericParam]
+    pkg methods: mem::List[Method]
+} InterfaceItem
+
+pkg struct ImplParam {
+    pkg name: Name
+    pkg bounds: mem::List[Bound]
+} ImplParam
+
+pkg struct ImplItem {
+    pkg target: Path
+    pkg params: Option[mem::List[ImplParam]]
+    pkg bound: Bound
+} ImplItem
+
+pkg enum LayoutRepr {
+    Bytes(size: u32, order: Option[Name])
+    Integer(ty: Name, order: Option[Name])
+} LayoutRepr
+
+pkg enum LayoutFieldKind {
+    Bit(low: u32, high: Option[u32])
+    Rest
+    Typed(ty: TypeExpr, at: u32)
+} LayoutFieldKind
+
+pkg struct LayoutField {
+    pkg name: Name
+    pkg kind: LayoutFieldKind
+} LayoutField
+
+pkg struct Tag {
+    pkg name: Name
+    pkg value: u32
+} Tag
+
+pkg struct LayoutItem {
+    pkg name: Name
+    pkg repr: LayoutRepr
+    /// Tags of a tags layout; none for a layout of fields.
+    pkg tags: Option[mem::List[Tag]]
+    pkg fields: mem::List[LayoutField]
+} LayoutItem
+
+pkg enum Access derives Copy, Eq {
+    Read
+    ReadWrite
+    Write
+    WriteOneClear
+} Access
+
+pkg struct Register {
+    pkg name: Name
+    pkg ty: TypeExpr
+    pkg at: u32
+    pkg stride: Option[u32]
+    pkg access: Access
+} Register
+
+pkg struct RegistersItem {
+    pkg name: Name
+    pkg members: mem::List[Register]
+} RegistersItem
+
+pkg struct ConstItem {
+    pkg name: Name
+    pkg ty: Option[TypeExpr]
+    pkg value: Expr
+} ConstItem
+
+pkg struct RegistryItem {
+    pkg name: Name
+    pkg entry: TypeExpr
+    pkg key: Name
+    pkg unique: mem::List[Name]
+} RegistryItem
+
+pkg struct ContributeItem {
+    pkg registry_path: Path
+    pkg name: Name
+    pkg value: Expr
+} ContributeItem
+
+pkg struct TestItem {
+    /// Whether `todo TEXT` precedes the test, which disputes it.
+    pkg disputed: bool
+    pkg name: Name
+    /// The test target: a path, and the member it names through it.
+    pkg target: Path
+    pkg member: Option[Name]
+    pkg params: Option[mem::List[Param]]
+    pkg body: Block
+} TestItem
+
+pkg enum RetiredNew {
+    Manual
+    Rewrite(expr: Expr, preserves: bool)
+} RetiredNew
+
+pkg struct RetiredItem {
+    pkg path: Path
+    pkg member: Option[Name]
+    pkg head: Option[Head]
+    pkg new: RetiredNew
+} RetiredItem
+
+pkg enum ItemKind {
+    Fn(FnItem)
+    Struct(StructItem)
+    Enum(EnumItem)
+    Interface(InterfaceItem)
+    Impl(ImplItem)
+    Layout(LayoutItem)
+    Registers(RegistersItem)
+    Const(ConstItem)
+    ConstAssert(Expr)
+    Registry(RegistryItem)
+    Contribute(ContributeItem)
+    Test(TestItem)
+    Retired(RetiredItem)
+    Package
+} ItemKind
+
+pkg struct Item {
+    /// The first token of the item's head, after its doc comment.
+    pkg token: u32
+    pkg visibility: Visibility
+    pkg type_modifiers: mem::List[Word[TypeModifier]]
+    pkg kind: ItemKind
+} Item
+
+/// Whether the item is a function with a body.
+pkg fn ItemKind.is_fn_with_body(self) -> bool {
+    let ItemKind.Fn(function) = self else {
+        return false
+    }
+    return match function.body {
+        FnBody.None => false
+        else => true
+    }
+} ItemKind.is_fn_with_body
+
+pkg fn Item.has_modifier(self, modifier: TypeModifier) -> bool {
+    for written in self.type_modifiers {
+        if written.kind == modifier {
+            return true
+        }
+    }
+    return false
+} Item.has_modifier
+
+/// The name the item declares, `Type.name` for a function named after a type.
+pkg fn Item.name(self, alloc: mem::Alloc) -> Option[text::String] {
+    return match self.kind {
+        ItemKind.Fn(item) => Some(item.label.written(alloc))
+        ItemKind.Struct(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Enum(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Interface(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Layout(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Registers(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Const(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Registry(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Contribute(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Test(item) => Some(text::String.of(item.name.text.as_str(), alloc))
+        ItemKind.Impl(_) or ItemKind.ConstAssert(_) or ItemKind.Retired(_) or ItemKind.Package => None
+    }
+} Item.name
+
+pkg struct Block {
+    pkg token: u32
+    /// The closing `}`.
+    pkg end: u32
+    pkg stmts: mem::List[Stmt]
+} Block
+
+pkg struct LoopBlock {
+    pkg invariants: mem::List[Expr]
+    pkg block: Block
+} LoopBlock
+
+pkg enum AssignOp derives Copy, Eq {
+    Set
+    Add
+    Sub
+    Mul
+    Div
+    Rem
+    BitAnd
+    BitOr
+    BitXor
+    Shl
+    Shr
+} AssignOp
+
+/// The binary operator a compound assignment applies.
+pkg fn AssignOp.binary(self) -> Option[BinaryOp] {
+    return match self {
+        AssignOp.Set => None
+        AssignOp.Add => Some(BinaryOp.Add)
+        AssignOp.Sub => Some(BinaryOp.Sub)
+        AssignOp.Mul => Some(BinaryOp.Mul)
+        AssignOp.Div => Some(BinaryOp.Div)
+        AssignOp.Rem => Some(BinaryOp.Rem)
+        AssignOp.BitAnd => Some(BinaryOp.BitAnd)
+        AssignOp.BitOr => Some(BinaryOp.BitOr)
+        AssignOp.BitXor => Some(BinaryOp.BitXor)
+        AssignOp.Shl => Some(BinaryOp.Shl)
+        AssignOp.Shr => Some(BinaryOp.Shr)
+    }
+} AssignOp.binary
+
+pkg struct Stmt {
+    pkg token: u32
+    pkg kind: StmtKind
+} Stmt
+
+pkg enum StmtKind {
+    Let(pattern: Pattern, ty: Option[TypeExpr], value: Expr, otherwise: Option[Block])
+    Var(name: Name, ty: Option[TypeExpr], value: Expr)
+    Discard(Expr)
+    While(condition: Expr, body: LoopBlock)
+    For(pattern: Pattern, iterated: Expr, body: LoopBlock)
+    Loop(label: Option[Name], body: LoopBlock)
+    Defer(Expr)
+    Undefer(Expr)
+    Expect(Expr)
+    Assume(condition: Expr, reason: Text)
+    Expr(Expr)
+    Assign(target: Expr, op: AssignOp, op_token: u32, value: Expr)
+} StmtKind
+
+pkg enum BinaryOp derives Copy, Eq, Hash {
+    Mul
+    Div
+    Rem
+    Add
+    Sub
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+    And
+    Or
+    BitAnd
+    BitOr
+    BitXor
+    Shl
+    Shr
+    RangeExclusive
+    RangeInclusive
+} BinaryOp
+
+pkg fn BinaryOp.is_comparison(self) -> bool {
+    return match self {
+        BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge => true
+        else => false
+    }
+} BinaryOp.is_comparison
+
+pkg fn BinaryOp.is_range(self) -> bool {
+    return match self {
+        BinaryOp.RangeExclusive or BinaryOp.RangeInclusive => true
+        else => false
+    }
+} BinaryOp.is_range
+
+pkg enum UnaryOp derives Copy, Eq {
+    Neg
+    BitNot
+    Not
+} UnaryOp
+
+pkg enum LiteralKind derives Copy, Eq {
+    Int
+    Float
+    Text
+    TextRun
+    Bytes
+    Char
+    Byte
+    True
+    False
+} LiteralKind
+
+pkg struct Literal {
+    pkg kind: LiteralKind
+    /// The literal's tokens: one, or each line of a text run.
+    pkg tokens: mem::List[u32]
+} Literal
+
+pkg enum FailureMarker derives Copy, Eq {
+    Try
+    Attempt
+} FailureMarker
+
+pkg struct Arg {
+    pkg token: u32
+    /// The expression before `:`, which must be one identifier.
+    pkg label: Option[Expr]
+    pkg value: Expr
+} Arg
+
+/// The label as a name, when it is one identifier.
+pkg proj fn Arg.label_name(self) -> Option[Name] {
+    let Some(label) = self.label else {
+        return None
+    }
+    return match first label.kind {
+        ExprKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(path.segments[0])
+        else => None
+    }
+} Arg.label_name
+
+pkg enum ArmPatterns {
+    Patterns(mem::List[Pattern])
+    Else
+} ArmPatterns
+
+pkg struct Arm {
+    pkg token: u32
+    pkg patterns: ArmPatterns
+    pkg guard: Option[Expr]
+    pkg body: ArmBody
+} Arm
+
+pkg enum ArmBody {
+    Block(Block)
+    Expr(Expr)
+} ArmBody
+
+pkg struct Capture {
+    pkg mode: Mode
+    pkg token: u32
+    pkg name: Name
+} Capture
+
+pkg enum ClosureBody {
+    Short(mem::Box[Expr])
+    Block(Block)
+} ClosureBody
+
+pkg struct Closure {
+    pkg captures: mem::List[Capture]
+    pkg params: mem::List[FnTypeParam]
+    /// The `)` closing the parameters.
+    pkg close: u32
+    pkg result: Option[TypeExpr]
+    pkg failure: Option[TypeExpr]
+    pkg usage: Option[Uses]
+    pkg limit_set: Option[Limits]
+    pkg body: ClosureBody
+} Closure
+
+pkg struct WhenAccess {
+    pkg token: u32
+    pkg mode: Mode
+    /// The place root and its field names.
+    pkg root: Name
+    pkg fields: mem::List[Name]
+} WhenAccess
+
+pkg enum WhenBody {
+    Block(Block)
+    Expr(mem::Box[Expr])
+} WhenBody
+
+pkg enum TrustedBody {
+    Expr(mem::Box[Expr])
+    Block(Block)
+} TrustedBody
+
+pkg struct Expr {
+    pkg token: u32
+    /// The expression's last token.
+    pkg last: u32
+    pkg kind: ExprKind
+} Expr
+
+pkg enum ExprKind {
+    Literal(Literal)
+    Path(path: Path, args: Option[mem::List[GenericArg]])
+    SelfValue
+    Paren(mem::Box[Expr])
+    If(condition: mem::Box[Expr], then: Block, otherwise: Option[mem::Box[Else]])
+    /// `ordered` when the match is written `match first`.
+    Match(ordered: bool, scrutinee: mem::Box[Expr], arms: mem::List[Arm])
+    Closure(mem::Box[Closure])
+    Trusted(premise: Text, body: TrustedBody)
+    Todo(Text)
+    Dbg(mem::Box[Expr])
+    /// `all` or `any`, binding `name` to each value of `range`.
+    Quantifier(all: bool, name: Name, range: mem::Box[Expr], body: mem::Box[Expr])
+    Field(base: mem::Box[Expr], name: Name)
+    Call(callee: mem::Box[Expr], args: mem::List[Arg])
+    Index(base: mem::Box[Expr], index: mem::Box[Expr])
+    Unary(op: UnaryOp, operand: mem::Box[Expr])
+    Binary(op: BinaryOp, op_token: u32, left: mem::Box[Expr], right: mem::Box[Expr])
+    /// Markers before a postfix expression or `when`, in the order written.
+    Marked(failure: Option[Word[FailureMarker]], awaited: Option[u32], mode: Option[Word[Mode]], inner: mem::Box[Expr])
+    When(accesses: mem::List[WhenAccess], body: WhenBody)
+    Return(Option[mem::Box[Expr]])
+    Break(Option[Name])
+    Continue(Option[Name])
+    Fail(mem::Box[Expr])
+} ExprKind
+
+pkg enum Else {
+    If(Expr)
+    Block(Block)
+} Else
+
+pkg enum RangeKind derives Copy, Eq {
+    Exclusive
+    Inclusive
+} RangeKind
+
+pkg enum PatternLiteral {
+    Number(negative: bool, literal: Literal)
+    Other(Literal)
+} PatternLiteral
+
+pkg proj fn PatternLiteral.literal(self) -> Literal {
+    return match self {
+        PatternLiteral.Number(negative: _, literal: literal) or PatternLiteral.Other(literal) => literal
+    }
+} PatternLiteral.literal
+
+pkg enum RangeBound {
+    Literal(PatternLiteral)
+    Path(Path)
+} RangeBound
+
+/// The range a pattern opens as its low bound: the range's kind and its high bound.
+pkg struct PatternRange {
+    pkg kind: RangeKind
+    pkg bound: RangeBound
+} PatternRange
+
+pkg struct FieldPattern {
+    pkg token: u32
+    /// The pattern before `:`, which must be one identifier.
+    pkg label: Option[Pattern]
+    pkg pattern: Pattern
+} FieldPattern
+
+pkg proj fn FieldPattern.label_name(self) -> Option[Name] {
+    let Some(label) = self.label else {
+        return None
+    }
+    return match first label.kind {
+        PatternKind.Named(path: path, member: None, fields: None, range: None) if path.segments.len() == 1 => Some(path.segments[0])
+        else => None
+    }
+} FieldPattern.label_name
+
+pkg struct Pattern {
+    pkg token: u32
+    pkg kind: PatternKind
+} Pattern
+
+pkg enum PatternKind {
+    Wildcard
+    Literal(literal: PatternLiteral, range: Option[PatternRange])
+    Named(path: Path, member: Option[Name], fields: Option[mem::List[FieldPattern]], range: Option[PatternRange])
+} PatternKind
+
+/// A copy of the name.
+pkg fn Name.copy(self, alloc: mem::Alloc) -> Name {
+    return Name(text: text::String.of(self.text.as_str(), alloc), token: self.token)
+} Name.copy
+
+/// Copies of names.
+pkg fn Name.copies(names: Slice[Name], alloc: mem::Alloc) -> mem::List[Name] {
+    var copies = mem::List[Name].empty(alloc)
+    for name in names {
+        mut copies.push(name.copy(alloc))
+    }
+    return copies
+} Name.copies
+
+/// A copy of an optional name.
+pkg fn Name.optional_copy(name: Option[Name], alloc: mem::Alloc) -> Option[Name] {
+    let Some(held) = name else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} Name.optional_copy
+
+/// A copy of the path.
+pkg fn Path.copy(self, alloc: mem::Alloc) -> Path {
+    return Path(segments: Name.copies(self.segments.view(), alloc))
+} Path.copy
+
+/// A copy of the text.
+pkg fn Text.copy(self, alloc: mem::Alloc) -> Text {
+    return Text(token: self.token, value: text::String.of(self.value.as_str(), alloc))
+} Text.copy
+
+/// A copy of an optional text.
+pkg fn Text.optional_copy(value: Option[Text], alloc: mem::Alloc) -> Option[Text] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} Text.optional_copy
+
+/// A copy of the literal.
+pkg fn Literal.copy(self, alloc: mem::Alloc) -> Literal {
+    var tokens = mem::List[u32].empty(alloc)
+    for token in self.tokens {
+        mut tokens.push(token)
+    }
+    return Literal(kind: self.kind, tokens: take tokens)
+} Literal.copy
+
+/// A copy of the type expression.
+pkg fn TypeExpr.copy(self, alloc: mem::Alloc) -> TypeExpr {
+    let kind = match self.kind {
+        TypeKind.Path(path: path, args: args) => TypeKind.Path(path: path.copy(alloc), args: GenericArg.optional_copies(args, alloc))
+        TypeKind.Fn(written) => TypeKind.Fn(mem::Heap.of(alloc).boxed(written.contents().copy(alloc)))
+    }
+    return TypeExpr(token: self.token, last: self.last, kind: take kind)
+} TypeExpr.copy
+
+/// A copy of an optional type expression.
+pkg fn TypeExpr.optional_copy(value: Option[TypeExpr], alloc: mem::Alloc) -> Option[TypeExpr] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} TypeExpr.optional_copy
+
+/// A copy of the generic argument.
+pkg fn GenericArg.copy(self, alloc: mem::Alloc) -> GenericArg {
+    return match self {
+        GenericArg.Type(written) => GenericArg.Type(written.copy(alloc))
+        GenericArg.Int(negative: negative, token: token) => GenericArg.Int(negative: negative, token: token)
+        GenericArg.Bool(value: value, token: token) => GenericArg.Bool(value: value, token: token)
+    }
+} GenericArg.copy
+
+/// Copies of optional generic arguments.
+pkg fn GenericArg.optional_copies(args: Option[mem::List[GenericArg]], alloc: mem::Alloc) -> Option[mem::List[GenericArg]] {
+    let Some(held) = args else {
+        return None
+    }
+    var copies = mem::List[GenericArg].empty(alloc)
+    for arg in held {
+        mut copies.push(arg.copy(alloc))
+    }
+    return Some(take copies)
+} GenericArg.optional_copies
+
+/// A copy of the function type.
+pkg fn FnType.copy(self, alloc: mem::Alloc) -> FnType {
+    return FnType(kind: self.kind, params: FnTypeParam.copies(self.params.view(), alloc), result: TypeExpr.optional_copy(self.result, alloc), failure: TypeExpr.optional_copy(self.failure, alloc), usage: Uses.optional_copy(self.usage, alloc), limit_set: Limits.optional_copy(self.limit_set, alloc), convention: Text.optional_copy(self.convention, alloc))
+} FnType.copy
+
+/// Copies of function type parameters.
+pkg fn FnTypeParam.copies(params: Slice[FnTypeParam], alloc: mem::Alloc) -> mem::List[FnTypeParam] {
+    var copies = mem::List[FnTypeParam].empty(alloc)
+    for param in params {
+        mut copies.push(FnTypeParam(mode: param.mode, name: param.name.copy(alloc), ty: param.ty.copy(alloc)))
+    }
+    return copies
+} FnTypeParam.copies
+
+/// A copy of an optional `uses` clause.
+pkg fn Uses.optional_copy(usage: Option[Uses], alloc: mem::Alloc) -> Option[Uses] {
+    let Some(held) = usage else {
+        return None
+    }
+    return Some(Uses(token: held.token, word: held.word.copy(alloc)))
+} Uses.optional_copy
+
+/// A copy of an optional `limits` clause.
+pkg fn Limits.optional_copy(limit_set: Option[Limits], alloc: mem::Alloc) -> Option[Limits] {
+    let Some(held) = limit_set else {
+        return None
+    }
+    var entries = mem::List[Limit].empty(alloc)
+    for entry in held.entries {
+        mut entries.push(Limit(kind: entry.kind, token: entry.token, size: entry.size))
+    }
+    return Some(Limits(entries: take entries))
+} Limits.optional_copy
+
+/// A copy of the expression.
+pkg fn Expr.copy(self, alloc: mem::Alloc) -> Expr {
+    return Expr(token: self.token, last: self.last, kind: self.kind.copy(alloc))
+} Expr.copy
+
+/// A boxed copy of a boxed expression.
+pkg fn Expr.boxed_copy(boxed: mem::Box[Expr], alloc: mem::Alloc) -> mem::Box[Expr] {
+    return mem::Heap.of(alloc).boxed(boxed.contents().copy(alloc))
+} Expr.boxed_copy
+
+/// A copy of an optional expression.
+pkg fn Expr.optional_copy(value: Option[Expr], alloc: mem::Alloc) -> Option[Expr] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} Expr.optional_copy
+
+/// A copy of an optional boxed expression.
+pkg fn Expr.optional_boxed_copy(value: Option[mem::Box[Expr]], alloc: mem::Alloc) -> Option[mem::Box[Expr]] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(Expr.boxed_copy(held, alloc))
+} Expr.optional_boxed_copy
+
+/// Copies of expressions.
+pkg fn Expr.copies(exprs: Slice[Expr], alloc: mem::Alloc) -> mem::List[Expr] {
+    var copies = mem::List[Expr].empty(alloc)
+    for expr in exprs {
+        mut copies.push(expr.copy(alloc))
+    }
+    return copies
+} Expr.copies
+
+/// A copy of what the expression is.
+pkg fn ExprKind.copy(self, alloc: mem::Alloc) -> ExprKind {
+    return match self {
+        ExprKind.Literal(literal) => ExprKind.Literal(literal.copy(alloc))
+        ExprKind.Path(path: path, args: args) => ExprKind.Path(path: path.copy(alloc), args: GenericArg.optional_copies(args, alloc))
+        ExprKind.SelfValue => ExprKind.SelfValue
+        ExprKind.Paren(inner) => ExprKind.Paren(Expr.boxed_copy(inner, alloc))
+        ExprKind.If(condition: condition, then: then, otherwise: otherwise) => ExprKind.If(condition: Expr.boxed_copy(condition, alloc), then: then.copy(alloc), otherwise: Else.optional_boxed_copy(otherwise, alloc))
+        ExprKind.Match(ordered: ordered, scrutinee: scrutinee, arms: arms) => ExprKind.Match(ordered: ordered, scrutinee: Expr.boxed_copy(scrutinee, alloc), arms: Arm.copies(arms.view(), alloc))
+        ExprKind.Closure(closure) => ExprKind.Closure(mem::Heap.of(alloc).boxed(closure.contents().copy(alloc)))
+        ExprKind.Trusted(premise: premise, body: body) => ExprKind.Trusted(premise: premise.copy(alloc), body: body.copy(alloc))
+        ExprKind.Todo(intent) => ExprKind.Todo(intent.copy(alloc))
+        ExprKind.Dbg(inner) => ExprKind.Dbg(Expr.boxed_copy(inner, alloc))
+        ExprKind.Quantifier(all: all, name: name, range: range, body: body) => ExprKind.Quantifier(all: all, name: name.copy(alloc), range: Expr.boxed_copy(range, alloc), body: Expr.boxed_copy(body, alloc))
+        ExprKind.Field(base: base, name: name) => ExprKind.Field(base: Expr.boxed_copy(base, alloc), name: name.copy(alloc))
+        ExprKind.Call(callee: callee, args: args) => ExprKind.Call(callee: Expr.boxed_copy(callee, alloc), args: Arg.copies(args.view(), alloc))
+        ExprKind.Index(base: base, index: index) => ExprKind.Index(base: Expr.boxed_copy(base, alloc), index: Expr.boxed_copy(index, alloc))
+        ExprKind.Unary(op: op, operand: operand) => ExprKind.Unary(op: op, operand: Expr.boxed_copy(operand, alloc))
+        ExprKind.Binary(op: op, op_token: op_token, left: left, right: right) => ExprKind.Binary(op: op, op_token: op_token, left: Expr.boxed_copy(left, alloc), right: Expr.boxed_copy(right, alloc))
+        ExprKind.Marked(failure: failure, awaited: awaited, mode: mode, inner: inner) => ExprKind.Marked(failure: failure, awaited: awaited, mode: mode, inner: Expr.boxed_copy(inner, alloc))
+        ExprKind.When(accesses: accesses, body: body) => ExprKind.When(accesses: WhenAccess.copies(accesses.view(), alloc), body: body.copy(alloc))
+        ExprKind.Return(value) => ExprKind.Return(Expr.optional_boxed_copy(value, alloc))
+        ExprKind.Break(label) => ExprKind.Break(Name.optional_copy(label, alloc))
+        ExprKind.Continue(label) => ExprKind.Continue(Name.optional_copy(label, alloc))
+        ExprKind.Fail(inner) => ExprKind.Fail(Expr.boxed_copy(inner, alloc))
+    }
+} ExprKind.copy
+
+/// A copy of an optional boxed `else` branch.
+pkg fn Else.optional_boxed_copy(value: Option[mem::Box[Else]], alloc: mem::Alloc) -> Option[mem::Box[Else]] {
+    let Some(held) = value else {
+        return None
+    }
+    let copied = match held.contents() {
+        Else.If(chained) => Else.If(chained.copy(alloc))
+        Else.Block(block) => Else.Block(block.copy(alloc))
+    }
+    return Some(mem::Heap.of(alloc).boxed(take copied))
+} Else.optional_boxed_copy
+
+/// A copy of the block.
+pkg fn Block.copy(self, alloc: mem::Alloc) -> Block {
+    var stmts = mem::List[Stmt].empty(alloc)
+    for stmt in self.stmts {
+        mut stmts.push(Stmt(token: stmt.token, kind: stmt.kind.copy(alloc)))
+    }
+    return Block(token: self.token, end: self.end, stmts: take stmts)
+} Block.copy
+
+/// A copy of an optional block.
+pkg fn Block.optional_copy(block: Option[Block], alloc: mem::Alloc) -> Option[Block] {
+    let Some(held) = block else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} Block.optional_copy
+
+/// A copy of the loop body.
+pkg fn LoopBlock.copy(self, alloc: mem::Alloc) -> LoopBlock {
+    return LoopBlock(invariants: Expr.copies(self.invariants.view(), alloc), block: self.block.copy(alloc))
+} LoopBlock.copy
+
+/// A copy of what the statement is.
+pkg fn StmtKind.copy(self, alloc: mem::Alloc) -> StmtKind {
+    return match self {
+        StmtKind.Let(pattern: pattern, ty: written, value: value, otherwise: otherwise) => StmtKind.Let(pattern: pattern.copy(alloc), ty: TypeExpr.optional_copy(written, alloc), value: value.copy(alloc), otherwise: Block.optional_copy(otherwise, alloc))
+        StmtKind.Var(name: name, ty: written, value: value) => StmtKind.Var(name: name.copy(alloc), ty: TypeExpr.optional_copy(written, alloc), value: value.copy(alloc))
+        StmtKind.Discard(value) => StmtKind.Discard(value.copy(alloc))
+        StmtKind.While(condition: condition, body: body) => StmtKind.While(condition: condition.copy(alloc), body: body.copy(alloc))
+        StmtKind.For(pattern: pattern, iterated: iterated, body: body) => StmtKind.For(pattern: pattern.copy(alloc), iterated: iterated.copy(alloc), body: body.copy(alloc))
+        StmtKind.Loop(label: label, body: body) => StmtKind.Loop(label: Name.optional_copy(label, alloc), body: body.copy(alloc))
+        StmtKind.Defer(value) => StmtKind.Defer(value.copy(alloc))
+        StmtKind.Undefer(value) => StmtKind.Undefer(value.copy(alloc))
+        StmtKind.Expect(value) => StmtKind.Expect(value.copy(alloc))
+        StmtKind.Assume(condition: condition, reason: reason) => StmtKind.Assume(condition: condition.copy(alloc), reason: reason.copy(alloc))
+        StmtKind.Expr(value) => StmtKind.Expr(value.copy(alloc))
+        StmtKind.Assign(target: target, op: op, op_token: op_token, value: value) => StmtKind.Assign(target: target.copy(alloc), op: op, op_token: op_token, value: value.copy(alloc))
+    }
+} StmtKind.copy
+
+/// A copy of the pattern.
+pkg fn Pattern.copy(self, alloc: mem::Alloc) -> Pattern {
+    let kind = match self.kind {
+        PatternKind.Wildcard => PatternKind.Wildcard
+        PatternKind.Literal(literal: literal, range: range) => PatternKind.Literal(literal: literal.copy(alloc), range: PatternRange.optional_copy(range, alloc))
+        PatternKind.Named(path: path, member: member, fields: fields, range: range) => PatternKind.Named(path: path.copy(alloc), member: Name.optional_copy(member, alloc), fields: FieldPattern.optional_copies(fields, alloc), range: PatternRange.optional_copy(range, alloc))
+    }
+    return Pattern(token: self.token, kind: take kind)
+} Pattern.copy
+
+/// A copy of an optional pattern.
+pkg fn Pattern.optional_copy(pattern: Option[Pattern], alloc: mem::Alloc) -> Option[Pattern] {
+    let Some(held) = pattern else {
+        return None
+    }
+    return Some(held.copy(alloc))
+} Pattern.optional_copy
+
+/// Copies of patterns.
+pkg fn Pattern.copies(patterns: Slice[Pattern], alloc: mem::Alloc) -> mem::List[Pattern] {
+    var copies = mem::List[Pattern].empty(alloc)
+    for pattern in patterns {
+        mut copies.push(pattern.copy(alloc))
+    }
+    return copies
+} Pattern.copies
+
+/// A copy of the pattern literal.
+pkg fn PatternLiteral.copy(self, alloc: mem::Alloc) -> PatternLiteral {
+    return match self {
+        PatternLiteral.Number(negative: negative, literal: literal) => PatternLiteral.Number(negative: negative, literal: literal.copy(alloc))
+        PatternLiteral.Other(literal) => PatternLiteral.Other(literal.copy(alloc))
+    }
+} PatternLiteral.copy
+
+/// A copy of an optional pattern range.
+pkg fn PatternRange.optional_copy(range: Option[PatternRange], alloc: mem::Alloc) -> Option[PatternRange] {
+    let Some(held) = range else {
+        return None
+    }
+    let bound = match held.bound {
+        RangeBound.Literal(literal) => RangeBound.Literal(literal.copy(alloc))
+        RangeBound.Path(path) => RangeBound.Path(path.copy(alloc))
+    }
+    return Some(PatternRange(kind: held.kind, bound: take bound))
+} PatternRange.optional_copy
+
+/// Copies of optional field patterns.
+pkg fn FieldPattern.optional_copies(fields: Option[mem::List[FieldPattern]], alloc: mem::Alloc) -> Option[mem::List[FieldPattern]] {
+    let Some(held) = fields else {
+        return None
+    }
+    var copies = mem::List[FieldPattern].empty(alloc)
+    for field in held {
+        mut copies.push(FieldPattern(token: field.token, label: Pattern.optional_copy(field.label, alloc), pattern: field.pattern.copy(alloc)))
+    }
+    return Some(take copies)
+} FieldPattern.optional_copies
+
+/// Copies of call arguments.
+pkg fn Arg.copies(args: Slice[Arg], alloc: mem::Alloc) -> mem::List[Arg] {
+    var copies = mem::List[Arg].empty(alloc)
+    for arg in args {
+        mut copies.push(Arg(token: arg.token, label: Expr.optional_copy(arg.label, alloc), value: arg.value.copy(alloc)))
+    }
+    return copies
+} Arg.copies
+
+/// Copies of match arms.
+pkg fn Arm.copies(arms: Slice[Arm], alloc: mem::Alloc) -> mem::List[Arm] {
+    var copies = mem::List[Arm].empty(alloc)
+    for arm in arms {
+        let patterns = match arm.patterns {
+            ArmPatterns.Patterns(written) => ArmPatterns.Patterns(Pattern.copies(written.view(), alloc))
+            ArmPatterns.Else => ArmPatterns.Else
+        }
+        let body = match arm.body {
+            ArmBody.Block(block) => ArmBody.Block(block.copy(alloc))
+            ArmBody.Expr(value) => ArmBody.Expr(value.copy(alloc))
+        }
+        mut copies.push(Arm(token: arm.token, patterns: take patterns, guard: Expr.optional_copy(arm.guard, alloc), body: take body))
+    }
+    return copies
+} Arm.copies
+
+/// A copy of the closure.
+pkg fn Closure.copy(self, alloc: mem::Alloc) -> Closure {
+    var captures = mem::List[Capture].empty(alloc)
+    for capture in self.captures {
+        mut captures.push(Capture(mode: capture.mode, token: capture.token, name: capture.name.copy(alloc)))
+    }
+    let body = match self.body {
+        ClosureBody.Short(value) => ClosureBody.Short(Expr.boxed_copy(value, alloc))
+        ClosureBody.Block(block) => ClosureBody.Block(block.copy(alloc))
+    }
+    return Closure(captures: take captures, params: FnTypeParam.copies(self.params.view(), alloc), close: self.close, result: TypeExpr.optional_copy(self.result, alloc), failure: TypeExpr.optional_copy(self.failure, alloc), usage: Uses.optional_copy(self.usage, alloc), limit_set: Limits.optional_copy(self.limit_set, alloc), body: take body)
+} Closure.copy
+
+/// A copy of the trusted body.
+pkg fn TrustedBody.copy(self, alloc: mem::Alloc) -> TrustedBody {
+    return match self {
+        TrustedBody.Expr(value) => TrustedBody.Expr(Expr.boxed_copy(value, alloc))
+        TrustedBody.Block(block) => TrustedBody.Block(block.copy(alloc))
+    }
+} TrustedBody.copy
+
+/// A copy of the `when` body.
+pkg fn WhenBody.copy(self, alloc: mem::Alloc) -> WhenBody {
+    return match self {
+        WhenBody.Block(block) => WhenBody.Block(block.copy(alloc))
+        WhenBody.Expr(value) => WhenBody.Expr(Expr.boxed_copy(value, alloc))
+    }
+} WhenBody.copy
+
+/// Copies of `when` accesses.
+pkg fn WhenAccess.copies(accesses: Slice[WhenAccess], alloc: mem::Alloc) -> mem::List[WhenAccess] {
+    var copies = mem::List[WhenAccess].empty(alloc)
+    for access in accesses {
+        mut copies.push(WhenAccess(token: access.token, mode: access.mode, root: access.root.copy(alloc), fields: Name.copies(access.fields.view(), alloc)))
+    }
+    return copies
+} WhenAccess.copies

@@ -1,0 +1,84 @@
+//! The tests of normalised and interface forms.
+
+/// What a path of the examples names: `u8`, `u32` and `Slice` themselves, a capitalised name or
+/// `helper` the `example` item of that name.
+fn example_path(segments: Slice[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    if segments.len() != 1 {
+        return None
+    }
+    let name = segments[0].as_str()
+    if name == "u8" or name == "u32" or name == "Slice" {
+        return Some(text::String.of(name, alloc))
+    }
+    let bytes = name.as_bytes()
+    if (bytes.len() > 0 and bytes[0] >= b'A' and bytes[0] <= b'Z') or name == "helper" {
+        var path = text::String.of("example::", alloc)
+        mut path.append(name)
+        return Some(take path)
+    }
+    return None
+} example_path
+
+/// The forms of the first item of `source` with a tree, as its consumers read it.
+fn forms_of(
+    source: Str,
+    own: Str,
+    take facts: Option[text::String],
+    transparent: bool,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Forms {
+    let file = syntax::parse(text::String.of(source, alloc).into_bytes(), grammar, alloc)
+    var index: usize = 0
+    while index < file.items.len() and file.items[index].tree.is_none() {
+        index += 1
+    }
+    expect index < file.items.len()
+    let known = Known(own: Some(text::String.of(own, alloc)), transparent: transparent, fields: Reach.Consumer, facts: take facts)
+    return Forms.of(file, item: file.items[index], known, resolve: fn(segments: Slice[text::String]) => example_path(segments, alloc), alloc)
+} forms_of
+
+/// Whether the forms have an interface form, written `expected`.
+fn interface_is(forms: Forms, expected: Str) -> bool {
+    return match forms.interface_form {
+        Some(form) => form.as_str() == expected
+        None => false
+    }
+} interface_is
+
+test a_function_is_flat_with_canonical_paths_and_numbered_bindings for Forms.of {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let forms = forms_of("/// Raises the level.\npub fn Gauge.raise(mut self, step: u32)\n    ensures self.level >= old(self.level)\n{\n    let next = self.level.saturating_add(step) // added\n    self.level = next\n} Gauge.raise\n", own: "example::Gauge.raise", facts: None, transparent: false, grammar, alloc)
+    expect forms.normalised.as_str() == "pub fn example::Gauge.raise(mut self, step: u32)\n    ensures self.level >= old(self.level)\n{\n    let $1 = self.level.saturating_add(step)\n    self.level = $1\n} example::Gauge.raise\n"
+    expect interface_is(forms, expected: "pub fn example::Gauge.raise(mut self, step: u32)\n    ensures self.level >= old(self.level)\n")
+} a_function_is_flat_with_canonical_paths_and_numbered_bindings
+
+test literals_order_free_members_and_punned_bindings_are_canonical for Forms.of {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let forms = forms_of("fn pick(values: Slice[u8], limit: u32) -> u32 {\n    let total = 0x1_0u32\n    let label = \"a\\\"b\\n\"\n    return match total {\n        2 => helper(values,\n            total)\n        1 => helper(values, limit: limit)\n    }\n} pick\n", own: "example::pick", facts: None, transparent: false, grammar, alloc)
+    expect forms.normalised.as_str() == "fn example::pick(values: Slice[u8], limit: u32) -> u32 {\n    let $1 = 16u32\n    let $2 = \"a\\x22b\\x0A\"\n    return match $1 {\n        1 => example::helper(values, limit)\n        2 => example::helper(values, total: $1)\n    }\n} example::pick\n"
+} literals_order_free_members_and_punned_bindings_are_canonical
+
+test a_struct_shows_its_visible_fields_and_facts for Forms.of {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let forms = forms_of("pub closed struct Meter derives Hash, Eq {\n    pub peak: u32\n    count: u32 where count <= 100\n    invariant count <= peak\n    pub base: u32\n} Meter\n", own: "example::Meter", facts: Some(text::String.of("facts Copy, Send", alloc)), transparent: false, grammar, alloc)
+    expect forms.normalised.as_str() == "pub closed struct example::Meter derives Eq, Hash {\n    count: u32 where count <= 100\n    pub base: u32\n    invariant count <= peak\n    pub peak: u32\n} example::Meter\n"
+    expect interface_is(forms, expected: "pub closed struct example::Meter derives Eq, Hash {\n    pub base: u32\n    pub peak: u32\n} example::Meter\nfacts Copy, Send\n")
+} a_struct_shows_its_visible_fields_and_facts
+
+test reduced_forms_drop_what_naming_code_does_not_see for Forms.of {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let hidden = forms_of("pub fn Meter.value(self) -> u32 = self.count\n", own: "example::Meter.value", facts: None, transparent: false, grammar, alloc)
+    expect interface_is(hidden, expected: "pub fn example::Meter.value(self) -> u32\n")
+    let shown = forms_of("pub fn Meter.value(self) -> u32 = self.count\n", own: "example::Meter.value", facts: None, transparent: true, grammar, alloc)
+    expect interface_is(shown, expected: shown.normalised.as_str())
+    let tested = forms_of("test bump_counts for Meter.bump {\n    expect 1 == 1\n} bump_counts\n", own: "example::bump_counts", facts: None, transparent: false, grammar, alloc)
+    expect interface_is(tested, expected: "test example::bump_counts for example::Meter.bump\n")
+    let constant = forms_of("pub const STEP: u32 = 5\n", own: "example::STEP", facts: None, transparent: false, grammar, alloc)
+    expect constant.normalised.as_str() == "pub const example::STEP: u32 = 5\n"
+    expect constant.interface_form.is_none()
+} reduced_forms_drop_what_naming_code_does_not_see

@@ -107,6 +107,17 @@ pub fn handles(clock: sys::Clock) -> bool {
 } handles
 "#;
 
+const PROJECTED: &str = r#"//! Projected option cases.
+
+pub fn once_or_zero(alloc: mem::Alloc) -> u64
+    example once_or_zero(testing::world().alloc) == 11
+{
+    let memo = mem::OnceMap[u32, u64].empty(seed: 0, alloc)
+    discard memo.insert(1, value: 11)
+    return memo.get(1).value_or(0)
+} once_or_zero
+"#;
+
 /// The diagnostics of a package of cases.
 fn diagnostics(cases: &str) -> Vec<String> {
     let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", cases)]);
@@ -126,5 +137,11 @@ fn channels_and_cowns_return_their_memory_and_sims_attenuate() {
 #[test]
 fn revoking_a_capability_makes_it_and_what_derives_from_it_stale() {
     let found = diagnostics(REVOCATION);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn value_or_of_a_projected_option_gives_the_value_its_part_holds() {
+    let found = diagnostics(PROJECTED);
     assert!(found.is_empty(), "{}", found.join("\n"));
 }

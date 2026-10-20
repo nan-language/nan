@@ -1,0 +1,661 @@
+//! The rules of struct and enum items: their members, inline recursion, closedness, the structural properties they must declare, and their derives.
+
+/// The entries a `derives` clause may list.
+const DERIVABLE: Str = "Copy Eq Ord Hash Default Render Encode Generate Send Inert AnyBits"
+
+/// The core types that hold their type arguments inline.
+const INLINE_HOLDERS: Str = "core::Option core::Result core::Array core::Untrusted"
+
+/// A member of a struct or enum: its field's or variant's token and the types it holds.
+struct MemberTypes {
+    token: u32
+    types: mem::List[ty::Ty]
+} MemberTypes
+
+/// The rules of a struct or enum item.
+fn Checker.check_type_item(self, item: ty::ItemId) {
+    self.check_members(item)
+    self.check_recursion(item)
+    self.check_declared_properties(item)
+    self.check_derives(item)
+} Checker.check_type_item
+
+/// Distinct member names, labelled payloads, and the `pub` fields of a closed struct.
+fn Checker.check_members(self, item: ty::ItemId) {
+    let node = self.db().ast(item)
+    match node.kind {
+        ast::ItemKind.Struct(structure) => {
+            let closed = node.has_modifier(ast::TypeModifier.Closed)
+            var index: usize = 0
+            for field in structure.fields() {
+                if self.field_named_before(structure, name: field.name.text.as_str(), count: index) {
+                    self.report(item, token: field.name.token, code: diagnostic::Code.TypeDuplicateMember)
+                }
+                index += 1
+                if closed and field.visibility != ast::Visibility.Pub {
+                    self.report(item, token: field.name.token, code: diagnostic::Code.TypeClosedHiddenField)
+                }
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            let variants = enumeration.variants
+            for index in 0..<variants.len() {
+                let variant = variants[index]
+                for earlier in 0..<index {
+                    if variants[earlier].name.text == variant.name.text {
+                        self.report(item, token: variant.name.token, code: diagnostic::Code.TypeDuplicateMember)
+                        break
+                    }
+                }
+                match variant.payload {
+                    Some(fields) => self.check_payload(item, variant, fields: fields.view())
+                    None => {}
+                }
+            }
+        }
+        else => {}
+    }
+} Checker.check_members
+
+/// Whether one of the first `count` fields of a struct has a name.
+fn Checker.field_named_before(self, structure: ast::StructItem, name: Str, count: usize) -> bool {
+    var index: usize = 0
+    for field in structure.fields() {
+        if index == count {
+            return false
+        }
+        if field.name.text.as_str() == name {
+            return true
+        }
+        index += 1
+    }
+    return false
+} Checker.field_named_before
+
+/// A payload: one unlabelled type, or fields each labelled by one distinct identifier.
+fn Checker.check_payload(self, item: ty::ItemId, variant: ast::Variant, fields: Slice[ast::PayloadField]) {
+    let single = fields.len() == 1 and fields[0].label.is_none()
+    var labelled = true
+    for field in fields {
+        if payload_label(field).is_none() {
+            labelled = false
+        }
+    }
+    if not single and not labelled {
+        self.report(item, token: variant.name.token, code: diagnostic::Code.TypeUnlabelledPayload)
+        return
+    }
+    let db = self.db()
+    for index in 0..<fields.len() {
+        let Some(label) = payload_label(fields[index]) else {
+            continue
+        }
+        let name = db.text(item, token: label)
+        for earlier in 0..<index {
+            let Some(earlier_label) = payload_label(fields[earlier]) else {
+                continue
+            }
+            if db.text(item, token: earlier_label) == name {
+                self.report(item, token: fields[index].token, code: diagnostic::Code.TypeDuplicateMember)
+                break
+            }
+        }
+    }
+} Checker.check_payload
+
+/// The token of a payload field's label, when it is one identifier.
+fn payload_label(field: ast::PayloadField) -> Option[u32] {
+    let Some(label) = field.label else {
+        return None
+    }
+    return match first label.kind {
+        ast::TypeKind.Path(path: path, args: None) if path.segments.len() == 1 => Some(path.segments[0].token)
+        else => None
+    }
+} payload_label
+
+/// The members of a struct or enum in source order: each field's or variant's token and the
+/// types it holds.
+fn Checker.members(self, item: ty::ItemId) -> mem::List[MemberTypes] {
+    let alloc = self.alloc()
+    var members = mem::List[MemberTypes].empty(alloc)
+    let sig = self.sig(item)
+    match sig.contents().kind {
+        SigKind.Struct(fields: fields) => {
+            for field in fields {
+                var held = mem::List[ty::Ty].empty(alloc)
+                mut held.push(field.ty)
+                mut members.push(MemberTypes(token: field.token, types: take held))
+            }
+        }
+        SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                var held = mem::List[ty::Ty].empty(alloc)
+                match variant.payload {
+                    Payload.None => {}
+                    Payload.Single(single) => mut held.push(single)
+                    Payload.Labelled(labelled) => {
+                        for field in labelled {
+                            mut held.push(field.ty)
+                        }
+                    }
+                }
+                mut members.push(MemberTypes(token: variant.token, types: take held))
+            }
+        }
+        else => {}
+    }
+    return members
+} Checker.members
+
+/// A struct or enum holding an instantiation of itself inline, reported once per cycle: on
+/// the type whose canonical path sorts first, at its first member holding itself.
+fn Checker.check_recursion(self, item: ty::ItemId) {
+    let alloc = self.alloc()
+    let Some(token) = self.first_member_holding(item) else {
+        return
+    }
+    let path = self.db().canonical(item)
+    let others = self.inline_items(item)
+    for other in others {
+        if other == item {
+            continue
+        }
+        var seen = mem::List[ty::ItemId].empty(alloc)
+        let other_ty = self.types().item(other, args: mem::List[ty::Arg].empty(alloc))
+        if not self.holds_inline(other_ty, target: item, mut seen) {
+            continue
+        }
+        let other_path = self.db().canonical(other)
+        if other_path.as_str() < path.as_str() {
+            return
+        }
+    }
+    self.report(item, token, code: diagnostic::Code.TypeRecursive)
+} Checker.check_recursion
+
+/// The token of the first member of a struct or enum holding an instantiation of itself inline.
+fn Checker.first_member_holding(self, item: ty::ItemId) -> Option[u32] {
+    let members = self.members(item)
+    for member in members {
+        for member_ty in member.types {
+            var seen = mem::List[ty::ItemId].empty(self.alloc())
+            if self.holds_inline(member_ty, target: item, mut seen) {
+                return Some(member.token)
+            }
+        }
+    }
+    return None
+} Checker.first_member_holding
+
+/// Whether a type holds an instantiation of `target` inline, through the core types holding
+/// their arguments inline and the members of structs and enums.
+fn Checker.holds_inline(self, ty: ty::Ty, target: ty::ItemId, mut seen: mem::List[ty::ItemId]) -> bool {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return false
+    }
+    if item == target {
+        return true
+    }
+    if self.is_inline_holder(ty) {
+        for arg in types.arg_list(args) {
+            let Some(held) = arg.ty() else {
+                continue
+            }
+            if self.holds_inline(held, target, mut seen) {
+                return true
+            }
+        }
+        return false
+    }
+    if self.is_base_type(item) or seen.position(fn(known: ty::ItemId) => known == item).is_some() {
+        return false
+    }
+    mut seen.push(item)
+    var held_inline = false
+    let inline = self.inline_types(item)
+    for inline_ty in inline {
+        if self.holds_inline(inline_ty, target, mut seen) {
+            held_inline = true
+            break
+        }
+    }
+    discard mut seen.pop()
+    return held_inline
+} Checker.holds_inline
+
+/// Whether a type is a core type holding its type arguments inline.
+fn Checker.is_inline_holder(self, ty: ty::Ty) -> bool {
+    let Some(path) = self.std_path(ty) else {
+        return false
+    }
+    return is_listed(INLINE_HOLDERS, word: path.as_str())
+} Checker.is_inline_holder
+
+/// The types a struct or enum holds inline in its members.
+fn Checker.inline_types(self, item: ty::ItemId) -> mem::List[ty::Ty] {
+    var held = mem::List[ty::Ty].empty(self.alloc())
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => {}
+        else => return held
+    }
+    let members = self.members(item)
+    for member in members {
+        for member_ty in member.types {
+            mut held.push(member_ty)
+        }
+    }
+    return held
+} Checker.inline_types
+
+/// The structs and enums a struct or enum holds inline, at any depth.
+fn Checker.inline_items(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
+    let alloc = self.alloc()
+    var found = mem::List[ty::ItemId].empty(alloc)
+    var pending = mem::List[ty::ItemId].empty(alloc)
+    mut pending.push(item)
+    loop {
+        let Some(current) = mut pending.pop() else {
+            break
+        }
+        let inline = self.inline_types(current)
+        for inline_ty in inline {
+            self.collect_inline(inline_ty, mut found, mut pending)
+        }
+    }
+    return found
+} Checker.inline_items
+
+fn Checker.collect_inline(self, ty: ty::Ty, mut found: mem::List[ty::ItemId], mut pending: mem::List[ty::ItemId]) {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return
+    }
+    if self.is_inline_holder(ty) {
+        for arg in types.arg_list(args) {
+            let Some(held) = arg.ty() else {
+                continue
+            }
+            self.collect_inline(held, mut found, mut pending)
+        }
+    } else if not self.is_base_type(item) and found.position(fn(known: ty::ItemId) => known == item).is_none() {
+        mut found.push(item)
+        mut pending.push(item)
+    }
+} Checker.collect_inline
+
+/// `linear` and `view`, which a struct or enum declares when a member holds a linear type,
+/// its type parameters counted droppable, or a view.
+fn Checker.check_declared_properties(self, item: ty::ItemId) {
+    let droppable = self.counted(item)
+    self.check_declared_property(item, property: Property.Linear, modifier: ast::TypeModifier.Linear, code: diagnostic::Code.PropLinearUndeclared, droppable)
+    self.check_declared_property(item, property: Property.View, modifier: ast::TypeModifier.View, code: diagnostic::Code.PropViewUndeclared, droppable)
+} Checker.check_declared_properties
+
+/// The modifier a struct or enum declares when a member holds a type with its property, its
+/// type parameters counted droppable, reported on the first such member with the fix writing
+/// it.
+fn Checker.check_declared_property(
+    self,
+    item: ty::ItemId,
+    property: Property,
+    modifier: ast::TypeModifier,
+    code: diagnostic::Code,
+    droppable: ty::Subst,
+    ) {
+    let node = self.db().ast(item)
+    if node.has_modifier(modifier) {
+        return
+    }
+    let Some(token) = self.first_member_with(item, property, subst: droppable) else {
+        return
+    }
+    let name = match node.kind {
+        ast::ItemKind.Struct(structure) => structure.name.token
+        ast::ItemKind.Enum(enumeration) => enumeration.name.token
+        else => return
+    }
+    let keyword = keyword_before(self.db().syntax(item), token: name)
+    let word = match modifier {
+        ast::TypeModifier.Linear => "linear "
+        else => "view "
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+    mut fixes.push(self.fix_inserting(item, before: keyword, text: word))
+    self.report_fixed(item, construct: nir::Span.at(token), code, fixes: take fixes, offer: diagnostic::Offer.Each)
+} Checker.check_declared_property
+
+/// The token of the first member of a struct or enum holding a type with a property under a
+/// substitution.
+fn Checker.first_member_with(self, item: ty::ItemId, property: Property, subst: ty::Subst) -> Option[u32] {
+    let types = self.types()
+    let members = self.members(item)
+    for member in members {
+        for member_ty in member.types {
+            if self.has(subst.ty(types, ty: member_ty), property) {
+                return Some(member.token)
+            }
+        }
+    }
+    return None
+} Checker.first_member_with
+
+/// A substitution of a struct's or enum's own type parameters by `Unit`, which has every
+/// property but linear and view: a type under it is read with its parameters counted Copy,
+/// Send, Inert and AnyBits, and droppable.
+fn Checker.counted(self, item: ty::ItemId) -> ty::Subst {
+    let alloc = self.alloc()
+    let sig = self.sig(item)
+    var args = mem::List[ty::Arg].empty(alloc)
+    for _ in sig.contents().generics {
+        mut args.push(ty::Arg.Ty(ty::Ty.unit()))
+    }
+    return self.generics_subst(sig.contents().generics.view(), args: args.view())
+} Checker.counted
+
+/// The substitution of each generic parameter by the argument at its position.
+fn Checker.generics_subst(self, generics: Slice[GenericDef], args: Slice[ty::Arg]) -> ty::Subst {
+    let alloc = self.alloc()
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in generics {
+        mut params.push(def.param)
+    }
+    return ty::Subst.of(params.view(), args, alloc)
+} Checker.generics_subst
+
+/// The entries of a `derives` clause, each checked in its own rules' order.
+fn Checker.check_derives(self, item: ty::ItemId) {
+    let node = self.db().ast(item)
+    let derived = match node.kind {
+        ast::ItemKind.Struct(structure) => structure.derived
+        ast::ItemKind.Enum(enumeration) => enumeration.derived
+        else => return
+    }
+    for index in 0..<derived.len() {
+        let entry = derived[index]
+        let name = entry.text.as_str()
+        if not is_listed(DERIVABLE, word: name) {
+            self.report(item, token: entry.token, code: diagnostic::Code.DeriveUnknown)
+            continue
+        }
+        var duplicate = false
+        for earlier in 0..<index {
+            if derived[earlier].text.as_str() == name {
+                duplicate = true
+            }
+        }
+        if duplicate {
+            self.report(item, token: entry.token, code: diagnostic::Code.DeriveDuplicate)
+            continue
+        }
+        let Some(code) = self.derive_problem(item, name) else {
+            continue
+        }
+        let token = match code {
+            diagnostic::Code.DeriveConstituentMissing or diagnostic::Code.EncodeLinear or diagnostic::Code.EncodeNotInert => node.token
+            diagnostic::Code.EncodeView or diagnostic::Code.TestGenerateType => node.token
+            else => entry.token
+        }
+        var fixes = mem::List[diagnostic::Fix].empty(self.alloc())
+        if code == diagnostic::Code.PropPromiseNotOpen {
+            match self.fix_element_deleted(item, head: entry.token, last: entry.token) {
+                Some(deleted) => mut fixes.push(take deleted)
+                None => mut fixes.push(self.fix_deleting(item, head: keyword_before(self.db().syntax(item), token: entry.token), last: entry.token))
+            }
+        }
+        self.report_fixed(item, construct: nir::Span.at(token), code, fixes: take fixes, offer: diagnostic::Offer.Each)
+    }
+} Checker.check_derives
+
+/// The rule a derive of the entry `name` on a struct or enum breaks.
+fn Checker.derive_problem(self, item: ty::ItemId, name: Str) -> Option[diagnostic::Code] {
+    let node = self.db().ast(item)
+    let sig = self.sig(item)
+    var own_args = mem::List[ty::Arg].empty(self.alloc())
+    for def in sig.contents().generics {
+        mut own_args.push(def.param_arg(self.types()))
+    }
+    let types = self.types()
+    let own = types.item(item, args: take own_args)
+    let declared_linear = node.has_modifier(ast::TypeModifier.Linear)
+    let declared_view = node.has_modifier(ast::TypeModifier.View)
+    let counted = self.counted(item)
+    if name == "Copy" {
+        if declared_linear or declared_view or not self.constituents_have(item, subst: counted, property: Property.Copy) {
+            return Some(diagnostic::Code.PropCopyIneligible)
+        }
+        return None
+    }
+    if name == "Send" or name == "Inert" or name == "AnyBits" {
+        let open = node.visibility == ast::Visibility.Pub and node.has_modifier(ast::TypeModifier.Open)
+        if not open {
+            return Some(diagnostic::Code.PropPromiseNotOpen)
+        }
+        let property = match name {
+            "Send" => Property.Send
+            "Inert" => Property.Inert
+            else => Property.AnyBits
+        }
+        if not self.definition_props(item).has(property) {
+            return Some(diagnostic::Code.PropPromiseUnmet)
+        }
+        return None
+    }
+    if (name == "Default" or name == "Encode" or name == "Generate") and self.is_capability(own) {
+        return Some(diagnostic::Code.PropCapabilityDerive)
+    }
+    let enumeration = match node.kind {
+        ast::ItemKind.Enum(_) => true
+        else => false
+    }
+    if name == "Default" and enumeration {
+        return Some(diagnostic::Code.DeriveEnumDefault)
+    }
+    if name == "Generate" and (declared_view or not self.has(counted.ty(types, ty: own), property: Property.Inert) or self.unending_generator(item)) {
+        return Some(diagnostic::Code.TestGenerateType)
+    }
+    if name == "Encode" {
+        if declared_view {
+            return Some(diagnostic::Code.EncodeView)
+        }
+        if declared_linear {
+            return Some(diagnostic::Code.EncodeLinear)
+        }
+        if not self.has(counted.ty(types, ty: own), property: Property.Inert) {
+            return Some(diagnostic::Code.EncodeNotInert)
+        }
+    }
+    let Some(interface_item) = self.db().core_item(name) else {
+        return None
+    }
+    if not self.constituents_implement(item, interface_item) {
+        return Some(diagnostic::Code.DeriveConstituentMissing)
+    }
+    return None
+} Checker.derive_problem
+
+/// Whether every constituent type of a struct or enum has a property under a substitution.
+fn Checker.constituents_have(self, item: ty::ItemId, subst: ty::Subst, property: Property) -> bool {
+    let types = self.types()
+    let constituents = self.constituents(item)
+    for constituent in constituents {
+        if not self.has(subst.ty(types, ty: constituent), property) {
+            return false
+        }
+    }
+    return true
+} Checker.constituents_have
+
+/// Whether the derived generator of a struct or enum never ends under the depth rule: a struct
+/// holding itself, or an enum each of whose variants holds it, as a constituent at any depth.
+fn Checker.unending_generator(self, item: ty::ItemId) -> bool {
+    let members = self.members(item)
+    let structure = match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) => true
+        else => false
+    }
+    if structure {
+        for member in members {
+            if self.mentions_itself(item, types: member.types.view()) {
+                return true
+            }
+        }
+        return false
+    }
+    if members.len() == 0 {
+        return false
+    }
+    for member in members {
+        if not self.mentions_itself(item, types: member.types.view()) {
+            return false
+        }
+    }
+    return true
+} Checker.unending_generator
+
+/// Whether one of some types holds a struct or enum as a constituent at any depth.
+fn Checker.mentions_itself(self, item: ty::ItemId, types: Slice[ty::Ty]) -> bool {
+    for member_ty in types {
+        var seen = mem::List[ty::ItemId].empty(self.alloc())
+        if self.mentions_item(member_ty, target: item, mut seen) {
+            return true
+        }
+    }
+    return false
+} Checker.mentions_itself
+
+/// Whether a type holds `target` as a constituent at any depth, through type arguments and the
+/// members of structs and enums.
+fn Checker.mentions_item(self, ty: ty::Ty, target: ty::ItemId, mut seen: mem::List[ty::ItemId]) -> bool {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return false
+    }
+    if item == target {
+        return true
+    }
+    for arg in types.arg_list(args) {
+        let Some(held) = arg.ty() else {
+            continue
+        }
+        if self.mentions_item(held, target, mut seen) {
+            return true
+        }
+    }
+    if seen.position(fn(known: ty::ItemId) => known == item).is_some() or self.is_base_type(item) {
+        return false
+    }
+    mut seen.push(item)
+    var mentioned = false
+    let constituents = self.constituents(item)
+    for constituent in constituents {
+        if self.mentions_item(constituent, target, mut seen) {
+            mentioned = true
+            break
+        }
+    }
+    discard mut seen.pop()
+    return mentioned
+} Checker.mentions_item
+
+/// The fields a struct's predicates mention: each field with a `where` condition, and each
+/// field a predicate names by its bare name.
+fn Checker.mentioned_fields(self, item: ty::ItemId) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var mentioned = mem::List[text::String].empty(alloc)
+    let ast::ItemKind.Struct(structure) = self.db().ast(item).kind else {
+        return mentioned
+    }
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                if field.where_clause.is_some() {
+                    mut mentioned.push(text::String.of(field.name.text.as_str(), alloc))
+                }
+            }
+            ast::StructMember.Invariant(_) => {}
+        }
+    }
+    for member in structure.members {
+        match member {
+            ast::StructMember.Field(field) => {
+                match field.where_clause {
+                    Some(condition) => self.mention_fields(condition, structure, mut mentioned)
+                    None => {}
+                }
+            }
+            ast::StructMember.Invariant(condition) => self.mention_fields(condition, structure, mut mentioned)
+        }
+    }
+    return mentioned
+} Checker.mentioned_fields
+
+/// Adds to `mentioned` each field of a struct a predicate names by its bare name, once.
+fn Checker.mention_fields(self, term: ast::Expr, structure: ast::StructItem, mut mentioned: mem::List[text::String]) {
+    let alloc = self.alloc()
+    term.visit_paths(fn[mut mentioned](path: ast::Path) {
+        if path.segments.len() != 1 {
+            return
+        }
+        let name = path.segments[0].text.as_str()
+        var field_named = false
+        for field in structure.fields() {
+            if field.name.text.as_str() == name {
+                field_named = true
+            }
+        }
+        if not field_named or mentioned.position(fn(known: text::String) => known.as_str() == name).is_some() {
+            return
+        }
+        mut mentioned.push(text::String.of(name, alloc))
+    })
+} Checker.mention_fields
+
+/// The field type of a struct instantiation.
+fn Checker.field_type(self, ty: ty::Ty, name: Str) -> Option[ty::Ty] {
+    let types = self.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return None
+    }
+    let sig = self.sig(item)
+    let SigKind.Struct(fields: fields) = sig.contents().kind else {
+        return None
+    }
+    let subst = self.generics_subst(sig.contents().generics.view(), args: types.arg_list(args))
+    for field in fields {
+        if field.name.as_str() == name {
+            return Some(subst.ty(types, ty: field.ty))
+        }
+    }
+    return None
+} Checker.field_type
+
+/// Whether every constituent type of a struct or enum implements an interface, its type
+/// parameters counted as implementing it.
+fn Checker.constituents_implement(self, item: ty::ItemId, interface_item: ty::ItemId) -> bool {
+    let alloc = self.alloc()
+    let bound = ty::Bound(item: interface_item, args: ty::Args.none())
+    let sig = self.sig(item)
+    var generics = mem::List[GenericDef].empty(alloc)
+    for def in sig.contents().generics {
+        var bounds = mem::List[ty::Bound].empty(alloc)
+        for held in def.bounds {
+            mut bounds.push(held)
+        }
+        mut bounds.push(bound)
+        mut generics.push(GenericDef(name: text::String.of(def.name.as_str(), alloc), param: def.param, bounds: take bounds, constant: def.constant))
+    }
+    let state = self.state.contents()
+    let saved = state.scope.replace(take generics)
+    var implemented = true
+    let constituents = self.constituents(item)
+    for constituent in constituents {
+        if not self.implements(constituent, interface_item) {
+            implemented = false
+            break
+        }
+    }
+    state.scope.restore(saved)
+    return implemented
+} Checker.constituents_implement

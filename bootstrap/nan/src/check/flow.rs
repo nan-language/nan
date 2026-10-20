@@ -11,12 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use place::Path;
 
 use super::Checker;
-use super::conform::Candidate;
 use super::db::ItemId;
 use super::props::Property;
-use super::sig::SigKind;
 use super::tir::{
-    Call, Callee, LocalId, LocalKind, TBlock, TBody, TCapture, TClosure, TExpr, TKind, TPattern,
+    Call, Form, LocalId, LocalKind, TBlock, TBody, TCapture, TClosure, TExpr, TKind, TPattern,
     TPatternKind, TStmt, TStmtKind,
 };
 use super::ty::Ty;
@@ -139,17 +137,6 @@ fn part_of(form: Option<Form>) -> Option<Form> {
     }
 }
 
-/// The form of a projection result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Form {
-    /// A part of the receiver, named in place.
-    Part,
-    /// An `Option` or `Result` whose non-Copy payloads are parts.
-    Wrapped,
-    /// A view value its holder owns.
-    View,
-}
-
 /// How an access reaches a place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
@@ -219,10 +206,12 @@ struct Scope {
 }
 
 /// What a view binding names.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct View {
     writable: bool,
     wrapped: bool,
+    /// The locals the part it names derives from.
+    roots: Vec<LocalId>,
 }
 
 /// The walk of one function, test, const or closure body.
@@ -236,6 +225,9 @@ struct Flow<'c, 'a> {
     loop_base: usize,
     scopes: Vec<Scope>,
     views: HashMap<LocalId, View>,
+    /// The locals an owned binding's value derives from, as a view value derives from what its
+    /// projection's receiver derives from.
+    derived: HashMap<LocalId, Vec<LocalId>>,
     /// Where each local was bound.
     bound: HashMap<LocalId, Tok>,
     reported: HashSet<(Tok, Code)>,
@@ -246,8 +238,11 @@ struct Flow<'c, 'a> {
     /// The locals assigned or accessed by `mut`, and those moved, in this body.
     mutated: HashSet<LocalId>,
     moved_locals: HashSet<LocalId>,
-    /// The closures whose bodies were walked.
-    walked: HashSet<u32>,
+    /// The closures whose bodies were walked, with the place paths each body reads through its
+    /// read captures.
+    walked: HashMap<u32, Vec<Path>>,
+    /// The place paths this body reads through its read captures.
+    capture_reads: Vec<Path>,
     /// Where each local is first used.
     first_use: HashMap<LocalId, Tok>,
     /// Whether the body holds a construct that failed a rule, whose effects are unknown: what
@@ -257,6 +252,9 @@ struct Flow<'c, 'a> {
     opener: Option<Tok>,
     /// The first token of the statement being walked.
     statement: Option<Tok>,
+    /// Whether the expression about to be walked gives the value a projection returns, which
+    /// the values of its branches then give in turn: such a branch value is returned, not moved.
+    returning: bool,
 }
 
 impl Checker<'_> {
@@ -285,17 +283,20 @@ impl<'c, 'a> Flow<'c, 'a> {
             loop_base: 0,
             scopes: vec![Scope::default()],
             views: HashMap::new(),
+            derived: HashMap::new(),
             bound: HashMap::new(),
             reported: HashSet::new(),
             projection: None,
             task: None,
             mutated: HashSet::new(),
             moved_locals: HashSet::new(),
-            walked: HashSet::new(),
+            walked: HashMap::new(),
+            capture_reads: Vec::new(),
             first_use: HashMap::new(),
             failed: false,
             opener: None,
             statement: None,
+            returning: false,
         }
     }
 
@@ -328,10 +329,11 @@ impl<'c, 'a> Flow<'c, 'a> {
         };
         let end = match &root.kind {
             TKind::Block(block) => {
-                self.block(block);
+                self.block(block, false);
                 block.end
             }
             _ => {
+                self.returning = self.projection.is_some();
                 let value = self.expr(root);
                 self.returned(&value, root);
                 root.token
@@ -471,6 +473,9 @@ impl<'c, 'a> Flow<'c, 'a> {
     /// The checks every access to a place makes: the holds its root keeps, a move on a path to
     /// it, and the holds it conflicts with.
     fn access(&mut self, path: &Path, access: Access, token: Tok) {
+        if self.body.local(path.root).kind == LocalKind::Capture(Mode::Read) {
+            self.capture_reads.push(path.clone());
+        }
         self.use_holder(path.root, token);
         let Some(state) = self.state.as_ref() else {
             return;
@@ -701,7 +706,8 @@ impl<'c, 'a> Flow<'c, 'a> {
 
     // Blocks and statements.
 
-    fn block(&mut self, block: &TBlock) -> Value {
+    /// A block, `returning` when the value it yields is a projection's returned value.
+    fn block(&mut self, block: &TBlock, returning: bool) -> Value {
         self.scopes.push(Scope::default());
         let mut value = Value::default();
         for (index, stmt) in block.stmts.iter().enumerate() {
@@ -709,6 +715,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 break;
             }
             let last = index + 1 == block.stmts.len();
+            self.returning = returning && last && matches!(stmt.kind, TStmtKind::Expr(_));
             value = self.stmt(stmt, last);
         }
         self.pop_scope(block.end);
@@ -761,7 +768,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let found = self.expr(value);
                 if let Some(otherwise) = otherwise {
                     let matched = self.state.clone();
-                    self.block(otherwise);
+                    self.block(otherwise, false);
                     self.state = matched;
                 }
                 self.bind(pattern, &found, value, stmt.token);
@@ -783,7 +790,7 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let value = flow.expr(condition);
                 flow.read(&value, condition.token);
                 let exhausted = flow.state.clone();
-                flow.block(body);
+                flow.block(body, false);
                 exhausted
             }),
             TStmtKind::For {
@@ -798,7 +805,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             ),
             TStmtKind::Loop { invariants, body } => self.looped(stmt.token, None, |flow| {
                 flow.contract(invariants);
-                flow.block(body);
+                flow.block(body, false);
                 None
             }),
             TStmtKind::Defer(call) => self.defer(stmt.token, call),
@@ -937,10 +944,14 @@ impl<'c, 'a> Flow<'c, 'a> {
     ) {
         let found = self.expr(iterated);
         let holder = LocalId(CURSORS + self.loops.len() as u32);
-        let projecting = self.next_projects(cursor);
+        let projecting = self.ck.next_projects(cursor);
         let mut element = Value {
             form: projecting.then_some(Form::Part),
             writable: mode == Mode::Mut,
+            roots: match projecting {
+                true => found.roots.clone(),
+                false => Vec::new(),
+            },
             ..Value::default()
         };
         match mode {
@@ -962,7 +973,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             flow.scopes.push(Scope::default());
             flow.match_part(pattern, &element, owned);
             flow.contract(invariants);
-            flow.block(body);
+            flow.block(body, false);
             flow.pop_scope(body.end);
             exhausted
         });
@@ -996,31 +1007,54 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
     }
 
-    /// Whether a cursor type's `next` is a projection.
-    fn next_projects(&self, cursor: &Ty) -> bool {
-        self.ck
-            .method_candidates(cursor, "next")
-            .into_iter()
-            .any(|candidate| match candidate {
-                Candidate::Function { item, .. } => {
-                    self.ck.fn_sig(item).is_some_and(|sig| sig.is_proj())
-                }
-                Candidate::Method { bound, method, .. } => match &self.ck.sig(bound.interface).kind
-                {
-                    SigKind::Interface { methods } => methods[method].sig.is_proj(),
-                    _ => false,
-                },
-            })
-    }
-
-    /// A branch's value, as its `if` or `match` yields it; one derived from a temporary the
-    /// branch creates, which ends with the branch, is an error at `token`.
-    fn branch_value(&mut self, mut value: Value, token: Tok, ty: &Ty) -> Value {
+    /// A branch's value, as its `if` or `match` yields it: what a projection returns, a part, or
+    /// else moved into what the `if` or `match` yields. One derived from a temporary the branch
+    /// creates, which ends with the branch, is an error at `token`.
+    fn branch_value(&mut self, mut value: Value, token: Tok, ty: &Ty, returning: bool) -> Value {
         if value.temporary && !self.is_copy(ty) {
             self.report(token, Code::OwnTemporarySource);
             value.temporary = false;
         }
-        value
+        if returning {
+            self.check_exposed(&value, token);
+            return value;
+        }
+        if value.form == Some(Form::Part) && !self.is_copy(ty) {
+            return value;
+        }
+        self.take(&value, ty, token);
+        Value {
+            holds: value.holds,
+            roots: value.roots,
+            captures: value.captures,
+            fresh: true,
+            ..Value::default()
+        }
+    }
+
+    /// What an `if` or `match` yields from the values its live branches yield: a part when each
+    /// is a part that is not Copy, outside a value a projection returns; otherwise each part is
+    /// moved, which is an error.
+    fn branches_value(&mut self, branches: Vec<(Value, Tok)>, ty: &Ty, returning: bool) -> Value {
+        let parts = !returning
+            && !branches.is_empty()
+            && branches
+                .iter()
+                .all(|(value, _)| value.form == Some(Form::Part));
+        let mut joined = Value {
+            writable: parts && branches.iter().all(|(value, _)| value.writable),
+            form: parts.then_some(Form::Part),
+            ..Value::default()
+        };
+        for (value, token) in branches {
+            if !returning && !parts && value.form == Some(Form::Part) && !self.is_copy(ty) {
+                self.report(token, Code::OwnMoveNotOwned);
+            }
+            joined.holds.extend(value.holds);
+            joined.roots.extend(value.roots);
+            joined.captures.extend(value.captures);
+        }
+        joined
     }
 
     // Bindings and patterns.
@@ -1048,6 +1082,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             let view = View {
                 writable: value.writable,
                 wrapped: value.form == Some(Form::Wrapped),
+                roots: value.roots.clone(),
             };
             self.views.insert(local, view);
             self.keep_holds(local, value);
@@ -1082,12 +1117,16 @@ impl<'c, 'a> Flow<'c, 'a> {
                     self.take(part, &pattern.ty, pattern.token);
                     self.declare(local, pattern.token);
                     self.keep_holds(local, part);
+                    if !part.roots.is_empty() {
+                        self.derived.insert(local, part.roots.clone());
+                    }
                 } else {
                     self.read(part, pattern.token);
                     self.declare(local, pattern.token);
                     let view = View {
                         writable: part.writable,
                         wrapped: part.form == Some(Form::Wrapped),
+                        roots: part.roots.clone(),
                     };
                     self.views.insert(local, view);
                     let mut held = Value::default();
@@ -1138,17 +1177,28 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
     }
 
-    /// A value received by `discard`: a linear one is dropped.
+    /// A value received by `discard`: a linear one is dropped, and a place owning its value
+    /// ends it as a move does.
     fn drop_value(&mut self, value: &Value, ty: &Ty, token: Tok) {
-        self.read(value, token);
-        if !self.is_linear(ty) || value.form.is_some() {
-            return;
+        let unowned = value.form.is_some();
+        let dropped = !unowned
+            && self.is_linear(ty)
+            && value
+                .place
+                .as_ref()
+                .is_none_or(|path| self.owns(path.root) && !self.consumed(path, self.scopes.len()));
+        let ends = !unowned
+            && !self.is_copy(ty)
+            && value
+                .place
+                .as_ref()
+                .is_some_and(|path| self.owns(path.root));
+        if ends {
+            self.take(value, ty, token);
+        } else {
+            self.read(value, token);
         }
-        let owned = value
-            .place
-            .as_ref()
-            .is_none_or(|path| self.owns(path.root) && !self.consumed(path, self.scopes.len()));
-        if owned {
+        if dropped {
             self.report(token, Code::OwnLinearDropped);
         }
     }
@@ -1193,21 +1243,27 @@ impl<'c, 'a> Flow<'c, 'a> {
     /// The value a function or closure body returns: moved out, or in a projection derived from
     /// its receiver.
     fn returned(&mut self, value: &Value, expr: &TExpr) {
-        let Some((receiver, held)) = self.projection else {
+        let Some((receiver, _)) = self.projection else {
             self.take(value, &expr.ty, expr.token);
             return;
         };
         self.read(value, expr.token);
-        if held
+        self.check_exposed(value, expr.token);
+        let derived = value.roots.contains(&receiver);
+        if !self.is_copy(&expr.ty) && !derived && value.roots.iter().any(|root| *root != receiver) {
+            self.report(expr.token, Code::OwnProjSource);
+        }
+    }
+
+    /// In a projection received by `mut`, a returned path from the receiver through a field its
+    /// predicates mention is an error at `token`.
+    fn check_exposed(&mut self, value: &Value, token: Tok) {
+        if let Some((receiver, true)) = self.projection
             && let Some(path) = &value.place
             && path.root == receiver
             && self.exposes_mentioned(path)
         {
-            self.report(expr.token, Code::PredicateExposedField);
-        }
-        let derived = value.roots.contains(&receiver);
-        if !self.is_copy(&expr.ty) && !derived && value.roots.iter().any(|root| *root != receiver) {
-            self.report(expr.token, Code::OwnProjSource);
+            self.report(token, Code::PredicateExposedField);
         }
     }
 
@@ -1247,6 +1303,7 @@ impl<'c, 'a> Flow<'c, 'a> {
     }
 
     fn expr(&mut self, expr: &TExpr) -> Value {
+        let returning = std::mem::take(&mut self.returning);
         if self.state.is_none() {
             return Value::default();
         }
@@ -1260,6 +1317,10 @@ impl<'c, 'a> Flow<'c, 'a> {
                         Form::Part
                     });
                     value.writable = view.writable;
+                    value.roots.extend(view.roots.iter().copied());
+                }
+                if let Some(roots) = self.derived.get(local) {
+                    value.roots.extend(roots.iter().copied());
                 }
                 if let Some(state) = self.state.as_ref() {
                     value.holds = state
@@ -1286,7 +1347,9 @@ impl<'c, 'a> Flow<'c, 'a> {
                 }
                 value
             }
-            TKind::Construct { values, .. } => self.construct(expr, values),
+            TKind::Construct {
+                values, wrapped, ..
+            } => self.construct(expr, values, *wrapped),
             TKind::Unary { operand, .. } => {
                 let value = self.expr(operand);
                 self.read(&value, operand.token);
@@ -1307,21 +1370,31 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let found = self.expr(condition);
                 self.read(&found, condition.token);
                 let entry = self.state.clone();
-                let value = self.block(then);
-                let mut value = self.branch_value(value, tail_token(then, expr.token), &expr.ty);
+                let mut branches = Vec::new();
+                let value = self.block(then, returning);
+                let token = tail_token(then, expr.token);
+                let value = self.branch_value(value, token, &expr.ty, returning);
+                if self.state.is_some() {
+                    branches.push((value, token));
+                }
                 let after_then = self.state.take();
                 self.state = entry;
                 if let Some(otherwise) = otherwise {
+                    self.returning = returning;
                     let other = self.expr(otherwise);
-                    let other = self.branch_value(other, value_token(otherwise), &expr.ty);
-                    value.holds.extend(other.holds);
-                    value.roots.extend(other.roots);
+                    let token = value_token(otherwise);
+                    let other = self.branch_value(other, token, &expr.ty, returning);
+                    if self.state.is_some() {
+                        branches.push((other, token));
+                    }
                 }
                 merge(&mut self.state, after_then);
-                value
+                self.branches_value(branches, &expr.ty, returning)
             }
-            TKind::Block(block) => self.block(block),
-            TKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, &expr.ty),
+            TKind::Block(block) => self.block(block, returning),
+            TKind::Match { scrutinee, arms } => {
+                self.match_expr(scrutinee, arms, &expr.ty, returning)
+            }
             TKind::Closure(closure) => self.closure(expr.token, closure),
             TKind::When { accesses, body, .. } => {
                 self.suspend(expr.token);
@@ -1356,6 +1429,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             }
             TKind::Return(value) => {
                 if let Some(value) = value {
+                    self.returning = self.projection.is_some();
                     let found = self.expr(value);
                     self.returned(&found, value);
                 }
@@ -1416,13 +1490,20 @@ impl<'c, 'a> Flow<'c, 'a> {
         }
     }
 
-    fn match_expr(&mut self, scrutinee: &TExpr, arms: &[super::tir::TArm], ty: &Ty) -> Value {
+    /// A `match`, `returning` when the value it yields is a projection's returned value.
+    fn match_expr(
+        &mut self,
+        scrutinee: &TExpr,
+        arms: &[super::tir::TArm],
+        ty: &Ty,
+        returning: bool,
+    ) -> Value {
         let found = self.expr(scrutinee);
         let owned = (found.form.is_none() || found.form == Some(Form::View))
             && found.place.as_ref().is_none_or(|path| self.owns(path.root));
         let entry = self.state.clone();
         let mut out: Option<State> = None;
-        let mut value = Value::default();
+        let mut branches = Vec::new();
         for arm in arms {
             self.state = entry.clone();
             self.scopes.push(Scope::default());
@@ -1442,10 +1523,13 @@ impl<'c, 'a> Flow<'c, 'a> {
                 let condition = self.expr(guard);
                 self.read(&condition, guard.token);
             }
+            self.returning = returning;
             let yielded = self.expr(&arm.body);
-            let yielded = self.branch_value(yielded, value_token(&arm.body), ty);
-            value.holds.extend(yielded.holds);
-            value.roots.extend(yielded.roots);
+            let token = value_token(&arm.body);
+            let yielded = self.branch_value(yielded, token, ty, returning);
+            if self.state.is_some() {
+                branches.push((yielded, token));
+            }
             self.pop_scope(arm.body.token);
             merge(&mut out, self.state.take());
         }
@@ -1453,14 +1537,11 @@ impl<'c, 'a> Flow<'c, 'a> {
             out = entry;
         }
         self.state = out;
-        value
+        self.branches_value(branches, ty, returning)
     }
 
-    /// A construction: its values move in, except parts wrapped in `Some`, `Ok` or `Err`.
-    fn construct(&mut self, expr: &TExpr, values: &[(String, TExpr)]) -> Value {
-        let wraps = ["core::Option", "core::Result"]
-            .iter()
-            .any(|path| self.ck.is_std(&expr.ty, path));
+    /// A construction: its values move in, except the part a wrapped part wraps.
+    fn construct(&mut self, expr: &TExpr, values: &[(String, TExpr)], wrapped: bool) -> Value {
         let mut result = Value {
             fresh: true,
             ..Value::default()
@@ -1468,7 +1549,7 @@ impl<'c, 'a> Flow<'c, 'a> {
         for (_, value) in values {
             let found = self.expr(value);
             result.roots.extend(found.roots.iter().copied());
-            if wraps && found.form == Some(Form::Part) {
+            if wrapped {
                 self.read(&found, value.token);
                 result.form = Some(Form::Wrapped);
                 result.writable = found.writable;
@@ -1500,16 +1581,19 @@ impl<'c, 'a> Flow<'c, 'a> {
                 Mode::Take if copy => Access::Read,
                 Mode::Take => Access::Move,
             };
+            let copied = copy && access == Access::Read;
             let through_part = matches!(value.form, Some(Form::Part | Form::Wrapped));
             if let Some(path) = &value.place
-                && !(copy && access == Access::Read)
+                && !copied
                 && !through_part
             {
                 accesses.push((path.clone(), access, arg.expr.token));
             }
-            for hold in &value.holds {
-                let access = if hold.held { Access::Mut } else { Access::Read };
-                accesses.push((hold.source.clone(), access, arg.expr.token));
+            if !(copied && through_part) {
+                for hold in &value.holds {
+                    let access = if hold.held { Access::Mut } else { Access::Read };
+                    accesses.push((hold.source.clone(), access, arg.expr.token));
+                }
             }
             accesses.extend(value.captures.iter().cloned());
         }
@@ -1569,7 +1653,7 @@ impl<'c, 'a> Flow<'c, 'a> {
         };
         let held = call.args.first().is_some_and(|arg| arg.mode == Mode::Mut);
         let mut result = Value {
-            form: Some(self.form(call)),
+            form: Some(self.ck.projection_form(call)),
             writable: held && (receiver.form.is_none() || receiver.writable),
             temporary: receiver.temporary || receiver.fresh,
             roots: receiver.roots.clone(),
@@ -1590,37 +1674,6 @@ impl<'c, 'a> Flow<'c, 'a> {
             });
         }
         result
-    }
-
-    /// The form of a projection call's result, from its head's result type with each type
-    /// parameter counted as no view.
-    fn form(&self, call: &Call) -> Form {
-        let declared = match &call.callee {
-            Callee::Function { item, .. } => self.ck.fn_sig(*item).map(|sig| sig.result),
-            Callee::Method {
-                interface, method, ..
-            } => match &self.ck.sig(interface.interface).kind {
-                SigKind::Interface { methods } => Some(methods[*method].sig.result.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-        .unwrap_or_else(|| call.head.result.clone());
-        if ["core::Option", "core::Result"]
-            .iter()
-            .any(|path| self.ck.is_std(&declared, path))
-        {
-            return if self.ck.counts_as_view(&declared) {
-                Form::View
-            } else {
-                Form::Wrapped
-            };
-        }
-        if self.ck.counts_as_view(&declared) {
-            Form::View
-        } else {
-            Form::Part
-        }
     }
 
     /// The captures of a task closure, this its body's walk: each of a Send type, a view only
@@ -1715,7 +1768,7 @@ impl<'c, 'a> Flow<'c, 'a> {
     /// A closure: its body is walked once on its own; at its creation `take` captures move in,
     /// and its other captures are accesses while it is live.
     fn closure(&mut self, token: Tok, closure: &TClosure) -> Value {
-        if self.walked.insert(closure.index) {
+        if !self.walked.contains_key(&closure.index) {
             let mut inner = Flow::new(self.ck, self.item, self.body);
             inner.task = Some(closure.task);
             inner.opener = Some(token);
@@ -1731,7 +1784,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             }
             let end = match &closure.body.kind {
                 TKind::Block(block) => {
-                    inner.block(block);
+                    inner.block(block, false);
                     block.end
                 }
                 _ => {
@@ -1764,6 +1817,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             self.failed |= inner.failed;
             self.reported = inner.reported;
             self.walked = inner.walked;
+            self.walked.insert(closure.index, inner.capture_reads);
         }
         let mut value = Value::default();
         for capture in &closure.captures {
@@ -1777,10 +1831,19 @@ impl<'c, 'a> Flow<'c, 'a> {
                     self.write(&found, Access::Mut, at);
                     value.captures.push((outer, Access::Mut, at));
                 }
+                _ if self.is_copy(ty) => self.read(&found, at),
                 _ => {
-                    self.read(&found, at);
-                    if !self.is_copy(ty) {
-                        value.captures.push((outer, Access::Read, at));
+                    let reads: BTreeSet<Path> = self.walked[&closure.index]
+                        .iter()
+                        .filter(|path| path.root == capture.local)
+                        .map(|path| Path {
+                            root: capture.outer,
+                            fields: path.fields.clone(),
+                        })
+                        .collect();
+                    for path in reads {
+                        self.read(&Value::place(path.clone()), at);
+                        value.captures.push((path, Access::Read, at));
                     }
                 }
             }

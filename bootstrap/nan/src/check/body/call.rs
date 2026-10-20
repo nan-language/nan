@@ -2136,7 +2136,21 @@ impl Body<'_, '_> {
         }
     }
 
-    /// Whether an item is `Option` or `Result`, whose payloads wrap parts unmarked.
+    /// Whether a typed expression names, in place, what a read parameter holds: the parameter, a
+    /// view binding of what it holds, or a field of one.
+    pub fn is_read_view(&self, expr: &TExpr) -> bool {
+        match &expr.kind {
+            TKind::Local(local) => {
+                self.read_views.contains(local)
+                    || matches!(self.local(*local).kind, LocalKind::Param(Mode::Read))
+            }
+            TKind::Field { base, .. } => self.is_read_view(base),
+            _ => false,
+        }
+    }
+
+    /// Whether an item is `Option` or `Result`, whose payloads wrap parts and read views
+    /// unmarked.
     fn wraps(&self, item: ItemId) -> bool {
         let db = &self.ck.db;
         [db.core_item("Option"), db.core_item("Result")].contains(&Some(item))
@@ -2312,8 +2326,9 @@ impl Body<'_, '_> {
             if let TKind::Closure(_) = typed.kind {
                 self.report(value.token, Code::ClosureSecondClass);
             }
-            let wraps_part =
-                self.wraps(item) && self.is_part(&typed) && !self.ck.has(&typed.ty, Property::Copy);
+            let wraps_part = self.wraps(item)
+                && (self.is_part(&typed) || self.is_read_view(&typed))
+                && !self.ck.has(&typed.ty, Property::Copy);
             let mode = if wraps_part { Mode::Read } else { Mode::Take };
             self.check_mode(
                 (value.token, value.last),

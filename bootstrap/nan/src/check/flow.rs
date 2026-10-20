@@ -1540,7 +1540,7 @@ impl<'c, 'a> Flow<'c, 'a> {
         self.branches_value(branches, ty, returning)
     }
 
-    /// A construction: its values move in, except the part a wrapped part wraps.
+    /// A construction: its values move in, except what a wrapped part wraps.
     fn construct(&mut self, expr: &TExpr, values: &[(String, TExpr)], wrapped: bool) -> Value {
         let mut result = Value {
             fresh: true,

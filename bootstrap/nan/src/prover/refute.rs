@@ -283,7 +283,7 @@ pub fn literal(ck: &Checker, input: &Input) -> String {
         Input::Value(value) => match value {
             Val::Int(value) => value.to_string(),
             Val::Bool(value) => value.to_string(),
-            Val::Char(value) => format!("{value:?}"),
+            Val::Char(value) => crate::format::normal::char_literal(*value),
             Val::F32(value) => format!("{value:?}"),
             Val::F64(value) => format!("{value:?}"),
             Val::Unit => "Unit".to_owned(),

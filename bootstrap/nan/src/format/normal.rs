@@ -850,6 +850,11 @@ fn byte_value(text: &str) -> Vec<u8> {
     value
 }
 
+/// A character as the normalised form writes a char literal holding it.
+pub fn char_literal(c: char) -> String {
+    quoted(c.to_string().bytes(), "'", false)
+}
+
 /// A literal between delimiters, writing `\xHH` for the delimiter, the backslash, each byte
 /// below `0x20` or equal to `0x7F` and, in a byte literal, each byte above `0x7F`.
 fn quoted(value: impl Iterator<Item = u8>, delimiter: &str, bytes: bool) -> String {

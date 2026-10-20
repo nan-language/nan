@@ -152,6 +152,9 @@ struct Body {
     /// `Some`, `Ok` and `Err` wrap unmarked.
     part_bindings: mem::Set[LocalId]
     wrapped_bindings: mem::Set[LocalId]
+    /// The view bindings of what a read parameter holds, which `Some`, `Ok` and `Err` wrap
+    /// unmarked.
+    read_views: mem::Set[LocalId]
     /// The folded names of the values the module declares, once a local's name is checked
     /// against them, under key 0.
     folded_values: mem::OnceMap[u8, mem::Set[text::String]]
@@ -319,6 +322,7 @@ fn Body.new(ck: Checker, item: ty::ItemId, take generics: mem::List[GenericDef])
         usage: Usage.empty(alloc),
         part_bindings: mem::Set[LocalId].empty(alloc),
         wrapped_bindings: mem::Set[LocalId].empty(alloc),
+        read_views: mem::Set[LocalId].empty(alloc),
         folded_values: mem::OnceMap[u8, mem::Set[text::String]].empty(seed: 0, alloc),
         enclosing: Enclosing(scope: scope, within: within),
     )
@@ -853,6 +857,8 @@ fn Body.var_stmt(mut self, stmt: ast::Stmt, name: ast::Name, ty: Option[ast::Typ
         discard mut self.part_bindings.insert(local)
     } else if self.is_wrapped_part(typed) {
         discard mut self.wrapped_bindings.insert(local)
+    } else if self.is_read_view(typed) {
+        discard mut self.read_views.insert(local)
     }
     let unit = typed.ty == ty::Ty.unit() or typed.ty == ty::Ty.never()
     discard mut self.usage.bindings.insert(local, value: Binding(statement: stmt.token, value: nir::Span(head: value.token, last: value.last), unit: unit))
@@ -1078,37 +1084,46 @@ fn Body.irrefutable_else(self, stmt: ast::Stmt, otherwise: Option[ast::Block]) {
 
 /// Records the bindings a pattern matching `value` makes as view bindings: of a part, each
 /// of them; of a wrapped part, a binding of the whole as a wrapped part and each other as a
-/// part.
+/// part; of what a read parameter holds, each of them as a read view.
 fn Body.bind_views(mut self, pattern: TPattern, value: TExpr) {
+    var bound = mem::List[LocalId].empty(self.ck.alloc())
+    bindings_of(pattern, mut bound)
     if self.is_part(value) {
-        mut self.bind_parts(pattern)
+        add_locals(mut self.part_bindings, bound: bound.view())
         return
     }
-    if not self.is_wrapped_part(value) {
-        return
-    }
-    match pattern.kind {
-        TPatternKind.Binding(local) => {
-            discard mut self.wrapped_bindings.insert(local)
+    if self.is_wrapped_part(value) {
+        match pattern.kind {
+            TPatternKind.Binding(local) => {
+                discard mut self.wrapped_bindings.insert(local)
+            }
+            else => add_locals(mut self.part_bindings, bound: bound.view())
         }
-        else => mut self.bind_parts(pattern)
+        return
+    }
+    if self.is_read_view(value) {
+        add_locals(mut self.read_views, bound: bound.view())
     }
 } Body.bind_views
 
-/// Records each binding of a pattern as a view binding of a part.
-fn Body.bind_parts(mut self, pattern: TPattern) {
+/// Adds each binding a pattern makes to `bound`.
+fn bindings_of(pattern: TPattern, mut bound: mem::List[LocalId]) {
     match pattern.kind {
-        TPatternKind.Binding(local) => {
-            discard mut self.part_bindings.insert(local)
-        }
+        TPatternKind.Binding(local) => mut bound.push(local)
         TPatternKind.Fields(variant: _, fields: fields) => {
             for field in fields {
-                mut self.bind_parts(field.pattern)
+                bindings_of(field.pattern, mut bound)
             }
         }
         TPatternKind.Wildcard or TPatternKind.Value(space: _, compared: _) or TPatternKind.Failed => {}
     }
-} Body.bind_parts
+} bindings_of
+
+fn add_locals(mut into: mem::Set[LocalId], bound: Slice[LocalId]) {
+    for local in bound {
+        discard mut into.insert(local)
+    }
+} add_locals
 
 /// An initializer: checked against the declared type, or fixed without an expected type.
 fn Body.initializer(mut self, value: ast::Expr, declared: Option[ty::Ty]) -> TExpr {
@@ -1610,7 +1625,9 @@ fn Body.for_stmt(mut self, pattern: ast::Pattern, iterated: ast::Expr, body: ast
     mut self.push_scope()
     let typed_pattern = mut self.top_pattern(pattern, ty: found.element, kind: LocalKind.Element(mode))
     if mode != ast::Mode.Take and self.ck.next_projects(found.cursor) {
-        mut self.bind_parts(typed_pattern)
+        var bound = mem::List[LocalId].empty(self.ck.alloc())
+        bindings_of(typed_pattern, mut bound)
+        add_locals(mut self.part_bindings, bound: bound.view())
     }
     if not self.ck.types().has_error(found.element) and self.refutable(typed_pattern) == Some(true) {
         self.report(pattern.token, code: diagnostic::Code.PatternRefutable)

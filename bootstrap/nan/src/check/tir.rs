@@ -335,7 +335,7 @@ pub enum TKind {
     Index(Box<Call>),
     /// A construction of a struct, layout or variant (by its index), with its values in the
     /// order written; a single payload's value is unlabelled. It is `wrapped` when it is `Some`,
-    /// `Ok` or `Err` of a part that is not Copy.
+    /// `Ok` or `Err` of a part or read view that is not Copy.
     Construct {
         variant: Option<usize>,
         values: Vec<(String, TExpr)>,

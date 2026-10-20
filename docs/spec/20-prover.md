@@ -287,7 +287,7 @@ Proof is demanded exactly for:
 Where proof is demanded, an unknown obligation is an error (`proof.unknown`), and so is a refuted one (`proof.refuted`); elsewhere neither outcome is a diagnostic. A rule of another chapter that requires any other condition to be proved names its own code.
 
 - The because-chain of `proof.unknown` holds a `raised` reason for the obligation's source, then `note` reasons for the reason: the fuel ran out, or the open state, at depth 2 or with nothing left to split on, gave no candidate or one that is not confirmed. Further `note` reasons list the fresh symbols and applications that stand for calls in the open state.
-- The because-chain of `proof.refuted` holds one `note` reason per parameter, its subject the labelled NaN literal of the counterexample, such as `credit: Credit(spent: 0, sends: 0)`.
+- The because-chain of `proof.refuted` holds one `note` reason per parameter, its subject the labelled NaN literal of the counterexample, each literal written as the [normalised form](29-identity-versioning.md#normalised-form) writes it, such as `credit: Credit(spent: 0, sends: 0)`.
 
 ```nan
 pub fn last_index(count: u32) -> u32 limits notrap {

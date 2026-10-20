@@ -125,3 +125,20 @@ fn obligations_explain_their_status_or_outcome() {
         "{explained}"
     );
 }
+
+#[test]
+fn a_refuted_char_is_written_as_the_normalised_form_writes_it() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Tab stops.\n\npub fn spaces(c: char) -> u32\n    requires 100 / (c.to_bits() - 9) > 0\n{\n    return 4\n} spaces\n",
+        ),
+    ]);
+    let explained = run_in(&scratch.0, "explain app::spaces").output;
+    assert!(
+        explained
+            .contains("refuted\n        requires 100 / (c.to_bits() - 9) > 0\n    c: '\\x00'\n"),
+        "{explained}"
+    );
+}

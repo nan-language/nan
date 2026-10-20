@@ -216,6 +216,9 @@ pub struct Body<'c, 'a> {
     /// `Some`, `Ok` and `Err` wrap unmarked.
     pub part_bindings: HashSet<LocalId>,
     pub wrapped_bindings: HashSet<LocalId>,
+    /// The view bindings of what a read parameter holds, which `Some`, `Ok` and `Err` wrap
+    /// unmarked.
+    pub read_views: HashSet<LocalId>,
     /// The generic scope and the item being typed that the body replaced in the checker.
     enclosing: (Vec<GenericDef>, Option<ItemId>),
 }
@@ -263,6 +266,7 @@ impl<'c, 'a> Body<'c, 'a> {
             usage: Usage::default(),
             part_bindings: HashSet::new(),
             wrapped_bindings: HashSet::new(),
+            read_views: HashSet::new(),
             enclosing,
         }
     }
@@ -672,6 +676,8 @@ impl<'c, 'a> Body<'c, 'a> {
                     self.part_bindings.insert(local);
                 } else if self.is_wrapped_part(&typed) {
                     self.wrapped_bindings.insert(local);
+                } else if self.is_read_view(&typed) {
+                    self.read_views.insert(local);
                 }
                 self.usage.bindings.insert(
                     local,
@@ -902,32 +908,21 @@ impl<'c, 'a> Body<'c, 'a> {
 
     /// Records the bindings a pattern matching `value` makes as view bindings: of a part, each
     /// of them; of a wrapped part, a binding of the whole as a wrapped part and each other as a
-    /// part.
+    /// part; of what a read parameter holds, each of them as a read view.
     pub fn bind_views(&mut self, pattern: &TPattern, value: &TExpr) {
+        let mut bound = Vec::new();
+        bindings_of(pattern, &mut bound);
         if self.is_part(value) {
-            self.bind_parts(pattern);
+            self.part_bindings.extend(bound);
         } else if self.is_wrapped_part(value) {
             match &pattern.kind {
                 TPatternKind::Binding(local) => {
                     self.wrapped_bindings.insert(*local);
                 }
-                _ => self.bind_parts(pattern),
+                _ => self.part_bindings.extend(bound),
             }
-        }
-    }
-
-    /// Records each binding of a pattern as a view binding of a part.
-    fn bind_parts(&mut self, pattern: &TPattern) {
-        match &pattern.kind {
-            TPatternKind::Binding(local) => {
-                self.part_bindings.insert(*local);
-            }
-            TPatternKind::Fields(_, fields) => {
-                for (_, field) in fields {
-                    self.bind_parts(field);
-                }
-            }
-            TPatternKind::Wildcard | TPatternKind::Value(..) | TPatternKind::Failed => {}
+        } else if self.is_read_view(value) {
+            self.read_views.extend(bound);
         }
     }
 
@@ -1441,7 +1436,9 @@ impl Body<'_, '_> {
         self.push_scope();
         let typed_pattern = self.top_pattern(pattern, &element, LocalKind::Element(mode));
         if mode != Mode::Take && self.ck.next_projects(&cursor) {
-            self.bind_parts(&typed_pattern);
+            let mut bound = Vec::new();
+            bindings_of(&typed_pattern, &mut bound);
+            self.part_bindings.extend(bound);
         }
         if !element.has_error() && self.refutable(&typed_pattern) == Some(true) {
             self.report(pattern.token, Code::PatternRefutable);
@@ -1713,6 +1710,19 @@ fn substituted(head: &FnSig, subst: &super::ty::Subst) -> FnSig {
 }
 
 /// The local at the root of a place.
+/// Adds each binding a pattern makes to `found`.
+fn bindings_of(pattern: &TPattern, found: &mut Vec<LocalId>) {
+    match &pattern.kind {
+        TPatternKind::Binding(local) => found.push(*local),
+        TPatternKind::Fields(_, fields) => {
+            for (_, field) in fields {
+                bindings_of(field, found);
+            }
+        }
+        TPatternKind::Wildcard | TPatternKind::Value(..) | TPatternKind::Failed => {}
+    }
+}
+
 fn root_local(place: &TExpr) -> Option<LocalId> {
     match &place.kind {
         TKind::Local(local) => Some(*local),

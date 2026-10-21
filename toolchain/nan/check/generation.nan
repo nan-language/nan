@@ -180,6 +180,7 @@ fn GenerationReader.unfolded(mut self, callee: ast::Expr, args: Slice[ast::Arg],
     let ck = self.ck.share()
     let db = ck.db()
     let alloc = ck.alloc()
+    expect scope < self.scopes.len()
     let module = db.module_of(self.scopes[scope].item)
     var function = ty::ItemId(index: 0)
     var receiver: Option[ast::Expr] = None
@@ -217,7 +218,9 @@ fn GenerationReader.unfolded(mut self, callee: ast::Expr, args: Slice[ast::Arg],
     }
     var params = mem::Map[text::String, ScopeArgument].empty(alloc)
     var next_value: usize = 0
-    for param in item.head.params {
+    for position in 0..<item.head.params.len() {
+        invariant next_value <= position
+        let param = item.head.params[position]
         let argument = match param.kind {
             ast::ParamKind.SelfValue => ast::Expr.optional_copy(receiver, alloc)
             ast::ParamKind.Named(name: _, ty: _) => GenerationReader.argument_at(args, index: next_value, alloc)
@@ -257,6 +260,7 @@ fn GenerationReader.place(self, expr: ast::Expr, scope: usize) -> Option[Generat
 /// The generated value a name read in a scope stands for: a parameter's argument's, or in the
 /// first scope a generated value's.
 fn GenerationReader.named_place(self, name: Str, scope: usize) -> Option[GeneratedValue] {
+    expect scope < self.scopes.len()
     match self.scopes[scope].params.get_by(fn(key: text::String) => key.as_str().cmp(name)) {
         Some(argument) => return self.place(argument.argument, scope: argument.scope)
         None => {}
@@ -296,6 +300,7 @@ fn GenerationReader.names_value(self, expr: ast::Expr, scope: usize) -> bool {
         }
     })
     for name in names {
+        expect scope < self.scopes.len()
         match self.scopes[scope].params.get_by(fn(key: text::String) => key.as_str().cmp(name.as_str())) {
             Some(argument) => {
                 if self.names_value(argument.argument, scope: argument.scope) {
@@ -314,10 +319,14 @@ fn GenerationReader.names_value(self, expr: ast::Expr, scope: usize) -> bool {
 
 /// A term read in a scope.
 fn GenerationReader.term(self, expr: ast::Expr, scope: usize) -> GenerationTerm {
+    expect scope < self.scopes.len()
     let item = self.scopes[scope].item
     match first expr.kind {
         ast::ExprKind.Paren(inner) => return self.term(inner.contents(), scope)
-        ast::ExprKind.Literal(literal) if literal.kind == ast::LiteralKind.Int => return GenerationTerm.Constant(int_literal(self.ck.db().text(item, token: literal.tokens[0])))
+        ast::ExprKind.Literal(literal) if literal.kind == ast::LiteralKind.Int => {
+            expect literal.tokens.len() > 0
+            return GenerationTerm.Constant(int_literal(self.ck.db().text(item, token: literal.tokens[0])))
+        }
         ast::ExprKind.Unary(op: ast::UnaryOp.Neg, operand: operand) => {
             return match self.term(operand.contents(), scope) {
                 GenerationTerm.Constant(value) => GenerationTerm.Constant(negated_value(value))
@@ -448,13 +457,15 @@ fn GenerationReader.constant(self, expr: ast::Expr, scope: usize) -> Option[Gene
         return None
     }
     if path.segments.len() == 1 and scope == 0 {
-        match self.consts.get_by(fn(key: text::String) => key.as_str().cmp(path.segments[0].text.as_str())) {
+        let name = path.segments[0].text.as_str()
+        match self.consts.get_by(fn(key: text::String) => key.as_str().cmp(name)) {
             Some(value) => return Some(GenerationTerm.Constant(value))
             None => {}
         }
     }
     let ck = self.ck
     let db = ck.db()
+    expect scope < self.scopes.len()
     let module = db.module_of(self.scopes[scope].item)
     let Ok(Named.Item(constant)) = db.resolve(module, path) else {
         return None
@@ -577,9 +588,10 @@ fn Constraints.of(conjuncts: Slice[Constructive], alloc: mem::Alloc) -> Constrai
         }
         mut built.bound(conjunct.op, left, right: right_node, offset)
     }
-    for index in 0..<built.drawn.len() {
-        let high = built.drawn[index].high
-        let low = built.drawn[index].low
+    let drawn = built.drawn.view()
+    for index in 0..<drawn.len() {
+        let high = drawn[index].high
+        let low = drawn[index].low
         mut built.edges.push(BoundEdge(from: 0, to: index + 1, weight: high))
         mut built.edges.push(BoundEdge(from: index + 1, to: 0, weight: low.wrapping_neg()))
     }
@@ -617,10 +629,10 @@ fn Constraints.bound(mut self, op: ast::BinaryOp, left: usize, right: usize, off
 fn Constraints.distances(self, inward: bool, alloc: mem::Alloc) -> Option[mem::List[wide::Wide]] {
     let unreached = wide::Wide.max().shift_right(2)
     var distance = mem::List[wide::Wide].empty(alloc)
-    for _ in 0..<(self.drawn.len() + 1) {
+    mut distance.push(wide::Wide.zero())
+    for _ in 0..<self.drawn.len() {
         mut distance.push(unreached)
     }
-    distance[0] = wide::Wide.zero()
     for _ in 0..=self.drawn.len() {
         var settled = true
         for edge in self.edges {
@@ -630,6 +642,7 @@ fn Constraints.distances(self, inward: bool, alloc: mem::Alloc) -> Option[mem::L
                 from = edge.to
                 to = edge.from
             }
+            expect from < distance.len() and to < distance.len()
             let through = distance[from].wrapping_add(edge.weight)
             if through.lt(distance[to]) {
                 distance[to] = through
@@ -654,6 +667,7 @@ fn Constraints.satisfiable(self, alloc: mem::Alloc) -> bool {
     let Some(lows) = lower else {
         return false
     }
+    expect lows.len() > self.drawn.len() and highs.len() > self.drawn.len()
     for node in 1..=self.drawn.len() {
         let low = lows[node].wrapping_neg()
         let high = highs[node]
@@ -727,7 +741,9 @@ fn Checker.check_generated(self, item: ty::ItemId) {
         return
     }
     let file = self.db().item_file(item)
-    let line = file.syntax.item_lines(file.syntax.items[self.db().item(item).index]).low
+    let data = self.db().item(item)
+    expect data.index < file.syntax.items.len()
+    let line = file.syntax.item_lines(file.syntax.items[data.index]).low
     self.report_line(item, line, code: diagnostic::Code.TestGeneratorGap)
 } Checker.check_generated
 

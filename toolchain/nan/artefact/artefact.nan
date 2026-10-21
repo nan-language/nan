@@ -281,24 +281,27 @@ pkg struct Chunk derives Copy, Eq {
 /// A copy of the bytes a chunk of `bytes` holds.
 pkg fn Chunk.copy(self, bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     var out = mem::Bytes.empty(alloc)
-    let Some(parts) = bytes.split_at(self.start) else {
+    let Some(upto) = bytes.prefix(self.next) else {
         return out
     }
-    let Some(held) = parts.tail.prefix(self.next - self.start) else {
+    let Some(parts) = upto.split_at(self.start) else {
         return out
     }
-    mut out.append(held)
+    mut out.append(parts.tail)
     return out
 } Chunk.copy
 
 /// The uvar at a position of `bytes`, without redundant trailing groups.
 pkg fn read_uvar(bytes: Slice[u8], at: usize) -> Option[Uvar] {
+    let Some(parts) = bytes.split_at(at) else {
+        return None
+    }
     var value = wide::Wide.zero()
     for index in 0..<19usize {
-        if at + index >= bytes.len() {
+        if index >= parts.tail.len() {
             return None
         }
-        let byte = bytes[at + index]
+        let byte = parts.tail[index]
         let group = wide::Wide.of_u64(u64.widen(byte & 0x7F))
         value = value.bit_or(group.shift_left(u32.fit(7 * index)))
         if (byte & 0x80) == 0 {
@@ -312,17 +315,25 @@ pkg fn read_uvar(bytes: Slice[u8], at: usize) -> Option[Uvar] {
 } read_uvar
 
 /// The bytes at a position of `bytes`: a uvar length and the bytes.
-pkg fn read_bytes(bytes: Slice[u8], at: usize) -> Option[Chunk] {
+pkg fn read_bytes(bytes: Slice[u8], at: usize) -> Option[Chunk]
+    ensures match result {
+        Some(chunk) => chunk.start <= chunk.next and chunk.next <= bytes.len()
+        None => true
+    }
+{
     let Some(length) = read_uvar(bytes, at) else {
         return None
     }
     let Some(count) = length.value.to_u64() else {
         return None
     }
-    if u64.widen(bytes.len() - length.next) < count {
+    let Some(next) = length.next.checked_add(usize.widen(count)) else {
         return None
     }
-    return Some(Chunk(start: length.next, next: length.next + usize.widen(count)))
+    if next > bytes.len() {
+        return None
+    }
+    return Some(Chunk(start: length.next, next: next))
 } read_bytes
 
 /// The parts of a small package's code root.
@@ -392,11 +403,13 @@ test a_reserved_section_or_another_format_is_its_own_error for decode {
     let alloc = testing::world().alloc
     let root = code_root(sample_parts(alloc), alloc)
     var reserved = artefact(root.view(), attested: b"", alloc)
+    expect reserved.len() > 0
     reserved[reserved.len() - 1] = 1
     mut reserved.append(b"\x01\x00")
     let reserved_code = failure(decode(reserved.view(), alloc))
     expect reserved_code == Some(diagnostic::Code.ArtefactReservedSection)
     var future = artefact(root.view(), attested: b"", alloc)
+    expect future.len() > 4
     future[4] = 2
     let future_code = failure(decode(future.view(), alloc))
     expect future_code == Some(diagnostic::Code.ArtefactVersionUnsupported)

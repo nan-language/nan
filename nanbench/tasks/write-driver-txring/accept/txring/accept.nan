@@ -1,0 +1,107 @@
+//! Acceptance tests of the transmit ring.
+
+/// A ring of empty descriptors drawn through `alloc`.
+fn empty_ring(alloc: mem::Alloc) -> hw::DmaShared[TxRing] {
+    let heap = mem::Heap.of(alloc)
+    return hw::DmaShared.of(heap.boxed(TxRing.from_bits(Array[u8, 128].filled(0))))
+} empty_ring
+
+/// Marks the descriptor in `slot` sent, as the controller does.
+fn mark_sent(mut tx: Transmitter, slot: usize) {
+    let posted = mut tx.ring.read_acquire_at(TxRing.descriptors, index: slot)
+    mut tx.ring.write_release_at(TxRing.descriptors, index: slot, value: TxDescriptor(address: posted.address, length: posted.length, status: SENT))
+} mark_sent
+
+test sends_fill_the_slots_in_order for Transmitter.send {
+    let alloc = testing::world().alloc
+    let block = hw::sim::Registers[TxRegs].of(alloc)
+    var tx = Transmitter.of(empty_ring(alloc), regs: block.mmio())
+    let sent_small = mut tx.send(hw::BusAddr(value: 0x1000), length: 64)
+    let sent_large = mut tx.send(hw::BusAddr(value: 0x2000), length: 1_500)
+    let ring = take tx.close()
+    expect sent_small and sent_large
+    expect ring.contents().descriptors[0] == TxDescriptor(address: 0x1000, length: 64, status: READY)
+    expect ring.contents().descriptors[1] == TxDescriptor(address: 0x2000, length: 1_500, status: READY)
+    expect ring.contents().descriptors[2] == TxDescriptor(address: 0, length: 0, status: EMPTY)
+    expect block.last_written(TxRegs.tail) == Some(2)
+} sends_fill_the_slots_in_order
+
+test a_full_ring_refuses_more for Transmitter.send {
+    let alloc = testing::world().alloc
+    let block = hw::sim::Registers[TxRegs].of(alloc)
+    var tx = Transmitter.of(empty_ring(alloc), regs: block.mmio())
+    var accepted: u32 = 0
+    for index in 0..<8u64 {
+        if mut tx.send(hw::BusAddr(value: 0x1000 + index), length: 60) {
+            accepted += 1
+        }
+    }
+    let overflowing = mut tx.send(hw::BusAddr(value: 0x9000), length: 60)
+    let ring = take tx.close()
+    expect accepted == 8
+    expect not overflowing
+    expect ring.contents().descriptors[0] == TxDescriptor(address: 0x1000, length: 60, status: READY)
+    expect block.last_written(TxRegs.tail) == Some(0)
+} a_full_ring_refuses_more
+
+test reaping_stops_at_the_first_unsent for Transmitter.reap {
+    let alloc = testing::world().alloc
+    let block = hw::sim::Registers[TxRegs].of(alloc)
+    var tx = Transmitter.of(empty_ring(alloc), regs: block.mmio())
+    for index in 0..<3u64 {
+        discard mut tx.send(hw::BusAddr(value: 0x4000 + index), length: 128)
+    }
+    mark_sent(mut tx, slot: 0)
+    mark_sent(mut tx, slot: 2)
+    let reaped_early = mut tx.reap()
+    mark_sent(mut tx, slot: 1)
+    let reaped_late = mut tx.reap()
+    let reaped_none = mut tx.reap()
+    let ring = take tx.close()
+    expect reaped_early == 1
+    expect reaped_late == 2
+    expect reaped_none == 0
+    expect ring.contents().descriptors[1] == TxDescriptor(address: 0, length: 0, status: EMPTY)
+} reaping_stops_at_the_first_unsent
+
+test slots_wrap_around_the_ring for Transmitter.send {
+    let alloc = testing::world().alloc
+    let block = hw::sim::Registers[TxRegs].of(alloc)
+    var tx = Transmitter.of(empty_ring(alloc), regs: block.mmio())
+    for index in 0..<8u64 {
+        discard mut tx.send(hw::BusAddr(value: 0x5000 + index), length: 100)
+    }
+    for slot in 0..<8usize {
+        mark_sent(mut tx, slot)
+    }
+    let reaped_all = mut tx.reap()
+    let wrapped = mut tx.send(hw::BusAddr(value: 0x6000), length: 200)
+    let ring = take tx.close()
+    expect reaped_all == 8
+    expect wrapped
+    expect ring.contents().descriptors[0] == TxDescriptor(address: 0x6000, length: 200, status: READY)
+    expect block.last_written(TxRegs.tail) == Some(1)
+} slots_wrap_around_the_ring
+
+test counts_wrap_past_the_largest_u32 for Transmitter.reap {
+    let alloc = testing::world().alloc
+    let block = hw::sim::Registers[TxRegs].of(alloc)
+    var tx = Transmitter(ring: empty_ring(alloc), regs: block.mmio(), posted: 4_294_967_295, reaped: 4_294_967_295)
+    let sent_last = mut tx.send(hw::BusAddr(value: 0x7000), length: 42)
+    let sent_next = mut tx.send(hw::BusAddr(value: 0x7001), length: 42)
+    mark_sent(mut tx, slot: 7)
+    mark_sent(mut tx, slot: 0)
+    let reaped_both = mut tx.reap()
+    var accepted: u32 = 0
+    for index in 0..<8u64 {
+        if mut tx.send(hw::BusAddr(value: 0x8000 + index), length: 42) {
+            accepted += 1
+        }
+    }
+    let ring = take tx.close()
+    expect sent_last and sent_next
+    expect reaped_both == 2
+    expect accepted == 8
+    expect ring.contents().descriptors[0] == TxDescriptor(address: 0x8007, length: 42, status: READY)
+    expect block.last_written(TxRegs.tail) == Some(1)
+} counts_wrap_past_the_largest_u32

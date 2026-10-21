@@ -20,13 +20,28 @@ The query is the weakest precondition of the obligation over the function's cont
 - `init P, o` and `assign P, o` give P the term of o, and a place containing P its former content with P's field replaced. A guard slot's content is the literal boolean last stored there on the path.
 - A call returning `ref T` or `ref mut T` designates a place whose content is the call's term. `ref P` and `ref mut P` designate P.
 - A call changes contents as the [frame rule](#frame-rule) states.
-- At a join, a block parameter, and the content of each place whose terms differ along the incoming edges, is ite(c1, a1, ite(c2, a2, ... an)): e1 to en are the incoming edges in the order of their source blocks, ai is the term along ei and ci the reach condition of ei.
+- At a join, a block parameter, and the content of each place whose terms differ along the incoming edges, is ite(c1, a1, ite(c2, a2, ... an)): e1 to en are the incoming edges in the order of their source blocks, ai is the term along ei and ci the condition of ei relative to the join's immediate dominator.
 - A loop's blocks are its header, the target of its back edges, and each block from which the source of one of them is reachable without passing through the header. At the header, each place whose content an instruction or call of the loop's blocks changes under these rules has a fresh symbol as content. An invariant's fact holds only on paths from its site; no premise of a query holds it at the header.
-- `all lo ..< hi R` and `any lo ..< hi R` are the [bounded quantifiers](#decidable-fragment) over the term that region R yields, its integer parameter being a bound symbol x. Within R, x has the facts lo ≤ x and x < hi, or x ≤ hi for `..=`. The other parameters of a region are fresh symbols, and its first block has the reach condition of its instruction's block.
+- `all lo ..< hi R` and `any lo ..< hi R` are the [bounded quantifiers](#decidable-fragment) over the term that region R yields, its integer parameter being a bound symbol x. Within R, x has the facts lo ≤ x and x < hi, or x ≤ hi for `..=`. The other parameters of a region are fresh symbols, and its first block, which its instruction's block dominates, has that block's reach condition and the local condition `true`.
 - The blocks of a `when` region are ordinary blocks of the walk, and a `jump` out of a region is an edge to its target.
 - A call of a function of role `requires`, `ensures`, `old`, `decreases`, `invariant`, `assume`, `predicate` or `where` has the term that its returned operand has under these rules, its parameters standing for the argument terms.
 
-The **reach condition** of the entry block is `true`, and that of any other block the disjunction of the reach conditions of its incoming edges. The reach condition of an edge is the conjunction of its source's reach condition and the edge's condition: `true` for `jump`; o and `not o` for the edges of `branch o`; a fresh boolean symbol and its negation for the `ok` and `fail` edges of a call that may fail. A conjunction omits its `true` operands and a disjunction its `false` operands.
+The **reach condition** of the entry block is `true`, and that of any other block B the conjunction of the reach condition of its **immediate dominator** D, the last block other than B that every path from the entry to B passes through, and B's **local condition**: the disjunction of the conditions of B's incoming edges relative to D, or `true` when one of these conditions is the negation of another. The entry block's local condition is `true`. The condition of an edge relative to a block D dominating its source S is the conjunction of the local conditions of S, of S's immediate dominator, of that block's immediate dominator and so on up to D, which is excluded, and of the edge's own condition: `true` for `jump`; o and `not o` for the edges of `branch o`; a fresh boolean symbol and its negation for the `ok` and `fail` edges of a call that may fail. A conjunction omits its `true` operands and a disjunction its `false` operands.
+
+In the next example the conditions of the `while` prove its index and increment despite the joins before them.
+
+```nan
+pub fn digits_end(text: Slice[u8]) -> usize limits notrap {
+    var at: usize = 0
+    if text.len() > 0 and text[0] == b'-' {
+        at = 1
+    }
+    while at < text.len() and text[at] >= b'0' and text[at] <= b'9' {
+        at += 1
+    }
+    return at
+} digits_end
+```
 
 The goal is the obligation's condition: for a `check`, the term of its operand; for any other site, the condition under which its operation does not trap by the rule defining the site: [Numbers](09-numbers.md) for arithmetic, shift, division and conversion sites, [indexing](07-ownership.md#indexing) for `bounds` sites, [layout values](23-low-level.md#layout-values) for the `conversion` sites of layout fields, and the owning section of each other built-in operation, each value the condition names having its term. For a `bounds` site, the goal is i < len(x), with x the indexed value's term, i the index's term and len the `len` application of the indexed value's type. For a layout field store, it is that the value is below 2^w, w the field's bit count, or for a `rest` field that its bitwise and with the covered bits is 0. A trapping condition that the decidable fragment does not interpret is a boolean application of the operation to its operand terms.
 

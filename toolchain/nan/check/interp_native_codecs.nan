@@ -162,6 +162,7 @@ fn Interpreter.codec_member(
         }
         else => return None
     }
+    expect args.len() > 1
     let ty = type_arg_or_unit(type_args, index: 0)
     if member == "encode" or member == "try_encode" {
         let tree = self.encoded(args[0], ty)
@@ -180,7 +181,9 @@ fn Interpreter.codec_member(
     if member != "decode" {
         return None
     }
-    let raw = self.deref(args[0]).fields()[0].copy(alloc)
+    let wrapped = self.deref(args[0])
+    expect wrapped.fields().len() > 0
+    let raw = wrapped.fields()[0].copy(alloc)
     let input = mut self.bytes(raw)
     let cell = self.cell_of(args[1])
     let decoded = attempt mut self.decode_value(json, take input, cell, ty, at, site)
@@ -263,6 +266,7 @@ fn Interpreter.encoded_item(self, value: Val, item: ty::ItemId, args: ty::Args) 
             return Tree.Text(value_bytes(self.memory.get(storage).fields(), alloc))
         }
         "text::Fixed" => {
+            expect value.fields().len() > 1
             let len = usize.widen(value.fields()[1].int_value().low_bits())
             let Some(held) = value.fields()[0].fields().prefix(len) else {
                 expect false
@@ -278,19 +282,29 @@ fn Interpreter.encoded_item(self, value: Val, item: ty::ItemId, args: ty::Args) 
             let storage = self.storage(value)
             return Tree.Sequence(self.encoded_all(self.memory.get(storage).fields(), ty: element))
         }
-        "mem::Bounded" => return Tree.Sequence(self.encoded_all(value.fields()[0].fields(), ty: element))
+        "mem::Bounded" => {
+            expect value.fields().len() > 0
+            return Tree.Sequence(self.encoded_all(value.fields()[0].fields(), ty: element))
+        }
         "mem::Map" => {
             let value_ty = type_arg_or_unit(listed, index: 1)
             let storage = self.storage(value)
             var pairs = mem::List[TreeEntry].empty(alloc)
             for entry in self.memory.get(storage).fields() {
                 let parts = entry.fields()
+                expect parts.len() > 1
                 mut pairs.push(TreeEntry(key: self.encoded(parts[0], ty: element), value: self.encoded(parts[1], ty: value_ty)))
             }
             return Tree.Map(take pairs)
         }
-        "mem::Box" or "mem::Shared" => return self.encoded(value.fields()[0], ty: element)
-        "mem::Id" => return Tree.Unsigned(value.fields()[0].int_value().low_bits())
+        "mem::Box" or "mem::Shared" => {
+            expect value.fields().len() > 0
+            return self.encoded(value.fields()[0], ty: element)
+        }
+        "mem::Id" => {
+            expect value.fields().len() > 0
+            return Tree.Unsigned(value.fields()[0].int_value().low_bits())
+        }
         else => return self.encoded_declared(value, item, args: listed)
     }
 } Interpreter.encoded_item
@@ -334,11 +348,13 @@ fn Interpreter.encoded_declared(self, value: Val, item: ty::ItemId, args: Slice[
                 expect false
                 return Tree.Bool(false)
             }
+            expect usize.widen(chosen) < variants.len()
             let variant = variants[usize.widen(chosen)]
             let key = name_bytes(variant.name.as_str(), alloc)
             match variant.payload {
                 Payload.None => return Tree.Variant(key: take key, payload: None)
                 Payload.Single(single) => {
+                    expect payload.contents().len() > 0
                     let encoded_payload = self.encoded(payload.contents()[0], ty: subst.ty(types, ty: single))
                     return Tree.Variant(key: take key, payload: Some(mem::Heap.of(alloc).boxed(take encoded_payload)))
                 }
@@ -581,7 +597,7 @@ fn write_decimal(value: u64, mut out: mem::Bytes) {
     if value >= 10 {
         write_decimal(value / 10, mut out)
     }
-    mut out.push(b'0' + u8.truncate(value % 10))
+    mut out.push(b'0' + u8.fit(value % 10))
 } write_decimal
 
 /// Appends a char's UTF-8 encoding.
@@ -639,24 +655,30 @@ fn write_json_string(bytes: Slice[u8], mut out: mem::Bytes, alloc: mem::Alloc) {
 
 /// The lowercase hexadecimal digit of a value below 16.
 fn lower_hex_digit(nibble: u32) -> u8 {
+    expect nibble < 16
     if nibble < 10 {
-        return b'0' + u8.truncate(nibble)
+        return b'0' + u8.fit(nibble)
     }
-    return b'a' + u8.truncate(nibble - 10)
+    return b'a' + u8.fit(nibble - 10)
 } lower_hex_digit
 
 /// Bytes in base64 with padding.
 fn base64_text(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    expect BASE64_ALPHABET.len() == 64
     var encoded = mem::Bytes.empty(alloc)
-    var start: usize = 0
-    while start < bytes.len() {
-        var count = bytes.len() - start
-        if count > 3 {
-            count = 3
-        }
+    var cursor = bytes.cursor()
+    loop {
         var group: u32 = 0
-        for index in 0..<count {
-            group = group | (u32.widen(bytes[start + index]) << u32.truncate(16 - 8 * index))
+        var count: usize = 0
+        while count < 3 {
+            let Some(byte) = mut cursor.next() else {
+                break
+            }
+            group = group | (u32.widen(byte) << u32.truncate(16 - 8 * count))
+            count += 1
+        }
+        if count == 0 {
+            break
         }
         for index in 0..<4usize {
             if index <= count {
@@ -665,7 +687,6 @@ fn base64_text(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
                 mut encoded.push(b'=')
             }
         }
-        start += 3
     }
     let Ok(written) = attempt text::String.try_from_utf8(encoded.view(), alloc) else {
         expect false
@@ -682,8 +703,14 @@ fn base64_bytes(encoded: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
     var bytes = mem::Bytes.empty(alloc)
     var start: usize = 0
     while start < encoded.len() {
+        let Some(parts) = encoded.split_at(start) else {
+            return None
+        }
+        let Some(digits) = parts.tail.prefix(4) else {
+            return None
+        }
         var padding: usize = 0
-        while padding < 4 and encoded[start + 3 - padding] == b'=' {
+        while padding < 4 and digits[3 - padding] == b'=' {
             padding += 1
         }
         if padding > 2 {
@@ -691,7 +718,7 @@ fn base64_bytes(encoded: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
         }
         var group: u32 = 0
         for index in 0..<(4 - padding) {
-            let Some(digit) = base64_digit(encoded[start + index]) else {
+            let Some(digit) = base64_digit(digits[index]) else {
                 return None
             }
             group = group | (digit << u32.truncate(18 - 6 * index))
@@ -738,10 +765,10 @@ proj fn DecodeKind.name(self) -> Str {
 
 /// Enters a sequence, map, record or variant.
 fn Decoding.nest(mut self) fails Failure {
-    self.depth += 1
-    if self.depth > DECODE_DEPTH_LIMIT {
+    if self.depth >= DECODE_DEPTH_LIMIT {
         fail Failure.Decode(DecodeKind.TooDeep)
     }
+    self.depth += 1
 } Decoding.nest
 
 /// The value of a type a reader holds, failing on anything after it.
@@ -756,6 +783,7 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
     match ck.types().kind(ty) {
         ty::TyKind.Scalar(scalar) => return try mut self.scalar(mut reader, scalar)
         ty::TyKind.Unit => {
+            let outer = self.depth
             try mut self.nest()
             try mut reader.begin_record()
             if try mut reader.next_follows() {
@@ -763,7 +791,7 @@ fn Decoding.value[R: Reader](mut self, mut interp: Interpreter, mut reader: R, t
                 fail Failure.Decode(DecodeKind.UnknownKey)
             }
             try mut reader.end()
-            self.depth -= 1
+            self.depth = outer
             return Val.Unit
         }
         ty::TyKind.Item(item: item, args: args) => return try mut self.item(mut interp, mut reader, item, args: ck.types().arg_list(args))
@@ -926,6 +954,7 @@ fn Decoding.map_entries[R: Reader](mut self, mut interp: Interpreter, mut reader
     let alloc = interp.alloc
     let key_ty = type_arg_or_unit(args, index: 0)
     let value_ty = type_arg_or_unit(args, index: 1)
+    let outer = self.depth
     try mut self.nest()
     try mut reader.begin_map()
     var keys = mem::List[Val].empty(alloc)
@@ -941,7 +970,7 @@ fn Decoding.map_entries[R: Reader](mut self, mut interp: Interpreter, mut reader
         mut pairs.push(Val.Struct(item: key_value, fields: mem::Shared.of(take parts, alloc)))
     }
     try mut reader.end()
-    self.depth -= 1
+    self.depth = outer
     try mut self.ascending(mut interp, keys: keys.view(), ty: key_ty)
     let entry = interp.entry_ty(key_ty, value: value_ty)
     return try mut self.held(mut interp, path: "mem::Map", values: take pairs, element: entry)
@@ -1009,6 +1038,7 @@ fn Decoding.declared_variant[R: Reader](
     ) -> Val fails Failure {
     let alloc = interp.alloc
     let ck = interp.ck.share()
+    let outer = self.depth
     try mut self.nest()
     let read = try mut reader.read_variant()
     let key = aliased_key(take read, aliases, alloc)
@@ -1048,7 +1078,7 @@ fn Decoding.declared_variant[R: Reader](
         }
     }
     try mut reader.end()
-    self.depth -= 1
+    self.depth = outer
     return Val.Variant(item: item, index: u32.truncate(chosen), fields: mem::Shared.of(take payload, alloc))
 } Decoding.declared_variant
 
@@ -1077,6 +1107,7 @@ fn Decoding.record[R: Reader](
     aliases: mem::HashMap[mem::Bytes, mem::Bytes],
     ) -> mem::List[Val] fails Failure {
     let alloc = interp.alloc
+    let outer = self.depth
     try mut self.nest()
     try mut reader.begin_record()
     var values = mem::List[Option[Val]].empty(alloc)
@@ -1084,6 +1115,7 @@ fn Decoding.record[R: Reader](
         mut values.push(None)
     }
     while try mut reader.next_follows() {
+        invariant values.len() == named.len()
         let read = try mut reader.read_key()
         let key = aliased_key(take read, aliases, alloc)
         var found: Option[usize] = None
@@ -1109,10 +1141,11 @@ fn Decoding.record[R: Reader](
         }
     }
     try mut reader.end()
-    self.depth -= 1
+    self.depth = outer
     var decoded = mem::List[Val].empty(alloc)
     var position: usize = 0
     for value in take values {
+        invariant position < named.len()
         match value {
             Some(present) => mut decoded.push(take present)
             None => {
@@ -1139,6 +1172,7 @@ fn Decoding.default(mut self, mut interp: Interpreter, ty: ty::Ty) -> Val fails 
 
 /// The variant one of `keys` names, with its payload when its key has a type.
 fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R, keys: Slice[VariantKey]) -> DecodedVariant fails Failure {
+    let outer = self.depth
     try mut self.nest()
     let key = try mut reader.read_variant()
     var found: Option[usize] = None
@@ -1167,11 +1201,12 @@ fn Decoding.variant[R: Reader](mut self, mut interp: Interpreter, mut reader: R,
         }
     }
     try mut reader.end()
-    self.depth -= 1
+    self.depth = outer
     return DecodedVariant(index: chosen, payload: take payload)
 } Decoding.variant
 
 fn Decoding.sequence[R: Reader](mut self, mut interp: Interpreter, mut reader: R, element: ty::Ty) -> mem::List[Val] fails Failure {
+    let outer = self.depth
     try mut self.nest()
     try mut reader.begin_sequence()
     var elements = mem::List[Val].empty(interp.alloc)
@@ -1179,15 +1214,14 @@ fn Decoding.sequence[R: Reader](mut self, mut interp: Interpreter, mut reader: R
         mut elements.push(try mut self.value(mut interp, mut reader, ty: element))
     }
     try mut reader.end()
-    self.depth -= 1
+    self.depth = outer
     return elements
 } Decoding.sequence
 
 /// Fails unless the keys of a set or map ascend strictly by `cmp`.
 fn Decoding.ascending(mut self, mut interp: Interpreter, keys: Slice[Val], ty: ty::Ty) fails Failure {
     let alloc = interp.alloc
-    var index: usize = 1
-    while index < keys.len() {
+    for index in 1..<keys.len() {
         var pair = Val.single(keys[index - 1].copy(alloc), alloc)
         mut pair.push(keys[index].copy(alloc))
         let compared = try mut interp.core_conformance(interface_name: "Ord", method: "cmp", ty, args: take pair, at: self.at, site: self.site)
@@ -1196,7 +1230,6 @@ fn Decoding.ascending(mut self, mut interp: Interpreter, keys: Slice[Val], ty: t
             core::Ordering.Greater => fail Failure.Decode(DecodeKind.Malformed)
             core::Ordering.Less => {}
         }
-        index += 1
     }
 } Decoding.ascending
 
@@ -1208,7 +1241,9 @@ fn Decoding.held(mut self, mut interp: Interpreter, path: Str, take values: mem:
     return container
 } Decoding.held
 
-fn CodecInput.byte(mut self) -> u8 fails Failure {
+fn CodecInput.byte(mut self) -> u8 fails Failure
+    ensures self.at <= self.bytes.len()
+{
     if self.at >= self.bytes.len() {
         fail Failure.Decode(DecodeKind.Truncated)
     }
@@ -1217,19 +1252,21 @@ fn CodecInput.byte(mut self) -> u8 fails Failure {
     return byte
 } CodecInput.byte
 
-fn CodecInput.next_bytes(mut self, count: usize) -> mem::Bytes fails Failure {
-    if count > self.bytes.len() - self.at {
+fn CodecInput.next_bytes(mut self, count: usize) -> mem::Bytes fails Failure
+    ensures result.len() == count
+{
+    let Some(end) = self.at.checked_add(count) else {
         fail Failure.Decode(DecodeKind.Truncated)
     }
-    var taken = mem::Bytes.empty(self.alloc)
     let Some(parts) = self.bytes.view().split_at(self.at) else {
         fail Failure.Decode(DecodeKind.Truncated)
     }
     let Some(chosen) = parts.tail.prefix(count) else {
         fail Failure.Decode(DecodeKind.Truncated)
     }
+    var taken = mem::Bytes.empty(self.alloc)
     mut taken.append(chosen)
-    self.at += count
+    self.at = end
     return taken
 } CodecInput.next_bytes
 
@@ -1237,7 +1274,9 @@ fn WireReader.new(take bytes: mem::Bytes, alloc: mem::Alloc) -> WireReader {
     return WireReader(input: CodecInput(bytes: take bytes, at: 0, alloc: alloc), frames: mem::List[WireFrame].empty(alloc))
 } WireReader.new
 
-fn WireReader.uvar(mut self) -> u64 fails Failure {
+fn WireReader.uvar(mut self) -> u64 fails Failure
+    ensures self.input.at <= self.input.bytes.len()
+{
     var value: u64 = 0
     for index in 0..<10u32 {
         let byte = try mut self.input.byte()
@@ -1264,11 +1303,13 @@ fn WireReader.framed(mut self) -> mem::Bytes fails Failure {
 /// The end of a byte length read at the current position.
 fn WireReader.length_end(mut self) -> usize fails Failure {
     let written = try mut self.uvar()
-    let len = usize.widen(written)
-    if len > self.input.bytes.len() - self.input.at {
+    let Some(end) = self.input.at.checked_add(usize.widen(written)) else {
         fail Failure.Decode(DecodeKind.Truncated)
     }
-    return self.input.at + len
+    if end > self.input.bytes.len() {
+        fail Failure.Decode(DecodeKind.Truncated)
+    }
+    return end
 } WireReader.length_end
 
 /// Fails unless the field value read last filled exactly its length.
@@ -1488,7 +1529,9 @@ fn JsonReader.space(mut self) {
     }
 } JsonReader.space
 
-fn JsonReader.peek(mut self) -> u8 fails Failure {
+fn JsonReader.peek(mut self) -> u8 fails Failure
+    ensures self.input.at < self.input.bytes.len()
+{
     mut self.space()
     if self.input.at >= self.input.bytes.len() {
         fail Failure.Decode(DecodeKind.Truncated)
@@ -1507,15 +1550,19 @@ fn JsonReader.expect_byte(mut self, byte: u8) fails Failure {
 fn JsonReader.literal(mut self, word: Slice[u8]) -> bool {
     mut self.space()
     let start = self.input.at
-    if word.len() > self.input.bytes.len() - start {
+    let Some(end) = start.checked_add(word.len()) else {
         return false
     }
-    for index in 0..<word.len() {
-        if self.input.bytes[start + index] != word[index] {
-            return false
-        }
+    let Some(upto) = self.input.bytes.view().prefix(end) else {
+        return false
     }
-    self.input.at = start + word.len()
+    let Some(parts) = upto.split_at(start) else {
+        return false
+    }
+    if parts.tail != word {
+        return false
+    }
+    self.input.at = end
     return true
 } JsonReader.literal
 
@@ -1525,19 +1572,20 @@ fn JsonReader.string(mut self) -> mem::Bytes fails Failure {
     var decoded = mem::Bytes.empty(self.input.alloc)
     loop {
         let start = self.input.at
-        var len: usize = 0
-        while start + len < self.input.bytes.len() and self.input.bytes[start + len] != b'"' and self.input.bytes[start + len] != b'\\' {
-            len += 1
+        var end = start
+        while end < self.input.bytes.len() and self.input.bytes[end] != b'"' and self.input.bytes[end] != b'\\' {
+            end += 1
         }
-        if start + len >= self.input.bytes.len() {
+        if end >= self.input.bytes.len() {
             fail Failure.Decode(DecodeKind.Truncated)
         }
-        let Some(parts) = self.input.bytes.view().split_at(start) else {
+        let Some(upto) = self.input.bytes.view().prefix(end) else {
             fail Failure.Decode(DecodeKind.Truncated)
         }
-        let Some(plain) = parts.tail.prefix(len) else {
+        let Some(parts) = upto.split_at(start) else {
             fail Failure.Decode(DecodeKind.Truncated)
         }
+        let plain = parts.tail
         if not text::utf8::is_valid(plain) {
             fail Failure.Decode(DecodeKind.InvalidText)
         }
@@ -1547,7 +1595,7 @@ fn JsonReader.string(mut self) -> mem::Bytes fails Failure {
             }
         }
         mut decoded.append(plain)
-        self.input.at = start + len
+        self.input.at = end
         let quote = try mut self.input.byte()
         if quote == b'"' {
             return decoded
@@ -1587,7 +1635,7 @@ fn JsonReader.escaped_unicode(mut self) -> char fails Failure {
         if low < 0xDC00 or low > 0xDFFF {
             fail Failure.Decode(DecodeKind.InvalidText)
         }
-        scalar = 0x1_0000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+        scalar = 0x1_0000 + (high - 0xD800) * 0x400 + (low - 0xDC00)
     } else if high >= 0xDC00 and high <= 0xDFFF {
         fail Failure.Decode(DecodeKind.InvalidText)
     }
@@ -1606,6 +1654,7 @@ fn JsonReader.hex4(mut self) -> u32 fails Failure {
     }
     var value: u32 = 0
     for index in start..<4usize {
+        invariant value <= 0xFFF
         let Some(digit) = hex_value(digits[index]) else {
             fail Failure.Decode(DecodeKind.Malformed)
         }
@@ -1615,7 +1664,12 @@ fn JsonReader.hex4(mut self) -> u32 fails Failure {
 } JsonReader.hex4
 
 /// The value of a hexadecimal digit.
-fn hex_value(byte: u8) -> Option[u32] {
+fn hex_value(byte: u8) -> Option[u32]
+    ensures match result {
+        Some(digit) => digit < 16
+        None => true
+    }
+{
     if byte >= b'0' and byte <= b'9' {
         return Some(u32.widen(byte - b'0'))
     }
@@ -1636,13 +1690,13 @@ fn JsonReader.number(mut self) -> text::String fails Failure {
         fail Failure.Decode(DecodeKind.Malformed)
     }
     self.input.at = end
-    let Some(parts) = self.input.bytes.view().split_at(start) else {
+    let Some(upto) = self.input.bytes.view().prefix(end) else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
-    let Some(digits) = parts.tail.prefix(end - start) else {
+    let Some(parts) = upto.split_at(start) else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
-    let Ok(written) = attempt text::String.try_from_utf8(digits, alloc: self.input.alloc) else {
+    let Ok(written) = attempt text::String.try_from_utf8(parts.tail, alloc: self.input.alloc) else {
         fail Failure.Decode(DecodeKind.Malformed)
     }
     return written
@@ -1752,13 +1806,14 @@ fn decimal_exponent(number: Slice[u8], start: usize) -> i64 {
         negative = number[position] == b'-'
         position += 1
     }
-    var exponent: i64 = 0
+    var magnitude: u64 = 0
     while position < number.len() and number[position] >= b'0' and number[position] <= b'9' {
-        if exponent < 100_000_000_000_000 {
-            exponent = exponent * 10 + i64.widen(number[position] - b'0')
+        if magnitude < 100_000_000_000_000 {
+            magnitude = magnitude * 10 + u64.widen(number[position] - b'0')
         }
         position += 1
     }
+    let exponent = i64.fit(magnitude)
     if negative {
         return -exponent
     }
@@ -1772,7 +1827,7 @@ fn plain_decimal(digits: Slice[u8], scale: i64, alloc: mem::Alloc) -> mem::Bytes
     let count = i64.fit(digits.len())
     if scale <= 0 {
         mut plain.append(b"0.")
-        for _ in 0..<(-scale) {
+        for _ in scale..<0 {
             mut plain.push(b'0')
         }
         mut plain.append(digits)
@@ -1826,6 +1881,7 @@ fn JsonReader.skip_value(mut self) fails Failure {
         return
     }
     if next == b'{' or next == b'[' {
+        self.input.at += 1
         try mut self.skip_container(object: next == b'{')
         return
     }
@@ -1845,13 +1901,12 @@ fn JsonReader.skip_value(mut self) fails Failure {
     discard try mut self.number()
 } JsonReader.skip_value
 
-/// Passes over a JSON object, or an array when not `object`, whose opening byte is next.
+/// Passes over a JSON object, or an array when not `object`, whose opening byte was read.
 fn JsonReader.skip_container(mut self, object: bool) fails Failure {
     var close = b']'
     if object {
         close = b'}'
     }
-    self.input.at += 1
     let next = try mut self.peek()
     if next == close {
         self.input.at += 1

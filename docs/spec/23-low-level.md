@@ -259,6 +259,12 @@ pub layout Control: u16 le {
 
 pub fn Control.is_long(self) -> bool = self.mode == Mode.Long
 
+pub fn Control.long(enabled: bool) -> Control
+    example Control.long(true).to_bits() == 0x8002
+{
+    return Control(mode: Mode.Long, enabled: enabled, reserved: 0)
+} Control.long
+
 pub layout Gdtr: bytes 10 le {
     limit: u16 at 0
     base: u64 at 2

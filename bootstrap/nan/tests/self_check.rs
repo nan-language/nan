@@ -4,7 +4,7 @@
 //! chapter, with each `nan check` command of its section's `text` blocks, for every std package,
 //! and for the toolchain workspace, which must check without a diagnostic and pass `nan verify`.
 //! The front end runs on a copy of the workspace and local store the bootstrap has just used,
-//! under an address-space cap, with a user directory of its own.
+//! on one processor under an address-space cap, with a user directory of its own.
 
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -193,9 +193,30 @@ fn image() -> Result<PathBuf, String> {
     Ok(image)
 }
 
+/// One processor of the harness's affinity set, picked by its process id. The runtime of an
+/// image sets up an executor thread and an io_uring instance per processor of its affinity set,
+/// and the kernel charges the instances' memory to the user's locked-memory limit, which
+/// concurrent front end runs with every processor would exhaust.
+fn processor() -> String {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let allowed: Vec<u32> = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .unwrap_or("0")
+        .trim()
+        .split(',')
+        .flat_map(|range| {
+            let (low, high) = range.split_once('-').unwrap_or((range, range));
+            low.parse().unwrap_or(0)..=high.parse().unwrap_or(0)
+        })
+        .collect();
+    allowed[std::process::id() as usize % allowed.len()].to_string()
+}
+
 /// What a run of the front end in `dir` prints and the status it exits with: with the
-/// harness's user directory and the local store `store`, under a 6 GB address-space cap,
-/// killed after `RUN_LIMIT`; with `nir`, the NIR of the package it names, every one when empty.
+/// harness's user directory and the local store `store`, on one processor, under a 6 GB
+/// address-space cap, killed after `RUN_LIMIT`; with `nir`, the NIR of the package it names,
+/// every one when empty.
 fn front(
     image: &Path,
     dir: &Path,
@@ -208,7 +229,8 @@ fn front(
     let mut command = Command::new("sh");
     command
         .arg("-c")
-        .arg("ulimit -v 6000000; exec \"$0\" \"$@\"")
+        .arg("ulimit -v 6000000; exec taskset -c \"$0\" \"$@\"")
+        .arg(processor())
         .arg(image)
         .args(args)
         .current_dir(dir)

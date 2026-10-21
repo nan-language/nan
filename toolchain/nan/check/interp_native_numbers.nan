@@ -5,8 +5,10 @@ fn Interpreter.scalar_member(mut self, scalar: ty::Scalar, member: Str, args: Sl
     if scalar.is_float() {
         return InterpFlow.Return(try self.float_member(member, args))
     }
+    expect args.len() >= 1
     let a = self.deref(args[0]).int_value()
     if member == "wrapping_add" or member == "wrapping_sub" or member == "wrapping_mul" {
+        expect args.len() >= 2
         let b = self.deref(args[1]).int_value()
         let result = match member {
             "wrapping_add" => a.wrapping_add(b)
@@ -16,9 +18,11 @@ fn Interpreter.scalar_member(mut self, scalar: ty::Scalar, member: Str, args: Sl
         return InterpFlow.Return(Val.Int(wrap_scalar(result, scalar)))
     }
     if member == "wrapping_shl" or member == "checked_shl" or member == "shr_arith" {
+        expect args.len() >= 2
         return InterpFlow.Return(try self.shifted(scalar, member, a, amount: self.deref(args[1]).int_value(), at))
     }
     if member == "div_trunc" or member == "rem_trunc" {
+        expect args.len() >= 2
         let divisor = self.deref(args[1]).int_value()
         if divisor.is_zero() {
             fail self.trap("trap.division-by-zero", at)
@@ -39,7 +43,7 @@ fn Interpreter.scalar_member(mut self, scalar: ty::Scalar, member: Str, args: Sl
         return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(bits.count_ones()))))
     }
     if member == "leading_zeros" {
-        return InterpFlow.Return(Val.Int(wide::Wide.of_i64(i64.widen(bits.leading_zeros()) - i64.widen(64 - scalar.bits()))))
+        return InterpFlow.Return(Val.Int(wide::Wide.of_i64(i64.widen(bits.leading_zeros()) + i64.widen(scalar.bits()) - 64)))
     }
     if member == "trailing_zeros" {
         var zeros = bits.trailing_zeros()
@@ -49,6 +53,7 @@ fn Interpreter.scalar_member(mut self, scalar: ty::Scalar, member: Str, args: Sl
         return InterpFlow.Return(Val.Int(wide::Wide.of_u64(u64.widen(zeros))))
     }
     if member == "wide_mul" {
+        expect args.len() >= 2
         let product = a.wrapping_mul(self.deref(args[1]).int_value())
         let high = if scalar.is_signed() {
             product.shift_right(64)
@@ -113,12 +118,13 @@ fn integer_bits(value: wide::Wide, scalar: ty::Scalar) -> u64 {
     if bits >= 64 {
         return value.low_bits()
     }
-    return value.low_bits() & ((1u64 << bits) - 1)
+    return value.low_bits() & ~((~0u64) << bits)
 } integer_bits
 
 /// A named or bit conversion.
 fn Interpreter.numeric_builtin(mut self, builtin: nir::Builtin, take args: mem::List[Val], at: ItemSpan, site: RunSite) -> InterpFlow fails End {
     let alloc = self.alloc
+    expect args.len() >= 1
     let value = self.deref(args[0])
     let option_item = self.ty_item("core", name: "Option")
     match builtin {
@@ -314,7 +320,10 @@ fn Interpreter.layout_bits(self, layout_item: ty::ItemId, value: Val) -> u64 {
     }
     match shape {
         LayoutShape.Tags(values) => match value {
-            Val.Variant(item: _, index: index, fields: _) => return values[usize.widen(index)]
+            Val.Variant(item: _, index: index, fields: _) => {
+                expect usize.widen(index) < values.len()
+                return values[usize.widen(index)]
+            }
             else => {
                 expect false
                 return 0
@@ -327,15 +336,7 @@ fn Interpreter.layout_bits(self, layout_item: ty::ItemId, value: Val) -> u64 {
             var index: usize = 0
             while index < fields.len() and index < parts.len() and index < types.len() {
                 let field = fields[index]
-                var bits = parts[index].int_value().low_bits()
-                if field.kind == BitsKind.Typed {
-                    match self.ck.types().kind(types[index]) {
-                        ty::TyKind.Item(item: nested, args: _) => {
-                            bits = self.layout_bits(nested, value: parts[index])
-                        }
-                        else => {}
-                    }
-                }
+                let bits = self.field_bits(field.kind, ty: types[index], value: parts[index])
                 if field.kind == BitsKind.Rest {
                     all = all | bits
                 } else {
@@ -372,7 +373,7 @@ fn Interpreter.layout_value(self, layout_item: ty::ItemId, bits: u64) -> Option[
                 let mask = if field.width >= 64 {
                     ~0u64
                 } else {
-                    (1u64 << field.width) - 1
+                    ~((~0u64) << field.width)
                 }
                 if field.kind != BitsKind.Rest {
                     covered = covered | (mask << field.low)
@@ -385,6 +386,7 @@ fn Interpreter.layout_value(self, layout_item: ty::ItemId, bits: u64) -> Option[
             }
             for position in 0..<values.len() {
                 if position < fields.len() and fields[position].kind == BitsKind.Rest {
+                    expect position < values.len()
                     values[position] = Val.Int(wide::Wide.of_u64(bits & ~covered))
                 }
             }
@@ -499,6 +501,17 @@ fn saturated(value: Val, target: ty::Scalar) -> Val {
 fn clamped(value: wide::Wide, range: ty::Range) -> wide::Wide {
     return value.max_of(range.low).min_of(range.high)
 } clamped
+
+/// The bits of a layout field's value: the bits value of a nested layout, or the integer it holds.
+fn Interpreter.field_bits(self, kind: BitsKind, ty: ty::Ty, value: Val) -> u64 {
+    if kind == BitsKind.Typed {
+        match self.ck.types().kind(ty) {
+            ty::TyKind.Item(item: nested, args: _) => return self.layout_bits(nested, value)
+            else => {}
+        }
+    }
+    return value.int_value().low_bits()
+} Interpreter.field_bits
 
 /// The value of a field of an integer layout with its raw bits, none for a niche; a `rest`
 /// field's is filled in once the others are known.

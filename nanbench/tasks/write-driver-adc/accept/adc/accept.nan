@@ -1,0 +1,75 @@
+//! Acceptance tests of the converter's sampling.
+
+/// A status with only `done` possibly set.
+fn status_showing(done: bool) -> Status = Status(done: done, overrun: false, reserved: 0)
+
+test a_finished_conversion_gives_its_value for sample {
+    let block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    block.queue(AdcRegs.status, value: status_showing(false))
+    block.queue(AdcRegs.status, value: status_showing(false))
+    block.queue(AdcRegs.status, value: status_showing(true))
+    block.set(AdcRegs.data, value: Sample(value: 0xABC, channel: 5, reserved: 0))
+    var window = block.mmio()
+    let converted_value = attempt sample(mut window, channel: 5)
+    take window.unmap()
+    expect converted_value == Ok(0xABC)
+    expect block.last_written(AdcRegs.control) == Some(Control(start: true, channel: 5, reserved: 0))
+    expect block.last_written(AdcRegs.status) == Some(status_showing(true))
+} a_finished_conversion_gives_its_value
+
+test the_hundredth_status_read_is_the_last for sample {
+    let block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    for _ in 0..<99u32 {
+        block.queue(AdcRegs.status, value: status_showing(false))
+    }
+    block.queue(AdcRegs.status, value: status_showing(true))
+    block.set(AdcRegs.data, value: Sample(value: 17, channel: 0, reserved: 0))
+    var window = block.mmio()
+    let in_time = attempt sample(mut window, channel: 0)
+    take window.unmap()
+    expect in_time == Ok(17)
+    let late_block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    for _ in 0..<100u32 {
+        late_block.queue(AdcRegs.status, value: status_showing(false))
+    }
+    late_block.queue(AdcRegs.status, value: status_showing(true))
+    var late_window = late_block.mmio()
+    let too_late = attempt sample(mut late_window, channel: 0)
+    take late_window.unmap()
+    expect too_late == Err(AdcError.Timeout)
+    expect late_block.last_written(AdcRegs.status) == None
+} the_hundredth_status_read_is_the_last
+
+test channels_above_seven_are_refused for sample {
+    let block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    block.set(AdcRegs.status, value: status_showing(true))
+    block.set(AdcRegs.data, value: Sample(value: 1, channel: 7, reserved: 0))
+    var window = block.mmio()
+    let highest_outcome = attempt sample(mut window, channel: 7)
+    let beyond_outcome = attempt sample(mut window, channel: 8)
+    take window.unmap()
+    expect highest_outcome == Ok(1)
+    expect beyond_outcome == Err(AdcError.NoChannel(8))
+    expect block.last_written(AdcRegs.control) == Some(Control(start: true, channel: 7, reserved: 0))
+} channels_above_seven_are_refused
+
+test overruns_are_acknowledged_and_reported for sample {
+    let block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    block.queue(AdcRegs.status, value: Status(done: true, overrun: true, reserved: 0))
+    block.set(AdcRegs.data, value: Sample(value: 9, channel: 1, reserved: 0))
+    var window = block.mmio()
+    let overrun_outcome = attempt sample(mut window, channel: 1)
+    take window.unmap()
+    expect overrun_outcome == Err(AdcError.Overrun)
+    expect block.last_written(AdcRegs.status) == Some(Status(done: true, overrun: true, reserved: 0))
+} overruns_are_acknowledged_and_reported
+
+test samples_of_another_channel_are_refused for sample {
+    let block = hw::sim::Registers[AdcRegs].of(testing::world().alloc)
+    block.queue(AdcRegs.status, value: status_showing(true))
+    block.set(AdcRegs.data, value: Sample(value: 9, channel: 2, reserved: 0))
+    var window = block.mmio()
+    let mismatched_outcome = attempt sample(mut window, channel: 3)
+    take window.unmap()
+    expect mismatched_outcome == Err(AdcError.WrongChannel(2))
+} samples_of_another_channel_are_refused

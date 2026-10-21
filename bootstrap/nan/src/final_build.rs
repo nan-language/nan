@@ -61,19 +61,6 @@ pub fn build(
         });
     }
     let name = checker.db.package(root).name.clone();
-    let entry = checker
-        .db
-        .package(root)
-        .root
-        .and_then(|module| checker.db.lookup(module, "main"))
-        .expect("a checked program's entry function");
-    let landing = checker
-        .db
-        .packages
-        .iter()
-        .find(|package| Some(package.name.as_str()) == target.platform_package())
-        .and_then(|package| checker.db.lookup(package.root?, LANDING))
-        .expect("the platform package's entry landing fn");
     let artefacts = artefacts(workspace, &checker, root);
     if let Some((image, written)) = compared {
         diagnostics.extend(crate::stage::compare(&checker, &artefacts, image, written));
@@ -84,17 +71,7 @@ pub fn build(
             });
         }
     }
-    let program = lower::Program {
-        entry,
-        landing,
-        roots: vec![root],
-        prefixes: prefixes(&artefacts),
-        section: section(&artefacts),
-    };
-    let lowered = match target.is_machine() {
-        true => lower::lower_machine(&checker, &program),
-        false => lower::lower(&checker, &program),
-    };
+    let lowered = lower_program(&checker, root, &artefacts);
     diagnostics.extend(collisions(source, &lowered));
     diagnostics.extend(lower::stack::judge(
         &checker,
@@ -131,6 +108,96 @@ pub fn build(
         diagnostics,
         image: Some(image),
     })
+}
+
+/// The lowering of the program whose package is `root`, for the checker's target, with the
+/// artefacts of its final closure.
+fn lower_program(
+    checker: &check::Checker,
+    root: PackageId,
+    artefacts: &BTreeMap<String, Vec<u8>>,
+) -> lower::Lowered {
+    let target = checker.db.target;
+    let entry = checker
+        .db
+        .package(root)
+        .root
+        .and_then(|module| checker.db.lookup(module, "main"))
+        .expect("a checked program's entry function");
+    let landing = checker
+        .db
+        .packages
+        .iter()
+        .find(|package| Some(package.name.as_str()) == target.platform_package())
+        .and_then(|package| checker.db.lookup(package.root?, LANDING))
+        .expect("the platform package's entry landing fn");
+    let program = lower::Program {
+        entry,
+        landing,
+        roots: vec![root],
+        prefixes: prefixes(artefacts),
+        section: section(artefacts),
+    };
+    match target.is_machine() {
+        true => lower::lower_machine(checker, &program),
+        false => lower::lower(checker, &program),
+    }
+}
+
+/// A task a program or test image starts, as the measurements of the freeze read it: where its
+/// entry is written, its stack use in bytes or, when unbounded, the call that leaves it so,
+/// and the stack it gets.
+pub struct TaskStack {
+    pub site: String,
+    pub used: Result<u64, String>,
+    pub stack: u64,
+}
+
+/// The tasks a lowering starts, with their stack uses.
+pub fn tasks(checker: &check::Checker, lowered: &lower::Lowered) -> Vec<TaskStack> {
+    let uses = lower::stack::uses(checker, &lowered.frames, &lowered.tasks);
+    lowered
+        .tasks
+        .iter()
+        .zip(uses)
+        .map(|(task, used)| TaskStack {
+            site: lower::stack::site(checker, task.at),
+            used: used.map_err(|because| {
+                let place = |reason: &Reason| match &reason.at {
+                    Some((path, line)) => format!("{} at {path}:{line}", reason.subject),
+                    None => reason.subject.clone(),
+                };
+                match because.as_slice() {
+                    [.., caller, raised] if raised.at.is_none() => {
+                        format!("{} in {}", raised.subject, place(caller))
+                    }
+                    [.., raised] => place(raised),
+                    [] => String::new(),
+                }
+            }),
+            stack: task.stack,
+        })
+        .collect()
+}
+
+/// The tasks of each program of the workspace that checks without error.
+pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
+    let std = crate::stdlib::packages();
+    let mut found = Vec::new();
+    for source in &workspace.packages {
+        let program = source
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.entry.is_some());
+        let Some(checked) = workspace.closure_of(source).filter(|_| program) else {
+            continue;
+        };
+        let checker = check::checked(workspace, checked, std, source.program_target());
+        let root = package_id(&checker, source);
+        let artefacts = artefacts(workspace, &checker, root);
+        found.extend(tasks(&checker, &lower_program(&checker, root, &artefacts)));
+    }
+    found
 }
 
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing any

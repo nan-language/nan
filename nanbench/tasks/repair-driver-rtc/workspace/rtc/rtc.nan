@@ -1,0 +1,107 @@
+//! The clock's CMOS registers and the time of day it keeps.
+
+/// The CMOS index port, which selects a register, and the data port, which reaches it.
+pub registers CmosPorts {
+    index: u8 at 0x0 write
+    data: u8 at 0x1 read write
+} CmosPorts
+
+/// Status register A, whose `updating` bit is set while the clock updates its registers.
+pub layout StatusA: u8 {
+    rate: bit 0..=3
+    divider: bit 4..=6
+    updating: bit 7
+} StatusA
+
+/// Status register B, saying how the clock writes its numbers.
+pub layout StatusB: u8 {
+    daylight: bit 0
+    hours_24: bit 1
+    binary: bit 2
+    reserved: rest
+} StatusB
+
+pub closed struct Time derives Copy, Eq, Render {
+    pub hours: u8
+    pub minutes: u8
+    pub seconds: u8
+} Time
+
+/// The CMOS registers of the clock.
+const SECONDS_REGISTER: u8 = 0x00
+
+const MINUTES_REGISTER: u8 = 0x02
+
+const HOURS_REGISTER: u8 = 0x04
+
+const STATUS_A_REGISTER: u8 = 0x0A
+
+const STATUS_B_REGISTER: u8 = 0x0B
+
+/// The reads of status A before the clock is taken as stuck.
+const UPDATE_POLLS: u32 = 1_000
+
+/// The first CMOS port.
+const CMOS_PORT: u16 = 0x70
+
+/// The clock's ports.
+pub fn map_cmos() -> hw::Ports[CmosPorts] {
+    return trusted "" { hw::Ports[CmosPorts].map(port: CMOS_PORT) }
+} map_cmos
+
+/// Selects CMOS register `register` and reads it.
+pub fn read_register(mut ports: hw::Ports[CmosPorts], register: u8) -> u8 {
+    mut ports.write(CmosPorts.index, value: register)
+    return mut ports.read(CmosPorts.data)
+} read_register
+
+/// The value of a binary-coded decimal byte.
+pub fn from_bcd(value: u8) -> u8 = (value >> 4) * 10 + (value & 0x0F)
+
+/// The binary-coded decimal byte of a value below 100.
+pub fn bcd_of(value: u8) -> u8
+    requires value <= 99
+{
+    return (value / 10) << 4 | value % 10
+} bcd_of
+
+/// The time of day the clock shows: reads status A until `updating` is clear, at most
+/// `UPDATE_POLLS` times, none when it never is; then status B, the seconds, the minutes and the
+/// hours, in that order. Values are binary-coded decimal unless status B says binary; unless it
+/// says 24-hour, the hours run from 1 to 12 with bit 7 set after noon.
+pub fn read_time(mut ports: hw::Ports[CmosPorts]) -> Option[Time] {
+    var settled = false
+    for _ in 0..<UPDATE_POLLS {
+        let status = StatusA.from_bits(read_register(mut ports, register: STATUS_A_REGISTER))
+        if not status.updating {
+            settled = true
+            break
+        }
+    }
+    if not settled {
+        return None
+    }
+    let format = StatusB.from_bits(read_register(mut ports, register: STATUS_B_REGISTER))
+    var seconds = read_register(mut ports, register: SECONDS_REGISTER)
+    var minutes = read_register(mut ports, register: MINUTES_REGISTER)
+    let raw_hours = read_register(mut ports, register: HOURS_REGISTER)
+    let after_noon = raw_hours & 0x80
+    var hours = raw_hours & 0x7F
+    if not format.binary {
+        seconds = from_bcd(seconds)
+        minutes = from_bcd(minutes)
+        hours = from_bcd(hours)
+    }
+    if not format.hours_24 {
+        hours = hours % 12
+        if after_noon {
+            hours += 12
+        }
+    }
+    return Some(Time(hours: hours, minutes: minutes, seconds: seconds))
+} read_time
+
+/// The seconds since midnight.
+pub fn Time.seconds_of_day(self) -> u32 {
+    return self.hours * 3_600 + self.minutes * 60 + self.seconds
+} Time.seconds_of_day

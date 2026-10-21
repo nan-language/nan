@@ -37,8 +37,10 @@ fn Interpreter.render_intrinsic(
 /// Writes a template's text between holes and each hole's argument through its `Render`.
 fn Interpreter.render_template(mut self, types: Slice[ty::Arg], args: Slice[Val], at: ItemSpan, site: RunSite) fails End {
     let alloc = self.alloc
+    expect args.len() > 1
     let template = self.deref(args[0])
     let parts = Val.copies(template.fields(), alloc)
+    expect parts.len() % 2 == 1 and types.len() == parts.len()
     let out = args[1]
     let text = mut self.bytes(parts[0])
     let bytes = text.view()
@@ -74,7 +76,7 @@ fn Interpreter.render_template(mut self, types: Slice[ty::Arg], args: Slice[Val]
         }
         var found: Option[usize] = None
         var index: usize = 1
-        while index < parts.len() {
+        while index < parts.len() - 1 {
             let candidate = mut self.bytes(parts[index])
             if candidate.view() == name.view() {
                 found = Some(index)
@@ -99,11 +101,13 @@ fn Interpreter.render_template(mut self, types: Slice[ty::Arg], args: Slice[Val]
 fn Interpreter.renderer_member(mut self, member: Str, args: Slice[Val]) -> Option[InterpFlow] {
     let alloc = self.alloc
     if member == "write" {
+        expect args.len() > 1
         let text = mut self.bytes(args[1])
         mut self.render_write(args[0], bytes: text.view())
         return Some(InterpFlow.Return(Val.Unit))
     }
     if member == "write_char" {
+        expect args.len() > 1
         let Val.Char(c) = self.deref(args[1]) else {
             expect false
             return None
@@ -114,6 +118,7 @@ fn Interpreter.renderer_member(mut self, member: Str, args: Slice[Val]) -> Optio
         return Some(InterpFlow.Return(Val.Unit))
     }
     if member == "remaining" or member == "is_elided" {
+        expect args.len() > 0
         let state = self.renderer_state(args[0])
         let written = wide::Wide.of_u64(u64.widen(self.memory.get(state.with(u32.fit(RENDERER_WRITTEN), alloc)).fields().len()))
         let budget = self.memory.get(state.with(u32.fit(RENDERER_BUDGET), alloc)).int_value()
@@ -146,6 +151,7 @@ fn Interpreter.render_output(mut self, value: Val, budget: usize, at: ItemSpan, 
     var call_args = mem::List[Val].empty(alloc)
     mut call_args.push(held.value.copy(alloc))
     mut call_args.push(take out)
+    expect held.methods.len() > 0
     let flow = try mut self.call_function(held.methods[0], args: take call_args, at, site)
     match flow {
         InterpFlow.Return(_) => {}
@@ -161,11 +167,17 @@ fn Interpreter.render_output(mut self, value: Val, budget: usize, at: ItemSpan, 
         return rendered
     }
     var dots: usize = 3
+    var kept: usize = 0
     if budget < 3 {
         dots = budget
+    } else {
+        kept = budget - 3
     }
-    var kept = budget - dots
-    while kept > 0 and (rendered[kept] & 0xC0) == 0x80 {
+    while kept > 0 {
+        invariant kept < rendered.len()
+        if (rendered[kept] & 0xC0) != 0x80 {
+            break
+        }
         kept -= 1
     }
     var output = mem::Bytes.empty(alloc)
@@ -198,6 +210,7 @@ fn Interpreter.render_value(
             let held = dynamic.contents()
             mut call_args.push(held.value.copy(alloc))
             mut call_args.push(out.copy(alloc))
+            expect held.methods.len() > 0
             let flow = try mut self.call_function(held.methods[0], args: take call_args, at, site)
             match flow {
                 InterpFlow.Return(_) => return
@@ -235,6 +248,7 @@ fn Interpreter.render_derived(
     site: RunSite,
     ) fails End {
     let alloc = self.alloc
+    expect args.len() > 1
     let value = self.deref(args[0])
     let out = args[1]
     let sig = self.ck.sig(owner)
@@ -263,6 +277,7 @@ fn Interpreter.render_derived(
                 expect false
                 fail End.Missing
             }
+            expect usize.widen(index) < variants.len()
             let variant = variants[usize.widen(index)]
             let bare = (name.as_str() == "Option" or name.as_str() == "Result") and self.ck.db().is_std(owner)
             var named = text::String.empty(alloc)
@@ -276,6 +291,7 @@ fn Interpreter.render_derived(
                 Payload.None => {}
                 Payload.Single(payload_ty) => {
                     mut self.render_write(out, bytes: b"(")
+                    expect payload.contents().len() > 0
                     try mut self.render_value(payload.contents()[0], ty: subst.ty(self.ck.types(), ty: payload_ty), out, at, site)
                     mut self.render_write(out, bytes: b")")
                 }
@@ -321,6 +337,7 @@ fn Interpreter.render_labelled(
 /// The rendering of a type whose `Render` the toolchain supplies.
 fn Interpreter.render_builtin(mut self, ty: ty::Ty, args: Slice[Val], at: ItemSpan, site: RunSite) fails End {
     let alloc = self.alloc
+    expect args.len() > 1
     let value = self.deref(args[0])
     let out = args[1]
     match self.ck.types().kind(ty) {
@@ -347,6 +364,7 @@ fn Interpreter.render_builtin(mut self, ty: ty::Ty, args: Slice[Val], at: ItemSp
                 return
             }
             if path == "mem::Box" or path == "mem::Shared" {
+                expect value.fields().len() > 0
                 let contents = self.deref(value.fields()[0])
                 try mut self.render_value(contents, ty: type_arg_at(self.ck.types(), args: item_args, index: 0), out, at, site)
                 return
@@ -407,7 +425,7 @@ fn float_text(value: f64, narrow: Option[f32], alloc: mem::Alloc) -> text::Strin
             return written
         }
         mut written.append("0.")
-        for _ in 0..<usize.fit(-exponent - 1) {
+        for _ in 0..<usize.fit(-(exponent + 1)) {
             mut written.push('0')
         }
         for digit in digits {
@@ -415,6 +433,7 @@ fn float_text(value: f64, narrow: Option[f32], alloc: mem::Alloc) -> text::Strin
         }
         return written
     }
+    expect digits.len() > 0
     mut written.push(ascii_char(digits[0]))
     mut written.push('.')
     if digits.len() > 1 {
@@ -442,18 +461,18 @@ fn Interpreter.render_write(mut self, out: Val, bytes: Slice[u8]) {
 /// The place of a renderer's state.
 fn Interpreter.renderer_state(self, out: Val) -> Loc {
     let renderer = self.deref(out)
+    expect renderer.fields().len() > 0
     return renderer.fields()[0].place().copy(self.alloc)
 } Interpreter.renderer_state
 
 /// The last segment of a canonical path.
 fn final_segment(path: Str, alloc: mem::Alloc) -> text::String {
     let bytes = path.as_bytes()
-    var start = bytes.len()
-    while start > 1 and not (bytes[start - 1] == b':' and bytes[start - 2] == b':') {
-        start -= 1
-    }
-    if start <= 1 {
-        start = 0
+    var start: usize = 0
+    for index in 1..<bytes.len() {
+        if bytes[index - 1] == b':' and bytes[index] == b':' {
+            start = index + 1
+        }
     }
     let Some(segment) = path.slice_bytes(start, end: bytes.len()) else {
         return text::String.of(path, alloc)
@@ -490,10 +509,14 @@ fn scalar_text(value: Val, scalar: ty::Scalar, alloc: mem::Alloc) -> text::Strin
 fn Interpreter.text_bytes(mut self, value: Val, path: Str) -> mem::Bytes {
     var bytes = mem::Bytes.empty(self.alloc)
     if path == "text::Fixed" {
+        expect value.fields().len() > 1
         let len = usize.widen(value.fields()[1].int_value().low_bits())
-        let held = value.fields()[0].fields()
-        for index in 0..<len {
-            mut bytes.push(u8.truncate(held[index].int_value().low_bits()))
+        let Some(held) = value.fields()[0].fields().prefix(len) else {
+            expect false
+            return bytes
+        }
+        for byte in held {
+            mut bytes.push(u8.truncate(byte.int_value().low_bits()))
         }
         return bytes
     }
@@ -537,6 +560,7 @@ fn bytes_literal(entries: Slice[Val], alloc: mem::Alloc) -> text::String {
 
 /// The uppercase hexadecimal digit of a value below 16.
 fn upper_hex_digit(value: u8) -> char {
+    expect value < 16
     if value < 10 {
         return ascii_char(b'0' + value)
     }
@@ -564,6 +588,7 @@ fn Interpreter.render_entries(mut self, value: Val, args: ty::Args, out: Val, at
             mut self.render_write(out, bytes: b", ")
         }
         let parts = entries[index].fields()
+        expect parts.len() > 1
         try mut self.render_value(parts[0], ty: type_arg_at(self.ck.types(), args, index: 0), out, at, site)
         mut self.render_write(out, bytes: b": ")
         try mut self.render_value(parts[1], ty: type_arg_at(self.ck.types(), args, index: 1), out, at, site)
@@ -583,6 +608,7 @@ fn Interpreter.render_elements(mut self, value: Val, path: Str, args: ty::Args, 
     } else if path == "mem::List" or path == "mem::Set" {
         elements = self.entries(value)
     } else if path == "mem::Bounded" {
+        expect value.fields().len() > 0
         elements = Val.copies(value.fields()[0].fields(), alloc)
     } else {
         fail End.Missing

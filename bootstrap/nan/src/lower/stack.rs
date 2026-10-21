@@ -89,6 +89,43 @@ pub enum Report {
     Fit(At),
 }
 
+/// A task entry a lowering writes: the function its task starts in, where it is written, and
+/// the stack its task gets.
+pub struct Task {
+    pub function: FuncId,
+    pub at: At,
+    pub stack: u64,
+}
+
+/// Each task's stack use in bytes, its entry judged on its own, or for an unbounded one the
+/// because-chain down to the call site that leaves it unbounded.
+pub fn uses(ck: &Checker, frames: &[Frame], tasks: &[Task]) -> Vec<Result<u64, Vec<Reason>>> {
+    let mut judge = Judge {
+        frames: frames.iter().map(|frame| (frame.function, frame)).collect(),
+        known: HashMap::new(),
+        active: Vec::new(),
+    };
+    tasks
+        .iter()
+        .map(|task| {
+            let own = judge
+                .frames
+                .get(&task.function)
+                .map_or_else(Vec::new, |frame| own_bounds(frame));
+            match judge.function(task.function, &own) {
+                Use::Bounded(bytes, _) => Ok(bytes),
+                Use::Unbounded(path) => Err(judge.because(ck, &path, true)),
+            }
+        })
+        .collect()
+}
+
+/// Where code lies, as `<path>:<line>`.
+pub fn site(ck: &Checker, at: At) -> String {
+    let (path, line) = location(ck, at);
+    format!("{path}:{line}")
+}
+
 /// A stack use in bytes with its deepest call path, or none with the path of calls down to
 /// the unbounded call site; each call is a function and the index of its site.
 #[derive(Clone)]

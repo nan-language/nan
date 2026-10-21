@@ -2,10 +2,10 @@
 //! the completeness test over them, and the last-green entries of items and of the closure sets
 //! of lines.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
-use super::db::{ItemId, TypeKey};
+use super::db::{ItemId, ModuleId, TypeKey};
 use super::reading::{Api, digest_lines};
 use super::{Checker, check_targets, checkers, ty};
 use crate::scope::Scope;
@@ -30,6 +30,10 @@ pub struct Context {
     pub apis: Vec<Api>,
 }
 
+/// The `api` records of context packs already built from one checker, by item and the module
+/// whose code sees it.
+type Apis = HashMap<(ItemId, ModuleId), Api>;
+
 /// The context packs of the items whose heads lie in a scope, by path and line, each closure set
 /// recorded while checking the item under the first target its package is checked under: of the
 /// item, or of its line `line`.
@@ -41,6 +45,7 @@ pub fn contexts(workspace: &Workspace, scope: &Scope, line: Option<u32>) -> Vec<
     for (target, checker) in &checkers {
         let db = &checker.db;
         db.record();
+        let mut apis = Apis::new();
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let data = db.item(item);
@@ -53,7 +58,7 @@ pub fn contexts(workspace: &Workspace, scope: &Scope, line: Option<u32>) -> Vec<
             {
                 continue;
             }
-            packs.push(checker.context(&checkers, item, line));
+            packs.push(checker.context(&checkers, item, line, &mut apis));
         }
     }
     packs.sort_by(|left, right| (&left.file, left.line).cmp(&(&right.file, right.line)));
@@ -119,8 +124,14 @@ impl Checker<'_> {
     }
 
     /// An item's context pack, recording its closure set, or that of its line `line`, by checking
-    /// it.
-    fn context(&self, checkers: &[(Target, Checker)], item: ItemId, line: Option<u32>) -> Context {
+    /// it; `apis` holds the records earlier packs of this checker built.
+    fn context(
+        &self,
+        checkers: &[(Target, Checker)],
+        item: ItemId,
+        line: Option<u32>,
+        apis: &mut Apis,
+    ) -> Context {
         let db = &self.db;
         let data = db.item(item);
         let package = db.package_of(item);
@@ -140,19 +151,22 @@ impl Checker<'_> {
                             .is_some_and(|name| super::resolve::is_core_vocabulary(&name)))
             })
             .map(|read| {
-                let other = db.item(read);
-                let mut lines = self.api_lines(read, false, Some(data.module));
-                lines.extend(digest_lines(checkers, self, read));
-                Api {
-                    path: self
-                        .canonical_path(read)
-                        .or_else(|| self.own_path(read))
-                        .unwrap_or_default(),
-                    package: db.package(db.package_of(read)).name.clone(),
-                    file: other.file.path.clone(),
-                    line: other.head_line(),
-                    lines,
-                }
+                let api = apis.entry((read, data.module)).or_insert_with(|| {
+                    let other = db.item(read);
+                    let mut lines = self.api_lines(read, false, Some(data.module));
+                    lines.extend(digest_lines(checkers, self, read));
+                    Api {
+                        path: self
+                            .canonical_path(read)
+                            .or_else(|| self.own_path(read))
+                            .unwrap_or_default(),
+                        package: db.package(db.package_of(read)).name.clone(),
+                        file: other.file.path.clone(),
+                        line: other.head_line(),
+                        lines,
+                    }
+                });
+                api.clone()
             })
             .collect();
         let mut names: Vec<String> = db
@@ -380,6 +394,7 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
     for (target, checker) in &checkers {
         let db = &checker.db;
         db.record();
+        let mut apis = Apis::new();
         for index in 0..db.items.len() {
             let item = ItemId(index as u32);
             let first =
@@ -387,7 +402,7 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
             if !db.is_reported(item) || !first {
                 continue;
             }
-            let pack = checker.context(&checkers, item, None);
+            let pack = checker.context(&checkers, item, None, &mut apis);
             let shown: HashSet<&str> = pack.apis.iter().map(|api| api.path.as_str()).collect();
             let core = db.core();
             for read in db.read_by(item) {

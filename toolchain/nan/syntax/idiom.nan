@@ -194,6 +194,7 @@ fn foreign_idiom(failed: Failed, file: SourceFile, grammar: Grammar) -> Option[I
 
 /// How the entry with the rewrite column `rewrite` reports the tokens it matched.
 fn Failed.reported(self, take matched: Matched, rewrite: Rewrite, file: SourceFile) -> Idiom {
+    expect matched.head < file.tokens.len() and matched.last < file.tokens.len()
     let span = diagnostic::Span(start: file.tokens[matched.head].start, end: file.tokens[matched.last].end)
     var fixes = mem::List[diagnostic::Replacement].empty(self.alloc)
     var expected: Option[text::String] = None
@@ -231,7 +232,7 @@ fn hole_filled(written: Str, hole: Hole, alloc: mem::Alloc) -> text::String {
     let name = hole.name.to_bits()
     var copied: usize = 0
     var at: usize = 0
-    while at + 3 <= bytes.len() {
+    while at < bytes.len() and bytes.len() - at >= 3 {
         if bytes[at] == b'{' and u32.widen(bytes[at + 1]) == name and bytes[at + 2] == b'}' {
             let Some(before) = written.slice_bytes(copied, end: at) else {
                 expect false
@@ -253,24 +254,29 @@ fn hole_filled(written: Str, hole: Hole, alloc: mem::Alloc) -> text::String {
     return out
 } hole_filled
 
-fn SourceFile.is_kind(self, at: usize, kind: TokenKind) -> bool {
+fn SourceFile.is_kind(self, at: usize, kind: TokenKind) -> bool
+    ensures at < self.tokens.len()
+{
+    expect at < self.tokens.len()
     return self.tokens[at].kind == kind
 } SourceFile.is_kind
 
-fn SourceFile.is_punct(self, at: usize, punct: Punct) -> bool {
-    return self.tokens[at].kind == TokenKind.Punct(punct)
+fn SourceFile.is_punct(self, at: usize, punct: Punct) -> bool
+    ensures at < self.tokens.len()
+{
+    return self.is_kind(at, kind: TokenKind.Punct(punct))
 } SourceFile.is_punct
 
 fn SourceFile.is_foreign(self, at: usize, spelt: Foreign) -> bool {
-    return self.tokens[at].kind == TokenKind.Foreign(spelt)
+    return self.is_kind(at, kind: TokenKind.Foreign(spelt))
 } SourceFile.is_foreign
 
 fn SourceFile.is_keyword(self, at: usize, keyword: Keyword) -> bool {
-    return self.tokens[at].kind == TokenKind.Keyword(keyword)
+    return self.is_kind(at, kind: TokenKind.Keyword(keyword))
 } SourceFile.is_keyword
 
 fn SourceFile.is_ident(self, at: usize, spelt: Str) -> bool {
-    return self.tokens[at].kind == TokenKind.Ident and self.text(at) == spelt
+    return self.is_kind(at, kind: TokenKind.Ident) and self.text(at) == spelt
 } SourceFile.is_ident
 
 /// Whether the token at `at` directly follows the one before it, without a space.
@@ -278,28 +284,38 @@ fn SourceFile.adjacent(self, at: usize) -> bool {
     let Some(previous) = self.previous(at) else {
         return false
     }
+    expect at < self.tokens.len()
     return self.tokens[previous].end == self.tokens[at].start
 } SourceFile.adjacent
 
 /// The run of spaces ending at `end` on its line, as its first byte.
 fn SourceFile.spaces_before(self, end: u32) -> u32 {
     var start = end
-    while start > 0 and self.source[usize.widen(start) - 1] == b' ' {
+    while start > 0 {
+        invariant usize.widen(start) <= self.source.len()
+        if self.source[usize.widen(start) - 1] != b' ' {
+            break
+        }
         start -= 1
     }
     return start
 } SourceFile.spaces_before
 
 /// The token after the failing one.
-fn Failed.after(self, file: SourceFile) -> usize {
+fn Failed.after(self, file: SourceFile) -> usize
+    ensures result < file.tokens.len()
+{
+    expect self.at < file.tokens.len()
     return file.next(self.at + 1)
 } Failed.after
 
 /// The source text of the tokens from `head` to `last`, its lines without comments and
 /// indentation joined by single spaces.
 fn Failed.text(self, head: usize, last: usize, file: SourceFile) -> text::String {
+    expect head < file.tokens.len() and last < file.tokens.len()
     let first_token = file.tokens[head]
     let last_token = file.tokens[last]
+    expect first_token.line > 0 and usize.widen(last_token.line) <= file.lines.len()
     var joined = text::String.empty(self.alloc)
     for index in (usize.widen(first_token.line) - 1)..<usize.widen(last_token.line) {
         let line = file.lines[index]
@@ -345,7 +361,9 @@ fn trim_bounds(written: Str) -> Trimmed {
     var at: usize = 0
     var leading = true
     for c in written {
+        invariant at <= written.byte_len()
         let width = c.utf8_len()
+        expect width <= written.byte_len() - at
         if not is_whitespace(c) {
             if leading {
                 start = at
@@ -409,7 +427,12 @@ fn Failed.derived(self, rule: Rule, start: usize, file: SourceFile, grammar: Gra
 } Failed.derived
 
 /// An expression between parentheses from `start`, followed by `closer`.
-fn Failed.enclosed(self, start: usize, closer: Punct, file: SourceFile, grammar: Grammar) -> Option[Spelt] {
+fn Failed.enclosed(self, start: usize, closer: Punct, file: SourceFile, grammar: Grammar) -> Option[Spelt]
+    ensures match result {
+        Some(spelt) => spelt.at < file.tokens.len()
+        None => true
+    }
+{
     let Some(end) = self.longest(Rule.Expr, start, file, grammar) else {
         return None
     }
@@ -430,6 +453,7 @@ fn Failed.ends_in_call(self, head: usize, last: usize, file: SourceFile) -> bool
     var depth: i64 = 0
     var at = last
     loop {
+        invariant at <= last and depth >= 0
         match file.tokens[at].kind {
             TokenKind.Punct(Punct.RParen) => {
                 depth += 1
@@ -484,17 +508,20 @@ fn Failed.statement_identifier(self, file: SourceFile) -> Option[usize] {
 /// The first token of the postfix expression the parse is reading, with the markers before it.
 fn Failed.marked_call_start(self) -> Option[usize] {
     var postfix = self.state.frames.len()
-    var found = false
-    while postfix > 0 and not found {
+    loop {
+        invariant postfix <= self.state.frames.len()
+        if postfix == 0 {
+            return None
+        }
         postfix -= 1
-        found = self.state.frames[postfix].rule == Some(Rule.PostfixExpr)
-    }
-    if not found {
-        return None
+        if self.state.frames[postfix].rule == Some(Rule.PostfixExpr) {
+            break
+        }
     }
     var start = self.state.frames[postfix].start
     var index = postfix
     while index > 0 {
+        invariant index <= postfix
         index -= 1
         let frame = self.state.frames[index]
         match frame.rule {
@@ -842,6 +869,7 @@ fn Failed.dot_await(self, file: SourceFile) -> Option[Matched] {
     if not (file.is_keyword(self.at, keyword: Keyword.Await) and self.ends_in_call(head, last: call_end, file)) {
         return None
     }
+    expect head < file.tokens.len()
     let failure_marker = match file.tokens[head].kind {
         TokenKind.Keyword(Keyword.Try) or TokenKind.Keyword(Keyword.Attempt) => true
         else => false
@@ -921,6 +949,7 @@ fn Failed.worded(self, worded: Worded, matched: Matched, file: SourceFile) -> di
 
 /// The rewrite of a `;` ending its logical line: it and the spaces before it deleted.
 fn Failed.semicolon_deleted(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    expect matched.head < file.tokens.len()
     let token = file.tokens[matched.head]
     return diagnostic::Replacement(start: file.spaces_before(token.start), end: token.end, text: text::String.empty(self.alloc))
 } Failed.semicolon_deleted
@@ -928,7 +957,9 @@ fn Failed.semicolon_deleted(self, matched: Matched, file: SourceFile) -> diagnos
 /// The rewrite of a `;` followed by more of its logical line: it and the spaces after it
 /// replaced by a line break and the indentation of its line.
 fn Failed.semicolon_broken(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    expect matched.head < file.tokens.len()
     let token = file.tokens[matched.head]
+    expect token.line > 0 and usize.widen(token.line) <= file.lines.len()
     let line = file.lines[usize.widen(token.line) - 1]
     var written = text::String.empty(self.alloc)
     mut written.push('\n')
@@ -942,6 +973,7 @@ fn Failed.semicolon_broken(self, matched: Matched, file: SourceFile) -> diagnost
 
 /// The rewrite of `-> ()`: the matched text and the space before it deleted.
 fn Failed.unit_result_deleted(self, matched: Matched, file: SourceFile) -> diagnostic::Replacement {
+    expect matched.head < file.tokens.len() and matched.last < file.tokens.len()
     return diagnostic::Replacement(start: file.spaces_before(file.tokens[matched.head].start), end: file.tokens[matched.last].end, text: text::String.empty(self.alloc))
 } Failed.unit_result_deleted
 

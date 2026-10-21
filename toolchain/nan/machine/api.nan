@@ -64,8 +64,12 @@ pkg struct Pending derives Eq {
 pkg fn ApiEntry.declares(self, member: Str) -> bool {
     for index in 1..<self.text.len() {
         let line = self.text[index].as_str()
-        let name = declared_name(line)
-        let Some(spelt) = line.slice_bytes(name.start, end: name.end) else {
+        let trimmed = platform::trimmed_run(line)
+        let Some(content) = line.slice_bytes(trimmed.start, end: trimmed.end) else {
+            continue
+        }
+        let name = declared_name(content)
+        let Some(spelt) = content.slice_bytes(name.start, end: name.end) else {
             continue
         }
         if spelt == member {
@@ -81,51 +85,27 @@ struct TextRange derives Copy {
     end: usize
 } TextRange
 
-/// The name a line of interface text starts with: after its white space and then a `pub ` and a
-/// `fn ` prefix, up to its first character that is neither ASCII alphanumeric nor `_`, within the
-/// line without its leading and trailing white space.
-fn declared_name(line: Str) -> TextRange {
-    let trimmed = trimmed_range(line)
-    let bytes = line.as_bytes()
-    var start = trimmed.start
-    if has_prefix(bytes, at: start, end: trimmed.end, prefix: b"pub ") {
+/// The name a line of interface text without its leading and trailing white space starts with:
+/// after a `pub ` and a `fn ` prefix, up to its first character that is neither ASCII
+/// alphanumeric nor `_`.
+fn declared_name(content: Str) -> TextRange {
+    let bytes = content.as_bytes()
+    var start: usize = 0
+    if has_prefix(bytes, at: start, prefix: b"pub ") {
         start += 4
     }
-    if has_prefix(bytes, at: start, end: trimmed.end, prefix: b"fn ") {
+    if has_prefix(bytes, at: start, prefix: b"fn ") {
         start += 3
     }
     var end = start
-    while end < trimmed.end and is_name_byte(bytes[end]) {
+    while end < bytes.len() and is_name_byte(bytes[end]) {
         end += 1
     }
     return TextRange(start: start, end: end)
 } declared_name
 
-/// The bytes of a line without its leading and trailing white space.
-fn trimmed_range(line: Str) -> TextRange {
-    var start: usize = 0
-    var end: usize = 0
-    var found = false
-    var at: usize = 0
-    for c in line {
-        let width = c.utf8_len()
-        if not platform::is_white_space(c) {
-            if not found {
-                start = at
-                found = true
-            }
-            end = at + width
-        }
-        at += width
-    }
-    return TextRange(start: start, end: end)
-} trimmed_range
-
-/// Whether the bytes from `at` to before `end` start with `prefix`.
-fn has_prefix(bytes: Slice[u8], at: usize, end: usize, prefix: Slice[u8]) -> bool {
-    if end < at or end - at < prefix.len() {
-        return false
-    }
+/// Whether the bytes from `at` start with `prefix`.
+fn has_prefix(bytes: Slice[u8], at: usize, prefix: Slice[u8]) -> bool {
     let Some(parts) = bytes.split_at(at) else {
         return false
     }
@@ -456,11 +436,22 @@ pkg fn Snapshot.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::All
         if not cursor.done() {
             return Err(invalid)
         }
-        at += 1
-        while at < records.len() and not records[at].text.starts_with("item ") {
-            at += 1
+        at = records.len()
+        for index in (start + 1)..<records.len() {
+            if records[index].text.starts_with("item ") {
+                at = index
+                break
+            }
         }
-        let entry = match entry_of(path.as_str(), records, start, end: at, grammar, alloc) {
+        let Some(parts) = records.split_at(start) else {
+            expect false
+            return Err(invalid)
+        }
+        let Some(held) = parts.tail.prefix(at - start) else {
+            expect false
+            return Err(invalid)
+        }
+        let entry = match entry_of(path.as_str(), records: held, grammar, alloc) {
             Ok(found) => found
             Err(line) => return Err(Invalid.at(line))
         }
@@ -473,31 +464,28 @@ pkg fn Snapshot.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::All
     return parsed.checked(take snapshot)
 } Snapshot.read
 
-/// The entry the records from `start` to before `end` hold, its `item` record first; or the line
-/// of the first that does not read or is not as the entry writes it.
-fn entry_of(path: Str, records: Slice[Record], start: usize, end: usize, grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[ApiEntry, u32] {
-    let first_line = records[start].line
-    let Some(parts) = records.split_at(start + 1) else {
+/// The entry the records hold, its `item` record first; or the line of the first that does not
+/// read or is not as the entry writes it.
+fn entry_of(path: Str, records: Slice[Record], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[ApiEntry, u32] {
+    expect not records.is_empty()
+    let first_line = records[0].line
+    let Some(parts) = records.split_at(1) else {
         expect false
         return Err(first_line)
     }
-    let Some(held) = parts.tail.prefix(end - start - 1) else {
-        expect false
-        return Err(first_line)
-    }
-    let entry = match read_entry(path, records: held, alloc) {
+    let entry = match read_entry(path, records: parts.tail, alloc) {
         Ok(found) => found
         Err(line) => return Err(line)
     }
     let lines = entry.lines(grammar, alloc)
-    for index in 0..<(end - start) {
-        let expected = records[start + index]
+    for index in 0..<records.len() {
+        let expected = records[index]
         if index >= lines.len() or lines[index] != expected.text {
             let line = expected.line
             return Err(line)
         }
     }
-    if lines.len() != end - start or not entry.ordered() {
+    if lines.len() != records.len() or not entry.ordered() {
         return Err(first_line)
     }
     return Ok(take entry)
@@ -527,6 +515,10 @@ fn read_entry(path: Str, records: Slice[Record], alloc: mem::Alloc) -> Result[Ap
 fn ApiEntry.read_record(mut self, word: Str, mut cursor: Cursor, mut method: Option[usize], alloc: mem::Alloc) -> bool
     waive length "one arm per record of an entry, as the format lists them"
 {
+    expect match method {
+        Some(index) => index < self.accepted.methods.len()
+        None => true
+    }
     match word {
         "text" => {
             let Some(line) = mut cursor.text() else {

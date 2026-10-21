@@ -38,11 +38,15 @@ fn Interpreter.text_write(
     site: RunSite,
     ) -> InterpFlow fails End {
     let alloc = self.alloc
+    expect args.len() > 2
     var budget = usize.widen(args[2].int_value().low_bits())
     if owner == "text::Fixed" {
         let bound = fixed_bound(type_args)
         let fixed = self.deref(args[0])
-        let room = bound - usize.widen(fixed.fields()[FIXED_LEN].int_value().low_bits())
+        expect fixed.fields().len() > FIXED_LEN
+        let len = usize.widen(fixed.fields()[FIXED_LEN].int_value().low_bits())
+        expect len <= bound
+        let room = bound - len
         if room < budget {
             budget = room
         }
@@ -50,13 +54,16 @@ fn Interpreter.text_write(
     let rendered = try mut self.render_output(args[1], budget, at, site)
     let receiver = args[0].place()
     if owner == "text::Fixed" {
+        let bound = fixed_bound(type_args)
         let len_place = receiver.with(u32.fit(FIXED_LEN), alloc)
-        let len = usize.widen(self.memory.get(len_place).int_value().low_bits())
         let bytes_place = receiver.with(u32.fit(FIXED_BYTES), alloc)
-        for offset in 0..<rendered.len() {
-            mut self.memory.set(bytes_place.with(u32.truncate(len + offset), alloc), stored: Val.Int(wide::Wide.of_u64(u64.widen(rendered[offset]))))
+        var position = usize.widen(self.memory.get(len_place).int_value().low_bits())
+        for byte in rendered.view() {
+            invariant position < bound
+            mut self.memory.set(bytes_place.with(u32.truncate(position), alloc), stored: Val.Int(wide::Wide.of_u64(u64.widen(byte))))
+            position += 1
         }
-        mut self.memory.set(len_place, stored: Val.Int(wide::Wide.of_u64(u64.widen(len + rendered.len()))))
+        mut self.memory.set(len_place, stored: Val.Int(wide::Wide.of_u64(u64.widen(position))))
         return InterpFlow.Return(Val.Unit)
     }
     var bytes = mem::List[Val].empty(alloc)
@@ -83,6 +90,7 @@ fn fixed_bound(type_args: Slice[ty::Arg]) -> usize {
 
 fn Interpreter.string_member(mut self, member: Str, args: Slice[Val], at: ItemSpan) -> Option[InterpFlow] fails End {
     let alloc = self.alloc
+    expect args.len() > 0
     match member {
         "empty" => {
             let cell = self.cell_of(args[0])
@@ -94,6 +102,7 @@ fn Interpreter.string_member(mut self, member: Str, args: Slice[Val], at: ItemSp
             return Some(InterpFlow.Return(Val.View(View(array: take storage, start: 0, len: len))))
         }
         "push" or "try_push" or "append" or "try_append" => {
+            expect args.len() > 1
             let bytes = mut self.added_bytes(member, value: args[1])
             if not mut self.append(place: args[0].place(), values: bytes.view(), element: ty::Ty.scalar(ty::Scalar.Unsigned8)) {
                 return Some(try self.exhausted(fallible: member.starts_with("try_"), at))
@@ -126,26 +135,31 @@ fn Interpreter.fixed_member(mut self, member: Str, type_args: Slice[ty::Arg], ar
             mut fields.push(Val.Int(wide::Wide.zero()))
             return Some(InterpFlow.Return(Val.Struct(item: item, fields: mem::Shared.of(take fields, alloc))))
         }
-        "as_str" => return Some(InterpFlow.Return(Val.View(mut self.fixed_view(receiver: args[0]))))
+        "as_str" => {
+            expect args.len() > 0
+            return Some(InterpFlow.Return(Val.View(mut self.fixed_view(receiver: args[0]))))
+        }
         "push" or "append" => {
+            expect args.len() > 1
             let receiver = args[0].place()
             let added = mut self.added_bytes(member, value: args[1])
             let len_place = receiver.with(u32.fit(FIXED_LEN), alloc)
             let len = usize.widen(self.memory.get(len_place).int_value().low_bits())
-            if len + added.len() > bound {
+            if len > bound or added.len() > bound - len {
                 fail self.trap("trap.requires", at)
             }
-            let count = added.len()
             let bytes_place = receiver.with(u32.fit(FIXED_BYTES), alloc)
-            var offset: usize = 0
+            var position = len
             for value in take added {
-                mut self.memory.set(bytes_place.with(u32.truncate(len + offset), alloc), stored: take value)
-                offset += 1
+                invariant position < bound
+                mut self.memory.set(bytes_place.with(u32.truncate(position), alloc), stored: take value)
+                position += 1
             }
-            mut self.memory.set(len_place, stored: Val.Int(wide::Wide.of_u64(u64.widen(len + count))))
+            mut self.memory.set(len_place, stored: Val.Int(wide::Wide.of_u64(u64.widen(position))))
             return Some(InterpFlow.Return(Val.Unit))
         }
         "clear" => {
+            expect args.len() > 0
             mut self.memory.set(args[0].place().with(u32.fit(FIXED_LEN), alloc), stored: Val.Int(wide::Wide.zero()))
             return Some(InterpFlow.Return(Val.Unit))
         }
@@ -156,6 +170,7 @@ fn Interpreter.fixed_member(mut self, member: Str, type_args: Slice[ty::Arg], ar
 fn Interpreter.interner_member(mut self, member: Str, args: Slice[Val], at: ItemSpan) -> Option[InterpFlow] fails End {
     let alloc = self.alloc
     let option = self.ty_item("core", name: "Option")
+    expect args.len() > 0
     match member {
         "empty" => {
             let cell = self.cell_of(args[0])
@@ -168,14 +183,19 @@ fn Interpreter.interner_member(mut self, member: Str, args: Slice[Val], at: Item
         }
         "intern" or "try_intern" or "lookup" => return Some(try mut self.interned(member, option, args, at))
         "resolve" => {
+            expect args.len() > 1
             let inner = self.held(args[0])
-            let index = usize.widen(self.deref(args[1]).fields()[0].int_value().low_bits())
+            let symbol = self.deref(args[1])
+            expect symbol.fields().len() > 0
+            let index = usize.widen(symbol.fields()[0].int_value().low_bits())
             let storage = self.storage(inner)
             let stored = self.memory.get(storage).fields()
             if index >= stored.len() {
                 fail self.trap("trap.bounds", at)
             }
-            let len = stored[index].fields()[0].fields().len()
+            let entry = stored[index].fields()
+            expect entry.len() > 0
+            let len = entry[0].fields().len()
             let array = storage.with(u32.truncate(index), alloc).with(0, alloc)
             return Some(InterpFlow.Return(Val.View(View(array: take array, start: 0, len: len))))
         }
@@ -187,12 +207,15 @@ fn Interpreter.interner_member(mut self, member: Str, args: Slice[Val], at: Item
 /// and their allocation for a text not interned yet, none for `lookup`.
 fn Interpreter.interned(mut self, member: Str, option: ty::ItemId, args: Slice[Val], at: ItemSpan) -> InterpFlow fails End {
     let alloc = self.alloc
+    expect args.len() > 1
     let written = mut self.bytes(args[1])
     let inner = self.held(args[0])
     let stored = self.entries(inner)
     var present: Option[usize] = None
     for index in 0..<stored.len() {
-        if same_bytes(stored[index].fields()[0].fields(), written: written.view()) {
+        let existing = stored[index].fields()
+        expect existing.len() > 0
+        if same_bytes(existing[0].fields(), written: written.view()) {
             present = Some(index)
             break
         }
@@ -208,6 +231,7 @@ fn Interpreter.interned(mut self, member: Str, option: ty::ItemId, args: Slice[V
         None => {}
     }
     let fallible = member == "try_intern"
+    expect inner.fields().len() > 1
     let cell = u32.truncate(inner.fields()[1].int_value().low_bits())
     if stored.len() > 0xFFFF_FFFF {
         return try self.exhausted(fallible, at)
@@ -256,12 +280,8 @@ fn Interpreter.symbol_value(self, index: usize) -> Val {
 /// The bytes a `push` or `append` adds: a char's encoding or a text's bytes.
 fn Interpreter.added_bytes(mut self, member: Str, value: Val) -> mem::List[Val] {
     let alloc = self.alloc
-    var skipped: usize = 0
-    while has_try_prefix(member, at: skipped) {
-        skipped += 4
-    }
     var encoded = mem::Bytes.empty(alloc)
-    if member.slice_bytes(skipped, end: member.byte_len()) == Some("push") {
+    if member == "push" or member == "try_push" {
         let Val.Char(c) = self.deref(value) else {
             expect false
             return mem::List[Val].empty(alloc)
@@ -279,19 +299,12 @@ fn Interpreter.added_bytes(mut self, member: Str, value: Val) -> mem::List[Val] 
     return bytes
 } Interpreter.added_bytes
 
-/// Whether a member name holds `try_` at a byte index.
-fn has_try_prefix(member: Str, at: usize) -> bool {
-    let Some(rest) = member.slice_bytes(at, end: member.byte_len()) else {
-        return false
-    }
-    return rest.starts_with("try_")
-} has_try_prefix
-
 /// The view of a fixed text's bytes up to its length: in its place for a reference, else in a
 /// new read-only extent.
 fn Interpreter.fixed_view(mut self, receiver: Val) -> View {
     let alloc = self.alloc
     let value = self.deref(receiver)
+    expect value.fields().len() > FIXED_LEN
     let len = usize.widen(value.fields()[FIXED_LEN].int_value().low_bits())
     match receiver {
         Val.Ref(loc) => return View(array: loc.with(u32.fit(FIXED_BYTES), alloc), start: 0, len: len)

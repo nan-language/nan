@@ -254,7 +254,12 @@ fn Workspace.layout_with(self, changed: mem::Map[text::String, mem::Bytes], allo
 } Workspace.layout_with
 
 /// The package directory of the layout nearest above a path: the last of the longest.
-fn holder_of(walked: Slice[Found], path: Str, alloc: mem::Alloc) -> Option[usize] {
+fn holder_of(walked: Slice[Found], path: Str, alloc: mem::Alloc) -> Option[usize]
+    ensures match result {
+        Some(index) => index < walked.len()
+        None => true
+    }
+{
     var holder: Option[usize] = None
     var longest: usize = 0
     for index in 0..<walked.len() {
@@ -336,7 +341,7 @@ fn Workspace.from_files(
     var walked = mem::List[Found].empty(alloc)
     for file in files {
         if file.path.ends_with("/package.nan") {
-            let Some(dir) = file.path.slice_bytes(0, end: file.path.byte_len() - 12) else {
+            let Some(dir) = file.path.slice_bytes(0, end: dir_length(file.path.as_str())) else {
                 continue
             }
             mut walked.push(Found.empty(dir, alloc))
@@ -392,11 +397,16 @@ fn Workspace.build(
         mut strays.push(StrayFile(path: take path, bytes: take bytes))
     }
     var paths = mem::Map[text::String, FileAt].empty(alloc)
-    for package_index in 0..<packages.len() {
-        for file_index in 0..<packages[package_index].files.len() {
-            let path = text::String.of(packages[package_index].files[file_index].path.as_str(), alloc)
-            discard mut paths.insert(take path, value: FileAt(package_index: package_index, file_index: file_index))
+    var package_index: usize = 0
+    for pack in packages {
+        invariant package_index < packages.len()
+        var file_index: usize = 0
+        for file in pack.files {
+            invariant file_index < pack.files.len()
+            discard mut paths.insert(text::String.of(file.path.as_str(), alloc), value: FileAt(package_index: package_index, file_index: file_index))
+            file_index += 1
         }
+        package_index += 1
     }
     let Read(closures: closures, releases: releases, confirmed: confirmed, found: found) = read
     return Workspace(root: take root, packages: take packages, releases: take releases, confirmed: take confirmed, closures: take closures, locked: take found, stray: take strays, paths: take paths, walked: take walked)
@@ -459,8 +469,12 @@ pkg view struct WorkspaceFiles {
 } WorkspaceFiles
 
 pkg fn WorkspaceFiles.next(mut self) -> Option[FileAt] {
-    while self.package_index < self.packages.len() {
-        if self.file_index < self.packages[self.package_index].files.len() {
+    let Some(parts) = self.packages.split_at(self.package_index) else {
+        return None
+    }
+    for pack in parts.tail {
+        invariant self.package_index < self.packages.len()
+        if self.file_index < pack.files.len() {
             let at = FileAt(package_index: self.package_index, file_index: self.file_index)
             self.file_index += 1
             return Some(at)
@@ -486,7 +500,7 @@ pkg fn Workspace.file(self, path: Str) -> Option[FileAt] {
 /// The bytes of a source or machine file of the workspace, by path.
 pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
     match self.file(path) {
-        Some(at) => return Some(self.packages[at.package_index].files[at.file_index].syntax.source.view())
+        Some(at) => return Some(self.file_at(at).syntax.source.view())
         None => {}
     }
     for held in self.stray {
@@ -506,7 +520,7 @@ pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
 /// The text of a line of a source or machine file of the workspace, without its line end.
 pkg proj fn Workspace.line_text(self, path: Str, line: u32) -> Option[Slice[u8]] {
     match self.file(path) {
-        Some(at) => return Some(self.packages[at.package_index].files[at.file_index].syntax.line_text(line))
+        Some(at) => return Some(self.file_at(at).syntax.line_text(line))
         None => {}
     }
     let Some(bytes) = self.bytes(path) else {
@@ -519,6 +533,7 @@ pkg proj fn Workspace.line_text(self, path: Str, line: u32) -> Option[Slice[u8]]
     var start: usize = 0
     var end = bytes.len()
     for at in 0..<bytes.len() {
+        invariant start <= at
         if bytes[at] != b'\n' {
             continue
         }
@@ -575,8 +590,14 @@ pkg fn Workspace.item_at(self, path: Str, line: u32, alloc: mem::Alloc) -> Optio
     let Some(at) = self.file(path) else {
         return None
     }
-    let pack = self.packages[at.package_index]
-    let file = pack.files[at.file_index]
+    let Some(pack) = self.packages.get(at.package_index) else {
+        expect false
+        return None
+    }
+    let Some(file) = pack.files.get(at.file_index) else {
+        expect false
+        return None
+    }
     let Some(item) = file.syntax.item_at(line) else {
         return None
     }
@@ -740,17 +761,19 @@ fn walk(
         let held = try platform::symlink_metadata(platform::join(root, name: path.as_str(), alloc).as_str())
         match holder {
             Some(index) => {
+                expect index < found.len() and found[index].dir.byte_len() < path.byte_len()
                 let Some(in_package) = path.slice_bytes(found[index].dir.byte_len() + 1, end: path.byte_len()) else {
                     expect false
                     continue
                 }
+                var holding = mut found.at_mut(index)
                 if held.is_symlink() and not name.starts_with(".") {
-                    mut found[index].links.push(text::String.of(in_package, alloc))
+                    mut holding.links.push(text::String.of(in_package, alloc))
                     continue
                 }
                 if in_package == ".nan" {
-                    try links_in_machine_dir(root, path: path.as_str(), in_package, links: mut found[index].links, alloc)
-                    try machine_files(root, path: path.as_str(), files: mut found[index].machine, alloc)
+                    try links_in_machine_dir(root, path: path.as_str(), in_package, links: mut holding.links, alloc)
+                    try machine_files(root, path: path.as_str(), files: mut holding.machine, alloc)
                 }
             }
             None => {}
@@ -767,6 +790,7 @@ fn walk(
         }
         match holder {
             Some(index) => {
+                expect index < found.len()
                 if name.as_str() != "package.nan" or found[index].dir.as_str() != dir {
                     mut (mut found.at_mut(index)).sources.push(take path)
                 }
@@ -859,9 +883,14 @@ fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     let bytes = written.as_bytes()
     var start: usize = 0
     while start < bytes.len() {
-        var end = start
-        while end < bytes.len() and bytes[end] != b'\n' {
-            end += 1
+        var end = bytes.len()
+        var next = bytes.len()
+        for at in start..<bytes.len() {
+            if bytes[at] == b'\n' {
+                end = at
+                next = at + 1
+                break
+            }
         }
         var stop = end
         if end < bytes.len() and stop > start and bytes[stop - 1] == b'\r' {
@@ -872,7 +901,7 @@ fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
             return lines
         }
         mut lines.push(text::String.of(line, alloc))
-        start = end + 1
+        start = next
     }
     return lines
 } text_lines
@@ -1000,6 +1029,7 @@ pkg fn Package.module_path(self, module: usize, alloc: mem::Alloc) -> Option[Ite
     let Some(package_name) = self.name() else {
         return None
     }
+    expect module < self.modules.len()
     let held = self.modules[module]
     var root_module = false
     for dir in held.dirs {
@@ -1044,6 +1074,7 @@ fn Package.item_path(self, file: File, tree: syntax::Tree, alloc: mem::Alloc) ->
         return None
     }
     let Some(separator) = owner.find("::") else {
+        expect module < self.types.len()
         if not self.types[module].contains_by(fn(value: text::String) => value.as_str().cmp(owner)) {
             return None
         }
@@ -1067,7 +1098,10 @@ fn Package.item_path(self, file: File, tree: syntax::Tree, alloc: mem::Alloc) ->
     let Some(moved) = self.module_path(found, alloc) else {
         return None
     }
-    let Some(member) = name.slice_bytes(separator + 2, end: name.byte_len()) else {
+    let Some(from_separator) = name.slice_bytes(separator, end: name.byte_len()) else {
+        return None
+    }
+    let Some(member) = from_separator.slice_bytes(2, end: from_separator.byte_len()) else {
         return None
     }
     var named = moved
@@ -1078,9 +1112,8 @@ fn Package.item_path(self, file: File, tree: syntax::Tree, alloc: mem::Alloc) ->
 /// The position of the last `.` of a name.
 fn last_dot(name: Str) -> Option[usize] {
     let bytes = name.as_bytes()
-    var at = bytes.len()
-    while at > 0 {
-        at -= 1
+    for step in 0..<bytes.len() {
+        let at = bytes.len() - 1 - step
         if bytes[at] == b'.' {
             return Some(at)
         }
@@ -1209,6 +1242,7 @@ fn Package.from_entry(entry: store::Entry, dir: Str, grammar: syntax::Grammar, a
         }
     }
     return try Package.load(take found, source: fn(path: Str) -> mem::Bytes fails platform::IoError {
+        expect paths.len() == entry.sources.len()
         for index in 0..<paths.len() {
             if paths[index].as_str() == path {
                 return copied_bytes(entry.sources[index].content.view(), alloc)
@@ -1258,28 +1292,29 @@ fn Package.check_misplaced_manifests(mut self, alloc: mem::Alloc) {
 /// The names of the structs, enums and layouts each module of `files` declares.
 fn type_names(files: Slice[File], modules: usize, alloc: mem::Alloc) -> mem::List[mem::Set[text::String]] {
     var types = mem::List[mem::Set[text::String]].empty(alloc)
-    for _ in 0..<modules {
-        mut types.push(mem::Set[text::String].empty(alloc))
-    }
-    for file in files {
-        let Some(module) = file.module else {
-            continue
+    for module in 0..<modules {
+        var names = mem::Set[text::String].empty(alloc)
+        for file in files {
+            if file.module != Some(module) {
+                continue
+            }
+            for item in file.syntax.items {
+                let Some(tree) = item.tree else {
+                    continue
+                }
+                let Some(kind) = tree.kind() else {
+                    continue
+                }
+                if kind.rule != syntax::Rule.StructItem and kind.rule != syntax::Rule.EnumItem and kind.rule != syntax::Rule.LayoutItem {
+                    continue
+                }
+                let Some(name) = tree.name(file.syntax, alloc) else {
+                    continue
+                }
+                discard mut names.insert(take name)
+            }
         }
-        for item in file.syntax.items {
-            let Some(tree) = item.tree else {
-                continue
-            }
-            let Some(kind) = tree.kind() else {
-                continue
-            }
-            if kind.rule != syntax::Rule.StructItem and kind.rule != syntax::Rule.EnumItem and kind.rule != syntax::Rule.LayoutItem {
-                continue
-            }
-            let Some(name) = tree.name(file.syntax, alloc) else {
-                continue
-            }
-            discard mut (mut types.at_mut(module)).insert(take name)
-        }
+        mut types.push(take names)
     }
     return types
 } type_names

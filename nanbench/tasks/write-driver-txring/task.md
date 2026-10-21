@@ -1,0 +1,4 @@
+kind: write
+area: driver
+
+In the package `txring`, write `pub fn Transmitter.send(mut self, buffer: hw::BusAddr, length: u32) -> bool` and `pub fn Transmitter.reap(mut self) -> u32`. `posted` and `reaped` count the descriptors posted and reaped since the ring started, modulo 2^32, and the descriptor numbered n in that count lies in slot n mod 8 of the ring. `send` returns false, changing nothing, when 8 descriptors are posted and not yet reaped; otherwise it writes the next descriptor with the buffer's address, the length and the status `READY`, counts it posted, writes the new `posted` mod 8 to `tail`, and returns true. `reap` goes through the posted descriptors not yet reaped, oldest first, and stops at the first whose status is not `SENT`; it writes each sent one back with address 0, length 0 and status `EMPTY`, counts it reaped, and returns how many it reaped. The controller reads and writes the ring while the driver runs.

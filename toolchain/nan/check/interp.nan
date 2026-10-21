@@ -108,6 +108,7 @@ struct StepIndex derives Copy {
 } StepIndex
 
 proj fn InterpFrame.nir(self) -> nir::Function {
+    expect self.function < self.unit.contents().functions.len()
     return self.unit.contents().functions[self.function]
 } InterpFrame.nir
 
@@ -292,7 +293,10 @@ fn Interpreter.wheres_hold(mut self, item: ty::ItemId, type_args: Slice[ty::Arg]
             }
             let param = def.param
             match generics.position(fn(own: GenericDef) => own.param == param) {
-                Some(at_index) => mut holder_args.push(type_args[at_index])
+                Some(at_index) => {
+                    expect at_index < type_args.len()
+                    mut holder_args.push(type_args[at_index])
+                }
                 None => mut holder_args.push(def.param_arg(ck.types()))
             }
         }
@@ -412,16 +416,17 @@ fn Interpreter.stops_at(self, site: RunSite, depth: usize) -> bool {
 
 /// Counts a step, ending the run past its step limit.
 fn Interpreter.step(mut self, at: ItemSpan) fails End {
-    self.steps += 1
-    if self.steps > STEP_LIMIT {
+    if self.steps >= STEP_LIMIT {
         fail End.Exhausted(self.report("steps exhausted", at))
     }
+    self.steps += 1
 } Interpreter.step
 
 fn Interpreter.report(self, word: Str, at: ItemSpan) -> Report {
     var callers = mem::List[ItemSpan].empty(self.alloc)
     var index = self.calls.len()
     while index > 0 {
+        invariant index <= self.calls.len()
         index -= 1
         mut callers.push(self.calls[index])
     }
@@ -434,6 +439,7 @@ fn Interpreter.trap(self, kind: Str, at: ItemSpan) -> End {
 
 fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function: usize, take args: mem::List[Val], type_args: Slice[ty::Arg]) -> InterpFlow fails End {
     let item = unit.contents().item
+    expect function < unit.contents().functions.len()
     let code = unit.contents().functions[function]
     var values = mem::List[Option[Val]].empty(self.alloc)
     mut values.reserve(code.types.len())
@@ -451,6 +457,7 @@ fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function:
             Val.Ref(_) => true
             else => false
         }
+        expect usize.widen(param.index) < frame.values.len()
         if referenced and not code.ty(param).is_reference() {
             frame.values[usize.widen(param.index)] = Some(self.deref(arg))
         } else {
@@ -472,6 +479,7 @@ fn Interpreter.execute(mut self, take unit: mem::Shared[nir::NirUnit], function:
 fn Interpreter.blocks(mut self, mut frame: InterpFrame, start: nir::BlockId) -> InterpFlow fails End {
     let unit = frame.unit.share()
     let item = unit.contents().item
+    expect frame.function < unit.contents().functions.len()
     let function = unit.contents().functions[frame.function]
     var current = start
     loop {
@@ -535,6 +543,7 @@ fn Interpreter.blocks(mut self, mut frame: InterpFrame, start: nir::BlockId) -> 
             if position >= params.len() {
                 break
             }
+            expect usize.widen(params[position].index) < frame.values.len()
             frame.values[usize.widen(params[position].index)] = Some(take arg)
             position += 1
         }
@@ -644,6 +653,7 @@ fn Interpreter.inst(mut self, mut frame: InterpFrame, inst: nir::Inst, site: Run
     let Some(computed) = value else {
         return
     }
+    expect usize.widen(result.index) < frame.values.len()
     frame.values[usize.widen(result.index)] = Some(take computed)
 } Interpreter.inst
 
@@ -808,12 +818,17 @@ fn Interpreter.quantified(
     if inclusive {
         end = end.wrapping_add(wide::Wide.one())
     }
+    expect region.blocks.len() > 0
     let entry = region.blocks[0]
     let unit = frame.unit.share()
-    let param = unit.contents().functions[frame.function].block(entry).params[0]
+    expect frame.function < unit.contents().functions.len()
+    let params = unit.contents().functions[frame.function].block(entry).params
+    expect params.len() > 0
+    let param = params[0]
     var decided = all
     var current = low_value.int_value()
     while current.lt(end) {
+        expect usize.widen(param.index) < frame.values.len()
         frame.values[usize.widen(param.index)] = Some(Val.Int(current))
         let flow = try mut self.blocks(mut frame, start: entry)
         let InterpFlow.Yield(result) = flow else {
@@ -949,7 +964,10 @@ fn Interpreter.import(mut self, value: ConstValue) -> Val {
         let size = u64.widen(data.fields().len())
         mut extents.push(mut self.memory.alloc_data(data.copy(self.alloc), size))
     }
-    return value.value.remap(map: fn(extent: u32) => extents[usize.widen(extent)], alloc: self.alloc)
+    return value.value.remap(map: fn(extent: u32) -> u32 {
+        expect usize.widen(extent) < extents.len()
+        return extents[usize.widen(extent)]
+    }, alloc: self.alloc)
 } Interpreter.import
 
 /// Whether the field at `index` of two const struct values compares `Equal` by `Ord.cmp`,
@@ -961,6 +979,7 @@ fn Interpreter.same_field(mut self, left: ConstValue, right: ConstValue, index: 
     }
     let left_value = mut self.import(left)
     let right_value = mut self.import(right)
+    expect index < left_value.fields().len() and index < right_value.fields().len()
     return self.equal(left_value.fields()[index], right: right_value.fields()[index])
 } Interpreter.same_field
 
@@ -968,6 +987,7 @@ fn Interpreter.same_field(mut self, left: ConstValue, right: ConstValue, index: 
 fn Interpreter.field_order(mut self, left: ConstValue, right: ConstValue, index: usize) -> core::Ordering {
     let left_value = mut self.import(left)
     let right_value = mut self.import(right)
+    expect index < left_value.fields().len() and index < right_value.fields().len()
     return self.order(left_value.fields()[index], right: right_value.fields()[index])
 } Interpreter.field_order
 
@@ -1021,7 +1041,7 @@ fn ExtentOrder.add(mut self, extent: u32) {
 fn Interpreter.operand(mut self, frame: InterpFrame, operand: nir::Operand, at: ItemSpan) -> Val fails End {
     match first operand {
         nir::Operand.Value(value) => {
-            let Some(held) = frame.values[usize.widen(value.index)] else {
+            let Some(Some(held)) = frame.values.get(usize.widen(value.index)) else {
                 expect false
                 return Val.Absent
             }
@@ -1071,7 +1091,7 @@ fn Interpreter.literal(mut self, literal: nir::Literal) -> Val {
 
 /// Where a place lies in memory, or none when it lies within an owned value.
 fn Interpreter.locate(self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Option[Loc] fails End {
-    let Some(root) = frame.values[usize.widen(place.root.index)] else {
+    let Some(Some(root)) = frame.values.get(usize.widen(place.root.index)) else {
         expect false
         return None
     }
@@ -1120,6 +1140,7 @@ fn Interpreter.stepped(
     labelled: bool,
     at: ItemSpan,
     ) -> Option[Loc] fails End {
+    expect step < place.steps.len()
     let taken = self.step_index(value, step: place.steps[step].as_str(), labelled)
     let Some(index) = taken.index else {
         return try self.located(take loc, value, place, step: step + 1, labelled: taken.labelled, at)
@@ -1131,6 +1152,7 @@ fn Interpreter.stepped(
         }
         None => {}
     }
+    expect usize.widen(index) < value.fields().len()
     return try self.located(take next, value: value.fields()[usize.widen(index)], place, step: step + 1, labelled: taken.labelled, at)
 } Interpreter.stepped
 
@@ -1145,6 +1167,7 @@ fn Interpreter.step_index(self, value: Val, step: Str, labelled: bool) -> StepIn
                 expect false
                 return StepIndex(index: None, labelled: false)
             }
+            expect usize.widen(variant) < variants.len()
             let current = variants[usize.widen(variant)]
             if labelled {
                 let Payload.Labelled(fields) = current.payload else {
@@ -1189,7 +1212,7 @@ fn Interpreter.field_index(self, item: ty::ItemId, name: Str) -> u32 {
 
 /// The value at a place.
 fn Interpreter.read(self, frame: InterpFrame, place: nir::Place, at: ItemSpan) -> Val fails End {
-    let Some(root) = frame.values[usize.widen(place.root.index)] else {
+    let Some(Some(root)) = frame.values.get(usize.widen(place.root.index)) else {
         expect false
         return Val.Absent
     }
@@ -1221,10 +1244,12 @@ fn Interpreter.read_from(self, value: Val, place: nir::Place, step: usize, label
 
 /// The part of `value` at `place`'s steps from `step`, its first step taken in `value` itself.
 fn Interpreter.read_step(self, value: Val, place: nir::Place, step: usize, labelled: bool, at: ItemSpan) -> Val fails End {
+    expect step < place.steps.len()
     let taken = self.step_index(value, step: place.steps[step].as_str(), labelled)
     let Some(index) = taken.index else {
         return try self.read_from(value, place, step: step + 1, labelled: taken.labelled, at)
     }
+    expect usize.widen(index) < value.fields().len()
     return try self.read_from(value.fields()[usize.widen(index)], place, step: step + 1, labelled: taken.labelled, at)
 } Interpreter.read_step
 
@@ -1549,8 +1574,8 @@ fn Interpreter.call(mut self, frame: InterpFrame, call: nir::Call, at: ItemSpan,
                 }
                 else => {}
             }
-            match frame.values[usize.widen(value.index)] {
-                Some(Val.Fn(function)) => return try mut self.called(function.contents(), take args, at, site)
+            match frame.values.get(usize.widen(value.index)) {
+                Some(Some(Val.Fn(function))) => return try mut self.called(function.contents(), take args, at, site)
                 else => {}
             }
             expect false
@@ -1562,6 +1587,7 @@ fn Interpreter.call(mut self, frame: InterpFrame, call: nir::Call, at: ItemSpan,
                 expect false
                 fail End.Missing
             }
+            expect args.len() > 0 and usize.widen(method) < dynamic.contents().methods.len()
             args[0] = dynamic.contents().value.copy(self.alloc)
             let callee = FnVal.Function(dynamic.contents().methods[usize.widen(method)].copy(self.alloc))
             return try mut self.called(callee, take args, at, site)
@@ -1657,6 +1683,7 @@ fn Interpreter.method_call(
         expect false
         fail End.Missing
     }
+    expect usize.widen(method) < methods.len()
     let name = methods[usize.widen(method)].name.as_str()
     match ck.types().kind(self_ty) {
         ty::TyKind.Param(_) => {
@@ -1694,6 +1721,7 @@ fn check_trap(kind: nir::CheckKind, alloc: mem::Alloc) -> text::String {
 
 /// The elements a view of the value sees.
 proj fn ConstValue.elements(self, view: View) -> Slice[Val] {
+    expect usize.widen(view.array.extent) < self.data.len()
     let array = self.data[usize.widen(view.array.extent)].at_path(view.array.path.view())
     let Some(parts) = array.fields().split_at(view.start) else {
         expect false

@@ -50,8 +50,8 @@ fn items_in(file: syntax::SourceFile, only: core::Range[u32], alloc: mem::Alloc)
         if lines.low > only.high or only.low > lines.high {
             continue
         }
-        let start = usize.widen(file.lines[usize.widen(lines.low) - 1].start)
-        let end = usize.widen(file.lines[usize.widen(lines.high) - 1].end) + 1
+        let start = usize.widen(physical_line(file, number: lines.low).start)
+        let end = usize.widen(physical_line(file, number: lines.high).end) + 1
         append_source(mut out, file, from: copied, to: start)
         for line in canonical_lines(file, item, alloc) {
             mut out.append(line.as_bytes())
@@ -113,6 +113,7 @@ fn whole(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::Bytes {
                 }
             }
             Part.Item(index) => {
+                expect index < file.items.len()
                 for line in take canonical_lines(file, item: file.items[index], alloc) {
                     mut out.push(take line)
                 }
@@ -139,6 +140,7 @@ fn parts(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::List[Part] {
     var summary: Option[u32] = None
     match file.summary {
         Some(token) => {
+            expect token < file.tokens.len()
             summary = Some(file.tokens[token].line)
         }
         None => {
@@ -148,28 +150,34 @@ fn parts(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::List[Part] {
     for item in file.items {
         mut spans.push(file.item_lines(item))
     }
+    expect spans.len() == file.items.len()
     var misplaced_docs = mem::HashMap[u32, usize].empty(seed: 0, alloc)
+    expect file.comment.len() >= file.tokens.len()
     for token in 0..<file.tokens.len() {
         let kind = file.tokens[token].kind
         if file.comment[token] and (kind == syntax::TokenKind.Doc or kind == syntax::TokenKind.FileDoc) {
             discard mut misplaced_docs.insert(file.tokens[token].line, value: token)
         }
     }
-    var line: u32 = 1
     var next_item: usize = 0
+    var covered: u32 = 0
     let last = u32.truncate(file.lines.len())
-    while line <= last {
+    for line in 1..=last {
+        if line <= covered {
+            continue
+        }
         if next_item < spans.len() and spans[next_item].low == line {
             let index = next_item
             next_item += 1
             if not file.items[index].abandoned {
                 mut found.push(Part.Item(index))
-                line = spans[index].high + 1
+                covered = spans[index].high
                 continue
             }
             var end = last
             for other in next_item..<spans.len() {
                 if not file.items[other].abandoned {
+                    expect spans[other].low > 0
                     end = spans[other].low - 1
                     break
                 }
@@ -182,11 +190,10 @@ fn parts(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::List[Part] {
                 }
             }
             mut found.push(Part.Kept(line..=end))
-            line = end + 1
+            covered = end
             continue
         }
         mut found.push(line_part(file, line, summary, misplaced_docs, alloc))
-        line += 1
     }
     return found
 } parts
@@ -199,7 +206,7 @@ fn line_part(
     misplaced_docs: mem::HashMap[u32, usize],
     alloc: mem::Alloc,
     ) -> Part {
-    let physical = file.lines[usize.widen(line) - 1]
+    let physical = physical_line(file, number: line)
     if physical.lexical_error {
         return Part.Kept(line..=line)
     }
@@ -293,8 +300,8 @@ fn group_number(spelt: Str, alloc: mem::Alloc) -> text::String {
             mut fraction.push(byte)
         } else if byte == b'.' {
             dotted = true
-        } else if hex and byte >= b'a' and byte <= b'z' {
-            mut integer.push(byte - 32)
+        } else if hex {
+            mut integer.push(uppercased(byte))
         } else {
             mut integer.push(byte)
         }
@@ -331,16 +338,35 @@ fn group_number(spelt: Str, alloc: mem::Alloc) -> text::String {
     return written
 } group_number
 
+/// A lowercase ASCII letter as its uppercase letter; any other byte as it is.
+fn uppercased(byte: u8) -> u8 {
+    if byte >= b'a' and byte <= b'z' {
+        return byte - 32
+    }
+    return byte
+} uppercased
+
 fn is_decimal_digit(byte: u8) -> bool = byte >= b'0' and byte <= b'9'
 
 fn is_hex_digit(byte: u8) -> bool = is_decimal_digit(byte) or (byte >= b'a' and byte <= b'f') or (byte >= b'A' and byte <= b'F')
 
+/// The physical line numbered `number`, from 1.
+fn physical_line(file: syntax::SourceFile, number: u32) -> syntax::Line {
+    expect number > 0 and usize.widen(number) <= file.lines.len()
+    return file.lines[usize.widen(number) - 1]
+} physical_line
+
+fn token_kind(file: syntax::SourceFile, token: u32) -> syntax::TokenKind {
+    expect usize.widen(token) < file.tokens.len()
+    return file.tokens[usize.widen(token)].kind
+} token_kind
+
 fn is_ident(file: syntax::SourceFile, token: u32) -> bool {
-    return file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident
+    return token_kind(file, token) == syntax::TokenKind.Ident
 } is_ident
 
 fn is_punct(file: syntax::SourceFile, token: u32, punct: syntax::Punct) -> bool {
-    return file.tokens[usize.widen(token)].kind == syntax::TokenKind.Punct(punct)
+    return token_kind(file, token) == syntax::TokenKind.Punct(punct)
 } is_punct
 
 /// The first child of `node`, if any, that expands `rule`.

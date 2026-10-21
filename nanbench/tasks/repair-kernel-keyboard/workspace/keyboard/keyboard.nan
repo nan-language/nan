@@ -1,0 +1,82 @@
+//! The keyboard controller, its interrupts and the counting of keys.
+
+/// The vector of the keyboard's interrupt.
+const KEYBOARD_VECTOR: u8 = 0x21
+
+pub layout ControllerStatus: u8 {
+    output_full: bit 0
+    reserved: rest
+} ControllerStatus
+
+pub registers ControllerPorts {
+    data: u8 at 0x0 read
+    status: ControllerStatus at 0x4 read
+} ControllerPorts
+
+/// The controller and the signal each scancode is posted to.
+pub open linear struct Keyboard {
+    ports: hw::Ports[ControllerPorts]
+    scancodes: mem::Shared[hw::Signal[u8]]
+} Keyboard
+
+/// The keys pressed so far and the scancodes received.
+pub closed struct Counts {
+    pub presses: u64
+    pub codes: u64
+} Counts
+
+/// Takes the byte the controller holds, if any, and posts it; tells whether there was one.
+pub fn Keyboard.receive(mut self, t: hw::IrqsDisabled) -> bool limits notrap, terminates, noalloc {
+    let status = mut self.ports.read(ControllerPorts.status)
+    if not status.output_full {
+        return false
+    }
+    let code = mut self.ports.read(ControllerPorts.data)
+    self.scancodes.contents().post(t, value: code)
+    return true
+} Keyboard.receive
+
+interrupt fn Keyboard.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits notrap, stack 512 {
+    discard mut self.receive(irq.irqs_disabled())
+    take irq.complete()
+    return hw::IrqExit.Reschedule
+} Keyboard.on_irq
+
+/// Completes an interrupt nothing raised.
+pub interrupt fn on_spurious(take irq: hw::IrqContext) limits stack 256 {
+    take irq.complete()
+} on_spurious
+
+/// Installs the keyboard on its vector.
+pub fn attach(take ports: hw::Ports[ControllerPorts], scancodes: mem::Shared[hw::Signal[u8]]) -> hw::IrqShared[Keyboard] {
+    let keyboard = Keyboard(ports: take ports, scancodes: scancodes.share())
+    return hw::IrqShared.install(take keyboard, vector: KEYBOARD_VECTOR, on_irq: Keyboard.on_irq)
+} attach
+
+/// Uninstalls the keyboard and gives its controller's ports back.
+pub fn detach(take shared: hw::IrqShared[Keyboard]) -> hw::Ports[ControllerPorts] {
+    let Keyboard(ports: ports, scancodes: _) = take shared.uninstall()
+    return ports
+} detach
+
+/// Counts a scancode under the lock: every code, and a press for each code below 0x80.
+pub fn count_code(counts: hw::SpinLock[Counts], code: u8) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        counts.with(t, body: fn(mut held: Counts) {
+            held.codes += 1
+            if code < 0x80 {
+                held.presses += 1
+            }
+        })
+    })
+} count_code
+
+/// The presses per minute that `presses` presses in `elapsed_ms` milliseconds make, rounded
+/// down; 0 when no time elapsed.
+pub fn presses_per_minute(presses: u32, elapsed_ms: u64) -> u64 {
+    if elapsed_ms == 0 {
+        return 0
+    }
+    let minutes = f64.nearest(elapsed_ms) / 60_000.0
+    return u64.saturate(f64.widen(presses) / minutes)
+} presses_per_minute

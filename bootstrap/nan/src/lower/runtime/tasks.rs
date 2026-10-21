@@ -17,9 +17,11 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use super::super::fx::{Fx, PTR};
 use super::super::host;
 use super::super::machine::Stub;
-use super::super::{CALL_CONV, Lowering};
+use super::super::{CALL_CONV, Lowering, stack};
 use super::regions::origin;
 use super::{Routine, state, system};
+use crate::check::db::ItemId;
+use crate::nir::Span;
 
 /// The offsets of a task record's fields.
 pub mod task {
@@ -343,6 +345,18 @@ impl Lowering<'_, '_> {
             && !self.entry_stacks.contains(&(code, stack))
         {
             self.entry_stacks.push((code, stack));
+        }
+    }
+
+    /// Records a task entry written at `span` of `item`, once, with the stack its task gets: its
+    /// own `limits stack N`, or the default task stack.
+    pub fn task(&mut self, function: FuncId, item: ItemId, span: Span, own: Option<u64>) {
+        if !self.tasks.iter().any(|task| task.function == function) {
+            self.tasks.push(stack::Task {
+                function,
+                at: stack::At { item, span },
+                stack: own.unwrap_or(STACK),
+            });
         }
     }
 

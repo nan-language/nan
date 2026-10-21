@@ -230,7 +230,7 @@ fn Solver.new(take ck: Checker, package_id: ty::PackageId) -> Solver {
 } Solver.new
 
 fn Solver.step(mut self) fails Halt {
-    if self.steps == FUEL {
+    if self.steps >= FUEL {
         fail Halt.Fuel
     }
     self.steps += 1
@@ -295,7 +295,7 @@ fn Solver.search(mut self, take state: State, depth: u32) -> Option[OpenBranch] 
         Err(Halt.Fuel) => fail Halt.Fuel
         Ok(_) => {}
     }
-    if depth == SPLIT_DEPTH {
+    if depth >= SPLIT_DEPTH {
         return Some(OpenBranch(state: take state, at_depth: true))
     }
     let split = match attempt mut self.split(mut state) {
@@ -340,6 +340,7 @@ fn Solver.assert_split(mut self, mut state: State, split: Split, value: bool) ->
 fn Solver.split(mut self, mut state: State) -> Option[Split] fails Halt {
     let alloc = state.terms.alloc
     for position in 0..<state.ites.len() {
+        expect position < state.ites.len()
         let Some(arms) = state.terms.ite_arms(state.ites[position]) else {
             continue
         }
@@ -349,10 +350,10 @@ fn Solver.split(mut self, mut state: State) -> Option[Split] fails Halt {
         }
     }
     for index in 0..<state.clauses.len() {
+        let literals = copied_literals(state.clauses[index].literals.view(), alloc)
         var open = mem::List[Literal].empty(alloc)
         var satisfied = false
-        for position in 0..<state.clauses[index].literals.len() {
-            let literal = state.clauses[index].literals[position].copy(alloc)
+        for literal in take literals {
             match try mut self.evaluate(mut state, literal) {
                 Some(true) => {
                     satisfied = true
@@ -400,6 +401,7 @@ fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
     var changed = false
     var seen = mem::HashMap[Term, u32].empty(seed: 0, alloc)
     for position in 0..<state.apps.len() {
+        expect position < state.apps.len()
         let app = state.apps[position]
         var roots = mem::List[u32].empty(alloc)
         for part in state.terms.get(app).parts(alloc) {
@@ -419,6 +421,7 @@ fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
     }
     var values = mem::HashMap[wide::Wide, u32].empty(seed: 0, alloc)
     for position in 0..<state.integers.len() {
+        expect position < state.integers.len()
         let term = state.integers[position]
         let root = state.find(term)
         let Some(value) = state.classes[usize.widen(root)].single() else {
@@ -443,6 +446,7 @@ fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
 fn Solver.ite_terms(mut self, mut state: State) -> bool fails Halt {
     var changed = false
     for position in 0..<state.ites.len() {
+        expect position < state.ites.len()
         let ite = state.ites[position]
         let Some(arms) = state.terms.ite_arms(ite) else {
             continue
@@ -572,10 +576,16 @@ fn divided_bound(bound: Option[wide::Wide], coefficient: wide::Wide, ceiling: bo
 
 /// The term of a sum a disequality may exclude a value of: its one term without a single
 /// value, or its first when every term has one.
-fn State.open_summand(self, sum: Linear) -> Option[usize] {
+fn State.open_summand(self, sum: Linear) -> Option[usize]
+    ensures match result {
+        Some(index) => index < sum.terms.len()
+        None => true
+    }
+{
     var open: Option[usize] = None
     var count: usize = 0
     for index in 0..<sum.terms.len() {
+        invariant count <= index
         if self.class(sum.terms[index].term).single().is_none() {
             if count == 0 {
                 open = Some(index)
@@ -597,6 +607,7 @@ fn Solver.disequality_intervals(mut self, mut state: State) -> bool fails Halt {
     let alloc = state.terms.alloc
     var changed = false
     for position in 0..<state.disequalities.len() {
+        expect position < state.disequalities.len()
         let sum = state.disequalities[position].copy(alloc)
         let Some(index) = state.open_summand(sum) else {
             continue
@@ -630,8 +641,10 @@ fn Solver.product_intervals(mut self, mut state: State) -> bool fails Halt {
     let alloc = state.terms.alloc
     var changed = false
     for position in 0..<state.muls.len() {
+        expect position < state.muls.len()
         let mul = state.muls[position]
         let parts = state.terms.get(mul).parts(alloc)
+        expect parts.len() == 2
         let a = state.class(parts[0])
         let b = state.class(parts[1])
         let Some(bounds) = a.product_bounds(b) else {
@@ -707,6 +720,7 @@ fn State.implied_congruence(self, sum: Linear, index: usize) -> Option[Congruenc
     let Some(rest) = sum.constant.checked_sub(total) else {
         return None
     }
+    expect index < sum.terms.len()
     let residue = euclid_rem(sum.terms[index].coefficient.wrapping_mul(rest), divisor: modulus)
     return Some(Congruence(residue: residue, modulus: modulus))
 } State.implied_congruence
@@ -721,6 +735,7 @@ fn Solver.differences(mut self, mut state: State) -> bool fails Halt {
         return false
     }
     for node in nodes {
+        expect usize.widen(node) < state.classes.len()
         let class = state.classes[usize.widen(node)]
         match class.high {
             Some(high) => lower_edge(mut edges, from: ZERO_NODE, to: node, weight: high)
@@ -908,37 +923,28 @@ fn Solver.clauses(mut self, mut state: State) -> bool fails Halt {
     var changed = false
     var index: usize = 0
     while index < state.clauses.len() {
-        let clause = index
+        let literals = copied_literals(state.clauses[index].literals.view(), alloc)
         index += 1
-        var open: Option[usize] = None
-        var count: usize = 0
+        var open = mem::List[Literal].empty(alloc)
         var satisfied = false
-        for position in 0..<state.clauses[clause].literals.len() {
-            let literal = state.clauses[clause].literals[position].copy(alloc)
+        for literal in take literals {
             let value = try mut self.evaluate(mut state, literal)
             if value == Some(true) {
                 satisfied = true
                 break
             }
             if value.is_none() {
-                if count == 0 {
-                    open = Some(position)
-                }
-                count += 1
+                mut open.push(take literal)
             }
         }
         if satisfied {
             continue
         }
-        if count == 0 {
+        if open.len() == 0 {
             fail Halt.Contradiction
         }
-        let Some(position) = open else {
-            continue
-        }
-        if count == 1 {
-            let literal = state.clauses[clause].literals[position].copy(alloc)
-            let asserted = try mut self.assert_literal(mut state, literal)
+        if open.len() == 1 {
+            let asserted = try mut self.assert_literal(mut state, literal: open[0])
             changed = changed or asserted
         }
     }
@@ -1003,6 +1009,7 @@ fn Solver.trigger_instances(
             continue
         }
         let app_parts = state.terms.get(app).parts(alloc)
+        expect trigger.position < app_parts.len()
         let instance = app_parts[trigger.position]
         if state.instantiated(entry.id, root: state.find(instance)) {
             continue
@@ -1163,6 +1170,7 @@ fn Solver.add_clause(mut self, mut state: State, take clause: mem::List[Literal]
     let key = mem::Shared.of(mut state.encodings.clause(self.ck, terms: state.terms, clause: sorted.view()), alloc)
     let at = state.clause_position(key.contents().view())
     mut state.clauses.insert(at, value: StateClause(id: state.next_clause, key: take key, literals: take sorted))
+    expect state.next_clause < 0xFFFF_FFFF
     state.next_clause += 1
 } Solver.add_clause
 
@@ -1172,6 +1180,7 @@ fn State.clause_position(self, key: Slice[u8]) -> usize {
     var high = self.clauses.len()
     while low < high {
         let middle = low + (high - low) / 2
+        expect middle < self.clauses.len()
         if self.clauses[middle].key.contents().view().cmp(key) == core::Ordering.Greater {
             high = middle
         } else {
@@ -1187,6 +1196,7 @@ fn State.atom_position(self, key: Slice[u8]) -> usize {
     var high = self.atoms.len()
     while low < high {
         let middle = low + (high - low) / 2
+        expect middle < self.atoms.len()
         if self.atoms[middle].key.contents().view().cmp(key) == core::Ordering.Greater {
             high = middle
         } else {
@@ -1202,6 +1212,7 @@ fn Encodings.position_of(mut self, ck: Checker, terms: Terms, list: Slice[u32], 
     var high = list.len()
     while low < high {
         let middle = low + (high - low) / 2
+        expect middle < list.len()
         let other = mut self.term(ck, terms, id: list[middle])
         if other.contents().view().cmp(key) == core::Ordering.Greater {
             high = middle
@@ -1232,6 +1243,7 @@ fn Solver.register(mut self, mut state: State, term: u32) {
         mut state.classes.push(ANY_CLASS)
         mut state.registered.push(false)
     }
+    expect index < state.size.len() and index < state.classes.len() and index < state.registered.len()
     state.parent[index] = term
     state.size[index] = 1
     state.registered[index] = true
@@ -1326,6 +1338,8 @@ fn Solver.merge(mut self, mut state: State, a: u32, b: u32) -> bool fails Halt {
         root = right
         child = left
     }
+    expect usize.widen(root) < state.size.len() and usize.widen(root) < state.classes.len()
+    expect usize.widen(child) < state.parent.len() and usize.widen(child) < state.size.len() and usize.widen(child) < state.classes.len()
     state.parent[usize.widen(child)] = root
     let added = state.size[usize.widen(child)]
     state.size[usize.widen(root)] += added
@@ -1624,12 +1638,18 @@ fn copied_instances(instances: Slice[Instance], alloc: mem::Alloc) -> mem::List[
     return copied
 } copied_instances
 
-fn State.find(self, term: u32) -> u32 {
+fn State.find(self, term: u32) -> u32
+    ensures usize.widen(result) < self.parent.len() and usize.widen(result) < self.size.len() and usize.widen(result) < self.classes.len()
+{
     var current = term
-    while self.parent[usize.widen(current)] != current {
-        current = self.parent[usize.widen(current)]
+    loop {
+        invariant usize.widen(current) < self.parent.len()
+        let parent = self.parent[usize.widen(current)]
+        if parent == current {
+            return current
+        }
+        current = parent
     }
-    return current
 } State.find
 
 fn State.is_registered(self, term: u32) -> bool {
@@ -1991,6 +2011,7 @@ fn Terms.triggers(self, forall: Forall) -> mem::List[Trigger] {
         var count: usize = 0
         var index: usize = 0
         for position in 0..<parts.len() {
+            invariant count <= position
             if parts[position] == forall.bound {
                 if count == 0 {
                     index = position

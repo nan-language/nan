@@ -85,6 +85,7 @@ fn doc_comments(source: syntax::SourceFile, tree: syntax::Tree, visibility: ast:
         }
         var lines = mem::List[usize].empty(alloc)
         for token in tree.child_tokens(node) {
+            expect usize.widen(token) < source.tokens.len()
             if source.tokens[usize.widen(token)].kind == syntax::TokenKind.Doc {
                 mut lines.push(usize.widen(token))
             }
@@ -157,6 +158,7 @@ fn member_documented(
     match tree.find(content, rule: syntax::Rule.Visibility) {
         Some(node) => match tree.span(node, alloc) {
             Some(written) => {
+                expect usize.widen(written.head) < source.tokens.len()
                 own = match source.tokens[usize.widen(written.head)].kind {
                     syntax::TokenKind.Keyword(syntax::Keyword.Pub) => ast::Visibility.Pub
                     else => ast::Visibility.Pkg
@@ -171,7 +173,9 @@ fn member_documented(
 
 /// Where the text of a `DOC` or `FILE_DOC` line starts in the line's token: after its opener and
 /// a space after it.
-fn line_text_offset(source: syntax::SourceFile, token: usize) -> usize {
+fn line_text_offset(source: syntax::SourceFile, token: usize) -> usize
+    ensures result == 3 or result == 4
+{
     let bytes = source.text(token).as_bytes()
     if bytes.len() > 3 and bytes[3] == b' ' {
         return 4
@@ -220,7 +224,10 @@ fn reference_ranges(text: Str, alloc: mem::Alloc) -> mem::List[core::Range[usize
     var found = mem::List[core::Range[usize]].empty(alloc)
     for part in text_parts(text, alloc) {
         match part {
-            Part.Reference(range) => mut found.push((range.low + 1)..<(range.high - 1))
+            Part.Reference(range) => {
+                expect range.low < range.high
+                mut found.push((range.low + 1)..<(range.high - 1))
+            }
             Part.Code(_) => {}
         }
     }
@@ -267,6 +274,7 @@ fn claim_lines(lines: Slice[DocLine], alloc: mem::Alloc) -> mem::Set[u32] {
                 written
             }
             let offset = at
+            expect at <= line.text.byte_len() and written.utf8_len() <= line.text.byte_len() - at
             at += written.utf8_len()
             let prose = code.position(fn(range: core::Range[usize]) => range.contains(offset)).is_none()
             if prose and (c.is_ascii_alphabetic() or c.is_ascii_digit() or c == '-' or c == '\'') {
@@ -394,6 +402,7 @@ fn Checker.public_docs(self, item: ty::ItemId) -> mem::List[PublicDoc] {
     var docs = mem::List[PublicDoc].empty(alloc)
     let data = db.item(item)
     let source = db.file(data.file).syntax
+    expect data.index < source.items.len()
     let Some(tree) = source.items[data.index].tree else {
         return docs
     }
@@ -402,7 +411,9 @@ fn Checker.public_docs(self, item: ty::ItemId) -> mem::List[PublicDoc] {
         mut interface_lines.push(trimmed_line(line.as_str(), alloc))
     }
     var invariants: u64 = 0
-    for doc in doc_comments(source, tree, visibility: db.declaration(item).visibility, alloc) {
+    let comments = doc_comments(source, tree, visibility: db.declaration(item).visibility, alloc)
+    for doc in comments {
+        invariant invariants < u64.widen(comments.len())
         let is_invariant = not doc.member.is_empty() and doc.member.starts_with("invariant ")
         if is_invariant {
             if interface_lines.position(fn(written: text::String) => written.as_str() == doc.member.as_str()).is_none() {
@@ -431,6 +442,7 @@ fn Checker.public_docs(self, item: ty::ItemId) -> mem::List[PublicDoc] {
             }
             mut joined.append(written)
         }
+        expect doc.lines.len() > 0 and doc.lines[0] < source.tokens.len()
         mut docs.push(PublicDoc(key: take key, text: take joined, line: source.tokens[doc.lines[0]].line))
     }
     return docs
@@ -443,6 +455,7 @@ fn Checker.check_docs(self, item: ty::ItemId) {
     let data = db.item(item)
     let file = db.file(data.file)
     let source = file.syntax
+    expect data.index < source.items.len()
     let Some(tree) = source.items[data.index].tree else {
         return
     }
@@ -465,7 +478,11 @@ fn Checker.check_docs(self, item: ty::ItemId) {
 fn Checker.check_summaries(self, package_id: ty::PackageId) {
     let db = self.db()
     let data = db.package_data(package_id)
-    self.check_summary(db.source(package_id).files[0], module: data.root)
+    let Some(manifest) = db.source(package_id).files.get(0) else {
+        expect false
+        return
+    }
+    self.check_summary(manifest, module: data.root)
     for module in data.modules {
         for file in db.module(module).files {
             self.check_summary(db.file(file), module: Some(module))
@@ -530,6 +547,7 @@ fn Checker.reference_problem(
     let Some(reference) = reference_path(written, grammar: self.session().grammar.contents(), alloc) else {
         return Some(DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: mem::List[diagnostic::Fix].empty(alloc)))
     }
+    expect optional_length(reference.member) < usize.widen(span.end)
     let member_at = span.end - u32.fit(optional_length(reference.member))
     let path_end = if reference.member.is_some() {
         member_at - 1
@@ -731,7 +749,10 @@ fn Checker.check_variant_docs(self, package_id: ty::PackageId) {
 } Checker.check_variant_docs
 
 /// Whether a token is the `DOC`, `NL` or `COL0` of a line rather than its text.
-fn is_line_token(source: syntax::SourceFile, token: u32) -> bool {
+fn is_line_token(source: syntax::SourceFile, token: u32) -> bool
+    ensures usize.widen(token) < source.tokens.len()
+{
+    expect usize.widen(token) < source.tokens.len()
     match source.tokens[usize.widen(token)].kind {
         syntax::TokenKind.Doc or syntax::TokenKind.Nl or syntax::TokenKind.Col0 => return true
         else => return false
@@ -776,7 +797,10 @@ fn doc_line_of(source: syntax::SourceFile, token: usize, alloc: mem::Alloc) -> D
         Some(written) => mut copied.append(written)
         None => {}
     }
-    return DocLine(line: source.tokens[token].line, start: source.tokens[token].start + u32.fit(offset), text: take copied)
+    expect token < source.tokens.len()
+    let at = source.tokens[token]
+    expect at.start <= at.end and offset <= usize.widen(at.end - at.start)
+    return DocLine(line: at.line, start: at.start + u32.fit(offset), text: take copied)
 } doc_line_of
 
 /// A line of an interface text without its surrounding white space.
@@ -845,6 +869,7 @@ fn Checker.unresolved_problem(
     for word in take core_vocabulary(alloc) {
         mut candidates.push(take word)
     }
+    expect span.start <= path_end
     let Some(written_path) = written.slice_bytes(0, end: usize.widen(path_end - span.start)) else {
         return DocProblem(code: diagnostic::Code.DocUnresolvedReference, fixes: take fixes)
     }
@@ -927,7 +952,10 @@ fn Checker.check_variant_summaries(self, source: workspace::Package, module: wor
         let Some(index) = source.files.position(fn(file: workspace::File) => file.path.as_str() == wanted.as_str()) else {
             continue
         }
-        let file = source.files[index]
+        let Some(file) = source.files.get(index) else {
+            expect false
+            continue
+        }
         let Some(summary) = file.syntax.summary else {
             continue
         }

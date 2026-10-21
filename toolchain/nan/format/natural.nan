@@ -25,13 +25,16 @@ fn Natural.of_digits(digits: Slice[u8], radix: u32, alloc: mem::Alloc) -> Natura
 } Natural.of_digits
 
 /// The value of an ASCII digit or letter, the letters from 10.
-fn digit_value(byte: u8) -> u32 {
+fn digit_value(byte: u8) -> u32
+    ensures result < 256
+{
     if byte >= b'a' {
         return u32.widen(byte - b'a') + 10
     }
     if byte >= b'A' {
         return u32.widen(byte - b'A') + 10
     }
+    expect byte >= b'0'
     return u32.widen(byte - b'0')
 } digit_value
 
@@ -73,6 +76,7 @@ fn Natural.added(self, other: Natural, alloc: mem::Alloc) -> Natural {
     var carry: u64 = 0
     var index: usize = 0
     while index < self.limbs.len() or index < other.limbs.len() {
+        invariant carry <= 1
         var sum = carry
         if index < self.limbs.len() {
             sum += u64.widen(self.limbs[index])
@@ -126,11 +130,11 @@ fn Natural.compare(self, other: Natural) -> core::Ordering {
     if self.limbs.len() != other.limbs.len() {
         return self.limbs.len().cmp(other.limbs.len())
     }
-    var index = self.limbs.len()
-    while index > 0 {
-        index -= 1
-        if self.limbs[index] != other.limbs[index] {
-            return self.limbs[index].cmp(other.limbs[index])
+    for back in 1..=self.limbs.len() {
+        let mine = self.limbs[self.limbs.len() - back]
+        let theirs = other.limbs[other.limbs.len() - back]
+        if mine != theirs {
+            return mine.cmp(theirs)
         }
     }
     return core::Ordering.Equal
@@ -139,28 +143,35 @@ fn Natural.compare(self, other: Natural) -> core::Ordering {
 /// Subtracts a number no greater than this one.
 fn Natural.subtract(mut self, other: Natural) {
     var borrow: u64 = 0
-    for index in 0..<self.limbs.len() {
+    let count = self.limbs.len()
+    for index in 0..<count {
+        invariant borrow <= 1 and self.limbs.len() == count
         var subtrahend = borrow
         if index < other.limbs.len() {
             subtrahend += u64.widen(other.limbs[index])
         }
         let minuend = u64.widen(self.limbs[index])
-        borrow = 0
         if minuend < subtrahend {
+            self.limbs[index] = u32.truncate(minuend + 0x1_0000_0000 - subtrahend)
             borrow = 1
+        } else {
+            self.limbs[index] = u32.truncate(minuend - subtrahend)
+            borrow = 0
         }
-        self.limbs[index] = u32.truncate((minuend + (borrow << 32)) - subtrahend)
     }
     expect borrow == 0
     mut self.trim()
 } Natural.subtract
 
 /// Divides the number by `divisor` and returns the remainder.
-fn Natural.div_small(mut self, divisor: u32) -> u32 {
+fn Natural.div_small(mut self, divisor: u32) -> u32
+    ensures result < divisor
+{
     let wide = u64.widen(divisor)
     var remainder: u64 = 0
     var index = self.limbs.len()
     while index > 0 {
+        invariant index <= self.limbs.len()
         index -= 1
         let current = (remainder << 32) | u64.widen(self.limbs[index])
         self.limbs[index] = u32.truncate(current / wide)
@@ -175,16 +186,14 @@ fn Natural.to_decimal(self, alloc: mem::Alloc) -> text::String {
     var rest = self.shifted(0, alloc)
     var reversed = mem::Bytes.empty(alloc)
     loop {
-        mut reversed.push(b'0' + u8.truncate(mut rest.div_small(10)))
+        mut reversed.push(b'0' + u8.fit(mut rest.div_small(10)))
         if rest.is_zero() {
             break
         }
     }
     var digits = mem::Bytes.empty(alloc)
-    var index = reversed.len()
-    while index > 0 {
-        index -= 1
-        mut digits.push(reversed[index])
+    for back in 1..=reversed.len() {
+        mut digits.push(reversed[reversed.len() - back])
     }
     let Ok(written) = attempt text::String.try_from_utf8(digits.view(), alloc) else {
         expect false
@@ -198,10 +207,12 @@ fn Natural.to_decimal(self, alloc: mem::Alloc) -> text::String {
 /// `precision` bits but its leading one, the normal exponents running from `1 - max_exponent`
 /// to `max_exponent`; infinity past the greatest finite value.
 fn nearest_float(number: Slice[u8], precision: u32, max_exponent: i64, alloc: mem::Alloc) -> u64 {
+    expect is_float_format(precision, max_exponent)
     var digits = mem::Bytes.empty(alloc)
     var fraction: usize = 0
     var after_point = false
     for byte in number {
+        invariant fraction <= digits.len()
         if byte == b'.' {
             after_point = true
             continue
@@ -246,7 +257,7 @@ fn nearest_float(number: Slice[u8], precision: u32, max_exponent: i64, alloc: me
         significand = significand >> 1
         exponent += 1
     }
-    if exponent + width - 1 > max_exponent {
+    if exponent > max_exponent - width + 1 {
         return u64.fit(2 * max_exponent + 1) << (precision - 1)
     }
     let hidden = 1u64 << (precision - 1)
@@ -255,6 +266,10 @@ fn nearest_float(number: Slice[u8], precision: u32, max_exponent: i64, alloc: me
     }
     return (u64.fit(exponent + width - 1 + max_exponent) << (precision - 1)) | (significand - hidden)
 } nearest_float
+
+/// Whether a binary format of `precision` significand bits and greatest exponent `max_exponent`
+/// lies between `f32` and `f64`.
+fn is_float_format(precision: u32, max_exponent: i64) -> bool = precision >= 24 and precision <= 53 and max_exponent >= 127 and max_exponent <= 1_023
 
 /// The integer part of a quotient, and how twice its remainder compares with the divisor.
 struct Quotient derives Copy {
@@ -269,7 +284,10 @@ fn scaled_quotient(
     exponent: i64,
     precision: u32,
     alloc: mem::Alloc,
-    ) -> Quotient {
+    ) -> Quotient
+    ensures result.value < 0x80_0000_0000_0000
+{
+    expect precision <= 53
     var numerator_shift: usize = 0
     var denominator_shift: usize = 0
     if exponent >= 0 {
@@ -301,9 +319,10 @@ fn scaled_quotient(
 /// `0`, or the shortest digits that read back as the value, positional, with a point only
 /// before a fraction.
 fn float_text(bits: u64, precision: u32, max_exponent: i64, alloc: mem::Alloc) -> text::String {
+    expect is_float_format(precision, max_exponent)
     let fraction_bits = precision - 1
     let biased = (bits >> fraction_bits) & u64.fit(2 * max_exponent + 1)
-    let fraction = bits & ((1u64 << fraction_bits) - 1)
+    let fraction = bits & ~(~0u64 << fraction_bits)
     if biased == u64.fit(2 * max_exponent + 1) {
         return text::String.of("inf", alloc)
     }
@@ -316,9 +335,10 @@ fn float_text(bits: u64, precision: u32, max_exponent: i64, alloc: mem::Alloc) -
 /// A positive finite nonzero float's bits as a fraction of naturals, in a binary format of
 /// `precision` significand bits and greatest exponent `max_exponent`.
 fn decoded_float(bits: u64, precision: u32, max_exponent: i64) -> Decoded {
+    expect is_float_format(precision, max_exponent)
     let fraction_bits = precision - 1
     let biased = (bits >> fraction_bits) & u64.fit(2 * max_exponent + 1)
-    let fraction = bits & ((1u64 << fraction_bits) - 1)
+    let fraction = bits & ~(~0u64 << fraction_bits)
     let shift = max_exponent + i64.widen(fraction_bits)
     if biased == 0 {
         return Decoded(mant: fraction << 1, minus: 1, plus: 1, exp: 0 - shift, inclusive: true)
@@ -357,9 +377,11 @@ fn below(order: core::Ordering, inclusive: bool) -> bool {
 /// The shortest digits between a float's neighbours, the nearer of the last two candidates and
 /// the greater on a tie: the digits of Dragon4's free-format algorithm.
 fn shortest_digits(decoded: Decoded, alloc: mem::Alloc) -> Digits {
+    expect decoded.mant < 0x100_0000_0000_0000 and decoded.plus >= 1 and decoded.plus <= 2 and decoded.exp > -2_048 and decoded.exp < 2_048
     let high = decoded.mant + decoded.plus
     let nbits = 64 - i64.widen((high - 1).leading_zeros())
     var k = ((nbits + decoded.exp) * 1_292_913_986).shr_arith(32)
+    expect k > -2_048 and k < 2_048
     var mant = Natural.of_u64(decoded.mant, alloc)
     var minus = Natural.of_u64(decoded.minus, alloc)
     var plus = Natural.of_u64(decoded.plus, alloc)
@@ -435,22 +457,24 @@ fn shortest_digits(decoded: Decoded, alloc: mem::Alloc) -> Digits {
 /// Adds one to the last of decimal digits; when they are all nines, they read `10...0` and the
 /// digit to append, a further `0`, comes back.
 fn rounded_up(mut digits: mem::Bytes) -> Option[u8] {
-    var index = digits.len()
-    while index > 0 {
-        index -= 1
+    let count = digits.len()
+    for back in 1..=count {
+        let index = count - back
         if digits[index] != b'9' {
             digits[index] = digits[index] + 1
-            for later in (index + 1)..<digits.len() {
+            for later in (index + 1)..<count {
+                invariant digits.len() == count
                 digits[later] = b'0'
             }
             return None
         }
     }
-    if digits.len() == 0 {
+    if count == 0 {
         return Some(b'1')
     }
     digits[0] = b'1'
-    for later in 1..<digits.len() {
+    for later in 1..<count {
+        invariant digits.len() == count
         digits[later] = b'0'
     }
     return Some(b'0')

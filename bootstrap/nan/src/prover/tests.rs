@@ -111,3 +111,10 @@ fn where_conditions_of_const_parameters_are_facts_in_their_items_and_members() {
         vec![(12, Status::Proven)]
     );
 }
+
+#[test]
+fn a_loop_changes_what_its_nested_loops_change() {
+    let source = "//! Counts.\n\npub fn nested(outer: usize, inner: usize) -> usize {\n    var count: usize = 0\n    for _ in 0..<outer {\n        for _ in 0..<inner {\n            count = count.wrapping_add(1)\n        }\n    }\n    expect count == 0\n    return count\n} nested\n";
+    let statuses = statuses(&[("example/example.nan", source)], "example::nested");
+    assert_eq!(statuses, vec![(10, Status::Checked)]);
+}

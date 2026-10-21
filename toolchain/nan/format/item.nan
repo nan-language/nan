@@ -354,7 +354,7 @@ fn Facts.member_clauses(
     ) {
     var member_head: Option[u32] = None
     for token in tokens {
-        match file.tokens[usize.widen(token)].kind {
+        match token_kind(file, token) {
             syntax::TokenKind.Keyword(syntax::Keyword.Proj) or syntax::TokenKind.Keyword(syntax::Keyword.Fn) => {
                 member_head = Some(token)
                 break
@@ -464,16 +464,16 @@ fn Facts.directive_order(
 /// The identifiers of a directive after its first, separated by spaces.
 fn directive_words(file: syntax::SourceFile, tree: syntax::Tree, directive: u32, alloc: mem::Alloc) -> text::String {
     var words = text::String.empty(alloc)
-    var seen: usize = 0
+    var first_seen = false
     for token in tree.child_tokens(directive) {
         if not is_ident(file, token) {
             continue
         }
-        seen += 1
-        if seen == 1 {
+        if not first_seen {
+            first_seen = true
             continue
         }
-        if seen > 2 {
+        if words.byte_len() > 0 {
             mut words.push(' ')
         }
         mut words.append(file.text(usize.widen(token)))
@@ -705,6 +705,7 @@ fn item_tokens(
     alloc: mem::Alloc,
     ) -> mem::List[Tok] {
     var order = mem::List[u32].empty(alloc)
+    expect item.end <= file.tokens.len() and file.tokens.len() <= file.comment.len()
     for token in item.head..<item.end {
         if not file.comment[token] and file.tokens[token].kind != syntax::TokenKind.Col0 {
             mut order.push(u32.truncate(token))
@@ -718,6 +719,7 @@ fn item_tokens(
     var carried = mem::List[text::String].empty(alloc)
     for token in order {
         let at = usize.widen(token)
+        expect at < file.tokens.len()
         let source = file.tokens[at]
         match mut attached.comments.remove(token) {
             Some(own) => {
@@ -732,7 +734,7 @@ fn item_tokens(
             continue
         }
         var ends_line = false
-        match next_real(file, after: at) {
+        match next_real(file, from: at + 1) {
             Some(next) => {
                 ends_line = file.tokens[next].line > source.line
             }
@@ -768,12 +770,18 @@ fn token_text(file: syntax::SourceFile, at: usize, kind: syntax::TokenKind, allo
 } token_text
 
 fn is_real(file: syntax::SourceFile, at: usize) -> bool {
+    expect at < file.comment.len() and at < file.tokens.len()
     return not file.comment[at] and not file.tokens[at].kind.is_virtual()
 } is_real
 
-/// The first token after `after` that is neither a comment nor virtual.
-fn next_real(file: syntax::SourceFile, after: usize) -> Option[usize] {
-    for at in (after + 1)..<file.tokens.len() {
+/// The first token from `from` on that is neither a comment nor virtual.
+fn next_real(file: syntax::SourceFile, from: usize) -> Option[usize]
+    ensures match result {
+        Some(at) => at < file.tokens.len()
+        None => true
+    }
+{
+    for at in from..<file.tokens.len() {
         if is_real(file, at) {
             return Some(at)
         }
@@ -782,10 +790,14 @@ fn next_real(file: syntax::SourceFile, after: usize) -> Option[usize] {
 } next_real
 
 /// The last token before `before` that is neither a comment nor virtual.
-fn previous_real(file: syntax::SourceFile, before: usize) -> Option[usize] {
-    var at = before
-    while at > 0 {
-        at -= 1
+fn previous_real(file: syntax::SourceFile, before: usize) -> Option[usize]
+    ensures match result {
+        Some(at) => at < before
+        None => true
+    }
+{
+    for back in 1..=before {
+        let at = before - back
         if is_real(file, at) {
             return Some(at)
         }
@@ -798,6 +810,7 @@ fn attached_comments(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: 
     var attached = Attached(comments: mem::HashMap[u32, mem::List[text::String]].empty(seed: 0, alloc), trailing: mem::HashMap[u32, text::String].empty(seed: 0, alloc))
     var pending = mem::List[text::String].empty(alloc)
     var index = item.head
+    expect item.end <= file.tokens.len() and file.tokens.len() <= file.comment.len()
     for line in file.item_lines(item) {
         var last_on_line: Option[u32] = None
         while index < item.end and file.tokens[index].line == line {
@@ -812,7 +825,7 @@ fn attached_comments(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: 
             }
             index += 1
         }
-        let physical = file.lines[usize.widen(line) - 1]
+        let physical = physical_line(file, number: line)
         let Some(offset) = physical.comment else {
             continue
         }
@@ -851,16 +864,22 @@ fn reorder(mut order: mem::List[u32], sorted: Sorted, alloc: mem::Alloc) {
         mut starts.push(found)
         mut ends.push(end)
     }
+    expect starts.len() > 0 and ends.len() == starts.len()
+    expect all i in 0..<starts.len(): starts[i] < ends[i] and ends[i] <= order.len()
     var ranked = mem::List[usize].empty(alloc)
     for index in 0..<starts.len() {
         mut ranked.push(index)
     }
-    mut ranked.sort_by(fn(left: usize, right: usize) => sorted.keys[left].cmp(sorted.keys[right]))
+    mut ranked.sort_by(fn(left: usize, right: usize) -> core::Ordering {
+        expect left < sorted.keys.len() and right < sorted.keys.len()
+        return sorted.keys[left].cmp(sorted.keys[right])
+    })
     let start = starts[0]
     let end = ends[ends.len() - 1]
     var segment = mem::List[u32].empty(alloc)
     for slot in 0..<ranked.len() {
         let element = ranked[slot]
+        expect element < starts.len()
         for at in starts[element]..<ends[element] {
             mut segment.push(order[at])
         }
@@ -888,6 +907,12 @@ struct Roles {
     roles: mem::List[Option[Role]]
     broken: mem::List[bool]
 } Roles
+
+/// Whether a breakable list is broken.
+fn Roles.is_broken(self, list: usize) -> bool {
+    expect list < self.broken.len()
+    return self.broken[list]
+} Roles.is_broken
 
 /// The roles of tokens whose lists are all flat, which need none.
 fn Roles.flat(tokens: usize, lists: usize, alloc: mem::Alloc) -> Roles {
@@ -934,11 +959,12 @@ fn positions(toks: mem::List[Tok], alloc: mem::Alloc) -> mem::HashMap[u32, usize
     return at
 } positions
 
-/// Which breakable lists are broken, and where trailing commas are added after or dropped.
+/// Which breakable lists are broken, and the positions of the tokens a trailing comma is added
+/// after and of the trailing commas dropped.
 struct CommaEdits {
     broken: mem::List[bool]
-    added: mem::List[bool]
-    dropped: mem::List[bool]
+    added: mem::HashMap[usize, Unit]
+    dropped: mem::HashMap[usize, Unit]
 } CommaEdits
 
 /// Decides which breakable lists are broken, every one when `flat` is false, gives a broken list
@@ -947,15 +973,13 @@ fn trailing_commas(mut toks: mem::List[Tok], facts: Facts, flat: bool, alloc: me
     let edits = comma_edits(toks, facts, flat, alloc)
     var pending = drained(mut toks, alloc)
     var carried = mem::List[text::String].empty(alloc)
-    var index: usize = 0
-    loop {
+    let count = pending.len()
+    for at in 0..<count {
         let Some(popped) = mut pending.pop() else {
             break
         }
         var tok = popped
-        let at = index
-        index += 1
-        if edits.dropped[at] {
+        if edits.dropped.contains(at) {
             carried = tok.comments
             continue
         }
@@ -967,33 +991,34 @@ fn trailing_commas(mut toks: mem::List[Tok], facts: Facts, flat: bool, alloc: me
             carried = mem::List[text::String].empty(alloc)
         }
         mut toks.push(take tok)
-        if edits.added[at] {
+        if edits.added.contains(at) {
             mut toks.push(Tok(source: None, kind: syntax::TokenKind.Punct(syntax::Punct.Comma), text: text::String.of(",", alloc), newline: false, ends_line: false, comments: mem::List[text::String].empty(alloc), trailing: None))
         }
     }
     let at = positions(toks, alloc)
-    var roles = mem::List[Option[Role]].empty(alloc)
-    for _ in 0..<toks.len() {
-        mut roles.push(None)
-    }
+    var assigned = mem::HashMap[usize, Role].empty(seed: 0, alloc)
     for list in 0..<facts.lists.len() {
         let shape = facts.lists[list]
-        let opener = at.at(shape.opener)
-        let closer = at.at(shape.closer)
-        roles[opener] = Some(Role.Opener(list))
+        discard mut assigned.insert(at.at(shape.opener), value: Role.Opener(list))
         for comma in shape.commas {
             match at.get(comma) {
                 Some(found) => {
-                    roles[found] = Some(Role.Comma(list))
+                    discard mut assigned.insert(found, value: Role.Comma(list))
                 }
                 None => {
                 }
             }
         }
-        roles[closer] = Some(Role.Closer(list))
+        let closer = at.at(shape.closer)
+        expect closer > 0 and closer < toks.len()
+        discard mut assigned.insert(closer, value: Role.Closer(list))
         if toks[closer - 1].source.is_none() {
-            roles[closer - 1] = Some(Role.Comma(list))
+            discard mut assigned.insert(closer - 1, value: Role.Comma(list))
         }
+    }
+    var roles = mem::List[Option[Role]].empty(alloc)
+    for position in 0..<toks.len() {
+        mut roles.push(assigned.get(position))
     }
     let CommaEdits(broken: broken, added: _, dropped: _) = edits
     return Roles(roles: take roles, broken: take broken)
@@ -1017,20 +1042,19 @@ fn comma_edits(toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc
     var commented: usize = 0
     mut commented_before.push(commented)
     for tok in toks {
+        invariant commented < commented_before.len()
         if tok.comments.len() > 0 or tok.trailing.is_some() {
             commented += 1
         }
         mut commented_before.push(commented)
     }
-    var edits = CommaEdits(broken: mem::List[bool].empty(alloc), added: mem::List[bool].empty(alloc), dropped: mem::List[bool].empty(alloc))
-    for _ in 0..<toks.len() {
-        mut edits.added.push(false)
-        mut edits.dropped.push(false)
-    }
+    expect commented_before.len() > toks.len()
+    var edits = CommaEdits(broken: mem::List[bool].empty(alloc), added: mem::HashMap[usize, Unit].empty(seed: 0, alloc), dropped: mem::HashMap[usize, Unit].empty(seed: 0, alloc))
     for list in 0..<facts.lists.len() {
         let shape = facts.lists[list]
         let opener = at.at(shape.opener)
         let closer = at.at(shape.closer)
+        expect opener < closer and closer < toks.len()
         var commas = mem::List[usize].empty(alloc)
         for comma in shape.commas {
             match at.get(comma) {
@@ -1050,7 +1074,7 @@ fn comma_edits(toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc
         mut edits.broken.push(broken)
         var closing_comma: Option[usize] = None
         for comma in commas {
-            if comma + 1 == closer {
+            if comma == closer - 1 {
                 closing_comma = Some(comma)
                 break
             }
@@ -1058,12 +1082,12 @@ fn comma_edits(toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc
         match closing_comma {
             Some(comma) => {
                 if not broken {
-                    edits.dropped[comma] = true
+                    discard mut edits.dropped.insert(comma, value: Unit)
                 }
             }
             None => {
                 if broken {
-                    edits.added[at.at(shape.ends[shape.ends.len() - 1])] = true
+                    discard mut edits.added.insert(at.at(shape.ends[shape.ends.len() - 1]), value: Unit)
                 }
             }
         }
@@ -1073,6 +1097,7 @@ fn comma_edits(toks: mem::List[Tok], facts: Facts, flat: bool, alloc: mem::Alloc
 
 fn any_ends_line(toks: mem::List[Tok], commas: mem::List[usize]) -> bool {
     for comma in commas {
+        expect comma < toks.len()
         if toks[comma].ends_line {
             return true
         }
@@ -1108,6 +1133,7 @@ fn Facts.one_line_of(self, tok: Tok) -> Option[usize] {
 
 /// Whether the line breaks before the token at `at`, not the item's first.
 fn Facts.breaks_before(self, toks: Slice[Tok], roles: Roles, at: usize) -> bool {
+    expect at > 0 and at < toks.len()
     let previous = toks[at - 1]
     let current = toks[at]
     if previous.kind == syntax::TokenKind.Nl or previous.trailing.is_some() or current.comments.len() > 0 {
@@ -1117,13 +1143,14 @@ fn Facts.breaks_before(self, toks: Slice[Tok], roles: Roles, at: usize) -> bool 
     if previous_line.is_some() and previous_line == self.one_line_of(current) {
         return false
     }
+    expect at < roles.roles.len()
     match roles.roles[at] {
-        Some(Role.Closer(list)) => return roles.broken[list]
+        Some(Role.Closer(list)) => return roles.is_broken(list)
         else => {
         }
     }
     match roles.roles[at - 1] {
-        Some(Role.Opener(list)) or Some(Role.Comma(list)) => return roles.broken[list]
+        Some(Role.Opener(list)) or Some(Role.Comma(list)) => return roles.is_broken(list)
         else => {
         }
     }
@@ -1138,6 +1165,7 @@ fn Facts.breaks_before(self, toks: Slice[Tok], roles: Roles, at: usize) -> bool 
 
 /// Whether one space separates two tokens on a line.
 fn Facts.spaced(self, toks: Slice[Tok], left: usize, right: usize) -> bool {
+    expect left < toks.len() and right < toks.len()
     let a = toks[left]
     let b = toks[right]
     match a.kind {
@@ -1188,27 +1216,26 @@ fn is_closer(kind: syntax::TokenKind) -> bool {
 
 /// The lines of the tokens: each line's tokens, spaced, at its depth, after its comment lines.
 fn Facts.render_lines(self, toks: Slice[Tok], roles: Roles, alloc: mem::Alloc) -> mem::List[text::String] {
-    var lines = mem::List[mem::List[usize]].empty(alloc)
+    var leads = mem::List[usize].empty(alloc)
     for at in 0..<toks.len() {
         if toks[at].kind == syntax::TokenKind.Nl {
             continue
         }
-        if lines.len() == 0 or self.breaks_before(toks, roles, at) {
-            var line = mem::List[usize].empty(alloc)
-            mut line.push(at)
-            mut lines.push(take line)
-        } else {
-            let last = lines.len() - 1
-            mut (mut lines.at_mut(last)).push(at)
+        if leads.len() == 0 or self.breaks_before(toks, roles, at) {
+            mut leads.push(at)
         }
     }
     var out = mem::List[text::String].empty(alloc)
     var contexts = Contexts(open: mem::List[Open].empty(alloc), file_unit: None)
     var depth_of = mem::HashMap[u32, usize].empty(seed: 0, alloc)
     var previous_depth: usize = 0
-    for index in 0..<lines.len() {
-        let line = lines[index]
-        let lead = line[0]
+    for index in 0..<leads.len() {
+        let lead = leads[index]
+        var end = toks.len()
+        if index + 1 < leads.len() {
+            end = leads[index + 1]
+        }
+        expect lead < end and end <= toks.len() and end <= roles.roles.len()
         let source = toks[lead].source.value_or(~0u32)
         let closes = is_closer(toks[lead].kind)
         var base: usize = 0
@@ -1234,51 +1261,56 @@ fn Facts.render_lines(self, toks: Slice[Tok], roles: Roles, alloc: mem::Alloc) -
             mut written.append(comment.as_str())
             mut out.push(take written)
         }
-        mut out.push(self.line_text(toks, line, depth, alloc))
-        for at in line {
-            match toks[at].source {
+        mut out.push(self.line_text(toks, lead, end, depth, alloc))
+        previous_depth = depth
+        for at in lead..<end {
+            let tok = toks[at]
+            match tok.source {
                 Some(token) => {
-                    discard mut depth_of.insert(token, value: depth)
+                    if tok.kind != syntax::TokenKind.Nl {
+                        discard mut depth_of.insert(token, value: depth)
+                    }
                 }
                 None => {
                 }
             }
-        }
-        previous_depth = depth
-        var end = toks.len()
-        if index + 1 < lines.len() {
-            end = lines[index + 1][0]
-        }
-        for at in lead..<end {
-            mut contexts.track(toks[at], role: roles.roles[at], depth)
+            mut contexts.track(tok, role: roles.roles[at], depth)
         }
     }
     return out
 } Facts.render_lines
 
-/// A line of tokens at its depth, spaced, with the comment ending it.
+/// The line of the tokens from `lead` to before `end`, line breaks aside, at its depth, spaced,
+/// with the comment ending it.
 fn Facts.line_text(
     self,
     toks: Slice[Tok],
-    line: mem::List[usize],
+    lead: usize,
+    end: usize,
     depth: usize,
     alloc: mem::Alloc,
     ) -> text::String {
+    expect end <= toks.len()
     var written = indentation(depth, alloc)
-    for position in 0..<line.len() {
-        let at = line[position]
-        if position > 0 and self.spaced(toks, left: line[position - 1], right: at) {
+    var previous = lead
+    for at in lead..<end {
+        let tok = toks[at]
+        if tok.kind == syntax::TokenKind.Nl {
+            continue
+        }
+        if at > lead and self.spaced(toks, left: previous, right: at) {
             mut written.push(' ')
         }
-        mut written.append(toks[at].text.as_str())
-    }
-    match toks[line[line.len() - 1]].trailing {
-        Some(comment) => {
-            mut written.push(' ')
-            mut written.append(comment.as_str())
+        mut written.append(tok.text.as_str())
+        match tok.trailing {
+            Some(comment) => {
+                mut written.push(' ')
+                mut written.append(comment.as_str())
+            }
+            None => {
+            }
         }
-        None => {
-        }
+        previous = at
     }
     return written
 } Facts.line_text
@@ -1294,6 +1326,7 @@ fn Facts.line_depth(
     previous_depth: usize,
     base: usize,
     ) -> usize {
+    expect lead < toks.len()
     let source = toks[lead].source.value_or(~0u32)
     if is_closer(toks[lead].kind) {
         let count = contexts.open.len()
@@ -1302,7 +1335,8 @@ fn Facts.line_depth(
         var params = false
         match open.list {
             Some(list) => {
-                params = self.lists[list].kind == ListKind.Params and roles.broken[list]
+                expect list < self.lists.len()
+                params = self.lists[list].kind == ListKind.Params and roles.is_broken(list)
             }
             None => {
             }

@@ -1,0 +1,63 @@
+//! The timer's registers, its interrupt and the signal it posts.
+
+/// The vector the timer's interrupt arrives on.
+const TIMER_VECTOR: u8 = 0x30
+
+/// `expired` is set when the timer fires and cleared by writing 1 to it.
+pub layout TimerStatus: u32 le {
+    expired: bit 0
+    reserved: rest
+} TimerStatus
+
+pub registers TimerRegs {
+    status: TimerStatus at 0x0 write_one_clear
+} TimerRegs
+
+/// The timer, the ticks counted since it was attached, and the signal that receives every
+/// `period`-th count, none when `period` is 0.
+pub open linear struct Ticker {
+    regs: hw::Mmio[TimerRegs]
+    ticks: u64
+    period: u64
+    wake: mem::Shared[hw::Signal[u64]]
+} Ticker
+
+pub fn Ticker.of(take regs: hw::Mmio[TimerRegs], period: u64, wake: mem::Shared[hw::Signal[u64]]) -> Ticker {
+    return Ticker(regs: take regs, ticks: 0, period: period, wake: wake.share())
+} Ticker.of
+
+/// Handles the timer firing: when `status` shows `expired`, acknowledges it, counts a tick and
+/// posts the count to the signal when it is a multiple of the period. Tells whether it posted.
+pub fn Ticker.tick(mut self, t: hw::IrqsDisabled) -> bool limits notrap, terminates, noalloc {
+    let status = mut self.regs.read(TimerRegs.status)
+    if not status.expired {
+        return false
+    }
+    mut self.regs.write(TimerRegs.status, value: TimerStatus(expired: true, reserved: 0))
+    self.ticks = self.ticks.wrapping_add(1)
+    if self.period == 0 or self.ticks % self.period != 0 {
+        return false
+    }
+    self.wake.contents().post(t, value: self.ticks)
+    return true
+} Ticker.tick
+
+interrupt fn Ticker.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let posted = mut self.tick(irq.irqs_disabled())
+    take irq.complete()
+    if posted {
+        return hw::IrqExit.Reschedule
+    }
+    return hw::IrqExit.Resume
+} Ticker.on_irq
+
+/// Installs the ticker on the timer's vector.
+pub fn attach(take ticker: Ticker) -> hw::IrqShared[Ticker] {
+    return hw::IrqShared.install(take ticker, vector: TIMER_VECTOR, on_irq: Ticker.on_irq)
+} attach
+
+/// Uninstalls the ticker and ends the timer's window.
+pub fn detach(take shared: hw::IrqShared[Ticker]) {
+    let Ticker(regs: regs, ticks: _, period: _, wake: _) = take shared.uninstall()
+    take regs.unmap()
+} detach

@@ -1,0 +1,163 @@
+//! Times a generation check, a seam and a thread switch with the HPET, writing them in picoseconds.
+
+/// The vector of the benchmark's self-interrupts.
+const SELF_VECTOR: u32 = 0x40
+
+/// The rounds of each timing.
+const ROUNDS: u64 = 200_000
+
+/// The local APIC's interrupt command bits naming the sending CPU itself.
+const TO_SELF: u32 = 0x4_0000
+
+layout LineStatus: u8 {
+    transmit_empty: bit 5
+    reserved: rest
+} LineStatus
+
+registers Uart {
+    data: u8 at 0x0 write
+    line_status: LineStatus at 0x5 read
+} Uart
+
+registers Hpet {
+    capabilities: u64 at 0x0 read
+    configuration: u64 at 0x10 read write
+    counter: u64 at 0xF0 read
+} Hpet
+
+registers Apic {
+    command: u32 at 0x300 read write
+} Apic
+
+/// The anchor, which the benchmark leaves empty.
+struct State {
+} State
+
+pub interrupt fn on_self(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    take irq.complete()
+    return hw::IrqExit.Resume
+} on_self
+
+contribute hw::vectors bench = hw::Vector(vector: 0x40, ist: 0, handler: hw::VectorHandler.Irq(on_self), user: None)
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let state = State()
+    take k.anchor(take state, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+        try await run(exec, alloc)
+    })
+} main
+
+/// Times each operation and writes the results, then stops the emulator.
+fn run(exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait limits stack 24_576 {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    defer take uart.unmap()
+    var hpet = trusted "the board's HPET lies at 0xFED0_0000, which the entry root maps uncached, and nothing else maps it" { hw::Mmio[Hpet].map(0xFED0_0000) }
+    defer take hpet.unmap()
+    var apic = trusted "the running CPU's local APIC lies at 0xFEE0_0000, which the entry root maps uncached, and sending it an interrupt leaves the runtime's use unchanged" { hw::Mmio[Apic].map(0xFEE0_0000) }
+    defer take apic.unmap()
+    let configuration = mut hpet.read(Hpet.configuration)
+    mut hpet.write(Hpet.configuration, value: configuration | 1)
+    let period = mut hpet.read(Hpet.capabilities) >> 32
+    let checks = time_checks(exec, mut hpet)
+    let seams = time_seams(mut hpet, mut apic)
+    let switches = try await time_switches(exec, mut hpet, alloc)
+    report(mut uart, label: b"generation", value: picoseconds(checks, period))
+    report(mut uart, label: b"seam", value: picoseconds(seams, period))
+    report(mut uart, label: b"switch", value: picoseconds(switches, period) / 2)
+} run
+
+/// The HPET ticks of `ROUNDS` operations failing at a stale executor's generation check.
+fn time_checks(exec: task::Executor, mut hpet: hw::Mmio[Hpet]) -> u64 {
+    let Ok(revoker) = attempt sys::revocable(exec) else {
+        return 0
+    }
+    let stale = revoker.capability()
+    take revoker.revoke()
+    let start = mut hpet.read(Hpet.counter)
+    for _ in 0..<ROUNDS {
+        match attempt sys::revocable(stale) {
+            Ok(derived) => take derived.revoke()
+            Err(_) => {}
+        }
+    }
+    return mut hpet.read(Hpet.counter) - start
+} time_checks
+
+/// The HPET ticks of `ROUNDS` self-interrupts, each sent through the local APIC and taken through
+/// a seam that saves and restores the extended state.
+fn time_seams(mut hpet: hw::Mmio[Hpet], mut apic: hw::Mmio[Apic]) -> u64 {
+    let start = mut hpet.read(Hpet.counter)
+    for _ in 0..<ROUNDS {
+        mut apic.write(Apic.command, value: TO_SELF | SELF_VECTOR)
+    }
+    return mut hpet.read(Hpet.counter) - start
+} time_seams
+
+/// The HPET ticks of `ROUNDS` round trips between two tasks, each waking the other with a signal.
+fn time_switches(exec: task::Executor, mut hpet: hw::Mmio[Hpet], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let ping = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let pong = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let start = mut hpet.read(Hpet.counter)
+    try await task::scope(exec, body: fn(s: task::Scope) fails task::Cancelled uses wait limits stack 16_384 {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+            for round in 0..<ROUNDS {
+                let value = try await ping.contents().wait()
+                hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+                    pong.contents().post(t, value: value)
+                })
+                discard round
+            }
+        })
+        for round in 0..<ROUNDS {
+            hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+                ping.contents().post(t, value: round)
+            })
+            discard try await pong.contents().wait()
+        }
+    })
+    return mut hpet.read(Hpet.counter) - start
+} time_switches
+
+/// The picoseconds of each of `ROUNDS` operations taking `ticks` HPET ticks of `period`
+/// femtoseconds in all.
+fn picoseconds(ticks: u64, period: u64) -> u64 {
+    return ticks * (period / 1_000) / ROUNDS
+} picoseconds
+
+/// Writes a label and a number in decimal on a line of its own.
+fn report(mut uart: hw::Ports[Uart], label: Slice[u8], value: u64) {
+    for byte in label {
+        put(mut uart, byte)
+    }
+    put(mut uart, byte: b' ')
+    var digits = Array[u8, 20].filled(b'0')
+    var rest = value
+    var leading: usize = 19
+    for position in 0usize..<20 {
+        let at = 19 - position
+        digits[at] = b'0' + u8.fit(rest % 10)
+        rest = rest / 10
+        if digits[at] != b'0' {
+            leading = at
+        }
+    }
+    let Some(parts) = digits.view().split_at(leading) else {
+        return
+    }
+    for byte in parts.tail {
+        put(mut uart, byte)
+    }
+    put(mut uart, byte: b'\n')
+} report
+
+/// Writes a byte once the transmitter is empty.
+fn put(mut uart: hw::Ports[Uart], byte: u8) {
+    loop {
+        let status = mut uart.read(Uart.line_status)
+        if status.transmit_empty {
+            break
+        }
+    }
+    mut uart.write(Uart.data, value: byte)
+} put

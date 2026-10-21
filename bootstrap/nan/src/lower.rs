@@ -209,6 +209,8 @@ pub struct Lowered {
     /// for the stack limits check.
     pub frames: Vec<Frame>,
     pub demands: Vec<Demand>,
+    /// The task entries lowered, for the measurements of the freeze.
+    pub tasks: Vec<stack::Task>,
     /// The two entities of each pair lowered with one host symbol name, as diagnostics name them.
     pub collisions: Vec<(String, String)>,
 }
@@ -261,6 +263,7 @@ pub struct Lowering<'c, 'a> {
     pub entry_table: Option<DataId>,
     frames: Vec<Frame>,
     pub demands: Vec<Demand>,
+    pub tasks: Vec<stack::Task>,
     /// For a test image, what its tests' runs need, and the sim table once declared.
     test: Option<test_image::Runtime>,
     sims: Option<DataId>,
@@ -366,6 +369,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             entry_table: None,
             frames: Vec::new(),
             demands: Vec::new(),
+            tasks: Vec::new(),
             test,
             sims: None,
         }
@@ -719,6 +723,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         self.finish_interrupts();
         let frames = std::mem::take(&mut self.frames);
         let demands = std::mem::take(&mut self.demands);
+        let tasks = std::mem::take(&mut self.tasks);
         let collisions = std::mem::take(&mut self.collisions)
             .iter()
             .map(|(first, second)| {
@@ -741,6 +746,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             object: product.emit().expect("an object file"),
             frames,
             demands,
+            tasks,
             collisions,
         }
     }

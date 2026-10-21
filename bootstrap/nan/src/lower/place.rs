@@ -646,6 +646,7 @@ impl Body<'_, '_, '_, '_> {
         let code_id = self.lo.instance(instance);
         if task {
             self.lo.entry_stack(code_id, own_stack);
+            self.lo.task(code_id, self.item, function.span, own_stack);
         }
         let reference = self.lo.func_ref(self.fx, code_id);
         let code = self.fx.b.ins().func_addr(PTR, reference);

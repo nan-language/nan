@@ -1,0 +1,73 @@
+//! Posting buffers to the controller and reaping the ones it sent.
+
+pub layout TxDescriptor: bytes 16 le {
+    address: u64 at 0
+    length: u32 at 8
+    status: u32 at 12
+} TxDescriptor
+
+pub layout TxRing: bytes 128 le {
+    descriptors: Array[TxDescriptor, 8] at 0
+} TxRing
+
+pub registers TxRegs {
+    tail: u32 at 0x0 write
+} TxRegs
+
+/// A descriptor's status: free, posted for the controller, or sent by it.
+pub const EMPTY: u32 = 0
+
+pub const READY: u32 = 1
+
+pub const SENT: u32 = 2
+
+/// The descriptors of the ring.
+pub const SLOTS: u32 = 8
+
+/// The ring, its doorbell and the descriptors posted and reaped since it started, each counted
+/// modulo 2^32.
+pub open linear struct Transmitter {
+    ring: hw::DmaShared[TxRing]
+    regs: hw::Mmio[TxRegs]
+    posted: u32
+    reaped: u32
+} Transmitter
+
+pub fn Transmitter.of(take ring: hw::DmaShared[TxRing], take regs: hw::Mmio[TxRegs]) -> Transmitter = Transmitter(ring: take ring, regs: take regs, posted: 0, reaped: 0)
+
+/// Ends the doorbell's window and gives the ring back.
+pub fn Transmitter.close(take self) -> mem::Box[TxRing] {
+    let Transmitter(ring: ring, regs: regs, posted: _, reaped: _) = self
+    take regs.unmap()
+    return take ring.into_box()
+} Transmitter.close
+
+/// Posts `length` bytes at `buffer` in the next slot and rings the doorbell; false when every
+/// slot is in flight.
+pub fn Transmitter.send(mut self, buffer: hw::BusAddr, length: u32) -> bool {
+    if self.posted.wrapping_sub(self.reaped) == SLOTS {
+        return false
+    }
+    let slot = usize.widen(self.posted % SLOTS)
+    mut self.ring.write_release_at(TxRing.descriptors, index: slot, value: TxDescriptor(address: buffer.value, length: length, status: READY))
+    self.posted = self.posted.wrapping_add(1)
+    mut self.regs.write(TxRegs.tail, value: self.posted % SLOTS)
+    return true
+} Transmitter.send
+
+/// Frees the sent descriptors in posting order, stopping at the first one not sent, and gives
+/// how many it freed.
+pub fn Transmitter.reap(mut self) -> u32 {
+    var freed: u32 = 0
+    while self.reaped != self.posted {
+        let slot = usize.widen(self.reaped % SLOTS)
+        let descriptor = mut self.ring.read_acquire_at(TxRing.descriptors, index: slot)
+        if descriptor.status != SENT {
+            break
+        }
+        mut self.ring.write_release_at(TxRing.descriptors, index: slot, value: TxDescriptor(address: 0, length: 0, status: EMPTY))
+        self.reaped = self.reaped.wrapping_add(1)
+        freed += 1
+    }
+    return freed
+} Transmitter.reap

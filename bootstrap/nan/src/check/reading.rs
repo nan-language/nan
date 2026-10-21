@@ -264,6 +264,7 @@ pub fn shown(workspace: &Workspace, scope: &Scope) -> Vec<Shown> {
 }
 
 /// An item consumers see, as `nan show --api` prints it.
+#[derive(Clone)]
 pub struct Api {
     pub path: String,
     /// The name of its package.
@@ -515,7 +516,7 @@ fn status_word(status: Status) -> &'static str {
 
 /// An obligation's kind as `nan explain` names it: its row's name with `-` for spaces, or for
 /// an arithmetic, shift, division or conversion obligation the operation's word.
-fn obligation_kind(unit: &Unit, site: &Obligated) -> String {
+pub(super) fn obligation_kind(unit: &Unit, site: &Obligated) -> String {
     if site.role.is_contract() {
         return "well-definedness".to_owned();
     }

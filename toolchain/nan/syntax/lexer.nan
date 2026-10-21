@@ -29,6 +29,11 @@ struct ByteRange derives Copy {
     end: usize
 } ByteRange
 
+/// The position in its file of a byte of the line, kept to 32 bits as tokens keep positions.
+fn ByteRange.position(self, offset: usize) -> u32 {
+    return u32.truncate(self.start).wrapping_add(u32.truncate(offset))
+} ByteRange.position
+
 pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
     waive length "one pass over the lines, as the specification orders their tokens"
 {
@@ -46,21 +51,23 @@ pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
     }
     var lexed = Lexed(tokens: mem::List[Token].empty(alloc), lines: mem::List[Line].empty(alloc), diagnostics: mem::List[LexDiagnostic].empty(alloc))
     var pending_nl: Option[Token] = None
+    expect ranges.len() <= usize.widen(~0u32)
     for index in 0..<ranges.len() {
         let range = ranges[index]
-        let number = u32.truncate(index) + 1
+        let number = u32.fit(index) + 1
         let is_last = index + 1 == ranges.len()
-        let Some(parts) = source.split_at(range.start) else {
+        let Some(head) = source.prefix(range.end) else {
             expect false
             return lexed
         }
-        let Some(bytes) = parts.tail.prefix(range.end - range.start) else {
+        let Some(parts) = head.split_at(range.start) else {
             expect false
             return lexed
         }
+        let bytes = parts.tail
         let scan = lex_line(bytes, last_unterminated: unterminated and is_last, grammar, alloc)
         let comment = match scan.comment {
-            Some(at) => Some(u32.truncate(range.start + at))
+            Some(at) => Some(range.position(at))
             None => None
         }
         mut lexed.lines.push(Line(start: u32.truncate(range.start), end: u32.truncate(range.end), comment: comment, lexical_error: scan.error.is_some()))
@@ -72,7 +79,7 @@ pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
             if scanned.from == 0 {
                 mut lexed.tokens.push(Token(kind: TokenKind.Col0, start: u32.truncate(range.start), end: u32.truncate(range.start), line: number))
             }
-            let token = Token(kind: scanned.kind, start: u32.truncate(range.start + scanned.from), end: u32.truncate(range.start + scanned.to), line: number)
+            let token = Token(kind: scanned.kind, start: range.position(scanned.from), end: range.position(scanned.to), line: number)
             mut lexed.tokens.push(token)
             last = Some(token)
         }
@@ -91,6 +98,7 @@ pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
             }
             continue
         }
+        expect offset <= bytes.len()
         var width: usize = 1
         if code == diagnostic::Code.LexTrailingWhitespace {
             width = bytes.len() - offset
@@ -105,15 +113,15 @@ pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
         var fix: Option[mem::List[diagnostic::Replacement]] = None
         match line_fix(bytes, at: offset, code, grammar, alloc) {
             Some(replacements) => {
-                fix = Some(shifted(take replacements, by: range.start, alloc))
+                fix = Some(shifted(take replacements, line: range, alloc))
             }
             None => {}
         }
-        let position = u32.truncate(range.start + offset)
+        let position = range.position(offset)
         if width > bytes.len() - offset {
             width = bytes.len() - offset
         }
-        let span = diagnostic::Span(start: position, end: u32.truncate(range.start + offset + width))
+        let span = diagnostic::Span(start: position, end: position.wrapping_add(u32.truncate(width)))
         mut lexed.diagnostics.push(LexDiagnostic(line: number, code: code, span: span, fix: take fix))
         mut lexed.tokens.push(Token(kind: TokenKind.LexError, start: position, end: position, line: number))
         mut lexed.tokens.push(Token(kind: TokenKind.Nl, start: position, end: position, line: number))
@@ -131,19 +139,29 @@ pkg fn lex(source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> Lexed
 
 /// Whether a line starts with `\\` after its spaces.
 fn starts_text_run(source: Slice[u8], range: ByteRange) -> bool {
-    var at = range.start
-    while at < range.end and source[at] == b' ' {
-        at += 1
+    let Some(head) = source.prefix(range.end) else {
+        expect false
+        return false
     }
-    return at + 2 <= range.end and source[at] == b'\\' and source[at + 1] == b'\\'
+    let Some(parts) = head.split_at(range.start) else {
+        expect false
+        return false
+    }
+    let line = parts.tail
+    for at in 0..<line.len() {
+        if line[at] != b' ' {
+            return starts_with_at(line, at, prefix: b"\\\\")
+        }
+    }
+    return false
 } starts_text_run
 
 /// Replacements of byte ranges of a line, moved by the offset of the line in its file.
-fn shifted(take replacements: mem::List[diagnostic::Replacement], by: usize, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
+fn shifted(take replacements: mem::List[diagnostic::Replacement], line: ByteRange, alloc: mem::Alloc) -> mem::List[diagnostic::Replacement] {
     var moved = mem::List[diagnostic::Replacement].empty(alloc)
     for replacement in take replacements {
-        let start = u32.truncate(by + usize.widen(replacement.start))
-        let end = u32.truncate(by + usize.widen(replacement.end))
+        let start = line.position(usize.widen(replacement.start))
+        let end = line.position(usize.widen(replacement.end))
         mut moved.push(diagnostic::Replacement(start: start, end: end, text: take replacement.text))
     }
     return moved
@@ -223,11 +241,14 @@ fn line_chars(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[CharAt] {
         match text::utf8::char_at(bytes, at) {
             Some(c) => {
                 mut chars.push(CharAt(at: at, ch: Ch.Char(c)))
+                expect c.utf8_len() <= bytes.len() - at
                 at += c.utf8_len()
             }
             None => {
                 mut chars.push(CharAt(at: at, ch: Ch.Invalid))
-                at += invalid_length(bytes, at)
+                let width = invalid_length(bytes, at)
+                expect width <= bytes.len() - at
+                at += width
             }
         }
     }
@@ -236,7 +257,10 @@ fn line_chars(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[CharAt] {
 
 /// The length of the maximal prefix of an ill-formed UTF-8 sequence starting at `at`: the bytes a
 /// well-formed sequence could start with.
-fn invalid_length(bytes: Slice[u8], at: usize) -> usize {
+fn invalid_length(bytes: Slice[u8], at: usize) -> usize
+    ensures result <= 3
+{
+    expect at < bytes.len()
     let lead = bytes[at]
     let second = byte_or_zero(bytes, at: at + 1)
     let allowed = match first lead {
@@ -257,7 +281,9 @@ fn invalid_length(bytes: Slice[u8], at: usize) -> usize {
     return 3
 } invalid_length
 
-fn byte_or_zero(bytes: Slice[u8], at: usize) -> u8 {
+fn byte_or_zero(bytes: Slice[u8], at: usize) -> u8
+    ensures result == 0 or at < bytes.len()
+{
     if at < bytes.len() {
         return bytes[at]
     }
@@ -295,6 +321,7 @@ fn lex_line(bytes: Slice[u8], last_unterminated: bool, grammar: Grammar, alloc: 
     while trailing < bytes.len() and bytes[bytes.len() - 1 - trailing] == b' ' {
         trailing += 1
     }
+    expect trailing <= bytes.len()
     if trailing > 0 {
         report(mut error, at: bytes.len() - trailing, code: diagnostic::Code.LexTrailingWhitespace)
     }
@@ -342,6 +369,7 @@ fn lex_line(bytes: Slice[u8], last_unterminated: bool, grammar: Grammar, alloc: 
 fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Grammar, alloc: mem::Alloc) -> Option[mem::List[diagnostic::Replacement]]
     waive length "one arm per code with an exact fix"
 {
+    expect at <= bytes.len()
     if not text::utf8::is_valid(bytes) {
         return None
     }
@@ -373,10 +401,13 @@ fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Gramma
             }
         }
         diagnostic::Code.LexTrailingWhitespace => {
-            var kept = bytes.len()
-            while kept > 0 and bytes[kept - 1] == b' ' {
-                kept -= 1
+            var kept: usize = 0
+            for offset in 0..<bytes.len() {
+                if bytes[offset] != b' ' {
+                    kept = offset + 1
+                }
             }
+            expect bytes.len() > 0
             if held[bytes.len() - 1].literal == Some(Literal.TextLine) {
                 mut fix.push(replacing(bytes.len() - 1, end: bytes.len(), written: "\\x20", alloc))
             } else {
@@ -388,6 +419,7 @@ fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Gramma
             let Some(c) = text::utf8::char_at(bytes, at) else {
                 return None
             }
+            expect c.utf8_len() <= bytes.len() - at
             var written = text::String.empty(alloc)
             match held[at].literal {
                 Some(Literal.Text) or Some(Literal.Char) or Some(Literal.TextLine) => {
@@ -411,6 +443,7 @@ fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Gramma
             mut fix.push(diagnostic::Replacement(start: u32.truncate(at), end: u32.truncate(at + c.utf8_len()), text: take written))
         }
         diagnostic::Code.LexNotAtLineStart if starts_with_at(bytes, at, prefix: b"///") or starts_with_at(bytes, at, prefix: b"//!") => {
+            expect bytes.len() - at >= 3
             mut fix.push(replacing(at, end: at + 3, written: "//", alloc))
         }
         diagnostic::Code.LexLiteralSuffix => {
@@ -420,7 +453,7 @@ fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Gramma
             mut fix.push(replacing(before, end: before, written: ".0", alloc))
         }
         diagnostic::Code.LexEscapeOutOfRange => {
-            if not starts_with_at(bytes, at, prefix: b"\\x") or at + 4 > bytes.len() or not is_char_boundary(bytes, at: at + 4) {
+            if not starts_with_at(bytes, at, prefix: b"\\x") or bytes.len() - at < 4 or not is_char_boundary(bytes, at: at + 4) {
                 return None
             }
             var written = text::String.empty(alloc)
@@ -431,6 +464,7 @@ fn line_fix(bytes: Slice[u8], at: usize, code: diagnostic::Code, grammar: Gramma
                     return None
                 }
                 mut written.push(c.to_ascii_uppercase())
+                expect c.utf8_len() <= bytes.len() - index
                 index += c.utf8_len()
             }
             mut written.push('}')
@@ -456,6 +490,7 @@ fn byte_escape(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[diagnos
     if not starts_with_at(bytes, at, prefix: b"\\u{") {
         return None
     }
+    expect at <= bytes.len() and bytes.len() - at >= 3
     var close = at + 3
     while close < bytes.len() and bytes[close] != b'}' {
         close += 1
@@ -463,6 +498,7 @@ fn byte_escape(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[diagnos
     if close == bytes.len() {
         return None
     }
+    expect close >= at + 3 and close < bytes.len()
     let Some(parts) = bytes.split_at(at + 3) else {
         return None
     }
@@ -483,40 +519,35 @@ fn byte_escape(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Option[diagnos
 
 /// The offset at which a `.0` turns the number run at `at` with a float suffix into a float.
 fn suffix_start(bytes: Slice[u8], at: usize) -> Option[usize] {
-    var length: usize = 0
-    while at + length < bytes.len() {
-        let byte = bytes[at + length]
-        let fraction = byte == b'.' and at + length + 1 < bytes.len() and is_decimal_byte(bytes[at + length + 1])
+    var end = at
+    while end < bytes.len() {
+        let byte = bytes[end]
+        let fraction = byte == b'.' and end + 1 < bytes.len() and is_decimal_byte(bytes[end + 1])
         if not (is_word_byte(byte) or fraction) {
             break
         }
-        length += 1
+        end += 1
     }
-    let Some(parts) = bytes.split_at(at) else {
+    let Some(run) = bytes.prefix(end) else {
         return None
     }
-    let Some(run) = parts.tail.prefix(length) else {
+    let Some(before) = dec_int(run, from: at) else {
         return None
     }
-    let Some(end) = dec_int(run, from: 0) else {
+    if not (rest_is(run, from: before, word: "f32") or rest_is(run, from: before, word: "f64")) {
         return None
     }
-    if not (rest_is(run, from: end, word: "f32") or rest_is(run, from: end, word: "f64")) {
-        return None
-    }
-    return Some(at + end)
+    return Some(before)
 } suffix_start
 
 fn starts_with_at(bytes: Slice[u8], at: usize, prefix: Slice[u8]) -> bool {
-    if at + prefix.len() > bytes.len() {
+    let Some(parts) = bytes.split_at(at) else {
         return false
     }
-    for index in 0..<prefix.len() {
-        if bytes[at + index] != prefix[index] {
-            return false
-        }
+    let Some(head) = parts.tail.prefix(prefix.len()) else {
+        return false
     }
-    return true
+    return head == prefix
 } starts_with_at
 
 fn is_char_boundary(bytes: Slice[u8], at: usize) -> bool {
@@ -532,6 +563,7 @@ fn push_hex(mut out: text::String, value: u32, width: usize) {
     if count < width {
         count = width
     }
+    expect count <= 8
     for index in 0..<count {
         let digit = (value >> u32.truncate(4 * (count - 1 - index))) & 0xF
         var code = u32.widen(b'0') + digit
@@ -553,7 +585,9 @@ struct Held derives Copy {
 
 /// The literal holding each byte of a line, read as the scanner reads literals, past the
 /// characters it rejects; none in code and comments.
-fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
+fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held]
+    ensures result.len() > bytes.len()
+{
     var held = mem::List[Held].empty(alloc)
     var first_byte: usize = 0
     while first_byte < bytes.len() and bytes[first_byte] == b' ' {
@@ -563,7 +597,7 @@ fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
         while held.len() < first_byte {
             mut held.push(Held(literal: None))
         }
-        while held.len() < bytes.len() + 1 {
+        while held.len() <= bytes.len() {
             mut held.push(Held(literal: Some(Literal.TextLine)))
         }
         return held
@@ -573,6 +607,7 @@ fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
         let byte = bytes[at]
         let next = byte_or_zero(bytes, at: at + 1)
         var literal = Literal.Text
+        var quote = byte
         var contents = at + 1
         if byte == b'/' and next == b'/' {
             break
@@ -582,9 +617,11 @@ fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
             literal = Literal.Char
         } else if byte == b'b' and next == b'"' {
             literal = Literal.Bytes
+            quote = next
             contents = at + 2
         } else if byte == b'b' and next == b'\'' {
             literal = Literal.Byte
+            quote = next
             contents = at + 2
         } else if is_word_byte(byte) {
             while at < bytes.len() and is_word_byte(bytes[at]) {
@@ -595,18 +632,17 @@ fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
             at += 1
             continue
         }
-        let quote = bytes[contents - 1]
         var end = contents
         while end < bytes.len() and bytes[end] != quote {
-            if bytes[end] == b'\\' {
+            if bytes[end] == b'\\' and end + 1 < bytes.len() {
                 end += 2
             } else {
                 end += 1
             }
         }
-        var stop = end + 1
-        if stop > bytes.len() {
-            stop = bytes.len()
+        var stop = bytes.len()
+        if end < bytes.len() {
+            stop = end + 1
         }
         while held.len() < at {
             mut held.push(Held(literal: None))
@@ -616,7 +652,7 @@ fn literals(bytes: Slice[u8], alloc: mem::Alloc) -> mem::List[Held] {
         }
         at = stop
     }
-    while held.len() < bytes.len() + 1 {
+    while held.len() <= bytes.len() {
         mut held.push(Held(literal: None))
     }
     return held
@@ -667,7 +703,12 @@ view struct Scanner {
     comment: Option[usize]
 } Scanner
 
-fn Scanner.char_at(self, index: usize) -> Option[char] {
+fn Scanner.char_at(self, index: usize) -> Option[char]
+    ensures match result {
+        Some(_) => index < self.chars.len()
+        None => true
+    }
+{
     if index >= self.chars.len() {
         return None
     }
@@ -711,14 +752,15 @@ fn Scanner.run(mut self) fails Offence {
                 if not first_token {
                     fail Offence.At(at: self.offset(start), code: diagnostic::Code.LexNotAtLineStart)
                 }
+                expect start + 1 < self.chars.len()
                 let end = self.chars.len()
                 try self.content(from: start + 2, to: end, literal: Literal.TextLine)
                 mut self.push(TokenKind.TextLine, from: start, to: end)
             }
-            '"' => try mut self.quoted(start, contents: start + 1, literal: Literal.Text)
-            '\'' => try mut self.quoted(start, contents: start + 1, literal: Literal.Char)
-            'b' if next == Some('"') => try mut self.quoted(start, contents: start + 2, literal: Literal.Bytes)
-            'b' if next == Some('\'') => try mut self.quoted(start, contents: start + 2, literal: Literal.Byte)
+            '"' => try mut self.quoted(start, quote_at: start, literal: Literal.Text)
+            '\'' => try mut self.quoted(start, quote_at: start, literal: Literal.Char)
+            'b' if next == Some('"') => try mut self.quoted(start, quote_at: start + 1, literal: Literal.Bytes)
+            'b' if next == Some('\'') => try mut self.quoted(start, quote_at: start + 1, literal: Literal.Byte)
             _ if c.is_ascii_alphabetic() or c == '_' => mut self.word(start)
             _ if c.is_ascii_digit() => try mut self.number(start)
             else => try mut self.punct(start, c)
@@ -728,6 +770,7 @@ fn Scanner.run(mut self) fails Offence {
 
 /// Scans the `//` at `start`: a plain comment ends the scan, a doc comment is a token.
 fn Scanner.comment_or_doc(mut self, start: usize, first_token: bool) fails Offence {
+    expect start <= self.chars.len() and self.chars.len() - start >= 2
     let third = self.char_at(start + 2)
     var kind = TokenKind.Doc
     if third == Some('!') {
@@ -744,7 +787,7 @@ fn Scanner.comment_or_doc(mut self, start: usize, first_token: bool) fails Offen
 } Scanner.comment_or_doc
 
 fn Scanner.word(mut self, start: usize) {
-    var end = start + 1
+    var end = start
     loop {
         let Some(c) = self.char_at(end) else {
             break
@@ -755,15 +798,15 @@ fn Scanner.word(mut self, start: usize) {
         end += 1
     }
     var kind = TokenKind.Ident
-    let Some(parts) = self.bytes.split_at(self.offset(start)) else {
+    let Some(head) = self.bytes.prefix(self.offset(end)) else {
         expect false
         return
     }
-    let Some(spelt) = parts.tail.prefix(self.offset(end) - self.offset(start)) else {
+    let Some(parts) = head.split_at(self.offset(start)) else {
         expect false
         return
     }
-    match Keyword.from_spelling(spelt) {
+    match Keyword.from_spelling(parts.tail) {
         Some(keyword) => {
             kind = TokenKind.Keyword(keyword)
         }
@@ -773,7 +816,7 @@ fn Scanner.word(mut self, start: usize) {
 } Scanner.word
 
 fn Scanner.number(mut self, start: usize) fails Offence {
-    var end = start + 1
+    var end = start
     loop {
         let Some(c) = self.char_at(end) else {
             break
@@ -790,15 +833,15 @@ fn Scanner.number(mut self, start: usize) fails Offence {
         }
         end += 2
     }
-    let Some(parts) = self.bytes.split_at(self.offset(start)) else {
+    let Some(head) = self.bytes.prefix(self.offset(end)) else {
         expect false
         return
     }
-    let Some(run) = parts.tail.prefix(self.offset(end) - self.offset(start)) else {
+    let Some(parts) = head.split_at(self.offset(start)) else {
         expect false
         return
     }
-    match classify_number(run) {
+    match classify_number(parts.tail) {
         Ok(kind) => mut self.push(kind, from: start, to: end)
         Err(code) => fail Offence.At(at: self.offset(start), code: code)
     }
@@ -843,19 +886,20 @@ fn Scanner.punct(mut self, start: usize, c: char) fails Offence {
     mut self.push(kind, from: start, to: start + length)
 } Scanner.punct
 
-/// Scans a literal from its opener at `open`, its contents starting at `contents`.
-fn Scanner.quoted(mut self, open: usize, contents: usize, literal: Literal) fails Offence {
-    let Some(quote) = self.char_at(contents - 1) else {
+/// Scans a literal from its opener at `open`, its opening quote at `quote_at`.
+fn Scanner.quoted(mut self, open: usize, quote_at: usize, literal: Literal) fails Offence {
+    let Some(quote) = self.char_at(quote_at) else {
         expect false
         return
     }
+    let contents = quote_at + 1
     var index = contents
     loop {
         if index >= self.chars.len() {
             fail Offence.At(at: self.offset(open), code: diagnostic::Code.LexUnterminatedLiteral)
         }
         let found = self.char_at(index)
-        if found == Some('\\') {
+        if found == Some('\\') and index + 1 < self.chars.len() {
             index += 2
         } else if found == Some(quote) {
             break
@@ -891,7 +935,7 @@ fn Scanner.content(self, from: usize, to: usize, literal: Literal) fails Offence
     var index = from
     while index < to {
         if self.char_at(index) == Some('\\') {
-            index += try self.escape(at: index, to, literal)
+            index = try self.escape(at: index, to, literal)
         } else if literal == Literal.Bytes and self.is_non_ascii(index) {
             fail Offence.At(at: self.offset(index), code: diagnostic::Code.LexNonAsciiByte)
         } else {
@@ -905,12 +949,13 @@ fn Scanner.units(self, from: usize, to: usize, literal: Literal) -> usize {
     var index = from
     var units: usize = 0
     while index < to {
+        invariant units <= index
         if self.char_at(index) == Some('\\') {
-            let Ok(length) = attempt self.escape(at: index, to, literal) else {
+            let Ok(after) = attempt self.escape(at: index, to, literal) else {
                 expect false
                 return units
             }
-            index += length
+            index = after
         } else {
             index += 1
         }
@@ -920,41 +965,44 @@ fn Scanner.units(self, from: usize, to: usize, literal: Literal) -> usize {
 } Scanner.units
 
 /// The character at `index` of the contents ending before `to`.
-fn Scanner.inside(self, index: usize, to: usize) -> Option[char] {
+fn Scanner.inside(self, index: usize, to: usize) -> Option[char]
+    ensures match result {
+        Some(_) => index < to
+        None => true
+    }
+{
     if index < to {
         return self.char_at(index)
     }
     return None
 } Scanner.inside
 
-/// The length in characters of the escape at `at`, which ends before `to`.
+/// The index after the escape at `at`, which ends before `to`.
 fn Scanner.escape(self, at: usize, to: usize, literal: Literal) -> usize fails Offence {
+    expect at < to
     let Some(escaped) = self.inside(index: at + 1, to) else {
         fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
     }
     match first escaped {
-        '\\' or '"' or '\'' or 'n' or 'r' or 't' or '0' => return 2
+        '\\' or '"' or '\'' or 'n' or 'r' or 't' or '0' => return at + 2
         'x' => {
-            let Some(value) = self.escape_digits(at, to) else {
+            let Some(value) = self.escape_digits(from: at + 2, to) else {
                 fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
             }
             if value > 0x7F and not literal.holds_bytes() {
                 fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexEscapeOutOfRange)
             }
-            return 4
+            return at + 4
         }
-        'u' if not literal.holds_bytes() and self.inside(index: at + 2, to) == Some('{') => {
-            var count: usize = 0
-            loop {
-                let Some(c) = self.inside(index: at + 3 + count, to) else {
-                    break
-                }
-                if not is_hex_byte_char(c) {
-                    break
-                }
-                count += 1
+        'u' if not literal.holds_bytes() => {
+            let Some('{') = self.inside(index: at + 2, to) else {
+                fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
             }
-            if count < 1 or count > 6 or self.inside(index: at + 3 + count, to) != Some('}') {
+            let Some(close) = self.digits_close(from: at + 3, to) else {
+                fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
+            }
+            let count = close - at - 3
+            if count < 1 or count > 6 {
                 fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
             }
             let Some(parts) = self.bytes.split_at(self.offset(at + 3)) else {
@@ -972,24 +1020,50 @@ fn Scanner.escape(self, at: usize, to: usize, literal: Literal) -> usize fails O
             if char.checked_from_bits(value).is_none() {
                 fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexEscapeOutOfRange)
             }
-            return count + 4
+            return close + 1
         }
         else => fail Offence.At(at: self.offset(at), code: diagnostic::Code.LexUnknownEscape)
     }
 } Scanner.escape
 
-/// The value of the two characters after the `\x` at `at`, as `u32::from_str_radix` reads them.
-fn Scanner.escape_digits(self, at: usize, to: usize) -> Option[u32] {
-    let Some(high) = self.inside(index: at + 2, to) else {
+/// The index of the `}` that ends the hexadecimal digits from `from` before `to`, if one does.
+fn Scanner.digits_close(self, from: usize, to: usize) -> Option[usize]
+    ensures match result {
+        Some(close) => from <= close and close < to
+        None => true
+    }
+{
+    for close in from..<to {
+        let Some(c) = self.char_at(close) else {
+            return None
+        }
+        if c == '}' {
+            return Some(close)
+        }
+        if not is_hex_byte_char(c) {
+            return None
+        }
+    }
+    return None
+} Scanner.digits_close
+
+/// The value of the two characters at `from`, after a `\x`, as `u32::from_str_radix` reads them.
+fn Scanner.escape_digits(self, from: usize, to: usize) -> Option[u32]
+    ensures match result {
+        Some(_) => from < to and from + 1 < to
+        None => true
+    }
+{
+    let Some(high) = self.inside(index: from, to) else {
         return None
     }
-    let Some(low) = self.inside(index: at + 3, to) else {
+    let Some(low) = self.inside(index: from + 1, to) else {
         return None
     }
     if not (high.is_ascii() and low.is_ascii()) {
         return None
     }
-    let Some(parts) = self.bytes.split_at(self.offset(at + 2)) else {
+    let Some(parts) = self.bytes.split_at(self.offset(from)) else {
         return None
     }
     let Some(written) = parts.tail.prefix(2) else {
@@ -1103,6 +1177,7 @@ fn classify_number(run: Slice[u8]) -> Result[TokenKind, diagnostic::Code] {
 } classify_number
 
 fn int_suffix(run: Slice[u8], from: usize) -> bool {
+    expect from <= run.len()
     if from == run.len() {
         return true
     }
@@ -1121,6 +1196,7 @@ fn float_suffix(run: Slice[u8], from: usize) -> bool {
 
 /// Whether the bytes of `run` from `from` on are exactly `word`.
 fn rest_is(run: Slice[u8], from: usize, word: Str) -> bool {
+    expect from <= run.len()
     return run.len() - from == word.byte_len() and starts_with_at(run, at: from, prefix: word.as_bytes())
 } rest_is
 
@@ -1142,9 +1218,10 @@ fn digits(text: Slice[u8], from: usize, is_digit: fn(byte: u8) -> bool) -> Optio
     }
     var end = from + 1
     loop {
+        invariant end <= text.len()
         if end < text.len() and is_digit(text[end]) {
             end += 1
-        } else if end + 1 < text.len() and text[end] == b'_' and is_digit(text[end + 1]) {
+        } else if text.len() - end >= 2 and text[end] == b'_' and is_digit(text[end + 1]) {
             end += 2
         } else {
             return Some(end)

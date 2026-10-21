@@ -488,8 +488,8 @@ const TIERS: [(&str, &str); 8] = [
     ("tools", "Tool card"),
 ];
 
-/// `nan primer [<topic> or tools]`: the tier's section of the primer, each link replaced by its
-/// text.
+/// `nan primer [<topic> or tools]`: the tier's section of the primer, each link outside code
+/// replaced by its text.
 pub fn primer(invocation: &Invocation) -> Output {
     let written = invocation.args.join(" ");
     let tier = match &invocation.operands[..] {
@@ -503,13 +503,13 @@ pub fn primer(invocation: &Invocation) -> Output {
     let Some((name, heading)) = tier else {
         return invocation.tool_error(Code::ToolUsage, &written);
     };
-    let mut lines: Vec<String> = PRIMER
-        .lines()
-        .skip_while(|line| *line != format!("## {heading}"))
-        .skip(1)
-        .take_while(|line| !line.starts_with("## "))
-        .map(unlinked)
-        .collect();
+    let mut lines = printed(
+        PRIMER
+            .lines()
+            .skip_while(|line| *line != format!("## {heading}"))
+            .skip(1)
+            .take_while(|line| !line.starts_with("## ")),
+    );
     while lines.first().is_some_and(String::is_empty) {
         lines.remove(0);
     }
@@ -524,23 +524,82 @@ pub fn primer(invocation: &Invocation) -> Output {
     listed_output(invocation, &written, vec![record])
 }
 
-/// A line with each Markdown link `[text](target)` replaced by its text.
+/// Lines of the primer with each Markdown link outside code blocks replaced by its text.
+fn printed<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut code = false;
+    lines
+        .map(|line| {
+            code ^= line.starts_with("```");
+            match code {
+                true => line.to_owned(),
+                false => unlinked(line),
+            }
+        })
+        .collect()
+}
+
+/// A line with each Markdown link `[text](target)` outside code spans replaced by its text.
 fn unlinked(line: &str) -> String {
     let mut out = String::new();
     let mut rest = line;
-    while let Some(open) = rest.find('[') {
-        let Some(close) = rest[open..].find("](").map(|at| open + at) else {
-            break;
+    while let Some(at) = rest.find(['`', '[']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let kept = match rest.starts_with('`') {
+            true => code_span(rest),
+            false => match link(rest) {
+                Some((text, length)) => {
+                    out.push_str(&unlinked(text));
+                    rest = &rest[length..];
+                    continue;
+                }
+                None => 1,
+            },
         };
-        let Some(end) = rest[close..].find(')').map(|at| close + at) else {
-            break;
-        };
-        out.push_str(&rest[..open]);
-        out.push_str(&rest[open + 1..close]);
-        rest = &rest[end + 1..];
+        out.push_str(&rest[..kept]);
+        rest = &rest[kept..];
     }
     out.push_str(rest);
     out
+}
+
+/// The length of the code span `text` starts with, or of its opening backticks when no run of
+/// as many closes them.
+fn code_span(text: &str) -> usize {
+    let run = |from: usize| text[from..].len() - text[from..].trim_start_matches('`').len();
+    let ticks = run(0);
+    let mut at = ticks;
+    while let Some(found) = text[at..].find('`') {
+        let start = at + found;
+        if run(start) == ticks {
+            return start + ticks;
+        }
+        at = start + run(start);
+    }
+    ticks
+}
+
+/// The text of the link `text` starts with, whose brackets balance outside code spans, and the
+/// link's length.
+fn link(text: &str) -> Option<(&str, usize)> {
+    let mut depth = 0;
+    let mut at = 0;
+    while at < text.len() {
+        match text.as_bytes()[at] {
+            b'`' => {
+                at += code_span(&text[at..]);
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' if depth == 1 => break,
+            b']' => depth -= 1,
+            _ => {}
+        }
+        at += 1;
+    }
+    let target = text.get(at + 1..)?.strip_prefix('(')?;
+    let end = target.find(')')?;
+    Some((&text[1..at], at + end + 3))
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ A tier's size is the largest of the token counts that the three tokenizers named
 
 ## Core
 
-NaN is a systems language without a garbage collector, a mandatory runtime or undefined behaviour in safe code. A line's meaning and acceptance depend only on its [closure set](00-charter.md#guarantees): its enclosing item, what the items and types it names expose, its module's grants, its package's targets, the aliases it uses and the core vocabulary. `nan context` prints that set, and `nan check --prefix` checks an unfinished file up to its first dead token.
+NaN is a systems language without a garbage collector, a mandatory runtime or undefined behaviour in safe code. A line's meaning and acceptance depend only on its [closure set](00-charter.md#guarantees): its enclosing item, what the items and types it names expose, its module's grants, its package's targets, the aliases it uses and the core vocabulary. `nan context` prints that set.
 
 ### Differences from mainstream languages
 
@@ -29,20 +29,11 @@ NaN is a systems language without a garbage collector, a mandatory runtime or un
 | `let mut x` | `var x`; a `let` binding is never assigned or accessed by `mut` |
 | `import`, `use`, `a.b.C` | none: every use writes its path, `mem::List`, `a::b::C` |
 | `impl T { ... }` blocks, classes | flat items `fn T.f(self)`; conformance is one line `impl T: I` |
-| `Vec<T>`, `Map<K, V>` | `mem::List[T]`, `mem::Map[K, V]` |
 | `null`, `nil`, tuples, `()` | `Option[T]`; a named struct; `Unit` |
 | `f(a, 3)`, `Point(1, 2)` | `f(a, count: 3)`, `Point(x: 1, y: 2)`: labels after the first argument and on every field |
-| the last expression is the result | `return e` |
-| `if let Some(x) = e` | `let Some(x) = e else { ... }`, or `match` |
 | `i++`, `x as u8`, `-7 / 2` | `i += 1`; `u8.truncate(x)` and the other named conversions; `div_trunc`, `div_floor` |
 | `async fn`, postfix `.await` | `uses wait` in the head, `await f(x)` before the call |
-| `Drop`, `__del__`, `finally` | no code runs at end of scope; `defer f(x)` runs `f(x)` at scope exit |
-| `static mut`, `println!`, `argv`, `getenv` | no globals: `main` receives everything in `host::World` |
 | `unsafe { ... }` | `trusted "premise" { ... }`, with a manifest grant |
-| `panic!`, `assert!` | traps; `expect cond` |
-| `switch` arms tried in order, guards anywhere | disjoint arms in any order; order and guards only in `match first` |
-| `sleep` loops, timeouts | `task::within` deadlines; in a component, `mut cx.after(ms: n, send: m)` |
-| guessing a library call | `nan show <path> --api` first: argument labels are checked |
 
 ### Source form
 
@@ -56,11 +47,10 @@ NaN is a systems language without a garbage collector, a mandatory runtime or un
 ### Items and heads
 
 - An [item](02-items.md#item-shape) starts at column 0 as `[pub|pkg] [modifiers] kind Name`. A braced item ends with a column-0 line `} Name` repeating its name. Impl lines, consts, contributions, tombstones and transparent functions are single lines.
-- The [item kinds](02-items.md#item-kinds) are `fn`, `struct`, `enum`, `interface`, `impl`, `layout`, `registers`, `const`, `const assert`, `registry`, `contribute`, `test`, `retired` and `package`.
 - Item order carries no meaning. A name is unique in its module, so nothing is overloaded.
 - [Visibility](03-packages-modules.md#visibility) is private by default, `pkg` for the package, `pub` for consumers. A `pub` struct or enum states `closed` (consumers construct, destructure and match it exhaustively) or `open` (consumers build it through functions and match it with `else =>`; it may gain fields or variants). A private or `pkg` type states neither.
 - [Modifiers](02-items.md#modifiers): types take `closed`, `open`, `linear` and `view`; a function takes at most one of `proj`, `interrupt`, `landing`, `foreign` and `validator`.
-- A function [head](02-items.md#heads) reads `fn Type.name[G](params) -> R fails E uses wait limits L`. Every parameter has a name, a mode and a type. `-> R` is omitted exactly when the result is `Unit`, `fails E` exactly when the function cannot fail, and `uses wait` exactly when it cannot wait other than through its function parameters. Nothing is inferred. Beyond four parameters, the head puts one parameter per line.
+- A function [head](02-items.md#heads) reads `fn Type.name[G](params) -> R fails E uses wait limits L`. Every parameter has a name, a mode and a type. `-> R` is omitted exactly when the result is `Unit`, `fails E` exactly when the function cannot fail, and `uses wait` exactly when it cannot wait other than through its function parameters. Nothing is inferred.
 - A [method](02-items.md#methods) is a flat item `Type.name` whose first parameter is `self`, `mut self` or `take self`; a generic type's parameters are in scope in its methods. An associated function has no `self` and is called `Type.name(...)`.
 - [Clause lines](02-items.md#clause-region) sit between head and body, indented 4 spaces, in the order `requires`, `ensures`, `example`, `decreases`, `todo`, `waive`. The body's `{` then opens at column 0.
 - A [transparent function](02-items.md#transparent-functions), `fn f(...) -> R = expr`, is pure, terminating and notrap, and its body is its contract.
@@ -109,10 +99,10 @@ pub fn Meter.mean(self) -> Option[u64]
 - [Scalars](04-types.md#scalars): `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `usize` and `isize` (64-bit), `f32`, `f64`, `bool`, `char`. `Unit` has one value, also written `Unit`; `Never` has none.
 - A struct has named fields, private unless marked `pub` or `pkg`. Several results come back as a named struct.
 - An enum's [variants](04-types.md#enums) are `V`, `V(T)` or `V(a: T, b: U)`, written `Enum.V`.
-- `Option[T]` is `Some(v)` or `None`; `Result[T, E]` is `Ok(v)` or `Err(e)`. `Option`, and `Result` when one side is empty, pack into a [niche](04-types.md#niches) of the other payload.
+- `Option[T]` is `Some(v)` or `None`; `Result[T, E]` is `Ok(v)` or `Err(e)`.
 - `Array[T, N]` is stored inline with a const length. `Slice[T]` and `SliceMut[T]` are views of contiguous elements.
 - [Construction](04-types.md#construction) labels every field and marks each value as a `take` argument: `Uart(regs: take regs, dropped: 0)`. Destructuring mirrors it.
-- A [predicate](04-types.md#predicates) is a field `where P` or a struct line `invariant P` over fields, consts and const generics. Only the defining module writes the fields a predicate mentions. The predicate holds whenever a value leaves that module; each obligation is proven or checked at run time, and a failed check traps (`trap.predicate`).
+- A [predicate](04-types.md#predicates), a field `where P` or a struct line `invariant P`, holds whenever a value leaves its defining module, which alone writes the fields it mentions; a failed check traps (`trap.predicate`).
 
 ### Structural properties
 
@@ -129,7 +119,6 @@ pub fn Meter.mean(self) -> Option[u64]
 - The [structural properties](05-properties.md#structural-properties) are computed from structure; source states only `linear`, `view` and `derives Copy`, and a missing `linear` or `view` comes with an exact fix.
 - A linear value left unconsumed is an error (`own.linear-dropped`): at end of scope, through `discard`, `_` or an `else` arm, by overwriting, or live at `try`, `fail` or `return` without a `defer` consuming it.
 - Generic parameters are droppable unless bounded `T: Any`.
-- Consumers see every computed property of a closed type and, of an open type, only its [interface facts](05-properties.md#interface-facts): whether it is linear or a view, a `Copy` derive and the promises its `derives` lists. A capability type never derives `Default`, `Encode` or `Generate`.
 
 ```nan
 linear struct Lease {
@@ -147,17 +136,6 @@ pub fn use_slot(slot: u32) -> u32 {
     let lease = Lease.open(slot)
     return take lease.release()
 } use_slot
-```
-
-```nan
-linear struct Lease {
-    slot: u32
-} Lease
-
-pub fn leak_slot(slot: u32) -> u32 {
-    let lease = Lease(slot: slot)
-    return lease.slot // error: own.linear-dropped
-} leak_slot
 ```
 
 ### Statements and control flow
@@ -190,15 +168,6 @@ pub fn classify(byte: u8) -> Token {
     return token
 } classify
 
-pub fn weight(token: Token) -> u32 {
-    let value: u32 = match first token {
-        Token.Digit(d) if d >= 5 => 2
-        Token.Digit(_) => 1
-        else => 0
-    }
-    return value
-} weight
-
 pub fn digit_sum(text: Slice[u8]) -> u32 {
     var sum: u32 = 0
     for byte in text {
@@ -226,7 +195,7 @@ pub fn digit_sum(text: Slice[u8]) -> u32 {
 - A [projection](07-ownership.md#projections) (`proj fn`) returns a result derived only from its receiver; projections take the place of `&` and `&mut`. `x[i]` calls `at` or `at_mut` and traps out of range (`trap.bounds`). A Copy projection used as a value is copied at once. `let v = xs.at(i)` of a non-Copy element binds a view, and `xs` stays frozen (no `mut` or `take` access) after a read projection, or held (no access) after a `mut` projection, while the view or anything derived from it is live. Writing through a mutable view needs `mut` on the view, so a local one is a `var`.
 - `for x in xs` reads elements, `for x in mut xs` modifies them in place, `for x in take xs` consumes `xs` and owns each element.
 - [Closures](07-ownership.md#closures): `fn(x: u32) => x > floor`, or a capture list and a full head, `fn[mut total, take conn](x: u8) -> u32 fails E uses wait { ... }`. Unlisted captures are reads. A closure is passed as an argument and never stored or returned, except a `task fn` closure, which its task scope stores; named functions are first-class values.
-- `mem::Box[T]` is the only owned indirection, and its contents never move. Values are built in their [result location](07-ownership.md#result-location), so returning a large struct copies nothing.
+- `mem::Box[T]` is the only owned indirection, and its contents never move.
 
 ```nan
 pub fn append_all(mut out: mem::List[u32], take extra: mem::List[u32]) {
@@ -256,7 +225,7 @@ pub fn count_above(values: Slice[u32], floor: u32) -> usize {
 - An [interface](08-generics-interfaces.md#interfaces) is a nominal set of method heads, optionally with default bodies. Conformance is an [impl line](08-generics-interfaces.md#impl-lines), `impl Square: Area`, in the type's or the interface's module; its methods are ordinary `Square.area` items. `Self` is an implicit generic parameter only inside interface items, and a type has at most one impl line per interface, whatever its arguments.
 - `x.f()` finds methods of `x`'s type, of interfaces from that type's package, and of core interfaces. Another package's interface method is called qualified: `geo::Area.area(x)`.
 - No blanket impls, overlapping impls, specialisation, orphan impls, overloading or inheritance exist.
-- Operators come only from core interfaces, `core::Add` to `core::Shr`, `Eq` and `Ord`, whose impls are pure and terminating; `Eq`, `Ord` and `Hash` impls are also notrap, so generic comparisons may appear in contracts. Floats compare with built-in IEEE `==` and `<`.
+- Operators come only from the core interfaces `core::Add` to `core::Shr`, `Eq` and `Ord`, whose impls are pure and terminating; `Eq`, `Ord` and `Hash` impls are also notrap. Floats compare with built-in IEEE `==` and `<`.
 - `Dyn[I]` is a view that dispatches dynamically, and `mem::Box[Dyn[I]]` owns one. Whether an interface is usable through `Dyn` is computed.
 - `derives` lists compiler-written conformances: `Eq`, `Ord`, `Hash`, `Copy`, `Default`, `Render`, `Encode`, `Generate`, and on open types the promises `Send`, `Inert` and `AnyBits`. `nan expand` prints the derived code.
 
@@ -275,14 +244,6 @@ pub fn Square.area(self) -> u64 {
     let side = u64.widen(self.side)
     return side * side
 } Square.area
-
-pub fn total_area[T: Area](shapes: Slice[T]) -> u64 {
-    var total: u64 = 0
-    for shape in shapes {
-        total += shape.area()
-    }
-    return total
-} total_area
 ```
 
 ### Numbers
@@ -290,7 +251,6 @@ pub fn total_area[T: Area](shapes: Slice[T]) -> u64 {
 - `+`, `-` and `*` trap on overflow in every build (`trap.overflow`). The prefixes `wrapping_`, `saturating_`, `checked_` (an `Option`) and `overflowing_` name the alternatives: `count.wrapping_add(1)`.
 - `/` and `%` exist only for unsigned integers and floats. Signed division is `div_trunc`, `rem_trunc`, `div_floor` or `mod_floor`. Division by zero traps (`trap.division-by-zero`).
 - `>>` shifts unsigned integers and `shr_arith` signed ones. A shift by the width or more traps (`trap.shift`); otherwise a signed `<<` that is not exact traps (`trap.overflow`).
-- `a.wide_mul(b)` returns a `core::WideProduct`; no 128-bit integer exists.
 - [Named conversions](09-numbers.md#conversions) are functions of the target type: `u64.widen(x)` is lossless, `u8.fit(x)` traps when the value does not fit (`trap.conversion`), `u8.checked_fit(x)` returns an `Option`, `u8.truncate(x)` keeps low bits, `u8.saturate(x)` clamps, and `nearest` rounds to the nearest value. `x.to_bits()`, `T.from_bits(b)` (into AnyBits types) and `T.checked_from_bits(b)` (an `Option`) reinterpret bits.
 - Floats are strict IEEE 754 with explicit `fused_mul_add`. They have no `Eq`, `Ord` or `Hash`; `core::TotalF64` and `core::TotalF32` order them totally.
 
@@ -302,17 +262,13 @@ pub fn checksum(data: Slice[u8]) -> u8 {
     }
     return u8.truncate(sum)
 } checksum
-
-pub fn bucket(offset: i32) -> i32 {
-    return offset.div_floor(16)
-} bucket
 ```
 
 ### Failures and traps
 
 - `fails E` names an [error enum](11-errors-domains.md#error-enums), a generic parameter or `task::Cancelled`. `fail e` raises the [failure](11-errors-domains.md#failures) `e`, an ordinary value: a variant `E.V`, or a failure caught earlier, converted through a `from` variant as `try` converts. `fail` diverges, so it may end a `match` arm that yields a value.
 - At a call that may fail, `try` passes the failure to the caller, converting it through a `Name(CalleeError) from` variant when the caller's enum differs; `attempt` yields a `Result` instead. A failing call with neither is an error (`error.unhandled`).
-- A [trap](11-errors-domains.md#traps) abandons the innermost domain (the process, a `sys::Domain` body, a test or the kernel) without unwinding; no deferred call or other user code runs. Traps signal bugs only. Their kinds are exactly `trap.bounds`, `trap.overflow`, `trap.division-by-zero`, `trap.shift`, `trap.conversion`, `trap.stale-handle`, `trap.exhausted`, `trap.predicate`, `trap.requires`, `trap.ensures`, `trap.expect`, `trap.todo`, `trap.stack-overflow`, `trap.duplicate-access` and `trap.poisoned`.
+- A [trap](11-errors-domains.md#traps) abandons the innermost domain (the process, a `sys::Domain` body, a test or the kernel) without unwinding; no deferred call or other user code runs. Traps signal bugs only.
 - `expect P` checks the pure condition `P` unless proven, traps when it is false (`trap.expect`) and is a fact afterwards.
 - `defer f(x)` runs `f(x)` at every exit of its scope except a trap, in reverse order of registration. Deferred calls never fail and never wait.
 
@@ -367,7 +323,7 @@ pub fn parse_port(text: Slice[u8]) -> u16 fails PortError {
 - The checker computes everything else into the item's [digest](10-effects-digests.md#digests): allocation, device and privileged access, synchronisation, possible traps, termination, float use, and the capabilities and validators reached. `nan explain` prints it.
 - A `limits` clause demands digest facts: `pure`, `notrap` (proven by the prover), `terminates`, `noalloc`, `stack N`. On a `pub` item all but `stack N` are [promises](05-properties.md#promises).
 - A [function type](10-effects-digests.md#function-types) carries a full head, `fn(x: u32) -> bool fails E uses wait limits notrap`. A function fits it when its failures, waiting and limits are within the type's. A call to a higher-order function is awaited when the callee or a function argument may wait.
-- Contract terms, transparent functions, const evaluation and the impls of operators, `Eq`, `Ord`, `Hash` and `Default` are pure: they have no effects and reach no authority.
+- Contract terms, transparent functions, const evaluation and the impls of operators, `Eq`, `Ord`, `Hash` and `Default` are pure.
 
 ```nan
 pub closed enum ReadError derives Render {
@@ -390,10 +346,10 @@ pub fn midpoint(low: u32, high: u32) -> u32 limits notrap
 
 ### Memory and text
 
-- No global allocator exists and `core` never allocates: allocation needs an [allocator](12-memory.md#allocators), the Copy capability `mem::Alloc`. `alloc.split(n)` returns a linear `mem::Budget` whose `budget.alloc()` draws on it; `take budget.close()` revokes every `mem::Alloc` drawn from it, so growth through them fails as exhaustion while live memory stays.
+- No global allocator exists and `core` never allocates: allocation needs an [allocator](12-memory.md#allocators), the Copy capability `mem::Alloc`. `alloc.split(n)` returns a linear `mem::Budget` whose `budget.alloc()` draws at most n bytes; `take budget.close()` revokes those allocators, so growth through them fails as exhaustion while live memory stays.
 - [Growable containers](12-memory.md#growth) store their allocator. `push`, `insert` and `reserve` trap when memory is exhausted (`trap.exhausted`); `try_push`, `try_insert` and `try_reserve` fail with `mem::OutOfMemory`. `Array`, `mem::Bounded` and `text::Fixed` never allocate.
 - Collections: `mem::List`, `mem::Map`, `mem::HashMap` (insertion-ordered, explicitly seeded), `mem::Set`, `mem::Bounded`, `mem::Bytes`. Their methods are eager and take closures.
-- [Stores](12-memory.md#stores): `mem::Heap`; `mem::Arena[T]`, insert-only and indexed by `mem::Id[T]`; `mem::Pool[T, B]`, indexed by generational `mem::Handle[T, B]`, where `pool[h]` traps once `h` is stale (`trap.stale-handle`). `mem::Shared[T]` is atomically counted, and `make_mut` clones only when shared.
+- [Stores](12-memory.md#stores): `mem::Heap`, the insert-only `mem::Arena[T]` indexed by `mem::Id[T]`, and `mem::Pool[T, B]` indexed by generational handles, stale ones trapping. `mem::Shared[T]` is atomically counted, and `make_mut` clones only when shared.
 - [Text](13-text-encode.md#text-types): `Str` is a UTF-8 view, `text::String` is owned, `text::Fixed[N]` is inline. Text has no integer indexing and no `len`: `byte_len`, `char_count`, and `slice_bytes`, which returns an `Option`.
 - `Render` writes a value as text within a [render budget](13-text-encode.md#render) and is derivable. `text::fmt` is the one template form; its holes name labelled arguments and are checked at compile time.
 
@@ -415,8 +371,8 @@ pub fn collect_even(values: Slice[u32], alloc: mem::Alloc) -> mem::List[u32] fai
 - On the host, `main` receives the [root grant](14-authority.md#root-grants) `host::World`, which is not linear. Its fields are `fs`, `net`, `clock`, `random`, `log`, `stdio`, `alloc` and `exec`, plus the Untrusted `args` (after the program name) and `environment`. `main` exits with status 0, or with a `u8` it returns; a failure, which implements `Render`, goes to standard error with status 1.
 - Ordinary methods such as `fs.subdir` and `alloc.split` attenuate capabilities. A revoked capability fails with `sys::Revoked`; draws through a revoked allocator are exhaustion.
 - What values cannot carry, the manifest grants per module: `allow device`, `allow priv`, `allow trusted`, `allow validate` and `allow contribute`.
-- Data from outside the program (network, files, standard input, arguments, environment, device-written buffers, user memory, model output) arrives [Untrusted](15-untrusted.md#untrusted-values), as `Untrusted[T]`: no `Eq`, `Ord` or `Hash`, an opaque rendering, no conversion to `T`. Any code may use the content-blind operations `byte_len`, `view`, `view_mut`, `prefix`, `split_at`, `append`, `copy_prefix` and `into_cleared`.
-- Only a [validator](15-untrusted.md#validators), `validator fn`, reads the contents, through `inspect()`, which returns ordinary data its helpers may read. The manifests of its package and of each consumer allow `validate` for it. A validator is parsing when its result, failure type, `mut` parameters and the parameters that can carry data out (type parameters, function types, `Dyn`, interior mutability, `task::Sender`, `sys::Outbox`), its Untrusted inputs excepted, hold only scalars, enums, structs of these, layouts and Untrusted values; any other is declassifying and needs a seal.
+- Data from outside the program (network, files, streams, arguments, environment, devices, model output) arrives [Untrusted](15-untrusted.md#untrusted-values), as `Untrusted[T]`: no `Eq`, `Ord` or `Hash`, an opaque rendering, no conversion to `T`. Any code may use the content-blind operations `byte_len`, `view`, `view_mut`, `prefix`, `split_at`, `append`, `copy_prefix` and `into_cleared`.
+- Only a [validator](15-untrusted.md#validators), `validator fn`, reads the contents, through `inspect()`, which returns ordinary data its helpers may read. The manifests of its package and of each consumer allow `validate` for it.
 
 ```nan
 // file: wire/package.nan
@@ -455,19 +411,12 @@ pub validator fn decode(raw: Untrusted[Slice[u8]]) -> Header fails HeaderError
 } decode
 ```
 
-### Encoding
-
-- `derives Encode` applies to Inert types without views, handles or capability types. It writes `T.encode(self, mut e: E)` for any `E: core::Encoder` and `T.decode(mut d: D, alloc: mem::Alloc) -> T fails core::DecodeError` for any `D: core::Decoder`.
-- A [decoder](13-text-encode.md#encode) is a compiler-written validator: it reads an Untrusted source and re-checks tags, niches and predicates. Stored allocators are never encoded; decoding gives `alloc` to the containers it rebuilds. A decoder is parsing exactly when the type it decodes is a parsing type; the decoder of a generic type item, or of a type holding arrays, text, bytes or collections, is declassifying, like a validator.
-- Keys derive from field and variant names, so a renamed field keeps its stored data only through a `retired T.old => T.new preserves` tombstone, which stays in source while `T` derives `Encode`.
-- `mem::wire` is the canonical binary format and `text::json` the JSON format.
-
 ### Contracts and tests
 
 - [Contracts](18-contracts.md#clauses): `requires P` is checked at each call that does not prove it; `ensures Q` may use `result` and `old(e)` and holds at each return, not when the call fails; `example E` is a `bool` expression the interpreter runs at check time, and it is part of the interface.
 - A run-time check is removed only by a proof; tests never remove checks. Tools show each obligation's [status](18-contracts.md#statuses): proven, checked, assumed or open.
 - `todo "intent"` is an expression of any type that traps when reached (`trap.todo`); in the clause region it marks a missing specification. `nan holes` lists every `todo` with its expected type.
-- `test name for target { ... } name` is a [test](22-testing.md#test-items) that counts only if its target runs. Its body may `await` and may pass any failure out with `try`; an escaping failure fails the test. Parameters of types implementing `Generate`, never views, make it a [property test](22-testing.md#property-tests): inputs are generated from types, predicates and the target's `requires`, boundary values included, and a failure shrinks to NaN literals.
+- `test name for target { ... } name` is a [test](22-testing.md#test-items) that counts only if its target runs. Its body may `await` and may pass any failure out with `try`; an escaping failure fails the test. Parameters of types implementing `Generate` make it a [property test](22-testing.md#property-tests).
 - `testing::world()` returns a `host::World` of simulated capabilities, with an empty file system, a loopback network and a virtual clock. `testing` items and `sim` constructors are legal only in tests and examples. `dbg(e)` writes to the test trace and is incompleteness.
 
 ```nan
@@ -488,7 +437,7 @@ test clamp_stays_in_range for clamp_percent (value: u32) {
 ### Diagnostics and incompleteness
 
 - A [diagnostic](34-diagnostics.md#diagnostic-record) gives a dotted code, the location and item, the quoted text, what was expected and found, a because-chain and re-checked exact fixes, which `nan fix` applies. Only root causes are reported.
-- No warnings exist. [Incompleteness](31-trust.md#incompleteness) covers `todo`, `dbg`, unused private items, locals, fields, dependencies and tombstones, uses of `preserves` tombstones, unwaived threshold excess, stale API snapshots or docs, generator gaps and missing seals. `nan check` and `nan test` accept it; the release gate, run by `nan verify` and `nan publish`, rejects it.
+- No warnings exist. [Incompleteness](31-trust.md#incompleteness) covers `todo`, `dbg`, unused code, uses of `preserves` tombstones, unwaived threshold excess, stale API snapshots or docs, generator gaps and missing seals. `nan check` and `nan test` accept it; the release gate, run by `nan verify` and `nan publish`, rejects it.
 
 ## Low-level topic
 
@@ -787,11 +736,19 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 - Agents never write versions or hashes. `nan dep add` writes a `dep` line whose source is a path or a package in the local store, and `nan dep sync` writes the [lock](29-identity-versioning.md#lock) `.nan/lock.nan`, choosing per dependency the newest release whose interfaces satisfy what each consumer relied on and against which the consumers' tests pass. A dependency closure holds one release per package.
 - [Compatibility](29-identity-versioning.md#compatibility) is computed per item from interface hashes; a body edit never changes an interface. `nan publish --local <dir>` appends a release to the local store, and `nan publish --local <dir> --breaking <item> "reason"` declares a behaviour change that types cannot show.
 - An authority a release gains (a widening) breaks consumers that relied on its absence and reaches the final-link root for approval.
-- A [tombstone](29-identity-versioning.md#tombstones) records a removed, renamed or changed API with its rewrite: `retired Ring.push_back(mut self, x: T) => mut self.push_overwrite(x) changes "a full ring drops its oldest item"`, or `retired old::Path => new::Path preserves` for a rename. A `preserves` tombstone keeps the old form callable; each use is incompleteness with an exact rewrite. `nan edit rename` and `nan edit move` write tombstones, and `nan upgrade` applies their rewrites. A renamed field of an Encode type keeps `retired T.old => T.new preserves` in source, never unused, so stored data still decodes. Decoding a closed type rejects unknown keys; decoding an open type skips unknown fields, defaults missing fields whose type derives `Default`, and fails on unknown variants.
+- Consumers see every computed property of a closed type and, of an open type, only its [interface facts](05-properties.md#interface-facts): whether it is linear or a view, a `Copy` derive and the promises its `derives` lists.
+- A [tombstone](29-identity-versioning.md#tombstones) records a removed, renamed or changed API with its rewrite: `retired Ring.push_back(mut self, x: T) => mut self.push_overwrite(x) changes "a full ring drops its oldest item"`, or `retired old::Path => new::Path preserves` for a rename. A `preserves` tombstone keeps the old form callable; each use is incompleteness with an exact rewrite. `nan edit rename` and `nan edit move` write tombstones, and `nan upgrade` applies their rewrites.
+
+### Encoding
+
+- `derives Encode` applies to Inert types without views, handles or capability types; a capability type never derives `Default`, `Encode` or `Generate`. It writes `T.encode(self, mut e: E)` for any `E: core::Encoder` and `T.decode(mut d: D, alloc: mem::Alloc) -> T fails core::DecodeError` for any `D: core::Decoder`. `mem::wire` is the canonical binary format and `text::json` the JSON format.
+- A [decoder](13-text-encode.md#encode) is a compiler-written validator: it reads an Untrusted source and re-checks tags, niches and predicates. Stored allocators are never encoded; decoding gives `alloc` to the containers it rebuilds.
+- Keys derive from field and variant names, so a renamed field keeps its stored data only through a `retired T.old => T.new preserves` tombstone, which stays in source, never unused, while `T` derives `Encode`. Decoding a closed type rejects unknown keys; decoding an open type skips unknown fields, defaults missing fields whose type derives `Default`, and fails on unknown variants.
 
 ### Trust and the release gate
 
 - [`nan verify`](31-trust.md#release-gate) rejects incompleteness and requires a current seal on every item holding a trust escape (trusted code, `assume`, foreign and landing fns, declassifying validators and decoders, and `device` and `priv` grants on the `package` item); a pending weakening blocks it until a seal of the item accepts it.
+- A [validator](15-untrusted.md#validators) is parsing when its result, failure type, `mut` parameters and the parameters that can carry data out (type parameters, function types, `Dyn`, interior mutability, `task::Sender`, `sys::Outbox`), its Untrusted inputs excepted, hold only scalars, enums, structs of these, layouts and Untrusted values; any other is declassifying and needs a seal. A decoder is parsing exactly when the type it decodes is a parsing type; the decoder of a generic type item, or of a type holding arrays, text, bytes or collections, is declassifying.
 - `nan seal <item> --as <principal>` binds the principal to the item hash and to the hash of what the item relies on; any change to either lapses the [seal](31-trust.md#seals). In a VCS workspace the sealing change's author differs from the author of every change to the item or to what it relies on, and `nan verify` checks that every weakening the API snapshots accept was accepted by such a seal, even when a snapshot is edited by hand.
 - The [ledger](31-trust.md#ledger) lists each item's trusted blocks, assumes, foreign, landing and validator fns, declassifying decoders, device and priv grants, waivers, todos and `dbg` uses.
 - `.nan/api/<module>.nan` is the machine-written [API snapshot](31-trust.md#api-snapshots), rewritten by `nan api update`. Weakening a contract, changing or removing an example, or removing, disputing or altering a targeting test stays a pending weakening until a seal accepts it.

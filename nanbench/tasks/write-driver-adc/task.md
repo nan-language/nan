@@ -1,0 +1,4 @@
+kind: write
+area: driver
+
+In the package `adc`, write two functions. `pub fn map_adc() -> hw::Mmio[AdcRegs]` maps the converter's registers, which the board decodes at physical address `0xFED4_0000` and nothing else maps. `pub fn sample(mut regs: hw::Mmio[AdcRegs], channel: u8) -> u16 fails AdcError` converts one channel. A channel above 7 fails with `NoChannel(channel)` before any register access. Otherwise it writes `control` with `start` set and the channel, then reads `status` until it shows `done`, at most 100 reads, failing with `Timeout` when none does. Once `done` shows, it writes `status` with `done` and with `overrun` as it read it, acknowledging them, then fails with `Overrun` when `overrun` was set. Otherwise it reads `data` and returns its `value`, failing with `WrongChannel(c)` when the sample's channel c is not the one converted.

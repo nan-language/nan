@@ -247,6 +247,27 @@ test revoked_copy_fails for read_config {
 ```
 
 ```nan
+pub fn still_derives(clock: sys::Clock) -> bool {
+    match attempt sys::revocable(clock) {
+        Ok(revoker) => {
+            take revoker.revoke()
+            return true
+        }
+        Err(_) => return false
+    }
+} still_derives
+
+test a_stale_clock_derives_nothing for still_derives {
+    let world = testing::world()
+    let revoker = try sys::revocable(world.clock)
+    let clock = revoker.capability()
+    take revoker.revoke()
+    let derived = still_derives(clock)
+    expect not derived
+} a_stale_clock_derives_nothing
+```
+
+```nan
 pub closed struct Meter {
     pub reads: u32
 } Meter

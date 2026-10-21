@@ -54,6 +54,7 @@ pkg fn parse_form(text: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
 
 /// The position of a character in the alphabet.
 fn digit_of(byte: u8) -> Option[u32] {
+    expect ALPHABET.byte_len() == 32
     for at in 0..<32usize {
         if ALPHABET.as_bytes()[at] == byte {
             return Some(u32.fit(at))
@@ -63,7 +64,12 @@ fn digit_of(byte: u8) -> Option[u32] {
 } digit_of
 
 /// The `length` bytes whose checksummed base32 is `text`, if any.
-pkg fn read_checksummed_base32(text: Str, length: usize, alloc: mem::Alloc) -> Option[mem::Bytes] {
+pkg fn read_checksummed_base32(text: Str, length: usize, alloc: mem::Alloc) -> Option[mem::Bytes]
+    ensures match result {
+        Some(bytes) => bytes.len() == length
+        None => true
+    }
+{
     let written = text.as_bytes()
     if written.len() != (length * 8 + 4) / 5 + 2 {
         return None
@@ -72,6 +78,7 @@ pkg fn read_checksummed_base32(text: Str, length: usize, alloc: mem::Alloc) -> O
     var bits: u32 = 0
     var held: u32 = 0
     for at in 0..<(written.len() - 2) {
+        invariant held < 8
         let Some(digit) = digit_of(written[at]) else {
             return None
         }
@@ -87,7 +94,7 @@ pkg fn read_checksummed_base32(text: Str, length: usize, alloc: mem::Alloc) -> O
             return None
         }
     }
-    let padding_zero = (bits & ((1u32 << held) - 1)) == 0
+    let padding_zero = bits.trailing_zeros() >= held
     if bytes.len() != length or not padding_zero {
         return None
     }
@@ -105,6 +112,7 @@ pkg fn checksummed_base32(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
     var bits: u32 = 0
     var held: u32 = 0
     for byte in bytes {
+        invariant held < 5
         bits = (bits << 8) | u32.widen(byte)
         held += 8
         while held >= 5 {
@@ -112,6 +120,7 @@ pkg fn checksummed_base32(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
             letter(mut out, position: (bits >> held) & 31)
         }
     }
+    expect held < 5
     if held > 0 {
         letter(mut out, position: (bits << (5 - held)) & 31)
     }
@@ -464,9 +473,12 @@ fn full_block(data: Slice[u8], start: usize) -> Words
 /// The message block of the `count` bytes of `data` from `start`, fewer than 64, zero-padded.
 fn partial_block(data: Slice[u8], start: usize, count: usize) -> Words {
     var bytes = Array[u8, 64].filled(0)
+    let Some(parts) = data.split_at(start) else {
+        return full_block(bytes.view(), start: 0)
+    }
     for index in 0..<count {
-        if index < 64 and start + index < data.len() {
-            bytes[index] = data[start + index]
+        if index < 64 and index < parts.tail.len() {
+            bytes[index] = parts.tail[index]
         }
     }
     return full_block(bytes.view(), start: 0)
@@ -475,31 +487,36 @@ fn partial_block(data: Slice[u8], start: usize, count: usize) -> Words {
 /// The output of one chunk, its 1 to 1024 bytes being those of `data` from `start`, or of the
 /// empty input.
 fn chunk(data: Slice[u8], start: usize, counter: u64) -> Compression {
-    var length = data.len() - start
-    if length > CHUNK_LEN {
-        length = CHUNK_LEN
+    expect start <= data.len()
+    var end = data.len()
+    if end - start > CHUNK_LEN {
+        end = start + CHUNK_LEN
     }
     var cv = Chain.initial()
-    var offset: usize = 0
+    var at = start
     var flags = CHUNK_START
-    while length - offset > BLOCK_LEN {
-        cv = chaining_value(Compression(cv: cv, block: full_block(data, start: start + offset), counter: counter, len: 64, flags: flags))
-        offset += BLOCK_LEN
+    loop {
+        invariant at <= end
+        if end - at <= BLOCK_LEN {
+            break
+        }
+        cv = chaining_value(Compression(cv: cv, block: full_block(data, start: at), counter: counter, len: 64, flags: flags))
+        at += BLOCK_LEN
         flags = 0
     }
-    let last = length - offset
-    var block = partial_block(data, start: start + offset, count: last)
+    let last = end - at
+    var block = partial_block(data, start: at, count: last)
     if last == BLOCK_LEN {
-        block = full_block(data, start: start + offset)
+        block = full_block(data, start: at)
     }
     return Compression(cv: cv, block: block, counter: counter, len: u32.fit(last), flags: flags | CHUNK_END)
 } chunk
 
 /// The BLAKE3-256 digest of `data`.
 pkg fn blake3(data: Slice[u8]) -> Array[u8, 32] {
-    var chunks = (data.len() + CHUNK_LEN - 1) / CHUNK_LEN
-    if chunks == 0 {
-        chunks = 1
+    var chunks = data.len() / CHUNK_LEN
+    if data.len() % CHUNK_LEN > 0 or chunks == 0 {
+        chunks += 1
     }
     var stack = mem::Bounded[Chain, 64].empty()
     let last = chunks - 1

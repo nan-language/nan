@@ -1565,7 +1565,7 @@ fn Body.qualified_calls(self, take interfaces: mem::List[ty::ItemId], receiver: 
     let written = ck.written(self.item, head: start, last: receiver_last)
     let open = u32.fit(syntax.next_code(usize.widen(name.token) + 1))
     var arguments = text::String.empty(alloc)
-    if open + 1 < last {
+    if last > 0 and open < last - 1 {
         mut arguments.append(", ")
         mut arguments.append(ck.written(self.item, head: open + 1, last: last - 1).as_str())
     }
@@ -1858,9 +1858,13 @@ fn Body.qualified_call(
         return TExpr.failed(token)
     }
     let sig = ck.sig(interface_item)
-    let has_self = match sig.contents().kind {
-        SigKind.Interface(methods: methods) => methods[method].sig.has_self()
-        else => false
+    var has_self = false
+    match sig.contents().kind {
+        SigKind.Interface(methods: methods) => {
+            expect method < methods.len()
+            has_self = methods[method].sig.has_self()
+        }
+        else => {}
     }
     var self_ty = ty::Ty.error()
     if has_self {
@@ -1934,11 +1938,11 @@ fn Body.apply_with(
     let ck = self.ck.share()
     let types = ck.types()
     let alloc = ck.alloc()
-    var offset: usize = 0
-    if receiver.is_some() {
-        offset = 1
+    let offset: usize = match receiver {
+        Some(_) => 1
+        None => 0
     }
-    if args.len() + offset != callable.head.params.len() {
+    if callable.head.params.len() < offset or args.len() != callable.head.params.len() - offset {
         self.report(token, code: diagnostic::Code.ExprArgumentCount)
         mut self.skim_args(args)
         return TExpr.failed(token)
@@ -1949,6 +1953,7 @@ fn Body.apply_with(
         return TExpr.failed(token)
     }
     let params = parts.tail
+    expect params.len() == args.len()
     self.check_labels(params, args, self_first)
     if callable.from_expected {
         match expected {
@@ -2228,6 +2233,7 @@ fn Body.judge_markers(
             }
         }
     }
+    expect self.frames.len() > 0
     let last = self.frames.len() - 1
     if may_wait and not only_own {
         self.frames[last].may_wait = true
@@ -2243,6 +2249,7 @@ fn Body.judge_markers(
                 None => false
             }
             if not attempted {
+                expect last < self.frames.len()
                 mut self.frames[last].raise(raised)
             }
         }
@@ -2579,6 +2586,7 @@ fn Body.check_volatile(self, token: u32, callable: Callable, args: Slice[TArg]) 
     let SigKind.Registers(members: window) = sig.contents().kind else {
         return
     }
+    expect index < window.len()
     let register = window[index]
     let reads = member.starts_with("read")
     let allowed = match register.access {
@@ -2720,6 +2728,7 @@ fn Body.label_fix(self, arg: ast::Arg, param: ParamSig, self_first: bool, index:
     }
     if self_first and index == 0 {
         let syntax = ck.db().syntax(self.item)
+        expect usize.widen(label.token) < syntax.tokens.len() and usize.widen(arg.value.token) < syntax.tokens.len()
         let start = syntax.tokens[usize.widen(label.token)].start
         let end = syntax.tokens[usize.widen(arg.value.token)].start
         return ck.fix_bytes(self.item, start, end, text: "")
@@ -2747,24 +2756,25 @@ fn Body.reordered(self, params: Slice[ParamSig], args: Slice[ast::Arg]) -> Optio
             }
         }
     }
+    expect names.len() == args.len()
     var ordered = text::String.empty(alloc)
     for index in 0..<params.len() {
-        var matching: Option[usize] = None
+        var matching: Option[nir::Span] = None
         for at in 0..<args.len() {
             if self.text(names[at]) == params[index].name.as_str() {
                 if matching.is_some() {
                     return None
                 }
-                matching = Some(at)
+                matching = Some(nir::Span(head: args[at].token, last: args[at].value.last))
             }
         }
-        let Some(at) = matching else {
+        let Some(span) = matching else {
             return None
         }
         if index > 0 {
             mut ordered.append(", ")
         }
-        mut ordered.append(ck.written(self.item, head: args[at].token, last: args[at].value.last).as_str())
+        mut ordered.append(ck.written(self.item, head: span.head, last: span.last).as_str())
     }
     let opening = args[0]
     let closing = args[args.len() - 1]
@@ -3020,7 +3030,10 @@ fn Body.construction_fields(
         }
         SigKind.Enum(variants: variants) => {
             match variant {
-                Some(index) => return mut self.construction_payload(token, payload: variants[index].payload, args)
+                Some(index) => {
+                    expect index < variants.len()
+                    return mut self.construction_payload(token, payload: variants[index].payload, args)
+                }
                 None => {}
             }
         }
@@ -3095,6 +3108,7 @@ fn Body.construction_values(
             mut named.push(text::String.of(name.as_str(), alloc))
             field = index
         }
+        expect field < fields.fields.len()
         let declared = fields.fields[field]
         let typed = mut self.construction_value(item, arg, field_ty: declared.ty, mut infer, mut wrapped)
         mut values.push(TLabelled(name: text::String.of(declared.name.as_str(), alloc), value: take typed))
@@ -3120,7 +3134,12 @@ fn Body.labelled_value(
     arg: ast::Arg,
     args: Slice[ast::Arg],
     fields: Slice[LabelledTy],
-    ) -> Option[usize] {
+    ) -> Option[usize]
+    ensures match result {
+        Some(index) => index < fields.len()
+        None => true
+    }
+{
     let ck = self.ck.share()
     let Some(label) = arg.label_name() else {
         var fixes = mem::List[diagnostic::Fix].empty(ck.alloc())
@@ -3282,6 +3301,7 @@ fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bo
         expect false
         return TExpr.failed(token)
     }
+    expect found.head.params.len() == 2
     let index_ty = found.infer.subst.ty(types, ty: found.head.params[1].ty)
     let index_typed = mut self.check(index, expected: index_ty)
     let head = found.infer.subst.fn_ty(types, fn_ty: found.head.fn_ty(alloc))
@@ -3667,7 +3687,7 @@ fn Body.template(mut self, token: u32, args: Slice[ast::Arg]) -> TExpr {
         self.report(template.token, code: diagnostic::Code.TextTemplateNotLiteral)
         return TExpr.failed(token)
     }
-    let value = syntax::text_value(self.text(literal.tokens[0]), alloc)
+    let value = syntax::text_value(self.literal_text(literal), alloc)
     let Some(holes) = template_holes(value.as_str(), alloc) else {
         self.report(template.token, code: diagnostic::Code.TextTemplateMalformed)
         return TExpr.failed(token)

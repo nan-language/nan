@@ -609,12 +609,13 @@ fn revocation(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let alloc = lo.ck.is_std(&capability, "mem::Alloc");
     match supply.member() {
         "" => {
-            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            let capability = supply.param(0).address();
+            let handle = fx.load(PTR, capability, 0);
             let derived = if alloc {
                 let unlimited = fx.int(PTR, -1);
                 lo.call_routine(fx, Routine::Split, &[handle, unlimited])[0]
             } else {
-                let record = lo.call_routine(fx, Routine::Check, &[handle])[0];
+                let record = checked(lo, fx, supply, capability);
                 let kind = fx.load(types::I32, record, entry::KIND);
                 let kind = fx.b.ins().uextend(PTR, kind);
                 let derived = lo.call_routine(fx, Routine::Derive, &[handle, kind])[0];

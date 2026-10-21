@@ -34,8 +34,10 @@ mod vcs;
 mod workspace;
 
 pub use cache::use_home;
+pub use check::{Discharge, Measured};
 pub use command::{Launch, Run, run};
 pub use diagnostic::Code;
+pub use final_build::TaskStack;
 
 /// The facts checking each item of the workspace rooted at `root` reads that its context pack
 /// lacks, for the completeness test.
@@ -56,4 +58,23 @@ pub fn nir_streams(root: &std::path::Path) -> std::io::Result<Vec<(String, Vec<u
 pub fn proof_cache_mismatches(root: &std::path::Path) -> std::io::Result<Vec<String>> {
     let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
     Ok(check::proof_cache_mismatches(&workspace))
+}
+
+/// The measurements of the freeze that checking gives over the workspace at `root`.
+pub fn measure(root: &std::path::Path) -> std::io::Result<Measured> {
+    let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
+    Ok(check::measure(&workspace))
+}
+
+/// The tasks of the programs and test images of the workspace at `root`, each entry once, with
+/// their stack uses, for the measurements of the freeze.
+pub fn task_stacks(root: &std::path::Path) -> std::io::Result<Vec<TaskStack>> {
+    let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
+    let mut found = final_build::program_tasks(&workspace);
+    for task in test_runs::task_stacks(&workspace) {
+        if !found.iter().any(|known| known.site == task.site) {
+            found.push(task);
+        }
+    }
+    Ok(found)
 }

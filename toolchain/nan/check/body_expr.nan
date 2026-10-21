@@ -85,6 +85,7 @@ fn Body.dot_for_path(self, name: ast::Name) {
 /// removing the qualifier.
 fn Body.qualified_core_variant(self, head: u32, name: ast::Name) {
     let syntax = self.ck.db().syntax(self.item)
+    expect usize.widen(head) < syntax.tokens.len() and usize.widen(name.token) < syntax.tokens.len()
     let start = syntax.tokens[usize.widen(head)].start
     let end = syntax.tokens[usize.widen(name.token)].start
     var fixes = mem::List[diagnostic::Fix].empty(self.ck.alloc())
@@ -149,7 +150,7 @@ fn Body.needs_expected(self, expr: ast::Expr) -> bool {
             if literal.kind != ast::LiteralKind.Int and literal.kind != ast::LiteralKind.Float {
                 return false
             }
-            return literal_suffix(self.text(literal.tokens[0])).is_none()
+            return literal_suffix(self.literal_text(literal)).is_none()
         }
         ast::ExprKind.Unary(op: op, operand: operand) => {
             if op == ast::UnaryOp.Not {
@@ -360,6 +361,7 @@ fn Body.todo_expr(mut self, token: u32, last: u32, reason: ast::Text, expected: 
         self.report(token, code: diagnostic::Code.ContractIllDefined)
     }
     let depth = self.frames.len()
+    expect depth > 0
     self.frames[depth - 1].holds_todo = true
     var hole = expected
     if hole.is_none() and self.statement == Some(nir::Span(head: token, last: last)) {
@@ -414,12 +416,18 @@ fn Body.literal(mut self, token: u32, literal: ast::Literal, expected: Option[ty
     return TExpr(token: token, last: token, ty: literal_ty, kind: TKind.Literal(take value))
 } Body.literal
 
+/// The text of a literal's first token.
+proj fn Body.literal_text(self, literal: ast::Literal) -> Str {
+    expect literal.tokens.len() > 0
+    return self.text(literal.tokens[0])
+} Body.literal_text
+
 /// The type of a number literal: the scalar its suffix or expected type fixes, its value within
 /// the type's range; none, reported, when neither fixes one or the value lies outside it.
 fn Body.number_type(self, token: u32, literal: ast::Literal, expected: Option[ty::Ty], negative: bool) -> Option[ty::Ty] {
     let types = self.ck.types()
     let alloc = self.ck.alloc()
-    let written = self.text(literal.tokens[0])
+    let written = self.literal_text(literal)
     let is_int = literal.kind == ast::LiteralKind.Int
     var number_ty = ty::Ty.error()
     match literal_suffix(written) {
@@ -484,7 +492,7 @@ fn float_digits(written: Str, alloc: mem::Alloc) -> mem::Bytes {
         let Some(head) = written.slice_bytes(0, end) else {
             break
         }
-        trimming = head.ends_with("f32")
+        trimming = end >= 3 and head.ends_with("f32")
         if trimming {
             end -= 3
         }
@@ -494,13 +502,14 @@ fn float_digits(written: Str, alloc: mem::Alloc) -> mem::Bytes {
         let Some(head) = written.slice_bytes(0, end) else {
             break
         }
-        trimming = head.ends_with("f64")
+        trimming = end >= 3 and head.ends_with("f64")
         if trimming {
             end -= 3
         }
     }
     var digits = mem::Bytes.empty(alloc)
     let bytes = written.as_bytes()
+    expect end <= bytes.len()
     for at in 0..<end {
         if bytes[at] != b'_' {
             mut digits.push(bytes[at])
@@ -520,7 +529,7 @@ fn is_infinity(bits: u64, single: bool) -> bool {
 /// The value a literal of a valid type denotes.
 fn Body.literal_value(self, literal: ast::Literal, ty: ty::Ty, negative: bool) -> Lit {
     let alloc = self.ck.alloc()
-    let written = self.text(literal.tokens[0])
+    let written = self.literal_text(literal)
     match literal.kind {
         ast::LiteralKind.Int => {
             var value = int_literal(written).value_or(wide::Wide.zero())
@@ -812,6 +821,7 @@ fn Body.unit_variant(
     let SigKind.Enum(variants: variants) = sig.contents().kind else {
         return TExpr.failed(token)
     }
+    expect variant < variants.len()
     match variants[variant].payload {
         Payload.None => {}
         else => {
@@ -1299,7 +1309,7 @@ fn Body.negative_literal(mut self, token: u32, literal: ast::Literal, expected: 
         return typed
     }
     if scalar.is_integer() and not scalar.is_signed() and literal.kind == ast::LiteralKind.Int {
-        let value = int_literal(self.text(literal.tokens[0])).value_or(wide::Wide.zero())
+        let value = int_literal(self.literal_text(literal)).value_or(wide::Wide.zero())
         if not value.is_zero() {
             self.report(token, code: diagnostic::Code.TypeLiteralRange)
             return TExpr.failed(token)
@@ -2273,6 +2283,7 @@ fn Body.jump_target(mut self, token: u32, label: Option[ast::Name], breaks: bool
         Some(written) => {
             var index = self.loops.len()
             while index > base {
+                invariant index <= self.loops.len()
                 index -= 1
                 let named = match self.loops[index].label {
                     Some(held) => held == written.text
@@ -2294,12 +2305,14 @@ fn Body.jump_target(mut self, token: u32, label: Option[ast::Name], breaks: bool
                 self.report(token, code: diagnostic::Code.StmtNoLoop)
                 return None
             }
+            expect self.loops.len() > 0
             found = Some(self.loops.len() - 1)
         }
     }
     if breaks {
         match found {
             Some(at) => {
+                expect at < self.loops.len()
                 self.loops[at].broken = true
             }
             None => {}
@@ -2338,6 +2351,7 @@ fn Body.fail_expr(mut self, token: u32, value: ast::Expr) -> TExpr {
         }
     }
     let depth = self.frames.len()
+    expect depth > 0
     mut (mut self.frames.at_mut(depth - 1)).raise(typed.ty)
     return TExpr(token: token, last: token, ty: ty::Ty.never(), kind: TKind.Fail(mem::Heap.of(ck.alloc()).boxed(take typed)))
 } Body.fail_expr
@@ -2355,8 +2369,8 @@ fn Body.when_expr(mut self, expr: ast::Expr, attempted: Option[u32], expected: O
     if self.cx.when_body {
         self.report(token, code: diagnostic::Code.TaskWhenWait)
     }
-    let depth = self.frames.len()
-    self.frames[depth - 1].may_wait = true
+    expect self.frames.len() > 0
+    self.frames[self.frames.len() - 1].may_wait = true
     var places = mem::List[TExpr].empty(alloc)
     var values = mem::List[ty::Ty].empty(alloc)
     var seen = mem::List[text::String].empty(alloc)
@@ -2387,6 +2401,7 @@ fn Body.when_expr(mut self, expr: ast::Expr, attempted: Option[u32], expected: O
     var typed_accesses = mem::List[TAccess].empty(alloc)
     var position: usize = 0
     for place in take places {
+        invariant position < accesses.len() and position < values.len() and self.scopes.len() > 0
         let access = accesses[position]
         let id = LocalId(index: u32.truncate(self.locals.len()))
         let closure = self.frame().closure

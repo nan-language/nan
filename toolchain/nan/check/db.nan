@@ -164,7 +164,10 @@ fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Ta
     }
     let carried = session.std.contents()
     for index in 0..<carried.packages.len() {
-        let source = carried.packages[index]
+        let Some(source) = carried.packages.get(index) else {
+            expect false
+            continue
+        }
         let Some(name) = source.name() else {
             continue
         }
@@ -172,8 +175,9 @@ fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Ta
             mut db.add_package(source, at: PackageSource.Carried(index), quiet: false)
         }
     }
-    for index in 0..<db.packages.len() {
-        let data = db.packages[index]
+    let packages = db.packages.view()
+    for index in 0..<packages.len() {
+        let data = packages[index]
         if data.std and is_alias(data.name.as_str()) {
             discard mut db.std.insert(text::String.of(data.name.as_str(), alloc), value: ty::PackageId(index: u32.fit(index)))
         }
@@ -184,6 +188,7 @@ fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Ta
     }
     var index: usize = 0
     for found in take deps {
+        invariant index < db.packages.len()
         db.packages[index].deps = found
         index += 1
     }
@@ -287,22 +292,24 @@ fn Db.add_package(mut self, source: workspace::Package, at: PackageSource, quiet
         }
         var data = ModuleData(package_id: id, name: text::String.of(module.name.as_str(), alloc), root: is_root, items: mem::List[ty::ItemId].empty(alloc), names: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc), abandoned: false, files: mem::List[FileRef].empty(alloc))
         for position in 0..<source.files.len() {
-            let file = source.files[position]
-            if file.module == Some(index) and selects_dir(file.path.as_str(), selected: selected.view()) {
-                mut data.files.push(FileRef(source: at, history: false, index: position))
+            let Some(file) = source.files.get(position) else {
+                expect false
+                continue
             }
-        }
-        var files = mem::List[FileRef].empty(alloc)
-        for file in data.files {
-            mut files.push(file)
+            if file.module == Some(index) and selects_dir(file.path.as_str(), selected: selected.view()) {
+                let reference = FileRef(source: at, history: false, index: position)
+                mut data.files.push(reference)
+                mut self.add_items(mut data, module: module_id, file: reference, held: file)
+            }
         }
         for position in 0..<source.history.len() {
-            if source.history[position].module == Some(index) {
-                mut files.push(FileRef(source: at, history: true, index: position))
+            let Some(file) = source.history.get(position) else {
+                expect false
+                continue
             }
-        }
-        for file in files {
-            mut self.add_items(mut data, module: module_id, file, source)
+            if file.module == Some(index) {
+                mut self.add_items(mut data, module: module_id, file: FileRef(source: at, history: true, index: position), held: file)
+            }
         }
         mut self.modules.push(take data)
         mut modules.push(module_id)
@@ -335,23 +342,19 @@ fn selected_dirs(module: workspace::Module, target: workspace::Target, alloc: me
             return selected
         }
     }
-    var chosen: Option[usize] = None
-    for index in 0..<module.dirs.len() {
-        match chosen {
-            Some(least) => {
-                if module.dirs[index].path.as_str() < module.dirs[least].path.as_str() {
-                    chosen = Some(index)
-                }
-            }
-            None => {
-                chosen = Some(index)
-            }
+    var least = ""
+    var found = false
+    for dir in module.dirs {
+        let path = dir.path.as_str()
+        if not found or path < least {
+            least = path
+            found = true
         }
     }
-    let Some(least) = chosen else {
+    if not found {
         return selected
     }
-    mut selected.push(text::String.of(module.dirs[least].path.as_str(), alloc))
+    mut selected.push(text::String.of(least, alloc))
     return selected
 } selected_dirs
 
@@ -360,6 +363,7 @@ fn selects_dir(path: Str, selected: Slice[text::String]) -> bool {
     let bytes = path.as_bytes()
     var end = bytes.len()
     loop {
+        invariant end <= bytes.len()
         if end == 0 {
             return false
         }
@@ -380,13 +384,10 @@ fn selects_dir(path: Str, selected: Slice[text::String]) -> bool {
 } selects_dir
 
 /// Adds the items of a module's file, lowered to abstract syntax.
-fn Db.add_items(mut self, mut data: ModuleData, module: ty::ModuleId, file: FileRef, source: workspace::Package) {
+fn Db.add_items(mut self, mut data: ModuleData, module: ty::ModuleId, file: FileRef, held: workspace::File) {
     let alloc = self.session.alloc
-    let held = match file.history {
-        true => source.history[file.index]
-        false => source.files[file.index]
-    }
     let lowered = held.lowered(alloc)
+    expect lowered.len() == held.syntax.items.len()
     for position in 0..<held.syntax.items.len() {
         let syntax = held.syntax.items[position]
         if syntax.abandoned {
@@ -424,13 +425,16 @@ fn add_named(mut names: mem::Map[text::String, mem::List[ty::ItemId]], take name
 
 proj fn Db.item(self, id: ty::ItemId) -> ItemData {
     self.note(id)
+    expect usize.widen(id.index) < self.items.len()
     return self.items[usize.widen(id.index)]
 } Db.item
 
 /// An item's syntax read for its name and kind alone, which the names of its module show.
 proj fn Db.declaration(self, id: ty::ItemId) -> ast::Item {
+    expect usize.widen(id.index) < self.items.len()
     let data = self.items[usize.widen(id.index)]
     let lowered = self.file(data.file).lowered(self.session.alloc)
+    expect data.index < lowered.len()
     let Some(item) = lowered[data.index] else {
         expect false
         return self.absent
@@ -574,15 +578,18 @@ fn Db.read_by(self, subject: ty::ItemId) -> mem::List[ty::ItemId] {
 } Db.read_by
 
 proj fn Db.module(self, id: ty::ModuleId) -> ModuleData {
+    expect usize.widen(id.index) < self.modules.len()
     return self.modules[usize.widen(id.index)]
 } Db.module
 
 proj fn Db.package_data(self, id: ty::PackageId) -> PackageData {
+    expect usize.widen(id.index) < self.packages.len()
     return self.packages[usize.widen(id.index)]
 } Db.package_data
 
 /// The package a package of the database is.
 proj fn Db.source(self, id: ty::PackageId) -> workspace::Package {
+    expect usize.widen(id.index) < self.packages.len()
     return self.source_of(self.packages[usize.widen(id.index)].source)
 } Db.source
 
@@ -607,7 +614,9 @@ proj fn Db.syntax(self, item: ty::ItemId) -> syntax::SourceFile {
 
 /// The line of one of an item's tokens.
 fn Db.line(self, item: ty::ItemId, token: u32) -> u32 {
-    return self.syntax(item).tokens[usize.widen(token)].line
+    let syntax = self.syntax(item)
+    expect usize.widen(token) < syntax.tokens.len()
+    return syntax.tokens[usize.widen(token)].line
 } Db.line
 
 /// The text of one of an item's tokens.
@@ -622,6 +631,7 @@ fn Db.head_line(self, item: ty::ItemId) -> u32 {
 
 /// Whether an item is a tombstone of its package's history.
 fn Db.in_history(self, item: ty::ItemId) -> bool {
+    expect usize.widen(item.index) < self.items.len()
     return self.items[usize.widen(item.index)].file.history
 } Db.in_history
 
@@ -731,6 +741,7 @@ fn Db.std_item(self, module: Str, name: Str) -> Option[ty::ItemId] {
     var found = self.package_data(package_id).root
     match split {
         Some(at) => {
+            expect at <= module.byte_len() and module.byte_len() - at >= 2
             let Some(below) = module.slice_bytes(at + 2, end: module.byte_len()) else {
                 return None
             }
@@ -770,6 +781,7 @@ fn Db.module_path(self, module: ty::ModuleId) -> text::String {
 /// The canonical path of a named item, or of a tombstone's old form.
 fn Db.canonical(self, item: ty::ItemId) -> text::String {
     let alloc = self.session.alloc
+    expect usize.widen(item.index) < self.items.len()
     let data = self.items[usize.widen(item.index)]
     match self.ast(item).kind {
         ast::ItemKind.Retired(tombstone) => {
@@ -804,6 +816,7 @@ fn member_start(name: Str) -> usize {
     let bytes = name.as_bytes()
     var at = bytes.len()
     while at > 0 {
+        invariant at <= bytes.len()
         at -= 1
         if bytes[at] == b'.' {
             return at + 1

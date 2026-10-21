@@ -142,3 +142,17 @@ fn a_refuted_char_is_written_as_the_normalised_form_writes_it() {
         "{explained}"
     );
 }
+
+#[test]
+fn the_primer_writes_each_link_as_its_text_outside_code() {
+    let section = "A static `Slice[u8]`; the [escapes](01-lexical.md#text-literals), [`nan verify`](31-trust.md#release-gate) and `fn Type.name[G](params)`.\n```nan\nlet body = fn[mut conn]() {}\n```";
+    assert_eq!(
+        super::printed(section.lines()),
+        [
+            "A static `Slice[u8]`; the escapes, `nan verify` and `fn Type.name[G](params)`.",
+            "```nan",
+            "let body = fn[mut conn]() {}",
+            "```",
+        ]
+    );
+}

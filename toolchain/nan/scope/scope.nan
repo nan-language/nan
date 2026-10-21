@@ -35,19 +35,18 @@ pkg fn Scope.resolve(
     written: Option[Str],
     alloc: mem::Alloc,
     ) -> Option[Resolved] {
-    var holding: Option[usize] = None
-    for index in 0..<workspace.packages.len() {
-        let base = platform::join(workspace.root.as_str(), name: workspace.packages[index].dir.as_str(), alloc)
-        if platform::strip_prefix(current, base: base.as_str(), alloc).is_some() {
-            holding = Some(index)
-            break
-        }
-    }
+    let holding = workspace.packages.position(fn(candidate: workspace::Package) -> bool {
+        let base = platform::join(workspace.root.as_str(), name: candidate.dir.as_str(), alloc)
+        return platform::strip_prefix(current, base: base.as_str(), alloc).is_some()
+    })
     let Some(argument) = written else {
         let Some(index) = holding else {
             return Some(Resolved(scope: Scope.Workspace, written: text::String.of(".", alloc)))
         }
-        let pack = workspace.packages[index]
+        let Some(pack) = workspace.packages.get(index) else {
+            expect false
+            return None
+        }
         let name = match pack.name() {
             Some(package_name) => package_name
             None => pack.dir.as_str()
@@ -109,6 +108,7 @@ fn file_line(argument: Str) -> Option[FileLine] {
     let bytes = argument.as_bytes()
     var colon = bytes.len()
     while colon > 0 {
+        invariant colon <= bytes.len()
         colon -= 1
         if bytes[colon] == b':' {
             let Some(path) = argument.slice_bytes(0, end: colon) else {
@@ -184,12 +184,18 @@ fn file_package(workspace: workspace::Workspace, path: Str) -> Option[usize] {
 } file_package
 
 /// The parts of a path between its `::` separators, empty ones included.
-fn path_segments(path: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+fn path_segments(path: Str, alloc: mem::Alloc) -> mem::List[text::String]
+    ensures result.len() > 0
+{
     var segments = mem::List[text::String].empty(alloc)
     let bytes = path.as_bytes()
     var start: usize = 0
     var at: usize = 0
-    while at + 1 < bytes.len() {
+    loop {
+        invariant at <= bytes.len()
+        if bytes.len() - at < 2 {
+            break
+        }
         if bytes[at] == b':' and bytes[at + 1] == b':' {
             let Some(segment) = path.slice_bytes(start, end: at) else {
                 return segments
@@ -218,13 +224,13 @@ fn named(workspace: workspace::Workspace, argument: Str, relative: Option[usize]
             index = given
         }
         None => {
-            var found: Option[usize] = None
-            for candidate in 0..<workspace.packages.len() {
-                if workspace.packages[candidate].name() == Some(segments[0].as_str()) {
-                    found = Some(candidate)
-                    break
+            let wanted = segments[0].as_str()
+            let found = workspace.packages.position(fn(candidate: workspace::Package) -> bool {
+                let Some(package_name) = candidate.name() else {
+                    return false
                 }
-            }
+                return package_name == wanted
+            })
             let Some(named_index) = found else {
                 return None
             }
@@ -232,7 +238,10 @@ fn named(workspace: workspace::Workspace, argument: Str, relative: Option[usize]
             discard mut segments.remove(0)
         }
     }
-    let pack = workspace.packages[index]
+    let Some(pack) = workspace.packages.get(index) else {
+        expect false
+        return None
+    }
     var root: Option[usize] = None
     for module in 0..<pack.modules.len() {
         for dir in pack.modules[module].dirs {
@@ -275,7 +284,10 @@ struct ItemAt derives Copy {
 /// The first item of a module's files with a tree whose head declares `name`.
 fn item_named(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc) -> Option[ItemAt] {
     for file in 0..<pack.files.len() {
-        let held = pack.files[file]
+        let Some(held) = pack.files.get(file) else {
+            expect false
+            continue
+        }
         if held.module != Some(module) {
             continue
         }
@@ -298,7 +310,11 @@ fn item_named(pack: workspace::Package, module: usize, name: Str, alloc: mem::Al
 fn member(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc) -> Option[Scope] {
     match item_named(pack, module, name, alloc) {
         Some(at) => {
-            let file = pack.files[at.file]
+            let Some(file) = pack.files.get(at.file) else {
+                expect false
+                return None
+            }
+            expect at.item < file.syntax.items.len()
             return Some(Scope.Lines(path: text::String.of(file.path.as_str(), alloc), lines: file.syntax.item_lines(file.syntax.items[at.item])))
         }
         None => {}
@@ -309,13 +325,18 @@ fn member(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc)
     let Some(owner) = name.slice_bytes(0, end: dot) else {
         return None
     }
+    expect dot < name.byte_len()
     let Some(declared) = name.slice_bytes(dot + 1, end: name.byte_len()) else {
         return None
     }
     let Some(at) = item_named(pack, module, name: owner, alloc) else {
         return None
     }
-    let file = pack.files[at.file]
+    let Some(file) = pack.files.get(at.file) else {
+        expect false
+        return None
+    }
+    expect at.item < file.syntax.items.len()
     let Some(tree) = file.syntax.items[at.item].tree else {
         return None
     }
@@ -328,6 +349,7 @@ fn member(pack: workspace::Package, module: usize, name: Str, alloc: mem::Alloc)
     let Some(span) = tree.span(line, alloc) else {
         return None
     }
+    expect usize.widen(span.head) < file.syntax.tokens.len() and usize.widen(span.last) < file.syntax.tokens.len()
     let first_line = file.syntax.tokens[usize.widen(span.head)].line
     let last_line = file.syntax.tokens[usize.widen(span.last)].line
     return Some(Scope.Lines(path: text::String.of(file.path.as_str(), alloc), lines: first_line..=last_line))
@@ -355,6 +377,7 @@ fn declares(file: syntax::SourceFile, tree: syntax::Tree, line: u32, name: Str, 
             continue
         }
         for token in tree.child_tokens(inner) {
+            expect usize.widen(token) < file.tokens.len()
             if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
                 if file.text(usize.widen(token)) == name {
                     return true

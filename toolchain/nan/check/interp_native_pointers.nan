@@ -12,6 +12,7 @@ fn Interpreter.pointer_member(mut self, member: Str, type_args: Slice[ty::Arg], 
     let placed = self.ck.interp_layout(element)
     let size = placed.size
     let align = placed.align
+    expect args.len() > 0
     match member {
         "of_addr" => return Some(InterpFlow.Return(Val.Ptr(Ptr(address: args[0].int_value().low_bits(), provenance: None))))
         "of_view" or "of_view_mut" => {
@@ -48,13 +49,14 @@ fn Interpreter.pointer_member(mut self, member: Str, type_args: Slice[ty::Arg], 
             return Some(InterpFlow.Return(Val.Bool(self.pointer(args[0]).address % divisor == 0)))
         }
         "offset" => {
+            expect args.len() > 1
             let ptr = self.pointer(args[0])
             let moved = wide::Wide.of_u64(ptr.address).wrapping_add(args[1].int_value().wrapping_mul(wide::Wide.of_u64(size)))
             let address = moved.low_bits()
             match ptr.provenance {
                 Some(provenance) => {
                     let extent = self.memory.extent(provenance.extent)
-                    if address < extent.address or address > extent.address + extent.size {
+                    if address < extent.address or address - extent.address > extent.size {
                         fail self.violation(rule: "bounds", at)
                     }
                 }
@@ -65,20 +67,24 @@ fn Interpreter.pointer_member(mut self, member: Str, type_args: Slice[ty::Arg], 
         "cast" => return Some(InterpFlow.Return(Val.Ptr(self.pointer(args[0]))))
         "read" or "atomic_load" => return Some(InterpFlow.Return(try self.pointer_load(args[0], size, align, at)))
         "write" or "atomic_store" => {
+            expect args.len() > 1
             try mut self.pointer_store(args[0], value: args[1].copy(alloc), size, align, at)
             return Some(InterpFlow.Return(Val.Unit))
         }
         "atomic_swap" or "atomic_compare_swap" or "atomic_wrapping_add" => return Some(InterpFlow.Return(try mut self.pointer_exchange(member, element, args, size, align, at)))
         "copy" => {
+            expect args.len() > 2
             let from = self.pointer(args[0])
             let to = self.pointer(args[1])
+            let count = args[2].int_value().low_bits()
             var copied = mem::List[Val].empty(alloc)
-            for index in 0..<args[2].int_value().low_bits() {
+            for index in 0..<count {
                 let source = Val.Ptr(Ptr(address: from.address + index * size, provenance: from.provenance))
                 mut copied.push(try self.pointer_load(source, size, align, at))
             }
             var index: u64 = 0
             for value in take copied {
+                invariant index < count
                 let target = Val.Ptr(Ptr(address: to.address + index * size, provenance: to.provenance))
                 try mut self.pointer_store(target, take value, size, align, at)
                 index += 1
@@ -101,6 +107,7 @@ fn Interpreter.pointer_exchange(
     at: ItemSpan,
     ) -> Val fails End {
     let alloc = self.alloc
+    expect args.len() > 2
     let previous = try self.pointer_load(args[0], size, align, at)
     var stored: Option[Val] = None
     var result = Val.Unit
@@ -189,7 +196,11 @@ fn Interpreter.pointer_access(
     if not extent.live {
         fail self.violation(rule: "provenance", at)
     }
-    if ptr.address < extent.address or ptr.address + size > extent.address + extent.size {
+    if ptr.address < extent.address {
+        fail self.violation(rule: "bounds", at)
+    }
+    let offset = ptr.address - extent.address
+    if size > extent.size or offset > extent.size - size {
         fail self.violation(rule: "bounds", at)
     }
     var divisor = align
@@ -202,7 +213,6 @@ fn Interpreter.pointer_access(
     if writing and (not extent.writable or provenance.read_only) {
         fail self.violation(rule: "read-only", at)
     }
-    let offset = ptr.address - extent.address
     match extent.value {
         Val.Array(elements) => {
             if size > 0 and offset % size == 0 {

@@ -26,7 +26,7 @@ use super::{CALL_CONV, Instance, Lowered, Lowering, lines};
 use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId};
 use crate::check::ty::{FnTy, LimitSet, Ty};
-use crate::nir::{Builtin, Callable, Role};
+use crate::nir::{Builtin, Callable, Role, Span};
 use crate::syntax::ast::FnKind;
 
 /// What a test image lowers: tests of one package, in the order the seam numbers them.
@@ -454,6 +454,10 @@ fn entry_glue(lo: &mut Lowering, tests: &Tests) -> FuncId {
     let runs: Vec<FuncId> = (0..tests.tests.len())
         .map(|index| run_glue(lo, tests, index))
         .collect();
+    for (run, test) in runs.iter().zip(&tests.tests) {
+        let span = Span::at(lo.ck.db.item(test.item).ast.token);
+        lo.task(*run, test.item, span, None);
+    }
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
     let id = lo

@@ -70,7 +70,8 @@ enum Located {
     Owned(u32)
 } Located
 
-/// An edge of the walk: its target, condition, the arguments it passes and the contents on it.
+/// An edge of the walk: its target, its own condition, the arguments it passes and the contents
+/// on it.
 struct Edge {
     target: nir::BlockId
     condition: u32
@@ -121,6 +122,11 @@ struct Walk {
     /// changes.
     projected: mem::HashMap[Root, Located]
     reach: mem::List[Option[u32]]
+    /// The local condition of each block: the disjunction of its incoming edges' conditions
+    /// relative to its immediate dominator.
+    local: mem::List[Option[u32]]
+    /// The immediate dominator of each block but the entry.
+    idom: mem::List[Option[nir::BlockId]]
     edges: mem::List[mem::List[Edge]]
     /// The forward predecessors of each block.
     preds: mem::List[mem::List[nir::BlockId]]
@@ -195,8 +201,11 @@ fn Walk.new(
     take entry: mem::List[Premise],
     ) -> Walk {
     let alloc = ck.alloc()
-    let blocks = unit.contents().functions[function].blocks.len()
-    let values = unit.contents().functions[function].types.len()
+    let shared = unit.share()
+    expect function < shared.contents().functions.len()
+    let walked = shared.contents().functions[function]
+    let blocks = walked.blocks.len()
+    let values = walked.types.len()
     let subst = ck.unit_subst(unit.contents().item, args: ck.types().arg_list(type_args))
     var walk = Walk(
         ck: take ck,
@@ -210,8 +219,10 @@ fn Walk.new(
         captured: mem::HashMap[nir::Value, mem::List[Located]].empty(seed: 0, alloc),
         projected: mem::HashMap[Root, Located].empty(seed: 0, alloc),
         reach: absent_terms(blocks, alloc),
+        local: absent_terms(blocks, alloc),
+        idom: mem::List[Option[nir::BlockId]].empty(alloc),
         edges: empty_edges(blocks, alloc),
-        preds: block_lists(blocks, alloc),
+        preds: mem::List[mem::List[nir::BlockId]].empty(alloc),
         region_parent: mem::HashMap[nir::BlockId, InstAt].empty(seed: 0, alloc),
         region_holder: mem::HashMap[nir::BlockId, nir::BlockId].empty(seed: 0, alloc),
         region_exits: mem::HashMap[nir::BlockId, mem::List[nir::BlockId]].empty(seed: 0, alloc),
@@ -228,8 +239,6 @@ fn Walk.new(
         ensures_calls: mem::HashMap[nir::Value, u32].empty(seed: 0, alloc),
         opaque: None,
     )
-    let shared = walk.unit.share()
-    let walked = shared.contents().functions[function]
     for param in walked.params {
         if walked.ty(param.value).is_reference() {
             discard mut walk.referents.insert(param.value, value: Located.Place(root: Root.Referent(param.value), steps: mem::List[text::String].empty(alloc)))
@@ -243,29 +252,47 @@ fn Walk.new(
 /// Gives the parameters their terms and the walk its entry facts, before it walks.
 fn Walk.restart(mut self, take params: mem::List[u32], take entry: mem::List[Premise]) {
     let shared = self.unit.share()
+    expect self.function < shared.contents().functions.len()
     let declared = shared.contents().functions[self.function].params
     var index: usize = 0
     while index < declared.len() and index < params.len() {
-        self.values[usize.widen(declared[index].value.index)] = Some(params[index])
+        self.values[self.value_index(declared[index].value)] = Some(params[index])
         index += 1
     }
     self.entry = entry
 } Walk.restart
 
 proj fn Walk.nir(self) -> nir::Function {
+    expect self.function < self.unit.contents().functions.len()
     return self.unit.contents().functions[self.function]
 } Walk.nir
+
+/// The position of a block in the lists the walk keeps by block.
+fn Walk.block_index(self, block: nir::BlockId) -> usize
+    ensures result < self.reach.len() and result < self.local.len() and result < self.idom.len() and result < self.edges.len() and result < self.preds.len()
+{
+    return usize.widen(block.index)
+} Walk.block_index
+
+/// The position of a value in the list the walk keeps by value.
+fn Walk.value_index(self, value: nir::Value) -> usize
+    ensures result < self.values.len()
+{
+    return usize.widen(value.index)
+} Walk.value_index
 
 /// The forward graph: predecessors, back edges and dominators, each region's first block
 /// dominated by its instruction's block, and the region blocks and exits of each block.
 fn Walk.shape(mut self) {
     let alloc = self.ck.alloc()
     let shared = self.unit.share()
+    expect self.function < shared.contents().functions.len()
     let function = shared.contents().functions[self.function]
     let count = function.blocks.len()
     var all_preds = block_lists(count, alloc)
     for index in 0..<count {
         for target in function.blocks[index].term.successors(alloc) {
+            expect usize.widen(target.index) < all_preds.len()
             mut all_preds[usize.widen(target.index)].push(nir::BlockId(index: u32.fit(index)))
         }
     }
@@ -282,20 +309,59 @@ fn Walk.shape(mut self) {
             }
         }
     }
-    let dominators = dominator_sets(dominating.view(), count, alloc)
-    for index in 0..<count {
+    let dominators = dominator_sets(dominating.view(), alloc)
+    for index in 0..<all_preds.len() {
         let target = nir::BlockId(index: u32.fit(index))
+        var forward = mem::List[nir::BlockId].empty(alloc)
         for pred in all_preds[index] {
+            expect usize.widen(pred.index) < dominators.len() and index < dominators[usize.widen(pred.index)].len()
             if dominators[usize.widen(pred.index)][index] {
                 discard mut self.back.insert(BackEdge(from: pred, to: target))
-            } else if not holds_block(self.preds[index].view(), block: pred) {
-                mut self.preds[index].push(pred)
+            } else if not holds_block(forward.view(), block: pred) {
+                mut forward.push(pred)
             }
         }
-        mut self.preds[index].sort_by(fn(left: nir::BlockId, right: nir::BlockId) => left.cmp(right))
+        mut forward.sort_by(fn(left: nir::BlockId, right: nir::BlockId) => left.cmp(right))
+        mut self.preds.push(take forward)
+    }
+    for block in 0..<count {
+        mut self.idom.push(immediate_dominator(dominators.view(), block))
     }
     self.dominators = dominators
 } Walk.shape
+
+/// The immediate dominator of a block: of the blocks dominating it other than itself, the one
+/// with the most dominators.
+fn immediate_dominator(dominators: Slice[mem::List[bool]], block: usize) -> Option[nir::BlockId] {
+    expect block < dominators.len()
+    let row = dominators[block]
+    expect row.len() == dominators.len()
+    var closest: Option[nir::BlockId] = None
+    var deepest: usize = 0
+    for other in 0..<row.len() {
+        if other == block or not row[other] {
+            continue
+        }
+        let depth = dominator_count(dominators[other].view())
+        if closest.is_none() or depth > deepest {
+            closest = Some(nir::BlockId(index: u32.fit(other)))
+            deepest = depth
+        }
+    }
+    return closest
+} immediate_dominator
+
+/// How many blocks dominate the block whose row of dominators is given.
+fn dominator_count(row: Slice[bool]) -> usize {
+    var count: usize = 0
+    for index in 0..<row.len() {
+        invariant count <= index
+        if row[index] {
+            count += 1
+        }
+    }
+    return count
+} dominator_count
 
 /// Records the region of an instruction: its first block's parent, which dominates that block,
 /// the holder of each of its blocks, and the blocks outside it they jump to.
@@ -308,8 +374,10 @@ fn Walk.note_region(
     mut dominating: mem::List[mem::List[nir::BlockId]],
     ) {
     let alloc = self.ck.alloc()
+    expect region.blocks.len() > 0
     let entry = region.blocks[0]
     discard mut self.region_parent.insert(entry, value: InstAt(block: holder, position: position))
+    expect usize.widen(entry.index) < dominating.len()
     mut dominating[usize.widen(entry.index)].push(holder)
     for inner in region.blocks {
         discard mut self.region_holder.insert(inner, value: holder)
@@ -334,14 +402,13 @@ fn Walk.add_region_exit(mut self, holder: nir::BlockId, target: nir::BlockId) {
 } Walk.add_region_exit
 
 /// The blocks dominating each block, as the fixed point over the given predecessors.
-fn dominator_sets(dominating: Slice[mem::List[nir::BlockId]], count: usize, alloc: mem::Alloc) -> mem::List[mem::List[bool]] {
+fn dominator_sets(dominating: Slice[mem::List[nir::BlockId]], alloc: mem::Alloc) -> mem::List[mem::List[bool]] {
+    let count = dominating.len()
     var dominators = mem::List[mem::List[bool]].empty(alloc)
     for index in 0..<count {
-        var row = flags_of(count, value: true, alloc)
-        if index == 0 {
-            for other in 0..<count {
-                row[other] = other == 0
-            }
+        var row = mem::List[bool].empty(alloc)
+        for other in 0..<count {
+            mut row.push(index != 0 or other == 0)
         }
         mut dominators.push(take row)
     }
@@ -369,6 +436,7 @@ fn dominator_sets(dominating: Slice[mem::List[nir::BlockId]], count: usize, allo
 /// Walks every block reachable from the entry, each after its forward predecessors.
 fn Walk.walk(mut self, mut terms: Terms) {
     let shared = self.unit.share()
+    expect self.function < shared.contents().functions.len()
     let function = shared.contents().functions[self.function]
     let order = self.order(nir::BlockId(index: 0), within: None)
     for index in 0..<order.len() {
@@ -384,10 +452,11 @@ fn Walk.walk(mut self, mut terms: Terms) {
 
 /// The contents at the function's entry: each reference parameter's place holds its term.
 fn Walk.start(mut self, mut terms: Terms) -> mem::HashMap[Root, u32] {
-    self.reach[0] = Some(mut terms.boolean(true))
+    let entry = self.block_index(nir::BlockId(index: 0))
+    self.reach[entry] = Some(mut terms.boolean(true))
+    self.local[entry] = Some(mut terms.boolean(true))
     var contents = mem::HashMap[Root, u32].empty(seed: 0, alloc: self.ck.alloc())
-    let shared = self.unit.share()
-    let function = shared.contents().functions[self.function]
+    let function = self.nir()
     for param in function.params {
         if function.ty(param.value).is_reference() {
             discard mut contents.insert(Root.Referent(param.value), value: self.value(param.value))
@@ -451,7 +520,7 @@ fn Walk.next_in_order(self, seen: mem::Set[nir::BlockId], done: mem::Set[nir::Bl
             continue
         }
         var ready = true
-        for pred in self.preds[usize.widen(block.index)] {
+        for pred in self.preds[self.block_index(block)] {
             let outer = self.outside(pred, seen)
             if seen.contains(outer) and not done.contains(outer) {
                 ready = false
@@ -480,7 +549,7 @@ fn Walk.outside(self, block: nir::BlockId, seen: mem::Set[nir::BlockId]) -> nir:
 
 /// The term of a value.
 fn Walk.value(self, value: nir::Value) -> u32 {
-    let Some(term) = self.values[usize.widen(value.index)] else {
+    let Some(term) = self.values[self.value_index(value)] else {
         expect false
         return 0
     }
@@ -497,25 +566,40 @@ fn Walk.block(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block,
         mut self.inst(mut terms, block, position, inst: data.insts[position], mut contents)
     }
     let edges = mut self.terminator(mut terms, block, data, take contents)
-    self.edges[usize.widen(block.index)] = edges
+    self.edges[self.block_index(block)] = edges
 } Walk.block
 
 /// The contents at a block's entry, its reach condition and parameters, merged from its
-/// incoming forward edges; at a loop's header, each place the loop changes, and each
-/// parameter, has a fresh symbol instead.
+/// incoming forward edges by their conditions relative to its immediate dominator; at a
+/// loop's header, each place the loop changes, and each parameter, has a fresh symbol
+/// instead.
 fn Walk.block_entry(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block) -> mem::HashMap[Root, u32] {
     let alloc = self.ck.alloc()
+    let at = self.block_index(block)
+    let Some(dominator) = self.idom[at] else {
+        expect false
+        return mem::HashMap[Root, u32].empty(seed: 0, alloc)
+    }
     var conditions = mem::List[u32].empty(alloc)
     var incoming = mem::List[Edge].empty(alloc)
-    for pred in self.preds[usize.widen(block.index)] {
-        for edge in self.edges[usize.widen(pred.index)] {
+    for pred in self.preds[at] {
+        for edge in self.edges[self.block_index(pred)] {
             if edge.target == block {
-                mut conditions.push(edge.condition)
+                mut conditions.push(self.relative(mut terms, source: pred, condition: edge.condition, dominator))
                 mut incoming.push(edge.copy(alloc))
             }
         }
     }
-    self.reach[usize.widen(block.index)] = Some(mut terms.disjunction(listed_terms(conditions.view(), alloc)))
+    var local = mut terms.boolean(true)
+    if not complementary(terms, conditions: conditions.view()) {
+        local = mut terms.disjunction(listed_terms(conditions.view(), alloc))
+    }
+    self.local[at] = Some(local)
+    let Some(above) = self.reach[self.block_index(dominator)] else {
+        expect false
+        return mem::HashMap[Root, u32].empty(seed: 0, alloc)
+    }
+    self.reach[at] = Some(mut terms.conjunction(term_pair(above, right: local, alloc)))
     var contents = mem::HashMap[Root, u32].empty(seed: 0, alloc)
     if incoming.len() > 0 {
         for root in sorted_roots(incoming[0].contents, alloc) {
@@ -536,11 +620,12 @@ fn Walk.block_entry(mut self, mut terms: Terms, block: nir::BlockId, data: nir::
         } else {
             var arms = mem::List[u32].empty(alloc)
             for edge in incoming {
+                expect index < edge.args.len()
                 mut arms.push(edge.args[index])
             }
             term = self.ites(mut terms, conditions: conditions.view(), arms: arms.view())
         }
-        self.values[usize.widen(param.index)] = Some(term)
+        self.values[self.value_index(param)] = Some(term)
     }
     if header {
         for root in self.changed_in_loop(block) {
@@ -566,11 +651,51 @@ fn Walk.is_header(self, block: nir::BlockId) -> bool {
     return false
 } Walk.is_header
 
+/// The condition of an edge leaving `source` relative to a block dominating `source`: the local
+/// conditions of the blocks from `source` up the dominator tree to `dominator`, which is
+/// excluded, then the edge's own condition.
+fn Walk.relative(self, mut terms: Terms, source: nir::BlockId, condition: u32, dominator: nir::BlockId) -> u32 {
+    var parts = mem::List[u32].empty(terms.alloc)
+    var at = source
+    while at != dominator {
+        let index = self.block_index(at)
+        let Some(local) = self.local[index] else {
+            expect false
+            break
+        }
+        mut parts.push(local)
+        let Some(above) = self.idom[index] else {
+            expect false
+            break
+        }
+        at = above
+    }
+    mut parts.push(condition)
+    return mut terms.conjunction(take parts)
+} Walk.relative
+
+/// Whether conditions hold a condition and its negation.
+fn complementary(terms: Terms, conditions: Slice[u32]) -> bool {
+    for condition in conditions {
+        match terms.get(condition) {
+            Term.Not(negated) => {
+                if holds_term(conditions, term: negated) {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} complementary
+
 /// `ite(c1, a1, ite(c2, a2, ... an))`, or the one term all arms are.
 fn Walk.ites(self, mut terms: Terms, conditions: Slice[u32], arms: Slice[u32]) -> u32 {
+    expect arms.len() > 0
     var term = arms[arms.len() - 1]
     var index = arms.len() - 1
     while index > 0 {
+        invariant index < arms.len() and index <= conditions.len()
         index -= 1
         term = mut terms.ite(conditions[index], then: arms[index], otherwise: term)
     }
@@ -595,8 +720,13 @@ fn Walk.changed_in_loop(self, header: nir::BlockId) -> mem::List[Root] {
             break
         }
         if mut blocks.insert(block) {
-            for pred in self.preds[usize.widen(block.index)] {
+            for pred in self.preds[self.block_index(block)] {
                 mut pending.push(pred)
+            }
+            for edge in self.back {
+                if edge.to == block {
+                    mut pending.push(edge.from)
+                }
             }
             match self.region_parent.get(block) {
                 Some(parent) => mut pending.push(parent.block)
@@ -736,7 +866,10 @@ fn Walk.field(mut self, mut terms: Terms, term: u32, step: Str) -> u32 {
         }
         Term.App(op: Op.Construct(constructed), args: operands) => {
             match self.field_index(ty: constructed, name: step) {
-                Some(index) => return operands[index]
+                Some(index) => {
+                    expect index < operands.len()
+                    return operands[index]
+                }
                 None => {}
             }
         }
@@ -986,6 +1119,7 @@ fn Walk.operands(mut self, mut terms: Terms, operands: Slice[nir::Operand], cont
 
 /// Records a fact holding after the instruction at `position` of a block.
 fn Walk.fact(mut self, block: nir::BlockId, position: usize, term: u32, origin: Origin) {
+    expect position < WHOLE_BLOCK
     mut self.fact_from(block, from: position + 1, term, origin)
 } Walk.fact
 
@@ -1041,7 +1175,7 @@ fn Walk.inst(
     let Some(value) = term else {
         return
     }
-    self.values[usize.widen(result.index)] = Some(value)
+    self.values[self.value_index(result)] = Some(value)
 } Walk.inst
 
 /// The term an instruction gives its result, after the facts, sites and stores it makes.
@@ -1236,6 +1370,7 @@ fn Walk.when_term(
     let shared = self.unit.share()
     var acquired = copied_contents(contents, alloc)
     var params = mem::List[u32].empty(alloc)
+    expect self.function < shared.contents().functions.len() and region.blocks.len() > 0
     for param in shared.contents().functions[self.function].block(region.blocks[0]).params {
         let ty = self.ty(param)
         let value = mut terms.fresh(ty)
@@ -1284,6 +1419,7 @@ fn Walk.substituted(self, fn_ref: nir::FnRef) -> nir::FnRef {
         ty::TyKind.Param(_) => return substituted
         else => {}
     }
+    expect usize.widen(method) < methods.len()
     let Some(implementation) = self.ck.implementation(self_ty, interface_item, method: methods[usize.widen(method)].name.as_str()) else {
         return substituted
     }
@@ -1849,11 +1985,7 @@ fn Walk.pure_call(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> b
             pure = digest.contents().pure()
         }
         nir::Callable.Method(item: interface_item, method: method) => {
-            let sig = self.ck.sig(interface_item)
-            pure = match sig.contents().kind {
-                SigKind.Interface(methods: methods) => methods[usize.widen(method)].sig.limit_set.pure
-                else => false
-            }
+            pure = self.ck.method_limits(interface_item, method).pure
         }
         else => {}
     }
@@ -1991,6 +2123,7 @@ fn Walk.builtin_goal(mut self, mut terms: Terms, fn_ref: nir::FnRef, args: Slice
     if obligation == Obligation.Conversion {
         match fn_ref.callable {
             nir::Callable.Builtin(nir::Builtin.Conversion(conversion: _, scalar: target)) => {
+                expect args.len() == 1
                 let source = self.ck.types().scalar_of(terms.ty(args[0]))
                 let integer_source = match source {
                     Some(scalar) => scalar.is_integer()
@@ -2005,6 +2138,7 @@ fn Walk.builtin_goal(mut self, mut terms: Terms, fn_ref: nir::FnRef, args: Slice
         }
     }
     if obligation == Obligation.Bounds {
+        expect args.len() == 2
         let len = mut self.len_of(mut terms, indexed: args[0])
         return mut terms.compare(nir::BinaryOp.Lt, left: args[1], right: len)
     }
@@ -2103,6 +2237,7 @@ fn Walk.through(self, terms: Terms, call: nir::Call, callee: Option[nir::FnRef],
     let nir::Callee.Dyn(place: _, item: interface_item, method: method) = call.callee else {
         return None
     }
+    expect args.len() > 0
     let self_ty = terms.ty(args[0])
     let bound_args = match types.kind(self_ty) {
         ty::TyKind.Dyn(bound) => bound.args
@@ -2255,6 +2390,7 @@ fn Walk.method_modes(self, interface_item: ty::ItemId, method: usize) -> mem::Li
     let SigKind.Interface(methods: methods) = sig.contents().kind else {
         return modes
     }
+    expect method < methods.len()
     for param in methods[method].sig.params {
         mut modes.push(param.mode)
     }
@@ -2432,6 +2568,7 @@ fn Walk.quantifier(
     }
     let below = mut terms.compare(op, left: bound, right: high)
     let within = mut terms.conjunction(term_pair(above, right: below, alloc))
+    expect region.blocks.len() > 0
     mut self.fact_from(region.blocks[0], from: 0, term: within, origin: Origin.Fact)
     var params = mem::List[u32].empty(alloc)
     mut params.push(bound)
@@ -2455,14 +2592,18 @@ fn Walk.region(
     contents: mem::HashMap[Root, u32],
     ) -> RegionWalked {
     let alloc = self.ck.alloc()
+    expect region.blocks.len() > 0
     let entry = region.blocks[0]
-    self.reach[usize.widen(entry.index)] = self.reach[usize.widen(block.index)]
+    let entry_index = self.block_index(entry)
+    self.reach[entry_index] = self.reach[self.block_index(block)]
+    self.local[entry_index] = Some(mut terms.boolean(true))
     let shared = self.unit.share()
+    expect self.function < shared.contents().functions.len()
     let function = shared.contents().functions[self.function]
     let entry_params = function.block(entry).params
     var index: usize = 0
     while index < entry_params.len() and index < params.len() {
-        self.values[usize.widen(entry_params[index].index)] = Some(params[index])
+        self.values[self.value_index(entry_params[index])] = Some(params[index])
         index += 1
     }
     var saved_returns = mem::List[Returned].empty(alloc)
@@ -2503,12 +2644,12 @@ fn Walk.region(
     return RegionWalked(yielded: yielded, contents: take after)
 } Walk.region
 
-/// The edges a terminator leaves by, with their conditions; a return or yield records its
+/// The edges a terminator leaves by, with their own conditions; a return or yield records its
 /// term with the block's reach condition.
 fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::Block, take contents: mem::HashMap[Root, u32]) -> mem::List[Edge] {
     let alloc = self.ck.alloc()
     var edges = mem::List[Edge].empty(alloc)
-    let Some(reach) = self.reach[usize.widen(block.index)] else {
+    let Some(reach) = self.reach[self.block_index(block)] else {
         expect false
         return edges
     }
@@ -2516,7 +2657,7 @@ fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::B
         nir::Terminator.Jump(jump) => {
             let args = mut self.operands(mut terms, operands: jump.args.view(), contents)
             let truth = mut terms.boolean(true)
-            mut edges.push(Edge.joined(mut terms, reach, target: jump.block, condition: truth, take args, take contents))
+            mut edges.push(Edge(target: jump.block, condition: truth, args: take args, contents: take contents))
         }
         nir::Terminator.Branch(operand: operand, then: then, otherwise: otherwise) => {
             let tested = mut self.operand(mut terms, operand, contents)
@@ -2524,11 +2665,13 @@ fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::B
             let then_args = mut self.operands(mut terms, operands: then.args.view(), contents)
             let else_args = mut self.operands(mut terms, operands: otherwise.args.view(), contents)
             let copied = copied_contents(contents, alloc)
-            mut edges.push(Edge.joined(mut terms, reach, target: then.block, condition: tested, args: take then_args, contents: take copied))
-            mut edges.push(Edge.joined(mut terms, reach, target: otherwise.block, condition: negated, args: take else_args, take contents))
+            mut edges.push(Edge(target: then.block, condition: tested, args: take then_args, contents: take copied))
+            mut edges.push(Edge(target: otherwise.block, condition: negated, args: take else_args, contents: take contents))
         }
         nir::Terminator.Call(call: call, ok: ok, failure: failure) => {
-            let ok_ty = self.ty(self.nir().block(ok).params[0])
+            let ok_params = self.nir().block(ok).params
+            expect ok_params.len() > 0
+            let ok_ty = self.ty(ok_params[0])
             let term = mut self.call(mut terms, block, position: data.insts.len(), ok: Some(ok), call, result_ty: Some(ok_ty), result: None, span: data.term_span, mut contents)
             let result = match term {
                 Some(value) => value
@@ -2536,15 +2679,17 @@ fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::B
             }
             let succeeded = mut terms.fresh(ty::Ty.scalar(ty::Scalar.Bool))
             let failed = mut terms.negation(succeeded)
-            let fail_ty = self.ty(self.nir().block(failure).params[0])
+            let fail_params = self.nir().block(failure).params
+            expect fail_params.len() > 0
+            let fail_ty = self.ty(fail_params[0])
             let failure_term = mut terms.fresh(fail_ty)
             let copied = copied_contents(contents, alloc)
             var ok_args = mem::List[u32].empty(alloc)
             mut ok_args.push(result)
             var fail_args = mem::List[u32].empty(alloc)
             mut fail_args.push(failure_term)
-            mut edges.push(Edge.joined(mut terms, reach, target: ok, condition: succeeded, args: take ok_args, contents: take copied))
-            mut edges.push(Edge.joined(mut terms, reach, target: failure, condition: failed, args: take fail_args, take contents))
+            mut edges.push(Edge(target: ok, condition: succeeded, args: take ok_args, contents: take copied))
+            mut edges.push(Edge(target: failure, condition: failed, args: take fail_args, contents: take contents))
         }
         nir::Terminator.Return(value) => {
             let term = match value {
@@ -2563,20 +2708,6 @@ fn Walk.terminator(mut self, mut terms: Terms, block: nir::BlockId, data: nir::B
     return edges
 } Walk.terminator
 
-/// An edge whose condition is the block's reach condition and the branch's own.
-fn Edge.joined(
-    mut terms: Terms,
-    reach: u32,
-    target: nir::BlockId,
-    condition: u32,
-    take args: mem::List[u32],
-    take contents: mem::HashMap[Root, u32],
-    ) -> Edge {
-    let alloc = terms.alloc
-    let joined = mut terms.conjunction(term_pair(reach, right: condition, alloc))
-    return Edge(target: target, condition: joined, args: take args, contents: take contents)
-} Edge.joined
-
 /// The queries of the function's sites, in site order.
 fn Walk.queries(self, mut terms: Terms) -> mem::List[StatementSite] {
     var queries = mem::List[StatementSite].empty(self.ck.alloc())
@@ -2593,7 +2724,7 @@ fn Walk.queries(self, mut terms: Terms) -> mem::List[StatementSite] {
 /// block.
 fn Walk.premises_at(self, mut terms: Terms, target: nir::BlockId, position: usize) -> mem::List[Premise] {
     var premises = mem::List[Premise].empty(self.ck.alloc())
-    let Some(reach) = self.reach[usize.widen(target.index)] else {
+    let Some(reach) = self.reach[self.block_index(target)] else {
         expect false
         return premises
     }
@@ -2606,6 +2737,7 @@ fn Walk.premises_at(self, mut terms: Terms, target: nir::BlockId, position: usiz
     for entry in reaching {
         let block = entry.key()
         let before = entry.value()
+        expect usize.widen(target.index) < self.dominators.len() and usize.widen(block.index) < self.dominators[usize.widen(target.index)].len()
         let dominates = self.dominators[usize.widen(target.index)][usize.widen(block.index)]
         for fact in self.facts {
             if fact.block != block or fact.from > before {
@@ -2613,7 +2745,7 @@ fn Walk.premises_at(self, mut terms: Terms, target: nir::BlockId, position: usiz
             }
             var term = fact.term
             if not dominates {
-                let Some(guard) = self.reach[usize.widen(block.index)] else {
+                let Some(guard) = self.reach[self.block_index(block)] else {
                     expect false
                     return premises
                 }
@@ -2637,7 +2769,7 @@ fn Walk.reaching(self, target: nir::BlockId) -> mem::Map[nir::BlockId, usize] {
         let Some(block) = mut pending.pop() else {
             break
         }
-        for pred in self.preds[usize.widen(block.index)] {
+        for pred in self.preds[self.block_index(block)] {
             note_reaching(mut seen, mut pending, pred, before: WHOLE_BLOCK)
         }
         match self.region_parent.get(block) {
@@ -2819,6 +2951,16 @@ fn yield_arms(yields: Slice[Yielded], root: Root, alloc: mem::Alloc) -> Option[m
     }
     return Some(take arms)
 } yield_arms
+
+/// Whether a list of terms holds a term.
+fn holds_term(held: Slice[u32], term: u32) -> bool {
+    for each in held {
+        if each == term {
+            return true
+        }
+    }
+    return false
+} holds_term
 
 /// Whether a block is among some blocks.
 fn holds_block(blocks: Slice[nir::BlockId], block: nir::BlockId) -> bool {

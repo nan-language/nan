@@ -472,7 +472,7 @@ fn Body.unknown_path(self, token: u32, take stub: Option[text::String]) {
     var candidates = mem::List[text::String].empty(alloc)
     for scope in self.scopes {
         for local in scope {
-            mut candidates.push(text::String.of(self.locals[usize.widen(local.index)].name.as_str(), alloc))
+            mut candidates.push(text::String.of(self.local(local).name.as_str(), alloc))
         }
     }
     let items = self.ck.item_candidates(self.module)
@@ -507,6 +507,7 @@ fn Body.line(self, token: u32) -> u32 {
 } Body.line
 
 proj fn Body.frame(self) -> Frame {
+    expect self.frames.len() > 0
     return self.frames[self.frames.len() - 1]
 } Body.frame
 
@@ -525,6 +526,7 @@ fn Body.declare(mut self, name: ast::Name, ty: ty::Ty, kind: LocalKind) -> Local
     let closure = self.frame().closure
     mut self.locals.push(Local(name: text::String.of(name.text.as_str(), alloc: self.ck.alloc()), ty: ty, kind: kind, token: name.token, captured: None, closure: closure))
     let depth = self.scopes.len()
+    expect depth > 0
     mut (mut self.scopes.at_mut(depth - 1)).push(id)
     return id
 } Body.declare
@@ -573,7 +575,7 @@ fn Body.check_local_name(self, name: ast::Name, kind: LocalKind) {
 fn Body.local_named(self, name: Str) -> bool {
     for scope in self.scopes {
         for local in scope {
-            if self.locals[usize.widen(local.index)].name.as_str() == name {
+            if self.local(local).name.as_str() == name {
                 return true
             }
         }
@@ -586,7 +588,7 @@ fn Body.local_folds_to(self, folded: Str) -> bool {
     let alloc = self.ck.alloc()
     for scope in self.scopes {
         for local in scope {
-            if fold(self.locals[usize.widen(local.index)].name.as_str(), alloc).as_str() == folded {
+            if fold(self.local(local).name.as_str(), alloc).as_str() == folded {
                 return true
             }
         }
@@ -633,12 +635,14 @@ fn Body.lookup_local(mut self, name: Str) -> Option[LocalId] {
     var depth = self.scopes.len()
     var found: Option[LocalId] = None
     while depth > 0 and found.is_none() {
+        invariant depth <= self.scopes.len()
         depth -= 1
         let scope = self.scopes[depth]
         var at = scope.len()
         while at > 0 {
+            invariant at <= scope.len()
             at -= 1
-            if self.locals[usize.widen(scope[at].index)].name.as_str() == name {
+            if self.local(scope[at]).name.as_str() == name {
                 found = Some(scope[at])
                 break
             }
@@ -649,6 +653,7 @@ fn Body.lookup_local(mut self, name: Str) -> Option[LocalId] {
     }
     var id = declared
     for frame in 0..<self.frames.len() {
+        invariant frame < self.frames.len()
         if self.frames[frame].closure == 0 or self.frames[frame].scopes <= depth {
             continue
         }
@@ -659,13 +664,14 @@ fn Body.lookup_local(mut self, name: Str) -> Option[LocalId] {
 
 /// The capture local standing in a closure's frame for a local of an enclosing frame.
 fn Body.capture(mut self, frame: usize, outer: LocalId) -> LocalId {
+    expect frame < self.frames.len()
     for captured in self.frames[frame].captures {
         if captured.reached == outer {
             return captured.local
         }
     }
     let alloc = self.ck.alloc()
-    let local = self.locals[usize.widen(outer.index)]
+    let local = self.local(outer)
     var mode = ast::Mode.Read
     for listed in self.frames[frame].listed {
         if listed.name == local.name {
@@ -681,6 +687,7 @@ fn Body.capture(mut self, frame: usize, outer: LocalId) -> LocalId {
 } Body.capture
 
 proj fn Body.local(self, id: LocalId) -> Local {
+    expect usize.widen(id.index) < self.locals.len()
     return self.locals[usize.widen(id.index)]
 } Body.local
 
@@ -688,7 +695,7 @@ proj fn Body.local(self, id: LocalId) -> Local {
 fn Body.binding(self, local: LocalId) -> LocalId {
     var current = local
     loop {
-        let Some(outer) = self.locals[usize.widen(current.index)].captured else {
+        let Some(outer) = self.local(current).captured else {
             return current
         }
         current = outer
@@ -903,6 +910,7 @@ fn Body.loop_stmt(mut self, label: Option[ast::Name], body: ast::LoopBlock) -> D
     mut self.loops.push(Loop(label: take loop_label, broken: false, label_used: false))
     let looped = mut self.loop_body_in(body)
     let count = self.loops.len()
+    expect count > 0
     let broken = self.loops[count - 1].broken
     let label_used = self.loops[count - 1].label_used
     discard mut self.loops.pop()
@@ -924,14 +932,10 @@ fn Body.loop_stmt(mut self, label: Option[ast::Name], body: ast::LoopBlock) -> D
 /// The token before one of a file's tokens that is not read as a comment, or the token itself
 /// when none is.
 fn keyword_before(syntax: syntax::SourceFile, token: u32) -> u32 {
-    var at = usize.widen(token)
-    while at > 0 {
-        at -= 1
-        if not syntax.comment[at] {
-            return u32.fit(at)
-        }
+    return match syntax.previous(usize.widen(token)) {
+        Some(at) => u32.fit(at)
+        None => token
     }
-    return token
 } keyword_before
 
 fn Body.expect_stmt(mut self, condition: ast::Expr) -> Diverging[TStmtKind] {
@@ -1059,6 +1063,7 @@ fn Body.let_stmt(
 /// nothing when the value has type `Unit` or `Never`.
 fn Body.wildcard_binding(self, stmt: ast::Stmt, value: ast::Expr, ty: ty::Ty) {
     let syntax = self.ck.db().syntax(self.item)
+    expect usize.widen(stmt.token) < syntax.tokens.len() and usize.widen(value.token) < syntax.tokens.len()
     let start = syntax.tokens[usize.widen(stmt.token)].start
     let end = syntax.tokens[usize.widen(value.token)].start
     let kept = if ty == ty::Ty.unit() or ty == ty::Ty.never() {
@@ -1139,7 +1144,7 @@ fn Body.assign(mut self, target: ast::Expr, op: ast::AssignOp, op_token: u32, va
         Some(root) => {
             let binding = self.binding(root)
             discard mut self.usage.assigned.insert(binding)
-            let element_mut = match self.locals[usize.widen(root.index)].kind {
+            let element_mut = match self.local(root).kind {
                 LocalKind.Element(ast::Mode.Mut) => true
                 else => false
             }
@@ -1356,6 +1361,7 @@ fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnS
         let entry = self.names_entry(item)
         let fixable = not entry or self.db().target == workspace::Target.Host
         let clauses = Clauses.of(function.head, fixable)
+        expect body.frames.len() > 0
         body.check_effects(token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: entry)
     }
     return take body.finish(take root)
@@ -1411,6 +1417,7 @@ fn Checker.method_body(self, item: ty::ItemId, index: usize, method: ast::Method
     }
     let typed_block = mut body.result_block(block, result: sig.result)
     let clauses = Clauses.of(method.head, fixable: true)
+    expect body.frames.len() > 0
     body.check_effects(method.token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: true)
     let typed = take body.finish(Some(TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed_block))))
     let shared = mem::Shared.of(take typed, alloc)
@@ -1463,6 +1470,7 @@ fn Checker.predicates(self, item: ty::ItemId, structure: ast::StructItem, generi
     for field in fields {
         let id = LocalId(index: u32.fit(body.locals.len()))
         mut body.locals.push(Local(name: text::String.of(field.name.as_str(), alloc), ty: field.ty, kind: LocalKind.Let, token: field.token, captured: None, closure: 0))
+        expect body.scopes.len() > 0
         mut (mut body.scopes.at_mut(0)).push(id)
         mut field_locals.push(FieldLocal(local: id, name: text::String.of(field.name.as_str(), alloc)))
     }
@@ -1542,6 +1550,7 @@ fn Body.declare_params(mut self, params: Slice[ast::Param], sig: FnSig) {
             ast::ParamKind.SelfValue => {
                 mut self.locals.push(Local(name: text::String.of("self", alloc), ty: param_ty, kind: LocalKind.Param(param.mode), token: param.token, captured: None, closure: 0))
                 let depth = self.scopes.len()
+                expect depth > 0
                 mut (mut self.scopes.at_mut(depth - 1)).push(id)
             }
         }

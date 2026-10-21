@@ -461,7 +461,30 @@ fn build(
     package: PackageId,
     tests: &[Selected],
 ) -> io::Result<Result<Image, Vec<Diagnostic>>> {
-    let lowered = test_image::lower(
+    let lowered = lower(checker, workspace, package, tests);
+    let data = checker.db.package(package);
+    let collisions = crate::final_build::collisions(data.source, &lowered);
+    if !collisions.is_empty() {
+        return Ok(Err(collisions));
+    }
+    let target = checker.db.target;
+    let image = workspace
+        .root
+        .join(".nan/tests")
+        .join(target.name())
+        .join(format!("{}{}", data.name, target.image_suffix()));
+    crate::final_build::write_image(target, &lowered.object, &image)?.map_err(io::Error::other)?;
+    Ok(Ok(Image::new(target, image)?))
+}
+
+/// The test image of a package's selected tests for a checker's target.
+fn lower(
+    checker: &Checker,
+    workspace: &Workspace,
+    package: PackageId,
+    tests: &[Selected],
+) -> crate::lower::Lowered {
+    test_image::lower(
         checker,
         &test_image::Tests {
             tests: tests
@@ -476,20 +499,31 @@ fn build(
                 workspace, checker, package,
             )),
         },
-    );
-    let data = checker.db.package(package);
-    let collisions = crate::final_build::collisions(data.source, &lowered);
-    if !collisions.is_empty() {
-        return Ok(Err(collisions));
+    )
+}
+
+/// The tasks of the test image of each package of the workspace, under each run target of its
+/// tests.
+pub fn task_stacks(workspace: &Workspace) -> Vec<crate::final_build::TaskStack> {
+    let std = crate::stdlib::packages();
+    let mut found = Vec::new();
+    for closure in &workspace.closures {
+        for target in scope_targets(workspace, closure, &Scope::Workspace) {
+            let checker = check::checked(workspace, closure, std, target);
+            let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
+            for selected in select(&checker, workspace, &Scope::Workspace) {
+                let package = checker.db.package_of(selected.item);
+                if run_targets(checker.db.package(package).source).contains(&target) {
+                    by_package.entry(package.0).or_default().push(selected);
+                }
+            }
+            for (package, tests) in by_package {
+                let lowered = lower(&checker, workspace, PackageId(package), &tests);
+                found.extend(crate::final_build::tasks(&checker, &lowered));
+            }
+        }
     }
-    let target = checker.db.target;
-    let image = workspace
-        .root
-        .join(".nan/tests")
-        .join(target.name())
-        .join(format!("{}{}", data.name, target.image_suffix()));
-    crate::final_build::write_image(target, &lowered.object, &image)?.map_err(io::Error::other)?;
-    Ok(Ok(Image::new(target, image)?))
+    found
 }
 
 /// The seed of a run: the first 8 bytes, little-endian, of the BLAKE3-256 hash of the test's

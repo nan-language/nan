@@ -1,0 +1,4 @@
+kind: write
+area: host
+
+In the program `tally`, write the two functions `main` calls. `pub fn total_file(fs: sys::Fs, path: Str, alloc: mem::Alloc) -> u64 fails TotalError uses wait` reads the file at `path`, whose lines are separated by line feeds, the last one possibly without its own, and returns the sum of the decimal amounts they hold, each line holding one amount written with the digits `0` to `9` alone; empty lines are skipped. It fails with `BadLine(n)` for the first line holding any other byte, n counting lines from 1 with empty lines included; with `Overflow` when an amount or the sum exceeds the `u64` range; and with `Fs(e)` when reading the file fails with `e`. `pub fn save_total(fs: sys::Fs, path: Str, total: u64, alloc: mem::Alloc) fails TotalError uses wait` writes `total=`, the total in decimal and a line feed to the file at `path`, replacing its contents.

@@ -1,0 +1,73 @@
+//! Ticks counted per CPU, the timer interrupt and the task reporting them.
+
+/// The ticks a CPU counted and those it spent idle.
+pub closed struct CpuTicks {
+    pub ticks: u32
+    pub idle: u32
+} CpuTicks
+
+/// What the timer interrupt reaches: each CPU's ticks and the signal receiving every hundredth
+/// tick count of a CPU.
+struct State {
+    per_cpu: hw::PerCpu[CpuTicks]
+    reports: mem::Shared[hw::Signal[u32]]
+} State
+
+/// Counts a tick on the current CPU, and an idle one when `idle`; gives the CPU's tick count.
+pub fn count_tick(per_cpu: hw::PerCpu[CpuTicks], t: hw::IrqsDisabled, idle: bool) -> u32 limits notrap, terminates, noalloc {
+    return per_cpu.with(t, body: fn(mut mine: CpuTicks) -> u32 limits notrap, terminates, noalloc {
+        mine.ticks = mine.ticks.wrapping_add(1)
+        if idle {
+            mine.idle = mine.idle.wrapping_add(1)
+        }
+        return mine.ticks
+    })
+} count_tick
+
+/// The share of `counts` the CPU spent busy, in percent rounded down; 0 without ticks.
+pub fn busy_percent(counts: CpuTicks) -> u32 {
+    if counts.ticks == 0 {
+        return 0
+    }
+    let busy = u64.widen(counts.ticks.saturating_sub(counts.idle))
+    return u32.fit(busy * 100 / u64.widen(counts.ticks))
+} busy_percent
+
+/// Counts a tick on the current CPU and posts every hundredth count of a CPU.
+pub interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let t = irq.irqs_disabled()
+    let counted = hw::Anchor[State].with(fn(state: State) -> u32 {
+        let count = count_tick(state.per_cpu, t, idle: false)
+        if count % 100 == 0 {
+            state.reports.contents().post(t, value: count)
+        }
+        return count
+    })
+    take irq.complete()
+    let Some(count) = counted else {
+        return hw::IrqExit.Resume
+    }
+    if count % 100 == 0 {
+        return hw::IrqExit.Reschedule
+    }
+    return hw::IrqExit.Resume
+} on_timer
+
+contribute hw::vectors timer = hw::Vector(vector: 0x20, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None)
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let reports = mem::Shared.of(hw::Signal[u32].empty(), alloc)
+    let received = reports.share()
+    let state = State(per_cpu: hw::PerCpu.of(fn(cpu: u32) => CpuTicks(ticks: 0, idle: 0), alloc), reports: take reports)
+    take k.anchor(take state, run: fn[take received](exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        try await report(take received)
+    })
+} main
+
+/// Waits for every report the timer posts.
+fn report(take received: mem::Shared[hw::Signal[u32]]) fails task::Cancelled uses wait limits stack 8_192 {
+    loop {
+        discard try await received.contents().wait()
+    }
+} report

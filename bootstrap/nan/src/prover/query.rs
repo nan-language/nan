@@ -86,7 +86,8 @@ enum Located {
 /// The content of each root place at a point.
 type Contents = HashMap<Root, TermId>;
 
-/// An edge of the walk: its target, condition, the arguments it passes and the contents on it.
+/// An edge of the walk: its target, its own condition, the arguments it passes and the contents
+/// on it.
 struct Edge {
     target: BlockId,
     condition: TermId,
@@ -113,6 +114,11 @@ pub struct Walk<'w, 'a> {
     /// changes.
     projected: HashMap<Root, Located>,
     reach: Vec<Option<TermId>>,
+    /// The local condition of each block: the disjunction of its incoming edges' conditions
+    /// relative to its immediate dominator.
+    local: Vec<Option<TermId>>,
+    /// The immediate dominator of each block but the entry.
+    idom: Vec<Option<BlockId>>,
     edges: Vec<Vec<Edge>>,
     /// The forward predecessors of each block.
     preds: Vec<Vec<BlockId>>,
@@ -173,6 +179,8 @@ impl<'w, 'a> Walk<'w, 'a> {
             captured: HashMap::new(),
             projected: HashMap::new(),
             reach: vec![None; blocks],
+            local: vec![None; blocks],
+            idom: vec![None; blocks],
             edges: (0..blocks).map(|_| Vec::new()).collect(),
             preds: vec![Vec::new(); blocks],
             region_parent: HashMap::new(),
@@ -281,6 +289,16 @@ impl<'w, 'a> Walk<'w, 'a> {
             }
             self.preds[index].sort();
         }
+        for (index, row) in dominators.iter().enumerate() {
+            let strict = (0..count).filter(|other| *other != index && row[*other]);
+            let closest = strict.max_by_key(|other| {
+                dominators[*other]
+                    .iter()
+                    .filter(|dominates| **dominates)
+                    .count()
+            });
+            self.idom[index] = closest.map(|other| BlockId(other as u32));
+        }
         self.dominators = dominators;
     }
 
@@ -301,6 +319,7 @@ impl<'w, 'a> Walk<'w, 'a> {
     /// The contents at the function's entry: each reference parameter's place holds its term.
     fn start(&mut self) -> Contents {
         self.reach[0] = Some(self.terms.bool(true));
+        self.local[0] = Some(self.terms.bool(true));
         let mut contents = Contents::new();
         for param in &self.nir().params {
             if self.nir().ty(param.value).is_reference() {
@@ -382,29 +401,46 @@ impl<'w, 'a> Walk<'w, 'a> {
     }
 
     /// The contents at a block's entry, its reach condition and parameters, merged from its
-    /// incoming forward edges; at a loop's header, each place the loop changes, and each
-    /// parameter, has a fresh symbol instead.
+    /// incoming forward edges by their conditions relative to its immediate dominator; at a
+    /// loop's header, each place the loop changes, and each parameter, has a fresh symbol
+    /// instead.
     fn entry(&mut self, block: BlockId, data: &Block) -> Contents {
-        let incoming: Vec<(TermId, Vec<TermId>, Contents)> = self.preds[block.0 as usize]
+        let dominator = self.idom[block.0 as usize].expect("a dominated block");
+        let incoming: Vec<(BlockId, TermId, Vec<TermId>, Contents)> = self.preds[block.0 as usize]
             .iter()
             .flat_map(|pred| {
                 self.edges[pred.0 as usize]
                     .iter()
                     .filter(|edge| edge.target == block)
-                    .map(|edge| (edge.condition, edge.args.clone(), edge.contents.clone()))
+                    .map(|edge| {
+                        let (args, contents) = (edge.args.clone(), edge.contents.clone());
+                        (*pred, edge.condition, args, contents)
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
-        let conditions: Vec<TermId> = incoming.iter().map(|(condition, ..)| *condition).collect();
-        self.reach[block.0 as usize] = Some(self.terms.or(conditions.clone()));
+        let conditions: Vec<TermId> = incoming
+            .iter()
+            .map(|(source, condition, ..)| self.relative(*source, *condition, dominator))
+            .collect();
+        let complementary = conditions.iter().any(|condition| {
+            matches!(self.terms.get(*condition), Term::Not(negated) if conditions.contains(negated))
+        });
+        let local = match complementary {
+            true => self.terms.bool(true),
+            false => self.terms.or(conditions.clone()),
+        };
+        self.local[block.0 as usize] = Some(local);
+        let above = self.reach[dominator.0 as usize].expect("a walked dominator");
+        self.reach[block.0 as usize] = Some(self.terms.and(vec![above, local]));
         let mut contents = Contents::new();
-        if let Some((_, _, first)) = incoming.first() {
+        if let Some((.., first)) = incoming.first() {
             let mut roots: Vec<&Root> = first.keys().collect();
             roots.sort();
             for root in roots {
                 let arms: Option<Vec<TermId>> = incoming
                     .iter()
-                    .map(|(_, _, contents)| contents.get(root).copied())
+                    .map(|(.., contents)| contents.get(root).copied())
                     .collect();
                 if let Some(arms) = arms {
                     let merged = self.ites(&conditions, &arms);
@@ -421,7 +457,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                 }
                 false => {
                     let arms: Vec<TermId> =
-                        incoming.iter().map(|(_, args, _)| args[index]).collect();
+                        incoming.iter().map(|(_, _, args, _)| args[index]).collect();
                     self.ites(&conditions, &arms)
                 }
             };
@@ -438,6 +474,20 @@ impl<'w, 'a> Walk<'w, 'a> {
             }
         }
         contents
+    }
+
+    /// The condition of an edge leaving `source` relative to a block dominating `source`: the
+    /// local conditions of the blocks from `source` up the dominator tree to `dominator`, which
+    /// is excluded, then the edge's own condition.
+    fn relative(&mut self, source: BlockId, condition: TermId, dominator: BlockId) -> TermId {
+        let mut parts = Vec::new();
+        let mut at = source;
+        while at != dominator {
+            parts.push(self.local[at.0 as usize].expect("a walked block"));
+            at = self.idom[at.0 as usize].expect("a dominated block");
+        }
+        parts.push(condition);
+        self.terms.and(parts)
     }
 
     /// `ite(c1, a1, ite(c2, a2, ... an))`, or the one term all arms are.
@@ -463,6 +513,12 @@ impl<'w, 'a> Walk<'w, 'a> {
         while let Some(block) = pending.pop() {
             if blocks.insert(block) {
                 pending.extend(self.preds[block.0 as usize].iter().copied());
+                pending.extend(
+                    self.back
+                        .iter()
+                        .filter(|(_, target)| *target == block)
+                        .map(|(source, _)| *source),
+                );
                 pending.extend(self.region_parent.get(&block).map(|(holder, _)| *holder));
             }
         }
@@ -1946,6 +2002,7 @@ impl<'w, 'a> Walk<'w, 'a> {
     ) -> (Option<TermId>, Contents) {
         let entry = region.blocks[0];
         self.reach[entry.0 as usize] = self.reach[block.0 as usize];
+        self.local[entry.0 as usize] = Some(self.terms.bool(true));
         let unit = self.unit.clone();
         let function = &unit.functions[self.function];
         for (param, term) in function.block(entry).params.iter().zip(params) {
@@ -1982,23 +2039,17 @@ impl<'w, 'a> Walk<'w, 'a> {
         (yielded, after)
     }
 
-    /// The edges a terminator leaves by, with their conditions; a return or yield records its
-    /// term with the block's reach condition.
+    /// The edges a terminator leaves by, with their own conditions; a return or yield records
+    /// its term with the block's reach condition.
     fn terminator(&mut self, block: BlockId, data: &Block, mut contents: Contents) -> Vec<Edge> {
         let reach = self.reach[block.0 as usize].expect("a reached block");
-        let edge = |walk: &mut Self,
-                    target: BlockId,
-                    condition: TermId,
-                    args: Vec<TermId>,
-                    contents: Contents| {
-            let condition = walk.terms.and(vec![reach, condition]);
-            Edge {
+        let edge =
+            |target: BlockId, condition: TermId, args: Vec<TermId>, contents: Contents| Edge {
                 target,
                 condition,
                 args,
                 contents,
-            }
-        };
+            };
         match &data.term {
             Terminator::Jump(jump) => {
                 let args = jump
@@ -2007,7 +2058,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                     .map(|operand| self.operand(operand, &contents))
                     .collect();
                 let truth = self.terms.bool(true);
-                vec![edge(self, jump.block, truth, args, contents)]
+                vec![edge(jump.block, truth, args, contents)]
             }
             Terminator::Branch(condition, then, otherwise) => {
                 let test = self.operand(condition, &contents);
@@ -2023,8 +2074,8 @@ impl<'w, 'a> Walk<'w, 'a> {
                     .map(|operand| self.operand(operand, &contents))
                     .collect();
                 vec![
-                    edge(self, then.block, test, then_args, contents.clone()),
-                    edge(self, otherwise.block, negated, else_args, contents),
+                    edge(then.block, test, then_args, contents.clone()),
+                    edge(otherwise.block, negated, else_args, contents),
                 ]
             }
             Terminator::Call { call, ok, fail } => {
@@ -2046,8 +2097,8 @@ impl<'w, 'a> Walk<'w, 'a> {
                 let fail_ty = self.ty(self.nir().block(*fail).params[0]);
                 let failure = self.terms.fresh(fail_ty);
                 vec![
-                    edge(self, *ok, succeeded, vec![result], contents.clone()),
-                    edge(self, *fail, failed, vec![failure], contents),
+                    edge(*ok, succeeded, vec![result], contents.clone()),
+                    edge(*fail, failed, vec![failure], contents),
                 ]
             }
             Terminator::Return(value) => {

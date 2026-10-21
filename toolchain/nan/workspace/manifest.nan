@@ -199,7 +199,7 @@ fn Manifest.read(
         return None
     }
     expect path.ends_with("/package.nan")
-    let Some(package_dir) = path.slice_bytes(0, end: path.byte_len() - 12) else {
+    let Some(package_dir) = path.slice_bytes(0, end: dir_length(path)) else {
         expect false
         return None
     }
@@ -217,6 +217,7 @@ fn directive_line(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc
         expect false
         return 0
     }
+    expect usize.widen(span.head) < file.tokens.len()
     return file.tokens[usize.widen(span.head)].line
 } directive_line
 
@@ -233,6 +234,7 @@ fn ManifestReader.report(mut self, line: u32, code: diagnostic::Code) {
 fn idents(file: syntax::SourceFile, tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> mem::List[text::String] {
     var found = mem::List[text::String].empty(alloc)
     for token in tree.child_tokens(node) {
+        expect usize.widen(token) < file.tokens.len()
         if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
             mut found.push(text::String.of(file.text(usize.widen(token)), alloc))
         }
@@ -257,6 +259,7 @@ fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, i
     let alloc = self.alloc
     var name_token: Option[u32] = None
     for token in tree.child_tokens(item_node) {
+        expect usize.widen(token) < file.tokens.len()
         if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Ident {
             name_token = Some(token)
             break
@@ -273,6 +276,7 @@ fn ManifestReader.read(mut self, file: syntax::SourceFile, tree: syntax::Tree, i
     var keyword_line: u32 = 0
     match mut tokens.next() {
         Some(keyword) => {
+            expect usize.widen(keyword) < file.tokens.len()
             keyword_line = file.tokens[usize.widen(keyword)].line
         }
         None => {
@@ -423,6 +427,7 @@ fn ManifestReader.read_dep(
     let alias = mut words.remove(1)
     var text_token: Option[u32] = None
     for token in tree.child_tokens(node) {
+        expect usize.widen(token) < file.tokens.len()
         if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Text {
             text_token = Some(token)
             break
@@ -509,6 +514,7 @@ fn ManifestReader.read_deny(
     ) {
     let alloc = self.alloc
     let modules = idents(file, tree, node, alloc)
+    expect modules.len() > 2
     let module = modules[1].as_str()
     let denied = modules[2].as_str()
     if module == denied {
@@ -569,10 +575,7 @@ enum SourceKind derives Copy, Eq {
 /// Whether a `dep` source is a relative path or a store name.
 fn source_kind(source: Str) -> Option[SourceKind] {
     let bytes = source.as_bytes()
-    var end: usize = 0
-    while end < bytes.len() and bytes[end] != b'/' {
-        end += 1
-    }
+    let end = segment_end(bytes, from: 0)
     let Some(head) = source.slice_bytes(0, end) else {
         return None
     }
@@ -580,10 +583,7 @@ fn source_kind(source: Str) -> Option[SourceKind] {
         var start = end
         while start < bytes.len() {
             start += 1
-            var stop = start
-            while stop < bytes.len() and bytes[stop] != b'/' {
-                stop += 1
-            }
+            let stop = segment_end(bytes, from: start)
             if stop == start {
                 return None
             }
@@ -600,11 +600,12 @@ fn source_kind(source: Str) -> Option[SourceKind] {
     }
     var start: usize = 0
     loop {
-        var stop = start
-        while stop < bytes.len() and bytes[stop] != b'/' {
-            stop += 1
+        let stop = segment_end(bytes, from: start)
+        let Some(segment) = source.slice_bytes(start, end: stop) else {
+            expect false
+            return None
         }
-        if not store_segment(bytes, start, stop) {
+        if not store_segment(segment.as_bytes()) {
             return None
         }
         if stop == bytes.len() {
@@ -614,18 +615,30 @@ fn source_kind(source: Str) -> Option[SourceKind] {
     }
 } source_kind
 
-/// Whether the bytes `start..<stop` are a segment of a store name: a lowercase letter or digit,
-/// then lowercase letters, digits, `.`, `-` and `_`.
-fn store_segment(bytes: Slice[u8], start: usize, stop: usize) -> bool {
-    if stop == start {
+/// The end of the segment of bytes from `from`: the position of the first `/` there, or their
+/// length.
+fn segment_end(bytes: Slice[u8], from: usize) -> usize
+    ensures result <= bytes.len()
+{
+    for at in from..<bytes.len() {
+        if bytes[at] == b'/' {
+            return at
+        }
+    }
+    return bytes.len()
+} segment_end
+
+/// Whether bytes are a segment of a store name: a lowercase letter or digit, then lowercase
+/// letters, digits, `.`, `-` and `_`.
+fn store_segment(segment: Slice[u8]) -> bool {
+    if segment.is_empty() {
         return false
     }
-    let head = bytes[start]
+    let head = segment[0]
     if not ((head >= b'a' and head <= b'z') or (head >= b'0' and head <= b'9')) {
         return false
     }
-    for at in start..<stop {
-        let byte = bytes[at]
+    for byte in segment {
         let plain = (byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9')
         if not plain and byte != b'.' and byte != b'-' and byte != b'_' {
             return false
@@ -657,8 +670,8 @@ fn split_text(written: Str, separator: u8, alloc: mem::Alloc) -> mem::List[text:
     var parts = mem::List[text::String].empty(alloc)
     let bytes = written.as_bytes()
     var start: usize = 0
-    for at in 0..=bytes.len() {
-        if at < bytes.len() and bytes[at] != separator {
+    for at in 0..<bytes.len() {
+        if bytes[at] != separator {
             continue
         }
         let Some(part) = written.slice_bytes(start, end: at) else {
@@ -668,6 +681,11 @@ fn split_text(written: Str, separator: u8, alloc: mem::Alloc) -> mem::List[text:
         mut parts.push(text::String.of(part, alloc))
         start = at + 1
     }
+    let Some(last) = written.slice_bytes(start, end: bytes.len()) else {
+        expect false
+        return parts
+    }
+    mut parts.push(text::String.of(last, alloc))
     return parts
 } split_text
 

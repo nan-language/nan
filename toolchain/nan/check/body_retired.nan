@@ -46,7 +46,9 @@ fn Checker.typed_rewrite(self, tombstone: ty::ItemId, head: ast::Head, rewrite: 
     let Some(sig) = self.fn_sig(tombstone) else {
         return None
     }
-    let start = self.db().syntax(tombstone).tokens[usize.widen(rewrite.token)].start
+    let tokens = self.db().syntax(tombstone).tokens
+    expect usize.widen(rewrite.token) < tokens.len()
+    let start = tokens[usize.widen(rewrite.token)].start
     let unmarked = self.rewrite_probe(tombstone, head, rewrite, sig, failure: None, awaited: None)
     var failure: Option[ast::Word[ast::FailureMarker]] = None
     if reported_from(unmarked.diagnostics.view(), code: diagnostic::Code.ErrorUnhandled, start) {
@@ -112,6 +114,7 @@ fn Checker.rewrite_probe(
             body.unused_result(Tail(token: rewrite.token, last: rewrite.last, ty: typed.ty))
         }
         let clauses = Clauses.of(head, fixable: false)
+        expect body.frames.len() > 0
         body.check_effects(rewrite.token, frame: body.frames[0], head: sig.fn_ty(alloc), clauses, exempt: false)
         return take body.finish(Some(take typed))
     })
@@ -136,8 +139,9 @@ fn Checker.quoted(self, tombstone: ty::ItemId) -> diagnostic::Reason {
     while arrow < tokens.len() and tokens[arrow].kind != syntax::TokenKind.Punct(syntax::Punct.FatArrow) {
         arrow += 1
     }
-    expect arrow < tokens.len()
-    let old = self.flat(tombstone, range: nir::Span(head: token + 1, last: u32.fit(arrow) - 1))
+    expect usize.widen(token) < arrow and arrow < tokens.len()
+    let last = u32.fit(arrow) - 1
+    let old = self.flat(tombstone, range: nir::Span(head: token + 1, last: last))
     if db.is_reported(tombstone) and not db.in_history(tombstone) {
         return self.reason(tombstone, token, role: diagnostic::Role.Declared, subject: take old)
     }
@@ -310,6 +314,7 @@ fn Checker.rewrite_written(self, tombstone: ty::ItemId, module: ty::ModuleId) ->
             let SigKind.Enum(variants: variants) = sig.contents().kind else {
                 return None
             }
+            expect variant < variants.len()
             var written = self.item_written(enumeration, from: module)
             mut written.push('.')
             mut written.append(variants[variant].name.as_str())
@@ -370,7 +375,7 @@ fn Checker.forward_path(self, item: ty::ItemId, module: ty::ModuleId, path: ast:
     let Some(tombstone) = self.renamed_path(module, path) else {
         return None
     }
-    let construct = nir::Span(head: path.token(), last: path.segments[path.segments.len() - 1].token)
+    let construct = nir::Span(head: path.token(), last: path.last().token)
     self.report_renamed_path(item, construct, tombstone)
     return self.forwarding(tombstone)
 } Checker.forward_path
@@ -614,17 +619,20 @@ fn Body.forwarded_fix(
         return None
     }
     let source = db.syntax(tombstone)
+    expect usize.widen(rewrite.token) < source.tokens.len() and usize.widen(rewrite.last) < source.tokens.len()
     let first_byte = source.tokens[usize.widen(rewrite.token)].start
     let end = source.tokens[usize.widen(rewrite.last)].end
     var written = text::String.empty(alloc)
     var at = first_byte
     for occurrence in occurrences {
+        expect usize.widen(occurrence.token) < source.tokens.len() and usize.widen(occurrence.last) < source.tokens.len()
         let from = source.tokens[usize.widen(occurrence.token)].start
         mut written.append(lossy_between(source.source.view(), start: at, end: from, alloc).as_str())
         mut written.append(occurrence.written.as_str())
         at = source.tokens[usize.widen(occurrence.last)].end
     }
     mut written.append(lossy_between(source.source.view(), start: at, end, alloc).as_str())
+    expect usize.widen(start) < using_file.tokens.len() and usize.widen(last) < using_file.tokens.len()
     let from = using_file.tokens[usize.widen(start)].start
     let to = using_file.tokens[usize.widen(last)].end
     return Some(self.ck.fix_bytes(self.item, start: from, end: to, text: written.as_str()))
@@ -667,7 +675,12 @@ fn Body.given_args(self, head: ast::Head, received: bool, args: Slice[ast::Arg])
 } Body.given_args
 
 /// The index of the argument given for a parameter.
-fn GivenArg.position_named(given: Slice[GivenArg], name: Str) -> Option[usize] {
+fn GivenArg.position_named(given: Slice[GivenArg], name: Str) -> Option[usize]
+    ensures match result {
+        Some(index) => index < given.len()
+        None => true
+    }
+{
     for index in 0..<given.len() {
         if given[index].name.as_str() == name {
             return Some(index)
@@ -791,13 +804,13 @@ fn in_order(given: Slice[GivenArg], occurrences: Slice[Occurrence], calls: Slice
 
 /// The bytes `start..end` of a source as text, each ill-formed sequence replaced.
 fn lossy_between(source: Slice[u8], start: u32, end: u32, alloc: mem::Alloc) -> text::String {
-    let Some(parts) = source.split_at(usize.widen(start)) else {
+    let Some(through) = source.prefix(usize.widen(end)) else {
         return text::String.empty(alloc)
     }
-    let Some(bytes) = parts.tail.prefix(usize.widen(end - start)) else {
+    let Some(parts) = through.split_at(usize.widen(start)) else {
         return text::String.empty(alloc)
     }
-    return output::lossy(bytes, alloc)
+    return output::lossy(parts.tail, alloc)
 } lossy_between
 
 /// The callable a tombstone's old head makes of a call of its path.
@@ -811,7 +824,12 @@ fn Body.retired_head(mut self, tombstone: ty::ItemId) -> Option[Callable] {
 /// The index of the field among the `fields` of a construction or pattern that a label names:
 /// the field it names, or, for a struct `owner`, the one a tombstone renaming it forwards to;
 /// none when it names none, which is reported.
-fn Body.labelled_field(self, owner: Option[ty::ItemId], label: ast::Name, fields: Slice[LabelledTy]) -> Option[usize] {
+fn Body.labelled_field(self, owner: Option[ty::ItemId], label: ast::Name, fields: Slice[LabelledTy]) -> Option[usize]
+    ensures match result {
+        Some(index) => index < fields.len()
+        None => true
+    }
+{
     let named = LabelledTy.position_in(fields, name: label.text.as_str())
     if named < fields.len() {
         return Some(named)

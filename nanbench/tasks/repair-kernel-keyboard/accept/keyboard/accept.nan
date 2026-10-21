@@ -1,0 +1,56 @@
+//! Acceptance tests of the keyboard driver.
+
+test a_held_byte_is_posted for Keyboard.receive {
+    let world = testing::world()
+    let block = hw::sim::Registers[ControllerPorts].of(world.alloc)
+    let scancodes = mem::Shared.of(hw::Signal[u8].empty(), alloc: world.alloc)
+    var keyboard = Keyboard(ports: block.ports(), scancodes: scancodes.share())
+    let idle = hw::without_irqs(fn[mut keyboard](t: hw::IrqsDisabled) -> bool limits notrap {
+        return mut keyboard.receive(t)
+    })
+    block.set(ControllerPorts.status, value: ControllerStatus(output_full: true, reserved: 0))
+    block.set(ControllerPorts.data, value: 0x1E)
+    let busy = hw::without_irqs(fn[mut keyboard](t: hw::IrqsDisabled) -> bool limits notrap {
+        return mut keyboard.receive(t)
+    })
+    let shared = hw::IrqShared.install(take keyboard, vector: 0x21, on_irq: Keyboard.on_irq)
+    detach(take shared).unmap()
+    let code = try await scancodes.contents().wait()
+    expect not idle
+    expect busy
+    expect code == 0x1E
+} a_held_byte_is_posted
+
+test attached_keyboards_give_their_ports_back for attach {
+    let world = testing::world()
+    let block = hw::sim::Registers[ControllerPorts].of(world.alloc)
+    let scancodes = mem::Shared.of(hw::Signal[u8].empty(), alloc: world.alloc)
+    let shared = attach(block.ports(), scancodes)
+    var ports = detach(take shared)
+    block.set(ControllerPorts.data, value: 0x2A)
+    let data = mut ports.read(ControllerPorts.data)
+    take ports.unmap()
+    expect data == 0x2A
+} attached_keyboards_give_their_ports_back
+
+test presses_are_codes_below_0x80 for count_code {
+    let counts = hw::SpinLock.of(Counts(presses: 0, codes: 0))
+    count_code(counts, code: 0x1E)
+    count_code(counts, code: 0x9E)
+    count_code(counts, code: 0x7F)
+    count_code(counts, code: 0x80)
+    let totals = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Counts limits notrap {
+        return counts.with(t, body: fn(mut held: Counts) -> Counts limits notrap, terminates, noalloc {
+            return Counts(presses: held.presses, codes: held.codes)
+        })
+    })
+    expect totals.presses == 2
+    expect totals.codes == 4
+} presses_are_codes_below_0x80
+
+test rates_round_down for presses_per_minute {
+    expect presses_per_minute(7, elapsed_ms: 9_000) == 46
+    expect presses_per_minute(5, elapsed_ms: 0) == 0
+    expect presses_per_minute(100_000, elapsed_ms: 1) == 6_000_000_000
+    expect presses_per_minute(4_294_967_295, elapsed_ms: 60_000) == 4_294_967_295
+} rates_round_down

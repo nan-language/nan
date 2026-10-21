@@ -37,7 +37,8 @@ fn Checker.report_unknown(
                 let db = self.db()
                 let data = db.item(item)
                 let syntax = db.syntax(item)
-                let end_line = usize.widen(syntax.tokens[syntax.items[data.index].end - 1].line)
+                expect data.index < syntax.items.len()
+                let end_line = usize.widen(syntax.item_lines(syntax.items[data.index]).high)
                 var at = u32.fit(syntax.source.len())
                 if end_line < syntax.lines.len() {
                     at = syntax.lines[end_line].start
@@ -185,23 +186,20 @@ fn near_candidates(written: Str, take candidates: mem::List[text::String], alloc
         if folded > longer {
             longer = folded
         }
-        if distance <= (longer + 2) / 3 {
+        var third = longer / 3
+        if longer % 3 > 0 {
+            third += 1
+        }
+        if distance <= third {
             mut near.push(NearCandidate(distance: distance, candidate: take candidate))
         }
     }
     mut near.sort_by(fn(left: NearCandidate, right: NearCandidate) => near_order(left, right))
     var listed = mem::List[text::String].empty(alloc)
-    var last: Option[usize] = None
     for index in 0..<near.len() {
-        match last {
-            Some(previous) => {
-                if near[previous].distance == near[index].distance and near[previous].candidate.as_str() == near[index].candidate.as_str() {
-                    continue
-                }
-            }
-            None => {}
+        if index > 0 and near[index - 1].distance == near[index].distance and near[index - 1].candidate.as_str() == near[index].candidate.as_str() {
+            continue
         }
-        last = Some(index)
         if listed.len() < LISTED_CANDIDATES {
             mut listed.push(text::String.of(near[index].candidate.as_str(), alloc))
         }
@@ -247,39 +245,39 @@ fn name_distance(written: Str, candidate: Str, alloc: mem::Alloc) -> usize {
     }
     let left = chars_of(fold_path(written, alloc).as_str(), alloc)
     let right = chars_of(fold_path(candidate, alloc).as_str(), alloc)
-    let width = right.len() + 1
-    var table = mem::List[usize].empty(alloc)
-    for at in 0..=left.len() {
-        for other in 0..=right.len() {
-            if at == 0 {
-                mut table.push(other)
-            } else if other == 0 {
-                mut table.push(at)
-            } else {
-                mut table.push(0)
-            }
-        }
+    var before = mem::List[usize].empty(alloc)
+    var above = mem::List[usize].empty(alloc)
+    for other in 0..=right.len() {
+        mut above.push(other)
     }
     for at in 1..=left.len() {
+        invariant above.len() > right.len()
+        invariant at == 1 or before.len() > right.len()
+        var row = mem::List[usize].empty(alloc)
+        mut row.push(at)
         for other in 1..=right.len() {
+            invariant row.len() == other
             var cost: usize = 1
             if left[at - 1] == right[other - 1] {
                 cost = 0
             }
-            var best = table[(at - 1) * width + other] + 1
-            if table[at * width + other - 1] + 1 < best {
-                best = table[at * width + other - 1] + 1
+            var best = above[other] + 1
+            if row[other - 1] + 1 < best {
+                best = row[other - 1] + 1
             }
-            if table[(at - 1) * width + other - 1] + cost < best {
-                best = table[(at - 1) * width + other - 1] + cost
+            if above[other - 1] + cost < best {
+                best = above[other - 1] + cost
             }
-            if at > 1 and other > 1 and left[at - 1] == right[other - 2] and left[at - 2] == right[other - 1] and table[(at - 2) * width + other - 2] + 1 < best {
-                best = table[(at - 2) * width + other - 2] + 1
+            if at > 1 and other > 1 and left[at - 1] == right[other - 2] and left[at - 2] == right[other - 1] and before[other - 2] + 1 < best {
+                best = before[other - 2] + 1
             }
-            table[at * width + other] = best
+            mut row.push(best)
         }
+        before = above
+        above = row
     }
-    return table[left.len() * width + right.len()]
+    expect above.len() > right.len()
+    return above[right.len()]
 } name_distance
 
 /// A candidate near a written name, with its distance.
@@ -321,13 +319,15 @@ fn synonym_of(written: Str, candidate: Str, alloc: mem::Alloc) -> bool {
     var starts = mem::List[usize].empty(alloc)
     var ends = mem::List[usize].empty(alloc)
     var start: usize = 0
-    for at in 0..=bytes.len() {
-        if at == bytes.len() or bytes[at] == b'_' {
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'_' {
             mut starts.push(start)
             mut ends.push(at)
             start = at + 1
         }
     }
+    mut starts.push(start)
+    mut ends.push(bytes.len())
     for head in 0..<starts.len() {
         for last in head..<ends.len() {
             let Some(run) = written.slice_bytes(starts[head], end: ends[last]) else {
@@ -350,6 +350,7 @@ fn synonym_replaced(written: Str, run_start: usize, run_end: usize, run: Str, ca
         while equals < bytes.len() and bytes[equals] != b'=' {
             equals += 1
         }
+        expect equals < bytes.len()
         let Some(verb) = entry.slice_bytes(0, end: equals) else {
             continue
         }
@@ -379,8 +380,8 @@ fn synonym_replaced(written: Str, run_start: usize, run_end: usize, run: Str, ca
 fn lists_synonym(alternatives: Str, wanted: Str) -> bool {
     let bytes = alternatives.as_bytes()
     var start: usize = 0
-    for at in 0..=bytes.len() {
-        if at < bytes.len() and bytes[at] != b',' {
+    for at in 0..<bytes.len() {
+        if bytes[at] != b',' {
             continue
         }
         let Some(synonym) = alternatives.slice_bytes(start, end: at) else {
@@ -391,5 +392,8 @@ fn lists_synonym(alternatives: Str, wanted: Str) -> bool {
         }
         start = at + 1
     }
-    return false
+    let Some(last) = alternatives.slice_bytes(start, end: bytes.len()) else {
+        return false
+    }
+    return last == wanted
 } lists_synonym

@@ -110,12 +110,15 @@ layout Queue: bytes 160 le {
     data_pad: Array[u8, 16] at 144
 } Queue
 
-/// The offsets of the driver and device areas and of the receive buffer in a `Queue`.
+/// The offsets of the driver and device areas and of the receive buffer in a `Queue`, and its
+/// size.
 const DRIVER_AREA: u64 = 64
 
 const DEVICE_AREA: u64 = 80
 
 const BUFFER: u64 = 128
+
+const QUEUE_BYTES: u64 = 160
 
 pub closed enum EntropyError derives Render {
     NoDevice
@@ -191,6 +194,7 @@ fn structures(mut config: hw::Ports[PciConfig], slot: u32, status: u32) -> Devic
     var multiplier: u32 = 0
     var at = read_config(mut config, slot, offset: PCI_CAPABILITIES) & 0xFC
     for _ in 0u32..<48 {
+        invariant at <= 0xFC
         if at == 0 {
             break
         }
@@ -199,11 +203,16 @@ fn structures(mut config: hw::Ports[PciConfig], slot: u32, status: u32) -> Devic
         if (head & 0xFF) == VENDOR_CAPABILITY and (kind == COMMON_KIND or kind == NOTIFY_KIND) {
             let bar = read_config(mut config, slot, offset: at + 4) & 0xFF
             let offset = read_config(mut config, slot, offset: at + 8)
-            let base = bar_base(mut config, slot, bar)
+            let Some(base) = bar_base(mut config, slot, bar) else {
+                fail EntropyError.NoCapability
+            }
+            let Some(address) = base.checked_add(u64.widen(offset)) else {
+                fail EntropyError.NoCapability
+            }
             if kind == COMMON_KIND {
-                common = base + u64.widen(offset)
+                common = address
             } else {
-                notify = base + u64.widen(offset)
+                notify = address
                 multiplier = read_config(mut config, slot, offset: at + 16)
             }
         }
@@ -215,15 +224,19 @@ fn structures(mut config: hw::Ports[PciConfig], slot: u32, status: u32) -> Devic
     return Device(common: common, notify: notify, multiplier: multiplier)
 } structures
 
-/// The memory address a device's base address register `bar` holds, both words of a 64-bit one.
-fn bar_base(mut config: hw::Ports[PciConfig], slot: u32, bar: u32) -> u64 {
+/// The memory address a device's base address register `bar` holds, both words of a 64-bit one;
+/// none when `bar` names none of the six registers.
+fn bar_base(mut config: hw::Ports[PciConfig], slot: u32, bar: u32) -> Option[u64] {
+    if bar > 5 {
+        return None
+    }
     let low = read_config(mut config, slot, offset: PCI_BARS + 4 * bar)
     let base = u64.widen(low & 0xFFFF_FFF0)
     if ((low >> 1) & 0x3) != 2 {
-        return base
+        return Some(base)
     }
     let high = read_config(mut config, slot, offset: PCI_BARS + 4 * bar + 4)
-    return base | (u64.widen(high) << 32)
+    return Some(base | (u64.widen(high) << 32))
 } bar_base
 
 fn read_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32) -> u32 {
@@ -240,17 +253,19 @@ fn write_config(mut config: hw::Ports[PciConfig], slot: u32, offset: u32, value:
 /// `SAMPLE_BYTES` bytes into the queue's receive buffer, and gives the number it wrote.
 fn exchange(device: Device, mut queue: hw::DmaShared[Queue]) -> u32 fails EntropyError {
     let bus = queue.bus_addr().value
-    if bus % 16 != 0 {
+    if bus % 16 != 0 or bus > ~0u64 - QUEUE_BYTES {
         fail EntropyError.Misaligned
     }
     var common = trusted "the device's common configuration lies at device.common, uncached in the entry root, and nothing else maps it" { hw::Mmio[Common].map(device.common) }
     defer take common.unmap()
-    try start(mut common, bus)
+    try start(mut common, table: bus, avail: bus + DRIVER_AREA, used: bus + DEVICE_AREA)
     let notify_off = mut common.read(Common.queue_notify_off)
     mut queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(address: bus + BUFFER, length: SAMPLE_BYTES, flags: DEVICE_WRITES, next: 0))
     mut queue.write_release_at(Queue.avail_ring, index: 0, value: 0)
     mut queue.write_release(Queue.avail_index, value: 1)
-    let doorbell = device.notify + u64.widen(notify_off) * u64.widen(device.multiplier)
+    let Some(doorbell) = device.notify.checked_add(u64.widen(notify_off) * u64.widen(device.multiplier)) else {
+        fail EntropyError.NoCapability
+    }
     var notify = trusted "the device's notification registers lie at doorbell, uncached in the entry root, and nothing else maps them" { hw::Mmio[Notify].map(doorbell) }
     mut notify.write(Notify.queue, value: 0)
     take notify.unmap()
@@ -263,9 +278,10 @@ fn exchange(device: Device, mut queue: hw::DmaShared[Queue]) -> u32 fails Entrop
     fail EntropyError.NoResponse
 } exchange
 
-/// Resets the device, negotiates virtio 1 alone, and sets up queue 0 of `QUEUE_SIZE` entries in
-/// the queue whose bus address is `bus`, leaving the device running.
-fn start(mut common: hw::Mmio[Common], bus: u64) fails EntropyError {
+/// Resets the device, negotiates virtio 1 alone, and sets up queue 0 of `QUEUE_SIZE` entries
+/// with its descriptor table, driver area and device area at the bus addresses `table`, `avail`
+/// and `used`, leaving the device running.
+fn start(mut common: hw::Mmio[Common], table: u64, avail: u64, used: u64) fails EntropyError {
     mut common.write(Common.status, value: 0)
     mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER)
     mut common.write(Common.device_feature_select, value: 1)
@@ -285,12 +301,12 @@ fn start(mut common: hw::Mmio[Common], bus: u64) fails EntropyError {
         fail EntropyError.Unsupported
     }
     mut common.write(Common.queue_size, value: QUEUE_SIZE)
-    mut common.write(Common.queue_desc_low, value: u32.truncate(bus))
-    mut common.write(Common.queue_desc_high, value: u32.truncate(bus >> 32))
-    mut common.write(Common.queue_driver_low, value: u32.truncate(bus + DRIVER_AREA))
-    mut common.write(Common.queue_driver_high, value: u32.truncate((bus + DRIVER_AREA) >> 32))
-    mut common.write(Common.queue_device_low, value: u32.truncate(bus + DEVICE_AREA))
-    mut common.write(Common.queue_device_high, value: u32.truncate((bus + DEVICE_AREA) >> 32))
+    mut common.write(Common.queue_desc_low, value: u32.truncate(table))
+    mut common.write(Common.queue_desc_high, value: u32.truncate(table >> 32))
+    mut common.write(Common.queue_driver_low, value: u32.truncate(avail))
+    mut common.write(Common.queue_driver_high, value: u32.truncate(avail >> 32))
+    mut common.write(Common.queue_device_low, value: u32.truncate(used))
+    mut common.write(Common.queue_device_high, value: u32.truncate(used >> 32))
     mut common.write(Common.queue_enable, value: 1)
     mut common.write(Common.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
 } start

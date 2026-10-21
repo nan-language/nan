@@ -24,7 +24,7 @@ use super::runtime::system::{self, unavailable_unless};
 use super::runtime::tasks::{self, kind, operation, task, thread};
 use super::runtime::{Routine, memory, state};
 use super::{CALL_CONV, Instance, Lowering, Program, lines};
-use crate::nir::Role;
+use crate::nir::{Role, Span};
 
 mod mmap {
     pub const READ_WRITE: i64 = 3;
@@ -110,6 +110,8 @@ pub fn entry_seam(lo: &mut Lowering, program: &Program) {
         .fn_sig(program.entry)
         .and_then(|sig| sig.limits.stack)
         .unwrap_or(tasks::ENTRY_STACK);
+    let head = Span::at(lo.ck.db.item(program.entry).ast.token);
+    lo.task(glue, program.entry, head, Some(stack));
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(types::I32));
     signature.params.push(AbiParam::new(PTR));

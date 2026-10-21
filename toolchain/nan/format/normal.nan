@@ -379,10 +379,10 @@ fn Normal.substitute(
 
 /// Writes the tokens of a span as one text: its first token as `by`, the others as nothing.
 fn replace(mut written: mem::HashMap[u32, Option[text::String]], span: syntax::TokenSpan, take by: text::String) {
-    discard mut written.insert(span.head, value: Some(take by))
-    for token in (span.head + 1)..=span.last {
+    for token in span.head..=span.last {
         discard mut written.insert(token, value: None)
     }
+    discard mut written.insert(span.head, value: Some(take by))
 } replace
 
 /// The spans of the item's declared name and closing label, and of a tombstone's old form.
@@ -495,6 +495,7 @@ fn Normal.paths(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::
             }
             syntax::Rule.Path => {
                 let tokens = child_token_list(tree, node, alloc)
+                expect tokens.len() > 0
                 var segments = mem::List[text::String].empty(alloc)
                 for token in tokens {
                     if is_ident(file, token) {
@@ -634,7 +635,7 @@ fn add_runs(
 
 fn holds_keyword(file: syntax::SourceFile, tree: syntax::Tree, node: u32, keyword: syntax::Keyword) -> bool {
     for token in tree.child_tokens(node) {
-        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Keyword(keyword) {
+        if token_kind(file, token) == syntax::TokenKind.Keyword(keyword) {
             return true
         }
     }
@@ -691,21 +692,22 @@ fn Normal.sort(self, mut toks: mem::List[Tok], run: Run, alloc: mem::Alloc) {
             }
         }
     }
+    mut spans.sort_by(fn(left: Positions, right: Positions) => left.start.cmp(right.start))
     if spans.len() < 2 {
         return
     }
-    mut spans.sort_by(fn(left: Positions, right: Positions) => left.start.cmp(right.start))
+    expect all i in 0..<spans.len(): spans[i].start < spans[i].end and spans[i].end <= toks.len()
     var keys = mem::List[text::String].empty(alloc)
     for span in spans {
-        let Some(halves) = toks.view().split_at(span.start) else {
+        let Some(before) = toks.view().split_at(span.end) else {
             expect false
             return
         }
-        let Some(member) = halves.tail.prefix(span.end - span.start) else {
+        let Some(halves) = before.head.split_at(span.start) else {
             expect false
             return
         }
-        let lines = self.render(member, alloc)
+        let lines = self.render(halves.tail, alloc)
         var key = text::String.empty(alloc)
         for index in 0..<lines.len() {
             if index > 0 {
@@ -719,28 +721,33 @@ fn Normal.sort(self, mut toks: mem::List[Tok], run: Run, alloc: mem::Alloc) {
     for index in 0..<spans.len() {
         mut ranked.push(index)
     }
-    mut ranked.sort_by(fn(left: usize, right: usize) => keys[left].cmp(keys[right]))
+    mut ranked.sort_by(fn(left: usize, right: usize) -> core::Ordering {
+        expect left < keys.len() and right < keys.len()
+        return keys[left].cmp(keys[right])
+    })
     let start = spans[0].start
-    var order = mem::List[usize].empty(alloc)
+    let end = spans[spans.len() - 1].end
+    var moved = mem::List[Tok].empty(alloc)
     for slot in 0..<ranked.len() {
         let element = ranked[slot]
+        expect element < spans.len()
         for at in spans[element].start..<spans[element].end {
-            mut order.push(at)
+            mut moved.push(toks[at].duplicate(alloc))
         }
         if slot + 1 < spans.len() {
             for at in spans[slot].end..<spans[slot + 1].start {
-                mut order.push(at)
+                mut moved.push(toks[at].duplicate(alloc))
             }
         }
     }
-    var moved = mem::List[Tok].empty(alloc)
-    for at in order {
-        mut moved.push(toks[at].duplicate(alloc))
-    }
-    var offset: usize = 0
-    for tok in take moved {
-        toks[start + offset] = tok
-        offset += 1
+    let count = toks.len()
+    var placed = drained(mut moved, alloc)
+    for position in start..<end {
+        invariant toks.len() == count
+        let Some(tok) = mut placed.pop() else {
+            break
+        }
+        toks[position] = tok
     }
 } Normal.sort
 
@@ -770,6 +777,7 @@ fn dollar_replaced(written: Str, by: Str, alloc: mem::Alloc) -> text::String {
     let bytes = written.as_bytes()
     var at = bytes.len()
     loop {
+        invariant at <= bytes.len()
         expect at > 0
         at -= 1
         if bytes[at] == b'$' {
@@ -943,7 +951,7 @@ fn Reduction.drop_hidden_fields(
                 var tokens = tree.child_tokens(node)
                 match mut tokens.next() {
                     Some(token) => {
-                        visibility = Some(file.tokens[usize.widen(token)].kind)
+                        visibility = Some(token_kind(file, token))
                     }
                     None => {
                     }
@@ -1028,8 +1036,8 @@ fn Reduction.default_methods(
             return
         }
         mark(mut self.defaults, token: span.head)
-        for token in (span.head + 1)..=span.last {
-            if file.tokens[usize.widen(token)].kind != syntax::TokenKind.Nl {
+        for token in span.head..=span.last {
+            if token > span.head and token_kind(file, token) != syntax::TokenKind.Nl {
                 mark(mut self.dropped, token)
             }
         }
@@ -1052,7 +1060,7 @@ fn Reduction.keep_test_head(
             continue
         }
         if not started {
-            if file.tokens[usize.widen(token)].kind != syntax::TokenKind.Keyword(syntax::Keyword.Test) {
+            if token_kind(file, token) != syntax::TokenKind.Keyword(syntax::Keyword.Test) {
                 continue
             }
             started = true
@@ -1112,10 +1120,12 @@ fn literal(kind: syntax::TokenKind, spelt: Str, alloc: mem::Alloc) -> Option[tex
         syntax::TokenKind.Int => return Some(canonical_integer(spelt, alloc))
         syntax::TokenKind.Float => return Some(canonical_float(spelt, alloc))
         syntax::TokenKind.Text or syntax::TokenKind.Char => {
+            expect bytes.len() > 0
             let value = syntax::text_value(spelt, alloc)
             return Some(quoted(value.as_bytes(), delimiter: bytes[0], bytes: false, alloc))
         }
         syntax::TokenKind.Bytes or syntax::TokenKind.Byte => {
+            expect bytes.len() > 1
             let value = byte_value(spelt, alloc)
             var written = text::String.of("b", alloc)
             mut written.append(quoted(value.view(), delimiter: bytes[1], bytes: true, alloc).as_str())
@@ -1140,14 +1150,16 @@ fn merge_runs(mut toks: mem::List[Tok], alloc: mem::Alloc) {
     var pending = drained(mut toks, alloc)
     var in_run = false
     loop {
+        invariant not in_run or toks.len() > 0
         let Some(tok) = mut pending.pop() else {
             break
         }
         let line = tok.kind == syntax::TokenKind.TextLine
         if line and in_run {
+            var appended = text::String.of("\n", alloc)
+            mut appended.append(tok.text.as_str())
             let last = toks.len() - 1
-            mut (mut toks.at_mut(last)).text.push('\n')
-            mut (mut toks.at_mut(last)).text.append(tok.text.as_str())
+            mut (mut toks.at_mut(last)).text.append(appended.as_str())
             continue
         }
         in_run = line
@@ -1261,7 +1273,7 @@ fn byte_value(spelt: Str, alloc: mem::Alloc) -> mem::Bytes {
     let bytes = spelt.as_bytes()
     var value = mem::Bytes.empty(alloc)
     var at: usize = 2
-    while at + 1 < bytes.len() {
+    while at < bytes.len() and bytes.len() - at > 1 {
         let byte = bytes[at]
         at += 1
         if byte != b'\\' {
@@ -1277,7 +1289,7 @@ fn byte_value(spelt: Str, alloc: mem::Alloc) -> mem::Bytes {
             b't' => mut value.push(b'\t')
             b'0' => mut value.push(0)
             b'x' => {
-                expect at + 2 < bytes.len() and is_hex_digit(bytes[at]) and is_hex_digit(bytes[at + 1])
+                expect bytes.len() - at > 2 and is_hex_digit(bytes[at]) and is_hex_digit(bytes[at + 1])
                 mut value.push(u8.truncate(digit_value(bytes[at]) * 16 + digit_value(bytes[at + 1])))
                 at += 2
             }
@@ -1319,6 +1331,7 @@ fn quoted(value: Slice[u8], delimiter: u8, bytes: bool, alloc: mem::Alloc) -> te
 
 /// The uppercase hexadecimal digit of a value below 16.
 fn hex_digit(value: u8) -> u8 {
+    expect value < 16
     if value < 10 {
         return b'0' + value
     }

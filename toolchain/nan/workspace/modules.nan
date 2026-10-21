@@ -23,9 +23,8 @@ struct Assigned {
 /// The length of the text before the last `/` of a path, 0 when it holds none.
 fn dir_length(path: Str) -> usize {
     let bytes = path.as_bytes()
-    var end = bytes.len()
-    while end > 0 {
-        end -= 1
+    for step in 0..<bytes.len() {
+        let end = bytes.len() - 1 - step
         if bytes[end] == b'/' {
             return end
         }
@@ -36,15 +35,19 @@ fn dir_length(path: Str) -> usize {
 /// The start of the text after the last `/` of a path, 0 when it holds none.
 fn segment_start(path: Str) -> usize {
     let bytes = path.as_bytes()
-    var start = bytes.len()
-    while start > 0 and bytes[start - 1] != b'/' {
-        start -= 1
+    for step in 0..<bytes.len() {
+        let start = bytes.len() - step
+        if bytes[start - 1] == b'/' {
+            return start
+        }
     }
-    return start
+    return 0
 } segment_start
 
 /// Groups the sources of a package into modules, returning them and each source's module.
-fn assign_modules(package_dir: Str, package_name: Option[text::String], sources: Slice[text::String], alloc: mem::Alloc) -> Assigned {
+fn assign_modules(package_dir: Str, package_name: Option[text::String], sources: Slice[text::String], alloc: mem::Alloc) -> Assigned
+    ensures result.assigned.len() == sources.len()
+{
     var modules = mem::List[Module].empty(alloc)
     var indexes = mem::Map[text::String, usize].empty(alloc)
     var assigned = mem::List[usize].empty(alloc)
@@ -67,6 +70,7 @@ fn assign_modules(package_dir: Str, package_name: Option[text::String], sources:
             }
             match last.find("@") {
                 Some(at) => {
+                    expect at < last.byte_len()
                     let Some(module) = last.slice_bytes(0, end: at) else {
                         expect false
                         continue
@@ -89,6 +93,7 @@ fn assign_modules(package_dir: Str, package_name: Option[text::String], sources:
             discard mut indexes.insert(text::String.of(name.as_str(), alloc), value: index)
             mut modules.push(Module(name: take name, dirs: mem::List[ModuleDir].empty(alloc)))
         }
+        expect index < modules.len()
         var known_dir = false
         for held in modules[index].dirs {
             if held.path.as_str() == dir {
@@ -117,7 +122,11 @@ fn selector_matches(selector: Str, target: Target) -> bool {
 /// Checks the variants of each module and that each module directory holds its summary file.
 fn check_modules(pack: Package, manifest: Manifest, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
     var found = mem::List[diagnostic::Diagnostic].empty(alloc)
-    let manifest_path = pack.files[0].path.as_str()
+    let Some(manifest_file) = pack.files.get(0) else {
+        expect false
+        return found
+    }
+    let manifest_path = manifest_file.path.as_str()
     var paths = mem::Set[text::String].empty(alloc)
     for file in pack.files {
         discard mut paths.insert(text::String.of(file.path.as_str(), alloc))
@@ -207,22 +216,25 @@ fn check_variants(
     mut found: mem::List[diagnostic::Diagnostic],
     alloc: mem::Alloc,
     ) {
-    var variants = mem::List[usize].empty(alloc)
-    for index in 0..<module.dirs.len() {
-        if module.dirs[index].selector.is_some() {
-            mut variants.push(index)
+    var varied = false
+    var plain = false
+    for dir in module.dirs {
+        if dir.selector.is_some() {
+            varied = true
+        } else {
+            plain = true
         }
     }
-    if variants.len() < module.dirs.len() {
-        for index in variants {
-            mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ModuleVariantMixed, path: module.dirs[index].first_file.as_str(), line: 1, alloc))
-        }
-    }
-    if variants.len() == 0 {
+    if not varied {
         return
     }
-    for index in variants {
-        let variant = module.dirs[index]
+    for variant in module.dirs {
+        if variant.selector.is_none() {
+            continue
+        }
+        if plain {
+            mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ModuleVariantMixed, path: variant.first_file.as_str(), line: 1, alloc))
+        }
         var matched = false
         for target in concrete {
             if variant_matches(variant, target) {
@@ -234,25 +246,35 @@ fn check_variants(
         }
     }
     for target in concrete {
-        var matching = mem::List[usize].empty(alloc)
-        for index in variants {
-            if variant_matches(module.dirs[index], target) {
-                mut matching.push(index)
+        var matching = false
+        for variant in module.dirs {
+            if variant.selector.is_none() or not variant_matches(variant, target) {
+                continue
+            }
+            matching = true
+            if matched_before(module.dirs.view(), variant, target) {
+                mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ModuleVariantOverlap, path: variant.first_file.as_str(), line: 1, alloc))
             }
         }
-        mut matching.sort_by(fn(left: usize, right: usize) => module.dirs[left].path.cmp(module.dirs[right].path))
-        if matching.len() == 0 {
+        if not matching {
             let Some(line) = manifest.targets_line else {
                 expect false
                 return
             }
             mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ModuleVariantMissing, path: manifest_path, line, alloc))
         }
-        for later in 1..<matching.len() {
-            mut found.push(diagnostic::Diagnostic.at(diagnostic::Code.ModuleVariantOverlap, path: module.dirs[matching[later]].first_file.as_str(), line: 1, alloc))
-        }
     }
 } check_variants
+
+/// Whether a variant directory before `variant` in byte order of path matches a concrete target.
+fn matched_before(dirs: Slice[ModuleDir], variant: ModuleDir, target: Target) -> bool {
+    for dir in dirs {
+        if dir.selector.is_some() and dir.path < variant.path and variant_matches(dir, target) {
+            return true
+        }
+    }
+    return false
+} matched_before
 
 /// Whether a variant directory's selector matches a concrete target.
 fn variant_matches(variant: ModuleDir, target: Target) -> bool {

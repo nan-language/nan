@@ -629,7 +629,8 @@ fn Checker.closure_function(
         None => {}
     }
     let finished = take elab.finish(result, failure: raised, wait: closure.ty.wait, closure: Some(head), span)
-    return take finished.into_unit(base + closure.index - 1)
+    expect closure.index > 0
+    return take finished.into_unit(base + (closure.index - 1))
 } Checker.closure_function
 
 /// A failure type with generic parameters replaced by `subst`.
@@ -966,7 +967,7 @@ fn Checker.ensures_clauses(self, item: ty::ItemId, method: Option[usize]) -> mem
         }
         Some(last) => {
             let state = self.state.contents()
-            for index in 0..<(last + 1) {
+            for index in 0..=last {
                 match state.method_bodies.get(MethodKey(item: item, method: index)) {
                     Some(body) => mut bodies.push(body.share())
                     None => {}
@@ -987,15 +988,16 @@ fn Checker.ensures_clauses(self, item: ty::ItemId, method: Option[usize]) -> mem
             collect_olds(clause.expr, visit: fn[mut count](token: u32, ty: ty::Ty) {
                 count += 1
             })
+            let end = old + count
             if method.is_none() or method == Some(position) {
                 var olds = mem::List[u32].empty(alloc)
-                for read in old..<(old + count) {
+                for read in old..<end {
                     mut olds.push(read)
                 }
                 mut clauses.push(EnsuresClause(index: index, olds: take olds, disputed: clause.disputed))
             }
             index += 1
-            old += count
+            old = end
         }
     }
     return clauses
@@ -1089,16 +1091,17 @@ fn Checker.call_implementation(self, take implementation: nir::FnRef, interface_
     let alloc = self.alloc()
     let types = self.types()
     let interface_sig = self.sig(interface_item)
+    let generics = interface_sig.contents().generics
     var interface_args: usize = 0
-    for def in interface_sig.contents().generics {
-        if not def.param.is_self() {
+    for index in 0..<generics.len() {
+        invariant interface_args <= index
+        if not generics[index].param.is_self() {
             interface_args += 1
         }
     }
-    let skipped = 1 + interface_args
     var own = mem::List[ty::Arg].empty(alloc)
-    if skipped <= args.len() {
-        for position in skipped..<args.len() {
+    if interface_args < args.len() {
+        for position in (interface_args + 1)..<args.len() {
             mut own.push(args[position])
         }
     }
@@ -1137,6 +1140,7 @@ fn Checker.function_args(self, item: ty::ItemId, args: ty::Args, own: Slice[ty::
     var listed = mem::List[ty::Arg].empty(self.alloc())
     var next: usize = 0
     for position in 0..<generics.len() {
+        invariant next <= position
         if position >= given.len() {
             break
         }
@@ -1165,17 +1169,16 @@ fn Checker.unit_subst(self, item: ty::ItemId, args: Slice[ty::Arg]) -> ty::Subst
     let SigKind.Interface(methods: methods) = held.kind else {
         return subst
     }
-    let start = held.generics.len()
-    if start > args.len() {
+    let Some(parts) = args.split_at(held.generics.len()) else {
         return subst
     }
     for method in methods {
         let own = method.sig.own_generics()
         for position in 0..<own.len() {
-            if start + position >= args.len() {
+            if position >= parts.tail.len() {
                 break
             }
-            mut subst.insert(own[position].param, arg: args[start + position])
+            mut subst.insert(own[position].param, arg: parts.tail[position])
         }
     }
     return subst
@@ -1198,6 +1201,7 @@ fn Checker.default_index(self, interface_item: ty::ItemId, method: usize) -> u32
     let SigKind.Interface(methods: methods) = sig.contents().kind else {
         return 0
     }
+    expect method <= methods.len()
     var count: u32 = 0
     for index in 0..<method {
         if methods[index].default {
@@ -1288,15 +1292,12 @@ fn Checker.predicate_count(self, item: ty::ItemId) -> u32 {
     }
     var count: u32 = 0
     for member in structure.members {
-        match member {
-            ast::StructMember.Field(field) => {
-                if field.where_clause.is_some() {
-                    count += 1
-                }
-            }
-            ast::StructMember.Invariant(_) => {
-                count += 1
-            }
+        let predicate = match member {
+            ast::StructMember.Field(field) => field.where_clause.is_some()
+            ast::StructMember.Invariant(_) => true
+        }
+        if predicate {
+            count += 1
         }
     }
     return count
@@ -1511,6 +1512,7 @@ fn renumber_premises(mut block: nir::Block, renumbered: Slice[u32]) {
     for inst in mut block.insts {
         match inst.premise {
             Some(premise) => {
+                expect usize.widen(premise) < renumbered.len()
                 inst.premise = Some(renumbered[usize.widen(premise)])
             }
             None => {}
@@ -1667,6 +1669,7 @@ fn Elab.read_param(mut self, name: Str, ty: ty::Ty, span: nir::Span) -> nir::Val
 fn Elab.enter(mut self, olds: mem::HashMap[u32, u32]) fails Fault {
     let alloc = self.ck.alloc()
     for position in 0..<self.take_params.len() {
+        invariant position < self.take_params.len()
         let param = self.take_params[position]
         let data = self.body.contents().local(param.local)
         let span = nir::Span.at(data.token)

@@ -346,7 +346,7 @@ fn main(take world: host::World) fails PauseError uses wait {
     let started = try world.clock.elapsed_ms()
     try await world.clock.sleep(10)
     let finished = try world.clock.elapsed_ms()
-    world.log.info("paused ms", value: finished - started)
+    world.log.info("paused at least 10 ms", value: finished - started >= 10)
 } main
 ```
 

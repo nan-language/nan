@@ -613,7 +613,7 @@ pub fn read_counted(take conn: sys::net::Conn, links: task::Cown[Links], clock: 
 
 ### Domains and replay
 
-- `sys::Domain.run(body, exec, alloc)` runs a `task fn` on its own stacks and memory, with take and Copy captures. It returns `Ok` with the result, whose memory passes to the caller, or `Err(sys::Trap)` after the runtime cancels the domain's in-flight I/O and awaits every acknowledgement.
+- `sys::Domain.run(body, exec, alloc)` runs a `task fn` on its own stacks and memory, with take and Copy captures. It returns `Ok` with the result, whose memory passes to the caller, or `Err(sys::Trap)` after the runtime cancels the domain's in-flight I/O and awaits every acknowledgement. `run_sized(body, stack, exec, alloc)` gives its first task a stack of at least `stack` bytes, for a body no stack limit bounds.
 - `nan test` runs tasks on a seeded scheduler that explores interleavings at `await`, `await when` and atomics, with a virtual clock that advances only when no task can run. A failure prints a [replay token](22-testing.md#replay) that `nan test --replay` reproduces.
 
 ## Kernel topic

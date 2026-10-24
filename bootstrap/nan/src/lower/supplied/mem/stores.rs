@@ -403,6 +403,8 @@ fn arena(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let next = fx.b.ins().iadd_imm_s(len, 1);
             fx.store(next, header, segments::LEN);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let reach = segments::outer_reach(lo, fx, header);
+            segments::lift_element(lo, fx, header, &element, len, reach);
             let id = fx.b.ins().ireduce(types::I32, len);
             let sret = supply.sret.expect("an id's address");
             fx.store(id, sret, 0);
@@ -832,6 +834,9 @@ fn once_map(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                     index::insert(fx, record, fragment, len);
                     fx.store(needed, header, segments::LEN);
                     lo.call_routine(fx, Routine::Unlock, &[lock]);
+                    let reach = segments::outer_reach(lo, fx, header);
+                    segments::lift_element(lo, fx, header, &entries.entry, len, reach);
+                    index::lift(lo, fx, record, reach);
                     vec![value_slot]
                 },
             )[0];

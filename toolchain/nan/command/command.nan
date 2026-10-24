@@ -538,18 +538,47 @@ fn usage(args: Slice[text::String], alloc: mem::Alloc) -> Ran {
     return Ran(output: written.render(output::Format(json: json, budget: None, skip: 0), alloc), status: output::Verdict.Invalid.status(), launch: None)
 } usage
 
+/// The stack a command runs on: the entry task stack of `x86_64-host`.
+const COMMAND_STACK: usize = 67_108_864
+
 /// What a command has learnt by the time it may fail: its workspace root, its scope as the
-/// verdict line writes it, and the workspace files it read.
+/// verdict line writes it, and the workspace files it read. Its arenas belong to the domain
+/// running the command's caller, so that what a trap abandons leaves them whole.
 struct Trace {
-    root: Option[text::String]
-    scope: Option[text::String]
-    read: mem::List[text::String]
+    root: mem::Arena[text::String]
+    scope: mem::Arena[text::String]
+    read: mem::Arena[text::String]
 } Trace
+
+fn Trace.empty(alloc: mem::Alloc) -> Trace {
+    return Trace(root: mem::Arena[text::String].empty(alloc), scope: mem::Arena[text::String].empty(alloc), read: mem::Arena[text::String].empty(alloc))
+} Trace.empty
+
+fn Trace.rooted(self, root: Str, alloc: mem::Alloc) {
+    discard self.root.push(text::String.of(root, alloc))
+} Trace.rooted
+
+fn Trace.scoped(self, written: Str, alloc: mem::Alloc) {
+    discard self.scope.push(text::String.of(written, alloc))
+} Trace.scoped
+
+/// The text an arena holds last, none when it holds none.
+fn latest(texts: mem::Arena[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let count = texts.len()
+    if count == 0 {
+        return None
+    }
+    let Some(held) = texts.get(mem::Id[text::String].of(u32.fit(count - 1))) else {
+        expect false
+        return None
+    }
+    return Some(text::String.of(held.as_str(), alloc))
+} latest
 
 /// Runs the command line the program was given in its working directory and prints its output,
 /// or starts the program `nan run` launches; `home` replaces the user directory, as a harness
 /// gives one. Returns the status the program ends with.
-pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 {
+pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 fails task::Cancelled uses wait {
     let alloc = world.alloc
     let Some(args) = platform::arguments(world.args, alloc) else {
         return 101
@@ -560,7 +589,7 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 {
     let Ok(current) = attempt text::String.try_from_utf8(directory.view(), alloc) else {
         return 101
     }
-    let ran = run(args.view(), current: current.as_str(), home, alloc)
+    let ran = try await run(take args, take current, home, exec: world.exec, alloc)
     match ran.launch {
         Some(launch) => return launch.start(alloc)
         None => {}
@@ -570,15 +599,27 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 {
 } entry
 
 /// What a command line prints run in `current`, and the status it ends with, or the program it
-/// starts.
-fn run(args: Slice[text::String], current: Str, home: Option[cache::HomeOverride], alloc: mem::Alloc) -> Ran {
-    let Some(invocation) = read_command(args, alloc) else {
-        return usage(args, alloc)
+/// starts. The command runs in a domain of its own, so that a trap of its implementation is an
+/// internal error.
+fn run(take args: mem::List[text::String], take current: text::String, home: Option[cache::HomeOverride], exec: task::Executor, alloc: mem::Alloc) -> Ran fails task::Cancelled uses wait {
+    let Some(invocation) = read_command(args.view(), alloc) else {
+        return usage(args.view(), alloc)
     }
-    var trace = Trace(root: None, scope: None, read: mem::List[text::String].empty(alloc))
-    let outcome = match attempt execute(invocation, current, home, trace: mut trace, alloc) {
-        Ok(done) => done
-        Err(_) => Outcome.Output(internal_error(invocation, args, trace, alloc))
+    let traced = mem::Shared.of(Trace.empty(alloc), alloc: alloc)
+    let given = traced.share()
+    let line = copied_lines(args.view(), alloc)
+    let user = cache::copied_override(home, alloc)
+    let attempted = try await sys::Domain.run_sized(fn[take given, take line, take current, take user]() -> Result[Outcome, platform::IoError] {
+        let Some(read) = read_command(line.view(), alloc) else {
+            expect false
+            return Err(platform::IoError.Other(0))
+        }
+        return attempt execute(read, current: current.as_str(), home: user, trace: given.contents(), alloc)
+    }, stack: COMMAND_STACK, exec, alloc)
+    let outcome = match attempted {
+        Ok(Ok(done)) => done
+        Ok(Err(_)) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: diagnostic::Code.InternalInvariant, alloc))
+        Err(trap) => Outcome.Output(internal_error(invocation, args: args.view(), trace: traced.contents(), code: trapped_code(trap.kind()), alloc))
     }
     return match outcome {
         Outcome.Output(written) => Ran(output: written.render(invocation.format, alloc), status: written.verdict.status(), launch: None)
@@ -587,12 +628,22 @@ fn run(args: Slice[text::String], current: Str, home: Option[cache::HomeOverride
     }
 } run
 
-/// The output of a command whose implementation failed, after writing its reproducer.
-fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trace, alloc: mem::Alloc) -> output::Output {
+/// The internal error a trap of a command's implementation is: one of a resource the command
+/// cannot obtain when it exhausted memory or its stack.
+fn trapped_code(kind: sys::TrapKind) -> diagnostic::Code {
+    return match kind {
+        sys::TrapKind.Exhausted or sys::TrapKind.StackOverflow => diagnostic::Code.InternalResourceExhausted
+        else => diagnostic::Code.InternalInvariant
+    }
+} trapped_code
+
+/// The output of a command whose implementation failed with the internal error `code`, after
+/// writing its reproducer.
+fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trace, code: diagnostic::Code, alloc: mem::Alloc) -> output::Output {
     var scope = text::String.of(".", alloc)
-    match trace.scope {
+    match latest(trace.scope, alloc) {
         Some(written) => {
-            scope = text::String.of(written.as_str(), alloc)
+            scope = written
         }
         None => {
             match invocation.scope() {
@@ -604,9 +655,9 @@ fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trac
         }
     }
     var lines = mem::List[text::String].empty(alloc)
-    match trace.root {
+    match latest(trace.root, alloc) {
         Some(root) => {
-            match attempt reproducer(root.as_str(), args, read: trace.read.view(), alloc) {
+            match attempt reproducer(root.as_str(), args, read: trace.read, alloc) {
                 Ok(path) => {
                     var line = text::String.of("reproducer ", alloc)
                     mut line.append(path.as_str())
@@ -620,13 +671,13 @@ fn internal_error(invocation: Invocation, args: Slice[text::String], trace: Trac
     var summary = mem::List[output::Count].empty(alloc)
     mut summary.push(output::Count(name: text::String.of("records", alloc), value: 1))
     var records = mem::List[output::Record].empty(alloc)
-    mut records.push(unlocated(diagnostic::Code.InternalInvariant, lines: take lines, alloc))
+    mut records.push(unlocated(code, lines: take lines, alloc))
     return output::Output(command: invocation.command(scope.as_str(), skip: true, alloc), elision: invocation.command(scope.as_str(), skip: false, alloc), verdict: output::Verdict.InternalError, summary: take summary, records: take records)
 } internal_error
 
 /// Writes `.nan/repro/<n>` for the least positive `n` naming no directory: the command line, the
 /// toolchain hashes and every workspace file the command read. Returns its path.
-fn reproducer(root: Str, args: Slice[text::String], read: Slice[text::String], alloc: mem::Alloc) -> text::String fails platform::IoError {
+fn reproducer(root: Str, args: Slice[text::String], read: mem::Arena[text::String], alloc: mem::Alloc) -> text::String fails platform::IoError {
     let repro = platform::join(root, name: ".nan/repro", alloc)
     try platform::create_dir_all(repro.as_str(), alloc)
     var number: u32 = 1
@@ -675,54 +726,54 @@ fn numbered(repro: Str, number: u32, alloc: mem::Alloc) -> text::String {
 
 /// Runs the command: `nan merge` and the workspace form of `nan diff` outside a workspace, every
 /// other command in the session of the workspace holding `current`, under the workspace lock.
-fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], mut trace: Trace, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], trace: Trace, alloc: mem::Alloc) -> Outcome fails platform::IoError {
     if invocation.name == Name.Merge {
-        return Outcome.Output(try merge_run(invocation, current, home, trace: mut trace, alloc))
+        return Outcome.Output(try merge_run(invocation, current, home, trace, alloc))
     }
     if invocation.name == Name.Diff and invocation.value("--path").is_none() and not invocation.flag("--green") {
-        return Outcome.Output(try diff_workspaces(invocation, current, home, trace: mut trace, alloc))
+        return Outcome.Output(try diff_workspaces(invocation, current, home, trace, alloc))
     }
     let root = workspace::root_of(current, alloc)
     if not try workspace::holds_package(root.as_str(), alloc) {
         return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolNoWorkspace, scope: ".", alloc))
     }
-    trace.root = Some(text::String.of(root.as_str(), alloc))
+    trace.rooted(root.as_str(), alloc)
     let lock = try journal::Lock.acquire(root.as_str(), exclusive: invocation.name.writes(), alloc)
     defer take lock.release()
     let grammar = syntax::Grammar.load(alloc)
-    let loaded = try workspace::Workspace.load(root.as_str(), read: mut trace.read, given: home, grammar, alloc)
+    let loaded = try workspace::Workspace.load(root.as_str(), read: trace.read, given: home, grammar, alloc)
     let std = workspace::Workspace.of_std(grammar, alloc)
     let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: mem::Shared.of(take std, alloc: alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(home, alloc), alloc)
     if invocation.name == Name.Upgrade and invocation.value("--language").is_some() {
-        return Outcome.Output(upgrade_language(invocation, session, current, trace: mut trace, alloc))
+        return Outcome.Output(upgrade_language(invocation, session, current, trace, alloc))
     }
     let written = match invocation.name {
-        Name.Build or Name.Run => return try build_run(invocation, session, current, trace: mut trace, alloc)
-        Name.Check or Name.Fix or Name.Fmt => try check_run(invocation, session, current, trace: mut trace, alloc)
-        Name.Test => try test_run(invocation, session, current, trace: mut trace, alloc)
-        Name.Holes => read_holes(invocation, session, current, trace: mut trace, alloc)
+        Name.Build or Name.Run => return try build_run(invocation, session, current, trace, alloc)
+        Name.Check or Name.Fix or Name.Fmt => try check_run(invocation, session, current, trace, alloc)
+        Name.Test => try test_run(invocation, session, current, trace, alloc)
+        Name.Holes => read_holes(invocation, session, current, trace, alloc)
         Name.Find => read_find(invocation, session, current, alloc)
-        Name.Show or Name.Read => read_show(invocation, session, current, trace: mut trace, alloc)
-        Name.Context => read_context(invocation, session, current, trace: mut trace, alloc)
-        Name.Explain => read_explain(invocation, session, current, trace: mut trace, alloc)
-        Name.Expand => read_expand(invocation, session, current, trace: mut trace, alloc)
-        Name.EditReplace => try edit_replace(invocation, session, current, trace: mut trace, alloc)
-        Name.EditRename => try edit_rename(invocation, session, current, trace: mut trace, alloc)
-        Name.EditMove => try edit_move_item(invocation, session, current, trace: mut trace, alloc)
+        Name.Show or Name.Read => read_show(invocation, session, current, trace, alloc)
+        Name.Context => read_context(invocation, session, current, trace, alloc)
+        Name.Explain => read_explain(invocation, session, current, trace, alloc)
+        Name.Expand => read_expand(invocation, session, current, trace, alloc)
+        Name.EditReplace => try edit_replace(invocation, session, current, trace, alloc)
+        Name.EditRename => try edit_rename(invocation, session, current, trace, alloc)
+        Name.EditMove => try edit_move_item(invocation, session, current, trace, alloc)
         Name.Primer => read_primer(invocation, alloc)
-        Name.ApiUpdate => try api_update(invocation, session, current, trace: mut trace, alloc)
-        Name.DepAdd => try dep_add(invocation, session, current, trace: mut trace, alloc)
-        Name.DepSync => try dep_sync(invocation, session, current, trace: mut trace, alloc)
-        Name.DepApprove => try dep_approve(invocation, session, current, trace: mut trace, alloc)
-        Name.Verify => try verify_run(invocation, session, current, trace: mut trace, alloc)
-        Name.Publish => try publish_run(invocation, session, current, trace: mut trace, alloc)
+        Name.ApiUpdate => try api_update(invocation, session, current, trace, alloc)
+        Name.DepAdd => try dep_add(invocation, session, current, trace, alloc)
+        Name.DepSync => try dep_sync(invocation, session, current, trace, alloc)
+        Name.DepApprove => try dep_approve(invocation, session, current, trace, alloc)
+        Name.Verify => try verify_run(invocation, session, current, trace, alloc)
+        Name.Publish => try publish_run(invocation, session, current, trace, alloc)
         Name.Merge => {
             expect false
             return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: ".", alloc))
         }
-        Name.Upgrade => try dep_upgrade(invocation, session, current, trace: mut trace, alloc)
-        Name.Diff => diff_run(invocation, session, current, trace: mut trace, alloc)
-        Name.Seal => try seal_run(invocation, session, current, trace: mut trace, alloc)
+        Name.Upgrade => try dep_upgrade(invocation, session, current, trace, alloc)
+        Name.Diff => diff_run(invocation, session, current, trace, alloc)
+        Name.Seal => try seal_run(invocation, session, current, trace, alloc)
     }
     return Outcome.Output(take written)
 } execute

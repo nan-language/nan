@@ -2,8 +2,9 @@
 //!
 //! A string is a vector of bytes; a fixed text is its length and its bytes inline. An interner
 //! is the address of its record, drawn through its allocator: its lock, its allocator handle,
-//! its count of texts, the address and capacity of its table of texts, and the address and size
-//! of its index. Each interned text is a copy drawn through the allocator, which never moves;
+//! its count of texts, the address and capacity of its table of texts, the address and size of
+//! its index, and its reach, the domain holding it, to which an insertion by a task of a domain
+//! nested in it passes the copy and the tables it draws. Each interned text is a copy drawn through the allocator, which never moves;
 //! the table holds each copy's address and length by symbol index, and each slot of the index,
 //! a power of two of them probed linearly from a text's hash, holds a symbol index plus one,
 //! zero when empty.
@@ -14,7 +15,7 @@ use super::super::Lowering;
 use super::super::body::Held;
 use super::super::data::const_arg;
 use super::super::fx::{Fx, PTR};
-use super::super::runtime::{Routine, report};
+use super::super::runtime::{Routine, report, tasks};
 use super::super::transfer;
 use super::Supply;
 use super::mem::lists;
@@ -29,7 +30,8 @@ mod interner {
     pub const CAPACITY: u64 = 32;
     pub const SLOTS: u64 = 40;
     pub const SLOT_COUNT: u64 = 48;
-    pub const SIZE: u64 = 56;
+    pub const REACH: u64 = 56;
+    pub const SIZE: u64 = 64;
 }
 
 /// The bytes of an entry of an interner's table: a copy's address and length.
@@ -79,6 +81,8 @@ pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, lift
         }
         "text::Interner" => {
             let record = fx.load(PTR, address, 0);
+            let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
+            fx.when(lifting, |fx| fx.store(lift, record, interner::REACH));
             transfer::lift(lo, fx, record, lift);
             let count = fx.load(PTR, record, interner::COUNT);
             let zero = fx.ptr(0);
@@ -87,17 +91,7 @@ pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, lift
                 let text = fx.load(PTR, entry, 0);
                 transfer::lift(lo, fx, text, lift);
             });
-            for (field, size) in [
-                (interner::TEXTS, interner::CAPACITY),
-                (interner::SLOTS, interner::SLOT_COUNT),
-            ] {
-                let held = fx.load(PTR, record, size);
-                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
-                fx.when(present, |fx| {
-                    let storage = fx.load(PTR, record, field);
-                    transfer::lift(lo, fx, storage, lift);
-                });
-            }
+            lift_tables(lo, fx, record, lift);
         }
         _ => return false,
     }
@@ -299,6 +293,8 @@ fn interner(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         let zero = fx.ptr(0);
         lo.call_routine(fx, Routine::Fill, &[record, zero, size]);
         fx.store(alloc, record, interner::ALLOC);
+        let reach = tasks::current_domain(lo, fx);
+        fx.store(reach, record, interner::REACH);
         let sret = supply.sret.expect("an interner's address");
         fx.store(record, sret, 0);
         supply.done(lo, fx);
@@ -344,6 +340,7 @@ fn interner(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             });
             let index = insert(lo, fx, supply, record, hash, start, len);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
+            lift_insertion(lo, fx, record, index);
             return_symbol(lo, fx, supply, index);
         }
         "resolve" => {
@@ -371,6 +368,35 @@ fn interner(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             supply.done(lo, fx);
         }
         member => panic!("no lowering of text::Interner.{member}"),
+    }
+}
+
+/// Passes what an insertion by a task of a domain nested in the interner's reach drew to that
+/// reach: the copy of the text at `index` and the interner's tables.
+fn lift_insertion(lo: &mut Lowering, fx: &mut Fx, record: Value, index: Value) {
+    let reach = fx.load(PTR, record, interner::REACH);
+    let domain = tasks::current_domain(lo, fx);
+    let nested = tasks::nested_in(fx, domain, reach);
+    fx.when(nested, |fx| {
+        let entry = text_entry(fx, record, index);
+        let text = fx.load(PTR, entry, 0);
+        transfer::lift(lo, fx, text, reach);
+        lift_tables(lo, fx, record, reach);
+    });
+}
+
+/// Passes the storage of an interner's text and slot tables to a domain.
+fn lift_tables(lo: &mut Lowering, fx: &mut Fx, record: Value, lift: Value) {
+    for (field, size) in [
+        (interner::TEXTS, interner::CAPACITY),
+        (interner::SLOTS, interner::SLOT_COUNT),
+    ] {
+        let held = fx.load(PTR, record, size);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, held, 0);
+        fx.when(present, |fx| {
+            let storage = fx.load(PTR, record, field);
+            transfer::lift(lo, fx, storage, lift);
+        });
     }
 }
 

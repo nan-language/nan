@@ -8,8 +8,15 @@
 //! which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record,
 //! found from the address of its first chunk through the chunk map: its cell handle, its domain,
 //! its live allocation count, the offset of its free bytes, its chunk count, its links in its
-//! domain's list and its address. A run passes to an enclosing domain when a value it holds
-//! leaves the domain owning it, and the runs a domain still owns are freed when it ends.
+//! domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A
+//! run passes to an enclosing domain when a value it holds leaves the domain owning it, and the
+//! runs a domain still owns are freed when it ends.
+//!
+//! A carved allocation starts at a granule and rounds up to a size class; the mark of its first
+//! granule names its class, with the freed bit once it is freed. A freed allocation joins its
+//! pool's free list of its class, through its first two words, and the pool's next allocation of
+//! that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned
+//! or passed to another domain, takes its freed allocations out of the lists first.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -59,17 +66,33 @@ pub mod chunk {
     pub const NEXT: u64 = 40;
     pub const PREVIOUS: u64 = 48;
     pub const BASE: u64 = 56;
-    pub const SIZE: u64 = 64;
+    pub const MARKS: u64 = 64;
+    pub const POOL: u64 = 72;
+    pub const SIZE: u64 = 80;
 }
 
-/// A domain's pool of the chunk it carves for one cell: the next pool, the cell handle and the
-/// chunk's record.
+/// A domain's pool of the chunk it carves for one cell: the next pool, the cell handle, the
+/// chunk's record, and the head of the free list of each size class.
 mod pool {
     pub const NEXT: u64 = 0;
     pub const CELL: u64 = 8;
     pub const CHUNK: u64 = 16;
-    pub const SIZE: u64 = 24;
+    pub const FREE: u64 = 24;
+    pub const SIZE: u64 = FREE + 8 * super::CLASSES;
 }
+
+/// The bytes of a granule, and how many a chunk holds.
+const GRANULE: u64 = 16;
+const GRANULES: u64 = CHUNK / GRANULE;
+
+/// The size classes: the multiples of a granule up to 128 bytes, then four per doubling up to a
+/// chunk.
+const CLASSES: u64 = 44;
+
+/// The mark of a granule an allocation aligned beyond a granule starts at, which no other
+/// allocation reuses, and the bit a mark holds while the allocation it names is freed.
+const UNSHARED: i64 = 0x7F;
+const FREED: i64 = 0x80;
 
 /// The byte routines of `mem_op`: the C library's on `x86_64-host`; on a machine target, which
 /// has no C library, the copy and fill compiler stubs and a comparison loop.
@@ -550,8 +573,63 @@ fn map_leaf(lo: &mut Lowering, fx: &mut Fx, base: Value) -> Value {
 /// devices reaching a DMA buffer of any type.
 const MIN_ALIGN: u64 = 16;
 
+/// The size class of a carved allocation of `size` bytes: its index and its bytes.
+fn class_of(fx: &mut Fx, size: Value) -> (Value, Value) {
+    let least = fx.ptr(GRANULE);
+    let size = fx.b.ins().umax(size, least);
+    let small =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, size, 128);
+    let class = fx.choose(
+        small,
+        &[PTR, PTR],
+        |fx| {
+            let bytes = fx.b.ins().iadd_imm_s(size, GRANULE as i64 - 1);
+            let bytes = fx.b.ins().band_imm_s(bytes, -(GRANULE as i64));
+            let index = fx.b.ins().ushr_imm_s(bytes, 4);
+            vec![fx.b.ins().iadd_imm_s(index, -1), bytes]
+        },
+        |fx| {
+            let below = fx.b.ins().iadd_imm_s(size, -1);
+            let zeros = fx.b.ins().clz(below);
+            let top = fx.ptr(63);
+            let exponent = fx.b.ins().isub(top, zeros);
+            let shift = fx.b.ins().iadd_imm_s(exponent, -2);
+            let one = fx.ptr(1);
+            let step = fx.b.ins().ishl(one, shift);
+            let mask = fx.b.ins().iadd_imm_s(step, -1);
+            let bytes = fx.b.ins().iadd(size, mask);
+            let inverse = fx.b.ins().bnot(mask);
+            let bytes = fx.b.ins().band(bytes, inverse);
+            let quarters = fx.b.ins().ushr(bytes, shift);
+            let doublings = fx.b.ins().iadd_imm_s(exponent, -7);
+            let doublings = fx.b.ins().ishl_imm_s(doublings, 2);
+            let index = fx.b.ins().iadd(doublings, quarters);
+            vec![fx.b.ins().iadd_imm_s(index, 3), bytes]
+        },
+    );
+    (class[0], class[1])
+}
+
+/// The address of the head of a pool's free list of a size class.
+fn free_head(fx: &mut Fx, pool: Value, index: Value) -> Value {
+    let offset = fx.b.ins().ishl_imm_s(index, 3);
+    let head = fx.b.ins().iadd(pool, offset);
+    fx.offset(head, pool::FREE)
+}
+
+/// The address of the mark of the granule an address lies in, in a chunk's marks.
+fn mark_at(fx: &mut Fx, record: Value, address: Value) -> Value {
+    let base = fx.load(PTR, record, chunk::BASE);
+    let offset = fx.b.ins().isub(address, base);
+    let granule = fx.b.ins().ushr_imm_s(offset, 4);
+    let marks = fx.load(PTR, record, chunk::MARKS);
+    fx.b.ins().iadd(marks, granule)
+}
+
 /// Carves a small allocation from the chunk a domain's pool for a cell holds, on a machine
-/// target at least `MIN_ALIGN`-aligned, drawing a new chunk when it lacks room.
+/// target at least `MIN_ALIGN`-aligned: a freed allocation of its size class when the pool holds
+/// one, otherwise fresh bytes, a new chunk drawn when the chunk lacks room.
 fn carve(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -561,7 +639,6 @@ fn carve(
     domain: Value,
 ) -> Value {
     let pool = domain_pool(lo, fx, domain, handle);
-    let current = fx.load(PTR, pool, pool::CHUNK);
     let align = match lo.machine() {
         true => {
             let least = fx.ptr(MIN_ALIGN);
@@ -569,6 +646,78 @@ fn carve(
         }
         false => align,
     };
+    let shared =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, align, GRANULE as i64);
+    let (index, bytes) = class_of(fx, size);
+    let head_at = free_head(fx, pool, index);
+    let head = fx.choose(
+        shared,
+        &[PTR],
+        |fx| vec![fx.load(PTR, head_at, 0)],
+        |fx| vec![fx.ptr(0)],
+    )[0];
+    let reused = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
+    fx.choose_in(
+        lo,
+        reused,
+        &[PTR],
+        |lo, fx| {
+            let next = fx.load(PTR, head, 0);
+            fx.store(next, head_at, 0);
+            let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+            fx.when(more, |fx| {
+                let zero = fx.ptr(0);
+                fx.store(zero, next, 8);
+            });
+            let base = fx.b.ins().band_imm_s(head, !(CHUNK as i64 - 1));
+            let leaf = map_leaf(lo, fx, base);
+            let record = fx.load(PTR, leaf, 0);
+            let live = fx.load(PTR, record, chunk::LIVE);
+            let live = fx.b.ins().iadd_imm_s(live, 1);
+            fx.store(live, record, chunk::LIVE);
+            let mark = mark_at(fx, record, head);
+            let named = fx.b.ins().iadd_imm_s(index, 1);
+            let named = fx.b.ins().ireduce(types::I8, named);
+            fx.store(named, mark, 0);
+            let zero = fx.ptr(0);
+            lo.call_routine(fx, Routine::Fill, &[head, zero, bytes]);
+            vec![head]
+        },
+        |lo, fx| {
+            let rounded = fx.b.ins().iadd_imm_s(size, GRANULE as i64 - 1);
+            let rounded = fx.b.ins().band_imm_s(rounded, -(GRANULE as i64));
+            let taken = fx.b.ins().select(shared, bytes, rounded);
+            let least = fx.ptr(GRANULE);
+            let aligned = fx.b.ins().umax(align, least);
+            let address = fresh(lo, fx, pool, handle, taken, aligned, domain);
+            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
+            fx.when(present, |fx| {
+                let record = fx.load(PTR, pool, pool::CHUNK);
+                let mark = mark_at(fx, record, address);
+                let named = fx.b.ins().iadd_imm_s(index, 1);
+                let unshared = fx.ptr(UNSHARED as u64);
+                let named = fx.b.ins().select(shared, named, unshared);
+                let named = fx.b.ins().ireduce(types::I8, named);
+                fx.store(named, mark, 0);
+            });
+            vec![address]
+        },
+    )[0]
+}
+
+/// Carves `size` fresh bytes aligned to `align` from the chunk a pool holds, drawing a new chunk
+/// with its marks when it lacks room; zero on exhaustion.
+fn fresh(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    pool: Value,
+    handle: Value,
+    size: Value,
+    align: Value,
+    domain: Value,
+) -> Value {
+    let current = fx.load(PTR, pool, pool::CHUNK);
     let start = |fx: &mut Fx, record: Value| {
         let used = fx.load(PTR, record, chunk::USED);
         let mask = fx.b.ins().iadd_imm_s(align, -1);
@@ -598,7 +747,17 @@ fn carve(
             let one = fx.ptr(1);
             let record = new_chunk(lo, fx, handle, one, domain);
             let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
-            fx.when(drawn, |fx| fx.store(record, pool, pool::CHUNK));
+            fx.when(drawn, |fx| {
+                let size = fx.ptr(GRANULES);
+                let marks = lo.record_alloc(fx, size);
+                let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, marks, 0);
+                fx.when(missing, |fx| {
+                    super::report::raise_kind(lo, fx, "trap.exhausted")
+                });
+                fx.store(marks, record, chunk::MARKS);
+                fx.store(pool, record, chunk::POOL);
+                fx.store(record, pool, pool::CHUNK);
+            });
             vec![record]
         },
     )[0];
@@ -662,8 +821,8 @@ fn domain_pool(lo: &mut Lowering, fx: &mut Fx, domain: Value, handle: Value) -> 
     )[0]
 }
 
-/// Frees an allocation: its chunk returns once none of its allocations is live. The caller
-/// holds the lock.
+/// Frees an allocation: its chunk returns once none of its allocations is live, and until then a
+/// carved allocation of a size class joins its pool's free list. The caller holds the lock.
 fn release(lo: &mut Lowering, fx: &mut Fx, address: Value) {
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
     fx.when(present, |fx| {
@@ -674,7 +833,42 @@ fn release(lo: &mut Lowering, fx: &mut Fx, address: Value) {
         let live = fx.b.ins().iadd_imm_s(live, -1);
         fx.store(live, record, chunk::LIVE);
         let empty = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 0);
-        fx.when(empty, |fx| return_chunk(lo, fx, record));
+        fx.choose_in(
+            lo,
+            empty,
+            &[],
+            |lo, fx| {
+                return_chunk(lo, fx, record);
+                Vec::new()
+            },
+            |_, fx| {
+                let pool = fx.load(PTR, record, chunk::POOL);
+                let pooled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, pool, 0);
+                fx.when(pooled, |fx| {
+                    let mark = mark_at(fx, record, address);
+                    let named = fx.load(types::I8, mark, 0);
+                    let named = fx.b.ins().uextend(PTR, named);
+                    let index = fx.b.ins().iadd_imm_s(named, -1);
+                    let classed =
+                        fx.b.ins()
+                            .icmp_imm_s(IntCC::UnsignedLessThan, index, CLASSES as i64);
+                    fx.when(classed, |fx| {
+                        let head_at = free_head(fx, pool, index);
+                        let head = fx.load(PTR, head_at, 0);
+                        fx.store(head, address, 0);
+                        let zero = fx.ptr(0);
+                        fx.store(zero, address, 8);
+                        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
+                        fx.when(more, |fx| fx.store(address, head, 8));
+                        fx.store(address, head_at, 0);
+                        let freed = fx.b.ins().bor_imm_s(named, FREED);
+                        let freed = fx.b.ins().ireduce(types::I8, freed);
+                        fx.store(freed, mark, 0);
+                    });
+                });
+                Vec::new()
+            },
+        );
     });
 }
 
@@ -691,6 +885,9 @@ pub fn return_chunk(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let leaf = map_leaf(lo, fx, base);
     let zero = fx.ptr(0);
     fx.store(zero, leaf, 0);
+    let marks = fx.load(PTR, record, chunk::MARKS);
+    let marked = fx.b.ins().icmp_imm_s(IntCC::NotEqual, marks, 0);
+    fx.when(marked, |fx| lo.record_free(fx, marks));
     let region = fx.load(PTR, cell, cell::SUPPLY);
     let platform = fx.b.ins().icmp_imm_s(IntCC::Equal, region, 0);
     fx.choose_in(
@@ -769,7 +966,8 @@ fn give_platform_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Valu
     );
 }
 
-/// Takes a run of chunks out of its domain's list and out of the pool carving it.
+/// Takes a run of chunks out of its domain's list and out of the pool carving it, with its freed
+/// allocations out of the pool's free lists.
 fn detach(fx: &mut Fx, record: Value) {
     let domain = fx.load(PTR, record, chunk::DOMAIN);
     let next = fx.load(PTR, record, chunk::NEXT);
@@ -789,27 +987,57 @@ fn detach(fx: &mut Fx, record: Value) {
     );
     let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
     fx.when(has_next, |fx| fx.store(previous, next, chunk::PREVIOUS));
-    let head = fx.load(PTR, domain, tasks::domain::POOLS);
-    fx.repeat(&[head], |fx, state| {
-        let pool = state[0];
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, pool, 0);
-        let next = fx.choose(
-            present,
-            &[PTR],
-            |fx| {
-                let held = fx.load(PTR, pool, pool::CHUNK);
-                let same = fx.b.ins().icmp(IntCC::Equal, held, record);
-                fx.when(same, |fx| {
-                    let zero = fx.ptr(0);
-                    fx.store(zero, pool, pool::CHUNK);
-                });
-                vec![fx.load(PTR, pool, pool::NEXT)]
-            },
-            |fx| vec![fx.ptr(0)],
-        );
-        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next[0], 0);
-        (more, next)
+    let pool = fx.load(PTR, record, chunk::POOL);
+    let pooled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, pool, 0);
+    fx.when(pooled, |fx| {
+        let held = fx.load(PTR, pool, pool::CHUNK);
+        let same = fx.b.ins().icmp(IntCC::Equal, held, record);
+        fx.when(same, |fx| {
+            let zero = fx.ptr(0);
+            fx.store(zero, pool, pool::CHUNK);
+        });
+        let marks = fx.load(PTR, record, chunk::MARKS);
+        let base = fx.load(PTR, record, chunk::BASE);
+        let zero = fx.ptr(0);
+        let granules = fx.ptr(GRANULES);
+        fx.each(zero, granules, |fx, granule| {
+            let mark = fx.b.ins().iadd(marks, granule);
+            let named = fx.load(types::I8, mark, 0);
+            let named = fx.b.ins().uextend(PTR, named);
+            let freed = fx.b.ins().band_imm_s(named, FREED);
+            let freed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, freed, 0);
+            fx.when(freed, |fx| {
+                let index = fx.b.ins().band_imm_s(named, FREED - 1);
+                let index = fx.b.ins().iadd_imm_s(index, -1);
+                let offset = fx.b.ins().ishl_imm_s(granule, 4);
+                let block = fx.b.ins().iadd(base, offset);
+                unlink(fx, pool, index, block);
+            });
+        });
+        fx.store(zero, record, chunk::POOL);
     });
+}
+
+/// Takes a freed allocation out of its pool's free list of a size class.
+fn unlink(fx: &mut Fx, pool: Value, index: Value, block: Value) {
+    let next = fx.load(PTR, block, 0);
+    let previous = fx.load(PTR, block, 8);
+    let first = fx.b.ins().icmp_imm_s(IntCC::Equal, previous, 0);
+    fx.choose(
+        first,
+        &[],
+        |fx| {
+            let head_at = free_head(fx, pool, index);
+            fx.store(next, head_at, 0);
+            Vec::new()
+        },
+        |fx| {
+            fx.store(next, previous, 0);
+            Vec::new()
+        },
+    );
+    let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+    fx.when(more, |fx| fx.store(previous, next, 8));
 }
 
 /// The record of the run of chunks an allocation lies at the start of, zero for an address no

@@ -1,6 +1,6 @@
-//! Domains: `sys::Domain.run`, which runs a body as the first task of a new domain, and the trap
-//! that abandons one. The body's captures pass to the domain; when the body returns or fails,
-//! its result or failure passes to the caller's domain with every holding the domain still
+//! Domains: `sys::Domain.run` and `run_sized`, which run a body as the first task of a new domain,
+//! and the trap that abandons one. The body's captures pass to the domain; when the body returns or
+//! fails, its result or failure passes to the caller's domain with every holding the domain still
 //! owns, and the domain's other chunks are freed.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
@@ -15,9 +15,13 @@ use super::super::Supply;
 use super::super::mem::lists::fn_param;
 use crate::check::ty::Ty;
 
+/// The largest stack the address space of an `x86_64` process holds.
+const MOST_STACK: i64 = 1 << 47;
+
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
-        "sys::Domain.run" => run(lo, fx, supply),
+        "sys::Domain.run" => run(lo, fx, supply, false),
+        "sys::Domain.run_sized" => run(lo, fx, supply, true),
         "sys::Trap.kind" => {
             let record = trap_record(fx, supply.param(0));
             let kind = fx.load(PTR, record, trap_record::KIND);
@@ -66,24 +70,43 @@ fn trap_kind_item(ty: &Ty) -> crate::check::db::ItemId {
 }
 
 /// `sys::Domain.run(body, exec, alloc)`: runs `body` as the first task of a new domain nested in
-/// the caller's and waits for it to end, or once a trap abandons it, for its settlement.
-fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+/// the caller's and waits for it to end, or once a trap abandons it, for its settlement; when
+/// `sized`, as `sys::Domain.run_sized(body, stack, exec, alloc)`, on a stack of `stack` usable
+/// bytes, trapping exhausted when no address space holds one.
+fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
     let result_ty = supply.type_arg(0);
     let fails = supply.type_arg(1);
     let body_ty = fn_param(supply, 0);
-    let (live, _) = super::executor(lo, fx, supply.param(1).address());
+    let given = usize::from(sized);
+    let (live, _) = super::executor(lo, fx, supply.param(1 + given).address());
     let stale = fx.b.ins().bxor_imm_s(live, 1);
     fx.when(stale, |fx| {
         let none = fx.ptr(0);
         super::fail_cancelled(lo, fx, supply, none);
     });
-    let cell = fx.load(PTR, supply.param(2).address(), 0);
+    let cell = fx.load(PTR, supply.param(2 + given).address(), 0);
     let caller_domain = tasks::current_domain(lo, fx);
+    let stack = sized.then(|| {
+        let stack = supply.param(1).scalar();
+        let huge =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThan, stack, MOST_STACK);
+        fx.when(huge, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+        stack
+    });
     let Nested {
         record,
         first,
         trap,
-    } = run_nested(lo, fx, &body_ty, supply.param(0).address(), cell, true);
+    } = run_nested(
+        lo,
+        fx,
+        &body_ty,
+        supply.param(0).address(),
+        cell,
+        stack,
+        true,
+    );
     let option = supply.abi.result.clone();
     let layout = lo.layout(&option);
     let slot = supply
@@ -141,15 +164,16 @@ pub struct Nested {
 }
 
 /// Runs the `task fn` value of a type held at `function` as the first task of a new domain
-/// nested in the running task's, its stack and trap record drawn through a cell, and waits
-/// until that task ends or a trap abandons the domain; the spawn is a scheduling point when
-/// `point` holds.
+/// nested in the running task's, its stack, of `stack` usable bytes or else of the size its type
+/// gives, and its trap record drawn through a cell, and waits until that task ends or a trap
+/// abandons the domain; the spawn is a scheduling point when `point` holds.
 pub fn run_nested(
     lo: &mut Lowering,
     fx: &mut Fx,
     body_ty: &crate::check::ty::FnTy,
     function: Value,
     cell: Value,
+    stack: Option<Value>,
     point: bool,
 ) -> Nested {
     let caller_domain = tasks::current_domain(lo, fx);
@@ -179,7 +203,7 @@ pub fn run_nested(
     lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record);
     let done = domain_done(lo);
     let first = super::scopes::start_task(
-        lo, fx, body_ty, function, cell, record, region, record, None, done,
+        lo, fx, body_ty, function, cell, record, region, record, stack, None, done,
     );
     match point {
         true => tasks::spawned(lo, fx, first),

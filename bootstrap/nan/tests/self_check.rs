@@ -30,6 +30,7 @@ datatest_stable::harness! {
     { test = std_package, root = "../../std", pattern = r"^[a-z_]+/package\.nan$" },
     { test = program, root = "tests/programs", pattern = r"^[a-z-]+/expected$" },
     { test = toolchain, root = "../../toolchain", pattern = r"^nan/package\.nan$" },
+    { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
 }
 
 /// The root file the toolchain is built with: the command line with the user directory and local
@@ -52,7 +53,7 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     let alloc = world.alloc
     let given = harness(world.environment, alloc)
     if given.nir.is_none() and given.lowered.is_none() {
-        return command::entry(take world, home: given.home)
+        return try await command::entry(take world, home: given.home)
     }
     let Ok(directory) = attempt platform::current_dir(alloc) else {
         return 101
@@ -62,8 +63,8 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     }
     let root = workspace::root_of(current.as_str(), alloc)
     let grammar = syntax::Grammar.load(alloc)
-    var read = mem::List[text::String].empty(alloc)
-    let Ok(loaded) = attempt workspace::Workspace.load(root.as_str(), read: mut read, given: given.home, grammar, alloc) else {
+    let read = mem::Arena[text::String].empty(alloc)
+    let Ok(loaded) = attempt workspace::Workspace.load(root.as_str(), read, given: given.home, grammar, alloc) else {
         return 101
     }
     let std = workspace::Workspace.of_std(grammar, alloc)
@@ -120,8 +121,11 @@ const RUN_LIMIT: Duration = Duration::from_secs(900);
 const SELF_LIMIT: Duration = Duration::from_secs(5_400);
 
 /// The address space, in KiB, a run of the NaN toolchain may take, and one over its own workspace.
-const RUN_SPACE: u64 = 12_000_000;
-const SELF_SPACE: u64 = 24_000_000;
+const RUN_SPACE: u64 = 6_000_000;
+const SELF_SPACE: u64 = 8_000_000;
+
+/// An address space, in KiB, in which the NaN toolchain starts but cannot check its workspace.
+const STARVED_SPACE: u64 = 800_000;
 
 /// The repository's root.
 fn repository() -> PathBuf {
@@ -796,6 +800,45 @@ fn toolchain(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let (output, status) = nan(&compared, &["build", "nan", "--compare-with", second_path])?;
     if status != Some(0) {
         return Err(format!("the stage comparison reports\n{output}").into());
+    }
+    fs::remove_dir_all(outside)?;
+    Ok(())
+}
+
+/// A trap of the NaN toolchain's own code is an internal error: checking its workspace in too
+/// little address space exhausts the memory of the domain the command runs in, which it reports
+/// as `internal.resource-exhausted` with a reproducer holding the command line and the files the
+/// command read, writing nothing to standard error.
+fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
+    let store = fresh_store("self-check-internal-error")?;
+    let starved = Toolchain {
+        space: STARVED_SPACE,
+        ..Toolchain::new(image()?)
+    };
+    let outside =
+        std::env::temp_dir().join(format!("nan-self-check-starved-{}", std::process::id()));
+    let dir = outside.join("toolchain");
+    copy_tree(&repository().join("toolchain"), &dir, false)?;
+    let home = front_home();
+    let given = Given {
+        home: &home,
+        store: &store,
+        asked: &[],
+    };
+    let (printed, code) = front(&starved, &dir, &given, &["check"])?;
+    let expected = "internal-error check .: records 1\ninternal internal.resource-exhausted - -\n    reproducer .nan/repro/1\ninternal-error check .: records 1\n";
+    if code != Some(3) || printed != expected.as_bytes() {
+        return Err(format!(
+            "the starved NaN toolchain exits with {code:?} and prints\n{}",
+            String::from_utf8_lossy(&printed)
+        )
+        .into());
+    }
+    let reproducer = dir.join(".nan/repro/1");
+    if fs::read_to_string(reproducer.join("command"))? != "check\n"
+        || !reproducer.join("nan/package.nan").is_file()
+    {
+        return Err("the reproducer lacks the command line or the files the command read".into());
     }
     fs::remove_dir_all(outside)?;
     Ok(())

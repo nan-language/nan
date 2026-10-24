@@ -1,6 +1,6 @@
 # 0038. The host entry task stack
 
-Status: accepted
+Status: accepted; the stack of a sized domain run's first task superseded by 0048
 
 ## Context
 

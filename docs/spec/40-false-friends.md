@@ -17,7 +17,7 @@ A **false friend** is a NaN form spelt like a form of C, Rust, Go, Python or Typ
 | `throw`, `raise`, error codes | `fail e`, where `e` converts to the type of the head's `fails` clause (`error.unconvertible`) | [Fail](11-errors-domains.md#fail) |
 | `try { ... } catch`, `except` | `try f(x)` passes a call's failure to the caller, `attempt f(x)` yields a `Result`, and a call that may fail with neither is `error.unhandled` | [Unhandled failures](11-errors-domains.md#unhandled-failures) |
 | `finally`, destructors, `with` | `defer` registers a call for the exit of its block; end of scope runs no user code | [Defer](17-suspension-io.md#defer), [Ownership](07-ownership.md#ownership) |
-| Catching a panic, `recover` | A trap abandons the innermost domain unobserved; only `sys::Domain.run` turns it into a value, in the caller's domain | [Traps](11-errors-domains.md#traps) |
+| Catching a panic, `recover` | A trap abandons the innermost domain unobserved; only a [domain run](11-errors-domains.md#domains) turns it into a value, in the caller's domain | [Traps](11-errors-domains.md#traps) |
 | `assert` | `expect P`, checked at run time unless proven; `const assert` is a check-time item | [Expect](18-contracts.md#expect), [Constants](02-items.md#constants) |
 | Macros, `#define`, `println!` | No macros exist; `x!(...)` is `syntax.foreign` | [Idiom table](34-diagnostics.md#idiom-table) |
 | Wrapping or unbounded integers | `+`, `-` and `*` trap on overflow in every build; `wrapping_` and its peers name the alternatives | [Overflow](09-numbers.md#overflow) |

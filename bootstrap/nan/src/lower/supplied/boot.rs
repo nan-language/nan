@@ -256,7 +256,7 @@ fn anchor(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let root = fx.load(PTR, state_address, state::ROOT);
     let done = first_task_done(lo);
     let first = scopes::start_task(
-        lo, fx, &run_ty, function, cell, process, root, process, None, done,
+        lo, fx, &run_ty, function, cell, process, root, process, None, None, done,
     );
     fx.store(exec, first, task::ARGUMENT);
     fx.store(first, state_address, state::ENTRY_TASK);

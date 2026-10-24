@@ -887,6 +887,7 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         task_region,
         node,
         None,
+        None,
         done,
     );
     fx.store(outbox, started, task::ARGUMENT);

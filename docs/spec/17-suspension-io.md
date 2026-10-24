@@ -40,6 +40,7 @@ test sleeps_in_nested_frames for pause_twice {
 The **entry** of a task is the code it starts with: the [task closure](16-concurrency.md#task-closures) or named function whose `task fn` value starts it, the body of a [test](22-testing.md#test-items) for the task of that test, or, on `x86_64-host`, the [entry function](27-program-model.md#entry) for the first task of a program.
 
 - When the entry's own head states `limits stack N`, the task's stack holds at least N bytes, and every final build lowering the entry checks that its stack use is at most N ([stack limits](10-effects-digests.md#stack-limits)).
+- The stack of the first task of a domain that `sys::Domain.run_sized` runs holds at least the `stack` bytes the call gives ([domain run](11-errors-domains.md#domain-run)).
 - Otherwise, on `x86_64-host`, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
 - On `x86_64-host`, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
 
@@ -207,7 +208,7 @@ pub fn fill_succeeded(take block: Block) -> bool {
 
 ## Acknowledged cancellation
 
-A call **is cancelled** when it lies in the region of a cancelling construct that has cancelled ([origin and absorption](11-errors-domains.md#origin-and-absorption)). The **exempt primitives** are `task::scope`, `task::Join.join`, `task::within`, `task::race`, `task::Receiver.drain`, `task::Sender.send` of a linear T, `sys::Domain.run` and `host::Runner.run`, whose own sections state how cancellation reaches them. A **cancellation point** is a call of a waiting primitive other than an exempt primitive; `await when` is never one ([await when](16-concurrency.md#await-when)). **Acknowledged cancellation** is the behaviour of cancellation points:
+A call **is cancelled** when it lies in the region of a cancelling construct that has cancelled ([origin and absorption](11-errors-domains.md#origin-and-absorption)). The **exempt primitives** are `task::scope`, `task::Join.join`, `task::within`, `task::race`, `task::Receiver.drain`, `task::Sender.send` of a linear T, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run`, whose own sections state how cancellation reaches them. A **cancellation point** is a call of a waiting primitive other than an exempt primitive; `await when` is never one ([await when](16-concurrency.md#await-when)). **Acknowledged cancellation** is the behaviour of cancellation points:
 
 1. A cancellation point whose call is cancelled when it starts begins no operation and fails at once with the cancellation of its failure type. A std completion operation instead returns at once, with that cancellation as `Err` in `outcome` and the buffer it took in `buf`.
 2. When the call of a cancellation point becomes cancelled after it has started, the runtime asks the kernel or device to cancel each of its operations in flight, and resumes the task only after each **acknowledgement**, by which the kernel or device guarantees that the operation no longer accesses its buffers and reports whether it completed first. What the call waits for without the kernel or a device, such as a channel value or a signal post, is acknowledged as soon as the call is cancelled.

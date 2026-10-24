@@ -306,6 +306,7 @@ Each term links to its home, whose definition governs.
 | [DMA buffer](23-low-level.md#dma) | `hw::Dma[T]` or `hw::DmaShared[T]`. |
 | [doc comment](32-docs.md#doc-comments) | `///` comment. |
 | [domain](11-errors-domains.md#domains) | Unit a trap abandons. |
+| [domain run](11-errors-domains.md#domains) | Call of `sys::Domain.run` or `run_sized`, running a body in a new domain. |
 | [droppable](05-properties.md#linear-types) | Of a type that is not linear. |
 | [Dyn-usable](08-generics-interfaces.md#dynamic-dispatch) | Usable through `Dyn[I]`. |
 | [elaboration](19-nir.md#elaboration) | Translating checked source into NIR. |

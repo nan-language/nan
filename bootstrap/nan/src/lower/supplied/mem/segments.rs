@@ -1,14 +1,16 @@
 //! Storage whose elements never move, for the stores that give parts through a read receiver:
 //! segment k holds 4 × 2^k elements and is drawn through the allocator when first needed. Its
 //! header, in runtime memory, is its length, its allocator handle, each segment's address, the
-//! lock its insertions hold, and for a once map its seed and its hash index's table record;
-//! reads by position take no lock, an element being written before the length grows past it.
+//! lock its insertions hold, for a once map its seed and its hash index's table record, and its
+//! reach, the domain holding the store, to which an insertion by a task of a domain nested in it
+//! passes what it stores; reads by position take no lock, an element being written before the
+//! length grows past it.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::super::Lowering;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::runtime::Routine;
+use super::super::super::runtime::{Routine, tasks};
 use super::super::super::transfer;
 use super::vector::Element;
 use crate::check::ty::Ty;
@@ -20,9 +22,10 @@ const COUNT: u64 = 58;
 pub const LOCK: u64 = SEGMENTS + 8 * COUNT;
 pub const SEED: u64 = LOCK + 8;
 pub const INDEX: u64 = SEED + 8;
-const SIZE: u64 = INDEX + 16;
+const REACH: u64 = INDEX + 16;
+const SIZE: u64 = REACH + 8;
 
-/// A new empty header drawing through an allocator handle.
+/// A new empty header drawing through an allocator handle, its reach the running task's domain.
 pub fn header(lo: &mut Lowering, fx: &mut Fx, alloc: Value) -> Value {
     let size = fx.ptr(SIZE);
     let header = lo.record_alloc(fx, size);
@@ -31,7 +34,39 @@ pub fn header(lo: &mut Lowering, fx: &mut Fx, alloc: Value) -> Value {
         super::super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted");
     });
     fx.store(alloc, header, ALLOC);
+    let reach = tasks::current_domain(lo, fx);
+    fx.store(reach, header, REACH);
     header
+}
+
+/// The reach of the storage when the running task's domain is nested in it, which then holds
+/// what the task stores; zero otherwise.
+pub fn outer_reach(lo: &mut Lowering, fx: &mut Fx, header: Value) -> Value {
+    let reach = fx.load(PTR, header, REACH);
+    let domain = tasks::current_domain(lo, fx);
+    let nested = tasks::nested_in(fx, domain, reach);
+    let zero = fx.ptr(0);
+    fx.b.ins().select(nested, reach, zero)
+}
+
+/// Passes element `index` to `reach`, unless it is zero: the chunks of its segment and of what
+/// it holds, and its holdings.
+pub fn lift_element(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    header: Value,
+    element: &Ty,
+    index: Value,
+    reach: Value,
+) {
+    let shape = Element::of(lo, element);
+    let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, reach, 0);
+    fx.when(lifting, |fx| {
+        let address = at(fx, header, index, shape);
+        transfer::lift(lo, fx, address, reach);
+        let owner = transfer::raised(fx, reach);
+        lo.transfer(fx, element, address, reach, owner);
+    });
 }
 
 /// The segment holding element `index`.
@@ -109,7 +144,8 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, header: Value, element: &Ty) {
     lo.record_free(fx, header);
 }
 
-/// Moves every element and the segments into another domain's reach.
+/// Moves every element and the segments into another domain's reach, which becomes the
+/// storage's.
 pub fn transfer(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -118,6 +154,8 @@ pub fn transfer(
     lift: Value,
     owner: Value,
 ) {
+    let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
+    fx.when(lifting, |fx| fx.store(lift, header, REACH));
     let shape = Element::of(lo, element);
     if lo.transfers(element) {
         let len = fx.load(PTR, header, LEN);

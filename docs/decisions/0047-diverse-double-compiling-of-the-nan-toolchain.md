@@ -1,6 +1,6 @@
 # 0047. Diverse double-compiling of the NaN toolchain
 
-Status: accepted
+Status: accepted; its memory figure superseded by 0049
 
 ## Context
 

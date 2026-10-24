@@ -1,6 +1,6 @@
 # Errors, traps and domains
 
-This chapter defines failures and the `fails` clause, `fail`, `try` and `attempt`; error enums and their from variants; failure conversion and from resolution; unhandled failures; the typing of cancellation with its origin and absorption; traps, their kinds, the abandoning of a domain and trap reports; the four domains with `sys::Domain.run`, settlement and domain memory; and poisoning.
+This chapter defines failures and the `fails` clause, `fail`, `try` and `attempt`; error enums and their from variants; failure conversion and from resolution; unhandled failures; the typing of cancellation with its origin and absorption; traps, their kinds, the abandoning of a domain and trap reports; the four domains with the domain runs, settlement and domain memory; and poisoning.
 
 ## Failures
 
@@ -309,7 +309,7 @@ pub fn store(totals: task::Cown[Totals], count: u64) fails StoreError uses wait 
 
 ## Traps
 
-A **trap** is the abandonment of the innermost domain holding the task or kernel context that executes an operation whose rule says it traps. No code of the abandoned domain observes the trap; only `sys::Domain.run` turns one into a value, in the caller's domain.
+A **trap** is the abandonment of the innermost domain holding the task or kernel context that executes an operation whose rule says it traps. No code of the abandoned domain observes the trap; only a [domain run](#domains) turns one into a value, in the caller's domain.
 
 The **trap kinds** are exactly these, forming the `trap` family:
 
@@ -406,12 +406,12 @@ trap.division-by-zero at tally/tally.nan:4 in tally::share
 
 ## Domains
 
-A **domain** is a unit that a trap abandons; a kernel domain also ends at every other [kernel halt](24-kernel.md#kernel-halts). Domains nest: every task belongs to the domain in which it was spawned, and the body of `sys::Domain.run` starts a new domain nested in the caller's. **Settlement** prepares an abandoned domain for freeing by cancelling its operations in flight and waiting for every acknowledgement ([settlement](#settlement)).
+A **domain** is a unit that a trap abandons; a kernel domain also ends at every other [kernel halt](24-kernel.md#kernel-halts). Domains nest: every task belongs to the domain in which it was spawned, and the body of a **domain run**, a call of `sys::Domain.run` or `sys::Domain.run_sized`, starts a new domain nested in the caller's. **Settlement** prepares an abandoned domain for freeing by cancelling its operations in flight and waiting for every acknowledgement ([settlement](#settlement)).
 
 | Domain | Holds | Abandoning ends it by |
 | --- | --- | --- |
 | process | the tasks of an `x86_64-host` program outside other domains | writing the trap report to standard error and exiting with status 70 ([host runs](27-program-model.md#host-runs)) |
-| `sys::Domain` body | the body passed to `sys::Domain.run` and its tasks | settlement, then freeing; `run` returns `Err` |
+| `sys::Domain` body | the body passed to a domain run and its tasks | settlement, then freeing; the domain run returns `Err` |
 | test | one run of a test on `x86_64-host` ([test runs](22-testing.md#test-runs)) | settlement, then freeing; the run fails with the trap report, or with `test.timeout` and no report when it timed out |
 | kernel | every context of an `x86_64-uefi` or `x86_64-bare` image, or of the boot of a test image ([emulator runs](22-testing.md#emulator-runs)) | a [kernel halt](24-kernel.md#kernel-halts) |
 
@@ -426,6 +426,8 @@ pub open struct Domain {
 } Domain
 
 pub fn Domain.run[T: Send, E: Send](take body: task fn() -> T fails E uses wait, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
+
+pub fn Domain.run_sized[T: Send, E: Send](take body: task fn() -> T fails E uses wait, stack: usize, exec: task::Executor, alloc: mem::Alloc) -> Result[T, Trap] fails E uses wait
 
 pub open struct Trap derives Send {
 } Trap
@@ -463,7 +465,9 @@ pub closed enum TrapKind derives Copy, Eq, Render {
 - The tasks of D lie in the region of every cancelling construct whose region holds the call of `run` ([origin and absorption](#origin-and-absorption)).
 - `sys::Domain` has no values that code obtains; it names the operation.
 
-A use of `sys::Domain.run` in code checked for `x86_64-uefi` or `x86_64-bare`, or within the reach of a final build for one of them ([environments](27-program-model.md#environments)), is an error (`domain.unavailable`).
+`sys::Domain.run_sized(body, stack, exec, alloc)` behaves as `run(body, exec, alloc)`, except that the first task's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a body whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run in a domain.
+
+A use of `sys::Domain.run` or `sys::Domain.run_sized` in code checked for `x86_64-uefi` or `x86_64-bare`, or within the reach of a final build for one of them ([environments](27-program-model.md#environments)), is an error (`domain.unavailable`).
 
 ```nan
 pub closed enum JobError derives Render {

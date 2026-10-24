@@ -1,8 +1,12 @@
-//! Domains: `sys::Domain.run`, which runs a body as the first task of a new domain, and the trap that abandons one. The body's captures pass to the domain; when the body returns or fails, its result or failure passes to the caller's domain with every holding the domain still owns, and the domain's other chunks are freed.
+//! Domains: `sys::Domain.run` and `run_sized`, which run a body as the first task of a new domain, and the trap that abandons one. The body's captures pass to the domain; when the body returns or fails, its result or failure passes to the caller's domain with every holding the domain still owns, and the domain's other chunks are freed.
+
+/// The largest stack the address space of an `x86_64` process holds.
+const MOST_STACK: i64 = 1 << 47
 
 fn domains_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.path.as_str() {
-        "sys::Domain.run" => domains_run(mut lo, mut fx, supply)
+        "sys::Domain.run" => domains_run(mut lo, mut fx, supply, sized: false)
+        "sys::Domain.run_sized" => domains_run(mut lo, mut fx, supply, sized: true)
         "sys::Trap.kind" => {
             let record = trap_record(mut fx, trap: supply.param(0))
             let kind = mut fx.load(PTR, addr: record, offset: TRAP_RECORD_KIND)
@@ -56,20 +60,35 @@ fn trap_kind_item(lo: Lowering, ty: ty::Ty) -> ty::ItemId {
 } trap_kind_item
 
 /// `sys::Domain.run(body, exec, alloc)`: runs `body` as the first task of a new domain nested in
-/// the caller's and waits for it to end, or once a trap abandons it, for its settlement.
-fn domains_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+/// the caller's and waits for it to end, or once a trap abandons it, for its settlement; when
+/// `sized`, as `sys::Domain.run_sized(body, stack, exec, alloc)`, on a stack of `stack` usable
+/// bytes, trapping exhausted when no address space holds one.
+fn domains_run(mut lo: Lowering, mut fx: Fx, supply: Supply, sized: bool) {
     let result_ty = supply.type_arg(lo, index: 0)
     let failure_ty = supply.type_arg(lo, index: 1)
     let body_ty = fn_param(lo, supply, index: 0)
-    let executor = tasks_executor(mut lo, mut fx, address: supply.param(1).address_value())
+    var given: usize = 0
+    if sized {
+        given = 1
+    }
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(1 + given).address_value())
     let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
     mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
         let none = mut fx1.ptr(0)
         tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
     })
-    let cell = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let cell = mut fx.load(PTR, addr: supply.param(2 + given).address_value(), offset: 0)
     let caller_domain = current_domain(mut lo, mut fx)
-    let nested = run_nested(mut lo, mut fx, body_ty, function: supply.param(0).address_value(), cell, point: true)
+    var stack: Option[clif::Value] = None
+    if sized {
+        let size = supply.param(1).scalar_value()
+        let huge = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: size, y: MOST_STACK)
+        mut fx.if_true(huge, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+        })
+        stack = Some(size)
+    }
+    let nested = run_nested(mut lo, mut fx, body_ty, function: supply.param(0).address_value(), cell, stack, point: true)
     let record = nested.record
     let first_task = nested.first_task
     let trap = nested.trap
@@ -129,10 +148,10 @@ struct Nested derives Copy {
 } Nested
 
 /// Runs the `task fn` value of a type held at `function` as the first task of a new domain
-/// nested in the running task's, its stack and trap record drawn through a cell, and waits
-/// until that task ends or a trap abandons the domain; the spawn is a scheduling point when
-/// `point` holds.
-fn run_nested(mut lo: Lowering, mut fx: Fx, body_ty: ty::FnTy, function: clif::Value, cell: clif::Value, point: bool) -> Nested {
+/// nested in the running task's, its stack, of `stack` usable bytes or else of the size its type
+/// gives, and its trap record drawn through a cell, and waits until that task ends or a trap
+/// abandons the domain; the spawn is a scheduling point when `point` holds.
+fn run_nested(mut lo: Lowering, mut fx: Fx, body_ty: ty::FnTy, function: clif::Value, cell: clif::Value, stack: Option[clif::Value], point: bool) -> Nested {
     let caller_domain = current_domain(mut lo, mut fx)
     let size = mut fx.ptr(TRAP_RECORD_BYTES + REPORT_REPORT)
     let align = mut fx.ptr(8)
@@ -167,7 +186,7 @@ fn run_nested(mut lo: Lowering, mut fx: Fx, body_ty: ty::FnTy, function: clif::V
     let function_ty = lo.ck.types().intern(ty::TyKind.Fn(lo.ck.types().fn_ty(take copied)))
     mut lo.transfer(mut fx, ty: function_ty, address: function, lift: none, owner: record)
     let done = domain_done(mut lo)
-    let first_task = start_task(mut lo, mut fx, fn_ty: body_ty, function, cell, domain: record, region_record: region, owner: record, end: None, done)
+    let first_task = start_task(mut lo, mut fx, fn_ty: body_ty, function, cell, domain: record, region_record: region, owner: record, stack, end: None, done)
     if point {
         spawned(mut lo, mut fx, record: first_task)
     } else {

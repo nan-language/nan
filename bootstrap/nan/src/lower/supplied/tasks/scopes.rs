@@ -382,8 +382,9 @@ fn storage(lo: &mut Lowering, fn_ty: &FnTy) -> (u64, u64) {
 }
 
 /// Starts a task running a `task fn` value of a type held at an address, in a region, owned by
-/// a construct or domain record, its stack drawn through a cell for a domain: its record,
-/// ready. It traps when the stack cannot be drawn.
+/// a construct or domain record, its stack drawn through a cell for a domain, of `stack` usable
+/// bytes or else of the size its type gives: its record, ready. It traps when the stack cannot be
+/// drawn.
 #[allow(clippy::too_many_arguments)]
 pub fn start_task(
     lo: &mut Lowering,
@@ -394,6 +395,7 @@ pub fn start_task(
     domain: Value,
     region_record: Value,
     owner: Value,
+    stack: Option<Value>,
     end: Option<FuncId>,
     done: FuncId,
 ) -> Value {
@@ -404,7 +406,7 @@ pub fn start_task(
     let code = fx.load(PTR, function, 0);
     let env = fx.load(PTR, function, 8);
     let extra = fx.ptr(extra);
-    let stack = fx.ptr(super::stack_size(fn_ty));
+    let stack = stack.unwrap_or_else(|| fx.ptr(super::stack_size(fn_ty)));
     let record = lo.call_routine(
         fx,
         Routine::Spawn,
@@ -517,6 +519,7 @@ fn spawn_child(
         domain,
         scope_record,
         scope_record,
+        None,
         Some(end),
         done,
     );
@@ -861,6 +864,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             domain,
             record,
             record,
+            None,
             Some(end),
             done,
         );

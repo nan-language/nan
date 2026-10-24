@@ -1708,7 +1708,7 @@ impl Body<'_, '_> {
                     "hw::Anchor.with" if !self.ck.is_entry_context(self.item) => {
                         self.report(token, Code::KernelAnchorOutsideEntry);
                     }
-                    "sys::Domain.run"
+                    "sys::Domain.run" | "sys::Domain.run_sized"
                         if matches!(self.ck.db.target, Target::Uefi | Target::Bare) =>
                     {
                         self.report(token, Code::DomainUnavailable);

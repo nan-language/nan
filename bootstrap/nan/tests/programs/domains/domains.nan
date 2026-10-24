@@ -146,6 +146,23 @@ fn wide(world: host::World) fails task::Cancelled uses wait {
     }
 } wide
 
+fn nested(level: u64) -> u64 {
+    if level == 0 {
+        return 0
+    }
+    return nested(level - 1) + 1
+} nested
+
+fn sized(world: host::World) fails task::Cancelled uses wait {
+    let outcome = try await sys::Domain.run_sized(fn() -> u64 {
+        return nested(100_000)
+    }, stack: 33_554_432, exec: world.exec, alloc: world.alloc)
+    match outcome {
+        Ok(value) => world.log.info("nested", value: value)
+        Err(trap) => world.log.info("nested kind", value: trap.kind())
+    }
+} sized
+
 fn revoked(world: host::World) fails task::Cancelled uses wait {
     let exec = world.exec
     let clock = world.clock
@@ -186,6 +203,41 @@ fn stores(world: host::World) fails task::Cancelled uses wait {
     world.log.info("names", value: names.len())
 } stores
 
+/// Stores with interior mutability that a domain body fills for its caller.
+struct Kept {
+    texts: mem::Arena[text::String]
+    named: mem::OnceMap[u32, text::String]
+    words: text::Interner
+} Kept
+
+fn kept(world: host::World) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let shared = mem::Shared.of(Kept(texts: mem::Arena[text::String].empty(alloc), named: mem::OnceMap[u32, text::String].empty(seed: 3, alloc: alloc), words: text::Interner.empty(alloc)), alloc: alloc)
+    let given = shared.share()
+    let outcome = try await sys::Domain.run(fn[take given]() -> u32 {
+        let held = given.contents()
+        for index in 0..<300u32 {
+            var made = text::String.empty(alloc)
+            mut made.write(text::fmt("text {index}", index), budget: 100)
+            discard held.words.intern(made.as_str())
+            discard held.named.insert(index, value: text::String.of(made.as_str(), alloc))
+            discard held.texts.push(take made)
+        }
+        return share(1, items: 0)
+    }, exec: world.exec, alloc: alloc)
+    let held = shared.contents()
+    var total: usize = 0
+    for written in held.texts {
+        total += written.byte_len()
+    }
+    let named = match held.named.get(299) {
+        Some(found) => found.byte_len()
+        None => 0
+    }
+    world.log.info("kept trapped", value: outcome.is_err())
+    world.log.info("kept bytes", value: total + named + held.words.len())
+} kept
+
 fn main(take world: host::World) fails task::Cancelled uses wait {
     try await contain(2, world: world)
     try await contain(0, world: world)
@@ -193,6 +245,8 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
     try await poisons(world)
     try await overflows(world)
     try await wide(world)
+    try await sized(world)
+    try await kept(world)
     try await revoked(world)
     try await stores(world)
     try await world.clock.sleep(500)

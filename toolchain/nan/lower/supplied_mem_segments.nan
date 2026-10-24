@@ -1,4 +1,4 @@
-//! Storage whose elements never move, for the stores that give parts through a read receiver: segment k holds 4 × 2^k elements and is drawn through the allocator when first needed. Its header, in runtime memory, is its length, its allocator handle, each segment's address, the lock its insertions hold, and for a once map its seed and its hash index's table record; reads by position take no lock, an element being written before the length grows past it.
+//! Storage whose elements never move, for the stores that give parts through a read receiver: segment k holds 4 × 2^k elements and is drawn through the allocator when first needed. Its header, in runtime memory, is its length, its allocator handle, each segment's address, the lock its insertions hold, for a once map its seed and its hash index's table record, and its reach, the domain holding the store, to which an insertion by a task of a domain nested in it passes what it stores; reads by position take no lock, an element being written before the length grows past it.
 
 const SEGMENTS_LEN: u64 = 0
 
@@ -14,9 +14,11 @@ const SEGMENTS_SEED: u64 = SEGMENTS_LOCK + 8
 
 const SEGMENTS_INDEX: u64 = SEGMENTS_SEED + 8
 
-const SEGMENTS_SIZE: u64 = SEGMENTS_INDEX + 16
+const SEGMENTS_REACH: u64 = SEGMENTS_INDEX + 16
 
-/// A new empty header drawing through an allocator handle.
+const SEGMENTS_SIZE: u64 = SEGMENTS_REACH + 8
+
+/// A new empty header drawing through an allocator handle, its reach the running task's domain.
 fn segments_header(mut lo: Lowering, mut fx: Fx, alloc: clif::Value) -> clif::Value {
     let size = mut fx.ptr(SEGMENTS_SIZE)
     let header = mut lo.record_alloc(mut fx, size)
@@ -25,8 +27,33 @@ fn segments_header(mut lo: Lowering, mut fx: Fx, alloc: clif::Value) -> clif::Va
         raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
     })
     mut fx.store(alloc, addr: header, offset: SEGMENTS_ALLOC)
+    let reach = current_domain(mut lo, mut fx)
+    mut fx.store(reach, addr: header, offset: SEGMENTS_REACH)
     return header
 } segments_header
+
+/// The reach of the storage when the running task's domain is nested in it, which then holds
+/// what the task stores; zero otherwise.
+fn outer_reach(mut lo: Lowering, mut fx: Fx, header: clif::Value) -> clif::Value {
+    let reach = mut fx.load(PTR, addr: header, offset: SEGMENTS_REACH)
+    let domain = current_domain(mut lo, mut fx)
+    let nested = nested_in(mut fx, inner: domain, outer: reach)
+    let zero = mut fx.ptr(0)
+    return mut fx.b.select(nested, x: reach, y: zero)
+} outer_reach
+
+/// Passes element `index` to `reach`, unless it is zero: the chunks of its segment and of what
+/// it holds, and its holdings.
+fn lift_element(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: ty::Ty, index: clif::Value, reach: clif::Value) {
+    let shape = Element.of(mut lo, ty: element)
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: reach, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        let address = segments_at(mut fx1, header, index, element: shape)
+        discard transfer_lift(mut lo, fx: mut fx1, address, lift: reach)
+        let owner = transfer_raised(mut fx1, reach)
+        mut lo.transfer(mut fx1, ty: element, address, lift: reach, owner)
+    })
+} lift_element
 
 /// The segment holding element `index`.
 fn segment_of(mut fx: Fx, index: clif::Value) -> clif::Value {
@@ -109,8 +136,13 @@ fn segments_release(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: 
     mut lo.record_free(mut fx, address: header)
 } segments_release
 
-/// Moves every element and the segments into another domain's reach.
+/// Moves every element and the segments into another domain's reach, which becomes the
+/// storage's.
 fn segments_transfer(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: ty::Ty, lift: clif::Value, owner: clif::Value) {
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    mut fx.if_true(lifting, then: fn(mut fx1: Fx) {
+        mut fx1.store(lift, addr: header, offset: SEGMENTS_REACH)
+    })
     let shape = Element.of(mut lo, ty: element)
     if mut lo.transfers(element) {
         let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)

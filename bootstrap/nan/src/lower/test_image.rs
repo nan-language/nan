@@ -490,7 +490,7 @@ fn entry_glue(lo: &mut Lowering, tests: &Tests) -> FuncId {
         let alloc = lo.layouts.field(lo.ck, &world_ty, None, "alloc").offset;
         let cell = fx.load(PTR, world, alloc);
         let domains::Nested { record, trap, .. } =
-            domains::run_nested(lo, fx, &run_type(), function, cell, false);
+            domains::run_nested(lo, fx, &run_type(), function, cell, None, false);
         let target = fx.load(PTR, slot, 0);
         let id = lo.ran_data();
         let global = lo.data_ref(fx, id);

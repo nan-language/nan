@@ -2,8 +2,9 @@
 
 /// The offsets of an interner's record, which the interner is the address of, drawn through its
 /// allocator: its lock, its allocator handle, its count of texts, the address and capacity of
-/// its table of texts, and the address and size of its index; then the record's size. Each
-/// interned text is a copy drawn through the allocator, which never moves; the table holds each
+/// its table of texts, the address and size of its index, and its reach, the domain holding it,
+/// to which an insertion by a task of a domain nested in it passes the copy and the tables it
+/// draws; then the record's size. Each interned text is a copy drawn through the allocator, which never moves; the table holds each
 /// copy's address and length by symbol index, and each slot of the index, a power of two of
 /// them probed linearly from a text's hash, holds a symbol index plus one, zero when empty.
 const INTERNER_LOCK: u64 = 0
@@ -20,7 +21,9 @@ const INTERNER_SLOTS: u64 = 40
 
 const INTERNER_SLOT_COUNT: u64 = 48
 
-const INTERNER_SIZE: u64 = 56
+const INTERNER_REACH: u64 = 56
+
+const INTERNER_SIZE: u64 = 64
 
 /// The bytes of an entry of an interner's table: a copy's address and length.
 const TEXT_ENTRY: u64 = 16
@@ -77,6 +80,10 @@ fn text_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::V
         }
         "text::Interner" => {
             let record = mut fx.load(PTR, addr: address, offset: 0)
+            let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+            mut fx.if_true(lifting, then: fn(mut fx1: Fx) {
+                mut fx1.store(lift, addr: record, offset: INTERNER_REACH)
+            })
             discard transfer_lift(mut lo, mut fx, address: record, lift)
             let count = mut fx.load(PTR, addr: record, offset: INTERNER_COUNT)
             let zero = mut fx.ptr(0)
@@ -85,13 +92,18 @@ fn text_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::V
                 let copied = mut fx1.load(PTR, addr: entry, offset: 0)
                 discard transfer_lift(mut lo, fx: mut fx1, address: copied, lift)
             })
-            lift_storage(mut lo, mut fx, record, field: INTERNER_TEXTS, size: INTERNER_CAPACITY, lift)
-            lift_storage(mut lo, mut fx, record, field: INTERNER_SLOTS, size: INTERNER_SLOT_COUNT, lift)
+            lift_tables(mut lo, mut fx, record, lift)
         }
         else => return false
     }
     return true
 } text_transfer
+
+/// Passes the storage of an interner's text and slot tables to a domain.
+fn lift_tables(mut lo: Lowering, mut fx: Fx, record: clif::Value, lift: clif::Value) {
+    lift_storage(mut lo, mut fx, record, field: INTERNER_TEXTS, size: INTERNER_CAPACITY, lift)
+    lift_storage(mut lo, mut fx, record, field: INTERNER_SLOTS, size: INTERNER_SLOT_COUNT, lift)
+} lift_tables
 
 /// Moves an interner's table or index, at `field` of its record, into another domain's reach
 /// when its size at `size` is not zero.
@@ -369,6 +381,8 @@ fn interner_empty(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let fill_args = fx.list3(record, b: zero, c: size)
     discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
     mut fx.store(alloc, addr: record, offset: INTERNER_ALLOC)
+    let reach = current_domain(mut lo, mut fx)
+    mut fx.store(reach, addr: record, offset: INTERNER_REACH)
     let Some(sret) = supply.sret else {
         expect false
         return
@@ -413,8 +427,23 @@ fn interner_intern(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::V
     })
     let index = text_insert(mut lo, mut fx, supply, record, hash, start, len)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: lock_args.view())
+    lift_insertion(mut lo, mut fx, record, index)
     return_symbol(mut lo, mut fx, supply, index)
 } interner_intern
+
+/// Passes what an insertion by a task of a domain nested in the interner's reach drew to that
+/// reach: the copy of the text at `index` and the interner's tables.
+fn lift_insertion(mut lo: Lowering, mut fx: Fx, record: clif::Value, index: clif::Value) {
+    let reach = mut fx.load(PTR, addr: record, offset: INTERNER_REACH)
+    let domain = current_domain(mut lo, mut fx)
+    let nested = nested_in(mut fx, inner: domain, outer: reach)
+    mut fx.if_true(nested, then: fn[mut lo](mut fx1: Fx) {
+        let entry = text_text_entry(mut fx1, record, index)
+        let copied = mut fx1.load(PTR, addr: entry, offset: 0)
+        discard transfer_lift(mut lo, fx: mut fx1, address: copied, lift: reach)
+        lift_tables(mut lo, fx: mut fx1, record, lift: reach)
+    })
+} lift_insertion
 
 /// `Interner.resolve`: the text of a symbol, the interner's lock held, trapping with
 /// `trap.bounds` for a symbol of no text.

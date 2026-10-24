@@ -28,6 +28,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `nanbench/` | The benchmark gating language versions: its crate in `src/`, the task corpus in `tasks/` (one directory per task), the benchmark programs in `bench/` and the published results in `results/` |
 | `docs/spec/` | The NaN 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
+| `editors/` | Editor support: the TextMate grammar of `.nan` files in `textmate/` |
 | `.config/` | nextest configuration |
 | `.github/` | The CI workflow |
 | `.agents/skills/` | Agent skills; `.claude/skills` links here |

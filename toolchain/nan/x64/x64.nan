@@ -1,0 +1,239 @@
+//! The x86-64 instruction set: registers, instructions, their encoding and the relocations encoded code needs.
+
+/// What a relocation writes at its offset: a 4- or 8-byte absolute address, a 4-byte address
+/// relative to the end of the field, a call through the procedure linkage table, the address of
+/// a global offset table entry, or the argument of a general-dynamic thread-local access.
+pkg enum RelocKind derives Copy, Eq, Hash {
+    Absolute4
+    Absolute8
+    Relative4
+    CallPlt4
+    GotRelative4
+    TlsGeneralDynamic
+} RelocKind
+
+/// A register: a general-purpose register by its number (0 to 15), an SSE register (16 to 31),
+/// or a virtual register (32 on), which register allocation replaces by one of them.
+pkg struct Reg derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Reg
+
+pkg const RAX: Reg = Reg(index: 0)
+
+pkg const RCX: Reg = Reg(index: 1)
+
+pkg const RDX: Reg = Reg(index: 2)
+
+pkg const RBX: Reg = Reg(index: 3)
+
+pkg const RSP: Reg = Reg(index: 4)
+
+pkg const RBP: Reg = Reg(index: 5)
+
+pkg const RSI: Reg = Reg(index: 6)
+
+pkg const RDI: Reg = Reg(index: 7)
+
+pkg const R8: Reg = Reg(index: 8)
+
+pkg const R9: Reg = Reg(index: 9)
+
+pkg const R10: Reg = Reg(index: 10)
+
+pkg const R11: Reg = Reg(index: 11)
+
+pkg const R12: Reg = Reg(index: 12)
+
+pkg const R13: Reg = Reg(index: 13)
+
+pkg const R14: Reg = Reg(index: 14)
+
+pkg const R15: Reg = Reg(index: 15)
+
+/// The number of physical registers: 16 general-purpose and 16 SSE.
+pkg const PHYSICAL: u32 = 32
+
+pkg fn Reg.xmm(number: u32) -> Reg
+    requires number < 16
+    ensures result.is_xmm()
+{
+    return Reg(index: 16 + number)
+} Reg.xmm
+
+pkg fn Reg.virtual_number(number: u32) -> Reg {
+    return Reg(index: PHYSICAL + number)
+} Reg.virtual_number
+
+pkg fn Reg.is_virtual(self) -> bool = self.index >= PHYSICAL
+
+pkg fn Reg.is_physical(self) -> bool = self.index < PHYSICAL
+
+/// Whether the register is a physical SSE register.
+pkg fn Reg.is_xmm(self) -> bool = self.index >= 16 and self.index < PHYSICAL
+
+/// The number of a virtual register.
+pkg fn Reg.vreg(self) -> u32
+    requires self.is_virtual()
+{
+    return self.index - PHYSICAL
+} Reg.vreg
+
+/// The 4-bit number of a physical register in its instruction encodings.
+pkg fn Reg.hw(self) -> u8 = u8.truncate(self.index & 15)
+
+/// A set of physical registers.
+pkg struct RegSet derives Copy, Eq {
+    pkg bits: u32
+} RegSet
+
+pkg fn RegSet.empty() -> RegSet = RegSet(bits: 0)
+
+pkg fn RegSet.of(reg: Reg) -> RegSet {
+    return RegSet(bits: 1u32 << reg.index)
+} RegSet.of
+
+pkg fn RegSet.plus(self, reg: Reg) -> RegSet {
+    return RegSet(bits: self.bits | (1u32 << reg.index))
+} RegSet.plus
+
+pkg fn RegSet.union(self, other: RegSet) -> RegSet = RegSet(bits: self.bits | other.bits)
+
+pkg fn RegSet.minus(self, other: RegSet) -> RegSet = RegSet(bits: self.bits & ~other.bits)
+
+pkg fn RegSet.contains(self, reg: Reg) -> bool {
+    if reg.index >= PHYSICAL {
+        return false
+    }
+    return (self.bits & (1u32 << reg.index)) != 0
+} RegSet.contains
+
+/// The registers a System V call may change: every SSE register and the general-purpose
+/// registers other than `rbx`, `rsp`, `rbp` and `r12` to `r15`.
+pkg fn RegSet.caller_saved() -> RegSet = RegSet(bits: 0xFFFF_0FC7)
+
+/// Every register other than `rsp` and `rbp`.
+pkg fn RegSet.all() -> RegSet = RegSet(bits: 0xFFFF_FFCF)
+
+/// The width of an operation: 8, 16, 32 or 64 bits, or for SSE scalars 32 (`f32`) or 64 (`f64`).
+pkg enum Size derives Copy, Eq {
+    Byte
+    Word
+    Dword
+    Qword
+} Size
+
+/// The width of a number of bits, 64 for any other.
+pkg fn Size.of_bits(bits: u32) -> Size {
+    return match bits {
+        8 => Size.Byte
+        16 => Size.Word
+        32 => Size.Dword
+        else => Size.Qword
+    }
+} Size.of_bits
+
+/// A condition on the flags, numbered as the `jcc`, `setcc` and `cmovcc` encodings number it.
+pkg enum Cond derives Copy, Eq {
+    Overflow
+    NoOverflow
+    Below
+    AboveOrEqual
+    Equal
+    NotEqual
+    BelowOrEqual
+    Above
+    Sign
+    NoSign
+    Parity
+    NoParity
+    Less
+    GreaterOrEqual
+    LessOrEqual
+    Greater
+} Cond
+
+pkg fn Cond.code(self) -> u8
+    ensures result <= 15
+{
+    return match self {
+        Cond.Overflow => 0
+        Cond.NoOverflow => 1
+        Cond.Below => 2
+        Cond.AboveOrEqual => 3
+        Cond.Equal => 4
+        Cond.NotEqual => 5
+        Cond.BelowOrEqual => 6
+        Cond.Above => 7
+        Cond.Sign => 8
+        Cond.NoSign => 9
+        Cond.Parity => 10
+        Cond.NoParity => 11
+        Cond.Less => 12
+        Cond.GreaterOrEqual => 13
+        Cond.LessOrEqual => 14
+        Cond.Greater => 15
+    }
+} Cond.code
+
+/// The condition holding exactly when this one does not.
+pkg fn Cond.invert(self) -> Cond {
+    return match self {
+        Cond.Overflow => Cond.NoOverflow
+        Cond.NoOverflow => Cond.Overflow
+        Cond.Below => Cond.AboveOrEqual
+        Cond.AboveOrEqual => Cond.Below
+        Cond.Equal => Cond.NotEqual
+        Cond.NotEqual => Cond.Equal
+        Cond.BelowOrEqual => Cond.Above
+        Cond.Above => Cond.BelowOrEqual
+        Cond.Sign => Cond.NoSign
+        Cond.NoSign => Cond.Sign
+        Cond.Parity => Cond.NoParity
+        Cond.NoParity => Cond.Parity
+        Cond.Less => Cond.GreaterOrEqual
+        Cond.GreaterOrEqual => Cond.Less
+        Cond.LessOrEqual => Cond.Greater
+        Cond.Greater => Cond.LessOrEqual
+    }
+} Cond.invert
+
+/// A symbol code refers to: a function or data object by its name, or the C library's
+/// `__tls_get_addr`.
+pkg enum Symbol derives Copy, Eq, Hash {
+    Name(clif::ExternalName)
+    TlsGetAddr
+} Symbol
+
+/// What a RIP-relative operand addresses: a label of the code, a symbol, or the global offset
+/// table entry holding a symbol's address.
+pkg enum RipTarget derives Copy, Eq {
+    Label(u32)
+    Direct(Symbol)
+    Got(Symbol)
+} RipTarget
+
+/// A memory operand: `base + index * 2^shift + disp`, or `rip + disp` from a target.
+pkg enum Amode derives Copy, Eq {
+    Mem(base: Reg, index: Option[Reg], shift: u8, disp: i32)
+    Rip(target: RipTarget, disp: i32)
+} Amode
+
+/// `[base + disp]`.
+pkg fn Amode.at(base: Reg, disp: i32) -> Amode = Amode.Mem(base: base, index: None, shift: 0, disp: disp)
+
+/// The operand `disp` bytes further on.
+pkg fn Amode.offset(self, disp: i32) -> Amode {
+    return match self {
+        Amode.Mem(base: base, index: index, shift: shift, disp: at) => Amode.Mem(base: base, index: index, shift: shift, disp: at.wrapping_add(disp))
+        Amode.Rip(target: target, disp: at) => Amode.Rip(target: target, disp: at.wrapping_add(disp))
+    }
+} Amode.offset
+
+/// A relocation of encoded code: at `offset`, the value `kind` computes from the target's
+/// address plus `addend`.
+pkg struct Reloc derives Copy, Eq {
+    pkg offset: u32
+    pkg kind: RelocKind
+    pkg target: Symbol
+    pkg addend: i64
+} Reloc

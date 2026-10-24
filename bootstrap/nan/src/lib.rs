@@ -53,6 +53,22 @@ pub fn nir_streams(root: &std::path::Path) -> std::io::Result<Vec<(String, Vec<u
     Ok(check::nir_streams(&workspace))
 }
 
+/// The symbol name and Cranelift text of each function the final build of the program `package`
+/// of the workspace at `root` lowers, in order of definition, for the comparison of the NaN
+/// toolchain's lowering with the bootstrap's.
+pub fn lowered_functions(
+    root: &std::path::Path,
+    package: &str,
+) -> std::io::Result<Vec<(String, String)>> {
+    let workspace = workspace::Workspace::load(root.to_owned(), &mut Vec::new())?;
+    let program = workspace
+        .packages
+        .iter()
+        .position(|source| source.name() == Some(package))
+        .ok_or_else(|| std::io::Error::other(format!("no package {package}")))?;
+    Ok(final_build::lowered_functions(&workspace, program))
+}
+
 /// The obligation hashes of the workspace at `root` whose result the proof cache holds and the
 /// prover's procedure does not give, for the harnesses.
 pub fn proof_cache_mismatches(root: &std::path::Path) -> std::io::Result<Vec<String>> {

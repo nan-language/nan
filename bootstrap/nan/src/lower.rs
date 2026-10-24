@@ -29,6 +29,7 @@ mod transfer;
 mod trap;
 mod types;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -589,6 +590,13 @@ impl<'c, 'a> Lowering<'c, 'a> {
             fx.b.finalize(self.isa.frontend_config());
             recorded
         };
+        DUMP.with(|dump| {
+            if let Some(texts) = dump.borrow_mut().as_mut() {
+                let declaration = self.module.declarations().get_function_decl(id);
+                let name = declaration.name.clone().unwrap_or_default();
+                texts.push((name, context.func.display().to_string()));
+            }
+        });
         let sites = self.sites(&context.func, recorded);
         if let Err(error) = self.module.define_function(id, &mut context) {
             panic!(
@@ -754,6 +762,22 @@ impl<'c, 'a> Lowering<'c, 'a> {
 
 /// The calling convention of every lowered function.
 pub const CALL_CONV: CallConv = CallConv::SystemV;
+
+thread_local! {
+    /// While `dumping` runs, the symbol name and text of each function defined, in order.
+    static DUMP: RefCell<Option<Vec<(String, String)>>> = const { RefCell::new(None) };
+}
+
+/// Runs `lower`, giving its result with the symbol name of each function it defines and that
+/// function's text as Cranelift writes it before compiling it, in order of definition.
+pub fn dumping<T>(lower: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+    DUMP.with(|dump| *dump.borrow_mut() = Some(Vec::new()));
+    let result = lower();
+    let texts = DUMP
+        .with(|dump| dump.borrow_mut().take())
+        .unwrap_or_default();
+    (result, texts)
+}
 
 #[cfg(test)]
 mod tests;

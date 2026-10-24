@@ -1,0 +1,269 @@
+//! Tests of the code generator: the machine code, frames, relocations and source locations of functions as lowering builds them.
+
+fn int_signature(count: u32, alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(clif::CallConv.SystemV, alloc)
+    for _ in 0u32..<count {
+        mut signature.params.push(clif::AbiParam(value_type: clif::Type.Int64))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int64))
+    return signature
+} int_signature
+
+/// A builder of a function named `u0:0` of 64-bit integers, its entry block current.
+fn builder_of(params: u32, alloc: mem::Alloc) -> clif::Builder {
+    var b = clif::Builder.new(clif::Function.new(clif::ExternalName(namespace: 0, index: 0), signature: int_signature(params, alloc), alloc), alloc)
+    let entry = mut b.create_block()
+    mut b.append_block_params_for_function_params(entry)
+    mut b.switch_to_block(entry)
+    mut b.seal_block(entry)
+    return b
+} builder_of
+
+fn params_of(b: clif::Builder, alloc: mem::Alloc) -> mem::List[clif::Value] {
+    let Some(entry) = b.current_block() else {
+        return mem::List[clif::Value].empty(alloc)
+    }
+    return b.block_params(entry, alloc)
+} params_of
+
+fn one(value: clif::Value, alloc: mem::Alloc) -> mem::List[clif::Value] {
+    var list = mem::List[clif::Value].empty(alloc)
+    mut list.push(value)
+    return list
+} one
+
+/// The one result of a call.
+fn call_result(b: clif::Builder, call: clif::Inst, alloc: mem::Alloc) -> clif::Value {
+    let results = b.inst_results(call, alloc)
+    expect results.len() == 1
+    return results[0]
+} call_result
+
+fn no_values(alloc: mem::Alloc) -> mem::List[clif::Value] = mem::List[clif::Value].empty(alloc)
+
+fn host_isa() -> Isa = Isa(pic: true, probes: true, floats: true)
+
+fn machine_isa() -> Isa = Isa(pic: false, probes: false, floats: false)
+
+test compiles_an_addition_without_moves for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let sum = mut b.iadd(params[0], y: params[1])
+    mut b.ret(one(sum, alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x8d\x04\x37\x5d\xc3"
+    expect code.frame == 16
+    expect code.relocs.len() == 0
+    expect code.locations.len() == 0
+} compiles_an_addition_without_moves
+
+/// The sum of the counter's values below the parameter, its loop's values in their parameters'
+/// registers.
+test carries_loop_values_in_the_registers_of_their_parameters for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let n = params[0]
+    let head = mut b.create_block()
+    let i = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let acc = mut b.append_block_param(head, ty: clif::Type.Int64)
+    let body = mut b.create_block()
+    let exit = mut b.create_block()
+    let total = mut b.append_block_param(exit, ty: clif::Type.Int64)
+    let zero = mut b.iconst(clif::Type.Int64, imm: 0)
+    var start = one(zero, alloc)
+    mut start.push(zero)
+    mut b.jump(head, args: start.view())
+    mut b.switch_to_block(head)
+    let more = mut b.icmp(clif::IntCC.UnsignedLessThan, x: i, y: n)
+    mut b.brif(more, then: body, then_args: no_values(alloc).view(), otherwise: exit, otherwise_args: one(acc, alloc).view())
+    mut b.switch_to_block(body)
+    let grown = mut b.iadd(acc, y: i)
+    let next = mut b.iadd_imm_s(i, y: 1)
+    var back = one(next, alloc)
+    mut back.push(grown)
+    mut b.jump(head, args: back.view())
+    mut b.switch_to_block(exit)
+    mut b.ret(one(total, alloc).view())
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\x48\x39\xf8\x0f\x82\x08\x00\x00\x00\x48\x89\xc8\xe9\x0d\x00\x00\x00\x48\x8d\x0c\x01\x48\x8d\x40\x01\xe9\xe2\xff\xff\xff\x5d\xc3"
+} carries_loop_values_in_the_registers_of_their_parameters
+
+/// `3x + 5f(x) + f(f(x) + x)` through a function pointer, `x`, `f` and `f(x)` live across calls.
+test keeps_values_across_calls_in_callee_saved_registers for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let sig_ref = mut b.import_signature(int_signature(1, alloc))
+    let first_call = mut b.call_indirect(sig_ref, callee: params[0], args: one(params[1], alloc).view())
+    let once = call_result(b, call: first_call, alloc)
+    let again = mut b.iadd(once, y: params[1])
+    let second_call = mut b.call_indirect(sig_ref, callee: params[0], args: one(again, alloc).view())
+    let twice = call_result(b, call: second_call, alloc)
+    let x3 = mut b.imul_imm_s(params[1], y: 3)
+    let y5 = mut b.imul_imm_s(once, y: 5)
+    let partial = mut b.iadd(x3, y: y5)
+    let total = mut b.iadd(partial, y: twice)
+    mut b.ret(one(total, alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x48\x83\xec\x08\x48\x89\xfb\x49\x89\xf4\x4c\x89\xe7\xff\xd3\x49\x89\xc5\x4b\x8d\x7c\x25\x00\xff\xd3\x49\x6b\xcc\x03\x49\x6b\xd5\x05\x48\x8d\x0c\x11\x48\x8d\x04\x01\x48\x83\xc4\x08\x41\x5d\x41\x5c\x5b\x5d\xc3"
+    expect code.frame == 48
+} keeps_values_across_calls_in_callee_saved_registers
+
+/// 24 values all live at once: five callee-saved registers pushed and 13 spill slots.
+test spills_what_the_registers_cannot_hold_into_the_frame for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let a = params[0]
+    var values = mem::List[clif::Value].empty(alloc)
+    for k in 0i64..<24 {
+        let scaled = mut b.imul_imm_s(a, y: k + 3)
+        let value = mut b.iadd_imm_s(scaled, y: k)
+        mut values.push(value)
+    }
+    var sum = mut b.iconst(clif::Type.Int64, imm: 0)
+    for value in values {
+        let times = mut b.imul_imm_s(sum, y: 31)
+        sum = mut b.iadd(times, y: value)
+    }
+    mut b.ret(one(sum, alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    expect code.frame == 160
+} spills_what_the_registers_cannot_hold_into_the_frame
+
+/// Calls of a colocated and an imported function at source locations 7 and 9, then the addresses
+/// of a colocated, an imported and a thread-local data object and of the imported function.
+fn symbols(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(0, alloc)
+    let local_sig = mut b.import_signature(int_signature(0, alloc))
+    let imported_sig = mut b.import_signature(int_signature(0, alloc))
+    let local = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 3), signature: local_sig, colocated: true))
+    let imported = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 4), signature: imported_sig, colocated: false))
+    let data = mut b.create_global_value(clif::GlobalValueData(name: clif::ExternalName(namespace: 1, index: 5), colocated: true, tls: false))
+    let extern_data = mut b.create_global_value(clif::GlobalValueData(name: clif::ExternalName(namespace: 1, index: 6), colocated: false, tls: false))
+    let thread = mut b.create_global_value(clif::GlobalValueData(name: clif::ExternalName(namespace: 1, index: 7), colocated: true, tls: true))
+    mut b.set_srcloc(clif::SourceLoc(bits: 7))
+    let first_call = mut b.call(local, args: no_values(alloc).view())
+    let first_value = call_result(b, call: first_call, alloc)
+    mut b.set_srcloc(clif::SourceLoc(bits: 9))
+    let second_call = mut b.call(imported, args: no_values(alloc).view())
+    let second_value = call_result(b, call: second_call, alloc)
+    mut b.set_srcloc(clif::DEFAULT_LOC)
+    let data_address = mut b.symbol_value(clif::Type.Int64, global_value: data)
+    let extern_address = mut b.symbol_value(clif::Type.Int64, global_value: extern_data)
+    let thread_address = mut b.tls_value(clif::Type.Int64, global_value: thread)
+    let function_address = mut b.func_addr(clif::Type.Int64, func_ref: imported)
+    let s1 = mut b.iadd(first_value, y: second_value)
+    let s2 = mut b.iadd(s1, y: data_address)
+    let s3 = mut b.iadd(s2, y: extern_address)
+    let s4 = mut b.iadd(s3, y: thread_address)
+    let s5 = mut b.iadd(s4, y: function_address)
+    mut b.ret(one(s5, alloc).view())
+    return take b.finalize()
+} symbols
+
+fn named(namespace: u32, index: u32) -> x64::Symbol = x64::Symbol.Name(clif::ExternalName(namespace: namespace, index: index))
+
+test relocates_symbols_by_where_they_are_defined_and_locates_calls for compile {
+    let alloc = testing::world().alloc
+    let code = compile(symbols(alloc), isa: host_isa(), alloc)
+    expect code.relocs.len() == 7
+    expect code.relocs[0] == x64::Reloc(offset: 12, kind: x64::RelocKind.Relative4, target: named(0, index: 3), addend: -4)
+    expect code.relocs[1] == x64::Reloc(offset: 20, kind: x64::RelocKind.CallPlt4, target: named(0, index: 4), addend: -4)
+    expect code.relocs[2] == x64::Reloc(offset: 30, kind: x64::RelocKind.Relative4, target: named(1, index: 5), addend: -4)
+    expect code.relocs[3] == x64::Reloc(offset: 37, kind: x64::RelocKind.GotRelative4, target: named(1, index: 6), addend: -4)
+    expect code.relocs[4] == x64::Reloc(offset: 45, kind: x64::RelocKind.TlsGeneralDynamic, target: named(1, index: 7), addend: -4)
+    expect code.relocs[5] == x64::Reloc(offset: 53, kind: x64::RelocKind.CallPlt4, target: x64::Symbol.TlsGetAddr, addend: -4)
+    expect code.relocs[6] == x64::Reloc(offset: 60, kind: x64::RelocKind.GotRelative4, target: named(0, index: 4), addend: -4)
+    expect code.locations.len() == 2
+    expect code.locations[0] == Located(offset: 11, loc: clif::SourceLoc(bits: 7))
+    expect code.locations[1] == Located(offset: 19, loc: clif::SourceLoc(bits: 9))
+    let fixed = compile(symbols(alloc), isa: machine_isa(), alloc)
+    expect fixed.relocs.len() == 7
+    expect fixed.relocs[3] == x64::Reloc(offset: 36, kind: x64::RelocKind.Absolute8, target: named(1, index: 6), addend: 0)
+    expect fixed.relocs[6] == x64::Reloc(offset: 62, kind: x64::RelocKind.Absolute8, target: named(0, index: 4), addend: 0)
+} relocates_symbols_by_where_they_are_defined_and_locates_calls
+
+/// A 20000-byte slot and an 8-byte one aligned to 64, the result mixing a word of the first with
+/// the second's address.
+fn large_frame(alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let a = params[0]
+    let flags = clif::MemFlags.owned()
+    let big = mut b.create_sized_stack_slot(clif::StackSlotData(size: 20000, align_shift: 3))
+    let aligned = mut b.create_sized_stack_slot(clif::StackSlotData(size: 8, align_shift: 6))
+    let start = mut b.stack_addr(clif::Type.Int64, slot: big, offset: 0)
+    mut b.store(flags, x: a, p: start, offset: 19992)
+    let word = mut b.load(clif::Type.Int64, flags, p: start, offset: 19992)
+    let place = mut b.stack_addr(clif::Type.Int64, slot: aligned, offset: 0)
+    let mixed = mut b.bxor(word, y: place)
+    mut b.ret(one(mixed, alloc).view())
+    return take b.finalize()
+} large_frame
+
+test probes_frames_reaching_the_guard_page_on_the_host_and_aligns_slots for compile {
+    let alloc = testing::world().alloc
+    let probed = compile(large_frame(alloc), isa: host_isa(), alloc)
+    let Some(head) = probed.bytes.view().prefix(18) else {
+        expect false
+        return
+    }
+    expect head == b"\x55\x48\x89\xe5\x48\x81\xec\x00\x10\x00\x00\xc7\x04\x24\x00\x00\x00\x00"
+    let unprobed = compile(large_frame(alloc), isa: machine_isa(), alloc)
+    let Some(start) = unprobed.bytes.view().prefix(15) else {
+        expect false
+        return
+    }
+    expect start == b"\x55\x48\x89\xe5\x48\x81\xec\x50\x4e\x00\x00\x48\x83\xe4\xc0"
+    expect probed.frame == unprobed.frame
+    expect probed.frame == 20112
+} probes_frames_reaching_the_guard_page_on_the_host_and_aligns_slots
+
+/// Copies the f64 at the first address to the second when the third parameter is not zero, else
+/// writes 1.5; gives the bits of the f32 eight bytes on.
+test moves_floats_through_general_registers_without_sse for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(3, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 3
+    let flags = clif::MemFlags.owned()
+    let value = mut b.load(clif::Type.Float64, flags, p: params[0], offset: 0)
+    let other = mut b.f64const(0x3FF8_0000_0000_0000)
+    let chosen = mut b.select(params[2], x: value, y: other)
+    mut b.store(flags, x: chosen, p: params[1], offset: 0)
+    let single = mut b.load(clif::Type.Float32, flags, p: params[0], offset: 8)
+    let bits = mut b.bitcast(clif::Type.Int32, flags: clif::MemFlags.new(), x: single)
+    let wide = mut b.uextend(clif::Type.Int64, x: bits)
+    mut b.ret(one(wide, alloc).view())
+    let code = compile(take b.finalize(), isa: machine_isa(), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x8b\x07\x48\x85\xd2\x48\xb9\x00\x00\x00\x00\x00\x00\xf8\x3f\x48\x0f\x45\xc8\x48\x89\x0e\x8b\x47\x08\x89\xc0\x5d\xc3"
+} moves_floats_through_general_registers_without_sse
+
+/// `stack_switch(store, load, payload) + 2 * payload`: the payload in `rdi` and spilled across
+/// the switch, every callee-saved register saved.
+test saves_every_callee_saved_register_around_a_stack_switch for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(3, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 3
+    let received = mut b.stack_switch(params[0], load_context_ptr: params[1], in_payload0: params[2])
+    let doubled = mut b.iadd(params[2], y: params[2])
+    let total = mut b.iadd(received, y: doubled)
+    mut b.ret(one(total, alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    let Some(head) = code.bytes.view().prefix(17) else {
+        expect false
+        return
+    }
+    expect head == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x41\x56\x41\x57\x48\x83\xec\x08"
+    expect code.frame == 64
+} saves_every_callee_saved_register_around_a_stack_switch

@@ -1,0 +1,571 @@
+//! Read-only data: the bytes of text and byte-string literals, the values of consts and contributions laid out as their types are, and registry tables; and the writable data of zeros a machine image reserves for its support routines. An image writes no data at run time but the support routines'.
+
+struct Data {
+    /// Literal bytes and the view records of literals, by their bytes.
+    bytes: mem::HashMap[mem::Bytes, object::DataId]
+    views: mem::HashMap[mem::Bytes, object::DataId]
+    /// The value of each const item and contribution, by item and type.
+    consts: mem::HashMap[ConstKey, object::DataId]
+    /// The table of each registry.
+    tables: mem::HashMap[ty::ItemId, object::DataId]
+    next: u32
+} Data
+
+/// A const item or contribution with the type its value is laid out as.
+struct ConstKey derives Copy, Eq, Hash {
+    item: ty::ItemId
+    ty: ty::Ty
+} ConstKey
+
+/// The bytes of a value with the addresses it holds: each a function's or data's, at an offset.
+struct Image {
+    bytes: mem::Bytes
+    functions: mem::List[FunctionAddress]
+    data: mem::List[DataAddress]
+} Image
+
+/// The address of a function an image holds at an offset.
+struct FunctionAddress {
+    offset: u32
+    instance: Instance
+} FunctionAddress
+
+/// The address of a data object plus an addend an image holds at an offset.
+struct DataAddress derives Copy {
+    offset: u32
+    target: object::DataId
+    addend: i64
+} DataAddress
+
+/// An offset of a data object at which the address of a target plus an addend is written.
+struct Relocation derives Copy {
+    offset: u32
+    addend: u64
+} Relocation
+
+/// An extent of a const value with the type of its elements.
+struct ExtentKey derives Copy, Eq, Hash {
+    extent: u32
+    element: ty::Ty
+} ExtentKey
+
+/// A contribution of a registry's table with its canonical path.
+struct Contributed {
+    path: text::String
+    item: ty::ItemId
+} Contributed
+
+fn Data.empty(alloc: mem::Alloc) -> Data {
+    return Data(bytes: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), views: mem::HashMap[mem::Bytes, object::DataId].empty(seed: 0, alloc), consts: mem::HashMap[ConstKey, object::DataId].empty(seed: 0, alloc), tables: mem::HashMap[ty::ItemId, object::DataId].empty(seed: 0, alloc), next: 0)
+} Data.empty
+
+/// The image of bytes holding no address.
+fn Image.of_bytes(take bytes: mem::Bytes, alloc: mem::Alloc) -> Image {
+    return Image(bytes: take bytes, functions: mem::List[FunctionAddress].empty(alloc), data: mem::List[DataAddress].empty(alloc))
+} Image.of_bytes
+
+/// A read-only data object holding bytes, named after `kind`.
+fn Lowering.define_data(mut self, kind: Str, take image: Image, align: u64) -> object::DataId {
+    var name = text::String.of("_NSdata_", alloc: self.alloc)
+    mut name.append(kind)
+    mut name.write(text::fmt("{next}", next: self.data.next), budget: 32)
+    expect self.data.next < 0xFFFF_FFFF
+    self.data.next += 1
+    let id = mut self.module.declare_data(name.as_str(), linkage: object::Linkage.Local, writable: false, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    let Image(bytes: bytes, functions: functions, data: addresses) = image
+    mut description.define(take bytes)
+    var data_align = align
+    if data_align == 0 {
+        data_align = 1
+    }
+    mut description.set_align(data_align)
+    for address in take functions {
+        let FunctionAddress(offset: offset, instance: instance) = address
+        let function = mut self.instance(take instance)
+        let reference = mut description.import_function(function)
+        mut description.write_function_addr(offset, function: reference)
+    }
+    for address in addresses {
+        let reference = mut description.import_data(address.target)
+        mut description.write_data_addr(address.offset, data: reference, addend: address.addend)
+    }
+    mut self.module.define_data(id, take description)
+    return id
+} Lowering.define_data
+
+/// A read-only data object holding bytes, each relocation an offset in it at which the
+/// address of `target` plus an addend is written.
+fn Lowering.relocated_data(mut self, kind: Str, take contents: mem::Bytes, relocations: Slice[Relocation], target: object::DataId) -> object::DataId {
+    var image = Image.of_bytes(take contents, alloc: self.alloc)
+    for relocation in relocations {
+        mut image.data.push(DataAddress(offset: relocation.offset, target: target, addend: i64.from_bits(relocation.addend)))
+    }
+    return mut self.define_data(kind, take image, align: 8)
+} Lowering.relocated_data
+
+/// The writable data object of zeros a machine image reserves under a name, declared once.
+fn Lowering.reserved_data(mut self, data_name: Str, size: u64, align: u64) -> object::DataId {
+    let key = text::String.of(data_name, alloc: self.alloc)
+    let known = self.reservations.get(key)
+    match known {
+        Some(id) => return id
+        None => {}
+    }
+    let id = mut self.module.declare_data(data_name, linkage: object::Linkage.Local, writable: true, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define_zeroinit(size)
+    mut description.set_align(align)
+    mut self.module.define_data(id, take description)
+    discard mut self.reservations.insert(take key, value: id)
+    return id
+} Lowering.reserved_data
+
+/// The address of the writable data object of zeros a machine image reserves under a name.
+fn Lowering.reserved(mut self, mut fx: Fx, data_name: Str, size: u64, align: u64) -> clif::Value {
+    let id = mut self.reserved_data(data_name, size, align)
+    return mut self.data_address(mut fx, id)
+} Lowering.reserved
+
+/// The address of a data object of the image.
+fn Lowering.data_address(mut self, mut fx: Fx, id: object::DataId) -> clif::Value {
+    let global = mut self.data_ref(mut fx, id)
+    return mut fx.b.symbol_value(PTR, global_value: global)
+} Lowering.data_address
+
+/// The data object holding bytes.
+fn Lowering.bytes_data(mut self, contents: Slice[u8]) -> object::DataId {
+    var key = mem::Bytes.empty(self.alloc)
+    mut key.append(contents)
+    let known = self.data.bytes.get(key)
+    match known {
+        Some(id) => return id
+        None => {}
+    }
+    var stored = mem::Bytes.empty(self.alloc)
+    if contents.len() == 0 {
+        mut stored.push(0)
+    } else {
+        mut stored.append(contents)
+    }
+    let id = mut self.define_data("bytes", image: Image.of_bytes(take stored, alloc: self.alloc), align: 1)
+    discard mut self.data.bytes.insert(take key, value: id)
+    return id
+} Lowering.bytes_data
+
+/// A text or byte-string literal: a view record in read-only data.
+fn Lowering.view_literal(mut self, mut fx: Fx, contents: Slice[u8]) -> Held {
+    var key = mem::Bytes.empty(self.alloc)
+    mut key.append(contents)
+    let known = self.data.views.get(key)
+    var id = object::DataId(index: 0)
+    match known {
+        Some(found) => {
+            id = found
+        }
+        None => {
+            let target = mut self.bytes_data(contents)
+            var image = Image.of_bytes(view_record(u64.widen(contents.len()), alloc: self.alloc), alloc: self.alloc)
+            mut image.data.push(DataAddress(offset: 0, target: target, addend: 0))
+            id = mut self.define_data("view", take image, align: 8)
+            discard mut self.data.views.insert(take key, value: id)
+        }
+    }
+    let global = mut self.data_ref(mut fx, id)
+    return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
+} Lowering.view_literal
+
+/// The 16 bytes of a view record holding `len` after the address of its elements.
+fn view_record(len: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var record = mem::Bytes.zeroed(16, alloc)
+    write_le(mut record, at: 8, value: len, size: 8, big: false)
+    return record
+} view_record
+
+/// Writes the low `size` bytes of `value` at `at`, least significant first, or most
+/// significant first when `big` holds.
+fn write_le(mut bytes: mem::Bytes, at: usize, value: u64, size: usize, big: bool)
+    requires size <= 8
+{
+    for index in 0..<size {
+        invariant at <= bytes.len() and size <= bytes.len() - at
+        let byte = u8.truncate(value >> u32.fit(8 * index))
+        if big {
+            expect at + size - 1 - index < bytes.len()
+            bytes[at + size - 1 - index] = byte
+        } else {
+            expect at + index < bytes.len()
+            bytes[at + index] = byte
+        }
+    }
+} write_le
+
+/// The value of a const item or contribution, or a registry's table as a slice.
+fn Lowering.const_item(mut self, mut fx: Fx, item: ty::ItemId, ty: ty::Ty) -> Held {
+    let registry_table = match self.ck.db().ast(item).kind {
+        ast::ItemKind.Registry(_) => true
+        else => false
+    }
+    if registry_table {
+        let table = mut self.table(item)
+        let global = mut self.data_ref(mut fx, id: table)
+        return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
+    }
+    let Some(value) = self.ck.const_value(item) else {
+        expect false
+        return Held.Empty
+    }
+    let held_layout = mut self.layout_of(ty)
+    match held_layout.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: _) => {
+            let bits = mut self.scalar_bits(ty, value: value.contents().value)
+            if scalar == clif::Type.Float32 {
+                return Held.Scalar(mut fx.b.f32const(u32.truncate(bits.low_bits())))
+            }
+            if scalar == clif::Type.Float64 {
+                return Held.Scalar(mut fx.b.f64const(bits.low_bits()))
+            }
+            return Held.Scalar(mut fx.b.iconst(scalar, imm: i64.from_bits(bits.low_bits())))
+        }
+        LayoutShape.Empty => return Held.Empty
+        else => {}
+    }
+    let key = ConstKey(item: item, ty: ty)
+    let known = self.data.consts.get(key)
+    var id = object::DataId(index: 0)
+    match known {
+        Some(found) => {
+            id = found
+        }
+        None => {
+            id = mut self.value_data(value, ty)
+            discard mut self.data.consts.insert(key, value: id)
+        }
+    }
+    let global = mut self.data_ref(mut fx, id)
+    return Held.Address(mut fx.b.symbol_value(PTR, global_value: global))
+} Lowering.const_item
+
+/// A data object holding a const value of a type.
+fn Lowering.value_data(mut self, value: mem::Shared[check::ConstValue], ty: ty::Ty) -> object::DataId {
+    let held_layout = mut self.layout_of(ty)
+    let laid = held_layout.contents()
+    var size = laid.size
+    if size == 0 {
+        size = 1
+    }
+    var image = Image.of_bytes(mem::Bytes.zeroed(usize.widen(size), alloc: self.alloc), alloc: self.alloc)
+    var extents = mem::HashMap[ExtentKey, object::DataId].empty(seed: 0, alloc: self.alloc)
+    mut self.write_val(constant: value, value: value.contents().value, ty, offset: 0, mut image, mut extents)
+    return mut self.define_data("const", take image, align: laid.align)
+} Lowering.value_data
+
+/// Writes a value of a type at an offset of an image.
+fn Lowering.write_val(mut self, constant: mem::Shared[check::ConstValue], value: check::Val, ty: ty::Ty, offset: u64, mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) {
+    let held_layout = mut self.layout_of(ty)
+    match held_layout.contents().shape {
+        LayoutShape.Empty => {}
+        LayoutShape.Scalar(ty: scalar, big: big) => {
+            let bits = mut self.scalar_bits(ty, value)
+            write_le(mut image.bytes, at: usize.widen(offset), value: bits.low_bits(), size: usize.widen(scalar.bytes()), big)
+        }
+        LayoutShape.Array(element: element, count: _) => {
+            let check::Val.Array(elements) = value else {
+                expect false
+                return
+            }
+            let element_layout = mut self.layout_of(element)
+            for index in 0..<elements.contents().len() {
+                let at = offset + u64.widen(index) * element_layout.contents().size
+                mut self.write_val(constant, value: elements.contents()[index], ty: element, offset: at, mut image, mut extents)
+            }
+        }
+        LayoutShape.Record(fields) => mut self.write_record(constant, value, ty, offset, fields: fields.view(), mut image, mut extents)
+        LayoutShape.Bytes(fields: fields, big: _) => {
+            let check::Val.Struct(item: _, fields: values) = value else {
+                expect false
+                return
+            }
+            mut self.write_fields(constant, fields: fields.view(), values: values.contents().view(), offset, mut image, mut extents)
+        }
+        LayoutShape.Enum(shape) => {
+            let check::Val.Variant(item: _, index: variant, fields: payload) = value else {
+                expect false
+                return
+            }
+            let index = usize.widen(variant)
+            expect index < shape.variants.len()
+            mut self.write_fields(constant, fields: shape.variants[index].fields.view(), values: payload.contents().view(), offset, mut image, mut extents)
+            write_variant_bytes(mut image, shape, index, offset)
+        }
+    }
+} Lowering.write_val
+
+/// Writes a value of a type laid out as a record of `fields` at an offset of an image: a
+/// view's record, a struct's fields or a function value's code.
+fn Lowering.write_record(mut self, constant: mem::Shared[check::ConstValue], value: check::Val, ty: ty::Ty, offset: u64, fields: Slice[Field], mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) {
+    match value {
+        check::Val.View(view) => {
+            let element = self.view_element(ty)
+            let element_layout = mut self.layout_of(element)
+            let key = ExtentKey(extent: view.array.extent, element: element)
+            let known = extents.get(key)
+            var target = object::DataId(index: 0)
+            match known {
+                Some(found) => {
+                    target = found
+                }
+                None => {
+                    target = mut self.extent_data(constant, extent: view.array.extent, element)
+                    discard mut extents.insert(key, value: target)
+                }
+            }
+            expect view.array.path.len() == 0
+            let addend = u64.widen(view.start) * element_layout.contents().size
+            mut image.data.push(DataAddress(offset: u32.truncate(offset), target: target, addend: i64.from_bits(addend)))
+            expect usize.widen(offset) <= image.bytes.len() and image.bytes.len() - usize.widen(offset) >= 16
+            write_le(mut image.bytes, at: usize.widen(offset) + 8, value: u64.widen(view.len), size: 8, big: false)
+        }
+        check::Val.Struct(item: _, fields: values) => mut self.write_fields(constant, fields, values: values.contents().view(), offset, mut image, mut extents)
+        check::Val.Fn(function) => {
+            let check::FnVal.Function(fn_ref) = function.contents() else {
+                expect false
+                return
+            }
+            let instance = mut self.callable_instance(fn_ref, as_value: true)
+            mut image.functions.push(FunctionAddress(offset: u32.truncate(offset), instance: Instance.value_of(take instance, alloc: self.alloc)))
+        }
+        else => {
+            expect false
+        }
+    }
+} Lowering.write_record
+
+/// Writes the values of fields, each laid out as its field's type at its offset past `offset`.
+fn Lowering.write_fields(mut self, constant: mem::Shared[check::ConstValue], fields: Slice[Field], values: Slice[check::Val], offset: u64, mut image: Image, mut extents: mem::HashMap[ExtentKey, object::DataId]) {
+    var index: usize = 0
+    while index < fields.len() and index < values.len() {
+        let field = fields[index]
+        mut self.write_val(constant, value: values[index], ty: field.ty, offset: offset + field.offset, mut image, mut extents)
+        index += 1
+    }
+} Lowering.write_fields
+
+/// Writes the tag or niche value of the variant at `index` of an enum laid out as `shape` at an
+/// offset of an image.
+fn write_variant_bytes(mut image: Image, shape: EnumShape, index: usize, offset: u64) {
+    match shape.tag {
+        Tag.Index(tag) => write_le(mut image.bytes, at: usize.widen(offset), value: u64.widen(index), size: usize.widen(tag.bytes()), big: false)
+        Tag.Packed(payload: _, niche: niche, values: _) => {
+            let Some(value) = shape.tag.value_of(index) else {
+                return
+            }
+            write_le(mut image.bytes, at: usize.widen(offset + niche.offset), value: value.shift_left(niche.bit).low_bits(), size: usize.widen(niche.ty.bytes()), big: niche.big)
+        }
+    }
+} write_variant_bytes
+
+/// The element type of a view type: a slice's element, or `u8` for a text.
+fn Lowering.view_element(self, ty: ty::Ty) -> ty::Ty {
+    if self.ck.is_std(ty, path: "core::Str") {
+        return ty::Ty.scalar(ty::Scalar.Unsigned8)
+    }
+    let Some(element) = self.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return ty::Ty.error()
+    }
+    return element
+} Lowering.view_element
+
+/// A data object holding an extent of a const value: an array of elements of a type.
+fn Lowering.extent_data(mut self, constant: mem::Shared[check::ConstValue], extent: u32, element: ty::Ty) -> object::DataId {
+    expect usize.widen(extent) < constant.contents().data.len()
+    let elements = constant.contents().data[usize.widen(extent)].fields()
+    let element_layout = mut self.layout_of(element)
+    let laid = element_layout.contents()
+    var size = laid.size * u64.widen(elements.len())
+    if size == 0 {
+        size = 1
+    }
+    var image = Image.of_bytes(mem::Bytes.zeroed(usize.widen(size), alloc: self.alloc), alloc: self.alloc)
+    var extents = mem::HashMap[ExtentKey, object::DataId].empty(seed: 0, alloc: self.alloc)
+    for index in 0..<elements.len() {
+        let at = u64.widen(index) * laid.size
+        mut self.write_val(constant, value: elements[index], ty: element, offset: at, mut image, mut extents)
+    }
+    return mut self.define_data("extent", take image, align: laid.align)
+} Lowering.extent_data
+
+/// The bits of a scalar const value.
+fn Lowering.scalar_bits(mut self, ty: ty::Ty, value: check::Val) -> wide::Wide {
+    match value {
+        check::Val.Int(number) => return number
+        check::Val.Bool(flag) => {
+            if flag {
+                return wide::Wide.one()
+            }
+            return wide::Wide.zero()
+        }
+        check::Val.Char(c) => return wide::Wide.of_u64(u64.widen(c.to_bits()))
+        check::Val.Float32(number) => return wide::Wide.of_u64(u64.widen(number.to_bits()))
+        check::Val.Float64(number) => return wide::Wide.of_u64(number.to_bits())
+        check::Val.Ptr(pointer) => return wide::Wide.of_u64(pointer.address)
+        check::Val.Struct(item: item, fields: fields) => return mut self.layout_bits(item, fields: fields.contents().view())
+        check::Val.Variant(item: item, index: index, fields: _) => {
+            let sig = self.ck.sig(item)
+            let tag_name = match sig.contents().kind {
+                check::SigKind.Layout(fields: _, tags: tags, bits: _) => tags[usize.widen(index)].as_str()
+                check::SigKind.Enum(variants: variants) => variants[usize.widen(index)].name.as_str()
+                else => ""
+            }
+            expect tag_name != ""
+            return wide::Wide.of_u64(self.tag_value(ty, variant: tag_name))
+        }
+        check::Val.Unit => return wide::Wide.zero()
+        else => {
+            expect false
+            return wide::Wide.zero()
+        }
+    }
+} Lowering.scalar_bits
+
+/// The bits of an integer layout value from its fields.
+fn Lowering.layout_bits(mut self, item: ty::ItemId, fields: Slice[check::Val]) -> wide::Wide {
+    let ty = self.ck.types().item(item, args: mem::List[ty::Arg].empty(self.alloc))
+    let sig = self.ck.sig(item)
+    let check::SigKind.Layout(fields: declared, tags: _, bits: _) = sig.contents().kind else {
+        expect false
+        return wide::Wide.zero()
+    }
+    var bits = wide::Wide.zero()
+    var index: usize = 0
+    while index < declared.len() and index < fields.len() {
+        let field = self.bit_field(ty, field_name: declared[index].name.as_str())
+        let value = mut self.scalar_bits(ty: field.ty, value: fields[index])
+        bits = bits.bit_or(value.bit_and(wide::Wide.of_u64(field.mask)).shift_left(field.low))
+        index += 1
+    }
+    return bits
+} Lowering.layout_bits
+
+/// The table of a registry: its admitted contributions in key order, as a slice record.
+fn Lowering.table(mut self, registry_item: ty::ItemId) -> object::DataId {
+    let known = self.data.tables.get(registry_item)
+    match known {
+        Some(id) => return id
+        None => {}
+    }
+    let sig = self.ck.sig(registry_item)
+    let check::SigKind.Registry(entry: entry) = sig.contents().kind else {
+        expect false
+        return object::DataId(index: 0)
+    }
+    let entries = mut self.table_entries(registry_item)
+    let held_layout = mut self.layout_of(entry)
+    let laid = held_layout.contents()
+    var size = laid.size * u64.widen(entries.len())
+    if size == 0 {
+        size = 1
+    }
+    var image = Image.of_bytes(mem::Bytes.zeroed(usize.widen(size), alloc: self.alloc), alloc: self.alloc)
+    for index in 0..<entries.len() {
+        var extents = mem::HashMap[ExtentKey, object::DataId].empty(seed: 0, alloc: self.alloc)
+        let at = u64.widen(index) * laid.size
+        mut self.write_val(constant: entries[index], value: entries[index].contents().value, ty: entry, offset: at, mut image, mut extents)
+    }
+    let array = mut self.define_data("table", take image, align: laid.align)
+    var record = Image.of_bytes(view_record(u64.widen(entries.len()), alloc: self.alloc), alloc: self.alloc)
+    mut record.data.push(DataAddress(offset: 0, target: array, addend: 0))
+    let id = mut self.define_data("registry", image: take record, align: 8)
+    discard mut self.data.tables.insert(registry_item, value: id)
+    return id
+} Lowering.table
+
+/// The values of a registry's admitted contributions in table order: by canonical path, each
+/// inserted before the first entry whose key is greater.
+fn Lowering.table_entries(mut self, registry_item: ty::ItemId) -> mem::List[mem::Shared[check::ConstValue]] {
+    var table = mem::List[mem::Shared[check::ConstValue]].empty(self.alloc)
+    let ast::ItemKind.Registry(declared) = self.ck.db().ast(registry_item).kind else {
+        expect false
+        return table
+    }
+    let key_name = text::String.of(declared.key.text.as_str(), alloc: self.alloc)
+    let sig = self.ck.sig(registry_item)
+    let check::SigKind.Registry(entry: entry) = sig.contents().kind else {
+        expect false
+        return table
+    }
+    let ty::TyKind.Item(item: entry_item, args: _) = self.ck.types().kind(entry) else {
+        expect false
+        return table
+    }
+    let entry_sig = self.ck.sig(entry_item)
+    let check::SigKind.Struct(fields: fields) = entry_sig.contents().kind else {
+        expect false
+        return table
+    }
+    let Some(key) = fields.position(fn(field: check::FieldSig) => field.name == key_name) else {
+        expect false
+        return table
+    }
+    let contributions = self.admitted_contributions(registry_item)
+    var interpreter = check::Interpreter.new(self.ck.share())
+    for contributed in contributions {
+        let Some(value) = self.ck.const_value(contributed.item) else {
+            continue
+        }
+        var at = table.len()
+        for index in 0..<table.len() {
+            if mut interpreter.field_order(table[index].contents(), right: value.contents(), index: key) == core::Ordering.Greater {
+                at = index
+                break
+            }
+        }
+        mut table.insert(at, take value)
+    }
+    return table
+} Lowering.table_entries
+
+/// The contributions to a registry the roots admit, by canonical path and item, each once.
+fn Lowering.admitted_contributions(self, registry_item: ty::ItemId) -> mem::List[Contributed] {
+    var contributions = mem::List[Contributed].empty(self.alloc)
+    for root in self.roots {
+        for contribution in self.ck.contributions(root) {
+            if contribution.admitted and contribution.registry_item == registry_item {
+                mut contributions.push(Contributed(path: self.ck.db().canonical(contribution.item), item: contribution.item))
+            }
+        }
+    }
+    mut contributions.sort_by(fn(left: Contributed, right: Contributed) -> core::Ordering {
+        let by_path = left.path.as_str().cmp(right.path.as_str())
+        if by_path != core::Ordering.Equal {
+            return by_path
+        }
+        return left.item.cmp(right.item)
+    })
+    var unique = mem::List[Contributed].empty(self.alloc)
+    for contributed in take contributions {
+        if unique.len() > 0 and unique[unique.len() - 1].path == contributed.path and unique[unique.len() - 1].item == contributed.item {
+            continue
+        }
+        mut unique.push(take contributed)
+    }
+    return unique
+} Lowering.admitted_contributions
+
+/// The argument of a const generic parameter.
+fn const_arg(arg: ty::Arg) -> wide::Wide {
+    match arg {
+        ty::Arg.Const(ty::Const.Int(value)) => return value
+        ty::Arg.Const(ty::Const.Bool(value)) => {
+            if value {
+                return wide::Wide.one()
+            }
+            return wide::Wide.zero()
+        }
+        else => {
+            expect false
+            return wide::Wide.zero()
+        }
+    }
+} const_arg

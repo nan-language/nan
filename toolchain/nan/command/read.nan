@@ -1,4 +1,313 @@
-//! The records of an item's context pack.
+//! The reading commands, which print what check time knows of a scope and no diagnostic.
+
+/// The output of a reading command printing `records` for the scope written `written`.
+fn listed_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], alloc: mem::Alloc) -> output::Output {
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("records", alloc), value: records.len()))
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: output::Verdict.Ok, summary: take summary, records: take records)
+} listed_output
+
+/// A record of a word, fields and lines.
+fn record_of(word: Str, take fields: mem::List[text::String], take lines: mem::List[text::String], alloc: mem::Alloc) -> output::Record {
+    return output::Record(word: text::String.of(word, alloc), fields: take fields, lines: take lines)
+} record_of
+
+/// `nan holes`: a record per hole of the scope, holding its source line and its producers.
+fn read_holes(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: invocation.scope_written(), alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let writer = writer_of(held, scope: resolved.scope, alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for hole in session.holes() {
+        if not resolved.scope.holds(held, path: hole.path.as_str(), line: Some(hole.line)) {
+            continue
+        }
+        let Some(at) = held.file(hole.path.as_str()) else {
+            expect false
+            continue
+        }
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(located(hole.path.as_str(), line: hole.line, alloc))
+        mut fields.push(item_written(held, writer, path: hole.path.as_str(), line: hole.line, known: None, alloc))
+        mut fields.push(text::String.of(hole.expected.as_str(), alloc))
+        var producers = text::String.of("producers:", alloc)
+        for index in 0..<hole.producers.len() {
+            if index == 0 {
+                mut producers.push(' ')
+            } else {
+                mut producers.append(", ")
+            }
+            mut producers.append(hole.producers[index].as_str())
+        }
+        var lines = mem::List[text::String].empty(alloc)
+        mut lines.push(output::printable(held.file_at(at).syntax.line_text(hole.line), alloc))
+        mut lines.push(take producers)
+        mut records.push(record_of("hole", fields: take fields, lines: take lines, alloc))
+    }
+    return listed_output(invocation, written: resolved.written.as_str(), records: take records, alloc)
+} read_holes
+
+/// `nan show <scope>`: a `module` record holding the summary of a module or package scope, then a
+/// record per item of the scope holding its text, with its item and interface hashes; with
+/// `--api`, a record per item of the scope that consumers see. `nan read <location>`: the record
+/// of the item holding that line.
+fn read_show(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    let operand = invocation.operands[0].as_str()
+    if invocation.name == Name.Read and not is_location(operand) {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: operand, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let writer = writer_of(held, scope: resolved.scope, alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    if invocation.flag("--api") {
+        for api in session.api(resolved.scope) {
+            var fields = mem::List[text::String].empty(alloc)
+            mut fields.push(written_for(api.path.as_str(), writer, alloc))
+            mut fields.push(located(api.file.as_str(), line: api.line, alloc))
+            mut records.push(record_of("api", fields: take fields, lines: copied_lines(api.lines.view(), alloc), alloc))
+        }
+        return listed_output(invocation, written: resolved.written.as_str(), records: take records, alloc)
+    }
+    match module_record(held, scope: resolved.scope, alloc) {
+        Some(summary) => {
+            mut records.push(take summary)
+        }
+        None => {}
+    }
+    for shown in session.shown(resolved.scope) {
+        let Some(at) = held.file(shown.file.as_str()) else {
+            expect false
+            continue
+        }
+        let file = held.file_at(at).syntax
+        var fields = mem::List[text::String].empty(alloc)
+        match shown.path {
+            Some(path) => mut fields.push(written_for(path.as_str(), writer, alloc))
+            None => mut fields.push(text::String.of("-", alloc))
+        }
+        mut fields.push(located(shown.file.as_str(), line: shown.line, alloc))
+        mut fields.push(shown.hashes.item.short(alloc))
+        mut fields.push(short_or_dash(shown.hashes.interface_hash, alloc))
+        var lines = mem::List[text::String].empty(alloc)
+        for number in shown.lines {
+            mut lines.push(output::printable(file.line_text(number), alloc))
+        }
+        mut records.push(record_of("item", fields: take fields, lines: take lines, alloc))
+    }
+    return listed_output(invocation, written: resolved.written.as_str(), records: take records, alloc)
+} read_show
+
+/// `nan context <item or location>`: the context pack of the item, or of the line: the item's
+/// text, its closure set's manifest directives, its module's names and a record per item, member
+/// and expression type checking it, or that line, reads.
+fn read_context(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    let operand = invocation.operands[0].as_str()
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: operand, alloc)
+    }
+    let scope::Scope.Lines(path: _, lines: _) = resolved.scope else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var line: Option[u32] = None
+    if is_location(operand) {
+        match last_colon(operand) {
+            Some(at) => {
+                let Some(digits) = operand.slice_bytes(at + 1, end: operand.byte_len()) else {
+                    expect false
+                    return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+                }
+                line = line_number(digits)
+            }
+            None => {}
+        }
+    }
+    let packs = session.contexts(resolved.scope, line)
+    if packs.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: resolved.written.as_str(), alloc)
+    }
+    let records = pack_records(held, pack: packs[0], writer: writer_of(held, scope: resolved.scope, alloc), alloc)
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("entries", alloc), value: records.len()))
+    mut summary.push(output::Count(name: text::String.of("radius", alloc), value: output::units_of(records.view(), alloc)))
+    return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: output::Verdict.Ok, summary: take summary, records: take records)
+} read_context
+
+/// `nan explain <item or package>`: of a function, its digest lines as `digest:` records, a `fact`
+/// record per line raising a digest fact and a `method` record per capability method it
+/// reaches; of an item, its `ledger` records and its `radius`; of a package, its items' ledger
+/// records.
+fn read_explain(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    let operand = invocation.operands[0].as_str()
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: operand, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var records = mem::List[output::Record].empty(alloc)
+    match resolved.scope {
+        scope::Scope.Package(_) => {
+            for ledger in take ledger_records(session, scope: resolved.scope, alloc) {
+                mut records.push(take ledger)
+            }
+        }
+        scope::Scope.Lines(path: _, lines: _) => {
+            explanation_records(mut records, session, scope: resolved.scope, alloc)
+        }
+        else => return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+    }
+    return listed_output(invocation, written: resolved.written.as_str(), records: take records, alloc)
+} read_explain
+
+/// Adds what `nan explain` prints of an item: of a function, its digest lines, facts, methods and
+/// obligations; then its ledger records and its radius.
+fn explanation_records(mut records: mem::List[output::Record], session: check::Session, scope: scope::Scope, alloc: mem::Alloc) {
+    let held = session.workspace.contents()
+    match session.explained(scope) {
+        Some(explained) => {
+            for digest in explained.digests {
+                let words = split_spaces(digest.as_str(), alloc)
+                var fields = mem::List[text::String].empty(alloc)
+                for index in 1..<words.len() {
+                    mut fields.push(text::String.of(words[index].as_str(), alloc))
+                }
+                expect words.len() > 0
+                mut records.push(record_of(words[0].as_str(), fields: take fields, lines: mem::List[text::String].empty(alloc), alloc))
+            }
+            for raised in explained.facts {
+                let Some(at) = held.file(raised.path.as_str()) else {
+                    expect false
+                    continue
+                }
+                var lines = mem::List[text::String].empty(alloc)
+                mut lines.push(output::printable(held.file_at(at).syntax.line_text(raised.line), alloc))
+                var fields = mem::List[text::String].empty(alloc)
+                mut fields.push(text::String.of(raised.fact.word(), alloc))
+                mut fields.push(located(raised.path.as_str(), line: raised.line, alloc))
+                mut records.push(record_of("fact", fields: take fields, lines: take lines, alloc))
+            }
+            for method in explained.methods {
+                var fields = mem::List[text::String].empty(alloc)
+                mut fields.push(text::String.of(method.as_str(), alloc))
+                mut records.push(record_of("method", fields: take fields, lines: mem::List[text::String].empty(alloc), alloc))
+            }
+            for obligation in explained.obligations {
+                let Some(at) = held.file(obligation.path.as_str()) else {
+                    expect false
+                    continue
+                }
+                var lines = mem::List[text::String].empty(alloc)
+                mut lines.push(output::printable(held.file_at(at).syntax.line_text(obligation.line), alloc))
+                for value in obligation.counterexample {
+                    mut lines.push(text::String.of(value.as_str(), alloc))
+                }
+                var fields = mem::List[text::String].empty(alloc)
+                mut fields.push(located(obligation.path.as_str(), line: obligation.line, alloc))
+                mut fields.push(text::String.of(obligation.kind.as_str(), alloc))
+                mut fields.push(text::String.of(obligation.status.as_str(), alloc))
+                mut records.push(record_of("obligation", fields: take fields, lines: take lines, alloc))
+            }
+        }
+        None => {}
+    }
+    for ledger in take ledger_records(session, scope, alloc) {
+        mut records.push(take ledger)
+    }
+    let packs = session.contexts(scope, line: None)
+    if packs.len() == 1 {
+        var radius = text::String.empty(alloc)
+        mut radius.write(text::fmt("{units}", units: output::units_of(pack_records(held, pack: packs[0], writer: writer_of(held, scope, alloc), alloc).view(), alloc)), budget: 100)
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(take radius)
+        mut records.push(record_of("radius", fields: take fields, lines: mem::List[text::String].empty(alloc), alloc))
+    }
+} explanation_records
+
+/// A `ledger` record per ledger entry of a scope, holding its premise, condition, reason or
+/// text, its kind followed by `escape` for a trust escape.
+fn ledger_records(session: check::Session, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[output::Record] {
+    var records = mem::List[output::Record].empty(alloc)
+    for ledgered in session.ledgered(scope) {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(ledgered.kind.word(), alloc))
+        if ledgered.escape {
+            mut fields.push(text::String.of("escape", alloc))
+        }
+        mut fields.push(located(ledgered.path.as_str(), line: ledgered.line, alloc))
+        let shown_from: Option[usize] = match ledgered.kind {
+            check::Kind.Trusted or check::Kind.Assume or check::Kind.Todo => Some(0)
+            check::Kind.Waiver => Some(1)
+            else => None
+        }
+        var lines = mem::List[text::String].empty(alloc)
+        match shown_from {
+            Some(from) => {
+                for index in from..<ledgered.texts.len() {
+                    mut lines.push(output::printable(ledgered.texts[index].as_bytes(), alloc))
+                }
+            }
+            None => {}
+        }
+        mut records.push(record_of("ledger", fields: take fields, lines: take lines, alloc))
+    }
+    return records
+} ledger_records
+
+/// `nan expand <type>`: an `item` record located `derived` per item the type's derives write,
+/// holding its text.
+fn read_expand(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    let operand = invocation.operands[0].as_str()
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: operand, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var derived: Option[mem::List[check::DerivedItem]] = None
+    match resolved.scope {
+        scope::Scope.Lines(path: _, lines: _) => {
+            derived = session.expanded(resolved.scope)
+        }
+        else => {}
+    }
+    let Some(items) = derived else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+    }
+    let writer = writer_of(held, scope: resolved.scope, alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for item in items {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(written_for(item.path.as_str(), writer, alloc))
+        mut fields.push(text::String.of("derived", alloc))
+        mut fields.push(item.hashes.item.short(alloc))
+        mut fields.push(short_or_dash(item.hashes.interface_hash, alloc))
+        mut records.push(record_of("item", fields: take fields, lines: text_lines(item.text.as_str(), alloc), alloc))
+    }
+    return listed_output(invocation, written: resolved.written.as_str(), records: take records, alloc)
+} read_expand
 
 /// The records of a context pack: the item's lines, its package's manifest directives, the names
 /// of its module and the api records of what checking it reads.
@@ -89,3 +398,394 @@ fn flush(mut out: mem::List[text::String], mut quoted: mem::List[text::String], 
     }
     mut quoted.truncate(0)
 } flush
+
+/// Whether an argument is a location: a source file's path, `:` and a line number.
+fn is_location(written: Str) -> bool {
+    let Some(at) = last_colon(written) else {
+        return false
+    }
+    let Some(path) = written.slice_bytes(0, end: at) else {
+        return false
+    }
+    let Some(line) = written.slice_bytes(at + 1, end: written.byte_len()) else {
+        return false
+    }
+    if not path.ends_with(".nan") or line.is_empty() {
+        return false
+    }
+    for byte in line.as_bytes() {
+        if byte < b'0' or byte > b'9' {
+            return false
+        }
+    }
+    return true
+} is_location
+
+/// The `module` record of a package or module scope, holding its module summary.
+fn module_record(workspace: workspace::Workspace, scope: scope::Scope, alloc: mem::Alloc) -> Option[output::Record] {
+    var index: usize = 0
+    var module: usize = 0
+    match scope {
+        scope::Scope.Package(package_index) => {
+            let Some(pack) = workspace.packages.get(package_index) else {
+                expect false
+                return None
+            }
+            let Some(root) = pack.modules.position(fn(candidate: workspace::Module) => candidate.dirs.position(fn(module_dir: workspace::ModuleDir) => module_dir.path.as_str() == pack.dir.as_str()).is_some()) else {
+                return None
+            }
+            index = package_index
+            module = root
+        }
+        scope::Scope.Module(package_index: package_index, module: scoped_module) => {
+            index = package_index
+            module = scoped_module
+        }
+        else => return None
+    }
+    let Some(pack) = workspace.packages.get(index) else {
+        expect false
+        return None
+    }
+    let Some(name) = pack.name() else {
+        return None
+    }
+    let Some(held_module) = pack.modules.get(module) else {
+        return None
+    }
+    let Some(dir) = held_module.dirs.get(0) else {
+        return None
+    }
+    var path = text::String.of(name, alloc)
+    if dir.path.as_str() != pack.dir.as_str() {
+        mut path.append("::")
+        mut path.append(held_module.name.as_str())
+    }
+    var file_path = text::String.of(dir.path.as_str(), alloc)
+    mut file_path.push('/')
+    mut file_path.append(held_module.name.as_str())
+    mut file_path.append(".nan")
+    let Some(at) = workspace.file(file_path.as_str()) else {
+        return None
+    }
+    let file = workspace.file_at(at).syntax
+    let Some(token) = file.summary else {
+        return None
+    }
+    let summary = file.text(token)
+    let Some(after_opener) = summary.slice_bytes(3, end: summary.byte_len()) else {
+        return None
+    }
+    var start: usize = 0
+    while start < after_opener.byte_len() and after_opener.as_bytes()[start] == b' ' {
+        start += 1
+    }
+    let Some(written) = after_opener.slice_bytes(start, end: after_opener.byte_len()) else {
+        return None
+    }
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(written_for(path.as_str(), writer: Some(text::String.of(name, alloc)), alloc))
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(output::printable(written.as_bytes(), alloc))
+    return Some(record_of("module", fields: take fields, lines: take lines, alloc))
+} module_record
+
+/// `nan find <name>`: a record per item or member of that folded name, holding its first line;
+/// with `--contributors`, a record per contribution to a registry in the dependency closure of a
+/// package, judged with it as judging root.
+fn read_find(invocation: Invocation, session: check::Session, current: Str, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    let held = session.workspace.contents()
+    var writer: Option[text::String] = None
+    match scope::Scope.resolve(held, current, written: None, alloc) {
+        Some(resolved) => {
+            writer = writer_of(held, scope: resolved.scope, alloc)
+        }
+        None => {}
+    }
+    var records = mem::List[output::Record].empty(alloc)
+    if invocation.flag("--contributors") {
+        if invocation.operands.len() == 0 {
+            return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+        }
+        let Some(root) = contributors_root(invocation, workspace: held, current, alloc) else {
+            return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: joined.as_str(), alloc)
+        }
+        let Some(listed) = session.contributed(root, written: invocation.operands[0].as_str()) else {
+            return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: joined.as_str(), alloc)
+        }
+        for contribution in listed {
+            var fields = mem::List[text::String].empty(alloc)
+            mut fields.push(written_for(contribution.registry_path.as_str(), writer, alloc))
+            mut fields.push(written_for(contribution.entry.as_str(), writer, alloc))
+            mut fields.push(located(contribution.file.as_str(), line: contribution.line, alloc))
+            if contribution.admitted {
+                mut fields.push(text::String.of("admitted", alloc))
+            } else {
+                mut fields.push(text::String.of("not-admitted", alloc))
+            }
+            mut records.push(record_of("contribution", fields: take fields, lines: mem::List[text::String].empty(alloc), alloc))
+        }
+        return listed_output(invocation, written: joined.as_str(), records: take records, alloc)
+    }
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    for declared in session.declared(invocation.operands[0].as_str()) {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(written_for(declared.path.as_str(), writer, alloc))
+        mut fields.push(located(declared.file.as_str(), line: declared.line, alloc))
+        var lines = mem::List[text::String].empty(alloc)
+        mut lines.push(text::String.of(declared.text.as_str(), alloc))
+        mut records.push(record_of("found", fields: take fields, lines: take lines, alloc))
+    }
+    return listed_output(invocation, written: joined.as_str(), records: take records, alloc)
+} read_find
+
+/// The judging root `nan find --contributors` names: the package named by its second operand, or
+/// else the package holding the current directory.
+fn contributors_root(invocation: Invocation, workspace: workspace::Workspace, current: Str, alloc: mem::Alloc) -> Option[usize] {
+    match invocation.operands.get(1) {
+        Some(named) => return workspace.packages.position(fn(candidate: workspace::Package) => candidate.name() == Some(named.as_str()))
+        None => {}
+    }
+    return workspace.packages.position(fn(candidate: workspace::Package) -> bool {
+        let base = platform::join(workspace.root.as_str(), name: candidate.dir.as_str(), alloc)
+        return platform::strip_prefix(current, base: base.as_str(), alloc).is_some()
+    })
+} contributors_root
+
+/// The heading of the primer section of the tier a word names.
+fn tier_heading(word: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let heading = match word {
+        "core" => "Core"
+        "low-level" => "Low-level topic"
+        "concurrency" => "Concurrency topic"
+        "kernel" => "Kernel topic"
+        "packages" => "Packages and trust topic"
+        "contracts" => "Contracts topic"
+        "components" => "Components topic"
+        "tools" => "Tool card"
+        else => return None
+    }
+    return Some(text::String.of(heading, alloc))
+} tier_heading
+
+/// `nan primer [<topic> or tools]`: the tier's section of the primer, each link outside code
+/// replaced by its text.
+fn read_primer(invocation: Invocation, alloc: mem::Alloc) -> output::Output {
+    let joined = invocation.joined_args(alloc)
+    var tier = "core"
+    if invocation.operands.len() > 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    if invocation.operands.len() == 1 {
+        tier = invocation.operands[0].as_str()
+        if tier == "core" {
+            return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+        }
+    }
+    let Some(heading) = tier_heading(tier, alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: joined.as_str(), alloc)
+    }
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(text::String.of(tier, alloc))
+    var records = mem::List[output::Record].empty(alloc)
+    mut records.push(record_of("primer", fields: take fields, lines: primer_section(heading.as_str(), alloc), alloc))
+    return listed_output(invocation, written: joined.as_str(), records: take records, alloc)
+} read_primer
+
+/// The lines of the primer's section under a heading, each link outside code blocks replaced by
+/// its text, without leading or trailing empty lines.
+fn primer_section(heading: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var title = text::String.of("## ", alloc)
+    mut title.append(heading)
+    var section = mem::List[text::String].empty(alloc)
+    var inside = false
+    for line in take text_lines(PRIMER, alloc) {
+        if not inside {
+            inside = line.as_str() == title.as_str()
+            continue
+        }
+        if line.starts_with("## ") {
+            break
+        }
+        mut section.push(take line)
+    }
+    let lines = printed(section.view(), alloc)
+    var low: usize = 0
+    while low < lines.len() and lines[low].as_str().is_empty() {
+        low += 1
+    }
+    var high = lines.len()
+    while high > low {
+        invariant high <= lines.len()
+        if not lines[high - 1].as_str().is_empty() {
+            break
+        }
+        high -= 1
+    }
+    var kept = mem::List[text::String].empty(alloc)
+    for index in low..<high {
+        mut kept.push(text::String.of(lines[index].as_str(), alloc))
+    }
+    return kept
+} primer_section
+
+/// Lines of the primer with each Markdown link outside code blocks replaced by its text.
+fn printed(lines: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var out = mem::List[text::String].empty(alloc)
+    var code = false
+    for line in lines {
+        if line.starts_with("```") {
+            code = not code
+        }
+        if code {
+            mut out.push(text::String.of(line.as_str(), alloc))
+        } else {
+            mut out.push(unlinked(line.as_str(), alloc))
+        }
+    }
+    return out
+} printed
+
+/// A line with each Markdown link `[text](target)` outside code spans replaced by its text.
+fn unlinked(line: Str, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    let bytes = line.as_bytes()
+    var copied: usize = 0
+    var at: usize = 0
+    while at < bytes.len() {
+        let byte = bytes[at]
+        if byte != b'`' and byte != b'[' {
+            at += 1
+            continue
+        }
+        let Some(kept) = line.slice_bytes(copied, end: at) else {
+            expect false
+            return out
+        }
+        mut out.append(kept)
+        let Some(rest) = line.slice_bytes(at, end: bytes.len()) else {
+            expect false
+            return out
+        }
+        var length: usize = 1
+        if byte == b'`' {
+            length = code_span(rest)
+            let Some(span) = rest.slice_bytes(0, end: length) else {
+                expect false
+                return out
+            }
+            mut out.append(span)
+        } else {
+            match link(rest) {
+                Some(found) => {
+                    let Some(linked) = rest.slice_bytes(1, end: found.text_end) else {
+                        expect false
+                        return out
+                    }
+                    mut out.append(unlinked(linked, alloc).as_str())
+                    length = found.length
+                }
+                None => {
+                    mut out.push('[')
+                }
+            }
+        }
+        expect at <= ~0usize - length
+        at += length
+        copied = at
+    }
+    let Some(rest) = line.slice_bytes(copied, end: bytes.len()) else {
+        expect false
+        return out
+    }
+    mut out.append(rest)
+    return out
+} unlinked
+
+/// The length of the code span `written` starts with, or of its opening backticks when no run of
+/// as many closes them.
+fn code_span(written: Str) -> usize {
+    let bytes = written.as_bytes()
+    let ticks = tick_run(bytes, from: 0)
+    var at = ticks
+    while at < bytes.len() {
+        if bytes[at] != b'`' {
+            at += 1
+            continue
+        }
+        let closing = tick_run(bytes, from: at)
+        if closing == ticks {
+            expect at <= ~0usize - ticks
+            return at + ticks
+        }
+        expect at <= ~0usize - closing
+        at += closing
+    }
+    return ticks
+} code_span
+
+/// The number of backticks from a position on.
+fn tick_run(bytes: Slice[u8], from: usize) -> usize {
+    let Some(parts) = bytes.split_at(from) else {
+        return 0
+    }
+    var count: usize = 0
+    for byte in parts.tail {
+        invariant count < parts.tail.len()
+        if byte != b'`' {
+            break
+        }
+        count += 1
+    }
+    return count
+} tick_run
+
+/// The link a text starts with: where its text, from 1, ends, and the link's length.
+struct LinkSpan derives Copy {
+    text_end: usize
+    length: usize
+} LinkSpan
+
+/// The link a text starting with `[` starts with, whose brackets balance outside code spans.
+fn link(written: Str) -> Option[LinkSpan] {
+    let bytes = written.as_bytes()
+    var depth: i64 = 0
+    var at: usize = 0
+    var closed = false
+    while at < bytes.len() {
+        let byte = bytes[at]
+        if byte == b'`' {
+            let Some(rest) = written.slice_bytes(at, end: bytes.len()) else {
+                return None
+            }
+            let span = code_span(rest)
+            expect at <= ~0usize - span
+            at += span
+            continue
+        }
+        if byte == b'[' {
+            expect depth < 0x7FFF_FFFF_FFFF_FFFF
+            depth += 1
+        } else if byte == b']' {
+            if depth == 1 {
+                closed = true
+                break
+            }
+            expect depth >= -0x7FFF_FFFF_FFFF_FFFF
+            depth -= 1
+        }
+        at += 1
+    }
+    if not closed or at + 1 >= bytes.len() or bytes[at + 1] != b'(' {
+        return None
+    }
+    for end in (at + 2)..<bytes.len() {
+        if bytes[end] == b')' {
+            return Some(LinkSpan(text_end: at, length: end + 1))
+        }
+    }
+    return None
+} link

@@ -1,0 +1,217 @@
+//! Whether the `preserves` tombstones a release adds to its parent preserve the exported items they retire, as publishing checks them.
+
+/// A forwarding function to judge, with the error its tombstone reports when it does not
+/// preserve the old item.
+struct Forwarding {
+    error: diagnostic::Diagnostic
+    function: Synthetic
+} Forwarding
+
+/// The `retired.not-preserved` errors of the `preserves` tombstones of the workspace package at
+/// `index` that its parent's code root does not hold, `held` giving the old forms it does, and
+/// whose old forms name exported items of the parent, `parent` and `release_exported` giving the
+/// exported entries of the parent and of the release.
+pkg fn Session.not_preserved(self, index: usize, parent: mem::Map[text::String, machine::ApiEntry], held: mem::Map[text::String, release::Forward], release_exported: mem::Map[text::String, machine::ApiEntry]) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.alloc
+    var errors = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let workspace_held = self.workspace.contents()
+    let Some(closure) = workspace_held.closure_of(index) else {
+        return errors
+    }
+    let Some(source) = workspace_held.packages.get(index) else {
+        expect false
+        return errors
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return errors
+    }
+    let checker = self.checked(closure, target)
+    let Some(name) = source.name() else {
+        return errors
+    }
+    let Some(package_id) = checker.package_named(name) else {
+        return errors
+    }
+    var forwardings = mem::List[Forwarding].empty(alloc)
+    let db = checker.db()
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            checker.judge_tombstone(item, module, parent, held, release_exported, errors: mut errors, forwardings: mut forwardings)
+        }
+    }
+    var functions = mem::List[Synthetic].empty(alloc)
+    for forwarding in forwardings {
+        mut functions.push(Synthetic(dir: text::String.of(forwarding.function.dir.as_str(), alloc), path: text::String.of(forwarding.function.path.as_str(), alloc), text: text::String.of(forwarding.function.text.as_str(), alloc)))
+    }
+    let judged = self.judge(index, functions: functions.view())
+    for at in 0..<forwardings.len() {
+        let kept = match judged.get(at) {
+            Some(Some(outcome)) => forwarding_preserves(outcome, written: forwardings[at].function.text.as_str())
+            else => false
+        }
+        if not kept {
+            mut errors.push(forwardings[at].error.copy(alloc))
+        }
+    }
+    return errors
+} Session.not_preserved
+
+/// Judges a tombstone of the release: a path tombstone by whether its replacement replaces the
+/// old item, a head tombstone through its forwarding function, both only for an old form the
+/// parent exports and its code root does not hold.
+fn Checker.judge_tombstone(self, item: ty::ItemId, module: ty::ModuleId, parent: mem::Map[text::String, machine::ApiEntry], held: mem::Map[text::String, release::Forward], release_exported: mem::Map[text::String, machine::ApiEntry], mut errors: mem::List[diagnostic::Diagnostic], mut forwardings: mem::List[Forwarding]) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let ast::ItemKind.Retired(retired_item) = db.ast(item).kind else {
+        return
+    }
+    let ast::RetiredNew.Rewrite(expr: rewrite, preserves: preserving) = retired_item.new else {
+        return
+    }
+    if not preserving {
+        return
+    }
+    let Some(form) = db.old_form(module, tombstone: retired_item) else {
+        return
+    }
+    let Some(old) = parent.get_by(fn(key: text::String) => key.as_str().cmp(form.as_str())) else {
+        return
+    }
+    if held.get_by(fn(key: text::String) => key.as_str().cmp(form.as_str())).is_some() {
+        return
+    }
+    let error = diagnostic::Diagnostic.at(diagnostic::Code.RetiredNotPreserved, path: db.item_file(item).path.as_str(), line: db.head_line(item), alloc)
+    if retired_item.head.is_none() {
+        let kept = match rewrite.kind {
+            ast::ExprKind.Path(path: written, args: None) => self.replaced_by(module, written, old, form: form.as_str(), release_exported)
+            else => true
+        }
+        if not kept {
+            mut errors.push(take error)
+        }
+        return
+    }
+    match self.forwarding_function(item, old, number: forwardings.len()) {
+        Some(function) => mut forwardings.push(Forwarding(error: take error, function: take function))
+        None => mut errors.push(take error)
+    }
+} Checker.judge_tombstone
+
+/// Whether the item a path tombstone's rewrite names replaces the old item it retires.
+fn Checker.replaced_by(self, module: ty::ModuleId, written: ast::Path, old: machine::ApiEntry, form: Str, release_exported: mem::Map[text::String, machine::ApiEntry]) -> bool {
+    let Some(new) = self.db().spelled(module, path: written) else {
+        return false
+    }
+    let Some(entry) = release_exported.get_by(fn(key: text::String) => key.as_str().cmp(new.as_str())) else {
+        return false
+    }
+    return release::replaces(old, new: entry, old_path: form, new_path: new.as_str(), alloc: self.alloc())
+} Checker.replaced_by
+
+/// The forwarding function of a head tombstone: a function of its module with its old head under
+/// a new name, the old item's requires, ensures and example clauses in the parent, and a body
+/// returning the rewrite; none when its line does not read as a head tombstone.
+fn Checker.forwarding_function(self, item: ty::ItemId, old: machine::ApiEntry, number: usize) -> Option[Synthetic] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let line = output::lossy(db.syntax(item).line_text(db.head_line(item)), alloc)
+    if not line.starts_with("retired ") {
+        return None
+    }
+    let Some(after) = line.as_str().slice_bytes(8, end: line.byte_len()) else {
+        return None
+    }
+    let Some(arrow) = after.find(" => ") else {
+        return None
+    }
+    let Some(head) = after.slice_bytes(0, end: arrow) else {
+        return None
+    }
+    let Some(rest) = after.slice_bytes(arrow + 4, end: after.byte_len()) else {
+        return None
+    }
+    if not rest.ends_with(" preserves") {
+        return None
+    }
+    expect rest.byte_len() >= 10
+    let Some(rewrite) = rest.slice_bytes(0, end: rest.byte_len() - 10) else {
+        return None
+    }
+    let Some(open) = head.find("(") else {
+        return None
+    }
+    let Some(name) = head.slice_bytes(0, end: open) else {
+        return None
+    }
+    let Some(signature) = head.slice_bytes(open, end: head.byte_len()) else {
+        return None
+    }
+    var renamed = text::String.of(name, alloc)
+    mut renamed.write(text::fmt("_forwarding_{number}", number), budget: 100)
+    var marked = text::String.empty(alloc)
+    let failing = signature.find(" fails ").is_some()
+    let waiting = signature.find(" uses wait").is_some()
+    if failing and waiting {
+        mut marked.append("try await ")
+    } else if failing {
+        mut marked.append("try ")
+    } else if waiting {
+        mut marked.append("await ")
+    }
+    mut marked.append(rewrite)
+    var written = text::String.of("\nfn ", alloc)
+    mut written.append(renamed.as_str())
+    mut written.append(signature)
+    if old.accepted.clauses.len() == 0 {
+        mut written.append(" {\n")
+    } else {
+        mut written.push('\n')
+        for clause in old.accepted.clauses {
+            mut written.append("    ")
+            mut written.append(clause.as_str())
+            mut written.push('\n')
+        }
+        mut written.append("{\n")
+    }
+    if signature.find(" -> ").is_some() {
+        mut written.append("    return ")
+    } else {
+        mut written.append("    ")
+    }
+    mut written.append(marked.as_str())
+    mut written.append("\n} ")
+    mut written.append(renamed.as_str())
+    mut written.push('\n')
+    return Some(Synthetic.beside(self, item, name: renamed.as_str(), text: take written))
+} Checker.forwarding_function
+
+/// Whether a forwarding function preserves its old item: it checks without error, and the prover
+/// proves every obligation or the old item's examples, which its text holds, all hold.
+fn forwarding_preserves(judged: Judged, written: Str) -> bool {
+    var proved = true
+    for site in judged.sites.contents() {
+        if site.status != Status.Proven and site.status != Status.Assumed {
+            proved = false
+        }
+    }
+    var examples = false
+    var start: usize = 0
+    let bytes = written.as_bytes()
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        match written.slice_bytes(start, end) {
+            Some(line) => {
+                if line.starts_with("    example ") {
+                    examples = true
+                }
+            }
+            None => {}
+        }
+        expect end < ~0usize
+        start = end + 1
+    }
+    return not judged.failed and (proved or examples)
+} forwarding_preserves

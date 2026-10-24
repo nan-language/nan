@@ -1,0 +1,615 @@
+//! Weakening judged by entailment. Of the parts of an accepted spec that a later spec's texts weaken, the prover clears `requires` when the accepted requires entail the later requires, and an accepted ensures when the accepted requires and the later ensures entail it, over a function of the item's module with the accepted head, requires and ensures whose body calls a function holding the later spec: the item itself for its current spec, or else a function stating it.
+
+/// A function of a checker whose later spec weakens an accepted spec by its texts: the later spec
+/// is the function's current one when `later` is none.
+pkg struct Weakened {
+    pkg ck: Checker
+    pkg item: ty::ItemId
+    pkg accepted: machine::Accepted
+    pkg later: Option[machine::Accepted]
+} Weakened
+
+/// A weakening's parts and the index of its judging function among those judged, if any.
+struct JudgedWeakening {
+    parts: mem::List[text::String]
+    at: Option[usize]
+} JudgedWeakening
+
+/// The parts of each weakening that entailment leaves, judging those of the functions of the
+/// workspace package at `index` together.
+pkg fn Session.left(self, index: usize, weakened: Slice[Weakened]) -> mem::List[mem::List[text::String]] {
+    let alloc = self.alloc
+    var functions = mem::List[Synthetic].empty(alloc)
+    var judging = mem::List[JudgedWeakening].empty(alloc)
+    for weakening in weakened {
+        var later = machine::Accepted.empty(alloc)
+        match weakening.later {
+            Some(stated) => {
+                later = stated.copy(alloc)
+            }
+            None => {
+                later = weakening.ck.spec(weakening.item)
+            }
+        }
+        let parts = weakening.ck.weakened(weakening.item, accepted: weakening.accepted, current: later)
+        var at: Option[usize] = None
+        if is_judged(parts.view(), accepted: weakening.accepted) {
+            match judging_functions(weakening, number: functions.len(), alloc) {
+                Some(made) => {
+                    for function in take made {
+                        mut functions.push(take function)
+                    }
+                    expect functions.len() > 0
+                    at = Some(functions.len() - 1)
+                }
+                None => {}
+            }
+        }
+        mut judging.push(JudgedWeakening(parts: take parts, at: at))
+    }
+    let judged = self.judge(index, functions: functions.view())
+    var left_parts = mem::List[mem::List[text::String]].empty(alloc)
+    var position: usize = 0
+    for weakening in weakened {
+        expect position < judging.len()
+        let held = judging[position]
+        match held.at {
+            Some(at) => {
+                expect at < judged.len()
+                mut left_parts.push(remaining(judged[at], accepted: weakening.accepted, parts: held.parts.view(), alloc))
+            }
+            None => mut left_parts.push(copied_parts(held.parts.view(), alloc))
+        }
+        position += 1
+    }
+    return left_parts
+} Session.left
+
+/// Whether entailment judges a weakening's parts: `requires` with accepted requires, or an
+/// ensures.
+fn is_judged(parts: Slice[text::String], accepted: machine::Accepted) -> bool {
+    var premised = false
+    for clause in accepted.clauses {
+        if clause.starts_with("requires ") {
+            premised = true
+        }
+    }
+    for part in parts {
+        if (part.as_str() == "requires" and premised) or part.starts_with("ensures ") {
+            return true
+        }
+    }
+    return false
+} is_judged
+
+fn copied_parts(parts: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copies = mem::List[text::String].empty(alloc)
+    for part in parts {
+        mut copies.push(text::String.of(part.as_str(), alloc))
+    }
+    return copies
+} copied_parts
+
+/// Re-judges by entailment the pending weakenings of the snapshots computed for the workspace
+/// package at `index`: an item left with no weakened part takes its current spec as accepted.
+pkg fn Session.refine(self, index: usize, items: Items, mut snapshots: Snapshots) {
+    let alloc = self.alloc
+    var weakened = mem::List[Weakened].empty(alloc)
+    for recorded in snapshots.recorded {
+        let Some(first_variant) = items.first_variant(recorded.path.as_str()) else {
+            continue
+        }
+        let Some(entry) = snapshots.entry(recorded.path.as_str()) else {
+            continue
+        }
+        mut weakened.push(Weakened(ck: first_variant.ck.share(), item: first_variant.item, accepted: entry.accepted.copy(alloc), later: None))
+    }
+    if weakened.len() == 0 {
+        return
+    }
+    let left_parts = self.left(index, weakened: weakened.view())
+    var position: usize = 0
+    for weakening in weakened {
+        expect position < left_parts.len()
+        let parts = left_parts[position]
+        position += 1
+        var path = text::String.empty(alloc)
+        match weakening.ck.canonical_path(weakening.item) {
+            Some(canonical) => {
+                path = canonical
+            }
+            None => {}
+        }
+        let hash = weakening.ck.hashes(weakening.item).item
+        let Some(at) = snapshots.entry_at(path.as_str()) else {
+            continue
+        }
+        expect at.module < snapshots.modules.len()
+        var module_snapshot = mut snapshots.modules.at_mut(at.module)
+        expect at.entry < module_snapshot.entries.len()
+        var entry = mut module_snapshot.entries.at_mut(at.entry)
+        if parts.len() == 0 {
+            entry.accepted = weakening.ck.spec(weakening.item)
+            mut entry.pending.truncate(0)
+            if not items.holds_escape(path.as_str()) {
+                mut entry.seals.retain(fn(seal: machine::Seal) => items.seal_current(path.as_str(), seal, alloc))
+            }
+            mut snapshots.recorded.retain(fn(held: Recorded) => held.path != path)
+            continue
+        }
+        var pending = mem::List[machine::Pending].empty(alloc)
+        for part in parts {
+            mut pending.push(machine::Pending(hash: hash, part: text::String.of(part.as_str(), alloc)))
+        }
+        entry.pending = pending
+        for held in mut snapshots.recorded {
+            if held.path == path {
+                held.parts = copied_parts(parts.view(), alloc)
+                break
+            }
+        }
+    }
+} Session.refine
+
+/// The parts the prover leaves of a weakening once its judging function is checked.
+fn remaining(judged: Option[Judged], accepted: machine::Accepted, parts: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(held) = judged else {
+        return copied_parts(parts, alloc)
+    }
+    if held.failed {
+        return copied_parts(parts, alloc)
+    }
+    let sites = held.sites.contents()
+    var requires_cleared = true
+    for site in sites {
+        if site.role == nir::Role.Body and site.obligation == Obligation.Check(nir::CheckKind.Requires) and not is_cleared(site) {
+            requires_cleared = false
+        }
+    }
+    var ensured = mem::List[text::String].empty(alloc)
+    for clause in accepted.clauses {
+        if clause.starts_with("ensures ") {
+            mut ensured.push(text::String.of(clause.as_str(), alloc))
+        }
+    }
+    var kept = mem::List[text::String].empty(alloc)
+    for part in parts {
+        if part.as_str() == "requires" {
+            if not requires_cleared {
+                mut kept.push(text::String.of(part.as_str(), alloc))
+            }
+            continue
+        }
+        let Some(clause) = ensured.position(fn(ensured_clause: text::String) => ensured_clause == part) else {
+            mut kept.push(text::String.of(part.as_str(), alloc))
+            continue
+        }
+        if not ensures_cleared(sites.view(), clause: u32.fit(clause)) {
+            mut kept.push(text::String.of(part.as_str(), alloc))
+        }
+    }
+    return kept
+} remaining
+
+/// Whether the body of a judging function proves an ensures clause of its own.
+fn ensures_cleared(sites: Slice[Obligated], clause: u32) -> bool {
+    for site in sites {
+        if site.role == nir::Role.Body and site.obligation == Obligation.Check(nir::CheckKind.Ensures) and site.clause == Some(clause) and is_cleared(site) {
+            return true
+        }
+    }
+    return false
+} ensures_cleared
+
+/// Whether an obligation site is proven or assumed.
+fn is_cleared(site: Obligated) -> bool {
+    return site.status == Status.Proven or site.status == Status.Assumed
+} is_cleared
+
+/// A head read from its text: its name, the text after the name, each parameter's mode and name,
+/// and whether it states a result, a failure type and `uses wait`.
+struct Head {
+    name: text::String
+    rest: text::String
+    params: mem::List[ModedName]
+    result: bool
+    failure: bool
+    wait: bool
+} Head
+
+/// A parameter's mode and name.
+struct ModedName {
+    mode: ast::Mode
+    name: text::String
+} ModedName
+
+fn Head.read(written: Str, alloc: mem::Alloc) -> Option[Head] {
+    let Some(at) = written.find("fn ") else {
+        return None
+    }
+    expect written.byte_len() >= 3 and at <= written.byte_len() - 3
+    let Some(head) = written.slice_bytes(at + 3, end: written.byte_len()) else {
+        return None
+    }
+    let Some(split) = first_opening(head) else {
+        return None
+    }
+    let Some(name) = head.slice_bytes(0, end: split) else {
+        return None
+    }
+    let Some(rest) = head.slice_bytes(split, end: head.byte_len()) else {
+        return None
+    }
+    let Some(read) = head_parameters(rest, alloc) else {
+        return None
+    }
+    let Some(after) = rest.slice_bytes(read.after, end: rest.byte_len()) else {
+        return None
+    }
+    let ReadParams(params: params, after: _) = read
+    return Some(Head(name: text::String.of(name, alloc), rest: text::String.of(rest, alloc), params: take params, result: after.find("->").is_some(), failure: after.find(" fails ").is_some(), wait: after.find(" uses wait").is_some()))
+} Head.read
+
+/// The position of the first `(` or `[` of a text.
+fn first_opening(written: Str) -> Option[usize] {
+    let bytes = written.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'(' or bytes[at] == b'[' {
+            return Some(at)
+        }
+    }
+    return None
+} first_opening
+
+/// The functions judging a weakening, the last of them the judging function: of the item's
+/// module, with the accepted head under a new name, the accepted requires and ensures, and a body
+/// calling a function holding the later spec with its parameters matched by position. A later
+/// spec other than the item's current one is stated by a function before the judging function.
+/// None when a head does not read so or the heads' parameters are not as many.
+fn judging_functions(weakening: Weakened, number: usize, alloc: mem::Alloc) -> Option[mem::List[Synthetic]] {
+    let ck = weakening.ck
+    let Some(accepted_head) = weakening.accepted.head else {
+        return None
+    }
+    let Some(accepted) = Head.read(accepted_head.as_str(), alloc) else {
+        return None
+    }
+    var functions = mem::List[Synthetic].empty(alloc)
+    var call = text::String.empty(alloc)
+    var unit = false
+    match weakening.later {
+        None => {
+            let Some(made) = item_call(ck, item: weakening.item, accepted, alloc) else {
+                return None
+            }
+            call = made.call
+            unit = made.unit
+        }
+        Some(later) => {
+            let Some(later_head) = later.head else {
+                return None
+            }
+            let Some(stated) = Head.read(later_head.as_str(), alloc) else {
+                return None
+            }
+            if stated.params.len() != accepted.params.len() {
+                return None
+            }
+            var stated_name = text::String.of(stated.name.as_str(), alloc)
+            mut stated_name.write(text::fmt("_stated_{number}", number), budget: 100)
+            var stated_body = "todo \"stated\""
+            if stated.result {
+                stated_body = "return todo \"stated\""
+            }
+            mut functions.push(synthetic_function(ck, item: weakening.item, renamed: stated_name.as_str(), rest: stated.rest.as_str(), spec: later, body: stated_body, alloc))
+            call = stated_call(stated, renamed: stated_name.as_str(), accepted, alloc)
+            unit = not stated.result
+        }
+    }
+    var body = text::String.empty(alloc)
+    if not unit {
+        mut body.append("return ")
+    }
+    mut body.append(call.as_str())
+    var renamed = text::String.of(accepted.name.as_str(), alloc)
+    mut renamed.write(text::fmt("_judged_{number}", number), budget: 100)
+    mut functions.push(synthetic_function(ck, item: weakening.item, renamed: renamed.as_str(), rest: accepted.rest.as_str(), spec: weakening.accepted, body: body.as_str(), alloc))
+    return Some(take functions)
+} judging_functions
+
+/// The text of a judging function's call, and whether its result is `Unit`.
+struct JudgingCall {
+    call: text::String
+    unit: bool
+} JudgingCall
+
+/// The call of an item by a function with the accepted head, and whether its result is `Unit`.
+fn item_call(ck: Checker, item: ty::ItemId, accepted: Head, alloc: mem::Alloc) -> Option[JudgingCall] {
+    let ast::ItemKind.Fn(function) = ck.db().ast(item).kind else {
+        return None
+    }
+    let Some(sig) = ck.fn_sig(item) else {
+        return None
+    }
+    if sig.params.len() != accepted.params.len() {
+        return None
+    }
+    var first_index: usize = 0
+    if sig.has_self() {
+        first_index = 1
+    }
+    var args = mem::List[text::String].empty(alloc)
+    for index in 0..<sig.params.len() {
+        let param = sig.params[index]
+        if param.is_self {
+            continue
+        }
+        let given = accepted.params[index].name.as_str()
+        var value = text::String.empty(alloc)
+        push_item_mark(mut value, ck, mode: param.mode, param_ty: param.ty)
+        mut value.append(given)
+        mut args.push(labelled_argument(index == first_index, label: param.name.as_str(), take value, given, alloc))
+    }
+    var call = text::String.empty(alloc)
+    push_markers(mut call, failure: sig.failure.is_some(), wait: sig.wait)
+    if sig.params.len() > 0 and sig.params[0].is_self {
+        let receiver = sig.params[0]
+        push_item_mark(mut call, ck, mode: receiver.mode, param_ty: receiver.ty)
+        mut call.append(accepted.params[0].name.as_str())
+        mut call.push('.')
+        mut call.append(function.label.name.text.as_str())
+    } else {
+        mut call.append(function.label.written(alloc).as_str())
+    }
+    push_arguments(mut call, args: args.view())
+    return Some(JudgingCall(call: take call, unit: sig.result == ty::Ty.unit()))
+} item_call
+
+/// Appends the marker an argument of a mode takes: `mut`, or `take` for a type that is not Copy.
+fn push_item_mark(mut written: text::String, ck: Checker, mode: ast::Mode, param_ty: ty::Ty) {
+    match mode {
+        ast::Mode.Mut => mut written.append("mut ")
+        ast::Mode.Take => {
+            if not ck.has(param_ty, property: Property.Copy) {
+                mut written.append("take ")
+            }
+        }
+        ast::Mode.Read => {}
+    }
+} push_item_mark
+
+/// The call of the function stating a later spec, named `renamed`, by a function with the
+/// accepted head.
+fn stated_call(stated: Head, renamed: Str, accepted: Head, alloc: mem::Alloc) -> text::String {
+    expect stated.params.len() == accepted.params.len()
+    let receiving = stated.params.len() > 0 and stated.params[0].name.as_str() == "self"
+    var first_index: usize = 0
+    if receiving {
+        first_index = 1
+    }
+    var args = mem::List[text::String].empty(alloc)
+    for index in 0..<stated.params.len() {
+        if index == 0 and receiving {
+            continue
+        }
+        let param = stated.params[index]
+        let given = accepted.params[index].name.as_str()
+        var value = text::String.empty(alloc)
+        push_mode_mark(mut value, mode: param.mode)
+        mut value.append(given)
+        mut args.push(labelled_argument(index == first_index, label: param.name.as_str(), take value, given, alloc))
+    }
+    var call = text::String.empty(alloc)
+    push_markers(mut call, failure: stated.failure, wait: stated.wait)
+    let method = match last_dot(renamed) {
+        Some(at) => renamed.slice_bytes(at + 1, end: renamed.byte_len())
+        None => None
+    }
+    match method {
+        Some(name) => {
+            if receiving {
+                push_mode_mark(mut call, mode: stated.params[0].mode)
+                mut call.append(accepted.params[0].name.as_str())
+                mut call.push('.')
+                mut call.append(name)
+            } else {
+                mut call.append(renamed)
+            }
+        }
+        None => mut call.append(renamed)
+    }
+    push_arguments(mut call, args: args.view())
+    return call
+} stated_call
+
+fn push_mode_mark(mut written: text::String, mode: ast::Mode) {
+    match mode {
+        ast::Mode.Mut => mut written.append("mut ")
+        ast::Mode.Take => mut written.append("take ")
+        ast::Mode.Read => {}
+    }
+} push_mode_mark
+
+/// Appends `(`, the arguments joined by `, ` and `)`.
+fn push_arguments(mut written: text::String, args: Slice[text::String]) {
+    mut written.push('(')
+    for index in 0..<args.len() {
+        if index > 0 {
+            mut written.append(", ")
+        }
+        mut written.append(args[index].as_str())
+    }
+    mut written.push(')')
+} push_arguments
+
+/// An argument as a call writes it: unlabelled first, or a binding named like its parameter;
+/// otherwise labelled.
+fn labelled_argument(first_arg: bool, label: Str, take value: text::String, given: Str, alloc: mem::Alloc) -> text::String {
+    if first_arg or label == given {
+        return value
+    }
+    var written = text::String.of(label, alloc)
+    mut written.append(": ")
+    mut written.append(value.as_str())
+    return written
+} labelled_argument
+
+/// Appends the markers of a call that may fail or wait.
+fn push_markers(mut written: text::String, failure: bool, wait: bool) {
+    if failure {
+        mut written.append("try ")
+    }
+    if wait {
+        mut written.append("await ")
+    }
+} push_markers
+
+/// A function of an item's module named `renamed`, with the head text `rest` after its name, the
+/// requires and ensures of a spec, and a body.
+fn synthetic_function(ck: Checker, item: ty::ItemId, renamed: Str, rest: Str, spec: machine::Accepted, body: Str, alloc: mem::Alloc) -> Synthetic {
+    var written = text::String.of("\nfn ", alloc)
+    mut written.append(renamed)
+    mut written.append(rest)
+    var clauses: usize = 0
+    for clause in spec.clauses {
+        invariant clauses < spec.clauses.len()
+        if clause.starts_with("requires ") or clause.starts_with("ensures ") {
+            if clauses == 0 {
+                mut written.push('\n')
+            }
+            mut written.append("    ")
+            mut written.append(clause.as_str())
+            mut written.push('\n')
+            clauses += 1
+        }
+    }
+    if clauses == 0 {
+        mut written.append(" {\n")
+    } else {
+        mut written.append("{\n")
+    }
+    mut written.append("    ")
+    mut written.append(body)
+    mut written.append("\n} ")
+    mut written.append(renamed)
+    mut written.push('\n')
+    return Synthetic.beside(ck, item, name: renamed, text: take written)
+} synthetic_function
+
+/// Parameters read from the text after a head's name, and the position after their `)`.
+struct ReadParams {
+    params: mem::List[ModedName]
+    after: usize
+} ReadParams
+
+/// The modes and names of the parameters a head writes after its name, generic parameters first
+/// when it has them, and the position of the text after them.
+fn head_parameters(rest: Str, alloc: mem::Alloc) -> Option[ReadParams] {
+    let Some(opening) = head_parameters_open(rest) else {
+        return None
+    }
+    var params = mem::List[ModedName].empty(alloc)
+    var depth: i64 = 0
+    expect opening < rest.byte_len()
+    var start = opening + 1
+    var at = opening + 1
+    let Some(inner) = rest.slice_bytes(at, end: rest.byte_len()) else {
+        return None
+    }
+    for c in inner {
+        invariant at < rest.byte_len()
+        expect c.utf8_len() <= rest.byte_len() - at
+        if c == '(' or c == '[' {
+            expect depth < 0x7FFF_FFFF_FFFF_FFFF
+            depth += 1
+        } else if c == ')' and depth == 0 {
+            add_head_parameter(mut params, param: rest.slice_bytes(start, end: at), alloc)
+            return Some(ReadParams(params: take params, after: at + 1))
+        } else if c == ')' or c == ']' {
+            expect depth >= -0x7FFF_FFFF_FFFF_FFFF
+            depth -= 1
+        } else if c == ',' and depth == 0 {
+            add_head_parameter(mut params, param: rest.slice_bytes(start, end: at), alloc)
+            start = at + 1
+        }
+        at += c.utf8_len()
+    }
+    return None
+} head_parameters
+
+/// The position of the `(` opening a head's parameters, after its generic parameters.
+fn head_parameters_open(rest: Str) -> Option[usize] {
+    var depth: i64 = 0
+    var at: usize = 0
+    for c in rest {
+        invariant at < rest.byte_len()
+        if c == '[' {
+            expect depth < 0x7FFF_FFFF_FFFF_FFFF
+            depth += 1
+        } else if c == ']' {
+            expect depth >= -0x7FFF_FFFF_FFFF_FFFF
+            depth -= 1
+        } else if c == '(' and depth == 0 {
+            return Some(at)
+        }
+        expect c.utf8_len() <= rest.byte_len() - at
+        at += c.utf8_len()
+    }
+    return None
+} head_parameters_open
+
+fn add_head_parameter(mut params: mem::List[ModedName], param: Option[Str], alloc: mem::Alloc) {
+    let Some(written) = param else {
+        return
+    }
+    match head_parameter(written, alloc) {
+        Some(read) => mut params.push(take read)
+        None => {}
+    }
+} add_head_parameter
+
+/// A parameter's mode and name from its text, `mode name: Type` or `mode self`.
+fn head_parameter(param: Str, alloc: mem::Alloc) -> Option[ModedName] {
+    let colon = match param.find(":") {
+        Some(at) => at
+        None => param.byte_len()
+    }
+    let Some(before) = param.slice_bytes(0, end: colon) else {
+        return None
+    }
+    let run = platform::trimmed_run(before)
+    let Some(named) = before.slice_bytes(run.start, end: run.end) else {
+        return None
+    }
+    let space = match named.find(" ") {
+        Some(at) => at
+        None => named.byte_len()
+    }
+    let Some(word) = named.slice_bytes(0, end: space) else {
+        return None
+    }
+    var mode = ast::Mode.Read
+    var name = text::String.of(word, alloc)
+    if space < named.byte_len() and (word == "mut" or word == "take") {
+        let Some(after) = named.slice_bytes(space + 1, end: named.byte_len()) else {
+            return None
+        }
+        let end = match after.find(" ") {
+            Some(at) => at
+            None => after.byte_len()
+        }
+        let Some(next) = after.slice_bytes(0, end) else {
+            return None
+        }
+        if word == "mut" {
+            mode = ast::Mode.Mut
+        } else {
+            mode = ast::Mode.Take
+        }
+        name = text::String.of(next, alloc)
+    }
+    if name.is_empty() {
+        return None
+    }
+    return Some(ModedName(mode: mode, name: take name))
+} head_parameter

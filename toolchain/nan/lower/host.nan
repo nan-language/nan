@@ -1,0 +1,1387 @@
+//! The `x86_64-host` target, everything Linux-specific: the program entry seam `main`, the executor threads with their io_uring rings, termination requests read from a `signalfd`, the support routines' calls into the system, and linking the image with `cc`. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
+
+const MMAP_READ_WRITE: i64 = 3
+
+const MMAP_NONE: i64 = 0
+
+const MMAP_PRIVATE_ANONYMOUS: i64 = 0x22
+
+const MMAP_STACK: i64 = 0x2_4022
+
+const MMAP_SHARED_POPULATE: i64 = 0x8001
+
+const MMAP_FAILED: i64 = -1
+
+/// The io_uring system calls, their constants and the opcodes the runtime submits itself.
+const URING_SETUP: i64 = 425
+
+const URING_ENTER: i64 = 426
+
+const URING_ENTRIES: i64 = 256
+
+const URING_GET_EVENTS: i64 = 1
+
+const URING_SQES: i64 = 0x1000_0000
+
+const URING_READ: i64 = 22
+
+const URING_TIMEOUT: i64 = 11
+
+const URING_ASYNC_CANCEL: i64 = 14
+
+const URING_MSG_RING: i64 = 40
+
+/// The offsets of a ring record's fields.
+const RING_FD: u64 = 0
+
+const RING_SQ_HEAD: u64 = 8
+
+const RING_SQ_TAIL: u64 = 16
+
+const RING_SQ_MASK: u64 = 24
+
+const RING_SQ_ARRAY: u64 = 32
+
+const RING_SQES: u64 = 40
+
+const RING_CQ_HEAD: u64 = 48
+
+const RING_CQ_TAIL: u64 = 56
+
+const RING_CQ_MASK: u64 = 64
+
+const RING_CQES: u64 = 72
+
+const RING_SIZE: u64 = 80
+
+/// The signal asking a thread to stop the task it runs, the signal of a fault, and that of an
+/// exceeded processor time limit.
+const SIGURG: i32 = 23
+
+const SIGSEGV: i32 = 11
+
+const SIGXCPU: i32 = 24
+
+/// The resource limit of processor time, and the seconds a test run may use.
+const RLIMIT_CPU: i64 = 0
+
+const CPU_SECONDS: u64 = 10
+
+/// The `sigaction` flags of the runtime's handlers: given a `siginfo_t` and a context, run on
+/// the thread's signal stack, and restarting interrupted system calls.
+const SA_SIGINFO: i64 = 4
+
+const SA_ONSTACK: i64 = 0x0800_0000
+
+const SA_RESTART: i64 = 0x1000_0000
+
+/// The size of a `struct sigaction` and the offset of its flags.
+const SIGACTION: u64 = 152
+
+const SIGACTION_FLAGS: u64 = 136
+
+/// The offsets in a `ucontext_t` of the registers a handler reads and redirects, and of the
+/// fault address in a `siginfo_t`.
+const CONTEXT_RDI: u64 = 40 + 8 * 8u64
+
+const CONTEXT_RBP: u64 = 40 + 10 * 8u64
+
+const CONTEXT_RSP: u64 = 40 + 15 * 8u64
+
+const CONTEXT_RIP: u64 = 40 + 16 * 8u64
+
+const CONTEXT_FAULT_ADDRESS: u64 = 16
+
+/// The size of each thread's signal stack and of its stack for stack overflow reports.
+const HOST_SIGNAL_STACK: u64 = 65_536
+
+/// The termination request signals and the length of a `signalfd_siginfo`.
+const SIGNALS: Array[i64, 3] = termination_signals()
+
+const SIGINFO: u64 = 128
+
+const SIGPIPE: i64 = 13
+
+fn termination_signals() -> Array[i64, 3] {
+    var listed = Array[i64, 3].filled(1)
+    listed[1] = 2
+    listed[2] = 15
+    return listed
+} termination_signals
+
+/// The first result of a call.
+fn first_result(take results: mem::List[clif::Value]) -> clif::Value {
+    expect results.len() > 0
+    return results[0]
+} first_result
+
+/// The signature of the entry seam `main`: the argument count and vector, the environment, and
+/// the exit status.
+fn main_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: clif::Type.Int32))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int32))
+    return signature
+} main_signature
+
+/// Defines the program entry seam `main` and the glue running the entry function as the first
+/// task.
+fn entry_seam(mut lo: Lowering, program: Program) {
+    let glue = host_entry_glue(mut lo, program)
+    let stack_bytes = match lo.ck.fn_sig(program.entry) {
+        Some(sig) => match sig.limit_set.stack {
+            Some(demanded) => demanded
+            None => ENTRY_STACK
+        }
+        None => ENTRY_STACK
+    }
+    let signature = main_signature(lo.alloc)
+    let id = mut lo.module.declare_function("main", linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        let no_values = mem::List[clif::Value].empty(seam_fx.alloc)
+        let incoming = mut seam_fx.entry()
+        let failed = first_result(mut seam_lo.call_routine(mut seam_fx, routine: Routine.Init, args: no_values.view()))
+        let unavailable = mut seam_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed, y: 0)
+        mut seam_fx.if_true(unavailable, then: fn[mut seam_lo](mut then_fx: Fx) {
+            system_unavailable(mut seam_lo, fx: mut then_fx)
+        })
+        let world_ty = seam_lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(seam_lo.alloc))
+        let laid = mut seam_lo.layout_of(world_ty)
+        let world = mut seam_fx.slot(laid.contents().size, align: laid.contents().align)
+        let landing_id = mut seam_lo.instance(Instance.Nir(item: program.landing_fn, role: nir::Role.Body, index: 0, args: ty::Args.none()))
+        let reference = mut seam_lo.func_ref(mut seam_fx, id: landing_id)
+        var landing_args = Array[clif::Value, 4].filled(world)
+        expect incoming.len() > 2
+        landing_args[1] = incoming[0]
+        landing_args[2] = incoming[1]
+        landing_args[3] = incoming[2]
+        discard mut seam_fx.b.call(reference, args: landing_args.view())
+        let env_bytes = if laid.contents().size > 8 {
+            laid.contents().size
+        } else {
+            8
+        }
+        let env_size = mut seam_fx.ptr(env_bytes)
+        let env = first_result(mut seam_lo.call_routine(mut seam_fx, routine: Routine.TaskEnv, args: Array[clif::Value, 1].filled(env_size).view()))
+        mut seam_lo.copy(mut seam_fx, dst: env, src: world, size: laid.contents().size, align: laid.contents().align)
+        let glue_ref = mut seam_lo.func_ref(mut seam_fx, id: glue)
+        let glue_address = mut seam_fx.b.func_addr(PTR, func_ref: glue_ref)
+        let state_address = mut seam_lo.state(mut seam_fx)
+        let process = mut seam_fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
+        let root = mut seam_fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+        let zero_word = mut seam_fx.ptr(0)
+        let stack_value = mut seam_fx.ptr(stack_bytes)
+        var spawn_args = Array[clif::Value, 8].filled(zero_word)
+        spawn_args[0] = glue_address
+        spawn_args[2] = env
+        spawn_args[4] = stack_value
+        spawn_args[6] = process
+        spawn_args[7] = root
+        let record = first_result(mut seam_lo.call_routine(mut seam_fx, routine: Routine.Spawn, args: spawn_args.view()))
+        let missing = mut seam_fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+        mut seam_fx.if_true(missing, then: fn[mut seam_lo](mut then_fx: Fx) {
+            system_unavailable(mut seam_lo, fx: mut then_fx)
+        })
+        mut seam_fx.store(record, addr: state_address, offset: STATE_ENTRY_TASK)
+        discard mut seam_lo.call_routine(mut seam_fx, routine: Routine.Wake, args: Array[clif::Value, 1].filled(record).view())
+        discard mut seam_lo.call_routine(mut seam_fx, routine: Routine.Schedule, args: no_values.view())
+        mut seam_fx.b.trap(clif::TrapCode(user: 1))
+    })
+} entry_seam
+
+/// Defines the entry seam `main` of a test image, whose arguments after the program's name are
+/// the texts naming its run.
+fn test_seam(mut lo: Lowering, entry_glue: object::FuncId) {
+    let signature = main_signature(lo.alloc)
+    let id = mut lo.module.declare_function("main", linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        let incoming = mut seam_fx.entry()
+        expect incoming.len() > 1
+        let widened = mut seam_fx.b.uextend(PTR, x: incoming[0])
+        let count = mut seam_fx.b.iadd_imm_s(widened, y: -1)
+        let texts = mut seam_fx.b.iadd_imm_s(incoming[1], y: 8)
+        start_run(mut seam_lo, fx: mut seam_fx, entry_glue, count, texts)
+    })
+} test_seam
+
+/// Writes a byte range to a descriptor, whole unless the descriptor refuses.
+fn host_write_all(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
+    let fd_value = mut fx.int(clif::Type.Int32, value: fd)
+    var carried = Array[clif::Value, 2].filled(text)
+    carried[1] = len
+    discard mut fx.repeat(carried.view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 1
+        let at = current[0]
+        let left_bytes = current[1]
+        var write_args = Array[clif::Value, 3].filled(fd_value)
+        write_args[1] = at
+        write_args[2] = left_bytes
+        let written = first_result(mut lo.call_libc(mut pass_fx, name: "write", args: write_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+        let progressed = mut pass_fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: written, y: 0)
+        let next_at = mut pass_fx.b.iadd(at, y: written)
+        let remaining = mut pass_fx.b.isub(left_bytes, y: written)
+        let zero_word = mut pass_fx.ptr(0)
+        let next_left = mut pass_fx.b.select(progressed, x: remaining, y: zero_word)
+        let more = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next_left, y: 0)
+        var next = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut next.push(next_at)
+        mut next.push(next_left)
+        return Pass(again: more, next: take next)
+    })
+} host_write_all
+
+/// The glue the entry task runs: calls the entry function with the root grant, then ends the
+/// process with the status its outcome gives.
+fn host_entry_glue(mut lo: Lowering, program: Program) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let id = mut lo.module.declare_function("_NSstack_switch_entry", linkage: object::Linkage.Local, signature)
+    let main_instance = Instance.Nir(item: program.entry, role: lo.entry_role(program.entry), index: 0, args: ty::Args.none())
+    let abi = mut lo.abi(main_instance)
+    let main_id = mut lo.instance(take main_instance)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN, build: fn(mut glue_lo: Lowering, mut glue_fx: Fx) {
+        let incoming = mut glue_fx.entry()
+        expect incoming.len() > 0
+        let record = incoming[0]
+        let world = mut glue_fx.load(PTR, addr: record, offset: TASK_ENV)
+        let Some(failure_ty) = abi.failure else {
+            expect false
+            return
+        }
+        let failure_laid = mut glue_lo.layout_of(failure_ty)
+        let failure_at = mut glue_fx.slot(failure_laid.contents().size, align: failure_laid.contents().align)
+        let reference = mut glue_lo.func_ref(mut glue_fx, id: main_id)
+        var main_args = Array[clif::Value, 2].filled(failure_at)
+        main_args[1] = world
+        let entry_call = mut glue_fx.b.call(reference, args: main_args.view())
+        let results = glue_fx.b.inst_results(entry_call, alloc: glue_fx.alloc)
+        let state_address = mut glue_lo.state(mut glue_fx)
+        let termination = mut glue_fx.load(PTR, addr: state_address, offset: STATE_TERMINATION)
+        let requested = mut glue_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: termination, y: 0)
+        mut glue_fx.if_true(requested, then: fn[mut glue_lo](mut then_fx: Fx) {
+            let status = mut then_fx.b.iadd_imm_s(termination, y: 128)
+            discard mut glue_lo.call_routine(mut then_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
+        })
+        expect results.len() > 0
+        let failed = mut glue_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: results[0], y: 0)
+        mut glue_fx.if_true(failed, then: fn[mut glue_lo](mut then_fx: Fx) {
+            write_err_literal(mut glue_lo, fx: mut then_fx, text: "error: ")
+            let failure_held = mut glue_lo.held_at(mut then_fx, ty: failure_ty, address: failure_at)
+            let rendered = render_value(mut glue_lo, fx: mut then_fx, ty: failure_ty, value: failure_held, budget: 4_096)
+            var written = Array[clif::Value, 2].filled(rendered.buffer)
+            written[1] = rendered.len
+            discard mut glue_lo.call_routine(mut then_fx, routine: Routine.WriteErr, args: written.view())
+            write_err_literal(mut glue_lo, fx: mut then_fx, text: "\n")
+            let status = mut then_fx.ptr(1)
+            discard mut glue_lo.call_routine(mut then_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
+        })
+        let status = match abi.returned {
+            Returned.Scalar(_) => mut glue_fx.b.uextend(PTR, x: results[1])
+            else => mut glue_fx.ptr(0)
+        }
+        discard mut glue_lo.call_routine(mut glue_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
+        mut glue_fx.b.ret(mem::List[clif::Value].empty(glue_fx.alloc).view())
+    })
+    return id
+} host_entry_glue
+
+/// Writes a literal text to standard error.
+fn write_err_literal(mut lo: Lowering, mut fx: Fx, text: Str) {
+    let literal = mut lo.view_literal(mut fx, contents: text.as_bytes())
+    let view_at = literal.address_value()
+    let start = mut fx.load(PTR, addr: view_at, offset: 0)
+    let len = mut fx.load(PTR, addr: view_at, offset: 8)
+    var written = Array[clif::Value, 2].filled(start)
+    written[1] = len
+    discard mut lo.call_routine(mut fx, routine: Routine.WriteErr, args: written.view())
+} write_err_literal
+
+fn host_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let incoming = mut fx.entry()
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    match routine {
+        Routine.RecordAlloc => {
+            let one = mut fx.ptr(1)
+            var calloc_args = Array[clif::Value, 2].filled(one)
+            expect incoming.len() > 0
+            calloc_args[1] = incoming[0]
+            let address = first_result(mut lo.call_libc(mut fx, name: "calloc", args: calloc_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+            mut fx.b.ret(Array[clif::Value, 1].filled(address).view())
+        }
+        Routine.RecordFree => {
+            expect incoming.len() > 0
+            discard mut lo.call_libc(mut fx, name: "free", args: Array[clif::Value, 1].filled(incoming[0]).view(), returns: no_types.view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.RecordResize => {
+            expect incoming.len() > 1
+            var realloc_args = Array[clif::Value, 2].filled(incoming[0])
+            realloc_args[1] = incoming[1]
+            let address = first_result(mut lo.call_libc(mut fx, name: "realloc", args: realloc_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+            mut fx.b.ret(Array[clif::Value, 1].filled(address).view())
+        }
+        Routine.Exit => {
+            expect incoming.len() > 0
+            let status = mut fx.b.ireduce(clif::Type.Int32, x: incoming[0])
+            discard mut lo.call_libc(mut fx, name: "_exit", args: Array[clif::Value, 1].filled(status).view(), returns: no_types.view())
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        Routine.Preempt => {
+            expect incoming.len() > 2
+            host_preempt(mut lo, mut fx, context: incoming[2])
+        }
+        Routine.Overflow => {
+            expect incoming.len() > 2
+            host_overflow(mut lo, mut fx, info: incoming[1], context: incoming[2])
+        }
+        Routine.CpuLimit => {
+            let status = mut fx.int(clif::Type.Int32, value: i64.widen(TIMED_OUT))
+            discard mut lo.call_libc(mut fx, name: "_exit", args: Array[clif::Value, 1].filled(status).view(), returns: no_types.view())
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        else => {
+            expect false
+        }
+    }
+} host_define
+
+/// Records the running thread in its record and gives it a signal stack and a stack for stack
+/// overflow reports; nonzero when the system refuses one.
+fn thread_signals(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let no_values = mem::List[clif::Value].empty(fx.alloc)
+    let pthread = first_result(mut lo.call_libc(mut fx, name: "pthread_self", args: no_values.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    mut fx.store(pthread, addr: record, offset: THREAD_PTHREAD)
+    let size = mut fx.ptr(HOST_SIGNAL_STACK)
+    let alt_stack = host_map_stack(mut lo, mut fx, len: size)
+    let trap_stack = host_map_stack(mut lo, mut fx, len: size)
+    let no_signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: alt_stack, y: 0)
+    let no_trap = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: trap_stack, y: 0)
+    let refused = mut fx.b.bor(no_signal, y: no_trap)
+    let outcome = mut fx.choose_in(mut lo, condition: refused, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var refusal = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut refusal.push(mut yes_fx.int(clif::Type.Int8, value: 1))
+        return refusal
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        let top = mut no_fx.b.iadd_imm_s(trap_stack, y: i64.fit(HOST_SIGNAL_STACK))
+        mut no_fx.store(top, addr: record, offset: THREAD_TRAP_STACK)
+        let stack_record = mut no_fx.slot(24, align: 8)
+        mut no_fx.store(alt_stack, addr: stack_record, offset: 0)
+        let zero_word = mut no_fx.ptr(0)
+        mut no_fx.store(zero_word, addr: stack_record, offset: 8)
+        mut no_fx.store(size, addr: stack_record, offset: 16)
+        var alt_args = Array[clif::Value, 2].filled(stack_record)
+        alt_args[1] = zero_word
+        discard mut cx.call_libc(mut no_fx, name: "sigaltstack", args: alt_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+        var installed = mem::List[clif::Value].empty(no_fx.alloc)
+        mut installed.push(mut no_fx.int(clif::Type.Int8, value: 0))
+        return installed
+    })
+    return outcome[0]
+} thread_signals
+
+/// Installs a routine as the handler of a signal, run on the thread's signal stack.
+fn install_handler(mut lo: Lowering, mut fx: Fx, signal_number: i32, routine: Routine, restart: bool) {
+    let action = mut fx.slot(SIGACTION, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(SIGACTION)
+    var fill_args = Array[clif::Value, 3].filled(action)
+    fill_args[1] = zero_word
+    fill_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let handler_id = mut lo.routine(routine)
+    let handler_ref = mut lo.func_ref(mut fx, id: handler_id)
+    let handler = mut fx.b.func_addr(PTR, func_ref: handler_ref)
+    mut fx.store(handler, addr: action, offset: 0)
+    var restarting: i64 = 0
+    if restart {
+        restarting = SA_RESTART
+    }
+    let flags = mut fx.int(clif::Type.Int32, value: SA_SIGINFO | SA_ONSTACK | restarting)
+    mut fx.store(flags, addr: action, offset: SIGACTION_FLAGS)
+    let signal_value = mut fx.int(clif::Type.Int32, value: i64.widen(signal_number))
+    var action_args = Array[clif::Value, 3].filled(signal_value)
+    action_args[1] = action
+    action_args[2] = zero_word
+    discard mut lo.call_libc(mut fx, name: "sigaction", args: action_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+} install_handler
+
+/// Whether a code address lies in a function a stopping task does not stop inside; an address
+/// outside lowered code counts as one when `unknown` holds.
+fn critical_at(mut lo: Lowering, mut fx: Fx, address: clif::Value, unknown: bool) -> clif::Value {
+    let holding = function_at(mut lo, mut fx, address)
+    let found = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: holding.start, y: 0)
+    let critical_bits = mut fx.b.band_imm_s(holding.flags, y: i64.widen(LINES_CRITICAL))
+    let is_critical = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: critical_bits, y: 0)
+    var unknown_flag: i64 = 0
+    if unknown {
+        unknown_flag = 1
+    }
+    let outside = mut fx.int(clif::Type.Int8, value: unknown_flag)
+    return mut fx.b.select(found, x: is_critical, y: outside)
+} critical_at
+
+/// `Preempt(signal, info, context)`: the handler of the stop signal. When the task the thread
+/// runs is asked to stop, holds no lock and has no frame of a function it does not stop inside,
+/// the handler makes it resume in `Stop` on its own stack, below the interrupted frame and its
+/// red zone; otherwise the task runs on and the stop signal comes again. The two words at the
+/// stack pointer stand for the return address of a function interrupted in its prologue or
+/// epilogue, before its frame pointer is set or after it is restored.
+fn host_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
+    let thread = mut lo.thread(mut fx)
+    let outside = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: thread, y: 0)
+    mut fx.if_true(outside, then: fn(mut then_fx: Fx) {
+        mut then_fx.b.ret(mem::List[clif::Value].empty(then_fx.alloc).view())
+    })
+    let record = mut fx.load(PTR, addr: thread, offset: THREAD_CURRENT)
+    let idle = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(idle, then: fn(mut then_fx: Fx) {
+        mut then_fx.b.ret(mem::List[clif::Value].empty(then_fx.alloc).view())
+    })
+    let asked = stop_asked(mut fx, record)
+    let locks = mut fx.load(PTR, addr: thread, offset: THREAD_LOCKS)
+    let unlocked = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: locks, y: 0)
+    let asked_unlocked = mut fx.b.band(asked, y: unlocked)
+    let rip = mut fx.load(PTR, addr: context, offset: CONTEXT_RIP)
+    let rsp = mut fx.load(PTR, addr: context, offset: CONTEXT_RSP)
+    let rbp = mut fx.load(PTR, addr: context, offset: CONTEXT_RBP)
+    let low = mut fx.load(PTR, addr: record, offset: TASK_GUARD)
+    let base = mut fx.load(PTR, addr: record, offset: TASK_STACK)
+    let size = mut fx.load(PTR, addr: record, offset: TASK_STACK_SIZE)
+    let high = mut fx.b.iadd(base, y: size)
+    let above = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: rsp, y: low)
+    let room = mut fx.b.iadd_imm_s(rsp, y: 16)
+    let below = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: room, y: high)
+    let on_stack = mut fx.b.band(above, y: below)
+    let stopping = mut fx.b.band(asked_unlocked, y: on_stack)
+    mut fx.if_true(stopping, then: fn[mut lo](mut stop_fx: Fx) {
+        let in_rip = critical_at(mut lo, fx: mut stop_fx, address: rip, unknown: true)
+        let top = mut stop_fx.load(PTR, addr: rsp, offset: 0)
+        let in_top = critical_at(mut lo, fx: mut stop_fx, address: top, unknown: false)
+        let next = mut stop_fx.load(PTR, addr: rsp, offset: 8)
+        let in_next = critical_at(mut lo, fx: mut stop_fx, address: next, unknown: false)
+        let busy_top = mut stop_fx.b.bor(in_rip, y: in_top)
+        let busy = mut stop_fx.b.bor(busy_top, y: in_next)
+        let free = mut stop_fx.b.bxor_imm_s(busy, y: 1)
+        mut stop_fx.if_true(free, then: fn[mut lo](mut free_fx: Fx) {
+            preempt_frames(mut lo, fx: mut free_fx, context, record, rsp, rbp, low, high, free)
+        })
+    })
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} host_preempt
+
+/// The rest of `Preempt` once neither the interrupted code nor the return addresses at the stack
+/// pointer forbid stopping, `free` holding: walks the frame pointers from `rbp` down the task's
+/// stack, between `low` and `high`, and when no frame forbids it, makes the task resume in
+/// `Stop`.
+fn preempt_frames(mut lo: Lowering, mut fx: Fx, context: clif::Value, record: clif::Value, rsp: clif::Value, rbp: clif::Value, low: clif::Value, high: clif::Value, free: clif::Value) {
+    var walk_start = Array[clif::Value, 2].filled(rbp)
+    walk_start[1] = free
+    let walked = mut fx.repeat(walk_start.view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 1
+        let frame = current[0]
+        let walk_free = current[1]
+        let frame_above = mut pass_fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: frame, y: low)
+        let end = mut pass_fx.b.iadd_imm_s(frame, y: 16)
+        let frame_below = mut pass_fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: high)
+        let inside = mut pass_fx.b.band(frame_above, y: frame_below)
+        var stepped_types = Array[clif::Type, 2].filled(PTR)
+        stepped_types[1] = clif::Type.Int8
+        let stepped = mut pass_fx.choose_in(mut lo, condition: inside, results: stepped_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+            let address = mut yes_fx.load(PTR, addr: frame, offset: 8)
+            let at_base = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+            let frame_critical = critical_at(mut cx, fx: mut yes_fx, address, unknown: true)
+            let frame_free = mut yes_fx.b.bxor_imm_s(frame_critical, y: 1)
+            let free_or_base = mut yes_fx.b.bor(at_base, y: frame_free)
+            var caller = mem::List[clif::Value].empty(yes_fx.alloc)
+            mut caller.push(mut yes_fx.load(PTR, addr: frame, offset: 0))
+            mut caller.push(free_or_base)
+            return caller
+        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+            var outside_stack = mem::List[clif::Value].empty(no_fx.alloc)
+            mut outside_stack.push(mut no_fx.ptr(0))
+            mut outside_stack.push(walk_free)
+            return outside_stack
+        })
+        let more = mut pass_fx.b.band(inside, y: stepped[1])
+        return Pass(again: more, next: take stepped)
+    })
+    let walked_free = walked[1]
+    mut fx.if_true(walked_free, then: fn[mut lo](mut then_fx: Fx) {
+        let lowered = mut then_fx.b.iadd_imm_s(rsp, y: -128)
+        let aligned = mut then_fx.b.band_imm_s(lowered, y: -16)
+        let entry_slot = mut then_fx.b.iadd_imm_s(aligned, y: -8)
+        let zero_word = mut then_fx.ptr(0)
+        mut then_fx.store(zero_word, addr: entry_slot, offset: 0)
+        mut then_fx.store(entry_slot, addr: context, offset: CONTEXT_RSP)
+        let stop_id = mut lo.routine(Routine.Stop)
+        let stop_ref = mut lo.func_ref(mut then_fx, id: stop_id)
+        let stop_address = mut then_fx.b.func_addr(PTR, func_ref: stop_ref)
+        mut then_fx.store(stop_address, addr: context, offset: CONTEXT_RIP)
+        mut then_fx.store(record, addr: context, offset: CONTEXT_RDI)
+    })
+} preempt_frames
+
+/// `Overflow(signal, info, context)`: the handler of a fault. A fault in the guard region of
+/// the running task's stack resumes in `OverflowRaise` on the thread's trap stack, as if
+/// called at the call whose frame does not fit; any other fault restores the default action
+/// and faults again.
+fn host_overflow(mut lo: Lowering, mut fx: Fx, info: clif::Value, context: clif::Value) {
+    let fault = mut fx.load(PTR, addr: info, offset: CONTEXT_FAULT_ADDRESS)
+    let thread = mut lo.thread(mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
+    let current = mut fx.choose(inside, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var running_record = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut running_record.push(mut yes_fx.load(PTR, addr: thread, offset: THREAD_CURRENT))
+        return running_record
+    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+        var no_record = mem::List[clif::Value].empty(no_fx.alloc)
+        mut no_record.push(mut no_fx.ptr(0))
+        return no_record
+    })
+    let record = current[0]
+    let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let guarded = mut fx.choose(running, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let base = mut yes_fx.load(PTR, addr: record, offset: TASK_STACK)
+        let low = mut yes_fx.load(PTR, addr: record, offset: TASK_GUARD)
+        let above = mut yes_fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: fault, y: base)
+        let below = mut yes_fx.b.icmp(clif::IntCC.UnsignedLessThan, x: fault, y: low)
+        var in_guard = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut in_guard.push(mut yes_fx.b.band(above, y: below))
+        return in_guard
+    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+        var not_guarded = mem::List[clif::Value].empty(no_fx.alloc)
+        mut not_guarded.push(mut no_fx.int(clif::Type.Int8, value: 0))
+        return not_guarded
+    })
+    let other = mut fx.b.bxor_imm_s(guarded[0], y: 1)
+    mut fx.if_true(other, then: fn[mut lo](mut then_fx: Fx) {
+        let signal_value = mut then_fx.int(clif::Type.Int32, value: i64.widen(SIGSEGV))
+        let default_handler = mut then_fx.ptr(0)
+        var signal_args = Array[clif::Value, 2].filled(signal_value)
+        signal_args[1] = default_handler
+        discard mut lo.call_libc(mut then_fx, name: "signal", args: signal_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
+        mut then_fx.b.ret(mem::List[clif::Value].empty(then_fx.alloc).view())
+    })
+    let rip = mut fx.load(PTR, addr: context, offset: CONTEXT_RIP)
+    let rsp = mut fx.load(PTR, addr: context, offset: CONTEXT_RSP)
+    let rbp = mut fx.load(PTR, addr: context, offset: CONTEXT_RBP)
+    let holding = function_at(mut lo, mut fx, address: rip)
+    let entering = mut fx.b.icmp(clif::IntCC.Equal, x: holding.start, y: rip)
+    let pushed = mut fx.b.iadd_imm_s(rsp, y: -8)
+    let calling = mut fx.b.icmp(clif::IntCC.Equal, x: fault, y: pushed)
+    let caller_types = Array[clif::Type, 2].filled(PTR)
+    let caller = mut fx.choose(entering, results: caller_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var entered = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut entered.push(mut yes_fx.load(PTR, addr: rsp, offset: 0))
+        mut entered.push(rbp)
+        return entered
+    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+        return mut no_fx.choose(calling, results: caller_types.view(), then: fn(mut call_fx: Fx) -> mem::List[clif::Value] {
+            var called = mem::List[clif::Value].empty(call_fx.alloc)
+            mut called.push(mut call_fx.b.iadd_imm_s(rip, y: 1))
+            mut called.push(rbp)
+            return called
+        }, otherwise: fn(mut body_fx: Fx) -> mem::List[clif::Value] {
+            var framed = mem::List[clif::Value].empty(body_fx.alloc)
+            mut framed.push(mut body_fx.load(PTR, addr: rbp, offset: 8))
+            mut framed.push(mut body_fx.load(PTR, addr: rbp, offset: 0))
+            return framed
+        })
+    })
+    let top = mut fx.load(PTR, addr: thread, offset: THREAD_TRAP_STACK)
+    let entry_slot = mut fx.b.iadd_imm_s(top, y: -8)
+    mut fx.store(caller[0], addr: entry_slot, offset: 0)
+    mut fx.store(entry_slot, addr: context, offset: CONTEXT_RSP)
+    mut fx.store(caller[1], addr: context, offset: CONTEXT_RBP)
+    let raise_id = mut lo.routine(Routine.OverflowRaise)
+    let raise_ref = mut lo.func_ref(mut fx, id: raise_id)
+    let raise_address = mut fx.b.func_addr(PTR, func_ref: raise_ref)
+    mut fx.store(raise_address, addr: context, offset: CONTEXT_RIP)
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} host_overflow
+
+/// The executor threads of `Init`: one per processor of the affinity set with its ring, the
+/// calling thread being the first, and the reading of termination requests; returns 1 from
+/// `Init` when the system refuses one.
+fn start_threads(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    if lo.seeded() {
+        start_seeded(mut lo, mut fx)
+        return
+    }
+    let count = processors(mut lo, mut fx)
+    mut fx.store(count, addr: state_address, offset: STATE_THREAD_COUNT)
+    let eight = mut fx.ptr(8)
+    var calloc_args = Array[clif::Value, 2].filled(count)
+    calloc_args[1] = eight
+    let threads = first_result(mut lo.call_libc(mut fx, name: "calloc", args: calloc_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let zero_word = mut fx.ptr(0)
+    mut fx.each(zero_word, end: count, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
+        let one = mut pass_fx.ptr(1)
+        let size = mut pass_fx.ptr(THREAD_SIZE)
+        var record_args = Array[clif::Value, 2].filled(one)
+        record_args[1] = size
+        let record = first_result(mut lo.call_libc(mut pass_fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+        unavailable_unless(mut pass_fx, address: record)
+        mut pass_fx.store(index, addr: record, offset: THREAD_INDEX)
+        let ring = setup_ring(mut lo, fx: mut pass_fx)
+        unavailable_unless(mut pass_fx, address: ring)
+        mut pass_fx.store(ring, addr: record, offset: THREAD_RING)
+        let slot_offset = mut pass_fx.b.imul_imm_s(index, y: 8)
+        let slot = mut pass_fx.b.iadd(threads, y: slot_offset)
+        mut pass_fx.store(record, addr: slot, offset: 0)
+    })
+    let first_thread = mut fx.load(PTR, addr: threads, offset: 0)
+    let thread_slot = mut lo.thread_slot(mut fx)
+    mut fx.store(first_thread, addr: thread_slot, offset: 0)
+    let refused = thread_signals(mut lo, mut fx, record: first_thread)
+    mut fx.if_true(refused, then: fn(mut then_fx: Fx) {
+        let refusal = mut then_fx.ptr(1)
+        mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
+    })
+    install_handler(mut lo, mut fx, signal_number: SIGURG, routine: Routine.Preempt, restart: true)
+    install_handler(mut lo, mut fx, signal_number: SIGSEGV, routine: Routine.Overflow, restart: false)
+    let ignore = mut fx.ptr(1)
+    let pipe = mut fx.int(clif::Type.Int32, value: SIGPIPE)
+    var pipe_args = Array[clif::Value, 2].filled(pipe)
+    pipe_args[1] = ignore
+    discard mut lo.call_libc(mut fx, name: "signal", args: pipe_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
+    read_signals(mut lo, mut fx)
+    let thread_main_id = mut lo.routine(Routine.ThreadMain)
+    let thread_main_ref = mut lo.func_ref(mut fx, id: thread_main_id)
+    let thread_main = mut fx.b.func_addr(PTR, func_ref: thread_main_ref)
+    let one = mut fx.ptr(1)
+    mut fx.each(one, end: count, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
+        let slot_offset = mut pass_fx.b.imul_imm_s(index, y: 8)
+        let slot = mut pass_fx.b.iadd(threads, y: slot_offset)
+        let record = mut pass_fx.load(PTR, addr: slot, offset: 0)
+        let thread_id = mut pass_fx.slot(8, align: 8)
+        let null = mut pass_fx.ptr(0)
+        var create_args = Array[clif::Value, 4].filled(thread_id)
+        create_args[1] = null
+        create_args[2] = thread_main
+        create_args[3] = record
+        let started = first_result(mut lo.call_libc(mut pass_fx, name: "pthread_create", args: create_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view()))
+        let failed = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: started, y: 0)
+        mut pass_fx.if_true(failed, then: fn(mut then_fx: Fx) {
+            let refusal = mut then_fx.ptr(1)
+            mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
+        })
+    })
+} start_threads
+
+/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
+/// thread, without a ring; a fault reports a stack overflow, and the run ends with status
+/// `TIMED_OUT` once it has used 10 seconds of processor time.
+fn start_seeded(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: state_address, offset: STATE_THREAD_COUNT)
+    let eight = mut fx.ptr(8)
+    var threads_args = Array[clif::Value, 2].filled(one)
+    threads_args[1] = eight
+    let threads = first_result(mut lo.call_libc(mut fx, name: "calloc", args: threads_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let size = mut fx.ptr(THREAD_SIZE)
+    var record_args = Array[clif::Value, 2].filled(one)
+    record_args[1] = size
+    let record = first_result(mut lo.call_libc(mut fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    unavailable_unless(mut fx, address: record)
+    mut fx.store(record, addr: threads, offset: 0)
+    let thread_slot = mut lo.thread_slot(mut fx)
+    mut fx.store(record, addr: thread_slot, offset: 0)
+    let refused = thread_signals(mut lo, mut fx, record)
+    mut fx.if_true(refused, then: fn(mut then_fx: Fx) {
+        let refusal = mut then_fx.ptr(1)
+        mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
+    })
+    install_handler(mut lo, mut fx, signal_number: SIGSEGV, routine: Routine.Overflow, restart: false)
+    install_handler(mut lo, mut fx, signal_number: SIGXCPU, routine: Routine.CpuLimit, restart: false)
+    let limit = mut fx.slot(16, align: 8)
+    let soft = mut fx.ptr(CPU_SECONDS)
+    let hard = mut fx.ptr(CPU_SECONDS + 2)
+    mut fx.store(soft, addr: limit, offset: 0)
+    mut fx.store(hard, addr: limit, offset: 8)
+    let cpu = mut fx.int(clif::Type.Int32, value: RLIMIT_CPU)
+    var limit_args = Array[clif::Value, 2].filled(cpu)
+    limit_args[1] = limit
+    discard mut lo.call_libc(mut fx, name: "setrlimit", args: limit_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+    let ignore = mut fx.ptr(1)
+    let pipe = mut fx.int(clif::Type.Int32, value: SIGPIPE)
+    var pipe_args = Array[clif::Value, 2].filled(pipe)
+    pipe_args[1] = ignore
+    discard mut lo.call_libc(mut fx, name: "signal", args: pipe_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
+} start_seeded
+
+/// The number of processors in the process's affinity set, at least 1.
+fn processors(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let mask = mut fx.slot(128, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(128)
+    var fill_args = Array[clif::Value, 3].filled(mask)
+    fill_args[1] = zero_word
+    fill_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let pid = mut fx.int(clif::Type.Int32, value: 0)
+    var affinity_args = Array[clif::Value, 3].filled(pid)
+    affinity_args[1] = size
+    affinity_args[2] = mask
+    discard mut lo.call_libc(mut fx, name: "sched_getaffinity", args: affinity_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+    var count = mut fx.ptr(0)
+    for word_index in 0..<16u64 {
+        let bits = mut fx.load(PTR, addr: mask, offset: 8 * word_index)
+        let set = mut fx.b.popcnt(bits)
+        count = mut fx.b.iadd(count, y: set)
+    }
+    let one = mut fx.ptr(1)
+    return mut fx.b.umax(count, y: one)
+} processors
+
+/// Blocks the termination request signals in every thread and starts reading them from a
+/// `signalfd` through the first thread's ring.
+fn read_signals(mut lo: Lowering, mut fx: Fx) {
+    let mask = mut fx.slot(128, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(128)
+    var fill_args = Array[clif::Value, 3].filled(mask)
+    fill_args[1] = zero_word
+    fill_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    var signal_bits: i64 = 0
+    for listed in SIGNALS {
+        expect listed > 0
+        signal_bits = signal_bits | (1i64 << u32.fit(listed - 1))
+    }
+    let bits = mut fx.int(PTR, value: signal_bits)
+    mut fx.store(bits, addr: mask, offset: 0)
+    let how_block = mut fx.int(clif::Type.Int32, value: 0)
+    var mask_args = Array[clif::Value, 3].filled(how_block)
+    mask_args[1] = mask
+    mask_args[2] = zero_word
+    discard mut lo.call_libc(mut fx, name: "pthread_sigmask", args: mask_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+    let new_fd = mut fx.int(clif::Type.Int32, value: -1)
+    let close_on_exec = mut fx.int(clif::Type.Int32, value: 0x8_0000)
+    var signalfd_args = Array[clif::Value, 3].filled(new_fd)
+    signalfd_args[1] = mask
+    signalfd_args[2] = close_on_exec
+    let fd = first_result(mut lo.call_libc(mut fx, name: "signalfd", args: signalfd_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view()))
+    let one = mut fx.ptr(1)
+    let op_size = mut fx.ptr(OPERATION_SIZE + SIGINFO)
+    var op_args = Array[clif::Value, 2].filled(one)
+    op_args[1] = op_size
+    let op = first_result(mut lo.call_libc(mut fx, name: "calloc", args: op_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    unavailable_unless(mut fx, address: op)
+    let signal_kind = mut fx.int(PTR, value: TASKS_KIND_SIGNAL)
+    mut fx.store(signal_kind, addr: op, offset: OPERATION_KIND)
+    let fd_word = mut fx.b.sextend(PTR, x: fd)
+    mut fx.store(fd_word, addr: op, offset: OPERATION_TASK)
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(op, addr: state_address, offset: STATE_SIGNALS)
+    submit_signal_read(mut lo, mut fx, op)
+} read_signals
+
+/// Submits the read of the next termination request on the running thread's ring.
+fn submit_signal_read(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let fd = mut fx.load(PTR, addr: op, offset: OPERATION_TASK)
+    let buffer = mut fx.b.iadd_imm_s(op, y: i64.fit(OPERATION_SIZE))
+    let prepared = mut fx.slot(64, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(64)
+    var fill_args = Array[clif::Value, 3].filled(prepared)
+    fill_args[1] = zero_word
+    fill_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let opcode = mut fx.int(clif::Type.Int8, value: URING_READ)
+    mut fx.store(opcode, addr: prepared, offset: 0)
+    let fd32 = mut fx.b.ireduce(clif::Type.Int32, x: fd)
+    mut fx.store(fd32, addr: prepared, offset: 4)
+    mut fx.store(buffer, addr: prepared, offset: 16)
+    let len = mut fx.int(clif::Type.Int32, value: i64.fit(SIGINFO))
+    mut fx.store(len, addr: prepared, offset: 24)
+    host_submit(mut lo, mut fx, prepared, op: Some(op))
+} submit_signal_read
+
+/// Handles a termination request read: the first cancels the entry task's construct, a later
+/// one ends the process at once.
+fn host_termination(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
+    let read = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: result, y: 0)
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    mut fx.if_true(read, then: fn[mut lo](mut then_fx: Fx) {
+        let signal_number = mut then_fx.load(clif::Type.Int32, addr: op, offset: OPERATION_SIZE)
+        let signal_word = mut then_fx.b.uextend(PTR, x: signal_number)
+        let state_address = mut lo.state(mut then_fx)
+        let earlier = mut then_fx.load(PTR, addr: state_address, offset: STATE_TERMINATION)
+        let first_request = mut then_fx.b.icmp_imm_s(clif::IntCC.Equal, x: earlier, y: 0)
+        discard mut then_fx.choose_in(mut lo, condition: first_request, results: no_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+            mut yes_fx.store(signal_word, addr: state_address, offset: STATE_TERMINATION)
+            let root = mut yes_fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+            discard mut cx.call_routine(mut yes_fx, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(root).view())
+            return mem::List[clif::Value].empty(yes_fx.alloc)
+        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+            let status = mut no_fx.b.iadd_imm_s(signal_word, y: 128)
+            discard mut cx.call_routine(mut no_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
+            return mem::List[clif::Value].empty(no_fx.alloc)
+        })
+    })
+    submit_signal_read(mut lo, mut fx, op)
+} host_termination
+
+/// Stores into a ring record's field the address of a part of the rings mapped at `rings`, at
+/// the offset the setup parameters at `setup_params` hold at `source`.
+fn ring_field(mut fx: Fx, setup_params: clif::Value, rings: clif::Value, record: clif::Value, field: u64, source: u64) {
+    let offset32 = mut fx.load(clif::Type.Int32, addr: setup_params, offset: source)
+    let part_offset = mut fx.b.uextend(PTR, x: offset32)
+    let address = mut fx.b.iadd(rings, y: part_offset)
+    mut fx.store(address, addr: record, offset: field)
+} ring_field
+
+/// Sets up an io_uring and gives its ring record, zero when the system refuses one.
+fn setup_ring(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let setup_params = mut fx.slot(120, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let len = mut fx.ptr(120)
+    var fill_args = Array[clif::Value, 3].filled(setup_params)
+    fill_args[1] = zero_word
+    fill_args[2] = len
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let setup_number = mut fx.int(PTR, value: URING_SETUP)
+    let entries = mut fx.int(PTR, value: URING_ENTRIES)
+    var setup_args = Array[clif::Value, 2].filled(entries)
+    setup_args[1] = setup_params
+    let fd = syscall(mut lo, mut fx, call_number: setup_number, args: setup_args.view())
+    let usable = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: fd, y: 0)
+    let ring_record = mut fx.choose_in(mut lo, condition: usable, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var mapped = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut mapped.push(mapped_ring(mut cx, fx: mut yes_fx, setup_params, fd))
+        return mapped
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        var refused = mem::List[clif::Value].empty(no_fx.alloc)
+        mut refused.push(mut no_fx.ptr(0))
+        return refused
+    })
+    return ring_record[0]
+} setup_ring
+
+/// The ring record of an io_uring set up as `fd` with the parameters at `setup_params`: its
+/// submission and completion rings and entries mapped.
+fn mapped_ring(mut lo: Lowering, mut fx: Fx, setup_params: clif::Value, fd: clif::Value) -> clif::Value {
+    let one = mut fx.ptr(1)
+    let record_size = mut fx.ptr(RING_SIZE)
+    var record_args = Array[clif::Value, 2].filled(one)
+    record_args[1] = record_size
+    let record = first_result(mut lo.call_libc(mut fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    mut fx.store(fd, addr: record, offset: RING_FD)
+    let sq_entries32 = mut fx.load(clif::Type.Int32, addr: setup_params, offset: 0)
+    let sq_entries = mut fx.b.uextend(PTR, x: sq_entries32)
+    let cq_entries32 = mut fx.load(clif::Type.Int32, addr: setup_params, offset: 4)
+    let cq_entries = mut fx.b.uextend(PTR, x: cq_entries32)
+    let sq_array32 = mut fx.load(clif::Type.Int32, addr: setup_params, offset: 40 + 24)
+    let sq_array = mut fx.b.uextend(PTR, x: sq_array32)
+    let cq_cqes32 = mut fx.load(clif::Type.Int32, addr: setup_params, offset: 80 + 20)
+    let cq_cqes = mut fx.b.uextend(PTR, x: cq_cqes32)
+    let sq_bytes = mut fx.b.imul_imm_s(sq_entries, y: 4)
+    let sq_size = mut fx.b.iadd(sq_array, y: sq_bytes)
+    let cq_bytes = mut fx.b.imul_imm_s(cq_entries, y: 16)
+    let cq_size = mut fx.b.iadd(cq_cqes, y: cq_bytes)
+    let rings_size = mut fx.b.umax(sq_size, y: cq_size)
+    let map_zero = mut fx.ptr(0)
+    let protection = mut fx.int(clif::Type.Int32, value: MMAP_READ_WRITE)
+    let flags = mut fx.int(clif::Type.Int32, value: MMAP_SHARED_POPULATE)
+    let fd32 = mut fx.b.ireduce(clif::Type.Int32, x: fd)
+    var rings_args = Array[clif::Value, 6].filled(map_zero)
+    rings_args[1] = rings_size
+    rings_args[2] = protection
+    rings_args[3] = flags
+    rings_args[4] = fd32
+    let rings = first_result(mut lo.call_libc(mut fx, name: "mmap", args: rings_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    let sqes_size = mut fx.b.imul_imm_s(sq_entries, y: 64)
+    let sqes_offset = mut fx.int(PTR, value: URING_SQES)
+    var sqes_args = Array[clif::Value, 6].filled(map_zero)
+    sqes_args[1] = sqes_size
+    sqes_args[2] = protection
+    sqes_args[3] = flags
+    sqes_args[4] = fd32
+    sqes_args[5] = sqes_offset
+    let sqes = first_result(mut lo.call_libc(mut fx, name: "mmap", args: sqes_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    ring_field(mut fx, setup_params, rings, record, field: RING_SQ_HEAD, source: 40)
+    ring_field(mut fx, setup_params, rings, record, field: RING_SQ_TAIL, source: 44)
+    ring_field(mut fx, setup_params, rings, record, field: RING_SQ_MASK, source: 48)
+    ring_field(mut fx, setup_params, rings, record, field: RING_SQ_ARRAY, source: 64)
+    ring_field(mut fx, setup_params, rings, record, field: RING_CQ_HEAD, source: 80)
+    ring_field(mut fx, setup_params, rings, record, field: RING_CQ_TAIL, source: 84)
+    ring_field(mut fx, setup_params, rings, record, field: RING_CQ_MASK, source: 88)
+    ring_field(mut fx, setup_params, rings, record, field: RING_CQES, source: 100)
+    mut fx.store(sqes, addr: record, offset: RING_SQES)
+    return record
+} mapped_ring
+
+/// Submits a 64-byte entry, built at `prepared`, on the running thread's ring, its completion to
+/// reach `op`, which joins the thread's operations in flight; an entry without an operation
+/// completes unseen.
+fn host_submit(mut lo: Lowering, mut fx: Fx, prepared: clif::Value, op: Option[clif::Value]) {
+    let current = mut lo.thread(mut fx)
+    match op {
+        Some(listed) => {
+            mut fx.store(current, addr: listed, offset: OPERATION_THREAD)
+            let head = mut fx.load(PTR, addr: current, offset: THREAD_OPERATIONS)
+            mut fx.store(head, addr: listed, offset: OPERATION_NEXT)
+            let zero_word = mut fx.ptr(0)
+            mut fx.store(zero_word, addr: listed, offset: OPERATION_PREVIOUS)
+            let has_head = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+            mut fx.if_true(has_head, then: fn(mut then_fx: Fx) {
+                mut then_fx.store(listed, addr: head, offset: OPERATION_PREVIOUS)
+            })
+            mut fx.store(listed, addr: current, offset: THREAD_OPERATIONS)
+        }
+        None => {}
+    }
+    let ring = mut fx.load(PTR, addr: current, offset: THREAD_RING)
+    let tail_address = mut fx.load(PTR, addr: ring, offset: RING_SQ_TAIL)
+    let tail = mut fx.load(clif::Type.Int32, addr: tail_address, offset: 0)
+    let mask_address = mut fx.load(PTR, addr: ring, offset: RING_SQ_MASK)
+    let mask = mut fx.load(clif::Type.Int32, addr: mask_address, offset: 0)
+    let masked = mut fx.b.band(tail, y: mask)
+    let index = mut fx.b.uextend(PTR, x: masked)
+    let sqes = mut fx.load(PTR, addr: ring, offset: RING_SQES)
+    let sqe_offset = mut fx.b.imul_imm_s(index, y: 64)
+    let sqe = mut fx.b.iadd(sqes, y: sqe_offset)
+    mut fx.copy_small(sqe, src: prepared, size: 64, align: 8)
+    let user_data = match op {
+        Some(listed) => listed
+        None => mut fx.ptr(0)
+    }
+    mut fx.store(user_data, addr: sqe, offset: 32)
+    let array = mut fx.load(PTR, addr: ring, offset: RING_SQ_ARRAY)
+    let slot_offset = mut fx.b.imul_imm_s(index, y: 4)
+    let slot = mut fx.b.iadd(array, y: slot_offset)
+    let index32 = mut fx.b.ireduce(clif::Type.Int32, x: index)
+    mut fx.store(index32, addr: slot, offset: 0)
+    let next = mut fx.b.iadd_imm_s(tail, y: 1)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: next, p: tail_address)
+    host_enter(mut lo, mut fx, ring, submitted: 1, complete: 0, flags: 0)
+} host_submit
+
+/// Submits an entry the runtime builds itself, of an opcode on a descriptor with an address,
+/// a length, an offset and flags, its completion reaching `op` when there is one.
+fn submit_built(
+    mut lo: Lowering,
+    mut fx: Fx,
+    opcode: i64,
+    fd: clif::Value,
+    address: clif::Value,
+    len: clif::Value,
+    offset: clif::Value,
+    flags: clif::Value,
+    op: Option[clif::Value],
+    ) {
+    let prepared = mut fx.slot(64, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(64)
+    var fill_args = Array[clif::Value, 3].filled(prepared)
+    fill_args[1] = zero_word
+    fill_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let opcode_value = mut fx.int(clif::Type.Int8, value: opcode)
+    mut fx.store(opcode_value, addr: prepared, offset: 0)
+    mut fx.store(fd, addr: prepared, offset: 4)
+    mut fx.store(offset, addr: prepared, offset: 8)
+    mut fx.store(address, addr: prepared, offset: 16)
+    mut fx.store(len, addr: prepared, offset: 24)
+    mut fx.store(flags, addr: prepared, offset: 28)
+    host_submit(mut lo, mut fx, prepared, op)
+} submit_built
+
+/// `io_uring_enter` on a ring.
+fn host_enter(mut lo: Lowering, mut fx: Fx, ring: clif::Value, submitted: i64, complete: i64, flags: i64) {
+    let enter_number = mut fx.int(PTR, value: URING_ENTER)
+    let fd = mut fx.load(PTR, addr: ring, offset: RING_FD)
+    let submitted_value = mut fx.int(PTR, value: submitted)
+    let complete_value = mut fx.int(PTR, value: complete)
+    let flags_value = mut fx.int(PTR, value: flags)
+    let zero_word = mut fx.ptr(0)
+    var enter_args = Array[clif::Value, 6].filled(zero_word)
+    enter_args[0] = fd
+    enter_args[1] = submitted_value
+    enter_args[2] = complete_value
+    enter_args[3] = flags_value
+    discard syscall(mut lo, mut fx, call_number: enter_number, args: enter_args.view())
+} host_enter
+
+/// Waits idle in the running thread's ring until a completion or a wake arrives, unless a task
+/// is ready, then handles the completions.
+fn host_idle(mut lo: Lowering, mut fx: Fx) {
+    let current = mut lo.thread(mut fx)
+    let idle_at = mut fx.offset(current, offset: THREAD_IDLE)
+    let one = mut fx.ptr(1)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: one, p: idle_at)
+    let state_address = mut lo.state(mut fx)
+    let head_at = mut fx.offset(state_address, offset: STATE_READY_HEAD)
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: head_at)
+    let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: head, y: 0)
+    host_reap(mut lo, mut fx, wait: Some(empty))
+    let zero_word = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: zero_word, p: idle_at)
+} host_idle
+
+/// Handles the completions on the running thread's ring, first submitting the cancellations
+/// other threads have asked of it and, when `wait` is given and nonzero, waiting for a
+/// completion.
+fn host_reap(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value]) {
+    let current = mut lo.thread(mut fx)
+    let ring = mut fx.load(PTR, addr: current, offset: THREAD_RING)
+    match wait {
+        Some(waiting) => mut fx.if_true(waiting, then: fn[mut lo](mut then_fx: Fx) {
+            host_enter(mut lo, fx: mut then_fx, ring, submitted: 0, complete: 1, flags: URING_GET_EVENTS)
+        })
+        None => {}
+    }
+    submit_requested(mut lo, mut fx, current)
+    let head_address = mut fx.load(PTR, addr: ring, offset: RING_CQ_HEAD)
+    let tail_address = mut fx.load(PTR, addr: ring, offset: RING_CQ_TAIL)
+    let mask_address = mut fx.load(PTR, addr: ring, offset: RING_CQ_MASK)
+    let mask = mut fx.load(clif::Type.Int32, addr: mask_address, offset: 0)
+    let cqes = mut fx.load(PTR, addr: ring, offset: RING_CQES)
+    let head = mut fx.load(clif::Type.Int32, addr: head_address, offset: 0)
+    let tail = mut fx.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: tail_address)
+    let pending = mut fx.b.icmp(clif::IntCC.NotEqual, x: head, y: tail)
+    mut fx.if_true(pending, then: fn[mut lo](mut then_fx: Fx) {
+        discard mut then_fx.repeat(Array[clif::Value, 1].filled(head).view(), body: fn[mut lo](mut pass_fx: Fx, current_head: Slice[clif::Value]) -> Pass {
+            expect current_head.len() > 0
+            let at_head = current_head[0]
+            let masked = mut pass_fx.b.band(at_head, y: mask)
+            let index = mut pass_fx.b.uextend(PTR, x: masked)
+            let cqe_offset = mut pass_fx.b.imul_imm_s(index, y: 16)
+            let cqe = mut pass_fx.b.iadd(cqes, y: cqe_offset)
+            let user_data = mut pass_fx.load(PTR, addr: cqe, offset: 0)
+            let completed = mut pass_fx.load(clif::Type.Int32, addr: cqe, offset: 8)
+            let next = mut pass_fx.b.iadd_imm_s(at_head, y: 1)
+            mut pass_fx.b.atomic_store(clif::MemFlags.owned(), x: next, p: head_address)
+            let is_operation = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: user_data, y: 0)
+            mut pass_fx.if_true(is_operation, then: fn[mut lo](mut op_fx: Fx) {
+                host_complete(mut lo, fx: mut op_fx, op: user_data, result: completed)
+            })
+            let more = mut pass_fx.b.icmp(clif::IntCC.NotEqual, x: next, y: tail)
+            var carried = mem::List[clif::Value].empty(pass_fx.alloc)
+            mut carried.push(next)
+            return Pass(again: more, next: take carried)
+        })
+    })
+} host_reap
+
+/// Delivers a completion to the operation it reaches, which leaves its thread's operations in
+/// flight.
+fn host_complete(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
+    let current = mut lo.thread(mut fx)
+    let next = mut fx.load(PTR, addr: op, offset: OPERATION_NEXT)
+    let previous = mut fx.load(PTR, addr: op, offset: OPERATION_PREVIOUS)
+    let has_previous = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose(has_previous, results: no_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+        mut yes_fx.store(next, addr: previous, offset: OPERATION_NEXT)
+        return mem::List[clif::Value].empty(yes_fx.alloc)
+    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+        mut no_fx.store(next, addr: current, offset: THREAD_OPERATIONS)
+        return mem::List[clif::Value].empty(no_fx.alloc)
+    })
+    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+    mut fx.if_true(has_next, then: fn(mut then_fx: Fx) {
+        mut then_fx.store(previous, addr: next, offset: OPERATION_PREVIOUS)
+    })
+    let kind = mut fx.load(PTR, addr: op, offset: OPERATION_KIND)
+    let is_signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_SIGNAL)
+    mut fx.if_true(is_signal, then: fn[mut lo](mut then_fx: Fx) {
+        host_termination(mut lo, fx: mut then_fx, op, result)
+    })
+    deliver(mut lo, mut fx, op, result)
+} host_complete
+
+/// Submits a deadline's timeout of the relative time at `spec` on the running thread's ring.
+fn submit_timeout(mut lo: Lowering, mut fx: Fx, op: clif::Value, spec: clif::Value) {
+    let fd = mut fx.int(clif::Type.Int32, value: -1)
+    let len = mut fx.int(clif::Type.Int32, value: 1)
+    let zero_word = mut fx.ptr(0)
+    let flags = mut fx.int(clif::Type.Int32, value: 0)
+    submit_built(mut lo, mut fx, opcode: URING_TIMEOUT, fd, address: spec, len, offset: zero_word, flags, op: Some(op))
+} submit_timeout
+
+/// Submits the cancellations other threads have asked of the operations in flight on the
+/// running thread's ring.
+fn submit_requested(mut lo: Lowering, mut fx: Fx, current: clif::Value) {
+    let flag = mut fx.offset(current, offset: THREAD_REQUESTS)
+    let zero_word = mut fx.ptr(0)
+    let exchanged = mut fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Xchg, p: flag, x: zero_word)
+    let asked = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: exchanged, y: 0)
+    mut fx.if_true(asked, then: fn[mut lo](mut then_fx: Fx) {
+        let head = mut then_fx.load(PTR, addr: current, offset: THREAD_OPERATIONS)
+        discard mut then_fx.repeat(Array[clif::Value, 1].filled(head).view(), body: fn[mut lo](mut pass_fx: Fx, current_op: Slice[clif::Value]) -> Pass {
+            expect current_op.len() > 0
+            let op = current_op[0]
+            let has_op = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+            let next = mut pass_fx.choose_in(mut lo, condition: has_op, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+                let cancel_at = mut yes_fx.offset(op, offset: OPERATION_CANCEL)
+                let cancel_state = mut yes_fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: cancel_at)
+                let requested = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: cancel_state, y: OPERATION_REQUESTED)
+                mut yes_fx.if_true(requested, then: fn[mut cx](mut cancel_fx: Fx) {
+                    submit_cancel(mut cx, fx: mut cancel_fx, op)
+                })
+                var following = mem::List[clif::Value].empty(yes_fx.alloc)
+                mut following.push(mut yes_fx.load(PTR, addr: op, offset: OPERATION_NEXT))
+                return following
+            }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+                var ended = mem::List[clif::Value].empty(no_fx.alloc)
+                mut ended.push(mut no_fx.ptr(0))
+                return ended
+            })
+            return Pass(again: has_op, next: take next)
+        })
+    })
+} submit_requested
+
+/// Submits the cancellation of an operation in flight on the running thread's ring.
+fn submit_cancel(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let fd = mut fx.int(clif::Type.Int32, value: -1)
+    let len = mut fx.int(clif::Type.Int32, value: 0)
+    let zero_word = mut fx.ptr(0)
+    let flags = mut fx.int(clif::Type.Int32, value: 0)
+    submit_built(mut lo, mut fx, opcode: URING_ASYNC_CANCEL, fd, address: op, len, offset: zero_word, flags, op: None)
+    let submitted = mut fx.ptr(u64.fit(OPERATION_SUBMITTED))
+    let cancel_at = mut fx.offset(op, offset: OPERATION_CANCEL)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: submitted, p: cancel_at)
+} submit_cancel
+
+/// Asks once for the cancellation of an operation whose record stays valid during the call:
+/// submitted at once when the running thread's ring holds it and it has not completed,
+/// otherwise asked of the thread whose ring holds it.
+fn cancel_operation(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let flag = mut fx.offset(op, offset: OPERATION_CANCEL)
+    let zero_word = mut fx.ptr(0)
+    let requested = mut fx.ptr(u64.fit(OPERATION_REQUESTED))
+    let previous = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero_word, x: requested)
+    let first_ask = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    mut fx.if_true(first_ask, then: fn[mut lo](mut then_fx: Fx) {
+        let owner = mut then_fx.load(PTR, addr: op, offset: OPERATION_THREAD)
+        let current = mut lo.thread(mut then_fx)
+        let here = mut then_fx.b.icmp(clif::IntCC.Equal, x: owner, y: current)
+        discard mut then_fx.choose_in(mut lo, condition: here, results: no_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+            let done_at = mut yes_fx.offset(op, offset: OPERATION_DONE)
+            let done = mut yes_fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: done_at)
+            let in_flight = mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+            mut yes_fx.if_true(in_flight, then: fn[mut cx](mut cancel_fx: Fx) {
+                submit_cancel(mut cx, fx: mut cancel_fx, op)
+            })
+            return mem::List[clif::Value].empty(yes_fx.alloc)
+        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+            let owner_flag = mut no_fx.offset(owner, offset: THREAD_REQUESTS)
+            let one = mut no_fx.ptr(1)
+            mut no_fx.b.atomic_store(clif::MemFlags.owned(), x: one, p: owner_flag)
+            send_wake(mut cx, fx: mut no_fx, target: owner)
+            return mem::List[clif::Value].empty(no_fx.alloc)
+        })
+    })
+} cancel_operation
+
+/// Wakes another executor thread waiting in its ring with a message on it.
+fn send_wake(mut lo: Lowering, mut fx: Fx, target: clif::Value) {
+    let ring = mut fx.load(PTR, addr: target, offset: THREAD_RING)
+    let fd_word = mut fx.load(PTR, addr: ring, offset: RING_FD)
+    let fd = mut fx.b.ireduce(clif::Type.Int32, x: fd_word)
+    let zero_word = mut fx.ptr(0)
+    let len = mut fx.int(clif::Type.Int32, value: 0)
+    let flags = mut fx.int(clif::Type.Int32, value: 0)
+    submit_built(mut lo, mut fx, opcode: URING_MSG_RING, fd, address: zero_word, len, offset: zero_word, flags, op: None)
+} send_wake
+
+/// Wakes one executor thread waiting idle in its ring, other than the running one, so a task
+/// made ready runs.
+fn host_wake_idle(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let threads = mut fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let current = mut lo.thread(mut fx)
+    let zero_word = mut fx.ptr(0)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(zero_word).view(), body: fn[mut lo](mut pass_fx: Fx, current_index: Slice[clif::Value]) -> Pass {
+        expect current_index.len() > 0
+        let index = current_index[0]
+        let inside = mut pass_fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+        var next_types = Array[clif::Type, 2].filled(PTR)
+        next_types[1] = clif::Type.Int8
+        let next = mut pass_fx.choose_in(mut lo, condition: inside, results: next_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+            return woken_next(mut cx, fx: mut yes_fx, threads, current, index)
+        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+            var done = mem::List[clif::Value].empty(no_fx.alloc)
+            mut done.push(index)
+            mut done.push(mut no_fx.int(clif::Type.Int8, value: 0))
+            return done
+        })
+        var carried = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut carried.push(next[0])
+        return Pass(again: next[1], next: take carried)
+    })
+} host_wake_idle
+
+/// One pass of `host_wake_idle` over the thread at `index`: wakes it when it is another thread
+/// and idle; gives the next index and whether to go on.
+fn woken_next(mut lo: Lowering, mut fx: Fx, threads: clif::Value, current: clif::Value, index: clif::Value) -> mem::List[clif::Value] {
+    let slot_offset = mut fx.b.imul_imm_s(index, y: 8)
+    let slot = mut fx.b.iadd(threads, y: slot_offset)
+    let record = mut fx.load(PTR, addr: slot, offset: 0)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: record, y: current)
+    let idle_at = mut fx.offset(record, offset: THREAD_IDLE)
+    let one = mut fx.ptr(1)
+    let zero_word = mut fx.ptr(0)
+    let woken_flag = mut fx.choose(other, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let seen = mut yes_fx.b.atomic_cas(clif::MemFlags.owned(), p: idle_at, e: one, x: zero_word)
+        var claimed = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut claimed.push(mut yes_fx.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: 1))
+        return claimed
+    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+        var skipped = mem::List[clif::Value].empty(no_fx.alloc)
+        mut skipped.push(mut no_fx.int(clif::Type.Int8, value: 0))
+        return skipped
+    })
+    let woken = woken_flag[0]
+    mut fx.if_true(woken, then: fn[mut lo](mut then_fx: Fx) {
+        send_wake(mut lo, fx: mut then_fx, target: record)
+    })
+    let next = mut fx.b.iadd_imm_s(index, y: 1)
+    var stepped = mem::List[clif::Value].empty(fx.alloc)
+    mut stepped.push(next)
+    mut stepped.push(mut fx.b.bxor_imm_s(woken, y: 1))
+    return stepped
+} woken_next
+
+/// Maps `count` chunks aligned to their size, zero when the system refuses.
+fn host_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    let chunk = i64.fit(MEMORY_CHUNK)
+    let len = mut fx.b.imul_imm_s(count, y: chunk)
+    let padded = mut fx.b.iadd_imm_s(len, y: chunk)
+    let zero_word = mut fx.ptr(0)
+    let protection = mut fx.int(clif::Type.Int32, value: MMAP_READ_WRITE)
+    let flags = mut fx.int(clif::Type.Int32, value: MMAP_PRIVATE_ANONYMOUS)
+    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
+    var map_args = Array[clif::Value, 6].filled(zero_word)
+    map_args[1] = padded
+    map_args[2] = protection
+    map_args[3] = flags
+    map_args[4] = no_fd
+    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: map_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MMAP_FAILED)
+    let mapped = mut fx.choose_in(mut lo, condition: failed, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var refused = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut refused.push(mut yes_fx.ptr(0))
+        return refused
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        expect chunk > 0
+        let bumped = mut no_fx.b.iadd_imm_s(base, y: chunk - 1)
+        let aligned = mut no_fx.b.band_imm_s(bumped, y: ~(chunk - 1))
+        let head = mut no_fx.b.isub(aligned, y: base)
+        let has_head = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        mut no_fx.if_true(has_head, then: fn[mut cx](mut head_fx: Fx) {
+            unmap(mut cx, fx: mut head_fx, address: base, len: head)
+        })
+        let end = mut no_fx.b.iadd(aligned, y: len)
+        let mapped_end = mut no_fx.b.iadd(base, y: padded)
+        let tail = mut no_fx.b.isub(mapped_end, y: end)
+        let has_tail = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+        mut no_fx.if_true(has_tail, then: fn[mut cx](mut tail_fx: Fx) {
+            unmap(mut cx, fx: mut tail_fx, address: end, len: tail)
+        })
+        var aligned_base = mem::List[clif::Value].empty(no_fx.alloc)
+        mut aligned_base.push(aligned)
+        return aligned_base
+    })
+    return mapped[0]
+} host_map_chunks
+
+/// Unmaps memory.
+fn unmap(mut lo: Lowering, mut fx: Fx, address: clif::Value, len: clif::Value) {
+    var unmap_args = Array[clif::Value, 2].filled(address)
+    unmap_args[1] = len
+    discard mut lo.call_libc(mut fx, name: "munmap", args: unmap_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+} unmap
+
+/// Maps a task stack of `len` bytes whose lowest page is an inaccessible guard, zero when the
+/// system refuses.
+fn host_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value) -> clif::Value {
+    let zero_word = mut fx.ptr(0)
+    let protection = mut fx.int(clif::Type.Int32, value: MMAP_READ_WRITE)
+    let flags = mut fx.int(clif::Type.Int32, value: MMAP_STACK)
+    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
+    var map_args = Array[clif::Value, 6].filled(zero_word)
+    map_args[1] = len
+    map_args[2] = protection
+    map_args[3] = flags
+    map_args[4] = no_fd
+    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: map_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MMAP_FAILED)
+    let mapped = mut fx.choose_in(mut lo, condition: failed, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var refused = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut refused.push(mut yes_fx.ptr(0))
+        return refused
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        host_protect_guard(mut cx, fx: mut no_fx, base, accessible: false)
+        var stack_base = mem::List[clif::Value].empty(no_fx.alloc)
+        mut stack_base.push(base)
+        return stack_base
+    })
+    return mapped[0]
+} host_map_stack
+
+/// Makes the guard region at the base of a stack inaccessible, or accessible again.
+fn host_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
+    let guard_size = mut fx.ptr(TASKS_GUARD)
+    var protection_bits = MMAP_NONE
+    if accessible {
+        protection_bits = MMAP_READ_WRITE
+    }
+    let protection = mut fx.int(clif::Type.Int32, value: protection_bits)
+    var protect_args = Array[clif::Value, 3].filled(base)
+    protect_args[1] = guard_size
+    protect_args[2] = protection
+    discard mut lo.call_libc(mut fx, name: "mprotect", args: protect_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
+} host_protect_guard
+
+/// A system call through the C library's `syscall`, its arguments padded to six words.
+fn syscall(mut lo: Lowering, mut fx: Fx, call_number: clif::Value, args: Slice[clif::Value]) -> clif::Value {
+    var call_words = mem::List[clif::Value].empty(fx.alloc)
+    mut call_words.push(call_number)
+    for arg in args {
+        mut call_words.push(arg)
+    }
+    while call_words.len() < 7 {
+        mut call_words.push(mut fx.ptr(0))
+    }
+    return first_result(mut lo.call_libc(mut fx, name: "syscall", args: call_words.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+} syscall
+
+/// Links an object into a position-independent executable at `image` with the `cc` of the
+/// `PATH`; the linker's output when it fails.
+pkg fn host_link(object: Str, image: Str, alloc: mem::Alloc) -> Result[Unit, text::String] {
+    var args = mem::List[text::String].empty(alloc)
+    mut args.push(text::String.of("-pie", alloc))
+    mut args.push(text::String.of("-o", alloc))
+    mut args.push(text::String.of(image, alloc))
+    mut args.push(text::String.of(object, alloc))
+    let ran = attempt platform::run_output("cc", args: args.view(), input: None, capture_errors: true, alloc)
+    match ran {
+        Ok(output) => {
+            if output.status.is_success() {
+                return Ok(Unit)
+            }
+            var written = output::lossy(output.stdout.view(), alloc)
+            mut written.append(output::lossy(output.stderr.view(), alloc).as_str())
+            return Err(take written)
+        }
+        Err(error) => {
+            var refused = text::String.empty(alloc)
+            mut refused.write(text::fmt("{error}", error), budget: 256)
+            return Err(take refused)
+        }
+    }
+} host_link

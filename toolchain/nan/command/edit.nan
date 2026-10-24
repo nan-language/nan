@@ -1,0 +1,386 @@
+//! The editing commands: `nan edit replace`, `nan edit rename` and `nan edit move`, which write their change through the journal only when the workspace with it reports no error it did not report before.
+
+/// `nan edit replace <item> --expect <hash> --from <file>`: replaces the item with the item the
+/// file holds while its item hash is the one expected, its identity stays and its lines check.
+fn edit_replace(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let args_written = invocation.joined_args(alloc)
+    let Some(expected_written) = invocation.value("--expect") else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    let Some(expected) = hashing::parse_form(expected_written, alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    let Some(from) = invocation.value("--from") else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: invocation.operands[0].as_str(), alloc)
+    }
+    let written = resolved.written.as_str()
+    let scope::Scope.Lines(path: path, lines: _) = resolved.scope.copied(alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    trace.scope = Some(text::String.of(written, alloc))
+    let shown_items = session.shown(resolved.scope)
+    if shown_items.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let shown = shown_items[0]
+    let item = match shown.path {
+        Some(canonical) => written_for(canonical.as_str(), writer: writer_of(held, scope: resolved.scope, alloc), alloc)
+        None => text::String.of("-", alloc)
+    }
+    let Some(at) = held.file(path.as_str()) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let file = held.file_at(at)
+    let failing_at = diagnostic::At(path: text::String.of(path.as_str(), alloc), line: shown.line)
+    if not hash_starts_with(shown.hashes.item, expected: expected.view()) {
+        var records = mem::List[output::Record].empty(alloc)
+        mut records.push(edit_error(session, scope: resolved.scope, at: failing_at, code: diagnostic::Code.EditStale, reasons: mem::List[diagnostic::Reason].empty(alloc), alloc))
+        mut records.push(stale_record(shown, item: take item, file: file.syntax, path: path.as_str(), alloc))
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    let Some(text_bytes) = replacement_text(from, current, alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    var parsed_bytes = mem::Bytes.empty(alloc)
+    mut parsed_bytes.append(text_bytes.view())
+    if not one_item(syntax::parse(take parsed_bytes, grammar: session.grammar.contents(), alloc)) {
+        var records = mem::List[output::Record].empty(alloc)
+        mut records.push(edit_error(session, scope: resolved.scope, at: failing_at, code: diagnostic::Code.EditNotOneItem, reasons: mem::List[diagnostic::Reason].empty(alloc), alloc))
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    return try edit_replaced(invocation, session, scope: resolved.scope, written, shown, item: item.as_str(), text_bytes: text_bytes.view(), alloc)
+} edit_replace
+
+/// The `item` record of an item whose hash is not the one expected: its location, hashes and
+/// lines.
+fn stale_record(shown: check::Shown, take item: text::String, file: syntax::SourceFile, path: Str, alloc: mem::Alloc) -> output::Record {
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(take item)
+    mut fields.push(located(path, line: shown.line, alloc))
+    mut fields.push(shown.hashes.item.short(alloc))
+    match shown.hashes.interface_hash {
+        Some(hash) => mut fields.push(hash.short(alloc))
+        None => mut fields.push(text::String.of("-", alloc))
+    }
+    var lines = mem::List[text::String].empty(alloc)
+    for line in shown.lines {
+        mut lines.push(output::printable(file.line_text(line), alloc))
+    }
+    return output::Record(word: text::String.of("item", alloc), fields: take fields, lines: take lines)
+} stale_record
+
+/// The text of the new item: standard input for `-`, or the file at `from`, with a final LF;
+/// none when it cannot be read.
+fn replacement_text(from: Str, current: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var text_bytes = mem::Bytes.empty(alloc)
+    if from == "-" {
+        let Ok(bytes) = attempt platform::read_stdin(alloc) else {
+            return None
+        }
+        text_bytes = bytes
+    } else {
+        let Ok(bytes) = attempt platform::read_file(platform::join(current, name: from, alloc).as_str(), alloc) else {
+            return None
+        }
+        text_bytes = bytes
+    }
+    if text_bytes.len() > 0 and text_bytes[text_bytes.len() - 1] != b'\n' {
+        mut text_bytes.push(b'\n')
+    }
+    return Some(take text_bytes)
+} replacement_text
+
+/// Replaces an item's lines with the text of one item when its identity stays and its new lines
+/// report no error the workspace did not report before.
+fn edit_replaced(invocation: Invocation, session: check::Session, scope: scope::Scope, written: Str, shown: check::Shown, item: Str, text_bytes: Slice[u8], alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let path = shown.file.as_str()
+    let Some(at) = held.file(path) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let file = held.file_at(at)
+    let failing_at = diagnostic::At(path: text::String.of(path, alloc), line: shown.line)
+    let first_line = shown.lines.low
+    expect first_line > 0 and usize.widen(first_line) <= file.syntax.lines.len()
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    mut edits.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: file.syntax.lines[usize.widen(first_line) - 1].start, end: line_after(file.syntax, line: shown.lines.high), text: output::lossy(text_bytes, alloc))))
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    mut fixes.push(diagnostic::Fix(edits: take edits))
+    let changed = fix::apply(held, fixes: fixes.view(), alloc)
+    let after = changed_session(session, changed, alloc)
+    if session.identity(path, line: shown.line) != after.identity(path, line: first_line) {
+        var command_reasons = mem::List[diagnostic::Reason].empty(alloc)
+        mut command_reasons.push(diagnostic::Reason(role: diagnostic::Role.Command, subject: text::String.of("nan edit rename", alloc), at: None))
+        var records = mem::List[output::Record].empty(alloc)
+        mut records.push(edit_error(session, scope, at: failing_at, code: diagnostic::Code.EditIdentityChanged, reasons: take command_reasons, alloc))
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    var line_count: u32 = 0
+    for byte in text_bytes {
+        if byte == b'\n' {
+            expect line_count < 0xFFFF_FFFF
+            line_count += 1
+        }
+    }
+    expect first_line <= ~0u32 - line_count
+    let new_lines = first_line..=(first_line + line_count - 1)
+    let before = session.reported(scope::Scope.Workspace)
+    let rechecked = after.reported(scope::Scope.Workspace)
+    var failing = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var elsewhere = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in take fix::introduced(before.view(), fix: fixes[0], rechecked: rechecked.view(), alloc) {
+        if lies_on(reported, path, lines: new_lines) {
+            mut failing.push(take reported)
+        } else {
+            mut elsewhere.push(take reported)
+        }
+    }
+    let after_held = after.workspace.contents()
+    var records = mem::List[output::Record].empty(alloc)
+    if failing.len() > 0 {
+        mut records.push(edit_error(session, scope, at: failing_at, code: diagnostic::Code.EditCheckFailed, reasons: mem::List[diagnostic::Reason].empty(alloc), alloc))
+        for reported in failing {
+            mut records.push(record(after_held, std: session.std.contents(), scope, reported, alloc))
+        }
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    let wrote = file_writes(take changed, alloc)
+    try journal::write(held.root.as_str(), files: wrote.view(), alloc)
+    for shown_item in take after.shown(scope::Scope.Lines(path: text::String.of(path, alloc), lines: new_lines)) {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(item, alloc))
+        mut fields.push(located(path, line: shown_item.line, alloc))
+        mut fields.push(shown_item.hashes.item.short(alloc))
+        mut records.push(output::Record(word: text::String.of("replaced", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    for reported in elsewhere {
+        mut records.push(record(after_held, std: session.std.contents(), scope, reported, alloc))
+    }
+    for wrote_line in take wrote_records(wrote.view(), alloc) {
+        mut records.push(take wrote_line)
+    }
+    return edited(invocation, written, take records, files: wrote.len(), alloc)
+} edit_replaced
+
+/// Whether a hash starts with the bytes a hash's form gives.
+fn hash_starts_with(hash: hashing::HashValue, expected: Slice[u8]) -> bool {
+    if expected.len() > hash.bytes.len() {
+        return false
+    }
+    for index in 0..<expected.len() {
+        if hash.bytes[index] != expected[index] {
+            return false
+        }
+    }
+    return true
+} hash_starts_with
+
+/// Whether a diagnostic lies on lines of a file.
+fn lies_on(reported: diagnostic::Diagnostic, path: Str, lines: core::Range[u32]) -> bool {
+    let Some(at) = reported.path else {
+        return false
+    }
+    let Some(line) = reported.line else {
+        return false
+    }
+    return at.as_str() == path and lines.contains(line)
+} lies_on
+
+/// The record of an editing error at a line of the workspace, with its because-chain.
+fn edit_error(session: check::Session, scope: scope::Scope, at: diagnostic::At, code: diagnostic::Code, take reasons: mem::List[diagnostic::Reason], alloc: mem::Alloc) -> output::Record {
+    var reported = diagnostic::Diagnostic.at(code, path: at.path.as_str(), line: at.line, alloc)
+    reported.because = reasons
+    return record(session.workspace.contents(), std: session.std.contents(), scope, reported, alloc)
+} edit_error
+
+/// The session of the workspace with changed sources.
+fn changed_session(session: check::Session, changed: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> check::Session {
+    let overlaid = session.workspace.contents().overlaid(changed, grammar: session.grammar.contents(), alloc)
+    return check::Session.of(mem::Shared.of(take overlaid, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+} changed_session
+
+/// The files to write of changed sources, in byte order of path.
+fn file_writes(take changed: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::List[journal::FileWrite] {
+    var writes = mem::List[journal::FileWrite].empty(alloc)
+    for changed_file in take changed {
+        let mem::KeyValue(key: path, value: content) = changed_file
+        mut writes.push(journal::FileWrite(path: take path, content: take content))
+    }
+    return writes
+} file_writes
+
+/// `nan edit rename <item> <name>`: renames an item or member, its declaration, labels and every
+/// reference of the workspace, writing the rename tombstone a field or variant of a type deriving
+/// `Encode` needs.
+fn edit_rename(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let args_written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: invocation.operands[0].as_str(), alloc)
+    }
+    let written = resolved.written.as_str()
+    let scope::Scope.Lines(path: path, lines: lines) = resolved.scope.copied(alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    trace.scope = Some(text::String.of(written, alloc))
+    let Some(fix) = session.renamed(path.as_str(), lines, name: invocation.operands[1].as_str()) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let at = diagnostic::At(path: text::String.of(path.as_str(), alloc), line: lines.low)
+    return try write_checked(invocation, session, scope: resolved.scope, written, at, take fix, relocated: mem::List[check::Relocated].empty(alloc).view(), alloc)
+} edit_rename
+
+/// `nan edit move <item> <module>`: moves an item, with the functions named after it and the impl
+/// lines naming it in its module, to another module of its package.
+fn edit_move_item(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let args_written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: args_written.as_str(), alloc)
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: invocation.operands[0].as_str(), alloc)
+    }
+    let written = resolved.written.as_str()
+    let scope::Scope.Lines(path: path, lines: lines) = resolved.scope.copied(alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    trace.scope = Some(text::String.of(written, alloc))
+    let at = diagnostic::At(path: text::String.of(path.as_str(), alloc), line: lines.low)
+    let Some(moving) = session.moved(path.as_str(), lines, module: invocation.operands[1].as_str()) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    let Ok(moved) = moving else {
+        var records = mem::List[output::Record].empty(alloc)
+        mut records.push(edit_error(session, scope: resolved.scope, at, code: diagnostic::Code.EditMoveInvalid, reasons: mem::List[diagnostic::Reason].empty(alloc), alloc))
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    let check::Move(fix: move_fix, relocated: relocated) = moved
+    return try write_checked(invocation, session, scope: resolved.scope, written, at, fix: take move_fix, relocated: relocated.view(), alloc)
+} edit_move_item
+
+/// Writes an edit's files when the workspace with it reports no error it did not report before,
+/// the lines of `relocated` items counting as the lines they left, and otherwise reports
+/// `edit.check-failed` at `at`, followed by those errors.
+fn write_checked(invocation: Invocation, session: check::Session, scope: scope::Scope, written: Str, at: diagnostic::At, take fix: diagnostic::Fix, relocated: Slice[check::Relocated], alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    mut fixes.push(take fix)
+    let changed = fix::apply(held, fixes: fixes.view(), alloc)
+    let after = changed_session(session, changed, alloc)
+    let before = session.reported(scope::Scope.Workspace)
+    let rechecked = after.reported(scope::Scope.Workspace)
+    var introduced = fix::introduced(before.view(), fix: fixes[0], rechecked: rechecked.view(), alloc)
+    mut introduced.retain(fn(reported: diagnostic::Diagnostic) => not reported_where_it_left(reported, relocated, before: before.view()))
+    if introduced.len() > 0 {
+        var records = mem::List[output::Record].empty(alloc)
+        mut records.push(edit_error(session, scope, at, code: diagnostic::Code.EditCheckFailed, reasons: mem::List[diagnostic::Reason].empty(alloc), alloc))
+        for reported in introduced {
+            mut records.push(record(after.workspace.contents(), std: session.std.contents(), scope, reported, alloc))
+        }
+        return edited(invocation, written, take records, files: 0, alloc)
+    }
+    let wrote = file_writes(take changed, alloc)
+    try journal::write(held.root.as_str(), files: wrote.view(), alloc)
+    return edited(invocation, written, records: wrote_records(wrote.view(), alloc), files: wrote.len(), alloc)
+} write_checked
+
+/// Whether an error on the lines of a relocated item was reported before on the line it left.
+fn reported_where_it_left(reported: diagnostic::Diagnostic, relocated: Slice[check::Relocated], before: Slice[diagnostic::Diagnostic]) -> bool {
+    let Some(line) = reported.line else {
+        return false
+    }
+    let Some(path) = reported.path else {
+        return false
+    }
+    for moved in relocated {
+        if path.as_str() != moved.to.path.as_str() or line < moved.to.line or line - moved.to.line >= moved.lines {
+            continue
+        }
+        let left = moved.from.line + (line - moved.to.line)
+        for earlier in before {
+            if earlier.code == reported.code and earlier.path == Some(moved.from.path) and earlier.line == Some(left) {
+                return true
+            }
+        }
+        return false
+    }
+    return false
+} reported_where_it_left
+
+/// A `wrote` record per file written, in byte order of path.
+fn wrote_records(wrote: Slice[journal::FileWrite], alloc: mem::Alloc) -> mem::List[output::Record] {
+    var paths = mem::List[text::String].empty(alloc)
+    for file in wrote {
+        mut paths.push(text::String.of(file.path.as_str(), alloc))
+    }
+    mut paths.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var records = mem::List[output::Record].empty(alloc)
+    for path in take paths {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(take path)
+        mut records.push(output::Record(word: text::String.of("wrote", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    return records
+} wrote_records
+
+/// The output of an editing command printing `records`, of which those headed `error` are its
+/// errors, having written `files` files.
+fn edited(invocation: Invocation, written: Str, take records: mem::List[output::Record], files: usize, alloc: mem::Alloc) -> output::Output {
+    var errors: usize = 0
+    var incomplete: usize = 0
+    for held in records {
+        invariant errors < records.len() and incomplete < records.len()
+        if held.word.as_str() == "error" {
+            errors += 1
+        } else if held.word.as_str() == "incomplete" {
+            incomplete += 1
+        }
+    }
+    var verdict = output::Verdict.Ok
+    if errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: written_summary(files, errors, incomplete, alloc), records: take records)
+} edited
+
+/// Whether a text is exactly one item starting at column 0.
+fn one_item(file: syntax::SourceFile) -> bool {
+    if file.items.len() != 1 {
+        return false
+    }
+    let item = file.items[0]
+    if item.tree.is_none() or file.summary.is_some() {
+        return false
+    }
+    expect item.head < file.tokens.len()
+    if file.tokens[item.head].kind != syntax::TokenKind.Col0 {
+        return false
+    }
+    for index in item.end..<file.tokens.len() {
+        if not file.tokens[index].kind.is_virtual() {
+            return false
+        }
+    }
+    return true
+} one_item
+
+/// The offset of the line after `line`, or the end of the source.
+fn line_after(file: syntax::SourceFile, line: u32) -> u32 {
+    if usize.widen(line) < file.lines.len() {
+        return file.lines[usize.widen(line)].start
+    }
+    return u32.fit(file.source.len())
+} line_after

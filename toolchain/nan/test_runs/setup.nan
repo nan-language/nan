@@ -1,0 +1,878 @@
+//! Setup forms: the values a failing case's parameters took, rebuilt from its draws by the rules the generators follow, each written as the statements binding it in the test's module; and the regression-test edit, which inserts them in a parameterless test of the same target.
+
+/// The depth of enclosing generator calls from which collections draw no elements and enums
+/// only their variants that do not hold themselves.
+const DEEP: u32 = 8
+
+/// A generated value, as its draws rebuild it.
+enum Part {
+    Int(wide::Wide)
+    Bool(bool)
+    Char(u32)
+    /// A float's bits and its type.
+    Float(bits: u64, scalar: ty::Scalar)
+    Unit
+    Struct(ty: ty::Ty, fields: mem::List[FieldPart])
+    /// A variant of an enum type, its payload with each field's label.
+    Variant(ty: ty::Ty, name: text::String, payload: mem::List[PayloadPart])
+    Array(ty: ty::Ty, elements: mem::List[Part])
+    /// A collection's elements, or a map's entries as pairs.
+    Elements(ty: ty::Ty, elements: mem::List[Part])
+    Entries(ty: ty::Ty, entries: mem::List[EntryPart])
+    Text(ty: ty::Ty, written: text::String)
+    /// The contents of a box, its one element.
+    Boxed(mem::List[Part])
+    /// The contents of an Untrusted value, its one element.
+    Untrusted(mem::List[Part])
+    Id(ty: ty::Ty, index: wide::Wide)
+    /// A value whose generator is not one whose draws rebuild it.
+    Opaque(ty::Ty)
+} Part
+
+/// A struct's field and its value.
+struct FieldPart {
+    name: text::String
+    part: Part
+} FieldPart
+
+/// A payload field's label, if any, and its value.
+struct PayloadPart {
+    label: Option[text::String]
+    part: Part
+} PayloadPart
+
+/// A map entry's key and value.
+struct EntryPart {
+    key: Part
+    value: Part
+} EntryPart
+
+/// The values a case's draws gave, consumed in order; past the recorded ones, zero.
+struct Draws {
+    given: mem::List[wide::Wide]
+    at: usize
+} Draws
+
+fn Draws.next(mut self) -> wide::Wide {
+    var value = wide::Wide.zero()
+    if self.at < self.given.len() {
+        value = self.given[self.at]
+    }
+    expect self.at < ~0usize
+    self.at += 1
+    return value
+} Draws.next
+
+/// The draw a length or a count is, as the generators truncate it.
+fn Draws.next_count(mut self) -> usize {
+    let drawn = mut self.next()
+    return usize.widen(drawn.low_bits())
+} Draws.next_count
+
+/// Rebuilds a value of a type from the draws its generator made under `depth` enclosing
+/// generator calls.
+fn rebuild(ck: check::Checker, held: ty::Ty, mut draws: Draws, depth: u32) -> Part {
+    return match ck.types().kind(held) {
+        ty::TyKind.Unit => Part.Unit
+        ty::TyKind.Scalar(scalar) => scalar_part(scalar, mut draws)
+        ty::TyKind.Item(item: item, args: args) => item_part(ck, held, item, args, mut draws, depth)
+        else => Part.Opaque(held)
+    }
+} rebuild
+
+/// Rebuilds a scalar value.
+fn scalar_part(scalar: ty::Scalar, mut draws: Draws) -> Part {
+    let drawn = mut draws.next()
+    return match scalar {
+        ty::Scalar.Bool => Part.Bool(not drawn.is_zero())
+        ty::Scalar.Char => char_part(u32.truncate(drawn.low_bits()))
+        ty::Scalar.Float32 or ty::Scalar.Float64 => Part.Float(bits: drawn.low_bits(), scalar: scalar)
+        else => Part.Int(drawn)
+    }
+} scalar_part
+
+/// The char a drawn code gives, the surrogates skipped.
+fn char_part(value: u32) -> Part {
+    if value >= 0xD800 {
+        return Part.Char(value.wrapping_add(0x800))
+    }
+    return Part.Char(value)
+} char_part
+
+/// The type argument at an index.
+fn arg_ty(args: Slice[ty::Arg], index: usize) -> Option[ty::Ty] {
+    if index >= args.len() {
+        return None
+    }
+    return args[index].ty()
+} arg_ty
+
+/// The const integer argument at an index, as a count; 0 for any other.
+fn arg_count(args: Slice[ty::Arg], index: usize) -> usize {
+    if index >= args.len() {
+        return 0
+    }
+    let ty::Arg.Const(ty::Const.Int(count)) = args[index] else {
+        return 0
+    }
+    return usize.widen(count.low_bits())
+} arg_count
+
+/// Rebuilds the elements of a collection: a drawn length, then each element.
+fn elements_of(ck: check::Checker, element: ty::Ty, mut draws: Draws, depth: u32) -> mem::List[Part] {
+    var parts = mem::List[Part].empty(ck.alloc())
+    let len = mut draws.next_count()
+    for _ in 0..<len {
+        mut parts.push(rebuild(ck, held: element, mut draws, depth))
+    }
+    return parts
+} elements_of
+
+/// Rebuilds a value of an item type: a std type by the rules its supplied generator follows,
+/// any other through its derived generator.
+fn item_part(ck: check::Checker, held: ty::Ty, item: ty::ItemId, args: ty::Args, mut draws: Draws, depth: u32) -> Part {
+    let alloc = ck.alloc()
+    expect depth < 0xFFFF_FFFF
+    let inner = depth + 1
+    let arg_list = ck.types().arg_list(args)
+    let path = ck.db().canonical(item)
+    let single = arg_ty(arg_list, index: 0)
+    match path.as_str() {
+        "core::Array" => {
+            let Some(element) = single else {
+                expect false
+                return Part.Opaque(held)
+            }
+            var parts = mem::List[Part].empty(alloc)
+            for _ in 0..<arg_count(arg_list, index: 1) {
+                mut parts.push(rebuild(ck, held: element, mut draws, depth: inner))
+            }
+            return Part.Array(ty: held, elements: take parts)
+        }
+        "core::Untrusted" or "mem::Box" => {
+            let Some(contents) = single else {
+                expect false
+                return Part.Opaque(held)
+            }
+            var one = mem::List[Part].empty(alloc)
+            mut one.push(rebuild(ck, held: contents, mut draws, depth: inner))
+            if path.as_str() == "mem::Box" {
+                return Part.Boxed(take one)
+            }
+            return Part.Untrusted(take one)
+        }
+        "mem::Id" => return Part.Id(ty: held, index: mut draws.next())
+        "mem::List" or "mem::Set" or "mem::Bounded" => {
+            let Some(element) = single else {
+                expect false
+                return Part.Opaque(held)
+            }
+            return Part.Elements(ty: held, elements: elements_of(ck, element, mut draws, depth: inner))
+        }
+        "mem::Bytes" => return Part.Elements(ty: held, elements: elements_of(ck, element: ty::Ty.scalar(ty::Scalar.Unsigned8), mut draws, depth: inner))
+        "text::String" => {
+            let chars = elements_of(ck, element: ty::Ty.scalar(ty::Scalar.Char), mut draws, depth: inner)
+            return Part.Text(ty: held, written: text_of(chars.view(), alloc))
+        }
+        "text::Fixed" => return Part.Text(ty: held, written: fixed_text(mut draws, alloc))
+        "mem::Map" or "mem::HashMap" => return entries_part(ck, held, args: arg_list, mut draws, depth)
+        else => return derived(ck, held, item, mut draws, depth)
+    }
+} item_part
+
+/// The text of a `text::Fixed`: a drawn length, then each char's code, an invalid one a space.
+fn fixed_text(mut draws: Draws, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    let len = mut draws.next_count()
+    for _ in 0..<len {
+        let drawn = mut draws.next()
+        mut written.push(char.checked_from_bits(u32.truncate(drawn.low_bits())).value_or(' '))
+    }
+    return written
+} fixed_text
+
+/// Rebuilds a map's entries: a `mem::HashMap` draws its seed first, then a length and each key
+/// and value.
+fn entries_part(ck: check::Checker, held: ty::Ty, args: Slice[ty::Arg], mut draws: Draws, depth: u32) -> Part {
+    expect depth < 0xFFFF_FFFF
+    let inner = depth + 1
+    if ck.std_path(held) == Some(text::String.of("mem::HashMap", alloc: ck.alloc())) {
+        discard mut draws.next()
+    }
+    let Some(key_ty) = arg_ty(args, index: 0) else {
+        expect false
+        return Part.Opaque(held)
+    }
+    let Some(value_ty) = arg_ty(args, index: 1) else {
+        expect false
+        return Part.Opaque(held)
+    }
+    var entries = mem::List[EntryPart].empty(ck.alloc())
+    let len = mut draws.next_count()
+    for _ in 0..<len {
+        let key = rebuild(ck, held: key_ty, mut draws, depth: inner)
+        let value = rebuild(ck, held: value_ty, mut draws, depth: inner)
+        mut entries.push(EntryPart(key: take key, value: take value))
+    }
+    return Part.Entries(ty: held, entries: take entries)
+} entries_part
+
+/// Rebuilds a value a derived generator built: a struct's fields in declaration order, or an
+/// enum's variant drawn among the eligible ones and its payload.
+fn derived(ck: check::Checker, held: ty::Ty, item: ty::ItemId, mut draws: Draws, depth: u32) -> Part {
+    let Some(generate) = ck.db().core_item("Generate") else {
+        return Part.Opaque(held)
+    }
+    if not ck.derives_interface(item, interface_item: generate) {
+        return Part.Opaque(held)
+    }
+    let alloc = ck.alloc()
+    expect depth < 0xFFFF_FFFF
+    let inner = depth + 1
+    let sig = ck.sig(item)
+    match sig.contents().kind {
+        check::SigKind.Struct(fields: fields) => {
+            var parts = mem::List[FieldPart].empty(alloc)
+            for field in fields {
+                let field_ty = ck.field_type(held, name: field.name.as_str()).value_or(ty::Ty.unit())
+                let part = rebuild(ck, held: field_ty, mut draws, depth: inner)
+                mut parts.push(FieldPart(name: text::String.of(field.name.as_str(), alloc), part: take part))
+            }
+            return Part.Struct(ty: held, fields: take parts)
+        }
+        check::SigKind.Enum(variants: variants) => {
+            var eligible = mem::List[usize].empty(alloc)
+            for index in 0..<variants.len() {
+                if depth < DEEP or not holds_itself(ck, held, payload: variants[index].payload, enumeration: item) {
+                    mut eligible.push(index)
+                }
+            }
+            let position = mut draws.next_count()
+            var index: usize = 0
+            if position < eligible.len() {
+                index = eligible[position]
+            }
+            expect index < variants.len()
+            let variant = variants[index]
+            var payload = mem::List[PayloadPart].empty(alloc)
+            for labelled in take payload_types(ck, held, payload: variant.payload) {
+                let LabelledType(label: label, ty: payload_ty) = labelled
+                let part = rebuild(ck, held: payload_ty, mut draws, depth: inner)
+                mut payload.push(PayloadPart(label: take label, part: take part))
+            }
+            return Part.Variant(ty: held, name: text::String.of(variant.name.as_str(), alloc), payload: take payload)
+        }
+        else => return Part.Opaque(held)
+    }
+} derived
+
+/// A payload field's type, with its label when it has one.
+struct LabelledType {
+    label: Option[text::String]
+    ty: ty::Ty
+} LabelledType
+
+/// The types of a variant's payload for an instantiation of its enum, with their labels.
+fn payload_types(ck: check::Checker, held: ty::Ty, payload: check::Payload) -> mem::List[LabelledType] {
+    let alloc = ck.alloc()
+    var found = mem::List[LabelledType].empty(alloc)
+    let types = ck.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(held) else {
+        return found
+    }
+    let subst = substitution(ck, item, args)
+    match payload {
+        check::Payload.None => {}
+        check::Payload.Single(single) => mut found.push(LabelledType(label: None, ty: subst.ty(types, ty: single)))
+        check::Payload.Labelled(fields) => {
+            for field in fields {
+                mut found.push(LabelledType(label: Some(text::String.of(field.name.as_str(), alloc)), ty: subst.ty(types, ty: field.ty)))
+            }
+        }
+    }
+    return found
+} payload_types
+
+/// The substitution of an item's generic parameters by its arguments.
+fn substitution(ck: check::Checker, item: ty::ItemId, args: ty::Args) -> ty::Subst {
+    let alloc = ck.alloc()
+    let sig = ck.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    return ty::Subst.of(params.view(), args: ck.types().arg_list(args), alloc)
+} substitution
+
+/// Whether a variant's payload holds its enum as a constituent type at any depth.
+fn holds_itself(ck: check::Checker, held: ty::Ty, payload: check::Payload, enumeration: ty::ItemId) -> bool {
+    for labelled in payload_types(ck, held, payload) {
+        var seen = mem::List[ty::ItemId].empty(ck.alloc())
+        if reaches(ck, held: labelled.ty, target: enumeration, mut seen) {
+            return true
+        }
+    }
+    return false
+} holds_itself
+
+/// Whether a type is an item or holds it as a constituent type.
+fn reaches(ck: check::Checker, held: ty::Ty, target: ty::ItemId, mut seen: mem::List[ty::ItemId]) -> bool {
+    let types = ck.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(held) else {
+        return false
+    }
+    if item == target {
+        return true
+    }
+    if seen.position(fn(known: ty::ItemId) => known == item).is_some() {
+        return false
+    }
+    mut seen.push(item)
+    let subst = substitution(ck, item, args)
+    for arg in types.arg_list(args) {
+        let Some(arg_type) = arg.ty() else {
+            continue
+        }
+        if reaches(ck, held: arg_type, target, mut seen) {
+            return true
+        }
+    }
+    for constituent in ck.constituents(item) {
+        if reaches(ck, held: subst.ty(types, ty: constituent), target, mut seen) {
+            return true
+        }
+    }
+    return false
+} reaches
+
+/// The text of rebuilt chars.
+fn text_of(chars: Slice[Part], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for part in chars {
+        let Part.Char(code) = part else {
+            continue
+        }
+        let Some(c) = char.checked_from_bits(code) else {
+            continue
+        }
+        mut written.push(c)
+    }
+    return written
+} text_of
+
+/// The statements a test's module writes to bind values, nested parts needing statements first
+/// bound to `n_1`, `n_2` and so on.
+struct Writer {
+    ck: check::Checker
+    module: ty::ModuleId
+    statements: mem::List[text::String]
+    names: usize
+    alloc: mem::Alloc
+} Writer
+
+fn Writer.show(self, held: ty::Ty) -> text::String {
+    return self.ck.show(held, from: self.module)
+} Writer.show
+
+/// The setup form of a value for a name: `let n: T = e`, or `var n: T = e` with the statements
+/// after it when it needs them or `var` is asked.
+fn Writer.bind(mut self, name: Str, held: ty::Ty, part: Part, as_var: bool) {
+    var after = mem::List[text::String].empty(self.alloc)
+    var value = text::String.empty(self.alloc)
+    match part {
+        Part.Elements(ty: collection, elements: elements) => {
+            value = self.empty_call(collection)
+            for element in elements {
+                let written = mut self.expr(element)
+                mut after.push(self.pushed(collection, name, element: written.as_str()))
+            }
+        }
+        Part.Entries(ty: map, entries: entries) => {
+            value = self.empty_call(map)
+            for entry in entries {
+                let key = mut self.expr(entry.key)
+                let entry_value = mut self.expr(entry.value)
+                var line = text::String.empty(self.alloc)
+                mut line.write(text::fmt("discard mut {name}.insert({key}, value: {entry_value})", name, key, entry_value), budget: 1_000_000)
+                mut after.push(take line)
+            }
+        }
+        Part.Array(ty: array, elements: elements) => {
+            var written = mem::List[text::String].empty(self.alloc)
+            for element in elements {
+                mut written.push(mut self.expr(element))
+            }
+            let most = most_frequent(written.view(), alloc: self.alloc)
+            for index in 0..<written.len() {
+                if written[index] != most {
+                    var line = text::String.empty(self.alloc)
+                    mut line.write(text::fmt("{name}[{index}] = {element}", name, index, element: written[index]), budget: 1_000_000)
+                    mut after.push(take line)
+                }
+            }
+            mut value.write(text::fmt("{array}.filled({most})", array: self.show(array), most), budget: 1_000_000)
+        }
+        else => {
+            value = mut self.expr(part)
+        }
+    }
+    var keyword = "let"
+    if as_var or after.len() > 0 {
+        keyword = "var"
+    }
+    var statement = text::String.empty(self.alloc)
+    mut statement.write(text::fmt("{keyword} {name}: {shown} = {value}", keyword, name, shown: self.show(held), value), budget: 1_000_000)
+    mut self.statements.push(take statement)
+    for line in take after {
+        mut self.statements.push(take line)
+    }
+} Writer.bind
+
+/// A collection's `empty` call.
+fn Writer.empty_call(self, collection: ty::Ty) -> text::String {
+    var written = self.show(collection)
+    let path = self.ck.std_path(collection)
+    if path == Some(text::String.of("mem::HashMap", alloc: self.alloc)) {
+        mut written.append(".empty(0, alloc: testing::world().alloc)")
+    } else if path == Some(text::String.of("mem::Bounded", alloc: self.alloc)) {
+        mut written.append(".empty()")
+    } else {
+        mut written.append(".empty(testing::world().alloc)")
+    }
+    return written
+} Writer.empty_call
+
+/// The statement adding an element to a collection: a `push`, or an `insert` into a set, whose
+/// result is discarded.
+fn Writer.pushed(self, collection: ty::Ty, name: Str, element: Str) -> text::String {
+    var line = text::String.empty(self.alloc)
+    if self.ck.std_path(collection) == Some(text::String.of("mem::Set", alloc: self.alloc)) {
+        mut line.write(text::fmt("discard mut {name}.insert({element})", name, element), budget: 1_000_000)
+    } else {
+        mut line.write(text::fmt("mut {name}.push({element})", name, element), budget: 1_000_000)
+    }
+    return line
+} Writer.pushed
+
+/// The expression of a value, a nested part needing statements bound first.
+fn Writer.expr(mut self, part: Part) -> text::String {
+    let alloc = self.alloc
+    var written = text::String.empty(alloc)
+    match part {
+        Part.Int(value) => return grouped(value, alloc)
+        Part.Bool(value) => mut written.write(text::fmt("{value}", value), budget: 8)
+        Part.Char(code) => {
+            var one = text::String.empty(alloc)
+            mut one.push(char.checked_from_bits(code).value_or(' '))
+            mut written.push('\'')
+            mut written.append(escaped(one.as_str(), quote: '\'', alloc).as_str())
+            mut written.push('\'')
+        }
+        Part.Float(bits: bits, scalar: scalar) => {
+            mut written.append(scalar.name())
+            mut written.append(".from_bits(")
+            mut written.append(hexadecimal(bits, alloc).as_str())
+            mut written.push(')')
+        }
+        Part.Unit => mut written.append("Unit")
+        Part.Struct(ty: held, fields: fields) => return mut self.construction(held, fields: fields.view())
+        Part.Variant(ty: held, name: variant, payload: payload) => return mut self.variant_expr(held, variant: variant.as_str(), payload: payload.view())
+        Part.Text(ty: held, written: contents) => {
+            var literal = text::String.of("\"", alloc)
+            mut literal.append(escaped(contents.as_str(), quote: '"', alloc).as_str())
+            mut literal.push('"')
+            if self.ck.std_path(held) == Some(text::String.of("text::Fixed", alloc)) {
+                mut written.write(text::fmt("{shown}.of({literal})", shown: self.show(held), literal), budget: 1_000_000)
+            } else {
+                mut written.write(text::fmt("text::String.of({literal}, alloc: testing::world().alloc)", literal), budget: 1_000_000)
+            }
+        }
+        Part.Boxed(contents) => {
+            expect contents.len() > 0
+            let inner = mut self.expr(contents[0])
+            mut written.write(text::fmt("mem::Heap.of(testing::world().alloc).boxed({inner})", inner), budget: 1_000_000)
+        }
+        Part.Untrusted(contents) => {
+            expect contents.len() > 0
+            let inner = mut self.expr(contents[0])
+            mut written.write(text::fmt("Untrusted.of({inner})", inner), budget: 1_000_000)
+        }
+        Part.Id(ty: held, index: index) => {
+            mut written.write(text::fmt("{shown}.of({index})", shown: self.show(held), index: grouped(index, alloc)), budget: 1_000_000)
+        }
+        Part.Opaque(held) => return self.todo_form(held)
+        Part.Elements(ty: held, elements: _) or Part.Entries(ty: held, entries: _) or Part.Array(ty: held, elements: _) => return mut self.nested(held, part)
+    }
+    return written
+} Writer.expr
+
+/// A struct's construction, or a `todo` when the module cannot write one.
+fn Writer.construction(mut self, held: ty::Ty, fields: Slice[FieldPart]) -> text::String {
+    if not self.constructible(held) {
+        return self.todo_form(held)
+    }
+    var written = mem::List[text::String].empty(self.alloc)
+    for field in fields {
+        var one = text::String.of(field.name.as_str(), alloc: self.alloc)
+        mut one.append(": ")
+        let value = mut self.expr(field.part)
+        mut one.append(value.as_str())
+        mut written.push(take one)
+    }
+    var construction = self.show(held)
+    mut construction.push('(')
+    mut construction.append(joined(written.view(), alloc: self.alloc).as_str())
+    mut construction.push(')')
+    return construction
+} Writer.construction
+
+/// A variant's expression: its payload's values with their labels, after the variant written
+/// alone for `Some`, `None`, `Ok` and `Err` of the core types or as `Type.Variant` otherwise.
+fn Writer.variant_expr(mut self, held: ty::Ty, variant: Str, payload: Slice[PayloadPart]) -> text::String {
+    var fields = mem::List[text::String].empty(self.alloc)
+    for field in payload {
+        var one = text::String.empty(self.alloc)
+        match field.label {
+            Some(label) => {
+                mut one.append(label.as_str())
+                mut one.append(": ")
+            }
+            None => {}
+        }
+        let value = mut self.expr(field.part)
+        mut one.append(value.as_str())
+        mut fields.push(take one)
+    }
+    let core_variant = variant == "Some" or variant == "None" or variant == "Ok" or variant == "Err"
+    let path = self.ck.std_path(held)
+    let core_type = path == Some(text::String.of("core::Option", alloc: self.alloc)) or path == Some(text::String.of("core::Result", alloc: self.alloc))
+    var head = text::String.empty(self.alloc)
+    if not (core_variant and core_type) {
+        mut head.append(self.show(held).as_str())
+        mut head.push('.')
+    }
+    mut head.append(variant)
+    if fields.len() == 0 {
+        return head
+    }
+    mut head.push('(')
+    mut head.append(joined(fields.view(), alloc: self.alloc).as_str())
+    mut head.push(')')
+    return head
+} Writer.variant_expr
+
+/// A nested collection or array, bound first to the next name `n_k`: the name, moved with
+/// `take` unless its type is Copy.
+fn Writer.nested(mut self, held: ty::Ty, part: Part) -> text::String {
+    expect self.names < ~0usize
+    self.names += 1
+    var name = text::String.empty(self.alloc)
+    mut name.write(text::fmt("n_{count}", count: self.names), budget: 32)
+    mut self.bind(name.as_str(), held, part, as_var: false)
+    if self.ck.has(held, property: check::Property.Copy) {
+        return name
+    }
+    var taken = text::String.of("take ", alloc: self.alloc)
+    mut taken.append(name.as_str())
+    return taken
+} Writer.nested
+
+fn Writer.todo_form(self, held: ty::Ty) -> text::String {
+    var path = text::String.empty(self.alloc)
+    match self.ck.types().kind(held) {
+        ty::TyKind.Item(item: item, args: _) => {
+            path = self.ck.db().canonical(item)
+        }
+        else => {
+            path = self.show(held)
+        }
+    }
+    var written = text::String.of("todo \"", alloc: self.alloc)
+    mut written.append(path.as_str())
+    mut written.push('"')
+    return written
+} Writer.todo_form
+
+/// Whether the module can write a construction of a struct: it sees the struct and every field,
+/// and the struct is its package's or not open.
+fn Writer.constructible(self, held: ty::Ty) -> bool {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(held) else {
+        return false
+    }
+    let db = self.ck.db()
+    let declared = db.ast(item)
+    let own = db.package_of(item) == db.module(self.module).package_id
+    let ast::ItemKind.Struct(structure) = declared.kind else {
+        return false
+    }
+    if not db.visible(self.module, item) {
+        return false
+    }
+    if not own and declared.has_modifier(ast::TypeModifier.Open) {
+        return false
+    }
+    for field in structure.fields() {
+        if not db.field_visible(self.module, owner: item, visibility: field.visibility) {
+            return false
+        }
+    }
+    return true
+} Writer.constructible
+
+/// Texts joined with `, `.
+fn joined(parts: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for index in 0..<parts.len() {
+        if index > 0 {
+            mut written.append(", ")
+        }
+        mut written.append(parts[index].as_str())
+    }
+    return written
+} joined
+
+/// The first most frequent of written elements, empty for none.
+fn most_frequent(written: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var best: Option[usize] = None
+    var most: usize = 0
+    for index in 0..<written.len() {
+        var count: usize = 0
+        for other in written {
+            invariant count < written.len()
+            if other == written[index] {
+                count += 1
+            }
+        }
+        if best.is_none() or count > most {
+            best = Some(index)
+            most = count
+        }
+    }
+    let Some(found) = best else {
+        return text::String.empty(alloc)
+    }
+    expect found < written.len()
+    return text::String.of(written[found].as_str(), alloc)
+} most_frequent
+
+/// A decimal integer literal in canonical format: `_` between each group of 3 digits from the
+/// right once there are 4 digits or more.
+fn grouped(value: wide::Wide, alloc: mem::Alloc) -> text::String {
+    var rendered = text::String.empty(alloc)
+    mut rendered.write(text::fmt("{value}", value), budget: 64)
+    var skipped: usize = 0
+    if value.is_negative() {
+        skipped = 1
+    }
+    let Some(digits) = rendered.as_str().slice_bytes(skipped, end: rendered.byte_len()) else {
+        return rendered
+    }
+    let count = digits.byte_len()
+    var out = text::String.empty(alloc)
+    if value.is_negative() {
+        mut out.push('-')
+    }
+    let bytes = digits.as_bytes()
+    for index in 0..<count {
+        if index > 0 and count >= 4 and (count - index) % 3 == 0 {
+            mut out.push('_')
+        }
+        mut out.push(char.checked_from_bits(u32.widen(bytes[index])).value_or('0'))
+    }
+    return out
+} grouped
+
+/// A hexadecimal literal in canonical format: uppercase digits, `_` between each group of 4 from
+/// the right once there are more than 4.
+fn hexadecimal(bits: u64, alloc: mem::Alloc) -> text::String {
+    var digits = mem::List[u8].empty(alloc)
+    var rest = bits
+    loop {
+        mut digits.push(u8.truncate(rest & 0xF))
+        rest = rest >> 4
+        if rest == 0 {
+            break
+        }
+    }
+    let count = digits.len()
+    var out = text::String.of("0x", alloc)
+    for index in 0..<count {
+        if index > 0 and count > 4 and (count - index) % 4 == 0 {
+            mut out.push('_')
+        }
+        let digit = digits[count - 1 - index]
+        var shown = '0'
+        if digit < 10 {
+            shown = char.checked_from_bits(u32.widen(digit) + 0x30).value_or('0')
+        } else {
+            shown = char.checked_from_bits(u32.widen(digit) + 0x37).value_or('0')
+        }
+        mut out.push(shown)
+    }
+    return out
+} hexadecimal
+
+/// A text's contents in a literal of a quote: `\` before `\` and the quote, and each char outside
+/// U+0020 to U+007E as `\u{H}`.
+fn escaped(contents: Str, quote: char, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    for c in contents {
+        if c == '\\' {
+            mut out.append("\\\\")
+        } else if c == quote {
+            mut out.push('\\')
+            mut out.push(c)
+        } else if c >= ' ' and c <= '~' {
+            mut out.push(c)
+        } else {
+            mut out.append("\\u{")
+            mut out.append(upper_hex(u64.widen(c.to_bits()), alloc).as_str())
+            mut out.push('}')
+        }
+    }
+    return out
+} escaped
+
+/// The uppercase hexadecimal digits of a number, without leading zeros.
+fn upper_hex(value: u64, alloc: mem::Alloc) -> text::String {
+    let written = hexadecimal(value, alloc)
+    var out = text::String.empty(alloc)
+    for c in written.as_str() {
+        if c != '_' {
+            mut out.push(c)
+        }
+    }
+    let Some(digits) = out.as_str().slice_bytes(2, end: out.byte_len()) else {
+        return out
+    }
+    return text::String.of(digits, alloc)
+} upper_hex
+
+/// The setup forms of a failing case's parameters and the regression-test edit.
+struct Regression {
+    statements: mem::List[text::String]
+    fix: diagnostic::Fix
+} Regression
+
+/// The setup forms of a failing case's parameters, rebuilt from the values its draws gave, and
+/// the regression-test edit: a test named `<name>_regression_<k>`, `k` the smallest positive
+/// number no item of the module uses, inserted after the failing test, holding the setup forms
+/// and then the failing test's statements.
+fn regression_of(ck: check::Checker, test_item: ty::ItemId, given: Slice[wide::Wide]) -> Regression {
+    let alloc = ck.alloc()
+    let db = ck.db()
+    let data = db.item(test_item)
+    let ast::ItemKind.Test(tested) = db.ast(test_item).kind else {
+        expect false
+        return Regression(statements: mem::List[text::String].empty(alloc), fix: diagnostic::Fix(edits: mem::List[diagnostic::Edit].empty(alloc)))
+    }
+    var writer = Writer(ck: ck.share(), module: data.module, statements: mem::List[text::String].empty(alloc), names: 0, alloc: alloc)
+    var copied = mem::List[wide::Wide].empty(alloc)
+    for value in given {
+        mut copied.push(value)
+    }
+    var draws = Draws(given: take copied, at: 0)
+    bind_params(ck, test_item, tested, mut writer, mut draws)
+    let label = free_label(ck, module: data.module, name: tested.name.text.as_str())
+    let text_held = inserted_text(ck, test_item, tested, label: label.as_str(), statements: writer.statements.view())
+    let syntax = db.syntax(test_item)
+    expect data.index < syntax.items.len()
+    let lines = syntax.item_lines(syntax.items[data.index])
+    var end = u32.fit(syntax.source.len())
+    let next = usize.widen(lines.high)
+    if next < syntax.lines.len() {
+        end = syntax.lines[next].start
+    }
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    mut edits.push(diagnostic::Edit(path: text::String.of(db.item_file(test_item).path.as_str(), alloc), replacement: diagnostic::Replacement(start: end, end: end, text: take text_held)))
+    let Writer(ck: _, module: _, statements: statements, names: _, alloc: _) = writer
+    return Regression(statements: take statements, fix: diagnostic::Fix(edits: take edits))
+} regression_of
+
+/// Binds each named parameter of a property test to the value its draws rebuild.
+fn bind_params(ck: check::Checker, test_item: ty::ItemId, tested: ast::TestItem, mut writer: Writer, mut draws: Draws) {
+    let Some(typed) = ck.typed(test_item) else {
+        expect false
+        return
+    }
+    let body = typed.contents()
+    let Some(params) = tested.params else {
+        return
+    }
+    var index: usize = 0
+    while index < params.len() and index < body.params.len() {
+        let param = params[index]
+        let param_ty = body.local(body.params[index]).ty
+        let part = rebuild(ck, held: param_ty, mut draws, depth: 0)
+        index += 1
+        let ast::ParamKind.Named(name: name, ty: _) = param.kind else {
+            continue
+        }
+        mut writer.bind(name.text.as_str(), held: param_ty, part, as_var: param.mode == ast::Mode.Take)
+    }
+} bind_params
+
+/// `<name>_regression_<k>`, `k` the smallest positive number no item of the module uses.
+fn free_label(ck: check::Checker, module: ty::ModuleId, name: Str) -> text::String {
+    let alloc = ck.alloc()
+    let db = ck.db()
+    var taken = mem::List[text::String].empty(alloc)
+    for other in db.module(module).items {
+        let Some(other_name) = db.ast(other).name(alloc) else {
+            continue
+        }
+        mut taken.push(take other_name)
+    }
+    var k: u64 = 1
+    loop {
+        var label = text::String.empty(alloc)
+        mut label.write(text::fmt("{name}_regression_{k}", name, k), budget: 1_000)
+        if taken.position(fn(known: text::String) => known == label).is_none() {
+            return label
+        }
+        expect k < ~0u64
+        k += 1
+    }
+} free_label
+
+/// The regression test's text: a blank line, its head naming the failing test's target, the
+/// setup forms, the failing test's statements and its closing line.
+fn inserted_text(ck: check::Checker, test_item: ty::ItemId, tested: ast::TestItem, label: Str, statements: Slice[text::String]) -> text::String {
+    let alloc = ck.alloc()
+    let db = ck.db()
+    var target = text::String.empty(alloc)
+    for index in 0..<tested.target.segments.len() {
+        if index > 0 {
+            mut target.append("::")
+        }
+        mut target.append(tested.target.segments[index].text.as_str())
+    }
+    match tested.member {
+        Some(member) => {
+            mut target.push('.')
+            mut target.append(member.text.as_str())
+        }
+        None => {}
+    }
+    let data = db.item(test_item)
+    let syntax = db.syntax(test_item)
+    expect data.index < syntax.items.len()
+    let lines = syntax.item_lines(syntax.items[data.index])
+    let opener = db.line(test_item, token: tested.body.token)
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("\ntest {label} for {target} {{\n", label, target), budget: 1_000_000)
+    for statement in statements {
+        mut written.append("    ")
+        mut written.append(statement.as_str())
+        mut written.push('\n')
+    }
+    expect opener < 0xFFFF_FFFF
+    var line = opener + 1
+    while line < lines.high {
+        mut written.append(output::lossy(syntax.line_text(line), alloc).as_str())
+        mut written.push('\n')
+        line += 1
+    }
+    mut written.write(text::fmt("}} {label}\n", label), budget: 1_000_000)
+    return written
+} inserted_text

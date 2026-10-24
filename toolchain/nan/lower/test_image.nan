@@ -1,0 +1,733 @@
+//! Test images: a package's tests lowered for their runs, each a process on `x86_64-host` or a boot of the emulator on a machine target, whose entry task mints the run's simulated world, runs the test as the first task of a new test domain on the seeded scheduler, then writes the run's outcome as a frame, its kind's byte, its payload's length as 4 bytes little-endian and the payload, on standard output or the machine's serial port: the outcome's code, whether the test's target ran and whether a scheduling point found two ready tasks, then the trap report, or for an escaped failure its variant's canonical path, a NUL and its rendering.
+
+/// What a test image lowers: tests of one package, in the order the seam numbers them.
+pkg struct Tests {
+    pkg tests: mem::List[Test]
+    pkg roots: mem::List[ty::PackageId]
+    /// The package names of the final closure with the prefix their symbols carry.
+    pkg prefixes: mem::HashMap[text::String, text::String]
+} Tests
+
+pkg struct Test {
+    pkg item: ty::ItemId
+    pkg target: TestImageTarget
+} Test
+
+/// What a test's target names, each of whose instances marks that it ran.
+pkg enum TestImageTarget derives Eq {
+    Function(ty::ItemId)
+    /// A method a derive writes for an owner, by name.
+    Derived(owner: ty::ItemId, method: text::String)
+} TestImageTarget
+
+/// The exit status of a run that used more processor time than a test run may.
+pkg const TIMED_OUT: i32 = 124
+
+/// The texts naming a run before any forced draws: its test's number, its index and seed, and
+/// its replay token.
+const RUN_TEXTS: u64 = 4
+
+/// The emulator configuration file holding the texts that name a machine run.
+pkg const RUN_FILE: Str = "opt/nan/run"
+
+/// What a machine test image writes to the serial port before its frames, after the firmware's
+/// own output.
+pkg const RUN_START: Slice[u8] = b"\0nan-run\0"
+
+/// The kinds of frames.
+pkg const FRAME_TRACE: u8 = 1
+
+pkg const FRAME_DRAW: u8 = 2
+
+pkg const FRAME_OUTCOME: u8 = 5
+
+/// The codes of outcomes.
+pkg const OUTCOME_PASSED: u8 = 0
+
+pkg const OUTCOME_TRAPPED: u8 = 1
+
+pkg const OUTCOME_ESCAPED: u8 = 2
+
+pkg const OUTCOME_STALLED: u8 = 3
+
+/// The offsets of the test state's fields: the test and run the seam read, the replay token,
+/// the forced draws of a rerun and their count, the run's world, and the failure that escaped
+/// the body.
+const TEST_STATE_TEST: u64 = 0
+
+const TEST_STATE_RUN: u64 = 8
+
+const TEST_STATE_TOKEN: u64 = 16
+
+const TEST_STATE_TOKEN_LEN: u64 = 24
+
+const TEST_STATE_FORCED: u64 = 32
+
+const TEST_STATE_FORCED_COUNT: u64 = 40
+
+const TEST_STATE_WORLD: u64 = 48
+
+const TEST_STATE_ESCAPED: u64 = 56
+
+const TEST_STATE_ESCAPE: u64 = 64
+
+const TEST_STATE_ESCAPE_LEN: u64 = 72
+
+const TEST_STATE_SIZE: u64 = 80
+
+/// What lowering keeps for a test image: the distinct targets of its tests, whose instances
+/// mark that they ran, each test's target among them, and the image's writable data.
+struct Runtime {
+    targets: mem::List[TestImageTarget]
+    test_targets: mem::List[usize]
+    ran: Option[object::DataId]
+    state: Option[object::DataId]
+} Runtime
+
+/// A copy of a target.
+pkg fn TestImageTarget.copy(self, alloc: mem::Alloc) -> TestImageTarget {
+    return match self {
+        TestImageTarget.Function(item) => TestImageTarget.Function(item)
+        TestImageTarget.Derived(owner: owner, method: method) => TestImageTarget.Derived(owner: owner, method: text::String.of(method.as_str(), alloc))
+    }
+} TestImageTarget.copy
+
+/// Lowers the tests of a package with the support routines their runs need.
+pkg fn test_image_lower(ck: check::Checker, tests: Tests) -> Lowered {
+    let alloc = ck.alloc()
+    var targets = mem::List[TestImageTarget].empty(alloc)
+    var test_targets = mem::List[usize].empty(alloc)
+    for listed_test in tests.tests {
+        match targets.position(fn(known: TestImageTarget) => known == listed_test.target) {
+            Some(index) => mut test_targets.push(index)
+            None => {
+                mut targets.push(listed_test.target.copy(alloc))
+                mut test_targets.push(targets.len() - 1)
+            }
+        }
+    }
+    let runtime = Runtime(targets: take targets, test_targets: take test_targets, ran: None, state: None)
+    var prefixes = mem::HashMap[text::String, text::String].empty(seed: 0, alloc)
+    for entry in tests.prefixes.cursor() {
+        discard mut prefixes.insert(text::String.of(entry.key().as_str(), alloc), value: text::String.of(entry.value().as_str(), alloc))
+    }
+    var roots = mem::List[ty::PackageId].empty(alloc)
+    for root in tests.roots {
+        mut roots.push(root)
+    }
+    var lowering = Lowering.new(ck.share(), prefixes: take prefixes, roots: take roots, test_runtime: Some(take runtime))
+    let entry_glue = test_image_entry_glue(mut lowering, tests)
+    if lowering.machine() {
+        machine_seam(mut lowering, entry_glue)
+    } else {
+        test_seam(mut lowering, entry_glue)
+    }
+    mut lowering.drain()
+    return take lowering.finish(None)
+} test_image_lower
+
+/// Starts the run of a test image that `count` NUL-terminated texts name, their addresses at
+/// `texts`: the `RUN_TEXTS` naming the run, its test's number, its index and seed and its replay
+/// token, then for a rerun its forced draws. Sets up the runtime, then starts the entry task,
+/// which runs `entry_glue`; ends with status 71 when the runtime cannot start.
+fn start_run(mut lo: Lowering, mut fx: Fx, entry_glue: object::FuncId, count: clif::Value, texts: clif::Value) {
+    let no_values = mem::List[clif::Value].empty(fx.alloc)
+    let failed = first_result(mut lo.call_routine(mut fx, routine: Routine.Init, args: no_values.view()))
+    let unavailable = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed, y: 0)
+    mut fx.if_true(unavailable, then: fn[mut lo](mut then_fx: Fx) {
+        system_unavailable(mut lo, fx: mut then_fx)
+    })
+    let unread = mut fx.ptr(0)
+    var run = Array[clif::Value, 3].filled(unread)
+    for index in 0..<run.len() {
+        let text_at = mut fx.load(PTR, addr: texts, offset: 8 * u64.widen(index))
+        run[index] = decimal(mut fx, text: text_at)
+    }
+    let token_text = mut fx.load(PTR, addr: texts, offset: 8 * (RUN_TEXTS - 1))
+    let token_len = test_image_text_len(mut fx, text: token_text)
+    let rerun = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: count, y: i64.fit(RUN_TEXTS))
+    let none = mut fx.ptr(0)
+    let first_forced = mut fx.b.iadd_imm_s(texts, y: 8 * i64.fit(RUN_TEXTS))
+    let forced = mut fx.b.select(rerun, x: first_forced, y: none)
+    let forced_left = mut fx.b.iadd_imm_s(count, y: -i64.fit(RUN_TEXTS))
+    let left_count = mut fx.b.select(rerun, x: forced_left, y: none)
+    arguments(mut lo, mut fx, run, token: Stretch(start: token_text, len: token_len), forced: Stretch(start: forced, len: left_count))
+    let state_address = mut lo.state(mut fx)
+    let process = mut fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
+    let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+    let glue_ref = mut lo.func_ref(mut fx, id: entry_glue)
+    let glue_address = mut fx.b.func_addr(PTR, func_ref: glue_ref)
+    let zero_word = mut fx.ptr(0)
+    let spawned_stack = mut fx.ptr(TASKS_STACK)
+    var spawn_args = Array[clif::Value, 8].filled(zero_word)
+    spawn_args[0] = glue_address
+    spawn_args[4] = spawned_stack
+    spawn_args[6] = process
+    spawn_args[7] = root
+    let record = first_result(mut lo.call_routine(mut fx, routine: Routine.Spawn, args: spawn_args.view()))
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut then_fx: Fx) {
+        system_unavailable(mut lo, fx: mut then_fx)
+    })
+    mut fx.store(record, addr: state_address, offset: STATE_ENTRY_TASK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: Array[clif::Value, 1].filled(record).view())
+    discard mut lo.call_routine(mut fx, routine: Routine.Schedule, args: no_values.view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} start_run
+
+/// The length of a NUL-terminated text.
+fn test_image_text_len(mut fx: Fx, text: clif::Value) -> clif::Value {
+    let zero_word = mut fx.ptr(0)
+    let counted = mut fx.repeat(Array[clif::Value, 1].filled(zero_word).view(), body: fn(mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let at = mut pass_fx.b.iadd(text, y: current[0])
+        let byte = mut pass_fx.load(clif::Type.Int8, addr: at, offset: 0)
+        let more = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: byte, y: 0)
+        let next = mut pass_fx.b.iadd_imm_s(current[0], y: 1)
+        let len = mut pass_fx.b.select(more, x: next, y: current[0])
+        var carried = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut carried.push(len)
+        return Pass(again: more, next: take carried)
+    })
+    return counted[0]
+} test_image_text_len
+
+/// The unsigned decimal number a NUL-terminated text writes.
+fn decimal(mut fx: Fx, text: clif::Value) -> clif::Value {
+    let zero_word = mut fx.ptr(0)
+    var start = Array[clif::Value, 2].filled(text)
+    start[1] = zero_word
+    let parsed = mut fx.repeat(start.view(), body: fn(mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 1
+        let at = current[0]
+        let value = current[1]
+        let loaded = mut pass_fx.load(clif::Type.Int8, addr: at, offset: 0)
+        let byte = mut pass_fx.b.uextend(PTR, x: loaded)
+        let more = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: byte, y: 0)
+        let digit = mut pass_fx.b.iadd_imm_s(byte, y: 0 - i64.widen(b'0'))
+        let shifted = mut pass_fx.b.imul_imm_s(value, y: 10)
+        let grown = mut pass_fx.b.iadd(shifted, y: digit)
+        let parsed_value = mut pass_fx.b.select(more, x: grown, y: value)
+        let next = mut pass_fx.b.iadd_imm_s(at, y: 1)
+        var carried = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut carried.push(next)
+        mut carried.push(parsed_value)
+        return Pass(again: more, next: take carried)
+    })
+    return parsed[1]
+} decimal
+
+/// The entry seam of a machine test image, whose boot glue ignores the platform's values,
+/// disables maskable interrupts, the firmware's included, and reads the texts naming its run,
+/// each NUL-terminated, from the emulator configuration file `RUN_FILE`.
+fn machine_seam(mut lo: Lowering, entry_glue: object::FuncId) {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let boot = mut lo.module.declare_function("_NStest_boot", linkage: object::Linkage.Local, signature)
+    mut lo.define(boot, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut boot_lo: Lowering, mut boot_fx: Fx) {
+        discard mut boot_fx.entry()
+        let no_values = mem::List[clif::Value].empty(boot_fx.alloc)
+        discard mut boot_lo.call_stub(mut boot_fx, stub: Stub.Cli, args: no_values.view())
+        let start = literal_stretch(mut boot_lo, fx: mut boot_fx, contents: RUN_START)
+        write_stream(mut boot_lo, fx: mut boot_fx, fd: 1, text: start.start, len: start.len)
+        let file = mut boot_lo.fw_cfg_file(mut boot_fx, file_name: RUN_FILE)
+        let listed = test_image_texts(mut boot_lo, fx: mut boot_fx, bytes_at: file.address, len: file.len)
+        start_run(mut boot_lo, fx: mut boot_fx, entry_glue, count: listed.len, texts: listed.start)
+    })
+    mut lo.entry_seam(boot, stack_bytes: MACHINE_BOOT_STACK)
+} machine_seam
+
+/// The NUL-terminated texts of a run file's bytes, which a NUL follows: their count and an array
+/// of their addresses, with `RUN_TEXTS` more entries addressing that last NUL, standing for texts
+/// the file lacks.
+fn test_image_texts(mut lo: Lowering, mut fx: Fx, bytes_at: clif::Value, len: clif::Value) -> Stretch {
+    let zero_word = mut fx.ptr(0)
+    let count_var = mut fx.variable(PTR, initial: zero_word)
+    mut fx.each(zero_word, end: len, body: fn(mut pass_fx: Fx, index: clif::Value) {
+        let at = mut pass_fx.b.iadd(bytes_at, y: index)
+        let byte = mut pass_fx.load(clif::Type.Int8, addr: at, offset: 0)
+        let ends = mut pass_fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        let ends_word = mut pass_fx.b.uextend(PTR, x: ends)
+        let counted = mut pass_fx.b.use_var(count_var)
+        let grown = mut pass_fx.b.iadd(counted, y: ends_word)
+        mut pass_fx.b.def_var(count_var, val: grown)
+    })
+    let count = mut fx.b.use_var(count_var)
+    let slots = mut fx.b.iadd_imm_s(count, y: i64.fit(RUN_TEXTS))
+    let size = mut fx.b.imul_imm_s(slots, y: 8)
+    let array = mut lo.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: array, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut then_fx: Fx) {
+        system_unavailable(mut lo, fx: mut then_fx)
+    })
+    let empty = mut fx.b.iadd(bytes_at, y: len)
+    mut fx.each(zero_word, end: slots, body: fn(mut pass_fx: Fx, index: clif::Value) {
+        let slot_offset = mut pass_fx.b.imul_imm_s(index, y: 8)
+        let slot = mut pass_fx.b.iadd(array, y: slot_offset)
+        mut pass_fx.store(empty, addr: slot, offset: 0)
+    })
+    let start_var = mut fx.variable(PTR, initial: bytes_at)
+    let filled_var = mut fx.variable(PTR, initial: zero_word)
+    mut fx.each(zero_word, end: len, body: fn(mut pass_fx: Fx, index: clif::Value) {
+        let at = mut pass_fx.b.iadd(bytes_at, y: index)
+        let byte = mut pass_fx.load(clif::Type.Int8, addr: at, offset: 0)
+        let ends = mut pass_fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        mut pass_fx.if_true(ends, then: fn(mut then_fx: Fx) {
+            let filled = mut then_fx.b.use_var(filled_var)
+            let slot_offset = mut then_fx.b.imul_imm_s(filled, y: 8)
+            let slot = mut then_fx.b.iadd(array, y: slot_offset)
+            let text_start = mut then_fx.b.use_var(start_var)
+            mut then_fx.store(text_start, addr: slot, offset: 0)
+            let next_filled = mut then_fx.b.iadd_imm_s(filled, y: 1)
+            mut then_fx.b.def_var(filled_var, val: next_filled)
+            let next = mut then_fx.b.iadd_imm_s(at, y: 1)
+            mut then_fx.b.def_var(start_var, val: next)
+        })
+    })
+    return Stretch(start: array, len: count)
+} test_image_texts
+
+/// The address and length of a view of literal bytes.
+fn literal_stretch(mut lo: Lowering, mut fx: Fx, contents: Slice[u8]) -> Stretch {
+    let literal = mut lo.view_literal(mut fx, contents)
+    let view_at = literal.address_value()
+    let start = mut fx.load(PTR, addr: view_at, offset: 0)
+    let len = mut fx.load(PTR, addr: view_at, offset: 8)
+    return Stretch(start: start, len: len)
+} literal_stretch
+
+/// Whether the image is a test image, whose tasks run on the seeded scheduler.
+fn Lowering.seeded(self) -> bool {
+    return self.test_runtime.is_some()
+} Lowering.seeded
+
+/// The index of the target an instance's calls run, when it is one of the image's tests'.
+fn Lowering.target_slot(self, instance: Instance) -> Option[u32] {
+    let Some(runtime) = self.test_runtime else {
+        return None
+    }
+    let target = match instance {
+        Instance.Nir(item: item, role: nir::Role.Body, index: _, args: _) or Instance.Supplied(item: item, args: _) => TestImageTarget.Function(item)
+        Instance.Derived(owner: owner, method: method, args: _) => TestImageTarget.Derived(owner: owner, method: text::String.of(method.as_str(), alloc: self.alloc))
+        else => return None
+    }
+    return match runtime.targets.position(fn(known: TestImageTarget) => known == target) {
+        Some(index) => Some(u32.fit(index))
+        None => None
+    }
+} Lowering.target_slot
+
+/// The index of the target a direct call runs, when it is one of the image's tests', for
+/// the calls lowered where they are written.
+fn Lowering.called_target(self, callable: nir::Callable) -> Option[u32] {
+    let Some(runtime) = self.test_runtime else {
+        return None
+    }
+    let found = runtime.targets.position(fn(known: TestImageTarget) -> bool {
+        let TestImageTarget.Function(target) = known else {
+            return false
+        }
+        return match callable {
+            nir::Callable.Item(item: item, role: _, index: _) => target == item
+            nir::Callable.Builtin(nir::Builtin.Intrinsic(intrinsic_path)) => self.ck.db().canonical(target).as_str() == intrinsic_path.as_str()
+            else => false
+        }
+    })
+    return match found {
+        Some(index) => Some(u32.fit(index))
+        None => None
+    }
+} Lowering.called_target
+
+/// The writable bytes recording which targets ran, one per target.
+fn Lowering.ran_data(mut self) -> object::DataId {
+    let Some(taken) = mut self.test_runtime.extract() else {
+        expect false
+        return object::DataId(index: 0)
+    }
+    var runtime = taken
+    match runtime.ran {
+        Some(known) => {
+            self.test_runtime = Some(take runtime)
+            return known
+        }
+        None => {}
+    }
+    var count = runtime.targets.len()
+    let id = mut self.module.declare_data("_NSreplay_ran", linkage: object::Linkage.Local, writable: true, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    if count < 1 {
+        count = 1
+    }
+    mut description.define_zeroinit(u64.widen(count))
+    mut self.module.define_data(id, take description)
+    runtime.ran = Some(id)
+    self.test_runtime = Some(take runtime)
+    return id
+} Lowering.ran_data
+
+/// Marks that the target at a slot ran.
+fn Lowering.mark_ran(mut self, mut fx: Fx, slot: u32) {
+    let id = mut self.ran_data()
+    let global = mut self.data_ref(mut fx, id)
+    let base = mut fx.b.symbol_value(PTR, global_value: global)
+    let one = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(one, addr: base, offset: u64.widen(slot))
+} Lowering.mark_ran
+
+/// The address of the test state.
+fn Lowering.test_state(mut self, mut fx: Fx) -> clif::Value {
+    let id = mut self.test_state_data()
+    let global = mut self.data_ref(mut fx, id)
+    return mut fx.b.symbol_value(PTR, global_value: global)
+} Lowering.test_state
+
+/// The writable data of the test state, declared and defined when first asked for.
+fn Lowering.test_state_data(mut self) -> object::DataId {
+    let Some(taken) = mut self.test_runtime.extract() else {
+        expect false
+        return object::DataId(index: 0)
+    }
+    var runtime = taken
+    match runtime.state {
+        Some(known) => {
+            self.test_runtime = Some(take runtime)
+            return known
+        }
+        None => {}
+    }
+    let id = mut self.module.declare_data("_NSreplay_test", linkage: object::Linkage.Local, writable: true, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define_zeroinit(TEST_STATE_SIZE)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+    runtime.state = Some(id)
+    self.test_runtime = Some(take runtime)
+    return id
+} Lowering.test_state_data
+
+/// The slot of each test's target among the image's targets, by test number.
+fn Lowering.test_target_slots(self) -> mem::List[usize] {
+    var slots = mem::List[usize].empty(self.alloc)
+    let Some(runtime) = self.test_runtime else {
+        expect false
+        return slots
+    }
+    for slot in runtime.test_targets {
+        mut slots.push(slot)
+    }
+    return slots
+} Lowering.test_target_slots
+
+/// Records the run the seam read: the test's number, the run's index and seed, its replay
+/// token, and for a rerun the texts of its forced draws and their count, zero otherwise.
+fn arguments(mut lo: Lowering, mut fx: Fx, run: Array[clif::Value, 3], token: Stretch, forced: Stretch) {
+    let at = mut lo.test_state(mut fx)
+    mut fx.store(run[0], addr: at, offset: TEST_STATE_TEST)
+    mut fx.store(run[1], addr: at, offset: TEST_STATE_RUN)
+    mut fx.store(token.start, addr: at, offset: TEST_STATE_TOKEN)
+    mut fx.store(token.len, addr: at, offset: TEST_STATE_TOKEN_LEN)
+    mut fx.store(forced.start, addr: at, offset: TEST_STATE_FORCED)
+    mut fx.store(forced.len, addr: at, offset: TEST_STATE_FORCED_COUNT)
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(run[2], addr: state_address, offset: STATE_SEED)
+} arguments
+
+/// The run's replay token: its address and length.
+fn test_image_token(mut lo: Lowering, mut fx: Fx) -> Stretch {
+    let at = mut lo.test_state(mut fx)
+    let start = mut fx.load(PTR, addr: at, offset: TEST_STATE_TOKEN)
+    let len = mut fx.load(PTR, addr: at, offset: TEST_STATE_TOKEN_LEN)
+    return Stretch(start: start, len: len)
+} test_image_token
+
+/// The address of the run's one `host::World`.
+fn test_image_world(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let at = mut lo.test_state(mut fx)
+    return mut fx.load(PTR, addr: at, offset: TEST_STATE_WORLD)
+} test_image_world
+
+/// The type of the function value a test's run starts its domain with.
+fn run_type(alloc: mem::Alloc) -> ty::FnTy {
+    return ty::FnTy(kind: ast::FnKind.Task, params: mem::List[ty::FnParam].empty(alloc), result: ty::Ty.unit(), failure: None, wait: true, limit_set: ty::LimitSet.none(), convention: None)
+} run_type
+
+/// The glue the entry task runs: mints the run's world, runs the numbered test as the first
+/// task of a test domain nested in the process domain, then writes the outcome and ends the
+/// process.
+fn test_image_entry_glue(mut lo: Lowering, tests: Tests) -> object::FuncId {
+    var runs = mem::List[object::FuncId].empty(lo.alloc)
+    for index in 0..<tests.tests.len() {
+        mut runs.push(run_glue(mut lo, tests, index))
+    }
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let id = mut lo.module.declare_function("_NSreplay_entry", linkage: object::Linkage.Local, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN, build: fn(mut glue_lo: Lowering, mut glue_fx: Fx) {
+        discard mut glue_fx.entry()
+        let world = mint_world(mut glue_lo, fx: mut glue_fx)
+        let at = mut glue_lo.test_state(mut glue_fx)
+        mut glue_fx.store(world, addr: at, offset: TEST_STATE_WORLD)
+        let test_number = mut glue_fx.load(PTR, addr: at, offset: TEST_STATE_TEST)
+        let function_value = mut glue_fx.slot(16, align: 8)
+        let zero_word = mut glue_fx.ptr(0)
+        mut glue_fx.store(zero_word, addr: function_value, offset: 0)
+        mut glue_fx.store(zero_word, addr: function_value, offset: 8)
+        let slots = glue_lo.test_target_slots()
+        let chosen_slot = mut glue_fx.slot(8, align: 8)
+        for index in 0..<runs.len() {
+            let is_this = mut glue_fx.b.icmp_imm_s(clif::IntCC.Equal, x: test_number, y: i64.fit(index))
+            let run = runs[index]
+            expect index < slots.len()
+            let slot_index = slots[index]
+            mut glue_fx.if_true(is_this, then: fn[mut glue_lo](mut then_fx: Fx) {
+                let run_ref = mut glue_lo.func_ref(mut then_fx, id: run)
+                let code = mut then_fx.b.func_addr(PTR, func_ref: run_ref)
+                mut then_fx.store(code, addr: function_value, offset: 0)
+                let target = mut then_fx.ptr(u64.widen(slot_index))
+                mut then_fx.store(target, addr: chosen_slot, offset: 0)
+            })
+        }
+        entry_outcome(mut glue_lo, fx: mut glue_fx, world, function_value, chosen_slot)
+    })
+    return id
+} test_image_entry_glue
+
+/// The rest of the entry glue once the run's world is minted and the test's run glue chosen:
+/// runs it in a test domain, then writes the outcome and ends the process.
+fn entry_outcome(mut lo: Lowering, mut fx: Fx, world: clif::Value, function_value: clif::Value, chosen_slot: clif::Value) {
+    let world_ty = lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(lo.alloc))
+    let alloc_field = mut lo.layouts.field(lo.ck, ty: world_ty, variant: None, label: "alloc")
+    let cell = mut fx.load(PTR, addr: world, offset: alloc_field.offset)
+    let body_ty = run_type(lo.alloc)
+    let nested = run_nested(mut lo, mut fx, body_ty, function: function_value, cell, point: false)
+    let target = mut fx.load(PTR, addr: chosen_slot, offset: 0)
+    let ran_id = mut lo.ran_data()
+    let ran_global = mut lo.data_ref(mut fx, id: ran_id)
+    let ran_base = mut fx.b.symbol_value(PTR, global_value: ran_global)
+    let ran_at = mut fx.b.iadd(ran_base, y: target)
+    let ran = mut fx.load(clif::Type.Int8, addr: ran_at, offset: 0)
+    let abandoned_word = mut fx.load(PTR, addr: nested.record, offset: DOMAIN_ABANDONED)
+    let abandoned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: abandoned_word, y: 0)
+    mut fx.if_true(abandoned, then: fn[mut lo](mut then_fx: Fx) {
+        discard mut lo.call_routine(mut then_fx, routine: Routine.Settle, args: Array[clif::Value, 1].filled(nested.record).view())
+        let trap_len = mut then_fx.load(PTR, addr: nested.trap, offset: TRAP_RECORD_LEN)
+        let trap_bytes = mut then_fx.offset(nested.trap, offset: TRAP_RECORD_BYTES)
+        test_image_finish(mut lo, fx: mut then_fx, code: OUTCOME_TRAPPED, ran, parts: Array[Stretch, 1].filled(Stretch(start: trap_bytes, len: trap_len)).view())
+    })
+    let state_at = mut lo.test_state(mut fx)
+    let escaped_word = mut fx.load(PTR, addr: state_at, offset: TEST_STATE_ESCAPED)
+    let escaped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: escaped_word, y: 0)
+    mut fx.if_true(escaped, then: fn[mut lo](mut then_fx: Fx) {
+        let escape_text = mut then_fx.load(PTR, addr: state_at, offset: TEST_STATE_ESCAPE)
+        let escape_len = mut then_fx.load(PTR, addr: state_at, offset: TEST_STATE_ESCAPE_LEN)
+        test_image_finish(mut lo, fx: mut then_fx, code: OUTCOME_ESCAPED, ran, parts: Array[Stretch, 1].filled(Stretch(start: escape_text, len: escape_len)).view())
+    })
+    let no_parts = mem::List[Stretch].empty(fx.alloc)
+    test_image_finish(mut lo, mut fx, code: OUTCOME_PASSED, ran, parts: no_parts.view())
+} entry_outcome
+
+/// Writes the run's outcome and ends the process.
+fn test_image_finish(mut lo: Lowering, mut fx: Fx, code: u8, ran: clif::Value, parts: Slice[Stretch]) {
+    let head = mut fx.slot(3, align: 1)
+    let code_value = mut fx.int(clif::Type.Int8, value: i64.widen(code))
+    mut fx.store(code_value, addr: head, offset: 0)
+    mut fx.store(ran, addr: head, offset: 1)
+    let state_address = mut lo.state(mut fx)
+    let contended = mut fx.load(clif::Type.Int8, addr: state_address, offset: STATE_CONTENDED)
+    mut fx.store(contended, addr: head, offset: 2)
+    let three = mut fx.ptr(3)
+    var all = mem::List[Stretch].empty(fx.alloc)
+    mut all.push(Stretch(start: head, len: three))
+    for part in parts {
+        mut all.push(part)
+    }
+    write_frame(mut lo, mut fx, kind: FRAME_OUTCOME, parts: all.view())
+    let status = mut fx.ptr(0)
+    discard mut lo.call_routine(mut fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} test_image_finish
+
+/// Ends a run in which no task is ready and no deadline is pending.
+fn stalled(mut lo: Lowering, mut fx: Fx) {
+    let id = mut lo.ran_data()
+    let global = mut lo.data_ref(mut fx, id)
+    let ran_base = mut fx.b.symbol_value(PTR, global_value: global)
+    let at = mut lo.test_state(mut fx)
+    let test_number = mut fx.load(PTR, addr: at, offset: TEST_STATE_TEST)
+    let slots = lo.test_target_slots()
+    var slot = mut fx.ptr(0)
+    for index in 0..<slots.len() {
+        let is_this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: test_number, y: i64.fit(index))
+        let candidate = mut fx.ptr(u64.widen(slots[index]))
+        slot = mut fx.b.select(is_this, x: candidate, y: slot)
+    }
+    let ran_at = mut fx.b.iadd(ran_base, y: slot)
+    let ran = mut fx.load(clif::Type.Int8, addr: ran_at, offset: 0)
+    let no_parts = mem::List[Stretch].empty(fx.alloc)
+    test_image_finish(mut lo, mut fx, code: OUTCOME_STALLED, ran, parts: no_parts.view())
+} stalled
+
+/// Writes a frame of a kind whose payload is the concatenation of byte ranges.
+fn write_frame(mut lo: Lowering, mut fx: Fx, kind: u8, parts: Slice[Stretch]) {
+    var len = mut fx.ptr(0)
+    for part in parts {
+        len = mut fx.b.iadd(len, y: part.len)
+    }
+    let header = mut fx.slot(5, align: 1)
+    let kind_value = mut fx.int(clif::Type.Int8, value: i64.widen(kind))
+    mut fx.store(kind_value, addr: header, offset: 0)
+    let len32 = mut fx.b.ireduce(clif::Type.Int32, x: len)
+    mut fx.b.store(clif::MemFlags.unaligned(), x: len32, p: header, offset: 1)
+    let five = mut fx.ptr(5)
+    write_stream(mut lo, mut fx, fd: 1, text: header, len: five)
+    for part in parts {
+        write_stream(mut lo, mut fx, fd: 1, text: part.start, len: part.len)
+    }
+} write_frame
+
+/// The glue a test's run starts its domain with, a function value's code: generates the case of
+/// a property test, calls the test's body with it and releases the parameters the body reads,
+/// then returns, a failure escaping the body having been recorded.
+fn run_glue(mut lo: Lowering, tests: Tests, index: usize) -> object::FuncId
+    requires index < tests.tests.len()
+{
+    let fn_ty = run_type(lo.alloc)
+    let abi = mut lo.fn_abi(fn_ty)
+    let item = tests.tests[index].item
+    var name = text::String.of("_NSreplay_run_", alloc: lo.alloc)
+    mut name.write(text::fmt("{index}", index), budget: 32)
+    let declared_signature = abi.signature(lo.alloc)
+    let id = mut lo.module.declare_function(name.as_str(), linkage: object::Linkage.Local, signature: declared_signature)
+    var param_types = mem::List[ty::Ty].empty(lo.alloc)
+    match lo.ck.typed(item) {
+        Some(body) => {
+            for param in body.contents().params {
+                mut param_types.push(body.contents().local(param).ty)
+            }
+        }
+        None => {}
+    }
+    mut lo.define(id, signature: abi.signature(lo.alloc), flags: LINES_HIDDEN, build: fn(mut run_lo: Lowering, mut run_fx: Fx) {
+        discard mut run_fx.entry()
+        let body = Instance.Nir(item: item, role: nir::Role.Body, index: 0, args: ty::Args.none())
+        let body_abi = mut run_lo.abi(body)
+        var args = mem::List[Held].empty(run_lo.alloc)
+        if param_types.len() > 0 {
+            let world_address = test_image_world(mut run_lo, fx: mut run_fx)
+            let world_ty = run_lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(run_lo.alloc))
+            let alloc_field = mut run_lo.layouts.field(run_lo.ck, ty: world_ty, variant: None, label: "alloc")
+            let alloc_value = mut run_fx.load(PTR, addr: world_address, offset: alloc_field.offset)
+            let at = mut run_lo.test_state(mut run_fx)
+            let case_index = mut run_fx.load(PTR, addr: at, offset: TEST_STATE_RUN)
+            let forced = mut run_fx.load(PTR, addr: at, offset: TEST_STATE_FORCED)
+            let forced_count = mut run_fx.load(PTR, addr: at, offset: TEST_STATE_FORCED_COUNT)
+            let slots = generate_case(mut run_lo, fx: mut run_fx, item, params: param_types.view(), alloc: alloc_value, run: CaseRun(case_index: case_index, forced: forced, forced_count: forced_count))
+            var pairs = param_types.len()
+            if slots.len() < pairs {
+                pairs = slots.len()
+            }
+            if body_abi.params.len() < pairs {
+                pairs = body_abi.params.len()
+            }
+            for position in 0..<pairs {
+                match body_abi.params[position].nty {
+                    nir::NTy.Owned(_) => mut args.push(mut run_lo.held_at(mut run_fx, ty: param_types[position], address: slots[position]))
+                    else => mut args.push(Held.Address(slots[position]))
+                }
+            }
+            let body_id = mut run_lo.instance(take body)
+            discard mut run_lo.invoke(mut run_fx, invoked: Invoked.Direct(body_id), abi: body_abi, args: args.view())
+            for position in 0..<pairs {
+                if body_abi.params[position].nty.is_reference() {
+                    mut run_lo.release(mut run_fx, ty: param_types[position], address: slots[position])
+                }
+            }
+        } else {
+            let body_id = mut run_lo.instance(take body)
+            discard mut run_lo.invoke(mut run_fx, invoked: Invoked.Direct(body_id), abi: body_abi, args: args.view())
+        }
+        let passed = mut run_fx.int(clif::Type.Int8, value: 0)
+        mut run_fx.b.ret(Array[clif::Value, 1].filled(passed).view())
+    })
+    return id
+} run_glue
+
+/// Records a failure of a type escaping a test's body: its variant's canonical path and, when
+/// its type implements `Render`, its rendering within a render budget of 4,096 bytes.
+fn test_image_escape(mut lo: Lowering, mut fx: Fx, held: Held, ty: ty::Ty) {
+    let address = escaped_address(mut lo, mut fx, held, ty)
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        expect false
+        return
+    }
+    let failure_path = lo.ck.db().canonical(item)
+    let names = lo.variant_names(item)
+    let buffer = mut fx.slot(8 + 4_096, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let len_var = mut fx.variable(PTR, initial: zero_word)
+    if names.len() == 0 {
+        let path_view = literal_stretch(mut lo, mut fx, contents: failure_path.as_bytes())
+        escape_append(mut lo, mut fx, buffer, len_var, part: path_view)
+    } else {
+        let index = mut lo.variant_index(mut fx, ty, address)
+        for position in 0..<names.len() {
+            let is_this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+            var written = text::String.of(failure_path.as_str(), alloc: lo.alloc)
+            mut written.push('.')
+            mut written.append(names[position].as_str())
+            mut fx.if_true(is_this, then: fn[mut lo](mut then_fx: Fx) {
+                let variant_view = literal_stretch(mut lo, fx: mut then_fx, contents: written.as_bytes())
+                escape_append(mut lo, fx: mut then_fx, buffer, len_var, part: variant_view)
+            })
+        }
+    }
+    let nul = literal_stretch(mut lo, mut fx, contents: b"\0")
+    escape_append(mut lo, mut fx, buffer, len_var, part: nul)
+    let render = lo.core_interface("Render")
+    if lo.ck.implements(ty, interface_item: render) {
+        let value = mut lo.held_at(mut fx, ty, address)
+        let rendered = render_value(mut lo, mut fx, ty, value, budget: 4_096)
+        escape_append(mut lo, mut fx, buffer, len_var, part: Stretch(start: rendered.buffer, len: rendered.len))
+    }
+    let size = mut fx.b.use_var(len_var)
+    let copy = mut lo.record_alloc(mut fx, size)
+    var copy_args = Array[clif::Value, 3].filled(copy)
+    copy_args[1] = buffer
+    copy_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let at = mut lo.test_state(mut fx)
+    mut fx.store(copy, addr: at, offset: TEST_STATE_ESCAPE)
+    mut fx.store(size, addr: at, offset: TEST_STATE_ESCAPE_LEN)
+    let yes = mut fx.ptr(1)
+    mut fx.store(yes, addr: at, offset: TEST_STATE_ESCAPED)
+} test_image_escape
+
+/// The address of a failure held as `held`, stored in a new slot unless it is held as one.
+fn escaped_address(mut lo: Lowering, mut fx: Fx, held: Held, ty: ty::Ty) -> clif::Value {
+    match held {
+        Held.Address(given_address) => return given_address
+        else => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.store_held(mut fx, address: slot, held, ty)
+    return slot
+} escaped_address
+
+/// Appends bytes to an escaped failure's text, within its 4,096 bytes, whose length so far
+/// `len_var` holds.
+fn escape_append(mut lo: Lowering, mut fx: Fx, buffer: clif::Value, len_var: clif::Variable, part: Stretch) {
+    let at = mut fx.b.use_var(len_var)
+    let room = mut fx.ptr(4_096)
+    let left_room = mut fx.b.isub(room, y: at)
+    let size = mut fx.b.umin(part.len, y: left_room)
+    let target = mut fx.b.iadd(buffer, y: at)
+    var copy_args = Array[clif::Value, 3].filled(target)
+    copy_args[1] = part.start
+    copy_args[2] = size
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let grown = mut fx.b.iadd(at, y: size)
+    mut fx.b.def_var(len_var, val: grown)
+} escape_append

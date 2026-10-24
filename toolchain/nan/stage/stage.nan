@@ -1,0 +1,103 @@
+//! Stage comparison: the code roots of the artefacts an image's `.nan` section holds against those a final build places in its own, by package name.
+
+/// The diagnostics of comparing the image at `image`, written `written`, with the artefacts a
+/// checker's final build places in its image, by package name: the image unreadable, or each
+/// package whose code roots differ or that one side lacks.
+pkg fn compare(checker: check::Checker, artefacts: mem::Map[text::String, mem::Bytes], image: Str, written: Str, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let Some(theirs) = image_roots(image, alloc) else {
+        var unreadable = diagnostic::Diagnostic.new(diagnostic::Code.BuildImageUnreadable, alloc)
+        unreadable.path = Some(text::String.of(written, alloc))
+        mut found.push(take unreadable)
+        return found
+    }
+    var ours = mem::Map[text::String, hashing::HashValue].empty(alloc)
+    for entry in artefacts {
+        let Ok(decoded) = artefact::decode(entry.value().view(), alloc) else {
+            continue
+        }
+        discard mut ours.insert(text::String.of(entry.key().as_str(), alloc), value: decoded.root_hash())
+    }
+    var names = mem::Set[text::String].empty(alloc)
+    for entry in ours {
+        discard mut names.insert(text::String.of(entry.key().as_str(), alloc))
+    }
+    for entry in theirs {
+        discard mut names.insert(text::String.of(entry.key().as_str(), alloc))
+    }
+    for name in names {
+        let mine = ours.get(name)
+        let other = theirs.get(name)
+        if mine == other {
+            continue
+        }
+        var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildStageMismatch, alloc)
+        locate(checker, name: name.as_str(), mut reported, alloc)
+        mut reported.because.push(diagnostic::Reason.note(name.as_str(), alloc))
+        mut reported.because.push(diagnostic::Reason.note(shown(mine, alloc).as_str(), alloc))
+        mut reported.because.push(diagnostic::Reason.note(shown(other, alloc).as_str(), alloc))
+        mut found.push(take reported)
+    }
+    return found
+} compare
+
+/// A code root hash in short form, `absent` for none.
+fn shown(root: Option[hashing::HashValue], alloc: mem::Alloc) -> text::String {
+    let Some(held) = root else {
+        return text::String.of("absent", alloc)
+    }
+    return held.short(alloc)
+} shown
+
+/// Locates a diagnostic on the `package` line of the workspace package of the checker's closure
+/// named `name`, when there is one.
+fn locate(checker: check::Checker, name: Str, mut reported: diagnostic::Diagnostic, alloc: mem::Alloc) {
+    let db = checker.db()
+    for index in 0..<db.packages.len() {
+        let data = db.packages[index]
+        if data.name.as_str() != name {
+            continue
+        }
+        let Some(workspace::Member.Source(_)) = data.member else {
+            continue
+        }
+        let source = db.source(ty::PackageId(index: u32.fit(index)))
+        let Some(manifest) = source.manifest else {
+            return
+        }
+        var path = text::String.of(source.dir.as_str(), alloc)
+        mut path.append("/package.nan")
+        reported.path = Some(take path)
+        reported.line = Some(manifest.line)
+        return
+    }
+} locate
+
+/// The code root hash of each artefact the image at a path holds in its `.nan` section, by the
+/// package name its manifest declares; none when the image cannot be read or an artefact does
+/// not decode.
+fn image_roots(image: Str, alloc: mem::Alloc) -> Option[mem::Map[text::String, hashing::HashValue]] {
+    let Ok(bytes) = attempt platform::read_file(image, alloc) else {
+        return None
+    }
+    let Some(held) = artefact::image_section(bytes.view(), alloc) else {
+        return None
+    }
+    return roots(held.view(), alloc)
+} image_roots
+
+/// The code root hash of each artefact, by the package name its manifest declares; none when
+/// one does not decode.
+fn roots(artefacts: Slice[mem::Bytes], alloc: mem::Alloc) -> Option[mem::Map[text::String, hashing::HashValue]] {
+    var found = mem::Map[text::String, hashing::HashValue].empty(alloc)
+    for held in artefacts {
+        let Ok(decoded) = artefact::decode(held.view(), alloc) else {
+            return None
+        }
+        let Some(name) = release::package_name(decoded.code_root.view(), alloc) else {
+            return None
+        }
+        discard mut found.insert(take name, value: decoded.root_hash())
+    }
+    return Some(take found)
+} roots

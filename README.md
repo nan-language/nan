@@ -32,7 +32,7 @@ target/debug/nan test
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 
-The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, `x86_64-uefi` and `x86_64-bare`.
+The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, `x86_64-uefi` and `x86_64-bare`. The NaN toolchain in `toolchain/`, written in NaN, implements the same commands; `nan build nan` run in `toolchain/` writes its image to `toolchain/.nan/images/x86_64-host/nan`.
 
 ## Commands
 
@@ -46,6 +46,6 @@ The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.
 | `cargo nextest run -p nan --test conformance -E 'test(/<chapter>/)'` | Run the conformance tests of one specification chapter, given by its file name (`01-lexical`) |
 | `cargo nextest run -p nan --test programs -E 'test(/<program>/)'` | Build and run one program of `bootstrap/nan/tests/programs`, given by its directory name |
 | `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |
-| `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN front end of `toolchain/` with the bootstrap on one chapter, std package or the toolchain (`toolchain`) |
-| `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenario and the NaN front end against the bound of the freeze |
+| `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN toolchain of `toolchain/` with the bootstrap on one chapter, std package, program or the toolchain, which it then builds twice to check itself (`toolchain`) |
+| `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenario and the NaN toolchain against the bound of the freeze |
 | `cargo run -p nanbench -- tokens`, `measure`, `corpus`, `run <model>`, `report` | Nanbench: the primer tiers' token counts, the measurements of the freeze, a check of the task corpus, a model's run of it (`ANTHROPIC_API_KEY`) and the metrics, written under `nanbench/results/` |

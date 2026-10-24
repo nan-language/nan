@@ -1,0 +1,380 @@
+//! The git history of a VCS workspace as the author rule reads it: its changes, the uncommitted state of the working tree being one more, each with its author and parents, and the workspace's files in each commit's tree.
+
+/// A change: the uncommitted state of the working tree, or a commit by its object name.
+pkg enum Change derives Eq, Hash {
+    Uncommitted
+    Commit(text::String)
+} Change
+
+pkg fn Change.copy(self, alloc: mem::Alloc) -> Change {
+    return match self {
+        Change.Uncommitted => Change.Uncommitted
+        Change.Commit(name) => Change.Commit(text::String.of(name.as_str(), alloc))
+    }
+} Change.copy
+
+/// A commit changing the workspace, with its nearest ancestors changing it.
+pkg struct Commit {
+    pkg name: text::String
+    pkg parents: mem::List[text::String]
+} Commit
+
+/// The git working tree holding a workspace.
+pkg struct Vcs {
+    top: text::String
+    /// The workspace root relative to the working tree's top level, `/`-separated, empty at it.
+    prefix: text::String
+    /// The author of the uncommitted change: the email the git configuration gives, lowercased.
+    email: text::String
+    alloc: mem::Alloc
+} Vcs
+
+/// The working tree holding the workspace at `root`; none outside every git working tree.
+pkg fn Vcs.open(root: Str, alloc: mem::Alloc) -> Option[Vcs] {
+    var shown_args = mem::List[text::String].empty(alloc)
+    mut shown_args.push(text::String.of("rev-parse", alloc))
+    mut shown_args.push(text::String.of("--show-toplevel", alloc))
+    let Some(shown) = git(root, args: shown_args.view(), alloc) else {
+        return None
+    }
+    let kept = platform::trimmed_run(shown.as_str())
+    let Some(top_written) = shown.as_str().slice_bytes(0, end: kept.end) else {
+        return None
+    }
+    let top = text::String.of(top_written, alloc)
+    let Ok(resolved_root) = attempt platform::canonicalize(root, alloc) else {
+        return None
+    }
+    let Ok(resolved_top) = attempt platform::canonicalize(top.as_str(), alloc) else {
+        return None
+    }
+    let Some(within) = platform::strip_prefix(resolved_root.as_str(), base: resolved_top.as_str(), alloc) else {
+        return None
+    }
+    var prefix = text::String.empty(alloc)
+    for c in within.as_str() {
+        if c == '\\' {
+            mut prefix.push('/')
+        } else {
+            mut prefix.push(c)
+        }
+    }
+    var email_args = mem::List[text::String].empty(alloc)
+    mut email_args.push(text::String.of("config", alloc))
+    mut email_args.push(text::String.of("user.email", alloc))
+    let email = match git(top.as_str(), args: email_args.view(), alloc) {
+        Some(found) => lowercased_trim(found.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    return Some(Vcs(top: take top, prefix: take prefix, email: take email, alloc: alloc))
+} Vcs.open
+
+/// A text without the white space at its ends, its ASCII letters lowercased.
+fn lowercased_trim(written: Str, alloc: mem::Alloc) -> text::String {
+    let kept = platform::trimmed_run(written)
+    var lowered = text::String.empty(alloc)
+    let Some(trimmed) = written.slice_bytes(kept.start, end: kept.end) else {
+        return lowered
+    }
+    for c in trimmed {
+        mut lowered.push(c.to_ascii_lowercase())
+    }
+    return lowered
+} lowercased_trim
+
+/// A change's author: its author email, lowercased.
+pkg fn Vcs.author(self, change: Change) -> text::String {
+    let alloc = self.alloc
+    match change {
+        Change.Uncommitted => return text::String.of(self.email.as_str(), alloc)
+        Change.Commit(name) => {
+            var args = mem::List[text::String].empty(alloc)
+            mut args.push(text::String.of("log", alloc))
+            mut args.push(text::String.of("-1", alloc))
+            mut args.push(text::String.of("--format=%ae", alloc))
+            mut args.push(text::String.of(name.as_str(), alloc))
+            return match git(self.top.as_str(), args: args.view(), alloc) {
+                Some(found) => lowercased_trim(found.as_str(), alloc)
+                None => text::String.empty(alloc)
+            }
+        }
+    }
+} Vcs.author
+
+/// The commits whose trees change the workspace, most recent first, each with its nearest
+/// ancestors that change it, as git simplifies the history of the workspace's directory.
+pkg fn Vcs.history(self) -> mem::List[Commit] {
+    let alloc = self.alloc
+    var args = mem::List[text::String].empty(alloc)
+    mut args.push(text::String.of("rev-list", alloc))
+    mut args.push(text::String.of("--parents", alloc))
+    mut args.push(text::String.of("HEAD", alloc))
+    self.limit_to_prefix(mut args)
+    var commits = mem::List[Commit].empty(alloc)
+    let Some(listed) = git(self.top.as_str(), args: args.view(), alloc) else {
+        return commits
+    }
+    for line in take text_lines(listed.as_str(), alloc) {
+        var names = whitespace_words(line.as_str(), alloc)
+        if names.len() == 0 {
+            continue
+        }
+        let name = mut names.remove(0)
+        mut commits.push(Commit(name: take name, parents: take names))
+    }
+    return commits
+} Vcs.history
+
+/// Adds `-- <prefix>` to git arguments when the workspace lies below the top level.
+fn Vcs.limit_to_prefix(self, mut args: mem::List[text::String]) {
+    if self.prefix.is_empty() {
+        return
+    }
+    mut args.push(text::String.of("--", alloc: self.alloc))
+    mut args.push(text::String.of(self.prefix.as_str(), alloc: self.alloc))
+} Vcs.limit_to_prefix
+
+/// The commits changing a file of the workspace whose path within it matches a glob.
+pkg fn Vcs.changing(self, glob: Str) -> mem::List[text::String] {
+    let alloc = self.alloc
+    var pattern = text::String.of(":(glob)", alloc)
+    if not self.prefix.is_empty() {
+        mut pattern.append(self.prefix.as_str())
+        mut pattern.push('/')
+    }
+    mut pattern.append(glob)
+    var args = mem::List[text::String].empty(alloc)
+    mut args.push(text::String.of("rev-list", alloc))
+    mut args.push(text::String.of("HEAD", alloc))
+    mut args.push(text::String.of("--", alloc))
+    mut args.push(take pattern)
+    let Some(listed) = git(self.top.as_str(), args: args.view(), alloc) else {
+        return mem::List[text::String].empty(alloc)
+    }
+    return text_lines(listed.as_str(), alloc)
+} Vcs.changing
+
+/// A path of the working tree's top level as a path within the workspace; none outside it.
+fn Vcs.within(self, path: Str) -> Option[text::String] {
+    if self.prefix.is_empty() {
+        return Some(text::String.of(path, alloc: self.alloc))
+    }
+    let length = self.prefix.byte_len()
+    if not path.starts_with(self.prefix.as_str()) or path.byte_len() <= length {
+        return None
+    }
+    let Some(rest) = path.slice_bytes(length, end: path.byte_len()) else {
+        return None
+    }
+    if not rest.starts_with("/") {
+        return None
+    }
+    let Some(inner) = rest.slice_bytes(1, end: rest.byte_len()) else {
+        return None
+    }
+    return Some(text::String.of(inner, alloc: self.alloc))
+} Vcs.within
+
+/// The files of the workspace in a commit's tree that `wanted` keeps, by path relative to
+/// the workspace root.
+pkg fn Vcs.files(self, commit: Str, wanted: fn(path: Str) -> bool) -> mem::List[artefact::SourceFile] {
+    let alloc = self.alloc
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    var args = mem::List[text::String].empty(alloc)
+    mut args.push(text::String.of("ls-tree", alloc))
+    mut args.push(text::String.of("-r", alloc))
+    mut args.push(text::String.of("-z", alloc))
+    mut args.push(text::String.of("--name-only", alloc))
+    mut args.push(text::String.of(commit, alloc))
+    self.limit_to_prefix(mut args)
+    let listed = match git(self.top.as_str(), args: args.view(), alloc) {
+        Some(found) => found
+        None => text::String.empty(alloc)
+    }
+    var paths = mem::List[text::String].empty(alloc)
+    for path in take split_at_nul(listed.as_str(), alloc) {
+        let Some(inner) = self.within(path.as_str()) else {
+            continue
+        }
+        if wanted(inner.as_str()) {
+            mut paths.push(take path)
+        }
+    }
+    var requests = mem::Bytes.empty(alloc)
+    for path in paths {
+        mut requests.append(commit.as_bytes())
+        mut requests.push(b':')
+        mut requests.append(path.as_bytes())
+        mut requests.push(b'\n')
+    }
+    var batch = mem::List[text::String].empty(alloc)
+    mut batch.push(text::String.of("-C", alloc))
+    mut batch.push(text::String.of(self.top.as_str(), alloc))
+    mut batch.push(text::String.of("cat-file", alloc))
+    mut batch.push(text::String.of("--batch", alloc))
+    let Ok(ran) = attempt platform::run_output("git", args: batch.view(), input: Some(take requests), capture_errors: false, alloc) else {
+        return files
+    }
+    self.read_batch(ran.stdout.view(), paths: paths.view(), files: mut files)
+    return files
+} Vcs.files
+
+/// Reads the output of `git cat-file --batch` for requests of paths, adding each file it holds.
+fn Vcs.read_batch(self, output: Slice[u8], paths: Slice[text::String], mut files: mem::List[artefact::SourceFile]) {
+    var at: usize = 0
+    for path in paths {
+        if at >= output.len() {
+            return
+        }
+        var end = at
+        while end < output.len() and output[end] != b'\n' {
+            end += 1
+        }
+        expect end <= output.len() and output.len() < ~0usize
+        let Some(size) = header_size(output, start: at, end) else {
+            at = end + 1
+            continue
+        }
+        at = end + 1
+        expect size < ~0usize
+        if at > output.len() or output.len() - at < size + 1 {
+            return
+        }
+        var content = mem::Bytes.empty(self.alloc)
+        let Some(parts) = output.split_at(at) else {
+            return
+        }
+        let Some(held) = parts.tail.prefix(size) else {
+            return
+        }
+        mut content.append(held)
+        expect at <= ~0usize - (size + 1)
+        at += size + 1
+        match self.within(path.as_str()) {
+            Some(inner) => mut files.push(artefact::SourceFile(path: take inner, content: take content))
+            None => {}
+        }
+    }
+} Vcs.read_batch
+
+/// The size a header line of `git cat-file --batch` gives as its third word, none when it gives
+/// none.
+fn header_size(output: Slice[u8], start: usize, end: usize) -> Option[usize] {
+    expect end <= output.len()
+    var word: usize = 0
+    var at = start
+    while at < end {
+        while at < end and is_ascii_space(output[at]) {
+            at += 1
+        }
+        if at >= end {
+            return None
+        }
+        var stop = at
+        while stop < end and not is_ascii_space(output[stop]) {
+            stop += 1
+        }
+        expect stop <= end
+        if word == 2 {
+            var value: usize = 0
+            for index in at..<stop {
+                let digit = output[index]
+                if digit < b'0' or digit > b'9' {
+                    return None
+                }
+                let Some(scaled) = value.checked_mul(10) else {
+                    return None
+                }
+                let Some(next) = scaled.checked_add(usize.widen(digit - b'0')) else {
+                    return None
+                }
+                value = next
+            }
+            return Some(value)
+        }
+        expect word < 2
+        word += 1
+        at = stop
+    }
+    return None
+} header_size
+
+fn is_ascii_space(byte: u8) -> bool = byte == b' ' or byte == b'\t' or byte == b'\n' or byte == b'\r' or byte == 0x0C
+
+/// The lines of a text as Rust's `lines` gives them: split at each line feed, a carriage return
+/// ending one dropped, without a last empty line after a final line feed.
+fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        expect end <= bytes.len() and bytes.len() < ~0usize
+        var stop = end
+        if stop > start and bytes[stop - 1] == b'\r' {
+            stop -= 1
+        }
+        let Some(line) = written.slice_bytes(start, end: stop) else {
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = end + 1
+    }
+    return lines
+} text_lines
+
+/// The words of a text between runs of white space.
+fn whitespace_words(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var words = mem::List[text::String].empty(alloc)
+    var word = text::String.empty(alloc)
+    for c in written {
+        if platform::is_white_space(c) {
+            if not word.is_empty() {
+                mut words.push(take word)
+                word = text::String.empty(alloc)
+            }
+            continue
+        }
+        mut word.push(c)
+    }
+    if not word.is_empty() {
+        mut words.push(take word)
+    }
+    return words
+} whitespace_words
+
+/// The parts of a text between its NUL characters.
+fn split_at_nul(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var parts = mem::List[text::String].empty(alloc)
+    var part = text::String.empty(alloc)
+    for c in written {
+        if c == '\0' {
+            mut parts.push(take part)
+            part = text::String.empty(alloc)
+            continue
+        }
+        mut part.push(c)
+    }
+    mut parts.push(take part)
+    return parts
+} split_at_nul
+
+/// The standard output of a git command run in `dir`, none when it fails.
+fn git(dir: Str, args: Slice[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    var full = mem::List[text::String].empty(alloc)
+    mut full.push(text::String.of("-C", alloc))
+    mut full.push(text::String.of(dir, alloc))
+    for arg in args {
+        mut full.push(text::String.of(arg.as_str(), alloc))
+    }
+    let Ok(ran) = attempt platform::run_output("git", args: full.view(), input: None, capture_errors: false, alloc) else {
+        return None
+    }
+    if not ran.status.is_success() {
+        return None
+    }
+    return Some(output::lossy(ran.stdout.view(), alloc))
+} git

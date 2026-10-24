@@ -1,0 +1,288 @@
+//! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root allocator, `hw::Ring0` and the usable memory of the machine, the firmware services of `x86_64-uefi`, and the anchor a kernel installs before its executor starts. The installed anchor lies in storage the image reserves, whose address and the location of the `anchor` call the runtime state records.
+
+fn boot_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "boot::Kernel.alloc" or "boot::Machine.alloc" => {
+            let grant = supply.param(0).address_value()
+            let at = boot_field(mut lo, supply, field_name: "alloc")
+            let alloc = mut fx.offset(grant, offset: at)
+            supply.ret(mut lo, mut fx, held: Held.Address(alloc))
+        }
+        "boot::Kernel.ring0" => boot_ring0(mut lo, mut fx, supply)
+        "boot::Kernel.regions" => regions(mut lo, mut fx, supply)
+        "boot::Kernel.anchor" => boot_anchor(mut lo, mut fx, supply)
+        "boot::Machine.with_services" => firmware_with_services(mut lo, mut fx, supply)
+        "boot::Machine.exit_services" => exit_services(mut lo, mut fx, supply)
+        "boot::Services.write_console" => write_console(mut lo, mut fx, supply)
+        "boot::Services.read_file" => read_file(mut lo, mut fx, supply)
+        "bare_platform::yield_task" or "uefi_platform::yield_task" => {
+            yield_preempted(mut lo, mut fx)
+            supply.done(mut lo, mut fx)
+        }
+        else => return false
+    }
+    return true
+} boot_lower
+
+/// The offset of a field of the root grant the operation is named after.
+fn boot_field(mut lo: Lowering, supply: Supply, field_name: Str) -> u64 {
+    let Some(grant) = supply.owner else {
+        expect false
+        return 0
+    }
+    let named = mut lo.layouts.field(lo.ck, ty: grant, variant: None, label: field_name)
+    return named.offset
+} boot_field
+
+/// `k.ring0()`: `Some` of the machine's one `hw::Ring0` the first time, `None` after.
+fn boot_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let grant = supply.param(0).address_value()
+    let at = boot_field(mut lo, supply, field_name: "ring0")
+    let taken = mut fx.load(clif::Type.Int8, addr: grant, offset: at)
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(yes, addr: grant, offset: at)
+    let option = supply.abi.result
+    let unclaimed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+    mut fx.if_true(unclaimed, then: fn[mut lo](mut fx1: Fx) {
+        let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Empty).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: some)
+    })
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} boot_ring0
+
+/// The first mebibyte, which `k.regions()` leaves out.
+const LOW_MEMORY: i64 = 0x10_0000
+
+/// The usable entries of the `x86_64-bare` start information's memory map, which version 1 of
+/// it has: the offsets of the map's address and entry count, an entry's size, and in an entry
+/// the offsets of its address, size and type, and the type of usable memory.
+const START_MAP_VERSION: u64 = 4
+
+const START_MAP_ADDRESS: u64 = 40
+
+const START_MAP_COUNT: u64 = 48
+
+const START_MAP_ENTRY: i64 = 24
+
+const START_MAP_BASE: u64 = 0
+
+const START_MAP_SIZE: u64 = 8
+
+const START_MAP_KIND: u64 = 16
+
+const START_MAP_USABLE: i64 = 1
+
+/// The usable entries of a UEFI memory map: in a descriptor the offsets of its type, physical
+/// start and page count, and the types of conventional memory and of boot services' code and
+/// data, which `exit_services` frees.
+const FIRMWARE_MAP_KIND: u64 = 0
+
+const FIRMWARE_MAP_BASE: u64 = 8
+
+const FIRMWARE_MAP_PAGES: u64 = 24
+
+const FIRMWARE_MAP_USABLE: Array[i64, 3] = listed_usable_kinds()
+
+fn listed_usable_kinds() -> Array[i64, 3] {
+    var listed = Array[i64, 3].filled(3)
+    listed[1] = 4
+    listed[2] = 7
+    return listed
+} listed_usable_kinds
+
+/// `k.regions()`: the first time, a region for each range of usable memory outside the first
+/// MiB and outside the image, below the 4 GiB the entry root maps, in address order, drawn
+/// through the root allocator; an empty list after.
+fn regions(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let grant = supply.param(0).address_value()
+    let at = boot_field(mut lo, supply, field_name: "regions")
+    let taken = mut fx.load(clif::Type.Int8, addr: grant, offset: at)
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(yes, addr: grant, offset: at)
+    let Some(list) = supply.sret else {
+        expect false
+        return
+    }
+    let Some(region_ty) = lo.ck.types().type_arg(supply.abi.result, index: 0) else {
+        expect false
+        return
+    }
+    let element = Element.of(mut lo, ty: region_ty)
+    let alloc_at = boot_field(mut lo, supply, field_name: "alloc")
+    let cell = mut fx.load(PTR, addr: grant, offset: alloc_at)
+    vector_empty(mut fx, address: list, alloc: cell, element)
+    let unclaimed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+    mut fx.if_true(unclaimed, then: fn[mut lo](mut fx1: Fx) {
+        let image = mut lo.image_extent(mut fx1)
+        let state_address = mut lo.state(mut fx1)
+        match lo.ck.db().target {
+            workspace::Target.Uefi => {
+                let map = mut fx1.load(PTR, addr: state_address, offset: STATE_MEMORY_MAP)
+                let size = mut fx1.load(PTR, addr: state_address, offset: STATE_MAP_SIZE)
+                let stride = mut fx1.load(PTR, addr: state_address, offset: STATE_MAP_STRIDE)
+                let count = mut fx1.b.udiv(size, y: stride)
+                let zero_value = mut fx1.ptr(0)
+                mut fx1.each(zero_value, end: count, body: fn[mut lo](mut fx2: Fx, index: clif::Value) {
+                    let offset = mut fx2.b.imul(index, y: stride)
+                    let entry = mut fx2.b.iadd(map, y: offset)
+                    let kind = mut fx2.load(clif::Type.Int32, addr: entry, offset: FIRMWARE_MAP_KIND)
+                    var free = mut fx2.int(clif::Type.Int8, value: 0)
+                    for usable_kind in FIRMWARE_MAP_USABLE {
+                        let same = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: usable_kind)
+                        free = mut fx2.b.bor(free, y: same)
+                    }
+                    mut fx2.if_true(free, then: fn[mut lo](mut fx3: Fx) {
+                        let base = mut fx3.load(PTR, addr: entry, offset: FIRMWARE_MAP_BASE)
+                        let pages = mut fx3.load(PTR, addr: entry, offset: FIRMWARE_MAP_PAGES)
+                        let page_bytes = mut fx3.b.ishl_imm_s(pages, y: 12)
+                        let end = mut fx3.b.iadd(base, y: page_bytes)
+                        push_usable(mut lo, fx: mut fx3, list, element, image, base, end)
+                    })
+                })
+            }
+            else => {
+                let info = mut fx1.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+                let version = mut fx1.load(clif::Type.Int32, addr: info, offset: START_MAP_VERSION)
+                let mapped = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: version, y: 1)
+                mut fx1.if_true(mapped, then: fn[mut lo](mut fx2: Fx) {
+                    let map = mut fx2.load(PTR, addr: info, offset: START_MAP_ADDRESS)
+                    let count_word = mut fx2.load(clif::Type.Int32, addr: info, offset: START_MAP_COUNT)
+                    let count = mut fx2.b.uextend(PTR, x: count_word)
+                    let zero_value = mut fx2.ptr(0)
+                    mut fx2.each(zero_value, end: count, body: fn[mut lo](mut fx3: Fx, index: clif::Value) {
+                        let offset = mut fx3.b.imul_imm_s(index, y: START_MAP_ENTRY)
+                        let entry = mut fx3.b.iadd(map, y: offset)
+                        let kind = mut fx3.load(clif::Type.Int32, addr: entry, offset: START_MAP_KIND)
+                        let free = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: START_MAP_USABLE)
+                        mut fx3.if_true(free, then: fn[mut lo](mut fx4: Fx) {
+                            let base = mut fx4.load(PTR, addr: entry, offset: START_MAP_BASE)
+                            let size = mut fx4.load(PTR, addr: entry, offset: START_MAP_SIZE)
+                            let end = mut fx4.b.iadd(base, y: size)
+                            push_usable(mut lo, fx: mut fx4, list, element, image, base, end)
+                        })
+                    })
+                })
+            }
+        }
+    })
+    supply.ret(mut lo, mut fx, held: Held.Address(list))
+} regions
+
+/// Inserts the usable memory from `base` to `end` into a list of regions in address order:
+/// outside the first MiB and below the 4 GiB the entry root maps, the parts before and after
+/// the image's extent.
+fn push_usable(mut lo: Lowering, mut fx: Fx, list: clif::Value, element: Element, image: Extent, base: clif::Value, end: clif::Value) {
+    let low = mut fx.ptr(u64.fit(LOW_MEMORY))
+    let clipped_base = mut fx.b.umax(base, y: low)
+    let mapped = mut fx.ptr(MACHINE_MAPPED)
+    let clipped_end = mut fx.b.umin(end, y: mapped)
+    let before = mut fx.b.umin(clipped_end, y: image.start)
+    push_region(mut lo, mut fx, list, element, base: clipped_base, end: before)
+    let after = mut fx.b.umax(clipped_base, y: image.end)
+    push_region(mut lo, mut fx, list, element, base: after, end: clipped_end)
+} push_usable
+
+/// Inserts the region from `base` to `end`, when it is not empty, into a list of regions in
+/// address order, trapping when the list cannot grow.
+fn push_region(mut lo: Lowering, mut fx: Fx, list: clif::Value, element: Element, base: clif::Value, end: clif::Value) {
+    let present = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: base, y: end)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let len = mut fx1.load(PTR, addr: list, offset: VECTOR_LEN)
+        let needed = mut fx1.b.iadd_imm_s(len, y: 1)
+        let room = vector_reserve(mut lo, fx: mut fx1, address: list, needed, element)
+        let short = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+        mut fx1.if_true(short, then: fn[mut lo](mut fx2: Fx) {
+            raise_kind(mut lo, fx: mut fx2, kind: "trap.exhausted")
+        })
+        let data = mut fx1.load(PTR, addr: list, offset: VECTOR_DATA)
+        let zero_value = mut fx1.ptr(0)
+        let found = mut fx1.repeat(Array[clif::Value, 1].filled(zero_value).view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 0
+            let index = current[0]
+            let inside = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+            let below_values = mut fx2.choose(inside, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let at = element.at(mut fx3, data, index)
+                let other = mut fx3.load(PTR, addr: at, offset: REGION_BASE)
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(mut fx3.b.icmp(clif::IntCC.UnsignedLessThan, x: other, y: base))
+                return produced
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(mut fx3.int(clif::Type.Int8, value: 0))
+                return produced
+            })
+            let below = below_values[0]
+            let next = mut fx2.b.iadd_imm_s(index, y: 1)
+            let next_index = mut fx2.b.select(below, x: next, y: index)
+            var state = mem::List[clif::Value].empty(fx2.alloc)
+            mut state.push(next_index)
+            return Pass(again: below, next: take state)
+        })
+        let at = open_gap(mut lo, fx: mut fx1, address: list, index: found[0], element)
+        let span = mut fx1.b.isub(end, y: base)
+        mut fx1.store(base, addr: at, offset: REGION_BASE)
+        mut fx1.store(span, addr: at, offset: REGION_LEN)
+    })
+} push_region
+
+/// `take k.anchor(take state, run: f)`: moves `state` into the storage the image reserves for
+/// the anchor and installs it, then starts the kernel executor on every CPU and runs `f` as its
+/// first kernel task, given the executor. The kernel halts once that task ends.
+fn boot_anchor(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let state_ty = supply.type_arg(lo, index: 0)
+    let laid = mut lo.layout_of(state_ty)
+    let storage = mut lo.reserved(mut fx, data_name: "_NSanchor", size: at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+    mut lo.store_held(mut fx, address: storage, held: supply.param(1), ty: state_ty)
+    let state_address = mut lo.state(mut fx)
+    let location = caller_location(mut lo, mut fx)
+    mut fx.store(location, addr: state_address, offset: STATE_ANCHOR_CALL)
+    mut fx.store(storage, addr: state_address, offset: STATE_ANCHOR)
+    let prepare = mut lo.interrupt_setup(mut fx)
+    let prepare_ref = mut lo.func_ref(mut fx, id: prepare)
+    discard mut fx.b.call(prepare_ref, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let boot = mut lo.cpu_records(mut fx)
+    mut lo.cpu_started(mut fx, record: boot)
+    mut lo.start_cpus(mut fx, prepare)
+    let grant = supply.param(0).address_value()
+    let alloc_at = boot_field(mut lo, supply, field_name: "alloc")
+    let cell = mut fx.load(PTR, addr: grant, offset: alloc_at)
+    let exec_at = boot_field(mut lo, supply, field_name: "exec")
+    let exec = mut fx.load(PTR, addr: grant, offset: exec_at)
+    expect supply.abi.params.len() > 2
+    let ty::TyKind.Fn(run_id) = lo.ck.types().kind(supply.abi.params[2].nty.ty()) else {
+        expect false
+        return
+    }
+    let run_ty = ty::copy_fn_ty(lo.ck.types().fn_of(run_id), alloc: lo.alloc)
+    let function = supply.param(2).address_value()
+    let process = mut fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
+    let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+    let done = first_task_done(mut lo)
+    let started = start_task(mut lo, mut fx, fn_ty: run_ty, function, cell, domain: process, region_record: root, owner: process, end: None, done)
+    mut fx.store(exec, addr: started, offset: TASK_ARGUMENT)
+    mut fx.store(started, addr: state_address, offset: STATE_ENTRY_TASK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: Array[clif::Value, 1].filled(started).view())
+    discard mut lo.call_stub(mut fx, stub: Stub.Sti, args: mem::List[clif::Value].empty(fx.alloc).view())
+    discard mut lo.call_routine(mut fx, routine: Routine.Schedule, args: mem::List[clif::Value].empty(fx.alloc).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} boot_anchor
+
+/// What the executor thread does once the anchor's first kernel task has ended: the kernel
+/// halts, at the `anchor` call.
+fn first_task_done(mut lo: Lowering) -> object::FuncId {
+    return mut lo.glue_function(Glue.AnchorDone, signature: record_signature(lo.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        discard mut fx1.entry()
+        let state_address = mut lo1.state(mut fx1)
+        let location = mut fx1.load(PTR, addr: state_address, offset: STATE_ANCHOR_CALL)
+        halt(mut lo1, fx: mut fx1, cause: "first-task-ended", location, operand: None)
+    })
+} first_task_done
+
+/// Whether releasing a boot type does anything, none for a type std declares in full.
+fn boot_needs_release(owner_path: Str) -> Option[bool] {
+    return match owner_path {
+        "boot::Kernel" or "boot::Machine" => Some(false)
+        else => None
+    }
+} boot_needs_release

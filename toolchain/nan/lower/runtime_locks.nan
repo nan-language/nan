@@ -1,0 +1,136 @@
+//! The runtime's locks: words its routines spin on until they take them, `Lock` and `Unlock`, recorded by the running executor thread so that a trap of its task releases them; on a kernel a lock is IRQ-saving, its outermost holder disabling maskable interrupts, and a lock word holds its CPU's number plus one, so a CPU reaching a lock it holds halts the kernel.
+
+/// The most locks a thread holds at once that a trap of its task releases.
+const HELD_LOCKS: u64 = 8
+
+fn locks_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let params = mut fx.entry()
+    expect params.len() > 0
+    let lock = params[0]
+    match routine {
+        Routine.Lock => locks_acquire(mut lo, mut fx, lock)
+        else => locks_release(mut lo, mut fx, lock)
+    }
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} locks_define
+
+/// `Lock(lock)`: spins until the running thread takes the lock, then records it.
+fn locks_acquire(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
+    var flags: Option[clif::Value] = None
+    if lo.kernel() {
+        let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+        expect saved.len() > 0
+        flags = Some(saved[0])
+    }
+    let thread = mut lo.thread(mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
+    var holders = mem::List[clif::Value].empty(fx.alloc)
+    if lo.kernel() {
+        holders = mut fx.choose(inside, results: fx.types1(clif::Type.Int32).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+            let index = mut fx1.load(clif::Type.Int32, addr: thread, offset: THREAD_INDEX)
+            let holder = mut fx1.b.iadd_imm_s(index, y: 1)
+            return fx1.list1(holder)
+        }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+            let holder = mut fx1.int(clif::Type.Int32, value: 1)
+            return fx1.list1(holder)
+        })
+    } else {
+        mut holders.push(mut fx.int(clif::Type.Int32, value: 1))
+    }
+    let holder = holders[0]
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.int(clif::Type.Int32, value: 0)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock, e: free, x: holder)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx1.if_true(busy, then: fn[mut lo](mut fx2: Fx) {
+            if lo.kernel() {
+                let again = mut fx2.b.icmp(clif::IntCC.Equal, x: seen, y: holder)
+                mut fx2.if_true(again, then: fn[mut lo](mut fx3: Fx) {
+                    let location = mut lo.interrupted_location(mut fx3)
+                    discard mut lo.call_routine(mut fx3, routine: Routine.Reacquired, args: fx3.list1(location).view())
+                })
+            }
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.if_true(inside, then: fn(mut fx1: Fx) {
+        let held = mut fx1.load(PTR, addr: thread, offset: THREAD_LOCKS)
+        match flags {
+            Some(saved) => {
+                let outermost = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: held, y: 0)
+                mut fx1.if_true(outermost, then: fn(mut fx2: Fx) {
+                    mut fx2.store(saved, addr: thread, offset: THREAD_SAVED_IF)
+                })
+            }
+            None => {}
+        }
+        let recorded = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: held, y: i64.fit(HELD_LOCKS))
+        mut fx1.if_true(recorded, then: fn(mut fx2: Fx) {
+            let offset = mut fx2.b.imul_imm_s(held, y: 8)
+            let slot = mut fx2.b.iadd(thread, y: offset)
+            mut fx2.store(lock, addr: slot, offset: THREAD_HELD)
+        })
+        let more = mut fx1.b.iadd_imm_s(held, y: 1)
+        mut fx1.store(more, addr: thread, offset: THREAD_LOCKS)
+    })
+} locks_acquire
+
+/// `Unlock(lock)`: forgets the lock the running thread holds and frees it; on a kernel, the
+/// outermost one restores the interrupt flag from before it was taken.
+fn locks_release(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
+    let thread = mut lo.thread(mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
+    let counted = mut fx.choose(inside, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let before = mut fx1.load(PTR, addr: thread, offset: THREAD_LOCKS)
+        let held = mut fx1.b.iadd_imm_s(before, y: -1)
+        mut fx1.store(held, addr: thread, offset: THREAD_LOCKS)
+        let recorded = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: held, y: i64.fit(HELD_LOCKS))
+        mut fx1.if_true(recorded, then: fn(mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.each(zero, end: held, body: fn(mut fx3: Fx, index: clif::Value) {
+                let offset = mut fx3.b.imul_imm_s(index, y: 8)
+                let slot = mut fx3.b.iadd(thread, y: offset)
+                let taken = mut fx3.load(PTR, addr: slot, offset: THREAD_HELD)
+                let same = mut fx3.b.icmp(clif::IntCC.Equal, x: taken, y: lock)
+                mut fx3.if_true(same, then: fn(mut fx4: Fx) {
+                    let last_offset = mut fx4.b.imul_imm_s(held, y: 8)
+                    let last = mut fx4.b.iadd(thread, y: last_offset)
+                    let moved = mut fx4.load(PTR, addr: last, offset: THREAD_HELD)
+                    mut fx4.store(moved, addr: slot, offset: THREAD_HELD)
+                })
+            })
+        })
+        return fx1.list1(held)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        return fx1.list1(one)
+    })
+    let held = counted[0]
+    let zero = mut fx.int(clif::Type.Int32, value: 0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: zero, p: lock)
+    if lo.kernel() {
+        let outermost = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: held, y: 0)
+        mut fx.if_true(outermost, then: fn[mut lo](mut fx1: Fx) {
+            let flags = mut fx1.load(PTR, addr: thread, offset: THREAD_SAVED_IF)
+            discard mut lo.call_stub(mut fx1, stub: Stub.IrqRestore, args: fx1.list1(flags).view())
+        })
+    }
+} locks_release
+
+/// Releases every lock the running thread holds, for its trapping task.
+fn locks_release_held(mut lo: Lowering, mut fx: Fx) {
+    let thread = mut lo.thread(mut fx)
+    let held = mut fx.load(PTR, addr: thread, offset: THREAD_LOCKS)
+    let most = mut fx.ptr(HELD_LOCKS)
+    let recorded = mut fx.b.umin(held, y: most)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: recorded, body: fn(mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(thread, y: offset)
+        let lock = mut fx1.load(PTR, addr: slot, offset: THREAD_HELD)
+        let free = mut fx1.int(clif::Type.Int32, value: 0)
+        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: free, p: lock)
+    })
+    mut fx.store(zero, addr: thread, offset: THREAD_LOCKS)
+} locks_release_held

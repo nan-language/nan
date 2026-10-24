@@ -1,0 +1,245 @@
+//! Machine targets: the `x86_64-uefi` and `x86_64-bare` program entry seams, which Cranelift cannot express, and the boot glue the seams call. Each seam is fixed machine code the implementation emits, with relocations the image writer resolves into the image's own addresses.
+
+/// The program entry seam's symbol, which the image writer enters.
+pkg const MACHINE_ENTRY: Str = "_NSentry"
+
+/// The least boot stack a machine image reserves, the stack UEFI guarantees an application's
+/// calls into the firmware.
+const MACHINE_BOOT_STACK: u64 = 128 * 1024
+
+/// A seam frame: the most stack a vector seam uses for the state it saves.
+const SEAM_FRAME: u64 = 4_096
+
+/// The `x86_64-bare` entry seam's machine code, which the PVH boot protocol enters in 32-bit
+/// protected mode: it loads the descriptor table and the entry root, enables SSE, switches to
+/// long mode, sets the boot stack and calls the boot glue with the start-information pointer.
+/// Its relocations, applied by the image writer, patch the addresses of the descriptor table's
+/// pseudo-descriptor, of the entry root and of the 64-bit code the far jump enters, the boot
+/// stack top and the call.
+const BARE_SEAM: Slice[u8] = b"\xfa\xfc\x0f\x01\x15\x00\x00\x00\x00\xb8\x00\x00\x00\x00\x0f\x22\xd8\x0f\x20\xe0\x0d\x20\x06\x00\x00\x0f\x22\xe0\xb9\x80\x00\x00\xc0\x0f\x32\x0d\x00\x01\x00\x00\x0f\x30\x0f\x20\xc0\x83\xe0\xfb\x0d\x03\x00\x00\x80\x0f\x22\xc0\xea\x00\x00\x00\x00\x08\x00\x66\xb8\x10\x00\x8e\xd8\x8e\xc0\x8e\xd0\x31\xc0\x8e\xe0\x8e\xe8\x48\xbc\x00\x00\x00\x00\x00\x00\x00\x00\x89\xdf\x31\xf6\xe8\x00\x00\x00\x00\xf4\xeb\xfd"
+
+/// The offset within `BARE_SEAM` of the 64-bit code the far jump enters.
+const BARE_LONG_MODE: i64 = 0x3f
+
+/// The memory the entry root maps at its physical addresses: the first 4 GiB.
+const MACHINE_MAPPED: u64 = 1 << 32
+
+/// The bits of a page-table entry: present, writable, a large page, and caching disabled.
+const MACHINE_PRESENT: u64 = 0x1
+
+const MACHINE_WRITABLE: u64 = 0x2
+
+const MACHINE_LARGE: u64 = 0x80
+
+const UNCACHED: u64 = 0x18
+
+/// The bytes a 2 MiB page maps, and the first address the entry root maps uncached: the last
+/// gigabyte below 4 GiB, where the memory-mapped devices lie.
+const LARGE_PAGE: u64 = 2u64 * 1024 * 1024
+
+const DEVICES: u64 = 3 << 30
+
+/// The `x86_64-uefi` entry seam's machine code: already in long mode, it sets the boot stack and
+/// calls the boot glue with the image handle and system table the firmware passed.
+const UEFI_SEAM: Slice[u8] = b"\x48\xbc\x00\x00\x00\x00\x00\x00\x00\x00\x48\x89\xcf\x48\x89\xd6\xe8\x00\x00\x00\x00\xf4\xeb\xfd"
+
+/// The addresses an image spans: its first address and its last address plus one.
+struct Extent derives Copy {
+    start: clif::Value
+    end: clif::Value
+} Extent
+
+/// The boot stack a final build's image reserves: the larger of its entry function's and its
+/// entry landing fn's `stack N` and a seam frame, at least `MACHINE_BOOT_STACK`, in 16-byte units so
+/// that its top is aligned.
+fn Lowering.boot_stack(self, program: Program) -> u64 {
+    var own: u64 = 0
+    var items = Array[ty::ItemId, 2].filled(program.entry)
+    items[1] = program.landing_fn
+    for item in items {
+        let Some(sig) = self.ck.fn_sig(item) else {
+            continue
+        }
+        let Some(stack_limit) = sig.limit_set.stack else {
+            continue
+        }
+        if stack_limit > own {
+            own = stack_limit
+        }
+    }
+    var framed = own + SEAM_FRAME
+    if framed < MACHINE_BOOT_STACK {
+        framed = MACHINE_BOOT_STACK
+    }
+    return next_multiple_of(framed, multiple: 16)
+} Lowering.boot_stack
+
+/// Emits the program entry seam of the target, which calls `boot` on a boot stack of
+/// `stack_bytes` bytes.
+fn Lowering.entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
+    match self.ck.db().target {
+        workspace::Target.Bare => mut self.bare_entry_seam(boot, stack_bytes)
+        else => mut self.uefi_entry_seam(boot, stack_bytes)
+    }
+} Lowering.entry_seam
+
+/// Reserves an `x86_64-bare` image's boot stack of `stack_bytes` bytes, defines its
+/// descriptor table, and emits the program entry seam, which calls `boot`.
+fn Lowering.bare_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
+    let root = mut self.entry_root()
+    let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
+    let gdtr = mut self.define_gdt()
+    let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
+    mut relocs.push(machine_abs4(0x05, data: gdtr, addend: 0))
+    mut relocs.push(machine_abs4(0x0a, data: root, addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: 0x39, kind: x64::RelocKind.Absolute4, target: object::RelocTarget.Function(seam), addend: BARE_LONG_MODE))
+    mut relocs.push(object::ModuleReloc(offset: 0x51, kind: x64::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: 0x5e, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: BARE_SEAM, relocs: relocs.view())
+} Lowering.bare_entry_seam
+
+/// Reserves an `x86_64-uefi` image's boot stack of `stack_bytes` bytes and emits the program
+/// entry seam. The firmware enters it in long mode under `"win64"` with the image handle and
+/// system table, which it passes to `boot`.
+fn Lowering.uefi_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
+    let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
+    let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
+    mut relocs.push(object::ModuleReloc(offset: 0x02, kind: x64::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: 0x11, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: UEFI_SEAM, relocs: relocs.view())
+} Lowering.uefi_entry_seam
+
+/// The boot glue a final build's entry seam calls with the two values the platform entered
+/// the image with: it records them, sets up the runtime, mints the root grant through the
+/// entry landing fn, which takes as many of the values as it has parameters, and calls the
+/// entry function with it.
+fn Lowering.boot_glue(mut self, program: Program) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let id = mut self.module.declare_function("_NSboot", linkage: object::Linkage.Local, signature)
+    let landing_instance = Instance.Nir(item: program.landing_fn, role: nir::Role.Body, index: 0, args: ty::Args.none())
+    let main = Instance.Nir(item: program.entry, role: self.entry_role(program.entry), index: 0, args: ty::Args.none())
+    mut self.define(id, take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let param_values = mut fx1.entry()
+        expect param_values.len() > 1
+        let state_address = mut lo1.state(mut fx1)
+        mut fx1.store(param_values[0], addr: state_address, offset: STATE_PLATFORM)
+        mut fx1.store(param_values[1], addr: state_address, offset: STATE_PLATFORM_TABLE)
+        let initialised = mut lo1.call_routine(mut fx1, routine: Routine.Init, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        expect initialised.len() > 0
+        let unavailable = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: initialised[0], y: 0)
+        mut fx1.if_true(unavailable, then: fn[mut lo1](mut fx2: Fx) {
+            system_unavailable(mut lo1, fx: mut fx2)
+        })
+        let landing_abi = mut lo1.abi(landing_instance)
+        var args = mem::List[Held].empty(fx1.alloc)
+        for value in param_values {
+            if args.len() == landing_abi.params.len() {
+                break
+            }
+            mut args.push(Held.Scalar(value))
+        }
+        let landing_id = mut lo1.instance(landing_instance.copy(lo1.alloc))
+        let minted = mut lo1.invoke(mut fx1, invoked: Invoked.Direct(landing_id), abi: landing_abi, args: args.view())
+        let main_abi = mut lo1.abi(main)
+        let main_id = mut lo1.instance(main.copy(lo1.alloc))
+        discard mut lo1.invoke(mut fx1, invoked: Invoked.Direct(main_id), abi: main_abi, args: Array[Held, 1].filled(minted.result).view())
+        mut fx1.b.trap(clif::TrapCode(user: 1))
+    })
+    return id
+} Lowering.boot_glue
+
+/// The entry root, whose tables the image holds: a top-level table, a page-directory-pointer
+/// table and four page directories of 2 MiB pages mapping the first 4 GiB writable at their
+/// physical addresses, the last gigabyte uncached.
+fn Lowering.entry_root(mut self) -> object::DataId {
+    let root_name = "_NSentry_root"
+    match self.reservations.get(text::String.of(root_name, alloc: self.alloc)) {
+        Some(reserved) => return reserved
+        None => {}
+    }
+    let id = mut self.module.declare_data(root_name, linkage: object::Linkage.Local, writable: true, tls: false)
+    var table_bytes = mem::Bytes.zeroed(2 * 4_096, alloc: self.alloc)
+    for page in 0..<(MACHINE_MAPPED / LARGE_PAGE) {
+        let address = page * LARGE_PAGE
+        var cached: u64 = 0
+        if address >= DEVICES {
+            cached = UNCACHED
+        }
+        let page_entry = address | MACHINE_LARGE | MACHINE_WRITABLE | MACHINE_PRESENT | cached
+        object::append_u64(mut table_bytes, value: page_entry)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take table_bytes)
+    mut description.set_align(4_096)
+    let own = mut description.import_data(id)
+    let table = MACHINE_WRITABLE | MACHINE_PRESENT
+    expect table < 4_096
+    mut description.write_data_addr(0, data: own, addend: i64.fit(4_096 + table))
+    for directory in 0..<4u64 {
+        let entry_offset = 4_096 + 8 * directory
+        let target = 2u64 * 4_096 + 4_096 * directory + table
+        mut description.write_data_addr(u32.fit(entry_offset), data: own, addend: i64.fit(target))
+    }
+    mut self.module.define_data(id, take description)
+    discard mut self.reservations.insert(text::String.of(root_name, alloc: self.alloc), value: id)
+    return id
+} Lowering.entry_root
+
+/// The image's first address and last address plus one, which the image writer records.
+fn Lowering.image_extent(mut self, mut fx: Fx) -> Extent {
+    if self.reservations.get(text::String.of(image::IMAGE_EXTENT, alloc: self.alloc)).is_none() {
+        let extent_id = mut self.module.declare_data(image::IMAGE_EXTENT, linkage: object::Linkage.Local, writable: true, tls: false)
+        var description = object::DataDescription.new(self.alloc)
+        mut description.define(mem::Bytes.zeroed(16, alloc: self.alloc))
+        mut description.set_align(8)
+        mut self.module.define_data(extent_id, take description)
+        discard mut self.reservations.insert(text::String.of(image::IMAGE_EXTENT, alloc: self.alloc), value: extent_id)
+    }
+    let id = self.reservations.at(text::String.of(image::IMAGE_EXTENT, alloc: self.alloc))
+    let extent = mut self.data_address(mut fx, id)
+    let start = mut fx.load(PTR, addr: extent, offset: 0)
+    let end = mut fx.load(PTR, addr: extent, offset: 8)
+    return Extent(start: start, end: end)
+} Lowering.image_extent
+
+/// The descriptor table's pseudo-descriptor, which `lgdt` loads: a null descriptor, a 64-bit
+/// privilege-0 code segment and a data segment, then a limit and the table's base address.
+fn Lowering.define_gdt(mut self) -> object::DataId {
+    let table = mut self.module.declare_data("_NSgdt", linkage: object::Linkage.Local, writable: false, tls: false)
+    var table_bytes = mem::Bytes.empty(self.alloc)
+    object::append_u64(mut table_bytes, value: 0)
+    object::append_u64(mut table_bytes, value: 0x0020_9A00_0000_0000)
+    object::append_u64(mut table_bytes, value: 0x0000_9200_0000_0000)
+    var table_description = object::DataDescription.new(self.alloc)
+    mut table_description.define(take table_bytes)
+    mut table_description.set_align(8)
+    mut self.module.define_data(table, description: take table_description)
+    let gdtr = mut self.module.declare_data("_NSgdtr", linkage: object::Linkage.Local, writable: false, tls: false)
+    var gdtr_bytes = mem::Bytes.empty(self.alloc)
+    object::append_u16(mut gdtr_bytes, value: 23)
+    object::append_u64(mut gdtr_bytes, value: 0)
+    var gdtr_description = object::DataDescription.new(self.alloc)
+    mut gdtr_description.define(take gdtr_bytes)
+    mut gdtr_description.set_align(8)
+    let reference = mut gdtr_description.import_data(table)
+    mut gdtr_description.write_data_addr(2, data: reference, addend: 0)
+    mut self.module.define_data(gdtr, description: take gdtr_description)
+    return gdtr
+} Lowering.define_gdt
+
+/// An absolute 4-byte relocation of a data object's address plus `addend` at `offset`.
+fn machine_abs4(offset: u32, data: object::DataId, addend: i64) -> object::ModuleReloc {
+    return object::ModuleReloc(offset: offset, kind: x64::RelocKind.Absolute4, target: object::RelocTarget.Data(data), addend: addend)
+} machine_abs4
+
+/// A size or alignment, 1 when it is 0.
+fn at_least_one(value: u64) -> u64 {
+    if value == 0 {
+        return 1
+    }
+    return value
+} at_least_one

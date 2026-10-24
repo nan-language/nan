@@ -1,0 +1,277 @@
+//! `testing::same`: structural equality, by a glue per type comparing two values at addresses. Scalars and layout values compare by bits, structs by fields, enum values by variant and payload; Untrusted values, boxes, shared values and text by contents; arrays, views and collections by elements in order, ignoring the allocators they store; function values by function; and every other std type by being the same table entry, cell or memory.
+
+fn same_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    if supply.path.as_str() != "testing::same" {
+        return false
+    }
+    let ty = supply.type_arg(lo, index: 0)
+    let one = same_address(mut lo, mut fx, ty, held: supply.param(0))
+    let other = same_address(mut lo, mut fx, ty, held: supply.param(1))
+    let same = same_compare(mut lo, mut fx, ty, one, other)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(same))
+    return true
+} same_lower
+
+/// The address of a value held one way or another.
+fn same_address(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, held: Held) -> clif::Value {
+    match held {
+        Held.Address(address) => return address
+        else => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.store_held(mut fx, address: slot, held, ty)
+    return slot
+} same_address
+
+/// Whether two values of a type at addresses are structurally equal.
+fn same_compare(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    let glue = same_glue(mut lo, ty)
+    let callee = mut lo.func_ref(mut fx, id: glue)
+    let args = fx.list2(one, b: other)
+    let call = mut fx.b.call(callee, args: args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 1
+    return results[0]
+} same_compare
+
+fn same_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+    return signature
+} same_signature
+
+/// The glue comparing two values of a type.
+fn same_glue(mut lo: Lowering, ty: ty::Ty) -> object::FuncId {
+    let signature = same_signature(lo.alloc)
+    return mut lo.glue_function(Glue.Same(ty), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let same = same_define(mut lo1, fx: mut fx1, ty, one: params[0], other: params[1])
+        let returned = fx1.list1(same)
+        mut fx1.b.ret(returned.view())
+    })
+} same_glue
+
+/// The comparison of two values of a type at addresses.
+fn same_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Fn(_) or ty::TyKind.Dyn(_) => {
+            let one_function = mut fx.load(PTR, addr: one, offset: 0)
+            let other_function = mut fx.load(PTR, addr: other, offset: 0)
+            return mut fx.b.icmp(clif::IntCC.Equal, x: one_function, y: other_function)
+        }
+        ty::TyKind.Item(item: item, args: _) => {
+            match same_std(mut lo, mut fx, ty, item, one, other) {
+                Some(same) => return same
+                None => {}
+            }
+        }
+        else => {}
+    }
+    return same_laid_out(mut lo, mut fx, ty, one, other)
+} same_define
+
+/// The comparison of two values of a std type that compares by contents or elements: a
+/// collection, a view, a bounded list or fixed text, a box or a shared value; none for any
+/// other item type.
+fn same_std(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, one: clif::Value, other: clif::Value) -> Option[clif::Value] {
+    let byte = ty::Ty.scalar(ty::Scalar.Unsigned8)
+    let path = lo.ck.db().canonical(item)
+    let leading = lo.ck.types().type_arg(ty, index: 0)
+    match path.as_str() {
+        "mem::List" or "mem::Set" => {
+            let Some(element) = leading else {
+                expect false
+                return None
+            }
+            return Some(same_vectors(mut lo, mut fx, element, one, other))
+        }
+        "mem::Bytes" or "text::String" => return Some(same_vectors(mut lo, mut fx, element: byte, one, other))
+        "mem::Map" or "mem::HashMap" => {
+            let Some(key) = leading else {
+                expect false
+                return None
+            }
+            let Some(value) = lo.ck.types().type_arg(ty, index: 1) else {
+                expect false
+                return None
+            }
+            var entry_args = mem::List[ty::Ty].empty(lo.alloc)
+            mut entry_args.push(key)
+            mut entry_args.push(value)
+            let entry = lo.std_ty("mem", type_name: "KeyValue", args: take entry_args)
+            return Some(same_vectors(mut lo, mut fx, element: entry, one, other))
+        }
+        "core::Slice" or "core::SliceMut" => {
+            let Some(element) = leading else {
+                expect false
+                return None
+            }
+            return Some(same_views(mut lo, mut fx, element, one, other))
+        }
+        "core::Str" => return Some(same_views(mut lo, mut fx, element: byte, one, other))
+        "mem::Bounded" => {
+            let Some(element) = leading else {
+                expect false
+                return None
+            }
+            return Some(same_bounded(mut lo, mut fx, ty, field: "items", element, one, other))
+        }
+        "text::Fixed" => return Some(same_bounded(mut lo, mut fx, ty, field: "bytes", element: byte, one, other))
+        "mem::Box" or "mem::Shared" => {
+            let Some(contents) = leading else {
+                expect false
+                return None
+            }
+            let dynamic = match lo.ck.types().kind(contents) {
+                ty::TyKind.Dyn(_) => true
+                else => false
+            }
+            if not dynamic {
+                let one_pointer = mut fx.load(PTR, addr: one, offset: 0)
+                let other_pointer = mut fx.load(PTR, addr: other, offset: 0)
+                let one_contents = contents_address(mut lo, mut fx, ty, pointer: one_pointer)
+                let other_contents = contents_address(mut lo, mut fx, ty, pointer: other_pointer)
+                return Some(same_compare(mut lo, mut fx, ty: contents, one: one_contents, other: other_contents))
+            }
+        }
+        else => {}
+    }
+    return None
+} same_std
+
+/// The comparison of two values of a type at addresses by its layout: scalars by bits, records
+/// by fields, enums by variant and payload, arrays by elements and bytes layouts by bytes.
+fn same_laid_out(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Empty => return mut fx.int(clif::Type.Int8, value: 1)
+        LayoutShape.Scalar(ty: scalar, big: _) => {
+            let one_bits = mut fx.load(scalar, addr: one, offset: 0)
+            let other_bits = mut fx.load(scalar, addr: other, offset: 0)
+            return mut fx.b.icmp(clif::IntCC.Equal, x: one_bits, y: other_bits)
+        }
+        LayoutShape.Record(fields) => return same_fields(mut lo, mut fx, fields: fields.view(), one, other)
+        LayoutShape.Enum(shape) => return same_variants(mut lo, mut fx, ty, shape, one, other)
+        LayoutShape.Array(element: element, count: count) => {
+            let len = mut fx.ptr(count)
+            return same_elements(mut lo, mut fx, element, one, other, count: len)
+        }
+        LayoutShape.Bytes(fields: _, big: _) => {
+            let size = mut fx.ptr(laid.contents().size)
+            let args = fx.list3(one, b: other, c: size)
+            let order = mut lo.call_routine(mut fx, routine: Routine.Compare, args: args.view())
+            expect order.len() == 1
+            return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order[0], y: 0)
+        }
+    }
+} same_laid_out
+
+/// Whether two enum values at addresses are the same variant with equal payloads.
+fn same_variants(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, shape: EnumShape, one: clif::Value, other: clif::Value) -> clif::Value {
+    let variant = mut lo.variant_index(mut fx, ty, address: one)
+    let other_variant = mut lo.variant_index(mut fx, ty, address: other)
+    let same_variant = mut fx.b.icmp(clif::IntCC.Equal, x: variant, y: other_variant)
+    let result = mut fx.variable(clif::Type.Int8, initial: same_variant)
+    mut fx.if_true(same_variant, then: fn[mut lo](mut fx1: Fx) {
+        for index in 0..<shape.variants.len() {
+            let this = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: variant, y: i64.fit(index))
+            mut fx1.if_true(this, then: fn[mut lo](mut fx2: Fx) {
+                expect index < shape.variants.len()
+                let same = same_fields(mut lo, fx: mut fx2, fields: shape.variants[index].fields.view(), one, other)
+                mut fx2.b.def_var(result, val: same)
+            })
+        }
+    })
+    return mut fx.b.use_var(result)
+} same_variants
+
+/// Whether two values at addresses have equal fields: each at its offset, compared in order.
+fn same_fields(mut lo: Lowering, mut fx: Fx, fields: Slice[Field], one: clif::Value, other: clif::Value) -> clif::Value {
+    var same = mut fx.int(clif::Type.Int8, value: 1)
+    for field in fields {
+        let one_field = mut fx.offset(one, offset: field.offset)
+        let other_field = mut fx.offset(other, offset: field.offset)
+        let part = same_compare(mut lo, mut fx, ty: field.ty, one: one_field, other: other_field)
+        same = mut fx.b.band(same, y: part)
+    }
+    return same
+} same_fields
+
+/// Whether the first `count` elements of a type at two addresses are equal in order.
+fn same_elements(mut lo: Lowering, mut fx: Fx, element: ty::Ty, one: clif::Value, other: clif::Value, count: clif::Value) -> clif::Value {
+    let laid = mut lo.layout_of(element)
+    let size = laid.contents().size
+    let zero = mut fx.ptr(0)
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    let initial = fx.list2(zero, b: yes)
+    let done = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, carried: Slice[clif::Value]) -> Pass {
+        expect carried.len() == 2
+        let index = carried[0]
+        let same = carried[1]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+        let going = mut fx1.b.band(inside, y: same)
+        let results = fx1.types2(PTR, b: clif::Type.Int8)
+        let next = mut fx1.choose_in(mut lo, condition: going, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let offset = mut fx2.b.imul_imm_s(index, y: i64.fit(size))
+            let at_one = mut fx2.b.iadd(one, y: offset)
+            let at_other = mut fx2.b.iadd(other, y: offset)
+            let equal = same_compare(mut lo2, fx: mut fx2, ty: element, one: at_one, other: at_other)
+            let following = mut fx2.b.iadd_imm_s(index, y: 1)
+            return fx2.list2(following, b: equal)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(index, b: same)
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect done.len() == 2
+    return done[1]
+} same_elements
+
+/// Whether two sequences of elements, each its start and length, are equal in order.
+fn sequences(mut lo: Lowering, mut fx: Fx, element: ty::Ty, one: Stretch, other: Stretch) -> clif::Value {
+    let same_len = mut fx.b.icmp(clif::IntCC.Equal, x: one.len, y: other.len)
+    let results = fx.types1(clif::Type.Int8)
+    let same = mut fx.choose_in(mut lo, condition: same_len, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let equal = same_elements(mut lo1, fx: mut fx1, element, one: one.start, other: other.start, count: one.len)
+        return fx1.list1(equal)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let unequal = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(unequal)
+    })
+    expect same.len() == 1
+    return same[0]
+} sequences
+
+/// Whether two vectors hold equal elements in order, whatever allocators they store.
+fn same_vectors(mut lo: Lowering, mut fx: Fx, element: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    let one_data = mut fx.load(PTR, addr: one, offset: VECTOR_DATA)
+    let one_len = mut fx.load(PTR, addr: one, offset: VECTOR_LEN)
+    let other_data = mut fx.load(PTR, addr: other, offset: VECTOR_DATA)
+    let other_len = mut fx.load(PTR, addr: other, offset: VECTOR_LEN)
+    return sequences(mut lo, mut fx, element, one: Stretch(start: one_data, len: one_len), other: Stretch(start: other_data, len: other_len))
+} same_vectors
+
+/// Whether two views see equal elements in order.
+fn same_views(mut lo: Lowering, mut fx: Fx, element: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    let one_start = mut fx.load(PTR, addr: one, offset: 0)
+    let one_len = mut fx.load(PTR, addr: one, offset: 8)
+    let other_start = mut fx.load(PTR, addr: other, offset: 0)
+    let other_len = mut fx.load(PTR, addr: other, offset: 8)
+    return sequences(mut lo, mut fx, element, one: Stretch(start: one_start, len: one_len), other: Stretch(start: other_start, len: other_len))
+} same_views
+
+/// Whether two bounded lists or fixed texts, each its length and then its elements inline in
+/// a field, hold equal elements in order.
+fn same_bounded(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, field: Str, element: ty::Ty, one: clif::Value, other: clif::Value) -> clif::Value {
+    let at_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: field)
+    let at = at_field.offset
+    let one_start = mut fx.offset(one, offset: at)
+    let one_len = mut fx.load(PTR, addr: one, offset: 0)
+    let other_start = mut fx.offset(other, offset: at)
+    let other_len = mut fx.load(PTR, addr: other, offset: 0)
+    return sequences(mut lo, mut fx, element, one: Stretch(start: one_start, len: one_len), other: Stretch(start: other_start, len: other_len))
+} same_bounded

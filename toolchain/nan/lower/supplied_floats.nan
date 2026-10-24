@@ -1,0 +1,704 @@
+//! The float operations the x86-64 base set with SSE2 has no instruction for, computed exactly in integer arithmetic over the operands' bit patterns: the remainder of a division, and the fused multiply-add, rounded once. Each is a function per float width that lowered code calls.
+
+/// A float width: the bits of its fraction and exponent fields.
+enum Width derives Copy, Eq, Hash {
+    Single
+    Double
+} Width
+
+/// A significand, and the exponent scaling it.
+struct Scaled derives Copy {
+    significand: clif::Value
+    exponent: clif::Value
+} Scaled
+
+/// A double's significand, the exponent scaling it and its sign bit.
+struct Unpacked derives Copy {
+    significand: clif::Value
+    exponent: clif::Value
+    sign: clif::Value
+} Unpacked
+
+/// A product's words and an addend's aligned to them, and their common scale.
+struct Aligned derives Copy {
+    high: clif::Value
+    low: clif::Value
+    zhigh: clif::Value
+    zlow: clif::Value
+    e: clif::Value
+} Aligned
+
+/// Whether a float is zero, infinite or NaN, and whether it is zero.
+struct FloatClass derives Copy {
+    special: clif::Value
+    zero: clif::Value
+} FloatClass
+
+fn Width.of(ty: clif::Type) -> Width {
+    if ty == clif::Type.Float32 {
+        return Width.Single
+    }
+    return Width.Double
+} Width.of
+
+fn Width.float(self) -> clif::Type {
+    return match self {
+        Width.Single => clif::Type.Float32
+        Width.Double => clif::Type.Float64
+    }
+} Width.float
+
+fn Width.int(self) -> clif::Type {
+    return match self {
+        Width.Single => clif::Type.Int32
+        Width.Double => clif::Type.Int64
+    }
+} Width.int
+
+fn Width.fraction(self) -> i64
+    ensures result == 23 or result == 52
+{
+    return match self {
+        Width.Single => 23
+        Width.Double => 52
+    }
+} Width.fraction
+
+fn Width.bias(self) -> i64
+    ensures result == 127 or result == 1_023
+{
+    return match self {
+        Width.Single => 127
+        Width.Double => 1_023
+    }
+} Width.bias
+
+fn Width.sign_bit(self) -> i64 {
+    return i64.widen(self.int().bits()) - 1
+} Width.sign_bit
+
+/// The bits of a pattern below its sign bit.
+fn Width.magnitude_mask(self) -> i64 {
+    return i64.fit((1u64 << u32.fit(self.sign_bit())) - 1)
+} Width.magnitude_mask
+
+/// The exponent field's value of infinities and NaNs.
+fn Width.top(self) -> i64 {
+    return self.bias() * 2 + 1
+} Width.top
+
+fn Width.canonical_nan(self) -> i64 {
+    return match self {
+        Width.Single => 0x7FC0_0000
+        Width.Double => 0x7FF8_0000_0000_0000
+    }
+} Width.canonical_nan
+
+/// The bit pattern of infinity, in 64 bits.
+fn Width.infinity(self) -> i64 {
+    return self.top() << u32.fit(self.fraction())
+} Width.infinity
+
+/// The bits of a pattern below its leading significand bit.
+fn Width.fraction_mask(self) -> i64 {
+    return (1i64 << u32.fit(self.fraction())) - 1
+} Width.fraction_mask
+
+/// Calls the remainder function of a width on two floats.
+fn floats_remainder(mut lo: Lowering, mut fx: Fx, a: clif::Value, b: clif::Value) -> clif::Value {
+    let width = Width.of(fx.b.value_type(a))
+    let function = remainder_function(mut lo, width)
+    let reference = mut lo.func_ref(mut fx, id: function)
+    let args = fx.list2(a, b)
+    let call = mut fx.b.call(reference, args: args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 1
+    return results[0]
+} floats_remainder
+
+/// Calls the fused multiply-add function of a width on three floats.
+fn fused_mul_add(mut lo: Lowering, mut fx: Fx, a: clif::Value, b: clif::Value, c: clif::Value) -> clif::Value {
+    let width = Width.of(fx.b.value_type(a))
+    let function = fused_function(mut lo, width)
+    let reference = mut lo.func_ref(mut fx, id: function)
+    let args = fx.list3(a, b, c)
+    let call = mut fx.b.call(reference, args: args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 1
+    return results[0]
+} fused_mul_add
+
+fn floats_signature(width: Width, count: usize, alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    for _ in 0..<count {
+        mut signature.params.push(clif::AbiParam(value_type: width.float()))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: width.float()))
+    return signature
+} floats_signature
+
+/// Returns a bit pattern as a float of a width.
+fn return_bits(mut fx: Fx, width: Width, bits: clif::Value) {
+    let float = mut fx.b.bitcast(width.float(), flags: clif::MemFlags.new(), x: bits)
+    let returned = fx.list1(float)
+    mut fx.b.ret(returned.view())
+} return_bits
+
+/// `a % b`: a − b × n for the quotient rounded toward zero, by long division of the
+/// significands, the result having the sign of `a`.
+fn remainder_function(mut lo: Lowering, width: Width) -> object::FuncId {
+    let signature = floats_signature(width, count: 2, alloc: lo.alloc)
+    return mut lo.glue_function(Glue.FloatRemainder(width), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        remainder_body(mut fx1, width)
+    })
+} remainder_function
+
+/// The code of the remainder function of a width.
+fn remainder_body(mut fx: Fx, width: Width) {
+    let params = mut fx.entry()
+    let int = width.int()
+    expect params.len() == 2
+    let x_bits = mut fx.b.bitcast(int, flags: clif::MemFlags.new(), x: params[0])
+    let y_bits = mut fx.b.bitcast(int, flags: clif::MemFlags.new(), x: params[1])
+    let ux = floats_widen(mut fx, width, bits: x_bits)
+    let uy = floats_widen(mut fx, width, bits: y_bits)
+    let x_field = exponent_field(mut fx, width, bits: ux)
+    let y_field = exponent_field(mut fx, width, bits: uy)
+    let sign_bit = mut fx.b.ushr_imm_s(ux, y: width.sign_bit())
+    let sign = mut fx.b.ishl_imm_s(sign_bit, y: width.sign_bit())
+    let ax = mut fx.b.band_imm_s(ux, y: width.magnitude_mask())
+    let ay = mut fx.b.band_imm_s(uy, y: width.magnitude_mask())
+    remainder_specials(mut fx, width, x_field, ax, ay, sign, x: params[0])
+    let x_scaled = floats_significand(mut fx, width, magnitude: ax, field: x_field)
+    let y_scaled = floats_significand(mut fx, width, magnitude: ay, field: y_field)
+    let my = y_scaled.significand
+    let ey = y_scaled.exponent
+    let initial = fx.list2(x_scaled.significand, b: x_scaled.exponent)
+    let reduced = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, carried: Slice[clif::Value]) -> Pass {
+        expect carried.len() == 2
+        let mx = carried[0]
+        let ex = carried[1]
+        let above = mut fx1.b.icmp(clif::IntCC.SignedGreaterThan, x: ex, y: ey)
+        let results = fx1.types2(clif::Type.Int64, b: clif::Type.Int64)
+        let next = mut fx1.choose(above, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let reduced_step = reduce_step(mut fx2, width, mx, my, sign)
+            let kept = mut fx2.b.ishl_imm_s(reduced_step, y: 1)
+            let lowered = mut fx2.b.iadd_imm_s(ex, y: -1)
+            return fx2.list2(kept, b: lowered)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(mx, b: ex)
+        })
+        return Pass(again: above, next: take next)
+    })
+    expect reduced.len() == 2
+    let mx = reduce_step(mut fx, width, mx: reduced[0], my, sign)
+    remainder_result(mut fx, width, mx, ex: reduced[1], sign)
+} remainder_body
+
+/// The exponent field of a width's bit pattern in 64 bits.
+fn exponent_field(mut fx: Fx, width: Width, bits: clif::Value) -> clif::Value {
+    let shifted = mut fx.b.ushr_imm_s(bits, y: width.fraction())
+    return mut fx.b.band_imm_s(shifted, y: width.top())
+} exponent_field
+
+/// Returns the remainder's special cases: NaN when `y` is zero or NaN or `x` is not finite, and
+/// `x` itself when its magnitude is below `y`'s, or zero of `x`'s sign when it equals it.
+fn remainder_specials(mut fx: Fx, width: Width, x_field: clif::Value, ax: clif::Value, ay: clif::Value, sign: clif::Value, x: clif::Value) {
+    let y_zero = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ay, y: 0)
+    let y_nan = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: ay, y: width.infinity())
+    let x_special = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: x_field, y: width.top())
+    let y_unusable = mut fx.b.bor(y_zero, y: y_nan)
+    let nan = mut fx.b.bor(y_unusable, y: x_special)
+    mut fx.if_true(nan, then: fn(mut fx1: Fx) {
+        let bits = mut fx1.int(width.int(), value: width.canonical_nan())
+        return_bits(mut fx1, width, bits)
+    })
+    let not_larger = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: ax, y: ay)
+    mut fx.if_true(not_larger, then: fn(mut fx1: Fx) {
+        let equal = mut fx1.b.icmp(clif::IntCC.Equal, x: ax, y: ay)
+        mut fx1.if_true(equal, then: fn(mut fx2: Fx) {
+            signed_zero(mut fx2, width, sign)
+        })
+        let returned = fx1.list1(x)
+        mut fx1.b.ret(returned.view())
+    })
+} remainder_specials
+
+/// Returns zero of the sign `sign` holds in its sign bit.
+fn signed_zero(mut fx: Fx, width: Width, sign: clif::Value) {
+    let zero = floats_narrow(mut fx, width, bits: sign)
+    return_bits(mut fx, width, bits: zero)
+} signed_zero
+
+/// One step of the long division: `mx - my` when it does not borrow, else `mx`, returning zero
+/// of the remainder's sign when the difference is exactly zero.
+fn reduce_step(mut fx: Fx, width: Width, mx: clif::Value, my: clif::Value, sign: clif::Value) -> clif::Value {
+    let fits = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: mx, y: my)
+    let less = mut fx.b.isub(mx, y: my)
+    let exact = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: less, y: 0)
+    let done = mut fx.b.band(fits, y: exact)
+    mut fx.if_true(done, then: fn(mut fx1: Fx) {
+        signed_zero(mut fx1, width, sign)
+    })
+    return mut fx.b.select(fits, x: less, y: mx)
+} reduce_step
+
+/// Returns the remainder `mx` scaled by the exponent field `ex`: normalized to the significand
+/// width, then encoded as a normal or subnormal with the sign.
+fn remainder_result(mut fx: Fx, width: Width, mx: clif::Value, ex: clif::Value, sign: clif::Value) {
+    let fraction = width.fraction()
+    let initial = fx.list2(mx, b: ex)
+    let normal = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, carried: Slice[clif::Value]) -> Pass {
+        expect carried.len() == 2
+        let significand = carried[0]
+        let exponent = carried[1]
+        let lead = mut fx1.b.ushr_imm_s(significand, y: fraction)
+        let short = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: lead, y: 0)
+        let results = fx1.types2(clif::Type.Int64, b: clif::Type.Int64)
+        let next = mut fx1.choose(short, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let doubled = mut fx2.b.ishl_imm_s(significand, y: 1)
+            let lowered = mut fx2.b.iadd_imm_s(exponent, y: -1)
+            return fx2.list2(doubled, b: lowered)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(significand, b: exponent)
+        })
+        return Pass(again: short, next: take next)
+    })
+    expect normal.len() == 2
+    let normal_significand = normal[0]
+    let normal_exponent = normal[1]
+    let positive = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: normal_exponent, y: 0)
+    let results = fx.types1(clif::Type.Int64)
+    let encoded = mut fx.choose(positive, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let without_lead = mut fx1.b.band_imm_s(normal_significand, y: width.fraction_mask())
+        let exponent = mut fx1.b.ishl_imm_s(normal_exponent, y: fraction)
+        let combined = mut fx1.b.bor(without_lead, y: exponent)
+        return fx1.list1(combined)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let shift = subtract_from(mut fx1, constant: 1, value: normal_exponent)
+        let subnormal = mut fx1.b.ushr(normal_significand, y: shift)
+        return fx1.list1(subnormal)
+    })
+    expect encoded.len() == 1
+    let signed = mut fx.b.bor(encoded[0], y: sign)
+    let bits = floats_narrow(mut fx, width, bits: signed)
+    return_bits(mut fx, width, bits)
+} remainder_result
+
+/// `constant - value` in 64 bits.
+fn subtract_from(mut fx: Fx, constant: i64, value: clif::Value) -> clif::Value {
+    let constant_value = mut fx.int(clif::Type.Int64, value: constant)
+    return mut fx.b.isub(constant_value, y: value)
+} subtract_from
+
+/// A width's bit pattern in 64 bits.
+fn floats_widen(mut fx: Fx, width: Width, bits: clif::Value) -> clif::Value {
+    return match width {
+        Width.Single => mut fx.b.uextend(clif::Type.Int64, x: bits)
+        Width.Double => bits
+    }
+} floats_widen
+
+/// A 64-bit pattern as a width's.
+fn floats_narrow(mut fx: Fx, width: Width, bits: clif::Value) -> clif::Value {
+    return match width {
+        Width.Single => mut fx.b.ireduce(clif::Type.Int32, x: bits)
+        Width.Double => bits
+    }
+} floats_narrow
+
+/// The significand of a nonzero finite magnitude with its leading bit at the fraction's width,
+/// and the exponent field that goes with it, below 1 for a subnormal.
+fn floats_significand(mut fx: Fx, width: Width, magnitude: clif::Value, field: clif::Value) -> Scaled {
+    let fraction = width.fraction()
+    let subnormal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: field, y: 0)
+    let results = fx.types2(clif::Type.Int64, b: clif::Type.Int64)
+    let parts = mut fx.choose(subnormal, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zeros = mut fx1.b.clz(magnitude)
+        expect fraction > 0
+        let shift = mut fx1.b.iadd_imm_s(zeros, y: fraction - 63)
+        let shifted = mut fx1.b.ishl(magnitude, y: shift)
+        let exponent = subtract_from(mut fx1, constant: 1, value: shift)
+        return fx1.list2(shifted, b: exponent)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let bits = mut fx1.b.band_imm_s(magnitude, y: width.fraction_mask())
+        let led = mut fx1.b.bor_imm_s(bits, y: 1i64 << u32.fit(fraction))
+        return fx1.list2(led, b: field)
+    })
+    expect parts.len() == 2
+    return Scaled(significand: parts[0], exponent: parts[1])
+} floats_significand
+
+/// a × b + c rounded once: the exact product as a 128-bit integer, the addend aligned to it
+/// with the bits shifted out kept as a sticky bit, their sum normalized to 63 bits and a sticky
+/// bit, then rounded to the width. A single's operands are computed as doubles, which hold
+/// them exactly.
+fn fused_function(mut lo: Lowering, width: Width) -> object::FuncId {
+    let signature = floats_signature(width, count: 3, alloc: lo.alloc)
+    return mut lo.glue_function(Glue.FusedMulAdd(width), take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        fused_body(mut fx1, width)
+    })
+} fused_function
+
+/// The code of the fused multiply-add function of a width.
+fn fused_body(mut fx: Fx, width: Width) {
+    let params = mut fx.entry()
+    expect params.len() == 3
+    let a = params[0]
+    let b = params[1]
+    let c = params[2]
+    let a_class = float_class(mut fx, width, value: a)
+    let b_class = float_class(mut fx, width, value: b)
+    let product_special = mut fx.b.bor(a_class.special, y: b_class.special)
+    mut fx.if_true(product_special, then: fn(mut fx1: Fx) {
+        let product = mut fx1.b.fmul(a, y: b)
+        let sum = mut fx1.b.fadd(product, y: c)
+        let returned = fx1.list1(sum)
+        mut fx1.b.ret(returned.view())
+    })
+    let c_class = float_class(mut fx, width, value: c)
+    let c_top = mut fx.b.bxor(c_class.special, y: c_class.zero)
+    mut fx.if_true(c_top, then: fn(mut fx1: Fx) {
+        var zero = c
+        match width {
+            Width.Single => {
+                zero = mut fx1.b.f32const((0.0f32).to_bits())
+            }
+            Width.Double => {
+                zero = mut fx1.b.f64const((0.0f64).to_bits())
+            }
+        }
+        let kept = mut fx1.b.fadd(c, y: zero)
+        let returned = fx1.list1(kept)
+        mut fx1.b.ret(returned.view())
+    })
+    let x = promoted(mut fx, width, value: a)
+    let y = promoted(mut fx, width, value: b)
+    let z = promoted(mut fx, width, value: c)
+    let x_parts = normalized(mut fx, value: x)
+    let y_parts = normalized(mut fx, value: y)
+    let low = mut fx.b.imul(x_parts.significand, y: y_parts.significand)
+    let high = mut fx.b.umulhi(x_parts.significand, y: y_parts.significand)
+    let e = mut fx.b.iadd(x_parts.exponent, y: y_parts.exponent)
+    let sign = mut fx.b.bxor(x_parts.sign, y: y_parts.sign)
+    let zero = mut fx.ptr(0)
+    let results = int64_types(fx, count: 6)
+    let aligned = mut fx.choose(c_class.zero, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list6(high, b: low, c: zero, d: zero, e, f: sign)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return add_addend(mut fx1, z, high, low, e, sign, zero)
+    })
+    expect aligned.len() == 6
+    let sum_high = aligned[0]
+    let sum_low = aligned[1]
+    let sum_e = aligned[4]
+    let sum_sign = aligned[5]
+    let words = mut fx.b.bor(sum_high, y: sum_low)
+    let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: words, y: 0)
+    mut fx.if_true(empty, then: fn(mut fx1: Fx) {
+        let bits = mut fx1.int(width.int(), value: 0)
+        return_bits(mut fx1, width, bits)
+    })
+    let top = normalize_sum(mut fx, high: sum_high, low: sum_low, e: sum_e)
+    let rounded = floats_round(mut fx, width, sign: sum_sign, top: top.significand, e: top.exponent)
+    let bits = floats_narrow(mut fx, width, bits: rounded)
+    return_bits(mut fx, width, bits)
+} fused_body
+
+/// Whether a float of a width is zero, infinite or NaN, and whether it is zero.
+fn float_class(mut fx: Fx, width: Width, value: clif::Value) -> FloatClass {
+    let raw = mut fx.b.bitcast(width.int(), flags: clif::MemFlags.new(), x: value)
+    let bits = floats_widen(mut fx, width, bits: raw)
+    let magnitude = mut fx.b.band_imm_s(bits, y: width.magnitude_mask())
+    let zero = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: magnitude, y: 0)
+    let top = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: magnitude, y: width.infinity())
+    let special = mut fx.b.bor(zero, y: top)
+    return FloatClass(special: special, zero: zero)
+} float_class
+
+/// A float of a width as a double.
+fn promoted(mut fx: Fx, width: Width, value: clif::Value) -> clif::Value {
+    return match width {
+        Width.Single => mut fx.b.fpromote(clif::Type.Float64, x: value)
+        Width.Double => value
+    }
+} promoted
+
+/// `count` 64-bit integer types.
+fn int64_types(fx: Fx, count: usize) -> mem::List[clif::Type] {
+    var types = mem::List[clif::Type].empty(fx.alloc)
+    for _ in 0..<count {
+        mut types.push(clif::Type.Int64)
+    }
+    return types
+} int64_types
+
+/// The sum of a 128-bit product scaled by 2^`e` and of the nonzero addend `z`: the addend
+/// aligned to the product, then added to or subtracted from it by its sign, as the words of the
+/// sum, zero words, the common scale and the sign.
+fn add_addend(mut fx: Fx, z: clif::Value, high: clif::Value, low: clif::Value, e: clif::Value, sign: clif::Value, zero: clif::Value) -> mem::List[clif::Value] {
+    let z_parts = normalized(mut fx, value: z)
+    let aligned = floats_align(mut fx, high, low, e, mz: z_parts.significand, ez: z_parts.exponent)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: sign, y: z_parts.sign)
+    let results = int64_types(fx, count: 3)
+    let summed = mut fx.choose(same, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let low_sum = mut fx1.b.iadd(aligned.low, y: aligned.zlow)
+        let carry_flag = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: low_sum, y: aligned.zlow)
+        let carry = mut fx1.b.uextend(clif::Type.Int64, x: carry_flag)
+        let high_sum = mut fx1.b.iadd(aligned.high, y: aligned.zhigh)
+        let carried = mut fx1.b.iadd(high_sum, y: carry)
+        return fx1.list3(carried, b: low_sum, c: sign)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return subtract_addend(mut fx1, aligned, sign)
+    })
+    expect summed.len() == 3
+    return fx.list6(summed[0], b: summed[1], c: zero, d: zero, e: aligned.e, f: summed[2])
+} add_addend
+
+/// The difference of an aligned product and addend of opposite signs, negated with the sign
+/// flipped when it is negative: its words and sign.
+fn subtract_addend(mut fx: Fx, aligned: Aligned, sign: clif::Value) -> mem::List[clif::Value] {
+    let low_difference = mut fx.b.isub(aligned.low, y: aligned.zlow)
+    let borrow_flag = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: aligned.low, y: low_difference)
+    let borrow = mut fx.b.uextend(clif::Type.Int64, x: borrow_flag)
+    let high_words = mut fx.b.isub(aligned.high, y: aligned.zhigh)
+    let high_difference = mut fx.b.isub(high_words, y: borrow)
+    let negative = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: high_difference, y: 0)
+    let results = int64_types(fx, count: 3)
+    return mut fx.choose(negative, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let low_negated = mut fx1.b.ineg(low_difference)
+        let nonzero_flag = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: low_negated, y: 0)
+        let nonzero = mut fx1.b.uextend(clif::Type.Int64, x: nonzero_flag)
+        let high_negation = mut fx1.b.ineg(high_difference)
+        let high_negated = mut fx1.b.isub(high_negation, y: nonzero)
+        let flipped = mut fx1.b.bxor_imm_s(sign, y: 1)
+        return fx1.list3(high_negated, b: low_negated, c: flipped)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list3(high_difference, b: low_difference, c: sign)
+    })
+} subtract_addend
+
+/// A nonzero finite double as an integer significand with its top 10 bits and last bit clear,
+/// the power of two scaling it and its sign bit.
+fn normalized(mut fx: Fx, value: clif::Value) -> Unpacked {
+    let bits = mut fx.b.bitcast(clif::Type.Int64, flags: clif::MemFlags.new(), x: value)
+    let sign = mut fx.b.ushr_imm_s(bits, y: 63)
+    let magnitude = mut fx.b.band_imm_s(bits, y: 9_223_372_036_854_775_807)
+    let field = mut fx.b.ushr_imm_s(magnitude, y: 52)
+    let scaled = floats_significand(mut fx, width: Width.Double, magnitude, field)
+    let shifted = mut fx.b.ishl_imm_s(scaled.significand, y: 1)
+    let exponent = mut fx.b.iadd_imm_s(scaled.exponent, y: -(1_023i64 + 52 + 1))
+    return Unpacked(significand: shifted, exponent: exponent, sign: sign)
+} normalized
+
+/// Aligns an addend's significand `mz` scaled by 2^`ez` with a 128-bit product scaled by
+/// 2^`e`: shifts the addend left, or the product right with a sticky bit, and returns the
+/// product's words, the addend's and their common scale.
+fn floats_align(mut fx: Fx, high: clif::Value, low: clif::Value, e: clif::Value, mz: clif::Value, ez: clif::Value) -> Aligned {
+    let d = mut fx.b.isub(ez, y: e)
+    let above = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: d, y: 0)
+    let results = int64_types(fx, count: 5)
+    let parts = mut fx.choose(above, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return align_left(mut fx1, high, low, e, mz, ez, d)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let distance = mut fx1.b.ineg(d)
+        let zlow = shift_sticky(mut fx1, value: mz, distance)
+        let zero = mut fx1.ptr(0)
+        return fx1.list5(high, b: low, c: zero, d: zlow, e)
+    })
+    expect parts.len() == 5
+    return Aligned(high: parts[0], low: parts[1], zhigh: parts[2], zlow: parts[3], e: parts[4])
+} floats_align
+
+/// The alignment of an addend scaled above the product by `d`: the addend shifted left when
+/// it stays within 128 bits, else the product shifted right past its low word.
+fn align_left(mut fx: Fx, high: clif::Value, low: clif::Value, e: clif::Value, mz: clif::Value, ez: clif::Value, d: clif::Value) -> mem::List[clif::Value] {
+    let near = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: d, y: 64)
+    let results = int64_types(fx, count: 5)
+    return mut fx.choose(near, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zlow = mut fx1.b.ishl(mz, y: d)
+        let back = subtract_from(mut fx1, constant: 64, value: d)
+        let zhigh = mut fx1.b.ushr(mz, y: back)
+        return fx1.list5(high, b: low, c: zhigh, d: zlow, e)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let rest = mut fx1.b.iadd_imm_s(d, y: -64)
+        let scale = mut fx1.b.iadd_imm_s(ez, y: -64)
+        let shifted = shift_right_sticky(mut fx1, high, low, distance: rest)
+        let zero = mut fx1.ptr(0)
+        return fx1.list5(shifted.high, b: shifted.low, c: mz, d: zero, e: scale)
+    })
+} align_left
+
+/// A 128-bit value shifted right by `distance` bits, at least 0, keeping whether a set bit was
+/// shifted out in its last bit.
+fn shift_right_sticky(mut fx: Fx, high: clif::Value, low: clif::Value, distance: clif::Value) -> clif::Halves {
+    let zero = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: distance, y: 0)
+    let near = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: distance, y: 64)
+    let results = int64_types(fx, count: 2)
+    let parts = mut fx.choose(zero, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list2(high, b: low)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let near_results = int64_types(fx1, count: 2)
+        return mut fx1.choose(near, results: near_results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let back = subtract_from(mut fx2, constant: 64, value: distance)
+            let carried = mut fx2.b.ishl(high, y: back)
+            let kept = mut fx2.b.ushr(low, y: distance)
+            let lost_bits = mut fx2.b.ishl(low, y: back)
+            let lost_flag = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: lost_bits, y: 0)
+            let lost = mut fx2.b.uextend(clif::Type.Int64, x: lost_flag)
+            let joined = mut fx2.b.bor(carried, y: kept)
+            let shifted_low = mut fx2.b.bor(joined, y: lost)
+            let shifted_high = mut fx2.b.ushr(high, y: distance)
+            return fx2.list2(shifted_high, b: shifted_low)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let cleared = mut fx2.ptr(0)
+            let sticky = mut fx2.ptr(1)
+            return fx2.list2(cleared, b: sticky)
+        })
+    })
+    expect parts.len() == 2
+    return clif::Halves(low: parts[1], high: parts[0])
+} shift_right_sticky
+
+/// A 64-bit value shifted right by `distance` bits, at least 0, keeping whether a set bit was
+/// shifted out in its last bit; a nonzero value shifted past every bit is 1.
+fn shift_sticky(mut fx: Fx, value: clif::Value, distance: clif::Value) -> clif::Value {
+    let zero = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: distance, y: 0)
+    let near = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: distance, y: 64)
+    let results = fx.types1(clif::Type.Int64)
+    let shifted = mut fx.choose(zero, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(value)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let near_results = fx1.types1(clif::Type.Int64)
+        return mut fx1.choose(near, results: near_results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let kept = mut fx2.b.ushr(value, y: distance)
+            let back = subtract_from(mut fx2, constant: 64, value: distance)
+            let lost_bits = mut fx2.b.ishl(value, y: back)
+            let lost_flag = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: lost_bits, y: 0)
+            let lost = mut fx2.b.uextend(clif::Type.Int64, x: lost_flag)
+            let sticky = mut fx2.b.bor(kept, y: lost)
+            return fx2.list1(sticky)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let sticky = mut fx2.ptr(1)
+            return fx2.list1(sticky)
+        })
+    })
+    expect shifted.len() == 1
+    return shifted[0]
+} shift_sticky
+
+/// A nonzero 128-bit sum scaled by 2^`e` as its top 63 bits, the last of them sticky, and the
+/// power of two scaling them.
+fn normalize_sum(mut fx: Fx, high: clif::Value, low: clif::Value, e: clif::Value) -> Scaled {
+    let in_high = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: high, y: 0)
+    let results = int64_types(fx, count: 2)
+    let parts = mut fx.choose(in_high, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zeros = mut fx1.b.clz(high)
+        let d = mut fx1.b.iadd_imm_s(zeros, y: -1)
+        let raised = mut fx1.b.ishl(high, y: d)
+        let back = subtract_from(mut fx1, constant: 64, value: d)
+        let carried = mut fx1.b.ushr(low, y: back)
+        let lost_bits = mut fx1.b.ishl(low, y: d)
+        let lost_flag = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: lost_bits, y: 0)
+        let lost = mut fx1.b.uextend(clif::Type.Int64, x: lost_flag)
+        let joined = mut fx1.b.bor(raised, y: carried)
+        let top = mut fx1.b.bor(joined, y: lost)
+        let scaled = mut fx1.b.iadd_imm_s(e, y: 64)
+        let exponent = mut fx1.b.isub(scaled, y: d)
+        return fx1.list2(top, b: exponent)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zeros = mut fx1.b.clz(low)
+        let full = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: zeros, y: 0)
+        let full_results = int64_types(fx1, count: 2)
+        return mut fx1.choose(full, results: full_results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let halved = mut fx2.b.ushr_imm_s(low, y: 1)
+            let last = mut fx2.b.band_imm_s(low, y: 1)
+            let top = mut fx2.b.bor(halved, y: last)
+            let exponent = mut fx2.b.iadd_imm_s(e, y: 1)
+            return fx2.list2(top, b: exponent)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let d = mut fx2.b.iadd_imm_s(zeros, y: -1)
+            let top = mut fx2.b.ishl(low, y: d)
+            let exponent = mut fx2.b.isub(e, y: d)
+            return fx2.list2(top, b: exponent)
+        })
+    })
+    expect parts.len() == 2
+    return Scaled(significand: parts[0], exponent: parts[1])
+} normalize_sum
+
+/// The bit pattern, in 64 bits, of `top` × 2^`e` rounded to a width by roundTiesToEven, `top`
+/// holding 63 bits with its leading bit at 62 and its last bit sticky.
+fn floats_round(mut fx: Fx, width: Width, sign: clif::Value, top: clif::Value, e: clif::Value) -> clif::Value {
+    let precision = width.fraction() + 1
+    let lowest = 1 - width.bias()
+    let leading = mut fx.b.iadd_imm_s(e, y: 62)
+    let normal = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: leading, y: lowest)
+    let below = subtract_from(mut fx, constant: lowest, value: leading)
+    let zero = mut fx.ptr(0)
+    let extra = mut fx.b.select(normal, x: zero, y: below)
+    let shift = mut fx.b.iadd_imm_s(extra, y: 63 - precision)
+    let gone = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: shift, y: 64)
+    let results = fx.types1(clif::Type.Int64)
+    let rounded_values = mut fx.choose(gone, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let nothing = mut fx1.ptr(0)
+        return fx1.list1(nothing)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let kept = round_kept(mut fx1, top, shift)
+        return fx1.list1(kept)
+    })
+    expect rounded_values.len() == 1
+    let rounded = rounded_values[0]
+    let sign_bits = mut fx.b.ishl_imm_s(sign, y: width.sign_bit())
+    let bits_results = fx.types1(clif::Type.Int64)
+    let bits = mut fx.choose(normal, results: bits_results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return encode_normal(mut fx1, width, rounded, leading)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(rounded)
+    })
+    expect bits.len() == 1
+    return mut fx.b.bor(bits[0], y: sign_bits)
+} floats_round
+
+/// The bits of `top` kept above `shift`, rounded to nearest with ties to even by the half bit
+/// below them and the sticky rest.
+fn round_kept(mut fx: Fx, top: clif::Value, shift: clif::Value) -> clif::Value {
+    let kept = mut fx.b.ushr(top, y: shift)
+    let half_at = mut fx.b.iadd_imm_s(shift, y: -1)
+    let half_bits = mut fx.b.ushr(top, y: half_at)
+    let half_bit = mut fx.b.band_imm_s(half_bits, y: 1)
+    let one = mut fx.ptr(1)
+    let half_unit = mut fx.b.ishl(one, y: half_at)
+    let below_half = mut fx.b.iadd_imm_s(half_unit, y: -1)
+    let rest = mut fx.b.band(top, y: below_half)
+    let sticky = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
+    let odd_bit = mut fx.b.band_imm_s(kept, y: 1)
+    let odd = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: odd_bit, y: 0)
+    let past_half = mut fx.b.bor(sticky, y: odd)
+    let half = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: half_bit, y: 0)
+    let up_flag = mut fx.b.band(half, y: past_half)
+    let up = mut fx.b.uextend(clif::Type.Int64, x: up_flag)
+    return mut fx.b.iadd(kept, y: up)
+} round_kept
+
+/// The bits of a rounded normal value of a width with its leading bit's position `leading`:
+/// infinity when its biased exponent passes the format's, else its exponent field and
+/// fraction.
+fn encode_normal(mut fx: Fx, width: Width, rounded: clif::Value, leading: clif::Value) -> mem::List[clif::Value] {
+    let precision = width.fraction() + 1
+    let carried = mut fx.b.ushr_imm_s(rounded, y: precision)
+    let significand = mut fx.b.ushr(rounded, y: carried)
+    let exponent = mut fx.b.iadd(leading, y: carried)
+    let biased = mut fx.b.iadd_imm_s(exponent, y: width.bias())
+    let overflow = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: biased, y: width.top())
+    let results = fx.types1(clif::Type.Int64)
+    return mut fx.choose(overflow, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let infinity = mut fx1.ptr(u64.fit(width.infinity()))
+        return fx1.list1(infinity)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let fraction = mut fx1.b.band_imm_s(significand, y: width.fraction_mask())
+        let field = mut fx1.b.ishl_imm_s(biased, y: width.fraction())
+        let encoded = mut fx1.b.bor(field, y: fraction)
+        return fx1.list1(encoded)
+    })
+} encode_normal

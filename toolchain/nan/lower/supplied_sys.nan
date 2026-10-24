@@ -1,0 +1,795 @@
+//! System capabilities: the root grant, the operations of `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::Random`, `sys::Log` and `sys::Stdio` through the host platform, or in a test image through the sims, files, listeners and connections, revocation, and the submission of io_uring operations. Each operation checks its capability's entry first. An `Fs` entry's state is its directory's descriptor, the address and length of its path prefix, and whether it is read-only; a `Net` entry's is the address and length of the one host it reaches, when restricted. A file, listener or connection is the entry it was opened through and the holding of its descriptor; a revoker is the holding of its entry or cell.
+
+/// The words of an entry's state.
+const WORD_DIRECTORY: u64 = 0
+
+const WORD_TEXT: u64 = 8
+
+const WORD_TEXT_LEN: u64 = 16
+
+const WORD_FLAGS: u64 = 24
+
+/// The render budget of a log record's value.
+const SYS_LOG_BUDGET: u64 = 1_024
+
+/// `hw::mint_root()`: a new root grant of the target, a `host::World`, `boot::Kernel` or
+/// `boot::Machine`.
+fn sys_mint_root(mut lo: Lowering, mut fx: Fx) -> Held {
+    let grant = lo.root_grant()
+    let laid = mut lo.layout_of(grant)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    discard mut lo.call_routine(mut fx, routine: Routine.MintRoot, args: Array[clif::Value, 1].filled(slot).view())
+    return Held.Address(slot)
+} sys_mint_root
+
+fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    let Some(owner) = path.slice_bytes(0, end: check::last_dot(path).value_or(path.byte_len())) else {
+        expect false
+        return false
+    }
+    match owner {
+        "sys::Fs" => sys_fs(mut lo, mut fx, supply)
+        "sys::Net" => sys_net(mut lo, mut fx, supply)
+        "sys::Clock" => sys_clock(mut lo, mut fx, supply)
+        "sys::Random" => sys_random(mut lo, mut fx, supply)
+        "sys::Log" => sys_log(mut lo, mut fx, supply)
+        "sys::Stdio" => sys_stdio(mut lo, mut fx, supply)
+        "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" => resource(mut lo, mut fx, supply)
+        "sys::revocable" or "sys::Revoker" => revocation(mut lo, mut fx, supply)
+        "host_platform::submit" => sys_submit(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} sys_lower
+
+/// The entry record of the capability held at an address, failing the operation with
+/// `Revoked.Stale` when its handle is stale.
+fn sys_checked(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) -> clif::Value {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.Check, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    return record
+} sys_checked
+
+/// Fails with a failure value of the operation's failure type: the variant of that name, or
+/// for a stale handle `Revoked.Stale` itself or the `Revoked` variant holding it.
+fn fail_with(mut lo: Lowering, mut fx: Fx, supply: Supply, variant: Str) {
+    let Some(failure_ty) = supply.abi.failure else {
+        expect false
+        return
+    }
+    var value = Held.Empty
+    if variant == "Revoked" {
+        let revoked = lo.std_ty("sys", type_name: "Revoked", args: mem::List[ty::Ty].empty(lo.alloc))
+        let stale = mut lo.variant_value(mut fx, ty: revoked, variant: "Stale", payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+        if failure_ty == revoked {
+            value = stale
+        } else {
+            value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "Revoked", payload_values: Array[Held, 1].filled(stale).view(), wrapped: None)
+        }
+    } else {
+        value = mut lo.variant_value(mut fx, ty: failure_ty, variant, payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+    }
+    let Some(failure) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: failure, held: value, ty: failure_ty)
+    supply.raise_failure(mut fx)
+} fail_with
+
+/// Ends the operation after a host platform call: its failure, when it failed, becomes the
+/// operation's, and `then` returns its result otherwise.
+fn sys_after(mut lo: Lowering, mut fx: Fx, supply: Supply, called: Called, then: fn(mut lo: Lowering, mut fx: Fx, result: Held)) {
+    supply.forward_failure(mut lo, mut fx, called)
+    then(mut lo, mut fx, result: called.result)
+} sys_after
+
+/// A view held in memory: its address and length.
+fn sys_view(mut fx: Fx, held: Held) -> Stretch {
+    let address = held.address_value()
+    let start = mut fx.load(PTR, addr: address, offset: 0)
+    let len = mut fx.load(PTR, addr: address, offset: 8)
+    return Stretch(start: start, len: len)
+} sys_view
+
+/// A new view value of `len` bytes from `start`.
+fn new_view(mut fx: Fx, start: clif::Value, len: clif::Value) -> Held {
+    let slot = mut fx.slot(16, align: 8)
+    mut fx.store(start, addr: slot, offset: 0)
+    mut fx.store(len, addr: slot, offset: 8)
+    return Held.Address(slot)
+} new_view
+
+/// A copy of `len` bytes from `start` in runtime memory, as an entry's state keeps texts.
+fn kept_text(mut lo: Lowering, mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
+    let size = mut fx.b.iadd_imm_s(len, y: 1)
+    let copy = mut lo.record_alloc(mut fx, size)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    var copied = Array[clif::Value, 3].filled(copy)
+    copied[1] = start
+    copied[2] = len
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copied.view())
+    return copy
+} kept_text
+
+/// Whether a path has the form a `sys::Fs` path has: relative segments separated by `/`, none
+/// empty, `.`, `..` or holding a NUL.
+fn valid_path(mut fx: Fx, start: clif::Value, len: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let valid = mut fx.int(clif::Type.Int8, value: 1)
+    var initial = Array[clif::Value, 4].filled(zero)
+    initial[3] = valid
+    let state = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 4
+        let index = current[0]
+        let segment = current[1]
+        let dots = current[2]
+        let still_valid = current[3]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: index, y: len)
+        let going = mut fx1.b.band(inside, y: still_valid)
+        var state_types = Array[clif::Type, 4].filled(PTR)
+        state_types[3] = clif::Type.Int8
+        let next = mut fx1.choose(going, results: state_types.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at_end = mut fx2.b.icmp(clif::IntCC.Equal, x: index, y: len)
+            let byte_values = mut fx2.choose(at_end, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var slash = mem::List[clif::Value].empty(fx3.alloc)
+                mut slash.push(mut fx3.int(clif::Type.Int8, value: i64.widen(b'/')))
+                return slash
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let address = mut fx3.b.iadd(start, y: index)
+                var loaded = mem::List[clif::Value].empty(fx3.alloc)
+                mut loaded.push(mut fx3.load(clif::Type.Int8, addr: address, offset: 0))
+                return loaded
+            })
+            expect byte_values.len() == 1
+            let byte = byte_values[0]
+            let separator = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'/'))
+            let nul = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+            let dot = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'.'))
+            let empty = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: segment, y: 0)
+            let all_dots = mut fx2.b.icmp(clif::IntCC.Equal, x: dots, y: segment)
+            let short = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: segment, y: 2)
+            let dotted = mut fx2.b.band(all_dots, y: short)
+            let bad_segment = mut fx2.b.bor(empty, y: dotted)
+            let bad_end = mut fx2.b.band(separator, y: bad_segment)
+            let bad = mut fx2.b.bor(bad_end, y: nul)
+            let still = mut fx2.b.bxor_imm_s(bad, y: 1)
+            let kept_valid = mut fx2.b.band(still_valid, y: still)
+            let grown = mut fx2.b.iadd_imm_s(segment, y: 1)
+            let restart = mut fx2.ptr(0)
+            let next_segment = mut fx2.b.select(separator, x: restart, y: grown)
+            let more_dots = mut fx2.b.iadd_imm_s(dots, y: 1)
+            let counted_dots = mut fx2.b.select(dot, x: more_dots, y: dots)
+            let next_dots = mut fx2.b.select(separator, x: restart, y: counted_dots)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(mut fx2.b.iadd_imm_s(index, y: 1))
+            mut stepped.push(next_segment)
+            mut stepped.push(next_dots)
+            mut stepped.push(kept_valid)
+            return stepped
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            var unchanged = mem::List[clif::Value].empty(fx2.alloc)
+            mut unchanged.push(index)
+            mut unchanged.push(segment)
+            mut unchanged.push(dots)
+            mut unchanged.push(still_valid)
+            return unchanged
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect state.len() == 4
+    return state[3]
+} valid_path
+
+fn sys_fs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let record = sys_checked(mut lo, mut fx, supply, capability)
+    let directory_word = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_DIRECTORY)
+    let directory_fd = mut fx.b.ireduce(clif::Type.Int32, x: directory_word)
+    let prefix_start = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
+    let prefix_len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
+    let prefix = new_view(mut fx, start: prefix_start, len: prefix_len)
+    let flags = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
+    let member = supply.member()
+    if member == "create" or member == "write_all" or member == "remove" {
+        let read_only = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flags, y: 0)
+        mut fx.if_true(read_only, then: fn[mut lo](mut fx1: Fx) {
+            fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+        })
+    }
+    if member == "subdir" or member == "open" or member == "create" or member == "read_all" or member == "write_all" or member == "remove" {
+        let path = sys_view(mut fx, held: supply.param(1))
+        let valid = valid_path(mut fx, start: path.start, len: path.len)
+        let invalid = mut fx.b.bxor_imm_s(valid, y: 1)
+        mut fx.if_true(invalid, then: fn[mut lo](mut fx1: Fx) {
+            fail_with(mut lo, fx: mut fx1, supply, variant: "InvalidPath")
+        })
+    }
+    let directory = Held.Scalar(directory_fd)
+    if lo.seeded() and not (member == "subdir" or member == "read_only") {
+        match member {
+            "open" or "create" => fs_open(mut lo, mut fx, supply, record, creates: member == "create")
+            "read_all" => read_all(mut lo, mut fx, supply, record)
+            "write_all" => fs_write_all(mut lo, mut fx, supply, record)
+            "remove" => fs_remove(mut lo, mut fx, supply, record)
+            else => {
+                expect false
+            }
+        }
+        return
+    }
+    if member == "subdir" or member == "read_only" {
+        fs_attenuate(mut lo, mut fx, supply, capability, prefix: Stretch(start: prefix_start, len: prefix_len))
+        return
+    }
+    fs_call(mut lo, mut fx, supply, capability, directory, prefix)
+} sys_fs
+
+/// `subdir` and `read_only` of `sys::Fs`: a new entry deriving from the capability's, keeping
+/// the joined path prefix or marked read-only.
+fn fs_attenuate(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, prefix: Stretch) {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let kind = mut fx.ptr(u64.fit(TABLES_KIND_FS))
+    var derive_args = Array[clif::Value, 2].filled(handle)
+    derive_args[1] = kind
+    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+    expect derived_values.len() == 1
+    let derived = derived_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let record = entry_at(mut lo, mut fx, handle: derived)
+    if supply.member() == "subdir" {
+        let path = sys_view(mut fx, held: supply.param(1))
+        let joined = mut fx.b.iadd(prefix.len, y: path.len)
+        let has_prefix = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: prefix.len, y: 0)
+        let separator = mut fx.b.uextend(PTR, x: has_prefix)
+        let joined_len = mut fx.b.iadd(joined, y: separator)
+        let size = mut fx.b.iadd_imm_s(joined_len, y: 1)
+        let text = mut lo.record_alloc(mut fx, size)
+        var prefix_args = Array[clif::Value, 3].filled(text)
+        prefix_args[1] = prefix.start
+        prefix_args[2] = prefix.len
+        discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: prefix_args.view())
+        mut fx.if_true(has_prefix, then: fn(mut fx1: Fx) {
+            let at = mut fx1.b.iadd(text, y: prefix.len)
+            let slash = mut fx1.int(clif::Type.Int8, value: i64.widen(b'/'))
+            mut fx1.store(slash, addr: at, offset: 0)
+        })
+        let after_prefix = mut fx.b.iadd(text, y: prefix.len)
+        let tail = mut fx.b.iadd(after_prefix, y: separator)
+        var tail_args = Array[clif::Value, 3].filled(tail)
+        tail_args[1] = path.start
+        tail_args[2] = path.len
+        discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: tail_args.view())
+        mut fx.store(text, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
+        mut fx.store(joined_len, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
+    } else {
+        let one = mut fx.ptr(1)
+        mut fx.store(one, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
+    }
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(derived, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} fs_attenuate
+
+/// The members of `sys::Fs` the host platform performs: opening, creating, reading, writing
+/// and removing files of the capability's directory.
+fn fs_call(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value, directory: Held, prefix: Held) {
+    match supply.member() {
+        "open" or "create" => {
+            var platform_name = "fs_create"
+            if supply.member() == "open" {
+                platform_name = "fs_open"
+            }
+            var open_args = Array[Held, 3].filled(directory)
+            open_args[1] = prefix
+            open_args[2] = supply.param(1)
+            let called = mut lo.platform_call(mut fx, name: platform_name, args: open_args.view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                let handle = mut fx1.load(PTR, addr: capability, offset: 0)
+                let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
+                ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
+            })
+        }
+        "read_all" => {
+            var read_args = Array[Held, 4].filled(directory)
+            read_args[1] = prefix
+            read_args[2] = supply.param(1)
+            read_args[3] = supply.param(2)
+            let called = mut lo.platform_call(mut fx, name: "fs_read_all", args: read_args.view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                supply.ret(mut lo1, fx: mut fx1, held: result)
+            })
+        }
+        "write_all" => {
+            var write_args = Array[Held, 4].filled(directory)
+            write_args[1] = prefix
+            write_args[2] = supply.param(1)
+            write_args[3] = supply.param(2)
+            let called = mut lo.platform_call(mut fx, name: "fs_write_all", args: write_args.view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                supply.done(mut lo1, fx: mut fx1)
+            })
+        }
+        "remove" => {
+            var remove_args = Array[Held, 3].filled(directory)
+            remove_args[1] = prefix
+            remove_args[2] = supply.param(1)
+            let called = mut lo.platform_call(mut fx, name: "fs_remove", args: remove_args.view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                supply.done(mut lo1, fx: mut fx1)
+            })
+        }
+        else => {
+            expect false
+        }
+    }
+} fs_call
+
+/// Returns a file, listener or connection: the entry it was opened through and the holding of
+/// a descriptor or sim, which settlement closes, or abandons for a connection.
+fn ret_resource(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: clif::Value, descriptor: clif::Value) {
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(handle, addr: sret, offset: 0)
+    let abandons = lo.ck.is_std(supply.abi.result, path: "sys::net::Conn")
+    var kind = HOLDINGS_KIND_CLOSE
+    if abandons {
+        kind = HOLDINGS_KIND_ABANDON
+    }
+    let kind_value = mut fx.ptr(u64.fit(kind))
+    var hold_args = Array[clif::Value, 2].filled(kind_value)
+    hold_args[1] = descriptor
+    let holding_values = mut lo.call_routine(mut fx, routine: Routine.Hold, args: hold_args.view())
+    expect holding_values.len() == 1
+    let holding = holding_values[0]
+    mut fx.store(holding, addr: sret, offset: 8)
+    supply.done(mut lo, mut fx)
+} ret_resource
+
+/// The descriptor of the resource at an address.
+fn sys_descriptor(mut fx: Fx, address: clif::Value) -> clif::Value {
+    let holding = mut fx.offset(address, offset: 8)
+    let descriptor = holdings_payload(mut fx, address: holding)
+    return mut fx.b.ireduce(clif::Type.Int32, x: descriptor)
+} sys_descriptor
+
+fn sys_net(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let record = sys_checked(mut lo, mut fx, supply, capability)
+    let host_start = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
+    let host_len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
+    let restricted_word = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
+    let restricted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: restricted_word, y: 0)
+    match supply.member() {
+        "only_host" => net_only_host(mut lo, mut fx, supply, capability)
+        "listen" => {
+            mut fx.if_true(restricted, then: fn[mut lo](mut fx1: Fx) {
+                fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+            })
+            if lo.seeded() {
+                listen(mut lo, mut fx, supply, record)
+                return
+            }
+            let called = mut lo.platform_call(mut fx, name: "net_listen", args: Array[Held, 1].filled(supply.param(1)).view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                let handle = mut fx1.load(PTR, addr: capability, offset: 0)
+                let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
+                ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
+            })
+        }
+        "connect" => {
+            let host = supply.param(1)
+            mut fx.if_true(restricted, then: fn[mut lo](mut fx1: Fx) {
+                let stored = new_view(mut fx1, start: host_start, len: host_len)
+                let same = mut lo.views_equal(mut fx1, left: stored, right: host)
+                let other = mut fx1.b.bxor_imm_s(same, y: 1)
+                mut fx1.if_true(other, then: fn[mut lo](mut fx2: Fx) {
+                    fail_with(mut lo, fx: mut fx2, supply, variant: "Denied")
+                })
+            })
+            if lo.seeded() {
+                connect(mut lo, mut fx, supply, record)
+                return
+            }
+            var connect_args = Array[Held, 2].filled(host)
+            connect_args[1] = supply.param(2)
+            let called = mut lo.platform_call(mut fx, name: "net_connect", args: connect_args.view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                let handle = mut fx1.load(PTR, addr: capability, offset: 0)
+                let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
+                ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
+            })
+        }
+        else => {
+            expect false
+        }
+    }
+} sys_net
+
+/// `sys::Net.only_host`: a new entry deriving from the capability's, restricted to one host.
+fn net_only_host(mut lo: Lowering, mut fx: Fx, supply: Supply, capability: clif::Value) {
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let kind = mut fx.ptr(u64.fit(TABLES_KIND_NET))
+    var derive_args = Array[clif::Value, 2].filled(handle)
+    derive_args[1] = kind
+    let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+    expect derived_values.len() == 1
+    let derived = derived_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let record = entry_at(mut lo, mut fx, handle: derived)
+    let host = sys_view(mut fx, held: supply.param(1))
+    let text = kept_text(mut lo, mut fx, start: host.start, len: host.len)
+    mut fx.store(text, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT)
+    mut fx.store(host.len, addr: record, offset: TABLES_ENTRY_STATE + WORD_TEXT_LEN)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: record, offset: TABLES_ENTRY_STATE + WORD_FLAGS)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(derived, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} net_only_host
+
+fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.Check, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    match supply.member() {
+        "elapsed_ms" => {
+            mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+                fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+            })
+            let minted = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+            let now = mut lo.now_ms(mut fx)
+            let elapsed = mut fx.b.isub(now, y: minted)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(elapsed))
+        }
+        "sleep" => {
+            mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+                supply.done(mut lo, fx: mut fx1)
+            })
+            if lo.seeded() {
+                sleep(mut lo, mut fx, supply, ms: supply.param(1).scalar_value())
+                return
+            }
+            let called = mut lo.platform_call(mut fx, name: "sleep", args: Array[Held, 1].filled(supply.param(1)).view())
+            sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+                supply.done(mut lo1, fx: mut fx1)
+            })
+        }
+        else => {
+            expect false
+        }
+    }
+} sys_clock
+
+fn sys_random(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let record = sys_checked(mut lo, mut fx, supply, capability)
+    if lo.seeded() {
+        random_fill(mut lo, mut fx, entry_record: record, buf: supply.param(1))
+    } else {
+        discard mut lo.platform_call(mut fx, name: "random_fill", args: Array[Held, 1].filled(supply.param(1)).view())
+    }
+    supply.done(mut lo, mut fx)
+} sys_random
+
+fn sys_log(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.Check, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let value_ty = supply.type_arg(lo, index: 0)
+    let level = supply.member()
+    mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
+        if lo.seeded() {
+            log_line(mut lo, fx: mut fx1, level, message: supply.param(1), value_ty, value: supply.param(2))
+            return
+        }
+        let rendered = render_value(mut lo, fx: mut fx1, ty: value_ty, value: supply.param(2), budget: SYS_LOG_BUDGET)
+        let rendering = new_view(mut fx1, start: rendered.buffer, len: rendered.len)
+        let level_view = mut lo.view_literal(mut fx1, contents: level.as_bytes())
+        var log_args = Array[Held, 3].filled(level_view)
+        log_args[1] = supply.param(1)
+        log_args[2] = rendering
+        discard mut lo.platform_call(mut fx1, name: "log_line", args: log_args.view())
+    })
+    supply.done(mut lo, mut fx)
+} sys_log
+
+fn sys_stdio(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability = supply.param(0).address_value()
+    let record = sys_checked(mut lo, mut fx, supply, capability)
+    if lo.seeded() {
+        if supply.member() == "read_in" {
+            stdio_read(mut lo, mut fx, supply, entry_record: record)
+        } else {
+            stdio_write(mut lo, mut fx, supply)
+        }
+        return
+    }
+    var called = Called(failed: None, failure: None, result: Held.Empty)
+    if supply.member() == "read_in" {
+        let buf = sys_view(mut fx, held: supply.param(1))
+        let fd = mut fx.int(clif::Type.Int32, value: 0)
+        var read_args = Array[Held, 3].filled(Held.Scalar(fd))
+        read_args[1] = Held.Scalar(buf.start)
+        read_args[2] = Held.Scalar(buf.len)
+        called = mut lo.platform_call(mut fx, name: "stdio_read", args: read_args.view())
+    } else {
+        var stream: i64 = 2
+        if supply.member() == "write_out" {
+            stream = 1
+        }
+        let fd = mut fx.int(clif::Type.Int32, value: stream)
+        var write_args = Array[Held, 2].filled(Held.Scalar(fd))
+        write_args[1] = supply.param(1)
+        called = mut lo.platform_call(mut fx, name: "stdio_write", args: write_args.view())
+    }
+    sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+        supply.ret(mut lo1, fx: mut fx1, held: result)
+    })
+} sys_stdio
+
+/// The operations of files, listeners and connections, through the entry each was opened by;
+/// a release completes whether or not that entry is revoked.
+fn resource(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let address = supply.param(0).address_value()
+    let member = supply.member()
+    let descriptor = Held.Scalar(sys_descriptor(mut fx, address))
+    if member == "abandon" {
+        if lo.seeded() {
+            let held_at = mut fx.offset(address, offset: 8)
+            let payload = holdings_payload(mut fx, address: held_at)
+            sims_abandon(mut lo, mut fx, index: payload)
+        } else {
+            discard mut lo.platform_call(mut fx, name: "conn_abandon", args: Array[Held, 1].filled(descriptor).view())
+        }
+        let holding = mut fx.load(PTR, addr: address, offset: 8)
+        discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+        supply.done(mut lo, mut fx)
+        return
+    }
+    if member != "close" {
+        discard sys_checked(mut lo, mut fx, supply, capability: address)
+    }
+    let path = supply.path.as_str()
+    let Some(owner) = path.slice_bytes(0, end: check::last_dot(path).value_or(0)) else {
+        expect false
+        return
+    }
+    if lo.seeded() {
+        resource_sim(mut lo, mut fx, supply, owner, member, address)
+        return
+    }
+    let file = owner == "sys::fs::File"
+    let conn = owner == "sys::net::Conn"
+    var called = Called(failed: None, failure: None, result: Held.Empty)
+    if (file or conn) and member == "read" {
+        let buf = sys_view(mut fx, held: supply.param(1))
+        var platform_name = "conn_read"
+        if file {
+            platform_name = "file_read"
+        }
+        var read_args = Array[Held, 3].filled(descriptor)
+        read_args[1] = Held.Scalar(buf.start)
+        read_args[2] = Held.Scalar(buf.len)
+        called = mut lo.platform_call(mut fx, name: platform_name, args: read_args.view())
+    } else if (file or conn) and member == "write" {
+        var platform_name = "conn_write"
+        if file {
+            platform_name = "file_write"
+        }
+        var write_args = Array[Held, 2].filled(descriptor)
+        write_args[1] = supply.param(1)
+        called = mut lo.platform_call(mut fx, name: platform_name, args: write_args.view())
+    } else if file and member == "byte_len" {
+        called = mut lo.platform_call(mut fx, name: "file_byte_len", args: Array[Held, 1].filled(descriptor).view())
+    } else if owner == "sys::net::Listener" and member == "accept" {
+        let accepted = mut lo.platform_call(mut fx, name: "listener_accept", args: Array[Held, 1].filled(descriptor).view())
+        sys_after(mut lo, mut fx, supply, called: accepted, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+            let handle = mut fx1.load(PTR, addr: address, offset: 0)
+            let fd = mut fx1.b.sextend(PTR, x: result.scalar_value())
+            ret_resource(mut lo1, fx: mut fx1, supply, handle, descriptor: fd)
+        })
+        return
+    } else if conn and member == "close" {
+        called = mut lo.platform_call(mut fx, name: "conn_close", args: Array[Held, 1].filled(descriptor).view())
+        let holding = mut fx.load(PTR, addr: address, offset: 8)
+        discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+    } else {
+        expect false
+    }
+    sys_after(mut lo, mut fx, supply, called, then: fn(mut lo1: Lowering, mut fx1: Fx, result: Held) {
+        supply.ret(mut lo1, fx: mut fx1, held: result)
+    })
+} resource
+
+/// The operations of files, listeners and connections in a test image, on the sims.
+fn resource_sim(mut lo: Lowering, mut fx: Fx, supply: Supply, owner: Str, member: Str, address: clif::Value) {
+    if owner == "sys::fs::File" and member == "read" {
+        fs_read(mut lo, mut fx, supply)
+    } else if owner == "sys::fs::File" and member == "write" {
+        fs_write(mut lo, mut fx, supply)
+    } else if owner == "sys::fs::File" and member == "byte_len" {
+        byte_len(mut lo, mut fx, supply)
+    } else if owner == "sys::net::Listener" and member == "accept" {
+        accept(mut lo, mut fx, supply)
+    } else if owner == "sys::net::Conn" and member == "read" {
+        net_read(mut lo, mut fx, supply)
+    } else if owner == "sys::net::Conn" and member == "write" {
+        net_write(mut lo, mut fx, supply)
+    } else if owner == "sys::net::Conn" and member == "close" {
+        net_close(mut lo, mut fx, supply)
+        let holding = mut fx.load(PTR, addr: address, offset: 8)
+        discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+        supply.done(mut lo, mut fx)
+    } else {
+        expect false
+    }
+} resource_sim
+
+/// Releases a file or listener: its descriptor closes.
+fn sys_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) -> bool {
+    if owner_path != "sys::fs::File" and owner_path != "sys::net::Listener" {
+        return false
+    }
+    if lo.seeded() {
+        let held_at = mut fx.offset(address, offset: 8)
+        let payload = holdings_payload(mut fx, address: held_at)
+        sims_release(mut lo, mut fx, index: payload)
+    } else {
+        let descriptor = sys_descriptor(mut fx, address)
+        discard mut lo.platform_call(mut fx, name: "release", args: Array[Held, 1].filled(Held.Scalar(descriptor)).view())
+    }
+    let holding = mut fx.load(PTR, addr: address, offset: 8)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+    return true
+} sys_release
+
+/// Whether moving a sys type into another domain's reach does anything, none for a type std
+/// declares in full.
+fn sys_transfers(owner_path: Str) -> Option[bool] {
+    return match owner_path {
+        "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" or "sys::Revoker" => Some(true)
+        else => None
+    }
+} sys_transfers
+
+/// Moves a resource or revoker into another domain's reach: its holding passes to `owner`.
+fn sys_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, address: clif::Value, owner: clif::Value) -> bool {
+    match owner_path {
+        "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" => {
+            let holding = mut fx.offset(address, offset: 8)
+            rehome(mut lo, mut fx, address: holding, owner)
+        }
+        "sys::Revoker" => rehome(mut lo, mut fx, address, owner)
+        else => return false
+    }
+    return true
+} sys_transfer
+
+/// Whether releasing a sys type does anything, none for a type std declares in full.
+fn sys_needs_release(owner_path: Str) -> Option[bool] {
+    return match owner_path {
+        "sys::fs::File" or "sys::net::Listener" => Some(true)
+        "sys::net::Conn" or "sys::Revoker" => Some(false)
+        else => None
+    }
+} sys_needs_release
+
+/// `sys::revocable`, `sys::Revoker.capability` and `sys::Revoker.revoke`: an allocator's
+/// revoker keeps a new cell, any other capability's a new entry deriving from its entry.
+fn revocation(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let capability_ty = supply.type_arg(lo, index: 0)
+    let allocator = lo.ck.is_std(capability_ty, path: "mem::Alloc")
+    match supply.member() {
+        "" => {
+            let capability = supply.param(0).address_value()
+            let handle = mut fx.load(PTR, addr: capability, offset: 0)
+            var derived = handle
+            if allocator {
+                let unlimited = mut fx.int(PTR, value: -1)
+                var split_args = Array[clif::Value, 2].filled(handle)
+                split_args[1] = unlimited
+                let derived_values = mut lo.call_routine(mut fx, routine: Routine.Split, args: split_args.view())
+                expect derived_values.len() == 1
+                derived = derived_values[0]
+            } else {
+                let record = sys_checked(mut lo, mut fx, supply, capability)
+                let kind_word = mut fx.load(clif::Type.Int32, addr: record, offset: TABLES_ENTRY_KIND)
+                let kind = mut fx.b.uextend(PTR, x: kind_word)
+                var derive_args = Array[clif::Value, 2].filled(handle)
+                derive_args[1] = kind
+                let derived_values = mut lo.call_routine(mut fx, routine: Routine.Derive, args: derive_args.view())
+                expect derived_values.len() == 1
+                derived = derived_values[0]
+                let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+                mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+                    fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+                })
+            }
+            var chosen_kind = HOLDINGS_KIND_REVOKE
+            if allocator {
+                chosen_kind = HOLDINGS_KIND_CLOSE_CELL
+            }
+            let kind_value = mut fx.ptr(u64.fit(chosen_kind))
+            var hold_args = Array[clif::Value, 2].filled(kind_value)
+            hold_args[1] = derived
+            let holding_values = mut lo.call_routine(mut fx, routine: Routine.Hold, args: hold_args.view())
+            expect holding_values.len() == 1
+            let holding = holding_values[0]
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(holding, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "capability" => {
+            let handle = holdings_payload(mut fx, address: supply.param(0).address_value())
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(handle, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "revoke" => {
+            let revoker = supply.param(0).address_value()
+            let handle = holdings_payload(mut fx, address: revoker)
+            var routine = Routine.Revoke
+            if allocator {
+                routine = Routine.Close
+            }
+            discard mut lo.call_routine(mut fx, routine, args: Array[clif::Value, 1].filled(handle).view())
+            let holding = mut fx.load(PTR, addr: revoker, offset: 0)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} revocation
+
+/// `host_platform::submit(entry)`: the operation's result once its completion arrives.
+fn sys_submit(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let entry = supply.param(0).address_value()
+    let results = mut lo.call_routine(mut fx, routine: Routine.IoSubmit, args: Array[clif::Value, 1].filled(entry).view())
+    expect results.len() == 2
+    let cancelled = results[0]
+    let result = results[1]
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        let origin = tasks_origin(mut lo, fx: mut fx1)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin)
+    })
+    supply.ret(mut lo, mut fx, held: Held.Scalar(result))
+} sys_submit

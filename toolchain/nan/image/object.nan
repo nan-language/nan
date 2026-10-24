@@ -1,0 +1,179 @@
+//! Reads the ELF64 relocatable object lowering writes: its sections, symbols and relocations.
+
+/// A section of the object: its bytes, empty for a section without contents, and its size in
+/// memory.
+struct ObjectSection {
+    kind: Kind
+    data: mem::Bytes
+    size: u64
+    align: u64
+    relocations: mem::List[Relocation]
+} ObjectSection
+
+/// Where a section goes in an image; `Other` sections are left out.
+enum Kind derives Copy, Eq {
+    Text
+    ReadOnly
+    Data
+    Zeroed
+    Other
+} Kind
+
+struct Symbol {
+    name: text::String
+    /// The index of the section defining it, none for an undefined or absolute symbol.
+    section: Option[usize]
+    value: u64
+} Symbol
+
+/// A relocation of a section: where it applies, its type, the symbol it names and its addend.
+struct Relocation derives Copy {
+    offset: u64
+    kind: u32
+    symbol: usize
+    addend: i64
+} Relocation
+
+struct Object {
+    sections: mem::List[ObjectSection]
+    symbols: mem::List[Symbol]
+} Object
+
+const SHT_SYMTAB: u32 = 2
+const SHT_RELA: u32 = 4
+const SHT_NOBITS: u32 = 8
+const SHF_WRITE: u64 = 1
+const SHF_ALLOC: u64 = 2
+const SHF_EXECINSTR: u64 = 4
+const SHF_TLS: u64 = 0x400
+const SHN_UNDEF: u16 = 0
+const SHN_LORESERVE: u16 = 0xFF00
+
+/// The NUL-terminated name at an offset of a string table.
+fn name_at(strings: Slice[u8], at: usize, alloc: mem::Alloc) -> text::String {
+    let Some(parts) = strings.split_at(at) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    var length: usize = 0
+    while length < parts.tail.len() and parts.tail[length] != 0 {
+        length += 1
+    }
+    let Some(name) = parts.tail.prefix(length) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return output::lossy(name, alloc)
+} name_at
+
+struct Header derives Copy {
+    kind: u32
+    flags: u64
+    offset: usize
+    size: usize
+    link: u32
+    info: u32
+    align: u64
+} Header
+
+/// The bytes of an object, read by section.
+view struct ObjectBytes {
+    bytes: Slice[u8]
+} ObjectBytes
+
+/// The object's bytes from an offset on.
+proj fn ObjectBytes.from_offset(self, offset: usize) -> Slice[u8] {
+    let Some(parts) = self.bytes.split_at(offset) else {
+        expect false
+        return self.bytes
+    }
+    return parts.tail
+} ObjectBytes.from_offset
+
+/// The bytes of the section a header describes.
+proj fn ObjectBytes.contents(self, header: Header) -> Slice[u8] {
+    let Some(within) = self.from_offset(header.offset).prefix(header.size) else {
+        expect false
+        return self.bytes
+    }
+    return within
+} ObjectBytes.contents
+
+/// The section a header describes, without its relocations.
+fn section_of(object: ObjectBytes, header: Header, alloc: mem::Alloc) -> ObjectSection {
+    let allocated = (header.flags & SHF_ALLOC) != 0
+    expect not allocated or (header.flags & SHF_TLS) == 0
+    var kind = Kind.ReadOnly
+    if not allocated {
+        kind = Kind.Other
+    } else if header.kind == SHT_NOBITS {
+        kind = Kind.Zeroed
+    } else if (header.flags & SHF_EXECINSTR) != 0 {
+        kind = Kind.Text
+    } else if (header.flags & SHF_WRITE) != 0 {
+        kind = Kind.Data
+    }
+    var data = mem::Bytes.empty(alloc)
+    if kind != Kind.Zeroed and kind != Kind.Other {
+        mut data.append(object.contents(header))
+    }
+    var align = header.align
+    if align == 0 {
+        align = 1
+    }
+    return ObjectSection(kind: kind, data: take data, size: u64.widen(header.size), align: align, relocations: mem::List[Relocation].empty(alloc))
+} section_of
+
+/// Reads an object lowering wrote; any other input is an invariant broken.
+fn read(bytes: Slice[u8], alloc: mem::Alloc) -> Object {
+    expect bytes.prefix(6) == Some(b"\x7fELF\x02\x01")
+    let count = usize.widen(bytes.u16_le(0x3C))
+    let Some(whole) = bytes.prefix(bytes.len()) else {
+        expect false
+        return Object(sections: mem::List[ObjectSection].empty(alloc), symbols: mem::List[Symbol].empty(alloc))
+    }
+    let object = ObjectBytes(bytes: take whole)
+    let table = object.from_offset(usize.widen(bytes.u64_le(0x28)))
+    var headers = mem::List[Header].empty(alloc)
+    for index in 0..<count {
+        let at = index * 64
+        mut headers.push(Header(kind: table.u32_le(at + 4), flags: table.u64_le(at + 8), offset: usize.widen(table.u64_le(at + 24)), size: usize.widen(table.u64_le(at + 32)), link: table.u32_le(at + 40), info: table.u32_le(at + 44), align: table.u64_le(at + 48)))
+    }
+    var sections = mem::List[ObjectSection].empty(alloc)
+    for header in headers {
+        mut sections.push(section_of(object, header, alloc))
+    }
+    var symbols = mem::List[Symbol].empty(alloc)
+    for header in headers {
+        if header.kind != SHT_SYMTAB {
+            continue
+        }
+        expect usize.widen(header.link) < headers.len()
+        let strings = object.contents(headers[usize.widen(header.link)])
+        let entries = object.contents(header)
+        for entry in 0..<(entries.len() / 24) {
+            let at = entry * 24
+            let index = entries.u16_le(at + 6)
+            var section: Option[usize] = None
+            if index != SHN_UNDEF and index < SHN_LORESERVE {
+                section = Some(usize.widen(index))
+            }
+            mut symbols.push(Symbol(name: name_at(strings, at: usize.widen(entries.u32_le(at)), alloc), section: section, value: entries.u64_le(at + 8)))
+        }
+    }
+    for header in headers {
+        if header.kind != SHT_RELA {
+            continue
+        }
+        let target = usize.widen(header.info)
+        expect target < sections.len()
+        var section = mut sections.at_mut(target)
+        let entries = object.contents(header)
+        for entry in 0..<(entries.len() / 24) {
+            let at = entry * 24
+            let info = entries.u64_le(at + 8)
+            mut section.relocations.push(Relocation(offset: entries.u64_le(at), kind: u32.truncate(info), symbol: usize.widen(info >> 32), addend: i64.from_bits(entries.u64_le(at + 16))))
+        }
+    }
+    return Object(sections: take sections, symbols: take symbols)
+} read

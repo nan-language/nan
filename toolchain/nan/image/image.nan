@@ -1,0 +1,256 @@
+//! The image writer: links the relocatable object of a machine target's lowering into its image, a PE32+ EFI application on `x86_64-uefi` or a static ELF64 executable entered by the PVH boot protocol on `x86_64-bare`. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
+
+/// The size of a page, to which every segment is aligned.
+const PAGE: u64 = 4_096
+
+/// The data object of 16 bytes into which the image writer writes the image's first and last
+/// address plus one.
+pkg const IMAGE_EXTENT: Str = "_NSimage"
+
+/// The image of a machine target linking an object lowering wrote, entered at the symbol `entry`.
+pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: mem::Alloc) -> mem::Bytes {
+    match target {
+        workspace::Target.Uefi => {
+            let linked = link(object, base: PE_BASE, alloc)
+            return pe_write(linked, entry: linked.symbol(entry), alloc)
+        }
+        workspace::Target.Bare => {
+            let linked = link(object, base: ELF_BASE, alloc)
+            return elf_write(linked, entry: linked.symbol(entry), alloc)
+        }
+        workspace::Target.Host or workspace::Target.Any => {
+            expect false
+            return mem::Bytes.empty(alloc)
+        }
+    }
+} write
+
+/// What a segment's memory permits beside reading.
+enum Access derives Copy, Eq {
+    Execute
+    Read
+    Write
+} Access
+
+/// A segment of an image: its address, its bytes and its size in memory, the rest zeros.
+struct Segment {
+    address: u64
+    access: Access
+    bytes: mem::Bytes
+    size: u64
+} Segment
+
+fn Segment.contains(self, address: u64) -> bool = address >= self.address and address - self.address < self.size
+
+/// The address and width in bytes of an absolute address a relocation wrote.
+struct Absolute derives Copy, Eq {
+    address: u64
+    width: u64
+} Absolute
+
+/// An object linked at an address: its segments, the address of each of its symbols, and the
+/// absolute addresses its relocations wrote.
+struct Linked {
+    segments: mem::List[Segment]
+    symbols: mem::Map[text::String, u64]
+    absolute: mem::List[Absolute]
+} Linked
+
+/// The address of a symbol the lowering defines.
+fn Linked.symbol(self, name: Str) -> u64 {
+    let Some(address) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        expect false
+        return 0
+    }
+    return address
+} Linked.symbol
+
+/// The end of the memory the segments occupy.
+fn Linked.end(self) -> u64 {
+    var end: u64 = 0
+    for segment in self.segments {
+        if segment.address + segment.size > end {
+            end = segment.address + segment.size
+        }
+    }
+    return end
+} Linked.end
+
+/// Writes the image's extent, from `base` to the end of its segments, into the data object
+/// `IMAGE_EXTENT` when the object defines one, as two absolute addresses.
+fn Linked.record_extent(mut self, base: u64) {
+    let Some(at) = self.symbols.get_by(fn(key: text::String) => key.as_str().cmp(IMAGE_EXTENT)) else {
+        return
+    }
+    let end = self.end()
+    let Some(index) = self.segments.position(fn(segment: Segment) => segment.contains(at)) else {
+        expect false
+        return
+    }
+    expect self.segments[index].contains(at)
+    let offset = usize.widen(at - self.segments[index].address)
+    var bytes = mut self.segments[index].bytes.view_mut()
+    mut bytes.write_u64_le(offset, value: base)
+    mut bytes.write_u64_le(offset + 8, value: end)
+    mut self.absolute.push(Absolute(address: at, width: 8))
+    mut self.absolute.push(Absolute(address: at + 8, width: 8))
+} Linked.record_extent
+
+/// The relocation types the objects lowering writes hold.
+const ABS64: u32 = 1
+const PC32: u32 = 2
+const PLT32: u32 = 4
+const ABS32: u32 = 10
+
+/// A value rounded up to a multiple.
+fn next_multiple_of(value: u64, multiple: u64) -> u64 {
+    let rest = value % multiple
+    if rest == 0 {
+        return value
+    }
+    return value + (multiple - rest)
+} next_multiple_of
+
+/// Links an object with its first segment at `base`.
+fn link(object: Slice[u8], base: u64, alloc: mem::Alloc) -> Linked {
+    let read_object = read(object, alloc)
+    var placed = mem::List[Option[u64]].empty(alloc)
+    for _ in read_object.sections {
+        mut placed.push(None)
+    }
+    var segments = mem::List[Segment].empty(alloc)
+    let sections = read_object.sections.view()
+    var next = add_segment(mut segments, mut placed, sections, address: base, access: Access.Execute, alloc)
+    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, alloc)
+    discard add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, alloc)
+    var symbols = mem::Map[text::String, u64].empty(alloc)
+    for symbol in read_object.symbols {
+        let Some(section) = symbol.section else {
+            continue
+        }
+        expect section < placed.len()
+        let Some(start) = placed[section] else {
+            continue
+        }
+        if not symbol.name.is_empty() {
+            discard mut symbols.insert(text::String.of(symbol.name.as_str(), alloc), value: start + symbol.value)
+        }
+    }
+    var absolute = mem::List[Absolute].empty(alloc)
+    expect placed.len() == read_object.sections.len()
+    for index in 0..<read_object.sections.len() {
+        let Some(start) = placed[index] else {
+            continue
+        }
+        if read_object.sections[index].relocations.len() == 0 {
+            continue
+        }
+        let Some(at) = segments.position(fn(segment: Segment) => segment.contains(start)) else {
+            expect false
+            continue
+        }
+        var segment = mut segments.at_mut(at)
+        for relocation in read_object.sections[index].relocations {
+            expect relocation.symbol < read_object.symbols.len()
+            let target = i64.from_bits(address_of(read_object.symbols[relocation.symbol], placed: placed.view())) + relocation.addend
+            mut segment.relocate(at: start + relocation.offset, kind: relocation.kind, target, mut absolute)
+        }
+    }
+    var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute)
+    mut linked.record_extent(base)
+    mut linked.absolute.sort_by(absolute_order)
+    return linked
+} link
+
+fn absolute_order(left: Absolute, right: Absolute) -> core::Ordering {
+    if left.address != right.address {
+        return left.address.cmp(right.address)
+    }
+    return left.width.cmp(right.width)
+} absolute_order
+
+/// Adds the segment of an access at an address when it holds any section, its sections of
+/// zeros after the others, returning the address of the next segment.
+fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], address: u64, access: Access, alloc: mem::Alloc) -> u64 {
+    var segment = Segment(address: address, access: access, bytes: mem::Bytes.empty(alloc), size: 0)
+    match access {
+        Access.Execute => place_kind(mut segment, mut placed, sections, kind: Kind.Text)
+        Access.Read => place_kind(mut segment, mut placed, sections, kind: Kind.ReadOnly)
+        Access.Write => {
+            place_kind(mut segment, mut placed, sections, kind: Kind.Data)
+            place_kind(mut segment, mut placed, sections, kind: Kind.Zeroed)
+        }
+    }
+    if segment.size == 0 {
+        return address
+    }
+    let next = next_multiple_of(segment.address + segment.size, multiple: PAGE)
+    mut segments.push(take segment)
+    return next
+} add_segment
+
+/// Places the sections of a kind at the end of a segment, at their alignments, recording their
+/// addresses.
+fn place_kind(mut segment: Segment, mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], kind: Kind) {
+    for index in 0..<sections.len() {
+        invariant placed.len() == sections.len()
+        let section = sections[index]
+        if section.kind != kind {
+            continue
+        }
+        let offset = next_multiple_of(segment.size, multiple: section.align)
+        placed[index] = Some(segment.address + offset)
+        segment.size = offset + section.size
+        if kind != Kind.Zeroed {
+            object::resize(mut segment.bytes, length: usize.widen(offset))
+            mut segment.bytes.append(section.data.view())
+        }
+    }
+} place_kind
+
+/// The address a symbol defined in a placed section has.
+fn address_of(symbol: Symbol, placed: Slice[Option[u64]]) -> u64 {
+    let Some(section) = symbol.section else {
+        expect false
+        return 0
+    }
+    expect section < placed.len()
+    let Some(start) = placed[section] else {
+        expect false
+        return 0
+    }
+    return start + symbol.value
+} address_of
+
+/// Writes the value a relocation computes from its target at an address of the segment,
+/// recording an absolute address written.
+fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem::List[Absolute]) {
+    expect self.contains(at)
+    let offset = usize.widen(at - self.address)
+    let relative = target - i64.from_bits(at)
+    var bytes = mut self.bytes.view_mut()
+    match kind {
+        ABS64 => {
+            mut bytes.write_u64_le(offset, value: target.to_bits())
+            mut absolute.push(Absolute(address: at, width: 8))
+        }
+        ABS32 => {
+            let Some(address) = u32.checked_fit(target) else {
+                expect false
+                return
+            }
+            mut bytes.write_u32_le(offset, value: address)
+            mut absolute.push(Absolute(address: at, width: 4))
+        }
+        PC32 or PLT32 => {
+            let Some(displacement) = i32.checked_fit(relative) else {
+                expect false
+                return
+            }
+            mut bytes.write_u32_le(offset, value: displacement.to_bits())
+        }
+        else => {
+            expect false
+        }
+    }
+} Segment.relocate

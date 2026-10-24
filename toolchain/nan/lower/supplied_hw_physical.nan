@@ -1,0 +1,223 @@
+//! Physical memory: regions, the aligned frames carved from them, the page-table roots owning a frame, and the stores whose supply is a region's chunks. Each of these values is its memory's physical address, which the entry root maps at the same address, and a region its length too.
+
+/// The offsets of a region's base and length.
+const REGION_BASE: u64 = 0
+
+const REGION_LEN: u64 = 8
+
+/// `hw::Region`: its base and length, and `frames`, which appends each frame of a size lying
+/// wholly inside it.
+fn lower_region(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let held = supply.param(0).address_value()
+    let base = mut fx.load(PTR, addr: held, offset: REGION_BASE)
+    let len = mut fx.load(PTR, addr: held, offset: REGION_LEN)
+    match supply.member() {
+        "base" => supply.ret(mut lo, mut fx, held: Held.Scalar(base))
+        "byte_len" => supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+        "frames" => {
+            let size = size_arg(lo, supply, index: 0)
+            let frame_list = supply.param(1).address_value()
+            let rounded = mut fx.b.iadd_imm_s(base, y: i64.fit(size) - 1)
+            let head = mut fx.b.band_imm_s(rounded, y: -i64.fit(size))
+            let end = mut fx.b.iadd(base, y: len)
+            discard mut fx.repeat(Array[clif::Value, 1].filled(head).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+                expect current.len() > 0
+                let at = current[0]
+                let step = mut fx1.ptr(size)
+                let summed = mut fx1.b.uadd_overflow(at, y: step)
+                let past = summed.value
+                let fits = mut fx1.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: past, y: end)
+                let kept = mut fx1.b.bxor_imm_s(summed.flag, y: 1)
+                let inside = mut fx1.b.band(fits, y: kept)
+                mut fx1.if_true(inside, then: fn[mut lo](mut fx2: Fx) {
+                    physical_push_frame(mut lo, fx: mut fx2, list: frame_list, base: at)
+                })
+                var state = mem::List[clif::Value].empty(fx1.alloc)
+                mut state.push(past)
+                return Pass(again: inside, next: take state)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} lower_region
+
+/// `hw::PhysFrame[S]`: its base; `split` into frames of a smaller size T, in address order;
+/// `merge` of S ÷ T contiguous frames, the first S-aligned, else the parts back; a projection
+/// of an AnyBits value at an offset inside it; and the region of its memory.
+fn lower_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let size = size_arg(lo, supply, index: 0)
+    match supply.member() {
+        "base" => {
+            let base = cpu_word(mut fx, held: supply.param(0))
+            supply.ret(mut lo, mut fx, held: Held.Scalar(base))
+        }
+        "split" => {
+            let base = cpu_word(mut fx, held: supply.param(0))
+            let part = size_arg(lo, supply, index: 1)
+            let part_list = supply.param(1).address_value()
+            let zero_value = mut fx.ptr(0)
+            let count = mut fx.ptr(size / part)
+            mut fx.each(zero_value, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(part))
+                let at = mut fx1.b.iadd(base, y: offset)
+                physical_push_frame(mut lo, fx: mut fx1, list: part_list, base: at)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "merge" => merge(mut lo, mut fx, supply, size)
+        "contents_mut" => {
+            let base = cpu_word(mut fx, held: supply.param(0))
+            let value_ty = supply.type_arg(lo, index: 1)
+            let laid = mut lo.layout_of(value_ty)
+            let offset = cpu_word(mut fx, held: supply.param(1))
+            let room = mut fx.ptr(size.saturating_sub(laid.contents().size))
+            let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: offset, y: room)
+            var oversized: i64 = 0
+            if laid.contents().size > size {
+                oversized = 1
+            }
+            let too_large = mut fx.b.iconst(clif::Type.Int8, imm: oversized)
+            let low_bits = mut fx.b.band_imm_s(offset, y: i64.fit(at_least_one(laid.contents().align)) - 1)
+            let misaligned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: low_bits, y: 0)
+            let outside = mut fx.b.bor(beyond, y: misaligned)
+            let out = mut fx.b.bor(outside, y: too_large)
+            mut fx.if_true(out, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+            })
+            let at = mut fx.b.iadd(base, y: offset)
+            supply.ret(mut lo, mut fx, held: Held.Address(at))
+        }
+        "into_region" => {
+            let base = cpu_word(mut fx, held: supply.param(0))
+            let held = mut fx.slot(16, align: 8)
+            mut fx.store(base, addr: held, offset: REGION_BASE)
+            let len = mut fx.ptr(size)
+            mut fx.store(len, addr: held, offset: REGION_LEN)
+            let result = mut lo.held_at(mut fx, ty: supply.abi.result, address: held)
+            supply.ret(mut lo, mut fx, held: result)
+        }
+        else => {
+            expect false
+        }
+    }
+} lower_frame
+
+/// `PhysFrame[S].merge(take parts)`: `Ok` of the frame the parts make up when they are exactly
+/// S ÷ T contiguous frames in address order whose first is S-aligned, their list's storage then
+/// freed, and otherwise `Err` of the parts unchanged.
+fn merge(mut lo: Lowering, mut fx: Fx, supply: Supply, size: u64) {
+    let part = size_arg(lo, supply, index: 1)
+    let part_list = supply.param(0).address_value()
+    let result_ty = supply.abi.result
+    let len = mut fx.load(PTR, addr: part_list, offset: VECTOR_LEN)
+    let data = mut fx.load(PTR, addr: part_list, offset: VECTOR_DATA)
+    let counted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: len, y: i64.fit(size / part))
+    let heads = mut fx.choose(counted, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.load(PTR, addr: data, offset: 0))
+        return produced
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.ptr(0))
+        return produced
+    })
+    let head = heads[0]
+    let low_bits = mut fx.b.band_imm_s(head, y: i64.fit(size) - 1)
+    let on_boundary = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: low_bits, y: 0)
+    let aligned = mut fx.b.band(counted, y: on_boundary)
+    let whole_var = mut fx.variable(clif::Type.Int8, initial: aligned)
+    mut fx.if_true(aligned, then: fn(mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        let count = mut fx1.ptr(size / part)
+        mut fx1.each(one, end: count, body: fn(mut fx2: Fx, index: clif::Value) {
+            let slot_offset = mut fx2.b.imul_imm_s(index, y: 8)
+            let slot = mut fx2.b.iadd(data, y: slot_offset)
+            let base = mut fx2.load(PTR, addr: slot, offset: 0)
+            let offset = mut fx2.b.imul_imm_s(index, y: i64.fit(part))
+            let expected = mut fx2.b.iadd(head, y: offset)
+            let follows = mut fx2.b.icmp(clif::IntCC.Equal, x: base, y: expected)
+            let so_far = mut fx2.b.use_var(whole_var)
+            let still = mut fx2.b.band(so_far, y: follows)
+            mut fx2.b.def_var(whole_var, val: still)
+        })
+    })
+    let whole = mut fx.b.use_var(whole_var)
+    mut fx.if_true(whole, then: fn[mut lo](mut fx1: Fx) {
+        free_storage(mut lo, fx: mut fx1, address: part_list)
+        let frame = mut fx1.slot(8, align: 8)
+        mut fx1.store(head, addr: frame, offset: 0)
+        let ok = mut lo.variant_value(mut fx1, ty: result_ty, variant: "Ok", payload_values: Array[Held, 1].filled(Held.Address(frame)).view(), wrapped: None)
+        supply.ret(mut lo, fx: mut fx1, held: ok)
+    })
+    let err = mut lo.variant_value(mut fx, ty: result_ty, variant: "Err", payload_values: Array[Held, 1].filled(Held.Address(part_list)).view(), wrapped: None)
+    supply.ret(mut lo, mut fx, held: err)
+} merge
+
+/// `hw::PageTableRoot`: `of` takes ownership of a frame for a top-level table, `into_frame`
+/// gives it back.
+fn page_table_root(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" or "into_frame" => {
+            let base = cpu_word(mut fx, held: supply.param(0))
+            word_result(mut lo, mut fx, supply, value: base)
+        }
+        else => {
+            expect false
+        }
+    }
+} page_table_root
+
+/// The new root cell over a region a store's `over` takes: its supply is the 64 KiB-aligned
+/// chunks lying wholly inside the region, and its limit their total size.
+fn physical_region_cell(mut lo: Lowering, mut fx: Fx, region: Held) -> clif::Value {
+    let held = region.address_value()
+    let base = mut fx.load(PTR, addr: held, offset: REGION_BASE)
+    let len = mut fx.load(PTR, addr: held, offset: REGION_LEN)
+    let end = mut fx.b.iadd(base, y: len)
+    let rounded = mut fx.b.iadd_imm_s(base, y: i64.fit(MEMORY_CHUNK) - 1)
+    let head = mut fx.b.band_imm_s(rounded, y: -i64.fit(MEMORY_CHUNK))
+    let last = mut fx.b.band_imm_s(end, y: -i64.fit(MEMORY_CHUNK))
+    let some = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: head, y: last)
+    let span = mut fx.b.isub(last, y: head)
+    let zero_value = mut fx.ptr(0)
+    let chunked = mut fx.b.select(some, x: span, y: zero_value)
+    let count = mut fx.b.ushr_imm_s(chunked, y: 16)
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let cell = memory_region_cell(mut lo, mut fx, head, count)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    return cell
+} physical_region_cell
+
+/// Appends a frame at a base address to a list of frames, trapping when the list cannot grow.
+fn physical_push_frame(mut lo: Lowering, mut fx: Fx, list: clif::Value, base: clif::Value) {
+    let element = Element(size: 8, align: 8)
+    let len = mut fx.load(PTR, addr: list, offset: VECTOR_LEN)
+    let needed = mut fx.b.iadd_imm_s(len, y: 1)
+    let room = vector_reserve(mut lo, mut fx, address: list, needed, element)
+    let short = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+    mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let data = mut fx.load(PTR, addr: list, offset: VECTOR_DATA)
+    let at = element.at(mut fx, data, index: len)
+    mut fx.store(base, addr: at, offset: 0)
+    mut fx.store(needed, addr: list, offset: VECTOR_LEN)
+} physical_push_frame
+
+/// The frame size a const argument of the operation states.
+fn size_arg(lo: Lowering, supply: Supply, index: usize) -> u64 {
+    let args = lo.ck.types().arg_list(supply.args)
+    if index < args.len() {
+        match args[index] {
+            ty::Arg.Const(ty::Const.Int(size)) => return size.low_bits()
+            else => {}
+        }
+    }
+    expect false
+    return 0
+} size_arg

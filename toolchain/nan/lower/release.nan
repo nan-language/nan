@@ -1,0 +1,138 @@
+//! Release: what the end of a value's scope does. No user code runs; the memory and resources a value holds return, through the release of each part that holds any.
+
+/// Releases the value of a type at an address.
+fn Lowering.release(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value) {
+    if not mut self.needs_release(ty) {
+        return
+    }
+    let glue = mut self.instance(Instance.Release(ty))
+    let reference = mut self.func_ref(mut fx, id: glue)
+    discard mut fx.b.call(reference, args: Array[clif::Value, 1].filled(address).view())
+} Lowering.release
+
+/// Whether releasing a value of a type does anything.
+fn Lowering.needs_release(mut self, ty: ty::Ty) -> bool {
+    match self.releases.get(ty) {
+        Some(known) => return known
+        None => {}
+    }
+    discard mut self.releases.insert(ty, value: false)
+    let needed = mut self.compute_needs_release(ty)
+    discard mut self.releases.insert(ty, value: needed)
+    return needed
+} Lowering.needs_release
+
+fn Lowering.compute_needs_release(mut self, ty: ty::Ty) -> bool {
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if self.ck.has(ty, property: check::Property.Copy) or self.ck.has(ty, property: check::Property.View) {
+                return false
+            }
+            if self.ck.db().is_std(item) {
+                let owner_path = self.ck.db().canonical(item)
+                match base_needs_release(mut self, owner_path: owner_path.as_str(), ty) {
+                    Some(needed) => return needed
+                    None => {}
+                }
+            }
+            let laid = mut self.layout_of(ty)
+            let parts = laid_parts(laid.contents(), alloc: self.alloc)
+            for part in parts {
+                if mut self.needs_release(part) {
+                    return true
+                }
+            }
+            return false
+        }
+        ty::TyKind.Fn(id) => return self.ck.types().fn_of(id).kind == ast::FnKind.Task
+        else => return false
+    }
+} Lowering.compute_needs_release
+
+/// The types of the parts of a value laid out as `laid`: the fields of a record or bytes
+/// layout, those of every variant of an enum, or an array's element.
+fn laid_parts(laid: Layout, alloc: mem::Alloc) -> mem::List[ty::Ty] {
+    var parts = mem::List[ty::Ty].empty(alloc)
+    match laid.shape {
+        LayoutShape.Record(fields) or LayoutShape.Bytes(fields: fields, big: _) => {
+            for field in fields {
+                mut parts.push(field.ty)
+            }
+        }
+        LayoutShape.Enum(shape) => {
+            for variant in shape.variants {
+                for field in variant.fields {
+                    mut parts.push(field.ty)
+                }
+            }
+        }
+        LayoutShape.Array(element: element, count: _) => mut parts.push(element)
+        else => {}
+    }
+    return parts
+} laid_parts
+
+/// The release of a value of a type, at the address its one parameter holds.
+fn release_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty) {
+    let incoming = mut fx.entry()
+    expect incoming.len() > 0
+    let address = incoming[0]
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if lo.ck.db().is_std(item) and release_base(mut lo, mut fx, ty, address) {
+                mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+                return
+            }
+        }
+        ty::TyKind.Fn(_) => {
+            let env = mut fx.load(PTR, addr: address, offset: 8)
+            discard mut lo.call_routine(mut fx, routine: Routine.TaskEnvFree, args: Array[clif::Value, 1].filled(env).view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+            return
+        }
+        else => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Record(fields) or LayoutShape.Bytes(fields: fields, big: _) => {
+            for field in fields {
+                let at = mut fx.offset(address, offset: field.offset)
+                mut lo.release(mut fx, ty: field.ty, address: at)
+            }
+        }
+        LayoutShape.Array(element: element, count: count) => {
+            let element_laid = mut lo.layout_of(element)
+            let size = element_laid.contents().size
+            let start = mut fx.ptr(0)
+            let end = mut fx.ptr(count)
+            mut fx.each(start, end, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
+                let stride = mut pass_fx.ptr(size)
+                let offset = mut pass_fx.b.imul(index, y: stride)
+                let at = mut pass_fx.b.iadd(address, y: offset)
+                mut lo.release(mut pass_fx, ty: element, address: at)
+            })
+        }
+        LayoutShape.Enum(shape) => {
+            for variant in shape.variants {
+                var fields = mem::List[Field].empty(lo.alloc)
+                for field in variant.fields {
+                    if mut lo.needs_release(field.ty) {
+                        mut fields.push(field.copy(lo.alloc))
+                    }
+                }
+                if fields.len() == 0 {
+                    continue
+                }
+                let is = mut lo.variant_is(mut fx, address, ty, variant: variant.name.as_str())
+                mut fx.if_true(is, then: fn[mut lo](mut then_fx: Fx) {
+                    for field in fields {
+                        let at = mut then_fx.offset(address, offset: field.offset)
+                        mut lo.release(mut then_fx, ty: field.ty, address: at)
+                    }
+                })
+            }
+        }
+        else => {}
+    }
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} release_define

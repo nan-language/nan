@@ -144,6 +144,21 @@ fn lower_program(
     }
 }
 
+/// The symbol name and Cranelift text of each function the final build of the program at index
+/// `program` of the workspace lowers, in order of definition, none when its closure does not
+/// check.
+pub fn lowered_functions(workspace: &Workspace, program: usize) -> Vec<(String, String)> {
+    let source = &workspace.packages[program];
+    let std = crate::stdlib::packages();
+    let Some(checked) = workspace.closure_of(source) else {
+        return Vec::new();
+    };
+    let checker = check::checked(workspace, checked, std, source.program_target());
+    let root = package_id(&checker, source);
+    let artefacts = artefacts(workspace, &checker, root);
+    lower::dumping(|| lower_program(&checker, root, &artefacts)).1
+}
+
 /// A task a program or test image starts, as the measurements of the freeze read it: where its
 /// entry is written, its stack use in bytes or, when unbounded, the call that leaves it so,
 /// and the stack it gets.

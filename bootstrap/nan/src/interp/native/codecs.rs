@@ -3,7 +3,7 @@
 //! decoding reads a format through the calls of `core::Decoder`, in the order the std
 //! encodings and derived decoders make them.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::super::value::Val;
@@ -690,7 +690,7 @@ impl Decoding<'_, '_, '_, '_> {
                             .iter()
                             .map(|(name, ty)| (name.clone(), subst.ty(ty)))
                             .collect();
-                        self.record(&named, false, &HashMap::new())?
+                        self.record(&named, false, &BTreeMap::new())?
                     }
                     _ => return fail("Malformed"),
                 };
@@ -707,7 +707,7 @@ impl Decoding<'_, '_, '_, '_> {
         &mut self,
         named: &[(String, Ty)],
         open: bool,
-        aliases: &HashMap<Vec<u8>, Vec<u8>>,
+        aliases: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Decoded<Vec<Val>> {
         self.nest()?;
         self.reader.begin_record()?;

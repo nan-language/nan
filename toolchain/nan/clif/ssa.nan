@@ -1,0 +1,295 @@
+//! Construction of SSA form from variables, after Braun et al.: the value each use of a variable reads, with the block parameters merging definitions that differ.
+
+/// The SSA construction state of the function a builder builds.
+struct SsaBuilder {
+    /// The last definition of each variable in each block that has one.
+    variables: mem::HashMap[Definition, Value]
+    /// Each block's predecessors and sealing, by block index.
+    ssa_blocks: mem::List[SsaBlockData]
+    /// The steps the lookup state machine has left.
+    calls: mem::List[Call]
+    /// The values the lookup state machine has found.
+    results: mem::List[Value]
+    /// The blocks lookups have added instructions to, which the builder reads and clears.
+    side_effects: mem::List[Block]
+    alloc: mem::Alloc
+} SsaBuilder
+
+/// A variable in a block.
+struct Definition derives Copy, Eq, Hash {
+    variable: Variable
+    block: Block
+} Definition
+
+/// A block's branches in, whether all of them are known, the variables whose lookup waits until
+/// they are, and the block's predecessor when it is sealed with exactly one.
+struct SsaBlockData {
+    predecessors: mem::List[Inst]
+    sealed: bool
+    undef_variables: mem::List[Variable]
+    single_predecessor: Option[Block]
+} SsaBlockData
+
+/// A step of the lookup state machine: look a variable up at the end of the block holding a
+/// branch, or choose a looked-up block parameter's value from its predecessors' values.
+enum Call derives Copy {
+    UseVar(Inst)
+    FinishPredecessorsLookup(sentinel: Value, dest_block: Block)
+} Call
+
+/// A definition found, and the block holding it.
+struct Found derives Copy {
+    value: Value
+    block: Block
+} Found
+
+fn SsaBuilder.empty(alloc: mem::Alloc) -> SsaBuilder {
+    return SsaBuilder(
+        variables: mem::HashMap[Definition, Value].empty(seed: 0, alloc),
+        ssa_blocks: mem::List[SsaBlockData].empty(alloc),
+        calls: mem::List[Call].empty(alloc),
+        results: mem::List[Value].empty(alloc),
+        side_effects: mem::List[Block].empty(alloc),
+        alloc: alloc,
+    )
+} SsaBuilder.empty
+
+fn SsaBuilder.def_var(mut self, variable: Variable, value: Value, block: Block) {
+    discard mut self.variables.insert(Definition(variable: variable, block: block), value)
+} SsaBuilder.def_var
+
+/// The value of `variable` where `block` uses it. A variable no definition reaches reads zero.
+fn SsaBuilder.use_var(mut self, mut func: Function, variable: Variable, ty: Type, block: Block) -> Value {
+    mut self.use_var_nonlocal(mut func, variable, ty, block)
+    return mut self.run_state_machine(mut func, variable, ty)
+} SsaBuilder.use_var
+
+/// Leaves the value of `variable` in `block` on the result stack, or the steps finding it on the
+/// call stack, and records it in the blocks between `block` and its definition.
+fn SsaBuilder.use_var_nonlocal(mut self, mut func: Function, variable: Variable, ty: Type, block: Block) {
+    let known = self.variables.get(Definition(variable: variable, block: block))
+    match known {
+        Some(value) => {
+            mut self.results.push(value)
+            return
+        }
+        None => {}
+    }
+    let found = mut self.find_var(mut func, variable, ty, block)
+    var current = block
+    while current != found.block {
+        discard mut self.variables.insert(Definition(variable: variable, block: current), value: found.value)
+        expect usize.widen(current.index) < self.ssa_blocks.len()
+        let Some(predecessor) = self.ssa_blocks[usize.widen(current.index)].single_predecessor else {
+            expect false
+            return
+        }
+        current = predecessor
+    }
+} SsaBuilder.use_var_nonlocal
+
+/// The most recent definition of `variable` along the single-predecessor edges from `block`, or
+/// else a new parameter of the block where those edges end, whose predecessors are looked up now
+/// when that block is sealed, and once it is sealed otherwise.
+fn SsaBuilder.find_var(mut self, mut func: Function, variable: Variable, ty: Type, block: Block) -> Found {
+    var visited = mem::Set[Block].empty(self.alloc)
+    var current = block
+    loop {
+        expect usize.widen(current.index) < self.ssa_blocks.len()
+        let Some(predecessor) = self.ssa_blocks[usize.widen(current.index)].single_predecessor else {
+            break
+        }
+        let first_visit = mut visited.insert(current)
+        if not first_visit {
+            break
+        }
+        current = predecessor
+        let known = self.variables.get(Definition(variable: variable, block: current))
+        let Some(value) = known else {
+            continue
+        }
+        mut self.results.push(value)
+        return Found(value: value, block: current)
+    }
+    let value = mut func.dfg.append_block_param(current, ty)
+    discard mut self.variables.insert(Definition(variable: variable, block: current), value)
+    let index = usize.widen(current.index)
+    if self.ssa_blocks[index].sealed {
+        mut self.begin_predecessors_lookup(value, dest_block: current)
+    } else {
+        mut (mut self.ssa_blocks.at_mut(index)).undef_variables.push(variable)
+        mut self.results.push(value)
+    }
+    return Found(value: value, block: current)
+} SsaBuilder.find_var
+
+fn SsaBuilder.declare_block(mut self, block: Block) {
+    while self.ssa_blocks.len() <= usize.widen(block.index) {
+        mut self.ssa_blocks.push(SsaBlockData(
+            predecessors: mem::List[Inst].empty(self.alloc),
+            sealed: false,
+            undef_variables: mem::List[Variable].empty(self.alloc),
+            single_predecessor: None,
+        ))
+    }
+} SsaBuilder.declare_block
+
+/// Records the branch `inst` as a predecessor of `block`.
+fn SsaBuilder.declare_block_predecessor(mut self, block: Block, inst: Inst) {
+    expect usize.widen(block.index) < self.ssa_blocks.len()
+    mut (mut self.ssa_blocks.at_mut(usize.widen(block.index))).predecessors.push(inst)
+} SsaBuilder.declare_block_predecessor
+
+fn SsaBuilder.seal_block(mut self, block: Block, mut func: Function) {
+    mut self.seal_one_block(block, mut func)
+} SsaBuilder.seal_block
+
+/// Seals every block not sealed yet, in block order.
+fn SsaBuilder.seal_all_blocks(mut self, mut func: Function) {
+    for index in 0..<self.ssa_blocks.len() {
+        mut self.seal_one_block(Block(index: u32.fit(index)), mut func)
+    }
+} SsaBuilder.seal_all_blocks
+
+/// Declares every predecessor of `block` known, and looks up the variables whose lookup waited
+/// for that in the order their parameters were added.
+fn SsaBuilder.seal_one_block(mut self, block: Block, mut func: Function) {
+    let index = usize.widen(block.index)
+    expect index < self.ssa_blocks.len()
+    if self.ssa_blocks[index].sealed {
+        return
+    }
+    var undef_variables = mem::List[Variable].empty(self.alloc)
+    for variable in self.ssa_blocks[index].undef_variables {
+        mut undef_variables.push(variable)
+    }
+    var data = mut self.ssa_blocks.at_mut(index)
+    data.sealed = true
+    mut data.undef_variables.truncate(0)
+    if data.predecessors.len() == 1 {
+        data.single_predecessor = func.laid.inst_block(data.predecessors[0])
+    }
+    var remaining = undef_variables.len()
+    for variable in undef_variables {
+        let params = func.dfg.block_params(block)
+        expect remaining > 0 and params.len() >= remaining
+        let value = params[params.len() - remaining]
+        mut self.begin_predecessors_lookup(value, dest_block: block)
+        let ty = func.dfg.value_type(value)
+        discard mut self.run_state_machine(mut func, variable, ty)
+        remaining -= 1
+    }
+} SsaBuilder.seal_one_block
+
+/// Schedules the lookup of the value `sentinel`, a parameter of `dest_block`, stands for: a
+/// lookup at each predecessor in order, then the choice among their values.
+fn SsaBuilder.begin_predecessors_lookup(mut self, sentinel: Value, dest_block: Block) {
+    mut self.calls.push(Call.FinishPredecessorsLookup(sentinel: sentinel, dest_block: dest_block))
+    let index = usize.widen(dest_block.index)
+    expect index < self.ssa_blocks.len()
+    let predecessors = self.ssa_blocks[index].predecessors.view()
+    for back in 0..<predecessors.len() {
+        mut self.calls.push(Call.UseVar(predecessors[predecessors.len() - 1 - back]))
+    }
+} SsaBuilder.begin_predecessors_lookup
+
+/// The value the parameter `sentinel` of `dest_block` stands for, from the values its
+/// predecessors pass, which the result stack holds: their one value, the parameter removed and
+/// made its alias, when they agree; zero when none reaches; else the parameter, each predecessor
+/// passing its value.
+fn SsaBuilder.finish_predecessors_lookup(mut self, mut func: Function, sentinel: Value, dest_block: Block) -> Value {
+    let index = usize.widen(dest_block.index)
+    expect index < self.ssa_blocks.len()
+    let num_predecessors = self.ssa_blocks[index].predecessors.len()
+    expect self.results.len() >= num_predecessors
+    let start = self.results.len() - num_predecessors
+    var unique: Option[Value] = None
+    var agree = true
+    for position in start..<self.results.len() {
+        let resolved = func.dfg.resolve_aliases(self.results[position])
+        if resolved == sentinel {
+            continue
+        }
+        let seen = unique
+        match seen {
+            Some(value) => {
+                if value != resolved {
+                    agree = false
+                }
+            }
+            None => {
+                unique = Some(resolved)
+            }
+        }
+    }
+    if unique.is_none() {
+        if not func.laid.is_block_inserted(dest_block) {
+            mut func.laid.append_block(dest_block)
+        }
+        mut self.side_effects.push(dest_block)
+        let ty = func.dfg.value_type(sentinel)
+        unique = Some(emit_zero(ty, mut func, block: dest_block))
+    }
+    let chosen = unique
+    match chosen {
+        Some(pred_val) => {
+            if agree {
+                mut self.results.truncate(start)
+                mut func.dfg.remove_block_param(sentinel)
+                mut func.dfg.change_to_alias(sentinel, src: pred_val)
+                return pred_val
+            }
+        }
+        None => {}
+    }
+    for position in start..<self.results.len() {
+        let branch = self.ssa_blocks[index].predecessors[position - start]
+        mut func.dfg.append_branch_argument(branch, block: dest_block, value: self.results[position])
+    }
+    mut self.results.truncate(start)
+    return sentinel
+} SsaBuilder.finish_predecessors_lookup
+
+/// Runs the scheduled steps of the lookup of `variable`, and gives the value found.
+fn SsaBuilder.run_state_machine(mut self, mut func: Function, variable: Variable, ty: Type) -> Value {
+    loop {
+        let Some(call) = mut self.calls.pop() else {
+            break
+        }
+        match call {
+            Call.UseVar(branch) => {
+                let Some(block) = func.laid.inst_block(branch) else {
+                    expect false
+                    continue
+                }
+                mut self.use_var_nonlocal(mut func, variable, ty, block)
+            }
+            Call.FinishPredecessorsLookup(sentinel: sentinel, dest_block: dest_block) => {
+                let value = mut self.finish_predecessors_lookup(mut func, sentinel, dest_block)
+                mut self.results.push(value)
+            }
+        }
+    }
+    expect self.results.len() == 1
+    let Some(value) = mut self.results.pop() else {
+        expect false
+        return Value(index: 0)
+    }
+    return value
+} SsaBuilder.run_state_machine
+
+/// Instructions at the first insertion point of `block` giving zero of type `ty`, for a variable
+/// read where no definition reaches.
+fn emit_zero(ty: Type, mut func: Function, block: Block) -> Value {
+    let before = func.laid.first_inst(block)
+    let data = match ty {
+        Type.Int128 => {
+            let zero = mut func.insert_inst(InstructionData.UnaryImm(opcode: Opcode.Iconst, imm: 0), ctrl_typevar: Type.Int64, block, before)
+            return mut func.insert_inst(InstructionData.Unary(opcode: Opcode.Uextend, arg: zero), ctrl_typevar: ty, block, before)
+        }
+        Type.Float32 => InstructionData.UnaryIeee32(opcode: Opcode.F32const, bits: 0)
+        Type.Float64 => InstructionData.UnaryIeee64(opcode: Opcode.F64const, bits: 0)
+        else => InstructionData.UnaryImm(opcode: Opcode.Iconst, imm: 0)
+    }
+    return mut func.insert_inst(take data, ctrl_typevar: ty, block, before)
+} emit_zero

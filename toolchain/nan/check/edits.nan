@@ -1,0 +1,146 @@
+//! The edits of the editing commands: an item's identity, and the replacements renaming or moving an item or member across the workspace.
+
+/// The identity of the item holding a line of a workspace file: its name, or an impl line's
+/// canonical path, a tombstone's old form or a const assert's item hash.
+pkg fn Session.identity(self, path: Str, line: u32) -> Option[text::String] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let Some(at) = held.file(path) else {
+        return None
+    }
+    let Some(closure) = held.closure_of(at.package_index) else {
+        return None
+    }
+    let Some(source) = held.packages.get(at.package_index) else {
+        expect false
+        return None
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return None
+    }
+    let checker = self.unchecked(closure, target)
+    let db = checker.db()
+    var found: Option[ty::ItemId] = None
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.item_file(item).path.as_str() != path {
+            continue
+        }
+        let syntax = db.syntax(item)
+        let data = db.item(item)
+        expect data.index < syntax.items.len()
+        if syntax.item_lines(syntax.items[data.index]).contains(line) {
+            found = Some(item)
+            break
+        }
+    }
+    let Some(item) = found else {
+        return None
+    }
+    return match db.ast(item).kind {
+        ast::ItemKind.Impl(_) => checker.canonical_path(item)
+        ast::ItemKind.Retired(_) => checker.own_path(item)
+        ast::ItemKind.ConstAssert(_) => Some(checker.hashes(item).item.full(alloc))
+        else => db.ast(item).name(alloc)
+    }
+} Session.identity
+
+/// The edit renaming the item or member declared on lines of a workspace file to `name`: each
+/// span writing its name rewritten, and for a field or variant of a type deriving `Encode` the
+/// rename tombstone after the type.
+pkg fn Session.renamed(self, path: Str, lines: core::Range[u32], name: Str) -> Option[diagnostic::Fix] {
+    let alloc = self.alloc
+    var spans = mem::Set[Span].empty(alloc)
+    var tombstone: Option[diagnostic::Edit] = None
+    var found = false
+    for held in self.closures_checked() {
+        let checker = held.checker
+        let Some(target) = checker.target_at(path, lines) else {
+            continue
+        }
+        found = true
+        for span in take checker.name_spans(target) {
+            discard mut spans.insert(take span)
+        }
+        match target {
+            RenameTarget.Field(owner: owner, name: old) or RenameTarget.Variant(owner: owner, name: old) => {
+                match checker.encode_tombstone(owner, old: old.as_str(), name) {
+                    Some(edit) => {
+                        tombstone = Some(take edit)
+                    }
+                    None => {}
+                }
+            }
+            else => {}
+        }
+    }
+    if not found {
+        return None
+    }
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    for span in spans {
+        mut edits.push(diagnostic::Edit(path: text::String.of(span.path.as_str(), alloc), replacement: diagnostic::Replacement(start: span.start, end: span.end, text: text::String.of(name, alloc))))
+    }
+    match tombstone {
+        Some(edit) => mut edits.push(take edit)
+        None => {}
+    }
+    return Some(diagnostic::Fix(edits: take edits))
+} Session.renamed
+
+/// The rename tombstone a field or variant of a type deriving `Encode` needs, after the type;
+/// none for a member of another type.
+fn Checker.encode_tombstone(self, owner: ty::ItemId, old: Str, name: Str) -> Option[diagnostic::Edit] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let derives_encode = match db.ast(owner).kind {
+        ast::ItemKind.Struct(structure) => names_encode(structure.derived.view())
+        ast::ItemKind.Enum(enumeration) => names_encode(enumeration.derived.view())
+        else => false
+    }
+    if not derives_encode {
+        return None
+    }
+    let syntax = db.syntax(owner)
+    let data = db.item(owner)
+    expect data.index < syntax.items.len()
+    let at = line_start_after(syntax, line: syntax.item_lines(syntax.items[data.index]).high)
+    let owner_name = declared_name_of(db.ast(owner), alloc)
+    var written = text::String.of("\nretired ", alloc)
+    mut written.append(owner_name.as_str())
+    mut written.push('.')
+    mut written.append(old)
+    mut written.append(" => ")
+    mut written.append(owner_name.as_str())
+    mut written.push('.')
+    mut written.append(name)
+    mut written.append(" preserves\n")
+    return Some(diagnostic::Edit(path: text::String.of(db.item_file(owner).path.as_str(), alloc), replacement: diagnostic::Replacement(start: at, end: at, text: take written)))
+} Checker.encode_tombstone
+
+/// The edit moving the item declared on lines of a workspace file into the module of its package
+/// named `module`: none when the lines declare nothing, an error when the move is invalid.
+pkg fn Session.moved(self, path: Str, lines: core::Range[u32], module: Str) -> Option[Result[Move, Unit]] {
+    let held = self.workspace.contents()
+    let Some(at) = held.file(path) else {
+        return None
+    }
+    let Some(closure) = held.closure_of(at.package_index) else {
+        return None
+    }
+    let Some(source) = held.packages.get(at.package_index) else {
+        expect false
+        return None
+    }
+    let Some(target) = check_targets(source, alloc: self.alloc).get(0) else {
+        return None
+    }
+    let checker = self.checked(closure, target)
+    let Some(declared) = checker.target_at(path, lines) else {
+        return None
+    }
+    let Some(made) = checker.moving(declared, module) else {
+        return Some(Err(Unit))
+    }
+    return Some(Ok(take made))
+} Session.moved

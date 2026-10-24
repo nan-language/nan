@@ -1,0 +1,166 @@
+//! The ports the machine descriptors name: the 16550 serial port reports and test frames are written to, the exit port that ends the emulator, and the emulator's configuration device, from which a test image reads the texts naming its run.
+
+/// The serial and exit ports the descriptor names for a machine target.
+const SERIAL_PORT: u64 = 0x3F8
+
+const EXIT_PORT: u64 = 0xF4
+
+/// The writes programming the serial port's UART, each a register's offset and its value: no
+/// interrupts, the divisor latch open, divisor 1, then 8N1 with the latch closed, the FIFOs on
+/// and cleared, and the modem lines raised with loopback off.
+const SERIAL_SETUP: Array[RegisterWrite, 7] = listed_serial_setup()
+
+fn listed_serial_setup() -> Array[RegisterWrite, 7] {
+    var listed = Array[RegisterWrite, 7].filled(RegisterWrite(register: 1, value: 0x00))
+    listed[1] = RegisterWrite(register: 3, value: 0x80)
+    listed[2] = RegisterWrite(register: 0, value: 0x01)
+    listed[3] = RegisterWrite(register: 1, value: 0x00)
+    listed[4] = RegisterWrite(register: 3, value: 0x03)
+    listed[5] = RegisterWrite(register: 2, value: 0xC7)
+    listed[6] = RegisterWrite(register: 4, value: 0x03)
+    return listed
+} listed_serial_setup
+
+/// A value written to a register at an offset.
+struct RegisterWrite derives Copy {
+    register: u64
+    value: u64
+} RegisterWrite
+
+/// The UART's line status register and its bit set while the transmitter holds no byte.
+const LINE_STATUS: u64 = 5
+
+const TRANSMITTER_EMPTY: i64 = 0x20
+
+/// Programs the 16550 UART at the serial port: 115200 baud, 8 data bits, no parity and one
+/// stop bit, its FIFOs on, its interrupts and loopback off.
+fn Lowering.serial_init(mut self, mut fx: Fx) {
+    for setup in SERIAL_SETUP {
+        expect setup.register < 8
+        let port = mut fx.ptr(SERIAL_PORT + setup.register)
+        let value = mut fx.ptr(setup.value)
+        mut self.port_out(mut fx, width: 1, port, value)
+    }
+} Lowering.serial_init
+
+/// Writes a byte range to the 16550 serial port, each byte once its transmitter holds none.
+fn Lowering.serial_write(mut self, mut fx: Fx, text: clif::Value, len: clif::Value) {
+    let port = mut fx.ptr(SERIAL_PORT)
+    let status = mut fx.ptr(SERIAL_PORT + LINE_STATUS)
+    let start = mut fx.ptr(0)
+    mut fx.each(start, end: len, body: fn[mut self](mut fx1: Fx, index: clif::Value) {
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            let line = mut self.port_in(mut fx2, width: 1, port: status)
+            let empty = mut fx2.b.band_imm_s(line, y: TRANSMITTER_EMPTY)
+            let busy = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: empty, y: 0)
+            return Pass(again: busy, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+        let at = mut fx1.b.iadd(text, y: index)
+        let loaded = mut fx1.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: at, offset: 0)
+        let byte = mut fx1.b.uextend(PTR, x: loaded)
+        mut self.port_out(mut fx1, width: 1, port, value: byte)
+    })
+} Lowering.serial_write
+
+/// Ends the machine through the exit port, which the emulator reads, then stops the processor
+/// with maskable interrupts disabled; `status` is the byte written. Nothing follows.
+fn Lowering.exit_machine(mut self, mut fx: Fx, status: clif::Value) {
+    let port = mut fx.ptr(EXIT_PORT)
+    mut self.port_out(mut fx, width: 1, port, value: status)
+    discard mut self.call_stub(mut fx, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx.alloc).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} Lowering.exit_machine
+
+/// The emulator's configuration device: its selector and data ports, the selector of its file
+/// directory, and the bytes of a directory entry, which holds the file's size and selector
+/// big-endian, two reserved bytes and its NUL-padded name.
+const FW_CFG_SELECTOR: u64 = 0x510
+
+const FW_CFG_DATA: u64 = 0x511
+
+const FW_CFG_FILE_DIR: u64 = 0x19
+
+const FW_CFG_NAME: u64 = 56
+
+/// An emulator configuration file read into a runtime record: the record's address, and the
+/// file's length.
+struct FwCfgFile derives Copy {
+    address: clif::Value
+    len: clif::Value
+} FwCfgFile
+
+/// Reads the emulator's configuration file of a name into a runtime record: its address and
+/// length, a NUL following its bytes; the length is zero when the file is absent.
+fn Lowering.fw_cfg_file(mut self, mut fx: Fx, file_name: Str) -> FwCfgFile {
+    let selector = mut fx.ptr(FW_CFG_SELECTOR)
+    let directory = mut fx.ptr(FW_CFG_FILE_DIR)
+    mut self.port_out(mut fx, width: 2, port: selector, value: directory)
+    let count = mut self.fw_cfg_number(mut fx, width: 4)
+    var wanted_bytes = mem::Bytes.empty(self.alloc)
+    mut wanted_bytes.append(file_name.as_bytes())
+    mut wanted_bytes.push(0)
+    let wanted_len = mut fx.ptr(u64.widen(wanted_bytes.len()))
+    let literal = mut self.view_literal(mut fx, contents: wanted_bytes.view())
+    let wanted = mut fx.load(PTR, addr: literal.address_value(), offset: 0)
+    let dir_entry = mut fx.slot(FW_CFG_NAME, align: 8)
+    let zero_value = mut fx.ptr(0)
+    let size_var = mut fx.variable(PTR, initial: zero_value)
+    let select_var = mut fx.variable(PTR, initial: zero_value)
+    mut fx.each(zero_value, end: count, body: fn[mut self](mut fx1: Fx, file_index: clif::Value) {
+        let file_size = mut self.fw_cfg_number(mut fx1, width: 4)
+        let file_select = mut self.fw_cfg_number(mut fx1, width: 2)
+        discard mut self.fw_cfg_number(mut fx1, width: 2)
+        let data = mut fx1.ptr(FW_CFG_DATA)
+        let start = mut fx1.ptr(0)
+        let end = mut fx1.ptr(FW_CFG_NAME)
+        mut fx1.each(start, end, body: fn[mut self](mut fx2: Fx, index: clif::Value) {
+            let read = mut self.port_in(mut fx2, width: 1, port: data)
+            let byte = mut fx2.b.ireduce(clif::Type.Int8, x: read)
+            let at = mut fx2.b.iadd(dir_entry, y: index)
+            mut fx2.store(byte, addr: at, offset: 0)
+        })
+        var args = Array[clif::Value, 3].filled(dir_entry)
+        args[1] = wanted
+        args[2] = wanted_len
+        let compared = mut self.call_routine(mut fx1, routine: Routine.Compare, args: args.view())
+        expect compared.len() > 0
+        let same = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: compared[0], y: 0)
+        mut fx1.if_true(same, then: fn(mut fx2: Fx) {
+            mut fx2.b.def_var(size_var, val: file_size)
+            mut fx2.b.def_var(select_var, val: file_select)
+        })
+    })
+    let size = mut fx.b.use_var(size_var)
+    let select = mut fx.b.use_var(select_var)
+    let room = mut fx.b.iadd_imm_s(size, y: 1)
+    let record = mut self.record_alloc(mut fx, size: room)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut self](mut fx1: Fx) {
+        system_unavailable(mut self, fx: mut fx1)
+    })
+    let exists = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: size, y: 0)
+    mut fx.if_true(exists, then: fn[mut self](mut fx1: Fx) {
+        mut self.port_out(mut fx1, width: 2, port: selector, value: select)
+        let data = mut fx1.ptr(FW_CFG_DATA)
+        let start = mut fx1.ptr(0)
+        mut fx1.each(start, end: size, body: fn[mut self](mut fx2: Fx, index: clif::Value) {
+            let read = mut self.port_in(mut fx2, width: 1, port: data)
+            let byte = mut fx2.b.ireduce(clif::Type.Int8, x: read)
+            let at = mut fx2.b.iadd(record, y: index)
+            mut fx2.store(byte, addr: at, offset: 0)
+        })
+    })
+    return FwCfgFile(address: record, len: size)
+} Lowering.fw_cfg_file
+
+/// A big-endian number of `width` bytes read from the configuration device's data port.
+fn Lowering.fw_cfg_number(mut self, mut fx: Fx, width: u64) -> clif::Value {
+    let data = mut fx.ptr(FW_CFG_DATA)
+    var value = mut fx.ptr(0)
+    for _ in 0..<width {
+        let byte = mut self.port_in(mut fx, width: 1, port: data)
+        let shifted = mut fx.b.ishl_imm_s(value, y: 8)
+        value = mut fx.b.bor(shifted, y: byte)
+    }
+    return value
+} Lowering.fw_cfg_number

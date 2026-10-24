@@ -1,0 +1,491 @@
+//! Releases compared at publishing: whether each change a release makes to the interface form of an exported item of its parent is one the compatible changes list for every role the item has, and the encode class, from the schema trees of the exported types implementing `Encode`.
+
+/// What comparing an item's interface texts leaves to judge: nothing for a breaking change, or
+/// the contract and the examples of a function whose head is compatible.
+enum CompatibleJudging {
+    Breaking
+    Compatible
+    Function(contract: Option[machine::Accepted], examples: mem::List[text::String])
+} CompatibleJudging
+
+/// An item whose contract a release changes, by canonical path, and its weakening to judge.
+struct ContractJudged {
+    path: text::String
+    weakened: Weakened
+} ContractJudged
+
+/// An item whose examples a release drops, by canonical path, and the function running them.
+struct ExamplesJudged {
+    path: text::String
+    function: Synthetic
+} ExamplesJudged
+
+/// The canonical paths of the exported items of the release that the workspace package at
+/// `index` is, whose interface form differs from their parent's only by compatible changes,
+/// `parent` and `release_exported` giving the two releases' exported entries.
+pkg fn Session.compatible(self, index: usize, parent: mem::Map[text::String, machine::ApiEntry], release_exported: mem::Map[text::String, machine::ApiEntry]) -> mem::Set[text::String] {
+    let alloc = self.alloc
+    var compatible = mem::Set[text::String].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(closure) = held.closure_of(index) else {
+        return compatible
+    }
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return compatible
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return compatible
+    }
+    let checker = self.checked(closure, target)
+    let items = checker.reported_by_path()
+    var contracts = mem::List[ContractJudged].empty(alloc)
+    var examples = mem::List[ExamplesJudged].empty(alloc)
+    for entry in release_exported {
+        let path = entry.key().as_str()
+        let Some(old) = parent.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+            continue
+        }
+        let Some(item) = items.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+            continue
+        }
+        let new = entry.value()
+        if old.interface_hash == new.interface_hash {
+            continue
+        }
+        match checker.judging(item, old, new) {
+            CompatibleJudging.Breaking => {}
+            CompatibleJudging.Compatible => {
+                discard mut compatible.insert(text::String.of(path, alloc))
+            }
+            CompatibleJudging.Function(contract: contract, examples: old_examples) => {
+                match contract {
+                    Some(accepted) => {
+                        mut contracts.push(ContractJudged(path: text::String.of(path, alloc), weakened: Weakened(ck: checker.share(), item: item, accepted: accepted.copy(alloc), later: None)))
+                    }
+                    None => {}
+                }
+                if old_examples.len() > 0 {
+                    let number = examples.len()
+                    mut examples.push(ExamplesJudged(path: text::String.of(path, alloc), function: examples_function(checker, item, examples: old_examples.view(), number)))
+                }
+                discard mut compatible.insert(text::String.of(path, alloc))
+            }
+        }
+    }
+    self.judge_compatible(index, compatible: mut compatible, contracts: contracts.view(), examples: examples.view())
+    return compatible
+} Session.compatible
+
+/// Removes from `compatible` each item whose changed contract entailment does not clear, and
+/// each whose dropped examples do not all hold against the release.
+fn Session.judge_compatible(self, index: usize, mut compatible: mem::Set[text::String], contracts: Slice[ContractJudged], examples: Slice[ExamplesJudged]) {
+    let alloc = self.alloc
+    var weakened = mem::List[Weakened].empty(alloc)
+    for judged in contracts {
+        mut weakened.push(Weakened(ck: judged.weakened.ck.share(), item: judged.weakened.item, accepted: judged.weakened.accepted.copy(alloc), later: None))
+    }
+    let left = self.left(index, weakened: weakened.view())
+    var position: usize = 0
+    for contract in contracts {
+        invariant position < contracts.len()
+        if position < left.len() and left[position].len() > 0 {
+            discard mut compatible.remove(contract.path)
+        }
+        position += 1
+    }
+    var functions = mem::List[Synthetic].empty(alloc)
+    for judged in examples {
+        mut functions.push(Synthetic(dir: text::String.of(judged.function.dir.as_str(), alloc), path: text::String.of(judged.function.path.as_str(), alloc), text: text::String.of(judged.function.text.as_str(), alloc)))
+    }
+    let outcomes = self.judge(index, functions: functions.view())
+    for at in 0..<examples.len() {
+        if at >= outcomes.len() {
+            break
+        }
+        let failed = match outcomes[at] {
+            Some(outcome) => outcome.failed
+            None => true
+        }
+        if failed {
+            discard mut compatible.remove(examples[at].path)
+        }
+    }
+} Session.judge_compatible
+
+/// The items a check reports on that are not tombstones of a history, by canonical path.
+fn Checker.reported_by_path(self) -> mem::Map[text::String, ty::ItemId] {
+    let db = self.db()
+    var items = mem::Map[text::String, ty::ItemId].empty(self.alloc())
+    for position in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(position))
+        if not db.is_reported(item) or db.in_history(item) {
+            continue
+        }
+        let Some(path) = self.canonical_path(item) else {
+            continue
+        }
+        discard mut items.insert(take path, value: item)
+    }
+    return items
+} Checker.reported_by_path
+
+/// The lines of an entry's interface text after its head that start, once trimmed, with a
+/// clause keyword.
+fn clauses_of(entry: machine::ApiEntry, keyword: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    for index in 1..<entry.text.len() {
+        let line = entry.text[index].as_str()
+        let kept = platform::trimmed_run(line)
+        let Some(trimmed) = line.slice_bytes(kept.start, end: kept.end) else {
+            continue
+        }
+        if trimmed.starts_with(keyword) {
+            mut found.push(text::String.of(trimmed, alloc))
+        }
+    }
+    return found
+} clauses_of
+
+/// Whether lines all lie in an entry's interface text.
+fn held_lines(lines: Slice[text::String], entry: machine::ApiEntry) -> bool {
+    for line in lines {
+        if entry.text.position(fn(held: text::String) => held == line).is_none() {
+            return false
+        }
+    }
+    return true
+} held_lines
+
+/// What an item's old and new interface texts leave to judge.
+fn Checker.judging(self, item: ty::ItemId, old: machine::ApiEntry, new: machine::ApiEntry) -> CompatibleJudging {
+    let alloc = self.alloc()
+    let Some(old_head) = old.text.get(0) else {
+        return CompatibleJudging.Breaking
+    }
+    let Some(new_head) = new.text.get(0) else {
+        return CompatibleJudging.Breaking
+    }
+    for promise in old.promises {
+        if new.promises.position(fn(held: machine::Promise) => held == promise).is_none() {
+            return CompatibleJudging.Breaking
+        }
+    }
+    if old.text == new.text {
+        return CompatibleJudging.Compatible
+    }
+    let sig = self.sig(item)
+    match sig.contents().kind {
+        SigKind.Fn(_) => return function_judging(old, new, old_head: old_head.as_str(), new_head: new_head.as_str(), alloc)
+        SigKind.Enum(variants: _) => {
+            if opened_type(old_head.as_str(), new: new_head.as_str()) and held_lines(old.text.view(), entry: new) {
+                return CompatibleJudging.Compatible
+            }
+            return CompatibleJudging.Breaking
+        }
+        SigKind.Struct(fields: fields) => {
+            if not opened_type(old_head.as_str(), new: new_head.as_str()) or not held_lines(old.text.view(), entry: new) {
+                return CompatibleJudging.Breaking
+            }
+            if self.added_fields_defaulted(old, new, encoded: new_head.find("Encode").is_some(), fields: fields.view()) {
+                return CompatibleJudging.Compatible
+            }
+            return CompatibleJudging.Breaking
+        }
+        SigKind.Interface(methods: _) => {
+            if old_head != new_head or not held_lines(old.text.view(), entry: new) or new.text.len() < 2 {
+                return CompatibleJudging.Breaking
+            }
+            for index in 1..<(new.text.len() - 1) {
+                let line = new.text[index]
+                if old.text.position(fn(held: text::String) => held == line).is_none() and not line.ends_with(" default") {
+                    return CompatibleJudging.Breaking
+                }
+            }
+            if self.dyn_usable(item) {
+                return CompatibleJudging.Compatible
+            }
+            return CompatibleJudging.Breaking
+        }
+        else => return CompatibleJudging.Breaking
+    }
+} Checker.judging
+
+/// What a function's old and new interface texts leave to judge: breaking unless its head keeps
+/// its form and limits, adding none but `stack`; else its old contract when the new differs, and
+/// its old examples the new drops.
+fn function_judging(old: machine::ApiEntry, new: machine::ApiEntry, old_head: Str, new_head: Str, alloc: mem::Alloc) -> CompatibleJudging {
+    let old_split = split_limits(old_head, alloc)
+    let new_split = split_limits(new_head, alloc)
+    var kept = true
+    for limit in old_split.limit_words {
+        if new_split.limit_words.position(fn(held: text::String) => held == limit).is_none() {
+            kept = false
+        }
+    }
+    var stack_added = false
+    for limit in new_split.limit_words {
+        if old_split.limit_words.position(fn(held: text::String) => held == limit).is_none() and limit.starts_with("stack ") {
+            stack_added = true
+        }
+    }
+    if old_split.core != new_split.core or not kept or stack_added {
+        return CompatibleJudging.Breaking
+    }
+    var old_contract = clauses_of(old, keyword: "requires ", alloc)
+    for clause in take clauses_of(old, keyword: "ensures ", alloc) {
+        mut old_contract.push(take clause)
+    }
+    var new_contract = clauses_of(new, keyword: "requires ", alloc)
+    for clause in take clauses_of(new, keyword: "ensures ", alloc) {
+        mut new_contract.push(take clause)
+    }
+    var contract: Option[machine::Accepted] = None
+    if old_contract != new_contract {
+        var accepted = machine::Accepted.empty(alloc)
+        accepted.head = Some(text::String.of(old_split.core.as_str(), alloc))
+        accepted.clauses = old_contract
+        contract = Some(take accepted)
+    }
+    let new_examples = clauses_of(new, keyword: "example ", alloc)
+    var examples = mem::List[text::String].empty(alloc)
+    for example in take clauses_of(old, keyword: "example ", alloc) {
+        if new_examples.position(fn(held: text::String) => held == example).is_none() {
+            mut examples.push(take example)
+        }
+    }
+    return CompatibleJudging.Function(contract: take contract, examples: take examples)
+} function_judging
+
+/// Whether each line a struct's new interface text adds is a field defaulting to its type's
+/// default, when the struct derives `Encode`.
+fn Checker.added_fields_defaulted(self, old: machine::ApiEntry, new: machine::ApiEntry, encoded: bool, fields: Slice[FieldSig]) -> bool {
+    if not encoded {
+        return true
+    }
+    let default = self.db().core_item("Default")
+    for line in new.text {
+        if old.text.position(fn(held: text::String) => held == line).is_some() {
+            continue
+        }
+        let kept = platform::trimmed_run(line.as_str())
+        var start = kept.start
+        while starts_with_pub(line.as_str(), start, end: kept.end) {
+            expect start <= kept.end and kept.end - start >= 4
+            start += 4
+        }
+        let Some(declared) = line.as_str().slice_bytes(start, end: kept.end) else {
+            return false
+        }
+        let name_end = match declared.find(":") {
+            Some(at) => at
+            None => declared.byte_len()
+        }
+        let Some(written) = declared.slice_bytes(0, end: name_end) else {
+            return false
+        }
+        let trimmed = platform::trimmed_run(written)
+        let Some(name) = written.slice_bytes(trimmed.start, end: trimmed.end) else {
+            return false
+        }
+        var defaulted = false
+        for field in fields {
+            if field.name.as_str() != name {
+                continue
+            }
+            match default {
+                Some(interface_item) => {
+                    if self.implements(field.ty, interface_item) {
+                        defaulted = true
+                    }
+                }
+                None => {}
+            }
+        }
+        if not defaulted {
+            return false
+        }
+    }
+    return true
+} Checker.added_fields_defaulted
+
+/// Whether the bytes `start..end` of a line start with `pub `.
+fn starts_with_pub(line: Str, start: usize, end: usize) -> bool {
+    let Some(rest) = line.slice_bytes(start, end) else {
+        return false
+    }
+    return rest.starts_with("pub ")
+} starts_with_pub
+
+/// Whether a struct or enum keeps its declaration line and is open.
+fn opened_type(old: Str, new: Str) -> bool {
+    return old == new and new.find(" open ").is_some()
+} opened_type
+
+/// A function's head line without its limits, and its limits.
+struct LimitsSplit {
+    core: text::String
+    limit_words: mem::List[text::String]
+} LimitsSplit
+
+fn split_limits(head: Str, alloc: mem::Alloc) -> LimitsSplit {
+    var limit_words = mem::List[text::String].empty(alloc)
+    let Some(at) = head.find(" limits ") else {
+        return LimitsSplit(core: text::String.of(head, alloc), limit_words: take limit_words)
+    }
+    var core = text::String.empty(alloc)
+    match head.slice_bytes(0, end: at) {
+        Some(held) => mut core.append(held)
+        None => {}
+    }
+    expect head.byte_len() >= 8 and at <= head.byte_len() - 8
+    let Some(rest) = head.slice_bytes(at + 8, end: head.byte_len()) else {
+        return LimitsSplit(core: take core, limit_words: take limit_words)
+    }
+    var start: usize = 0
+    loop {
+        let Some(tail_text) = rest.slice_bytes(start, end: rest.byte_len()) else {
+            break
+        }
+        let Some(comma) = tail_text.find(", ") else {
+            mut limit_words.push(text::String.of(tail_text, alloc))
+            break
+        }
+        let Some(limit) = tail_text.slice_bytes(0, end: comma) else {
+            break
+        }
+        mut limit_words.push(text::String.of(limit, alloc))
+        expect comma <= ~0usize - 2 and start <= ~0usize - 2 - comma
+        start += comma + 2
+    }
+    return LimitsSplit(core: take core, limit_words: take limit_words)
+} split_limits
+
+/// A function of an item's module holding an item's old examples, whose check runs them against
+/// the release.
+fn examples_function(ck: Checker, item: ty::ItemId, examples: Slice[text::String], number: usize) -> Synthetic {
+    let alloc = ck.alloc()
+    var name = text::String.of("judged_examples_", alloc)
+    mut name.write(text::fmt("{number}", number), budget: 100)
+    var written = text::String.of("\nfn ", alloc)
+    mut written.append(name.as_str())
+    mut written.append("() -> bool\n")
+    for example in examples {
+        mut written.append("    ")
+        mut written.append(example.as_str())
+        mut written.push('\n')
+    }
+    mut written.append("{\n    return true\n} ")
+    mut written.append(name.as_str())
+    mut written.push('\n')
+    return Synthetic.beside(ck, item, name: name.as_str(), text: take written)
+} examples_function
+
+/// The encode class of the release the workspace package at `index` is against the parent its
+/// store entry holds: the worst class of the exported types implementing `Encode` in either,
+/// identical for an unchanged schema hash, additive for a new type or a new tree accepting the
+/// old one, breaking otherwise.
+pkg fn Session.encode_class(self, index: usize, parent: Option[mem::Shared[store::Entry]]) -> store::Class {
+    let alloc = self.alloc
+    let Some(held_parent) = parent else {
+        return store::Class.Additive
+    }
+    let held = self.workspace.contents()
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return store::Class.Breaking
+    }
+    let dir = source.dir.as_str()
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    for file in held_parent.contents().sources {
+        var path = text::String.of(dir, alloc)
+        mut path.push('/')
+        mut path.append(file.path.as_str())
+        var content = mem::Bytes.empty(alloc)
+        mut content.append(file.content.view())
+        mut files.push(artefact::SourceFile(path: take path, content: take content))
+    }
+    let Ok(published) = attempt workspace::Workspace.of_stored_files(held.root.as_str(), files: files.view(), given: cache::copied_override(self.home, alloc), grammar: self.grammar.contents(), alloc) else {
+        return store::Class.Breaking
+    }
+    let published_session = Session.of(mem::Shared.of(take published, alloc), std: self.std.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+    let new = self.encoded(index)
+    let old = published_session.encoded(0)
+    var class = store::Class.Identical
+    for entry in new {
+        let tree = entry.value()
+        let item_class = match old.get_by(fn(key: text::String) => key.as_str().cmp(entry.key().as_str())) {
+            None => store::Class.Additive
+            Some(held_tree) => tree_class(tree, old: held_tree, alloc)
+        }
+        if item_class > class {
+            class = item_class
+        }
+    }
+    for entry in old {
+        if new.get_by(fn(key: text::String) => key.as_str().cmp(entry.key().as_str())).is_none() {
+            class = store::Class.Breaking
+        }
+    }
+    return class
+} Session.encode_class
+
+/// The class of a type's new schema tree against its old one.
+fn tree_class(tree: SchemaNode, old: SchemaNode, alloc: mem::Alloc) -> store::Class {
+    if old.hash(alloc) == tree.hash(alloc) {
+        return store::Class.Identical
+    }
+    if tree.accepts(old) {
+        return store::Class.Additive
+    }
+    return store::Class.Breaking
+} tree_class
+
+/// The schema tree of each exported type implementing `Encode` of the workspace package at
+/// `index`, by canonical path.
+fn Session.encoded(self, index: usize) -> mem::Map[text::String, SchemaNode] {
+    let alloc = self.alloc
+    var trees = mem::Map[text::String, SchemaNode].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(source) = held.packages.get(index) else {
+        return trees
+    }
+    let Some(closure) = held.closure_of(index) else {
+        return trees
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return trees
+    }
+    let checker = self.checked(closure, target)
+    let Some(name) = source.name() else {
+        return trees
+    }
+    let Some(package_id) = checker.package_named(name) else {
+        return trees
+    }
+    let db = checker.db()
+    let Some(encode) = db.core_item("Encode") else {
+        return trees
+    }
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            let declared = db.ast(item)
+            let typed = match declared.kind {
+                ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => true
+                else => false
+            }
+            if not typed or declared.visibility != ast::Visibility.Pub or checker.sig(item).contents().generics.len() > 0 {
+                continue
+            }
+            let ty = checker.types().item(item, args: mem::List[ty::Arg].empty(alloc))
+            if not checker.implements(ty, interface_item: encode) {
+                continue
+            }
+            let Some(path) = checker.canonical_path(item) else {
+                continue
+            }
+            discard mut trees.insert(take path, value: checker.schema(ty))
+        }
+    }
+    return trees
+} Session.encoded

@@ -1,0 +1,561 @@
+//! The support routines: the fixed routines of the implementation that lowered code, compiler stubs and seams call, each named `_NS`, its routine's name, `_` and a suffix, with their state in the writable data object `_NSstate` and the thread-local `_NSthread`. `mem_op` copies, fills and compares; `cap_table` keeps the cells, chunks and capability tables; `stack_switch` keeps tasks, their stacks and the executors' run queues; `trap` writes trap reports and abandons domains; `settle` settles abandoned domains; `replay` runs the seeded scheduler of test images.
+
+/// A support routine.
+enum Routine derives Copy, Eq, Hash {
+    /// `(dst, src, len)`: copies bytes between ranges that may overlap.
+    Copy
+    /// `(dst, byte, len)`: writes one byte value over a range.
+    Fill
+    /// `(left, right, len) -> i32`: compares two ranges as unsigned bytes.
+    Compare
+    /// `(cell, size, align) -> address`: an allocation through an allocator in the running
+    /// task's domain, zero on exhaustion.
+    Alloc
+    /// `(cell, size, align, domain) -> address`: an allocation in a domain's chunks.
+    AllocIn
+    /// `(address)`: frees an allocation.
+    Free
+    /// `(size) -> address`: a zeroed runtime record of `size` bytes, zero on exhaustion.
+    RecordAlloc
+    /// `(address)`: frees a runtime record.
+    RecordFree
+    /// `(address, size) -> address`: a runtime record moved to `size` bytes, keeping its
+    /// leading bytes; zero on exhaustion, the record then unchanged.
+    RecordResize
+    /// `(cell, limit) -> cell`: a budget's new cell under an allocator's.
+    Split
+    /// `(cell)`: closes a cell.
+    Close
+    /// `(cell) -> bytes`: a cell's charge.
+    Charged
+    /// `(cell) -> bytes`: a cell's limit.
+    Limit
+    /// `(size) -> address`: the environment of a task closure, in runtime memory.
+    TaskEnv
+    /// `(address)`: frees a task closure's environment.
+    TaskEnvFree
+    /// `(address, domain) -> lifted`: passes the chunks an allocation lies in to a domain when
+    /// a domain nested in it owns them; nonzero when they passed.
+    Lift
+    /// `(kind, payload) -> holding`: a new holding the running task's domain owns.
+    Hold
+    /// `(holding)`: ends a holding released.
+    Unhold
+    /// `(holding, domain)`: passes a holding to a domain, or to none for zero.
+    Rehome
+    /// `(world)`: fills a root grant's capabilities and allocator.
+    MintRoot
+    /// `(handle) -> entry`: a capability's table entry, zero when stale.
+    Check
+    /// `(handle, kind) -> handle`: a new entry deriving from a capability's entry.
+    Derive
+    /// `(handle)`: revokes an entry and every entry deriving from it.
+    Revoke
+    /// `(runner, key, keyed) -> handle`: a new outbox of a runner.
+    OutboxMint
+    /// `(handle)`: makes an outbox stale.
+    OutboxRetire
+    /// `(handle) -> runner`: the runner of a live outbox, taking a reference to its record;
+    /// zero for a stale outbox.
+    OutboxClaim
+    /// `(kind, operands, count, caller) -> Never`: traps the running task.
+    TrapRaise
+    /// `(location) -> Never`: halts the kernel for a lock its CPU acquires again.
+    Reacquired
+    /// `(domain)`: settles an abandoned `sys::Domain` body.
+    Settle
+    /// `(signal, info, context)`: the handler of the stop signal.
+    Preempt
+    /// `(signal, info, context)`: the handler of a fault, which reports a stack overflow.
+    Overflow
+    /// `(signal, info, context)`: the handler of an exceeded processor time limit, which ends a
+    /// test run.
+    CpuLimit
+    /// `() -> Never`: traps with `trap.stack-overflow`, run on a thread's trap stack.
+    OverflowRaise
+    /// `(task) -> Never`: stops the running task, which a stop signal interrupted.
+    Stop
+    /// `(report, bits, how)`: writes a scalar in a trap report as its writing says.
+    ReportScalar
+    /// `(report, start, len, bytes)`: writes the bytes of a range in a trap report as a text
+    /// literal, or as a byte-string literal when `bytes` is not 0.
+    ReportText
+    /// `(text, len)`: writes bytes to standard error.
+    WriteErr
+    /// `(glue, code, env, extra, stack, cell, domain, region) -> task`: a new task, not yet
+    /// ready, its stack drawn through a cell; zero on exhaustion.
+    Spawn
+    /// `(task)`: makes a task ready.
+    Wake
+    /// `()`: suspends the running task until a wake.
+    Park
+    /// `(task)`: the first code a task runs on its own stack.
+    TaskStart
+    /// `(entry) -> (cancelled, result)`: submits an io_uring entry and waits for its
+    /// completion or its acknowledged cancellation.
+    IoSubmit
+    /// `() -> Never`: runs the executor's scheduler on the calling thread.
+    Schedule
+    /// `(thread) -> Never`: the start routine of an executor thread.
+    ThreadMain
+    /// `(size) -> region`: a cancelling construct's new record of `size` bytes, enclosed by
+    /// the running task's region.
+    RegionOpen
+    /// `(region)`: cancels a construct.
+    Cancel
+    /// `() -> origin`: the origin a cancellation of the running call holds, zero when no
+    /// construct holding it has cancelled.
+    Origin
+    /// `(held)`: releases the cowns an `await when` holds.
+    CownRelease
+    /// `(status) -> Never`: ends the process.
+    Exit
+    /// `()`: sets up the runtime, nonzero when it cannot.
+    Init
+    /// `(lock)`: takes a lock word.
+    Lock
+    /// `(lock)`: releases a lock word.
+    Unlock
+    /// `() -> thread`: the record of the executor thread running the caller, which a call
+    /// reads anew after each suspension as a task may resume on another thread.
+    Thread
+    /// `()`: a scheduling point of the running task on the seeded scheduler.
+    Yield
+    /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
+    Stream
+    /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
+    Draw
+} Routine
+
+/// The parameter and result types of a routine.
+struct RoutineTypes {
+    params: mem::List[clif::Type]
+    returns: mem::List[clif::Type]
+} RoutineTypes
+
+proj fn Routine.name(self) -> Str {
+    return match self {
+        Routine.Copy => "_NSmem_op_copy"
+        Routine.Fill => "_NSmem_op_fill"
+        Routine.Compare => "_NSmem_op_compare"
+        Routine.Alloc => "_NScap_table_alloc"
+        Routine.AllocIn => "_NScap_table_alloc_in"
+        Routine.Free => "_NScap_table_free"
+        Routine.RecordAlloc => "_NScap_table_record_alloc"
+        Routine.RecordFree => "_NScap_table_record_free"
+        Routine.RecordResize => "_NScap_table_record_resize"
+        Routine.Split => "_NScap_table_split"
+        Routine.Close => "_NScap_table_close"
+        Routine.Charged => "_NScap_table_charged"
+        Routine.Limit => "_NScap_table_limit"
+        Routine.TaskEnv => "_NScap_table_task_env"
+        Routine.TaskEnvFree => "_NScap_table_task_env_free"
+        Routine.Lift => "_NScap_table_lift"
+        Routine.Hold => "_NScap_table_hold"
+        Routine.Unhold => "_NScap_table_unhold"
+        Routine.Rehome => "_NScap_table_rehome"
+        Routine.MintRoot => "_NScap_table_mint_root"
+        Routine.Check => "_NScap_table_check"
+        Routine.Derive => "_NScap_table_derive"
+        Routine.Revoke => "_NScap_table_revoke"
+        Routine.OutboxMint => "_NScap_table_outbox_mint"
+        Routine.OutboxRetire => "_NScap_table_outbox_retire"
+        Routine.OutboxClaim => "_NScap_table_outbox_claim"
+        Routine.TrapRaise => "_NStrap_raise"
+        Routine.Reacquired => "_NStrap_reacquired"
+        Routine.ReportScalar => "_NStrap_scalar"
+        Routine.Settle => "_NSsettle_domain"
+        Routine.Preempt => "_NStrap_preempt"
+        Routine.Overflow => "_NStrap_overflow"
+        Routine.CpuLimit => "_NSreplay_cpu_limit"
+        Routine.OverflowRaise => "_NStrap_overflow_raise"
+        Routine.Stop => "_NSstack_switch_stop"
+        Routine.ReportText => "_NStrap_text"
+        Routine.WriteErr => "_NStrap_write_err"
+        Routine.Spawn => "_NSstack_switch_spawn"
+        Routine.Wake => "_NSstack_switch_wake"
+        Routine.Park => "_NSstack_switch_park"
+        Routine.TaskStart => "_NSstack_switch_task_start"
+        Routine.IoSubmit => "_NSstack_switch_io_submit"
+        Routine.Schedule => "_NSstack_switch_schedule"
+        Routine.ThreadMain => "_NSstack_switch_thread_main"
+        Routine.RegionOpen => "_NSstack_switch_region_open"
+        Routine.Cancel => "_NSstack_switch_cancel"
+        Routine.Origin => "_NSstack_switch_origin"
+        Routine.CownRelease => "_NSstack_switch_cown_release"
+        Routine.Exit => "_NSstack_switch_exit"
+        Routine.Init => "_NSstack_switch_init"
+        Routine.Lock => "_NSstack_switch_lock"
+        Routine.Unlock => "_NSstack_switch_unlock"
+        Routine.Thread => "_NSstack_switch_thread"
+        Routine.Yield => "_NSreplay_yield"
+        Routine.Stream => "_NSreplay_stream"
+        Routine.Draw => "_NSreplay_draw"
+    }
+} Routine.name
+
+/// The parameter and result types of the routine.
+fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
+    let int8 = clif::Type.Int8
+    let int32 = clif::Type.Int32
+    return match self {
+        Routine.Copy or Routine.Fill => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.OutboxMint => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Compare => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(Some(int32), count: 0, trailing: None, alloc))
+        Routine.Alloc => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.AllocIn => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Split or Routine.Derive or Routine.Hold => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Lift => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: None, alloc))
+        Routine.Rehome => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.Check or Routine.OutboxClaim or Routine.RegionOpen or Routine.RecordAlloc => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.RecordResize => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Free or Routine.RecordFree or Routine.Close or Routine.TaskEnvFree or Routine.Unhold or Routine.MintRoot or Routine.Revoke or Routine.OutboxRetire or Routine.Wake or Routine.TaskStart or Routine.Cancel or Routine.CownRelease or Routine.Exit or Routine.ThreadMain or Routine.Lock or Routine.Unlock or Routine.Settle or Routine.Reacquired or Routine.Stop => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Preempt or Routine.Overflow or Routine.CpuLimit => RoutineTypes(params: type_list(Some(int32), count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.OverflowRaise => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.TrapRaise or Routine.ReportText => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.ReportScalar => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.WriteErr => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Spawn => RoutineTypes(params: type_list(None, count: 8, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Park or Routine.Schedule or Routine.Yield => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.Stream => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Draw => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.Origin or Routine.Init or Routine.Thread => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.IoSubmit => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: Some(int32), alloc))
+    }
+} Routine.types
+
+/// A list of types: `leading` when given, `count` pointer-sized types, then `trailing` when
+/// given.
+fn type_list(leading: Option[clif::Type], count: usize, trailing: Option[clif::Type], alloc: mem::Alloc) -> mem::List[clif::Type] {
+    var types = mem::List[clif::Type].empty(alloc)
+    match leading {
+        Some(ty) => mut types.push(ty)
+        None => {}
+    }
+    var pushed: usize = 0
+    while pushed < count {
+        mut types.push(PTR)
+        pushed += 1
+    }
+    match trailing {
+        Some(ty) => mut types.push(ty)
+        None => {}
+    }
+    return types
+} type_list
+
+fn Routine.signature(self, alloc: mem::Alloc) -> clif::Signature {
+    let types = self.types(alloc)
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    for param in types.params {
+        mut signature.params.push(clif::AbiParam(value_type: param))
+    }
+    for returned in types.returns {
+        mut signature.returns.push(clif::AbiParam(value_type: returned))
+    }
+    return signature
+} Routine.signature
+
+/// The offsets of the runtime state's fields. The lock of the cell and capability tables and of
+/// chunks.
+const STATE_LOCK: u64 = 0
+
+/// The lock of the run queue, and its first and last tasks.
+const STATE_QUEUE_LOCK: u64 = 8
+
+const STATE_READY_HEAD: u64 = 16
+
+const STATE_READY_TAIL: u64 = 24
+
+/// The executor thread records and their count.
+const STATE_THREADS: u64 = 32
+
+const STATE_THREAD_COUNT: u64 = 40
+
+/// The cell table: its records and the count of slots used.
+const STATE_CELLS: u64 = 48
+
+const STATE_CELL_COUNT: u64 = 56
+
+/// The capability table: its records and the count of slots used.
+const STATE_ENTRIES: u64 = 64
+
+const STATE_ENTRY_COUNT: u64 = 72
+
+/// The process domain's record.
+const STATE_PROCESS: u64 = 80
+
+/// The entry task.
+const STATE_ENTRY_TASK: u64 = 88
+
+/// The signal number of the first termination request, zero before one.
+const STATE_TERMINATION: u64 = 96
+
+/// The operation reading termination requests.
+const STATE_SIGNALS: u64 = 104
+
+/// Every live task, linked through their records, and the lock of that list.
+const STATE_TASKS: u64 = 120
+
+const STATE_TASKS_LOCK: u64 = 128
+
+/// The milliseconds of the monotonic clock when the root grant was minted.
+const STATE_MINTED: u64 = 136
+
+/// The last rank a cown took.
+const STATE_RANKS: u64 = 144
+
+/// The chunk map's table of roots.
+const STATE_CHUNK_MAP: u64 = 152
+
+/// The index plus one of the first free capability entry, zero when none is free.
+const STATE_FREE_ENTRY: u64 = 160
+
+/// The last id a cancelling construct took.
+const STATE_REGIONS: u64 = 168
+
+/// The construct that termination requests cancel, whose region is the entry task.
+const STATE_ROOT: u64 = 176
+
+/// On the seeded scheduler: the run's seed, the index of the scheduling stream's next value,
+/// the virtual clock's milliseconds and its first timer, the last order a task or timer took,
+/// whether a scheduling point found two ready tasks, and the first and last of the completions
+/// not yet delivered.
+const STATE_SEED: u64 = 184
+
+const STATE_PICKS: u64 = 192
+
+const RUNTIME_STATE_NOW: u64 = 200
+
+const STATE_TIMERS: u64 = 208
+
+const STATE_ORDER: u64 = 216
+
+const STATE_CONTENDED: u64 = 224
+
+const STATE_COMPLETIONS: u64 = 232
+
+const STATE_COMPLETIONS_TAIL: u64 = 240
+
+/// On a machine target: the two values the platform entered the image with, the
+/// start-information address on `x86_64-bare` and the image handle and system table on
+/// `x86_64-uefi`; the installed anchor's address, zero before one; the location record of the
+/// `anchor` call that installed it; the number of CPUs that started their executor; nonzero
+/// once a kernel halt begins; the number of CPUs it has stopped; and on `x86_64-uefi`, once
+/// `exit_services` ends the firmware's boot services, the record of its final memory map, the
+/// map's size and the size of each of its descriptors.
+const STATE_PLATFORM: u64 = 248
+
+const STATE_PLATFORM_TABLE: u64 = 256
+
+const STATE_ANCHOR: u64 = 264
+
+const STATE_ANCHOR_CALL: u64 = 272
+
+const STATE_STARTED_CPUS: u64 = 280
+
+const STATE_HALTING: u64 = 288
+
+const STATE_STOPPED_CPUS: u64 = 296
+
+const STATE_MEMORY_MAP: u64 = 304
+
+const STATE_MAP_SIZE: u64 = 312
+
+const STATE_MAP_STRIDE: u64 = 320
+
+/// The single chunks returned to the platform's supply and kept mapped for the next draws,
+/// zeroed, linked through their first words, and their count.
+const STATE_KEPT_CHUNKS: u64 = 328
+
+const STATE_KEPT_COUNT: u64 = 336
+
+const STATE_SIZE: u64 = 384
+
+/// The function of a routine, declared now and defined once lowering reaches the end of its
+/// queue.
+fn Lowering.routine(mut self, routine: Routine) -> object::FuncId {
+    match self.routines.get(routine) {
+        Some(known) => return known
+        None => {}
+    }
+    let id = mut self.module.declare_function(routine.name(), linkage: object::Linkage.Local, signature: routine.signature(self.alloc))
+    discard mut self.routines.insert(routine, value: id)
+    mut self.queue.push(Pending.Routine(routine: routine, id: id))
+    return id
+} Lowering.routine
+
+/// Calls a routine, giving its results.
+fn Lowering.call_routine(mut self, mut fx: Fx, routine: Routine, args: Slice[clif::Value]) -> mem::List[clif::Value] {
+    let id = mut self.routine(routine)
+    let reference = mut self.func_ref(mut fx, id)
+    let call = mut fx.b.call(reference, args)
+    return fx.b.inst_results(call, alloc: fx.alloc)
+} Lowering.call_routine
+
+/// The address of the runtime state.
+fn Lowering.state(mut self, mut fx: Fx) -> clif::Value {
+    let id = mut self.state_data()
+    let global = mut self.data_ref(mut fx, id)
+    return mut fx.b.symbol_value(PTR, global_value: global)
+} Lowering.state
+
+fn Lowering.state_data(mut self) -> object::DataId {
+    match self.state_id {
+        Some(known) => return known
+        None => {}
+    }
+    let id = mut self.module.declare_data("_NSstate", linkage: object::Linkage.Local, writable: true, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define_zeroinit(STATE_SIZE)
+    mut description.set_align(64)
+    mut self.module.define_data(id, take description)
+    self.state_id = Some(id)
+    return id
+} Lowering.state_data
+
+/// The address of the thread-local word holding the running executor thread's record, on
+/// `x86_64-host`.
+fn Lowering.thread_slot(mut self, mut fx: Fx) -> clif::Value {
+    let id = match self.thread_id {
+        Some(known) => known
+        None => mut self.thread_word()
+    }
+    let global = mut self.data_ref(mut fx, id)
+    return mut fx.b.tls_value(PTR, global_value: global)
+} Lowering.thread_slot
+
+/// The thread-local word holding the running executor thread's record, declared and defined
+/// at its first use.
+fn Lowering.thread_word(mut self) -> object::DataId {
+    let id = mut self.module.declare_data("_NSthread", linkage: object::Linkage.Local, writable: true, tls: true)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define_zeroinit(8)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+    self.thread_id = Some(id)
+    return id
+} Lowering.thread_word
+
+/// A zeroed runtime record of `size` bytes, zero on exhaustion.
+fn Lowering.record_alloc(mut self, mut fx: Fx, size: clif::Value) -> clif::Value {
+    let results = mut self.call_routine(mut fx, routine: Routine.RecordAlloc, args: fx.list1(size).view())
+    expect results.len() > 0
+    return results[0]
+} Lowering.record_alloc
+
+/// Frees a runtime record.
+fn Lowering.record_free(mut self, mut fx: Fx, address: clif::Value) {
+    discard mut self.call_routine(mut fx, routine: Routine.RecordFree, args: fx.list1(address).view())
+} Lowering.record_free
+
+/// A runtime record moved to `size` bytes, zero on exhaustion.
+fn Lowering.record_resize(mut self, mut fx: Fx, address: clif::Value, size: clif::Value) -> clif::Value {
+    let results = mut self.call_routine(mut fx, routine: Routine.RecordResize, args: fx.list2(address, b: size).view())
+    expect results.len() > 0
+    return results[0]
+} Lowering.record_resize
+
+/// The record of the running executor thread, zero outside one: on a machine target the
+/// running CPU's, which its record holds.
+fn Lowering.thread(mut self, mut fx: Fx) -> clif::Value {
+    if self.machine() {
+        let results = mut self.call_stub(mut fx, stub: Stub.Thread, args: mem::List[clif::Value].empty(fx.alloc).view())
+        expect results.len() > 0
+        return results[0]
+    }
+    let results = mut self.call_routine(mut fx, routine: Routine.Thread, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect results.len() > 0
+    return results[0]
+} Lowering.thread
+
+/// A C library function, by name, which only an `x86_64-host` image links.
+fn Lowering.libc(mut self, name: Str, params: Slice[clif::Type], returns: Slice[clif::Type]) -> object::FuncId {
+    expect not self.machine()
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for param in params {
+        mut signature.params.push(clif::AbiParam(value_type: param))
+    }
+    for returned in returns {
+        mut signature.returns.push(clif::AbiParam(value_type: returned))
+    }
+    return mut self.module.declare_function(name, linkage: object::Linkage.Import, signature)
+} Lowering.libc
+
+/// Calls a C library function, giving its results.
+fn Lowering.call_libc(mut self, mut fx: Fx, name: Str, args: Slice[clif::Value], returns: Slice[clif::Type]) -> mem::List[clif::Value] {
+    var params = mem::List[clif::Type].empty(fx.alloc)
+    for arg in args {
+        mut params.push(fx.b.value_type(arg))
+    }
+    let id = mut self.libc(name, params: params.view(), returns)
+    let reference = mut self.func_ref(mut fx, id)
+    let call = mut fx.b.call(reference, args)
+    return fx.b.inst_results(call, alloc: fx.alloc)
+} Lowering.call_libc
+
+/// Relaxes the processor in a spin loop: on `x86_64-host` it yields the processor to the
+/// system, on a machine target it hints the spin with `pause`.
+fn Lowering.relax(mut self, mut fx: Fx) {
+    if self.machine() {
+        discard mut self.call_stub(mut fx, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx.alloc).view())
+    } else {
+        discard mut self.call_libc(mut fx, name: "sched_yield", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view())
+    }
+} Lowering.relax
+
+/// Copies `size` bytes, inline when small.
+fn Lowering.copy(mut self, mut fx: Fx, dst: clif::Value, src: clif::Value, size: u64, align: u64) {
+    if size <= 64 {
+        mut fx.copy_small(dst, src, size, align)
+        return
+    }
+    let len = mut fx.ptr(size)
+    discard mut self.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(dst, b: src, c: len).view())
+} Lowering.copy
+
+/// Whether two views of bytes hold the same bytes.
+fn Lowering.views_equal(mut self, mut fx: Fx, left: Held, right: Held) -> clif::Value {
+    let left_at = left.address_value()
+    let right_at = right.address_value()
+    let left_len = mut fx.load(PTR, addr: left_at, offset: 8)
+    let right_len = mut fx.load(PTR, addr: right_at, offset: 8)
+    let same_len = mut fx.b.icmp(clif::IntCC.Equal, x: left_len, y: right_len)
+    let result = mut fx.choose(same_len, results: fx.types1(clif::Type.Int8).view(), then: fn[mut self](mut fx1: Fx) -> mem::List[clif::Value] {
+        let left_bytes = mut fx1.load(PTR, addr: left_at, offset: 0)
+        let right_bytes = mut fx1.load(PTR, addr: right_at, offset: 0)
+        let order = mut self.call_routine(mut fx1, routine: Routine.Compare, args: fx1.list3(left_bytes, b: right_bytes, c: left_len).view())
+        expect order.len() > 0
+        let same = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: order[0], y: 0)
+        return fx1.list1(same)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let differ = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(differ)
+    })
+    return result[0]
+} Lowering.views_equal
+
+/// Defines a routine's body.
+fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    match routine {
+        Routine.Copy or Routine.Fill or Routine.Compare => memory_bytes(mut lo, mut fx, routine)
+        Routine.Alloc or Routine.AllocIn or Routine.Free or Routine.Split or Routine.Close or Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.TaskEnvFree or Routine.Lift => memory_define(mut lo, mut fx, routine)
+        Routine.Hold or Routine.Unhold or Routine.Rehome => holdings_define(mut lo, mut fx, routine)
+        Routine.MintRoot or Routine.Check or Routine.Derive or Routine.Revoke or Routine.OutboxMint or Routine.OutboxRetire or Routine.OutboxClaim => tables_define(mut lo, mut fx, routine)
+        Routine.TrapRaise or Routine.Reacquired or Routine.ReportScalar or Routine.ReportText or Routine.WriteErr or Routine.OverflowRaise => report_define(mut lo, mut fx, routine)
+        Routine.Settle => settle_define(mut lo, mut fx, routine)
+        Routine.Spawn or Routine.Wake or Routine.Park or Routine.TaskStart or Routine.IoSubmit or Routine.Schedule or Routine.ThreadMain or Routine.Thread or Routine.Stop => tasks_define(mut lo, mut fx, routine)
+        Routine.RegionOpen or Routine.Cancel or Routine.Origin => regions_define(mut lo, mut fx, routine)
+        Routine.CownRelease => release_routine(mut lo, mut fx)
+        Routine.Yield or Routine.Stream => seeded_define(mut lo, mut fx, routine)
+        Routine.Draw => define_draw(mut lo, mut fx)
+        Routine.Lock or Routine.Unlock => locks_define(mut lo, mut fx, routine)
+        Routine.Init or Routine.Exit or Routine.RecordAlloc or Routine.RecordFree or Routine.RecordResize => system_define(mut lo, mut fx, routine)
+        Routine.Preempt or Routine.Overflow or Routine.CpuLimit => host_define(mut lo, mut fx, routine)
+    }
+} runtime_define
+
+/// Atomically adds to a word, giving its previous value.
+fn fetch_add(mut fx: Fx, address: clif::Value, amount: clif::Value) -> clif::Value {
+    return mut fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Add, p: address, x: amount)
+} fetch_add

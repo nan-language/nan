@@ -1,0 +1,626 @@
+//! The author rule of a VCS workspace, read from its git history: a seal meets it when each change writing it is by another author than each change introducing its sealed item hash or a hash its closure entries record; and a change whose accepted spec of an item keeps none of its parents' writes such a seal of the item, by another author than the changes introducing that spec as the item's spec.
+
+/// What the API snapshot entry of an item records that the author rule reads: its seals and its
+/// accepted spec.
+struct RecordedEntry {
+    seals: mem::List[machine::Seal]
+    accepted: machine::Accepted
+} RecordedEntry
+
+/// The machine records of the workspace in one change: each item's API snapshot entry by
+/// canonical path, and the lock lines of each package by the package each locks.
+struct ChangeRecords {
+    entries: mem::Map[text::String, RecordedEntry]
+    locks: mem::Map[text::String, mem::Map[text::String, text::String]]
+} ChangeRecords
+
+fn ChangeRecords.empty(alloc: mem::Alloc) -> ChangeRecords {
+    return ChangeRecords(entries: mem::Map[text::String, RecordedEntry].empty(alloc), locks: mem::Map[text::String, mem::Map[text::String, text::String]].empty(alloc))
+} ChangeRecords.empty
+
+/// What checking the workspace in one change gives, by canonical path: each item's item hash and
+/// interface hash, sealed item hash and current spec.
+struct ChangeChecks {
+    hashes: mem::Map[text::String, Hashes]
+    sealed: mem::Map[text::String, hashing::HashValue]
+    specs: mem::Map[text::String, machine::Accepted]
+} ChangeChecks
+
+fn ChangeChecks.empty(alloc: mem::Alloc) -> ChangeChecks {
+    return ChangeChecks(hashes: mem::Map[text::String, Hashes].empty(alloc), sealed: mem::Map[text::String, hashing::HashValue].empty(alloc), specs: mem::Map[text::String, machine::Accepted].empty(alloc))
+} ChangeChecks.empty
+
+/// The states of a workspace across the changes of its git history.
+pkg struct History {
+    vcs: vcs::Vcs
+    /// The session of the workspace's current state.
+    session: Session
+    /// Each commit changing the workspace, with its nearest ancestors changing it.
+    parents: mem::HashMap[text::String, mem::List[text::String]]
+    /// The most recent commit changing the workspace.
+    top: Option[text::String]
+    records_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeRecords]]
+    checks_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeChecks]]
+} History
+
+/// The history of a session's workspace inside a git working tree; none outside every one.
+pkg fn History.open(session: Session) -> Option[History] {
+    let alloc = session.alloc
+    let Some(opened) = vcs::Vcs.open(session.workspace.contents().root.as_str(), alloc) else {
+        return None
+    }
+    let listed = opened.history()
+    var top: Option[text::String] = None
+    match listed.get(0) {
+        Some(commit) => {
+            top = Some(text::String.of(commit.name.as_str(), alloc))
+        }
+        None => {}
+    }
+    var parents = mem::HashMap[text::String, mem::List[text::String]].empty(seed: 0, alloc)
+    for commit in take listed {
+        let vcs::Commit(name: name, parents: held) = commit
+        discard mut parents.insert(take name, value: take held)
+    }
+    return Some(History(vcs: take opened, session: session.share(), parents: take parents, top: take top, records_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeRecords]].empty(seed: 0, alloc), checks_by_change: mem::OnceMap[vcs::Change, mem::Shared[ChangeChecks]].empty(seed: 0, alloc)))
+} History.open
+
+fn History.parents_of(self, change: vcs::Change) -> mem::List[vcs::Change] {
+    let alloc = self.session.alloc
+    var found = mem::List[vcs::Change].empty(alloc)
+    match change {
+        vcs::Change.Uncommitted => {
+            match self.top {
+                Some(name) => mut found.push(vcs::Change.Commit(text::String.of(name.as_str(), alloc)))
+                None => {}
+            }
+        }
+        vcs::Change.Commit(name) => {
+            match self.parents.get(name) {
+                Some(held) => {
+                    for parent in held {
+                        mut found.push(vcs::Change.Commit(text::String.of(parent.as_str(), alloc)))
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    return found
+} History.parents_of
+
+/// The session of the workspace in a commit's tree, with only its machine files when
+/// `machine_only`.
+fn History.workspace_at(self, commit: Str, machine_only: bool) -> Option[Session] {
+    let alloc = self.session.alloc
+    let files = self.vcs.files(commit, wanted: fn(path: Str) -> bool {
+        if not machine_only {
+            return true
+        }
+        return path.ends_with("/package.nan") or path.find("/.nan/").is_some()
+    })
+    let root = self.session.workspace.contents().root.as_str()
+    let grammar = self.session.grammar.contents()
+    let Ok(loaded) = attempt workspace::Workspace.of_stored_files(root, files: files.view(), given: cache::copied_override(self.session.home, alloc), grammar, alloc) else {
+        return None
+    }
+    return Some(Session.of(mem::Shared.of(take loaded, alloc), std: self.session.std.share(), grammar: self.session.grammar.share(), home: cache::copied_override(self.session.home, alloc), alloc))
+} History.workspace_at
+
+fn History.recorded(self, change: vcs::Change) -> mem::Shared[ChangeRecords] {
+    let alloc = self.session.alloc
+    match self.records_by_change.get(change) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let computed = match change {
+        vcs::Change.Uncommitted => ChangeRecords.of(self.session)
+        vcs::Change.Commit(name) => match self.workspace_at(name.as_str(), machine_only: true) {
+            Some(at) => ChangeRecords.of(at)
+            None => ChangeRecords.empty(alloc)
+        }
+    }
+    let stored = self.records_by_change.insert(change.copy(alloc), value: mem::Shared.of(take computed, alloc))
+    return stored.share()
+} History.recorded
+
+fn History.checked(self, change: vcs::Change) -> mem::Shared[ChangeChecks] {
+    let alloc = self.session.alloc
+    match self.checks_by_change.get(change) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let computed = match change {
+        vcs::Change.Uncommitted => ChangeChecks.of(self.session)
+        vcs::Change.Commit(name) => match self.workspace_at(name.as_str(), machine_only: false) {
+            Some(at) => ChangeChecks.of(at)
+            None => ChangeChecks.empty(alloc)
+        }
+    }
+    let stored = self.checks_by_change.insert(change.copy(alloc), value: mem::Shared.of(take computed, alloc))
+    return stored.share()
+} History.checked
+
+/// The changes, at or before `from`, introducing a fact that `from` holds: holding it while
+/// none of their parents does.
+fn History.introducers(self, from: vcs::Change, holds: fn(change: vcs::Change) -> bool) -> mem::List[vcs::Change] {
+    let alloc = self.session.alloc
+    var found = mem::List[vcs::Change].empty(alloc)
+    var seen = mem::HashMap[vcs::Change, Unit].empty(seed: 0, alloc)
+    var pending = mem::List[vcs::Change].empty(alloc)
+    mut pending.push(from.copy(alloc))
+    loop {
+        let Some(change) = mut pending.pop() else {
+            return found
+        }
+        if seen.contains(change) {
+            continue
+        }
+        discard mut seen.insert(change.copy(alloc), value: Unit)
+        var holding = mem::List[vcs::Change].empty(alloc)
+        for parent in take self.parents_of(change) {
+            if holds(parent) {
+                mut holding.push(take parent)
+            }
+        }
+        if holding.len() == 0 {
+            mut found.push(take change)
+            continue
+        }
+        for parent in take holding {
+            mut pending.push(take parent)
+        }
+    }
+} History.introducers
+
+fn History.authors(self, written_by: Slice[vcs::Change]) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(self.session.alloc)
+    for change in written_by {
+        mut found.push(self.vcs.author(change))
+    }
+    return found
+} History.authors
+
+/// Whether texts hold one.
+fn holds_author(authors: Slice[text::String], author: Str) -> bool {
+    for held in authors {
+        if held.as_str() == author {
+            return true
+        }
+    }
+    return false
+} holds_author
+
+/// Whether an item's sealed item hash as of a change is `item`.
+fn History.seals_item(self, change: vcs::Change, path: Str, item: hashing::HashValue) -> bool {
+    return self.checked(change).contents().sealed.get_by(fn(key: text::String) => key.as_str().cmp(path)) == Some(item)
+} History.seals_item
+
+/// Whether an item's hashes as of a change hold the hash a closure entry records.
+fn History.holds_entry_hash(self, change: vcs::Change, entry: machine::ClosureEntry) -> bool {
+    let Some(hashes) = self.checked(change).contents().hashes.get(entry.path) else {
+        return false
+    }
+    return held_hash(entry, item: hashes.item, interface_hash: hashes.interface_hash)
+} History.holds_entry_hash
+
+/// The lock line of a package for a dependency, as of a change.
+fn History.lock_line(self, change: vcs::Change, package_name: Str, dep: Str) -> Option[text::String] {
+    let records = self.recorded(change)
+    let Some(lines) = records.contents().locks.get_by(fn(key: text::String) => key.as_str().cmp(package_name)) else {
+        return None
+    }
+    let Some(line) = lines.get_by(fn(key: text::String) => key.as_str().cmp(dep)) else {
+        return None
+    }
+    return Some(text::String.of(line.as_str(), alloc: self.session.alloc))
+} History.lock_line
+
+/// Whether a package's lock line for a dependency is `line` as of a change.
+fn History.holds_lock_line(self, change: vcs::Change, package_name: Str, dep: Str, line: Str) -> bool {
+    let Some(held) = self.lock_line(change, package_name, dep) else {
+        return false
+    }
+    return held.as_str() == line
+} History.holds_lock_line
+
+/// The author that a change of `writers`, writing a seal of the item at `path` in the package
+/// `package_name` as of `from`, shares with a change introducing its sealed item hash or a hash
+/// its closure entries record; the empty text for a seal not current as of `from`.
+fn History.shared(self, from: vcs::Change, writers: Slice[vcs::Change], package_name: Str, path: Str, seal: machine::Seal) -> Option[text::String] {
+    let alloc = self.session.alloc
+    if not self.seals_item(from, path, item: seal.item) {
+        return Some(text::String.empty(alloc))
+    }
+    var introducers = self.introducers(from, holds: fn(change: vcs::Change) => self.seals_item(change, path, item: seal.item))
+    for entry in seal.entries {
+        if self.checked(from).contents().hashes.contains(entry.path) {
+            if self.holds_entry_hash(from, entry) {
+                for change in take self.introducers(from, holds: fn(change: vcs::Change) => self.holds_entry_hash(change, entry)) {
+                    mut introducers.push(take change)
+                }
+            }
+            continue
+        }
+        let dep = match entry.path.find("::") {
+            Some(at) => entry.path.slice_bytes(0, end: at)
+            None => Some(entry.path.as_str())
+        }
+        let Some(dep_name) = dep else {
+            continue
+        }
+        let Some(current) = self.lock_line(from, package_name, dep: dep_name) else {
+            continue
+        }
+        for change in take self.introducers(from, holds: fn(change: vcs::Change) => self.holds_lock_line(change, package_name, dep: dep_name, line: current.as_str())) {
+            mut introducers.push(take change)
+        }
+    }
+    let written = self.authors(writers)
+    for change in introducers {
+        let author = self.vcs.author(change)
+        if holds_author(written.view(), author: author.as_str()) {
+            return Some(take author)
+        }
+    }
+    return None
+} History.shared
+
+/// The author the seal `nan seal` would write on the item at `path` of `package_name` shares
+/// with a change introducing a hash it records or, when it accepts a pending weakening, with a
+/// change introducing the item's current spec.
+pkg fn History.would_share(self, package_name: Str, path: Str, seal: machine::Seal, accepting: Option[machine::Accepted]) -> Option[text::String] {
+    let alloc = self.session.alloc
+    var writers = mem::List[vcs::Change].empty(alloc)
+    mut writers.push(vcs::Change.Uncommitted)
+    match self.shared(vcs::Change.Uncommitted, writers: writers.view(), package_name, path, seal) {
+        Some(author) => return Some(take author)
+        None => {}
+    }
+    let Some(spec) = accepting else {
+        return None
+    }
+    let introducers = self.introducers(vcs::Change.Uncommitted, holds: fn(change: vcs::Change) => self.introduces_spec(change, path, spec))
+    let author = self.vcs.author(vcs::Change.Uncommitted)
+    if holds_author(self.authors(introducers.view()).view(), author: author.as_str()) {
+        return Some(take author)
+    }
+    return None
+} History.would_share
+
+/// Whether an item's spec as of a change is `spec`.
+fn History.introduces_spec(self, change: vcs::Change, path: Str, spec: machine::Accepted) -> bool {
+    let checks = self.checked(change)
+    let Some(held) = checks.contents().specs.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return false
+    }
+    return held.same(spec)
+} History.introduces_spec
+
+/// The `seal.same-author` incompleteness of each item of `escaping`, which hold trust escapes,
+/// whose current seals all break the author rule.
+pkg fn History.same_author(self, package_index: usize, items: Items, escaping: Slice[text::String]) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.session.alloc
+    let Some(source) = self.session.workspace.contents().packages.get(package_index) else {
+        expect false
+        return mem::List[diagnostic::Diagnostic].empty(alloc)
+    }
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    let records = self.recorded(vcs::Change.Uncommitted)
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for path in escaping {
+        var seals = mem::List[machine::Seal].empty(alloc)
+        match records.contents().entries.get(path) {
+            Some(entry) => {
+                for seal in entry.seals {
+                    if items.seal_current(path.as_str(), seal, alloc) {
+                        mut seals.push(seal.copy(alloc))
+                    }
+                }
+            }
+            None => {}
+        }
+        if seals.len() == 0 {
+            continue
+        }
+        let shared = self.shared_authors(package_name, path: path.as_str(), seals: seals.view())
+        if shared.len() < seals.len() {
+            continue
+        }
+        let Some(at) = location(items, source, path: path.as_str(), alloc) else {
+            continue
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.SealSameAuthor, path: at.path.as_str(), line: at.line, alloc)
+        for text_held in shared {
+            mut reported.because.push(diagnostic::Reason.note(text_held.as_str(), alloc))
+        }
+        reported.item = Some(text::String.of(path.as_str(), alloc))
+        mut found.push(take reported)
+    }
+    return found
+} History.same_author
+
+/// `<principal> <author>` for each seal, in order, whose writers share an author with a change
+/// introducing what it records, up to the first that shares none.
+fn History.shared_authors(self, package_name: Str, path: Str, seals: Slice[machine::Seal]) -> mem::List[text::String] {
+    let alloc = self.session.alloc
+    var shared = mem::List[text::String].empty(alloc)
+    for seal in seals {
+        let writers = self.introducers(vcs::Change.Uncommitted, holds: fn(change: vcs::Change) => self.writes_seal(change, path, seal))
+        let Some(author) = self.shared(vcs::Change.Uncommitted, writers: writers.view(), package_name, path, seal) else {
+            return shared
+        }
+        var written = text::String.of(seal.principal.as_str(), alloc)
+        mut written.push(' ')
+        mut written.append(author.as_str())
+        mut shared.push(take written)
+    }
+    return shared
+} History.shared_authors
+
+/// Whether an item's API snapshot entry holds a seal as of a change.
+fn History.writes_seal(self, change: vcs::Change, path: Str, seal: machine::Seal) -> bool {
+    let records = self.recorded(change)
+    let Some(entry) = records.contents().entries.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return false
+    }
+    return entry.seals.position(fn(held: machine::Seal) => held == seal).is_some()
+} History.writes_seal
+
+/// An accepted spec judged: the change accepting it, the item, the spec and its parents'.
+struct Acceptance {
+    change: vcs::Change
+    path: text::String
+    accepted: machine::Accepted
+    earlier: mem::List[machine::Accepted]
+} Acceptance
+
+/// The `api.weakening-pending` incompleteness of each item of the package at `package_index`
+/// and each change whose accepted spec of the item keeps none of its parents' and which writes
+/// no seal of the item that meets the author rule by another author than the changes
+/// introducing that spec as the item's spec.
+pkg fn History.acceptances(self, package_index: usize, items: Items) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.session.alloc
+    let Some(source) = self.session.workspace.contents().packages.get(package_index) else {
+        expect false
+        return mem::List[diagnostic::Diagnostic].empty(alloc)
+    }
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    let judged = self.judged_acceptances(items)
+    var weakened = mem::List[Weakened].empty(alloc)
+    for acceptance in judged {
+        let Some(variant) = items.first_variant(acceptance.path.as_str()) else {
+            continue
+        }
+        for before in acceptance.earlier {
+            mut weakened.push(Weakened(ck: variant.ck.share(), item: variant.item, accepted: before.copy(alloc), later: Some(acceptance.accepted.copy(alloc))))
+        }
+    }
+    var left = mem::List[mem::List[text::String]].empty(alloc)
+    if weakened.len() > 0 {
+        left = self.session.left(package_index, weakened: weakened.view())
+    }
+    var next: usize = 0
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for acceptance in judged {
+        var entailed = false
+        if items.first_variant(acceptance.path.as_str()).is_some() {
+            for _ in 0..<acceptance.earlier.len() {
+                if next < left.len() and left[next].len() == 0 {
+                    entailed = true
+                }
+                expect next < weakened.len()
+                next += 1
+            }
+        }
+        if entailed or self.accepted_by_seal(acceptance.change, package_name, path: acceptance.path.as_str(), accepted: acceptance.accepted) {
+            continue
+        }
+        let Some(at) = location(items, source, path: acceptance.path.as_str(), alloc) else {
+            continue
+        }
+        var named = text::String.of("change ", alloc)
+        match acceptance.change {
+            vcs::Change.Uncommitted => mut named.append("uncommitted")
+            vcs::Change.Commit(name) => mut named.append(name.as_str())
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.ApiWeakeningPending, path: at.path.as_str(), line: at.line, alloc)
+        mut reported.because.push(diagnostic::Reason.note(named.as_str(), alloc))
+        reported.item = Some(text::String.of(acceptance.path.as_str(), alloc))
+        mut found.push(take reported)
+    }
+    return found
+} History.acceptances
+
+/// The accepted specs of each item and change, the uncommitted one and each commit changing an
+/// API snapshot, that keep none of their parents' specs.
+fn History.judged_acceptances(self, items: Items) -> mem::List[Acceptance] {
+    let alloc = self.session.alloc
+    var judged_changes = mem::List[vcs::Change].empty(alloc)
+    mut judged_changes.push(vcs::Change.Uncommitted)
+    for commit in take self.vcs.changing("**/.nan/api/*.nan") {
+        if self.parents.contains(commit) {
+            mut judged_changes.push(vcs::Change.Commit(take commit))
+        }
+    }
+    var judged = mem::List[Acceptance].empty(alloc)
+    for item in items.by_path {
+        let path = item.key().as_str()
+        for change in judged_changes {
+            let accepted = self.accepted_at(change, path)
+            let parents = self.parents_of(change)
+            var earlier = mem::List[machine::Accepted].empty(alloc)
+            for parent in parents {
+                mut earlier.push(self.accepted_at(parent, path))
+            }
+            var kept = accepted.is_empty() or parents.len() == 0
+            for before in earlier {
+                if spec_keeps(current: accepted, accepted: before, alloc) {
+                    kept = true
+                }
+            }
+            if not kept {
+                mut judged.push(Acceptance(change: change.copy(alloc), path: text::String.of(path, alloc), accepted: take accepted, earlier: take earlier))
+            }
+        }
+    }
+    return judged
+} History.judged_acceptances
+
+/// The spec an item's API snapshot entry accepts as of a change, empty without one.
+fn History.accepted_at(self, change: vcs::Change, path: Str) -> machine::Accepted {
+    let alloc = self.session.alloc
+    let records = self.recorded(change)
+    let Some(entry) = records.contents().entries.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return machine::Accepted.empty(alloc)
+    }
+    return entry.accepted.copy(alloc)
+} History.accepted_at
+
+/// Whether a change writes a seal of the item at `path` that meets the author rule as of the
+/// change, by another author than the changes introducing `accepted` as the item's spec.
+fn History.accepted_by_seal(self, change: vcs::Change, package_name: Str, path: Str, accepted: machine::Accepted) -> bool {
+    let alloc = self.session.alloc
+    var earlier = mem::List[machine::Seal].empty(alloc)
+    for parent in self.parents_of(change) {
+        for seal in take self.seals_at(parent, path) {
+            mut earlier.push(take seal)
+        }
+    }
+    let author = self.vcs.author(change)
+    var introducers = mem::List[vcs::Change].empty(alloc)
+    if self.introduces_spec(change, path, spec: accepted) {
+        introducers = self.introducers(change, holds: fn(at: vcs::Change) => self.introduces_spec(at, path, spec: accepted))
+    }
+    if holds_author(self.authors(introducers.view()).view(), author: author.as_str()) {
+        return false
+    }
+    var writers = mem::List[vcs::Change].empty(alloc)
+    mut writers.push(change.copy(alloc))
+    for seal in take self.seals_at(change, path) {
+        if earlier.position(fn(held: machine::Seal) => held == seal).is_some() {
+            continue
+        }
+        if self.shared(change, writers: writers.view(), package_name, path, seal).is_none() {
+            return true
+        }
+    }
+    return false
+} History.accepted_by_seal
+
+/// The seals an item's API snapshot entry holds as of a change.
+fn History.seals_at(self, change: vcs::Change, path: Str) -> mem::List[machine::Seal] {
+    let alloc = self.session.alloc
+    var seals = mem::List[machine::Seal].empty(alloc)
+    let records = self.recorded(change)
+    let Some(entry) = records.contents().entries.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return seals
+    }
+    for seal in entry.seals {
+        mut seals.push(seal.copy(alloc))
+    }
+    return seals
+} History.seals_at
+
+/// The records of a session's workspace.
+fn ChangeRecords.of(session: Session) -> ChangeRecords {
+    let alloc = session.alloc
+    let grammar = session.grammar.contents()
+    var recorded = ChangeRecords.empty(alloc)
+    for source in session.workspace.contents().packages {
+        for named in source.machine.snapshots {
+            let Some(snapshot) = named.loaded.valid() else {
+                continue
+            }
+            for entry in snapshot.entries {
+                var seals = mem::List[machine::Seal].empty(alloc)
+                for seal in entry.seals {
+                    mut seals.push(seal.copy(alloc))
+                }
+                discard mut recorded.entries.insert(text::String.of(entry.path.as_str(), alloc), value: RecordedEntry(seals: take seals, accepted: entry.accepted.copy(alloc)))
+            }
+        }
+        let Some(name) = source.name() else {
+            continue
+        }
+        let Some(lock) = source.machine.lock() else {
+            continue
+        }
+        var lines = mem::Map[text::String, text::String].empty(alloc)
+        for line in lock.deps {
+            discard mut lines.insert(text::String.of(line.package_name.as_str(), alloc), value: line.record(grammar, alloc))
+        }
+        discard mut recorded.locks.insert(text::String.of(name, alloc), value: take lines)
+    }
+    return recorded
+} ChangeRecords.of
+
+/// What checking a session's workspace gives.
+fn ChangeChecks.of(session: Session) -> ChangeChecks {
+    let alloc = session.alloc
+    var checked = ChangeChecks.empty(alloc)
+    let held = session.workspace.contents()
+    for index in 0..<held.packages.len() {
+        let Some(source) = held.packages.get(index) else {
+            expect false
+            continue
+        }
+        let Some(name) = source.name() else {
+            continue
+        }
+        let checkers = session.package_checkers(index)
+        let items = Items.of(checkers.view(), package_name: name, alloc)
+        for entry in items.by_path {
+            let path = entry.key()
+            let Some(variant) = entry.value().get(0) else {
+                continue
+            }
+            discard mut checked.hashes.insert(text::String.of(path.as_str(), alloc), value: variant.ck.hashes(variant.item))
+            discard mut checked.specs.insert(text::String.of(path.as_str(), alloc), value: variant.ck.spec(variant.item))
+            match items.sealed_hash(path.as_str(), alloc) {
+                Some(sealed) => {
+                    discard mut checked.sealed.insert(text::String.of(path.as_str(), alloc), value: sealed)
+                }
+                None => {}
+            }
+        }
+        let Some(package_path) = items.package_path(alloc) else {
+            continue
+        }
+        let Some(sealed) = items.sealed_hash(name, alloc) else {
+            continue
+        }
+        discard mut checked.sealed.insert(take package_path, value: sealed)
+    }
+    return checked
+} ChangeChecks.of
+
+/// Whether a closure entry records the item hash or interface hash an item has.
+fn held_hash(entry: machine::ClosureEntry, item: hashing::HashValue, interface_hash: Option[hashing::HashValue]) -> bool {
+    if entry.body {
+        return entry.hash == item
+    }
+    return interface_hash == Some(entry.hash)
+} held_hash
+
+/// The file and first line of an item of a package: the package item's on its `package` line.
+fn location(items: Items, source: workspace::Package, path: Str, alloc: mem::Alloc) -> Option[diagnostic::At] {
+    if items.is_package_path(path) {
+        let Some(manifest) = source.manifest else {
+            return None
+        }
+        var file = text::String.of(source.dir.as_str(), alloc)
+        mut file.append("/package.nan")
+        return Some(diagnostic::At(path: take file, line: manifest.line))
+    }
+    let Some(variant) = items.first_variant(path) else {
+        return None
+    }
+    return Some(diagnostic::At(path: text::String.of(variant.file.as_str(), alloc), line: variant.ck.db().head_line(variant.item)))
+} location

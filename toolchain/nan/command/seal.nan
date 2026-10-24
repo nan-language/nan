@@ -1,0 +1,117 @@
+//! `nan seal <item> --as <principal>`: records a seal of the principal on the item in its module's API snapshot, accepting the item's pending weakening.
+
+/// What `nan seal` seals: its package's index, the item's canonical path, and the location it
+/// reports on.
+struct SealTarget {
+    index: usize
+    path: text::String
+    at: diagnostic::At
+} SealTarget
+
+/// `nan seal`.
+fn seal_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    let Some(principal) = invocation.value("--as") else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    if invocation.operands.len() != 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: Some(invocation.operands[0].as_str()), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: invocation.operands[0].as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let Some(target) = seal_target(held, named_scope: resolved.scope, alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let Some(source) = held.packages.get(target.index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var changes = mem::List[journal::Change].empty(alloc)
+    if not is_principal(principal) {
+        mut diagnostics.push(diagnostic::Diagnostic.new(diagnostic::Code.SealBadPrincipal, alloc))
+    } else {
+        match session.sealed(target.index, path: target.path.as_str(), principal) {
+            Ok(sealed) => {
+                var file = text::String.of(source.dir.as_str(), alloc)
+                mut file.append("/.nan/api/")
+                mut file.append(sealed.module.as_str())
+                mut file.append(".nan")
+                mut changes.push(journal::Change(path: take file, content: sealed.snapshot.bytes(grammar: session.grammar.contents(), alloc)))
+            }
+            Err(check::Unsealed.Unneeded) => mut diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.SealUnneeded, path: target.at.path.as_str(), line: target.at.line, alloc))
+            Err(check::Unsealed.Stale) => mut diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.ApiStale, path: target.at.path.as_str(), line: target.at.line, alloc))
+            Err(check::Unsealed.SameAuthor(author)) => {
+                var reported = diagnostic::Diagnostic.at(diagnostic::Code.SealSameAuthor, path: target.at.path.as_str(), line: target.at.line, alloc)
+                var note = text::String.of(principal, alloc)
+                mut note.push(' ')
+                mut note.append(author.as_str())
+                mut reported.because.push(diagnostic::Reason.note(note.as_str(), alloc))
+                mut diagnostics.push(take reported)
+            }
+        }
+    }
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        mut records.push(record(held, std: session.std.contents(), scope: scope::Scope.Workspace, reported, alloc))
+    }
+    return written_output(invocation, written: written.as_str(), take records, changes: changes.view(), alloc)
+} seal_run
+
+/// The package, canonical path and location of what a scope names for `nan seal`: a package, or
+/// the item holding the first of its lines.
+fn seal_target(held: workspace::Workspace, named_scope: scope::Scope, alloc: mem::Alloc) -> Option[SealTarget] {
+    match named_scope {
+        scope::Scope.Package(index) => {
+            let Some(source) = held.packages.get(index) else {
+                expect false
+                return None
+            }
+            let Some(manifest) = source.manifest else {
+                expect false
+                return None
+            }
+            var file = text::String.of(source.dir.as_str(), alloc)
+            mut file.append("/package.nan")
+            return Some(SealTarget(index: index, path: text::String.of(manifest.name.as_str(), alloc), at: diagnostic::At(path: take file, line: manifest.line)))
+        }
+        scope::Scope.Lines(path: file, lines: lines) => {
+            let Some(item) = held.item_at(file.as_str(), line: lines.low, alloc) else {
+                return None
+            }
+            let Some(index) = held.packages.position(fn(candidate: workspace::Package) => is_under(file.as_str(), dir: candidate.dir.as_str())) else {
+                expect false
+                return None
+            }
+            return Some(SealTarget(index: index, path: item.canonical(alloc), at: diagnostic::At(path: text::String.of(file.as_str(), alloc), line: lines.low)))
+        }
+        else => return None
+    }
+} seal_target
+
+/// Whether a path lies under a directory: it starts with the directory and `/`.
+fn is_under(path: Str, dir: Str) -> bool {
+    let Some(rest) = path.slice_bytes(dir.byte_len(), end: path.byte_len()) else {
+        return false
+    }
+    return path.starts_with(dir) and rest.starts_with("/")
+} is_under
+
+/// Whether a principal is named well: 1 to 64 ASCII letters, digits, `.`, `_`, `-` and `@`.
+fn is_principal(principal: Str) -> bool {
+    let bytes = principal.as_bytes()
+    if bytes.len() < 1 or bytes.len() > 64 {
+        return false
+    }
+    for byte in bytes {
+        let named = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9')
+        if not named and byte != b'.' and byte != b'_' and byte != b'-' and byte != b'@' {
+            return false
+        }
+    }
+    return true
+} is_principal

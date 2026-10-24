@@ -1,0 +1,368 @@
+//! The instructions: their operands, how each accesses its registers, and the registers calls and switches clobber.
+
+/// How an instruction accesses a register operand.
+pkg enum Role derives Copy, Eq {
+    /// Read before the instruction writes any register.
+    Use
+    /// Written after the instruction reads its uses.
+    Def
+    /// Read, then written.
+    Mod
+    /// Written before the instruction has read all its uses.
+    EarlyDef
+    /// Written and read only within the instruction.
+    Temp
+} Role
+
+/// What a load reads: a byte or word zero-extended to 32 bits, a doubleword, a quadword, or an
+/// SSE scalar.
+pkg enum LoadKind derives Copy, Eq {
+    Zx8
+    Zx16
+    Dword
+    Qword
+    Float32
+    Float64
+} LoadKind
+
+/// An arithmetic or logic operation of the `op r/m, r` family, numbered as its encodings are.
+pkg enum AluOp derives Copy, Eq {
+    Add
+    Or
+    Adc
+    Sbb
+    And
+    Sub
+    Xor
+} AluOp
+
+pkg fn AluOp.code(self) -> u8
+    ensures result <= 6
+{
+    return match self {
+        AluOp.Add => 0
+        AluOp.Or => 1
+        AluOp.Adc => 2
+        AluOp.Sbb => 3
+        AluOp.And => 4
+        AluOp.Sub => 5
+        AluOp.Xor => 6
+    }
+} AluOp.code
+
+pkg enum UnaryOp derives Copy, Eq {
+    Not
+    Neg
+} UnaryOp
+
+pkg enum ShiftOp derives Copy, Eq {
+    Rol
+    Ror
+    Shl
+    Shr
+    Sar
+} ShiftOp
+
+pkg fn ShiftOp.code(self) -> u8 {
+    return match self {
+        ShiftOp.Rol => 0
+        ShiftOp.Ror => 1
+        ShiftOp.Shl => 4
+        ShiftOp.Shr => 5
+        ShiftOp.Sar => 7
+    }
+} ShiftOp.code
+
+/// A register-to-register extension: zero-extending a byte, word or doubleword, or
+/// sign-extending one to 64 bits.
+pkg enum ExtendKind derives Copy, Eq {
+    Zx8
+    Zx16
+    Zx32
+    Sx8
+    Sx16
+    Sx32
+} ExtendKind
+
+/// An SSE scalar arithmetic operation.
+pkg enum FloatOp derives Copy, Eq {
+    Add
+    Sub
+    Mul
+    Div
+} FloatOp
+
+/// An SSE bitwise operation on whole registers; `AndNot` complements its destination first.
+pkg enum BitOp derives Copy, Eq {
+    And
+    AndNot
+    Or
+    Xor
+} BitOp
+
+/// Where a call goes: a symbol, through a `rel32` with the relocation kind its displacement
+/// takes, or the address in a register.
+pkg enum CallTarget derives Copy, Eq {
+    Direct(symbol: Symbol, kind: RelocKind)
+    Indirect(Reg)
+} CallTarget
+
+/// An instruction, or a short sequence of them that register allocation treats as one. Sizes
+/// name the operation's width; narrow integer results leave the register's upper bits
+/// unspecified.
+pkg enum Inst derives Copy, Eq {
+    /// `mov r64, r64`, or `movaps` between SSE registers.
+    Mov(dst: Reg, src: Reg)
+    /// The shortest of `mov r32, imm32`, `mov r64, simm32` and `movabs`.
+    MovImm(dst: Reg, imm: u64)
+    /// `movabs` of a symbol's address plus an addend.
+    MovSymbol(dst: Reg, symbol: Symbol, addend: i64)
+    Load(kind: LoadKind, dst: Reg, src: Amode)
+    Store(size: Size, src: Reg, dst: Amode)
+    StoreImm(size: Size, imm: i32, dst: Amode)
+    Lea(dst: Reg, src: Amode)
+    Alu(op: AluOp, size: Size, dst: Reg, src: Reg)
+    AluImm(op: AluOp, size: Size, dst: Reg, imm: i32)
+    Cmp(size: Size, lhs: Reg, rhs: Reg)
+    CmpImm(size: Size, lhs: Reg, imm: i32)
+    Test(size: Size, lhs: Reg, rhs: Reg)
+    Unary(op: UnaryOp, size: Size, reg: Reg)
+    Imul(size: Size, dst: Reg, src: Reg)
+    ImulImm(size: Size, dst: Reg, src: Reg, imm: i32)
+    /// `mul` or `imul` of `rax` by `src` into `rdx:rax` (`ax` for bytes).
+    MulWide(signed: bool, size: Size, src: Reg)
+    /// `div` or `idiv` of `rdx:rax` by `divisor` (of `ax` for bytes).
+    Div(signed: bool, size: Size, divisor: Reg)
+    /// `idiv`, except that a divisor of -1 leaves a remainder of 0 in `rdx`.
+    CheckedSrem(size: Size, divisor: Reg)
+    /// `cbw`, `cwd`, `cdq` or `cqo`: `rax` sign-extended into `rdx` (`ah` for bytes).
+    SignExtendData(size: Size)
+    Shift(op: ShiftOp, size: Size, dst: Reg, amount: u8)
+    /// A shift by `cl`.
+    ShiftCl(op: ShiftOp, size: Size, dst: Reg)
+    Setcc(cond: Cond, dst: Reg)
+    Cmov(cond: Cond, size: Size, dst: Reg, src: Reg)
+    Extend(kind: ExtendKind, dst: Reg, src: Reg)
+    /// `bsr` when `reverse`, else `bsf`.
+    BitScan(reverse: bool, size: Size, dst: Reg, src: Reg)
+    Bswap(size: Size, reg: Reg)
+    /// `lock xadd`: adds `reg` to memory, leaving the previous value in `reg`.
+    LockXadd(size: Size, reg: Reg, mem: Amode)
+    /// `xchg` with memory, locked by the processor.
+    Xchg(size: Size, reg: Reg, mem: Amode)
+    /// `lock cmpxchg`: stores `replacement` when memory holds `rax`, leaving the previous value
+    /// in `rax`.
+    LockCmpxchg(size: Size, replacement: Reg, mem: Amode)
+    /// A `lock cmpxchg` loop applying `op` with `operand` to memory, leaving the previous value
+    /// in `rax`.
+    AtomicRmwLoop(op: AluOp, size: Size, operand: Reg, mem: Amode, temp: Reg)
+    Mfence
+    Ud2
+    /// A call reading its arguments from the registers `args`, writing its results to `results`
+    /// and changing `clobbers`.
+    Call(target: CallTarget, args: RegSet, results: RegSet, clobbers: RegSet)
+    Jmp(label: u32)
+    Jcc(cond: Cond, label: u32)
+    /// `ret`, the function's results in `results`.
+    Ret(results: RegSet)
+    Push(reg: Reg)
+    Pop(reg: Reg)
+    /// No code: the function's parameters arriving in `params`.
+    Args(params: RegSet)
+    /// Saves `rsp`, `rbp` and the resume address at `store`, loads them from `load` and jumps,
+    /// the payload passing in `rdi`.
+    StackSwitch(store: Reg, load: Reg, temp: Reg, other: Reg)
+    /// The general-dynamic sequence calling `__tls_get_addr` for a thread-local symbol, its
+    /// address in `rax`.
+    TlsGetAddr(symbol: Symbol)
+    FloatArith(op: FloatOp, size: Size, dst: Reg, src: Reg)
+    FloatSqrt(size: Size, dst: Reg, src: Reg)
+    /// `cvtss2sd` from `Dword` or `cvtsd2ss` from `Qword`.
+    FloatConvert(source: Size, dst: Reg, src: Reg)
+    FloatBits(op: BitOp, dst: Reg, src: Reg)
+    Ucomis(size: Size, lhs: Reg, rhs: Reg)
+    CvtIntToFloat(int_size: Size, size: Size, dst: Reg, src: Reg)
+    /// `cvttss2si` or `cvttsd2si`, truncating.
+    CvtFloatToInt(size: Size, int_size: Size, dst: Reg, src: Reg)
+    MovToXmm(size: Size, dst: Reg, src: Reg)
+    MovFromXmm(size: Size, dst: Reg, src: Reg)
+    /// A float truncated to a 64-bit integer, saturating at the integer's bounds, NaN giving 0.
+    FloatToIntSat(signed: bool, size: Size, dst: Reg, src: Reg, temp: Reg)
+    /// An unsigned 64-bit integer converted to a float.
+    UintToFloat(size: Size, dst: Reg, src: Reg, temp: Reg)
+    /// Replaces a NaN by the canonical quiet NaN.
+    CanonNan(size: Size, reg: Reg, temp: Reg)
+    /// `movaps dst, src` when the condition holds.
+    XmmCmov(cond: Cond, dst: Reg, src: Reg)
+} Inst
+
+/// The memory operand with its registers replaced by what `visit` gives for them.
+fn mapped(mem: Amode, visit: fn(reg: Reg, role: Role) -> Reg) -> Amode {
+    match mem {
+        Amode.Mem(base: base, index: index, shift: shift, disp: disp) => {
+            let new_base = visit(base, role: Role.Use)
+            let Some(reg) = index else {
+                return Amode.Mem(base: new_base, index: None, shift: shift, disp: disp)
+            }
+            return Amode.Mem(base: new_base, index: Some(visit(reg, role: Role.Use)), shift: shift, disp: disp)
+        }
+        Amode.Rip(target: _, disp: _) => return mem
+    }
+} mapped
+
+/// Shows `visit` each register of a set.
+fn each_reg(set: RegSet, role: Role, visit: fn(reg: Reg, role: Role) -> Reg) {
+    for index in 0u32..<PHYSICAL {
+        if (set.bits & (1u32 << index)) != 0 {
+            discard visit(Reg(index: index), role)
+        }
+    }
+} each_reg
+
+/// The instruction with each register operand replaced by what `visit` gives for it, visited
+/// in a fixed order. `visit` also sees the registers the instruction accesses implicitly; their
+/// replacements are ignored.
+pkg fn Inst.map_regs(self, visit: fn(reg: Reg, role: Role) -> Reg) -> Inst
+    waive length "one arm per instruction, its operands in field order"
+{
+    match self {
+        Inst.Mov(dst: dst, src: src) => return Inst.Mov(dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.MovImm(dst: dst, imm: imm) => return Inst.MovImm(dst: visit(dst, role: Role.Def), imm: imm)
+        Inst.MovSymbol(dst: dst, symbol: symbol, addend: addend) => return Inst.MovSymbol(dst: visit(dst, role: Role.Def), symbol: symbol, addend: addend)
+        Inst.Load(kind: kind, dst: dst, src: src) => return Inst.Load(kind: kind, dst: visit(dst, role: Role.Def), src: mapped(src, visit))
+        Inst.Store(size: size, src: src, dst: dst) => return Inst.Store(size: size, src: visit(src, role: Role.Use), dst: mapped(dst, visit))
+        Inst.StoreImm(size: size, imm: imm, dst: dst) => return Inst.StoreImm(size: size, imm: imm, dst: mapped(dst, visit))
+        Inst.Lea(dst: dst, src: src) => return Inst.Lea(dst: visit(dst, role: Role.Def), src: mapped(src, visit))
+        Inst.Alu(op: op, size: size, dst: dst, src: src) => return Inst.Alu(op: op, size: size, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.AluImm(op: op, size: size, dst: dst, imm: imm) => return Inst.AluImm(op: op, size: size, dst: visit(dst, role: Role.Mod), imm: imm)
+        Inst.Cmp(size: size, lhs: lhs, rhs: rhs) => return Inst.Cmp(size: size, lhs: visit(lhs, role: Role.Use), rhs: visit(rhs, role: Role.Use))
+        Inst.CmpImm(size: size, lhs: lhs, imm: imm) => return Inst.CmpImm(size: size, lhs: visit(lhs, role: Role.Use), imm: imm)
+        Inst.Test(size: size, lhs: lhs, rhs: rhs) => return Inst.Test(size: size, lhs: visit(lhs, role: Role.Use), rhs: visit(rhs, role: Role.Use))
+        Inst.Unary(op: op, size: size, reg: reg) => return Inst.Unary(op: op, size: size, reg: visit(reg, role: Role.Mod))
+        Inst.Imul(size: size, dst: dst, src: src) => return Inst.Imul(size: size, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.ImulImm(size: size, dst: dst, src: src, imm: imm) => return Inst.ImulImm(size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use), imm: imm)
+        Inst.MulWide(signed: signed, size: size, src: src) => {
+            let mapped_src = visit(src, role: Role.Use)
+            discard visit(RAX, role: Role.Mod)
+            if size != Size.Byte {
+                discard visit(RDX, role: Role.Def)
+            }
+            return Inst.MulWide(signed: signed, size: size, src: mapped_src)
+        }
+        Inst.Div(signed: signed, size: size, divisor: divisor) => {
+            let mapped_divisor = visit(divisor, role: Role.Use)
+            discard visit(RAX, role: Role.Mod)
+            if size != Size.Byte {
+                discard visit(RDX, role: Role.Mod)
+            }
+            return Inst.Div(signed: signed, size: size, divisor: mapped_divisor)
+        }
+        Inst.CheckedSrem(size: size, divisor: divisor) => {
+            let mapped_divisor = visit(divisor, role: Role.Use)
+            discard visit(RAX, role: Role.Mod)
+            discard visit(RDX, role: Role.Mod)
+            return Inst.CheckedSrem(size: size, divisor: mapped_divisor)
+        }
+        Inst.SignExtendData(size: size) => {
+            if size == Size.Byte {
+                discard visit(RAX, role: Role.Mod)
+            } else {
+                discard visit(RAX, role: Role.Use)
+                discard visit(RDX, role: Role.Def)
+            }
+            return self
+        }
+        Inst.Shift(op: op, size: size, dst: dst, amount: amount) => return Inst.Shift(op: op, size: size, dst: visit(dst, role: Role.Mod), amount: amount)
+        Inst.ShiftCl(op: op, size: size, dst: dst) => {
+            let mapped_dst = visit(dst, role: Role.Mod)
+            discard visit(RCX, role: Role.Use)
+            return Inst.ShiftCl(op: op, size: size, dst: mapped_dst)
+        }
+        Inst.Setcc(cond: cond, dst: dst) => return Inst.Setcc(cond: cond, dst: visit(dst, role: Role.Def))
+        Inst.Cmov(cond: cond, size: size, dst: dst, src: src) => return Inst.Cmov(cond: cond, size: size, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.Extend(kind: kind, dst: dst, src: src) => return Inst.Extend(kind: kind, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.BitScan(reverse: reverse, size: size, dst: dst, src: src) => return Inst.BitScan(reverse: reverse, size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.Bswap(size: size, reg: reg) => return Inst.Bswap(size: size, reg: visit(reg, role: Role.Mod))
+        Inst.LockXadd(size: size, reg: reg, mem: mem) => return Inst.LockXadd(size: size, reg: visit(reg, role: Role.Mod), mem: mapped(mem, visit))
+        Inst.Xchg(size: size, reg: reg, mem: mem) => return Inst.Xchg(size: size, reg: visit(reg, role: Role.Mod), mem: mapped(mem, visit))
+        Inst.LockCmpxchg(size: size, replacement: replacement, mem: mem) => {
+            let mapped_replacement = visit(replacement, role: Role.Use)
+            let mapped_mem = mapped(mem, visit)
+            discard visit(RAX, role: Role.Mod)
+            return Inst.LockCmpxchg(size: size, replacement: mapped_replacement, mem: mapped_mem)
+        }
+        Inst.AtomicRmwLoop(op: op, size: size, operand: operand, mem: mem, temp: temp) => {
+            let mapped_operand = visit(operand, role: Role.Use)
+            let mapped_mem = mapped(mem, visit)
+            let mapped_temp = visit(temp, role: Role.Temp)
+            discard visit(RAX, role: Role.EarlyDef)
+            return Inst.AtomicRmwLoop(op: op, size: size, operand: mapped_operand, mem: mapped_mem, temp: mapped_temp)
+        }
+        Inst.Call(target: target, args: args, results: results, clobbers: clobbers) => {
+            var mapped_target = target
+            match target {
+                CallTarget.Indirect(reg) => {
+                    mapped_target = CallTarget.Indirect(visit(reg, role: Role.Use))
+                }
+                CallTarget.Direct(symbol: _, kind: _) => {}
+            }
+            each_reg(args, role: Role.Use, visit)
+            each_reg(results, role: Role.Def, visit)
+            return Inst.Call(target: mapped_target, args: args, results: results, clobbers: clobbers)
+        }
+        Inst.Ret(results: results) => {
+            each_reg(results, role: Role.Use, visit)
+            return self
+        }
+        Inst.Args(params: params) => {
+            each_reg(params, role: Role.Def, visit)
+            return self
+        }
+        Inst.StackSwitch(store: store, load: load, temp: temp, other: other) => {
+            let mapped_store = visit(store, role: Role.Use)
+            let mapped_load = visit(load, role: Role.Use)
+            let mapped_temp = visit(temp, role: Role.Temp)
+            let mapped_other = visit(other, role: Role.Temp)
+            discard visit(RDI, role: Role.Mod)
+            return Inst.StackSwitch(store: mapped_store, load: mapped_load, temp: mapped_temp, other: mapped_other)
+        }
+        Inst.TlsGetAddr(symbol: _) => {
+            discard visit(RAX, role: Role.Def)
+            return self
+        }
+        Inst.FloatArith(op: op, size: size, dst: dst, src: src) => return Inst.FloatArith(op: op, size: size, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.FloatSqrt(size: size, dst: dst, src: src) => return Inst.FloatSqrt(size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.FloatConvert(source: source, dst: dst, src: src) => return Inst.FloatConvert(source: source, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.FloatBits(op: op, dst: dst, src: src) => return Inst.FloatBits(op: op, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.Ucomis(size: size, lhs: lhs, rhs: rhs) => return Inst.Ucomis(size: size, lhs: visit(lhs, role: Role.Use), rhs: visit(rhs, role: Role.Use))
+        Inst.CvtIntToFloat(int_size: int_size, size: size, dst: dst, src: src) => return Inst.CvtIntToFloat(int_size: int_size, size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.CvtFloatToInt(size: size, int_size: int_size, dst: dst, src: src) => return Inst.CvtFloatToInt(size: size, int_size: int_size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.MovToXmm(size: size, dst: dst, src: src) => return Inst.MovToXmm(size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.MovFromXmm(size: size, dst: dst, src: src) => return Inst.MovFromXmm(size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use))
+        Inst.FloatToIntSat(signed: signed, size: size, dst: dst, src: src, temp: temp) => return Inst.FloatToIntSat(signed: signed, size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use), temp: visit(temp, role: Role.Temp))
+        Inst.UintToFloat(size: size, dst: dst, src: src, temp: temp) => return Inst.UintToFloat(size: size, dst: visit(dst, role: Role.Def), src: visit(src, role: Role.Use), temp: visit(temp, role: Role.Temp))
+        Inst.CanonNan(size: size, reg: reg, temp: temp) => return Inst.CanonNan(size: size, reg: visit(reg, role: Role.Mod), temp: visit(temp, role: Role.Temp))
+        Inst.XmmCmov(cond: cond, dst: dst, src: src) => return Inst.XmmCmov(cond: cond, dst: visit(dst, role: Role.Mod), src: visit(src, role: Role.Use))
+        Inst.Mfence or Inst.Ud2 or Inst.Jmp(label: _) or Inst.Jcc(cond: _, label: _) or Inst.Push(reg: _) or Inst.Pop(reg: _) => return self
+    }
+} Inst.map_regs
+
+/// The registers the instruction changes beyond its operands.
+pkg fn Inst.clobbers(self) -> RegSet {
+    return match self {
+        Inst.Call(target: _, args: _, results: _, clobbers: clobbers) => clobbers
+        Inst.StackSwitch(store: _, load: _, temp: _, other: _) => RegSet.all().minus(RegSet.of(RDI))
+        Inst.TlsGetAddr(symbol: _) => RegSet.caller_saved()
+        else => RegSet.empty()
+    }
+} Inst.clobbers
+
+/// Whether the instruction is a sequence that may write a register before it has read all its
+/// operands, so that a definition must not share a register with a use.
+pkg fn Inst.is_sequence(self) -> bool {
+    return match self {
+        Inst.CheckedSrem(size: _, divisor: _) or Inst.AtomicRmwLoop(op: _, size: _, operand: _, mem: _, temp: _) or Inst.StackSwitch(store: _, load: _, temp: _, other: _) or Inst.TlsGetAddr(symbol: _) => true
+        Inst.FloatToIntSat(signed: _, size: _, dst: _, src: _, temp: _) or Inst.UintToFloat(size: _, dst: _, src: _, temp: _) or Inst.CanonNan(size: _, reg: _, temp: _) or Inst.XmmCmov(cond: _, dst: _, src: _) => true
+        else => false
+    }
+} Inst.is_sequence

@@ -1,0 +1,852 @@
+//! Test runs: the tests a scope selects, the test image holding each package's tests for each run target, lowered by a checker of that target, each run as a process of that image or a boot of the emulator on it, the failure each failing test reports, and the pass record each passing test leaves in the build cache.
+
+/// The most runs of a test without parameters: schedules 0 to 63.
+const SCHEDULES: u64 = 64
+
+/// The runs of a property test: cases 0 to 255.
+const CASES: u64 = 256
+
+/// The coverage class of every replay token.
+const CLASS: Str = "sc"
+
+/// A test that failed on a run target: its canonical path, the location of its head, its cause
+/// and what its record holds.
+pkg struct Failure {
+    pkg item: text::String
+    pkg path: text::String
+    pkg line: u32
+    pkg target: workspace::Target
+    pkg cause: text::String
+    pkg lines: mem::List[text::String]
+} Failure
+
+/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, and
+/// what building their test images reports.
+pkg struct Report {
+    pkg tests: usize
+    pkg failures: mem::List[Failure]
+    pkg diagnostics: mem::List[diagnostic::Diagnostic]
+} Report
+
+/// The report of no run.
+pkg fn Report.empty(alloc: mem::Alloc) -> Report {
+    return Report(tests: 0, failures: mem::List[Failure].empty(alloc), diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc))
+} Report.empty
+
+/// A test selected to run: its item, its target and whether it is a property test.
+struct Selected {
+    item: ty::ItemId
+    target: lower::TestImageTarget
+    property: bool
+} Selected
+
+/// The tests selected in a package.
+struct Planned {
+    package_id: ty::PackageId
+    tests: mem::List[Selected]
+} Planned
+
+/// Which runs of the tests a scope selects take place.
+pkg enum Runs {
+    /// Every run of each test on each run target.
+    All
+    /// Every run of each test on each run target where it is affected.
+    Affected
+    /// The one run a replay token names.
+    Replay(Token)
+    /// Every run of each reliance test, and of each test whose reach holds an item of one of
+    /// these packages.
+    Reaching(mem::List[text::String])
+} Runs
+
+/// The run a replay token names: its run target, its test's canonical path, its index and seed.
+pkg struct Token {
+    target: workspace::Target
+    test_path: text::String
+    index: u64
+    seed: u64
+} Token
+
+/// The run a token names, when it parses and its class is `sc`.
+pkg fn Token.read(written: Str, alloc: mem::Alloc) -> Option[Token] {
+    var parts = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    expect bytes.len() < ~0usize
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b'/' {
+            continue
+        }
+        let Some(part) = written.slice_bytes(start, end: at) else {
+            return None
+        }
+        mut parts.push(text::String.of(part, alloc))
+        start = at + 1
+    }
+    if parts.len() != 5 or parts[0].as_str() != CLASS {
+        return None
+    }
+    let Some(index) = platform::parse_decimal(parts[3].as_str()) else {
+        return None
+    }
+    var canonical = text::String.empty(alloc)
+    mut canonical.write(text::fmt("{index}", index), budget: 32)
+    if canonical != parts[3] {
+        return None
+    }
+    let Some(seed) = hashing::read_checksummed_base32(parts[4].as_str(), length: 8, alloc) else {
+        return None
+    }
+    let Some(target) = workspace::Target.from_name(parts[1].as_str()) else {
+        return None
+    }
+    if target == workspace::Target.Any {
+        return None
+    }
+    return Some(Token(target: target, test_path: text::String.of(parts[2].as_str(), alloc), index: index, seed: seed.view().u64_le(0)))
+} Token.read
+
+/// The location of the head of the test the token names, when it is a test of the workspace and
+/// the token names one of its run targets.
+pkg fn Token.location(self, session: check::Session) -> Option[text::String] {
+    let held = session.workspace.contents()
+    for closure in held.closures {
+        let checker = session.unchecked(closure, target: self.target)
+        let db = checker.db()
+        let alloc = session.alloc
+        var found: Option[ty::ItemId] = None
+        for index in 0..<db.items.len() {
+            let item = ty::ItemId(index: u32.fit(index))
+            let ast::ItemKind.Test(_) = db.ast(item).kind else {
+                continue
+            }
+            if db.is_reported(item) and db.canonical(item) == self.test_path {
+                found = Some(item)
+                break
+            }
+        }
+        let Some(item) = found else {
+            continue
+        }
+        let targets = run_targets(db.source(db.package_of(item)), alloc)
+        if targets.position(fn(target: workspace::Target) => target == self.target).is_none() {
+            continue
+        }
+        var location = text::String.of(db.item_file(item).path.as_str(), alloc)
+        mut location.write(text::fmt(":{line}", line: db.head_line(item)), budget: 32)
+        return Some(take location)
+    }
+    return None
+} Token.location
+
+/// Runs the tests a scope selects on each run target of their packages, as `runs` keeps them;
+/// a part of the build cache that is exposed ends it before any run.
+pkg fn run(session: check::Session, scope: scope::Scope, runs: Runs, user_cache: cache::Cache) -> Result[Report, cache::Exposed] fails platform::IoError {
+    let alloc = session.alloc
+    let held = session.workspace.contents()
+    var report = Report.empty(alloc)
+    for closure in held.closures {
+        for target in scope_targets(held, closure, scope, alloc) {
+            let checker = session.checked(closure, target)
+            match try run_target(session, checker, scope, runs, user_cache, report: mut report) {
+                Ok(_) => {}
+                Err(exposed) => return Err(take exposed)
+            }
+        }
+    }
+    mut report.failures.sort_by(fn(left: Failure, right: Failure) => failure_order(left, right))
+    return Ok(take report)
+} run
+
+/// The order of failures by path, line and target name.
+fn failure_order(left: Failure, right: Failure) -> core::Ordering {
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    let lines = left.line.cmp(right.line)
+    if lines != core::Ordering.Equal {
+        return lines
+    }
+    return left.target.name().cmp(right.target.name())
+} failure_order
+
+/// The run targets of the packages a closure checks that hold a test a scope may select: one
+/// whose head the scope holds, or any for the lines of an item that is no test, which tests
+/// anywhere may target.
+fn scope_targets(held: workspace::Workspace, closure: workspace::Closure, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[workspace::Target] {
+    var targeted = false
+    match scope {
+        scope::Scope.Lines(path: path, lines: lines) => {
+            match held.file(path.as_str()) {
+                Some(at) => {
+                    targeted = true
+                    for line in test_heads(held.file_at(at), alloc) {
+                        if lines.contains(line) {
+                            targeted = false
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    var targets = mem::List[workspace::Target].empty(alloc)
+    for index in closure.checked {
+        let Some(source) = held.packages.get(index) else {
+            expect false
+            continue
+        }
+        if not selects(held, source, scope, targeted, alloc) {
+            continue
+        }
+        for target in run_targets(source, alloc) {
+            mut targets.push(target)
+        }
+    }
+    mut targets.sort_by(fn(left: workspace::Target, right: workspace::Target) => left.cmp(right))
+    var distinct = mem::List[workspace::Target].empty(alloc)
+    for target in targets {
+        let count = distinct.len()
+        if count == 0 or distinct[count - 1] != target {
+            mut distinct.push(target)
+        }
+    }
+    return distinct
+} scope_targets
+
+/// Whether a package holds a test a scope may select.
+fn selects(held: workspace::Workspace, source: workspace::Package, scope: scope::Scope, targeted: bool, alloc: mem::Alloc) -> bool {
+    for file in source.files {
+        for line in test_heads(file, alloc) {
+            if targeted or scope.holds(held, path: file.path.as_str(), line: Some(line)) {
+                return true
+            }
+        }
+    }
+    return false
+} selects
+
+/// The lines of the heads of a file's tests.
+fn test_heads(file: workspace::File, alloc: mem::Alloc) -> mem::List[u32] {
+    var heads = mem::List[u32].empty(alloc)
+    for lowered in file.lowered(alloc) {
+        let Some(item) = lowered else {
+            continue
+        }
+        let ast::ItemKind.Test(_) = item.kind else {
+            continue
+        }
+        expect usize.widen(item.token) < file.syntax.tokens.len()
+        mut heads.push(file.syntax.tokens[usize.widen(item.token)].line)
+    }
+    return heads
+} test_heads
+
+/// Runs the tests a scope selects on a checker's target, in the packages it is a run target of.
+fn run_target(session: check::Session, checker: check::Checker, scope: scope::Scope, runs: Runs, user_cache: cache::Cache, mut report: Report) -> Result[Unit, cache::Exposed] fails platform::IoError {
+    let alloc = session.alloc
+    let db = checker.db()
+    let target = db.target
+    var by_package = mem::List[Planned].empty(alloc)
+    for selected in take select(checker, held: session.workspace.contents(), scope, alloc) {
+        let package_id = db.package_of(selected.item)
+        if run_targets(db.source(package_id), alloc).position(fn(run_target_of: workspace::Target) => run_target_of == target).is_none() {
+            continue
+        }
+        match by_package.position(fn(group: Planned) => group.package_id == package_id) {
+            Some(at) => mut by_package[at].tests.push(take selected)
+            None => {
+                var tests = mem::List[Selected].empty(alloc)
+                mut tests.push(take selected)
+                mut by_package.push(Planned(package_id: package_id, tests: take tests))
+            }
+        }
+    }
+    mut by_package.sort_by(fn(left: Planned, right: Planned) => left.package_id.index.cmp(right.package_id.index))
+    var planned = mem::List[Planned].empty(alloc)
+    for group in take by_package {
+        let Planned(package_id: package_id, tests: tests) = group
+        match try kept_tests(checker, package_id, take tests, runs, user_cache, alloc) {
+            Ok(kept) => mut planned.push(Planned(package_id: package_id, tests: take kept))
+            Err(exposed) => return Err(take exposed)
+        }
+    }
+    for group in planned {
+        expect report.tests <= ~0usize - group.tests.len()
+        report.tests += group.tests.len()
+        try run_package(session, checker, package_id: group.package_id, tests: group.tests.view(), runs, user_cache, report: mut report)
+    }
+    return Ok(Unit)
+} run_target
+
+/// The tests of a package that `runs` keeps on a checker's target; a part of the build cache that
+/// is exposed when it reads a pass record.
+fn kept_tests(checker: check::Checker, package_id: ty::PackageId, take tests: mem::List[Selected], runs: Runs, user_cache: cache::Cache, alloc: mem::Alloc) -> Result[mem::List[Selected], cache::Exposed] fails platform::IoError {
+    var kept = mem::List[Selected].empty(alloc)
+    let target = checker.db().target
+    match runs {
+        Runs.All => return Ok(take tests)
+        Runs.Affected => {
+            for selected_test in take tests {
+                let name = record_name(checker, test_item: selected_test.item, alloc)
+                let record = match try user_cache.record(name.as_str()) {
+                    Ok(found) => found
+                    Err(exposed) => return Err(take exposed)
+                }
+                let Some(passed) = pass_record(checker, test_item: selected_test.item, alloc) else {
+                    mut kept.push(take selected_test)
+                    continue
+                }
+                let Some(found) = record else {
+                    mut kept.push(take selected_test)
+                    continue
+                }
+                if found.view() != passed.view() {
+                    mut kept.push(take selected_test)
+                }
+            }
+        }
+        Runs.Replay(token) => {
+            if token.target == target {
+                return Ok(take tests)
+            }
+        }
+        Runs.Reaching(packages) => {
+            for selected_test in take tests {
+                if is_reaching(checker, package_id, test_item: selected_test.item, packages: packages.view()) {
+                    mut kept.push(take selected_test)
+                }
+            }
+        }
+    }
+    return Ok(take kept)
+} kept_tests
+
+/// Whether a test relies on another package's function, or reaches an item of one of the
+/// packages named.
+fn is_reaching(checker: check::Checker, package_id: ty::PackageId, test_item: ty::ItemId, packages: Slice[text::String]) -> bool {
+    let db = checker.db()
+    match db.ast(test_item).kind {
+        ast::ItemKind.Test(tested) => {
+            match checker.test_target(test_item, tested) {
+                Some(check::TestTarget.Function(function)) => {
+                    if db.package_of(function) != package_id {
+                        return true
+                    }
+                }
+                Some(check::TestTarget.Derived(owner)) => {
+                    if db.package_of(owner) != package_id {
+                        return true
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    for item in checker.test_reach(test_item) {
+        let name = db.package_data(db.package_of(item)).name
+        for wanted in packages {
+            if wanted == name {
+                return true
+            }
+        }
+    }
+    return false
+} is_reaching
+
+/// The name of the cache record of a test's passes on a checker's target.
+fn record_name(checker: check::Checker, test_item: ty::ItemId, alloc: mem::Alloc) -> text::String {
+    let db = checker.db()
+    var key = mem::Bytes.empty(alloc)
+    encoding::bytes(mut key, value: db.canonical(test_item).as_bytes())
+    encoding::bytes(mut key, value: db.target.name().as_bytes())
+    var name = text::String.of("pass-", alloc)
+    mut name.append(hashing::HashValue.of(key.view()).full(alloc).as_str())
+    return name
+} record_name
+
+/// A canonical path and an item hash of a test's reach.
+struct Reached {
+    path: text::String
+    hash: hashing::HashValue
+} Reached
+
+/// The record of a test passing on a checker's target: the toolchain hash, the target's name,
+/// then the canonical path and item hash of each item of the test's reach, in path order; none
+/// when the toolchain hash cannot be known.
+fn pass_record(checker: check::Checker, test_item: ty::ItemId, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let db = checker.db()
+    let Some(tree) = db.session.toolchain_tree() else {
+        return None
+    }
+    var reach = mem::List[Reached].empty(alloc)
+    for item in checker.test_reach(test_item) {
+        mut reach.push(Reached(path: db.canonical(item), hash: checker.hashes(item).item))
+    }
+    mut reach.sort_by(fn(left: Reached, right: Reached) => reached_order(left, right))
+    var record = mem::Bytes.empty(alloc)
+    encoding::bytes(mut record, value: toolchain::hash(1, tree, alloc).bytes.view())
+    encoding::bytes(mut record, value: db.target.name().as_bytes())
+    encoding::uvar(mut record, value: u64.widen(reach.len()))
+    for reached in reach {
+        encoding::bytes(mut record, value: reached.path.as_bytes())
+        encoding::bytes(mut record, value: reached.hash.bytes.view())
+    }
+    return Some(take record)
+} pass_record
+
+/// The order of reached items by canonical path, then item hash.
+fn reached_order(left: Reached, right: Reached) -> core::Ordering {
+    let paths = left.path.as_str().cmp(right.path.as_str())
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    return left.hash.cmp(right.hash)
+} reached_order
+
+/// The tests of a scope that run: of a package, module or file, every test in it; of a test,
+/// that test; of another item, the tests targeting it; never a disputed test or a property test
+/// with a generator gap.
+fn select(checker: check::Checker, held: workspace::Workspace, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[Selected] {
+    let db = checker.db()
+    var targeted: Option[ty::ItemId] = None
+    match scope {
+        scope::Scope.Lines(path: path, lines: lines) => {
+            match item_at(checker, path: path.as_str(), line: lines.low) {
+                Some(item) => {
+                    match db.ast(item).kind {
+                        ast::ItemKind.Test(_) => {}
+                        else => {
+                            targeted = Some(item)
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        else => {}
+    }
+    var selected = mem::List[Selected].empty(alloc)
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        let ast::ItemKind.Test(tested) = db.ast(item).kind else {
+            continue
+        }
+        if tested.disputed or not db.is_reported(item) {
+            continue
+        }
+        let property = tested.params.is_some()
+        if property and checker.generation(item).is_none() {
+            continue
+        }
+        let Some(target) = checker.test_target(item, tested) else {
+            continue
+        }
+        var wanted = false
+        match targeted {
+            Some(scoped) => {
+                wanted = match target {
+                    check::TestTarget.Function(function) => function == scoped
+                    check::TestTarget.Derived(owner) => owner == scoped
+                }
+            }
+            None => {
+                wanted = scope.holds(held, path: db.item_file(item).path.as_str(), line: Some(db.head_line(item)))
+            }
+        }
+        if not wanted {
+            continue
+        }
+        let image_target = match target {
+            check::TestTarget.Function(function) => lower::TestImageTarget.Function(function)
+            check::TestTarget.Derived(owner) => lower::TestImageTarget.Derived(owner: owner, method: derived_method(tested, alloc))
+        }
+        mut selected.push(Selected(item: item, target: take image_target, property: property))
+    }
+    return selected
+} select
+
+/// The name of the derived method a test's target names.
+fn derived_method(tested: ast::TestItem, alloc: mem::Alloc) -> text::String {
+    let Some(member) = tested.member else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text::String.of(member.text.as_str(), alloc)
+} derived_method
+
+/// The item holding a line of a file.
+fn item_at(checker: check::Checker, path: Str, line: u32) -> Option[ty::ItemId] {
+    let db = checker.db()
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.item_file(item).path.as_str() != path {
+            continue
+        }
+        let syntax = db.syntax(item)
+        let data = db.item(item)
+        expect data.index < syntax.items.len()
+        if syntax.item_lines(syntax.items[data.index]).contains(line) {
+            return Some(item)
+        }
+    }
+    return None
+} item_at
+
+/// The run targets of a package: each target it declares, `any` standing for `x86_64-host`.
+fn run_targets(source: workspace::Package, alloc: mem::Alloc) -> mem::List[workspace::Target] {
+    var targets = mem::List[workspace::Target].empty(alloc)
+    match source.manifest {
+        Some(manifest) => {
+            for target in manifest.targets {
+                if target == workspace::Target.Any {
+                    mut targets.push(workspace::Target.Host)
+                } else {
+                    mut targets.push(target)
+                }
+            }
+        }
+        None => {}
+    }
+    if targets.len() == 0 {
+        mut targets.push(workspace::Target.Host)
+    }
+    mut targets.sort_by(fn(left: workspace::Target, right: workspace::Target) => left.cmp(right))
+    var distinct = mem::List[workspace::Target].empty(alloc)
+    for target in targets {
+        let count = distinct.len()
+        if count == 0 or distinct[count - 1] != target {
+            mut distinct.push(target)
+        }
+    }
+    return distinct
+} run_targets
+
+/// Runs a package's tests on a checker's target, each run a process of the package's test image
+/// or a boot of the emulator on it, and records in the cache each test whose every run passes,
+/// unless replaying; every run fails on a machine target whose emulator cannot start.
+fn run_package(session: check::Session, checker: check::Checker, package_id: ty::PackageId, tests: Slice[Selected], runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
+    let alloc = session.alloc
+    if tests.len() == 0 {
+        return
+    }
+    let target = checker.db().target
+    if target.is_machine() and not emulator::available(target, alloc) {
+        for selected_test in tests {
+            mut report.failures.push(failure(checker, item: selected_test.item, cause: "test.emulator-unavailable", lines: mem::List[text::String].empty(alloc)))
+        }
+        return
+    }
+    let built = try build_image(session, checker, package_id, tests)
+    let Built(image: image, collisions: collisions) = built
+    for collision in take collisions {
+        mut report.diagnostics.push(take collision)
+    }
+    let Some(test_image) = image else {
+        return
+    }
+    for number in 0..<tests.len() {
+        try run_test_runs(checker, test_image, number, selected_test: tests[number], runs, user_cache, report: mut report)
+    }
+    try test_image.remove(alloc)
+} run_package
+
+/// Runs the runs of the numbered test of a test image, the first failing one recording the test's
+/// failure, and records the test's passes in the cache when none fails, unless replaying.
+fn run_test_runs(checker: check::Checker, test_image: Image, number: usize, selected_test: Selected, runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
+    let db = checker.db()
+    let alloc = checker.alloc()
+    let target = db.target
+    let path = db.canonical(selected_test.item)
+    var indexed = mem::List[Indexed].empty(alloc)
+    match runs {
+        Runs.Replay(token) => mut indexed.push(Indexed(index: token.index, seed: token.seed))
+        else => {
+            let hash = checker.hashes(selected_test.item).item
+            var count = SCHEDULES
+            if selected_test.property {
+                count = CASES
+            }
+            for index in 0..<count {
+                mut indexed.push(Indexed(index: index, seed: seed_of(hash, target, index, alloc)))
+            }
+        }
+    }
+    let failures = report.failures.len()
+    for run_index in indexed {
+        let token_text = token_of(target, test_path: path.as_str(), index: run_index.index, seed: run_index.seed, alloc)
+        let none = mem::List[wide::Wide].empty(alloc)
+        let ran = try run_test(test_image, number, index: run_index.index, seed: run_index.seed, token: token_text.as_str(), forced: none.view(), alloc)
+        let Some(cause) = cause_of(ran, alloc) else {
+            if not selected_test.property and not ran.contended {
+                break
+            }
+            continue
+        }
+        let failed = try failed_lines(checker, test_image, number, selected_test, run_index, token: token_text.as_str(), take ran)
+        mut report.failures.push(failure(checker, item: selected_test.item, cause: cause.as_str(), lines: take failed))
+        break
+    }
+    let replaying = match runs {
+        Runs.Replay(_) => true
+        else => false
+    }
+    if report.failures.len() == failures and not replaying {
+        let name = record_name(checker, test_item: selected_test.item, alloc)
+        let Some(passed) = pass_record(checker, test_item: selected_test.item, alloc) else {
+            return
+        }
+        try user_cache.replace(name.as_str(), contents: passed.view())
+    }
+} run_test_runs
+
+/// The index and seed of a run.
+struct Indexed derives Copy {
+    index: u64
+    seed: u64
+} Indexed
+
+/// What the record of a failing run holds: its trap report or escaped failure, its test trace,
+/// for a property test the setup forms and regression-test edit of its shrunk case, and its
+/// replay token.
+fn failed_lines(checker: check::Checker, test_image: Image, number: usize, selected_test: Selected, run_index: Indexed, token: Str, take ran: Run) -> mem::List[text::String] fails platform::IoError {
+    let alloc = checker.alloc()
+    var lines = mem::List[text::String].empty(alloc)
+    var final_run = ran
+    if selected_test.property {
+        let failed = signature_of(final_run, alloc)
+        let shrunk = try shrink(take final_run, rerun: fn(forced: Slice[wide::Wide]) -> Option[Run] fails platform::IoError {
+            let candidate = try run_test(test_image, number, index: run_index.index, seed: run_index.seed, token, forced, alloc)
+            if signature_of(candidate, alloc) != failed {
+                return None
+            }
+            return Some(take candidate)
+        }, alloc)
+        for line in take regression(checker, test_item: selected_test.item, shrunk) {
+            mut lines.push(take line)
+        }
+        final_run = shrunk
+    }
+    var held = record_lines(final_run, token, alloc)
+    let replay = mut held.pop()
+    for line in take lines {
+        mut held.push(take line)
+    }
+    let Some(replay_line) = replay else {
+        return held
+    }
+    mut held.push(take replay_line)
+    return held
+} failed_lines
+
+/// The lowered test image of a package's tests and where it is written, or the symbol collisions
+/// of its lowering.
+struct Built {
+    image: Option[Image]
+    collisions: mem::List[diagnostic::Diagnostic]
+} Built
+
+/// Lowers and writes the test image of a package's tests for a checker's target, under
+/// `.nan/tests/`, readied for its runs; or the symbol collisions of its lowering.
+fn build_image(session: check::Session, checker: check::Checker, package_id: ty::PackageId, tests: Slice[Selected]) -> Built fails platform::IoError {
+    let alloc = session.alloc
+    let db = checker.db()
+    let lowered = lower_tests(session, checker, package_id, tests)
+    let source = db.source(package_id)
+    let collisions = final_build::collisions(source, lowered, alloc)
+    if collisions.len() > 0 {
+        return Built(image: None, collisions: take collisions)
+    }
+    let target = db.target
+    var image = platform::join(session.workspace.contents().root.as_str(), name: ".nan/tests", alloc)
+    image = platform::join(image.as_str(), name: target.name(), alloc)
+    var name = text::String.of(db.package_data(package_id).name.as_str(), alloc)
+    mut name.append(target.image_suffix())
+    image = platform::join(image.as_str(), name: name.as_str(), alloc)
+    let Ok(_) = try final_build::write_image(target, object: lowered.object.view(), image: image.as_str(), alloc) else {
+        fail platform::IoError.Other(0)
+    }
+    return Built(image: Some(try Image.new(target, path: take image, alloc)), collisions: take collisions)
+} build_image
+
+/// The test image of a package's selected tests for a checker's target.
+fn lower_tests(session: check::Session, checker: check::Checker, package_id: ty::PackageId, tests: Slice[Selected]) -> lower::Lowered {
+    let alloc = session.alloc
+    var lowered = mem::List[lower::Test].empty(alloc)
+    for selected_test in tests {
+        mut lowered.push(lower::Test(item: selected_test.item, target: selected_test.target.copy(alloc)))
+    }
+    var roots = mem::List[ty::PackageId].empty(alloc)
+    mut roots.push(package_id)
+    let prefixes = final_build::prefixes(final_build::artefacts_of(session, checker, root: package_id, alloc), alloc)
+    return lower::test_image_lower(checker, tests: lower::Tests(tests: take lowered, roots: take roots, prefixes: take prefixes))
+} lower_tests
+
+/// The seed of a run: the first 8 bytes, little-endian, of the BLAKE3-256 hash of the test's item
+/// hash, the run target's name and the run's index.
+fn seed_of(hash: hashing::HashValue, target: workspace::Target, index: u64, alloc: mem::Alloc) -> u64 {
+    var input = mem::Bytes.empty(alloc)
+    mut input.append(hash.bytes.view())
+    mut input.append(target.name().as_bytes())
+    for shift in 0..<8u32 {
+        mut input.push(u8.truncate(index >> (8 * shift)))
+    }
+    let digest = hashing::blake3(input.view())
+    return digest.view().u64_le(0)
+} seed_of
+
+/// The replay token naming a run.
+fn token_of(target: workspace::Target, test_path: Str, index: u64, seed: u64, alloc: mem::Alloc) -> text::String {
+    var seed_bytes = mem::Bytes.empty(alloc)
+    for shift in 0..<8u32 {
+        mut seed_bytes.push(u8.truncate(seed >> (8 * shift)))
+    }
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("{class}/{target}/{test_path}/{index}/{seed}", class: CLASS, target: target.name(), test_path, index, seed: hashing::checksummed_base32(seed_bytes.view(), alloc)), budget: 1_000_000)
+    return written
+} token_of
+
+/// The cause of a failing run, the first that applies of a trap, an escaped failure, a target
+/// that did not run, a stall and a timeout; none for a passing run.
+fn cause_of(ran: Run, alloc: mem::Alloc) -> Option[text::String] {
+    return match ran.ended {
+        Ended.Passed(ran: true) => None
+        Ended.Passed(ran: false) or Ended.Stalled(ran: false) => Some(text::String.of("test.target-not-run", alloc))
+        Ended.Trapped(report: report) => Some(first_word(report.as_str(), alloc))
+        Ended.Escaped(path: _, rendering: _) => Some(text::String.of("test.escaped-failure", alloc))
+        Ended.Stalled(ran: true) => Some(text::String.of("test.stalled", alloc))
+        Ended.TimedOut => Some(text::String.of("test.timeout", alloc))
+    }
+} cause_of
+
+/// The text before the first space of a text, or all of it.
+fn first_word(written: Str, alloc: mem::Alloc) -> text::String {
+    let cut = match written.find(" ") {
+        Some(at) => at
+        None => written.byte_len()
+    }
+    let Some(word) = written.slice_bytes(0, end: cut) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(word, alloc)
+} first_word
+
+/// How a run failed, for keeping a candidate that fails the same way: its trap kind and the
+/// location of the trapping operation, its escaped failure's variant, or its outcome code.
+fn signature_of(ran: Run, alloc: mem::Alloc) -> Option[text::String] {
+    match ran.ended {
+        Ended.Trapped(report: report) => {
+            let Some(cut) = report.as_str().find(" in ") else {
+                return None
+            }
+            let Some(kind_and_location) = report.as_str().slice_bytes(0, end: cut) else {
+                return None
+            }
+            return Some(text::String.of(kind_and_location, alloc))
+        }
+        Ended.Escaped(path: path, rendering: _) => return Some(text::String.of(path.as_str(), alloc))
+        else => return cause_of(ran, alloc)
+    }
+} signature_of
+
+/// The setup forms of a shrunk case's parameters and the lines of its regression-test edit,
+/// offered when the edited workspace reports no error in the test it inserts.
+fn regression(checker: check::Checker, test_item: ty::ItemId, shrunk: Run) -> mem::List[text::String] {
+    let alloc = checker.alloc()
+    let session = checker.db().session
+    let held = session.workspace.contents()
+    var given = mem::List[wide::Wide].empty(alloc)
+    for draw in shrunk.draws {
+        mut given.push(draw.given)
+    }
+    let Regression(statements: statements, fix: regression_fix) = regression_of(checker, test_item, given: given.view())
+    var lines = mem::List[text::String].empty(alloc)
+    mut lines.push(text::String.of("setup", alloc))
+    for statement in statements {
+        var line = text::String.of("    ", alloc)
+        mut line.append(output::printable(statement.as_bytes(), alloc).as_str())
+        mut lines.push(take line)
+    }
+    expect regression_fix.edits.len() > 0
+    let edit = regression_fix.edits[0]
+    var first_line: u32 = 0
+    match held.file(edit.path.as_str()) {
+        Some(at) => {
+            for spanned in held.file_at(at).syntax.lines {
+                if spanned.start <= edit.replacement.start {
+                    expect first_line < 0xFFFF_FFFF
+                    first_line += 1
+                }
+            }
+        }
+        None => {}
+    }
+    let count = u32.fit(final_build::lines_of(edit.replacement.text.as_str(), alloc).len())
+    let after = fix::fixed_by(held, fix: regression_fix, grammar: session.grammar.contents(), alloc)
+    let rechecking = check::Session.of(mem::Shared.of(take after, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    for reported in rechecking.reported(scope::Scope.Workspace) {
+        if reported.code.class() != diagnostic::Class.Error or reported.path != Some(text::String.of(edit.path.as_str(), alloc)) {
+            continue
+        }
+        let Some(line) = reported.line else {
+            continue
+        }
+        expect first_line <= ~0u32 - count
+        if line >= first_line and line <= first_line + count {
+            return lines
+        }
+    }
+    var fixes = mem::List[diagnostic::Fix].empty(alloc)
+    mut fixes.push(fix::copied_fix(regression_fix, alloc))
+    for line in take fix::shown(held, fixes: fixes.view(), alloc) {
+        mut lines.push(take line)
+    }
+    return lines
+} regression
+
+/// What the record of a failing run holds: its trap report or escaped failure, its test trace and
+/// its replay token.
+fn record_lines(ran: Run, token: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    match ran.ended {
+        Ended.Trapped(report: report) => {
+            for line in take final_build::lines_of(report.as_str(), alloc) {
+                mut lines.push(take line)
+            }
+        }
+        Ended.Escaped(path: path, rendering: rendering) => {
+            var header = text::String.of("failure ", alloc)
+            mut header.append(path.as_str())
+            mut lines.push(take header)
+            for line in final_build::lines_of(rendering.as_str(), alloc) {
+                var indented = text::String.of("    ", alloc)
+                mut indented.append(output::printable(line.as_bytes(), alloc).as_str())
+                mut lines.push(take indented)
+            }
+        }
+        else => {}
+    }
+    if ran.trace.len() > 0 {
+        mut lines.push(text::String.of("trace", alloc))
+        let trace = output::lossy(ran.trace.view(), alloc)
+        for line in final_build::lines_of(trace.as_str(), alloc) {
+            var indented = text::String.of("    ", alloc)
+            mut indented.append(output::printable(line.as_bytes(), alloc).as_str())
+            mut lines.push(take indented)
+        }
+    }
+    var replay = text::String.of("replay ", alloc)
+    mut replay.append(token)
+    mut lines.push(take replay)
+    return lines
+} record_lines
+
+/// The failure of a test on a checker's target, at its head.
+fn failure(checker: check::Checker, item: ty::ItemId, cause: Str, take lines: mem::List[text::String]) -> Failure {
+    let db = checker.db()
+    let alloc = checker.alloc()
+    return Failure(item: db.canonical(item), path: text::String.of(db.item_file(item).path.as_str(), alloc), line: db.head_line(item), target: db.target, cause: text::String.of(cause, alloc), lines: take lines)
+} failure

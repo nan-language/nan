@@ -1,0 +1,667 @@
+//! Register windows, the simulated register blocks of `hw::sim::Registers`, and DMA buffers. A window reaches a simulated block or, on a machine target, a device's port or physical address through compiler stubs; on a machine target each part of a DMA access is a compiler stub too.
+
+/// A simulated register block: whether a window is mapped over it, the cell its queue nodes are
+/// drawn through, then a descriptor per register and the element slots the descriptors point
+/// into.
+const BLOCK_MAPPED: u64 = 0
+
+const BLOCK_CELL: u64 = 8
+
+const BLOCK_DESC: u64 = 16
+
+/// A descriptor: the byte offset of the register's first slot, its element count and whether
+/// it is write-one-clear.
+const BLOCK_DESC_SIZE: u64 = 16
+
+const BLOCK_SLOT_BASE: u64 = 0
+
+const BLOCK_COUNT: u64 = 4
+
+const BLOCK_WOC: u64 = 8
+
+/// An element's slot: its held value, whether it has a last-written value, that value, and the
+/// head and tail of its queue.
+const SLOT_HELD: u64 = 0
+
+const SLOT_HAS_LAST: u64 = 8
+
+const SLOT_LAST: u64 = 16
+
+const SLOT_QHEAD: u64 = 24
+
+const SLOT_QTAIL: u64 = 32
+
+const SLOT_SIZE: u64 = 40
+
+/// A queue node: its value and the next node.
+const SLOT_NODE_VALUE: u64 = 0
+
+const SLOT_NODE_NEXT: u64 = 8
+
+const SLOT_NODE_SIZE: u64 = 16
+
+/// A DMA buffer, whose value is its box's content pointer: its bus address, contents and box are
+/// that pointer; on the host no device reaches it.
+fn dma(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" or "into_box" => supply.ret(mut lo, mut fx, held: supply.param(0))
+        "contents" or "contents_mut" => {
+            let pointer = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(pointer))
+        }
+        "bus_addr" => {
+            let place = supply.param(0).address_value()
+            let pointer = mut fx.load(PTR, addr: place, offset: 0)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(pointer, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        else => {
+            expect false
+        }
+    }
+} dma
+
+/// The bit of a window's word set when the window reaches a simulated block, which a machine
+/// test image holds beside windows mapped over devices; no port, physical address or block's
+/// address has it.
+const WINDOWS_SIMULATED: i64 = i64.from_bits(0x8000_0000_0000_0000)
+
+/// A register window, which reaches the registers of a simulated block or, on a machine target,
+/// those of a device: on the host every window is simulated, a machine image's other than a test
+/// image's never are, and a machine test image's word says which one is.
+fn windows_window(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    if supply.member() == "map" {
+        expect lo.machine()
+        let given = supply.param(0).scalar_value()
+        let base = match supply.path.starts_with("hw::Ports") {
+            true => mut fx.b.uextend(PTR, x: given)
+            false => given
+        }
+        let Some(sret) = supply.sret else {
+            expect false
+            return
+        }
+        mut fx.store(base, addr: sret, offset: 0)
+        supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        return
+    }
+    let word = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    if not lo.machine() {
+        simulated_window(mut lo, mut fx, supply, block: word)
+    } else if not lo.seeded() {
+        device_window(mut lo, mut fx, supply, base: word)
+    } else {
+        let simulated = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: word, y: 0)
+        mut fx.if_true(simulated, then: fn[mut lo](mut fx1: Fx) {
+            let block = mut fx1.b.band_imm_s(word, y: ~WINDOWS_SIMULATED)
+            simulated_window(mut lo, fx: mut fx1, supply, block)
+        })
+        device_window(mut lo, mut fx, supply, base: word)
+    }
+} windows_window
+
+/// A window's operation on the simulated block at `block`: `unmap` ends the window, the block
+/// staying mapped, and a volatile call acts on the register's slot.
+fn simulated_window(mut lo: Lowering, mut fx: Fx, supply: Supply, block: clif::Value) {
+    let member = supply.member()
+    if member == "unmap" {
+        supply.done(mut lo, mut fx)
+        return
+    }
+    let value_ty = supply.type_arg(lo, index: 1)
+    let register = supply.param(1).scalar_value()
+    let indexed = member.ends_with("_at")
+    let element = match indexed {
+        true => supply.param(2).scalar_value()
+        false => mut fx.ptr(0)
+    }
+    let addr = windows_slot_address(mut lo, mut fx, block, register, element, indexed)
+    if member.starts_with("read") {
+        let value = read_slot(mut lo, mut fx, value_ty, addr)
+        supply.ret(mut lo, mut fx, held: value)
+    } else {
+        let value = match indexed {
+            true => supply.param(3)
+            false => supply.param(2)
+        }
+        write_slot(mut lo, mut fx, block, register, value_ty, addr, value)
+        supply.done(mut lo, mut fx)
+    }
+} simulated_window
+
+/// The address of a register's or element's slot in a block, trapping when an element index is
+/// not below the register's count.
+fn windows_slot_address(mut lo: Lowering, mut fx: Fx, block: clif::Value, register: clif::Value, element: clif::Value, indexed: bool) -> clif::Value {
+    let desc = windows_descriptor(mut fx, block, register)
+    if indexed {
+        let count_word = mut fx.load(clif::Type.Int32, addr: desc, offset: BLOCK_COUNT)
+        let count = mut fx.b.uextend(PTR, x: count_word)
+        let out = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: element, y: count)
+        mut fx.if_true(out, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+        })
+    }
+    let base_word = mut fx.load(clif::Type.Int32, addr: desc, offset: BLOCK_SLOT_BASE)
+    let base_offset = mut fx.b.uextend(PTR, x: base_word)
+    let base = mut fx.b.iadd(block, y: base_offset)
+    let offset = mut fx.b.imul_imm_s(element, y: i64.fit(SLOT_SIZE))
+    return mut fx.b.iadd(base, y: offset)
+} windows_slot_address
+
+/// The descriptor of a register in a block.
+fn windows_descriptor(mut fx: Fx, block: clif::Value, register: clif::Value) -> clif::Value {
+    let offset = mut fx.b.imul_imm_s(register, y: i64.fit(BLOCK_DESC_SIZE))
+    let base = mut fx.b.iadd_imm_s(block, y: i64.fit(BLOCK_DESC))
+    return mut fx.b.iadd(base, y: offset)
+} windows_descriptor
+
+/// Reads a slot's oldest queued value, or its held value when the queue is empty.
+fn read_slot(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, addr: clif::Value) -> Held {
+    let head = mut fx.load(PTR, addr: addr, offset: SLOT_QHEAD)
+    let queued = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let chosen = mut fx.choose(queued, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let next = mut fx1.load(PTR, addr: head, offset: SLOT_NODE_NEXT)
+        mut fx1.store(next, addr: addr, offset: SLOT_QHEAD)
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+        mut fx1.if_true(last, then: fn(mut fx2: Fx) {
+            let zero_value = mut fx2.ptr(0)
+            mut fx2.store(zero_value, addr: addr, offset: SLOT_QTAIL)
+        })
+        let node = mut fx1.b.iadd_imm_s(head, y: i64.fit(SLOT_NODE_VALUE))
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(node)
+        return produced
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.b.iadd_imm_s(addr, y: i64.fit(SLOT_HELD)))
+        return produced
+    })
+    return mut lo.held_at(mut fx, ty: value_ty, address: chosen[0])
+} read_slot
+
+/// Writes a slot's held and last-written values, clearing bits for a write-one-clear register.
+fn write_slot(mut lo: Lowering, mut fx: Fx, block: clif::Value, register: clif::Value, value_ty: ty::Ty, addr: clif::Value, value: Held) {
+    let desc = windows_descriptor(mut fx, block, register)
+    let woc = mut fx.load(clif::Type.Int32, addr: desc, offset: BLOCK_WOC)
+    let clears = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: woc, y: 0)
+    let value_slot = mut fx.slot(8, align: 8)
+    let zero_value = mut fx.ptr(0)
+    mut fx.store(zero_value, addr: value_slot, offset: 0)
+    mut lo.store_held(mut fx, address: value_slot, held: value, ty: value_ty)
+    let bits = mut fx.load(PTR, addr: value_slot, offset: 0)
+    let held_at = mut fx.b.iadd_imm_s(addr, y: i64.fit(SLOT_HELD))
+    let held = mut fx.load(PTR, addr: held_at, offset: 0)
+    let cleared = mut fx.b.band_not(held, y: bits)
+    let next = mut fx.b.select(clears, x: cleared, y: bits)
+    mut fx.store(next, addr: held_at, offset: 0)
+    mut fx.store(bits, addr: addr, offset: SLOT_LAST)
+    let one = mut fx.int(clif::Type.Int8, value: 1)
+    mut fx.store(one, addr: addr, offset: SLOT_HAS_LAST)
+} write_slot
+
+/// The `hw::sim::Registers` methods: building a block from its registers block, the one window
+/// over it, and the host-only ways to set, queue and read the last-written value of a register.
+fn windows_registers(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" => {
+            let block_ty = supply.type_arg(lo, index: 0)
+            let descriptors = register_descriptors(mut lo, block_ty)
+            var total = BLOCK_DESC
+            if descriptors.len() > 0 {
+                let last = descriptors[descriptors.len() - 1]
+                total = last.slot_base + last.count * SLOT_SIZE
+            }
+            let cell = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let size = mut fx.ptr(total)
+            let block = sims_draw(mut lo, mut fx, cell, size)
+            mut fx.store(cell, addr: block, offset: BLOCK_CELL)
+            for index in 0..<descriptors.len() {
+                let desc = descriptors[index]
+                let at = mut fx.b.iadd_imm_s(block, y: i64.fit(BLOCK_DESC + u64.widen(index) * BLOCK_DESC_SIZE))
+                let slot_base = mut fx.int(clif::Type.Int32, value: i64.fit(desc.slot_base))
+                mut fx.store(slot_base, addr: at, offset: BLOCK_SLOT_BASE)
+                let count = mut fx.int(clif::Type.Int32, value: i64.fit(desc.count))
+                mut fx.store(count, addr: at, offset: BLOCK_COUNT)
+                var clearing: i64 = 0
+                if desc.woc {
+                    clearing = 1
+                }
+                let woc = mut fx.int(clif::Type.Int32, value: clearing)
+                mut fx.store(woc, addr: at, offset: BLOCK_WOC)
+            }
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(block, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "mmio" or "ports" => {
+            let block = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let mapped = mut fx.load(clif::Type.Int8, addr: block, offset: BLOCK_MAPPED)
+            let twice = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: mapped, y: 0)
+            mut fx.if_true(twice, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
+            })
+            let one = mut fx.int(clif::Type.Int8, value: 1)
+            mut fx.store(one, addr: block, offset: BLOCK_MAPPED)
+            let word = match lo.machine() {
+                true => mut fx.b.bor_imm_s(block, y: WINDOWS_SIMULATED)
+                false => block
+            }
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(word, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        else => sim_access(mut lo, mut fx, supply, member: supply.member())
+    }
+} windows_registers
+
+/// A `set`, `queue` or `last_written` on a register's slot.
+fn sim_access(mut lo: Lowering, mut fx: Fx, supply: Supply, member: Str) {
+    let value_ty = supply.type_arg(lo, index: 1)
+    let block = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let register = supply.param(1).scalar_value()
+    let indexed = member.ends_with("_at")
+    let element = match indexed {
+        true => supply.param(2).scalar_value()
+        false => mut fx.ptr(0)
+    }
+    let addr = windows_slot_address(mut lo, mut fx, block, register, element, indexed)
+    var operation_end = member.byte_len()
+    loop {
+        let Some(prefix) = member.slice_bytes(0, end: operation_end) else {
+            break
+        }
+        if not prefix.ends_with("_at") {
+            break
+        }
+        expect operation_end >= 3
+        operation_end -= 3
+    }
+    let Some(operation) = member.slice_bytes(0, end: operation_end) else {
+        expect false
+        return
+    }
+    match operation {
+        "set" => {
+            let value = match indexed {
+                true => supply.param(3)
+                false => supply.param(2)
+            }
+            let held_at = mut fx.b.iadd_imm_s(addr, y: i64.fit(SLOT_HELD))
+            let value_slot = mut fx.slot(8, align: 8)
+            let zero_value = mut fx.ptr(0)
+            mut fx.store(zero_value, addr: value_slot, offset: 0)
+            mut lo.store_held(mut fx, address: value_slot, held: value, ty: value_ty)
+            let bits = mut fx.load(PTR, addr: value_slot, offset: 0)
+            mut fx.store(bits, addr: held_at, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "queue" => {
+            let value = match indexed {
+                true => supply.param(3)
+                false => supply.param(2)
+            }
+            let cell = mut fx.load(PTR, addr: block, offset: BLOCK_CELL)
+            let node_size = mut fx.ptr(SLOT_NODE_SIZE)
+            let node = sims_draw(mut lo, mut fx, cell, size: node_size)
+            let value_at = mut fx.b.iadd_imm_s(node, y: i64.fit(SLOT_NODE_VALUE))
+            mut lo.store_held(mut fx, address: value_at, held: value, ty: value_ty)
+            let tail = mut fx.load(PTR, addr: addr, offset: SLOT_QTAIL)
+            let has_tail = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+            discard mut fx.choose(has_tail, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                mut fx1.store(node, addr: tail, offset: SLOT_NODE_NEXT)
+                return mem::List[clif::Value].empty(fx1.alloc)
+            }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                mut fx1.store(node, addr: addr, offset: SLOT_QHEAD)
+                return mem::List[clif::Value].empty(fx1.alloc)
+            })
+            mut fx.store(node, addr: addr, offset: SLOT_QTAIL)
+            supply.done(mut lo, mut fx)
+        }
+        "last_written" => {
+            let option = supply.abi.result
+            let laid = mut lo.layout_of(option)
+            let sret = match supply.sret {
+                Some(given) => given
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            let has = mut fx.load(clif::Type.Int8, addr: addr, offset: SLOT_HAS_LAST)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: has, y: 0)
+            let last_at = mut fx.b.iadd_imm_s(addr, y: i64.fit(SLOT_LAST))
+            let held = mut lo.held_at(mut fx, ty: value_ty, address: last_at)
+            mut lo.write_option(mut fx, option, address: sret, presence: present, value: held)
+            let result = mut lo.held_at(mut fx, ty: option, address: sret)
+            supply.ret(mut lo, mut fx, held: result)
+        }
+        else => {
+            expect false
+        }
+    }
+} sim_access
+
+/// A register's descriptor computed from the registers block: where its slots start, how many
+/// elements it has and whether it is write-one-clear.
+struct Descriptor derives Copy {
+    slot_base: u64
+    count: u64
+    woc: bool
+} Descriptor
+
+/// The descriptors of a registers block's registers, in order.
+fn register_descriptors(mut lo: Lowering, block_ty: ty::Ty) -> mem::List[Descriptor]
+    waive depth "an array register's length is read through its type's arguments"
+{
+    var descriptors = mem::List[Descriptor].empty(lo.alloc)
+    let ty::TyKind.Registers(item) = lo.ck.types().kind(block_ty) else {
+        expect false
+        return descriptors
+    }
+    let sig = lo.ck.sig(item)
+    let check::SigKind.Registers(members: members) = sig.contents().kind else {
+        expect false
+        return descriptors
+    }
+    var base = BLOCK_DESC + u64.widen(members.len()) * BLOCK_DESC_SIZE
+    for member in members {
+        var count: u64 = 1
+        match lo.ck.types().kind(member.ty) {
+            ty::TyKind.Item(item: array, args: array_args) => {
+                if lo.ck.db().canonical(array).as_str() == "core::Array" {
+                    let arg_list = lo.ck.types().arg_list(array_args)
+                    if arg_list.len() > 1 {
+                        match arg_list[1] {
+                            ty::Arg.Const(ty::Const.Int(length)) => {
+                                count = length.low_bits()
+                            }
+                            else => {}
+                        }
+                    }
+                }
+            }
+            else => {}
+        }
+        mut descriptors.push(Descriptor(slot_base: base, count: count, woc: member.access == ast::Access.WriteOneClear))
+        base += count * SLOT_SIZE
+    }
+    return descriptors
+} register_descriptors
+
+/// A DMA access call `hw::Dma.access`: its type arguments name the field's bytes layout, its
+/// index in it and whether the access writes and is indexed; its operands are the buffer, then an
+/// index and a value as the access needs them. On the host the acquire and release orderings are
+/// implicit; on a machine target each part is one access through a compiler stub, across which
+/// no memory access moves.
+fn dma_access(mut body: Body, mut lo: Lowering, mut fx: Fx, args: ty::Args, operands: Slice[nir::Operand]) -> Held
+    waive length "the four access forms, by whether the access writes and whether a device serves it"
+{
+    let arg_list = lo.ck.types().arg_list(args)
+    expect arg_list.len() > 3
+    let Some(layout_ty) = arg_list[0].ty() else {
+        expect false
+        return Held.Empty
+    }
+    let ty::Arg.Const(ty::Const.Int(field_number)) = arg_list[1] else {
+        expect false
+        return Held.Empty
+    }
+    let field_index = usize.widen(field_number.low_bits())
+    let write = arg_list[2] == ty::Arg.Const(ty::Const.Bool(true))
+    let indexed = arg_list[3] == ty::Arg.Const(ty::Const.Bool(true))
+    expect operands.len() > 0
+    let receiver = mut body.operand(mut lo, mut fx, operand: operands[0])
+    let content = mut fx.load(PTR, addr: receiver.held.address_value(), offset: 0)
+    let laid = mut lo.layout_of(layout_ty)
+    let LayoutShape.Bytes(fields: fields, big: _) = laid.contents().shape else {
+        expect false
+        return Held.Empty
+    }
+    expect field_index < fields.len()
+    let field_ty = fields[field_index].ty
+    let base = mut fx.b.iadd_imm_s(content, y: i64.fit(fields[field_index].offset))
+    var element_ty = field_ty
+    var addr = base
+    if indexed {
+        let Some(element) = lo.ck.types().type_arg(field_ty, index: 0) else {
+            expect false
+            return Held.Empty
+        }
+        var count: u64 = 0
+        match lo.ck.types().kind(field_ty) {
+            ty::TyKind.Item(item: _, args: field_args) => {
+                let field_arg_list = lo.ck.types().arg_list(field_args)
+                if field_arg_list.len() > 1 {
+                    match field_arg_list[1] {
+                        ty::Arg.Const(ty::Const.Int(length)) => {
+                            count = length.low_bits()
+                        }
+                        else => {}
+                    }
+                }
+            }
+            else => {}
+        }
+        expect operands.len() > 1
+        let index_value = mut body.operand(mut lo, mut fx, operand: operands[1])
+        let index = index_value.held.scalar_value()
+        let bound = mut fx.ptr(count)
+        let out = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: index, y: bound)
+        mut fx.if_true(out, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+        })
+        let element_layout = mut lo.layout_of(element)
+        let offset = mut fx.b.imul_imm_s(index, y: i64.fit(element_layout.contents().size))
+        element_ty = element
+        addr = mut fx.b.iadd(base, y: offset)
+    }
+    var value_position: usize = 1
+    if indexed {
+        value_position = 2
+    }
+    expect not write or value_position < operands.len()
+    let machine = lo.machine()
+    if write and not machine {
+        let value = mut body.operand(mut lo, mut fx, operand: operands[value_position])
+        mut lo.store_held(mut fx, address: addr, held: value.held, ty: element_ty)
+        return Held.Empty
+    }
+    if not write and not machine {
+        return mut lo.held_at(mut fx, ty: element_ty, address: addr)
+    }
+    if write {
+        let value = mut body.operand(mut lo, mut fx, operand: operands[value_position])
+        let element_layout = mut lo.layout_of(element_ty)
+        let staged = mut fx.slot(at_least_one(element_layout.contents().size), align: at_least_one(element_layout.contents().align))
+        mut lo.store_held(mut fx, address: staged, held: value.held, ty: element_ty)
+        let accesses = dma_parts(mut lo, ty: element_ty)
+        for access_part in accesses {
+            expect access_part.width <= 8
+            let Some(width_type) = clif::Type.int(8 * u32.fit(access_part.width)) else {
+                expect false
+                return Held.Empty
+            }
+            let loaded = mut fx.b.load(width_type, flags: clif::MemFlags.unaligned(), p: staged, offset: i32.fit(access_part.offset))
+            let part = match access_part.width {
+                8 => loaded
+                else => mut fx.b.uextend(PTR, x: loaded)
+            }
+            let at = mut fx.offset(addr, offset: access_part.offset)
+            mut lo.mmio_write(mut fx, width: access_part.width, address: at, value: part)
+        }
+        return Held.Empty
+    }
+    let element_layout = mut lo.layout_of(element_ty)
+    let staged = mut fx.slot(at_least_one(element_layout.contents().size), align: at_least_one(element_layout.contents().align))
+    let accesses = dma_parts(mut lo, ty: element_ty)
+    for access_part in accesses {
+        expect access_part.width <= 8
+        let Some(width_type) = clif::Type.int(8 * u32.fit(access_part.width)) else {
+            expect false
+            return Held.Empty
+        }
+        let at = mut fx.offset(addr, offset: access_part.offset)
+        let read = mut lo.mmio_read(mut fx, width: access_part.width, address: at)
+        let part = match access_part.width {
+            8 => read
+            else => mut fx.b.ireduce(width_type, x: read)
+        }
+        mut fx.b.store(clif::MemFlags.unaligned(), x: part, p: staged, offset: i32.fit(access_part.offset))
+    }
+    return mut lo.held_at(mut fx, ty: element_ty, address: staged)
+} dma_access
+
+/// A part of a DMA access: its offset and its width.
+struct DmaPart derives Copy {
+    offset: u64
+    width: u64
+} DmaPart
+
+/// The integer scalars and integer layouts of a DMA access's field or element, in ascending
+/// address order: holdings_each one's offset and width, one access each.
+fn dma_parts(mut lo: Lowering, ty: ty::Ty) -> mem::List[DmaPart] {
+    var parts = mem::List[DmaPart].empty(lo.alloc)
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: _) => mut parts.push(DmaPart(offset: 0, width: u64.widen(scalar.bytes())))
+        LayoutShape.Bytes(fields: fields, big: _) => {
+            for field in fields {
+                let inner = dma_parts(mut lo, ty: field.ty)
+                for inner_part in inner {
+                    mut parts.push(DmaPart(offset: field.offset + inner_part.offset, width: inner_part.width))
+                }
+            }
+        }
+        LayoutShape.Array(element: element, count: count) => {
+            let element_layout = mut lo.layout_of(element)
+            let size = element_layout.contents().size
+            let inner = dma_parts(mut lo, ty: element)
+            for index in 0..<count {
+                for inner_part in inner {
+                    mut parts.push(DmaPart(offset: index * size + inner_part.offset, width: inner_part.width))
+                }
+            }
+        }
+        else => {
+            expect false
+        }
+    }
+    return parts
+} dma_parts
+
+/// The bytes of a register's entry in the table of its registers block a device window reads:
+/// its byte offset, then its stride, each 4 bytes.
+const REGISTER_ENTRY: u64 = 8
+
+/// The table of a registers block, an entry per register in order.
+fn register_table(mut lo: Lowering, block: ty::ItemId) -> object::DataId {
+    var table_bytes = mem::Bytes.empty(lo.alloc)
+    let item = lo.ck.db().ast(block)
+    let ast::ItemKind.Registers(declared) = item.kind else {
+        expect false
+        return mut lo.bytes_data(table_bytes.view())
+    }
+    for member in declared.members {
+        object::append_u32(mut table_bytes, value: register_number(lo, block, token: member.at))
+        var stride: u32 = 0
+        match member.stride {
+            Some(token) => {
+                stride = register_number(lo, block, token)
+            }
+            None => {}
+        }
+        object::append_u32(mut table_bytes, value: stride)
+    }
+    return mut lo.bytes_data(table_bytes.view())
+} register_table
+
+/// The number a token of a registers block writes, zero when it writes none.
+fn register_number(lo: Lowering, block: ty::ItemId, token: u32) -> u32 {
+    let Some(value) = check::int_literal(lo.ck.db().text(block, token)) else {
+        return 0
+    }
+    return u32.truncate(value.low_bits())
+} register_number
+
+/// A window's operation on the device whose port or physical address is `base`: `unmap` ends
+/// the window, and a volatile call reaches the register, an array register's element at its
+/// stride, through the port compiler stubs or a memory-mapped access.
+fn device_window(mut lo: Lowering, mut fx: Fx, supply: Supply, base: clif::Value) {
+    let member = supply.member()
+    if member == "unmap" {
+        supply.done(mut lo, mut fx)
+        return
+    }
+    let ty::TyKind.Registers(block) = lo.ck.types().kind(supply.type_arg(lo, index: 0)) else {
+        expect false
+        return
+    }
+    let element_ty = supply.type_arg(lo, index: 1)
+    let element_layout = mut lo.layout_of(element_ty)
+    let width = element_layout.contents().size
+    let registers_table = register_table(mut lo, block)
+    let table = mut lo.data_address(mut fx, id: registers_table)
+    let register = supply.param(1).scalar_value()
+    let entry_offset = mut fx.b.imul_imm_s(register, y: i64.fit(REGISTER_ENTRY))
+    let entry = mut fx.b.iadd(table, y: entry_offset)
+    let offset_word = mut fx.b.load(clif::Type.Int32, flags: clif::MemFlags.unaligned(), p: entry, offset: 0)
+    let offset = mut fx.b.uextend(PTR, x: offset_word)
+    var addr = mut fx.b.iadd(base, y: offset)
+    let indexed = member.ends_with("_at")
+    if indexed {
+        let arg_list = lo.ck.types().arg_list(supply.args)
+        var count: i64 = 0
+        if arg_list.len() > 2 {
+            match arg_list[2] {
+                ty::Arg.Const(ty::Const.Int(length)) => {
+                    count = i64.from_bits(length.low_bits())
+                }
+                else => {
+                    expect false
+                }
+            }
+        }
+        let index = supply.param(2).scalar_value()
+        let out = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: index, y: count)
+        mut fx.if_true(out, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+        })
+        let stride_word = mut fx.b.load(clif::Type.Int32, flags: clif::MemFlags.unaligned(), p: entry, offset: 4)
+        let stride = mut fx.b.uextend(PTR, x: stride_word)
+        let step = mut fx.b.imul(index, y: stride)
+        addr = mut fx.b.iadd(addr, y: step)
+    }
+    let ports = supply.path.starts_with("hw::Ports")
+    if member.starts_with("read") {
+        let value = match ports {
+            true => mut lo.port_in(mut fx, width, port: addr)
+            false => mut lo.mmio_read(mut fx, width, address: addr)
+        }
+        let slot = mut fx.slot(8, align: 8)
+        mut fx.store(value, addr: slot, offset: 0)
+        let held = mut lo.held_at(mut fx, ty: element_ty, address: slot)
+        supply.ret(mut lo, mut fx, held)
+    } else {
+        let value = match indexed {
+            true => supply.param(3)
+            false => supply.param(2)
+        }
+        let slot = mut fx.slot(8, align: 8)
+        let zero_value = mut fx.ptr(0)
+        mut fx.store(zero_value, addr: slot, offset: 0)
+        mut lo.store_held(mut fx, address: slot, held: value, ty: element_ty)
+        let bits = mut fx.load(PTR, addr: slot, offset: 0)
+        match ports {
+            true => mut lo.port_out(mut fx, width, port: addr, value: bits)
+            false => mut lo.mmio_write(mut fx, width, address: addr, value: bits)
+        }
+        supply.done(mut lo, mut fx)
+    }
+} device_window

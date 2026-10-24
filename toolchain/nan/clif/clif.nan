@@ -1,0 +1,611 @@
+//! The intermediate form lowering builds: the subset of Cranelift's IR, numbered and laid out as Cranelift numbers and lays it out, with its function builder and text form.
+
+/// The type of a value.
+pkg enum Type derives Copy, Eq, Ord, Hash {
+    Int8
+    Int16
+    Int32
+    Int64
+    Int128
+    Float32
+    Float64
+} Type
+
+pkg fn Type.bits(self) -> u32
+    ensures result >= 8 and result <= 128
+{
+    return match self {
+        Type.Int8 => 8
+        Type.Int16 => 16
+        Type.Int32 or Type.Float32 => 32
+        Type.Int64 or Type.Float64 => 64
+        Type.Int128 => 128
+    }
+} Type.bits
+
+pkg fn Type.bytes(self) -> u32 {
+    return self.bits() / 8
+} Type.bytes
+
+pkg fn Type.is_int(self) -> bool {
+    return match self {
+        Type.Float32 or Type.Float64 => false
+        else => true
+    }
+} Type.is_int
+
+pkg fn Type.is_float(self) -> bool {
+    return not self.is_int()
+} Type.is_float
+
+/// The integer type of a width in bits, none for a width no integer type has.
+pkg fn Type.int(bits: u32) -> Option[Type] {
+    return match bits {
+        8 => Some(Type.Int8)
+        16 => Some(Type.Int16)
+        32 => Some(Type.Int32)
+        64 => Some(Type.Int64)
+        128 => Some(Type.Int128)
+        else => None
+    }
+} Type.int
+
+/// The type's name in the text form.
+pkg proj fn Type.name(self) -> Str {
+    return match self {
+        Type.Int8 => "i8"
+        Type.Int16 => "i16"
+        Type.Int32 => "i32"
+        Type.Int64 => "i64"
+        Type.Int128 => "i128"
+        Type.Float32 => "f32"
+        Type.Float64 => "f64"
+    }
+} Type.name
+
+/// The type of addresses and sizes.
+pkg const POINTER: Type = Type.Int64
+
+pkg struct Value derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Value
+
+pkg struct Block derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Block
+
+pkg struct Inst derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Inst
+
+pkg struct StackSlot derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} StackSlot
+
+/// A function a function names, by its index among the function's imported functions.
+pkg struct FuncRef derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} FuncRef
+
+/// A signature a function names, by its index among the function's imported signatures.
+pkg struct SigRef derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} SigRef
+
+/// A symbol a function names, by its index among the function's global values.
+pkg struct GlobalValue derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} GlobalValue
+
+/// A variable of the function builder, by its index in declaration order.
+pkg struct Variable derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} Variable
+
+/// An integer comparison.
+pkg enum IntCC derives Copy, Eq, Hash {
+    Equal
+    NotEqual
+    SignedLessThan
+    SignedGreaterThanOrEqual
+    SignedGreaterThan
+    SignedLessThanOrEqual
+    UnsignedLessThan
+    UnsignedGreaterThanOrEqual
+    UnsignedGreaterThan
+    UnsignedLessThanOrEqual
+} IntCC
+
+pkg proj fn IntCC.name(self) -> Str {
+    return match self {
+        IntCC.Equal => "eq"
+        IntCC.NotEqual => "ne"
+        IntCC.SignedLessThan => "slt"
+        IntCC.SignedGreaterThanOrEqual => "sge"
+        IntCC.SignedGreaterThan => "sgt"
+        IntCC.SignedLessThanOrEqual => "sle"
+        IntCC.UnsignedLessThan => "ult"
+        IntCC.UnsignedGreaterThanOrEqual => "uge"
+        IntCC.UnsignedGreaterThan => "ugt"
+        IntCC.UnsignedLessThanOrEqual => "ule"
+    }
+} IntCC.name
+
+/// A float comparison.
+pkg enum FloatCC derives Copy, Eq, Hash {
+    Ordered
+    Unordered
+    Equal
+    NotEqual
+    OrderedNotEqual
+    UnorderedOrEqual
+    LessThan
+    LessThanOrEqual
+    GreaterThan
+    GreaterThanOrEqual
+    UnorderedOrLessThan
+    UnorderedOrLessThanOrEqual
+    UnorderedOrGreaterThan
+    UnorderedOrGreaterThanOrEqual
+} FloatCC
+
+pkg proj fn FloatCC.name(self) -> Str {
+    return match self {
+        FloatCC.Ordered => "ord"
+        FloatCC.Unordered => "uno"
+        FloatCC.Equal => "eq"
+        FloatCC.NotEqual => "ne"
+        FloatCC.OrderedNotEqual => "one"
+        FloatCC.UnorderedOrEqual => "ueq"
+        FloatCC.LessThan => "lt"
+        FloatCC.LessThanOrEqual => "le"
+        FloatCC.GreaterThan => "gt"
+        FloatCC.GreaterThanOrEqual => "ge"
+        FloatCC.UnorderedOrLessThan => "ult"
+        FloatCC.UnorderedOrLessThanOrEqual => "ule"
+        FloatCC.UnorderedOrGreaterThan => "ugt"
+        FloatCC.UnorderedOrGreaterThanOrEqual => "uge"
+    }
+} FloatCC.name
+
+/// How a function receives its parameters and gives its results.
+pkg enum CallConv derives Copy, Eq, Hash {
+    SystemV
+    WindowsFastcall
+} CallConv
+
+pkg proj fn CallConv.name(self) -> Str {
+    return match self {
+        CallConv.SystemV => "system_v"
+        CallConv.WindowsFastcall => "windows_fastcall"
+    }
+} CallConv.name
+
+pkg struct AbiParam derives Copy, Eq, Hash {
+    pkg value_type: Type
+} AbiParam
+
+pkg struct Signature derives Eq, Hash {
+    pkg params: mem::List[AbiParam]
+    pkg returns: mem::List[AbiParam]
+    pkg call_conv: CallConv
+} Signature
+
+pkg fn Signature.new(call_conv: CallConv, alloc: mem::Alloc) -> Signature = Signature(params: mem::List[AbiParam].empty(alloc), returns: mem::List[AbiParam].empty(alloc), call_conv: call_conv)
+
+/// What an access to memory may assume: that its address is aligned to its width, and that it
+/// cannot fault.
+pkg struct MemFlags derives Copy, Eq, Hash {
+    pkg aligned: bool
+    pkg notrap: bool
+} MemFlags
+
+/// The flags of an access that assumes nothing.
+pkg fn MemFlags.new() -> MemFlags = MemFlags(aligned: false, notrap: false)
+
+/// The flags of an access to memory lowered code owns: aligned, and unable to fault.
+pkg fn MemFlags.owned() -> MemFlags = MemFlags(aligned: true, notrap: true)
+
+/// The flags of an access unable to fault whose address may be unaligned.
+pkg fn MemFlags.unaligned() -> MemFlags = MemFlags(aligned: false, notrap: true)
+
+/// What a `trap` instruction reports: a user code.
+pkg struct TrapCode derives Copy, Eq, Hash {
+    pkg user: u8
+} TrapCode
+
+pkg enum AtomicRmwOp derives Copy, Eq, Hash {
+    Add
+    And
+    Or
+    Xor
+    Xchg
+} AtomicRmwOp
+
+pkg proj fn AtomicRmwOp.name(self) -> Str {
+    return match self {
+        AtomicRmwOp.Add => "add"
+        AtomicRmwOp.And => "and"
+        AtomicRmwOp.Or => "or"
+        AtomicRmwOp.Xor => "xor"
+        AtomicRmwOp.Xchg => "xchg"
+    }
+} AtomicRmwOp.name
+
+/// The source location an instruction carries, `DEFAULT_LOC` for none.
+pkg struct SourceLoc derives Copy, Eq, Hash {
+    pkg bits: u32
+} SourceLoc
+
+pkg const DEFAULT_LOC: SourceLoc = SourceLoc(bits: 0xFFFF_FFFF)
+
+pkg fn SourceLoc.is_default(self) -> bool = self.bits == 0xFFFF_FFFF
+
+pkg enum Opcode derives Copy, Eq, Hash {
+    Iconst
+    F32const
+    F64const
+    Iadd
+    Isub
+    Imul
+    Ineg
+    Udiv
+    Sdiv
+    Urem
+    Srem
+    Umulhi
+    Smulhi
+    Band
+    Bor
+    Bxor
+    Bnot
+    Ishl
+    Ushr
+    Sshr
+    Rotr
+    Clz
+    Ctz
+    Popcnt
+    Bswap
+    Umin
+    Umax
+    Icmp
+    Select
+    Uextend
+    Sextend
+    Ireduce
+    Iconcat
+    Isplit
+    Bitcast
+    UaddOverflow
+    SaddOverflow
+    UsubOverflow
+    SsubOverflow
+    UmulOverflow
+    SmulOverflow
+    Fadd
+    Fsub
+    Fmul
+    Fdiv
+    Sqrt
+    Fabs
+    Fneg
+    Fcopysign
+    Fcmp
+    Fpromote
+    Fdemote
+    FcvtToSintSat
+    FcvtToUintSat
+    FcvtFromSint
+    FcvtFromUint
+    Load
+    Store
+    AtomicLoad
+    AtomicStore
+    AtomicRmw
+    AtomicCas
+    Fence
+    StackAddr
+    SymbolValue
+    TlsValue
+    FuncAddr
+    GetFramePointer
+    Call
+    CallIndirect
+    Return
+    Jump
+    Brif
+    Trap
+    StackSwitch
+} Opcode
+
+/// Whether the opcode ends its block.
+pkg fn Opcode.is_terminator(self) -> bool {
+    return match self {
+        Opcode.Return or Opcode.Jump or Opcode.Brif or Opcode.Trap => true
+        else => false
+    }
+} Opcode.is_terminator
+
+/// Whether the opcode branches to blocks of its function.
+pkg fn Opcode.is_branch(self) -> bool {
+    return match self {
+        Opcode.Jump or Opcode.Brif => true
+        else => false
+    }
+} Opcode.is_branch
+
+/// Whether the opcode's types vary with a controlling type.
+fn Opcode.is_polymorphic(self) -> bool {
+    return match self {
+        Opcode.F32const or Opcode.F64const or Opcode.Fence or Opcode.Call or Opcode.Return or Opcode.Jump or Opcode.Trap => false
+        else => true
+    }
+} Opcode.is_polymorphic
+
+/// Whether the controlling type of a polymorphic opcode may be read from its designated operand.
+fn Opcode.uses_typevar_operand(self) -> bool {
+    return match self {
+        Opcode.Iconst or Opcode.F32const or Opcode.F64const or Opcode.Uextend or Opcode.Sextend or Opcode.Ireduce or Opcode.Bitcast => false
+        Opcode.Fpromote or Opcode.Fdemote or Opcode.FcvtToSintSat or Opcode.FcvtToUintSat or Opcode.FcvtFromSint or Opcode.FcvtFromUint => false
+        Opcode.Load or Opcode.AtomicLoad or Opcode.AtomicRmw or Opcode.Fence or Opcode.StackAddr or Opcode.SymbolValue or Opcode.TlsValue => false
+        Opcode.FuncAddr or Opcode.GetFramePointer or Opcode.Call or Opcode.Return or Opcode.Jump or Opcode.Trap => false
+        else => true
+    }
+} Opcode.uses_typevar_operand
+
+/// Whether the controlling type of a polymorphic opcode is always its designated operand's type,
+/// rather than its first result's.
+fn Opcode.requires_typevar_operand(self) -> bool {
+    return match self {
+        Opcode.Icmp or Opcode.Iconcat or Opcode.Isplit or Opcode.Fcmp or Opcode.Store or Opcode.AtomicStore or Opcode.CallIndirect or Opcode.Brif => true
+        else => false
+    }
+} Opcode.requires_typevar_operand
+
+/// The opcode's name in the text form.
+pkg proj fn Opcode.name(self) -> Str {
+    return match self {
+        Opcode.Iconst => "iconst"
+        Opcode.F32const => "f32const"
+        Opcode.F64const => "f64const"
+        Opcode.Iadd => "iadd"
+        Opcode.Isub => "isub"
+        Opcode.Imul => "imul"
+        Opcode.Ineg => "ineg"
+        Opcode.Udiv => "udiv"
+        Opcode.Sdiv => "sdiv"
+        Opcode.Urem => "urem"
+        Opcode.Srem => "srem"
+        Opcode.Umulhi => "umulhi"
+        Opcode.Smulhi => "smulhi"
+        Opcode.Band => "band"
+        Opcode.Bor => "bor"
+        Opcode.Bxor => "bxor"
+        Opcode.Bnot => "bnot"
+        Opcode.Ishl => "ishl"
+        Opcode.Ushr => "ushr"
+        Opcode.Sshr => "sshr"
+        Opcode.Rotr => "rotr"
+        Opcode.Clz => "clz"
+        Opcode.Ctz => "ctz"
+        Opcode.Popcnt => "popcnt"
+        Opcode.Bswap => "bswap"
+        Opcode.Umin => "umin"
+        Opcode.Umax => "umax"
+        Opcode.Icmp => "icmp"
+        Opcode.Select => "select"
+        Opcode.Uextend => "uextend"
+        Opcode.Sextend => "sextend"
+        Opcode.Ireduce => "ireduce"
+        Opcode.Iconcat => "iconcat"
+        Opcode.Isplit => "isplit"
+        Opcode.Bitcast => "bitcast"
+        Opcode.UaddOverflow => "uadd_overflow"
+        Opcode.SaddOverflow => "sadd_overflow"
+        Opcode.UsubOverflow => "usub_overflow"
+        Opcode.SsubOverflow => "ssub_overflow"
+        Opcode.UmulOverflow => "umul_overflow"
+        Opcode.SmulOverflow => "smul_overflow"
+        Opcode.Fadd => "fadd"
+        Opcode.Fsub => "fsub"
+        Opcode.Fmul => "fmul"
+        Opcode.Fdiv => "fdiv"
+        Opcode.Sqrt => "sqrt"
+        Opcode.Fabs => "fabs"
+        Opcode.Fneg => "fneg"
+        Opcode.Fcopysign => "fcopysign"
+        Opcode.Fcmp => "fcmp"
+        Opcode.Fpromote => "fpromote"
+        Opcode.Fdemote => "fdemote"
+        Opcode.FcvtToSintSat => "fcvt_to_sint_sat"
+        Opcode.FcvtToUintSat => "fcvt_to_uint_sat"
+        Opcode.FcvtFromSint => "fcvt_from_sint"
+        Opcode.FcvtFromUint => "fcvt_from_uint"
+        Opcode.Load => "load"
+        Opcode.Store => "store"
+        Opcode.AtomicLoad => "atomic_load"
+        Opcode.AtomicStore => "atomic_store"
+        Opcode.AtomicRmw => "atomic_rmw"
+        Opcode.AtomicCas => "atomic_cas"
+        Opcode.Fence => "fence"
+        Opcode.StackAddr => "stack_addr"
+        Opcode.SymbolValue => "symbol_value"
+        Opcode.TlsValue => "tls_value"
+        Opcode.FuncAddr => "func_addr"
+        Opcode.GetFramePointer => "get_frame_pointer"
+        Opcode.Call => "call"
+        Opcode.CallIndirect => "call_indirect"
+        Opcode.Return => "return"
+        Opcode.Jump => "jump"
+        Opcode.Brif => "brif"
+        Opcode.Trap => "trap"
+        Opcode.StackSwitch => "stack_switch"
+    }
+} Opcode.name
+
+/// A branch's target block with the values its parameters receive.
+pkg struct BlockCall derives Eq, Hash {
+    pkg block: Block
+    pkg args: mem::List[Value]
+} BlockCall
+
+/// An instruction, in the format its opcode has.
+pkg enum InstructionData derives Eq, Hash {
+    UnaryImm(opcode: Opcode, imm: i64)
+    UnaryIeee32(opcode: Opcode, bits: u32)
+    UnaryIeee64(opcode: Opcode, bits: u64)
+    Unary(opcode: Opcode, arg: Value)
+    Binary(opcode: Opcode, x: Value, y: Value)
+    Ternary(opcode: Opcode, x: Value, y: Value, z: Value)
+    IntCompare(opcode: Opcode, cond: IntCC, x: Value, y: Value)
+    FloatCompare(opcode: Opcode, cond: FloatCC, x: Value, y: Value)
+    Load(opcode: Opcode, flags: MemFlags, arg: Value, offset: i32)
+    Store(opcode: Opcode, flags: MemFlags, x: Value, p: Value, offset: i32)
+    LoadNoOffset(opcode: Opcode, flags: MemFlags, arg: Value)
+    StoreNoOffset(opcode: Opcode, flags: MemFlags, x: Value, p: Value)
+    AtomicRmw(opcode: Opcode, flags: MemFlags, op: AtomicRmwOp, p: Value, x: Value)
+    AtomicCas(opcode: Opcode, flags: MemFlags, p: Value, e: Value, x: Value)
+    NullAry(opcode: Opcode)
+    StackLoad(opcode: Opcode, slot: StackSlot, offset: i32)
+    UnaryGlobalValue(opcode: Opcode, global_value: GlobalValue)
+    FuncAddr(opcode: Opcode, func_ref: FuncRef)
+    Call(opcode: Opcode, func_ref: FuncRef, args: mem::List[Value])
+    CallIndirect(opcode: Opcode, sig_ref: SigRef, callee: Value, args: mem::List[Value])
+    MultiAry(opcode: Opcode, args: mem::List[Value])
+    Jump(opcode: Opcode, destination: BlockCall)
+    Brif(opcode: Opcode, arg: Value, then: BlockCall, otherwise: BlockCall)
+    Trap(opcode: Opcode, code: TrapCode)
+} InstructionData
+
+pkg fn InstructionData.opcode(self) -> Opcode {
+    return match self {
+        InstructionData.UnaryImm(opcode: opcode, imm: _) => opcode
+        InstructionData.UnaryIeee32(opcode: opcode, bits: _) => opcode
+        InstructionData.UnaryIeee64(opcode: opcode, bits: _) => opcode
+        InstructionData.Unary(opcode: opcode, arg: _) => opcode
+        InstructionData.Binary(opcode: opcode, x: _, y: _) => opcode
+        InstructionData.Ternary(opcode: opcode, x: _, y: _, z: _) => opcode
+        InstructionData.IntCompare(opcode: opcode, cond: _, x: _, y: _) => opcode
+        InstructionData.FloatCompare(opcode: opcode, cond: _, x: _, y: _) => opcode
+        InstructionData.Load(opcode: opcode, flags: _, arg: _, offset: _) => opcode
+        InstructionData.Store(opcode: opcode, flags: _, x: _, p: _, offset: _) => opcode
+        InstructionData.LoadNoOffset(opcode: opcode, flags: _, arg: _) => opcode
+        InstructionData.StoreNoOffset(opcode: opcode, flags: _, x: _, p: _) => opcode
+        InstructionData.AtomicRmw(opcode: opcode, flags: _, op: _, p: _, x: _) => opcode
+        InstructionData.AtomicCas(opcode: opcode, flags: _, p: _, e: _, x: _) => opcode
+        InstructionData.NullAry(opcode: opcode) => opcode
+        InstructionData.StackLoad(opcode: opcode, slot: _, offset: _) => opcode
+        InstructionData.UnaryGlobalValue(opcode: opcode, global_value: _) => opcode
+        InstructionData.FuncAddr(opcode: opcode, func_ref: _) => opcode
+        InstructionData.Call(opcode: opcode, func_ref: _, args: _) => opcode
+        InstructionData.CallIndirect(opcode: opcode, sig_ref: _, callee: _, args: _) => opcode
+        InstructionData.MultiAry(opcode: opcode, args: _) => opcode
+        InstructionData.Jump(opcode: opcode, destination: _) => opcode
+        InstructionData.Brif(opcode: opcode, arg: _, then: _, otherwise: _) => opcode
+        InstructionData.Trap(opcode: opcode, code: _) => opcode
+    }
+} InstructionData.opcode
+
+/// The operand whose type is the controlling type of a polymorphic opcode, when the format
+/// designates one.
+fn InstructionData.typevar_operand(self) -> Option[Value] {
+    return match self {
+        InstructionData.Unary(opcode: _, arg: arg) => Some(arg)
+        InstructionData.Load(opcode: _, flags: _, arg: arg, offset: _) => Some(arg)
+        InstructionData.LoadNoOffset(opcode: _, flags: _, arg: arg) => Some(arg)
+        InstructionData.Brif(opcode: _, arg: arg, then: _, otherwise: _) => Some(arg)
+        InstructionData.Binary(opcode: _, x: x, y: _) => Some(x)
+        InstructionData.IntCompare(opcode: _, cond: _, x: x, y: _) => Some(x)
+        InstructionData.FloatCompare(opcode: _, cond: _, x: x, y: _) => Some(x)
+        InstructionData.Store(opcode: _, flags: _, x: x, p: _, offset: _) => Some(x)
+        InstructionData.StoreNoOffset(opcode: _, flags: _, x: x, p: _) => Some(x)
+        InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: p, x: _) => Some(p)
+        InstructionData.Ternary(opcode: _, x: _, y: y, z: _) => Some(y)
+        InstructionData.AtomicCas(opcode: _, flags: _, p: _, e: _, x: x) => Some(x)
+        InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: callee, args: _) => Some(callee)
+        else => None
+    }
+} InstructionData.typevar_operand
+
+/// The values the instruction reads: its arguments, then those it passes to its branch targets.
+fn InstructionData.values(self, alloc: mem::Alloc) -> mem::List[Value] {
+    var values = mem::List[Value].empty(alloc)
+    match self {
+        InstructionData.Unary(opcode: _, arg: arg) => mut values.push(arg)
+        InstructionData.Load(opcode: _, flags: _, arg: arg, offset: _) => mut values.push(arg)
+        InstructionData.LoadNoOffset(opcode: _, flags: _, arg: arg) => mut values.push(arg)
+        InstructionData.Binary(opcode: _, x: x, y: y) or InstructionData.IntCompare(opcode: _, cond: _, x: x, y: y) or InstructionData.FloatCompare(opcode: _, cond: _, x: x, y: y) => {
+            mut values.push(x)
+            mut values.push(y)
+        }
+        InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: _) or InstructionData.StoreNoOffset(opcode: _, flags: _, x: x, p: p) => {
+            mut values.push(x)
+            mut values.push(p)
+        }
+        InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: p, x: x) => {
+            mut values.push(p)
+            mut values.push(x)
+        }
+        InstructionData.Ternary(opcode: _, x: x, y: y, z: z) or InstructionData.AtomicCas(opcode: _, flags: _, p: x, e: y, x: z) => {
+            mut values.push(x)
+            mut values.push(y)
+            mut values.push(z)
+        }
+        InstructionData.Call(opcode: _, func_ref: _, args: args) or InstructionData.MultiAry(opcode: _, args: args) => {
+            for arg in args {
+                mut values.push(arg)
+            }
+        }
+        InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: callee, args: args) => {
+            mut values.push(callee)
+            for arg in args {
+                mut values.push(arg)
+            }
+        }
+        InstructionData.Jump(opcode: _, destination: destination) => {
+            for arg in destination.args {
+                mut values.push(arg)
+            }
+        }
+        InstructionData.Brif(opcode: _, arg: arg, then: then, otherwise: otherwise) => {
+            mut values.push(arg)
+            for passed in then.args {
+                mut values.push(passed)
+            }
+            for passed in otherwise.args {
+                mut values.push(passed)
+            }
+        }
+        else => {}
+    }
+    return values
+} InstructionData.values
+
+/// A stack area of a function: its size in bytes and the log2 of its alignment.
+pkg struct StackSlotData derives Copy, Eq, Hash {
+    pkg size: u32
+    pkg align_shift: u8
+} StackSlotData
+
+/// A name a function or data object is linked by: a user name, by namespace and index.
+pkg struct ExternalName derives Copy, Eq, Hash {
+    pkg namespace: u32
+    pkg index: u32
+} ExternalName
+
+/// A symbol's address as a global value: its name, whether it is defined in the same image
+/// and reached directly, and whether it is thread-local.
+pkg struct GlobalValueData derives Copy, Eq, Hash {
+    pkg name: ExternalName
+    pkg colocated: bool
+    pkg tls: bool
+} GlobalValueData
+
+/// A function a function calls or takes the address of: its name, signature, and whether it
+/// is defined in the same image and reached directly.
+pkg struct ExtFuncData derives Copy, Eq, Hash {
+    pkg name: ExternalName
+    pkg signature: SigRef
+    pkg colocated: bool
+} ExtFuncData

@@ -643,12 +643,9 @@ impl Checker<'_> {
             return false;
         }
         seen.push(*item);
-        let found = self
-            .constituents(*item)
+        self.constituents(*item)
             .iter()
-            .any(|constituent| self.contains_from(constituent, test, seen));
-        seen.pop();
-        found
+            .any(|constituent| self.contains_from(constituent, test, seen))
     }
 
     /// Whether a type is a state token: a struct declared `view` without fields.

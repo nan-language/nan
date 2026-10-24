@@ -99,7 +99,7 @@ The **toolchain hash** identifies a toolchain's behaviour for one language versi
 | 1 | language version | a uvar |
 | 2 | toolchain source tree hash | the hash of the encoding of a list of pairs, in byte order of path, one per file of the toolchain source tree: its path relative to the tree's root, with `/` separators, as a text, and its content, as bytes |
 
-The **toolchain source tree** is the set of files the toolchain is built from: its source, the sources of the std packages it carries, the advisories it carries, and the files pinning the version of every library and compiler its build uses.
+The **toolchain source tree** is the set of files the toolchain is built from: its source, the sources of the std packages it carries, the advisories it carries, and the files pinning the version of every library and compiler its build uses. A toolchain written in NaN is the image of a final build of its packages, whose code roots identify that source tree whichever toolchain built it ([reproducibility](#reproducibility)): its toolchain source tree hash is the hash of the encoding of the list of the code roots its image's [host ELF section](30-artefacts.md#host-elf-section) holds, in that section's order.
 
 - A toolchain has one toolchain hash per language version it implements, fixed when it is built, and applies to each package the one of that package's language version.
 - Two toolchains with equal toolchain hashes must produce equal outputs from equal build inputs.

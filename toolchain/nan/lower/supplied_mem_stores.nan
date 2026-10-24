@@ -1,0 +1,964 @@
+//! Allocators, budgets and stores: heaps, boxes, shared values, arenas, pools and once maps. An allocator or heap is a cell handle, and a budget the holding of one. A box is the address of its contents. A shared value is the address of its count, its allocator handle, its reach and its contents. An arena or once map is the address of the header of its segments. A pool is a vector of slots, each its generation, whether it is occupied and its value, then the count of occupied slots.
+
+/// The offsets of a shared value's count, allocator handle and reach, and of its contents.
+const SHARED_COUNT: u64 = 0
+
+const SHARED_ALLOC: u64 = 8
+
+const SHARED_REACH: u64 = 16
+
+const SHARED_HEADER: u64 = 24
+
+/// The offset of a pool's count of occupied slots.
+const POOL_COUNT: u64 = 32
+
+/// The layout of a pool slot: its size and alignment, and the offset of its value.
+struct SlotShape derives Copy {
+    slot: Element
+    value_at: u64
+} SlotShape
+
+/// The layout of a pool slot holding a value of a layout: its size and alignment, and the
+/// offset of the value after the generation and the occupied flag.
+fn slot_shape(mut lo: Lowering, value: ty::Ty) -> SlotShape {
+    let laid = mut lo.layout_of(value)
+    let align = if laid.contents().align > 4 {
+        laid.contents().align
+    } else {
+        4
+    }
+    let value_align = if laid.contents().align > 1 {
+        laid.contents().align
+    } else {
+        1
+    }
+    let at = stores_round_up(8, align: value_align)
+    let size = stores_round_up(at + laid.contents().size, align)
+    return SlotShape(slot: Element(size: size, align: align), value_at: at)
+} slot_shape
+
+/// `value` rounded up to a multiple of `align`.
+fn stores_round_up(value: u64, align: u64) -> u64 {
+    return (value + align - 1) / align * align
+} stores_round_up
+
+/// The offset of a shared value's contents of a type.
+fn contents_at(mut lo: Lowering, value: ty::Ty) -> u64 {
+    let laid = mut lo.layout_of(value)
+    let align = if laid.contents().align > 1 {
+        laid.contents().align
+    } else {
+        1
+    }
+    return stores_round_up(SHARED_HEADER, align)
+} contents_at
+
+fn stores_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    let owner_end = match check::last_dot(path) {
+        Some(dot) => dot
+        None => 0
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        expect false
+        return false
+    }
+    match owner {
+        "mem::Alloc" or "mem::Budget" => stores_budget(mut lo, mut fx, supply)
+        "mem::Heap" => stores_heap(mut lo, mut fx, supply)
+        "mem::Box" => boxed_member(mut lo, mut fx, supply)
+        "mem::Shared" => stores_shared(mut lo, mut fx, supply)
+        "mem::Arena" => arena(mut lo, mut fx, supply)
+        "mem::ArenaCursor" => arena_next(mut lo, mut fx, supply)
+        "mem::Id" => stores_id(mut lo, mut fx, supply)
+        "mem::Pool" => stores_pool(mut lo, mut fx, supply)
+        "mem::PoolCursor" => pool_next(mut lo, mut fx, supply)
+        "mem::OnceMap" => once_map(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} stores_lower
+
+/// The cell handle of an allocator or heap held at an address.
+fn stores_handle(mut fx: Fx, held: Held) -> clif::Value {
+    return mut fx.load(PTR, addr: held.address_value(), offset: 0)
+} stores_handle
+
+/// The cell a new store draws through: its allocator's, or a new root cell over the region its
+/// `over` takes.
+fn store_cell(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
+    return match supply.member() {
+        "over" => physical_region_cell(mut lo, mut fx, region: supply.param(0))
+        else => stores_handle(mut fx, held: supply.param(0))
+    }
+} store_cell
+
+/// Returns a cell handle as an allocator or heap.
+fn ret_handle(mut lo: Lowering, mut fx: Fx, supply: Supply, cell: clif::Value) {
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(cell, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} ret_handle
+
+fn stores_budget(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let receiver = supply.param(0).address_value()
+    let cell = if supply.path.starts_with("mem::Budget.") {
+        holdings_payload(mut fx, address: receiver)
+    } else {
+        mut fx.load(PTR, addr: receiver, offset: 0)
+    }
+    match supply.member() {
+        "split" => {
+            let limit = supply.param(1).scalar_value()
+            let split_args = fx.list2(cell, b: limit)
+            let budgets = mut lo.call_routine(mut fx, routine: Routine.Split, args: split_args.view())
+            let kind = mut fx.ptr(HOLDINGS_KIND_CLOSE_CELL.to_bits())
+            expect budgets.len() == 1
+            let hold_args = fx.list2(kind, b: budgets[0])
+            let holdings = mut lo.call_routine(mut fx, routine: Routine.Hold, args: hold_args.view())
+            expect holdings.len() == 1
+            ret_handle(mut lo, mut fx, supply, cell: holdings[0])
+        }
+        "alloc" => ret_handle(mut lo, mut fx, supply, cell)
+        "limit" or "charged" => {
+            let routine = match supply.member() {
+                "limit" => Routine.Limit
+                else => Routine.Charged
+            }
+            let cell_args = fx.list1(cell)
+            let bytes = mut lo.call_routine(mut fx, routine, args: cell_args.view())
+            expect bytes.len() == 1
+            supply.ret(mut lo, mut fx, held: Held.Scalar(bytes[0]))
+        }
+        "close" => {
+            let close_args = fx.list1(cell)
+            discard mut lo.call_routine(mut fx, routine: Routine.Close, args: close_args.view())
+            let holding = mut fx.load(PTR, addr: receiver, offset: 0)
+            let unhold_args = fx.list1(holding)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: unhold_args.view())
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} stores_budget
+
+fn stores_heap(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" or "alloc" or "over" => {
+            let cell = store_cell(mut lo, mut fx, supply)
+            ret_handle(mut lo, mut fx, supply, cell)
+        }
+        "boxed" or "try_boxed" => {
+            let cell = stores_handle(mut fx, held: supply.param(0))
+            stores_boxed(mut lo, mut fx, supply, cell)
+        }
+        else => {
+            expect false
+        }
+    }
+} stores_heap
+
+/// `boxed` and `try_boxed` of a store drawing through a cell: a box holding the value taken.
+fn stores_boxed(mut lo: Lowering, mut fx: Fx, supply: Supply, cell: clif::Value) {
+    let args_len = lo.ck.types().arg_list(supply.args).len()
+    expect args_len > 0
+    let value_ty = supply.type_arg(lo, index: args_len - 1)
+    let value = supply.param(1)
+    let laid = mut lo.layout_of(value_ty)
+    let size_bytes = if laid.contents().size > 1 {
+        laid.contents().size
+    } else {
+        1
+    }
+    let align_bytes = if laid.contents().align > 1 {
+        laid.contents().align
+    } else {
+        1
+    }
+    let size = mut fx.ptr(size_bytes)
+    let align = mut fx.ptr(align_bytes)
+    let alloc_args = fx.list3(cell, b: size, c: align)
+    let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect drawn.len() == 1
+    let address = drawn[0]
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        let taken = Array[Taken, 1].filled(Taken(held: value, ty: value_ty))
+        supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+    })
+    mut lo.store_held(mut fx, address, held: value, ty: value_ty)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(address, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} stores_boxed
+
+fn boxed_member(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let contents = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    match supply.member() {
+        "contents" or "contents_mut" => supply.ret(mut lo, mut fx, held: Held.Address(contents))
+        "into_contents" => {
+            let value_ty = supply.type_arg(lo, index: 0)
+            let laid = mut lo.layout_of(value_ty)
+            let result = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            let held = mut lo.held_at(mut fx, ty: value_ty, address: contents)
+            mut lo.store_held(mut fx, address: result, held, ty: value_ty)
+            let free_args = fx.list1(contents)
+            discard mut lo.call_routine(mut fx, routine: Routine.Free, args: free_args.view())
+            let moved = mut lo.held_at(mut fx, ty: value_ty, address: result)
+            supply.ret(mut lo, mut fx, held: moved)
+        }
+        else => {
+            expect false
+        }
+    }
+} boxed_member
+
+/// Releases a box of a type at an address: its contents, then its memory. A box of a `Dyn`
+/// releases its contents through the method table.
+fn release_box(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) {
+    let contents = mut fx.load(PTR, addr: address, offset: 0)
+    match lo.ck.types().type_arg(ty, index: 0) {
+        Some(inner) => {
+            match lo.ck.types().kind(inner) {
+                ty::TyKind.Dyn(_) => {
+                    let table = mut fx.load(PTR, addr: address, offset: 8)
+                    let release = mut fx.load(PTR, addr: table, offset: 0)
+                    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: release, y: 0)
+                    mut fx.if_true(present, then: fn(mut fx1: Fx) {
+                        var signature = clif::Signature.new(CALL_CONV, alloc: fx1.alloc)
+                        mut signature.params.push(clif::AbiParam(value_type: PTR))
+                        let imported = mut fx1.b.import_signature(take signature)
+                        let release_args = fx1.list1(contents)
+                        discard mut fx1.b.call_indirect(imported, callee: release, args: release_args.view())
+                    })
+                }
+                else => mut lo.release(mut fx, ty: inner, address: contents)
+            }
+        }
+        None => {}
+    }
+    let free_args = fx.list1(contents)
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: free_args.view())
+} release_box
+
+fn stores_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let at = contents_at(mut lo, value: value_ty)
+    match supply.member() {
+        "of" or "try_of" => {
+            let value = supply.param(0)
+            let cell = stores_handle(mut fx, held: supply.param(1))
+            let record = new_shared(mut lo, mut fx, cell, value_ty, value)
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                let taken = Array[Taken, 1].filled(Taken(held: value, ty: value_ty))
+                supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+            })
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(record, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "share" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let one = mut fx.ptr(1)
+            discard mut fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Add, p: record, x: one)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(record, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "contents" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let contents = mut fx.offset(record, offset: at)
+            supply.ret(mut lo, mut fx, held: Held.Address(contents))
+        }
+        "make_mut" => {
+            let receiver = supply.param(0).address_value()
+            let clone = supply.param(1).address_value()
+            let fn_ty = fn_param(lo, supply, index: 1)
+            let record = mut fx.load(PTR, addr: receiver, offset: 0)
+            let count = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: record)
+            let shared_more = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: count, y: 1)
+            mut fx.if_true(shared_more, then: fn[mut lo](mut fx1: Fx) {
+                let contents = mut fx1.offset(record, offset: at)
+                let cell = mut fx1.load(PTR, addr: record, offset: SHARED_ALLOC)
+                let alloc = mut fx1.slot(8, align: 8)
+                mut fx1.store(cell, addr: alloc, offset: 0)
+                let held = mut lo.held_at(mut fx1, ty: value_ty, address: contents)
+                var clone_args = Array[Held, 2].filled(held)
+                clone_args[1] = Held.Address(alloc)
+                let called = mut lo.call_value(mut fx1, fn_ty, function: clone, args: clone_args.view())
+                let fresh = new_shared(mut lo, fx: mut fx1, cell, value_ty, value: called.result)
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: fresh, y: 0)
+                mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+                    raise_kind(mut lo, fx: mut fx2, kind: "trap.exhausted")
+                })
+                release_shared(mut lo, fx: mut fx1, value_ty, address: receiver)
+                mut fx1.store(fresh, addr: receiver, offset: 0)
+            })
+            let current = mut fx.load(PTR, addr: receiver, offset: 0)
+            let reach = current_domain(mut lo, mut fx)
+            mut fx.store(reach, addr: current, offset: SHARED_REACH)
+            let contents = mut fx.offset(current, offset: at)
+            supply.ret(mut lo, mut fx, held: Held.Address(contents))
+        }
+        else => {
+            expect false
+        }
+    }
+} stores_shared
+
+/// A new shared value holding a value with a count of 1, drawn through a cell; zero on
+/// exhaustion.
+fn new_shared(mut lo: Lowering, mut fx: Fx, cell: clif::Value, value_ty: ty::Ty, value: Held) -> clif::Value {
+    let at = contents_at(mut lo, value: value_ty)
+    let laid = mut lo.layout_of(value_ty)
+    let size = mut fx.ptr(at + laid.contents().size)
+    let align_bytes = if laid.contents().align > 8 {
+        laid.contents().align
+    } else {
+        8
+    }
+    let align = mut fx.ptr(align_bytes)
+    let alloc_args = fx.list3(cell, b: size, c: align)
+    let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect drawn.len() == 1
+    let record = drawn[0]
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: SHARED_COUNT)
+        mut fx1.store(cell, addr: record, offset: SHARED_ALLOC)
+        let reach = current_domain(mut lo, fx: mut fx1)
+        mut fx1.store(reach, addr: record, offset: SHARED_REACH)
+        let contents = mut fx1.offset(record, offset: at)
+        mut lo.store_held(mut fx1, address: contents, held: value, ty: value_ty)
+    })
+    return record
+} new_shared
+
+/// Releases a shared value at an address: the last one releases the contents and frees them.
+fn release_shared(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, address: clif::Value) {
+    let record = mut fx.load(PTR, addr: address, offset: 0)
+    let minus = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+    let before = mut fx.b.atomic_rmw(PTR, flags: clif::MemFlags.owned(), op: clif::AtomicRmwOp.Add, p: record, x: minus)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 1)
+    let at = contents_at(mut lo, value: value_ty)
+    mut fx.if_true(last, then: fn[mut lo](mut fx1: Fx) {
+        let contents = mut fx1.offset(record, offset: at)
+        mut lo.release(mut fx1, ty: value_ty, address: contents)
+        let free_args = fx1.list1(record)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: free_args.view())
+    })
+} release_shared
+
+/// Moves a shared value into another domain's reach: when its reach widens, its record and
+/// contents follow, the contents' holdings raised to the new reach.
+fn transfer_shared(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, address: clif::Value, lift: clif::Value) {
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        let record = mut fx1.load(PTR, addr: address, offset: 0)
+        let reach = mut fx1.offset(record, offset: SHARED_REACH)
+        let widened = transfer_widen(mut fx1, reach_at: reach, to: lift)
+        mut fx1.if_true(widened, then: fn[mut lo](mut fx2: Fx) {
+            discard transfer_lift(mut lo, fx: mut fx2, address: record, lift)
+            let at = contents_at(mut lo, value: value_ty)
+            let contents = mut fx2.offset(record, offset: at)
+            let owner = transfer_raised(mut fx2, reach: lift)
+            mut lo.transfer(mut fx2, ty: value_ty, address: contents, lift, owner)
+        })
+    })
+} transfer_shared
+
+/// Moves a pool into another domain's reach: its storage and the value of each occupied slot.
+fn transfer_pool(mut lo: Lowering, mut fx: Fx, element: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    let shaped = slot_shape(mut lo, value: element)
+    let capacity = mut fx.load(PTR, addr: address, offset: VECTOR_CAPACITY)
+    let allocated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: capacity, y: 0)
+    mut fx.if_true(allocated, then: fn[mut lo](mut fx1: Fx) {
+        let data = mut fx1.load(PTR, addr: address, offset: VECTOR_DATA)
+        discard transfer_lift(mut lo, fx: mut fx1, address: data, lift)
+    })
+    if not mut lo.transfers(element) {
+        return
+    }
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shaped.slot.at(mut fx1, data, index)
+        let flag = mut fx1.load(clif::Type.Int32, addr: at, offset: 4)
+        let occupied = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+        mut fx1.if_true(occupied, then: fn[mut lo](mut fx2: Fx) {
+            let stored = mut fx2.offset(at, offset: shaped.value_at)
+            mut lo.transfer(mut fx2, ty: element, address: stored, lift, owner)
+        })
+    })
+} transfer_pool
+
+/// The address of the contents of a box or shared value whose first word is `pointer`.
+fn contents_address(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, pointer: clif::Value) -> clif::Value {
+    if lo.ck.is_std(ty, path: "mem::Shared") {
+        let Some(value_ty) = lo.ck.types().type_arg(ty, index: 0) else {
+            expect false
+            return pointer
+        }
+        let at = contents_at(mut lo, value: value_ty)
+        return mut fx.offset(pointer, offset: at)
+    }
+    return pointer
+} contents_address
+
+fn arena(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "one arm per member of `mem::Arena`, as they are dispatched"
+{
+    let element = supply.type_arg(lo, index: 0)
+    let shape = Element.of(mut lo, ty: element)
+    match supply.member() {
+        "empty" or "over" => {
+            let cell = store_cell(mut lo, mut fx, supply)
+            let header = segments_header(mut lo, mut fx, alloc: cell)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(header, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "len" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+        }
+        "push" or "try_push" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let value = supply.param(1)
+            let lock = mut fx.offset(header, offset: SEGMENTS_LOCK)
+            let lock_args = fx.list1(lock)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: lock_args.view())
+            let room = reserve_one(mut lo, mut fx, header, element: shape)
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                let unlock_args = fx1.list1(lock)
+                discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: unlock_args.view())
+                let taken = Array[Taken, 1].filled(Taken(held: value, ty: element))
+                supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+            })
+            let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+            let at = segments_at(mut fx, header, index: len, element: shape)
+            mut lo.store_held(mut fx, address: at, held: value, ty: element)
+            let next = mut fx.b.iadd_imm_s(len, y: 1)
+            mut fx.store(next, addr: header, offset: SEGMENTS_LEN)
+            let unlock_args = fx.list1(lock)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: unlock_args.view())
+            let id = mut fx.b.ireduce(clif::Type.Int32, x: len)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(id, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "at" or "at_mut" or "get" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let narrow = mut fx.load(clif::Type.Int32, addr: supply.param(1).address_value(), offset: 0)
+            let index = mut fx.b.uextend(PTR, x: narrow)
+            let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+            let found = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+            if supply.member() == "get" {
+                let results = fx.types1(PTR)
+                let addresses = mut fx.choose(found, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                    let at = segments_at(mut fx1, header, index, element: shape)
+                    return fx1.list1(at)
+                }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                    let none = mut fx1.ptr(0)
+                    return fx1.list1(none)
+                })
+                expect addresses.len() == 1
+                projected(mut lo, mut fx, supply, value: element, found, address: addresses[0])
+            } else {
+                let outside = mut fx.b.bxor_imm_s(found, y: 1)
+                mut fx.if_true(outside, then: fn[mut lo](mut fx1: Fx) {
+                    raise_kind(mut lo, fx: mut fx1, kind: "trap.bounds")
+                })
+                let at = segments_at(mut fx, header, index, element: shape)
+                supply.ret(mut lo, mut fx, held: Held.Address(at))
+            }
+        }
+        "cursor" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(header, addr: sret, offset: 0)
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: 8)
+            supply.done(mut lo, mut fx)
+        }
+        "boxed" or "try_boxed" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let cell = segments_allocator(mut fx, header)
+            stores_boxed(mut lo, mut fx, supply, cell)
+        }
+        else => {
+            expect false
+        }
+    }
+} arena
+
+/// Returns a projection's `Option`: `Some` of the part at `address` when `found`, else `None`.
+fn projected(mut lo: Lowering, mut fx: Fx, supply: Supply, value: ty::Ty, found: clif::Value, address: clif::Value) {
+    let layout_ty = supply.abi.result
+    let laid = mut lo.layout_of(layout_ty)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let part = match supply.wrap {
+        Some(wrap) => lo.is_part(value, wrap)
+        None => false
+    }
+    mut lo.write_option_with(mut fx, layout_ty, address: result, presence: found, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        if part {
+            mut fx1.store(address, addr: payload, offset: 0)
+        } else {
+            let held = mut lo1.held_at(mut fx1, ty: value, address)
+            mut lo1.store_held(mut fx1, address: payload, held, ty: value)
+        }
+    })
+    let held = mut lo.held_at(mut fx, ty: layout_ty, address: result)
+    supply.ret(mut lo, mut fx, held)
+} projected
+
+/// `ArenaCursor.next`: the arena's header and the next index.
+fn arena_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let element = supply.type_arg(lo, index: 0)
+    let shape = Element.of(mut lo, ty: element)
+    let cursor = supply.param(0).address_value()
+    let header = mut fx.load(PTR, addr: cursor, offset: 0)
+    let position = mut fx.load(PTR, addr: cursor, offset: 8)
+    let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+    let found = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: position, y: len)
+    let results = fx.types1(PTR)
+    let addresses = mut fx.choose(found, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let next = mut fx1.b.iadd_imm_s(position, y: 1)
+        mut fx1.store(next, addr: cursor, offset: 8)
+        let at = segments_at(mut fx1, header, index: position, element: shape)
+        return fx1.list1(at)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    expect addresses.len() == 1
+    projected(mut lo, mut fx, supply, value: element, found, address: addresses[0])
+} arena_next
+
+fn stores_id(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(supply.param(0).scalar_value(), addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            let index = mut fx.load(clif::Type.Int32, addr: supply.param(0).address_value(), offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(index))
+        }
+    }
+} stores_id
+
+fn stores_pool(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "one arm per member of `mem::Pool`, as they are dispatched"
+{
+    let element = supply.type_arg(lo, index: 0)
+    let shaped = slot_shape(mut lo, value: element)
+    let slot = shaped.slot
+    let value_at = shaped.value_at
+    match supply.member() {
+        "empty" or "over" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let cell = store_cell(mut lo, mut fx, supply)
+            vector_empty(mut fx, address: sret, alloc: cell, element: slot)
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: POOL_COUNT)
+            supply.done(mut lo, mut fx)
+        }
+        "len" => {
+            let count = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: POOL_COUNT)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+        }
+        "insert" or "try_insert" => {
+            let address = supply.param(0).address_value()
+            let value = supply.param(1)
+            let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let free = first_free(mut fx, data, len, slot)
+            let appended = mut fx.b.icmp(clif::IntCC.Equal, x: free, y: len)
+            mut fx.if_true(appended, then: fn[mut lo](mut fx1: Fx) {
+                let needed = mut fx1.b.iadd_imm_s(len, y: 1)
+                let room = vector_reserve(mut lo, fx: mut fx1, address, needed, element: slot)
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+                mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+                    let taken = Array[Taken, 1].filled(Taken(held: value, ty: element))
+                    supply.exhausted(mut lo, fx: mut fx2, taken: taken.view())
+                })
+                let grown_data = mut fx1.load(PTR, addr: address, offset: VECTOR_DATA)
+                let at = slot.at(mut fx1, data: grown_data, index: len)
+                let zero = mut fx1.int(clif::Type.Int32, value: 0)
+                mut fx1.store(zero, addr: at, offset: 0)
+                mut fx1.store(needed, addr: address, offset: VECTOR_LEN)
+            })
+            let current = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+            let at = slot.at(mut fx, data: current, index: free)
+            let occupied = mut fx.int(clif::Type.Int32, value: 1)
+            mut fx.store(occupied, addr: at, offset: 4)
+            let stored = mut fx.offset(at, offset: value_at)
+            mut lo.store_held(mut fx, address: stored, held: value, ty: element)
+            let count = mut fx.load(PTR, addr: address, offset: POOL_COUNT)
+            let counted = mut fx.b.iadd_imm_s(count, y: 1)
+            mut fx.store(counted, addr: address, offset: POOL_COUNT)
+            let generation = mut fx.load(clif::Type.Int32, addr: at, offset: 0)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let index = mut fx.b.ireduce(clif::Type.Int32, x: free)
+            mut fx.store(index, addr: sret, offset: 0)
+            mut fx.store(generation, addr: sret, offset: 4)
+            supply.done(mut lo, mut fx)
+        }
+        "reserve" or "try_reserve" => {
+            let address = supply.param(0).address_value()
+            let additional = supply.param(1).scalar_value()
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let count = mut fx.load(PTR, addr: address, offset: POOL_COUNT)
+            let free = mut fx.b.isub(len, y: count)
+            let short = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: additional, y: free)
+            mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
+                let missing = mut fx1.b.isub(additional, y: free)
+                let sum = mut fx1.b.uadd_overflow(len, y: missing)
+                let results = fx1.types1(clif::Type.Int8)
+                let rooms = mut fx1.choose(sum.flag, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+                    let no_room = mut fx2.int(clif::Type.Int8, value: 0)
+                    return fx2.list1(no_room)
+                }, otherwise: fn[mut lo](mut fx2: Fx) -> mem::List[clif::Value] {
+                    let reserved = vector_reserve(mut lo, fx: mut fx2, address, needed: sum.value, element: slot)
+                    return fx2.list1(reserved)
+                })
+                expect rooms.len() == 1
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: rooms[0], y: 0)
+                mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+                    let taken = mem::List[Taken].empty(fx2.alloc)
+                    supply.exhausted(mut lo, fx: mut fx2, taken: taken.view())
+                })
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "contains" or "get" or "get_mut" or "at" or "at_mut" or "remove" => pool_handle_member(mut lo, mut fx, supply, element, slot, value_at)
+        "cursor" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(supply.param(0).address_value(), addr: sret, offset: 0)
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: 8)
+            supply.done(mut lo, mut fx)
+        }
+        "boxed" or "try_boxed" => {
+            let cell = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: VECTOR_ALLOC)
+            stores_boxed(mut lo, mut fx, supply, cell)
+        }
+        else => {
+            expect false
+        }
+    }
+} stores_pool
+
+/// The members of `mem::Pool` taking a handle, `contains`, `get`, `get_mut`, `at`, `at_mut` and
+/// `remove`: the slot's value when it is live, a stale handle trapping where a value is
+/// required.
+fn pool_handle_member(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty, slot: Element, value_at: u64) {
+    let member = supply.member()
+    let address = supply.param(0).address_value()
+    let handle = supply.param(1).address_value()
+    let narrow = mut fx.load(clif::Type.Int32, addr: handle, offset: 0)
+    let index = mut fx.b.uextend(PTR, x: narrow)
+    let generation = mut fx.load(clif::Type.Int32, addr: handle, offset: 4)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let inside = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+    let results = fx.types1(clif::Type.Int8)
+    let lives = mut fx.choose(inside, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let at = slot.at(mut fx1, data, index)
+        let flag = mut fx1.load(clif::Type.Int32, addr: at, offset: 4)
+        let occupied = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+        let stored = mut fx1.load(clif::Type.Int32, addr: at, offset: 0)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: stored, y: generation)
+        let current = mut fx1.b.band(occupied, y: same)
+        return fx1.list1(current)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let stale = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(stale)
+    })
+    expect lives.len() == 1
+    let live = lives[0]
+    let at = slot.at(mut fx, data, index)
+    let stored = mut fx.offset(at, offset: value_at)
+    match member {
+        "contains" => supply.ret(mut lo, mut fx, held: Held.Scalar(live))
+        "get" or "get_mut" => projected(mut lo, mut fx, supply, value: element, found: live, address: stored)
+        "at" or "at_mut" => {
+            let stale = mut fx.b.bxor_imm_s(live, y: 1)
+            mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.stale-handle")
+            })
+            supply.ret(mut lo, mut fx, held: Held.Address(stored))
+        }
+        else => {
+            let stale = mut fx.b.bxor_imm_s(live, y: 1)
+            mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.stale-handle")
+            })
+            let laid = mut lo.layout_of(element)
+            let result = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            let held = mut lo.held_at(mut fx, ty: element, address: stored)
+            mut lo.store_held(mut fx, address: result, held, ty: element)
+            let next = mut fx.b.iadd_imm_s(generation, y: 1)
+            mut fx.store(next, addr: at, offset: 0)
+            let vacant = mut fx.int(clif::Type.Int32, value: 0)
+            mut fx.store(vacant, addr: at, offset: 4)
+            let count = mut fx.load(PTR, addr: address, offset: POOL_COUNT)
+            let counted = mut fx.b.iadd_imm_s(count, y: -1)
+            mut fx.store(counted, addr: address, offset: POOL_COUNT)
+            let removed = mut lo.held_at(mut fx, ty: element, address: result)
+            supply.ret(mut lo, mut fx, held: removed)
+        }
+    }
+} pool_handle_member
+
+/// The index of the earliest slot not occupied, or the length when every slot is.
+fn first_free(mut fx: Fx, data: clif::Value, len: clif::Value, slot: Element) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let initial = fx.list1(zero)
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let index = current[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+        let results = fx1.types2(PTR, b: clif::Type.Int8)
+        let next = mut fx1.choose(inside, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = slot.at(mut fx2, data, index)
+            let flag = mut fx2.load(clif::Type.Int32, addr: at, offset: 4)
+            let occupied = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+            let following = mut fx2.b.iadd_imm_s(index, y: 1)
+            let position = mut fx2.b.select(occupied, x: following, y: index)
+            return fx2.list2(position, b: occupied)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list2(index, b: stop)
+        })
+        expect next.len() == 2
+        return Pass(again: next[1], next: fx1.list1(next[0]))
+    })
+    expect found.len() == 1
+    return found[0]
+} first_free
+
+/// `PoolCursor.next`: the pool's address and the next index; it skips slots not occupied.
+fn pool_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let element = supply.type_arg(lo, index: 0)
+    let shaped = slot_shape(mut lo, value: element)
+    let cursor = supply.param(0).address_value()
+    let pool = mut fx.load(PTR, addr: cursor, offset: 0)
+    let data = mut fx.load(PTR, addr: pool, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: pool, offset: VECTOR_LEN)
+    let start = mut fx.load(PTR, addr: cursor, offset: 8)
+    let initial = fx.list1(start)
+    let found_at = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let index = current[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+        let results = fx1.types2(PTR, b: clif::Type.Int8)
+        let next = mut fx1.choose(inside, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = shaped.slot.at(mut fx2, data, index)
+            let flag = mut fx2.load(clif::Type.Int32, addr: at, offset: 4)
+            let occupied = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+            let following = mut fx2.b.iadd_imm_s(index, y: 1)
+            let position = mut fx2.b.select(occupied, x: index, y: following)
+            let vacant = mut fx2.b.bxor_imm_s(occupied, y: 1)
+            return fx2.list2(position, b: vacant)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list2(index, b: stop)
+        })
+        expect next.len() == 2
+        return Pass(again: next[1], next: fx1.list1(next[0]))
+    })
+    expect found_at.len() == 1
+    let found = found_at[0]
+    let present = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: found, y: len)
+    let after = mut fx.b.iadd_imm_s(found, y: 1)
+    let position = mut fx.b.select(present, x: after, y: len)
+    mut fx.store(position, addr: cursor, offset: 8)
+    let at = shaped.slot.at(mut fx, data, index: found)
+    let stored = mut fx.offset(at, offset: shaped.value_at)
+    projected(mut lo, mut fx, supply, value: element, found: present, address: stored)
+} pool_next
+
+/// Releases a pool at an address: its occupied values, then its storage.
+fn release_pool(mut lo: Lowering, mut fx: Fx, element: ty::Ty, address: clif::Value) {
+    let shaped = slot_shape(mut lo, value: element)
+    if mut lo.needs_release(element) {
+        let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+        let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+        let zero = mut fx.ptr(0)
+        mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+            let at = shaped.slot.at(mut fx1, data, index)
+            let flag = mut fx1.load(clif::Type.Int32, addr: at, offset: 4)
+            let occupied = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+            mut fx1.if_true(occupied, then: fn[mut lo](mut fx2: Fx) {
+                let stored = mut fx2.offset(at, offset: shaped.value_at)
+                mut lo.release(mut fx2, ty: element, address: stored)
+            })
+        })
+    }
+    free_storage(mut lo, mut fx, address)
+} release_pool
+
+/// A member of `mem::OnceMap[K, V]`: key-value entries in segments, found through its hash
+/// index under its lock.
+fn once_map(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "one arm per member of `mem::OnceMap`, an insertion drawing its entry and index under the lock"
+{
+    let key = supply.type_arg(lo, index: 0)
+    let value = supply.type_arg(lo, index: 1)
+    let entries = Entries.of_map(mut lo, key, value)
+    let value_field = mut lo.layouts.field(lo.ck, ty: entries.entry, variant: None, label: "value")
+    let value_at = value_field.offset
+    match supply.member() {
+        "empty" => {
+            let cell = stores_handle(mut fx, held: supply.param(1))
+            let header = segments_header(mut lo, mut fx, alloc: cell)
+            let seed = supply.param(0).scalar_value()
+            mut fx.store(seed, addr: header, offset: SEGMENTS_SEED)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(header, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "len" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+        }
+        "get" or "insert" or "try_insert" => {
+            let header = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let key_held = supply.param(1)
+            let sought = held_address(mut lo, mut fx, ty: key, held: key_held)
+            let seed = mut fx.load(clif::Type.Int64, addr: header, offset: SEGMENTS_SEED)
+            let fragment = index_fragment(mut lo, mut fx, key, at: sought, seed)
+            let record = mut fx.offset(header, offset: SEGMENTS_INDEX)
+            let lock = mut fx.offset(header, offset: SEGMENTS_LOCK)
+            let lock_args = fx.list1(lock)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: lock_args.view())
+            let looked = index_find(mut lo, mut fx, record, fragment, matches: fn(mut lo1: Lowering, mut fx1: Fx, index: clif::Value) -> clif::Value {
+                let at = segments_at(mut fx1, header, index, element: entries.shape)
+                let stored = mut fx1.offset(at, offset: entries.key_at)
+                return mut lo1.equal(mut fx1, ty: key, left_at: stored, right_at: sought)
+            })
+            if supply.member() == "get" {
+                let unlock_args = fx.list1(lock)
+                discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: unlock_args.view())
+                let results = fx.types1(PTR)
+                let addresses = mut fx.choose(looked.found, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                    let at = segments_at(mut fx1, header, index: looked.index, element: entries.shape)
+                    let stored = mut fx1.offset(at, offset: value_at)
+                    return fx1.list1(stored)
+                }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                    let none = mut fx1.ptr(0)
+                    return fx1.list1(none)
+                })
+                expect addresses.len() == 1
+                projected(mut lo, mut fx, supply, value, found: looked.found, address: addresses[0])
+                return
+            }
+            let value_held = supply.param(2)
+            let results = fx.types1(PTR)
+            let addresses = mut fx.choose_in(mut lo, condition: looked.found, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                let unlock_args = fx1.list1(lock)
+                discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: unlock_args.view())
+                mut lo1.release(mut fx1, ty: key, address: sought)
+                match value_held {
+                    Held.Address(taken) => mut lo1.release(mut fx1, ty: value, address: taken)
+                    else => {}
+                }
+                let at = segments_at(mut fx1, header, index: looked.index, element: entries.shape)
+                let stored = mut fx1.offset(at, offset: value_at)
+                return fx1.list1(stored)
+            }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                let len = mut fx1.load(PTR, addr: header, offset: SEGMENTS_LEN)
+                var taken = Array[Taken, 2].filled(Taken(held: key_held, ty: key))
+                taken[1] = Taken(held: value_held, ty: value)
+                let room = reserve_one(mut lo1, fx: mut fx1, header, element: entries.shape)
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+                mut fx1.if_true(failed, then: fn[mut lo1](mut fx2: Fx) {
+                    let unlock_args = fx2.list1(lock)
+                    discard mut lo1.call_routine(mut fx2, routine: Routine.Unlock, args: unlock_args.view())
+                    supply.exhausted(mut lo1, fx: mut fx2, taken: taken.view())
+                })
+                let needed = mut fx1.b.iadd_imm_s(len, y: 1)
+                let alloc = segments_allocator(mut fx1, header)
+                let indexed = index_reserve(mut lo1, fx: mut fx1, record, alloc, needed)
+                let unindexed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: indexed, y: 0)
+                mut fx1.if_true(unindexed, then: fn[mut lo1](mut fx2: Fx) {
+                    let unlock_args = fx2.list1(lock)
+                    discard mut lo1.call_routine(mut fx2, routine: Routine.Unlock, args: unlock_args.view())
+                    supply.exhausted(mut lo1, fx: mut fx2, taken: taken.view())
+                })
+                let at = segments_at(mut fx1, header, index: len, element: entries.shape)
+                let key_slot = mut fx1.offset(at, offset: entries.key_at)
+                mut lo1.store_held(mut fx1, address: key_slot, held: key_held, ty: key)
+                let value_slot = mut fx1.offset(at, offset: value_at)
+                mut lo1.store_held(mut fx1, address: value_slot, held: value_held, ty: value)
+                index_insert(mut fx1, record, fragment, index: len)
+                mut fx1.store(needed, addr: header, offset: SEGMENTS_LEN)
+                let unlock_args = fx1.list1(lock)
+                discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: unlock_args.view())
+                return fx1.list1(value_slot)
+            })
+            expect addresses.len() == 1
+            supply.ret(mut lo, mut fx, held: Held.Address(addresses[0]))
+        }
+        else => {
+            expect false
+        }
+    }
+} once_map

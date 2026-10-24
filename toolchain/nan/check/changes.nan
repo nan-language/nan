@@ -1,0 +1,646 @@
+//! The change classes of the items changed between two states of a workspace, as `nan diff` reports them.
+
+/// What `nan diff` compares of an item in one state.
+struct Facts {
+    file: text::String
+    line: u32
+    /// Its lines as written, doc comments included.
+    text: mem::List[text::String]
+    item: hashing::HashValue
+    normalised: text::String
+    interface_form: Option[text::String]
+    spec: machine::Accepted
+    trust: Trust
+    /// Its schema hash, when it derives `Encode`.
+    encode: Option[hashing::HashValue]
+    /// For a `package` item: its `dep`, `allow` and `deny` directives, its lock's `approved` and
+    /// `epoch` records, and its authority summary.
+    directives: mem::List[text::String]
+    approvals: mem::List[text::String]
+    summary: mem::List[text::String]
+} Facts
+
+/// The trust records of an item: its ledger entries, and its accepted spec, pending weakening and
+/// seals as its module's API snapshot records them.
+struct Trust derives Eq {
+    ledger: mem::List[text::String]
+    accepted: machine::Accepted
+    pending: mem::List[machine::Pending]
+    seals: mem::List[machine::Seal]
+} Trust
+
+/// An item changed between two states: its canonical path, its location in the new state or,
+/// when removed, the old, its change classes in order, whether it is a weakening or a widening,
+/// and its old and new texts.
+pkg struct Change {
+    pkg path: text::String
+    pkg file: text::String
+    pkg line: u32
+    pkg classes: mem::List[text::String]
+    pkg weakening: bool
+    pkg widening: bool
+    pkg old: mem::List[text::String]
+    pkg new: mem::List[text::String]
+} Change
+
+/// The lines a `changed` record merges: its text, then its lock's approvals.
+fn Facts.shown(self, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    for line in self.text {
+        mut lines.push(text::String.of(line.as_str(), alloc))
+    }
+    for line in self.approvals {
+        mut lines.push(text::String.of(line.as_str(), alloc))
+    }
+    return lines
+} Facts.shown
+
+/// An item of a state: the index of the checker holding it, the item and its facts.
+struct StateItem {
+    index: usize
+    item: ty::ItemId
+    facts: Facts
+} StateItem
+
+/// One state's items by canonical path, with the checker holding each; with `file`, only the
+/// items of that file.
+struct ChangeState {
+    checkers: mem::List[Checker]
+    items: mem::Map[text::String, StateItem]
+    /// The old canonical paths its rename tombstones retire, with the paths their rewrites name.
+    renames: mem::Map[text::String, text::String]
+} ChangeState
+
+fn ChangeState.of(session: Session, file: Option[Str]) -> ChangeState {
+    let alloc = session.alloc
+    var checkers = mem::List[Checker].empty(alloc)
+    for held in take session.closures_checked() {
+        let TargetChecker(target: _, checker: checker) = held
+        mut checkers.push(take checker)
+    }
+    var items = mem::Map[text::String, StateItem].empty(alloc)
+    var renames = mem::Map[text::String, text::String].empty(alloc)
+    for index in 0..<checkers.len() {
+        let Some(checker) = checkers.get(index) else {
+            expect false
+            continue
+        }
+        let db = checker.db()
+        for position in 0..<db.items.len() {
+            let item = ty::ItemId(index: u32.fit(position))
+            if not db.is_reported(item) {
+                continue
+            }
+            match checker.rename(item) {
+                Some(pair) => {
+                    let RenamePair(old: old, new: new) = pair
+                    discard mut renames.insert(take old, value: take new)
+                }
+                None => {}
+            }
+            if db.in_history(item) {
+                continue
+            }
+            match file {
+                Some(only) => {
+                    if db.item_file(item).path.as_str() != only {
+                        continue
+                    }
+                }
+                None => {}
+            }
+            let Some(path) = checker.canonical_path(item) else {
+                continue
+            }
+            if not items.contains(path) {
+                discard mut items.insert(take path, value: StateItem(index: index, item: item, facts: checker.facts(item)))
+            }
+        }
+    }
+    return ChangeState(checkers: take checkers, items: take items, renames: take renames)
+} ChangeState.of
+
+/// An old canonical path a rename tombstone retires and the path its rewrite names.
+struct RenamePair {
+    old: text::String
+    new: text::String
+} RenamePair
+
+/// The old canonical path a rename tombstone retires and the path its rewrite names.
+fn Checker.rename(self, item: ty::ItemId) -> Option[RenamePair] {
+    let db = self.db()
+    let ast::ItemKind.Retired(tombstone) = db.ast(item).kind else {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: expr, preserves: true) = tombstone.new else {
+        return None
+    }
+    if tombstone.head.is_some() {
+        return None
+    }
+    let module = db.module_of(item)
+    let Some(old) = db.old_form(module, tombstone) else {
+        return None
+    }
+    match expr.kind {
+        ast::ExprKind.Path(path: path, args: None) => {
+            let Some(new) = db.spelled(module, path) else {
+                return None
+            }
+            return Some(RenamePair(old: take old, new: take new))
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            let ast::ExprKind.Path(path: path, args: None) = base.contents().kind else {
+                return None
+            }
+            var owner = text::String.empty(self.alloc())
+            match db.owner_key(module, owner: path) {
+                Some(key) => {
+                    owner = db.type_path(key)
+                }
+                None => {
+                    let Some(spelt) = db.spelled(module, path) else {
+                        return None
+                    }
+                    owner = spelt
+                }
+            }
+            mut owner.push('.')
+            mut owner.append(name.text.as_str())
+            return Some(RenamePair(old: take old, new: take owner))
+        }
+        else => return None
+    }
+} Checker.rename
+
+fn Checker.facts(self, item: ty::ItemId) -> Facts {
+    let alloc = self.alloc()
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    expect data.index < syntax.items.len()
+    let lines = syntax.item_lines(syntax.items[data.index])
+    var text_lines = mem::List[text::String].empty(alloc)
+    for line in lines {
+        mut text_lines.push(output::lossy(syntax.line_text(line), alloc))
+    }
+    let forms = self.forms(item)
+    let source = db.source(db.package_of(item))
+    let module = db.module(data.module).name.as_str()
+    var path = text::String.empty(alloc)
+    match self.canonical_path(item) {
+        Some(canonical) => {
+            path = canonical
+        }
+        None => {}
+    }
+    var accepted = machine::Accepted.empty(alloc)
+    var pending = mem::List[machine::Pending].empty(alloc)
+    var seals = mem::List[machine::Seal].empty(alloc)
+    match source.machine.entry(module, path: path.as_str()) {
+        Some(entry) => {
+            accepted = entry.accepted.copy(alloc)
+            pending = machine::Pending.copies(entry.pending.view(), alloc)
+            for seal in entry.seals {
+                mut seals.push(seal.copy(alloc))
+            }
+        }
+        None => {}
+    }
+    var ledger = mem::List[text::String].empty(alloc)
+    for entry in self.ledger(item) {
+        var written = text::String.of(entry.kind.word(), alloc)
+        mut written.push(' ')
+        for index in 0..<entry.texts.len() {
+            if index > 0 {
+                mut written.push(' ')
+            }
+            mut written.append(entry.texts[index].as_str())
+        }
+        mut ledger.push(take written)
+    }
+    var derives_encode = false
+    match db.ast(item).kind {
+        ast::ItemKind.Struct(structure) => {
+            derives_encode = names_encode(structure.derived.view())
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            derives_encode = names_encode(enumeration.derived.view())
+        }
+        else => {}
+    }
+    var encode: Option[hashing::HashValue] = None
+    if derives_encode {
+        encode = Some(self.schema(self.types().item(item, args: mem::List[ty::Arg].empty(alloc))).hash(alloc))
+    }
+    var authority = PackageAuthority(directives: mem::List[text::String].empty(alloc), approvals: mem::List[text::String].empty(alloc), summary: mem::List[text::String].empty(alloc))
+    match db.ast(item).kind {
+        ast::ItemKind.Package => {
+            authority = self.package_authority(source)
+        }
+        else => {}
+    }
+    let PackageAuthority(directives: directives, approvals: approvals, summary: summary) = authority
+    let hashes = self.hashes(item)
+    return Facts(file: text::String.of(db.item_file(item).path.as_str(), alloc), line: lines.low, text: take text_lines, item: hashes.item, normalised: take forms.normalised, interface_form: take forms.interface_form, spec: self.spec(item), trust: Trust(ledger: take ledger, accepted: take accepted, pending: take pending, seals: take seals), encode: encode, directives: take directives, approvals: take approvals, summary: take summary)
+} Checker.facts
+
+/// A package item's `dep`, `allow` and `deny` directives, its lock's `approved` and `epoch`
+/// records, and its package's authority summary.
+struct PackageAuthority {
+    directives: mem::List[text::String]
+    approvals: mem::List[text::String]
+    summary: mem::List[text::String]
+} PackageAuthority
+
+/// A package item's `dep`, `allow` and `deny` directives, its lock's `approved` and `epoch`
+/// records, and its package's authority summary.
+fn Checker.package_authority(self, source: workspace::Package) -> PackageAuthority {
+    let alloc = self.alloc()
+    let grammar = self.session().grammar.contents()
+    var directives = mem::List[text::String].empty(alloc)
+    match source.manifest {
+        Some(manifest) => {
+            let Some(manifest_file) = source.files.get(0) else {
+                expect false
+                return PackageAuthority(directives: take directives, approvals: mem::List[text::String].empty(alloc), summary: mem::List[text::String].empty(alloc))
+            }
+            let file = manifest_file.syntax
+            var lines = mem::List[u32].empty(alloc)
+            for dep in manifest.deps {
+                mut lines.push(dep.line)
+            }
+            for allow in manifest.allows {
+                mut lines.push(allow.line)
+            }
+            for deny in manifest.denies {
+                mut lines.push(deny.line)
+            }
+            for line in lines {
+                let written = output::lossy(file.line_text(line), alloc)
+                let run = platform::trimmed_run(written.as_str())
+                match written.slice_bytes(run.start, end: run.end) {
+                    Some(trimmed) => mut directives.push(text::String.of(trimmed, alloc))
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+    var approvals = mem::List[text::String].empty(alloc)
+    match source.machine.lock() {
+        Some(lock) => {
+            for approval in lock.approved {
+                mut approvals.push(approval.record(grammar, alloc))
+            }
+            for epoch in lock.epochs {
+                mut approvals.push(epoch.record(grammar, alloc))
+            }
+        }
+        None => {}
+    }
+    var summary = mem::List[text::String].empty(alloc)
+    match source.name() {
+        Some(name) => {
+            match self.package_named(name) {
+                Some(id) => {
+                    for entry in self.authority_summary(id) {
+                        mut summary.push(entry.written(grammar, alloc))
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    return PackageAuthority(directives: take directives, approvals: take approvals, summary: take summary)
+} Checker.package_authority
+
+/// A form with each canonical path a rename retires replaced by the path its rewrite names.
+fn changes_rewritten(form: Str, renames: mem::Map[text::String, text::String], alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(form, alloc)
+    for rename in renames {
+        let old = rename.key().as_str()
+        let new = rename.value().as_str()
+        var out = text::String.empty(alloc)
+        var start: usize = 0
+        loop {
+            let Some(rest) = written.slice_bytes(start, end: written.byte_len()) else {
+                break
+            }
+            let Some(at) = rest.find(old) else {
+                mut out.append(rest)
+                break
+            }
+            expect at <= ~0usize - old.byte_len()
+            let Some(before) = rest.slice_bytes(0, end: at) else {
+                break
+            }
+            mut out.append(before)
+            let Some(after) = rest.slice_bytes(at + old.byte_len(), end: rest.byte_len()) else {
+                break
+            }
+            if continues_name(after) {
+                mut out.append(old)
+            } else {
+                mut out.append(new)
+            }
+            expect start <= ~0usize - (at + old.byte_len())
+            start += at + old.byte_len()
+        }
+        written = out
+    }
+    return written
+} changes_rewritten
+
+/// Whether a text continues a name or path: it starts with an ASCII letter, digit, `_` or `::`.
+fn continues_name(after: Str) -> bool {
+    let bytes = after.as_bytes()
+    if bytes.len() == 0 {
+        return false
+    }
+    let byte = bytes[0]
+    let named = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_'
+    return named or after.starts_with("::")
+} continues_name
+
+/// An item of the old state, by its path there, and whether the new state holds it.
+struct Matched {
+    old: Option[text::String]
+    new: bool
+} Matched
+
+/// The items changed between two states of a workspace, with `file` only those of that file,
+/// in byte order of canonical path.
+pkg fn changes(old: Session, new: Session, file: Option[Str]) -> mem::List[Change] {
+    let alloc = new.alloc
+    let before = ChangeState.of(old, file)
+    let after = ChangeState.of(new, file)
+    var renames = mem::Map[text::String, text::String].empty(alloc)
+    for rename in after.renames {
+        if not before.renames.contains(rename.key()) {
+            discard mut renames.insert(text::String.of(rename.key().as_str(), alloc), value: text::String.of(rename.value().as_str(), alloc))
+        }
+    }
+    var matched = mem::Map[text::String, Matched].empty(alloc)
+    for held in before.items {
+        let path = held.key()
+        var target = text::String.of(path.as_str(), alloc)
+        match renames.get(path) {
+            Some(renamed) => {
+                target = text::String.of(renamed.as_str(), alloc)
+            }
+            None => {}
+        }
+        var entry = match mut matched.remove(target) {
+            Some(known) => known
+            None => Matched(old: None, new: false)
+        }
+        entry.old = Some(text::String.of(path.as_str(), alloc))
+        discard mut matched.insert(take target, value: take entry)
+    }
+    for held in after.items {
+        let path = held.key()
+        var entry = match mut matched.remove(path) {
+            Some(known) => known
+            None => Matched(old: None, new: false)
+        }
+        entry.new = true
+        discard mut matched.insert(text::String.of(path.as_str(), alloc), value: take entry)
+    }
+    var found = mem::List[Change].empty(alloc)
+    for pair in matched {
+        let path = pair.key().as_str()
+        let held = pair.value()
+        let Some(old_path) = held.old else {
+            if held.new {
+                let Some(added) = after.items.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+                    expect false
+                    continue
+                }
+                mut found.push(Change(path: text::String.of(path, alloc), file: text::String.of(added.facts.file.as_str(), alloc), line: added.facts.line, classes: one_class("interface", alloc), weakening: false, widening: added.facts.summary.len() > 0, old: mem::List[text::String].empty(alloc), new: added.facts.shown(alloc)))
+            }
+            continue
+        }
+        let Some(removed) = before.items.get(old_path) else {
+            expect false
+            continue
+        }
+        if not held.new {
+            mut found.push(Change(path: text::String.of(path, alloc), file: text::String.of(removed.facts.file.as_str(), alloc), line: removed.facts.line, classes: one_class("interface", alloc), weakening: false, widening: false, old: removed.facts.shown(alloc), new: mem::List[text::String].empty(alloc)))
+            continue
+        }
+        let Some(kept) = after.items.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+            expect false
+            continue
+        }
+        let renamed = not before.items.get_by(fn(key: text::String) => key.as_str().cmp(path)).is_some()
+        let classes = change_classes(removed.facts, new_facts: kept.facts, renamed, renames, alloc)
+        if classes.len() == 0 {
+            continue
+        }
+        let Some(checker) = after.checkers.get(kept.index) else {
+            expect false
+            continue
+        }
+        let weakening = weakens(new, checker, item: kept.item, accepted: removed.facts.spec)
+        var widening = false
+        for entry in kept.facts.summary {
+            if not holds_line(removed.facts.summary.view(), line: entry.as_str()) {
+                widening = true
+            }
+        }
+        mut found.push(Change(path: text::String.of(path, alloc), file: text::String.of(kept.facts.file.as_str(), alloc), line: kept.facts.line, classes: take classes, weakening: weakening, widening: widening, old: removed.facts.shown(alloc), new: kept.facts.shown(alloc)))
+    }
+    return found
+} changes
+
+fn one_class(class: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var classes = mem::List[text::String].empty(alloc)
+    mut classes.push(text::String.of(class, alloc))
+    return classes
+} one_class
+
+fn holds_line(lines: Slice[text::String], line: Str) -> bool {
+    for held in lines {
+        if held.as_str() == line {
+            return true
+        }
+    }
+    return false
+} holds_line
+
+/// The change classes of an item between its old and new facts, in order.
+fn change_classes(old: Facts, new_facts: Facts, renamed: bool, renames: mem::Map[text::String, text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    let form = changes_rewritten(old.normalised.as_str(), renames, alloc)
+    var interface_form: Option[text::String] = None
+    match old.interface_form {
+        Some(written) => {
+            interface_form = Some(changes_rewritten(written.as_str(), renames, alloc))
+        }
+        None => {}
+    }
+    var classes = mem::List[text::String].empty(alloc)
+    let text_changed = old.text != new_facts.text or old.file != new_facts.file
+    if text_changed and not renamed and old.item == new_facts.item {
+        mut classes.push(text::String.of("format", alloc))
+    }
+    if renamed or (old.item != new_facts.item and form == new_facts.normalised) {
+        mut classes.push(text::String.of("move", alloc))
+    }
+    if form != new_facts.normalised and interface_form == new_facts.interface_form {
+        mut classes.push(text::String.of("body", alloc))
+    }
+    if interface_form != new_facts.interface_form {
+        mut classes.push(text::String.of("interface", alloc))
+    }
+    if not old.spec.same(new_facts.spec) {
+        mut classes.push(text::String.of("spec", alloc))
+    }
+    if old.directives != new_facts.directives or old.approvals != new_facts.approvals or old.summary != new_facts.summary {
+        mut classes.push(text::String.of("authority", alloc))
+    }
+    if old.encode != new_facts.encode {
+        mut classes.push(text::String.of("encode", alloc))
+    }
+    if old.trust != new_facts.trust {
+        mut classes.push(text::String.of("trust", alloc))
+    }
+    return classes
+} change_classes
+
+/// Whether an item of the new state weakens its old accepted spec by more than entailment
+/// clears, judged in its workspace package; never for an item of another package.
+fn weakens(new: Session, checker: Checker, item: ty::ItemId, accepted: machine::Accepted) -> bool {
+    let db = checker.db()
+    let Some(workspace::Member.Source(index)) = db.package_data(db.package_of(item)).member else {
+        return false
+    }
+    let alloc = new.alloc
+    var weakened = mem::List[Weakened].empty(alloc)
+    mut weakened.push(Weakened(ck: checker.share(), item: item, accepted: accepted.copy(alloc), later: None))
+    let left_parts = new.left(index, weakened: weakened.view())
+    let Some(parts) = left_parts.get(0) else {
+        return false
+    }
+    return parts.len() > 0
+} weakens
+
+/// What a semantic conflict reads of an item in one version: its interface hash, the canonical
+/// paths of the items it names, and its interface text.
+struct Naming {
+    interface_hash: Option[hashing::HashValue]
+    names: mem::Set[text::String]
+    api: mem::List[text::String]
+} Naming
+
+/// The items of a version by canonical path, with `file` only those of that file.
+fn namings(session: Session, file: Option[Str]) -> mem::Map[text::String, Naming] {
+    let alloc = session.alloc
+    var found = mem::Map[text::String, Naming].empty(alloc)
+    for held in session.closures_checked() {
+        let checker = held.checker
+        let db = checker.db()
+        for position in 0..<db.items.len() {
+            let item = ty::ItemId(index: u32.fit(position))
+            if not db.is_reported(item) or db.in_history(item) {
+                continue
+            }
+            match file {
+                Some(only) => {
+                    if db.item_file(item).path.as_str() != only {
+                        continue
+                    }
+                }
+                None => {}
+            }
+            let Some(path) = checker.canonical_path(item) else {
+                continue
+            }
+            if found.contains(path) {
+                continue
+            }
+            var names = mem::Set[text::String].empty(alloc)
+            for entry in take checker.closure_entries(item) {
+                let machine::ClosureEntry(path: named, body: _, hash: _) = entry
+                discard mut names.insert(take named)
+            }
+            let naming = Naming(interface_hash: checker.hashes(item).interface_hash, names: take names, api: checker.interface_text(item, viewer: None))
+            discard mut found.insert(take path, value: take naming)
+        }
+    }
+    return found
+} namings
+
+/// A semantic conflict's item J and the item I it names, as conflicts order by them.
+struct ConflictKey derives Eq, Ord {
+    path: text::String
+    named: text::String
+} ConflictKey
+
+/// The semantic conflicts of merging two versions of a workspace, or with `file` of one file, into
+/// `merged`: one side changed the interface hash of an item I, and the other added an item J
+/// naming I or changed J so that it names I where its base did not. Each is reported on J where
+/// `merged` holds it, quoting I's base and changed interface text.
+pkg fn semantic_conflicts(base: Session, ours: Session, theirs: Session, merged: Session, file: Option[Str]) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = merged.alloc
+    let base_namings = namings(base, file)
+    let ours_namings = namings(ours, file)
+    let theirs_namings = namings(theirs, file)
+    var found = mem::Map[ConflictKey, diagnostic::Diagnostic].empty(alloc)
+    add_conflicts(mut found, base: base_namings, changer: ours_namings, other: theirs_namings, merged: merged.workspace.contents(), alloc)
+    add_conflicts(mut found, base: base_namings, changer: theirs_namings, other: ours_namings, merged: merged.workspace.contents(), alloc)
+    var conflicts = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for held in take found {
+        let mem::KeyValue(key: _, value: conflict) = held
+        mut conflicts.push(take conflict)
+    }
+    return conflicts
+} semantic_conflicts
+
+/// Adds the semantic conflicts of one side changing an item's interface hash while the other
+/// names it anew.
+fn add_conflicts(mut found: mem::Map[ConflictKey, diagnostic::Diagnostic], base: mem::Map[text::String, Naming], changer: mem::Map[text::String, Naming], other: mem::Map[text::String, Naming], merged: workspace::Workspace, alloc: mem::Alloc) {
+    for held in base {
+        let named = held.key()
+        let old = held.value()
+        let Some(changed) = changer.get(named) else {
+            continue
+        }
+        if changed.interface_hash == old.interface_hash {
+            continue
+        }
+        for naming in other {
+            let path = naming.key()
+            if not naming.value().names.contains(named) or not names_newly(base, path, named) {
+                continue
+            }
+            let Some(at) = merged.item_location(path.as_str(), alloc) else {
+                continue
+            }
+            var reported = diagnostic::Diagnostic.at(diagnostic::Code.MergeSemanticConflict, path: at.path.as_str(), line: at.line, alloc)
+            var because = mem::List[diagnostic::Reason].empty(alloc)
+            for line in old.api {
+                var note = text::String.of("- ", alloc)
+                mut note.append(line.as_str())
+                mut because.push(diagnostic::Reason.note(note.as_str(), alloc))
+            }
+            for line in changed.api {
+                var note = text::String.of("+ ", alloc)
+                mut note.append(line.as_str())
+                mut because.push(diagnostic::Reason.note(note.as_str(), alloc))
+            }
+            reported.because = because
+            reported.item = Some(text::String.of(path.as_str(), alloc))
+            discard mut found.insert(ConflictKey(path: text::String.of(path.as_str(), alloc), named: text::String.of(named.as_str(), alloc)), value: take reported)
+        }
+    }
+} add_conflicts
+
+/// Whether an item names another where its base version did not, or has no base version.
+fn names_newly(base: mem::Map[text::String, Naming], path: text::String, named: text::String) -> bool {
+    let Some(before) = base.get(path) else {
+        return true
+    }
+    return not before.names.contains(named)
+} names_newly

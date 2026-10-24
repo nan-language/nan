@@ -1,0 +1,411 @@
+//! Settlement of an abandoned `sys::Domain` body, which the task waiting for the domain runs: every task of the domain and of the domains nested in it stops, then what those tasks and domains hold is released and their memory is freed.
+
+/// The offsets of a wait record's fields: the glue withdrawing the wait, given the record and
+/// the waiting task, the structure waited in, the waiting node and the record of the wait it is
+/// nested in.
+const WAIT_GLUE: u64 = 0
+
+const WAIT_OBJECT: u64 = 8
+
+const WAIT_NODE: u64 = 16
+
+const WAIT_OUTER: u64 = 24
+
+const WAIT_SIZE: u64 = 32
+
+/// The signature of a glue withdrawing a wait: the wait record and the task.
+fn withdraw_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    return signature
+} withdraw_signature
+
+/// Records the running task's wait in a structure other domains reach, innermost of its waits,
+/// which settlement withdraws through `glue` should the task stop.
+fn enter_wait(mut lo: Lowering, mut fx: Fx, glue: object::FuncId, object: clif::Value, node: clif::Value) {
+    let record = mut fx.slot(WAIT_SIZE, align: 8)
+    let reference = mut lo.func_ref(mut fx, id: glue)
+    let address = mut fx.b.func_addr(PTR, func_ref: reference)
+    mut fx.store(address, addr: record, offset: WAIT_GLUE)
+    mut fx.store(object, addr: record, offset: WAIT_OBJECT)
+    mut fx.store(node, addr: record, offset: WAIT_NODE)
+    let current = current_task(mut lo, mut fx)
+    let outer = mut fx.load(PTR, addr: current, offset: TASK_WAIT)
+    mut fx.store(outer, addr: record, offset: WAIT_OUTER)
+    mut fx.store(record, addr: current, offset: TASK_WAIT)
+} enter_wait
+
+/// Ends the running task's innermost recorded wait.
+fn leave_wait(mut lo: Lowering, mut fx: Fx) {
+    let current = current_task(mut lo, mut fx)
+    let innermost = mut fx.load(PTR, addr: current, offset: TASK_WAIT)
+    let outer = mut fx.load(PTR, addr: innermost, offset: WAIT_OUTER)
+    mut fx.store(outer, addr: current, offset: TASK_WAIT)
+} leave_wait
+
+fn settle_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    match routine {
+        Routine.Settle => {
+            let params = mut fx.entry()
+            expect params.len() > 0
+            settle(mut lo, mut fx, abandoned: params[0])
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        else => {
+            expect false
+        }
+    }
+} settle_define
+
+/// `Settle(domain)`: stops every task of an abandoned domain, takes them out of the list of
+/// live tasks, cancels their operations in flight and waits for each acknowledgement, withdraws
+/// their waits from what other domains reach, releases their stacks and records, then ends the
+/// domains nested in it and itself: each one's holdings are released and its chunks freed.
+fn settle(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
+    stop_tasks(mut lo, mut fx, abandoned)
+    let head = detach_tasks(mut lo, mut fx, abandoned)
+    each_stopped(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
+        cancel_operations(mut lo, fx: mut fx1, record)
+    })
+    each_stopped(mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
+        settle_withdraw(mut fx1, record)
+    })
+    each_stopped(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
+        poison_held(mut lo, fx: mut fx1, record)
+    })
+    each_stopped(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
+        release_stack(mut lo, fx: mut fx1, record)
+        mut lo.record_free(mut fx1, address: record)
+    })
+    settle_end_nested(mut lo, mut fx, abandoned)
+    settlement_end(mut lo, mut fx, domain: abandoned)
+} settle
+
+/// Ends an abandoned domain: releases its holdings, then frees its chunks.
+fn settlement_end(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {
+    release_all(mut lo, mut fx, domain)
+    free_chunks(mut lo, mut fx, domain)
+} settlement_end
+
+/// Runs `visit` on each task of the chain of stopped tasks from `head`, reading each task's
+/// link before the visit.
+fn each_stopped(mut fx: Fx, head: clif::Value, visit: fn(mut fx: Fx, record: clif::Value)) {
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(any, then: fn(mut fx1: Fx) {
+        discard mut fx1.repeat(fx1.list1(head).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let record = state[0]
+            let next = mut fx2.load(PTR, addr: record, offset: TASK_SETTLE)
+            visit(mut fx2, record)
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+            return Pass(again: more, next: fx2.list1(next))
+        })
+    })
+} each_stopped
+
+/// Cancels the operation a stopped task waits on and the deadlines it armed, and waits until
+/// each one's completion has been delivered; a deadline then leaves its clock's deadlines and
+/// its region is freed.
+fn cancel_operations(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let op = claim_operation(mut lo, mut fx, record)
+    let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+    mut fx.if_true(waits, then: fn[mut lo](mut fx1: Fx) {
+        settle_operation(mut lo, fx: mut fx1, op)
+    })
+    let head = mut fx.load(PTR, addr: record, offset: TASK_DEADLINES)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(armed, then: fn[mut lo](mut fx1: Fx) {
+        discard mut fx1.repeat(fx1.list1(head).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let timer = state[0]
+            let next = mut fx2.load(PTR, addr: timer, offset: OPERATION_LINK)
+            settle_operation(mut lo, fx: mut fx2, op: timer)
+            unlink_deadline(mut lo, fx: mut fx2, timer)
+            let region = mut fx2.load(PTR, addr: timer, offset: OPERATION_TASK)
+            mut lo.record_free(mut fx2, address: region)
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+            return Pass(again: more, next: fx2.list1(next))
+        })
+    })
+} cancel_operations
+
+/// The operation a stopped task waits on, claimed so that no cancellation reads its record any
+/// more, or zero when it waits on none.
+fn claim_operation(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let word = mut fx.offset(record, offset: TASK_IO)
+    let zero = mut fx.ptr(0)
+    let claimed_op = mut fx.repeat(fx.list1(zero).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let io = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: word)
+        let claimed_bit = mut fx1.b.band_imm_s(io, y: TASKS_CLAIMED)
+        let claimed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: claimed_bit, y: 0)
+        let operation = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: io, y: REGIONS_WAITING)
+        let unclaimed = mut fx1.b.bxor_imm_s(claimed, y: 1)
+        let waits_on_operation = mut fx1.b.band(operation, y: unclaimed)
+        let result = mut fx1.choose(waits_on_operation, results: fx1.types2(clif::Type.Int8, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let held = mut fx2.b.bor_imm_s(io, y: TASKS_CLAIMED)
+            let seen = mut fx2.b.atomic_cas(clif::MemFlags.owned(), p: word, e: io, x: held)
+            let taken = mut fx2.b.icmp(clif::IntCC.Equal, x: seen, y: io)
+            let none = mut fx2.ptr(0)
+            let op = mut fx2.b.select(taken, x: io, y: none)
+            let again = mut fx2.b.bxor_imm_s(taken, y: 1)
+            return fx2.list2(again, b: op)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.ptr(0)
+            return fx2.list2(claimed, b: none)
+        })
+        mut fx1.if_true(result[0], then: fn[mut lo](mut fx2: Fx) {
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: result[0], next: fx1.list1(result[1]))
+    })
+    return claimed_op[0]
+} claim_operation
+
+/// Cancels an operation and waits until its completion has been delivered, handling the
+/// completions on the running thread's ring meanwhile.
+fn settle_operation(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    mut lo.cancel_operation(mut fx, op)
+    let word = mut fx.offset(op, offset: OPERATION_DONE)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        mut lo.reap(mut fx1)
+        let done = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: word)
+        let pending = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: OPERATION_DELIVERED)
+        mut fx1.if_true(pending, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: pending, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} settle_operation
+
+/// Runs the glue withdrawing each of a stopped task's waits in structures other domains reach,
+/// innermost first.
+fn settle_withdraw(mut fx: Fx, record: clif::Value) {
+    let innermost = mut fx.load(PTR, addr: record, offset: TASK_WAIT)
+    let waiting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: innermost, y: 0)
+    mut fx.if_true(waiting, then: fn(mut fx1: Fx) {
+        discard mut fx1.repeat(fx1.list1(innermost).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let recorded = state[0]
+            let outer = mut fx2.load(PTR, addr: recorded, offset: WAIT_OUTER)
+            let glue = mut fx2.load(PTR, addr: recorded, offset: WAIT_GLUE)
+            let signature = mut fx2.b.import_signature(withdraw_signature(fx2.alloc))
+            discard mut fx2.b.call_indirect(signature, callee: glue, args: fx2.list2(recorded, b: record).view())
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: outer, y: 0)
+            return Pass(again: more, next: fx2.list1(outer))
+        })
+    })
+} settle_withdraw
+
+/// Poisons the cowns of the `await when` body a stopped task runs.
+fn poison_held(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let held = mut fx.load(PTR, addr: record, offset: TASK_HELD)
+    let holds = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+    mut fx.if_true(holds, then: fn[mut lo](mut fx1: Fx) {
+        let domain = mut fx1.load(PTR, addr: record, offset: TASK_DOMAIN)
+        poison(mut lo, fx: mut fx1, held, domain)
+    })
+} poison_held
+
+/// Visits each live task of a domain or of the domains nested in it, holding the lock of the
+/// list of live tasks; `visit` gives the next task to visit after the one it receives.
+fn each_task(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TASKS_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TASKS)
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(any, then: fn[mut lo](mut fx1: Fx) {
+        discard mut fx1.repeat(fx1.list1(head).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let record = state[0]
+            let owner = mut fx2.load(PTR, addr: record, offset: TASK_DOMAIN)
+            let inside = tasks_within(mut fx2, inner: owner, outer: abandoned)
+            let visited = mut fx2.choose_in(mut lo, condition: inside, results: fx2.types1(PTR).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let following = visit(mut lo3, fx: mut fx3, record)
+                return fx3.list1(following)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let following = mut fx3.load(PTR, addr: record, offset: TASK_ALL_NEXT)
+                return fx3.list1(following)
+            })
+            let next = visited[0]
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+            return Pass(again: more, next: fx2.list1(next))
+        })
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+} each_task
+
+/// Asks every task of the domain to stop and waits until each has: a new or parked task stops
+/// at once, a ready one leaves the run queue, and a running one stops once its thread has
+/// switched away from it, its thread receiving the stop signal until then.
+fn stop_tasks(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let pending = mut fx1.b.declare_var(clif::Type.Int8)
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        mut fx1.b.def_var(pending, val: none)
+        each_task(mut lo, fx: mut fx1, abandoned, visit: fn(mut lo2: Lowering, mut fx2: Fx, record: clif::Value) -> clif::Value {
+            let held = settle_stop(mut lo2, fx: mut fx2, record)
+            let waiting_before = mut fx2.b.use_var(pending)
+            let waiting_now = mut fx2.b.bor(waiting_before, y: held)
+            mut fx2.b.def_var(pending, val: waiting_now)
+            return mut fx2.load(PTR, addr: record, offset: TASK_ALL_NEXT)
+        })
+        let waiting = mut fx1.b.use_var(pending)
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} stop_tasks
+
+/// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to
+/// stop.
+fn settle_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let one = mut fx.ptr(1)
+    let asked = mut fx.offset(record, offset: TASK_STOP)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: one, p: asked)
+    let word = mut fx.offset(record, offset: TASK_STATE)
+    let current = mut fx.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: word)
+    let stopped = mut fx.int(clif::Type.Int32, value: RUN_STOPPED)
+    let is_new = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_NEW)
+    let is_parked = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_PARKED)
+    let idle = mut fx.b.bor(is_new, y: is_parked)
+    let is_ready = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_READY)
+    let is_stopped = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_STOPPED)
+    let left = mut fx.choose_in(mut lo, condition: idle, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: word, e: current, x: stopped)
+        let raced = mut fx1.b.icmp(clif::IntCC.NotEqual, x: seen, y: current)
+        return fx1.list1(raced)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let still = mut fx1.choose_in(mut lo1, condition: is_ready, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let removed = remove_ready(mut lo2, fx: mut fx2, record)
+            mut fx2.if_true(removed, then: fn(mut fx3: Fx) {
+                mut fx3.b.atomic_store(clif::MemFlags.owned(), x: stopped, p: word)
+            })
+            let remains = mut fx2.b.bxor_imm_s(removed, y: 1)
+            return fx2.list1(remains)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let running = mut fx2.b.bxor_imm_s(is_stopped, y: 1)
+            mut fx2.if_true(running, then: fn[mut lo2](mut fx3: Fx) {
+                if lo2.machine() {
+                    mut fx3.b.trap(clif::TrapCode(user: 1))
+                    return
+                }
+                let thread = mut fx3.load(PTR, addr: record, offset: TASK_THREAD)
+                let pthread = mut fx3.load(PTR, addr: thread, offset: THREAD_PTHREAD)
+                let signal = mut fx3.int(clif::Type.Int32, value: i64.widen(SIGURG))
+                discard mut lo2.call_libc(mut fx3, name: "pthread_kill", args: fx3.list2(pthread, b: signal).view(), returns: fx3.types1(clif::Type.Int32).view())
+            })
+            return fx2.list1(running)
+        })
+        return fx1.list1(still[0])
+    })
+    return left[0]
+} settle_stop
+
+/// Takes a task out of the run queue; gives whether it was there.
+fn remove_ready(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_QUEUE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_READY_HEAD)
+    let zero = mut fx.ptr(0)
+    let searched = mut fx.repeat(fx.list3(head, b: zero, c: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let previous = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let result = mut fx1.choose(present, results: fx1.types4(PTR, b: PTR, c: PTR, d: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: current, y: record)
+            let next = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            let at = mut fx2.b.select(same, x: current, y: next)
+            let before = mut fx2.b.select(same, x: previous, y: current)
+            let none = mut fx2.ptr(0)
+            let matched = mut fx2.b.select(same, x: current, y: none)
+            let again = mut fx2.b.bxor_imm_s(same, y: 1)
+            return fx2.list4(at, b: before, c: matched, d: again)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = mut fx2.ptr(0)
+            let matched = mut fx2.ptr(0)
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list4(at, b: previous, c: matched, d: stop)
+        })
+        return Pass(again: result[3], next: fx1.list3(result[0], b: result[1], c: result[2]))
+    })
+    let previous = searched[1]
+    let found = searched[2]
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: found, y: 0)
+    mut fx.if_true(present, then: fn(mut fx1: Fx) {
+        let next = mut fx1.load(PTR, addr: record, offset: TASK_NEXT)
+        let at_head = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+        discard mut fx1.choose(at_head, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: state_address, offset: STATE_READY_HEAD)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: previous, offset: TASK_NEXT)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+        mut fx1.if_true(last, then: fn(mut fx2: Fx) {
+            mut fx2.store(previous, addr: state_address, offset: STATE_READY_TAIL)
+        })
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return present
+} remove_ready
+
+/// Takes every stopped task of the domain out of the list of live tasks into a chain of their
+/// own; gives the chain's first task.
+fn detach_tasks(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) -> clif::Value {
+    let chain = mut fx.b.declare_var(PTR)
+    let none = mut fx.ptr(0)
+    mut fx.b.def_var(chain, val: none)
+    each_task(mut lo, mut fx, abandoned, visit: fn(mut lo1: Lowering, mut fx1: Fx, record: clif::Value) -> clif::Value {
+        let state_address = mut lo1.state(mut fx1)
+        let next = mut fx1.load(PTR, addr: record, offset: TASK_ALL_NEXT)
+        let previous = mut fx1.load(PTR, addr: record, offset: TASK_ALL_PREVIOUS)
+        let has_previous = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+        discard mut fx1.choose(has_previous, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: previous, offset: TASK_ALL_NEXT)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: state_address, offset: STATE_TASKS)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        let has_next = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        mut fx1.if_true(has_next, then: fn(mut fx2: Fx) {
+            mut fx2.store(previous, addr: next, offset: TASK_ALL_PREVIOUS)
+        })
+        let chained = mut fx1.b.use_var(chain)
+        mut fx1.store(chained, addr: record, offset: TASK_SETTLE)
+        mut fx1.b.def_var(chain, val: record)
+        return next
+    })
+    return mut fx.b.use_var(chain)
+} detach_tasks
+
+/// Ends the domains nested in the abandoned one, innermost first, and frees their records.
+fn settle_end_nested(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let child = mut fx1.load(PTR, addr: abandoned, offset: DOMAIN_CHILDREN)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: child, y: 0)
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            let descended = mut fx2.repeat(fx2.list1(child).view(), body: fn(mut fx3: Fx, nested: Slice[clif::Value]) -> Pass {
+                expect nested.len() > 0
+                let current = nested[0]
+                let inner = mut fx3.load(PTR, addr: current, offset: DOMAIN_CHILDREN)
+                let deeper = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: inner, y: 0)
+                let next = mut fx3.b.select(deeper, x: inner, y: current)
+                return Pass(again: deeper, next: fx3.list1(next))
+            })
+            let innermost = descended[0]
+            let outer = mut fx2.load(PTR, addr: innermost, offset: DOMAIN_PARENT)
+            let sibling = mut fx2.load(PTR, addr: innermost, offset: DOMAIN_SIBLING)
+            mut fx2.store(sibling, addr: outer, offset: DOMAIN_CHILDREN)
+            settlement_end(mut lo, fx: mut fx2, domain: innermost)
+            mut lo.record_free(mut fx2, address: innermost)
+        })
+        return Pass(again: present, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} settle_end_nested

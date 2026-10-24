@@ -1,0 +1,621 @@
+//! The ELF64 relocatable object a module writes: its sections, symbols and relocations, and their layout in the file.
+
+const FILE_HEADER: u64 = 64
+const SECTION_HEADER: u64 = 64
+const SYMBOL_ENTRY: u64 = 24
+const RELA_ENTRY: u64 = 24
+
+const ET_REL: u16 = 1
+const EM_X86_64: u16 = 62
+const EV_CURRENT: u8 = 1
+
+const SHT_PROGBITS: u32 = 1
+const SHT_SYMTAB: u32 = 2
+const SHT_STRTAB: u32 = 3
+const SHT_RELA: u32 = 4
+const SHT_NOBITS: u32 = 8
+
+const SHF_WRITE: u64 = 1
+const SHF_ALLOC: u64 = 2
+const SHF_EXECINSTR: u64 = 4
+const SHF_INFO_LINK: u64 = 0x40
+const SHF_TLS: u64 = 0x400
+
+const SHN_ABS: u16 = 0xFFF1
+
+const STB_LOCAL: u8 = 0
+const STB_GLOBAL: u8 = 1
+const STT_NOTYPE: u8 = 0
+const STT_OBJECT: u8 = 1
+const STT_FUNC: u8 = 2
+const STT_FILE: u8 = 4
+const STT_TLS: u8 = 6
+
+const R_X86_64_64: u32 = 1
+const R_X86_64_PC32: u32 = 2
+const R_X86_64_PLT32: u32 = 4
+const R_X86_64_GOTPCREL: u32 = 9
+const R_X86_64_32: u32 = 10
+const R_X86_64_TLSGD: u32 = 19
+
+/// The kinds of section an object holds, each in one section at most.
+enum SectionKind derives Copy, Eq {
+    Text
+    Data
+    ReadOnly
+    /// Read-only data holding addresses, which the dynamic linker writes before protecting it.
+    ReadOnlyRelocated
+    Zeroed
+    Tls
+    ZeroedTls
+    /// The artefacts of an image's final closure.
+    Artefacts
+    /// The marker of a non-executable stack.
+    GnuStack
+} SectionKind
+
+proj fn SectionKind.name(self) -> Str {
+    return match self {
+        SectionKind.Text => ".text"
+        SectionKind.Data => ".data"
+        SectionKind.ReadOnly => ".rodata"
+        SectionKind.ReadOnlyRelocated => ".data.rel.ro"
+        SectionKind.Zeroed => ".bss"
+        SectionKind.Tls => ".tdata"
+        SectionKind.ZeroedTls => ".tbss"
+        SectionKind.Artefacts => ".nan"
+        SectionKind.GnuStack => ".note.GNU-stack"
+    }
+} SectionKind.name
+
+fn SectionKind.is_zeroed(self) -> bool = self == SectionKind.Zeroed or self == SectionKind.ZeroedTls
+
+fn SectionKind.flags(self) -> u64 {
+    return match self {
+        SectionKind.Text => SHF_ALLOC | SHF_EXECINSTR
+        SectionKind.Data or SectionKind.ReadOnlyRelocated or SectionKind.Zeroed => SHF_ALLOC | SHF_WRITE
+        SectionKind.Tls or SectionKind.ZeroedTls => SHF_ALLOC | SHF_WRITE | SHF_TLS
+        SectionKind.ReadOnly => SHF_ALLOC
+        SectionKind.Artefacts or SectionKind.GnuStack => 0
+    }
+} SectionKind.flags
+
+/// A section: its contents, empty in a section of zeros, its size, its alignment and its
+/// relocations.
+struct Section {
+    kind: SectionKind
+    data: mem::Bytes
+    size: u64
+    align: u64
+    relocations: mem::List[Relocation]
+} Section
+
+/// Appends bytes at an alignment, returning their offset.
+fn Section.append_data(mut self, data: Slice[u8], align: u64) -> u64 {
+    if self.align < align {
+        self.align = align
+    }
+    let offset = aligned(u64.widen(self.data.len()), align)
+    resize(mut self.data, length: usize.widen(offset))
+    mut self.data.append(data)
+    self.size = u64.widen(self.data.len())
+    return offset
+} Section.append_data
+
+/// Appends zeros at an alignment, returning their offset.
+fn Section.append_zeros(mut self, size: u64, align: u64) -> u64 {
+    if self.align < align {
+        self.align = align
+    }
+    let offset = aligned(self.size, align)
+    self.size = offset + size
+    return offset
+} Section.append_zeros
+
+/// An offset rounded up to a power-of-two alignment.
+fn aligned(offset: u64, align: u64) -> u64
+    requires align > 0
+{
+    let rest = offset & (align - 1)
+    if rest == 0 {
+        return offset
+    }
+    return offset + (align - rest)
+} aligned
+
+/// What a symbol names.
+enum SymbolKind derives Copy, Eq {
+    Text
+    Data
+    Tls
+    File
+} SymbolKind
+
+/// Where a symbol is defined: nowhere, for the file's name; in another object; or at its value
+/// in a section, by index.
+enum Placement derives Copy, Eq {
+    Absolute
+    Undefined
+    Section(u32)
+} Placement
+
+struct Symbol {
+    name: text::String
+    kind: SymbolKind
+    /// Whether the symbol is seen only in its object.
+    local: bool
+    placement: Placement
+    value: u64
+    size: u64
+} Symbol
+
+/// The ELF binding and type of a symbol.
+fn Symbol.info(self) -> u8 {
+    let undefined = self.placement == Placement.Undefined
+    var kind = match self.kind {
+        SymbolKind.Text => STT_FUNC
+        SymbolKind.Data => STT_OBJECT
+        SymbolKind.Tls => STT_TLS
+        SymbolKind.File => STT_FILE
+    }
+    if undefined and (self.kind == SymbolKind.Text or self.kind == SymbolKind.Data) {
+        kind = STT_NOTYPE
+    }
+    var bind = STB_GLOBAL
+    if self.local and not undefined {
+        bind = STB_LOCAL
+    }
+    return (bind << 4) | kind
+} Symbol.info
+
+/// A relocation of a section: where it applies, its ELF type, the symbol it names by index and
+/// its addend.
+struct Relocation derives Copy {
+    offset: u64
+    kind: u32
+    symbol: u32
+    addend: i64
+} Relocation
+
+/// The sections and symbols of an object being written: the sections in order of creation and
+/// the symbols in order of addition, the first naming the file.
+struct Elf {
+    sections: mem::List[Section]
+    symbols: mem::List[Symbol]
+    /// The symbol of each name added, the file's aside.
+    named: mem::Map[text::String, u32]
+    alloc: mem::Alloc
+} Elf
+
+fn Elf.new(file: Str, alloc: mem::Alloc) -> Elf {
+    var symbols = mem::List[Symbol].empty(alloc)
+    mut symbols.push(Symbol(name: text::String.of(file, alloc), kind: SymbolKind.File, local: true, placement: Placement.Absolute, value: 0, size: 0))
+    return Elf(sections: mem::List[Section].empty(alloc), symbols: take symbols, named: mem::Map[text::String, u32].empty(alloc), alloc: alloc)
+} Elf.new
+
+/// The section of a kind, added empty when the object has none.
+fn Elf.section(mut self, kind: SectionKind) -> u32
+    ensures usize.widen(result) < self.sections.len()
+{
+    for index in 0..<self.sections.len() {
+        if self.sections[index].kind == kind {
+            return u32.fit(index)
+        }
+    }
+    mut self.sections.push(Section(kind: kind, data: mem::Bytes.empty(self.alloc), size: 0, align: 1, relocations: mem::List[Relocation].empty(self.alloc)))
+    return u32.fit(self.sections.len() - 1)
+} Elf.section
+
+/// Adds an undefined symbol, returning its index.
+fn Elf.add_symbol(mut self, name: Str, kind: SymbolKind, local: bool) -> u32 {
+    let index = u32.fit(self.symbols.len())
+    mut self.symbols.push(Symbol(name: text::String.of(name, alloc: self.alloc), kind: kind, local: local, placement: Placement.Undefined, value: 0, size: 0))
+    discard mut self.named.insert(text::String.of(name, alloc: self.alloc), value: index)
+    return index
+} Elf.add_symbol
+
+/// The symbol of a function of a library the object links against, added undefined when the
+/// object has no symbol of its name.
+fn Elf.library_symbol(mut self, name: Str) -> u32 {
+    let Some(known) = self.named.get_by(fn(key: text::String) => key.as_str().cmp(name)) else {
+        return mut self.add_symbol(name, kind: SymbolKind.Text, local: false)
+    }
+    return known
+} Elf.library_symbol
+
+/// Defines a symbol as bytes appended to a section, returning their offset.
+fn Elf.define(mut self, symbol: u32, section: u32, data: Slice[u8], align: u64) -> u64
+    requires usize.widen(section) < self.sections.len()
+{
+    let offset = mut self.sections[usize.widen(section)].append_data(data, align)
+    mut self.place(symbol, section, offset, size: u64.widen(data.len()))
+    return offset
+} Elf.define
+
+/// Defines a symbol as zeros appended to a section, returning their offset.
+fn Elf.define_zeros(mut self, symbol: u32, section: u32, size: u64, align: u64) -> u64
+    requires usize.widen(section) < self.sections.len()
+{
+    let offset = mut self.sections[usize.widen(section)].append_zeros(size, align)
+    mut self.place(symbol, section, offset, size)
+    return offset
+} Elf.define_zeros
+
+fn Elf.place(mut self, symbol: u32, section: u32, offset: u64, size: u64) {
+    let at = usize.widen(symbol)
+    expect at < self.symbols.len()
+    var placed = mut self.symbols.at_mut(at)
+    placed.placement = Placement.Section(section)
+    placed.value = offset
+    placed.size = size
+} Elf.place
+
+/// The bytes of the object: its file header, the contents of its sections, its symbol table,
+/// its string tables and relocations, then its section headers.
+fn Elf.write(self, alloc: mem::Alloc) -> mem::Bytes {
+    let laid = self.lay_out(alloc)
+    var out = mem::Bytes.empty(alloc)
+    write_file_header(mut out, laid)
+    for at in 0..<self.sections.len() {
+        resize(mut out, length: usize.widen(laid.sections[at].offset))
+        mut out.append(self.sections[at].data.view())
+    }
+    resize(mut out, length: usize.widen(laid.symbols.offset + SYMBOL_ENTRY))
+    for at in 0..<self.symbols.len() {
+        if self.symbols[at].local {
+            self.write_symbol(mut out, at, laid)
+        }
+    }
+    for at in 0..<self.symbols.len() {
+        if not self.symbols[at].local {
+            self.write_symbol(mut out, at, laid)
+        }
+    }
+    mut out.append(laid.symbol_names.data.view())
+    for at in 0..<self.sections.len() {
+        if self.sections[at].relocations.len() == 0 {
+            continue
+        }
+        resize(mut out, length: usize.widen(laid.sections[at].relocation_offset))
+        for relocation in self.sections[at].relocations {
+            expect usize.widen(relocation.symbol) < self.symbols.len()
+            append_u64(mut out, value: relocation.offset)
+            append_u64(mut out, value: (u64.widen(laid.symbol_indexes[usize.widen(relocation.symbol)]) << 32) | u64.widen(relocation.kind))
+            append_u64(mut out, value: relocation.addend.to_bits())
+        }
+    }
+    mut out.append(laid.section_names.data.view())
+    resize(mut out, length: usize.widen(laid.headers + SECTION_HEADER))
+    self.write_section_headers(mut out, laid)
+    expect u64.widen(out.len()) == laid.length
+    return out
+} Elf.write
+
+fn write_file_header(mut out: mem::Bytes, laid: Layout) {
+    mut out.append(b"\x7fELF\x02\x01")
+    mut out.push(EV_CURRENT)
+    resize(mut out, length: 16)
+    append_u16(mut out, value: ET_REL)
+    append_u16(mut out, value: EM_X86_64)
+    append_u32(mut out, value: u32.widen(EV_CURRENT))
+    append_u64(mut out, value: 0)
+    append_u64(mut out, value: 0)
+    append_u64(mut out, value: laid.headers)
+    append_u32(mut out, value: 0)
+    append_u16(mut out, value: u16.fit(FILE_HEADER))
+    append_u16(mut out, value: 0)
+    append_u16(mut out, value: 0)
+    append_u16(mut out, value: u16.fit(SECTION_HEADER))
+    append_u16(mut out, value: u16.fit(laid.section_count))
+    append_u16(mut out, value: u16.fit(laid.section_names.index))
+} write_file_header
+
+fn Elf.write_symbol(self, mut out: mem::Bytes, at: usize, laid: Layout)
+    requires at < self.symbols.len() and laid.symbol_strings.len() == self.symbols.len()
+{
+    let symbol = self.symbols[at]
+    let name = match laid.symbol_strings[at] {
+        Some(id) => laid.symbol_names.offset_of(id)
+        None => 0
+    }
+    append_u32(mut out, value: name)
+    mut out.push(symbol.info())
+    mut out.push(0)
+    let index = match symbol.placement {
+        Placement.Absolute => SHN_ABS
+        Placement.Undefined => 0
+        Placement.Section(section) => u16.fit(laid.header_of(section))
+    }
+    append_u16(mut out, value: index)
+    append_u64(mut out, value: symbol.value)
+    append_u64(mut out, value: symbol.size)
+} Elf.write_symbol
+
+fn Elf.write_section_headers(self, mut out: mem::Bytes, laid: Layout)
+    requires laid.sections.len() == self.sections.len()
+{
+    for at in 0..<self.sections.len() {
+        let section = self.sections[at]
+        let placed = laid.sections[at]
+        var kind = SHT_PROGBITS
+        if section.kind.is_zeroed() {
+            kind = SHT_NOBITS
+        }
+        write_section_header(mut out, header: Header(name: laid.section_names.offset_of(placed.name), kind: kind, flags: section.kind.flags(), offset: placed.offset, size: section.size, link: 0, info: 0, align: section.align, entry: 0))
+        let count = u64.widen(section.relocations.len())
+        if count > 0 {
+            write_section_header(mut out, header: Header(name: laid.section_names.offset_of(placed.relocation_name), kind: SHT_RELA, flags: SHF_INFO_LINK, offset: placed.relocation_offset, size: count * RELA_ENTRY, link: laid.symbols.index, info: placed.index, align: 8, entry: RELA_ENTRY))
+        }
+    }
+    write_section_header(mut out, header: Header(name: laid.section_names.offset_of(laid.symbols.name), kind: SHT_SYMTAB, flags: 0, offset: laid.symbols.offset, size: u64.widen(laid.symbol_count) * SYMBOL_ENTRY, link: laid.symbol_names.index, info: laid.locals, align: 8, entry: SYMBOL_ENTRY))
+    write_section_header(mut out, header: Header(name: laid.section_names.offset_of(laid.symbol_names.name), kind: SHT_STRTAB, flags: 0, offset: laid.symbol_names.offset, size: u64.widen(laid.symbol_names.data.len()), link: 0, info: 0, align: 1, entry: 0))
+    write_section_header(mut out, header: Header(name: laid.section_names.offset_of(laid.section_names.name), kind: SHT_STRTAB, flags: 0, offset: laid.section_names.offset, size: u64.widen(laid.section_names.data.len()), link: 0, info: 0, align: 1, entry: 0))
+} Elf.write_section_headers
+
+/// The fields of a section header, its address aside, always 0 in an object.
+struct Header derives Copy {
+    name: u32
+    kind: u32
+    flags: u64
+    offset: u64
+    size: u64
+    link: u32
+    info: u32
+    align: u64
+    entry: u64
+} Header
+
+fn write_section_header(mut out: mem::Bytes, header: Header) {
+    append_u32(mut out, value: header.name)
+    append_u32(mut out, value: header.kind)
+    append_u64(mut out, value: header.flags)
+    append_u64(mut out, value: 0)
+    append_u64(mut out, value: header.offset)
+    append_u64(mut out, value: header.size)
+    append_u32(mut out, value: header.link)
+    append_u32(mut out, value: header.info)
+    append_u64(mut out, value: header.align)
+    append_u64(mut out, value: header.entry)
+} write_section_header
+
+/// Where the file places each part of an object, and the indexes and names its headers and
+/// symbols give.
+struct Layout {
+    sections: mem::List[Placed]
+    /// The index of each symbol in the symbol table, where the local symbols come first.
+    symbol_indexes: mem::List[u32]
+    /// The number of entries of the symbol table, and of those up to its last local symbol.
+    symbol_count: u32
+    locals: u32
+    /// The string of each symbol's name in the symbol names, none for an empty name.
+    symbol_strings: mem::List[Option[u32]]
+    symbols: Part
+    symbol_names: Table
+    section_names: Table
+    section_count: u32
+    headers: u64
+    length: u64
+} Layout
+
+/// Where the file places a section and its relocations, the index of its header and the
+/// strings of its name and of its relocations' section.
+struct Placed derives Copy {
+    index: u32
+    offset: u64
+    name: u32
+    relocation_name: u32
+    relocation_offset: u64
+} Placed
+
+/// A section the file adds: the index of its header, the string of its name and its offset.
+struct Part derives Copy {
+    index: u32
+    name: u32
+    offset: u64
+} Part
+
+/// A string table written: the index of its header, the string of its name, its offset, its
+/// bytes and the offset of each string in them.
+struct Table {
+    index: u32
+    name: u32
+    offset: u64
+    data: mem::Bytes
+    offsets: mem::List[u32]
+} Table
+
+/// The index of the header of a section of the object.
+fn Layout.header_of(self, section: u32) -> u32 {
+    expect usize.widen(section) < self.sections.len()
+    return self.sections[usize.widen(section)].index
+} Layout.header_of
+
+/// The offset of a string of the table.
+fn Table.offset_of(self, id: u32) -> u32 {
+    expect usize.widen(id) < self.offsets.len()
+    return self.offsets[usize.widen(id)]
+} Table.offset_of
+
+fn Elf.lay_out(self, alloc: mem::Alloc) -> Layout
+    ensures result.sections.len() == self.sections.len() and result.symbol_strings.len() == self.symbols.len() and result.symbol_indexes.len() == self.symbols.len()
+{
+    var names = Strings.empty(alloc)
+    var sections = mem::List[Placed].empty(alloc)
+    var count: u32 = 1
+    var length = FILE_HEADER
+    for section in self.sections {
+        let offset = aligned(length, align: section.align)
+        length = offset + u64.widen(section.data.len())
+        var placed = Placed(index: count, offset: offset, name: mut names.add(section.kind.name()), relocation_name: 0, relocation_offset: 0)
+        count += 1
+        if section.relocations.len() > 0 {
+            var relocation_name = text::String.of(".rela", alloc)
+            mut relocation_name.append(section.kind.name())
+            placed.relocation_name = mut names.add(relocation_name.as_str())
+            count += 1
+        }
+        mut sections.push(placed)
+    }
+    var symbol_indexes = mem::List[u32].empty(alloc)
+    var next: u32 = 1
+    for symbol in self.symbols {
+        var index: u32 = 0
+        if symbol.local {
+            index = next
+            next += 1
+        }
+        mut symbol_indexes.push(index)
+    }
+    let locals = next
+    for at in 0..<self.symbols.len() {
+        invariant symbol_indexes.len() == self.symbols.len()
+        if not self.symbols[at].local {
+            symbol_indexes[at] = next
+            next += 1
+        }
+    }
+    var strings = Strings.empty(alloc)
+    var symbol_strings = mem::List[Option[u32]].empty(alloc)
+    for symbol in self.symbols {
+        if symbol.name.is_empty() {
+            mut symbol_strings.push(None)
+        } else {
+            mut symbol_strings.push(Some(mut strings.add(symbol.name.as_str())))
+        }
+    }
+    let symbols = Part(index: count, name: mut names.add(".symtab"), offset: aligned(length, align: 8))
+    length = symbols.offset + u64.widen(next) * SYMBOL_ENTRY
+    let strtab_name = mut names.add(".strtab")
+    let symbol_names = strings.table(index: count + 1, name: strtab_name, offset: length, alloc)
+    length += u64.widen(symbol_names.data.len())
+    for at in 0..<self.sections.len() {
+        invariant sections.len() == self.sections.len()
+        let relocations = u64.widen(self.sections[at].relocations.len())
+        if relocations > 0 {
+            let relocation_offset = aligned(length, align: 8)
+            sections[at].relocation_offset = relocation_offset
+            length = relocation_offset + relocations * RELA_ENTRY
+        }
+    }
+    let shstrtab_name = mut names.add(".shstrtab")
+    let section_names = names.table(index: count + 2, name: shstrtab_name, offset: length, alloc)
+    length += u64.widen(section_names.data.len())
+    let headers = aligned(length, align: 8)
+    length = headers + u64.widen(count + 3) * SECTION_HEADER
+    return Layout(sections: take sections, symbol_indexes: take symbol_indexes, symbol_count: next, locals: locals, symbol_strings: take symbol_strings, symbols: symbols, symbol_names: take symbol_names, section_names: take section_names, section_count: count + 3, headers: headers, length: length)
+} Elf.lay_out
+
+/// The strings of a string table, each once, in order of addition.
+struct Strings {
+    strings: mem::List[text::String]
+    ids: mem::Map[text::String, u32]
+    alloc: mem::Alloc
+} Strings
+
+fn Strings.empty(alloc: mem::Alloc) -> Strings {
+    return Strings(strings: mem::List[text::String].empty(alloc), ids: mem::Map[text::String, u32].empty(alloc), alloc: alloc)
+} Strings.empty
+
+/// The id of a string, added when new.
+fn Strings.add(mut self, string: Str) -> u32 {
+    let Some(known) = self.ids.get_by(fn(key: text::String) => key.as_str().cmp(string)) else {
+        let added = u32.fit(self.strings.len())
+        mut self.strings.push(text::String.of(string, alloc: self.alloc))
+        discard mut self.ids.insert(text::String.of(string, alloc: self.alloc), value: added)
+        return added
+    }
+    return known
+} Strings.add
+
+/// The table of the strings, from a NUL: each string after those it ends, and a string ending
+/// the one written last taking that one's tail.
+fn Strings.table(self, index: u32, name: u32, offset: u64, alloc: mem::Alloc) -> Table {
+    var order = mem::List[u32].empty(alloc)
+    var offsets = mem::List[u32].empty(alloc)
+    for id in 0..<self.strings.len() {
+        mut order.push(u32.fit(id))
+        mut offsets.push(0)
+    }
+    mut order.sort_by(fn(left: u32, right: u32) => suffix_order(self.text_of(left), right: self.text_of(right)))
+    var data = mem::Bytes.empty(alloc)
+    mut data.push(0)
+    var previous: Option[u32] = None
+    for id in order {
+        let string = self.text_of(id)
+        let tail = match previous {
+            Some(last) => self.text_of(last).ends_with(string)
+            None => false
+        }
+        let at = usize.widen(id)
+        expect at < offsets.len()
+        if tail {
+            expect data.len() > string.byte_len()
+            offsets[at] = u32.fit(data.len() - string.byte_len() - 1)
+            continue
+        }
+        offsets[at] = u32.fit(data.len())
+        mut data.append(string.as_bytes())
+        mut data.push(0)
+        previous = Some(id)
+    }
+    return Table(index: index, name: name, offset: offset, data: take data, offsets: take offsets)
+} Strings.table
+
+proj fn Strings.text_of(self, id: u32) -> Str {
+    expect usize.widen(id) < self.strings.len()
+    return self.strings[usize.widen(id)].as_str()
+} Strings.text_of
+
+/// The order of a string table: from the last byte backwards, greater bytes first, and a string
+/// before the strings it ends with.
+fn suffix_order(left: Str, right: Str) -> core::Ordering {
+    let a = left.as_bytes()
+    let b = right.as_bytes()
+    var position: usize = 1
+    loop {
+        invariant position >= 1
+        var x: u8 = 0
+        if position <= a.len() {
+            x = a[a.len() - position]
+        }
+        var y: u8 = 0
+        if position <= b.len() {
+            y = b[b.len() - position]
+        }
+        if x != y {
+            if x > y {
+                return core::Ordering.Less
+            }
+            return core::Ordering.Greater
+        }
+        if x == 0 {
+            return core::Ordering.Equal
+        }
+        position += 1
+    }
+} suffix_order
+
+pkg fn append_u16(mut out: mem::Bytes, value: u16) {
+    mut out.push(u8.truncate(value))
+    mut out.push(u8.truncate(value >> 8))
+} append_u16
+
+pkg fn append_u32(mut out: mem::Bytes, value: u32) {
+    for byte in 0..<4u32 {
+        mut out.push(u8.truncate(value >> (8 * byte)))
+    }
+} append_u32
+
+pkg fn append_u64(mut out: mem::Bytes, value: u64) {
+    for byte in 0..<8u32 {
+        mut out.push(u8.truncate(value >> (8 * byte)))
+    }
+} append_u64
+
+/// Grows bytes with zeros, or shortens them, to a length.
+pkg fn resize(mut out: mem::Bytes, length: usize) {
+    mut out.truncate(length)
+    while out.len() < length {
+        mut out.push(0)
+    }
+} resize

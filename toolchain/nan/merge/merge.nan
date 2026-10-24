@@ -1,0 +1,1156 @@
+//! The merge driver: three versions of a file merged into one, a source file per item and per order-free member, the lock, history and API snapshots by their own rules, any other file as one unit. A conflict leaves a conflict block in place of the conflicting text.
+
+/// A merged file: its content, none when it is deleted, and the first line of each conflict
+/// block it holds.
+pkg struct Merged {
+    pkg content: Option[mem::Bytes]
+    pkg conflicts: mem::List[u32]
+} Merged
+
+/// The kind of a file, by its path within its package.
+enum Kind derives Copy, Eq {
+    Source
+    Lock
+    History
+    Api
+    Other
+} Kind
+
+fn kind_of(path: Str) -> Kind {
+    if path.ends_with("/.nan/lock.nan") {
+        return Kind.Lock
+    }
+    if path.ends_with("/.nan/history.nan") {
+        return Kind.History
+    }
+    if path.find("/.nan/api/").is_some() and path.ends_with(".nan") {
+        return Kind.Api
+    }
+    if path.ends_with(".nan") and path.find("/.nan/").is_none() {
+        return Kind.Source
+    }
+    return Kind.Other
+} kind_of
+
+/// Merges three versions of the file at `path`, an absent version counting as one.
+pkg fn merge(path: Str, base: Option[mem::Bytes], ours: Option[mem::Bytes], theirs: Option[mem::Bytes], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    if ours == theirs {
+        return whole(ours, alloc)
+    }
+    if base == ours {
+        return whole(theirs, alloc)
+    }
+    if base == theirs {
+        return whole(ours, alloc)
+    }
+    let Some(mine) = ours else {
+        let Some(other) = theirs else {
+            return conflict(b"", theirs: b"", alloc)
+        }
+        return conflict(b"", theirs: other.view(), alloc)
+    }
+    let Some(other) = theirs else {
+        return conflict(mine.view(), theirs: b"", alloc)
+    }
+    return match kind_of(path) {
+        Kind.Source => sources(base, ours: mine.view(), theirs: other.view(), grammar, alloc)
+        Kind.Lock => lock(mine.view(), theirs: other.view(), grammar, alloc)
+        Kind.History => history(base, ours: mine.view(), theirs: other.view(), grammar, alloc)
+        Kind.Api => snapshot(base, ours: mine.view(), theirs: other.view(), grammar, alloc)
+        Kind.Other => conflict(mine.view(), theirs: other.view(), alloc)
+    }
+} merge
+
+/// A source file merged per item when each of its versions lexes, a conflict otherwise.
+fn sources(base: Option[mem::Bytes], ours: Slice[u8], theirs: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    let base_lexes = match base {
+        Some(bytes) => lexes(bytes.view(), grammar, alloc)
+        None => true
+    }
+    if not (base_lexes and lexes(ours, grammar, alloc) and lexes(theirs, grammar, alloc)) {
+        return conflict(ours, theirs, alloc)
+    }
+    return match base {
+        Some(bytes) => source(bytes.view(), ours, theirs, grammar, alloc)
+        None => source(b"", ours, theirs, grammar, alloc)
+    }
+} sources
+
+fn lexes(text: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> bool {
+    return syntax::lex(text, grammar, alloc).diagnostics.len() == 0
+} lexes
+
+fn whole(content: Option[mem::Bytes], alloc: mem::Alloc) -> Merged {
+    let Some(bytes) = content else {
+        return Merged(content: None, conflicts: mem::List[u32].empty(alloc))
+    }
+    return kept_whole(bytes.view(), alloc)
+} whole
+
+/// One version kept whole.
+fn kept_whole(bytes: Slice[u8], alloc: mem::Alloc) -> Merged {
+    var held = mem::Bytes.empty(alloc)
+    mut held.append(bytes)
+    return Merged(content: Some(take held), conflicts: mem::List[u32].empty(alloc))
+} kept_whole
+
+/// The conflict block of two versions of a text: ours', then theirs'.
+fn block(ours: Str, theirs: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of("<<<<<<< ours\n", alloc)
+    mut written.append(ours)
+    if not ours.is_empty() and not ours.ends_with("\n") {
+        mut written.push('\n')
+    }
+    mut written.append("=======\n")
+    mut written.append(theirs)
+    if not theirs.is_empty() and not theirs.ends_with("\n") {
+        mut written.push('\n')
+    }
+    mut written.append(">>>>>>> theirs\n")
+    return written
+} block
+
+fn conflict(ours: Slice[u8], theirs: Slice[u8], alloc: mem::Alloc) -> Merged {
+    let written = block(output::lossy(ours, alloc).as_str(), theirs: output::lossy(theirs, alloc).as_str(), alloc)
+    var conflicts = mem::List[u32].empty(alloc)
+    mut conflicts.push(1)
+    return Merged(content: Some(take written.into_bytes()), conflicts: take conflicts)
+} conflict
+
+/// A unit of a source file: the file summary, or an item with the comment lines before it, by
+/// identity, with its text.
+struct FileUnit {
+    identity: text::String
+    text: text::String
+    /// The item's syntax kind, for members: an enum, a struct, a manifest, or another item.
+    shape: Shape
+} FileUnit
+
+fn FileUnit.copy(self, alloc: mem::Alloc) -> FileUnit {
+    return FileUnit(identity: text::String.of(self.identity.as_str(), alloc), text: text::String.of(self.text.as_str(), alloc), shape: self.shape)
+} FileUnit.copy
+
+/// The text of a unit, when there is one.
+fn unit_text(unit: Option[FileUnit], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(held) = unit else {
+        return None
+    }
+    return Some(text::String.of(held.text.as_str(), alloc))
+} unit_text
+
+enum Shape derives Copy, Eq {
+    Enum
+    Struct
+    Ordered
+    Manifest
+    Other
+} Shape
+
+/// The units of a source file, in order.
+fn units(text: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::List[FileUnit] {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(text)
+    let file = syntax::parse(take bytes, grammar, alloc)
+    var found = mem::List[FileUnit].empty(alloc)
+    var taken: u32 = 0
+    match file.summary {
+        Some(summary) => {
+            expect summary < file.tokens.len()
+            let at = file.tokens[summary].line
+            mut found.push(FileUnit(identity: text::String.of("summary", alloc), text: line_of(file, number: at, alloc), shape: Shape.Other))
+            taken = at
+        }
+        None => {}
+    }
+    for item in file.items {
+        if item.head >= item.end {
+            continue
+        }
+        let lines = file.item_lines(item)
+        if lines.high <= taken {
+            continue
+        }
+        let real = item.tree.is_some() and not item.abandoned
+        var opening = lines.low
+        while opening > taken + 1 and is_comment(line_of(file, number: opening - 1, alloc).as_str()) {
+            opening -= 1
+        }
+        var held = mem::List[text::String].empty(alloc)
+        for number in opening..=lines.high {
+            mut held.push(line_of(file, number, alloc))
+        }
+        var identified: Option[Identified] = None
+        if real {
+            match item.tree {
+                Some(tree) => {
+                    identified = Some(identify(file, tree, alloc))
+                }
+                None => {}
+            }
+        }
+        let Some(unit) = identified else {
+            if held.position(fn(line: text::String) => not (is_blank(line.as_str()) or is_comment(line.as_str()))).is_none() {
+                taken = lines.high
+                continue
+            }
+            var identity = text::String.of("line ", alloc)
+            mut identity.append(line_of(file, number: lines.low, alloc).as_str())
+            mut found.push(FileUnit(identity: take identity, text: joined(held.view(), separator: "\n", alloc), shape: Shape.Other))
+            taken = lines.high
+            continue
+        }
+        let Identified(identity: identity, shape: shape) = unit
+        mut found.push(FileUnit(identity: take identity, text: joined(held.view(), separator: "\n", alloc), shape: shape))
+        taken = lines.high
+    }
+    return found
+} units
+
+/// A physical line of a file, each ill-formed sequence written as U+FFFD.
+fn line_of(file: syntax::SourceFile, number: u32, alloc: mem::Alloc) -> text::String {
+    return output::lossy(file.line_text(number), alloc)
+} line_of
+
+fn is_comment(line: Str) -> bool {
+    let Some(content) = line.slice_bytes(leading_space(line), end: line.byte_len()) else {
+        return false
+    }
+    return content.starts_with("//") and not line.starts_with("//!")
+} is_comment
+
+/// An item's identity and shape.
+struct Identified {
+    identity: text::String
+    shape: Shape
+} Identified
+
+/// An item's identity and shape: its name, or an impl line's target and interface, a
+/// tombstone's old form, a const assert's condition, the manifest.
+fn identify(file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> Identified {
+    let Some(item) = ast::lower(file, tree, alloc) else {
+        return Identified(identity: text::String.empty(alloc), shape: Shape.Other)
+    }
+    var identity = named(item, alloc)
+    var shape = Shape.Other
+    match item.kind {
+        ast::ItemKind.Package => {
+            identity = text::String.of("package", alloc)
+            shape = Shape.Manifest
+        }
+        ast::ItemKind.Impl(line) => {
+            identity = text::String.of("impl ", alloc)
+            mut identity.append(line.target.written(alloc).as_str())
+            mut identity.append(": ")
+            mut identity.append(line.bound.path.written(alloc).as_str())
+        }
+        ast::ItemKind.Retired(tombstone) => {
+            identity = text::String.of("retired ", alloc)
+            mut identity.append(tombstone.path.written(alloc).as_str())
+            match tombstone.member {
+                Some(member) => {
+                    mut identity.push('.')
+                    mut identity.append(member.text.as_str())
+                }
+                None => {}
+            }
+        }
+        ast::ItemKind.ConstAssert(condition) => {
+            identity = text::String.of("assert ", alloc)
+            for token in condition.token..=condition.last {
+                if token > condition.token {
+                    mut identity.push(' ')
+                }
+                mut identity.append(file.text(usize.widen(token)))
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            shape = Shape.Enum
+            if derives_ordered(enumeration.derived.view()) {
+                shape = Shape.Ordered
+            }
+        }
+        ast::ItemKind.Struct(structure) => {
+            shape = Shape.Struct
+            if derives_ordered(structure.derived.view()) {
+                shape = Shape.Ordered
+            }
+        }
+        else => {}
+    }
+    return Identified(identity: take identity, shape: shape)
+} identify
+
+/// The name an item declares, empty for none.
+fn named(item: ast::Item, alloc: mem::Alloc) -> text::String {
+    return match item.name(alloc) {
+        Some(name) => name
+        None => text::String.empty(alloc)
+    }
+} named
+
+fn derives_ordered(derived: Slice[ast::Name]) -> bool {
+    for name in derived {
+        let written = name.text.as_str()
+        if written == "Ord" or written == "Render" or written == "Generate" {
+            return true
+        }
+    }
+    return false
+} derives_ordered
+
+/// The side whose version a three-way merge of one unit takes.
+enum Side derives Copy, Eq {
+    Ours
+    Theirs
+} Side
+
+/// The side a three-way merge of one unit takes, or none for a conflict: equal versions, or the
+/// version changed on one side only.
+fn three[T: Eq](base: Option[T], ours: Option[T], theirs: Option[T]) -> Option[Side] {
+    if ours == theirs or base == theirs {
+        return Some(Side.Ours)
+    }
+    if base == ours {
+        return Some(Side.Theirs)
+    }
+    return None
+} three
+
+/// Places the keys only `theirs` holds among `ours`': each after the nearest preceding key in
+/// `theirs` that the result holds, after those ours added there, or first.
+fn ordered(ours: Slice[text::String], theirs: Slice[text::String], kept: fn(key: Str) -> bool, alloc: mem::Alloc) -> mem::List[text::String] {
+    var result = mem::List[text::String].empty(alloc)
+    for key in ours {
+        if kept(key.as_str()) {
+            mut result.push(text::String.of(key.as_str(), alloc))
+        }
+    }
+    for position in 0..<theirs.len() {
+        let key = theirs[position].as_str()
+        if holds(result.view(), key) or not kept(key) {
+            continue
+        }
+        var anchor: Option[usize] = None
+        for step in 0..<position {
+            let back = position - 1 - step
+            expect back < theirs.len()
+            let earlier = theirs[back].as_str()
+            let Some(at) = result.position(fn(known: text::String) => known.as_str() == earlier) else {
+                continue
+            }
+            anchor = Some(at)
+            break
+        }
+        var at: usize = 0
+        match anchor {
+            Some(known) => {
+                at = known + 1
+                while at < result.len() and not holds(theirs, key: result[at].as_str()) {
+                    at += 1
+                }
+            }
+            None => {}
+        }
+        mut result.insert(at, value: text::String.of(key, alloc))
+    }
+    return result
+} ordered
+
+fn holds(keys: Slice[text::String], key: Str) -> bool {
+    for known in keys {
+        if known.as_str() == key {
+            return true
+        }
+    }
+    return false
+} holds
+
+/// The units of a file by identity, the last of equal identities kept.
+fn by_identity(held: Slice[FileUnit], alloc: mem::Alloc) -> mem::Map[text::String, FileUnit] {
+    var by = mem::Map[text::String, FileUnit].empty(alloc)
+    for unit in held {
+        discard mut by.insert(text::String.of(unit.identity.as_str(), alloc), value: unit.copy(alloc))
+    }
+    return by
+} by_identity
+
+fn identities(held: Slice[FileUnit], alloc: mem::Alloc) -> mem::List[text::String] {
+    var keys = mem::List[text::String].empty(alloc)
+    for unit in held {
+        mut keys.push(text::String.of(unit.identity.as_str(), alloc))
+    }
+    return keys
+} identities
+
+fn source(base: Slice[u8], ours: Slice[u8], theirs: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    let base_units = units(base, grammar, alloc)
+    let ours_units = units(ours, grammar, alloc)
+    let theirs_units = units(theirs, grammar, alloc)
+    let base_by = by_identity(base_units.view(), alloc)
+    let ours_by = by_identity(ours_units.view(), alloc)
+    let theirs_by = by_identity(theirs_units.view(), alloc)
+    let order = ordered(identities(ours_units.view(), alloc).view(), theirs: identities(theirs_units.view(), alloc).view(), kept: fn(key: Str) => true, alloc)
+    var texts = mem::List[text::String].empty(alloc)
+    var conflicts: usize = 0
+    for identity in order {
+        invariant conflicts < order.len()
+        let merged = unit_merge(base_by.get(identity), ours: ours_by.get(identity), theirs: theirs_by.get(identity), alloc)
+        if merged.conflict {
+            conflicts += 1
+        }
+        match merged.text {
+            Some(text) => mut texts.push(text::String.of(text.as_str(), alloc))
+            None => {}
+        }
+    }
+    var written = joined(texts.view(), separator: "\n\n", alloc)
+    mut written.push('\n')
+    var lines = conflict_lines(written.as_str(), alloc)
+    mut lines.truncate(conflicts)
+    return Merged(content: Some(take written.into_bytes()), conflicts: take lines)
+} source
+
+/// What a three-way merge of one unit gives: its text, none when it is deleted, and whether it is
+/// a conflict block.
+struct UnitMerge {
+    text: Option[text::String]
+    conflict: bool
+} UnitMerge
+
+/// The merge of the versions of one unit: the version a three-way merge takes, its members
+/// merged, or a conflict block.
+fn unit_merge(base: Option[FileUnit], ours: Option[FileUnit], theirs: Option[FileUnit], alloc: mem::Alloc) -> UnitMerge {
+    match three(unit_text(base, alloc), ours: unit_text(ours, alloc), theirs: unit_text(theirs, alloc)) {
+        Some(Side.Ours) => return UnitMerge(text: unit_text(ours, alloc), conflict: false)
+        Some(Side.Theirs) => return UnitMerge(text: unit_text(theirs, alloc), conflict: false)
+        None => {}
+    }
+    match merged_unit(base, ours, theirs, alloc) {
+        Some(text) => return UnitMerge(text: Some(take text), conflict: false)
+        None => {}
+    }
+    var ours_text = text::String.empty(alloc)
+    match unit_text(ours, alloc) {
+        Some(text) => {
+            ours_text = text
+        }
+        None => {}
+    }
+    var theirs_text = text::String.empty(alloc)
+    match unit_text(theirs, alloc) {
+        Some(text) => {
+            theirs_text = text
+        }
+        None => {}
+    }
+    let written = block(ours_text.as_str(), theirs: theirs_text.as_str(), alloc)
+    return UnitMerge(text: Some(trimmed_end(written.as_str(), alloc)), conflict: true)
+} unit_merge
+
+/// An item all three versions hold, merged per member; none for a conflict.
+fn merged_unit(base: Option[FileUnit], ours: Option[FileUnit], theirs: Option[FileUnit], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(base_unit) = base else {
+        return None
+    }
+    let Some(ours_unit) = ours else {
+        return None
+    }
+    let Some(theirs_unit) = theirs else {
+        return None
+    }
+    return members(base_unit, ours: ours_unit, theirs: theirs_unit, alloc)
+} merged_unit
+
+/// The first line of each conflict block of a text.
+pkg fn conflict_lines(text: Str, alloc: mem::Alloc) -> mem::List[u32] {
+    var found = mem::List[u32].empty(alloc)
+    let lines = text_lines(text, alloc)
+    for index in 0..<lines.len() {
+        if lines[index].as_str() == "<<<<<<< ours" {
+            mut found.push(u32.fit(index + 1))
+        }
+    }
+    return found
+} conflict_lines
+
+/// An item's member lines: its lines between the head ending in `{` and the closing line, each
+/// member with the doc comment lines before it and the lines continuing it.
+struct MemberLines {
+    head: mem::List[text::String]
+    members: mem::List[Member]
+    tail: mem::List[text::String]
+} MemberLines
+
+/// A member by the key it matches by, with its text.
+struct Member {
+    key: text::String
+    text: text::String
+} Member
+
+fn split(unit: FileUnit, alloc: mem::Alloc) -> Option[MemberLines] {
+    let lines = text_lines(unit.text.as_str(), alloc)
+    let Some(open) = lines.position(fn(line: text::String) => line.as_str().ends_with("{")) else {
+        return None
+    }
+    var close: Option[usize] = None
+    for step in 0..<lines.len() {
+        let at = lines.len() - 1 - step
+        if lines[at].as_str().starts_with("}") {
+            close = Some(at)
+            break
+        }
+    }
+    let Some(closing) = close else {
+        return None
+    }
+    if closing <= open {
+        return None
+    }
+    var keys = mem::List[text::String].empty(alloc)
+    var held = mem::List[mem::List[text::String]].empty(alloc)
+    var docs = mem::List[text::String].empty(alloc)
+    expect closing < lines.len()
+    for at in (open + 1)..<closing {
+        let line = lines[at].as_str()
+        let indent = leading_space(line)
+        let Some(content) = line.slice_bytes(indent, end: line.byte_len()) else {
+            return None
+        }
+        if content.starts_with("///") and indent == 4 {
+            mut docs.push(text::String.of(line, alloc))
+            continue
+        }
+        let count = held.len()
+        if indent > 4 and count > 0 {
+            mut held[count - 1].push(text::String.of(line, alloc))
+            continue
+        }
+        let Some(key) = member_key(unit.shape, line: content, alloc) else {
+            return None
+        }
+        var member = mem::List[text::String].empty(alloc)
+        for doc in docs {
+            mut member.push(text::String.of(doc.as_str(), alloc))
+        }
+        mut docs.truncate(0)
+        mut member.push(text::String.of(line, alloc))
+        mut keys.push(take key)
+        mut held.push(take member)
+    }
+    if docs.len() > 0 {
+        return None
+    }
+    var head = mem::List[text::String].empty(alloc)
+    for at in 0..=open {
+        mut head.push(text::String.of(lines[at].as_str(), alloc))
+    }
+    var kept_members = mem::List[Member].empty(alloc)
+    expect held.len() == keys.len()
+    for index in 0..<keys.len() {
+        mut kept_members.push(Member(key: text::String.of(keys[index].as_str(), alloc), text: joined(held[index].view(), separator: "\n", alloc)))
+    }
+    var tail = mem::List[text::String].empty(alloc)
+    for at in closing..<lines.len() {
+        mut tail.push(text::String.of(lines[at].as_str(), alloc))
+    }
+    return Some(MemberLines(head: take head, members: take kept_members, tail: take tail))
+} split
+
+/// The key a member matches by: an invariant line or another directive by its text, a `dep`
+/// directive by alias, an `allow` directive by authority, `language`, `targets` and `entry` by
+/// word, a field or variant by name.
+fn member_key(shape: Shape, line: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let words = white_words(line, alloc)
+    if words.len() == 0 {
+        return None
+    }
+    let word = words[0].as_str()
+    match shape {
+        Shape.Manifest => {
+            if word == "language" or word == "targets" or word == "entry" {
+                return Some(text::String.of(word, alloc))
+            }
+            if word == "dep" {
+                if words.len() < 2 {
+                    return None
+                }
+                var key = text::String.of("dep ", alloc)
+                mut key.append(words[1].as_str())
+                return Some(take key)
+            }
+            if word == "allow" {
+                var key = text::String.of("allow ", alloc)
+                for index in 1..<words.len() {
+                    if words[index].as_str() == "in" {
+                        break
+                    }
+                    if index > 1 {
+                        mut key.push(' ')
+                    }
+                    mut key.append(words[index].as_str())
+                }
+                return Some(take key)
+            }
+            return Some(text::String.of(line, alloc))
+        }
+        Shape.Struct or Shape.Enum => {
+            if shape == Shape.Struct and word == "invariant" {
+                return Some(text::String.of(line, alloc))
+            }
+            var at: usize = 0
+            if word == "pub" or word == "pkg" {
+                if words.len() < 2 {
+                    return None
+                }
+                at = 1
+            }
+            let name = words[at].as_str()
+            let bytes = name.as_bytes()
+            var end: usize = 0
+            while end < bytes.len() and is_name_byte(bytes[end]) {
+                end += 1
+            }
+            let Some(leading) = name.slice_bytes(0, end) else {
+                return None
+            }
+            return Some(text::String.of(leading, alloc))
+        }
+        Shape.Ordered or Shape.Other => return None
+    }
+} member_key
+
+fn is_name_byte(byte: u8) -> bool {
+    return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_'
+} is_name_byte
+
+/// The member texts of a split item by key, the last of equal keys kept.
+fn by_key(held: Slice[Member], alloc: mem::Alloc) -> mem::Map[text::String, text::String] {
+    var by = mem::Map[text::String, text::String].empty(alloc)
+    for member in held {
+        discard mut by.insert(text::String.of(member.key.as_str(), alloc), value: text::String.of(member.text.as_str(), alloc))
+    }
+    return by
+} by_key
+
+fn keys_of(held: Slice[Member], alloc: mem::Alloc) -> mem::List[text::String] {
+    var keys = mem::List[text::String].empty(alloc)
+    for member in held {
+        mut keys.push(text::String.of(member.key.as_str(), alloc))
+    }
+    return keys
+} keys_of
+
+/// An item both sides changed, merged per order-free member when its text outside them changed
+/// on one side only; none for a conflict.
+fn members(base: FileUnit, ours: FileUnit, theirs: FileUnit, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(b) = split(base, alloc) else {
+        return None
+    }
+    let Some(o) = split(ours, alloc) else {
+        return None
+    }
+    let Some(t) = split(theirs, alloc) else {
+        return None
+    }
+    let Some(side) = outside_side(b, ours: o, theirs: t) else {
+        return None
+    }
+    let Some(merged) = merged_members(b, ours: o, theirs: t, alloc) else {
+        return None
+    }
+    let order = ordered(keys_of(o.members.view(), alloc).view(), theirs: keys_of(t.members.view(), alloc).view(), kept: fn(key: Str) => merged.get_by(fn(held: text::String) => held.as_str().cmp(key)).is_some(), alloc)
+    var lines = mem::List[text::String].empty(alloc)
+    let head = match side {
+        Side.Ours => o.head.view()
+        Side.Theirs => t.head.view()
+    }
+    for line in head {
+        mut lines.push(text::String.of(line.as_str(), alloc))
+    }
+    for key in order {
+        let Some(text) = merged.get(key) else {
+            expect false
+            return None
+        }
+        mut lines.push(text::String.of(text.as_str(), alloc))
+    }
+    let tail = match side {
+        Side.Ours => o.tail.view()
+        Side.Theirs => t.tail.view()
+    }
+    for line in tail {
+        mut lines.push(text::String.of(line.as_str(), alloc))
+    }
+    return Some(joined(lines.view(), separator: "\n", alloc))
+} members
+
+/// The members of three splits of an item merged by key, each as items merge or, both sides
+/// having changed it differently, as a listing directive merges; none for a conflict.
+fn merged_members(base: MemberLines, ours: MemberLines, theirs: MemberLines, alloc: mem::Alloc) -> Option[mem::Map[text::String, text::String]] {
+    let base_by = by_key(base.members.view(), alloc)
+    let ours_by = by_key(ours.members.view(), alloc)
+    let theirs_by = by_key(theirs.members.view(), alloc)
+    var all = mem::Set[text::String].empty(alloc)
+    add_keys(mut all, held: base.members.view(), alloc)
+    add_keys(mut all, held: ours.members.view(), alloc)
+    add_keys(mut all, held: theirs.members.view(), alloc)
+    var merged = mem::Map[text::String, text::String].empty(alloc)
+    for key in all {
+        var taken: Option[text::String] = None
+        match three(base_by.get(key), ours: ours_by.get(key), theirs: theirs_by.get(key)) {
+            Some(Side.Ours) => {
+                taken = copied(ours_by.get(key), alloc)
+            }
+            Some(Side.Theirs) => {
+                taken = copied(theirs_by.get(key), alloc)
+            }
+            None => {
+                let Some(mine) = ours_by.get(key) else {
+                    return None
+                }
+                let Some(other) = theirs_by.get(key) else {
+                    return None
+                }
+                let Some(names) = listed(base_by.get(key), ours: mine.as_str(), theirs: other.as_str(), alloc) else {
+                    return None
+                }
+                taken = Some(take names)
+            }
+        }
+        match taken {
+            Some(text) => {
+                discard mut merged.insert(text::String.of(key.as_str(), alloc), value: take text)
+            }
+            None => {}
+        }
+    }
+    return Some(take merged)
+} merged_members
+
+fn add_keys(mut keys: mem::Set[text::String], held: Slice[Member], alloc: mem::Alloc) {
+    for member in held {
+        discard mut keys.insert(text::String.of(member.key.as_str(), alloc))
+    }
+} add_keys
+
+/// A copy of a text, when there is one.
+fn copied(held: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(text) = held else {
+        return None
+    }
+    return Some(text::String.of(text.as_str(), alloc))
+} copied
+
+/// The side whose lines outside the members a merge of an item takes, or none for a conflict:
+/// equal versions, or the version changed on one side only.
+fn outside_side(base: MemberLines, ours: MemberLines, theirs: MemberLines) -> Option[Side] {
+    if same_outside(ours, other: theirs) or same_outside(base, other: theirs) {
+        return Some(Side.Ours)
+    }
+    if same_outside(base, other: ours) {
+        return Some(Side.Theirs)
+    }
+    return None
+} outside_side
+
+fn same_outside(lines: MemberLines, other: MemberLines) -> bool {
+    return lines.head == other.head and lines.tail == other.tail
+} same_outside
+
+/// A `targets` or `allow` directive both sides changed, its names merged as a set: the base's
+/// names neither side removed and the names either side added, in byte order.
+fn listed(base: Option[text::String], ours: Str, theirs: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(start) = list_prefix(ours, alloc) else {
+        return None
+    }
+    var base_names = mem::List[text::String].empty(alloc)
+    match base {
+        Some(line) => {
+            base_names = list_names(line.as_str(), alloc)
+        }
+        None => {}
+    }
+    let ours_names = list_names(ours, alloc)
+    let theirs_names = list_names(theirs, alloc)
+    var merged = mem::List[text::String].empty(alloc)
+    for name in base_names {
+        if holds(ours_names.view(), key: name.as_str()) and holds(theirs_names.view(), key: name.as_str()) {
+            mut merged.push(text::String.of(name.as_str(), alloc))
+        }
+    }
+    add_new_names(mut merged, names: ours_names.view(), base: base_names.view(), alloc)
+    add_new_names(mut merged, names: theirs_names.view(), base: base_names.view(), alloc)
+    mut merged.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var written = text::String.of(start.as_str(), alloc)
+    mut written.append(joined(merged.view(), separator: ", ", alloc).as_str())
+    return Some(take written)
+} listed
+
+/// Adds each of `names` that neither the base names nor the merged names hold.
+fn add_new_names(mut merged: mem::List[text::String], names: Slice[text::String], base: Slice[text::String], alloc: mem::Alloc) {
+    for name in names {
+        if not holds(base, key: name.as_str()) and not holds(merged.view(), key: name.as_str()) {
+            mut merged.push(text::String.of(name.as_str(), alloc))
+        }
+    }
+} add_new_names
+
+/// The names a `targets` or `allow` directive lists.
+fn list_names(line: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(trimmed) = line.slice_bytes(leading_space(line), end: line.byte_len()) else {
+        return pieces("", separator: ", ", alloc)
+    }
+    if trimmed.starts_with("targets ") {
+        let Some(list) = trimmed.slice_bytes(8, end: trimmed.byte_len()) else {
+            return pieces("", separator: ", ", alloc)
+        }
+        return pieces(list, separator: ", ", alloc)
+    }
+    let Some(at) = line.find(" in ") else {
+        return pieces("", separator: ", ", alloc)
+    }
+    expect line.byte_len() >= 4 and at <= line.byte_len() - 4
+    let Some(list) = line.slice_bytes(at + 4, end: line.byte_len()) else {
+        return pieces("", separator: ", ", alloc)
+    }
+    return pieces(list, separator: ", ", alloc)
+} list_names
+
+/// The text a `targets` or `allow` directive writes before its names.
+fn list_prefix(line: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let indent = leading_space(line)
+    let Some(trimmed) = line.slice_bytes(indent, end: line.byte_len()) else {
+        return None
+    }
+    if trimmed.starts_with("targets ") {
+        let Some(leading) = line.slice_bytes(0, end: indent) else {
+            return None
+        }
+        var written = text::String.of(leading, alloc)
+        mut written.append("targets ")
+        return Some(take written)
+    }
+    if not trimmed.starts_with("allow ") {
+        return None
+    }
+    let Some(at) = line.find(" in ") else {
+        return None
+    }
+    let Some(head) = line.slice_bytes(0, end: at) else {
+        return None
+    }
+    var written = text::String.of(head, alloc)
+    mut written.append(" in ")
+    return Some(take written)
+} list_prefix
+
+/// The lock of the version with the later snapshot, ours when neither is later.
+fn lock(ours: Slice[u8], theirs: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    let ours_at = match machine::Lock.read(ours, grammar, alloc) {
+        Ok(read) => Some(read.snapshot)
+        Err(_) => None
+    }
+    let theirs_at = match machine::Lock.read(theirs, grammar, alloc) {
+        Ok(read) => Some(read.snapshot)
+        Err(_) => None
+    }
+    let Some(later) = theirs_at else {
+        return kept_whole(ours, alloc)
+    }
+    let Some(earlier) = ours_at else {
+        return kept_whole(theirs, alloc)
+    }
+    if later > earlier {
+        return kept_whole(theirs, alloc)
+    }
+    return kept_whole(ours, alloc)
+} lock
+
+/// The union of two histories' tombstones, ours' winning for equal identities, with the store
+/// name and head of the version that changed them from the base, ours' when both did.
+fn history(base: Option[mem::Bytes], ours: Slice[u8], theirs: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    let Ok(o) = machine::History.read(ours, grammar, alloc) else {
+        return conflict(ours, theirs, alloc)
+    }
+    let Ok(t) = machine::History.read(theirs, grammar, alloc) else {
+        return conflict(ours, theirs, alloc)
+    }
+    var b: Option[machine::History] = None
+    match base {
+        Some(bytes) => {
+            match machine::History.read(bytes.view(), grammar, alloc) {
+                Ok(read) => {
+                    b = Some(take read)
+                }
+                Err(_) => {}
+            }
+        }
+        None => {}
+    }
+    var name = text::String.of(o.name.as_str(), alloc)
+    var head = o.head
+    if not history_changed(b, side: o) and history_changed(b, side: t) {
+        name = text::String.of(t.name.as_str(), alloc)
+        head = t.head
+    }
+    var modules = mem::Map[text::String, mem::List[text::String]].empty(alloc)
+    for held in o.modules {
+        discard mut modules.insert(text::String.of(held.module.as_str(), alloc), value: copied_lines(held.tombstones.view(), alloc))
+    }
+    for held in t.modules {
+        var tombstones = match mut modules.remove(held.module) {
+            Some(known) => known
+            None => mem::List[text::String].empty(alloc)
+        }
+        for tombstone in held.tombstones {
+            if tombstones.position(fn(known: text::String) => same_identity(known.as_str(), other: tombstone.as_str())).is_none() {
+                mut tombstones.push(text::String.of(tombstone.as_str(), alloc))
+            }
+        }
+        mut tombstones.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        discard mut modules.insert(text::String.of(held.module.as_str(), alloc), value: take tombstones)
+    }
+    var listed_modules = mem::List[machine::ModuleTombstones].empty(alloc)
+    for entry in take modules {
+        let mem::KeyValue(key: module, value: tombstones) = entry
+        mut listed_modules.push(machine::ModuleTombstones(module: take module, tombstones: take tombstones))
+    }
+    let merged = machine::History(name: take name, head: head, modules: take listed_modules)
+    return Merged(content: merged.bytes(grammar, alloc), conflicts: mem::List[u32].empty(alloc))
+} history
+
+/// Whether a history changed its store name or head from the base's, an absent base counting as
+/// a change.
+fn history_changed(base: Option[machine::History], side: machine::History) -> bool {
+    let Some(held) = base else {
+        return true
+    }
+    return held.name != side.name or held.head != side.head
+} history_changed
+
+/// Whether two tombstones have the same identity: their texts before ` => `.
+fn same_identity(tombstone: Str, other: Str) -> bool {
+    return tombstone.slice_bytes(0, end: identity_end(tombstone)) == other.slice_bytes(0, end: identity_end(other))
+} same_identity
+
+/// The length of a tombstone's identity: its text before ` => `.
+fn identity_end(tombstone: Str) -> usize {
+    return match tombstone.find(" => ") {
+        Some(at) => at
+        None => tombstone.byte_len()
+    }
+} identity_end
+
+fn copied_lines(lines: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copies = mem::List[text::String].empty(alloc)
+    for line in lines {
+        mut copies.push(text::String.of(line.as_str(), alloc))
+    }
+    return copies
+} copied_lines
+
+/// Two snapshots merged per entry as items merge, an entry both sides changed differently
+/// taking ours' records and theirs' `pending` records.
+fn snapshot(base: Option[mem::Bytes], ours: Slice[u8], theirs: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Merged {
+    let Ok(o) = machine::Snapshot.read(ours, grammar, alloc) else {
+        return conflict(ours, theirs, alloc)
+    }
+    let Ok(t) = machine::Snapshot.read(theirs, grammar, alloc) else {
+        return conflict(ours, theirs, alloc)
+    }
+    var b = machine::Snapshot.empty(alloc)
+    match base {
+        Some(bytes) => {
+            match machine::Snapshot.read(bytes.view(), grammar, alloc) {
+                Ok(read) => {
+                    b = read
+                }
+                Err(_) => {}
+            }
+        }
+        None => {}
+    }
+    var paths = mem::Set[text::String].empty(alloc)
+    add_paths(mut paths, entries: b.entries.view(), alloc)
+    add_paths(mut paths, entries: o.entries.view(), alloc)
+    add_paths(mut paths, entries: t.entries.view(), alloc)
+    var base_by = by_path(take b, alloc)
+    var ours_by = by_path(take o, alloc)
+    var theirs_by = by_path(take t, alloc)
+    var entries = mem::List[machine::ApiEntry].empty(alloc)
+    for path in paths {
+        let side = three(base_by.get(path), ours: ours_by.get(path), theirs: theirs_by.get(path))
+        match side {
+            Some(Side.Ours) => {
+                match mut ours_by.remove(path) {
+                    Some(entry) => mut entries.push(take entry)
+                    None => {}
+                }
+            }
+            Some(Side.Theirs) => {
+                match mut theirs_by.remove(path) {
+                    Some(entry) => mut entries.push(take entry)
+                    None => {}
+                }
+            }
+            None => {
+                let Some(found) = mut ours_by.remove(path) else {
+                    continue
+                }
+                var kept = found
+                match mut theirs_by.remove(path) {
+                    Some(other) => {
+                        kept.pending = other.pending
+                    }
+                    None => {}
+                }
+                mut entries.push(take kept)
+            }
+        }
+    }
+    let merged = machine::Snapshot(entries: take entries)
+    return Merged(content: merged.bytes(grammar, alloc), conflicts: mem::List[u32].empty(alloc))
+} snapshot
+
+fn add_paths(mut paths: mem::Set[text::String], entries: Slice[machine::ApiEntry], alloc: mem::Alloc) {
+    for entry in entries {
+        discard mut paths.insert(text::String.of(entry.path.as_str(), alloc))
+    }
+} add_paths
+
+/// A snapshot's entries by canonical path, the last of equal paths kept.
+fn by_path(take read: machine::Snapshot, alloc: mem::Alloc) -> mem::Map[text::String, machine::ApiEntry] {
+    var by = mem::Map[text::String, machine::ApiEntry].empty(alloc)
+    let machine::Snapshot(entries: entries) = read
+    for entry in take entries {
+        let key = text::String.of(entry.path.as_str(), alloc)
+        discard mut by.insert(take key, value: take entry)
+    }
+    return by
+} by_path
+
+/// The bytes of a line's leading white space.
+fn leading_space(line: Str) -> usize {
+    var count: usize = 0
+    var chars = line.cursor()
+    loop {
+        let Some(c) = mut chars.next() else {
+            return count
+        }
+        if not platform::is_white_space(c) {
+            return count
+        }
+        expect count <= line.byte_len() and c.utf8_len() <= line.byte_len() - count
+        count += c.utf8_len()
+    }
+} leading_space
+
+/// Whether a line holds white space alone.
+fn is_blank(line: Str) -> bool {
+    return leading_space(line) == line.byte_len()
+} is_blank
+
+/// A text without its trailing white space.
+fn trimmed_end(written: Str, alloc: mem::Alloc) -> text::String {
+    let Some(kept_text) = written.slice_bytes(0, end: platform::trimmed_run(written).end) else {
+        return text::String.of(written, alloc)
+    }
+    return text::String.of(kept_text, alloc)
+} trimmed_end
+
+/// The lines of a text: its pieces between LFs, each without a final CR, without the empty piece
+/// after a final LF.
+fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        expect end <= bytes.len() and bytes.len() < ~0usize
+        var kept = end
+        if end < bytes.len() and kept > start and bytes[kept - 1] == b'\r' {
+            kept -= 1
+        }
+        let Some(line) = written.slice_bytes(start, end: kept) else {
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = end + 1
+    }
+    return lines
+} text_lines
+
+/// The pieces of a text between occurrences of a separator, at least one.
+fn pieces(written: Str, separator: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    var start: usize = 0
+    loop {
+        let Some(rest) = written.slice_bytes(start, end: written.byte_len()) else {
+            return found
+        }
+        let Some(at) = rest.find(separator) else {
+            mut found.push(text::String.of(rest, alloc))
+            return found
+        }
+        let Some(piece) = rest.slice_bytes(0, end: at) else {
+            return found
+        }
+        mut found.push(text::String.of(piece, alloc))
+        expect at <= ~0usize - separator.byte_len() and start <= ~0usize - (at + separator.byte_len())
+        start += at + separator.byte_len()
+    }
+} pieces
+
+/// The words of a text between runs of white space.
+fn white_words(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var words = mem::List[text::String].empty(alloc)
+    var start: Option[usize] = None
+    var at: usize = 0
+    var chars = written.cursor()
+    loop {
+        let Some(c) = mut chars.next() else {
+            break
+        }
+        if platform::is_white_space(c) {
+            match start {
+                Some(from) => {
+                    let Some(word) = written.slice_bytes(from, end: at) else {
+                        return words
+                    }
+                    mut words.push(text::String.of(word, alloc))
+                    start = None
+                }
+                None => {}
+            }
+        } else if start.is_none() {
+            start = Some(at)
+        }
+        expect at <= written.byte_len() and c.utf8_len() <= written.byte_len() - at
+        at += c.utf8_len()
+    }
+    match start {
+        Some(from) => {
+            let Some(word) = written.slice_bytes(from, end: at) else {
+                return words
+            }
+            mut words.push(text::String.of(word, alloc))
+        }
+        None => {}
+    }
+    return words
+} white_words
+
+/// Texts joined by a separator.
+fn joined(texts: Slice[text::String], separator: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    for index in 0..<texts.len() {
+        if index > 0 {
+            mut written.append(separator)
+        }
+        mut written.append(texts[index].as_str())
+    }
+    return written
+} joined

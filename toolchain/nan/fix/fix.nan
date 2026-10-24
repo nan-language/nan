@@ -6,11 +6,25 @@ struct Shift {
     replacements: mem::List[diagnostic::Replacement]
 } Shift
 
-/// The sources of the files a fix changes, once its replacements, which do not overlap, are
+/// The sources of the files fixes change, once their replacements, which do not overlap, are
 /// made.
+pkg fn apply(workspace: workspace::Workspace, fixes: Slice[diagnostic::Fix], alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+    var shifts = mem::List[Shift].empty(alloc)
+    for fix in fixes {
+        add_shifts(mut shifts, fix, alloc)
+    }
+    sort_shifts(mut shifts)
+    return shifted_sources(workspace, shifts: shifts.view(), alloc)
+} apply
+
+/// The sources of the files a fix changes, once its replacements are made.
 fn applied(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+    return shifted_sources(workspace, shifts: shifts_of(fix, alloc).view(), alloc)
+} applied
+
+/// The sources of the files shifts change, once their replacements are made.
+fn shifted_sources(workspace: workspace::Workspace, shifts: Slice[Shift], alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
     var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
-    let shifts = shifts_of(fix, alloc)
     for shift in shifts {
         let Some(at) = workspace.file(shift.path.as_str()) else {
             continue
@@ -27,7 +41,7 @@ fn applied(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Al
         discard mut changed.insert(text::String.of(shift.path.as_str(), alloc), value: take made)
     }
     return changed
-} applied
+} shifted_sources
 
 /// Appends the bytes `from..to` of a source.
 fn append_range(mut out: mem::Bytes, source: Slice[u8], from: usize, to: usize) {
@@ -60,6 +74,13 @@ fn lossy_range(source: Slice[u8], from: usize, to: usize, alloc: mem::Alloc) -> 
 /// The shifts of a fix, one per file it changes, in byte order of path.
 fn shifts_of(fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[Shift] {
     var shifts = mem::List[Shift].empty(alloc)
+    add_shifts(mut shifts, fix, alloc)
+    sort_shifts(mut shifts)
+    return shifts
+} shifts_of
+
+/// Adds a fix's replacements to the shifts of the files they change.
+fn add_shifts(mut shifts: mem::List[Shift], fix: diagnostic::Fix, alloc: mem::Alloc) {
     for edit in fix.edits {
         let path = edit.path.as_str()
         let replacement = copied_replacement(edit.replacement, alloc)
@@ -74,12 +95,15 @@ fn shifts_of(fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[Shift] {
             }
         }
     }
+} add_shifts
+
+/// Orders shifts by path, and each one's replacements by start, then end.
+fn sort_shifts(mut shifts: mem::List[Shift]) {
     for shift in mut shifts {
         mut shift.replacements.sort_by(replacement_order)
     }
     mut shifts.sort_by(fn(left: Shift, right: Shift) => left.path.as_str().cmp(right.path.as_str()))
-    return shifts
-} shifts_of
+} sort_shifts
 
 /// The order of two replacements by start, then end.
 fn replacement_order(left: diagnostic::Replacement, right: diagnostic::Replacement) -> core::Ordering {
@@ -107,6 +131,7 @@ fn shift_in(shifts: Slice[Shift], path: Str) -> Option[usize]
 /// How much longer a replacement's text is than the bytes it replaces, modulo 2^32 as the
 /// positions it moves.
 fn delta(replacement: diagnostic::Replacement) -> u32 {
+    expect replacement.start <= replacement.end
     return u32.truncate(replacement.text.as_str().byte_len()).wrapping_sub(replacement.end - replacement.start)
 } delta
 
@@ -322,7 +347,7 @@ fn copied_reason(reason: diagnostic::Reason, alloc: mem::Alloc) -> diagnostic::R
     return diagnostic::Reason(role: reason.role, subject: text::String.of(reason.subject.as_str(), alloc), at: take at)
 } copied_reason
 
-fn copied_fix(fix: diagnostic::Fix, alloc: mem::Alloc) -> diagnostic::Fix {
+pkg fn copied_fix(fix: diagnostic::Fix, alloc: mem::Alloc) -> diagnostic::Fix {
     var edits = mem::List[diagnostic::Edit].empty(alloc)
     for edit in fix.edits {
         mut edits.push(diagnostic::Edit(path: text::String.of(edit.path.as_str(), alloc), replacement: copied_replacement(edit.replacement, alloc)))
@@ -420,6 +445,19 @@ fn passes(
     }
     return true
 } passes
+
+/// The errors a workspace changed by `fix` reports that the workspace did not report before, in
+/// `before`: each of another code, or not at the place an earlier one moves to.
+pkg fn introduced(before: Slice[diagnostic::Diagnostic], fix: diagnostic::Fix, rechecked: Slice[diagnostic::Diagnostic], alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    let shifts = shifts_of(fix, alloc)
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in rechecked {
+        if reported.code.class() == diagnostic::Class.Error and not reported_before(reported, before, shifts: shifts.view()) {
+            mut found.push(reported.copy(alloc))
+        }
+    }
+    return found
+} introduced
 
 /// Whether a diagnostic's construct starts in an item's declaration.
 fn declared_at(workspace: workspace::Workspace, fixed: diagnostic::Diagnostic) -> bool {
@@ -538,6 +576,7 @@ fn line_of(file: syntax::SourceFile, position: u32) -> u32 {
     var high = file.lines.len()
     while low < high {
         let middle = low + (high - low) / 2
+        expect middle < file.lines.len()
         if file.lines[middle].start <= position {
             low = middle + 1
         } else {
@@ -650,6 +689,23 @@ struct LineRun derives Copy {
     top: u32
     last: u32
 } LineRun
+
+/// The lines holding a fix's changed texts, by path, an inserted text held by the line holding
+/// the character after it, or by the last line at the end of its file.
+pkg fn held_lines(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Alloc) -> mem::List[diagnostic::At] {
+    var held_at = mem::List[diagnostic::At].empty(alloc)
+    for edit in fix.edits {
+        let Some(at) = workspace.file(edit.path.as_str()) else {
+            expect false
+            continue
+        }
+        let run = held(workspace.file_at(at).syntax, replacement: edit.replacement)
+        for line in run.top..=run.last {
+            mut held_at.push(diagnostic::At(path: text::String.of(edit.path.as_str(), alloc), line: line))
+        }
+    }
+    return held_at
+} held_lines
 
 /// The lines holding a replacement's changed text.
 fn held(file: syntax::SourceFile, replacement: diagnostic::Replacement) -> LineRun {

@@ -1,7 +1,7 @@
 //! Tombstones: the forms their rewrites take, what a rewrite names beside its replacement, and the
 //! old forms that live items, members and the tombstones of other modules take.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use super::Checker;
@@ -18,7 +18,7 @@ use crate::syntax::ast::{self, ExprKind, ItemKind, RetiredItem, RetiredNew, Visi
 impl Checker<'_> {
     /// The aliases tombstones give the keys of a type's fields and variants: each old key, by
     /// the key its rewrite reaches through further tombstones.
-    pub fn key_aliases(&self, item: ItemId) -> HashMap<Vec<u8>, Vec<u8>> {
+    pub fn key_aliases(&self, item: ItemId) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let prefix = format!("{}.", self.db.type_path(TypeKey::Item(item)));
         let renamed: HashMap<String, String> = self
             .db

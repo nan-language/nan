@@ -1,0 +1,435 @@
+//! Final builds: checking a program's final closure, lowering its reach and linking its image.
+
+/// The entry landing fn each platform package holds.
+const LANDING: Str = "enter"
+
+/// What a final build reports and the image it writes, relative to the workspace root.
+pkg struct Build {
+    pkg diagnostics: mem::List[diagnostic::Diagnostic]
+    pkg image: Option[text::String]
+} Build
+
+/// An image whose code roots a final build compares with those of its own: its path, and how
+/// the command line writes it.
+pkg struct Compared {
+    pkg path: text::String
+    pkg written: text::String
+} Compared
+
+/// Performs the final build of the program at index `program` of the workspace, comparing its
+/// code roots with those of the image `compared` gives, when given.
+pkg fn build(session: check::Session, program: usize, compared: Option[Compared], alloc: mem::Alloc) -> Build fails platform::IoError {
+    let held = session.workspace.contents()
+    let Some(source) = held.packages.get(program) else {
+        expect false
+        return Build(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), image: None)
+    }
+    var diagnostics = session.reported(scope::Scope.Workspace)
+    let Some(checked) = held.closure_of(program) else {
+        return Build(diagnostics: take diagnostics, image: None)
+    }
+    let target = source.program_target()
+    let checker = session.checked(checked, target)
+    let root = package_id(checker, program)
+    let closure = closure_of(checker, root, alloc)
+    mut diagnostics.retain(fn(reported: diagnostic::Diagnostic) -> bool {
+        let Some(path) = reported.path else {
+            return true
+        }
+        let Some(at) = held.file(path.as_str()) else {
+            return false
+        }
+        return holds_source(checker, closure: closure.view(), package_index: at.package_index)
+    })
+    if errors(diagnostics.view()) {
+        return Build(diagnostics: take diagnostics, image: None)
+    }
+    let name = text::String.of(checker.db().package_data(root).name.as_str(), alloc)
+    let artefacts = artefacts_of(session, checker, root, alloc)
+    match compared {
+        Some(image) => {
+            for reported in take stage::compare(checker, artefacts, image: image.path.as_str(), written: image.written.as_str(), alloc) {
+                mut diagnostics.push(take reported)
+            }
+            if errors(diagnostics.view()) {
+                return Build(diagnostics: take diagnostics, image: None)
+            }
+        }
+        None => {}
+    }
+    let lowered = lower_program(checker, root, artefacts, dumping: false, alloc)
+    for reported in take collisions(source, lowered, alloc) {
+        mut diagnostics.push(take reported)
+    }
+    for reported in take lower::stack_judge(checker, all_frames: lowered.frames.view(), demands: lowered.demands.view(), alloc) {
+        mut diagnostics.push(take reported)
+    }
+    if errors(diagnostics.view()) {
+        return Build(diagnostics: take diagnostics, image: None)
+    }
+    var image = text::String.of(".nan/images/", alloc)
+    mut image.append(target.name())
+    mut image.push('/')
+    mut image.append(name.as_str())
+    mut image.append(target.image_suffix())
+    let written = platform::join(held.root.as_str(), name: image.as_str(), alloc)
+    let Err(output) = try write_image(target, object: lowered.object.view(), image: written.as_str(), alloc) else {
+        return Build(diagnostics: take diagnostics, image: Some(take image))
+    }
+    mut diagnostics.push(link_failed(source, output: output.as_str(), alloc))
+    return Build(diagnostics: take diagnostics, image: None)
+} build
+
+/// The diagnostic of a failing `cc` run linking a program's image, on the program's `entry`
+/// directive, quoting `cc`'s output.
+fn link_failed(source: workspace::Package, output: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    var line: u32 = 1
+    match source.manifest {
+        Some(manifest) => {
+            line = manifest.line
+            match manifest.entry {
+                Some(entry) => {
+                    line = entry.line
+                }
+                None => {}
+            }
+        }
+        None => {
+            expect false
+        }
+    }
+    let Some(manifest_file) = source.files.get(0) else {
+        expect false
+        return diagnostic::Diagnostic.new(diagnostic::Code.TargetLinkFailed, alloc)
+    }
+    var reported = diagnostic::Diagnostic.at(diagnostic::Code.TargetLinkFailed, path: manifest_file.path.as_str(), line, alloc)
+    reported.envelope = Some(diagnostic::Envelope(origin: text::String.of("cc", alloc), lines: lines_of(output, alloc)))
+    return reported
+} link_failed
+
+/// The lines of a text: its parts between line feeds, a carriage return before a line feed
+/// excluded, and no last empty part after a final line feed.
+pkg fn lines_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        expect end <= bytes.len() and bytes.len() < ~0usize
+        var content_end = end
+        if end < bytes.len() and content_end > start and bytes[content_end - 1] == b'\r' {
+            content_end -= 1
+        }
+        let Some(line) = written.slice_bytes(start, end: content_end) else {
+            return lines
+        }
+        mut lines.push(text::String.of(line, alloc))
+        start = end + 1
+    }
+    return lines
+} lines_of
+
+/// The lowering of the program whose package is `root`, for the checker's target, with the
+/// artefacts of its final closure; keeping the text of each function it defines when `dumping`.
+fn lower_program(checker: check::Checker, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], dumping: bool, alloc: mem::Alloc) -> lower::Lowered {
+    let db = checker.db()
+    let target = db.target
+    var entry: Option[ty::ItemId] = None
+    match db.package_data(root).root {
+        Some(module) => {
+            entry = db.lookup(module, name: "main")
+        }
+        None => {}
+    }
+    var landing_item: Option[ty::ItemId] = None
+    match target.platform_package() {
+        Some(platform) => {
+            for data in db.packages {
+                if data.name.as_str() != platform {
+                    continue
+                }
+                let Some(module) = data.root else {
+                    break
+                }
+                landing_item = db.lookup(module, name: LANDING)
+                break
+            }
+        }
+        None => {}
+    }
+    let Some(entry_fn) = entry else {
+        expect false
+        return lower::lower_lower(checker, program: program_of(entry_fn: ty::ItemId(index: 0), landing_fn: ty::ItemId(index: 0), root, artefacts, dumping, alloc))
+    }
+    let Some(landing_fn) = landing_item else {
+        expect false
+        return lower::lower_lower(checker, program: program_of(entry_fn, landing_fn: ty::ItemId(index: 0), root, artefacts, dumping, alloc))
+    }
+    let program = program_of(entry_fn, landing_fn, root, artefacts, dumping, alloc)
+    if target.is_machine() {
+        return lower::lower_machine(checker, program)
+    }
+    return lower::lower_lower(checker, program)
+} lower_program
+
+/// What the final build of the program whose package is `root` lowers.
+fn program_of(entry_fn: ty::ItemId, landing_fn: ty::ItemId, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], dumping: bool, alloc: mem::Alloc) -> lower::Program {
+    var roots = mem::List[ty::PackageId].empty(alloc)
+    mut roots.push(root)
+    return lower::Program(entry: entry_fn, landing_fn: landing_fn, roots: take roots, prefixes: prefixes(artefacts, alloc), section: section(artefacts, alloc), dump: dumping)
+} program_of
+
+/// The symbol name and Cranelift text of each function the final build of the program package
+/// named `package_name` of the workspace lowers, in order of definition, each text after a line
+/// holding the symbol name and the text's length; nothing when its closure does not check.
+pkg fn lowered_functions(session: check::Session, package_name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var written = mem::Bytes.empty(alloc)
+    let held = session.workspace.contents()
+    let Some(program) = named_package(held, name: package_name) else {
+        return written
+    }
+    let Some(checked) = held.closure_of(program) else {
+        return written
+    }
+    let Some(source) = held.packages.get(program) else {
+        expect false
+        return written
+    }
+    let checker = session.checked(checked, target: source.program_target())
+    let root = package_id(checker, program)
+    let artefacts = artefacts_of(session, checker, root, alloc)
+    let lowered = lower_program(checker, root, artefacts, dumping: true, alloc)
+    for function in lowered.dumped {
+        var header = text::String.of(function.name.as_str(), alloc)
+        mut header.write(text::fmt(" {length}\n", length: function.text.byte_len()), budget: 100)
+        mut written.append(header.as_bytes())
+        mut written.append(function.text.as_bytes())
+    }
+    return written
+} lowered_functions
+
+/// Writes the image of a lowered object at `image` through a staged file beside it, replacing
+/// any earlier image at once: on `x86_64-host` an executable the `cc` of the `PATH` links, giving
+/// `cc`'s output when it fails; on a machine target the image writer's, entered by the program
+/// entry seam.
+pkg fn write_image(target: workspace::Target, object: Slice[u8], image: Str, alloc: mem::Alloc) -> Result[Unit, text::String] fails platform::IoError {
+    let Some(directory) = platform::parent(image, alloc) else {
+        expect false
+        fail platform::IoError.NotFound
+    }
+    try platform::create_dir_all(directory.as_str(), alloc)
+    let Some(name) = platform::file_name(image, alloc) else {
+        expect false
+        fail platform::IoError.NotFound
+    }
+    let staged_new = staged(directory.as_str(), name: name.as_str(), extension: "new", alloc)
+    if target.is_machine() {
+        let bytes = image::write(target, object, entry: lower::MACHINE_ENTRY, alloc)
+        try platform::write_file(staged_new.as_str(), contents: bytes.view())
+    } else {
+        let staged_object = staged(directory.as_str(), name: name.as_str(), extension: "o", alloc)
+        try platform::write_file(staged_object.as_str(), contents: object)
+        let linked = lower::host_link(staged_object.as_str(), image: staged_new.as_str(), alloc)
+        try platform::remove_file(staged_object.as_str())
+        let Ok(_) = linked else {
+            return linked
+        }
+    }
+    try platform::rename_path(staged_new.as_str(), to: image)
+    return Ok(Unit)
+} write_image
+
+/// The path of a file staged beside an image: `.<name>.<process id>.<extension>` in its directory.
+fn staged(directory: Str, name: Str, extension: Str, alloc: mem::Alloc) -> text::String {
+    var file = text::String.of(".", alloc)
+    mut file.append(name)
+    mut file.write(text::fmt(".{id}.", id: platform::process_id()), budget: 32)
+    mut file.append(extension)
+    return platform::join(directory, name: file.as_str(), alloc)
+} staged
+
+/// The symbol collisions of a lowering for the image of a final-link root or tested package,
+/// each reported on its `package` line, quoting both entities.
+pkg fn collisions(source: workspace::Package, lowered: lower::Lowered, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var line: u32 = 1
+    match source.manifest {
+        Some(manifest) => {
+            line = manifest.line
+        }
+        None => {}
+    }
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for collision in lowered.collisions {
+        let Some(manifest_file) = source.files.get(0) else {
+            expect false
+            return found
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.ArtefactSymbolCollision, path: manifest_file.path.as_str(), line, alloc)
+        mut reported.because.push(diagnostic::Reason.note(collision.named.as_str(), alloc))
+        mut reported.because.push(diagnostic::Reason.note(collision.colliding.as_str(), alloc))
+        mut found.push(take reported)
+    }
+    return found
+} collisions
+
+fn errors(diagnostics: Slice[diagnostic::Diagnostic]) -> bool {
+    for reported in diagnostics {
+        if reported.code.class() == diagnostic::Class.Error {
+            return true
+        }
+    }
+    return false
+} errors
+
+/// The checker's id of the workspace package at an index.
+fn package_id(checker: check::Checker, program: usize) -> ty::PackageId {
+    let Some(id) = checker.db().package_of_member(workspace::Member.Source(program)) else {
+        expect false
+        return ty::PackageId(index: 0)
+    }
+    return id
+} package_id
+
+/// Whether the packages of a closure hold the workspace package at an index.
+fn holds_source(checker: check::Checker, closure: Slice[ty::PackageId], package_index: usize) -> bool {
+    let db = checker.db()
+    for id in closure {
+        if db.package_data(id).member == Some(workspace::Member.Source(package_index)) {
+            return true
+        }
+    }
+    return false
+} holds_source
+
+/// The workspace packages of a program's dependency closure.
+fn closure_of(checker: check::Checker, root: ty::PackageId, alloc: mem::Alloc) -> mem::List[ty::PackageId] {
+    let db = checker.db()
+    var found = mem::List[ty::PackageId].empty(alloc)
+    mut found.push(root)
+    var index: usize = 0
+    while index < found.len() {
+        for entry in db.package_data(found[index]).deps {
+            let Some(dependency) = entry.value() else {
+                continue
+            }
+            if found.position(fn(known: ty::PackageId) => known == dependency).is_none() {
+                mut found.push(dependency)
+            }
+        }
+        index += 1
+    }
+    return found
+} closure_of
+
+/// The artefact of each package lowered with the workspace package `root` of a checker's
+/// closure, by package name: of the packages `root` reaches, a workspace package's of its current
+/// state and a release's from the local store, and of each std package the toolchain's.
+pkg fn artefacts_of(session: check::Session, checker: check::Checker, root: ty::PackageId, alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+    let db = checker.db()
+    var packages = closure_of(checker, root, alloc)
+    for index in 0..<db.packages.len() {
+        if db.packages[index].std {
+            mut packages.push(ty::PackageId(index: u32.fit(index)))
+        }
+    }
+    let held = session.workspace.contents()
+    let carried = check::Session.of(session.std.share(), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    var found = mem::Map[text::String, mem::Bytes].empty(alloc)
+    for id in packages {
+        let data = db.package_data(id)
+        let built = match data.member {
+            Some(workspace::Member.Release(index)) => released(held, index, alloc)
+            Some(workspace::Member.Source(index)) => built_source(session, index)
+            None => built_carried(carried, name: data.name.as_str())
+        }
+        let Some(artefact) = built else {
+            continue
+        }
+        discard mut found.insert(text::String.of(data.name.as_str(), alloc), value: take artefact)
+    }
+    return found
+} artefacts_of
+
+/// The artefact of the release at an index of a workspace's releases, from the local store.
+fn released(held: workspace::Workspace, index: usize, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var artefact = mem::Bytes.empty(alloc)
+    let Some(release) = held.releases.get(index) else {
+        expect false
+        return None
+    }
+    mut artefact.append(release.entry.contents().artefact.view())
+    return Some(take artefact)
+} released
+
+/// The artefact of the current state of the package at an index of a session's workspace, none
+/// when no closure checks it.
+fn built_source(session: check::Session, index: usize) -> Option[mem::Bytes] {
+    let Some(closure) = session.workspace.contents().closure_of(index) else {
+        return None
+    }
+    let built = session.build(closure, member: workspace::Member.Source(index))
+    let check::Built(artefact: artefact, sources: _) = built
+    return Some(take artefact)
+} built_source
+
+/// The artefact of the std package of a name that the toolchain carries, from a session of the
+/// std workspace.
+fn built_carried(carried: check::Session, name: Str) -> Option[mem::Bytes] {
+    let Some(index) = named_package(carried.workspace.contents(), name) else {
+        expect false
+        return None
+    }
+    return built_source(carried, index)
+} built_carried
+
+/// The index of the package of a workspace named `name`.
+fn named_package(held: workspace::Workspace, name: Str) -> Option[usize] {
+    for index in 0..<held.packages.len() {
+        let Some(source) = held.packages.get(index) else {
+            expect false
+            continue
+        }
+        let Some(found) = source.name() else {
+            continue
+        }
+        if found == name {
+            return Some(index)
+        }
+    }
+    return None
+} named_package
+
+/// The prefix the symbols of each package carry, by package name: the first 12 characters of the
+/// checksummed base32 of its code root hash's digest bytes.
+pkg fn prefixes(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::HashMap[text::String, text::String] {
+    var found = mem::HashMap[text::String, text::String].empty(seed: 0, alloc)
+    for entry in artefacts {
+        let Ok(decoded) = artefact::decode(entry.value().view(), alloc) else {
+            continue
+        }
+        let root = decoded.root_hash()
+        let Some(digest) = root.bytes.view().split_at(1) else {
+            continue
+        }
+        let written = hashing::checksummed_base32(digest.tail, alloc)
+        let Some(prefix) = written.as_str().slice_bytes(0, end: 12) else {
+            continue
+        }
+        discard mut found.insert(text::String.of(entry.key().as_str(), alloc), value: text::String.of(prefix, alloc))
+    }
+    return found
+} prefixes
+
+/// The content of an image's `.nan` section: each package's artefact, in byte order of package
+/// name.
+fn section(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::uvar(mut out, value: u64.widen(artefacts.len()))
+    for entry in artefacts {
+        encoding::bytes(mut out, value: entry.value().view())
+    }
+    return out
+} section

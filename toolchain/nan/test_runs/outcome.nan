@@ -1,0 +1,242 @@
+//! A test image as its runs start it, and one run of a test, given the test's number, the run's index and seed, its replay token and the draws a rerun forces: a process of the image on `x86_64-host`, a boot of the emulator on it on a machine target, whose standard output or serial port carries frames, and how it ended.
+
+/// The signal ending a process that passed its processor time limit, `SIGXCPU`.
+const SIGXCPU: i32 = 24
+
+/// A test image as its runs start it: an `x86_64-host` executable, or a machine image and the
+/// emulator invocation booting it.
+enum Image {
+    Host(text::String)
+    Machine(path: text::String, launch: emulator::Launch)
+} Image
+
+/// The test image at a path, as its runs on a run target start it: a machine image's boot
+/// volume is made once, and every run finds it as it was made.
+fn Image.new(target: workspace::Target, take path: text::String, alloc: mem::Alloc) -> Image fails platform::IoError {
+    if target.is_machine() {
+        let none = mem::List[text::String].empty(alloc)
+        let launch = try emulator::launch(target, image: path.as_str(), files: none.view(), writes: emulator::Writes.Dropped, alloc)
+        return Image.Machine(path: take path, launch: take launch)
+    }
+    return Image.Host(take path)
+} Image.new
+
+proj fn Image.path(self) -> Str {
+    return match self {
+        Image.Host(path) => path.as_str()
+        Image.Machine(path: path, launch: _) => path.as_str()
+    }
+} Image.path
+
+/// Removes the image and its boot volume.
+fn Image.remove(self, alloc: mem::Alloc) fails platform::IoError {
+    match self {
+        Image.Host(path) => try platform::remove_file(path.as_str())
+        Image.Machine(path: path, launch: _) => try emulator::remove_image(path.as_str(), alloc)
+    }
+} Image.remove
+
+/// How a run ended.
+enum Ended derives Eq {
+    /// The body returned, and whether the target ran.
+    Passed(ran: bool)
+    /// A trap abandoned the test domain, with its report.
+    Trapped(report: text::String)
+    /// A failure escaped the body: its variant's canonical path and its rendering.
+    Escaped(path: text::String, rendering: text::String)
+    /// No task was ready and no deadline pending, and whether the target ran.
+    Stalled(ran: bool)
+    TimedOut
+} Ended
+
+/// A draw of a case: its value, the bounds it was drawn within, and the value it gave once the
+/// values its exclusions skip were set apart.
+struct Draw derives Copy, Eq {
+    value: wide::Wide
+    low: wide::Wide
+    high: wide::Wide
+    given: wide::Wide
+} Draw
+
+/// What a run gave: how it ended, whether a scheduling point found two ready tasks, its test
+/// trace and its draws.
+struct Run {
+    ended: Ended
+    contended: bool
+    trace: mem::Bytes
+    draws: mem::List[Draw]
+} Run
+
+/// The run of a test that outlived its bound.
+fn timed_out(alloc: mem::Alloc) -> Run {
+    return Run(ended: Ended.TimedOut, contended: false, trace: mem::Bytes.empty(alloc), draws: mem::List[Draw].empty(alloc))
+} timed_out
+
+/// Performs one run of the numbered test of an image, its draws forced for a rerun when
+/// `forced` holds some.
+fn run_test(image: Image, number: usize, index: u64, seed: u64, token: Str, forced: Slice[wide::Wide], alloc: mem::Alloc) -> Run fails platform::IoError {
+    var texts = mem::List[text::String].empty(alloc)
+    mut texts.push(decimal(u64.widen(number), alloc))
+    mut texts.push(decimal(index, alloc))
+    mut texts.push(decimal(seed, alloc))
+    mut texts.push(text::String.of(token, alloc))
+    for value in forced {
+        var written = text::String.empty(alloc)
+        mut written.write(text::fmt("{value}", value), budget: 64)
+        mut texts.push(take written)
+    }
+    match image {
+        Image.Host(path) => {
+            let ran_output = try platform::run_output(path.as_str(), args: texts.view(), input: None, capture_errors: true, alloc)
+            if ran_output.status == platform::Status.Exited(lower::TIMED_OUT) or ran_output.status == platform::Status.Signalled(SIGXCPU) {
+                return timed_out(alloc)
+            }
+            return try ran_from(ran_output, start: Some(0), alloc)
+        }
+        Image.Machine(path: path, launch: launch) => {
+            let file = platform::replaced_extension(path.as_str(), extension: "run", alloc)
+            var contents = mem::Bytes.empty(alloc)
+            for written in texts {
+                mut contents.append(written.as_bytes())
+                mut contents.push(0)
+            }
+            try platform::write_file(file.as_str(), contents: contents.view())
+            let booted = attempt emulator::boot(launch, name: lower::RUN_FILE, path: file.as_str(), alloc)
+            try platform::remove_file(file.as_str())
+            match booted {
+                Err(error) => fail error
+                Ok(_) => {}
+            }
+            let Ok(Some(ran_output)) = booted else {
+                return timed_out(alloc)
+            }
+            let start = run_start(ran_output.stdout.view())
+            return try ran_from(ran_output, start, alloc)
+        }
+    }
+} run_test
+
+/// A number in decimal.
+fn decimal(value: u64, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("{value}", value), budget: 32)
+    return written
+} decimal
+
+/// Where the frames of a machine run start: after the first `RUN_START` of its serial output.
+fn run_start(serial: Slice[u8]) -> Option[usize] {
+    let marker = lower::RUN_START
+    if marker.len() > serial.len() {
+        return None
+    }
+    for at in 0..=(serial.len() - marker.len()) {
+        let Some(parts) = serial.split_at(at) else {
+            return None
+        }
+        let Some(window) = parts.tail.prefix(marker.len()) else {
+            return None
+        }
+        if window == marker {
+            expect at <= ~0usize - marker.len()
+            return Some(at + marker.len())
+        }
+    }
+    return None
+} run_start
+
+/// The run that a program's output gives, its frames from `start` of its standard output;
+/// fails when no outcome frame ends it.
+fn ran_from(ran_output: platform::Output, start: Option[usize], alloc: mem::Alloc) -> Run fails platform::IoError {
+    var trace = mem::Bytes.empty(alloc)
+    var draws = mem::List[Draw].empty(alloc)
+    var ended: Option[Ended] = None
+    var contended = false
+    let Some(from) = start else {
+        fail platform::IoError.InvalidData
+    }
+    let Some(parts) = ran_output.stdout.view().split_at(from) else {
+        fail platform::IoError.InvalidData
+    }
+    let frames = parts.tail
+    var at: usize = 0
+    loop {
+        invariant at <= frames.len()
+        if frames.len() - at < 5 {
+            break
+        }
+        let kind = frames[at]
+        let len = usize.widen(frames.u32_le(at + 1))
+        let Some(tail) = frames.split_at(at + 5) else {
+            break
+        }
+        let Some(payload) = tail.tail.prefix(len) else {
+            break
+        }
+        if kind == lower::FRAME_TRACE {
+            mut trace.append(payload)
+        } else if kind == lower::FRAME_DRAW and payload.len() == 64 {
+            mut draws.push(Draw(value: wide_at(payload, at: 0), low: wide_at(payload, at: 16), high: wide_at(payload, at: 32), given: wide_at(payload, at: 48)))
+        } else if kind == lower::FRAME_OUTCOME {
+            let decoded = try decode(payload, alloc)
+            contended = decoded.contended
+            ended = Some(take decoded.ended)
+        }
+        expect at + 5 <= ~0usize - len
+        at = at + 5 + len
+    }
+    let Some(found) = ended else {
+        fail platform::IoError.InvalidData
+    }
+    return Run(ended: take found, contended: contended, trace: take trace, draws: take draws)
+} ran_from
+
+/// The signed 128-bit little-endian integer at an offset of a draw frame's payload.
+fn wide_at(payload: Slice[u8], at: usize) -> wide::Wide {
+    let low = wide::Wide.of_u64(payload.u64_le(at))
+    let high = wide::Wide.of_u64(payload.u64_le(at + 8))
+    return high.shift_left(64).bit_or(low)
+} wide_at
+
+/// How a run ended, and whether it was contended.
+struct Decoded {
+    ended: Ended
+    contended: bool
+} Decoded
+
+/// An outcome frame's payload: how the run ended and whether it was contended.
+fn decode(payload: Slice[u8], alloc: mem::Alloc) -> Decoded fails platform::IoError {
+    let Some(parts) = payload.split_at(3) else {
+        fail platform::IoError.InvalidData
+    }
+    let code = payload[0]
+    let ran = payload[1] != 0
+    let contended = payload[2] != 0
+    let written = output::lossy(parts.tail, alloc)
+    if code == lower::OUTCOME_PASSED {
+        return Decoded(ended: Ended.Passed(ran: ran), contended: contended)
+    }
+    if code == lower::OUTCOME_TRAPPED {
+        return Decoded(ended: Ended.Trapped(report: take written), contended: contended)
+    }
+    if code == lower::OUTCOME_ESCAPED {
+        let text_held = written.as_str()
+        var path = text::String.of(text_held, alloc)
+        var rendering = text::String.empty(alloc)
+        match text_held.find("\0") {
+            Some(cut) => {
+                expect cut < text_held.byte_len()
+                let Some(head) = text_held.slice_bytes(0, end: cut) else {
+                    fail platform::IoError.InvalidData
+                }
+                let Some(rest) = text_held.slice_bytes(cut + 1, end: text_held.byte_len()) else {
+                    fail platform::IoError.InvalidData
+                }
+                path = text::String.of(head, alloc)
+                rendering = text::String.of(rest, alloc)
+            }
+            None => {}
+        }
+        return Decoded(ended: Ended.Escaped(path: take path, rendering: take rendering), contended: contended)
+    }
+    return Decoded(ended: Ended.Stalled(ran: ran), contended: contended)
+} decode

@@ -1,0 +1,523 @@
+//! Lists and bytes over vectors, bounded lists holding their elements inline, and their owning cursors.
+
+/// A member of `mem::List[T]` or `mem::Bytes`, whose elements have type `element`.
+fn lists_list(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty)
+    waive length "one arm per member of the list types, as they are dispatched"
+{
+    let shape = Element.of(mut lo, ty: element)
+    match supply.member() {
+        "empty" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let alloc = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            vector_empty(mut fx, address: sret, alloc, element: shape)
+            supply.done(mut lo, mut fx)
+        }
+        "zeroed" or "try_zeroed" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let len = supply.param(0).scalar_value()
+            let alloc = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            vector_empty(mut fx, address: sret, alloc, element: shape)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+                let drawn = vector_resize(mut lo, fx: mut fx1, address: sret, capacity: len, element: shape)
+                let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+                mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+                    let taken = mem::List[Taken].empty(fx2.alloc)
+                    supply.exhausted(mut lo, fx: mut fx2, taken: taken.view())
+                })
+                let data = mut fx1.load(PTR, addr: sret, offset: VECTOR_DATA)
+                let zero = mut fx1.ptr(0)
+                let fill_args = fx1.list3(data, b: zero, c: len)
+                discard mut lo.call_routine(mut fx1, routine: Routine.Fill, args: fill_args.view())
+                mut fx1.store(len, addr: sret, offset: VECTOR_LEN)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "len" or "capacity" => {
+            let field = match supply.member() {
+                "len" => VECTOR_LEN
+                else => VECTOR_CAPACITY
+            }
+            let value = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: field)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "push" or "try_push" => {
+            let address = supply.param(0).address_value()
+            let value = supply.param(1)
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let needed = mut fx.b.iadd_imm_s(len, y: 1)
+            let room = vector_reserve(mut lo, mut fx, address, needed, element: shape)
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                let taken = Array[Taken, 1].filled(Taken(held: value, ty: element))
+                supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+            })
+            push_reserved(mut lo, mut fx, address, value, element)
+            supply.done(mut lo, mut fx)
+        }
+        "append" or "try_append" => {
+            let address = supply.param(0).address_value()
+            let data = supply.param(1).address_value()
+            let start = mut fx.load(PTR, addr: data, offset: 0)
+            let count = mut fx.load(PTR, addr: data, offset: 8)
+            lists_append(mut lo, mut fx, supply, address, start, count)
+            supply.done(mut lo, mut fx)
+        }
+        "insert" or "try_insert" => {
+            let address = supply.param(0).address_value()
+            let index = supply.param(1).scalar_value()
+            let value = supply.param(2)
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let needed = mut fx.b.iadd_imm_s(len, y: 1)
+            let room = vector_reserve(mut lo, mut fx, address, needed, element: shape)
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                let taken = Array[Taken, 1].filled(Taken(held: value, ty: element))
+                supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+            })
+            let at = open_gap(mut lo, mut fx, address, index, element: shape)
+            mut lo.store_held(mut fx, address: at, held: value, ty: element)
+            supply.done(mut lo, mut fx)
+        }
+        "reserve" or "try_reserve" => {
+            let address = supply.param(0).address_value()
+            let additional = supply.param(1).scalar_value()
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let sum = mut fx.b.uadd_overflow(len, y: additional)
+            let results = fx.types1(clif::Type.Int8)
+            let rooms = mut fx.choose(sum.flag, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+                let no_room = mut fx1.int(clif::Type.Int8, value: 0)
+                return fx1.list1(no_room)
+            }, otherwise: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+                let reserved = vector_reserve(mut lo, fx: mut fx1, address, needed: sum.value, element: shape)
+                return fx1.list1(reserved)
+            })
+            expect rooms.len() == 1
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: rooms[0], y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                let taken = mem::List[Taken].empty(fx1.alloc)
+                supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "pop" => {
+            let address = supply.param(0).address_value()
+            let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            let option = supply.abi.result
+            let laid = mut lo.layout_of(option)
+            let result = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+                let last = mut fx1.b.iadd_imm_s(len, y: -1)
+                let data = mut fx1.load(PTR, addr: address, offset: VECTOR_DATA)
+                let at = shape.at(mut fx1, data, index: last)
+                let held = mut lo1.held_at(mut fx1, ty: element, address: at)
+                mut lo1.store_held(mut fx1, address: payload, held, ty: element)
+                mut fx1.store(last, addr: address, offset: VECTOR_LEN)
+            })
+            let held = mut lo.held_at(mut fx, ty: option, address: result)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "remove" => {
+            let address = supply.param(0).address_value()
+            let index = supply.param(1).scalar_value()
+            let laid = mut lo.layout_of(element)
+            let result = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+            let at = shape.at(mut fx, data, index)
+            let held = mut lo.held_at(mut fx, ty: element, address: at)
+            mut lo.store_held(mut fx, address: result, held, ty: element)
+            close_gap(mut lo, mut fx, address, index, element: shape)
+            let removed = mut lo.held_at(mut fx, ty: element, address: result)
+            supply.ret(mut lo, mut fx, held: removed)
+        }
+        "truncate" => {
+            let address = supply.param(0).address_value()
+            let len = supply.param(1).scalar_value()
+            let current = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+            let shorter = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: len, y: current)
+            mut fx.if_true(shorter, then: fn[mut lo](mut fx1: Fx) {
+                release_elements(mut lo, fx: mut fx1, address, element, from: len)
+                mut fx1.store(len, addr: address, offset: VECTOR_LEN)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "at" or "at_mut" => {
+            let address = supply.param(0).address_value()
+            let index = supply.param(1).scalar_value()
+            let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+            let at = shape.at(mut fx, data, index)
+            supply.ret(mut lo, mut fx, held: Held.Address(at))
+        }
+        "view" or "view_mut" or "cursor_mut" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            vector_write_view(mut fx, view: sret, address: supply.param(0).address_value())
+            supply.done(mut lo, mut fx)
+        }
+        "into_cursor" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let source = supply.param(0).address_value()
+            mut lo.copy(mut fx, dst: sret, src: source, size: 32, align: 8)
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: 32)
+            supply.done(mut lo, mut fx)
+        }
+        "retain" => {
+            let address = supply.param(0).address_value()
+            let keep = supply.param(1).address_value()
+            let fn_ty = fn_param(lo, supply, index: 1)
+            retain(mut lo, mut fx, address, element, keep: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) -> clif::Value {
+                let held = mut lo1.held_at(mut fx1, ty: element, address: at)
+                let called = mut lo1.call_value(mut fx1, fn_ty, function: keep, args: Array[Held, 1].filled(held).view())
+                return called.result.scalar_value()
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "sort_by" => {
+            sort_by(mut lo, mut fx, supply, element)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} lists_list
+
+/// The function type of a parameter.
+fn fn_param(lo: Lowering, supply: Supply, index: usize) -> ty::FnTy {
+    let types = lo.ck.types()
+    expect index < supply.abi.params.len()
+    let ty::TyKind.Fn(id) = types.kind(supply.abi.params[index].nty.ty()) else {
+        expect false
+        return ty::FnTy(kind: ast::FnKind.Plain, params: mem::List[ty::FnParam].empty(lo.alloc), result: ty::Ty.unit(), failure: None, wait: false, limit_set: ty::LimitSet.none(), convention: None)
+    }
+    return ty::copy_fn_ty(types.fn_of(id), alloc: lo.alloc)
+} fn_param
+
+/// Appends `count` bytes from `start` to the bytes at an address, as `append` and `try_append`
+/// do.
+fn lists_append(mut lo: Lowering, mut fx: Fx, supply: Supply, address: clif::Value, start: clif::Value, count: clif::Value) {
+    let shape = Element(size: 1, align: 1)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let sum = mut fx.b.uadd_overflow(len, y: count)
+    let results = fx.types1(clif::Type.Int8)
+    let rooms = mut fx.choose(sum.flag, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let no_room = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(no_room)
+    }, otherwise: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let reserved = vector_reserve(mut lo, fx: mut fx1, address, needed: sum.value, element: shape)
+        return fx1.list1(reserved)
+    })
+    expect rooms.len() == 1
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: rooms[0], y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        let taken = mem::List[Taken].empty(fx1.alloc)
+        supply.exhausted(mut lo, fx: mut fx1, taken: taken.view())
+    })
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let end = mut fx.b.iadd(data, y: len)
+    let copy_args = fx.list3(end, b: start, c: count)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    mut fx.store(sum.value, addr: address, offset: VECTOR_LEN)
+} lists_append
+
+/// `sort_by`: the stable binary insertion sort its section states, calling `order` with the
+/// element moved and an element before it.
+fn sort_by(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let address = supply.param(0).address_value()
+    let order = supply.param(1).address_value()
+    let fn_ty = fn_param(lo, supply, index: 1)
+    let shape = Element.of(mut lo, ty: element)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let moved = mut fx.slot(shape.size, align: shape.align)
+    let one = mut fx.ptr(1)
+    mut fx.each(one, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data, index)
+        let size = mut fx1.ptr(shape.size)
+        let save_args = fx1.list3(moved, b: at, c: size)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: save_args.view())
+        let zero = mut fx1.ptr(0)
+        let initial = fx1.list2(zero, b: index)
+        let bounds = mut fx1.repeat(initial.view(), body: fn[mut lo](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 2
+            let low = current[0]
+            let high = current[1]
+            let open = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: low, y: high)
+            let results = fx2.types2(PTR, b: PTR)
+            let next = mut fx2.choose(open, results: results.view(), then: fn[mut lo](mut fx3: Fx) -> mem::List[clif::Value] {
+                let sum = mut fx3.b.iadd(low, y: high)
+                let middle = mut fx3.b.ushr_imm_s(sum, y: 1)
+                let candidate = shape.at(mut fx3, data, index: middle)
+                let left = mut lo.held_at(mut fx3, ty: element, address: moved)
+                let right = mut lo.held_at(mut fx3, ty: element, address: candidate)
+                var compared = Array[Held, 2].filled(left)
+                compared[1] = right
+                let called = mut lo.call_value(mut fx3, fn_ty, function: order, args: compared.view())
+                let ordering = mut lo.ordering_index(mut fx3, ordering: called.result)
+                let less = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: ordering, y: 0)
+                let above = mut fx3.b.iadd_imm_s(middle, y: 1)
+                let next_low = mut fx3.b.select(less, x: low, y: above)
+                let next_high = mut fx3.b.select(less, x: middle, y: high)
+                return fx3.list2(next_low, b: next_high)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list2(low, b: high)
+            })
+            return Pass(again: open, next: take next)
+        })
+        expect bounds.len() == 2
+        let low = bounds[0]
+        let target = shape.at(mut fx1, data, index: low)
+        let after = mut fx1.b.iadd_imm_s(target, y: i64.from_bits(shape.size))
+        let count = mut fx1.b.isub(index, y: low)
+        let between = shape.bytes(mut fx1, count)
+        let shift_args = fx1.list3(after, b: target, c: between)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: shift_args.view())
+        let moved_size = mut fx1.ptr(shape.size)
+        let place_args = fx1.list3(target, b: moved, c: moved_size)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: place_args.view())
+    })
+} sort_by
+
+/// A member of `mem::Bounded[T, N]`: its length, then its elements inline.
+fn lists_bounded(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "one arm per member of `mem::Bounded`, as they are dispatched"
+{
+    let Some(bounded_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element = supply.type_arg(lo, index: 0)
+    let shape = Element.of(mut lo, ty: element)
+    let len_field = mut lo.layouts.field(lo.ck, ty: bounded_ty, variant: None, label: "len")
+    let len_at = len_field.offset
+    let items_field = mut lo.layouts.field(lo.ck, ty: bounded_ty, variant: None, label: "items")
+    let items_at = items_field.offset
+    match supply.member() {
+        "empty" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: len_at)
+            supply.done(mut lo, mut fx)
+        }
+        "len" => {
+            let len = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: len_at)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+        }
+        "is_full" => {
+            let len = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: len_at)
+            let listed = lo.ck.types().arg_list(lo.ck.types().args_of(bounded_ty))
+            expect listed.len() > 1
+            let bound_arg = listed[1]
+            let bound = const_arg(bound_arg)
+            let full = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: len, y: i64.from_bits(bound.low_bits()))
+            supply.ret(mut lo, mut fx, held: Held.Scalar(full))
+        }
+        "push" => {
+            let address = supply.param(0).address_value()
+            let len = mut fx.load(PTR, addr: address, offset: len_at)
+            let items = mut fx.offset(address, offset: items_at)
+            let at = shape.at(mut fx, data: items, index: len)
+            mut lo.store_held(mut fx, address: at, held: supply.param(1), ty: element)
+            let grown = mut fx.b.iadd_imm_s(len, y: 1)
+            mut fx.store(grown, addr: address, offset: len_at)
+            supply.done(mut lo, mut fx)
+        }
+        "pop" => {
+            let address = supply.param(0).address_value()
+            let len = mut fx.load(PTR, addr: address, offset: len_at)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+            let option = supply.abi.result
+            let laid = mut lo.layout_of(option)
+            let result = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+                let last = mut fx1.b.iadd_imm_s(len, y: -1)
+                let items = mut fx1.offset(address, offset: items_at)
+                let at = shape.at(mut fx1, data: items, index: last)
+                let held = mut lo1.held_at(mut fx1, ty: element, address: at)
+                mut lo1.store_held(mut fx1, address: payload, held, ty: element)
+                mut fx1.store(last, addr: address, offset: len_at)
+            })
+            let held = mut lo.held_at(mut fx, ty: option, address: result)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "at" or "at_mut" => {
+            let address = supply.param(0).address_value()
+            let index = supply.param(1).scalar_value()
+            let items = mut fx.offset(address, offset: items_at)
+            let at = shape.at(mut fx, data: items, index)
+            supply.ret(mut lo, mut fx, held: Held.Address(at))
+        }
+        "view" or "view_mut" or "cursor_mut" => {
+            let address = supply.param(0).address_value()
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let items = mut fx.offset(address, offset: items_at)
+            let len = mut fx.load(PTR, addr: address, offset: len_at)
+            mut fx.store(items, addr: sret, offset: 0)
+            mut fx.store(len, addr: sret, offset: 8)
+            supply.done(mut lo, mut fx)
+        }
+        "into_cursor" => {
+            let source = supply.param(0).address_value()
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let cursor = supply.abi.result
+            let position_field = mut lo.layouts.field(lo.ck, ty: cursor, variant: None, label: "position")
+            let position_at = position_field.offset
+            let held_field = mut lo.layouts.field(lo.ck, ty: cursor, variant: None, label: "bounded")
+            let held_at = held_field.offset
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: position_at)
+            let target = mut fx.offset(sret, offset: held_at)
+            let laid = mut lo.layout_of(bounded_ty)
+            mut lo.copy(mut fx, dst: target, src: source, size: laid.contents().size, align: laid.contents().align)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} lists_bounded
+
+/// `next` of an owning cursor over a vector: its storage, length, capacity, allocator and
+/// position. The element moves out.
+fn vector_next(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let cursor = supply.param(0).address_value()
+    let shape = Element.of(mut lo, ty: element)
+    let len = mut fx.load(PTR, addr: cursor, offset: VECTOR_LEN)
+    let position = mut fx.load(PTR, addr: cursor, offset: 32)
+    let present = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: position, y: len)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        let data = mut fx1.load(PTR, addr: cursor, offset: VECTOR_DATA)
+        let at = shape.at(mut fx1, data, index: position)
+        let held = mut lo1.held_at(mut fx1, ty: element, address: at)
+        mut lo1.store_held(mut fx1, address: payload, held, ty: element)
+        let next = mut fx1.b.iadd_imm_s(position, y: 1)
+        mut fx1.store(next, addr: cursor, offset: 32)
+    })
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} vector_next
+
+/// Releases an owning cursor over a vector: the elements from its position, then the storage.
+fn release_cursor(mut lo: Lowering, mut fx: Fx, address: clif::Value, element: ty::Ty) {
+    let position = mut fx.load(PTR, addr: address, offset: 32)
+    vector_release(mut lo, mut fx, address, element, from: position)
+} release_cursor
+
+/// `next` of a bounded list's cursor: its position, then the bounded list. The element moves
+/// out.
+fn bounded_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(cursor_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element = supply.type_arg(lo, index: 0)
+    let shape = Element.of(mut lo, ty: element)
+    let cursor = supply.param(0).address_value()
+    let position_field = mut lo.layouts.field(lo.ck, ty: cursor_ty, variant: None, label: "position")
+    let position_at = position_field.offset
+    let bounded_field = mut lo.layouts.field(lo.ck, ty: cursor_ty, variant: None, label: "bounded")
+    let bounded_at = bounded_field.offset
+    let bounded_ty = bounded_field.ty
+    let len_field = mut lo.layouts.field(lo.ck, ty: bounded_ty, variant: None, label: "len")
+    let len_at = len_field.offset + bounded_at
+    let items_field = mut lo.layouts.field(lo.ck, ty: bounded_ty, variant: None, label: "items")
+    let items_at = items_field.offset + bounded_at
+    let position = mut fx.load(PTR, addr: cursor, offset: position_at)
+    let len = mut fx.load(PTR, addr: cursor, offset: len_at)
+    let present = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: position, y: len)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        let items = mut fx1.offset(cursor, offset: items_at)
+        let at = shape.at(mut fx1, data: items, index: position)
+        let held = mut lo1.held_at(mut fx1, ty: element, address: at)
+        mut lo1.store_held(mut fx1, address: payload, held, ty: element)
+        let next = mut fx1.b.iadd_imm_s(position, y: 1)
+        mut fx1.store(next, addr: cursor, offset: position_at)
+    })
+    let held = mut lo.held_at(mut fx, ty: option, address: result)
+    supply.ret(mut lo, mut fx, held)
+} bounded_next
+
+/// `Untrusted.append` and `try_append`: bytes appended to untrusted bytes.
+fn append_untrusted(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let address = supply.param(0).address_value()
+    let data = supply.param(1).address_value()
+    let start = mut fx.load(PTR, addr: data, offset: 0)
+    let count = mut fx.load(PTR, addr: data, offset: 8)
+    lists_append(mut lo, mut fx, supply, address, start, count)
+    supply.done(mut lo, mut fx)
+} append_untrusted
+
+/// `Untrusted.copy_prefix` and `try_copy_prefix`: new untrusted bytes holding a prefix of the
+/// content's bytes.
+fn copy_prefix(mut lo: Lowering, mut fx: Fx, supply: Supply, start: clif::Value) {
+    let count = supply.param(1).scalar_value()
+    let alloc = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let shape = Element(size: 1, align: 1)
+    vector_empty(mut fx, address: sret, alloc, element: shape)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let drawn = vector_resize(mut lo, fx: mut fx1, address: sret, capacity: count, element: shape)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: drawn, y: 0)
+        mut fx1.if_true(failed, then: fn[mut lo](mut fx2: Fx) {
+            let taken = mem::List[Taken].empty(fx2.alloc)
+            supply.exhausted(mut lo, fx: mut fx2, taken: taken.view())
+        })
+        let data = mut fx1.load(PTR, addr: sret, offset: VECTOR_DATA)
+        let copy_args = fx1.list3(data, b: start, c: count)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        mut fx1.store(count, addr: sret, offset: VECTOR_LEN)
+    })
+    supply.done(mut lo, mut fx)
+} copy_prefix
+
+/// The element type of `mem::Bytes`.
+fn lists_byte() -> ty::Ty {
+    return ty::Ty.scalar(ty::Scalar.Unsigned8)
+} lists_byte

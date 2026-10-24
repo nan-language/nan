@@ -1,0 +1,140 @@
+//! `nan api update`: computes the API snapshots of the packages holding its scope and rewrites those of the modules in its scope, confirming the public docs of the items `--confirm-docs` names.
+
+/// `nan api update`.
+fn api_update(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        let named = match invocation.scope() {
+            Some(written) => written
+            None => "."
+        }
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: named, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let confirmed = match confirmed_docs(invocation, session, current, scope: resolved.scope, alloc) {
+        Ok(items) => items
+        Err(code) => return invocation.tool_error(code, scope: resolved.written.as_str(), alloc)
+    }
+    var changes = mem::List[journal::Change].empty(alloc)
+    var diagnostics = session.reported(resolved.scope)
+    for index in 0..<held.packages.len() {
+        let Some(source) = held.packages.get(index) else {
+            expect false
+            continue
+        }
+        var touched = false
+        for module in 0..<source.modules.len() {
+            if module_in_scope(held, scope: resolved.scope, index, module) {
+                touched = true
+            }
+        }
+        if touched {
+            package_updates(session, scope: resolved.scope, index, confirmed: confirmed.view(), mut changes, mut diagnostics, alloc)
+        }
+    }
+    mut changes.sort_by(fn(left: journal::Change, right: journal::Change) => left.path.as_str().cmp(right.path.as_str()))
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        mut records.push(record(held, std: session.std.contents(), scope: resolved.scope, reported, alloc))
+    }
+    return written_output(invocation, written: resolved.written.as_str(), take records, changes: changes.view(), alloc)
+} api_update
+
+/// The canonical paths of the items `--confirm-docs` names, each with public docs and in the
+/// scope; or the code of the tool error naming one otherwise.
+fn confirmed_docs(invocation: Invocation, session: check::Session, current: Str, scope: scope::Scope, alloc: mem::Alloc) -> Result[mem::List[text::String], diagnostic::Code] {
+    let held = session.workspace.contents()
+    var confirmed = mem::List[text::String].empty(alloc)
+    for named in take invocation.listed("--confirm-docs", alloc) {
+        let Some(item_scope) = scope::Scope.resolve(held, current, written: Some(named.as_str()), alloc) else {
+            return Err(diagnostic::Code.ToolUnknownScope)
+        }
+        let scope::Scope.Lines(path: path, lines: lines) = item_scope.scope else {
+            return Err(diagnostic::Code.ToolUsage)
+        }
+        let Some(item) = held.item_at(path.as_str(), line: lines.low, alloc) else {
+            return Err(diagnostic::Code.ToolUsage)
+        }
+        let canonical = item.canonical(alloc)
+        if not session.has_public_docs(canonical.as_str()) or not scope.holds(held, path: path.as_str(), line: Some(lines.low)) {
+            return Err(diagnostic::Code.ToolUsage)
+        }
+        mut confirmed.push(take canonical)
+    }
+    return Ok(take confirmed)
+} confirmed_docs
+
+/// Adds the snapshot files of the modules in scope of the workspace package at `index` that
+/// differ from those it holds, and the pending weakenings recorded on lines of the scope.
+fn package_updates(session: check::Session, scope: scope::Scope, index: usize, confirmed: Slice[text::String], mut changes: mem::List[journal::Change], mut diagnostics: mem::List[diagnostic::Diagnostic], alloc: mem::Alloc) {
+    let held = session.workspace.contents()
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return
+    }
+    let check::Snapshots(modules: modules, recorded: recorded) = session.package_snapshots(index, confirmed)
+    for computed in take modules {
+        let Some(module) = source.modules.position(fn(candidate: workspace::Module) => candidate.name == computed.name) else {
+            continue
+        }
+        if not module_in_scope(held, scope, index, module) {
+            continue
+        }
+        var path = text::String.of(source.dir.as_str(), alloc)
+        mut path.append("/.nan/api/")
+        mut path.append(computed.name.as_str())
+        mut path.append(".nan")
+        var bytes: Option[mem::Bytes] = None
+        let snapshot = take computed.into_snapshot()
+        match snapshot {
+            Some(written_snapshot) => {
+                bytes = written_snapshot.bytes(grammar: session.grammar.contents(), alloc)
+            }
+            None => {}
+        }
+        if not same_content(bytes, old: source.machine.bytes(path.as_str())) {
+            mut changes.push(journal::Change(path: take path, content: take bytes))
+        }
+    }
+    for pending in recorded {
+        if not scope.holds(held, path: pending.file.as_str(), line: Some(pending.line)) {
+            continue
+        }
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.ApiWeakeningPending, path: pending.file.as_str(), line: pending.line, alloc)
+        for part in pending.parts {
+            mut reported.because.push(diagnostic::Reason.note(part.as_str(), alloc))
+        }
+        reported.item = Some(text::String.of(pending.path.as_str(), alloc))
+        mut diagnostics.push(take reported)
+    }
+} package_updates
+
+/// Whether a scope holds a module of the workspace package at `index`.
+fn module_in_scope(held: workspace::Workspace, scope: scope::Scope, index: usize, module: usize) -> bool {
+    return match scope {
+        scope::Scope.Workspace => true
+        scope::Scope.Package(package_index) => package_index == index
+        scope::Scope.Module(package_index: package_index, module: module_index) => package_index == index and module_index == module
+        scope::Scope.File(path) or scope::Scope.Lines(path: path, lines: _) => file_in_module(held, path: path.as_str(), index, module)
+    }
+} module_in_scope
+
+/// Whether the workspace file at `path` belongs to a module of the package at `index`.
+fn file_in_module(held: workspace::Workspace, path: Str, index: usize, module: usize) -> bool {
+    let Some(at) = held.file(path) else {
+        return false
+    }
+    return at.package_index == index and held.file_at(at).module == Some(module)
+} file_in_module
+
+/// Whether new content of a machine file is what it holds, absence included.
+fn same_content(content: Option[mem::Bytes], old: Option[Slice[u8]]) -> bool {
+    let Some(bytes) = content else {
+        return old.is_none()
+    }
+    let Some(held) = old else {
+        return false
+    }
+    return bytes.view() == held
+} same_content

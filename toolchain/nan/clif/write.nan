@@ -1,0 +1,601 @@
+//! The text form of functions, as Cranelift's `write` module and the displays it uses write it.
+
+/// Writes `func` as `Function::display` does: its name and signature, the entities its preamble
+/// declares, then each block of the layout with its instructions.
+fn write_function(func: Function, mut w: text::String, alloc: mem::Alloc) {
+    mut w.append("function ")
+    write_external_name(mut w, name: func.name)
+    write_signature(mut w, signature: func.signature)
+    mut w.append(" {\n")
+    let aliases = alias_map(func, alloc)
+    var any = write_preamble(func, mut w)
+    for block in func.laid.order {
+        if any {
+            mut w.push('\n')
+        }
+        decorate_block(func, mut w, aliases, block, alloc)
+        any = true
+    }
+    mut w.append("}\n")
+} write_function
+
+/// The aliases of each value that is an alias's immediate target, in value order.
+fn alias_map(func: Function, alloc: mem::Alloc) -> mem::HashMap[Value, mem::List[Value]] {
+    var aliases = mem::HashMap[Value, mem::List[Value]].empty(seed: 0, alloc)
+    for index in 0..<func.dfg.values.len() {
+        let ValueData.Alias(ty: _, original: original) = func.dfg.values[index] else {
+            continue
+        }
+        let alias = Value(index: u32.fit(index))
+        if aliases.contains(original) {
+            var listed = mut aliases.at_mut(original)
+            mut listed.push(alias)
+            continue
+        }
+        var fresh = mem::List[Value].empty(alloc)
+        mut fresh.push(alias)
+        discard mut aliases.insert(original, value: take fresh)
+    }
+    return aliases
+} alias_map
+
+/// Writes the stack slots, global values, signatures and external functions the function
+/// declares, and gives whether it wrote any.
+fn write_preamble(func: Function, mut w: text::String) -> bool {
+    var any = false
+    for index in 0..<func.stack_slots.len() {
+        any = true
+        let slot = func.stack_slots[index]
+        mut w.append("    ss")
+        write_decimal(mut w, value: u64.widen(index))
+        mut w.append(" = explicit_slot ")
+        write_decimal(mut w, value: u64.widen(slot.size))
+        if slot.align_shift != 0 {
+            mut w.append(", align = ")
+            write_decimal(mut w, value: 1u64 << u32.widen(slot.align_shift))
+        }
+        mut w.push('\n')
+    }
+    for index in 0..<func.global_values.len() {
+        any = true
+        let data = func.global_values[index]
+        mut w.append("    gv")
+        write_decimal(mut w, value: u64.widen(index))
+        mut w.append(" = symbol ")
+        if data.colocated {
+            mut w.append("colocated ")
+        }
+        if data.tls {
+            mut w.append("tls ")
+        }
+        mut w.append("userextname")
+        write_decimal(mut w, value: u64.widen(func.params.user_name_ref(data.name)))
+        mut w.push('\n')
+    }
+    for index in 0..<func.dfg.signatures.len() {
+        any = true
+        mut w.append("    sig")
+        write_decimal(mut w, value: u64.widen(index))
+        mut w.append(" = ")
+        write_signature(mut w, signature: func.dfg.signatures[index])
+        mut w.push('\n')
+    }
+    for index in 0..<func.dfg.ext_funcs.len() {
+        any = true
+        let data = func.dfg.ext_funcs[index]
+        mut w.append("    fn")
+        write_decimal(mut w, value: u64.widen(index))
+        mut w.append(" = ")
+        if data.colocated {
+            mut w.append("colocated ")
+        }
+        write_external_name(mut w, name: data.name)
+        mut w.append(" sig")
+        write_decimal(mut w, value: u64.widen(data.signature.index))
+        mut w.push('\n')
+    }
+    return any
+} write_preamble
+
+fn write_external_name(mut w: text::String, name: ExternalName) {
+    mut w.push('u')
+    write_decimal(mut w, value: u64.widen(name.namespace))
+    mut w.push(':')
+    write_decimal(mut w, value: u64.widen(name.index))
+} write_external_name
+
+fn write_signature(mut w: text::String, signature: Signature) {
+    mut w.push('(')
+    write_types(mut w, params: signature.params.view())
+    mut w.push(')')
+    if signature.returns.len() > 0 {
+        mut w.append(" -> ")
+        write_types(mut w, params: signature.returns.view())
+    }
+    mut w.push(' ')
+    mut w.append(signature.call_conv.name())
+} write_signature
+
+fn write_types(mut w: text::String, params: Slice[AbiParam]) {
+    for index in 0..<params.len() {
+        if index > 0 {
+            mut w.append(", ")
+        }
+        mut w.append(params[index].value_type.name())
+    }
+} write_types
+
+/// Writes a block's header, the aliases of its parameters and its instructions, indented further
+/// when the function has source locations.
+fn decorate_block(func: Function, mut w: text::String, aliases: mem::HashMap[Value, mem::List[Value]], block: Block, alloc: mem::Alloc) {
+    let indent: usize = match func.srclocs.len() {
+        0 => 4
+        else => 36
+    }
+    write_spaces(mut w, count: indent - 4)
+    write_entity(mut w, prefix: "block", index: block.index)
+    let params = func.dfg.block_params(block)
+    for position in 0..<params.len() {
+        match position {
+            0 => mut w.push('(')
+            else => mut w.append(", ")
+        }
+        write_value(mut w, value: params[position])
+        mut w.append(": ")
+        mut w.append(func.dfg.value_type(params[position]).name())
+    }
+    if params.len() > 0 {
+        mut w.push(')')
+    }
+    if func.laid.is_cold(block) {
+        mut w.append(" cold")
+    }
+    mut w.append(":\n")
+    for param in params {
+        write_value_aliases(mut w, aliases, target: param, indent, alloc)
+    }
+    for inst in func.laid.block_insts(block) {
+        write_instruction(func, mut w, aliases, inst, indent, alloc)
+    }
+} decorate_block
+
+/// Writes the aliases of `target`, each followed by its own aliases.
+fn write_value_aliases(mut w: text::String, aliases: mem::HashMap[Value, mem::List[Value]], target: Value, indent: usize, alloc: mem::Alloc) {
+    var pending = mem::List[Value].empty(alloc)
+    mut pending.push(target)
+    loop {
+        let Some(current) = mut pending.pop() else {
+            return
+        }
+        let Some(listed) = aliases.get(current) else {
+            continue
+        }
+        for alias in listed {
+            write_spaces(mut w, count: indent)
+            write_value(mut w, value: alias)
+            mut w.append(" -> ")
+            write_value(mut w, value: current)
+            mut w.push('\n')
+            mut pending.push(alias)
+        }
+    }
+} write_value_aliases
+
+fn write_instruction(func: Function, mut w: text::String, aliases: mem::HashMap[Value, mem::List[Value]], inst: Inst, indent: usize, alloc: mem::Alloc) {
+    var prefix = text::String.empty(alloc)
+    let srcloc = func.srcloc(inst)
+    if not srcloc.is_default() {
+        mut prefix.push('@')
+        write_hex(mut prefix, value: u64.widen(srcloc.bits), digits: 4)
+        mut prefix.push(' ')
+    }
+    mut w.append(prefix.as_str())
+    if prefix.byte_len() < indent {
+        write_spaces(mut w, count: indent - prefix.byte_len())
+    }
+    let results = func.dfg.inst_results(inst, alloc)
+    for position in 0..<results.len() {
+        if position > 0 {
+            mut w.append(", ")
+        }
+        write_value(mut w, value: results[position])
+    }
+    if results.len() > 0 {
+        mut w.append(" = ")
+    }
+    let data = func.dfg.inst_data(inst)
+    mut w.append(data.opcode().name())
+    match type_suffix(func, inst) {
+        Some(suffix) => {
+            mut w.push('.')
+            mut w.append(suffix.name())
+        }
+        None => {}
+    }
+    write_operands(mut w, dfg: func.dfg, inst, alloc)
+    mut w.push('\n')
+    for result in results {
+        write_value_aliases(mut w, aliases, target: result, indent, alloc)
+    }
+} write_instruction
+
+/// The controlling type an instruction's text names, which it leaves out when its designated
+/// operand is defined in the instruction's own block.
+fn type_suffix(func: Function, inst: Inst) -> Option[Type] {
+    let data = func.dfg.inst_data(inst)
+    let opcode = data.opcode()
+    if not opcode.is_polymorphic() {
+        return None
+    }
+    if opcode.uses_typevar_operand() {
+        let Some(operand) = data.typevar_operand() else {
+            expect false
+            return None
+        }
+        let def_block = match func.dfg.value_data(func.dfg.resolve_aliases(operand)) {
+            ValueData.Inst(ty: _, num: _, inst: defining) => func.laid.inst_block(defining)
+            ValueData.Param(ty: _, num: _, block: block) => Some(block)
+            ValueData.Alias(ty: _, original: _) => None
+        }
+        if def_block.is_some() and def_block == func.laid.inst_block(inst) {
+            return None
+        }
+    }
+    return func.dfg.ctrl_typevar(inst)
+} type_suffix
+
+/// Writes an instruction's operands, then the constants among the values it reads as a comment.
+fn write_operands(mut w: text::String, dfg: DataFlowGraph, inst: Inst, alloc: mem::Alloc)
+    waive length "one arm per instruction format, as Cranelift writes them"
+{
+    let data = dfg.inst_data(inst)
+    match data {
+        InstructionData.AtomicRmw(opcode: _, flags: _, op: op, p: p, x: x) => {
+            mut w.push(' ')
+            mut w.append(op.name())
+            mut w.push(' ')
+            write_values(mut w, left: p, right: x)
+        }
+        InstructionData.AtomicCas(opcode: _, flags: _, p: p, e: e, x: x) => {
+            mut w.push(' ')
+            write_values(mut w, left: p, right: e)
+            mut w.append(", ")
+            write_value(mut w, value: x)
+        }
+        InstructionData.LoadNoOffset(opcode: _, flags: flags, arg: arg) => {
+            write_mem_flags(mut w, flags)
+            mut w.push(' ')
+            write_value(mut w, value: arg)
+        }
+        InstructionData.StoreNoOffset(opcode: _, flags: flags, x: x, p: p) => {
+            write_mem_flags(mut w, flags)
+            mut w.push(' ')
+            write_values(mut w, left: x, right: p)
+        }
+        InstructionData.Unary(opcode: _, arg: arg) => {
+            mut w.push(' ')
+            write_value(mut w, value: arg)
+        }
+        InstructionData.UnaryImm(opcode: _, imm: imm) => {
+            mut w.push(' ')
+            write_imm(mut w, imm: sign_extend(imm, ty: dfg.ctrl_typevar(inst)))
+        }
+        InstructionData.UnaryIeee32(opcode: _, bits: bits) => {
+            mut w.push(' ')
+            write_float(mut w, bits: u64.widen(bits), exponent_bits: 8, significand_bits: 23)
+        }
+        InstructionData.UnaryIeee64(opcode: _, bits: bits) => {
+            mut w.push(' ')
+            write_float(mut w, bits, exponent_bits: 11, significand_bits: 52)
+        }
+        InstructionData.UnaryGlobalValue(opcode: _, global_value: global_value) => {
+            mut w.push(' ')
+            write_entity(mut w, prefix: "gv", index: global_value.index)
+        }
+        InstructionData.Binary(opcode: _, x: x, y: y) => {
+            mut w.push(' ')
+            write_values(mut w, left: x, right: y)
+        }
+        InstructionData.Ternary(opcode: _, x: x, y: y, z: z) => {
+            mut w.push(' ')
+            write_values(mut w, left: x, right: y)
+            mut w.append(", ")
+            write_value(mut w, value: z)
+        }
+        InstructionData.MultiAry(opcode: _, args: args) => {
+            if args.len() > 0 {
+                mut w.push(' ')
+                write_value_list(mut w, values: args.view())
+            }
+        }
+        InstructionData.NullAry(opcode: _) => mut w.push(' ')
+        InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            mut w.push(' ')
+            mut w.append(cond.name())
+            mut w.push(' ')
+            write_values(mut w, left: x, right: y)
+        }
+        InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            mut w.push(' ')
+            mut w.append(cond.name())
+            mut w.push(' ')
+            write_values(mut w, left: x, right: y)
+        }
+        InstructionData.Jump(opcode: _, destination: destination) => {
+            mut w.push(' ')
+            write_block_call(mut w, call: destination)
+        }
+        InstructionData.Brif(opcode: _, arg: arg, then: then, otherwise: otherwise) => {
+            mut w.push(' ')
+            write_value(mut w, value: arg)
+            mut w.append(", ")
+            write_block_call(mut w, call: then)
+            mut w.append(", ")
+            write_block_call(mut w, call: otherwise)
+        }
+        InstructionData.Call(opcode: _, func_ref: func_ref, args: args) => {
+            mut w.push(' ')
+            write_entity(mut w, prefix: "fn", index: func_ref.index)
+            mut w.push('(')
+            write_value_list(mut w, values: args.view())
+            mut w.push(')')
+        }
+        InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: callee, args: args) => {
+            mut w.push(' ')
+            write_entity(mut w, prefix: "sig", index: sig_ref.index)
+            mut w.append(", ")
+            write_value(mut w, value: callee)
+            mut w.push('(')
+            write_value_list(mut w, values: args.view())
+            mut w.push(')')
+        }
+        InstructionData.FuncAddr(opcode: _, func_ref: func_ref) => {
+            mut w.push(' ')
+            write_entity(mut w, prefix: "fn", index: func_ref.index)
+        }
+        InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => {
+            mut w.push(' ')
+            write_entity(mut w, prefix: "ss", index: slot.index)
+            write_offset(mut w, offset)
+        }
+        InstructionData.Load(opcode: _, flags: flags, arg: arg, offset: offset) => {
+            write_mem_flags(mut w, flags)
+            mut w.push(' ')
+            write_value(mut w, value: arg)
+            write_offset(mut w, offset)
+        }
+        InstructionData.Store(opcode: _, flags: flags, x: x, p: p, offset: offset) => {
+            write_mem_flags(mut w, flags)
+            mut w.push(' ')
+            write_values(mut w, left: x, right: p)
+            write_offset(mut w, offset)
+        }
+        InstructionData.Trap(opcode: _, code: code) => {
+            mut w.append(" user")
+            write_decimal(mut w, value: u64.widen(code.user))
+        }
+    }
+    write_constants(mut w, dfg, values: data.values(alloc))
+} write_operands
+
+/// Writes the values among `values` that constants define, with their constants, as a comment.
+fn write_constants(mut w: text::String, dfg: DataFlowGraph, values: mem::List[Value]) {
+    var separator: Str = "  ; "
+    for arg in values {
+        let ValueData.Inst(ty: _, num: _, inst: source) = dfg.value_data(dfg.resolve_aliases(arg)) else {
+            continue
+        }
+        match dfg.inst_data(source) {
+            InstructionData.UnaryImm(opcode: _, imm: imm) => {
+                write_constant(mut w, separator, arg)
+                write_imm(mut w, imm: sign_extend(imm, ty: dfg.ctrl_typevar(source)))
+            }
+            InstructionData.UnaryIeee32(opcode: _, bits: bits) => {
+                write_constant(mut w, separator, arg)
+                write_float(mut w, bits: u64.widen(bits), exponent_bits: 8, significand_bits: 23)
+            }
+            InstructionData.UnaryIeee64(opcode: _, bits: bits) => {
+                write_constant(mut w, separator, arg)
+                write_float(mut w, bits, exponent_bits: 11, significand_bits: 52)
+            }
+            else => continue
+        }
+        separator = ", "
+    }
+} write_constants
+
+fn write_constant(mut w: text::String, separator: Str, arg: Value) {
+    mut w.append(separator)
+    write_value(mut w, value: arg)
+    mut w.append(" = ")
+} write_constant
+
+/// An immediate sign-extended from the width of the type it is a constant of.
+fn sign_extend(imm: i64, ty: Option[Type]) -> i64 {
+    let Some(ctrl) = ty else {
+        return imm
+    }
+    let bits = ctrl.bits()
+    if bits >= 64 {
+        return imm
+    }
+    let delta = 64 - bits
+    return imm.wrapping_shl(delta).shr_arith(delta)
+} sign_extend
+
+fn write_mem_flags(mut w: text::String, flags: MemFlags) {
+    if flags.notrap {
+        mut w.append(" notrap")
+    }
+    if flags.aligned {
+        mut w.append(" aligned")
+    }
+} write_mem_flags
+
+fn write_block_call(mut w: text::String, call: BlockCall) {
+    write_entity(mut w, prefix: "block", index: call.block.index)
+    if call.args.len() > 0 {
+        mut w.push('(')
+        write_value_list(mut w, values: call.args.view())
+        mut w.push(')')
+    }
+} write_block_call
+
+fn write_value_list(mut w: text::String, values: Slice[Value]) {
+    for index in 0..<values.len() {
+        if index > 0 {
+            mut w.append(", ")
+        }
+        write_value(mut w, value: values[index])
+    }
+} write_value_list
+
+fn write_values(mut w: text::String, left: Value, right: Value) {
+    write_value(mut w, value: left)
+    mut w.append(", ")
+    write_value(mut w, value: right)
+} write_values
+
+fn write_value(mut w: text::String, value: Value) {
+    write_entity(mut w, prefix: "v", index: value.index)
+} write_value
+
+fn write_entity(mut w: text::String, prefix: Str, index: u32) {
+    mut w.append(prefix)
+    write_decimal(mut w, value: u64.widen(index))
+} write_entity
+
+fn write_spaces(mut w: text::String, count: usize) {
+    for _ in 0..<count {
+        mut w.push(' ')
+    }
+} write_spaces
+
+fn write_decimal(mut w: text::String, value: u64) {
+    mut w.write(text::fmt("{value}", value), budget: 32)
+} write_decimal
+
+/// An `Imm64`: in decimal below 10000, negative values included, in hexadecimal otherwise.
+fn write_imm(mut w: text::String, imm: i64) {
+    if imm < 10_000 {
+        mut w.write(text::fmt("{imm}", imm), budget: 32)
+        return
+    }
+    write_grouped_hex(mut w, value: imm.to_bits())
+} write_imm
+
+/// An `Offset32`: nothing for zero, else its sign and magnitude, in decimal below 10000 and in
+/// hexadecimal otherwise.
+fn write_offset(mut w: text::String, offset: i32) {
+    if offset == 0 {
+        return
+    }
+    var magnitude = i64.widen(offset)
+    if magnitude < 0 {
+        mut w.push('-')
+        magnitude = 0 - magnitude
+    } else {
+        mut w.push('+')
+    }
+    if magnitude < 10_000 {
+        mut w.write(text::fmt("{magnitude}", magnitude), budget: 32)
+        return
+    }
+    write_grouped_hex(mut w, value: magnitude.to_bits())
+} write_offset
+
+/// `0x` and the value's hexadecimal digits in groups of four separated by `_`, the first group
+/// zero-padded.
+fn write_grouped_hex(mut w: text::String, value: u64) {
+    let zeros = value.leading_zeros()
+    expect zeros < 64
+    var position = (63 - zeros) & 0xF0
+    mut w.append("0x")
+    write_hex(mut w, value: (value >> position) & 0xFFFF, digits: 4)
+    while position > 0 {
+        invariant position % 16 == 0
+        position -= 16
+        mut w.push('_')
+        write_hex(mut w, value: (value >> position) & 0xFFFF, digits: 4)
+    }
+} write_grouped_hex
+
+const HEX_DIGITS: Str = "0123456789abcdef"
+
+/// A value's lowercase hexadecimal digits, zero-padded to at least `digits` of them.
+fn write_hex(mut w: text::String, value: u64, digits: u32)
+    requires digits <= 16
+{
+    var count: u32 = 1
+    while count < 16 and (value >> (4 * count)) != 0 {
+        count += 1
+    }
+    if count < digits {
+        count = digits
+    }
+    expect count <= 16
+    for back in 0..<count {
+        let position = count - 1 - back
+        let digit = usize.widen((value >> (4 * position)) & 0xF)
+        let Some(spelt) = HEX_DIGITS.slice_bytes(digit, end: digit + 1) else {
+            return
+        }
+        mut w.append(spelt)
+    }
+} write_hex
+
+/// An IEEE float given its bits and the widths of its exponent and trailing significand: a
+/// hexadecimal significand with a decimal binary exponent, `0.0`, `Inf` or a NaN with its payload.
+fn write_float(mut w: text::String, bits: u64, exponent_bits: u32, significand_bits: u32)
+    requires exponent_bits >= 1 and exponent_bits <= 11 and significand_bits >= 1 and significand_bits <= 52
+{
+    let max_e_bits = 0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - exponent_bits)
+    let t_bits = bits & (0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - significand_bits))
+    let e_bits = (bits >> significand_bits) & max_e_bits
+    let sign_bit = (bits >> (exponent_bits + significand_bits)) & 1
+    let bias = i64.fit(max_e_bits >> 1)
+    let digits = (significand_bits + 3) / 4
+    let left_t_bits = t_bits << ((4 * digits) - significand_bits)
+    if sign_bit != 0 {
+        mut w.push('-')
+    }
+    if e_bits == 0 {
+        if t_bits == 0 {
+            mut w.append("0.0")
+            return
+        }
+        mut w.append("0x0.")
+        write_hex(mut w, value: left_t_bits, digits)
+        mut w.push('p')
+        let emin = 1 - bias
+        mut w.write(text::fmt("{emin}", emin), budget: 32)
+        return
+    }
+    if e_bits == max_e_bits {
+        if sign_bit == 0 {
+            mut w.push('+')
+        }
+        if t_bits == 0 {
+            mut w.append("Inf")
+            return
+        }
+        let quiet = 1u64 << (significand_bits - 1)
+        let payload = t_bits & ~quiet
+        if (t_bits & quiet) == 0 {
+            mut w.append("sNaN:0x")
+            write_hex(mut w, value: payload, digits: 1)
+            return
+        }
+        mut w.append("NaN")
+        if payload != 0 {
+            mut w.append(":0x")
+            write_hex(mut w, value: payload, digits: 1)
+        }
+        return
+    }
+    mut w.append("0x1.")
+    write_hex(mut w, value: left_t_bits, digits)
+    mut w.push('p')
+    let e = i64.fit(e_bits) - bias
+    mut w.write(text::fmt("{e}", e), budget: 32)
+} write_float

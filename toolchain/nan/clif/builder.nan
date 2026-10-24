@@ -1,0 +1,675 @@
+//! The function builder: Cranelift's, with its construction of SSA form from variables.
+
+/// Builds a function's blocks and instructions in the current block, giving each use of a
+/// variable the SSA value that reaches it.
+pkg struct Builder {
+    pkg func: Function
+    /// The source location of the instructions built next.
+    srcloc: SourceLoc
+    /// The block instructions are built in.
+    position: Option[Block]
+    /// How far each block is filled, by block index.
+    status: mem::List[BlockStatus]
+    /// The type of each variable declared, by variable index.
+    variables: mem::List[Type]
+    ssa: SsaBuilder
+    alloc: mem::Alloc
+} Builder
+
+/// How far a block is filled: no instruction yet, some but no terminator, or a terminator.
+enum BlockStatus derives Copy, Eq {
+    Empty
+    Partial
+    Filled
+} BlockStatus
+
+/// The two halves of a 128-bit value.
+pkg struct Halves derives Copy, Eq {
+    pkg low: Value
+    pkg high: Value
+} Halves
+
+/// The result of an arithmetic operation checking overflow, and whether it overflowed.
+pkg struct Overflowed derives Copy, Eq {
+    pkg value: Value
+    pkg flag: Value
+} Overflowed
+
+pkg fn Builder.new(take func: Function, alloc: mem::Alloc) -> Builder {
+    return Builder(
+        func: take func,
+        srcloc: DEFAULT_LOC,
+        position: None,
+        status: mem::List[BlockStatus].empty(alloc),
+        variables: mem::List[Type].empty(alloc),
+        ssa: SsaBuilder.empty(alloc),
+        alloc: alloc,
+    )
+} Builder.new
+
+/// The function built, once every block is filled and sealed.
+pkg fn Builder.finalize(take self) -> Function {
+    return self.func
+} Builder.finalize
+
+pkg fn Builder.current_block(self) -> Option[Block] {
+    return self.position
+} Builder.current_block
+
+/// Sets the source location of the instructions built next.
+pkg fn Builder.set_srcloc(mut self, loc: SourceLoc) {
+    self.srcloc = loc
+} Builder.set_srcloc
+
+pkg fn Builder.create_block(mut self) -> Block {
+    let block = mut self.func.make_block()
+    mut self.ssa.declare_block(block)
+    mut self.status.push(BlockStatus.Empty)
+    return block
+} Builder.create_block
+
+pkg fn Builder.set_cold_block(mut self, block: Block) {
+    mut self.func.laid.set_cold(block)
+} Builder.set_cold_block
+
+pkg fn Builder.switch_to_block(mut self, block: Block) {
+    self.position = Some(block)
+} Builder.switch_to_block
+
+/// Declares that every predecessor of a block is known.
+pkg fn Builder.seal_block(mut self, block: Block) {
+    mut self.ssa.seal_block(block, func: mut self.func)
+    mut self.handle_ssa_side_effects()
+} Builder.seal_block
+
+pkg fn Builder.seal_all_blocks(mut self) {
+    mut self.ssa.seal_all_blocks(mut self.func)
+    mut self.handle_ssa_side_effects()
+} Builder.seal_all_blocks
+
+pkg fn Builder.declare_var(mut self, ty: Type) -> Variable {
+    let variable = Variable(index: u32.fit(self.variables.len()))
+    mut self.variables.push(ty)
+    return variable
+} Builder.declare_var
+
+pkg fn Builder.use_var(mut self, variable: Variable) -> Value {
+    mut self.ensure_inserted_block()
+    let Some(block) = self.position else {
+        expect false
+        return Value(index: 0)
+    }
+    expect usize.widen(variable.index) < self.variables.len()
+    let ty = self.variables[usize.widen(variable.index)]
+    let value = mut self.ssa.use_var(mut self.func, variable, ty, block)
+    mut self.handle_ssa_side_effects()
+    return value
+} Builder.use_var
+
+pkg fn Builder.def_var(mut self, variable: Variable, val: Value) {
+    expect usize.widen(variable.index) < self.variables.len()
+    expect self.variables[usize.widen(variable.index)] == self.func.dfg.value_type(val)
+    let Some(block) = self.position else {
+        expect false
+        return
+    }
+    mut self.ssa.def_var(variable, value: val, block)
+} Builder.def_var
+
+pkg fn Builder.create_sized_stack_slot(mut self, data: StackSlotData) -> StackSlot {
+    return mut self.func.create_sized_stack_slot(data)
+} Builder.create_sized_stack_slot
+
+pkg fn Builder.import_signature(mut self, take signature: Signature) -> SigRef {
+    return mut self.func.import_signature(take signature)
+} Builder.import_signature
+
+/// Declares a function the function calls or takes the address of, numbering its name among the
+/// names the function refers to.
+pkg fn Builder.import_function(mut self, data: ExtFuncData) -> FuncRef {
+    discard mut self.func.declare_imported_user_function(data.name)
+    return mut self.func.import_function(data)
+} Builder.import_function
+
+/// Declares a symbol whose address the function takes, numbering its name among the names the
+/// function refers to.
+pkg fn Builder.create_global_value(mut self, data: GlobalValueData) -> GlobalValue {
+    discard mut self.func.declare_imported_user_function(data.name)
+    return mut self.func.create_global_value(data)
+} Builder.create_global_value
+
+pkg fn Builder.append_block_params_for_function_params(mut self, block: Block) {
+    for param in self.func.signature.params {
+        discard mut self.func.dfg.append_block_param(block, ty: param.value_type)
+    }
+} Builder.append_block_params_for_function_params
+
+pkg fn Builder.append_block_param(mut self, block: Block, ty: Type) -> Value {
+    return mut self.func.dfg.append_block_param(block, ty)
+} Builder.append_block_param
+
+pkg fn Builder.block_params(self, block: Block, alloc: mem::Alloc) -> mem::List[Value] {
+    return self.func.block_params(block, alloc)
+} Builder.block_params
+
+pkg fn Builder.inst_results(self, inst: Inst, alloc: mem::Alloc) -> mem::List[Value] {
+    return self.func.dfg.inst_results(inst, alloc)
+} Builder.inst_results
+
+pkg fn Builder.value_type(self, value: Value) -> Type {
+    return self.func.dfg.value_type(value)
+} Builder.value_type
+
+/// Whether the current block ends in a terminator.
+pkg fn Builder.is_filled(self) -> bool {
+    let Some(block) = self.position else {
+        return false
+    }
+    let Some(inst) = self.func.laid.last_inst(block) else {
+        return false
+    }
+    return self.func.inst_data(inst).opcode().is_terminator()
+} Builder.is_filled
+
+/// Inserts the current block in the layout when no instruction was added to it yet.
+fn Builder.ensure_inserted_block(mut self) {
+    let Some(block) = self.position else {
+        expect false
+        return
+    }
+    if self.is_pristine(block) {
+        if not self.func.laid.is_block_inserted(block) {
+            mut self.func.laid.append_block(block)
+        }
+        expect usize.widen(block.index) < self.status.len()
+        self.status[usize.widen(block.index)] = BlockStatus.Partial
+    }
+} Builder.ensure_inserted_block
+
+fn Builder.is_pristine(self, block: Block) -> bool {
+    expect usize.widen(block.index) < self.status.len()
+    return self.status[usize.widen(block.index)] == BlockStatus.Empty
+} Builder.is_pristine
+
+/// Marks the blocks the SSA construction added instructions to as no longer empty.
+fn Builder.handle_ssa_side_effects(mut self) {
+    for block in self.ssa.side_effects {
+        if self.is_pristine(block) {
+            expect usize.widen(block.index) < self.status.len()
+            self.status[usize.widen(block.index)] = BlockStatus.Partial
+        }
+    }
+    mut self.ssa.side_effects.truncate(0)
+} Builder.handle_ssa_side_effects
+
+/// Builds an instruction at the end of the current block, which enters the layout with its first
+/// instruction and is filled by a terminator.
+fn Builder.build(mut self, take data: InstructionData, ctrl_typevar: Option[Type]) -> Inst {
+    mut self.ensure_inserted_block()
+    let Some(block) = self.position else {
+        expect false
+        return Inst(index: 0)
+    }
+    let opcode = data.opcode()
+    let inst = mut self.func.dfg.make_inst(take data)
+    discard mut self.func.dfg.make_inst_results(inst, ctrl_typevar)
+    mut self.func.laid.append_inst(inst, block)
+    if not self.srcloc.is_default() {
+        mut self.func.set_srcloc(inst, srcloc: self.srcloc)
+    }
+    if opcode.is_terminator() {
+        expect usize.widen(block.index) < self.status.len()
+        self.status[usize.widen(block.index)] = BlockStatus.Filled
+    }
+    return inst
+} Builder.build
+
+/// Builds an instruction and gives its first result.
+fn Builder.build_value(mut self, take data: InstructionData, ctrl_typevar: Option[Type]) -> Value {
+    let inst = mut self.build(take data, ctrl_typevar)
+    return self.func.dfg.first_result(inst)
+} Builder.build_value
+
+fn Builder.unary(mut self, opcode: Opcode, ctrl_typevar: Type, arg: Value) -> Value {
+    return mut self.build_value(InstructionData.Unary(opcode: opcode, arg: arg), ctrl_typevar: Some(ctrl_typevar))
+} Builder.unary
+
+fn Builder.binary(mut self, opcode: Opcode, x: Value, y: Value) -> Value {
+    let ctrl_typevar = self.value_type(x)
+    return mut self.build_value(InstructionData.Binary(opcode: opcode, x: x, y: y), ctrl_typevar: Some(ctrl_typevar))
+} Builder.binary
+
+/// An `iconst` of `imm` in `controlling_type`, an `i64` one extended when that is `i128`.
+fn Builder.build_imm_const(mut self, controlling_type: Type, imm: i64, signed: bool) -> Value {
+    if controlling_type != Type.Int128 {
+        let masked = mask_to_width(imm, bits: controlling_type.bits())
+        return mut self.build_value(InstructionData.UnaryImm(opcode: Opcode.Iconst, imm: masked), ctrl_typevar: Some(controlling_type))
+    }
+    let low = mut self.build_value(InstructionData.UnaryImm(opcode: Opcode.Iconst, imm: imm), ctrl_typevar: Some(Type.Int64))
+    let opcode = match signed {
+        true => Opcode.Sextend
+        false => Opcode.Uextend
+    }
+    return mut self.unary(opcode, ctrl_typevar: controlling_type, arg: low)
+} Builder.build_imm_const
+
+/// An immediate cut to the low `bits` bits, as an instruction of a type that wide keeps it.
+fn mask_to_width(imm: i64, bits: u32) -> i64
+    requires bits > 0
+{
+    if bits >= 64 {
+        return imm
+    }
+    let mask = 0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - bits)
+    return i64.from_bits(imm.to_bits() & mask)
+} mask_to_width
+
+/// An operation with an immediate of the type of `x`, sign-extended: Cranelift's `_imm_s`
+/// instruction builders.
+fn Builder.binary_imm(mut self, opcode: Opcode, x: Value, y: i64) -> Value {
+    let ty = self.value_type(x)
+    let imm = mut self.build_imm_const(ty, imm: y, signed: true)
+    return mut self.binary(opcode, x, y: imm)
+} Builder.binary_imm
+
+fn Builder.overflowing(mut self, opcode: Opcode, x: Value, y: Value) -> Overflowed {
+    let value = mut self.binary(opcode, x, y)
+    expect value.index < 0xFFFF_FFFF
+    return Overflowed(value: value, flag: Value(index: value.index + 1))
+} Builder.overflowing
+
+/// Records a branch as a predecessor of its target.
+fn Builder.declare_successor(mut self, dest_block: Block, jump_inst: Inst) {
+    mut self.ssa.declare_block_predecessor(dest_block, inst: jump_inst)
+} Builder.declare_successor
+
+/// The arguments a branch passes to a block.
+fn Builder.block_call(self, block: Block, args: Slice[Value]) -> BlockCall {
+    return BlockCall(block: block, args: self.value_list(args))
+} Builder.block_call
+
+fn Builder.value_list(self, args: Slice[Value]) -> mem::List[Value] {
+    var values = mem::List[Value].empty(self.alloc)
+    for arg in args {
+        mut values.push(arg)
+    }
+    return values
+} Builder.value_list
+
+pkg fn Builder.iconst(mut self, ty: Type, imm: i64) -> Value {
+    let masked = mask_to_width(imm, bits: ty.bits())
+    return mut self.build_value(InstructionData.UnaryImm(opcode: Opcode.Iconst, imm: masked), ctrl_typevar: Some(ty))
+} Builder.iconst
+
+pkg fn Builder.f32const(mut self, bits: u32) -> Value {
+    return mut self.build_value(InstructionData.UnaryIeee32(opcode: Opcode.F32const, bits: bits), ctrl_typevar: None)
+} Builder.f32const
+
+pkg fn Builder.f64const(mut self, bits: u64) -> Value {
+    return mut self.build_value(InstructionData.UnaryIeee64(opcode: Opcode.F64const, bits: bits), ctrl_typevar: None)
+} Builder.f64const
+
+pkg fn Builder.iadd(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Iadd, x, y)
+} Builder.iadd
+
+pkg fn Builder.iadd_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Iadd, x, y)
+} Builder.iadd_imm_s
+
+pkg fn Builder.isub(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Isub, x, y)
+} Builder.isub
+
+pkg fn Builder.imul(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Imul, x, y)
+} Builder.imul
+
+pkg fn Builder.imul_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Imul, x, y)
+} Builder.imul_imm_s
+
+pkg fn Builder.ineg(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Ineg, ctrl_typevar: ty, arg: x)
+} Builder.ineg
+
+pkg fn Builder.udiv(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Udiv, x, y)
+} Builder.udiv
+
+pkg fn Builder.sdiv(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Sdiv, x, y)
+} Builder.sdiv
+
+pkg fn Builder.urem(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Urem, x, y)
+} Builder.urem
+
+pkg fn Builder.srem(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Srem, x, y)
+} Builder.srem
+
+pkg fn Builder.umulhi(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Umulhi, x, y)
+} Builder.umulhi
+
+pkg fn Builder.smulhi(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Smulhi, x, y)
+} Builder.smulhi
+
+pkg fn Builder.band(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Band, x, y)
+} Builder.band
+
+pkg fn Builder.band_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Band, x, y)
+} Builder.band_imm_s
+
+pkg fn Builder.bor(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Bor, x, y)
+} Builder.bor
+
+pkg fn Builder.bor_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Bor, x, y)
+} Builder.bor_imm_s
+
+pkg fn Builder.bxor(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Bxor, x, y)
+} Builder.bxor
+
+pkg fn Builder.bxor_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Bxor, x, y)
+} Builder.bxor_imm_s
+
+pkg fn Builder.bnot(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Bnot, ctrl_typevar: ty, arg: x)
+} Builder.bnot
+
+/// `x` and not `y`: a `bnot` then a `band`, as Cranelift builds it.
+pkg fn Builder.band_not(mut self, x: Value, y: Value) -> Value {
+    let neg = mut self.bnot(y)
+    return mut self.band(x, y: neg)
+} Builder.band_not
+
+pkg fn Builder.ishl(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Ishl, x, y)
+} Builder.ishl
+
+pkg fn Builder.ishl_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Ishl, x, y)
+} Builder.ishl_imm_s
+
+pkg fn Builder.ushr(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Ushr, x, y)
+} Builder.ushr
+
+pkg fn Builder.ushr_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Ushr, x, y)
+} Builder.ushr_imm_s
+
+pkg fn Builder.sshr(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Sshr, x, y)
+} Builder.sshr
+
+pkg fn Builder.sshr_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Sshr, x, y)
+} Builder.sshr_imm_s
+
+pkg fn Builder.rotr_imm_s(mut self, x: Value, y: i64) -> Value {
+    return mut self.binary_imm(Opcode.Rotr, x, y)
+} Builder.rotr_imm_s
+
+pkg fn Builder.clz(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Clz, ctrl_typevar: ty, arg: x)
+} Builder.clz
+
+pkg fn Builder.ctz(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Ctz, ctrl_typevar: ty, arg: x)
+} Builder.ctz
+
+pkg fn Builder.popcnt(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Popcnt, ctrl_typevar: ty, arg: x)
+} Builder.popcnt
+
+pkg fn Builder.bswap(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Bswap, ctrl_typevar: ty, arg: x)
+} Builder.bswap
+
+pkg fn Builder.umin(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Umin, x, y)
+} Builder.umin
+
+pkg fn Builder.umax(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Umax, x, y)
+} Builder.umax
+
+pkg fn Builder.icmp(mut self, cond: IntCC, x: Value, y: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.build_value(InstructionData.IntCompare(opcode: Opcode.Icmp, cond: cond, x: x, y: y), ctrl_typevar: Some(ty))
+} Builder.icmp
+
+pkg fn Builder.icmp_imm_s(mut self, cond: IntCC, x: Value, y: i64) -> Value {
+    let ty = self.value_type(x)
+    let imm = mut self.build_imm_const(ty, imm: y, signed: true)
+    return mut self.icmp(cond, x, y: imm)
+} Builder.icmp_imm_s
+
+pkg fn Builder.select(mut self, c: Value, x: Value, y: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.build_value(InstructionData.Ternary(opcode: Opcode.Select, x: c, y: x, z: y), ctrl_typevar: Some(ty))
+} Builder.select
+
+pkg fn Builder.uextend(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.Uextend, ctrl_typevar: ty, arg: x)
+} Builder.uextend
+
+pkg fn Builder.sextend(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.Sextend, ctrl_typevar: ty, arg: x)
+} Builder.sextend
+
+pkg fn Builder.ireduce(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.Ireduce, ctrl_typevar: ty, arg: x)
+} Builder.ireduce
+
+pkg fn Builder.iconcat(mut self, lo: Value, hi: Value) -> Value {
+    return mut self.binary(Opcode.Iconcat, x: lo, y: hi)
+} Builder.iconcat
+
+pkg fn Builder.isplit(mut self, x: Value) -> Halves {
+    let ty = self.value_type(x)
+    let low = mut self.unary(Opcode.Isplit, ctrl_typevar: ty, arg: x)
+    expect low.index < 0xFFFF_FFFF
+    return Halves(low: low, high: Value(index: low.index + 1))
+} Builder.isplit
+
+pkg fn Builder.bitcast(mut self, ty: Type, flags: MemFlags, x: Value) -> Value {
+    return mut self.build_value(InstructionData.LoadNoOffset(opcode: Opcode.Bitcast, flags: flags, arg: x), ctrl_typevar: Some(ty))
+} Builder.bitcast
+
+pkg fn Builder.uadd_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.UaddOverflow, x, y)
+} Builder.uadd_overflow
+
+pkg fn Builder.sadd_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.SaddOverflow, x, y)
+} Builder.sadd_overflow
+
+pkg fn Builder.usub_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.UsubOverflow, x, y)
+} Builder.usub_overflow
+
+pkg fn Builder.ssub_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.SsubOverflow, x, y)
+} Builder.ssub_overflow
+
+pkg fn Builder.umul_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.UmulOverflow, x, y)
+} Builder.umul_overflow
+
+pkg fn Builder.smul_overflow(mut self, x: Value, y: Value) -> Overflowed {
+    return mut self.overflowing(Opcode.SmulOverflow, x, y)
+} Builder.smul_overflow
+
+pkg fn Builder.fadd(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Fadd, x, y)
+} Builder.fadd
+
+pkg fn Builder.fsub(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Fsub, x, y)
+} Builder.fsub
+
+pkg fn Builder.fmul(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Fmul, x, y)
+} Builder.fmul
+
+pkg fn Builder.fdiv(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Fdiv, x, y)
+} Builder.fdiv
+
+pkg fn Builder.sqrt(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Sqrt, ctrl_typevar: ty, arg: x)
+} Builder.sqrt
+
+pkg fn Builder.fabs(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Fabs, ctrl_typevar: ty, arg: x)
+} Builder.fabs
+
+pkg fn Builder.fneg(mut self, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.unary(Opcode.Fneg, ctrl_typevar: ty, arg: x)
+} Builder.fneg
+
+pkg fn Builder.fcopysign(mut self, x: Value, y: Value) -> Value {
+    return mut self.binary(Opcode.Fcopysign, x, y)
+} Builder.fcopysign
+
+pkg fn Builder.fcmp(mut self, cond: FloatCC, x: Value, y: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.build_value(InstructionData.FloatCompare(opcode: Opcode.Fcmp, cond: cond, x: x, y: y), ctrl_typevar: Some(ty))
+} Builder.fcmp
+
+pkg fn Builder.fpromote(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.Fpromote, ctrl_typevar: ty, arg: x)
+} Builder.fpromote
+
+pkg fn Builder.fdemote(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.Fdemote, ctrl_typevar: ty, arg: x)
+} Builder.fdemote
+
+pkg fn Builder.fcvt_to_sint_sat(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.FcvtToSintSat, ctrl_typevar: ty, arg: x)
+} Builder.fcvt_to_sint_sat
+
+pkg fn Builder.fcvt_to_uint_sat(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.FcvtToUintSat, ctrl_typevar: ty, arg: x)
+} Builder.fcvt_to_uint_sat
+
+pkg fn Builder.fcvt_from_sint(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.FcvtFromSint, ctrl_typevar: ty, arg: x)
+} Builder.fcvt_from_sint
+
+pkg fn Builder.fcvt_from_uint(mut self, ty: Type, x: Value) -> Value {
+    return mut self.unary(Opcode.FcvtFromUint, ctrl_typevar: ty, arg: x)
+} Builder.fcvt_from_uint
+
+pkg fn Builder.load(mut self, ty: Type, flags: MemFlags, p: Value, offset: i32) -> Value {
+    return mut self.build_value(InstructionData.Load(opcode: Opcode.Load, flags: flags, arg: p, offset: offset), ctrl_typevar: Some(ty))
+} Builder.load
+
+pkg fn Builder.store(mut self, flags: MemFlags, x: Value, p: Value, offset: i32) {
+    let ty = self.value_type(x)
+    discard mut self.build(InstructionData.Store(opcode: Opcode.Store, flags: flags, x: x, p: p, offset: offset), ctrl_typevar: Some(ty))
+} Builder.store
+
+pkg fn Builder.atomic_load(mut self, ty: Type, flags: MemFlags, p: Value) -> Value {
+    return mut self.build_value(InstructionData.LoadNoOffset(opcode: Opcode.AtomicLoad, flags: flags, arg: p), ctrl_typevar: Some(ty))
+} Builder.atomic_load
+
+pkg fn Builder.atomic_store(mut self, flags: MemFlags, x: Value, p: Value) {
+    let ty = self.value_type(x)
+    discard mut self.build(InstructionData.StoreNoOffset(opcode: Opcode.AtomicStore, flags: flags, x: x, p: p), ctrl_typevar: Some(ty))
+} Builder.atomic_store
+
+pkg fn Builder.atomic_rmw(mut self, ty: Type, flags: MemFlags, op: AtomicRmwOp, p: Value, x: Value) -> Value {
+    return mut self.build_value(InstructionData.AtomicRmw(opcode: Opcode.AtomicRmw, flags: flags, op: op, p: p, x: x), ctrl_typevar: Some(ty))
+} Builder.atomic_rmw
+
+pkg fn Builder.atomic_cas(mut self, flags: MemFlags, p: Value, e: Value, x: Value) -> Value {
+    let ty = self.value_type(x)
+    return mut self.build_value(InstructionData.AtomicCas(opcode: Opcode.AtomicCas, flags: flags, p: p, e: e, x: x), ctrl_typevar: Some(ty))
+} Builder.atomic_cas
+
+pkg fn Builder.fence(mut self) {
+    discard mut self.build(InstructionData.NullAry(opcode: Opcode.Fence), ctrl_typevar: None)
+} Builder.fence
+
+pkg fn Builder.stack_addr(mut self, ty: Type, slot: StackSlot, offset: i32) -> Value {
+    return mut self.build_value(InstructionData.StackLoad(opcode: Opcode.StackAddr, slot: slot, offset: offset), ctrl_typevar: Some(ty))
+} Builder.stack_addr
+
+pkg fn Builder.symbol_value(mut self, ty: Type, global_value: GlobalValue) -> Value {
+    return mut self.build_value(InstructionData.UnaryGlobalValue(opcode: Opcode.SymbolValue, global_value: global_value), ctrl_typevar: Some(ty))
+} Builder.symbol_value
+
+pkg fn Builder.tls_value(mut self, ty: Type, global_value: GlobalValue) -> Value {
+    return mut self.build_value(InstructionData.UnaryGlobalValue(opcode: Opcode.TlsValue, global_value: global_value), ctrl_typevar: Some(ty))
+} Builder.tls_value
+
+pkg fn Builder.func_addr(mut self, ty: Type, func_ref: FuncRef) -> Value {
+    return mut self.build_value(InstructionData.FuncAddr(opcode: Opcode.FuncAddr, func_ref: func_ref), ctrl_typevar: Some(ty))
+} Builder.func_addr
+
+pkg fn Builder.get_frame_pointer(mut self, ty: Type) -> Value {
+    return mut self.build_value(InstructionData.NullAry(opcode: Opcode.GetFramePointer), ctrl_typevar: Some(ty))
+} Builder.get_frame_pointer
+
+pkg fn Builder.call(mut self, func_ref: FuncRef, args: Slice[Value]) -> Inst {
+    let values = self.value_list(args)
+    return mut self.build(InstructionData.Call(opcode: Opcode.Call, func_ref: func_ref, args: take values), ctrl_typevar: None)
+} Builder.call
+
+pkg fn Builder.call_indirect(mut self, sig_ref: SigRef, callee: Value, args: Slice[Value]) -> Inst {
+    let ty = self.value_type(callee)
+    let values = self.value_list(args)
+    return mut self.build(InstructionData.CallIndirect(opcode: Opcode.CallIndirect, sig_ref: sig_ref, callee: callee, args: take values), ctrl_typevar: Some(ty))
+} Builder.call_indirect
+
+/// Returns from the function with `args`: Cranelift's `return`.
+pkg fn Builder.ret(mut self, args: Slice[Value]) {
+    let values = self.value_list(args)
+    discard mut self.build(InstructionData.MultiAry(opcode: Opcode.Return, args: take values), ctrl_typevar: None)
+} Builder.ret
+
+pkg fn Builder.jump(mut self, block: Block, args: Slice[Value]) {
+    let destination = self.block_call(block, args)
+    let inst = mut self.build(InstructionData.Jump(opcode: Opcode.Jump, destination: take destination), ctrl_typevar: None)
+    mut self.declare_successor(block, jump_inst: inst)
+} Builder.jump
+
+pkg fn Builder.brif(mut self, c: Value, then: Block, then_args: Slice[Value], otherwise: Block, otherwise_args: Slice[Value]) {
+    let block_then = self.block_call(then, args: then_args)
+    let block_else = self.block_call(otherwise, args: otherwise_args)
+    let ty = self.value_type(c)
+    let inst = mut self.build(InstructionData.Brif(opcode: Opcode.Brif, arg: c, then: take block_then, otherwise: take block_else), ctrl_typevar: Some(ty))
+    mut self.declare_successor(then, jump_inst: inst)
+    if then != otherwise {
+        mut self.declare_successor(otherwise, jump_inst: inst)
+    }
+} Builder.brif
+
+pkg fn Builder.trap(mut self, code: TrapCode) {
+    discard mut self.build(InstructionData.Trap(opcode: Opcode.Trap, code: code), ctrl_typevar: None)
+} Builder.trap
+
+pkg fn Builder.stack_switch(mut self, store_context_ptr: Value, load_context_ptr: Value, in_payload0: Value) -> Value {
+    let ty = self.value_type(load_context_ptr)
+    return mut self.build_value(InstructionData.Ternary(opcode: Opcode.StackSwitch, x: store_context_ptr, y: load_context_ptr, z: in_payload0), ctrl_typevar: Some(ty))
+} Builder.stack_switch

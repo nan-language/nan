@@ -1,0 +1,326 @@
+//! Instruction selection of memory accesses with their address computations folded into the operand, atomics, stack slot and symbol addresses, calls, returns and stack switches.
+
+/// A stack slot's address plus an offset, from the stack pointer.
+fn Selector.slot_disp(self, slot: clif::StackSlot, offset: i32) -> i32 {
+    return i32.fit(i64.widen(self.slot_offset(slot)) + i64.widen(offset))
+} Selector.slot_disp
+
+/// A stack slot's offset from the stack pointer.
+fn Selector.slot_offset(self, slot: clif::StackSlot) -> u32 {
+    let at = usize.widen(slot.index)
+    expect at < self.slot_offsets.len()
+    return self.slot_offsets[at]
+} Selector.slot_offset
+
+/// The memory operand of an access to `p + offset`: folding a stack slot's address, a colocated
+/// symbol's, or an addition only this access reads, its register operands an index when
+/// `indexed`.
+fn Selector.amode(mut self, p: clif::Value, func: clif::Function, offset: i32, indexed: bool) -> x64::Amode {
+    let resolved = func.resolve_aliases(p)
+    let at = usize.widen(resolved.index)
+    expect at < self.defs.len() and at < self.use_counts.len()
+    let def = self.defs[at]
+    if def != NONE {
+        match func.inst_data(clif::Inst(index: def)) {
+            clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: slot_offset) => {
+                let disp = i64.widen(self.slot_offset(slot)) + i64.widen(slot_offset) + i64.widen(offset)
+                let Some(fitting) = i32.checked_fit(disp) else {
+                    return mut self.register_amode(p, func, offset)
+                }
+                return x64::Amode.at(x64::RSP, disp: fitting)
+            }
+            clif::InstructionData.UnaryGlobalValue(opcode: clif::Opcode.SymbolValue, global_value: global_value) => {
+                let data = func.global_value_data(global_value)
+                if data.colocated and not data.tls {
+                    return x64::Amode.Rip(target: x64::RipTarget.Direct(x64::Symbol.Name(data.name)), disp: offset)
+                }
+            }
+            clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) => {
+                if self.use_counts[at] == 1 and func.value_type(resolved) == clif::POINTER {
+                    let Some(folded) = mut self.folded_add(func, x, y, offset, indexed) else {
+                        return mut self.register_amode(p, func, offset)
+                    }
+                    return folded
+                }
+            }
+            else => {}
+        }
+    }
+    return mut self.register_amode(p, func, offset)
+} Selector.amode
+
+fn Selector.register_amode(mut self, p: clif::Value, func: clif::Function, offset: i32) -> x64::Amode {
+    let base = mut self.src(p, func)
+    return x64::Amode.at(base, disp: offset)
+} Selector.register_amode
+
+/// The memory operand of `x + y + offset`: a constant addend folded into the displacement, or the
+/// two registers as base and index when `indexed`.
+fn Selector.folded_add(mut self, func: clif::Function, x: clif::Value, y: clif::Value, offset: i32, indexed: bool) -> Option[x64::Amode] {
+    let operands = self.commuted(func, x, y)
+    match self.imm(operands.y, func) {
+        Some(imm) => {
+            let Some(disp) = i32.checked_fit(i64.widen(imm) + i64.widen(offset)) else {
+                return None
+            }
+            return Some(mut self.amode(operands.x, func, offset: disp, indexed))
+        }
+        None => {}
+    }
+    if not indexed {
+        return None
+    }
+    let base = mut self.src(operands.x, func)
+    let index = mut self.src(operands.y, func)
+    return Some(x64::Amode.Mem(base: base, index: Some(index), shift: 0, disp: offset))
+} Selector.folded_add
+
+/// A load, zero-extending a narrow integer; a 128-bit one in two halves.
+fn Selector.load(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value, offset: i32) {
+    let result = result_of(func, inst, alloc: self.alloc)
+    let ty = func.value_type(result)
+    let dst = mut self.reg(result, func)
+    if ty == clif::Type.Int128 {
+        let mem = mut self.amode(p, func, offset, indexed: false)
+        let dst_high = mut self.high(result, func)
+        mut self.emit(x64::Inst.Load(kind: x64::LoadKind.Qword, dst: dst, src: mem))
+        mut self.emit(x64::Inst.Load(kind: x64::LoadKind.Qword, dst: dst_high, src: mem.offset(8)))
+        return
+    }
+    let mem = mut self.amode(p, func, offset, indexed: true)
+    let kind = load_kind(self.code.is_float(dst), size: exact_size(ty))
+    mut self.emit(x64::Inst.Load(kind: kind, dst: dst, src: mem))
+} Selector.load
+
+/// A store, of an immediate when the value is a constant that fits; a 128-bit one in two
+/// halves.
+fn Selector.store(mut self, func: clif::Function, x: clif::Value, p: clif::Value, offset: i32) {
+    let ty = func.value_type(x)
+    let mem = mut self.amode(p, func, offset, indexed: false)
+    if ty == clif::Type.Int128 {
+        let low = mut self.src(x, func)
+        let high = mut self.src_high(x, func)
+        mut self.emit(x64::Inst.Store(size: x64::Size.Qword, src: low, dst: mem))
+        mut self.emit(x64::Inst.Store(size: x64::Size.Qword, src: high, dst: mem.offset(8)))
+        return
+    }
+    let size = exact_size(ty)
+    match self.constant(x, func) {
+        Some(bits) => {
+            match imm32(bits, width: ty.bits()) {
+                Some(imm) => {
+                    mut self.emit(x64::Inst.StoreImm(size: size, imm: imm, dst: mem))
+                    return
+                }
+                None => {}
+            }
+            let reg = mut self.temp(false)
+            mut self.emit(x64::Inst.MovImm(dst: reg, imm: bits))
+            mut self.emit(x64::Inst.Store(size: size, src: reg, dst: mem))
+            return
+        }
+        None => {}
+    }
+    let reg = mut self.src(x, func)
+    mut self.emit(x64::Inst.Store(size: size, src: reg, dst: mem))
+} Selector.store
+
+/// An atomic read-modify-write giving the previous value: `lock xadd` for an addition, `xchg` for
+/// an exchange, a `lock cmpxchg` loop otherwise.
+fn Selector.atomic_rmw(mut self, func: clif::Function, inst: clif::Inst, op: clif::AtomicRmwOp, p: clif::Value, x: clif::Value) {
+    let size = exact_size(func.value_type(x))
+    let mem = mut self.amode(p, func, offset: 0, indexed: false)
+    let operand = mut self.src(x, func)
+    let dst = mut self.dst_of(func, inst)
+    match op {
+        clif::AtomicRmwOp.Add => {
+            mut self.mov(dst, src: operand)
+            mut self.emit(x64::Inst.LockXadd(size: size, reg: dst, mem: mem))
+        }
+        clif::AtomicRmwOp.Xchg => {
+            mut self.mov(dst, src: operand)
+            mut self.emit(x64::Inst.Xchg(size: size, reg: dst, mem: mem))
+        }
+        clif::AtomicRmwOp.And => mut self.atomic_loop(x64::AluOp.And, size: size, operand: operand, mem: mem, dst: dst)
+        clif::AtomicRmwOp.Or => mut self.atomic_loop(x64::AluOp.Or, size: size, operand: operand, mem: mem, dst: dst)
+        clif::AtomicRmwOp.Xor => mut self.atomic_loop(x64::AluOp.Xor, size: size, operand: operand, mem: mem, dst: dst)
+    }
+} Selector.atomic_rmw
+
+fn Selector.atomic_loop(mut self, op: x64::AluOp, size: x64::Size, operand: x64::Reg, mem: x64::Amode, dst: x64::Reg) {
+    mut self.emit(x64::Inst.AtomicRmwLoop(op: op, size: size, operand: operand, mem: mem, temp: x64::RCX))
+    mut self.mov(dst, src: x64::RAX)
+} Selector.atomic_loop
+
+/// `lock cmpxchg`, giving the value memory held.
+fn Selector.atomic_cas(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value, e: clif::Value, x: clif::Value) {
+    let size = exact_size(func.value_type(x))
+    let mem = mut self.amode(p, func, offset: 0, indexed: false)
+    let expected = mut self.src(e, func)
+    let replacement = mut self.src(x, func)
+    mut self.mov(x64::RAX, src: expected)
+    mut self.emit(x64::Inst.LockCmpxchg(size: size, replacement: replacement, mem: mem))
+    let dst = mut self.dst_of(func, inst)
+    mut self.mov(dst, src: x64::RAX)
+} Selector.atomic_cas
+
+/// A symbol's address, or a thread-local variable's through `__tls_get_addr`.
+fn Selector.global_value(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, global_value: clif::GlobalValue) {
+    let data = func.global_value_data(global_value)
+    let dst = mut self.dst_of(func, inst)
+    if opcode == clif::Opcode.TlsValue {
+        mut self.emit(x64::Inst.TlsGetAddr(symbol: x64::Symbol.Name(data.name)))
+        mut self.mov(dst, src: x64::RAX)
+        return
+    }
+    mut self.symbol_address(dst, name: data.name, colocated: data.colocated)
+} Selector.global_value
+
+/// A symbol's address: relative to the instruction pointer when the symbol is in this object,
+/// from its global offset table entry in position-independent code, else absolute.
+fn Selector.symbol_address(mut self, dst: x64::Reg, name: clif::ExternalName, colocated: bool) {
+    let symbol = x64::Symbol.Name(name)
+    if colocated {
+        mut self.emit(x64::Inst.Lea(dst: dst, src: x64::Amode.Rip(target: x64::RipTarget.Direct(symbol), disp: 0)))
+    } else if self.isa.pic {
+        mut self.emit(x64::Inst.Load(kind: x64::LoadKind.Qword, dst: dst, src: x64::Amode.Rip(target: x64::RipTarget.Got(symbol), disp: 0)))
+    } else {
+        mut self.emit(x64::Inst.MovSymbol(dst: dst, symbol: symbol, addend: 0))
+    }
+} Selector.symbol_address
+
+/// A direct call: relative to the instruction pointer when the callee is in this object, else
+/// through the procedure linkage table.
+fn Selector.call(mut self, func: clif::Function, inst: clif::Inst, func_ref: clif::FuncRef, args: Slice[clif::Value]) {
+    let ext = func.ext_func(func_ref)
+    var kind = x64::RelocKind.CallPlt4
+    if ext.colocated {
+        kind = x64::RelocKind.Relative4
+    }
+    let target = x64::CallTarget.Direct(symbol: x64::Symbol.Name(ext.name), kind: kind)
+    mut self.call_with(func, inst, sig: func.imported_signature(ext.signature), target, args)
+} Selector.call
+
+fn Selector.call_indirect(mut self, func: clif::Function, inst: clif::Inst, sig_ref: clif::SigRef, callee: clif::Value, args: Slice[clif::Value]) {
+    let reg = mut self.src(callee, func)
+    mut self.call_with(func, inst, sig: func.imported_signature(sig_ref), target: x64::CallTarget.Indirect(reg), args)
+} Selector.call_indirect
+
+/// A call: the arguments moved where the signature places them, then the results taken from
+/// where it returns them.
+fn Selector.call_with(mut self, func: clif::Function, inst: clif::Inst, sig: clif::Signature, target: x64::CallTarget, args: Slice[clif::Value]) {
+    let placed = places(sig, floats: self.isa.floats, alloc: self.alloc)
+    var passed = x64::RegSet.empty()
+    var at: usize = 0
+    for arg in args {
+        expect at < placed.params.len()
+        passed = passed.union(mut self.pass(arg, func, high: false, place: placed.params[at]))
+        at += 1
+        if func.value_type(arg) == clif::Type.Int128 {
+            expect at < placed.params.len()
+            passed = passed.union(mut self.pass(arg, func, high: true, place: placed.params[at]))
+            at += 1
+        }
+    }
+    var returned = x64::RegSet.empty()
+    for place in placed.returns {
+        match place {
+            Place.Reg(reg) => {
+                returned = returned.plus(reg)
+            }
+            Place.Stack(_) => {
+                expect false
+            }
+        }
+    }
+    mut self.emit(x64::Inst.Call(target: target, args: passed, results: returned, clobbers: x64::RegSet.caller_saved()))
+    var index: usize = 0
+    for result in func.inst_results(inst, alloc: self.alloc) {
+        let low = mut self.reg(result, func)
+        expect index < placed.returns.len()
+        mut self.take_result(low, place: placed.returns[index])
+        index += 1
+        if func.value_type(result) == clif::Type.Int128 {
+            let high = mut self.high(result, func)
+            expect index < placed.returns.len()
+            mut self.take_result(high, place: placed.returns[index])
+            index += 1
+        }
+    }
+} Selector.call_with
+
+/// Moves an argument, or a 128-bit one's high half, where a call takes it, giving the register
+/// it passes in.
+fn Selector.pass(mut self, arg: clif::Value, func: clif::Function, high: bool, place: Place) -> x64::RegSet {
+    var reg = NO_REG
+    if high {
+        reg = mut self.src_high(arg, func)
+    } else {
+        match self.constant(arg, func) {
+            Some(bits) => {
+                match place {
+                    Place.Reg(target) => {
+                        if not target.is_xmm() {
+                            mut self.emit(x64::Inst.MovImm(dst: target, imm: bits))
+                            return x64::RegSet.of(target)
+                        }
+                    }
+                    Place.Stack(_) => {}
+                }
+            }
+            None => {}
+        }
+        reg = mut self.src(arg, func)
+    }
+    match place {
+        Place.Reg(target) => {
+            mut self.mov(target, src: reg)
+            return x64::RegSet.of(target)
+        }
+        Place.Stack(offset) => {
+            var size = x64::Size.Qword
+            if self.code.is_float(reg) {
+                size = exact_size(func.value_type(arg))
+            }
+            mut self.emit(x64::Inst.Store(size: size, src: reg, dst: x64::Amode.at(x64::RSP, disp: i32.fit(offset))))
+            return x64::RegSet.empty()
+        }
+    }
+} Selector.pass
+
+fn Selector.take_result(mut self, reg: x64::Reg, place: Place) {
+    match place {
+        Place.Reg(returned) => mut self.mov(reg, src: returned)
+        Place.Stack(_) => {
+            expect false
+        }
+    }
+} Selector.take_result
+
+/// A return: the results moved where the function's signature returns them.
+fn Selector.ret(mut self, func: clif::Function, args: Slice[clif::Value]) {
+    let placed = places(func.signature, floats: self.isa.floats, alloc: self.alloc)
+    var passed = x64::RegSet.empty()
+    var at: usize = 0
+    for arg in args {
+        expect at < placed.returns.len()
+        passed = passed.union(mut self.pass(arg, func, high: false, place: placed.returns[at]))
+        at += 1
+        if func.value_type(arg) == clif::Type.Int128 {
+            expect at < placed.returns.len()
+            passed = passed.union(mut self.pass(arg, func, high: true, place: placed.returns[at]))
+            at += 1
+        }
+    }
+    mut self.emit(x64::Inst.Ret(results: passed))
+} Selector.ret
+
+/// Switches stacks, the payload passing in `rdi`, every register clobbered.
+fn Selector.stack_switch(mut self, func: clif::Function, inst: clif::Inst, store: clif::Value, load: clif::Value, payload: clif::Value) {
+    let store_reg = mut self.src(store, func)
+    let load_reg = mut self.src(load, func)
+    discard mut self.pass(payload, func, high: false, place: Place.Reg(x64::RDI))
+    mut self.emit(x64::Inst.StackSwitch(store: store_reg, load: load_reg, temp: x64::RAX, other: x64::RCX))
+    let dst = mut self.dst_of(func, inst)
+    mut self.mov(dst, src: x64::RDI)
+} Selector.stack_switch

@@ -1,0 +1,89 @@
+//! Shrinking: moving the recorded draws of a failing case toward their shrink points by candidates, reruns of the case with changed draws kept when they fail the same way.
+
+/// The most candidates a shrinking runs.
+const CANDIDATES: usize = 4_096
+
+/// The value within a draw's bounds nearest 0.
+fn shrink_point(draw: Draw) -> wide::Wide {
+    expect draw.low.le(draw.high)
+    return wide::Wide.zero().max_of(draw.low).min_of(draw.high)
+} shrink_point
+
+/// The shrinking of a case: the run of the last candidate kept, or the case's own, and the count
+/// of candidates run.
+struct Shrinking {
+    kept: Run
+    candidates: usize
+    alloc: mem::Alloc
+} Shrinking
+
+fn Shrinking.is_exhausted(self) -> bool = self.candidates >= CANDIDATES
+
+/// Runs the candidate changing one recorded draw's value, keeping it when it fails the way the
+/// case does.
+fn Shrinking.candidate(mut self, index: usize, value: wide::Wide, rerun: fn(forced: Slice[wide::Wide]) -> Option[Run] fails platform::IoError) -> bool fails platform::IoError {
+    expect self.candidates < ~0usize
+    self.candidates += 1
+    var values = mem::List[wide::Wide].empty(self.alloc)
+    for draw in self.kept.draws {
+        mut values.push(draw.value)
+    }
+    expect index < values.len()
+    values[index] = value
+    let Some(candidate_run) = try rerun(values.view()) else {
+        return false
+    }
+    self.kept = candidate_run
+    return true
+} Shrinking.candidate
+
+/// Shrinks a failing case from its run: each pass tries each recorded draw's shrink point, else
+/// bisects between it and the draw's value, the draw keeping the upper end, until a pass changes
+/// no draw or the candidates run out. `rerun` runs a candidate's draws and gives its run when it
+/// fails the way the case does.
+fn shrink(take failing: Run, rerun: fn(forced: Slice[wide::Wide]) -> Option[Run] fails platform::IoError, alloc: mem::Alloc) -> Run fails platform::IoError {
+    var shrinking = Shrinking(kept: take failing, candidates: 0, alloc: alloc)
+    var changed = true
+    while changed and not shrinking.is_exhausted() {
+        changed = false
+        var index: usize = 0
+        while index < shrinking.kept.draws.len() and not shrinking.is_exhausted() {
+            let draw = shrinking.kept.draws[index]
+            let point = shrink_point(draw)
+            if draw.value != point {
+                if try mut shrinking.candidate(index, value: point, rerun) {
+                    changed = true
+                } else if try bisect(mut shrinking, index, point, value: draw.value, rerun) {
+                    changed = true
+                }
+            }
+            index += 1
+        }
+    }
+    let Shrinking(kept: kept, candidates: _, alloc: _) = shrinking
+    return kept
+} shrink
+
+/// Bisects between a draw's shrink point and its value, keeping the upper end; whether a
+/// candidate was kept.
+fn bisect(mut shrinking: Shrinking, index: usize, point: wide::Wide, value: wide::Wide, rerun: fn(forced: Slice[wide::Wide]) -> Option[Run] fails platform::IoError) -> bool fails platform::IoError {
+    var changed = false
+    var low = point
+    var high = value
+    let one = wide::Wide.one()
+    let two = wide::Wide.of_u64(2)
+    while one.lt(high.wrapping_sub(low).wrapping_abs()) and not shrinking.is_exhausted() {
+        let Some(half) = high.wrapping_sub(low).checked_div_trunc(two) else {
+            expect false
+            return changed
+        }
+        let middle = low.wrapping_add(half)
+        if try mut shrinking.candidate(index, value: middle, rerun) {
+            high = middle
+            changed = true
+        } else {
+            low = middle
+        }
+    }
+    return changed
+} bisect

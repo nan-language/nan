@@ -1,0 +1,591 @@
+//! Memory: allocators, budgets and stores, lists, bytes, maps and sets, the release of the std types holding memory, and the conformances the toolchain supplies to sequences and collections.
+
+fn mem_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    let owner_end = match check::last_dot(path) {
+        Some(dot) => dot
+        None => 0
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        expect false
+        return false
+    }
+    match owner {
+        "mem::List" => {
+            let element = supply.type_arg(lo, index: 0)
+            lists_list(mut lo, mut fx, supply, element)
+        }
+        "mem::Bytes" => lists_list(mut lo, mut fx, supply, element: lists_byte())
+        "mem::Bounded" => lists_bounded(mut lo, mut fx, supply)
+        "mem::ListCursor" or "mem::MapIntoCursor" or "mem::HashMapIntoCursor" or "mem::SetIntoCursor" => {
+            let element = owning_element(mut lo, owner, supply)
+            vector_next(mut lo, mut fx, supply, element)
+        }
+        "mem::BoundedCursor" => bounded_next(mut lo, mut fx, supply)
+        "mem::Map" => maps_map(mut lo, mut fx, supply, order: Order.Sorted)
+        "mem::HashMap" => maps_map(mut lo, mut fx, supply, order: Order.Hashed)
+        "mem::Set" => maps_set(mut lo, mut fx, supply)
+        "mem::Entry" => maps_entry(mut lo, mut fx, supply)
+        "mem::MapCursor" or "mem::MapCursorMut" or "mem::HashMapCursor" or "mem::HashMapCursorMut" => {
+            let key = supply.type_arg(lo, index: 0)
+            let value = supply.type_arg(lo, index: 1)
+            let entries = Entries.of_map(mut lo, key, value)
+            view_next(mut lo, mut fx, supply, entries)
+        }
+        "mem::SetCursor" => {
+            let value = supply.type_arg(lo, index: 0)
+            let entries = Entries.of_set(mut lo, value)
+            view_next(mut lo, mut fx, supply, entries)
+        }
+        else => return stores_lower(mut lo, mut fx, supply)
+    }
+    return true
+} mem_lower
+
+/// Type argument `index` of a mem type.
+fn mem_arg(lo: Lowering, ty: ty::Ty, index: usize) -> ty::Ty {
+    let Some(arg) = lo.ck.types().type_arg(ty, index) else {
+        expect false
+        return ty::Ty.error()
+    }
+    return arg
+} mem_arg
+
+/// The `mem::KeyValue` entries of a map type.
+fn mem_entry(lo: Lowering, ty: ty::Ty) -> ty::Ty {
+    var parts = mem::List[ty::Ty].empty(lo.alloc)
+    mut parts.push(mem_arg(lo, ty, index: 0))
+    mut parts.push(mem_arg(lo, ty, index: 1))
+    return lo.std_ty("mem", type_name: "KeyValue", args: take parts)
+} mem_entry
+
+/// The element an owning cursor moves out.
+fn owning_element(mut lo: Lowering, owner: Str, supply: Supply) -> ty::Ty {
+    match owner {
+        "mem::ListCursor" or "mem::SetIntoCursor" => return supply.type_arg(lo, index: 0)
+        else => {
+            var parts = mem::List[ty::Ty].empty(lo.alloc)
+            mut parts.push(supply.type_arg(lo, index: 0))
+            mut parts.push(supply.type_arg(lo, index: 1))
+            return lo.std_ty("mem", type_name: "KeyValue", args: take parts)
+        }
+    }
+} owning_element
+
+/// Whether moving a value of a mem type into another domain's reach does anything, none for a
+/// type std declares in full.
+fn mem_transfers(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    match owner_path {
+        "mem::List" or "mem::Bytes" or "mem::Map" or "mem::HashMap" or "mem::Set" or "mem::Pool" or "mem::Arena" or "mem::OnceMap" or "mem::Box" or "mem::Shared" or "mem::ListCursor" or "mem::MapIntoCursor" or "mem::HashMapIntoCursor" or "mem::SetIntoCursor" or "mem::Budget" => return Some(true)
+        "mem::Bounded" or "mem::BoundedCursor" => {
+            let element = mem_arg(lo, ty, index: 0)
+            return Some(mut lo.transfers(element))
+        }
+        else => return None
+    }
+} mem_transfers
+
+/// Moves a value of a mem type at an address into another domain's reach; false for a type std
+/// declares in full.
+fn mem_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) -> bool {
+    match owner_path {
+        "mem::List" or "mem::Set" => {
+            let element = mem_arg(lo, ty, index: 0)
+            vector_transfer(mut lo, mut fx, address, element, from: None, lift, owner)
+        }
+        "mem::Bytes" => vector_transfer(mut lo, mut fx, address, element: lists_byte(), from: None, lift, owner)
+        "mem::Map" or "mem::HashMap" => {
+            let entry = mem_entry(lo, ty)
+            vector_transfer(mut lo, mut fx, address, element: entry, from: None, lift, owner)
+            if owner_path == "mem::HashMap" {
+                lift_index(mut lo, mut fx, address, lift)
+            }
+        }
+        "mem::ListCursor" or "mem::SetIntoCursor" => {
+            let position = mut fx.load(PTR, addr: address, offset: 32)
+            let element = mem_arg(lo, ty, index: 0)
+            vector_transfer(mut lo, mut fx, address, element, from: Some(position), lift, owner)
+        }
+        "mem::MapIntoCursor" or "mem::HashMapIntoCursor" => {
+            let entry = mem_entry(lo, ty)
+            let position = mut fx.load(PTR, addr: address, offset: 32)
+            vector_transfer(mut lo, mut fx, address, element: entry, from: Some(position), lift, owner)
+        }
+        "mem::Bounded" => {
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let items_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "items")
+            let element = mem_arg(lo, ty, index: 0)
+            transfer_inline(mut lo, mut fx, element, address, len_at: len_field.offset, items_at: items_field.offset, position_at: None, lift, owner)
+        }
+        "mem::BoundedCursor" => {
+            let position_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "position")
+            let bounded_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bounded")
+            let len_field = mut lo.layouts.field(lo.ck, ty: bounded_field.ty, variant: None, label: "len")
+            let items_field = mut lo.layouts.field(lo.ck, ty: bounded_field.ty, variant: None, label: "items")
+            let len_at = len_field.offset + bounded_field.offset
+            let items_at = items_field.offset + bounded_field.offset
+            let element = mem_arg(lo, ty, index: 0)
+            transfer_inline(mut lo, mut fx, element, address, len_at, items_at, position_at: Some(position_field.offset), lift, owner)
+        }
+        "mem::Pool" => {
+            let element = mem_arg(lo, ty, index: 0)
+            transfer_pool(mut lo, mut fx, element, address, lift, owner)
+        }
+        "mem::Arena" => {
+            let header = mut fx.load(PTR, addr: address, offset: 0)
+            let element = mem_arg(lo, ty, index: 0)
+            segments_transfer(mut lo, mut fx, header, element, lift, owner)
+        }
+        "mem::OnceMap" => {
+            let header = mut fx.load(PTR, addr: address, offset: 0)
+            let entry = mem_entry(lo, ty)
+            segments_transfer(mut lo, mut fx, header, element: entry, lift, owner)
+            let record = mut fx.offset(header, offset: SEGMENTS_INDEX)
+            index_lift(mut lo, mut fx, record, lift)
+        }
+        "mem::Box" => {
+            let contents = mut fx.load(PTR, addr: address, offset: 0)
+            discard transfer_lift(mut lo, mut fx, address: contents, lift)
+            let element = mem_arg(lo, ty, index: 0)
+            mut lo.transfer(mut fx, ty: element, address: contents, lift, owner)
+        }
+        "mem::Shared" => {
+            let element = mem_arg(lo, ty, index: 0)
+            transfer_shared(mut lo, mut fx, value_ty: element, address, lift)
+        }
+        "mem::Budget" => rehome(mut lo, mut fx, address, owner)
+        else => return false
+    }
+    return true
+} mem_transfer
+
+/// Moves the elements a bounded list or its cursor holds inline, given the offsets of its
+/// length, its items and its cursor's position.
+fn transfer_inline(mut lo: Lowering, mut fx: Fx, element: ty::Ty, address: clif::Value, len_at: u64, items_at: u64, position_at: Option[u64], lift: clif::Value, owner: clif::Value) {
+    let shape = Element.of(mut lo, ty: element)
+    let len = mut fx.load(PTR, addr: address, offset: len_at)
+    let from = match position_at {
+        Some(at) => mut fx.load(PTR, addr: address, offset: at)
+        None => mut fx.ptr(0)
+    }
+    let items = mut fx.offset(address, offset: items_at)
+    mut fx.each(from, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data: items, index)
+        mut lo.transfer(mut fx1, ty: element, address: at, lift, owner)
+    })
+} transfer_inline
+
+/// Whether releasing a value of a mem type does anything, none for a type std declares in
+/// full.
+fn mem_needs_release(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    match owner_path {
+        "mem::List" or "mem::Bytes" or "mem::Map" or "mem::HashMap" or "mem::Set" or "mem::Pool" or "mem::Arena" or "mem::OnceMap" or "mem::Box" or "mem::Shared" or "mem::ListCursor" or "mem::MapIntoCursor" or "mem::HashMapIntoCursor" or "mem::SetIntoCursor" => return Some(true)
+        "mem::Bounded" or "mem::BoundedCursor" => {
+            let element = mem_arg(lo, ty, index: 0)
+            return Some(mut lo.needs_release(element))
+        }
+        else => return None
+    }
+} mem_needs_release
+
+/// Releases a value of a mem type at an address; false for a type std declares in full.
+fn mem_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) -> bool {
+    match owner_path {
+        "mem::List" or "mem::Set" => {
+            let zero = mut fx.ptr(0)
+            let element = mem_arg(lo, ty, index: 0)
+            vector_release(mut lo, mut fx, address, element, from: zero)
+        }
+        "mem::Bytes" => free_storage(mut lo, mut fx, address)
+        "mem::Map" or "mem::HashMap" => {
+            if owner_path == "mem::HashMap" {
+                free_index(mut lo, mut fx, address)
+            }
+            let entry = mem_entry(lo, ty)
+            let zero = mut fx.ptr(0)
+            vector_release(mut lo, mut fx, address, element: entry, from: zero)
+        }
+        "mem::ListCursor" or "mem::SetIntoCursor" => {
+            let element = mem_arg(lo, ty, index: 0)
+            release_cursor(mut lo, mut fx, address, element)
+        }
+        "mem::MapIntoCursor" or "mem::HashMapIntoCursor" => {
+            let entry = mem_entry(lo, ty)
+            release_cursor(mut lo, mut fx, address, element: entry)
+        }
+        "mem::Bounded" => {
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let items_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "items")
+            let element = mem_arg(lo, ty, index: 0)
+            release_inline(mut lo, mut fx, element, address, len_at: len_field.offset, items_at: items_field.offset, position_at: None)
+        }
+        "mem::BoundedCursor" => {
+            let position_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "position")
+            let bounded_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bounded")
+            let len_field = mut lo.layouts.field(lo.ck, ty: bounded_field.ty, variant: None, label: "len")
+            let items_field = mut lo.layouts.field(lo.ck, ty: bounded_field.ty, variant: None, label: "items")
+            let len_at = len_field.offset + bounded_field.offset
+            let items_at = items_field.offset + bounded_field.offset
+            let element = mem_arg(lo, ty, index: 0)
+            release_inline(mut lo, mut fx, element, address, len_at, items_at, position_at: Some(position_field.offset))
+        }
+        "mem::Pool" => {
+            let element = mem_arg(lo, ty, index: 0)
+            release_pool(mut lo, mut fx, element, address)
+        }
+        "mem::Arena" => {
+            let header = mut fx.load(PTR, addr: address, offset: 0)
+            let element = mem_arg(lo, ty, index: 0)
+            segments_release(mut lo, mut fx, header, element)
+        }
+        "mem::OnceMap" => {
+            let header = mut fx.load(PTR, addr: address, offset: 0)
+            let record = mut fx.offset(header, offset: SEGMENTS_INDEX)
+            index_free(mut lo, mut fx, record)
+            let entry = mem_entry(lo, ty)
+            segments_release(mut lo, mut fx, header, element: entry)
+        }
+        "mem::Box" => release_box(mut lo, mut fx, ty, address)
+        "mem::Shared" => {
+            let element = mem_arg(lo, ty, index: 0)
+            release_shared(mut lo, mut fx, value_ty: element, address)
+        }
+        else => return false
+    }
+    return true
+} mem_release
+
+/// Releases the elements an inline list holds, from its position when it is a cursor's.
+fn release_inline(mut lo: Lowering, mut fx: Fx, element: ty::Ty, address: clif::Value, len_at: u64, items_at: u64, position_at: Option[u64]) {
+    let shape = Element.of(mut lo, ty: element)
+    let len = mut fx.load(PTR, addr: address, offset: len_at)
+    let from = match position_at {
+        Some(at) => mut fx.load(PTR, addr: address, offset: at)
+        None => mut fx.ptr(0)
+    }
+    let items = mut fx.offset(address, offset: items_at)
+    mut fx.each(from, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data: items, index)
+        mut lo.release(mut fx1, ty: element, address: at)
+    })
+} release_inline
+
+/// A sequence a conformance walks: the address of its first element, its length and its
+/// elements' type.
+struct Sequence derives Copy {
+    element: ty::Ty
+    /// Whether its hash starts with its length.
+    counted: bool
+    /// Whether its elements are bytes that one write hashes, as a text's are.
+    text: bool
+} Sequence
+
+/// The sequence a std type is, none for a type whose conformances are not sequences'.
+fn mem_sequence(mut lo: Lowering, ty: ty::Ty) -> Option[Sequence] {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return None
+    }
+    if not lo.ck.db().is_std(item) {
+        return None
+    }
+    let path = lo.ck.db().canonical(item)
+    let byte = ty::Ty.scalar(ty::Scalar.Unsigned8)
+    return match path.as_str() {
+        "core::Str" or "text::String" or "text::Fixed" => Some(Sequence(element: byte, counted: true, text: true))
+        "mem::Bytes" => Some(Sequence(element: byte, counted: true, text: false))
+        "core::Slice" or "core::SliceMut" or "mem::List" or "mem::Set" or "mem::Bounded" => Some(Sequence(element: mem_arg(lo, ty, index: 0), counted: true, text: false))
+        "core::Array" => Some(Sequence(element: mem_arg(lo, ty, index: 0), counted: false, text: false))
+        "mem::Map" or "mem::HashMap" => Some(Sequence(element: mem_entry(lo, ty), counted: true, text: false))
+        else => None
+    }
+} mem_sequence
+
+/// The address of the first element and the length of a sequence value of a type at an address.
+fn mem_elements(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) -> Stretch {
+    if lo.ck.is_std(ty, path: "core::Array") {
+        let listed = lo.ck.types().arg_list(lo.ck.types().args_of(ty))
+        expect listed.len() > 1
+        let count_arg = listed[1]
+        let count = mut fx.ptr(const_arg(count_arg).low_bits())
+        return Stretch(start: address, len: count)
+    }
+    if lo.ck.is_std(ty, path: "mem::Bounded") or lo.ck.is_std(ty, path: "text::Fixed") {
+        let items_name = if lo.ck.is_std(ty, path: "text::Fixed") {
+            "bytes"
+        } else {
+            "items"
+        }
+        let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+        let items_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: items_name)
+        let len = mut fx.load(PTR, addr: address, offset: len_field.offset)
+        let items = mut fx.offset(address, offset: items_field.offset)
+        return Stretch(start: items, len: len)
+    }
+    let start = mut fx.load(PTR, addr: address, offset: 0)
+    let len = mut fx.load(PTR, addr: address, offset: 8)
+    return Stretch(start: start, len: len)
+} mem_elements
+
+/// Defines `eq`, `cmp`, `hash` or `default` of a sequence or collection type; false for another
+/// type.
+fn mem_conformance(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty, method: Str) -> bool
+    waive length "one arm per conformance, each defining the whole function"
+{
+    let Some(sequence) = mem_sequence(mut lo, ty) else {
+        return false
+    }
+    let incoming = mut fx.entry()
+    var next_param: usize = 0
+    var sret: Option[clif::Value] = None
+    if abi.returned == Returned.Indirect {
+        expect next_param < incoming.len()
+        sret = Some(incoming[next_param])
+        next_param += 1
+    }
+    var params = mem::List[Held].empty(lo.alloc)
+    for param in abi.params {
+        match param.repr {
+            Repr.Scalar(_) => {
+                expect next_param < incoming.len()
+                mut params.push(Held.Scalar(incoming[next_param]))
+                next_param += 1
+            }
+            Repr.Address => {
+                expect next_param < incoming.len()
+                mut params.push(Held.Address(incoming[next_param]))
+                next_param += 1
+            }
+            Repr.Empty => mut params.push(Held.Empty)
+        }
+    }
+    let shape = Element.of(mut lo, ty: sequence.element)
+    match method {
+        "eq" or "cmp" => {
+            expect params.len() == 2
+            let left = mem_elements(mut lo, mut fx, ty, address: params[0].address_value())
+            let right = mem_elements(mut lo, mut fx, ty, address: params[1].address_value())
+            let order = if sequence.text {
+                text_order(mut lo, mut fx, left: left.start, left_len: left.len, right: right.start, right_len: right.len)
+            } else {
+                walk_order(mut lo, mut fx, element: sequence.element, shape, method, left, right)
+            }
+            var held = Held.Empty
+            if method == "eq" {
+                held = Held.Scalar(mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 1))
+            } else {
+                let less = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 0)
+                let greater = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 2)
+                held = mut lo.ordering(mut fx, less, greater)
+            }
+            match held {
+                Held.Scalar(value) => {
+                    let returned = fx.list1(value)
+                    mut fx.b.ret(returned.view())
+                }
+                Held.Address(source) => {
+                    let Some(target) = sret else {
+                        expect false
+                        return true
+                    }
+                    let laid = mut lo.layout_of(abi.result)
+                    mut lo.copy(mut fx, dst: target, src: source, size: laid.contents().size, align: laid.contents().align)
+                    let returned = mem::List[clif::Value].empty(fx.alloc)
+                    mut fx.b.ret(returned.view())
+                }
+                Held.Empty => {
+                    let returned = mem::List[clif::Value].empty(fx.alloc)
+                    mut fx.b.ret(returned.view())
+                }
+            }
+        }
+        "hash" => {
+            expect abi.params.len() == 2 and params.len() == 2
+            let hasher_ty = abi.params[1].nty.ty()
+            let hasher = params[1]
+            let walked = mem_elements(mut lo, mut fx, ty, address: params[0].address_value())
+            if sequence.counted {
+                let count = mut fx.slot(8, align: 8)
+                mut fx.store(walked.len, addr: count, offset: 0)
+                let eight = mut fx.ptr(8)
+                write_bytes(mut lo, mut fx, hasher_ty, hasher, start: count, len: eight)
+            }
+            if sequence.text {
+                write_bytes(mut lo, mut fx, hasher_ty, hasher, start: walked.start, len: walked.len)
+            } else {
+                let element = sequence.element
+                let zero = mut fx.ptr(0)
+                mut fx.each(zero, end: walked.len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                    let at = shape.at(mut fx1, data: walked.start, index)
+                    hash_part(mut lo, fx: mut fx1, ty: element, at, hasher_ty, hasher)
+                })
+            }
+            let returned = mem::List[clif::Value].empty(fx.alloc)
+            mut fx.b.ret(returned.view())
+        }
+        "default" => {
+            let Some(target) = sret else {
+                expect false
+                return true
+            }
+            let element = sequence.element
+            let walked = mem_elements(mut lo, mut fx, ty, address: target)
+            let zero = mut fx.ptr(0)
+            mut fx.each(zero, end: walked.len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let no_own = mem::List[ty::Arg].empty(fx1.alloc)
+                let no_args = mem::List[Held].empty(fx1.alloc)
+                let value = mut lo.call_method(mut fx1, ty: element, interface_name: "Default", own: take no_own, args: no_args.view())
+                let at = shape.at(mut fx1, data: walked.start, index)
+                mut lo.store_held(mut fx1, address: at, held: value, ty: element)
+            })
+            let returned = mem::List[clif::Value].empty(fx.alloc)
+            mut fx.b.ret(returned.view())
+        }
+        else => {
+            expect false
+        }
+    }
+    return true
+} mem_conformance
+
+/// Hashes a part of a type at an address: a key-value entry's key then value, another value
+/// through its `Hash`.
+fn hash_part(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, at: clif::Value, hasher_ty: ty::Ty, hasher: Held) {
+    if lo.ck.is_std(ty, path: "mem::KeyValue") {
+        let key_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "key")
+        let key_part = mut fx.offset(at, offset: key_field.offset)
+        hash_part(mut lo, mut fx, ty: key_field.ty, at: key_part, hasher_ty, hasher)
+        let value_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "value")
+        let value_part = mut fx.offset(at, offset: value_field.offset)
+        hash_part(mut lo, mut fx, ty: value_field.ty, at: value_part, hasher_ty, hasher)
+        return
+    }
+    let held = mut lo.held_at(mut fx, ty, address: at)
+    var hasher_arg = mem::List[ty::Arg].empty(lo.alloc)
+    mut hasher_arg.push(ty::Arg.Ty(hasher_ty))
+    var hash_args = Array[Held, 2].filled(held)
+    hash_args[1] = hasher
+    discard mut lo.call_method(mut fx, ty, interface_name: "Hash", own: take hasher_arg, args: hash_args.view())
+} hash_part
+
+/// Writes `len` bytes from an address to a hasher in one write.
+fn write_bytes(mut lo: Lowering, mut fx: Fx, hasher_ty: ty::Ty, hasher: Held, start: clif::Value, len: clif::Value) {
+    let view = mut fx.slot(16, align: 8)
+    mut fx.store(start, addr: view, offset: 0)
+    mut fx.store(len, addr: view, offset: 8)
+    var write_args = Array[Held, 2].filled(hasher)
+    write_args[1] = Held.Address(view)
+    let no_own = mem::List[ty::Arg].empty(lo.alloc)
+    discard mut lo.call_method(mut fx, ty: hasher_ty, interface_name: "Hasher", own: take no_own, args: write_args.view())
+} write_bytes
+
+/// The order of two byte texts as an ordering index: by their common prefix's bytes, then by
+/// length.
+fn text_order(mut lo: Lowering, mut fx: Fx, left: clif::Value, left_len: clif::Value, right: clif::Value, right_len: clif::Value) -> clif::Value {
+    let common = mut fx.b.umin(left_len, y: right_len)
+    let compare_args = fx.list3(left, b: right, c: common)
+    let compares = mut lo.call_routine(mut fx, routine: Routine.Compare, args: compare_args.view())
+    expect compares.len() == 1
+    let compared = compares[0]
+    let before = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: compared, y: 0)
+    let after = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: compared, y: 0)
+    let shorter = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: left_len, y: right_len)
+    let longer = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: left_len, y: right_len)
+    let one = mut fx.int(clif::Type.Int8, value: 1)
+    let zero = mut fx.int(clif::Type.Int8, value: 0)
+    let two = mut fx.int(clif::Type.Int8, value: 2)
+    let by_short = mut fx.b.select(shorter, x: zero, y: one)
+    let by_len = mut fx.b.select(longer, x: two, y: by_short)
+    let by_bytes = mut fx.b.select(after, x: two, y: by_len)
+    return mut fx.b.select(before, x: zero, y: by_bytes)
+} text_order
+
+/// The order of two sequences as an ordering index, element by element through `eq` or `cmp`,
+/// then by length; `eq` only tells equal (1) from not (0 or 2).
+fn walk_order(mut lo: Lowering, mut fx: Fx, element: ty::Ty, shape: Element, method: Str, left: Stretch, right: Stretch) -> clif::Value {
+    let common = mut fx.b.umin(left.len, y: right.len)
+    let same_len = mut fx.b.icmp(clif::IntCC.Equal, x: left.len, y: right.len)
+    if method == "eq" {
+        let start = mut fx.int(clif::Type.Int8, value: 1)
+        let zero = mut fx.ptr(0)
+        let results = fx.types1(clif::Type.Int8)
+        let state = mut fx.choose(same_len, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+            let initial = fx1.list2(zero, b: start)
+            let walked = mut fx1.repeat(initial.view(), body: fn[mut lo](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+                expect current.len() == 2
+                let index = current[0]
+                let equal = current[1]
+                let more = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: common)
+                let going = mut fx2.b.band(more, y: equal)
+                let step_results = fx2.types2(PTR, b: clif::Type.Int8)
+                let next = mut fx2.choose(going, results: step_results.view(), then: fn[mut lo](mut fx3: Fx) -> mem::List[clif::Value] {
+                    let a = shape.at(mut fx3, data: left.start, index)
+                    let b = shape.at(mut fx3, data: right.start, index)
+                    let same = elements_equal(mut lo, fx: mut fx3, ty: element, a, b)
+                    let next_index = mut fx3.b.iadd_imm_s(index, y: 1)
+                    return fx3.list2(next_index, b: same)
+                }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                    return fx3.list2(index, b: equal)
+                })
+                return Pass(again: going, next: take next)
+            })
+            expect walked.len() == 2
+            return fx1.list1(walked[1])
+        }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+            let unequal = mut fx1.int(clif::Type.Int8, value: 0)
+            return fx1.list1(unequal)
+        })
+        expect state.len() == 1
+        return state[0]
+    }
+    let zero = mut fx.ptr(0)
+    let undecided = mut fx.int(clif::Type.Int8, value: 1)
+    let initial = fx.list2(zero, b: undecided)
+    let walked = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let index = current[0]
+        let order = current[1]
+        let more = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: common)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 1)
+        let going = mut fx1.b.band(more, y: open)
+        let step_results = fx1.types2(PTR, b: clif::Type.Int8)
+        let next = mut fx1.choose(going, results: step_results.view(), then: fn[mut lo](mut fx2: Fx) -> mem::List[clif::Value] {
+            let a = shape.at(mut fx2, data: left.start, index)
+            let b = shape.at(mut fx2, data: right.start, index)
+            let element_order = mut lo.order(mut fx2, ty: element, left_at: a, right_at: b)
+            let next_index = mut fx2.b.iadd_imm_s(index, y: 1)
+            return fx2.list2(next_index, b: element_order)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(index, b: order)
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect walked.len() == 2
+    let order = walked[1]
+    let open = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 1)
+    let shorter = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: left.len, y: right.len)
+    let zero8 = mut fx.int(clif::Type.Int8, value: 0)
+    let two = mut fx.int(clif::Type.Int8, value: 2)
+    let one = mut fx.int(clif::Type.Int8, value: 1)
+    let by_short = mut fx.b.select(shorter, x: zero8, y: two)
+    let by_len = mut fx.b.select(same_len, x: one, y: by_short)
+    return mut fx.b.select(open, x: by_len, y: order)
+} walk_order
+
+/// Whether two elements at addresses are equal: a key-value entry by key then value, another
+/// through its `Eq`.
+fn elements_equal(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, a: clif::Value, b: clif::Value) -> clif::Value {
+    if lo.ck.is_std(ty, path: "mem::KeyValue") {
+        let equal = mut fx.int(clif::Type.Int8, value: 1)
+        let key_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "key")
+        let key_left = mut fx.offset(a, offset: key_field.offset)
+        let key_right = mut fx.offset(b, offset: key_field.offset)
+        let key_same = elements_equal(mut lo, mut fx, ty: key_field.ty, a: key_left, b: key_right)
+        let keys_equal = mut fx.b.band(equal, y: key_same)
+        let value_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "value")
+        let value_left = mut fx.offset(a, offset: value_field.offset)
+        let value_right = mut fx.offset(b, offset: value_field.offset)
+        let value_same = elements_equal(mut lo, mut fx, ty: value_field.ty, a: value_left, b: value_right)
+        return mut fx.b.band(keys_equal, y: value_same)
+    }
+    return mut lo.equal(mut fx, ty, left_at: a, right_at: b)
+} elements_equal

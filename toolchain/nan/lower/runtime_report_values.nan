@@ -1,0 +1,323 @@
+//! The values trap reports write beyond scalars: text as a text literal, `mem::Bytes` as a byte-string literal, and a struct, enum, `Option`, `Result`, array or slice whose parts can be written as the construction, variant or `[a, b]` form that builds it, each by a glue writing the value at an address.
+
+/// A field a report writes: its name, empty for the payload of `V(T)`, its type and its offset.
+struct Part {
+    name: text::String
+    ty: ty::Ty
+    offset: u64
+} Part
+
+/// A variant a report writes: the variant as written, and its payload's fields.
+struct WrittenVariant {
+    written: text::String
+    fields: mem::List[Part]
+} WrittenVariant
+
+/// How a report writes a value of a type.
+enum ValuesForm {
+    Scalar(ty::Scalar)
+    /// Text at the data and length of a vector or view, or in a fixed text.
+    Text(fixed: bool)
+    Bytes
+    /// A construction: the struct's name and its fields.
+    Struct(name: text::String, fields: mem::List[Part])
+    /// The variants of an enum: each as written, and its payload's fields.
+    Enum(mem::List[WrittenVariant])
+    Array(element: ty::Ty, count: u64)
+    Slice(ty::Ty)
+} ValuesForm
+
+/// Whether a report writes values of a type otherwise than `_`.
+fn values_writable(mut lo: Lowering, ty: ty::Ty) -> bool {
+    var visiting = mem::List[ty::Ty].empty(lo.alloc)
+    let found = values_form(mut lo, ty, mut visiting)
+    return found.is_some()
+} values_writable
+
+/// The glue writing a value of a writable type, given the report and the value's address.
+fn values_writer(mut lo: Lowering, ty: ty::Ty) -> object::FuncId {
+    return mut lo.glue_function(Glue.Written(ty), signature: writer_signature(lo.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() > 1
+        let report = ReportReport(out: params[0])
+        var visiting = mem::List[ty::Ty].empty(lo1.alloc)
+        let Some(form) = values_form(mut lo1, ty, mut visiting) else {
+            expect false
+            return
+        }
+        values_write(mut lo1, fx: mut fx1, report, ty, form, value: params[1])
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} values_writer
+
+/// The type argument at `index` of an item's arguments, none when it has none there or it is a
+/// const argument.
+fn type_argument(lo: Lowering, args: ty::Args, index: usize) -> Option[ty::Ty] {
+    let listed = lo.ck.types().arg_list(args)
+    if index >= listed.len() {
+        return None
+    }
+    return listed[index].ty()
+} type_argument
+
+/// How a report writes a value of a type whose parts it can all write, none otherwise.
+fn values_form(mut lo: Lowering, ty: ty::Ty, mut visiting: mem::List[ty::Ty]) -> Option[ValuesForm]
+    waive length "one decision per kind of type, as the Rust decides them"
+{
+    let ty::TyKind.Item(item: item, args: args) = lo.ck.types().kind(ty) else {
+        return match ty.interned_scalar() {
+            Some(scalar) => Some(ValuesForm.Scalar(scalar))
+            None => None
+        }
+    }
+    if visiting.position(matches: fn(value: ty::Ty) => value == ty).is_some() or lo.ck.is_capability(ty) {
+        return None
+    }
+    let path = lo.ck.db().canonical(item)
+    match path.as_str() {
+        "core::Str" or "text::String" => return Some(ValuesForm.Text(fixed: false))
+        "text::Fixed" => return Some(ValuesForm.Text(fixed: true))
+        "mem::Bytes" => return Some(ValuesForm.Bytes)
+        "core::Untrusted" => return None
+        else => {}
+    }
+    mut visiting.push(ty)
+    var found: Option[ValuesForm] = None
+    if path.as_str() == "core::Array" {
+        let Some(element) = type_argument(lo, args, index: 0) else {
+            return None
+        }
+        let inner = values_form(mut lo, ty: element, mut visiting)
+        if inner.is_none() {
+            return None
+        }
+        let array_args = lo.ck.types().arg_list(args)
+        expect array_args.len() > 1
+        let count = const_arg(array_args[1]).low_bits()
+        found = Some(ValuesForm.Array(element: element, count: count))
+    } else if path.as_str() == "core::Slice" or path.as_str() == "core::SliceMut" {
+        let Some(element) = type_argument(lo, args, index: 0) else {
+            return None
+        }
+        let inner = values_form(mut lo, ty: element, mut visiting)
+        if inner.is_none() {
+            return None
+        }
+        found = Some(ValuesForm.Slice(element))
+    } else {
+        let sig = lo.ck.sig(item)
+        var params = mem::List[ty::Param].empty(lo.alloc)
+        for def in sig.contents().generics {
+            mut params.push(def.param)
+        }
+        let subst = ty::Subst.of(params.view(), args: lo.ck.types().arg_list(args), alloc: lo.alloc)
+        let name = check::final_segment(path.as_str(), alloc: lo.alloc)
+        match sig.contents().kind {
+            check::SigKind.Struct(fields: declared) => {
+                var fields = mem::List[Part].empty(lo.alloc)
+                for field in declared {
+                    let laid = mut lo.layouts.field(lo.ck, ty, variant: None, label: field.name.as_str())
+                    let field_ty = subst.ty(lo.ck.types(), ty: field.ty)
+                    mut fields.push(Part(name: text::String.of(field.name.as_str(), alloc: lo.alloc), ty: field_ty, offset: laid.offset))
+                }
+                if parts_writable(mut lo, mut visiting, parts: fields.view()) {
+                    found = Some(ValuesForm.Struct(name: take name, fields: take fields))
+                }
+            }
+            check::SigKind.Enum(variants: _) => {
+                let laid = mut lo.layout_of(ty)
+                let LayoutShape.Enum(shape) = laid.contents().shape else {
+                    discard mut visiting.pop()
+                    return None
+                }
+                let bare = path.as_str() == "core::Option" or path.as_str() == "core::Result"
+                var variants = mem::List[WrittenVariant].empty(lo.alloc)
+                for variant in shape.variants {
+                    var written = text::String.empty(lo.alloc)
+                    if not bare {
+                        mut written.append(name.as_str())
+                        mut written.push('.')
+                    }
+                    mut written.append(variant.name.as_str())
+                    var fields = mem::List[Part].empty(lo.alloc)
+                    for field in variant.fields {
+                        mut fields.push(Part(name: text::String.of(field.name.as_str(), alloc: lo.alloc), ty: field.ty, offset: field.offset))
+                    }
+                    mut variants.push(WrittenVariant(written: take written, fields: take fields))
+                }
+                var all_writable = true
+                for variant in variants {
+                    if not parts_writable(mut lo, mut visiting, parts: variant.fields.view()) {
+                        all_writable = false
+                        break
+                    }
+                }
+                if all_writable {
+                    found = Some(ValuesForm.Enum(take variants))
+                }
+            }
+            else => {}
+        }
+    }
+    discard mut visiting.pop()
+    return found
+} values_form
+
+/// Whether a report writes every part of a list, the first part it cannot write ending the
+/// search.
+fn parts_writable(mut lo: Lowering, mut visiting: mem::List[ty::Ty], parts: Slice[Part]) -> bool {
+    for part in parts {
+        let found = values_form(mut lo, ty: part.ty, mut visiting)
+        if found.is_none() {
+            return false
+        }
+    }
+    return true
+} parts_writable
+
+/// Writes the value of a type at an address as its form says.
+fn values_write(mut lo: Lowering, mut fx: Fx, report: ReportReport, ty: ty::Ty, form: ValuesForm, value: clif::Value) {
+    match form {
+        ValuesForm.Scalar(scalar) => scalar_part(mut lo, mut fx, report, scalar, at: value)
+        ValuesForm.Text(fixed: false) or ValuesForm.Bytes => {
+            let start = mut fx.load(PTR, addr: value, offset: 0)
+            let len = mut fx.load(PTR, addr: value, offset: 8)
+            let byte_string: u64 = match form {
+                ValuesForm.Bytes => 1
+                else => 0
+            }
+            let bytes = mut fx.ptr(byte_string)
+            discard mut lo.call_routine(mut fx, routine: Routine.ReportText, args: fx.list4(report.out, b: start, c: len, d: bytes).view())
+        }
+        ValuesForm.Text(fixed: true) => {
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
+            let start = mut fx.offset(value, offset: bytes_field.offset)
+            let len = mut fx.load(PTR, addr: value, offset: len_field.offset)
+            let text = mut fx.ptr(0)
+            discard mut lo.call_routine(mut fx, routine: Routine.ReportText, args: fx.list4(report.out, b: start, c: len, d: text).view())
+        }
+        ValuesForm.Struct(name: name, fields: fields) => {
+            var opening = text::String.of(name.as_str(), alloc: lo.alloc)
+            mut opening.push('(')
+            report.text(mut fx, mut lo, text: opening.as_str())
+            values_labelled(mut lo, mut fx, report, fields: fields.view(), value)
+            report.text(mut fx, mut lo, text: ")")
+        }
+        ValuesForm.Enum(variants) => {
+            let index = mut lo.variant_index(mut fx, ty, address: value)
+            var position: i64 = 0
+            for variant in variants {
+                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: position)
+                mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+                    report.text(mut fx1, mut lo, text: variant.written.as_str())
+                    if variant.fields.len() > 0 {
+                        report.text(mut fx1, mut lo, text: "(")
+                        values_labelled(mut lo, fx: mut fx1, report, fields: variant.fields.view(), value)
+                        report.text(mut fx1, mut lo, text: ")")
+                    }
+                })
+                position += 1
+            }
+        }
+        ValuesForm.Array(element: element, count: count) => {
+            let length = mut fx.ptr(count)
+            values_elements(mut lo, mut fx, report, element, start: value, count: length)
+        }
+        ValuesForm.Slice(element) => {
+            let start = mut fx.load(PTR, addr: value, offset: 0)
+            let len = mut fx.load(PTR, addr: value, offset: 8)
+            values_elements(mut lo, mut fx, report, element, start, count: len)
+        }
+    }
+} values_write
+
+/// Writes the fields of a construction or payload at an address, `name: ` before each named
+/// one, separated by `, `.
+fn values_labelled(mut lo: Lowering, mut fx: Fx, report: ReportReport, fields: Slice[Part], value: clif::Value) {
+    var index: usize = 0
+    for field in fields {
+        invariant index < fields.len()
+        let separator = if index == 0 {
+            ""
+        } else {
+            ", "
+        }
+        var label = text::String.of(separator, alloc: lo.alloc)
+        if field.name.byte_len() > 0 {
+            mut label.append(field.name.as_str())
+            mut label.append(": ")
+        }
+        if label.byte_len() > 0 {
+            report.text(mut fx, mut lo, text: label.as_str())
+        }
+        let at = mut fx.offset(value, offset: field.offset)
+        values_part(mut lo, mut fx, report, ty: field.ty, at)
+        index += 1
+    }
+} values_labelled
+
+/// Writes `count` elements from `start` as `[a, b]`, stopping once the report is full.
+fn values_elements(mut lo: Lowering, mut fx: Fx, report: ReportReport, element: ty::Ty, start: clif::Value, count: clif::Value) {
+    report.text(mut fx, mut lo, text: "[")
+    let laid = mut lo.layout_of(element)
+    let stride = laid.contents().size
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    mut fx.if_true(any, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        discard mut fx1.repeat(fx1.list1(zero).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let index = state[0]
+            let later = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: index, y: 0)
+            mut fx2.if_true(later, then: fn[mut lo](mut fx3: Fx) {
+                report.text(mut fx3, mut lo, text: ", ")
+            })
+            let offset = mut fx2.b.imul_imm_s(index, y: i64.fit(stride))
+            let at = mut fx2.b.iadd(start, y: offset)
+            values_part(mut lo, fx: mut fx2, report, ty: element, at)
+            let next = mut fx2.b.iadd_imm_s(index, y: 1)
+            let inside = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: count)
+            let full = report.full(mut fx2)
+            let room = mut fx2.b.bxor_imm_s(full, y: 1)
+            let more = mut fx2.b.band(inside, y: room)
+            return Pass(again: more, next: fx2.list1(next))
+        })
+    })
+    report.text(mut fx, mut lo, text: "]")
+} values_elements
+
+/// Writes a part of a value at an address: a scalar in place, any other by its type's glue.
+fn values_part(mut lo: Lowering, mut fx: Fx, report: ReportReport, ty: ty::Ty, at: clif::Value) {
+    match ty.interned_scalar() {
+        Some(scalar) => scalar_part(mut lo, mut fx, report, scalar, at)
+        None => {
+            let glue = values_writer(mut lo, ty)
+            let reference = mut lo.func_ref(mut fx, id: glue)
+            discard mut fx.b.call(reference, args: fx.list2(report.out, b: at).view())
+        }
+    }
+} values_part
+
+/// Writes the scalar at an address.
+fn scalar_part(mut lo: Lowering, mut fx: Fx, report: ReportReport, scalar: ty::Scalar, at: clif::Value) {
+    let value = mut fx.load(scalar_type(scalar), addr: at, offset: 0)
+    let bits = values_bits(mut fx, scalar, value)
+    let how = mut fx.ptr(trap_written(ty::Ty.scalar(scalar)).number())
+    discard mut lo.call_routine(mut fx, routine: Routine.ReportScalar, args: fx.list3(report.out, b: bits, c: how).view())
+} scalar_part
+
+/// The 64 bits a report reads a scalar's value from: a float's bit pattern, a signed integer's
+/// value sign-extended and any other zero-extended.
+fn values_bits(mut fx: Fx, scalar: ty::Scalar, value: clif::Value) -> clif::Value {
+    if scalar == ty::Scalar.Float32 {
+        let raw = mut fx.b.bitcast(clif::Type.Int32, flags: clif::MemFlags.new(), x: value)
+        return mut fx.b.uextend(clif::Type.Int64, x: raw)
+    }
+    if scalar == ty::Scalar.Float64 {
+        return mut fx.b.bitcast(clif::Type.Int64, flags: clif::MemFlags.new(), x: value)
+    }
+    if scalar.is_signed() and scalar.bits() < 64 {
+        return mut fx.b.sextend(clif::Type.Int64, x: value)
+    }
+    return body_widen(mut fx, value)
+} values_bits

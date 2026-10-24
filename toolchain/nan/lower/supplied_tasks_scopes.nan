@@ -1,0 +1,1051 @@
+//! Task scopes, their children and join handles, deadlines and races. A scope's record is its region, its lock, the state of its kept failure (none, being recorded, a value of its failure type, or a cancellation's origin), that origin, its executor's cell, the count of what references it, whether its call has returned, and its kept failure. A child's record keeps its scope as owner; a join handle is the child's record. A race's record is its region, its lock and the task that decided it.
+
+const SCOPES_SCOPE_LOCK: u64 = 40
+
+const SCOPES_SCOPE_FAILED: u64 = 48
+
+const SCOPES_SCOPE_ORIGIN: u64 = 56
+
+const SCOPES_SCOPE_EXECUTOR: u64 = 64
+
+const SCOPES_SCOPE_REFS: u64 = 72
+
+const SCOPES_SCOPE_RETURNED: u64 = 80
+
+const SCOPES_SCOPE_FAILURE: u64 = 88
+
+/// The states of a scope's kept failure.
+const KEPT_RECORDING: i64 = 1
+
+const KEPT_VALUE: i64 = 2
+
+const KEPT_CANCELLATION: i64 = 3
+
+const RACE_LOCK: u64 = 40
+
+const RACE_DECIDED: u64 = 48
+
+const RACE_SIZE: u64 = 56
+
+/// Where a task's failure lies after its record, and the bytes its result and failure take.
+struct TaskStorage derives Copy {
+    failure_at: u64
+    size: u64
+} TaskStorage
+
+/// The function creating a closure, by its position in its unit, and the value one of its
+/// captures names.
+struct CaptureSite derives Copy {
+    function: usize
+    value: nir::Value
+} CaptureSite
+
+fn scopes_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.path.as_str() {
+        "task::scope" => scope_call(mut lo, mut fx, supply)
+        "task::within" => scopes_within(mut lo, mut fx, supply)
+        "task::race" => race_call(mut lo, mut fx, supply)
+        "task::Scope.cancel" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            discard mut lo.call_routine(mut fx, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
+            supply.done(mut lo, mut fx)
+        }
+        "task::Scope.is_cancelled" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let origin = regions_origin(mut fx, region: record)
+            let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(cancelled))
+        }
+        "task::Scope.spawn" => {
+            let child_ty = fn_param(lo, supply, index: 1)
+            let scope_record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let child = supply.param(1).address_value()
+            let handle = spawn_child(mut lo, mut fx, scope_record, child, child_ty, scope_fails: None)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(handle, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "task::Join.join" => scopes_join(mut lo, mut fx, supply)
+        else => {
+            expect false
+        }
+    }
+} scopes_lower
+
+/// A call of `task::Scope.spawn` lowered where it is written: at a lexical spawn, the child's
+/// failure converts to the failure type of its scope's body closure.
+fn spawn_at(mut body: Body, mut lo: Lowering, mut fx: Fx, operands: Slice[nir::Operand]) -> Held {
+    expect operands.len() == 2
+    let scope_fails = lexical_scope(body, lo, receiver: operands[0])
+    let receiver = mut body.operand(mut lo, mut fx, operand: operands[0])
+    let receiver_address = tasks_address_of(mut lo, mut fx, ty: receiver.nty.ty(), held: receiver.held)
+    let scope_record = mut fx.load(PTR, addr: receiver_address, offset: 0)
+    let child = mut body.operand(mut lo, mut fx, operand: operands[1])
+    let ty::TyKind.Fn(child_fn) = lo.ck.types().kind(child.nty.ty()) else {
+        expect false
+        return Held.Empty
+    }
+    let child_ty = ty::Subst.empty(lo.alloc).fn_ty(lo.ck.types(), fn_ty: lo.ck.types().fn_of(child_fn))
+    let child_address = tasks_address_of(mut lo, mut fx, ty: child.nty.ty(), held: child.held)
+    let handle = spawn_child(mut lo, mut fx, scope_record, child: child_address, child_ty, scope_fails)
+    let slot = mut fx.slot(8, align: 8)
+    mut fx.store(handle, addr: slot, offset: 0)
+    return Held.Address(slot)
+} spawn_at
+
+/// Whether a call names `task::Scope.spawn`.
+fn is_spawn(lo: Lowering, fn_ref: nir::FnRef) -> bool {
+    let nir::Callable.Item(item: item, role: role, index: _) = fn_ref.callable else {
+        return false
+    }
+    return role == nir::Role.Body and lo.ck.db().is_std(item) and lo.ck.db().canonical(item).as_str() == "task::Scope.spawn"
+} is_spawn
+
+/// The value an operand names, as a value or a place without steps.
+fn operand_root(operand: nir::Operand) -> Option[nir::Value] {
+    return match first operand {
+        nir::Operand.Value(value) => Some(value)
+        nir::Operand.Place(mode: _, place: place) if place.steps.len() == 0 => Some(place.root)
+        else => None
+    }
+} operand_root
+
+/// The failure type of the body closure whose parameter a spawn's receiver is, reached through
+/// the captures of the closures nested in it; none when the spawn is not lexical.
+fn lexical_scope(body: Body, lo: Lowering, receiver: nir::Operand) -> Option[ty::Ty] {
+    let Some(start) = operand_root(receiver) else {
+        return None
+    }
+    let unit = body.unit.contents()
+    var function = body.function_index
+    var value = start
+    loop {
+        invariant function < unit.functions.len()
+        let nir_function = unit.functions[function]
+        let Some(position) = nir_function.params.position(fn(param: nir::Param) => param.value == value) else {
+            return None
+        }
+        if nir_function.closure.is_none() {
+            return None
+        }
+        let captures = lo.closure_captures(unit, index: nir_function.index)
+        if position >= captures {
+            let Some(head) = nir_function.params.get(captures) else {
+                return None
+            }
+            let is_scope = lo.ck.is_std(nir_function.ty(head.value).ty(), path: "task::Scope")
+            if position != captures or not is_scope {
+                return None
+            }
+            return scope_failure(body, lo, unit, closure: nir_function.index)
+        }
+        let Some(site) = capture_site(unit, closure: nir_function.index, position) else {
+            return None
+        }
+        value = site.value
+        function = site.function
+    }
+} lexical_scope
+
+/// Where the closure of index `closure` is created with a capture at `position`: the creating
+/// function and the value that capture names; none when that capture names no value.
+fn capture_site(unit: nir::NirUnit, closure: u32, position: usize) -> Option[CaptureSite] {
+    for function in 0..<unit.functions.len() {
+        for block in unit.functions[function].blocks {
+            for inst in block.insts {
+                let nir::Op.Closure(index: index, captures: captures) = inst.op else {
+                    continue
+                }
+                if index != closure {
+                    continue
+                }
+                let Some(captured) = captures.get(position) else {
+                    continue
+                }
+                let Some(value) = operand_root(captured) else {
+                    return None
+                }
+                return Some(CaptureSite(function: function, value: value))
+            }
+        }
+    }
+    return None
+} capture_site
+
+/// The failure type of the `task::scope` call whose body argument is the closure of index
+/// `closure`, written there.
+fn scope_failure(body: Body, lo: Lowering, unit: nir::NirUnit, closure: u32) -> Option[ty::Ty] {
+    for function in unit.functions {
+        var created: Option[nir::Value] = None
+        for block in function.blocks {
+            for inst in block.insts {
+                let nir::Op.Closure(index: index, captures: _) = inst.op else {
+                    continue
+                }
+                if created.is_none() and index == closure {
+                    created = inst.result
+                }
+            }
+        }
+        let Some(made) = created else {
+            continue
+        }
+        var holders = mem::List[nir::Value].empty(lo.alloc)
+        mut holders.push(made)
+        for block in function.blocks {
+            for inst in block.insts {
+                let nir::Op.Init(place: place, operand: nir::Operand.Value(initial)) = inst.op else {
+                    continue
+                }
+                if initial == made and place.steps.len() == 0 {
+                    mut holders.push(place.root)
+                }
+            }
+        }
+        for block in function.blocks {
+            for inst in block.insts {
+                let nir::Op.Call(call) = inst.op else {
+                    continue
+                }
+                if is_scope_body_call(lo, call, holders: holders.view()) {
+                    return scope_body_failure(body, lo, call)
+                }
+            }
+            let nir::Terminator.Call(call: call, ok: _, failure: _) = block.term else {
+                continue
+            }
+            if is_scope_body_call(lo, call, holders: holders.view()) {
+                return scope_body_failure(body, lo, call)
+            }
+        }
+    }
+    return None
+} scope_failure
+
+/// Whether a call is of `task::scope` with a body argument that one of `holders` names.
+fn is_scope_body_call(lo: Lowering, call: nir::Call, holders: Slice[nir::Value]) -> bool {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return false
+    }
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return false
+    }
+    if lo.ck.db().canonical(item).as_str() != "task::scope" {
+        return false
+    }
+    let Some(argument) = call.args.get(1) else {
+        return false
+    }
+    return match first argument {
+        nir::Operand.Value(value) => holds_value(holders, value)
+        nir::Operand.Place(mode: _, place: place) => place.steps.len() == 0 and holds_value(holders, value: place.root)
+        else => false
+    }
+} is_scope_body_call
+
+/// Whether `value` is one of `holders`.
+fn holds_value(holders: Slice[nir::Value], value: nir::Value) -> bool {
+    for holder in holders {
+        if holder == value {
+            return true
+        }
+    }
+    return false
+} holds_value
+
+/// The failure type a `task::scope` call states, in the body's instantiation.
+fn scope_body_failure(body: Body, lo: Lowering, call: nir::Call) -> Option[ty::Ty] {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return None
+    }
+    let args = lo.ck.types().arg_list(fn_ref.args)
+    if args.len() == 0 {
+        return None
+    }
+    let Some(stated) = args[0].ty() else {
+        return None
+    }
+    return Some(body.subst.ty(lo.ck.types(), ty: stated))
+} scope_body_failure
+
+/// `task::scope(exec, body: b)`.
+fn scope_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let failure_ty = supply.type_arg(lo, index: 0)
+    let body_ty = fn_param(lo, supply, index: 1)
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(0).address_value())
+    let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        let none = mut fx1.ptr(0)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
+    })
+    let laid = mut lo.layout_of(failure_ty)
+    var kept_size: u64 = 8
+    if laid.contents().size > 8 {
+        kept_size = laid.contents().size
+    }
+    let size = mut fx.ptr(SCOPES_SCOPE_FAILURE + kept_size)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    mut fx.store(executor.cell, addr: record, offset: SCOPES_SCOPE_EXECUTOR)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: record, offset: SCOPES_SCOPE_REFS)
+    let current = current_task(mut lo, mut fx)
+    let enclosing = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+    mut fx.store(record, addr: current, offset: TASKS_TASK_REGION)
+    let value = mut fx.slot(8, align: 8)
+    mut fx.store(record, addr: value, offset: 0)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(1).address_value(), args: Array[Held, 1].filled(Held.Address(value)).view())
+    mut fx.store(enclosing, addr: current, offset: TASKS_TASK_REGION)
+    match called.failed {
+        Some(failed) => {
+            match called.failure {
+                Some(failure) => {
+                    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                        let held = mut lo.held_at(mut fx1, ty: failure_ty, address: failure)
+                        keep_failure(mut lo, fx: mut fx1, record, failure_ty, held)
+                    })
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    wait_children(mut lo, mut fx, record, live_at: REGIONS_REGION_LIVE)
+    let state = mut fx.load(PTR, addr: record, offset: SCOPES_SCOPE_FAILED)
+    let Some(target) = supply.failure else {
+        expect false
+        return
+    }
+    let value_kept = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: state, y: KEPT_VALUE)
+    mut fx.if_true(value_kept, then: fn[mut lo](mut fx1: Fx) {
+        let kept = mut fx1.offset(record, offset: SCOPES_SCOPE_FAILURE)
+        let held = mut lo.held_at(mut fx1, ty: failure_ty, address: kept)
+        mut lo.store_held(mut fx1, address: target, held, ty: failure_ty)
+    })
+    let cancellation_kept = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: state, y: KEPT_CANCELLATION)
+    mut fx.if_true(cancellation_kept, then: fn[mut lo](mut fx1: Fx) {
+        let origin = mut fx1.load(PTR, addr: record, offset: SCOPES_SCOPE_ORIGIN)
+        let held = mut lo.cancellation(mut fx1, failure_ty, origin)
+        mut lo.store_held(mut fx1, address: target, held, ty: failure_ty)
+    })
+    let returned = mut fx.ptr(1)
+    mut fx.store(returned, addr: record, offset: SCOPES_SCOPE_RETURNED)
+    scopes_unreference(mut lo, mut fx, record)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: state, y: KEPT_VALUE)
+    mut fx.if_true(failed, then: fn(mut fx1: Fx) {
+        supply.raise_failure(mut fx1)
+    })
+    supply.done(mut lo, mut fx)
+} scope_call
+
+/// Keeps a failure of a scope's failure type as the scope's failure unless it is a cancellation
+/// of the scope itself, which the scope absorbs, or another failure was kept first, which it
+/// releases.
+fn keep_failure(mut lo: Lowering, mut fx: Fx, record: clif::Value, failure_ty: ty::Ty, held: Held) {
+    let id = mut fx.load(PTR, addr: record, offset: REGIONS_REGION_ID)
+    var absorbed = id
+    match mut lo.cancellation_origin(mut fx, failure_ty, held) {
+        Some(found) => {
+            let own = mut fx.b.icmp(clif::IntCC.Equal, x: found.origin, y: id)
+            absorbed = mut fx.b.band(found.cancelled, y: own)
+        }
+        None => {
+            absorbed = mut fx.int(clif::Type.Int8, value: 0)
+        }
+    }
+    let recorded = mut fx.b.bxor_imm_s(absorbed, y: 1)
+    mut fx.if_true(recorded, then: fn[mut lo](mut fx1: Fx) {
+        let claimed = claim(mut lo, fx: mut fx1, record)
+        discard mut fx1.choose_in(mut lo, condition: claimed, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let kept = mut fx2.offset(record, offset: SCOPES_SCOPE_FAILURE)
+            mut lo2.store_held(mut fx2, address: kept, held, ty: failure_ty)
+            settle_kept(mut lo2, fx: mut fx2, record, state: KEPT_VALUE)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let address = tasks_address_of(mut lo2, fx: mut fx2, ty: failure_ty, held)
+            mut lo2.release(mut fx2, ty: failure_ty, address)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+    })
+} keep_failure
+
+/// Claims a scope's kept failure: nonzero for the first claimant.
+fn claim(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let state = mut fx.offset(record, offset: SCOPES_SCOPE_FAILED)
+    let zero = mut fx.ptr(0)
+    let recording = mut fx.ptr(u64.fit(KEPT_RECORDING))
+    let previous = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: state, e: zero, x: recording)
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+} claim
+
+/// Ends the recording of a scope's kept failure and cancels the scope.
+fn settle_kept(mut lo: Lowering, mut fx: Fx, record: clif::Value, state: i64) {
+    let word = mut fx.offset(record, offset: SCOPES_SCOPE_FAILED)
+    let state_value = mut fx.ptr(u64.fit(state))
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: state_value, p: word)
+    discard mut lo.call_routine(mut fx, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
+} settle_kept
+
+/// Waits until a construct has no live task, whatever cancellation reaches the waiting task.
+fn wait_children(mut lo: Lowering, mut fx: Fx, record: clif::Value, live_at: u64) {
+    let lock = mut fx.offset(record, offset: SCOPES_SCOPE_LOCK)
+    let current = current_task(mut lo, mut fx)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let live = mut fx1.load(PTR, addr: record, offset: live_at)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: live, y: 0)
+        mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
+            mut fx2.store(current, addr: record, offset: REGIONS_REGION_WAITER)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Park, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} wait_children
+
+/// Drops one reference to a scope's record, freeing it with the last.
+fn scopes_unreference(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let refs = mut fx.offset(record, offset: SCOPES_SCOPE_REFS)
+    let minus = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+    let previous = fetch_add(mut fx, address: refs, amount: minus)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 1)
+    mut fx.if_true(last, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.record_free(mut fx1, address: record)
+    })
+} scopes_unreference
+
+/// The offsets of a task's result and failure after its record, and the bytes they take.
+fn scopes_storage(mut lo: Lowering, fn_ty: ty::FnTy) -> TaskStorage {
+    let result_laid = mut lo.layout_of(fn_ty.result)
+    let result_size = result_laid.contents().size
+    var failure_size: u64 = 8
+    var failure_align: u64 = 8
+    match fn_ty.failure {
+        Some(failure_ty) => {
+            let laid = mut lo.layout_of(failure_ty)
+            failure_size = laid.contents().size
+            failure_align = at_least_one(laid.contents().align)
+        }
+        None => {}
+    }
+    let failure_at = next_multiple_of(result_size, multiple: failure_align)
+    return TaskStorage(failure_at: failure_at, size: failure_at + failure_size)
+} scopes_storage
+
+/// Starts a task running a `task fn` value of a type held at an address, in a region, owned by
+/// a construct or domain record, its stack drawn through a cell for a domain: its record,
+/// ready. It traps when the stack cannot be drawn.
+fn start_task(
+    mut lo: Lowering,
+    mut fx: Fx,
+    fn_ty: ty::FnTy,
+    function: clif::Value,
+    cell: clif::Value,
+    domain: clif::Value,
+    region_record: clif::Value,
+    owner: clif::Value,
+    end: Option[object::FuncId],
+    done: object::FuncId,
+    ) -> clif::Value {
+    let storage = scopes_storage(mut lo, fn_ty)
+    let entry = scopes_entry_glue(mut lo, fn_ty)
+    let entry_ref = mut lo.func_ref(mut fx, id: entry)
+    let glue = mut fx.b.func_addr(PTR, func_ref: entry_ref)
+    let code = mut fx.load(PTR, addr: function, offset: 0)
+    let env = mut fx.load(PTR, addr: function, offset: 8)
+    let extra = mut fx.ptr(storage.size)
+    let stack = mut fx.ptr(stack_size(fn_ty))
+    var spawn_args = Array[clif::Value, 8].filled(glue)
+    spawn_args[1] = code
+    spawn_args[2] = env
+    spawn_args[3] = extra
+    spawn_args[4] = stack
+    spawn_args[5] = cell
+    spawn_args[6] = domain
+    spawn_args[7] = region_record
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.Spawn, args: spawn_args.view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let failure = mut fx.b.iadd_imm_s(record, y: i64.from_bits(TASK_SIZE + storage.failure_at))
+    mut fx.store(failure, addr: record, offset: TASK_FAILURE)
+    mut fx.store(owner, addr: record, offset: TASK_OWNER)
+    match end {
+        Some(ended) => {
+            let end_ref = mut lo.func_ref(mut fx, id: ended)
+            let end_address = mut fx.b.func_addr(PTR, func_ref: end_ref)
+            mut fx.store(end_address, addr: record, offset: TASK_END)
+        }
+        None => {}
+    }
+    let done_ref = mut lo.func_ref(mut fx, id: done)
+    let done_address = mut fx.b.func_addr(PTR, func_ref: done_ref)
+    mut fx.store(done_address, addr: record, offset: TASK_DONE)
+    if mut lo.needs_release(fn_ty.result) {
+        let release = mut lo.instance(Instance.Release(fn_ty.result))
+        let release_ref = mut lo.func_ref(mut fx, id: release)
+        let release_address = mut fx.b.func_addr(PTR, func_ref: release_ref)
+        mut fx.store(release_address, addr: record, offset: TASK_RESULT_RELEASE)
+    }
+    return record
+} start_task
+
+/// The glue running a task's entry, a function value of a type taking at most the argument the
+/// record holds: it writes the result or failure after the record, records the outcome and
+/// frees the closure's environment.
+fn scopes_entry_glue(mut lo: Lowering, fn_ty: ty::FnTy) -> object::FuncId {
+    let entry_fn = lo.ck.types().fn_ty(ty::Subst.empty(lo.alloc).fn_ty(lo.ck.types(), fn_ty))
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.Entry(entry_fn), signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let abi = mut lo1.fn_abi(fn_ty)
+        let code = mut fx1.load(PTR, addr: record, offset: TASK_CODE)
+        let env = mut fx1.load(PTR, addr: record, offset: TASK_ENV)
+        let result = mut fx1.load(PTR, addr: record, offset: TASK_RESULT)
+        let failure = mut fx1.load(PTR, addr: record, offset: TASK_FAILURE)
+        var args = mem::List[clif::Value].empty(fx1.alloc)
+        mut args.push(env)
+        if abi.returned == Returned.Indirect {
+            mut args.push(result)
+        }
+        if abi.flagged {
+            mut args.push(failure)
+        }
+        for param in abi.params {
+            let argument = mut fx1.offset(record, offset: TASK_ARGUMENT)
+            let held = adapt_value(mut lo1, fx: mut fx1, held: Held.Address(argument), nty: param.nty, wanted: param.repr)
+            for passed in held.values(fx1.alloc) {
+                mut args.push(passed)
+            }
+        }
+        let signature_ref = mut fx1.b.import_signature(abi.signature(fx1.alloc))
+        let call = mut fx1.b.call_indirect(signature_ref, callee: code, args: args.view())
+        let returns = fx1.b.inst_results(call, alloc: fx1.alloc)
+        var next_return: usize = 0
+        var failed: Option[clif::Value] = None
+        if abi.flagged {
+            expect next_return < returns.len()
+            failed = Some(returns[next_return])
+            next_return += 1
+        }
+        match abi.returned {
+            Returned.Scalar(_) => {
+                expect next_return < returns.len()
+                mut lo1.store_held(mut fx1, address: result, held: Held.Scalar(returns[next_return]), ty: fn_ty.result)
+            }
+            else => {}
+        }
+        let returned = mut fx1.ptr(1)
+        var outcome = returned
+        match failed {
+            Some(flag) => {
+                let widened = mut fx1.b.uextend(PTR, x: flag)
+                outcome = mut fx1.b.iadd(returned, y: widened)
+            }
+            None => {}
+        }
+        mut fx1.store(outcome, addr: record, offset: TASK_OUTCOME)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.TaskEnvFree, args: Array[clif::Value, 1].filled(env).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} scopes_entry_glue
+
+/// Spawns a scope's child running a `task fn` value: its join handle, which is its record.
+fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: clif::Value, child_ty: ty::FnTy, scope_fails: Option[ty::Ty]) -> clif::Value {
+    let cell = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_EXECUTOR)
+    let domain = current_domain(mut lo, mut fx)
+    let end = child_end(mut lo, child_ty, scope_fails)
+    let done = child_done(mut lo)
+    let lock = mut fx.offset(scope_record, offset: SCOPES_SCOPE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let live = mut fx.load(PTR, addr: scope_record, offset: REGIONS_REGION_LIVE)
+    let more_live = mut fx.b.iadd_imm_s(live, y: 1)
+    mut fx.store(more_live, addr: scope_record, offset: REGIONS_REGION_LIVE)
+    let refs = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_REFS)
+    let more_refs = mut fx.b.iadd_imm_s(refs, y: 1)
+    mut fx.store(more_refs, addr: scope_record, offset: SCOPES_SCOPE_REFS)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let record = start_task(mut lo, mut fx, fn_ty: child_ty, function: child, cell, domain, region_record: scope_record, owner: scope_record, end: Some(end), done)
+    spawned(mut lo, mut fx, record)
+    return record
+} spawn_child
+
+/// The end of a scope's child: a failure that is no cancellation of the scope itself becomes
+/// the scope's kept failure, converted to the scope's failure type at a lexical spawn, or its
+/// cancellation's origin.
+fn child_end(mut lo: Lowering, child_ty: ty::FnTy, scope_fails: Option[ty::Ty]) -> object::FuncId {
+    let entry_fn = lo.ck.types().fn_ty(ty::Subst.empty(lo.alloc).fn_ty(lo.ck.types(), fn_ty: child_ty))
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.ChildEnd(entry: entry_fn, scope_failure: scope_fails), signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let Some(failure_ty) = child_ty.failure else {
+            mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+            return
+        }
+        let outcome = mut fx1.load(PTR, addr: record, offset: TASK_OUTCOME)
+        let failed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 2)
+        mut fx1.if_true(failed, then: fn[mut lo1](mut fx2: Fx) {
+            child_failed(mut lo1, fx: mut fx2, record, failure_ty, scope_fails)
+        })
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} child_end
+
+/// What the end of a scope's child does once it failed: a cancellation of another region
+/// becomes the scope's kept cancellation when first; any other failure is kept, converted at a
+/// lexical spawn, or else released.
+fn child_failed(mut lo: Lowering, mut fx: Fx, record: clif::Value, failure_ty: ty::Ty, scope_fails: Option[ty::Ty]) {
+    let scope_record = mut fx.load(PTR, addr: record, offset: TASK_OWNER)
+    let id = mut fx.load(PTR, addr: scope_record, offset: REGIONS_REGION_ID)
+    let failure = mut fx.load(PTR, addr: record, offset: TASK_FAILURE)
+    let held = mut lo.held_at(mut fx, ty: failure_ty, address: failure)
+    var is_cancellation = id
+    var origin = id
+    match mut lo.cancellation_origin(mut fx, failure_ty, held) {
+        Some(found) => {
+            is_cancellation = found.cancelled
+            origin = found.origin
+        }
+        None => {
+            is_cancellation = mut fx.int(clif::Type.Int8, value: 0)
+            origin = mut fx.ptr(0)
+        }
+    }
+    discard mut fx.choose_in(mut lo, condition: is_cancellation, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let other = mut fx1.b.icmp(clif::IntCC.NotEqual, x: origin, y: id)
+        mut fx1.if_true(other, then: fn[mut lo1](mut fx2: Fx) {
+            let claimed = claim(mut lo1, fx: mut fx2, record: scope_record)
+            mut fx2.if_true(claimed, then: fn[mut lo1](mut fx3: Fx) {
+                mut fx3.store(origin, addr: scope_record, offset: SCOPES_SCOPE_ORIGIN)
+                settle_kept(mut lo1, fx: mut fx3, record: scope_record, state: KEPT_CANCELLATION)
+            })
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        match scope_fails {
+            Some(scope_ty) => {
+                match lo1.ck.conversion_variant(failure_ty, to: scope_ty) {
+                    Some(via) => {
+                        let converted = mut lo1.convert_failure(mut fx1, held, from: failure_ty, to: scope_ty, via: Some(via.as_str()))
+                        keep_failure(mut lo1, fx: mut fx1, record: scope_record, failure_ty: scope_ty, held: converted)
+                    }
+                    None => {
+                        let converted = mut lo1.convert_failure(mut fx1, held, from: failure_ty, to: scope_ty, via: None)
+                        keep_failure(mut lo1, fx: mut fx1, record: scope_record, failure_ty: scope_ty, held: converted)
+                    }
+                }
+            }
+            None => {
+                let address = tasks_address_of(mut lo1, fx: mut fx1, ty: failure_ty, held)
+                mut lo1.release(mut fx1, ty: failure_ty, address)
+            }
+        }
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} child_failed
+
+/// What the executor thread does once a scope's child has ended: the joiner and, after the
+/// last child, the scope's caller wake; a reaped child's result is released and its record
+/// freed.
+fn child_done(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.ChildDone, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let scope_record = mut fx1.load(PTR, addr: record, offset: TASK_OWNER)
+        let lock = mut fx1.offset(scope_record, offset: SCOPES_SCOPE_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let flags = mut fx1.load(PTR, addr: record, offset: TASK_FLAGS)
+        let done_flags = mut fx1.b.bor_imm_s(flags, y: FLAG_DONE)
+        mut fx1.store(done_flags, addr: record, offset: TASK_FLAGS)
+        let live = mut fx1.load(PTR, addr: scope_record, offset: REGIONS_REGION_LIVE)
+        let fewer = mut fx1.b.iadd_imm_s(live, y: -1)
+        mut fx1.store(fewer, addr: scope_record, offset: REGIONS_REGION_LIVE)
+        let joiner = mut fx1.load(PTR, addr: record, offset: TASK_JOINER)
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: fewer, y: 0)
+        let scope_waiter = mut fx1.load(PTR, addr: scope_record, offset: REGIONS_REGION_WAITER)
+        let zero = mut fx1.ptr(0)
+        let waiter = mut fx1.b.select(last, x: scope_waiter, y: zero)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        var woken = Array[clif::Value, 2].filled(joiner)
+        woken[1] = waiter
+        for task in woken {
+            let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: task, y: 0)
+            mut fx1.if_true(present, then: fn[mut lo1](mut fx2: Fx) {
+                discard mut lo1.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
+            })
+        }
+        let reaped_bit = mut fx1.b.band_imm_s(done_flags, y: FLAG_REAPED)
+        let reaped = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: reaped_bit, y: 0)
+        mut fx1.if_true(reaped, then: fn[mut lo1](mut fx2: Fx) {
+            finish_child(mut lo1, fx: mut fx2, record, scope_record, result_ty: None)
+        })
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} child_done
+
+/// Frees an ended child's record, releasing its result when it returned one, and drops its
+/// reference to its scope. The result's type, when known, releases it by a direct call; the
+/// executor thread, which ends children of every type, releases it through the release the
+/// child's record holds.
+fn finish_child(mut lo: Lowering, mut fx: Fx, record: clif::Value, scope_record: clif::Value, result_ty: Option[ty::Ty]) {
+    let outcome = mut fx.load(PTR, addr: record, offset: TASK_OUTCOME)
+    let returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
+    match result_ty {
+        Some(known) => {
+            if mut lo.needs_release(known) {
+                mut fx.if_true(returned, then: fn[mut lo](mut fx1: Fx) {
+                    let result = mut fx1.load(PTR, addr: record, offset: TASK_RESULT)
+                    mut lo.release(mut fx1, ty: known, address: result)
+                })
+            }
+        }
+        None => {
+            let release = mut fx.load(PTR, addr: record, offset: TASK_RESULT_RELEASE)
+            let has_release = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: release, y: 0)
+            let releases = mut fx.b.band(returned, y: has_release)
+            mut fx.if_true(releases, then: fn(mut fx1: Fx) {
+                let result = mut fx1.load(PTR, addr: record, offset: TASK_RESULT)
+                let signature_ref = mut fx1.b.import_signature(record_signature(fx1.alloc))
+                discard mut fx1.b.call_indirect(signature_ref, callee: release, args: Array[clif::Value, 1].filled(result).view())
+            })
+        }
+    }
+    mut lo.record_free(mut fx, address: record)
+    scopes_unreference(mut lo, mut fx, record: scope_record)
+} finish_child
+
+/// `take h.join()`: waits until the child has ended, then yields its result, or fails with the
+/// cancellation of its failure type when it did not return.
+fn scopes_join(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result_ty = supply.type_arg(lo, index: 0)
+    let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let scope_record = mut fx.load(PTR, addr: record, offset: TASK_OWNER)
+    let returned = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_RETURNED)
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: returned, y: 0)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.stale-handle")
+    })
+    let lock = mut fx.offset(scope_record, offset: SCOPES_SCOPE_LOCK)
+    let current = current_task(mut lo, mut fx)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let flags = mut fx1.load(PTR, addr: record, offset: TASK_FLAGS)
+        let done = mut fx1.b.band_imm_s(flags, y: FLAG_DONE)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+        mut fx1.if_true(waiting, then: fn(mut fx2: Fx) {
+            mut fx2.store(current, addr: record, offset: TASK_JOINER)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Park, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let outcome = mut fx.load(PTR, addr: record, offset: TASK_OUTCOME)
+    let child_returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
+    let laid = mut lo.layout_of(result_ty)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    mut fx.if_true(child_returned, then: fn[mut lo](mut fx1: Fx) {
+        let result = mut fx1.load(PTR, addr: record, offset: TASK_RESULT)
+        let held = mut lo.held_at(mut fx1, ty: result_ty, address: result)
+        mut lo.store_held(mut fx1, address: slot, held, ty: result_ty)
+    })
+    mut lo.record_free(mut fx, address: record)
+    scopes_unreference(mut lo, mut fx, record: scope_record)
+    let failed = mut fx.b.bxor_imm_s(child_returned, y: 1)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        let origin = tasks_origin(mut lo, fx: mut fx1)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin)
+    })
+    let held = mut lo.held_at(mut fx, ty: result_ty, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} scopes_join
+
+/// Releases a join handle: reaps its child, releasing its result once it has ended.
+fn release_join(mut lo: Lowering, mut fx: Fx, address: clif::Value, result: ty::Ty) {
+    let record = mut fx.load(PTR, addr: address, offset: 0)
+    let scope_record = mut fx.load(PTR, addr: record, offset: TASK_OWNER)
+    let lock = mut fx.offset(scope_record, offset: SCOPES_SCOPE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let flags = mut fx.load(PTR, addr: record, offset: TASK_FLAGS)
+    let done_bit = mut fx.b.band_imm_s(flags, y: FLAG_DONE)
+    let done = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: done_bit, y: 0)
+    let reaped = mut fx.b.bor_imm_s(flags, y: FLAG_REAPED)
+    let kept_flags = mut fx.b.select(done, x: flags, y: reaped)
+    mut fx.store(kept_flags, addr: record, offset: TASK_FLAGS)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    mut fx.if_true(done, then: fn[mut lo](mut fx1: Fx) {
+        finish_child(mut lo, fx: mut fx1, record, scope_record, result_ty: Some(result))
+    })
+} release_join
+
+/// `task::within(clock, ms, body: b)`: runs `b` in a region that a deadline cancels; `None`
+/// when `b` fails with a cancellation of that region.
+fn scopes_within(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let body_ty = fn_param(lo, supply, index: 2)
+    let clock = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let ms = supply.param(1).scalar_value()
+    let size = mut fx.ptr(REGIONS_REGION_SIZE)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let timer = mut fx.slot(DEADLINE_SIZE, align: 8)
+    let zero = mut fx.ptr(0)
+    let timer_size = mut fx.ptr(DEADLINE_SIZE)
+    var fill_args = Array[clif::Value, 3].filled(timer)
+    fill_args[1] = zero
+    fill_args[2] = timer_size
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+    let deadline = mut fx.int(PTR, value: TASKS_KIND_DEADLINE)
+    mut fx.store(deadline, addr: timer, offset: OPERATION_KIND)
+    mut fx.store(record, addr: timer, offset: OPERATION_TASK)
+    let live = link_deadline(mut lo, mut fx, clock, timer)
+    discard mut fx.choose_in(mut lo, condition: live, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        arm_deadline(mut lo1, fx: mut fx1, timer, ms)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(record).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let current = current_task(mut lo, mut fx)
+    let enclosing = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+    mut fx.store(record, addr: current, offset: TASKS_TASK_REGION)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: mem::List[Held].empty(fx.alloc).view())
+    mut fx.store(enclosing, addr: current, offset: TASKS_TASK_REGION)
+    mut fx.if_true(live, then: fn[mut lo](mut fx1: Fx) {
+        unlink_deadline(mut lo, fx: mut fx1, timer)
+        disarm_deadline(mut lo, fx: mut fx1, timer)
+    })
+    let id = mut fx.load(PTR, addr: record, offset: REGIONS_REGION_ID)
+    mut lo.record_free(mut fx, address: record)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    match called.failed {
+        Some(failed) => {
+            match called.failure {
+                Some(failure) => {
+                    match body_ty.failure {
+                        Some(failure_ty) => {
+                            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                                within_failed(mut lo, fx: mut fx1, supply, failure_ty, failure, id, slot)
+                            })
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let some = mut fx.int(clif::Type.Int8, value: 1)
+    mut lo.write_option(mut fx, option, address: slot, presence: some, value: called.result)
+    let held = mut lo.held_at(mut fx, ty: option, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} scopes_within
+
+/// What `task::within` does once its body failed: a cancellation of its own region gives
+/// `None`, any other failure becomes the call's.
+fn within_failed(mut lo: Lowering, mut fx: Fx, supply: Supply, failure_ty: ty::Ty, failure: clif::Value, id: clif::Value, slot: clif::Value) {
+    let option = supply.abi.result
+    let held = mut lo.held_at(mut fx, ty: failure_ty, address: failure)
+    var own = id
+    match mut lo.cancellation_origin(mut fx, failure_ty, held) {
+        Some(found) => {
+            let same = mut fx.b.icmp(clif::IntCC.Equal, x: found.origin, y: id)
+            own = mut fx.b.band(found.cancelled, y: same)
+        }
+        None => {
+            own = mut fx.int(clif::Type.Int8, value: 0)
+        }
+    }
+    discard mut fx.choose_in(mut lo, condition: own, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        mut lo1.write_option(mut fx1, option, address: slot, presence: none, value: Held.Empty)
+        let none_held = mut lo1.held_at(mut fx1, ty: option, address: slot)
+        supply.ret(mut lo1, fx: mut fx1, held: none_held)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let Some(target) = supply.failure else {
+            expect false
+            return mem::List[clif::Value].empty(fx1.alloc)
+        }
+        mut lo1.store_held(mut fx1, address: target, held, ty: failure_ty)
+        supply.raise_failure(mut fx1)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} within_failed
+
+/// Arms a deadline's timer of `ms` milliseconds, whose expiry cancels its region, first among
+/// the deadlines the running task armed.
+fn arm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value, ms: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let armed = mut fx.load(PTR, addr: current, offset: TASK_DEADLINES)
+    mut fx.store(armed, addr: timer, offset: OPERATION_LINK)
+    mut fx.store(timer, addr: current, offset: TASK_DEADLINES)
+    let spec = mut fx.offset(timer, offset: OPERATION_SIZE)
+    mut lo.arm_timer(mut fx, op: timer, ms, spec)
+} arm_deadline
+
+/// Cancels a deadline's timeout unless it has expired, waits for its completion, and takes it
+/// out of the deadlines the running task armed, of which it is the first.
+fn disarm_deadline(mut lo: Lowering, mut fx: Fx, timer: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let waiter = mut fx.offset(timer, offset: OPERATION_WAITER)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: current, p: waiter)
+    mut lo.cancel_operation(mut fx, op: timer)
+    wait_delivered(mut lo, mut fx, op: timer)
+    let now_current = current_task(mut lo, mut fx)
+    let armed = mut fx.load(PTR, addr: timer, offset: OPERATION_LINK)
+    mut fx.store(armed, addr: now_current, offset: TASK_DEADLINES)
+} disarm_deadline
+
+/// `task::race(exec, left: l, right: r)`: the result or failure of the first of two tasks to
+/// end, once both have ended.
+fn race_call(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result_ty = supply.type_arg(lo, index: 0)
+    let failure_ty = supply.type_arg(lo, index: 1)
+    let task_ty = fn_param(lo, supply, index: 1)
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(0).address_value())
+    let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        let none = mut fx1.ptr(0)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
+    })
+    let size = mut fx.ptr(RACE_SIZE)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.RegionOpen, args: Array[clif::Value, 1].filled(size).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let two = mut fx.ptr(2)
+    mut fx.store(two, addr: record, offset: REGIONS_REGION_LIVE)
+    let domain = current_domain(mut lo, mut fx)
+    let end = race_end(mut lo)
+    let done = race_done(mut lo)
+    var started = Array[clif::Value, 2].filled(record)
+    for index in 0..<2usize {
+        let function = supply.param(index + 1).address_value()
+        started[index] = start_task(mut lo, mut fx, fn_ty: task_ty, function, cell: executor.cell, domain, region_record: record, owner: record, end: Some(end), done)
+    }
+    for task in started {
+        spawned(mut lo, mut fx, record: task)
+    }
+    wait_children(mut lo, mut fx, record, live_at: REGIONS_REGION_LIVE)
+    let decided = mut fx.load(PTR, addr: record, offset: RACE_DECIDED)
+    let first_decided = mut fx.b.icmp(clif::IntCC.Equal, x: decided, y: started[0])
+    let other = mut fx.b.select(first_decided, x: started[1], y: started[0])
+    release_outcome(mut lo, mut fx, record: other, result_ty, failure_ty)
+    let outcome = mut fx.load(PTR, addr: decided, offset: TASK_OUTCOME)
+    let returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
+    let laid = mut lo.layout_of(result_ty)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let Some(target) = supply.failure else {
+        expect false
+        return
+    }
+    discard mut fx.choose_in(mut lo, condition: returned, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let result = mut fx1.load(PTR, addr: decided, offset: TASK_RESULT)
+        let held = mut lo1.held_at(mut fx1, ty: result_ty, address: result)
+        mut lo1.store_held(mut fx1, address: slot, held, ty: result_ty)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let failure = mut fx1.load(PTR, addr: decided, offset: TASK_FAILURE)
+        let held = mut lo1.held_at(mut fx1, ty: failure_ty, address: failure)
+        mut lo1.store_held(mut fx1, address: target, held, ty: failure_ty)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    for task in started {
+        mut lo.record_free(mut fx, address: task)
+    }
+    mut lo.record_free(mut fx, address: record)
+    let failed = mut fx.b.bxor_imm_s(returned, y: 1)
+    mut fx.if_true(failed, then: fn(mut fx1: Fx) {
+        supply.raise_failure(mut fx1)
+    })
+    let held = mut lo.held_at(mut fx, ty: result_ty, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} race_call
+
+/// Releases what an ended task's entry gave: its result or its failure.
+fn release_outcome(mut lo: Lowering, mut fx: Fx, record: clif::Value, result_ty: ty::Ty, failure_ty: ty::Ty) {
+    let outcome = mut fx.load(PTR, addr: record, offset: TASK_OUTCOME)
+    let returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
+    discard mut fx.choose_in(mut lo, condition: returned, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let result = mut fx1.load(PTR, addr: record, offset: TASK_RESULT)
+        mut lo1.release(mut fx1, ty: result_ty, address: result)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let failure = mut fx1.load(PTR, addr: record, offset: TASK_FAILURE)
+        mut lo1.release(mut fx1, ty: failure_ty, address: failure)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} release_outcome
+
+/// The end of a race's task: the first to end decides the race, which then cancels.
+fn race_end(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.RaceEnd, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let owner = mut fx1.load(PTR, addr: record, offset: TASK_OWNER)
+        let decided = mut fx1.offset(owner, offset: RACE_DECIDED)
+        let zero = mut fx1.ptr(0)
+        let previous = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: decided, e: zero, x: record)
+        let decides = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+        mut fx1.if_true(decides, then: fn[mut lo1](mut fx2: Fx) {
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(owner).view())
+        })
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} race_end
+
+/// What the executor thread does once a race's task has ended: after the second, the race's
+/// caller wakes.
+fn race_done(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.RaceDone, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let record = params[0]
+        let owner = mut fx1.load(PTR, addr: record, offset: TASK_OWNER)
+        let lock = mut fx1.offset(owner, offset: RACE_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let live = mut fx1.load(PTR, addr: owner, offset: REGIONS_REGION_LIVE)
+        let fewer = mut fx1.b.iadd_imm_s(live, y: -1)
+        mut fx1.store(fewer, addr: owner, offset: REGIONS_REGION_LIVE)
+        let waiter = mut fx1.load(PTR, addr: owner, offset: REGIONS_REGION_WAITER)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: fewer, y: 0)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+        let wakes = mut fx1.b.band(last, y: present)
+        mut fx1.if_true(wakes, then: fn[mut lo1](mut fx2: Fx) {
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(waiter).view())
+        })
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} race_done

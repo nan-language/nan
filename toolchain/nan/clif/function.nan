@@ -1,0 +1,641 @@
+//! Functions as built: their values, instructions and blocks, numbered as Cranelift numbers them, and the order of their blocks and instructions.
+
+/// A function's instructions, values and blocks as built, and its layout.
+pkg struct Function {
+    pkg name: ExternalName
+    pkg signature: Signature
+    stack_slots: mem::List[StackSlotData]
+    global_values: mem::List[GlobalValueData]
+    dfg: DataFlowGraph
+    laid: Layout
+    params: FunctionParameters
+    /// Each instruction's source location relative to the base location, by instruction index;
+    /// empty until an instruction is given a location.
+    srclocs: mem::List[SourceLoc]
+} Function
+
+pkg fn Function.new(name: ExternalName, take signature: Signature, alloc: mem::Alloc) -> Function {
+    return Function(
+        name: name,
+        signature: take signature,
+        stack_slots: mem::List[StackSlotData].empty(alloc),
+        global_values: mem::List[GlobalValueData].empty(alloc),
+        dfg: DataFlowGraph.empty(alloc),
+        laid: Layout.empty(alloc),
+        params: FunctionParameters.empty(alloc),
+        srclocs: mem::List[SourceLoc].empty(alloc),
+    )
+} Function.new
+
+fn Function.create_sized_stack_slot(mut self, data: StackSlotData) -> StackSlot {
+    let slot = StackSlot(index: u32.fit(self.stack_slots.len()))
+    mut self.stack_slots.push(data)
+    return slot
+} Function.create_sized_stack_slot
+
+fn Function.import_signature(mut self, take signature: Signature) -> SigRef {
+    let sig_ref = SigRef(index: u32.fit(self.dfg.signatures.len()))
+    mut self.dfg.signatures.push(take signature)
+    return sig_ref
+} Function.import_signature
+
+fn Function.import_function(mut self, data: ExtFuncData) -> FuncRef {
+    let func_ref = FuncRef(index: u32.fit(self.dfg.ext_funcs.len()))
+    mut self.dfg.ext_funcs.push(data)
+    return func_ref
+} Function.import_function
+
+fn Function.create_global_value(mut self, data: GlobalValueData) -> GlobalValue {
+    let global_value = GlobalValue(index: u32.fit(self.global_values.len()))
+    mut self.global_values.push(data)
+    return global_value
+} Function.create_global_value
+
+/// A new block, with its node in the layout.
+fn Function.make_block(mut self) -> Block {
+    let block = mut self.dfg.make_block()
+    mut self.laid.add_block_node()
+    return block
+} Function.make_block
+
+/// Gives a name the function's external names refer to its reference, numbering it on first use.
+fn Function.declare_imported_user_function(mut self, name: ExternalName) -> u32 {
+    return mut self.params.ensure_user_func_name(name)
+} Function.declare_imported_user_function
+
+/// Records an instruction's source location, relative to the first location the function records.
+fn Function.set_srcloc(mut self, inst: Inst, srcloc: SourceLoc) {
+    let base = mut self.params.ensure_base_srcloc(srcloc)
+    let index = usize.widen(inst.index)
+    while self.srclocs.len() <= index {
+        mut self.srclocs.push(DEFAULT_LOC)
+    }
+    if base.is_default() or srcloc.is_default() {
+        self.srclocs[index] = DEFAULT_LOC
+        return
+    }
+    self.srclocs[index] = SourceLoc(bits: srcloc.bits.wrapping_sub(base.bits))
+} Function.set_srcloc
+
+pkg fn Function.srcloc(self, inst: Inst) -> SourceLoc {
+    let base = self.params.base_srcloc()
+    let index = usize.widen(inst.index)
+    if index >= self.srclocs.len() {
+        return DEFAULT_LOC
+    }
+    let relative = self.srclocs[index]
+    if relative.is_default() or base.is_default() {
+        return DEFAULT_LOC
+    }
+    return SourceLoc(bits: relative.bits.wrapping_add(base.bits))
+} Function.srcloc
+
+/// Inserts a new instruction before `before`, or at the end of `block` when none, without a source
+/// location, and gives its first result.
+fn Function.insert_inst(mut self, take data: InstructionData, ctrl_typevar: Type, block: Block, before: Option[Inst]) -> Value {
+    let inst = mut self.dfg.make_inst(take data)
+    discard mut self.dfg.make_inst_results(inst, ctrl_typevar: Some(ctrl_typevar))
+    match before {
+        Some(next) => mut self.laid.insert_inst(inst, before: next)
+        None => mut self.laid.append_inst(inst, block)
+    }
+    return self.dfg.first_result(inst)
+} Function.insert_inst
+
+/// The blocks in layout order.
+pkg fn Function.layout_blocks(self, alloc: mem::Alloc) -> mem::List[Block] {
+    var blocks = mem::List[Block].empty(alloc)
+    for block in self.laid.order {
+        mut blocks.push(block)
+    }
+    return blocks
+} Function.layout_blocks
+
+pkg fn Function.entry_block(self) -> Option[Block] {
+    return self.laid.entry_block()
+} Function.entry_block
+
+/// The instructions of a block in layout order.
+pkg fn Function.block_insts(self, block: Block, alloc: mem::Alloc) -> mem::List[Inst] {
+    var insts = mem::List[Inst].empty(alloc)
+    for inst in self.laid.block_insts(block) {
+        mut insts.push(inst)
+    }
+    return insts
+} Function.block_insts
+
+pkg proj fn Function.inst_data(self, inst: Inst) -> InstructionData {
+    return self.dfg.inst_data(inst)
+} Function.inst_data
+
+pkg fn Function.inst_results(self, inst: Inst, alloc: mem::Alloc) -> mem::List[Value] {
+    return self.dfg.inst_results(inst, alloc)
+} Function.inst_results
+
+pkg fn Function.block_params(self, block: Block, alloc: mem::Alloc) -> mem::List[Value] {
+    var params = mem::List[Value].empty(alloc)
+    for param in self.dfg.block_params(block) {
+        mut params.push(param)
+    }
+    return params
+} Function.block_params
+
+pkg fn Function.value_type(self, value: Value) -> Type {
+    return self.dfg.value_type(value)
+} Function.value_type
+
+/// The value an alias stands for, or the value itself.
+pkg fn Function.resolve_aliases(self, value: Value) -> Value {
+    return self.dfg.resolve_aliases(value)
+} Function.resolve_aliases
+
+/// How many values the function numbers, aliases included.
+pkg fn Function.value_count(self) -> u32 {
+    return u32.fit(self.dfg.values.len())
+} Function.value_count
+
+pkg fn Function.is_cold(self, block: Block) -> bool {
+    return self.laid.is_cold(block)
+} Function.is_cold
+
+pkg proj fn Function.imported_signature(self, sig_ref: SigRef) -> Signature {
+    expect usize.widen(sig_ref.index) < self.dfg.signatures.len()
+    return self.dfg.signatures[usize.widen(sig_ref.index)]
+} Function.imported_signature
+
+pkg fn Function.ext_func(self, func_ref: FuncRef) -> ExtFuncData {
+    return self.dfg.ext_func(func_ref)
+} Function.ext_func
+
+pkg fn Function.global_value_data(self, global_value: GlobalValue) -> GlobalValueData {
+    expect usize.widen(global_value.index) < self.global_values.len()
+    return self.global_values[usize.widen(global_value.index)]
+} Function.global_value_data
+
+pkg fn Function.stack_slot_count(self) -> u32 {
+    return u32.fit(self.stack_slots.len())
+} Function.stack_slot_count
+
+pkg fn Function.stack_slot_data(self, slot: StackSlot) -> StackSlotData {
+    expect usize.widen(slot.index) < self.stack_slots.len()
+    return self.stack_slots[usize.widen(slot.index)]
+} Function.stack_slot_data
+
+/// The text form Cranelift's `Function::display` writes.
+pkg fn Function.display(self, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    write_function(self, w: mut written, alloc)
+    return written
+} Function.display
+
+/// The base of a function's source locations, and the external names it refers to, numbered in
+/// order of first use.
+struct FunctionParameters {
+    base: Option[SourceLoc]
+    user_named_funcs: mem::List[ExternalName]
+    user_ext_name_to_ref: mem::HashMap[ExternalName, u32]
+} FunctionParameters
+
+fn FunctionParameters.empty(alloc: mem::Alloc) -> FunctionParameters {
+    return FunctionParameters(
+        base: None,
+        user_named_funcs: mem::List[ExternalName].empty(alloc),
+        user_ext_name_to_ref: mem::HashMap[ExternalName, u32].empty(seed: 0, alloc),
+    )
+} FunctionParameters.empty
+
+fn FunctionParameters.base_srcloc(self) -> SourceLoc {
+    return self.base.value_or(DEFAULT_LOC)
+} FunctionParameters.base_srcloc
+
+/// The base location, which the first location recorded sets.
+fn FunctionParameters.ensure_base_srcloc(mut self, srcloc: SourceLoc) -> SourceLoc {
+    let Some(base) = self.base else {
+        self.base = Some(srcloc)
+        return srcloc
+    }
+    return base
+} FunctionParameters.ensure_base_srcloc
+
+fn FunctionParameters.ensure_user_func_name(mut self, name: ExternalName) -> u32 {
+    let declared = self.user_ext_name_to_ref.get(name)
+    let Some(reference) = declared else {
+        let numbered = u32.fit(self.user_named_funcs.len())
+        mut self.user_named_funcs.push(name)
+        discard mut self.user_ext_name_to_ref.insert(name, value: numbered)
+        return numbered
+    }
+    return reference
+} FunctionParameters.ensure_user_func_name
+
+/// The reference of a name the function's external names refer to.
+fn FunctionParameters.user_name_ref(self, name: ExternalName) -> u32 {
+    let declared = self.user_ext_name_to_ref.get(name)
+    let Some(reference) = declared else {
+        expect false
+        return 0
+    }
+    return reference
+} FunctionParameters.user_name_ref
+
+/// A function's instructions, values and blocks, and the signatures and functions they name.
+struct DataFlowGraph {
+    insts: mem::List[InstructionData]
+    /// Each instruction's results, by instruction index.
+    results: mem::List[Results]
+    /// Each block's parameters, by block index.
+    blocks: mem::List[mem::List[Value]]
+    values: mem::List[ValueData]
+    signatures: mem::List[Signature]
+    ext_funcs: mem::List[ExtFuncData]
+    alloc: mem::Alloc
+} DataFlowGraph
+
+/// An instruction's results, numbered consecutively from `start` to `end`.
+struct Results derives Copy {
+    start: u32
+    end: u32
+} Results
+
+/// How a value is defined: as an instruction's result or a block's parameter, by position, or as
+/// an alias of another value.
+enum ValueData derives Copy, Eq {
+    Inst(ty: Type, num: u32, inst: Inst)
+    Param(ty: Type, num: u32, block: Block)
+    Alias(ty: Type, original: Value)
+} ValueData
+
+fn ValueData.ty(self) -> Type {
+    return match self {
+        ValueData.Inst(ty: ty, num: _, inst: _) or ValueData.Param(ty: ty, num: _, block: _) or ValueData.Alias(ty: ty, original: _) => ty
+    }
+} ValueData.ty
+
+fn DataFlowGraph.empty(alloc: mem::Alloc) -> DataFlowGraph {
+    return DataFlowGraph(
+        insts: mem::List[InstructionData].empty(alloc),
+        results: mem::List[Results].empty(alloc),
+        blocks: mem::List[mem::List[Value]].empty(alloc),
+        values: mem::List[ValueData].empty(alloc),
+        signatures: mem::List[Signature].empty(alloc),
+        ext_funcs: mem::List[ExtFuncData].empty(alloc),
+        alloc: alloc,
+    )
+} DataFlowGraph.empty
+
+proj fn DataFlowGraph.inst_data(self, inst: Inst) -> InstructionData {
+    expect usize.widen(inst.index) < self.insts.len()
+    return self.insts[usize.widen(inst.index)]
+} DataFlowGraph.inst_data
+
+fn DataFlowGraph.value_data(self, value: Value) -> ValueData {
+    expect usize.widen(value.index) < self.values.len()
+    return self.values[usize.widen(value.index)]
+} DataFlowGraph.value_data
+
+fn DataFlowGraph.ext_func(self, func_ref: FuncRef) -> ExtFuncData {
+    expect usize.widen(func_ref.index) < self.ext_funcs.len()
+    return self.ext_funcs[usize.widen(func_ref.index)]
+} DataFlowGraph.ext_func
+
+fn DataFlowGraph.make_inst(mut self, take data: InstructionData) -> Inst {
+    let inst = Inst(index: u32.fit(self.insts.len()))
+    mut self.insts.push(take data)
+    mut self.results.push(Results(start: 0, end: 0))
+    return inst
+} DataFlowGraph.make_inst
+
+/// Creates an instruction's results, typed by the signature it calls or by its opcode and the
+/// controlling type, and gives their count.
+fn DataFlowGraph.make_inst_results(mut self, inst: Inst, ctrl_typevar: Option[Type]) -> usize {
+    let types = self.inst_result_types(inst, ctrl_typevar)
+    let start = u32.fit(self.values.len())
+    for num in 0..<types.len() {
+        mut self.values.push(ValueData.Inst(ty: types[num], num: u32.fit(num), inst: inst))
+    }
+    expect usize.widen(inst.index) < self.results.len()
+    self.results[usize.widen(inst.index)] = Results(start: start, end: u32.fit(self.values.len()))
+    return types.len()
+} DataFlowGraph.make_inst_results
+
+fn DataFlowGraph.inst_result_types(self, inst: Inst, ctrl_typevar: Option[Type]) -> mem::List[Type] {
+    var types = mem::List[Type].empty(self.alloc)
+    let data = self.inst_data(inst)
+    let called = match data {
+        InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => Some(self.ext_func(func_ref).signature)
+        InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: _, args: _) => Some(sig_ref)
+        else => None
+    }
+    match called {
+        Some(signature) => {
+            expect usize.widen(signature.index) < self.signatures.len()
+            for returned in self.signatures[usize.widen(signature.index)].returns {
+                mut types.push(returned.value_type)
+            }
+        }
+        None => push_result_types(data.opcode(), ctrl_typevar, mut types)
+    }
+    return types
+} DataFlowGraph.inst_result_types
+
+/// The result types of an opcode that calls nothing, given its controlling type.
+fn push_result_types(opcode: Opcode, ctrl_typevar: Option[Type], mut types: mem::List[Type]) {
+    match opcode {
+        Opcode.F32const => {
+            mut types.push(Type.Float32)
+            return
+        }
+        Opcode.F64const => {
+            mut types.push(Type.Float64)
+            return
+        }
+        Opcode.Icmp or Opcode.Fcmp => {
+            mut types.push(Type.Int8)
+            return
+        }
+        Opcode.Store or Opcode.AtomicStore or Opcode.Fence or Opcode.Return or Opcode.Jump or Opcode.Brif or Opcode.Trap => return
+        else => {}
+    }
+    let Some(ctrl) = ctrl_typevar else {
+        expect false
+        return
+    }
+    match opcode {
+        Opcode.Iconcat => {
+            let Some(double) = Type.int(ctrl.bits() * 2) else {
+                expect false
+                return
+            }
+            mut types.push(double)
+        }
+        Opcode.Isplit => {
+            let Some(half) = Type.int(ctrl.bits() / 2) else {
+                expect false
+                return
+            }
+            mut types.push(half)
+            mut types.push(half)
+        }
+        Opcode.UaddOverflow or Opcode.SaddOverflow or Opcode.UsubOverflow or Opcode.SsubOverflow or Opcode.UmulOverflow or Opcode.SmulOverflow => {
+            mut types.push(ctrl)
+            mut types.push(Type.Int8)
+        }
+        else => mut types.push(ctrl)
+    }
+} push_result_types
+
+fn DataFlowGraph.first_result(self, inst: Inst) -> Value {
+    expect usize.widen(inst.index) < self.results.len()
+    let results = self.results[usize.widen(inst.index)]
+    expect results.start < results.end
+    return Value(index: results.start)
+} DataFlowGraph.first_result
+
+fn DataFlowGraph.inst_results(self, inst: Inst, alloc: mem::Alloc) -> mem::List[Value] {
+    expect usize.widen(inst.index) < self.results.len()
+    let results = self.results[usize.widen(inst.index)]
+    var values = mem::List[Value].empty(alloc)
+    for index in results.start..<results.end {
+        mut values.push(Value(index: index))
+    }
+    return values
+} DataFlowGraph.inst_results
+
+/// The controlling type of an instruction's opcode, none when the opcode is not polymorphic.
+fn DataFlowGraph.ctrl_typevar(self, inst: Inst) -> Option[Type] {
+    let data = self.inst_data(inst)
+    let opcode = data.opcode()
+    if not opcode.is_polymorphic() {
+        return None
+    }
+    if not opcode.requires_typevar_operand() {
+        return Some(self.value_type(self.first_result(inst)))
+    }
+    let Some(operand) = data.typevar_operand() else {
+        expect false
+        return None
+    }
+    return Some(self.value_type(operand))
+} DataFlowGraph.ctrl_typevar
+
+fn DataFlowGraph.make_block(mut self) -> Block {
+    let block = Block(index: u32.fit(self.blocks.len()))
+    mut self.blocks.push(mem::List[Value].empty(self.alloc))
+    return block
+} DataFlowGraph.make_block
+
+proj fn DataFlowGraph.block_params(self, block: Block) -> Slice[Value] {
+    expect usize.widen(block.index) < self.blocks.len()
+    return self.blocks[usize.widen(block.index)].view()
+} DataFlowGraph.block_params
+
+fn DataFlowGraph.append_block_param(mut self, block: Block, ty: Type) -> Value {
+    let param = Value(index: u32.fit(self.values.len()))
+    let index = usize.widen(block.index)
+    expect index < self.blocks.len()
+    let num = u32.fit(self.blocks[index].len())
+    mut (mut self.blocks.at_mut(index)).push(param)
+    mut self.values.push(ValueData.Param(ty: ty, num: num, block: block))
+    return param
+} DataFlowGraph.append_block_param
+
+/// Removes a block parameter, keeping the order of the others.
+fn DataFlowGraph.remove_block_param(mut self, value: Value) {
+    expect usize.widen(value.index) < self.values.len()
+    let ValueData.Param(ty: _, num: num, block: block) = self.values[usize.widen(value.index)] else {
+        expect false
+        return
+    }
+    let index = usize.widen(block.index)
+    expect index < self.blocks.len()
+    var params = mut self.blocks.at_mut(index)
+    discard mut params.remove(usize.widen(num))
+    for position in usize.widen(num)..<params.len() {
+        let moved_index = usize.widen(params[position].index)
+        expect moved_index < self.values.len()
+        let ValueData.Param(ty: ty, num: _, block: _) = self.values[moved_index] else {
+            expect false
+            return
+        }
+        self.values[moved_index] = ValueData.Param(ty: ty, num: u32.fit(position), block: block)
+    }
+} DataFlowGraph.remove_block_param
+
+fn DataFlowGraph.value_type(self, value: Value) -> Type {
+    return self.value_data(value).ty()
+} DataFlowGraph.value_type
+
+fn DataFlowGraph.resolve_aliases(self, value: Value) -> Value {
+    var resolved = value
+    for _ in 0..=self.values.len() {
+        let ValueData.Alias(ty: _, original: original) = self.value_data(resolved) else {
+            return resolved
+        }
+        resolved = original
+    }
+    expect false
+    return resolved
+} DataFlowGraph.resolve_aliases
+
+/// Turns `dest` into an alias of the value `src` stands for.
+fn DataFlowGraph.change_to_alias(mut self, dest: Value, src: Value) {
+    let original = self.resolve_aliases(src)
+    let ty = self.value_type(original)
+    expect usize.widen(dest.index) < self.values.len()
+    self.values[usize.widen(dest.index)] = ValueData.Alias(ty: ty, original: original)
+} DataFlowGraph.change_to_alias
+
+/// Appends `value` to the arguments the branch `inst` passes to `block`, in each of its targets
+/// that is `block`.
+fn DataFlowGraph.append_branch_argument(mut self, inst: Inst, block: Block, value: Value) {
+    let index = usize.widen(inst.index)
+    expect index < self.insts.len()
+    match mut self.insts.at_mut(index) {
+        InstructionData.Jump(opcode: _, destination: destination) => {
+            var call = destination
+            append_block_argument(mut call, block, value)
+            return
+        }
+        InstructionData.Brif(opcode: _, arg: _, then: then, otherwise: _) => {
+            var taken = then
+            append_block_argument(mut taken, block, value)
+        }
+        else => {
+            expect false
+            return
+        }
+    }
+    expect index < self.insts.len()
+    match mut self.insts.at_mut(index) {
+        InstructionData.Brif(opcode: _, arg: _, then: _, otherwise: otherwise) => {
+            var fallen = otherwise
+            append_block_argument(mut fallen, block, value)
+        }
+        else => {}
+    }
+} DataFlowGraph.append_branch_argument
+
+fn append_block_argument(mut call: BlockCall, block: Block, value: Value) {
+    if call.block == block {
+        mut call.args.push(value)
+    }
+} append_block_argument
+
+/// The order of a function's blocks and of each block's instructions, and which blocks are cold.
+struct Layout {
+    /// The blocks inserted, in order.
+    order: mem::List[Block]
+    /// Each block's node, by block index.
+    blocks: mem::List[BlockNode]
+    /// The block holding each instruction, by instruction index; none past the end.
+    inst_blocks: mem::List[Option[Block]]
+    alloc: mem::Alloc
+} Layout
+
+/// A block's place in the layout: whether it is inserted and cold, and its instructions in order.
+struct BlockNode {
+    inserted: bool
+    cold: bool
+    insts: mem::List[Inst]
+} BlockNode
+
+fn Layout.empty(alloc: mem::Alloc) -> Layout {
+    return Layout(
+        order: mem::List[Block].empty(alloc),
+        blocks: mem::List[BlockNode].empty(alloc),
+        inst_blocks: mem::List[Option[Block]].empty(alloc),
+        alloc: alloc,
+    )
+} Layout.empty
+
+/// The node of the next block made.
+fn Layout.add_block_node(mut self) {
+    mut self.blocks.push(BlockNode(inserted: false, cold: false, insts: mem::List[Inst].empty(self.alloc)))
+} Layout.add_block_node
+
+fn Layout.is_block_inserted(self, block: Block) -> bool {
+    expect usize.widen(block.index) < self.blocks.len()
+    return self.blocks[usize.widen(block.index)].inserted
+} Layout.is_block_inserted
+
+fn Layout.append_block(mut self, block: Block) {
+    expect usize.widen(block.index) < self.blocks.len()
+    self.blocks[usize.widen(block.index)].inserted = true
+    mut self.order.push(block)
+} Layout.append_block
+
+fn Layout.entry_block(self) -> Option[Block] {
+    if self.order.len() == 0 {
+        return None
+    }
+    return Some(self.order[0])
+} Layout.entry_block
+
+fn Layout.set_cold(mut self, block: Block) {
+    expect usize.widen(block.index) < self.blocks.len()
+    self.blocks[usize.widen(block.index)].cold = true
+} Layout.set_cold
+
+fn Layout.is_cold(self, block: Block) -> bool {
+    expect usize.widen(block.index) < self.blocks.len()
+    return self.blocks[usize.widen(block.index)].cold
+} Layout.is_cold
+
+fn Layout.append_inst(mut self, inst: Inst, block: Block) {
+    expect usize.widen(block.index) < self.blocks.len()
+    mut (mut self.blocks.at_mut(usize.widen(block.index))).insts.push(inst)
+    mut self.set_inst_block(inst, block)
+} Layout.append_inst
+
+/// Inserts `inst` just before `before`, in its block.
+fn Layout.insert_inst(mut self, inst: Inst, before: Inst) {
+    let Some(block) = self.inst_block(before) else {
+        expect false
+        return
+    }
+    let index = usize.widen(block.index)
+    expect index < self.blocks.len()
+    let Some(position) = self.blocks[index].insts.position(fn(value: Inst) => value == before) else {
+        expect false
+        return
+    }
+    mut (mut self.blocks.at_mut(index)).insts.insert(position, value: inst)
+    mut self.set_inst_block(inst, block)
+} Layout.insert_inst
+
+fn Layout.set_inst_block(mut self, inst: Inst, block: Block) {
+    let index = usize.widen(inst.index)
+    while self.inst_blocks.len() <= index {
+        mut self.inst_blocks.push(None)
+    }
+    self.inst_blocks[index] = Some(block)
+} Layout.set_inst_block
+
+fn Layout.inst_block(self, inst: Inst) -> Option[Block] {
+    let index = usize.widen(inst.index)
+    if index >= self.inst_blocks.len() {
+        return None
+    }
+    return self.inst_blocks[index]
+} Layout.inst_block
+
+fn Layout.first_inst(self, block: Block) -> Option[Inst] {
+    let insts = self.block_insts(block)
+    if insts.len() == 0 {
+        return None
+    }
+    return Some(insts[0])
+} Layout.first_inst
+
+fn Layout.last_inst(self, block: Block) -> Option[Inst] {
+    let insts = self.block_insts(block)
+    if insts.len() == 0 {
+        return None
+    }
+    return Some(insts[insts.len() - 1])
+} Layout.last_inst
+
+proj fn Layout.block_insts(self, block: Block) -> Slice[Inst] {
+    expect usize.widen(block.index) < self.blocks.len()
+    return self.blocks[usize.widen(block.index)].insts.view()
+} Layout.block_insts

@@ -185,3 +185,69 @@ fn Checker.needed(self, root: ty::PackageId) -> Needed {
     }
     return needed
 } Checker.needed
+
+/// A lock with the approvals its package's final closure needs: every one when `all`, else those
+/// it holds that are still needed.
+pkg fn Session.approvals(self, package_index: usize, take lock: machine::Lock, all: bool) -> machine::Lock {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let Some(closure) = held.closure_of(package_index) else {
+        return lock
+    }
+    let Some(source) = held.packages.get(package_index) else {
+        expect false
+        return lock
+    }
+    var pairs = mem::Set[NeededPair].empty(alloc)
+    var epochs = mem::Set[NeededEpoch].empty(alloc)
+    for target in check_targets(source, alloc) {
+        let checker = self.unchecked(closure, target)
+        let Some(root) = checker.db().package_of_member(workspace::Member.Source(package_index)) else {
+            continue
+        }
+        let needed = checker.needed(root)
+        for pair in take needed.pairs {
+            discard mut pairs.insert(take pair)
+        }
+        for pair in take needed.epochs {
+            discard mut epochs.insert(take pair)
+        }
+    }
+    var approved = lock
+    if all {
+        var listed = mem::List[machine::Approval].empty(alloc)
+        for pair in take pairs {
+            let NeededPair(package_name: package_name, entry: entry) = pair
+            mut listed.push(machine::Approval(package_name: take package_name, entry: take entry))
+        }
+        var listed_epochs = mem::List[machine::ApprovedEpoch].empty(alloc)
+        for pair in take epochs {
+            let NeededEpoch(path: path, epoch: epoch) = pair
+            mut listed_epochs.push(machine::ApprovedEpoch(path: take path, epoch: epoch))
+        }
+        approved.approved = listed
+        approved.epochs = listed_epochs
+        return approved
+    }
+    mut approved.approved.retain(fn(pair: machine::Approval) => pairs.contains_by(fn(needed: NeededPair) => needed_order(needed, pair)))
+    mut approved.epochs.retain(fn(pair: machine::ApprovedEpoch) => epochs.contains_by(fn(needed: NeededEpoch) => epoch_order(needed, pair)))
+    return approved
+} Session.approvals
+
+/// The order of a needed pair relative to an approved one.
+fn needed_order(needed: NeededPair, pair: machine::Approval) -> core::Ordering {
+    let by_package = needed.package_name.as_str().cmp(pair.package_name.as_str())
+    if by_package != core::Ordering.Equal {
+        return by_package
+    }
+    return needed.entry.cmp(pair.entry)
+} needed_order
+
+/// The order of a needed epoch relative to an approved one.
+fn epoch_order(needed: NeededEpoch, pair: machine::ApprovedEpoch) -> core::Ordering {
+    let by_path = needed.path.as_str().cmp(pair.path.as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    return needed.epoch.cmp(pair.epoch)
+} epoch_order

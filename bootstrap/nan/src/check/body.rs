@@ -466,12 +466,7 @@ impl<'c, 'a> Body<'c, 'a> {
         }
         let folded = fold(&name.text);
         let clashes_local = visible.iter().any(|local| fold(&local.name) == folded);
-        let clashes_value = self.ck.db.module(self.module).items.iter().any(|item| {
-            let ast = self.ck.db.declaration(*item);
-            super::decl::in_values_namespace(ast)
-                && super::decl::declared_name(ast)
-                    .is_some_and(|declared| fold(&declared.text) == folded)
-        });
+        let clashes_value = self.ck.module_values(self.module).contains(&folded);
         let clashes_scalar = self.ck.db.package_of(self.item) != self.ck.db.core()
             && Scalar::ALL.iter().any(|scalar| scalar.name() == folded);
         if clashes_scalar {

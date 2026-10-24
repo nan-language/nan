@@ -1,0 +1,410 @@
+//! Values at addresses: loading and storing them as their layouts hold them, and building and inspecting enum variants, for bodies and for the code lowering writes itself.
+
+/// Whether a failure of a cancellable type is a cancellation, and the origin it holds then.
+struct CancellationOrigin derives Copy {
+    cancelled: clif::Value
+    origin: clif::Value
+} CancellationOrigin
+
+/// The value of a type at an address, held as its type is: a scalar loaded.
+fn Lowering.held_at(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value) -> Held {
+    let held_layout = mut self.layout_of(ty)
+    return match held_layout.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: big) => Held.Scalar(mut fx.load_ordered(scalar, addr: address, offset: 0, unaligned_access: false, big))
+        LayoutShape.Empty => Held.Empty
+        else => Held.Address(address)
+    }
+} Lowering.held_at
+
+/// Stores a value of a type at an address.
+fn Lowering.store_held(mut self, mut fx: Fx, address: clif::Value, held: Held, ty: ty::Ty) {
+    let held_layout = mut self.layout_of(ty)
+    let laid = held_layout.contents()
+    if laid.shape.is_empty() {
+        return
+    }
+    match held {
+        Held.Empty => {}
+        Held.Scalar(value) => {
+            let LayoutShape.Scalar(ty: _, big: big) = laid.shape else {
+                expect false
+                return
+            }
+            mut fx.store_ordered(value, addr: address, offset: 0, unaligned_access: false, big)
+        }
+        Held.Address(source) => {
+            match laid.shape {
+                LayoutShape.Scalar(ty: scalar, big: _) => {
+                    let value = mut fx.load(scalar, addr: source, offset: 0)
+                    mut fx.store(value, addr: address, offset: 0)
+                }
+                else => {
+                    if source != address {
+                        mut self.copy(mut fx, dst: address, src: source, size: laid.size, align: laid.align)
+                    }
+                }
+            }
+        }
+    }
+} Lowering.store_held
+
+/// A value of enum `ty` of a variant holding `payload_values`, one value per payload field in
+/// order. In a wrapped value, a part's payload is given and stored as its address.
+fn Lowering.variant_value(mut self, mut fx: Fx, ty: ty::Ty, variant: Str, payload_values: Slice[Held], wrapped: Option[Wrap]) -> Held {
+    var layout_ty = ty
+    match wrapped {
+        Some(wrap) => {
+            layout_ty = self.wrapped_type(ty, wrap)
+        }
+        None => {}
+    }
+    let held_layout = mut self.layout_of(layout_ty)
+    let laid = held_layout.contents()
+    match laid.shape {
+        LayoutShape.Scalar(ty: scalar, big: _) => {
+            let value = self.tag_value(ty, variant)
+            return Held.Scalar(mut fx.b.iconst(scalar, imm: i64.from_bits(value)))
+        }
+        LayoutShape.Empty => return Held.Empty
+        LayoutShape.Enum(shape) => {
+            let index = variant_position(shape, variant)
+            let slot = mut fx.slot(laid.size, align: laid.align)
+            let fields = shape.variants[index].fields
+            var position: usize = 0
+            while position < fields.len() and position < payload_values.len() {
+                let field = fields[position]
+                let held = payload_values[position]
+                position += 1
+                let at = mut fx.offset(slot, offset: field.offset)
+                let real_field = mut self.layouts.field(self.ck, ty, variant: Some(variant), label: field.name.as_str())
+                let real = real_field.ty
+                var part = false
+                match wrapped {
+                    Some(wrap) => {
+                        part = self.is_part(real, wrap)
+                    }
+                    None => {}
+                }
+                if part {
+                    mut fx.store(held.address_value(), addr: at, offset: 0)
+                } else {
+                    mut self.store_held(mut fx, address: at, held, ty: field.ty)
+                }
+            }
+            write_tag(mut fx, address: slot, tag: shape.tag, index)
+            return Held.Address(slot)
+        }
+        else => {
+            expect false
+            return Held.Empty
+        }
+    }
+} Lowering.variant_value
+
+/// Whether the enum value of `ty` at an address is a variant.
+fn Lowering.variant_is(mut self, mut fx: Fx, address: clif::Value, ty: ty::Ty, variant: Str) -> clif::Value {
+    let held_layout = mut self.layout_of(ty)
+    match held_layout.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: big) => {
+            let value = mut fx.load_ordered(scalar, addr: address, offset: 0, unaligned_access: false, big)
+            let expected = self.tag_value(ty, variant)
+            return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: i64.from_bits(expected))
+        }
+        LayoutShape.Enum(shape) => {
+            let index = variant_position(shape, variant)
+            match shape.tag {
+                Tag.Index(tag) => {
+                    let value = mut fx.load(tag, addr: address, offset: 0)
+                    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: i64.from_bits(u64.widen(index)))
+                }
+                Tag.Packed(payload: payload, niche: niche, values: values) => return packed_is(mut fx, address, shape, index, payload, niche, values: values.view())
+            }
+        }
+        else => return mut fx.int(clif::Type.Int8, value: 1)
+    }
+} Lowering.variant_is
+
+/// Whether the value of a packed enum at an address is the variant at `index`: for its payload
+/// variant, that its niche bits hold none of the unit variants' values.
+fn packed_is(mut fx: Fx, address: clif::Value, shape: EnumShape, index: usize, payload: usize, niche: Niche, values: Slice[wide::Wide]) -> clif::Value {
+    let bits = niche_bits(mut fx, address, niche)
+    if index == payload {
+        var holds = mut fx.int(clif::Type.Int8, value: 1)
+        for value in values {
+            let differs = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: bits, y: i64.from_bits(value.low_bits()))
+            holds = mut fx.b.band(holds, y: differs)
+        }
+        return holds
+    }
+    let Some(value) = shape.tag.value_of(index) else {
+        expect false
+        return holds_nothing(mut fx)
+    }
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: bits, y: i64.from_bits(value.low_bits()))
+} packed_is
+
+/// A false condition, standing for an impossible test.
+fn holds_nothing(mut fx: Fx) -> clif::Value {
+    return mut fx.int(clif::Type.Int8, value: 0)
+} holds_nothing
+
+/// The index of the variant of the enum value of `ty` at an address, as a 64-bit integer.
+fn Lowering.variant_index(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value) -> clif::Value {
+    let held_layout = mut self.layout_of(ty)
+    match held_layout.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: big) => {
+            let loaded = mut fx.load_ordered(scalar, addr: address, offset: 0, unaligned_access: false, big)
+            let value = body_widen(mut fx, value: loaded)
+            let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+                return value
+            }
+            let names = self.variant_names(item)
+            var index = mut fx.int(clif::Type.Int64, value: 0)
+            for position in 0..<names.len() {
+                let expected = self.tag_value(ty, variant: names[position].as_str())
+                let hit = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: i64.from_bits(expected))
+                let candidate = mut fx.int(clif::Type.Int64, value: i64.fit(position))
+                index = mut fx.b.select(hit, x: candidate, y: index)
+            }
+            return index
+        }
+        LayoutShape.Enum(shape) => {
+            match shape.tag {
+                Tag.Index(tag) => {
+                    let value = mut fx.load(tag, addr: address, offset: 0)
+                    return body_widen(mut fx, value)
+                }
+                Tag.Packed(payload: payload, niche: niche, values: _) => return packed_index(mut fx, address, shape, payload, niche)
+            }
+        }
+        else => return mut fx.int(clif::Type.Int64, value: 0)
+    }
+} Lowering.variant_index
+
+/// The index of the variant of the packed enum value at an address: the unit variant whose
+/// niche value its niche bits hold, else its payload variant.
+fn packed_index(mut fx: Fx, address: clif::Value, shape: EnumShape, payload: usize, niche: Niche) -> clif::Value {
+    let bits = niche_bits(mut fx, address, niche)
+    var index = mut fx.int(clif::Type.Int64, value: i64.fit(payload))
+    for variant in 0..<shape.variants.len() {
+        if variant == payload {
+            continue
+        }
+        let Some(value) = shape.tag.value_of(variant) else {
+            continue
+        }
+        let hit = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: bits, y: i64.from_bits(value.low_bits()))
+        let candidate = mut fx.int(clif::Type.Int64, value: i64.fit(variant))
+        index = mut fx.b.select(hit, x: candidate, y: index)
+    }
+    return index
+} packed_index
+
+/// The address of a variant's payload field in an enum value of `ty` at an address.
+fn Lowering.payload_address(mut self, mut fx: Fx, ty: ty::Ty, variant: Str, label: Str, address: clif::Value) -> clif::Value {
+    let field = mut self.layouts.field(self.ck, ty, variant: Some(variant), label)
+    let offset = field.offset
+    return mut fx.offset(address, offset)
+} Lowering.payload_address
+
+/// The names of an enum's variants in order.
+fn Lowering.variant_names(self, item: ty::ItemId) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(self.alloc)
+    let sig = self.ck.sig(item)
+    match sig.contents().kind {
+        check::SigKind.Enum(variants: variants) => {
+            for variant in variants {
+                mut names.push(text::String.of(variant.name.as_str(), alloc: self.alloc))
+            }
+        }
+        else => {}
+    }
+    return names
+} Lowering.variant_names
+
+/// Writes `Some(value)` when `presence` is nonzero, else `None`, as a value of `option` at
+/// an address.
+fn Lowering.write_option(mut self, mut fx: Fx, option: ty::Ty, address: clif::Value, presence: clif::Value, value: Held) {
+    let Some(payload_ty) = self.ck.types().type_arg(option, index: 0) else {
+        expect false
+        return
+    }
+    mut self.write_option_with(mut fx, layout_ty: option, address, presence, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
+        mut lo1.store_held(mut fx1, address: at, held: value, ty: payload_ty)
+    })
+} Lowering.write_option
+
+/// Writes an option laid out as `layout_ty` at an address: `Some` with its payload written
+/// by `write_payload` at the payload's address when `presence` is nonzero, else `None`.
+fn Lowering.write_option_with(mut self, mut fx: Fx, layout_ty: ty::Ty, address: clif::Value, presence: clif::Value, write_payload: fn(mut lo: Lowering, mut fx: Fx, at: clif::Value)) {
+    let held_layout = mut self.layout_of(layout_ty)
+    let LayoutShape.Enum(shape) = held_layout.contents().shape else {
+        expect false
+        return
+    }
+    var offset: u64 = 0
+    expect shape.variants.len() > 0
+    if shape.variants[0].fields.len() > 0 {
+        offset = shape.variants[0].fields[0].offset
+    }
+    mut fx.if_true(presence, then: fn[mut self](mut fx1: Fx) {
+        let at = mut fx1.offset(address, offset)
+        write_payload(mut self, fx: mut fx1, at)
+    })
+    match shape.tag {
+        Tag.Index(tag) => {
+            let none = mut fx.b.iconst(tag, imm: 1)
+            let some = mut fx.b.iconst(tag, imm: 0)
+            let chosen = mut fx.b.select(presence, x: some, y: none)
+            mut fx.store(chosen, addr: address, offset: 0)
+        }
+        Tag.Packed(payload: _, niche: _, values: _) => {
+            let absent = mut fx.b.bxor_imm_s(presence, y: 1)
+            mut fx.if_true(absent, then: fn(mut fx1: Fx) {
+                write_tag(mut fx1, address, tag: shape.tag, index: 1)
+            })
+        }
+    }
+} Lowering.write_option_with
+
+/// A failure of type `from` converted to the failure type `to`: unchanged, wrapped in the
+/// from variant `via`, or a cancellation turned into the cancellation of `to` holding the
+/// same origin.
+fn Lowering.convert_failure(mut self, mut fx: Fx, held: Held, from: ty::Ty, to: ty::Ty, via: Option[Str]) -> Held {
+    if from == to {
+        return held
+    }
+    if self.cancellation_variant(to).is_none() {
+        return mut self.wrap_failure(mut fx, held, to, via)
+    }
+    let Some(found) = mut self.cancellation_origin(mut fx, failure_ty: from, held) else {
+        return mut self.wrap_failure(mut fx, held, to, via)
+    }
+    let held_layout = mut self.layout_of(to)
+    let slot = mut fx.slot(held_layout.contents().size, align: held_layout.contents().align)
+    let no_types = mem::List[clif::Type].empty(self.alloc)
+    discard mut fx.choose_in(mut self, condition: found.cancelled, results: no_types.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let built = mut lo1.cancellation(mut fx1, failure_ty: to, origin: found.origin)
+        mut lo1.store_held(mut fx1, address: slot, held: built, ty: to)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let wrapped = mut lo1.wrap_failure(mut fx1, held, to, via)
+        mut lo1.store_held(mut fx1, address: slot, held: wrapped, ty: to)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    return mut self.held_at(mut fx, ty: to, address: slot)
+} Lowering.convert_failure
+
+/// A failure held as `held` wrapped in the from variant `via` of the failure type `to`, or
+/// unchanged without one.
+fn Lowering.wrap_failure(mut self, mut fx: Fx, held: Held, to: ty::Ty, via: Option[Str]) -> Held {
+    let Some(variant) = via else {
+        return held
+    }
+    var payload_values = mem::List[Held].empty(self.alloc)
+    mut payload_values.push(held)
+    return mut self.variant_value(mut fx, ty: to, variant, payload_values: payload_values.view(), wrapped: None)
+} Lowering.wrap_failure
+
+/// The cancellation of a cancellable failure type holding the origin `origin`.
+fn Lowering.cancellation(mut self, mut fx: Fx, failure_ty: ty::Ty, origin: clif::Value) -> Held {
+    let cancelled_ty = self.std_ty("task", type_name: "Cancelled", args: mem::List[ty::Ty].empty(self.alloc))
+    let cancelled = mut fx.slot(8, align: 8)
+    mut fx.store(origin, addr: cancelled, offset: 0)
+    match self.cancellation_variant(failure_ty) {
+        Some(Some(variant)) => {
+            var payload_values = mem::List[Held].empty(self.alloc)
+            mut payload_values.push(Held.Address(cancelled))
+            return mut self.variant_value(mut fx, ty: failure_ty, variant: variant.as_str(), payload_values: payload_values.view(), wrapped: None)
+        }
+        else => return mut self.held_at(mut fx, ty: cancelled_ty, address: cancelled)
+    }
+} Lowering.cancellation
+
+/// For a failure of a cancellable type held one way or another: whether it is a
+/// cancellation, and the origin it holds then; none for a type that is not cancellable.
+fn Lowering.cancellation_origin(mut self, mut fx: Fx, failure_ty: ty::Ty, held: Held) -> Option[CancellationOrigin] {
+    let Some(variant) = self.cancellation_variant(failure_ty) else {
+        return None
+    }
+    let Some(name) = variant else {
+        let yes = mut fx.int(clif::Type.Int8, value: 1)
+        let origin = mut fx.load(PTR, addr: held.address_value(), offset: 0)
+        return Some(CancellationOrigin(cancelled: yes, origin: origin))
+    }
+    let address = held.address_value()
+    let hit = mut self.variant_is(mut fx, address, ty: failure_ty, variant: name.as_str())
+    let payload_at = mut self.payload_address(mut fx, ty: failure_ty, variant: name.as_str(), label: "", address)
+    let zero = mut fx.ptr(0)
+    let results = fx.types1(PTR)
+    let chosen = mut fx.choose(hit, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let loaded = mut fx1.load(PTR, addr: payload_at, offset: 0)
+        return fx1.list1(loaded)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(zero)
+    })
+    return Some(CancellationOrigin(cancelled: hit, origin: chosen[0]))
+} Lowering.cancellation_origin
+
+/// Writes the tag of a variant into an enum value at an address whose payload is in place.
+fn Lowering.write_variant_tag(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value, variant: Str) {
+    let held_layout = mut self.layout_of(ty)
+    match held_layout.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: big) => {
+            let value = self.tag_value(ty, variant)
+            let tag = mut fx.b.iconst(scalar, imm: i64.from_bits(value))
+            mut fx.store_ordered(tag, addr: address, offset: 0, unaligned_access: false, big)
+        }
+        LayoutShape.Enum(shape) => {
+            let index = variant_position(shape, variant)
+            write_tag(mut fx, address, tag: shape.tag, index)
+        }
+        else => {}
+    }
+} Lowering.write_variant_tag
+
+/// `None` of an option type.
+fn Lowering.none_value(mut self, mut fx: Fx, option: ty::Ty) -> Held {
+    let no_values = mem::List[Held].empty(self.alloc)
+    return mut self.variant_value(mut fx, ty: option, variant: "None", payload_values: no_values.view(), wrapped: None)
+} Lowering.none_value
+
+fn variant_position(shape: EnumShape, variant: Str) -> usize
+    ensures result < shape.variants.len()
+{
+    for index in 0..<shape.variants.len() {
+        if shape.variants[index].name.as_str() == variant {
+            return index
+        }
+    }
+    expect false
+    return 0
+} variant_position
+
+/// Writes the tag or niche value of the variant at `index` into an enum value at an address.
+fn write_tag(mut fx: Fx, address: clif::Value, tag: Tag, index: usize) {
+    match tag {
+        Tag.Index(ty) => {
+            let value = mut fx.b.iconst(ty, imm: i64.fit(index))
+            mut fx.store(value, addr: address, offset: 0)
+        }
+        Tag.Packed(payload: _, niche: niche, values: _) => {
+            let Some(value) = tag.value_of(index) else {
+                return
+            }
+            let constant = mut fx.b.iconst(niche.ty, imm: i64.from_bits(value.shift_left(niche.bit).low_bits()))
+            mut fx.store_ordered(constant, addr: address, offset: niche.offset, unaligned_access: false, big: niche.big)
+        }
+    }
+} write_tag
+
+/// The bits of a niche in a value at an address, as their own integer.
+fn niche_bits(mut fx: Fx, address: clif::Value, niche: Niche) -> clif::Value {
+    let whole = mut fx.load_ordered(niche.ty, addr: address, offset: niche.offset, unaligned_access: false, big: niche.big)
+    if niche.bit == 0 and niche.width == niche.ty.bits() {
+        return whole
+    }
+    let shifted = mut fx.b.ushr_imm_s(whole, y: i64.widen(niche.bit))
+    let mask = wide::Wide.one().shift_left(niche.width).wrapping_sub(wide::Wide.one())
+    return mut fx.b.band_imm_s(shifted, y: i64.from_bits(mask.low_bits()))
+} niche_bits

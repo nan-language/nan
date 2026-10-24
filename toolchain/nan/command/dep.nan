@@ -1,0 +1,304 @@
+//! `nan dep sync`, `nan dep add`, `nan dep approve` and `nan upgrade` without `--language`: resolving a package's dependency closure into its lock, after adding a `dep` directive to its manifest for `nan dep add`, forwarding its uses of retired forms for `nan upgrade`.
+
+/// `nan dep sync [<package>]`: resolves the package's dependency closure and writes its lock.
+fn dep_sync(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let unknown = match invocation.scope() {
+        Some(written) => written
+        None => "."
+    }
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    let scope::Scope.Package(index) = resolved.scope else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var records = mem::List[output::Record].empty(alloc)
+    var changes = mem::List[journal::Change].empty(alloc)
+    try synced(session, index, records: mut records, changes: mut changes, forwarding: false, alloc)
+    return written_output(invocation, written: resolved.written.as_str(), take records, changes: changes.view(), alloc)
+} dep_sync
+
+/// `nan upgrade [<package>]`: resolves the package's dependency closure as `nan dep sync` does,
+/// writing its lock and the forwarding fixes of its uses of retired forms, and reports each use
+/// still moved.
+fn dep_upgrade(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let unknown = match invocation.scope() {
+        Some(written) => written
+        None => "."
+    }
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    let scope::Scope.Package(index) = resolved.scope else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var records = mem::List[output::Record].empty(alloc)
+    var changes = mem::List[journal::Change].empty(alloc)
+    try synced(session, index, records: mut records, changes: mut changes, forwarding: true, alloc)
+    return written_output(invocation, written: resolved.written.as_str(), take records, changes: changes.view(), alloc)
+} dep_upgrade
+
+/// `nan dep add <alias> <source>`: writes the `dep` directive into the manifest of the current
+/// directory's package, then resolves its closure as `nan dep sync` does.
+fn dep_add(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    let held = session.workspace.contents()
+    let holding = held.packages.position(fn(candidate: workspace::Package) -> bool {
+        let base = platform::join(held.root.as_str(), name: candidate.dir.as_str(), alloc)
+        return platform::strip_prefix(current, base: base.as_str(), alloc).is_some()
+    })
+    let Some(index) = holding else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let Some(pack) = held.packages.get(index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let Some(manifest) = pack.files.get(0) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let source_text = output::lossy(manifest.syntax.source.view(), alloc)
+    let Some(closing) = last_closing(source_text.as_str()) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let grammar = session.grammar.contents()
+    let Some(before) = source_text.as_str().slice_bytes(0, end: closing) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let Some(after) = source_text.as_str().slice_bytes(closing, end: source_text.byte_len()) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    var added = text::String.of(before, alloc)
+    mut added.append("\n    dep ")
+    mut added.append(invocation.operands[0].as_str())
+    mut added.push(' ')
+    mut added.append(machine::escaped(invocation.operands[1].as_str(), grammar, alloc).as_str())
+    mut added.append(after)
+    var parsed_bytes = mem::Bytes.empty(alloc)
+    mut parsed_bytes.append(added.as_bytes())
+    let formatted = format::source_file(syntax::parse(take parsed_bytes, grammar, alloc), only: None, alloc)
+    var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(formatted.view())
+    discard mut changed.insert(text::String.of(manifest.path.as_str(), alloc), value: take copy)
+    let with_dep = check::Session.of(mem::Shared.of(held.overlaid(changed, grammar, alloc), alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    var changes = mem::List[journal::Change].empty(alloc)
+    mut changes.push(journal::Change(path: text::String.of(manifest.path.as_str(), alloc), content: Some(take formatted)))
+    try synced(with_dep, index, records: mut records, changes: mut changes, forwarding: false, alloc)
+    return written_output(invocation, written: written.as_str(), take records, changes: changes.view(), alloc)
+} dep_add
+
+/// Where the last `\n}` of a text starts.
+fn last_closing(written: Str) -> Option[usize] {
+    let bytes = written.as_bytes()
+    var at = bytes.len()
+    while at > 1 {
+        invariant at <= bytes.len()
+        at -= 1
+        if bytes[at] == b'}' and bytes[at - 1] == b'\n' {
+            return Some(at - 1)
+        }
+    }
+    return None
+} last_closing
+
+/// `nan dep approve [<package>]`: writes the package's lock with every approval its final closure
+/// needs.
+fn dep_approve(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let unknown = match invocation.scope() {
+        Some(written) => written
+        None => "."
+    }
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    let scope::Scope.Package(index) = resolved.scope else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: unknown, alloc)
+    }
+    let lock = match source.machine.lock() {
+        Some(locked) => locked.copy(alloc)
+        None => machine::Lock.empty(alloc)
+    }
+    let approved = session.approvals(index, take lock, all: true)
+    var path = text::String.of(source.dir.as_str(), alloc)
+    mut path.append("/.nan/lock.nan")
+    let bytes = approved.bytes(session.grammar.contents(), alloc)
+    var changes = mem::List[journal::Change].empty(alloc)
+    if not same_bytes(bytes, held: source.machine.bytes(path.as_str())) {
+        mut changes.push(journal::Change(path: take path, content: take bytes))
+    }
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+    return written_output(invocation, written: resolved.written.as_str(), records: mem::List[output::Record].empty(alloc), changes: changes.view(), alloc)
+} dep_approve
+
+/// Whether new bytes of a file, none for a file not written, are those the file holds, none for
+/// a missing file.
+fn same_bytes(bytes: Option[mem::Bytes], held: Option[Slice[u8]]) -> bool {
+    match bytes {
+        Some(written) => {
+            let Some(old) = held else {
+                return false
+            }
+            return written.view() == old
+        }
+        None => return held.is_none()
+    }
+} same_bytes
+
+/// Resolves a package's closure, forwarding its uses of retired forms when `forwarding`, writing
+/// its lock, the files forwarding rewrites and those of `changes` when an assignment is
+/// acceptable, and records what it prints.
+fn synced(session: check::Session, index: usize, mut records: mem::List[output::Record], mut changes: mem::List[journal::Change], forwarding: bool, alloc: mem::Alloc) fails platform::IoError {
+    let held = session.workspace.contents()
+    let user_cache = match try cache::Cache.open(cache::copied_override(session.home, alloc), alloc) {
+        Ok(opened) => opened
+        Err(exposed) => {
+            mut records.push(exposed_record(session, path: exposed.path.as_str(), alloc))
+            mut changes.truncate(0)
+            return
+        }
+    }
+    let local = store::Store.new(user_cache.store())
+    let outcome = match try resolution::resolve(session, package_index: index, local, user_cache, forwarding) {
+        Ok(decided) => decided
+        Err(exposed) => {
+            mut records.push(exposed_record(session, path: exposed.path.as_str(), alloc))
+            mut changes.truncate(0)
+            return
+        }
+    }
+    let std = session.std.contents()
+    match outcome {
+        resolution::Outcome.Unresolved(diagnostics) => {
+            mut changes.truncate(0)
+            for reported in diagnostics {
+                mut records.push(record(held, std, scope: scope::Scope.Workspace, reported, alloc))
+            }
+            return
+        }
+        else => {}
+    }
+    let resolution::Outcome.Resolved(lock: lock, changes: released, sources: sources, moved: moved) = outcome else {
+        expect false
+        return
+    }
+    for change in released {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(change.package_name.as_str(), alloc))
+        mut fields.push(short_or_dash(change.old, alloc))
+        mut fields.push(short_or_dash(change.new, alloc))
+        mut fields.push(text::String.of(change.class.word(), alloc))
+        mut records.push(output::Record(word: text::String.of("release", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    for reported in moved {
+        mut records.push(record(held, std, scope: scope::Scope.Workspace, reported, alloc))
+    }
+    let Some(pack) = held.packages.get(index) else {
+        expect false
+        return
+    }
+    var path = text::String.of(pack.dir.as_str(), alloc)
+    mut path.append("/.nan/lock.nan")
+    let bytes = lock.bytes(session.grammar.contents(), alloc)
+    if not same_bytes(bytes, held: pack.machine.bytes(path.as_str())) {
+        mut changes.push(journal::Change(path: take path, content: take bytes))
+    }
+    for source in take sources {
+        let mem::KeyValue(key: source_path, value: content) = source
+        mut changes.push(journal::Change(path: take source_path, content: Some(take content)))
+    }
+    mut changes.sort_by(fn(left: journal::Change, right: journal::Change) => change_order(left, right))
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+} synced
+
+/// A code root in short form, `-` for none.
+fn short_or_dash(hash: Option[hashing::HashValue], alloc: mem::Alloc) -> text::String {
+    let Some(root) = hash else {
+        return text::String.of("-", alloc)
+    }
+    return root.short(alloc)
+} short_or_dash
+
+/// The order of changes by path, then content, a deletion first.
+fn change_order(left: journal::Change, right: journal::Change) -> core::Ordering {
+    let by_path = left.path.as_str().cmp(right.path.as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    match left.content {
+        Some(written) => {
+            let Some(other) = right.content else {
+                return core::Ordering.Greater
+            }
+            return written.view().cmp(other.view())
+        }
+        None => {
+            if right.content.is_none() {
+                return core::Ordering.Equal
+            }
+            return core::Ordering.Less
+        }
+    }
+} change_order
+
+/// The record of an exposed part of the user directory.
+fn exposed_record(session: check::Session, path: Str, alloc: mem::Alloc) -> output::Record {
+    var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildCacheExposed, alloc)
+    reported.path = Some(text::String.of(path, alloc))
+    return record(session.workspace.contents(), std: session.std.contents(), scope: scope::Scope.Workspace, reported, alloc)
+} exposed_record
+
+/// The output of a command writing files: its records, then a `wrote` or `deleted` record per
+/// file, counting errors and incompleteness among its records.
+fn written_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], changes: Slice[journal::Change], alloc: mem::Alloc) -> output::Output {
+    var errors: usize = 0
+    var incomplete: usize = 0
+    for held in records {
+        invariant errors < records.len() and incomplete < records.len()
+        if held.word.as_str() == diagnostic::Class.Error.word() {
+            errors += 1
+        } else if held.word.as_str() == diagnostic::Class.Incompleteness.word() {
+            incomplete += 1
+        }
+    }
+    var all = records
+    for change in changes {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(change.path.as_str(), alloc))
+        let word = match change.content {
+            Some(_) => "wrote"
+            None => "deleted"
+        }
+        mut all.push(output::Record(word: text::String.of(word, alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    var verdict = output::Verdict.Ok
+    if errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: written_summary(files: changes.len(), errors, incomplete, alloc), records: take all)
+} written_output
+
+/// The summary of a command that can write files: the files it wrote or deleted, its errors and
+/// its incompleteness.
+fn written_summary(files: usize, errors: usize, incomplete: usize, alloc: mem::Alloc) -> mem::List[output::Count] {
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("files", alloc), value: files))
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
+    mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: incomplete))
+    return summary
+} written_summary

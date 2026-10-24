@@ -1,0 +1,302 @@
+//! Calling forms: how each lowered function receives its parameters, returns its result and fails; a value of a scalar type passes in a register, any other value as the address of its bytes and a reference as the address of its place, and a function that may fail writes its failure where its caller says and returns whether it failed.
+
+/// How a value is held: a scalar in a register, an address, or nothing for an empty type.
+enum Repr derives Copy, Eq {
+    Scalar(clif::Type)
+    Address
+    Empty
+} Repr
+
+/// How a function gives its result.
+enum Returned derives Copy, Eq {
+    /// In a register.
+    Scalar(clif::Type)
+    /// Written at the address the caller passes.
+    Indirect
+    /// The address of a part, which a projection returns.
+    Part
+    Empty
+} Returned
+
+struct Abi {
+    /// Whether the first parameter is the environment of a function value.
+    env: bool
+    params: mem::List[ParamRepr]
+    result: ty::Ty
+    returned: Returned
+    /// The failure type, when the function may fail.
+    failure: Option[ty::Ty]
+    /// Whether the function receives a failure address and returns whether it failed: those
+    /// that may fail, a test's body, from which failures of any type escape, and every function
+    /// value, whichever its type, as a function that cannot fail fits a type that may.
+    flagged: bool
+} Abi
+
+/// A parameter of a calling form: its NIR type and how its value is held.
+struct ParamRepr derives Copy, Eq {
+    nty: nir::NTy
+    repr: Repr
+} ParamRepr
+
+/// The type a function gives for its result and how it gives it.
+struct ResultForm derives Copy, Eq {
+    result: ty::Ty
+    returned: Returned
+} ResultForm
+
+fn Abi.signature(self, alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    let pointer = clif::AbiParam(value_type: clif::Type.Int64)
+    if self.env {
+        mut signature.params.push(pointer)
+    }
+    if self.returned == Returned.Indirect {
+        mut signature.params.push(pointer)
+    }
+    if self.flagged {
+        mut signature.params.push(pointer)
+        mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+    }
+    for param in self.params {
+        match param.repr {
+            Repr.Scalar(ty) => {
+                mut signature.params.push(clif::AbiParam(value_type: ty))
+            }
+            Repr.Address => {
+                mut signature.params.push(pointer)
+            }
+            Repr.Empty => {}
+        }
+    }
+    match self.returned {
+        Returned.Scalar(ty) => {
+            mut signature.returns.push(clif::AbiParam(value_type: ty))
+        }
+        Returned.Part => {
+            mut signature.returns.push(pointer)
+        }
+        Returned.Indirect or Returned.Empty => {}
+    }
+    return signature
+} Abi.signature
+
+/// A copy of a calling form.
+fn Abi.copy(self, alloc: mem::Alloc) -> Abi {
+    var params = mem::List[ParamRepr].empty(alloc)
+    for param in self.params {
+        mut params.push(param)
+    }
+    return Abi(env: self.env, params: take params, result: self.result, returned: self.returned, failure: self.failure, flagged: self.flagged)
+} Abi.copy
+
+/// The calling form standing for an instance lowering finds no function for.
+fn unlowered_abi(alloc: mem::Alloc) -> Abi {
+    return Abi(env: false, params: mem::List[ParamRepr].empty(alloc), result: ty::Ty.unit(), returned: Returned.Empty, failure: None, flagged: false)
+} unlowered_abi
+
+/// How a value of a NIR type is held.
+fn Lowering.repr(mut self, nty: nir::NTy) -> Repr {
+    return match nty {
+        nir::NTy.Ref(_) or nir::NTy.RefMut(_) => Repr.Address
+        nir::NTy.Owned(ty) => mut self.owned_repr(ty)
+    }
+} Lowering.repr
+
+fn Lowering.owned_repr(mut self, ty: ty::Ty) -> Repr {
+    let laid = mut self.layout_of(ty)
+    return match laid.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: _) => Repr.Scalar(scalar)
+        LayoutShape.Empty => Repr.Empty
+        else => Repr.Address
+    }
+} Lowering.owned_repr
+
+/// The NIR type of a parameter of a function type or head, its type concrete: a read
+/// parameter is its value when Copy or a view and a reference otherwise.
+fn Lowering.param_nty(self, mode: ast::Mode, ty: ty::Ty) -> nir::NTy {
+    match mode {
+        ast::Mode.Mut => return nir::NTy.RefMut(ty)
+        ast::Mode.Take => return nir::NTy.Owned(ty)
+        ast::Mode.Read => {}
+    }
+    if self.ck.nir_copy(ty) or self.ck.nir_view(ty) {
+        return nir::NTy.Owned(ty)
+    }
+    return nir::NTy.Ref(ty)
+} Lowering.param_nty
+
+/// The type a function returning a value of `ty` gives and how it gives it, a projection's
+/// result taking the form `given`.
+fn Lowering.result_form(mut self, ty: ty::Ty, given: Option[Given]) -> ResultForm {
+    var form_ty = ty
+    match given {
+        Some(Given.Part) => return ResultForm(result: ty, returned: Returned.Part)
+        Some(Given.Wrapped(wrap)) => {
+            form_ty = self.wrapped_type(ty, wrap)
+        }
+        Some(Given.View) or None => {}
+    }
+    let returned = match mut self.owned_repr(form_ty) {
+        Repr.Scalar(scalar) => Returned.Scalar(scalar)
+        Repr.Address => Returned.Indirect
+        Repr.Empty => Returned.Empty
+    }
+    return ResultForm(result: form_ty, returned: returned)
+} Lowering.result_form
+
+/// Whether a type is an `Option` or a `Result`, which a projection returns as a wrapped part.
+fn Lowering.wraps(self, ty: ty::Ty) -> bool {
+    return self.ck.is_std(ty, path: "core::Option") or self.ck.is_std(ty, path: "core::Result")
+} Lowering.wraps
+
+/// The calling form of a function type's values: the environment, then the parameters as
+/// its head gives them.
+fn Lowering.fn_abi(mut self, fn_ty: ty::FnTy) -> Abi {
+    var params = mem::List[ParamRepr].empty(self.alloc)
+    for param in fn_ty.params {
+        let nty = self.param_nty(param.mode, ty: param.ty)
+        let repr = mut self.repr(nty)
+        mut params.push(ParamRepr(nty: nty, repr: repr))
+    }
+    let form = mut self.result_form(fn_ty.result, given: None)
+    return Abi(env: true, params: take params, result: form.result, returned: form.returned, failure: abi_failure(fn_ty.failure), flagged: true)
+} Lowering.fn_abi
+
+/// The calling form of an instance.
+fn Lowering.abi(mut self, instance: Instance) -> Abi {
+    match instance {
+        Instance.Nir(item: item, role: role, index: index, args: args) => return mut self.nir_abi(item, role, index, args)
+        Instance.Supplied(item: item, args: args) => {
+            let Some(sig) = self.ck.fn_sig(item) else {
+                expect false
+                return unlowered_abi(self.alloc)
+            }
+            let params = check::generic_params(sig.generics.view(), alloc: self.alloc)
+            let subst = ty::Subst.of(params.view(), args: self.ck.types().arg_list(args), alloc: self.alloc)
+            let given = self.sig_given(sig)
+            var abi = mut self.head_abi(sig.fn_ty(self.alloc), subst, given)
+            if self.ck.reads_in_place(item) {
+                expect abi.params.len() > 0
+                let read = abi.params[0].nty.ty()
+                abi.params[0] = ParamRepr(nty: nir::NTy.Ref(read), repr: Repr.Address)
+            }
+            return abi
+        }
+        Instance.Derived(owner: owner, method: method, args: args) => {
+            let fn_ty = mut self.derived_head(owner, method: method.as_str(), args)
+            return mut self.head_abi(fn_ty, subst: ty::Subst.empty(self.alloc), given: None)
+        }
+        Instance.Conformance(ty: ty, method: method, args: args) => {
+            let fn_ty = mut self.conformance_head(ty, method: method.as_str(), own: args)
+            return mut self.head_abi(fn_ty, subst: ty::Subst.empty(self.alloc), given: None)
+        }
+        Instance.Release(ty) => {
+            var params = mem::List[ParamRepr].empty(self.alloc)
+            mut params.push(ParamRepr(nty: nir::NTy.RefMut(ty), repr: Repr.Address))
+            return Abi(env: false, params: take params, result: ty::Ty.unit(), returned: Returned.Empty, failure: None, flagged: false)
+        }
+        Instance.Value(inner) => {
+            expect inner.len() > 0
+            let fn_ty = mut self.instance_fn_ty(inner[0])
+            return mut self.fn_abi(fn_ty)
+        }
+        Instance.Dyn(ty: ty, interface_item: interface_item, args: args, method: method) => {
+            let head = mut self.method_head(ty, interface_item, args, method)
+            var abi = mut self.head_abi(head.fn_ty, subst: ty::Subst.empty(self.alloc), given: head.given)
+            expect abi.params.len() > 0
+            abi.params[0] = ParamRepr(nty: nir::NTy.Ref(ty), repr: Repr.Address)
+            return abi
+        }
+        Instance.Sides(inner) => {
+            expect inner.len() > 0
+            let found = mut self.abi(inner[0])
+            return Abi(env: found.env, params: take found.params, result: ty::Ty.unit(), returned: Returned.Indirect, failure: found.failure, flagged: found.flagged)
+        }
+    }
+} Lowering.abi
+
+/// The calling form of a NIR function of an item's unit with the arguments of the item's generic
+/// parameters.
+fn Lowering.nir_abi(mut self, item: ty::ItemId, role: nir::Role, index: u32, args: ty::Args) -> Abi {
+    let Some(unit) = self.ck.unit(item) else {
+        expect false
+        return unlowered_abi(self.alloc)
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        expect false
+        return unlowered_abi(self.alloc)
+    }
+    let subst = self.subst(item, args)
+    if role == nir::Role.Closure {
+        let captures = self.closure_captures(unit.contents(), index)
+        let fn_ty = self.closure_type(function, captures, subst)
+        return mut self.fn_abi(fn_ty)
+    }
+    var params = mem::List[ParamRepr].empty(self.alloc)
+    for param in function.params {
+        let nty = substituted(subst, types: self.ck.types(), nty: function.ty(param.value))
+        let repr = mut self.repr(nty)
+        mut params.push(ParamRepr(nty: nty, repr: repr))
+    }
+    let given = self.callable_given(nir::Callable.Item(item: item, role: role, index: index))
+    let form = mut self.result_form(subst.ty(self.ck.types(), ty: function.result), given)
+    var declared_failure: Option[ty::Ty] = None
+    match function.failure {
+        Some(written) => {
+            declared_failure = Some(subst.ty(self.ck.types(), ty: written))
+        }
+        None => {}
+    }
+    let failure = abi_failure(declared_failure)
+    let in_test = match self.ck.db().ast(item).kind {
+        ast::ItemKind.Test(_) => true
+        else => false
+    }
+    return Abi(env: false, params: take params, result: form.result, returned: form.returned, failure: failure, flagged: failure.is_some() or (in_test and role == nir::Role.Body))
+} Lowering.nir_abi
+
+/// The calling form of a function head whose types `subst` makes concrete.
+fn Lowering.head_abi(mut self, fn_ty: ty::FnTy, subst: ty::Subst, given: Option[Given]) -> Abi {
+    let concrete = subst.fn_ty(self.ck.types(), fn_ty)
+    var params = mem::List[ParamRepr].empty(self.alloc)
+    for param in concrete.params {
+        let nty = self.param_nty(param.mode, ty: param.ty)
+        let repr = mut self.repr(nty)
+        mut params.push(ParamRepr(nty: nty, repr: repr))
+    }
+    let form = mut self.result_form(concrete.result, given)
+    let failure = abi_failure(concrete.failure)
+    return Abi(env: false, params: take params, result: form.result, returned: form.returned, failure: failure, flagged: failure.is_some())
+} Lowering.head_abi
+
+/// The substitution an item's generic parameters receive from an instance's arguments.
+fn Lowering.subst(self, item: ty::ItemId, args: ty::Args) -> ty::Subst {
+    return self.ck.unit_subst(item, args: self.ck.types().arg_list(args))
+} Lowering.subst
+
+/// How a projection gives its result: a part, a wrapped part or a view value.
+enum Given derives Copy, Eq {
+    Part
+    Wrapped(Wrap)
+    View
+} Given
+
+/// The failure type of a head, none for one that cannot fail.
+fn abi_failure(head_failure: Option[ty::Ty]) -> Option[ty::Ty] {
+    let Some(ty) = head_failure else {
+        return None
+    }
+    if ty.is_never() {
+        return None
+    }
+    return Some(ty)
+} abi_failure
+
+/// A NIR type with its type substituted.
+fn substituted(subst: ty::Subst, types: ty::Types, nty: nir::NTy) -> nir::NTy {
+    return match nty {
+        nir::NTy.Owned(ty) => nir::NTy.Owned(subst.ty(types, ty))
+        nir::NTy.Ref(ty) => nir::NTy.Ref(subst.ty(types, ty))
+        nir::NTy.RefMut(ty) => nir::NTy.RefMut(subst.ty(types, ty))
+    }
+} substituted

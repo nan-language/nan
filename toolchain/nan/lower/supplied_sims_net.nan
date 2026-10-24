@@ -1,0 +1,362 @@
+//! The simulated network: one loopback network per `sys::sim::net()`, whose listeners each take the connections to their port on `localhost`, `127.0.0.1` or `::1`. A connection is two endpoints, each buffering the bytes its peer wrote until they are read, and ending when its peer closes it or abandons it.
+
+/// The offsets of a network's fields: its first listener.
+const NETWORK_LISTENERS: u64 = 8
+
+const NETWORK_SIZE: u64 = 16
+
+/// The offsets of a listener's fields: its port, whether it is still held, the first and last
+/// of the endpoints it has not accepted, the waiter slot of its accept, and the next listener
+/// of its network.
+const LISTENER_PORT: u64 = 8
+
+const LISTENER_HELD: u64 = 16
+
+const LISTENER_FIRST: u64 = 24
+
+const LISTENER_LAST: u64 = 32
+
+const LISTENER_ACCEPTOR: u64 = 40
+
+const LISTENER_NEXT: u64 = 48
+
+const LISTENER_SIZE: u64 = 56
+
+/// The offsets of an endpoint's fields: its peer, the bytes its peer wrote and how many it has
+/// read, how its peer ended, the waiter slot of its read, the next endpoint of a listener's,
+/// its own index and whether its side is still held.
+const ENDPOINT_PEER: u64 = 8
+
+const ENDPOINT_DATA: u64 = 16
+
+const ENDPOINT_LEN: u64 = 24
+
+const ENDPOINT_CAPACITY: u64 = 32
+
+const ENDPOINT_READ: u64 = 40
+
+const ENDPOINT_ENDED: u64 = 48
+
+const ENDPOINT_READER: u64 = 56
+
+const ENDPOINT_NEXT: u64 = 64
+
+const ENDPOINT_INDEX: u64 = 72
+
+const ENDPOINT_HELD: u64 = 80
+
+const ENDPOINT_SIZE: u64 = 88
+
+/// How an endpoint's peer ended.
+const ENDED_OPEN: i64 = 0
+
+const ENDED_CLOSED: i64 = 1
+
+const ENDED_RESET: i64 = 2
+
+/// The hosts a loopback network reaches, separated by spaces.
+const NET_LOOPBACK: Str = "localhost 127.0.0.1 ::1"
+
+/// A new loopback network: its index.
+fn net_new(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_NET, size: NETWORK_SIZE)
+    return created.index
+} net_new
+
+/// The network an entry names.
+fn net_of_entry(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let index = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+    return object_at(mut lo, mut fx, index)
+} net_of_entry
+
+/// The record of the listener or endpoint a resource at an address names.
+fn net_held(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> clif::Value {
+    let holding = mut fx.offset(address, offset: 8)
+    let index = holdings_payload(mut fx, address: holding)
+    return object_at(mut lo, mut fx, index)
+} net_held
+
+/// The listener of a network held on a port, zero when none.
+fn listener_on(mut fx: Fx, net: clif::Value, port: clif::Value) -> clif::Value {
+    let wide_port = mut fx.b.uextend(PTR, x: port)
+    let first_listener = mut fx.load(PTR, addr: net, offset: NETWORK_LISTENERS)
+    let initial = fx.list1(first_listener)
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 1
+        let current = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let results = fx1.types1(clif::Type.Int8)
+        let matched = mut fx1.choose(present, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let own = mut fx2.load(PTR, addr: current, offset: LISTENER_PORT)
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: own, y: wide_port)
+            let held_flag = mut fx2.load(PTR, addr: current, offset: LISTENER_HELD)
+            let held = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_flag, y: 0)
+            let listening = mut fx2.b.band(same, y: held)
+            return fx2.list1(listening)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let missing = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(missing)
+        })
+        let absent = mut fx1.b.bxor_imm_s(present, y: 1)
+        expect matched.len() == 1
+        let stop = mut fx1.b.bor(matched[0], y: absent)
+        let next_results = fx1.types1(PTR)
+        let next = mut fx1.choose(stop, results: next_results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(current)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: LISTENER_NEXT)
+            return fx2.list1(following)
+        })
+        let again = mut fx1.b.bxor_imm_s(stop, y: 1)
+        return Pass(again: again, next: take next)
+    })
+    expect found.len() == 1
+    return found[0]
+} listener_on
+
+/// `sys::Net.listen`: a listener on a port no held listener of the network has.
+fn listen(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let port = supply.param(1).scalar_value()
+    let zero_port = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: port, y: 0)
+    mut fx.if_true(zero_port, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+    let net = net_of_entry(mut lo, mut fx, record)
+    let holder = listener_on(mut fx, net, port)
+    let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: holder, y: 0)
+    mut fx.if_true(taken, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "AddressInUse")
+    })
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_LISTENER, size: LISTENER_SIZE)
+    let wide_port = mut fx.b.uextend(PTR, x: port)
+    mut fx.store(wide_port, addr: created.record, offset: LISTENER_PORT)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: created.record, offset: LISTENER_HELD)
+    let first_listener = mut fx.load(PTR, addr: net, offset: NETWORK_LISTENERS)
+    mut fx.store(first_listener, addr: created.record, offset: LISTENER_NEXT)
+    mut fx.store(created.record, addr: net, offset: NETWORK_LISTENERS)
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    ret_resource(mut lo, mut fx, supply, handle, descriptor: created.index)
+} listen
+
+/// A new endpoint, held: its index and record.
+fn new_endpoint(mut lo: Lowering, mut fx: Fx) -> SimObject {
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_ENDPOINT, size: ENDPOINT_SIZE)
+    mut fx.store(created.index, addr: created.record, offset: ENDPOINT_INDEX)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: created.record, offset: ENDPOINT_HELD)
+    return created
+} new_endpoint
+
+/// `sys::Net.connect`: a connection to the listener on the port, whose accept takes the other
+/// endpoint; a host outside the loopback network is unreachable and a port without a listener
+/// refuses.
+fn connect(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let host = supply.param(1)
+    var loopback = mut fx.int(clif::Type.Int8, value: 0)
+    for name in check::Words(list: NET_LOOPBACK, at: 0) {
+        let known = mut lo.view_literal(mut fx, contents: name.as_bytes())
+        let same = mut lo.views_equal(mut fx, left: known, right: host)
+        loopback = mut fx.b.bor(loopback, y: same)
+    }
+    let elsewhere = mut fx.b.bxor_imm_s(loopback, y: 1)
+    mut fx.if_true(elsewhere, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Unreachable")
+    })
+    let net = net_of_entry(mut lo, mut fx, record)
+    let target = listener_on(mut fx, net, port: supply.param(2).scalar_value())
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: target, y: 0)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Refused")
+    })
+    let client = new_endpoint(mut lo, mut fx)
+    let server = new_endpoint(mut lo, mut fx)
+    mut fx.store(server.record, addr: client.record, offset: ENDPOINT_PEER)
+    mut fx.store(client.record, addr: server.record, offset: ENDPOINT_PEER)
+    let last = mut fx.load(PTR, addr: target, offset: LISTENER_LAST)
+    let has_last = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: last, y: 0)
+    let no_results = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose(has_last, results: no_results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(server.record, addr: last, offset: ENDPOINT_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(server.record, addr: target, offset: LISTENER_FIRST)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.store(server.record, addr: target, offset: LISTENER_LAST)
+    let acceptor = mut fx.offset(target, offset: LISTENER_ACCEPTOR)
+    sims_wake(mut lo, mut fx, slot: acceptor)
+    let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    ret_resource(mut lo, mut fx, supply, handle, descriptor: client.index)
+} connect
+
+/// `sys::net::Listener.accept`: the oldest connection to the listener it has not accepted,
+/// waiting for one.
+fn accept(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let address = supply.param(0).address_value()
+    let record = net_held(mut lo, mut fx, address)
+    let acceptor = mut fx.offset(record, offset: LISTENER_ACCEPTOR)
+    let no_state = mem::List[clif::Value].empty(fx.alloc)
+    discard mut fx.repeat(no_state.view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let oldest = mut fx1.load(PTR, addr: record, offset: LISTENER_FIRST)
+        let none = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: oldest, y: 0)
+        mut fx1.if_true(none, then: fn[mut lo](mut fx2: Fx) {
+            let cancelled = sims_wait(mut lo, fx: mut fx2, slot: Some(acceptor), enqueue: fn(mut lo3: Lowering, mut fx3: Fx, op: clif::Value) {
+                sims_enqueue(mut fx3, slot: acceptor, op)
+            })
+            mut fx2.if_true(cancelled, then: fn[mut lo](mut fx3: Fx) {
+                sims_fail_cancelled(mut lo, fx: mut fx3, supply)
+            })
+        })
+        return Pass(again: none, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let oldest = mut fx.load(PTR, addr: record, offset: LISTENER_FIRST)
+    let next = mut fx.load(PTR, addr: oldest, offset: ENDPOINT_NEXT)
+    mut fx.store(next, addr: record, offset: LISTENER_FIRST)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+    mut fx.if_true(last, then: fn(mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: LISTENER_LAST)
+    })
+    let index = mut fx.load(PTR, addr: oldest, offset: ENDPOINT_INDEX)
+    let handle = mut fx.load(PTR, addr: address, offset: 0)
+    ret_resource(mut lo, mut fx, supply, handle, descriptor: index)
+} accept
+
+/// `sys::net::Conn.read`: the bytes its peer wrote that it has not read, as many as fit,
+/// waiting for some; none once its peer has closed, and `Reset` once its peer has abandoned it.
+fn net_read(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let record = net_held(mut lo, mut fx, address: supply.param(0).address_value())
+    let reader = mut fx.offset(record, offset: ENDPOINT_READER)
+    let no_state = mem::List[clif::Value].empty(fx.alloc)
+    discard mut fx.repeat(no_state.view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let len = mut fx1.load(PTR, addr: record, offset: ENDPOINT_LEN)
+        let read = mut fx1.load(PTR, addr: record, offset: ENDPOINT_READ)
+        let buffered = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThan, x: len, y: read)
+        let how = mut fx1.load(PTR, addr: record, offset: ENDPOINT_ENDED)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: how, y: ENDED_OPEN)
+        let reset = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: how, y: ENDED_RESET)
+        let empty = mut fx1.b.bxor_imm_s(buffered, y: 1)
+        let waits = mut fx1.b.band(empty, y: open)
+        mut fx1.if_true(waits, then: fn[mut lo](mut fx2: Fx) {
+            let cancelled = sims_wait(mut lo, fx: mut fx2, slot: Some(reader), enqueue: fn(mut lo3: Lowering, mut fx3: Fx, op: clif::Value) {
+                sims_enqueue(mut fx3, slot: reader, op)
+            })
+            mut fx2.if_true(cancelled, then: fn[mut lo](mut fx3: Fx) {
+                sims_fail_cancelled(mut lo, fx: mut fx3, supply)
+            })
+        })
+        let resets = mut fx1.b.band(empty, y: reset)
+        mut fx1.if_true(resets, then: fn[mut lo](mut fx2: Fx) {
+            fail_with(mut lo, fx: mut fx2, supply, variant: "Reset")
+        })
+        return Pass(again: waits, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    let len = mut fx.load(PTR, addr: record, offset: ENDPOINT_LEN)
+    let read = mut fx.load(PTR, addr: record, offset: ENDPOINT_READ)
+    let left = mut fx.b.isub(len, y: read)
+    let buffer = sys_view(mut fx, held: supply.param(1))
+    let count = mut fx.b.umin(left, y: buffer.len)
+    let data = mut fx.load(PTR, addr: record, offset: ENDPOINT_DATA)
+    let from = mut fx.b.iadd(data, y: read)
+    let copy_args = fx.list3(buffer.start, b: from, c: count)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let total_read = mut fx.b.iadd(read, y: count)
+    let drained = mut fx.b.icmp(clif::IntCC.Equal, x: total_read, y: len)
+    let zero = mut fx.ptr(0)
+    let kept_read = mut fx.b.select(drained, x: zero, y: total_read)
+    mut fx.store(kept_read, addr: record, offset: ENDPOINT_READ)
+    let kept_len = mut fx.b.select(drained, x: zero, y: len)
+    mut fx.store(kept_len, addr: record, offset: ENDPOINT_LEN)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+} net_read
+
+/// `sys::net::Conn.write`: all of `data` enters its peer's buffer, waking its read; `Reset`
+/// once its peer has ended.
+fn net_write(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let record = net_held(mut lo, mut fx, address: supply.param(0).address_value())
+    let how = mut fx.load(PTR, addr: record, offset: ENDPOINT_ENDED)
+    let ended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: how, y: ENDED_OPEN)
+    mut fx.if_true(ended, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Reset")
+    })
+    let peer = mut fx.load(PTR, addr: record, offset: ENDPOINT_PEER)
+    let written = sys_view(mut fx, held: supply.param(1))
+    let len = mut fx.load(PTR, addr: peer, offset: ENDPOINT_LEN)
+    let needed = mut fx.b.iadd(len, y: written.len)
+    let capacity = mut fx.load(PTR, addr: peer, offset: ENDPOINT_CAPACITY)
+    let short = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: needed, y: capacity)
+    mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
+        let doubled = mut fx1.b.ishl_imm_s(capacity, y: 1)
+        let grown = mut fx1.b.umax(doubled, y: needed)
+        let data = mut fx1.load(PTR, addr: peer, offset: ENDPOINT_DATA)
+        let moved = mut lo.record_resize(mut fx1, address: data, size: grown)
+        exhausted_unless(mut lo, fx: mut fx1, address: moved)
+        mut fx1.store(moved, addr: peer, offset: ENDPOINT_DATA)
+        mut fx1.store(grown, addr: peer, offset: ENDPOINT_CAPACITY)
+    })
+    let data = mut fx.load(PTR, addr: peer, offset: ENDPOINT_DATA)
+    let at = mut fx.b.iadd(data, y: len)
+    let copy_args = fx.list3(at, b: written.start, c: written.len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    mut fx.store(needed, addr: peer, offset: ENDPOINT_LEN)
+    let reader = mut fx.offset(peer, offset: ENDPOINT_READER)
+    sims_wake(mut lo, mut fx, slot: reader)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(written.len))
+} net_write
+
+/// `sys::net::Conn.close`: its peer reads the bytes left, then nothing.
+fn net_close(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let record = net_held(mut lo, mut fx, address: supply.param(0).address_value())
+    net_end(mut lo, mut fx, record, how: ENDED_CLOSED)
+} net_close
+
+/// Ends an endpoint's side as `how`: its peer, unless already ended, ends that way and its
+/// read wakes.
+fn net_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, how: i64) {
+    let held_flag = mut fx.load(PTR, addr: record, offset: ENDPOINT_HELD)
+    let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_flag, y: 0)
+    mut fx.if_true(held, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: ENDPOINT_HELD)
+        let peer = mut fx1.load(PTR, addr: record, offset: ENDPOINT_PEER)
+        let current = mut fx1.load(PTR, addr: peer, offset: ENDPOINT_ENDED)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: ENDED_OPEN)
+        mut fx1.if_true(open, then: fn[mut lo](mut fx2: Fx) {
+            let how_value = mut fx2.ptr(how.to_bits())
+            mut fx2.store(how_value, addr: peer, offset: ENDPOINT_ENDED)
+            let reader = mut fx2.offset(peer, offset: ENDPOINT_READER)
+            sims_wake(mut lo, fx: mut fx2, slot: reader)
+        })
+    })
+} net_end
+
+/// Releases a listener: its port is free again, and each connection it has not accepted is
+/// reset.
+fn close_listener(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: LISTENER_HELD)
+    let first_endpoint = mut fx.load(PTR, addr: record, offset: LISTENER_FIRST)
+    mut fx.store(zero, addr: record, offset: LISTENER_FIRST)
+    mut fx.store(zero, addr: record, offset: LISTENER_LAST)
+    let initial = fx.list1(first_endpoint)
+    discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 1
+        let current = state[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let results = fx1.types1(PTR)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: ENDPOINT_NEXT)
+            net_end(mut lo2, fx: mut fx2, record: current, how: ENDED_RESET)
+            return fx2.list1(following)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.ptr(0)
+            return fx2.list1(none)
+        })
+        return Pass(again: present, next: take next)
+    })
+} close_listener

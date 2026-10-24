@@ -1,0 +1,1117 @@
+//! Trap sites: the call of the trap routine that each failing check and partial operation makes, with its kind and the operands its report shows; and the lines `dbg` writes to the test trace, which show their operand as reports do. An operand record is 40 bytes: the address and length of the operand's source text, the bits of a scalar value or the address of another, how the report writes the bits, as `Written` numbers it, and the address of the glue writing another value, or zero.
+
+/// The trap kinds, numbered by their position, as reports and `sys::TrapKind` order them.
+const TRAP_KINDS: Str = "trap.bounds trap.overflow trap.division-by-zero trap.shift trap.conversion trap.stale-handle trap.exhausted trap.predicate trap.requires trap.ensures trap.expect trap.todo trap.stack-overflow trap.duplicate-access trap.poisoned"
+
+/// How a report writes an operand's value.
+enum Written derives Copy {
+    Unsigned
+    Signed
+    Bool
+    Char
+    Float32
+    Float64
+    /// A value no report writes: `_`.
+    Hidden
+} Written
+
+/// The number a report reads for it.
+fn Written.number(self) -> u64 {
+    return match self {
+        Written.Unsigned => 0
+        Written.Signed => 1
+        Written.Bool => 2
+        Written.Char => 3
+        Written.Float32 => 4
+        Written.Float64 => 5
+        Written.Hidden => 6
+    }
+} Written.number
+
+const OPERAND_RECORD: u64 = 40
+
+/// The operands a trap site's report shows.
+enum Operands {
+    None
+    /// The operands of the trapping operation, each with its value, and how its source shows
+    /// them.
+    Values(form: TrapForm, values: mem::List[HeldOperand])
+    /// The two sides of a failing check's condition when it is a comparison.
+    Condition(Option[nir::Value])
+    /// The index of an `at` or `at_mut` call and the length it lies outside.
+    Bounds(index: nir::Operand, at: clif::Value, len: clif::Value)
+} Operands
+
+/// A copy of the operands.
+fn Operands.copy(self, alloc: mem::Alloc) -> Operands {
+    match self {
+        Operands.None => return Operands.None
+        Operands.Values(form: form, values: values) => {
+            var copied = mem::List[HeldOperand].empty(alloc)
+            for value in values {
+                mut copied.push(HeldOperand(operand: value.operand.copy(alloc), held: value.held, nty: value.nty))
+            }
+            return Operands.Values(form: form.copy(alloc), values: take copied)
+        }
+        Operands.Condition(condition) => return Operands.Condition(condition)
+        Operands.Bounds(index: index, at: at, len: len) => return Operands.Bounds(index: index.copy(alloc), at: at, len: len)
+    }
+} Operands.copy
+
+/// An operand of a trapping operation, with its value and NIR type.
+struct HeldOperand {
+    operand: nir::Operand
+    held: Held
+    nty: nir::NTy
+} HeldOperand
+
+/// How the source text of a trapping operation shows its operands.
+enum TrapForm {
+    /// The sides of a binary operator, or of the compound assignment applying it.
+    Binary(nir::BinaryOp)
+    /// What follows a unary operator.
+    Unary
+    /// The arguments in the last parentheses or brackets, after the receiver when the
+    /// operation has one more operand than them.
+    Call
+    /// The value stored into a field: what follows `=`, or the argument with its label.
+    Field(text::String)
+} TrapForm
+
+/// A copy of the form.
+fn TrapForm.copy(self, alloc: mem::Alloc) -> TrapForm {
+    return match self {
+        TrapForm.Binary(op) => TrapForm.Binary(op)
+        TrapForm.Unary => TrapForm.Unary
+        TrapForm.Call => TrapForm.Call
+        TrapForm.Field(name) => TrapForm.Field(text::String.of(name.as_str(), alloc))
+    }
+} TrapForm.copy
+
+/// The item, role and span of a requires, ensures or invariant clause.
+struct Clause derives Copy {
+    item: ty::ItemId
+    role: nir::Role
+    span: nir::Span
+} Clause
+
+/// The comparison defining a value: its operator, its two sides and its span.
+struct Comparison {
+    op: nir::BinaryOp
+    sides: mem::List[nir::Operand]
+    span: nir::Span
+} Comparison
+
+/// The offsets of the two sides of a comparison in the record its `Sides` function writes, and
+/// the record's size.
+struct SidesLayout derives Copy {
+    offsets: Array[u64, 2]
+    size: u64
+} SidesLayout
+
+fn kind_number(kind: Str) -> i64 {
+    let bytes = TRAP_KINDS.as_bytes()
+    var number: i64 = 0
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b' ' {
+            continue
+        }
+        let Some(known) = TRAP_KINDS.slice_bytes(start, end: at) else {
+            break
+        }
+        if known == kind {
+            return number
+        }
+        expect number < 0x7FFF_FFFF_FFFF_FFFF
+        number += 1
+        start = at + 1
+    }
+    expect false
+    return number
+} kind_number
+
+/// The trap kind of a kept check.
+fn check_kind(kind: nir::CheckKind, alloc: mem::Alloc) -> text::String {
+    let word = match kind {
+        nir::CheckKind.Requires => "trap.requires"
+        nir::CheckKind.Ensures => "trap.ensures"
+        nir::CheckKind.Predicate => "trap.predicate"
+        nir::CheckKind.Expect or nir::CheckKind.Invariant or nir::CheckKind.Decreases => "trap.expect"
+    }
+    return text::String.of(word, alloc)
+} check_kind
+
+/// Traps with `kind` at the current source location, or for a failed requires, ensures or
+/// invariant check at its clause or line in the item declaring it unless that is std, a
+/// requires checked at a call naming the call as the first caller: the trap routine never
+/// returns.
+fn trap_raise(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    kind: Str,
+    take operands: Operands,
+    ) {
+    var clause: Option[Clause] = None
+    match operands {
+        Operands.Condition(Some(condition)) => {
+            clause = clause_of(body, lo, condition)
+        }
+        else => {}
+    }
+    var caller: Option[u32] = None
+    match clause {
+        Some(found) => if found.role == nir::Role.Requires and (found.item != body.item or body.function().role != nir::Role.Entry) {
+            caller = Some(mut lo.lines.location(lo.ck, item: body.item, span: body.current))
+        }
+        None => {}
+    }
+    let records = trap_records(mut body, mut lo, mut fx, take operands)
+    let count = u64.widen(records.len())
+    var array_size = count * OPERAND_RECORD
+    if array_size < 8 {
+        array_size = 8
+    }
+    let array = mut fx.slot(array_size, align: 8)
+    write_records(mut lo, mut fx, array, take records)
+    let kind_value = mut fx.int(clif::Type.Int64, value: kind_number(kind))
+    let count_value = mut fx.ptr(count)
+    let caller_value = mut fx.ptr(u64.widen(caller.value_or(0)))
+    match clause {
+        Some(found) => mut lo.locate(mut fx, item: found.item, span: found.span)
+        None => {}
+    }
+    let args = fx.list4(kind_value, b: array, c: count_value, d: caller_value)
+    discard mut lo.call_routine(mut fx, routine: Routine.TrapRaise, args: args.view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+    mut lo.locate(mut fx, item: body.item, span: body.current)
+} trap_raise
+
+/// Writes the record of each operand a report shows into the array at `array`.
+fn write_records(mut lo: Lowering, mut fx: Fx, array: clif::Value, take records: mem::List[ShownOperand]) {
+    var index: u64 = 0
+    for record in records {
+        let at = index * OPERAND_RECORD
+        let data = mut lo.bytes_data(record.text.as_bytes())
+        let global = mut lo.data_ref(mut fx, id: data)
+        let address = mut fx.b.symbol_value(PTR, global_value: global)
+        mut fx.store(address, addr: array, offset: at)
+        let len = mut fx.ptr(u64.widen(record.text.byte_len()))
+        mut fx.store(len, addr: array, offset: at + 8)
+        mut fx.store(record.shown.bits, addr: array, offset: at + 16)
+        let how = mut fx.ptr(record.shown.written.number())
+        mut fx.store(how, addr: array, offset: at + 24)
+        var writer = clif::Value(index: 0)
+        match record.shown.writer {
+            Some(glue) => {
+                let reference = mut lo.func_ref(mut fx, id: glue)
+                writer = mut fx.b.func_addr(PTR, func_ref: reference)
+            }
+            None => {
+                writer = mut fx.ptr(0)
+            }
+        }
+        mut fx.store(writer, addr: array, offset: at + 32)
+        index += 1
+    }
+} write_records
+
+/// The item, role and span of the requires, ensures or invariant clause whose function a call
+/// defining a condition calls, when that item is not std.
+fn clause_of(body: Body, lo: Lowering, condition: nir::Value) -> Option[Clause] {
+    let Some(call) = condition_call(body, condition, alloc: lo.alloc) else {
+        return None
+    }
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return None
+    }
+    let nir::Callable.Item(item: item, role: role, index: index) = fn_ref.callable else {
+        return None
+    }
+    let clause = role == nir::Role.Requires or role == nir::Role.Ensures or role == nir::Role.Invariant
+    if not clause or lo.ck.db().is_std(item) {
+        return None
+    }
+    let Some(unit) = lo.ck.unit(item) else {
+        return None
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        return None
+    }
+    return Some(Clause(item: item, role: role, span: function.span))
+} clause_of
+
+/// The call defining a value of the function, when a call does.
+fn condition_call(body: Body, condition: nir::Value, alloc: mem::Alloc) -> Option[nir::Call] {
+    for block in body.function().blocks {
+        for inst in block.insts {
+            if inst.result != Some(condition) {
+                continue
+            }
+            match inst.op {
+                nir::Op.Call(call) => return Some(copy_call(call, alloc))
+                else => {}
+            }
+        }
+    }
+    return None
+} condition_call
+
+/// A copy of a call.
+fn copy_call(call: nir::Call, alloc: mem::Alloc) -> nir::Call {
+    let callee = match call.callee {
+        nir::Callee.Fn(fn_ref) => nir::Callee.Fn(fn_ref.copy(alloc))
+        nir::Callee.Value(value) => nir::Callee.Value(value)
+        nir::Callee.Dyn(place: place, item: item, method: method) => nir::Callee.Dyn(place: place.copy(alloc), item: item, method: method)
+    }
+    return nir::Call(awaited: call.awaited, callee: take callee, args: nir::Operand.copies(call.args.view(), alloc))
+} copy_call
+
+/// What a report writes for a value: a scalar's bits and their writing, or the address of a
+/// writable value with its type's glue; any other value hidden.
+struct Shown derives Copy {
+    bits: clif::Value
+    written: Written
+    writer: Option[object::FuncId]
+} Shown
+
+fn Shown.hidden(mut fx: Fx) -> Shown {
+    return Shown(bits: mut fx.ptr(0), written: Written.Hidden, writer: None)
+} Shown.hidden
+
+/// A writable value at an address.
+fn Shown.at(mut lo: Lowering, ty: ty::Ty, address: clif::Value) -> Shown {
+    return Shown(bits: address, written: Written.Hidden, writer: Some(values_writer(mut lo, ty)))
+} Shown.at
+
+/// Appends the value to a report.
+fn Shown.write(self, mut lo: Lowering, mut fx: Fx, report: ReportReport) {
+    match self.writer {
+        Some(writer) => {
+            let reference = mut lo.func_ref(mut fx, id: writer)
+            let args = fx.list2(report.out, b: self.bits)
+            discard mut fx.b.call(reference, args: args.view())
+        }
+        None => {
+            let how = mut fx.ptr(self.written.number())
+            let args = fx.list3(report.out, b: self.bits, c: how)
+            discard mut lo.call_routine(mut fx, routine: Routine.ReportScalar, args: args.view())
+        }
+    }
+} Shown.write
+
+/// The source text of an operand a report shows, and what it writes for its value.
+struct ShownOperand {
+    text: text::String
+    shown: Shown
+} ShownOperand
+
+/// Writes the line of the `dbg` being lowered to the test trace: its path and line, the source
+/// text of its operand, ` = ` and the operand's value.
+fn dbg_line(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    nty: nir::NTy,
+    ) {
+    let span = body.current
+    let file = lo.ck.db().syntax(body.item)
+    let source = Source.of(file, span, alloc: lo.alloc)
+    var last: usize = 0
+    if source.tokens.len() >= 2 {
+        last = source.tokens.len() - 2
+    }
+    let operand_source = match source.text(file, head: 2, last) {
+        Some(written) => written
+        None => text::String.empty(lo.alloc)
+    }
+    let line = lo.ck.db().line(body.item, token: span.head)
+    let path = lines_path(lo.ck, item: body.item)
+    let shown = trap_shown(mut body, mut lo, mut fx, held, nty)
+    let out = mut fx.slot(8 + REPORT_REPORT, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: out, offset: 0)
+    let report = ReportReport(out: out)
+    var heading = text::String.of(path.as_str(), alloc: lo.alloc)
+    mut heading.push(':')
+    mut heading.write(text::fmt("{line}", line), budget: 32)
+    mut heading.push(' ')
+    mut heading.append(operand_source.as_str())
+    mut heading.append(" = ")
+    report.text(mut fx, mut lo, text: heading.as_str())
+    shown.write(mut lo, mut fx, report)
+    report.text(mut fx, mut lo, text: "\n")
+    let bytes = mut fx.b.iadd_imm_s(out, y: 8)
+    let len = mut fx.load(PTR, addr: out, offset: 0)
+    var parts = mem::List[Stretch].empty(lo.alloc)
+    mut parts.push(Stretch(start: bytes, len: len))
+    trace(mut lo, mut fx, parts: parts.view())
+} dbg_line
+
+/// The source text and shown value of each operand a report shows.
+fn trap_records(mut body: Body, mut lo: Lowering, mut fx: Fx, take operands: Operands) -> mem::List[ShownOperand] {
+    match operands {
+        Operands.None => return mem::List[ShownOperand].empty(lo.alloc)
+        Operands.Values(form: form, values: values) => return value_records(mut body, mut lo, mut fx, form, values: values.view())
+        Operands.Bounds(index: index, at: at, len: len) => {
+            var written = text::String.empty(lo.alloc)
+            match source_texts(lo, item: body.item, span: body.current, form: TrapForm.Call, count: 2) {
+                Some(texts) => {
+                    written = text::String.of(texts[1].as_str(), alloc: lo.alloc)
+                }
+                None => {
+                    written = operand_text(body, lo, operand: index)
+                }
+            }
+            var records = mem::List[ShownOperand].empty(lo.alloc)
+            mut records.push(ShownOperand(text: take written, shown: Shown(bits: at, written: Written.Unsigned, writer: None)))
+            mut records.push(ShownOperand(text: text::String.of("len", alloc: lo.alloc), shown: Shown(bits: len, written: Written.Unsigned, writer: None)))
+            return records
+        }
+        Operands.Condition(None) => return mem::List[ShownOperand].empty(lo.alloc)
+        Operands.Condition(Some(condition)) => {
+            match own_sides(mut body, mut lo, mut fx, condition) {
+                Some(sides) => return sides
+                None => {}
+            }
+            match called_sides(mut body, mut lo, mut fx, condition) {
+                Some(sides) => return sides
+                None => {}
+            }
+            return mem::List[ShownOperand].empty(lo.alloc)
+        }
+    }
+} trap_records
+
+/// The source text and shown value of each operand of a trapping operation, as its form shows
+/// them, or as its operands' own texts when its text does not have that form.
+fn value_records(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    form: TrapForm,
+    values: Slice[HeldOperand],
+    ) -> mem::List[ShownOperand] {
+    let found = source_texts(lo, item: body.item, span: body.current, form, count: values.len())
+    var texts = mem::List[text::String].empty(lo.alloc)
+    var shown_as_form = false
+    match found {
+        Some(listed) => {
+            texts = listed
+            shown_as_form = true
+        }
+        None => {}
+    }
+    var records = mem::List[ShownOperand].empty(lo.alloc)
+    for index in 0..<values.len() {
+        let value = values[index]
+        let written = if shown_as_form {
+            text::String.of(texts[index].as_str(), alloc: lo.alloc)
+        } else {
+            operand_text(body, lo, operand: value.operand)
+        }
+        let shown = trap_shown(mut body, mut lo, mut fx, held: value.held, nty: value.nty)
+        mut records.push(ShownOperand(text: take written, shown: shown))
+    }
+    return records
+} value_records
+
+/// The sides of the comparison defining a condition in this function, when its source text
+/// is one.
+fn own_sides(mut body: Body, mut lo: Lowering, mut fx: Fx, condition: nir::Value) -> Option[mem::List[ShownOperand]] {
+    let Some(found) = comparison(body.function(), value: condition, alloc: lo.alloc) else {
+        return None
+    }
+    let Some(texts) = source_texts(lo, item: body.item, span: found.span, form: TrapForm.Binary(found.op), count: 2) else {
+        return None
+    }
+    var sides = mem::List[ShownOperand].empty(lo.alloc)
+    for index in 0..<texts.len() {
+        if index >= found.sides.len() {
+            break
+        }
+        let operated = mut body.operand(mut lo, mut fx, operand: found.sides[index])
+        let shown = trap_shown(mut body, mut lo, mut fx, held: operated.held, nty: operated.nty)
+        mut sides.push(ShownOperand(text: text::String.of(texts[index].as_str(), alloc: lo.alloc), shown: shown))
+    }
+    return Some(take sides)
+} own_sides
+
+/// The comparison defining a value of a function, when one may: its operator, sides and span.
+/// A comparison of values no instruction compares is a call of their `eq`, or of their `cmp`
+/// tested for a variant, negated for `!=`, `<=` and `>=`.
+fn comparison(function: nir::Function, value: nir::Value, alloc: mem::Alloc) -> Option[Comparison] {
+    for block in function.blocks {
+        for inst in block.insts {
+            if inst.result == Some(value) {
+                return compared_by(function, inst, alloc)
+            }
+        }
+    }
+    return None
+} comparison
+
+/// The comparison the instruction defining a value makes, when it makes one.
+fn compared_by(function: nir::Function, inst: nir::Inst, alloc: mem::Alloc) -> Option[Comparison] {
+    match inst.op {
+        nir::Op.Binary(op: op, left: left, right: right) => {
+            if not op.is_comparison() {
+                return None
+            }
+            var sides = mem::List[nir::Operand].empty(alloc)
+            mut sides.push(left.copy(alloc))
+            mut sides.push(right.copy(alloc))
+            return Some(Comparison(op: op, sides: take sides, span: inst.span))
+        }
+        nir::Op.Call(call) => {
+            if call.args.len() != 2 {
+                return None
+            }
+            return Some(Comparison(op: nir::BinaryOp.Eq, sides: nir::Operand.copies(call.args.view(), alloc), span: inst.span))
+        }
+        nir::Op.Is(place: place, ty: _, variant: variant) => {
+            if place.steps.len() != 0 {
+                return None
+            }
+            let Some(inner) = comparison(function, value: place.root, alloc) else {
+                return None
+            }
+            let op = match variant.as_str() {
+                "Less" => nir::BinaryOp.Lt
+                "Greater" => nir::BinaryOp.Gt
+                else => return None
+            }
+            return Some(Comparison(op: op, sides: take inner.sides, span: inst.span))
+        }
+        nir::Op.Unary(op: nir::UnaryOp.Not, operand: nir::Operand.Value(negated)) => {
+            let Some(inner) = comparison(function, value: negated, alloc) else {
+                return None
+            }
+            let op = match inner.op {
+                nir::BinaryOp.Eq => nir::BinaryOp.Ne
+                nir::BinaryOp.Lt => nir::BinaryOp.Ge
+                nir::BinaryOp.Gt => nir::BinaryOp.Le
+                else => return None
+            }
+            return Some(Comparison(op: op, sides: take inner.sides, span: inst.span))
+        }
+        else => return None
+    }
+} compared_by
+
+/// The sides of the comparison that the contract function a call defining a condition calls
+/// returns, computed again from the call's operands.
+fn called_sides(mut body: Body, mut lo: Lowering, mut fx: Fx, condition: nir::Value) -> Option[mem::List[ShownOperand]] {
+    let Some(call) = condition_call(body, condition, alloc: lo.alloc) else {
+        return None
+    }
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return None
+    }
+    let nir::Callable.Item(item: item, role: role, index: index) = fn_ref.callable else {
+        return None
+    }
+    if not role.is_contract() {
+        return None
+    }
+    let Some(unit) = lo.ck.unit(item) else {
+        return None
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        return None
+    }
+    let Some(returned) = returned_value(function) else {
+        return None
+    }
+    let Some(found) = comparison(function, value: returned, alloc: lo.alloc) else {
+        return None
+    }
+    let Some(texts) = source_texts(lo, item, span: found.span, form: TrapForm.Binary(found.op), count: 2) else {
+        return None
+    }
+    let subst = lo.subst(item, args: body.subst.args(lo.ck.types(), args: fn_ref.args))
+    let types = side_types(lo, function, subst, sides: found.sides.view())
+    let laid_out = sides_layout(mut lo, types)
+    let record = mut body.call_sides(mut lo, mut fx, fn_ref, operands: call.args.view(), size: laid_out.size)
+    return Some(read_sides(mut lo, mut fx, record, texts: texts.view(), types, offsets: laid_out.offsets))
+} called_sides
+
+/// The value the first return of a function returning a value returns.
+fn returned_value(function: nir::Function) -> Option[nir::Value] {
+    for block in function.blocks {
+        match block.term {
+            nir::Terminator.Return(Some(nir::Operand.Value(value))) => return Some(value)
+            else => {}
+        }
+    }
+    return None
+} returned_value
+
+/// The shown values of the two sides a `Sides` function kept in its record, with their texts.
+fn read_sides(
+    mut lo: Lowering,
+    mut fx: Fx,
+    record: clif::Value,
+    texts: Slice[text::String],
+    types: Array[ty::Ty, 2],
+    offsets: Array[u64, 2],
+    ) -> mem::List[ShownOperand] {
+    var sides = mem::List[ShownOperand].empty(lo.alloc)
+    for index in 0..<texts.len() {
+        if index >= 2 {
+            break
+        }
+        let ty = types[index]
+        let at = mut fx.offset(record, offset: offsets[index])
+        let side = if ty.interned_scalar().is_some() {
+            Shown(bits: mut fx.load(PTR, addr: at, offset: 0), written: trap_written(ty), writer: None)
+        } else if values_writable(mut lo, ty) {
+            Shown.at(mut lo, ty, address: at)
+        } else {
+            Shown.hidden(mut fx)
+        }
+        mut sides.push(ShownOperand(text: text::String.of(texts[index].as_str(), alloc: lo.alloc), shown: side))
+    }
+    return sides
+} read_sides
+
+/// The types of the sides of a comparison in a function whose types `subst` makes concrete,
+/// `Unit` for a place.
+fn side_types(lo: Lowering, function: nir::Function, subst: ty::Subst, sides: Slice[nir::Operand]) -> Array[ty::Ty, 2] {
+    var types = Array[ty::Ty, 2].filled(ty::Ty.unit())
+    for index in 0..<sides.len() {
+        if index >= 2 {
+            break
+        }
+        types[index] = match sides[index] {
+            nir::Operand.Value(value) => subst.ty(lo.ck.types(), ty: function.ty(value).ty())
+            nir::Operand.Literal(literal) => literal_ty(lo, literal)
+            nir::Operand.Place(mode: _, place: _) => ty::Ty.unit()
+        }
+    }
+    return types
+} side_types
+
+/// The offsets of the two sides of a comparison in the record its `Sides` function writes, a
+/// scalar side taking 8 bytes and any other the bytes of its value, and the record's size.
+fn sides_layout(mut lo: Lowering, types: Array[ty::Ty, 2]) -> SidesLayout {
+    let head_size = side_size(mut lo, ty: types[0])
+    let tail_size = side_size(mut lo, ty: types[1])
+    var offsets = Array[u64, 2].filled(0)
+    offsets[1] = head_size
+    var size = head_size + tail_size
+    if size < 8 {
+        size = 8
+    }
+    return SidesLayout(offsets: offsets, size: size)
+} sides_layout
+
+/// The bytes a side of a comparison takes in the record of its `Sides` function.
+fn side_size(mut lo: Lowering, ty: ty::Ty) -> u64 {
+    if ty.interned_scalar().is_some() {
+        return 8
+    }
+    let laid = mut lo.layout_of(ty)
+    return (laid.contents().size + 7) / 8 * 8
+} side_size
+
+/// Keeps a side of a comparison at an offset of the record of its `Sides` function: a
+/// scalar's bits, or the bytes of a writable value.
+fn keep_side(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    nty: nir::NTy,
+    ty: ty::Ty,
+    record: clif::Value,
+    offset: u64,
+    ) {
+    if ty.interned_scalar().is_some() {
+        let shown = trap_shown(mut body, mut lo, mut fx, held, nty)
+        mut fx.store(shown.bits, addr: record, offset)
+        return
+    }
+    if values_writable(mut lo, ty) {
+        let address = trap_address_of(mut lo, mut fx, held, ty)
+        let target = mut fx.offset(record, offset)
+        let laid = mut lo.layout_of(ty)
+        let size = mut fx.ptr(laid.contents().size)
+        let args = fx.list3(target, b: address, c: size)
+        discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: args.view())
+    }
+} keep_side
+
+/// The source texts of the `count` operands of the operation a span of an item covers, as its
+/// form shows them; none when its text does not have that form.
+fn source_texts(
+    lo: Lowering,
+    item: ty::ItemId,
+    span: nir::Span,
+    form: TrapForm,
+    count: usize,
+    ) -> Option[mem::List[text::String]]
+    ensures match result {
+        Some(listed) => listed.len() == count
+        None => true
+    }
+{
+    let file = lo.ck.db().syntax(item)
+    let source = Source.of(file, span, alloc: lo.alloc)
+    var texts = mem::List[text::String].empty(lo.alloc)
+    match form {
+        TrapForm.Binary(op) => {
+            let symbol = op_symbol(op, alloc: lo.alloc)
+            let Some(sides) = source.binary(file, symbol: symbol.as_str()) else {
+                return None
+            }
+            texts = sides
+        }
+        TrapForm.Unary => {
+            if source.tokens.len() == 0 {
+                return None
+            }
+            let Some(operand) = source.text(file, head: 1, last: source.tokens.len() - 1) else {
+                return None
+            }
+            mut texts.push(take operand)
+        }
+        TrapForm.Call => {
+            let Some(call_texts) = source.call(file, count) else {
+                return None
+            }
+            texts = call_texts
+        }
+        TrapForm.Field(name) => {
+            let Some(stored) = source.field(file, name: name.as_str()) else {
+                return None
+            }
+            mut texts.push(take stored)
+        }
+    }
+    if texts.len() != count {
+        return None
+    }
+    return Some(take texts)
+} source_texts
+
+/// The code tokens a span covers, and the depth of brackets each lies in.
+struct Source {
+    tokens: mem::List[usize]
+    depths: mem::List[u32]
+    alloc: mem::Alloc
+} Source
+
+fn Source.of(file: syntax::SourceFile, span: nir::Span, alloc: mem::Alloc) -> Source {
+    var tokens = mem::List[usize].empty(alloc)
+    expect usize.widen(span.last) < file.tokens.len()
+    for token in usize.widen(span.head)..=usize.widen(span.last) {
+        if not file.tokens[token].kind.is_virtual() {
+            mut tokens.push(token)
+        }
+    }
+    var depths = mem::List[u32].empty(alloc)
+    var depth: u32 = 0
+    for token in tokens {
+        let spelt = file.text(token)
+        if spelt == "(" or spelt == "[" or spelt == "{" {
+            mut depths.push(depth)
+            expect depth < 0xFFFF_FFFF
+            depth += 1
+        } else if spelt == ")" or spelt == "]" or spelt == "}" {
+            depth = depth.saturating_sub(1)
+            mut depths.push(depth)
+        } else {
+            mut depths.push(depth)
+        }
+    }
+    return Source(tokens: take tokens, depths: take depths, alloc: alloc)
+} Source.of
+
+/// The source text from the code token at `head` to the one at `last`, each line break
+/// with its indentation written as one space; none for an empty range.
+fn Source.text(self, file: syntax::SourceFile, head: usize, last: usize) -> Option[text::String] {
+    if head > last or last >= self.tokens.len() {
+        return None
+    }
+    expect self.tokens[head] < file.tokens.len() and self.tokens[last] < file.tokens.len()
+    let start = file.tokens[self.tokens[head]].start
+    let end = file.tokens[self.tokens[last]].end
+    let spanned = output::lossy(file.source_bytes(start, end: end), alloc: self.alloc)
+    return Some(joined_lines(spanned.as_str(), alloc: self.alloc))
+} Source.text
+
+/// A text's lines, each without the white space at its ends, joined by single spaces.
+fn joined_lines(written: Str, alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    let bytes = written.as_bytes()
+    var start: usize = 0
+    var lines: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b'\n' {
+            continue
+        }
+        if at == bytes.len() and start == at {
+            break
+        }
+        let Some(line) = written.slice_bytes(start, end: at) else {
+            break
+        }
+        let run = platform::trimmed_run(line)
+        let Some(trimmed) = line.slice_bytes(run.start, end: run.end) else {
+            break
+        }
+        if lines > 0 {
+            mut joined.push(' ')
+        }
+        mut joined.append(trimmed)
+        expect lines <= at and at < 0xFFFF_FFFF_FFFF_FFFF
+        lines += 1
+        start = at + 1
+    }
+    return joined
+} joined_lines
+
+/// The sides of the outermost binary operator `symbol`, or of the compound assignment
+/// `symbol=`: a binary operator of no higher precedence than the operators at depth 0
+/// beside it is the rightmost there, as operators of one precedence group to the left.
+fn Source.binary(self, file: syntax::SourceFile, symbol: Str) -> Option[mem::List[text::String]] {
+    if self.tokens.len() == 0 {
+        return None
+    }
+    let last = self.tokens.len() - 1
+    expect self.depths.len() == self.tokens.len()
+    var compound = text::String.of(symbol, alloc: self.alloc)
+    mut compound.push('=')
+    var found: Option[usize] = None
+    for at in 0..=last {
+        if self.depths[at] == 0 and file.text(self.tokens[at]) == compound.as_str() {
+            found = Some(at)
+            break
+        }
+    }
+    if found.is_none() {
+        var at = last
+        while at > 1 {
+            invariant at <= last
+            at -= 1
+            if self.depths[at] == 0 and file.text(self.tokens[at]) == symbol and self.ends_operand(file, at: at - 1) {
+                found = Some(at)
+                break
+            }
+        }
+    }
+    let Some(at) = found else {
+        return None
+    }
+    if at == 0 {
+        return None
+    }
+    let Some(left) = self.text(file, head: 0, last: at - 1) else {
+        return None
+    }
+    let Some(right) = self.text(file, head: at + 1, last) else {
+        return None
+    }
+    var sides = mem::List[text::String].empty(self.alloc)
+    mut sides.push(take left)
+    mut sides.push(take right)
+    return Some(take sides)
+} Source.binary
+
+/// Whether the code token at `at` can end an operand, so that an operator after it is
+/// binary.
+fn Source.ends_operand(self, file: syntax::SourceFile, at: usize) -> bool {
+    expect at < self.tokens.len() and self.tokens[at] < file.tokens.len()
+    return match file.tokens[self.tokens[at]].kind {
+        syntax::TokenKind.Ident or syntax::TokenKind.Int or syntax::TokenKind.Float or syntax::TokenKind.Text or syntax::TokenKind.Bytes or syntax::TokenKind.Char or syntax::TokenKind.Byte or syntax::TokenKind.TextLine => true
+        syntax::TokenKind.Keyword(keyword) => keyword == syntax::Keyword.SelfValue or keyword == syntax::Keyword.True or keyword == syntax::Keyword.False
+        syntax::TokenKind.Punct(punct) => punct == syntax::Punct.RParen or punct == syntax::Punct.RBracket or punct == syntax::Punct.RBrace
+        else => false
+    }
+} Source.ends_operand
+
+/// The arguments in the last parentheses or brackets, labels left out, after the receiver
+/// when there are `count` operands, one more than the arguments.
+fn Source.call(self, file: syntax::SourceFile, count: usize) -> Option[mem::List[text::String]] {
+    if self.tokens.len() == 0 {
+        return None
+    }
+    let close = self.tokens.len() - 1
+    let bracket = file.text(self.tokens[close]) == "]"
+    if not bracket and file.text(self.tokens[close]) != ")" {
+        return None
+    }
+    let Some(open) = self.opening(close) else {
+        return None
+    }
+    let Some(argument_texts) = self.arguments(file, open, close) else {
+        return None
+    }
+    var texts = argument_texts
+    if count == texts.len() + 1 {
+        let Some(before) = self.receiver_end(file, open, bracket) else {
+            return None
+        }
+        if before == 0 {
+            return None
+        }
+        let Some(receiver) = self.text(file, head: 0, last: before - 1) else {
+            return None
+        }
+        mut texts.insert(0, value: take receiver)
+    }
+    return Some(take texts)
+} Source.call
+
+/// The position of the token after the receiver of a call whose arguments open at `open`: the
+/// bracket itself for an index, else the `.` before the method's name and its generic
+/// arguments.
+fn Source.receiver_end(self, file: syntax::SourceFile, open: usize, bracket: bool) -> Option[usize] {
+    if bracket {
+        return Some(open)
+    }
+    if open == 0 {
+        return None
+    }
+    expect open < self.tokens.len()
+    var name = open - 1
+    if file.text(self.tokens[name]) == "]" {
+        let Some(generic) = self.opening(name) else {
+            return None
+        }
+        if generic == 0 {
+            return None
+        }
+        name = generic - 1
+    }
+    if name == 0 {
+        return None
+    }
+    let dot = name - 1
+    if file.text(self.tokens[dot]) != "." {
+        return None
+    }
+    return Some(dot)
+} Source.receiver_end
+
+/// The position of the bracket opening the one closing at `close`.
+fn Source.opening(self, close: usize) -> Option[usize]
+    ensures match result {
+        Some(found) => found < close
+        None => true
+    }
+{
+    expect close < self.depths.len()
+    var at = close
+    while at > 0 {
+        invariant at <= close
+        at -= 1
+        if self.depths[at] == self.depths[close] {
+            return Some(at)
+        }
+    }
+    return None
+} Source.opening
+
+/// The texts of the arguments between brackets at `open` and `close`, labels left out.
+fn Source.arguments(self, file: syntax::SourceFile, open: usize, close: usize) -> Option[mem::List[text::String]] {
+    expect open < close and close < self.tokens.len() and close < self.depths.len()
+    expect self.depths[open] < 0xFFFF_FFFF
+    let inner = self.depths[open] + 1
+    var texts = mem::List[text::String].empty(self.alloc)
+    var head = open + 1
+    for at in (open + 1)..=close {
+        if at != close and (self.depths[at] != inner or file.text(self.tokens[at]) != ",") {
+            continue
+        }
+        if head < at {
+            let labelled = at - head > 2 and file.text(self.tokens[head + 1]) == ":"
+            var start = head
+            if labelled {
+                start = head + 2
+            }
+            let Some(argument) = self.text(file, head: start, last: at - 1) else {
+                return None
+            }
+            mut texts.push(take argument)
+        }
+        head = at + 1
+    }
+    return Some(take texts)
+} Source.arguments
+
+/// The value stored into the field `name`: what follows `=` at depth 0, or the argument
+/// labelled `name` in the last parentheses.
+fn Source.field(self, file: syntax::SourceFile, name: Str) -> Option[text::String] {
+    if self.tokens.len() == 0 {
+        return None
+    }
+    let last = self.tokens.len() - 1
+    expect self.depths.len() == self.tokens.len()
+    for at in 0..=last {
+        if self.depths[at] == 0 and file.text(self.tokens[at]) == "=" {
+            return self.text(file, head: at + 1, last)
+        }
+    }
+    let Some(open) = self.opening(last) else {
+        return None
+    }
+    expect self.depths[open] < 0xFFFF_FFFF
+    let inner = self.depths[open] + 1
+    let Some(label) = self.label_at(file, open, last, inner, name) else {
+        return None
+    }
+    var end = last
+    for at in (label + 2)..<last {
+        if self.depths[at] == inner and file.text(self.tokens[at]) == "," {
+            end = at
+            break
+        }
+    }
+    return self.text(file, head: label + 2, last: end - 1)
+} Source.field
+
+/// The position of the label `name` of an argument between brackets at depth `inner`, from
+/// `open` to `last`.
+fn Source.label_at(
+    self,
+    file: syntax::SourceFile,
+    open: usize,
+    last: usize,
+    inner: u32,
+    name: Str,
+    ) -> Option[usize]
+    ensures match result {
+        Some(found) => found < last
+        None => true
+    }
+{
+    expect open < last and last < self.tokens.len() and self.depths.len() == self.tokens.len()
+    for at in (open + 1)..<last {
+        if self.depths[at] != inner or file.text(self.tokens[at]) != name or file.text(self.tokens[at + 1]) != ":" {
+            continue
+        }
+        let before = file.text(self.tokens[at - 1])
+        if before == "(" or before == "," {
+            return Some(at)
+        }
+    }
+    return None
+} Source.label_at
+
+/// The symbol writing a binary operator.
+fn op_symbol(op: nir::BinaryOp, alloc: mem::Alloc) -> text::String {
+    let symbol = match op {
+        nir::BinaryOp.Add => "+"
+        nir::BinaryOp.Sub => "-"
+        nir::BinaryOp.Mul => "*"
+        nir::BinaryOp.Div => "/"
+        nir::BinaryOp.Rem => "%"
+        nir::BinaryOp.Shl => "<<"
+        nir::BinaryOp.Shr => ">>"
+        nir::BinaryOp.Band => "&"
+        nir::BinaryOp.Bor => "|"
+        nir::BinaryOp.Bxor => "^"
+        nir::BinaryOp.Eq => "=="
+        nir::BinaryOp.Ne => "!="
+        nir::BinaryOp.Lt => "<"
+        nir::BinaryOp.Le => "<="
+        nir::BinaryOp.Gt => ">"
+        nir::BinaryOp.Ge => ">="
+    }
+    return text::String.of(symbol, alloc)
+} op_symbol
+
+/// What a report writes for an operand's value.
+fn trap_shown(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    nty: nir::NTy,
+    ) -> Shown {
+    let ty = nty.ty()
+    match ty.interned_scalar() {
+        Some(scalar) => {
+            let repr = mut lo.owned_repr(ty)
+            let adapted = mut body.adapt(mut lo, mut fx, held, nty, wanted: repr)
+            let value = adapted.scalar_value()
+            return Shown(bits: values_bits(mut fx, scalar, value), written: trap_written(ty), writer: None)
+        }
+        None => {}
+    }
+    let empty = match held {
+        Held.Empty => true
+        else => false
+    }
+    if empty or not values_writable(mut lo, ty) {
+        return Shown.hidden(mut fx)
+    }
+    let address = trap_address_of(mut lo, mut fx, held, ty)
+    return Shown.at(mut lo, ty, address)
+} trap_shown
+
+/// The address of a value held in memory, or in a slot holding a copy of it.
+fn trap_address_of(mut lo: Lowering, mut fx: Fx, held: Held, ty: ty::Ty) -> clif::Value {
+    let Held.Address(address) = held else {
+        let laid = mut lo.layout_of(ty)
+        let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+        mut lo.store_held(mut fx, address: slot, held, ty)
+        return slot
+    }
+    return address
+} trap_address_of
+
+/// How a report writes a value of a type.
+fn trap_written(ty: ty::Ty) -> Written {
+    let Some(scalar) = ty.interned_scalar() else {
+        return Written.Hidden
+    }
+    return match scalar {
+        ty::Scalar.Float32 => Written.Float32
+        ty::Scalar.Float64 => Written.Float64
+        ty::Scalar.Bool => Written.Bool
+        ty::Scalar.Char => Written.Char
+        else => if scalar.is_signed() {
+            Written.Signed
+        } else {
+            Written.Unsigned
+        }
+    }
+} trap_written
+
+/// The type of a literal's value.
+fn literal_ty(lo: Lowering, literal: nir::Literal) -> ty::Ty {
+    return match literal {
+        nir::Literal.Int(value: _, scalar: scalar) or nir::Literal.Float(bits: _, scalar: scalar) => ty::Ty.scalar(scalar)
+        nir::Literal.Bool(_) => ty::Ty.scalar(ty::Scalar.Bool)
+        nir::Literal.Char(_) => ty::Ty.scalar(ty::Scalar.Char)
+        nir::Literal.Text(_) => lo.std_ty("core", type_name: "Str", args: mem::List[ty::Ty].empty(lo.alloc))
+        nir::Literal.Bytes(_) => lo.slice_of(ty::Ty.scalar(ty::Scalar.Unsigned8))
+        nir::Literal.Unit => ty::Ty.unit()
+    }
+} literal_ty
+
+/// The source text of an operand when its operation's text does not show it: an integer or
+/// `bool` literal's, or the text the definition of its value spans.
+fn operand_text(body: Body, lo: Lowering, operand: nir::Operand) -> text::String {
+    match first operand {
+        nir::Operand.Literal(nir::Literal.Int(value: value, scalar: _)) => {
+            var written = text::String.empty(lo.alloc)
+            mut written.write(text::fmt("{value}", value), budget: 64)
+            return written
+        }
+        nir::Operand.Literal(nir::Literal.Bool(truth)) => {
+            if truth {
+                return text::String.of("true", alloc: lo.alloc)
+            }
+            return text::String.of("false", alloc: lo.alloc)
+        }
+        nir::Operand.Literal(_) => return text::String.of("_", alloc: lo.alloc)
+        nir::Operand.Value(value) => return body.value_text(lo, value)
+        nir::Operand.Place(mode: _, place: place) => return body.value_text(lo, value: place.root)
+    }
+} operand_text

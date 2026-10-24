@@ -1,0 +1,392 @@
+//! The simulated file system: its files by joined path, each holding bytes drawn through the file system's allocator and counted against its size limit, and its open files, each the file it reads or writes and its position. Directories are implicit.
+
+/// The offsets of a file system's fields: its size limit, its files' total size, the cell it
+/// draws through and its first file.
+const SYSTEM_LIMIT: u64 = 8
+
+const SYSTEM_TOTAL: u64 = 16
+
+const SYSTEM_CELL: u64 = 24
+
+const SYSTEM_FILES: u64 = 32
+
+const SYSTEM_SIZE: u64 = 40
+
+/// The offsets of a file's fields: the next file, its joined path and its bytes.
+const FS_FILE_NEXT: u64 = 0
+
+const FS_FILE_PATH: u64 = 8
+
+const FS_FILE_PATH_LEN: u64 = 16
+
+const FS_FILE_DATA: u64 = 24
+
+const FS_FILE_LEN: u64 = 32
+
+const FS_FILE_SIZE: u64 = 40
+
+/// The offsets of an open file's fields: its file system, its file, its position and whether
+/// it was opened for writing.
+const OPEN_SYSTEM: u64 = 8
+
+const OPEN_FILE: u64 = 16
+
+const OPEN_POSITION: u64 = 24
+
+const OPEN_WRITING: u64 = 32
+
+const OPEN_SIZE: u64 = 40
+
+/// A file system and the path prefix of the entry naming it.
+struct EntrySystem derives Copy {
+    system: clif::Value
+    prefix: Stretch
+} EntrySystem
+
+/// A file and the link pointing at it.
+struct FileLink derives Copy {
+    file: clif::Value
+    link: clif::Value
+} FileLink
+
+/// A new empty file system of a size limit drawing through a cell: its index.
+fn fs_new(mut lo: Lowering, mut fx: Fx, limit: clif::Value, cell: clif::Value) -> clif::Value {
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_FS, size: SYSTEM_SIZE)
+    mut fx.store(limit, addr: created.record, offset: SYSTEM_LIMIT)
+    mut fx.store(cell, addr: created.record, offset: SYSTEM_CELL)
+    return created.index
+} fs_new
+
+/// The file system an entry names, and its path prefix.
+fn fs_of_entry(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> EntrySystem {
+    let index = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE)
+    let system = object_at(mut lo, mut fx, index)
+    let start = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 8)
+    let len = mut fx.load(PTR, addr: record, offset: TABLES_ENTRY_STATE + 16)
+    return EntrySystem(system: system, prefix: Stretch(start: start, len: len))
+} fs_of_entry
+
+/// The joined path of a prefix and a path in runtime memory: the prefix, `/` when it is not
+/// empty, and the path.
+fn fs_joined(mut lo: Lowering, mut fx: Fx, prefix: Stretch, path: Held) -> Stretch {
+    let tail_path = sys_view(mut fx, held: path)
+    let has_prefix = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: prefix.len, y: 0)
+    let separator = mut fx.b.uextend(PTR, x: has_prefix)
+    let with_separator = mut fx.b.iadd(prefix.len, y: separator)
+    let len = mut fx.b.iadd(with_separator, y: tail_path.len)
+    let size = mut fx.b.iadd_imm_s(len, y: 1)
+    let text = mut lo.record_alloc(mut fx, size)
+    exhausted_unless(mut lo, mut fx, address: text)
+    let prefix_args = fx.list3(text, b: prefix.start, c: prefix.len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: prefix_args.view())
+    mut fx.if_true(has_prefix, then: fn(mut fx1: Fx) {
+        let at = mut fx1.b.iadd(text, y: prefix.len)
+        let slash = mut fx1.int(clif::Type.Int8, value: i64.widen(b'/'))
+        mut fx1.store(slash, addr: at, offset: 0)
+    })
+    let after_prefix = mut fx.b.iadd(text, y: prefix.len)
+    let tail = mut fx.b.iadd(after_prefix, y: separator)
+    let path_args = fx.list3(tail, b: tail_path.start, c: tail_path.len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: path_args.view())
+    return Stretch(start: text, len: len)
+} fs_joined
+
+/// The file of a joined path, with the link pointing at it, or zeros when none.
+fn fs_find(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stretch) -> FileLink {
+    let link = mut fx.offset(system, offset: SYSTEM_FILES)
+    let first_file = mut fx.load(PTR, addr: link, offset: 0)
+    let initial = fx.list2(link, b: first_file)
+    let found = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let pointing = current[0]
+        let file = current[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let results = fx1.types1(clif::Type.Int8)
+        let matched = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let len = mut fx2.load(PTR, addr: file, offset: FS_FILE_PATH_LEN)
+            let same_len = mut fx2.b.icmp(clif::IntCC.Equal, x: len, y: path.len)
+            let same_results = fx2.types1(clif::Type.Int8)
+            let same = mut fx2.choose_in(mut lo2, condition: same_len, results: same_results.view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let text = mut fx3.load(PTR, addr: file, offset: FS_FILE_PATH)
+                let compare_args = fx3.list3(text, b: path.start, c: len)
+                let order = mut lo3.call_routine(mut fx3, routine: Routine.Compare, args: compare_args.view())
+                expect order.len() == 1
+                let equal = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: order[0], y: 0)
+                return fx3.list1(equal)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let differ = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(differ)
+            })
+            expect same.len() == 1
+            return fx2.list1(same[0])
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let missing = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(missing)
+        })
+        let absent = mut fx1.b.bxor_imm_s(present, y: 1)
+        expect matched.len() == 1
+        let stop = mut fx1.b.bor(matched[0], y: absent)
+        let pair = fx1.types2(PTR, b: PTR)
+        let next = mut fx1.choose(stop, results: pair.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(pointing, b: file)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next_link = mut fx2.offset(file, offset: FS_FILE_NEXT)
+            let next_file = mut fx2.load(PTR, addr: file, offset: FS_FILE_NEXT)
+            return fx2.list2(next_link, b: next_file)
+        })
+        let again = mut fx1.b.bxor_imm_s(stop, y: 1)
+        return Pass(again: again, next: take next)
+    })
+    expect found.len() == 2
+    let file = found[1]
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+    let zero = mut fx.ptr(0)
+    let pointing = mut fx.b.select(present, x: found[0], y: zero)
+    return FileLink(file: file, link: pointing)
+} fs_find
+
+/// The file of a joined path, created empty when missing; the joined path's memory passes to
+/// a created file or is freed.
+fn find_or_create(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stretch) -> clif::Value {
+    let found = fs_find(mut lo, mut fx, system, path)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    let results = fx.types1(PTR)
+    let target = mut fx.choose_in(mut lo, condition: missing, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let size = mut fx1.ptr(FS_FILE_SIZE)
+        let created = mut lo1.record_alloc(mut fx1, size)
+        exhausted_unless(mut lo1, fx: mut fx1, address: created)
+        mut fx1.store(path.start, addr: created, offset: FS_FILE_PATH)
+        mut fx1.store(path.len, addr: created, offset: FS_FILE_PATH_LEN)
+        let first_file = mut fx1.load(PTR, addr: system, offset: SYSTEM_FILES)
+        mut fx1.store(first_file, addr: created, offset: FS_FILE_NEXT)
+        mut fx1.store(created, addr: system, offset: SYSTEM_FILES)
+        return fx1.list1(created)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut lo1.record_free(mut fx1, address: path.start)
+        return fx1.list1(found.file)
+    })
+    expect target.len() == 1
+    return target[0]
+} find_or_create
+
+/// Replaces a file's bytes with `len` bytes, the first `kept` of them its own, then those at
+/// `data`; fails with `NoSpace`, changing nothing, when its file system's total size would pass
+/// its limit.
+fn fs_resize(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, target: clif::Value, kept: clif::Value, data: Stretch) {
+    let old = mut fx.load(PTR, addr: target, offset: FS_FILE_LEN)
+    let len = mut fx.b.iadd(kept, y: data.len)
+    let stored_total = mut fx.load(PTR, addr: system, offset: SYSTEM_TOTAL)
+    let others = mut fx.b.isub(stored_total, y: old)
+    let sum = mut fx.b.uadd_overflow(others, y: len)
+    let limit = mut fx.load(PTR, addr: system, offset: SYSTEM_LIMIT)
+    let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: sum.value, y: limit)
+    let over = mut fx.b.bor(beyond, y: sum.flag)
+    mut fx.if_true(over, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "NoSpace")
+    })
+    let cell = mut fx.load(PTR, addr: system, offset: SYSTEM_CELL)
+    let bytes = sims_draw(mut lo, mut fx, cell, size: len)
+    let previous = mut fx.load(PTR, addr: target, offset: FS_FILE_DATA)
+    let kept_args = fx.list3(bytes, b: previous, c: kept)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: kept_args.view())
+    let tail = mut fx.b.iadd(bytes, y: kept)
+    let data_args = fx.list3(tail, b: data.start, c: data.len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: data_args.view())
+    let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+    mut fx.if_true(held, then: fn[mut lo](mut fx1: Fx) {
+        let free_args = fx1.list1(previous)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: free_args.view())
+    })
+    mut fx.store(bytes, addr: target, offset: FS_FILE_DATA)
+    mut fx.store(len, addr: target, offset: FS_FILE_LEN)
+    mut fx.store(sum.value, addr: system, offset: SYSTEM_TOTAL)
+} fs_resize
+
+/// `sys::Fs.open` and `sys::Fs.create`: a file opened for reading, which must exist, or for
+/// writing, created or truncated.
+fn fs_open(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, creates: bool) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_of_entry(mut lo, mut fx, record)
+    let path = fs_joined(mut lo, mut fx, prefix: named.prefix, path: supply.param(1))
+    let target = if creates {
+        fs_writing_target(mut lo, mut fx, supply, system: named.system, path)
+    } else {
+        fs_reading_target(mut lo, mut fx, supply, system: named.system, path)
+    }
+    let opened = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_FILE, size: OPEN_SIZE)
+    mut fx.store(named.system, addr: opened.record, offset: OPEN_SYSTEM)
+    mut fx.store(target, addr: opened.record, offset: OPEN_FILE)
+    let flag: u64 = if creates {
+        1
+    } else {
+        0
+    }
+    let writing = mut fx.ptr(flag)
+    mut fx.store(writing, addr: opened.record, offset: OPEN_WRITING)
+    let capability = supply.param(0).address_value()
+    let handle = mut fx.load(PTR, addr: capability, offset: 0)
+    ret_resource(mut lo, mut fx, supply, handle, descriptor: opened.index)
+} fs_open
+
+/// The file `open` gives for writing: created when missing, then emptied.
+fn fs_writing_target(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, path: Stretch) -> clif::Value {
+    let target = find_or_create(mut lo, mut fx, system, path)
+    let none = mut fx.ptr(0)
+    let empty = Stretch(start: none, len: none)
+    fs_resize(mut lo, mut fx, supply, system, target, kept: none, data: empty)
+    return target
+} fs_writing_target
+
+/// The file `open` gives for reading, which must exist; the joined path's memory is freed.
+fn fs_reading_target(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, path: Stretch) -> clif::Value {
+    let found = fs_find(mut lo, mut fx, system, path)
+    mut lo.record_free(mut fx, address: path.start)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
+    })
+    return found.file
+} fs_reading_target
+
+/// `sys::Fs.read_all`: a copy of a file's bytes drawn through `alloc`.
+fn read_all(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_of_entry(mut lo, mut fx, record)
+    let path = fs_joined(mut lo, mut fx, prefix: named.prefix, path: supply.param(1))
+    let found = fs_find(mut lo, mut fx, system: named.system, path)
+    mut lo.record_free(mut fx, address: path.start)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
+    })
+    let alloc = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let len = mut fx.load(PTR, addr: found.file, offset: FS_FILE_LEN)
+    let Some(bytes) = supply.sret else {
+        expect false
+        return
+    }
+    let element = Element(size: 1, align: 1)
+    vector_empty(mut fx, address: bytes, alloc, element)
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    mut fx.if_true(any, then: fn[mut lo](mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        let alloc_args = fx1.list3(alloc, b: len, c: one)
+        let storages = mut lo.call_routine(mut fx1, routine: Routine.Alloc, args: alloc_args.view())
+        expect storages.len() == 1
+        let storage = storages[0]
+        exhausted_unless(mut lo, fx: mut fx1, address: storage)
+        let data = mut fx1.load(PTR, addr: found.file, offset: FS_FILE_DATA)
+        let copy_args = fx1.list3(storage, b: data, c: len)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        mut fx1.store(storage, addr: bytes, offset: VECTOR_DATA)
+        mut fx1.store(len, addr: bytes, offset: VECTOR_LEN)
+        mut fx1.store(len, addr: bytes, offset: VECTOR_CAPACITY)
+    })
+    supply.ret(mut lo, mut fx, held: Held.Address(bytes))
+} read_all
+
+/// `sys::Fs.write_all`: a file holding exactly `data`, created when missing.
+fn fs_write_all(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_of_entry(mut lo, mut fx, record)
+    let path = fs_joined(mut lo, mut fx, prefix: named.prefix, path: supply.param(1))
+    let target = find_or_create(mut lo, mut fx, system: named.system, path)
+    let data = sys_view(mut fx, held: supply.param(2))
+    let none = mut fx.ptr(0)
+    fs_resize(mut lo, mut fx, supply, system: named.system, target, kept: none, data)
+    supply.done(mut lo, mut fx)
+} fs_write_all
+
+/// `sys::Fs.remove`: the file leaves its file system, its bytes freed once no open file reads
+/// them.
+fn fs_remove(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_of_entry(mut lo, mut fx, record)
+    let path = fs_joined(mut lo, mut fx, prefix: named.prefix, path: supply.param(1))
+    let found = fs_find(mut lo, mut fx, system: named.system, path)
+    mut lo.record_free(mut fx, address: path.start)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
+    })
+    let next = mut fx.load(PTR, addr: found.file, offset: FS_FILE_NEXT)
+    mut fx.store(next, addr: found.link, offset: 0)
+    let len = mut fx.load(PTR, addr: found.file, offset: FS_FILE_LEN)
+    let total = mut fx.load(PTR, addr: named.system, offset: SYSTEM_TOTAL)
+    let remaining = mut fx.b.isub(total, y: len)
+    mut fx.store(remaining, addr: named.system, offset: SYSTEM_TOTAL)
+    supply.done(mut lo, mut fx)
+} fs_remove
+
+/// The open file a resource at an address names.
+fn fs_opened(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> clif::Value {
+    let holding = mut fx.offset(address, offset: 8)
+    let index = holdings_payload(mut fx, address: holding)
+    return object_at(mut lo, mut fx, index)
+} fs_opened
+
+/// `sys::fs::File.read`: the bytes from the position, as many as fit, none at the end; a file
+/// opened for writing refuses.
+fn fs_read(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let opened = fs_opened(mut lo, mut fx, address: supply.param(0).address_value())
+    let flag = mut fx.load(PTR, addr: opened, offset: OPEN_WRITING)
+    let writing = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: flag, y: 0)
+    mut fx.if_true(writing, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+    let target = mut fx.load(PTR, addr: opened, offset: OPEN_FILE)
+    let position = mut fx.load(PTR, addr: opened, offset: OPEN_POSITION)
+    let len = mut fx.load(PTR, addr: target, offset: FS_FILE_LEN)
+    let left = mut fx.b.isub(len, y: position)
+    let buffer = sys_view(mut fx, held: supply.param(1))
+    let count = mut fx.b.umin(left, y: buffer.len)
+    let data = mut fx.load(PTR, addr: target, offset: FS_FILE_DATA)
+    let from = mut fx.b.iadd(data, y: position)
+    let copy_args = fx.list3(buffer.start, b: from, c: count)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let moved = mut fx.b.iadd(position, y: count)
+    mut fx.store(moved, addr: opened, offset: OPEN_POSITION)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+} fs_read
+
+/// `sys::fs::File.write`: all of `data` at the position, extending the file; a file opened for
+/// reading refuses.
+fn fs_write(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let opened = fs_opened(mut lo, mut fx, address: supply.param(0).address_value())
+    let writing = mut fx.load(PTR, addr: opened, offset: OPEN_WRITING)
+    let reading = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: writing, y: 0)
+    mut fx.if_true(reading, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+    let system = mut fx.load(PTR, addr: opened, offset: OPEN_SYSTEM)
+    let target = mut fx.load(PTR, addr: opened, offset: OPEN_FILE)
+    let position = mut fx.load(PTR, addr: opened, offset: OPEN_POSITION)
+    let data = sys_view(mut fx, held: supply.param(1))
+    let len = mut fx.load(PTR, addr: target, offset: FS_FILE_LEN)
+    let end = mut fx.b.iadd(position, y: data.len)
+    let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: len, y: end)
+    let no_results = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose_in(mut lo, condition: beyond, results: no_results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let bytes = mut fx1.load(PTR, addr: target, offset: FS_FILE_DATA)
+        let at = mut fx1.b.iadd(bytes, y: position)
+        let copy_args = fx1.list3(at, b: data.start, c: data.len)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        fs_resize(mut lo1, fx: mut fx1, supply, system, target, kept: position, data)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.store(end, addr: opened, offset: OPEN_POSITION)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(data.len))
+} fs_write
+
+/// `sys::fs::File.byte_len`: the file's size.
+fn byte_len(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let opened = fs_opened(mut lo, mut fx, address: supply.param(0).address_value())
+    let target = mut fx.load(PTR, addr: opened, offset: OPEN_FILE)
+    let len = mut fx.load(PTR, addr: target, offset: FS_FILE_LEN)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+} byte_len

@@ -1,0 +1,844 @@
+//! Interrupt delivery on the machine targets: the vector seam, which saves the interrupted state and preempts the interrupted kernel task when told to; the dispatcher, which calls the interrupt fn bound to the fired vector by an `hw::vectors` contribution or by `hw::IrqShared.install`; each CPU's local APIC and timer; and the stopping of the CPUs in a kernel halt.
+
+/// The vectors whose exception pushes an error code the CPU leaves on the stack; every other
+/// vector's stub pushes a zero so each interrupt frame has the same shape.
+const ERROR_CODE_VECTORS: Slice[u8] = b"\x08\x0a\x0b\x0c\x0d\x0e\x11\x15\x1d\x1e"
+
+/// The bytes of one vector's entry stub.
+const VECTOR_STUB: u32 = 12
+
+/// The bytes of one vector's entry stub, which normalises the error code and pushes the vector
+/// number, then jumps to the common seam's entry at `seam_entry` from the stub's start at `at`.
+fn interrupts_vector_stub(vector: u8, at: u32, seam_entry: u32) -> Array[u8, 12]
+    requires at <= 255 * VECTOR_STUB
+{
+    var stub_bytes = Array[u8, 12].filled(0x90)
+    var pushes_code = false
+    for listed in ERROR_CODE_VECTORS {
+        if listed == vector {
+            pushes_code = true
+        }
+    }
+    var push_at: usize = 3
+    var jump_at: usize = 7
+    if pushes_code {
+        stub_bytes[0] = 0x68
+        push_at = 1
+        jump_at = 5
+    } else {
+        stub_bytes[0] = 0x6a
+        stub_bytes[1] = 0x00
+        stub_bytes[2] = 0x68
+    }
+    let after = at + u32.fit(jump_at) + 5
+    let rel = seam_entry.wrapping_sub(after)
+    var written = mut stub_bytes.view_mut()
+    mut written.write_u32_le(push_at, value: u32.widen(vector))
+    written[jump_at] = 0xe9
+    mut written.write_u32_le(jump_at + 1, value: rel)
+    return stub_bytes
+} interrupts_vector_stub
+
+/// The common seam. Its first entry, for vectors of `ist` 0, pushes the 15 general-purpose
+/// registers and switches to the CPU's interrupt stack, whose top and lowest address its record
+/// holds, unless already on it; its second entry, for the other vectors, whose stack the CPU
+/// switched to, only pushes the registers. Both then save the extended state, with `xsave64`
+/// when the CPU's record says AVX is enabled and `fxsave64` otherwise, and call the dispatcher
+/// with the vector and the saved frame. When the dispatcher gives zero they restore the state
+/// and return from the interrupt; otherwise they copy the frame and the extended state below the
+/// interrupted stack pointer, call the preemption glue there, and restore from the copies once
+/// it returns.
+const SEAM_COMMON: Slice[u8] = b"\x41\x57\x41\x56\x41\x55\x41\x54\x41\x53\x41\x52\x41\x51\x41\x50\x57\x56\x55\x53\x52\x51\x50\xfc\x48\x89\xe3\x65\x48\x8b\x04\x25\x10\x00\x00\x00\x65\x48\x3b\x24\x25\x18\x00\x00\x00\x72\x05\x48\x39\xc4\x72\x20\x48\x89\xc4\xeb\x1b\x41\x57\x41\x56\x41\x55\x41\x54\x41\x53\x41\x52\x41\x51\x41\x50\x57\x56\x55\x53\x52\x51\x50\xfc\x48\x89\xe3\x48\x81\xec\x00\x04\x00\x00\x48\x83\xe4\xc0\x49\x89\xe7\x65\x48\x83\x3c\x25\xe8\x00\x00\x00\x00\x74\x23\x48\x8d\xbc\x24\x00\x02\x00\x00\x31\xc0\xb9\x08\x00\x00\x00\xf3\x48\xab\xb8\xff\xff\xff\xff\xba\xff\xff\xff\xff\x48\x0f\xae\x24\x24\xeb\x05\x48\x0f\xae\x04\x24\x48\x8b\x7b\x78\x48\x89\xde\xe8\x00\x00\x00\x00\x48\x85\xc0\x75\x45\x4c\x89\xfc\x65\x48\x83\x3c\x25\xe8\x00\x00\x00\x00\x74\x11\xb8\xff\xff\xff\xff\xba\xff\xff\xff\xff\x48\x0f\xae\x2c\x24\xeb\x05\x48\x0f\xae\x0c\x24\x48\x89\xdc\x58\x59\x5a\x5b\x5d\x5e\x5f\x41\x58\x41\x59\x41\x5a\x41\x5b\x41\x5c\x41\x5d\x41\x5e\x41\x5f\x48\x83\xc4\x10\x48\xcf\x48\x8b\xbb\xa0\x00\x00\x00\x48\x81\xef\xb0\x00\x00\x00\x48\x83\xe7\xf0\x48\x89\xde\x48\x89\xfb\xb9\x16\x00\x00\x00\xf3\x48\xa5\x48\x8d\xbb\x00\xfc\xff\xff\x48\x83\xe7\xc0\x4c\x89\xfe\x49\x89\xff\xb9\x80\x00\x00\x00\xf3\x48\xa5\x4c\x89\xfc\xe8\x00\x00\x00\x00\xe9\x75\xff\xff\xff"
+
+/// The offsets within `SEAM_COMMON` of its entry for vectors on another stack, and of the
+/// displacements of its calls of the dispatcher and the preemption glue.
+const SEAM_STAY: u32 = 0x39
+
+const SEAM_DISPATCH: u32 = 0x9e
+
+const SEAM_PREEMPT: u32 = 0x129
+
+// The common seam's code reads the CPU record and the saved frame at these offsets.
+const assert CPU_STACK_TOP == 0x10 and CPU_STACK_BASE == 0x18 and CPU_AVX == 0xe8
+
+const assert FRAME_CODE == 0x80 and FRAME_RSP == 0xa0
+
+/// The offsets in the frame the seam saves of what its readers read: after the 15 saved
+/// registers and the vector, the error code, then the interrupted instruction pointer, flags and
+/// stack pointer.
+const FRAME_CODE: u64 = 128
+
+const FRAME_RIP: u64 = 136
+
+const FRAME_RFLAGS: u64 = 152
+
+const FRAME_RSP: u64 = 160
+
+/// The vector of page faults, whose trap frame holds the faulting address.
+const PAGE_FAULT: i64 = 14
+
+/// The interrupt flag of the saved flags.
+const INTERRUPTS_ENABLED: i64 = 0x200
+
+/// The size of an interrupt descriptor table, and the type and privilege level of its gates.
+const IDT_BYTES: u64 = 256 * 16
+
+const INTERRUPTS_GATE: i64 = 0x8E00
+
+/// The local APIC, in the memory the entry root maps uncached, and the registers the kernel
+/// programs: its id, the spurious-interrupt vector, the end-of-interrupt register, the
+/// interrupt command register's two halves, the timer's local vector table entry, its divide
+/// configuration and its initial count.
+const INTERRUPTS_APIC: u64 = 0xFEE0_0000
+
+const APIC_ID: u64 = 0x20
+
+const APIC_SPURIOUS: u64 = 0xF0
+
+const APIC_EOI: u64 = 0xB0
+
+const APIC_COMMAND: u64 = 0x300
+
+const APIC_DESTINATION: u64 = 0x310
+
+const APIC_LVT_TIMER: u64 = 0x320
+
+const APIC_TIMER_DIVIDE: u64 = 0x3E0
+
+const APIC_TIMER_COUNT: u64 = 0x380
+
+/// The interrupt command register's delivery-pending bit, and the commands the kernel sends: an
+/// INIT and a startup IPI to one CPU, and a non-maskable interrupt to every other CPU.
+const IPI_PENDING: i64 = 0x1000
+
+const IPI_INIT: u64 = 0x4500
+
+const IPI_STARTUP: u64 = 0x4600
+
+const IPI_NMI_OTHERS: u64 = 0xC_4400
+
+/// The local APIC's software-enable bit in its spurious-interrupt register, the divide
+/// configuration slowing its timer's clock by 16, and the timer mode firing periodically.
+const APIC_ENABLED: u64 = 0x100
+
+const DIVIDE_BY_16: u64 = 0x3
+
+const PERIODIC: u64 = 0x2_0000
+
+/// The interrupt vector each CPU's local APIC timer fires, periodically, the initial count that
+/// paces it on the emulator, and the vector of the local APIC's spurious interrupts.
+const TIMER_VECTOR: i64 = 0x20
+
+const TIMER_COUNT: u64 = 0x10_0000
+
+const SPURIOUS_VECTOR: i64 = 0xFF
+
+/// The vector of non-maskable interrupts, and those whose interrupt fn's return halts the
+/// kernel.
+const NMI_VECTOR: i64 = 2
+
+const ABORT_VECTORS: Array[i64, 2] = listed_abort_vectors()
+
+fn listed_abort_vectors() -> Array[i64, 2] {
+    var listed = Array[i64, 2].filled(8)
+    listed[1] = 18
+    return listed
+} listed_abort_vectors
+
+/// The stack the dispatcher and its glue use beside the interrupt fns they call, a halt report
+/// included.
+const DISPATCH_RESERVE: u64 = 16_384
+
+/// A vector's binding by `hw::IrqShared.install`: the record of its device, zero while unbound,
+/// then the number of CPUs running the device's glue for the vector.
+const BINDING_RUNNING: u64 = 8
+
+const BINDING_SIZE: u64 = 16
+
+/// The offsets of a device record's fields, which `hw::IrqShared.install` fills: the lock word,
+/// the vector, the glue the dispatcher calls with the record, the interrupt fn as a function
+/// value, and the device from `DEVICE_RECORD_VALUE` on, at its alignment.
+const DEVICE_RECORD_LOCK: u64 = 0
+
+const DEVICE_RECORD_VECTOR: u64 = 8
+
+const DEVICE_RECORD_GLUE: u64 = 16
+
+const DEVICE_RECORD_HANDLER: u64 = 24
+
+const DEVICE_RECORD_VALUE: u64 = 40
+
+/// An interrupt vector the final build binds by contribution: its number, its `ist`, the class
+/// its handler's variant names and the interrupt fn bound to it.
+struct Bound {
+    vector: i64
+    ist: u8
+    class: HandlerClass
+    handler: Instance
+} Bound
+
+/// The class of interrupt fn a `hw::vectors` entry's handler variant names.
+enum HandlerClass derives Copy, Eq {
+    Irq
+    Trap
+    TrapWithCode
+    PageFault
+} HandlerClass
+
+/// The interrupt vectors the final build binds, in vector order: holdings_each entry of the
+/// `hw::vectors` table whose handler holds an interrupt fn.
+fn Lowering.bound_vectors(mut self) -> mem::List[Bound] {
+    let Some(registry_item) = self.ck.db().std_item("hw", name: "vectors") else {
+        return mem::List[Bound].empty(self.alloc)
+    }
+    var bound = mem::List[Bound].empty(self.alloc)
+    let entries = mut self.table_entries(registry_item)
+    for entry in entries {
+        let check::Val.Struct(item: _, fields: fields) = entry.contents().value else {
+            continue
+        }
+        let parts = fields.contents()
+        expect parts.len() > 2
+        let check::Val.Int(vector) = parts[0] else {
+            continue
+        }
+        let check::Val.Int(ist) = parts[1] else {
+            continue
+        }
+        let check::Val.Variant(item: _, index: variant, fields: payload) = parts[2] else {
+            continue
+        }
+        let payload_values = payload.contents()
+        if payload_values.len() == 0 {
+            continue
+        }
+        let check::Val.Fn(function) = payload_values[0] else {
+            continue
+        }
+        let check::FnVal.Function(fn_ref) = function.contents() else {
+            continue
+        }
+        let class = match variant {
+            0 => HandlerClass.Irq
+            1 => HandlerClass.Trap
+            2 => HandlerClass.TrapWithCode
+            else => HandlerClass.PageFault
+        }
+        let handler = mut self.callable_instance(fn_ref, as_value: false)
+        mut bound.push(Bound(vector: i64.from_bits(vector.low_bits()), ist: u8.truncate(ist.low_bits()), class: class, handler: take handler))
+    }
+    return bound
+} Lowering.bound_vectors
+
+/// The handler of the `hw::preempt` table's entry, a landing fn the platform package
+/// contributes.
+fn Lowering.preempt_handler(mut self) -> Option[Instance] {
+    let Some(registry_item) = self.ck.db().std_item("hw", name: "preempt") else {
+        return None
+    }
+    let entries = mut self.table_entries(registry_item)
+    if entries.len() == 0 {
+        return None
+    }
+    let check::Val.Struct(item: _, fields: fields) = entries[0].contents().value else {
+        return None
+    }
+    let parts = fields.contents()
+    if parts.len() < 2 {
+        return None
+    }
+    let check::Val.Fn(function) = parts[1] else {
+        return None
+    }
+    let check::FnVal.Function(fn_ref) = function.contents() else {
+        return None
+    }
+    let handler = mut self.callable_instance(fn_ref, as_value: false)
+    return Some(take handler)
+} Lowering.preempt_handler
+
+/// Sets up interrupt delivery for a kernel's executor: builds the interrupt descriptor table,
+/// masks the legacy interrupt controller, and gives the glue each CPU runs to take
+/// interrupts: it draws its interrupt stacks, loads the table and starts its local APIC and
+/// timer. Maskable interrupts stay disabled until the executor enables them.
+fn Lowering.interrupt_setup(mut self, mut fx: Fx) -> object::FuncId {
+    let idt = mut self.reserved(mut fx, data_name: "_NSidt", size: IDT_BYTES, align: 16)
+    mut self.fill_idt(mut fx, table: idt)
+    let masked = mut fx.ptr(0xFF)
+    var ports = Array[u64, 2].filled(0x21)
+    ports[1] = 0xA1
+    for port_number in ports {
+        let port = mut fx.ptr(port_number)
+        mut self.port_out(mut fx, width: 1, port, value: masked)
+    }
+    let ists = mut self.ists()
+    var used = Array[bool, 256].filled(false)
+    for ist in ists {
+        if ist != 0 {
+            used[usize.widen(ist)] = true
+        }
+    }
+    var stacks = mem::List[u8].empty(self.alloc)
+    for ist in 0..<used.len() {
+        if used[ist] {
+            mut stacks.push(u8.fit(ist))
+        }
+    }
+    return mut self.cpu_interrupts(stacks.view())
+} Lowering.interrupt_setup
+
+/// Writes an interrupt descriptor table at `table` whose gate n is an interrupt gate of
+/// privilege level 0 entering the vector seam's stub for n, with the `ist` of n's binding.
+fn Lowering.fill_idt(mut self, mut fx: Fx, table: clif::Value) {
+    let seam_id = mut self.seam()
+    let seam_ref = mut self.func_ref(mut fx, id: seam_id)
+    let base = mut fx.b.func_addr(PTR, func_ref: seam_ref)
+    let zero_value = mut fx.ptr(0)
+    let count = mut fx.ptr(256)
+    mut fx.each(zero_value, end: count, body: fn(mut fx1: Fx, vector: clif::Value) {
+        let gate_offset = mut fx1.b.imul_imm_s(vector, y: 16)
+        let gate = mut fx1.b.iadd(table, y: gate_offset)
+        let handler_offset = mut fx1.b.imul_imm_s(vector, y: i64.widen(VECTOR_STUB))
+        let handler = mut fx1.b.iadd(base, y: handler_offset)
+        let low = mut fx1.b.ireduce(clif::Type.Int16, x: handler)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: low, p: gate, offset: 0)
+        let selector = mut fx1.int(clif::Type.Int16, value: 0x08)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: selector, p: gate, offset: 2)
+        let attributes = mut fx1.int(clif::Type.Int16, value: INTERRUPTS_GATE)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: attributes, p: gate, offset: 4)
+        let mid_word = mut fx1.b.ushr_imm_s(handler, y: 16)
+        let mid = mut fx1.b.ireduce(clif::Type.Int16, x: mid_word)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: mid, p: gate, offset: 6)
+        let high_word = mut fx1.b.ushr_imm_s(handler, y: 32)
+        let high = mut fx1.b.ireduce(clif::Type.Int32, x: high_word)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: high, p: gate, offset: 8)
+        let reserved = mut fx1.int(clif::Type.Int32, value: 0)
+        mut fx1.b.store(clif::MemFlags.unaligned(), x: reserved, p: gate, offset: 12)
+    })
+    let ists = mut self.ists()
+    for vector in 0..<ists.len() {
+        let ist = ists[vector]
+        if ist != 0 {
+            let attributes = mut fx.int(clif::Type.Int16, value: INTERRUPTS_GATE | i64.widen(ist))
+            mut fx.b.store(clif::MemFlags.unaligned(), x: attributes, p: table, offset: i32.fit(16 * vector + 4))
+        }
+    }
+} Lowering.fill_idt
+
+/// The `ist` each vector's binding gives, 0 for an unbound vector.
+fn Lowering.ists(mut self) -> Array[u8, 256] {
+    var ists = Array[u8, 256].filled(0)
+    let bound = mut self.bound_vectors()
+    for bound_entry in bound {
+        expect bound_entry.vector < 256
+        ists[usize.fit(bound_entry.vector)] = bound_entry.ist
+    }
+    return ists
+} Lowering.ists
+
+/// The final build's vector seam, emitted once with its dispatcher and preemption glue.
+fn Lowering.seam(mut self) -> object::FuncId {
+    match self.vector_seam_id {
+        Some(emitted) => return emitted
+        None => {}
+    }
+    let bound = mut self.bound_vectors()
+    let dispatch = mut self.dispatcher(bound.view())
+    let preemption = mut self.preempt_glue()
+    let ists = mut self.ists()
+    let seam = mut self.vector_seam(dispatch, preemption, ists)
+    self.vector_seam_id = Some(seam)
+    return seam
+} Lowering.seam
+
+/// The glue a CPU runs to take interrupts: it draws its interrupt stack and one for each of
+/// `stacks`, the nonzero `ist` values bindings use, loads the interrupt descriptor table and
+/// enables its local APIC, its timer firing `TIMER_VECTOR`.
+fn Lowering.cpu_interrupts(mut self, stacks: Slice[u8]) -> object::FuncId {
+    let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    let id = mut self.module.declare_function("_NScpu_interrupts", linkage: object::Linkage.Local, signature)
+    let sizes = mut self.interrupt_stack_sizes()
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        discard mut fx1.entry()
+        let record = mut lo1.running_cpu(mut fx1)
+        let sizes_address = mut lo1.data_address(mut fx1, id: sizes)
+        let size = mut fx1.load(PTR, addr: sizes_address, offset: 0)
+        let stack_base = mut lo1.interrupt_stack(mut fx1, size)
+        let top = mut fx1.b.iadd(stack_base, y: size)
+        mut fx1.store(top, addr: record, offset: CPU_STACK_TOP)
+        mut fx1.store(stack_base, addr: record, offset: CPU_STACK_BASE)
+        for ist in stacks {
+            let ist_size = mut fx1.load(PTR, addr: sizes_address, offset: 8)
+            let ist_stack = mut lo1.interrupt_stack(mut fx1, size: ist_size)
+            let ist_top = mut fx1.b.iadd(ist_stack, y: ist_size)
+            mut lo1.set_interrupt_stack(mut fx1, record, ist, top: ist_top)
+        }
+        let idt = mut lo1.reserved(mut fx1, data_name: "_NSidt", size: IDT_BYTES, align: 16)
+        mut lo1.load_idt(mut fx1, table: idt)
+        mut lo1.apic_write(mut fx1, register: APIC_SPURIOUS, value: APIC_ENABLED | u64.fit(SPURIOUS_VECTOR))
+        mut lo1.apic_write(mut fx1, register: APIC_TIMER_DIVIDE, value: DIVIDE_BY_16)
+        mut lo1.apic_write(mut fx1, register: APIC_LVT_TIMER, value: u64.fit(TIMER_VECTOR) | PERIODIC)
+        mut lo1.apic_write(mut fx1, register: APIC_TIMER_COUNT, value: TIMER_COUNT)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+    return id
+} Lowering.cpu_interrupts
+
+/// The read-only sizes of the interrupt stacks, which `finish_interrupts` defines once every
+/// interrupt fn is lowered: that of `ist` 0, then that of each other `ist`.
+fn Lowering.interrupt_stack_sizes(mut self) -> object::DataId {
+    let id = mut self.module.declare_data("_NSirq_stacks", linkage: object::Linkage.Local, writable: false, tls: false)
+    self.irq_stacks = Some(id)
+    return id
+} Lowering.interrupt_stack_sizes
+
+/// Defines the interrupt stack sizes from the largest `limits stack N` among the lowered
+/// interrupt fns: the stack of `ist` 0 holds two of them, one for an interrupt vector and
+/// one for an exception interrupting it, and two seam frames; every other stack holds one
+/// and one seam frame; each also holds what the dispatcher uses.
+fn Lowering.finish_interrupts(mut self) {
+    let Some(id) = self.irq_stacks else {
+        return
+    }
+    var largest: u64 = 0
+    for instance_entry in self.instances.cursor() {
+        let Instance.Nir(item: item, role: _, index: _, args: _) = instance_entry.key() else {
+            continue
+        }
+        let Some(sig) = self.ck.fn_sig(item) else {
+            continue
+        }
+        if sig.modifier != Some(ast::FnModifier.Interrupt) {
+            continue
+        }
+        let Some(stack_limit) = sig.limit_set.stack else {
+            continue
+        }
+        if stack_limit > largest {
+            largest = stack_limit
+        }
+    }
+    let first_size = 2 * (largest + SEAM_FRAME) + DISPATCH_RESERVE
+    let other_size = largest + SEAM_FRAME + DISPATCH_RESERVE
+    var sizes = mem::Bytes.empty(self.alloc)
+    object::append_u64(mut sizes, value: next_multiple_of(first_size, multiple: 16))
+    object::append_u64(mut sizes, value: next_multiple_of(other_size, multiple: 16))
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take sizes)
+    mut description.set_align(8)
+    mut self.module.define_data(id, take description)
+} Lowering.finish_interrupts
+
+/// Emits the vector seam: a stub per vector, each entered through its interrupt gate, then
+/// the common seam they jump to, which calls `dispatch` and, to preempt, `preemption`. Gives
+/// the seam's symbol, whose stub for vector n lies at `n * VECTOR_STUB` bytes.
+fn Lowering.vector_seam(mut self, dispatch: object::FuncId, preemption: object::FuncId, ists: Array[u8, 256]) -> object::FuncId {
+    let common = 256 * VECTOR_STUB
+    var seam_bytes = mem::Bytes.empty(self.alloc)
+    mut seam_bytes.reserve(usize.widen(common) + SEAM_COMMON.len())
+    for vector in 0..<256u32 {
+        let at = vector * VECTOR_STUB
+        var stub_entry = common
+        if ists[usize.widen(vector)] != 0 {
+            stub_entry = common + SEAM_STAY
+        }
+        let stub = interrupts_vector_stub(u8.fit(vector), at, seam_entry: stub_entry)
+        mut seam_bytes.append(stub.view())
+    }
+    mut seam_bytes.append(SEAM_COMMON)
+    let seam = mut self.module.declare_function("_NSseam", linkage: object::Linkage.Local, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
+    mut relocs.push(object::ModuleReloc(offset: common + SEAM_DISPATCH, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(dispatch), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: common + SEAM_PREEMPT, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(preemption), addend: -4))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: seam_bytes.view(), relocs: relocs.view())
+    return seam
+} Lowering.vector_seam
+
+/// The glue the seam calls on a preempted task's stack: it calls the `hw::preempt` entry's
+/// landing fn, which returns once a later switch resumes the task.
+fn Lowering.preempt_glue(mut self) -> object::FuncId {
+    let signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    let id = mut self.module.declare_function("_NSseam_preempt", linkage: object::Linkage.Local, signature)
+    let preempt_target = mut self.preempt_handler()
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        discard mut fx1.entry()
+        match preempt_target {
+            Some(target) => {
+                let abi = mut lo1.abi(target)
+                let target_id = mut lo1.instance(target.copy(lo1.alloc))
+                discard mut lo1.invoke(mut fx1, invoked: Invoked.Direct(target_id), abi, args: mem::List[Held].empty(fx1.alloc).view())
+            }
+            None => {}
+        }
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+    return id
+} Lowering.preempt_glue
+
+/// The interrupt dispatcher the vector seam calls with the fired vector and the saved frame;
+/// it gives nonzero when the seam is to preempt the interrupted task. It records both in the
+/// running CPU's record while it dispatches the vector, then restores those of the interrupt
+/// it nested in.
+fn Lowering.dispatcher(mut self, bound: Slice[Bound]) -> object::FuncId {
+    let signature = dispatch_signature(self.alloc)
+    let id = mut self.module.declare_function("_NSseam_dispatch", linkage: object::Linkage.Local, signature)
+    let dispatch = mut self.dispatch_vector(bound, signature: dispatch_signature(self.alloc))
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let param_values = mut fx1.entry()
+        expect param_values.len() > 1
+        let record = mut lo1.running_cpu(mut fx1)
+        let outer_vector = mut fx1.load(PTR, addr: record, offset: CPU_VECTOR)
+        let outer_frame = mut fx1.load(PTR, addr: record, offset: CPU_FRAME)
+        mut fx1.store(param_values[0], addr: record, offset: CPU_VECTOR)
+        mut fx1.store(param_values[1], addr: record, offset: CPU_FRAME)
+        let dispatch_ref = mut lo1.func_ref(mut fx1, id: dispatch)
+        let dispatched = mut fx1.b.call(dispatch_ref, args: param_values.view())
+        let results = fx1.b.inst_results(dispatched, alloc: fx1.alloc)
+        expect results.len() > 0
+        let preempt_flag = results[0]
+        mut fx1.store(outer_vector, addr: record, offset: CPU_VECTOR)
+        mut fx1.store(outer_frame, addr: record, offset: CPU_FRAME)
+        mut fx1.b.ret(Array[clif::Value, 1].filled(preempt_flag).view())
+    })
+    return id
+} Lowering.dispatcher
+
+/// Loads the interrupt descriptor table at `table` on the running CPU.
+fn Lowering.load_idt(mut self, mut fx: Fx, table: clif::Value) {
+    let idtr = mut fx.slot(16, align: 8)
+    let limit = mut fx.int(clif::Type.Int16, value: i64.fit(IDT_BYTES) - 1)
+    mut fx.b.store(clif::MemFlags.unaligned(), x: limit, p: idtr, offset: 0)
+    mut fx.b.store(clif::MemFlags.unaligned(), x: table, p: idtr, offset: 2)
+    discard mut self.call_stub(mut fx, stub: Stub.Lidt, args: Array[clif::Value, 1].filled(idtr).view())
+} Lowering.load_idt
+
+/// An interrupt stack of `size` bytes drawn as a runtime record, trapping on exhaustion.
+fn Lowering.interrupt_stack(mut self, mut fx: Fx, size: clif::Value) -> clif::Value {
+    let stack_base = mut self.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: stack_base, y: 0)
+    mut fx.if_true(missing, then: fn[mut self](mut fx1: Fx) {
+        raise_kind(mut self, fx: mut fx1, kind: "trap.exhausted")
+    })
+    return stack_base
+} Lowering.interrupt_stack
+
+/// The location of the instruction the interrupt the running CPU serves interrupted, zero
+/// outside one.
+fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
+    let record = mut self.running_cpu(mut fx)
+    let saved = mut fx.load(PTR, addr: record, offset: CPU_FRAME)
+    let serving = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: saved, y: 0)
+    let located = mut fx.choose_in(mut self, condition: serving, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let rip = mut fx1.load(PTR, addr: saved, offset: FRAME_RIP)
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(location_at(mut lo1, fx: mut fx1, address: rip))
+        return produced
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.ptr(0))
+        return produced
+    })
+    return located[0]
+} Lowering.interrupted_location
+
+/// Dispatches a fired vector with its saved frame: calls the interrupt fn the final build
+/// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
+/// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
+/// binds. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with maskable
+/// interrupts enabled and the anchor is installed, the task is preempted. After an interrupt
+/// fn for vector 8 or 18 returns, and on an unbound vector, the kernel halts at the
+/// interrupted instruction.
+fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif::Signature) -> object::FuncId {
+    let id = mut self.module.declare_function("_NSseam_dispatch_vector", linkage: object::Linkage.Local, signature)
+    let handler = mut self.preempt_handler()
+    let preempting = handler.is_some()
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let param_values = mut fx1.entry()
+        expect param_values.len() > 1
+        let vector = param_values[0]
+        let saved = param_values[1]
+        let nmi = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: NMI_VECTOR)
+        mut fx1.if_true(nmi, then: fn[mut lo1](mut fx2: Fx) {
+            mut lo1.stop_if_halting(mut fx2)
+        })
+        let zero_value = mut fx1.ptr(0)
+        for bound_entry in bound {
+            let this = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound_entry.vector)
+            mut fx1.if_true(this, then: fn[mut lo1](mut fx2: Fx) {
+                let reschedule = mut lo1.dispatch_bound(mut fx2, bound_entry, saved)
+                var aborts = false
+                for abort_vector in ABORT_VECTORS {
+                    if abort_vector == bound_entry.vector {
+                        aborts = true
+                    }
+                }
+                if aborts {
+                    let rip = mut fx2.load(PTR, addr: saved, offset: FRAME_RIP)
+                    let location = location_at(mut lo1, fx: mut fx2, address: rip)
+                    halt(mut lo1, fx: mut fx2, cause: "abort-exception", location, operand: None)
+                    return
+                }
+                let preempt_flag = mut lo1.preempts(mut fx2, reschedule, saved, preempting)
+                mut fx2.b.ret(Array[clif::Value, 1].filled(preempt_flag).view())
+            })
+        }
+        let installable = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: 32)
+        mut fx1.if_true(installable, then: fn[mut lo1](mut fx2: Fx) {
+            let slot = mut lo1.irq_binding(mut fx2, vector)
+            let running = mut fx2.offset(slot, offset: BINDING_RUNNING)
+            let one = mut fx2.ptr(1)
+            discard fetch_add(mut fx2, address: running, amount: one)
+            let device = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: device, y: 0)
+            let rescheduled = mut fx2.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let glue = mut fx3.load(PTR, addr: device, offset: DEVICE_RECORD_GLUE)
+                var call_signature = clif::Signature.new(CALL_CONV, alloc: fx3.alloc)
+                mut call_signature.params.push(clif::AbiParam(value_type: PTR))
+                mut call_signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+                let sig_ref = mut fx3.b.import_signature(take call_signature)
+                let inst = mut fx3.b.call_indirect(sig_ref, callee: glue, args: Array[clif::Value, 1].filled(device).view())
+                let results = fx3.b.inst_results(inst, alloc: fx3.alloc)
+                expect results.len() > 0
+                return fx3.list1(results[0])
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var produced = mem::List[clif::Value].empty(fx3.alloc)
+                mut produced.push(mut fx3.int(clif::Type.Int8, value: 0))
+                return produced
+            })
+            let reschedule = rescheduled[0]
+            let minus = mut fx2.int(PTR, value: -1)
+            discard fetch_add(mut fx2, address: running, amount: minus)
+            mut fx2.if_true(present, then: fn[mut lo1](mut fx3: Fx) {
+                let preempt_flag = mut lo1.preempts(mut fx3, reschedule, saved, preempting)
+                mut fx3.b.ret(Array[clif::Value, 1].filled(preempt_flag).view())
+            })
+        })
+        let timer = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: TIMER_VECTOR)
+        mut fx1.if_true(timer, then: fn[mut lo1](mut fx2: Fx) {
+            mut lo1.apic_eoi(mut fx2)
+            mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
+        })
+        let spurious = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: SPURIOUS_VECTOR)
+        mut fx1.if_true(spurious, then: fn(mut fx2: Fx) {
+            mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
+        })
+        let rip = mut fx1.load(PTR, addr: saved, offset: FRAME_RIP)
+        let location = location_at(mut lo1, fx: mut fx1, address: rip)
+        halt(mut lo1, fx: mut fx1, cause: "unbound-vector", location, operand: Some(HaltOperand(name: "vector", value: vector)))
+    })
+    return id
+} Lowering.dispatch_vector
+
+/// Calls the interrupt fn a contribution binds to the fired vector: an `Irq` handler with a
+/// new `hw::IrqContext`, an exception handler with an `hw::TrapFrame` naming the saved frame
+/// and, for a page fault, holding the faulting address.
+/// Gives whether its `hw::IrqExit` is `Reschedule`.
+fn Lowering.dispatch_bound(mut self, mut fx: Fx, bound_entry: Bound, saved: clif::Value) -> clif::Value {
+    let abi = mut self.abi(bound_entry.handler)
+    let id = mut self.instance(bound_entry.handler.copy(self.alloc))
+    var arg = Held.Empty
+    if bound_entry.class != HandlerClass.Irq {
+        expect abi.params.len() > 0
+        let frame_ty = abi.params[0].nty.ty()
+        let laid = mut self.layout_of(frame_ty)
+        let trap_frame = mut fx.slot(laid.contents().size, align: laid.contents().align)
+        let saved_field = mut self.layouts.field(self.ck, ty: frame_ty, variant: None, label: "saved")
+        mut fx.store(saved, addr: trap_frame, offset: saved_field.offset)
+        var faults = mem::List[clif::Value].empty(fx.alloc)
+        if bound_entry.vector == PAGE_FAULT {
+            faults = mut self.call_stub(mut fx, stub: Stub.ReadCr2, args: mem::List[clif::Value].empty(fx.alloc).view())
+        } else {
+            mut faults.push(mut fx.ptr(0))
+        }
+        let fault_field = mut self.layouts.field(self.ck, ty: frame_ty, variant: None, label: "fault")
+        expect faults.len() > 0
+        mut fx.store(faults[0], addr: trap_frame, offset: fault_field.offset)
+        arg = Held.Address(trap_frame)
+    }
+    let called = mut self.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: Array[Held, 1].filled(arg).view())
+    let exit_ty = abi.result
+    return mut self.reschedules(mut fx, exit_ty, exit: called.result)
+} Lowering.dispatch_bound
+
+/// Whether an `hw::IrqExit` an interrupt fn gave is `Reschedule`.
+fn Lowering.reschedules(mut self, mut fx: Fx, exit_ty: ty::Ty, exit: Held) -> clif::Value {
+    let exit_address = match exit {
+        Held.Address(address) => address
+        else => mut self.spilled_exit(mut fx, exit_ty, exit)
+    }
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(exit_ty) else {
+        expect false
+        return clif::Value(index: 0)
+    }
+    let names = self.variant_names(item)
+    let Some(reschedule) = names.position(fn(variant_name: text::String) => variant_name.as_str() == "Reschedule") else {
+        expect false
+        return clif::Value(index: 0)
+    }
+    let index = mut self.variant_index(mut fx, ty: exit_ty, address: exit_address)
+    return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(reschedule))
+} Lowering.reschedules
+
+/// Whether the seam preempts the interrupted code: its interrupt fn rescheduled, the final
+/// build has a `hw::preempt` entry, the code is a kernel task that ran with maskable
+/// interrupts enabled on its own stack, and the anchor is installed. Gives a word.
+fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif::Value, preempting: bool) -> clif::Value {
+    if not preempting {
+        return mut fx.ptr(0)
+    }
+    let flags = mut fx.load(PTR, addr: saved, offset: FRAME_RFLAGS)
+    let enabled_bit = mut fx.b.band_imm_s(flags, y: INTERRUPTS_ENABLED)
+    let enabled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: enabled_bit, y: 0)
+    let state_address = mut self.state(mut fx)
+    let anchor = mut fx.load(PTR, addr: state_address, offset: STATE_ANCHOR)
+    let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: anchor, y: 0)
+    let record = current_task(mut self, mut fx)
+    let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let on_stack_values = mut fx.choose(running, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let rsp = mut fx1.load(PTR, addr: saved, offset: FRAME_RSP)
+        let base = mut fx1.load(PTR, addr: record, offset: TASK_STACK)
+        let size = mut fx1.load(PTR, addr: record, offset: TASK_STACK_SIZE)
+        let top = mut fx1.b.iadd(base, y: size)
+        let above = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: rsp, y: base)
+        let below = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: rsp, y: top)
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.b.band(above, y: below))
+        return produced
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.int(clif::Type.Int8, value: 0))
+        return produced
+    })
+    let allowed = mut fx.b.band(enabled, y: installed)
+    let allowed_here = mut fx.b.band(allowed, y: on_stack_values[0])
+    let decided = mut fx.b.band(allowed_here, y: reschedule)
+    return mut fx.b.uextend(PTR, x: decided)
+} Lowering.preempts
+
+/// The binding of a vector by `hw::IrqShared.install`, in the image's table of them.
+fn Lowering.irq_binding(mut self, mut fx: Fx, vector: clif::Value) -> clif::Value {
+    let table = mut self.reserved(mut fx, data_name: "_NSirq_bindings", size: 256 * BINDING_SIZE, align: 8)
+    let offset = mut fx.b.imul_imm_s(vector, y: i64.fit(BINDING_SIZE))
+    return mut fx.b.iadd(table, y: offset)
+} Lowering.irq_binding
+
+/// The vectors the final build binds by contribution.
+fn Lowering.statically_bound(mut self) -> mem::List[i64] {
+    let bound = mut self.bound_vectors()
+    var numbers = mem::List[i64].empty(self.alloc)
+    for bound_entry in bound {
+        mut numbers.push(bound_entry.vector)
+    }
+    return numbers
+} Lowering.statically_bound
+
+/// The vector the running CPU's interrupt fn serves.
+fn Lowering.current_vector(mut self, mut fx: Fx) -> clif::Value {
+    let record = mut self.running_cpu(mut fx)
+    let vector = mut fx.load(PTR, addr: record, offset: CPU_VECTOR)
+    return mut fx.b.ireduce(clif::Type.Int8, x: vector)
+} Lowering.current_vector
+
+/// Writes a 32-bit register of the running CPU's local APIC.
+fn Lowering.apic_write(mut self, mut fx: Fx, register: u64, value: u64)
+    requires register < 0x1000
+{
+    let at = mut fx.ptr(INTERRUPTS_APIC + register)
+    let value_word = mut fx.ptr(value)
+    mut self.mmio_write(mut fx, width: 4, address: at, value: value_word)
+} Lowering.apic_write
+
+/// Writes the local APIC's end-of-interrupt register, ending the interrupt in service.
+fn Lowering.apic_eoi(mut self, mut fx: Fx) {
+    mut self.apic_write(mut fx, register: APIC_EOI, value: 0)
+} Lowering.apic_eoi
+
+/// The running CPU's local APIC id.
+fn Lowering.local_apic_id(mut self, mut fx: Fx) -> clif::Value {
+    let at = mut fx.ptr(INTERRUPTS_APIC + APIC_ID)
+    let id = mut self.mmio_read(mut fx, width: 4, address: at)
+    return mut fx.b.ushr_imm_s(id, y: 24)
+} Lowering.local_apic_id
+
+/// Sends an IPI of a command to the CPU whose local APIC has the id `destination` and waits
+/// until it is delivered.
+fn Lowering.send_ipi(mut self, mut fx: Fx, destination: clif::Value, command: u64) {
+    let target = mut fx.b.ishl_imm_s(destination, y: 24)
+    let destination_at = mut fx.ptr(INTERRUPTS_APIC + APIC_DESTINATION)
+    mut self.mmio_write(mut fx, width: 4, address: destination_at, value: target)
+    mut self.apic_write(mut fx, register: APIC_COMMAND, value: command)
+    let command_at = mut fx.ptr(INTERRUPTS_APIC + APIC_COMMAND)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut self](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let status = mut self.mmio_read(mut fx1, width: 4, address: command_at)
+        let pending_bit = mut fx1.b.band_imm_s(status, y: IPI_PENDING)
+        let pending = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: pending_bit, y: 0)
+        mut fx1.if_true(pending, then: fn[mut self](mut fx2: Fx) {
+            discard mut self.call_stub(mut fx2, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: pending, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} Lowering.send_ipi
+
+/// The first step of a kernel halt, with maskable interrupts disabled so that nothing else
+/// runs on the halting CPU: the first CPU to begin one sends every other started CPU a
+/// non-maskable interrupt and waits until each has stopped; a CPU beginning a halt after it
+/// stops instead.
+fn Lowering.stop_other_cpus(mut self, mut fx: Fx) {
+    discard mut self.call_stub(mut fx, stub: Stub.Cli, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let state_address = mut self.state(mut fx)
+    let flag = mut fx.offset(state_address, offset: STATE_HALTING)
+    let zero_value = mut fx.ptr(0)
+    let one = mut fx.ptr(1)
+    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero_value, x: one)
+    let later = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+    mut fx.if_true(later, then: fn[mut self](mut fx1: Fx) {
+        discard mut self.call_stub(mut fx1, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+    let started = mut fx.load(PTR, addr: state_address, offset: STATE_STARTED_CPUS)
+    let others = mut fx.b.iadd_imm_s(started, y: -1)
+    let running = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: others, y: 0)
+    mut fx.if_true(running, then: fn[mut self](mut fx1: Fx) {
+        let all = mut fx1.ptr(0)
+        mut self.send_ipi(mut fx1, destination: all, command: IPI_NMI_OTHERS)
+        let stopped = mut fx1.offset(state_address, offset: STATE_STOPPED_CPUS)
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            let count = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: stopped)
+            let waiting = mut fx2.b.icmp(clif::IntCC.SignedLessThan, x: count, y: others)
+            mut fx2.if_true(waiting, then: fn[mut self](mut fx3: Fx) {
+                discard mut self.call_stub(mut fx3, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx3.alloc).view())
+            })
+            return Pass(again: waiting, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+    })
+} Lowering.stop_other_cpus
+
+/// On a non-maskable interrupt during a kernel halt, stops the running CPU, counting it.
+fn Lowering.stop_if_halting(mut self, mut fx: Fx) {
+    let state_address = mut self.state(mut fx)
+    let halting_word = mut fx.load(PTR, addr: state_address, offset: STATE_HALTING)
+    let halting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: halting_word, y: 0)
+    mut fx.if_true(halting, then: fn[mut self](mut fx1: Fx) {
+        let stopped = mut fx1.offset(state_address, offset: STATE_STOPPED_CPUS)
+        let one = mut fx1.ptr(1)
+        discard fetch_add(mut fx1, address: stopped, amount: one)
+        discard mut self.call_stub(mut fx1, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} Lowering.stop_if_halting
+
+/// The signature of the dispatcher and of the vector dispatch it calls: the fired vector and
+/// the saved frame, giving whether to preempt.
+fn dispatch_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: PTR))
+    return signature
+} dispatch_signature
+
+/// The address of an `hw::IrqExit` an interrupt fn gave in a register, written to a new slot.
+fn Lowering.spilled_exit(mut self, mut fx: Fx, exit_ty: ty::Ty, exit: Held) -> clif::Value {
+    let laid = mut self.layout_of(exit_ty)
+    let slot = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+    mut self.store_held(mut fx, address: slot, held: exit, ty: exit_ty)
+    return slot
+} Lowering.spilled_exit

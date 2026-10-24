@@ -1,0 +1,350 @@
+//! Supplied operations: the std functions without a body, each a lowered function of its own written by the family of its owning type, and the builtins, lowered where they are called.
+
+/// The parameters of a supplied operation being defined, and how it returns.
+struct Supply {
+    abi: Abi
+    args: ty::Args
+    path: text::String
+    /// The type of the owner the operation is named after, with its arguments.
+    owner: Option[ty::Ty]
+    sret: Option[clif::Value]
+    failure: Option[clif::Value]
+    params: mem::List[Held]
+    /// How its result holds a wrapped part, when it is a projection giving one.
+    wrap: Option[Wrap]
+} Supply
+
+/// A value an operation took, with its type.
+struct Taken derives Copy {
+    held: Held
+    ty: ty::Ty
+} Taken
+
+/// The member name after the owner's path.
+proj fn Supply.member(self) -> Str {
+    let written = self.path.as_str()
+    let spelling = written.as_bytes()
+    var at = spelling.len()
+    while at > 0 {
+        invariant at <= spelling.len()
+        at -= 1
+        if spelling[at] == b'.' {
+            let Some(member) = written.slice_bytes(at + 1, end: spelling.len()) else {
+                return ""
+            }
+            return member
+        }
+    }
+    return ""
+} Supply.member
+
+fn Supply.param(self, index: usize) -> Held {
+    expect index < self.params.len()
+    return self.params[index]
+} Supply.param
+
+fn Supply.type_arg(self, lo: Lowering, index: usize) -> ty::Ty {
+    let args = lo.ck.types().arg_list(self.args)
+    if index < args.len() {
+        match args[index].ty() {
+            Some(found) => return found
+            None => {}
+        }
+    }
+    expect false
+    return ty::Ty.error()
+} Supply.type_arg
+
+/// Returns a value held one way or another as the operation's result.
+fn Supply.ret(self, mut lo: Lowering, mut fx: Fx, held: Held) {
+    var returns = mem::List[clif::Value].empty(fx.alloc)
+    if self.abi.flagged {
+        mut returns.push(mut fx.int(clif::Type.Int8, value: 0))
+    }
+    match self.abi.returned {
+        Returned.Scalar(_) => {
+            let nty = nir::NTy.Owned(self.abi.result)
+            let repr = mut lo.owned_repr(self.abi.result)
+            let adapted = adapt_value(mut lo, mut fx, held, nty, wanted: repr)
+            mut returns.push(adapted.scalar_value())
+        }
+        Returned.Part => mut returns.push(held.address_value())
+        Returned.Indirect => {
+            let laid = mut lo.layout_of(self.abi.result)
+            let Some(sret) = self.sret else {
+                expect false
+                return
+            }
+            match held {
+                Held.Address(source) => {
+                    if source != sret {
+                        mut lo.copy(mut fx, dst: sret, src: source, size: laid.contents().size, align: laid.contents().align)
+                    }
+                }
+                else => {}
+            }
+        }
+        Returned.Empty => {}
+    }
+    mut fx.b.ret(returns.view())
+} Supply.ret
+
+/// Returns `Unit`.
+fn Supply.done(self, mut lo: Lowering, mut fx: Fx) {
+    self.ret(mut lo, mut fx, held: Held.Empty)
+} Supply.done
+
+/// Ends the operation on exhaustion: a `try_` form releases the values it took and fails
+/// with `mem::OutOfMemory.Exhausted`, any other form traps with `trap.exhausted`.
+fn Supply.exhausted(self, mut lo: Lowering, mut fx: Fx, taken: Slice[Taken]) {
+    if not self.member().starts_with("try_") {
+        raise_kind(mut lo, mut fx, kind: "trap.exhausted")
+        return
+    }
+    for took in taken {
+        match took.held {
+            Held.Address(address) => mut lo.release(mut fx, ty: took.ty, address)
+            else => {}
+        }
+    }
+    let Some(failure_ty) = self.abi.failure else {
+        expect false
+        return
+    }
+    let out_of_memory = lo.std_ty("mem", type_name: "OutOfMemory", args: mem::List[ty::Ty].empty(lo.alloc))
+    let none = mem::List[Held].empty(lo.alloc)
+    let exhausted = mut lo.variant_value(mut fx, ty: out_of_memory, variant: "Exhausted", payload_values: none.view(), wrapped: None)
+    var value = exhausted
+    if failure_ty != out_of_memory {
+        let wrapped_exhausted = Array[Held, 1].filled(exhausted)
+        value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "OutOfMemory", payload_values: wrapped_exhausted.view(), wrapped: None)
+    }
+    let Some(failure) = self.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: failure, held: value, ty: failure_ty)
+    self.raise_failure(mut fx)
+} Supply.exhausted
+
+/// Fails with the failure a called function gave when it failed, provided the operation
+/// itself may fail: a function value always carries a failure flag, which stays clear when
+/// the operation cannot fail.
+fn Supply.forward_failure(self, mut lo: Lowering, mut fx: Fx, called: Called) {
+    let Some(failed) = called.failed else {
+        return
+    }
+    let Some(source) = called.failure else {
+        return
+    }
+    let Some(failure_ty) = self.abi.failure else {
+        return
+    }
+    let Some(target) = self.failure else {
+        return
+    }
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        let laid = mut lo.layout_of(failure_ty)
+        mut lo.copy(mut fx1, dst: target, src: source, size: laid.contents().size, align: laid.contents().align)
+        self.raise_failure(mut fx1)
+    })
+} Supply.forward_failure
+
+/// Fails with the failure value already written at the failure address.
+fn Supply.raise_failure(self, mut fx: Fx) {
+    var returns = mem::List[clif::Value].empty(fx.alloc)
+    mut returns.push(mut fx.int(clif::Type.Int8, value: 1))
+    match self.abi.returned {
+        Returned.Scalar(ty) => mut returns.push(body_zero(mut fx, ty))
+        Returned.Part => mut returns.push(mut fx.ptr(0))
+        else => {}
+    }
+    mut fx.b.ret(returns.view())
+} Supply.raise_failure
+
+/// The address of element `index` of a sequence of elements of a type starting at `start`.
+fn element_at(mut lo: Lowering, mut fx: Fx, element: ty::Ty, start: clif::Value, index: clif::Value) -> clif::Value {
+    let laid = mut lo.layout_of(element)
+    let offset = mut fx.b.imul_imm_s(index, y: i64.fit(laid.contents().size))
+    return mut fx.b.iadd(start, y: offset)
+} element_at
+
+/// Defines the lowered function of a std function without a body.
+fn supplied_lower(mut lo: Lowering, mut fx: Fx, abi: Abi, item: ty::ItemId, args: ty::Args) {
+    let incoming = mut fx.entry()
+    var next: usize = 0
+    var sret: Option[clif::Value] = None
+    if abi.returned == Returned.Indirect {
+        expect next < incoming.len()
+        sret = Some(incoming[next])
+        next += 1
+    }
+    var failure: Option[clif::Value] = None
+    if abi.flagged {
+        expect next < incoming.len()
+        failure = Some(incoming[next])
+        next += 1
+    }
+    var params = mem::List[Held].empty(lo.alloc)
+    for param in abi.params {
+        match param.repr {
+            Repr.Scalar(_) => {
+                expect next < incoming.len()
+                mut params.push(Held.Scalar(incoming[next]))
+                next += 1
+            }
+            Repr.Address => {
+                expect next < incoming.len()
+                mut params.push(Held.Address(incoming[next]))
+                next += 1
+            }
+            Repr.Empty => mut params.push(Held.Empty)
+        }
+    }
+    expect params.len() == abi.params.len()
+    for position in 0..<abi.params.len() {
+        let function_typed = match lo.ck.types().kind(abi.params[position].nty.ty()) {
+            ty::TyKind.Fn(_) => true
+            else => false
+        }
+        match params[position] {
+            Held.Address(address) => {
+                if function_typed {
+                    discard mut fx.fn_params.insert(address, value: position)
+                }
+            }
+            else => {}
+        }
+    }
+    let path = lo.ck.db().canonical(item)
+    var owner: Option[ty::Ty] = None
+    match lo.ck.db().owners.get(item) {
+        Some(check::TypeKey.Item(owner_item)) => {
+            let generics = lo.ck.sig(owner_item).contents().generics.len()
+            let given = lo.ck.types().arg_list(args)
+            var owner_args = mem::List[ty::Arg].empty(lo.alloc)
+            for index in 0..<given.len() {
+                if index >= generics {
+                    break
+                }
+                mut owner_args.push(given[index])
+            }
+            owner = Some(lo.ck.types().item(owner_item, args: take owner_args))
+        }
+        Some(check::TypeKey.Scalar(scalar)) => {
+            owner = Some(ty::Ty.scalar(scalar))
+        }
+        else => {}
+    }
+    var wrap: Option[Wrap] = None
+    match lo.ck.fn_sig(item) {
+        Some(sig) => {
+            match lo.sig_given(sig) {
+                Some(Given.Wrapped(given)) => {
+                    wrap = Some(given)
+                }
+                else => {}
+            }
+        }
+        None => {}
+    }
+    let supply = Supply(abi: abi.copy(lo.alloc), args: args, path: take path, owner: owner, sret: sret, failure: failure, params: take params, wrap: wrap)
+    let lowered = numbers_lower(mut lo, mut fx, supply) or generate_lower(mut lo, mut fx, supply) or sequences_lower(mut lo, mut fx, supply) or pointers_lower(mut lo, mut fx, supply) or mem_lower(mut lo, mut fx, supply) or render_lower(mut lo, mut fx, supply) or (lo.seeded() and sims_lower(mut lo, mut fx, supply)) or same_lower(mut lo, mut fx, supply) or hw_lower(mut lo, mut fx, supply) or boot_lower(mut lo, mut fx, supply) or sys_lower(mut lo, mut fx, supply) or tasks_lower(mut lo, mut fx, supply) or text_lower(mut lo, mut fx, supply) or codecs_lower(mut lo, mut fx, supply)
+    expect lowered
+} supplied_lower
+
+/// Lowers a builtin where it is called.
+fn supplied_builtin(mut body: Body, mut lo: Lowering, mut fx: Fx, builtin: nir::Builtin, args: ty::Args, operands: Slice[nir::Operand], result: Option[nir::Value], block: nir::BlockId, position: usize) -> Held {
+    match builtin {
+        nir::Builtin.Conversion(conversion: conversion, scalar: scalar) => {
+            expect operands.len() > 0
+            return numbers_conversion(mut body, mut lo, mut fx, conversion, target: scalar, operand: operands[0], block, position)
+        }
+        nir::Builtin.Bits(conversion: conversion, owner: owner) => {
+            expect operands.len() > 0
+            return numbers_bits(mut body, mut lo, mut fx, conversion, owner, operand: operands[0], result)
+        }
+        nir::Builtin.Intrinsic(path) => {
+            match path.as_str() {
+                "hw::mint_root" => return sys_mint_root(mut lo, mut fx)
+                "hw::Dma.access" => return dma_access(mut body, mut lo, mut fx, args, operands)
+                "text::fmt" => return template(mut body, mut lo, mut fx, args, operands)
+                "Dyn.view" => {
+                    expect operands.len() > 0
+                    return dyn_view(mut body, mut lo, mut fx, args, operand: operands[0])
+                }
+                else => {}
+            }
+            expect false
+            return Held.Empty
+        }
+    }
+} supplied_builtin
+
+/// Whether releasing a std base type does anything, none for a type std declares in full.
+fn base_needs_release(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    let in_mem = mem_needs_release(mut lo, owner_path, ty)
+    if in_mem.is_some() {
+        return in_mem
+    }
+    let in_sys = sys_needs_release(owner_path)
+    if in_sys.is_some() {
+        return in_sys
+    }
+    let in_tasks = tasks_needs_release(owner_path)
+    if in_tasks.is_some() {
+        return in_tasks
+    }
+    let in_text = text_needs_release(owner_path)
+    if in_text.is_some() {
+        return in_text
+    }
+    let in_hw = hw_needs_release(mut lo, owner_path, ty)
+    if in_hw.is_some() {
+        return in_hw
+    }
+    return boot_needs_release(owner_path)
+} base_needs_release
+
+/// Whether moving a value of a std base type into another domain's reach does anything; none
+/// for a type std declares in full.
+fn base_transfers(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    let in_mem = mem_transfers(mut lo, owner_path, ty)
+    if in_mem.is_some() {
+        return in_mem
+    }
+    let in_sys = sys_transfers(owner_path)
+    if in_sys.is_some() {
+        return in_sys
+    }
+    let in_tasks = tasks_transfers(owner_path)
+    if in_tasks.is_some() {
+        return in_tasks
+    }
+    let in_text = text_transfers(owner_path)
+    if in_text.is_some() {
+        return in_text
+    }
+    return hw_transfers(mut lo, owner_path, ty)
+} base_transfers
+
+/// Moves a value of a std base type into another domain's reach; false for a type std declares
+/// in full.
+fn transfer_base(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) -> bool {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return false
+    }
+    let path = lo.ck.db().canonical(item)
+    let owner_path = path.as_str()
+    return mem_transfer(mut lo, mut fx, owner_path, ty, address, lift, owner) or sys_transfer(mut lo, mut fx, owner_path, address, owner) or tasks_transfer(mut lo, mut fx, owner_path, ty, address, lift, owner) or text_transfer(mut lo, mut fx, owner_path, address, lift) or hw_transfer(mut lo, mut fx, owner_path, ty, address, lift, owner)
+} transfer_base
+
+/// Releases a value of a std base type; false for a type std declares in full.
+fn release_base(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) -> bool {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return false
+    }
+    let path = lo.ck.db().canonical(item)
+    let owner_path = path.as_str()
+    return mem_release(mut lo, mut fx, owner_path, ty, address) or sys_release(mut lo, mut fx, owner_path, ty, address) or tasks_release(mut lo, mut fx, owner_path, ty, address) or text_release(mut lo, mut fx, owner_path, address) or hw_release(mut lo, mut fx, owner_path, ty, address)
+} release_base

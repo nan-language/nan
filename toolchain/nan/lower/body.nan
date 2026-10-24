@@ -1,0 +1,1649 @@
+//! The lowering of a NIR function: its values as registers or addresses, its blocks as Cranelift blocks, regions as loops or cown acquisitions around their blocks, and each instruction and terminator as the code that behaves as NIR defines.
+
+/// How a NIR value is held in lowered code.
+enum Held derives Copy {
+    /// A scalar in a register.
+    Scalar(clif::Value)
+    /// The address of a value's bytes or of the place a reference designates.
+    Address(clif::Value)
+    /// The value of an empty type.
+    Empty
+} Held
+
+/// A value as lowered code holds it, with its NIR type.
+struct HeldValue derives Copy {
+    held: Held
+    nty: nir::NTy
+} HeldValue
+
+fn Held.address_value(self) -> clif::Value {
+    let Held.Address(address) = self else {
+        expect false
+        return clif::Value(index: 0)
+    }
+    return address
+} Held.address_value
+
+fn Held.scalar_value(self) -> clif::Value {
+    let Held.Scalar(value) = self else {
+        expect false
+        return clif::Value(index: 0)
+    }
+    return value
+} Held.scalar_value
+
+/// The registers holding it.
+fn Held.values(self, alloc: mem::Alloc) -> mem::List[clif::Value] {
+    var values = mem::List[clif::Value].empty(alloc)
+    match self {
+        Held.Scalar(value) or Held.Address(value) => mut values.push(value)
+        Held.Empty => {}
+    }
+    return values
+} Held.values
+
+/// The value a register received for a value held as `repr` holds.
+fn held_as(repr: Repr, value: clif::Value) -> Held {
+    return match repr {
+        Repr.Scalar(_) => Held.Scalar(value)
+        Repr.Address => Held.Address(value)
+        Repr.Empty => Held.Empty
+    }
+} held_as
+
+/// Where the code after a region continues: the block its `yield` jumps to, and the cowns a
+/// `when` region holds, which every exit from it releases.
+struct RegionExit derives Copy {
+    yield_to: clif::Block
+    held: Option[clif::Value]
+} RegionExit
+
+/// An obligation site of a function, by its block and its position there.
+struct SiteKey derives Copy, Eq, Hash {
+    block: nir::BlockId
+    position: usize
+} SiteKey
+
+/// The result type of a projection whose results are wrapped parts, and how they hold their
+/// payloads.
+struct WrappedResult derives Copy {
+    ty: ty::Ty
+    wrap: Wrap
+} WrappedResult
+
+struct Body {
+    item: ty::ItemId
+    unit: mem::Shared[nir::NirUnit]
+    function_index: usize
+    subst: ty::Subst
+    args: ty::Args
+    values: mem::List[Option[Held]]
+    /// The type of each value, its generic parameters substituted; a wrapped part's is the
+    /// type whose non-Copy payloads are pointers.
+    types: mem::List[nir::NTy]
+    /// Whether each value is a slot, whose held address is the slot's storage.
+    slots: mem::List[bool]
+    /// How each value holds a wrapped part, none for a value holding none.
+    wrapped: mem::List[Option[Wrap]]
+    blocks: mem::List[clif::Block]
+    /// The region holding each block, by the region's first block.
+    region_of: mem::HashMap[nir::BlockId, nir::BlockId]
+    exits: mem::HashMap[nir::BlockId, RegionExit]
+    sret: Option[clif::Value]
+    failure: Option[clif::Value]
+    abi: Abi
+    /// The status of each obligation site of the function, none when the statuses are not
+    /// decided and every site is checked.
+    statuses: Option[mem::HashMap[SiteKey, check::Status]]
+    /// The span of the instruction being lowered.
+    current: nir::Span
+    /// Whether the function's returns write the bits of the two sides of the comparison it
+    /// returns at the result address, as its `Sides` instance.
+    sides: bool
+} Body
+
+/// Lowers a NIR function of an item's unit, instantiated with `args`.
+fn body_lower(
+    mut lo: Lowering,
+    mut fx: Fx,
+    abi: Abi,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    args: ty::Args,
+    sides: bool,
+    ) {
+    let Some(unit) = lo.ck.unit(item) else {
+        expect false
+        return
+    }
+    var position: usize = 0
+    var found = false
+    for at in 0..<unit.contents().functions.len() {
+        let candidate = unit.contents().functions[at]
+        if candidate.role == role and candidate.index == index {
+            position = at
+            found = true
+            break
+        }
+    }
+    expect found
+    let subst = lo.subst(item, args)
+    let function = unit.contents().functions[position]
+    let statuses = body_statuses(lo, item, role, index)
+    var values = mem::List[Option[Held]].empty(lo.alloc)
+    var slots = mem::List[bool].empty(lo.alloc)
+    var wrapped = mem::List[Option[Wrap]].empty(lo.alloc)
+    for _ in 0..<function.types.len() {
+        mut values.push(None)
+        mut slots.push(false)
+        mut wrapped.push(None)
+    }
+    var body = Body(item: item, unit: unit.share(), function_index: position, subst: take subst, args: args, values: take values, types: mem::List[nir::NTy].empty(lo.alloc), slots: take slots, wrapped: take wrapped, blocks: mem::List[clif::Block].empty(lo.alloc), region_of: mem::HashMap[nir::BlockId, nir::BlockId].empty(seed: 0, alloc: lo.alloc), exits: mem::HashMap[nir::BlockId, RegionExit].empty(seed: 0, alloc: lo.alloc), sret: None, failure: None, abi: abi.copy(lo.alloc), statuses: take statuses, current: function.span, sides: sides)
+    mut body.prepare(mut lo, mut fx)
+    mut body.entry(mut lo, mut fx)
+    for block in 0..<body.function().blocks.len() {
+        mut body.block(mut lo, mut fx, block: nir::BlockId(index: u32.fit(block)))
+    }
+} body_lower
+
+/// The statuses of a function's obligation sites, none for an item whose statuses the checker
+/// does not decide.
+fn body_statuses(lo: Lowering, item: ty::ItemId, role: nir::Role, index: u32) -> Option[mem::HashMap[SiteKey, check::Status]] {
+    if lo.ck.db().is_carried(item) {
+        return None
+    }
+    var statuses = mem::HashMap[SiteKey, check::Status].empty(seed: 0, alloc: lo.alloc)
+    let sites = lo.ck.obligations(item)
+    for site in sites.contents() {
+        if site.role == role and site.index == index {
+            discard mut statuses.insert(SiteKey(block: site.block, position: site.position), value: site.status)
+        }
+    }
+    return Some(take statuses)
+} body_statuses
+
+proj fn Body.function(self) -> nir::Function {
+    expect self.function_index < self.unit.contents().functions.len()
+    return self.unit.contents().functions[self.function_index]
+} Body.function
+
+/// Whether the function is the body of a test item, from which failures escape.
+fn Body.test_body(self, lo: Lowering) -> bool {
+    if self.function().role != nir::Role.Body {
+        return false
+    }
+    return match lo.ck.db().ast(self.item).kind {
+        ast::ItemKind.Test(_) => true
+        else => false
+    }
+} Body.test_body
+
+/// Computes the types, slots, wrapped parts and regions of the function, and creates its
+/// blocks.
+fn Body.prepare(mut self, mut lo: Lowering, mut fx: Fx) {
+    let unit = self.unit.share()
+    expect self.function_index < unit.contents().functions.len()
+    let function = unit.contents().functions[self.function_index]
+    var types = mem::List[nir::NTy].empty(lo.alloc)
+    for nty in function.types {
+        mut types.push(substituted(self.subst, types: lo.ck.types(), nty))
+    }
+    self.types = types
+    for block in function.blocks {
+        for inst in block.insts {
+            match inst.result {
+                Some(result) => match inst.op {
+                    nir::Op.Slot(name: _, ty: _) => {
+                        expect usize.widen(result.index) < self.slots.len()
+                        self.slots[usize.widen(result.index)] = true
+                    }
+                    else => {}
+                }
+                None => {}
+            }
+            match inst.op {
+                nir::Op.Quantifier(all: _, low: _, high: _, inclusive: _, region: region) or nir::Op.When(attempted: _, accesses: _, region: region) => mut self.note_region(region)
+                else => {}
+            }
+        }
+    }
+    mut self.mark_wrapped(lo, function)
+    for block in function.blocks {
+        let ir_block = mut fx.b.create_block()
+        for param in block.params {
+            let ty = match mut self.value_repr(mut lo, value: param) {
+                Repr.Scalar(scalar) => scalar
+                Repr.Address => PTR
+                Repr.Empty => continue
+            }
+            discard mut fx.b.append_block_param(ir_block, ty)
+        }
+        mut self.blocks.push(ir_block)
+    }
+} Body.prepare
+
+/// Records a region an instruction opens as the region holding each of its blocks no region
+/// opened earlier holds.
+fn Body.note_region(mut self, region: nir::Region) {
+    expect region.blocks.len() > 0
+    let head = region.blocks[0]
+    for block in region.blocks {
+        if not self.region_of.contains(block) {
+            discard mut self.region_of.insert(block, value: head)
+        }
+    }
+} Body.note_region
+
+/// Gives each value holding a wrapped part its wrapped type: the results of projections
+/// returning an `Option` or `Result`, variants built from references, and block
+/// parameters receiving one of these.
+fn Body.mark_wrapped(mut self, lo: Lowering, function: nir::Function) {
+    var wrapped = mem::List[Option[Wrap]].empty(lo.alloc)
+    for _ in 0..<function.types.len() {
+        mut wrapped.push(None)
+    }
+    let projection_result = self.wraps_result(lo)
+    loop {
+        var changed = false
+        for block in function.blocks {
+            for inst in block.insts {
+                let Some(result) = inst.result else {
+                    continue
+                }
+                let marks = self.inst_wraps(lo, inst, projection_result, wrapped: wrapped.view())
+                expect usize.widen(result.index) < wrapped.len()
+                if marks.is_some() and wrapped[usize.widen(result.index)].is_none() {
+                    wrapped[usize.widen(result.index)] = marks
+                    changed = true
+                }
+            }
+            if self.mark_successors(lo, function, block, wrapped: mut wrapped) {
+                changed = true
+            }
+        }
+        if not changed {
+            break
+        }
+    }
+    self.wrapped = wrapped
+} Body.mark_wrapped
+
+/// How the result of an instruction holds a wrapped part, from what its operation builds.
+fn Body.inst_wraps(
+    self,
+    lo: Lowering,
+    inst: nir::Inst,
+    projection_result: Option[WrappedResult],
+    wrapped: Slice[Option[Wrap]],
+    ) -> Option[Wrap] {
+    match inst.op {
+        nir::Op.Call(call) => return self.call_wraps(lo, call)
+        nir::Op.Variant(ty: variant_ty, variant: _, payload: payload) => {
+            match projection_result {
+                Some(given) => if given.ty == self.subst.ty(lo.ck.types(), ty: variant_ty) {
+                    return Some(given.wrap)
+                }
+                None => {}
+            }
+            let operands = payload_operands(payload, alloc: lo.alloc)
+            for operand in operands {
+                let Some(wrap) = self.operand_wrap(operand, wrapped) else {
+                    continue
+                }
+                return Some(wrap)
+            }
+            return None
+        }
+        nir::Op.Dbg(nir::Operand.Value(value)) => {
+            expect usize.widen(value.index) < wrapped.len()
+            return wrapped[usize.widen(value.index)]
+        }
+        else => return None
+    }
+} Body.inst_wraps
+
+/// Gives the parameters of a block's successors the wrapped parts its terminator passes them,
+/// and whether it gave any.
+fn Body.mark_successors(
+    self,
+    lo: Lowering,
+    function: nir::Function,
+    block: nir::Block,
+    mut wrapped: mem::List[Option[Wrap]],
+    ) -> bool {
+    match block.term {
+        nir::Terminator.Jump(jump) => return mark_passed(function, jump, wrapped: mut wrapped)
+        nir::Terminator.Branch(operand: _, then: then, otherwise: otherwise) => {
+            let then_marked = mark_passed(function, jump: then, wrapped: mut wrapped)
+            let otherwise_marked = mark_passed(function, jump: otherwise, wrapped: mut wrapped)
+            return then_marked or otherwise_marked
+        }
+        nir::Terminator.Call(call: call, ok: ok, failure: _) => {
+            expect usize.widen(ok.index) < function.blocks.len()
+            let target = function.blocks[usize.widen(ok.index)]
+            expect target.params.len() > 0
+            let param = usize.widen(target.params[0].index)
+            let Some(wrap) = self.call_wraps(lo, call) else {
+                return false
+            }
+            expect param < wrapped.len()
+            if wrapped[param].is_some() {
+                return false
+            }
+            wrapped[param] = Some(wrap)
+            return true
+        }
+        else => return false
+    }
+} Body.mark_successors
+
+/// Gives the parameters of a jump's target the wrapped parts its arguments hold, and whether it
+/// gave any.
+fn mark_passed(function: nir::Function, jump: nir::Jump, mut wrapped: mem::List[Option[Wrap]]) -> bool {
+    expect usize.widen(jump.block.index) < function.blocks.len()
+    let params = function.blocks[usize.widen(jump.block.index)].params
+    var changed = false
+    for position in 0..<params.len() {
+        if position >= jump.args.len() {
+            break
+        }
+        let nir::Operand.Value(value) = jump.args[position] else {
+            continue
+        }
+        expect usize.widen(value.index) < wrapped.len()
+        let Some(wrap) = wrapped[usize.widen(value.index)] else {
+            continue
+        }
+        let param = usize.widen(params[position].index)
+        expect param < wrapped.len()
+        if wrapped[param].is_none() {
+            wrapped[param] = Some(wrap)
+            changed = true
+        }
+    }
+    return changed
+} mark_passed
+
+/// How a value holds a wrapped part, laid out as its type's wrapped type; none when it holds
+/// none.
+fn Body.wrapped_flag(self, value: nir::Value) -> Option[Wrap] {
+    expect usize.widen(value.index) < self.wrapped.len()
+    return self.wrapped[usize.widen(value.index)]
+} Body.wrapped_flag
+
+/// The Cranelift block of a NIR block.
+fn Body.block_of(self, block: nir::BlockId) -> clif::Block {
+    expect usize.widen(block.index) < self.blocks.len()
+    return self.blocks[usize.widen(block.index)]
+} Body.block_of
+
+/// The source text a value's definition spans: a parameter's name, or the text of the
+/// construct an instruction elaborates.
+fn Body.value_text(self, lo: Lowering, value: nir::Value) -> text::String {
+    let Some(span) = value_span(self.function(), value) else {
+        return text::String.of("_", alloc: lo.alloc)
+    }
+    let file = lo.ck.db().syntax(self.item)
+    expect usize.widen(span.head) < file.tokens.len() and usize.widen(span.last) < file.tokens.len()
+    let head = file.tokens[usize.widen(span.head)]
+    let last = file.tokens[usize.widen(span.last)]
+    return output::lossy(file.source_bytes(head.start, end: last.end), alloc: lo.alloc)
+} Body.value_text
+
+/// The span of a value's definition: its parameter's, or its instruction's.
+fn value_span(function: nir::Function, value: nir::Value) -> Option[nir::Span] {
+    for param in function.params {
+        if param.value == value {
+            return Some(param.span)
+        }
+    }
+    for block in function.blocks {
+        for inst in block.insts {
+            if inst.result == Some(value) {
+                return Some(inst.span)
+            }
+        }
+    }
+    return None
+} value_span
+
+/// The result type of a projection whose results are wrapped parts and how they hold their
+/// payloads, when this function is the body of one.
+fn Body.wraps_result(self, lo: Lowering) -> Option[WrappedResult] {
+    let function = self.function()
+    if function.role != nir::Role.Body and function.role != nir::Role.Entry {
+        return None
+    }
+    let Some(sig) = lo.ck.fn_sig(self.item) else {
+        return None
+    }
+    let Some(Given.Wrapped(wrap)) = lo.sig_given(sig) else {
+        return None
+    }
+    return Some(WrappedResult(ty: self.subst.ty(lo.ck.types(), ty: function.result), wrap: wrap))
+} Body.wraps_result
+
+/// How a call's result holds a wrapped part, when it is one: a projection's `Option` or
+/// `Result` returned as a value, not as a reference to a part.
+fn Body.call_wraps(self, lo: Lowering, call: nir::Call) -> Option[Wrap] {
+    let given = match call.callee {
+        nir::Callee.Fn(fn_ref) => lo.callable_given(fn_ref.callable)
+        nir::Callee.Dyn(place: _, item: interface_item, method: method) => lo.method_given(interface_item, method)
+        nir::Callee.Value(_) => None
+    }
+    return match given {
+        Some(Given.Wrapped(wrap)) => Some(wrap)
+        else => None
+    }
+} Body.call_wraps
+
+/// How a variant payload operand makes the variant a wrapped part: a reference, writable when
+/// mutable, or a wrapped part.
+fn Body.operand_wrap(self, operand: nir::Operand, wrapped: Slice[Option[Wrap]]) -> Option[Wrap] {
+    match operand {
+        nir::Operand.Value(value) => {
+            expect usize.widen(value.index) < wrapped.len()
+            return match self.function().ty(value) {
+                nir::NTy.Ref(_) => Some(Wrap(writable: false))
+                nir::NTy.RefMut(_) => Some(Wrap(writable: true))
+                nir::NTy.Owned(_) => wrapped[usize.widen(value.index)]
+            }
+        }
+        nir::Operand.Place(mode: ast::Mode.Read, place: _) => return Some(Wrap(writable: false))
+        nir::Operand.Place(mode: ast::Mode.Mut, place: _) => return Some(Wrap(writable: true))
+        else => return None
+    }
+} Body.operand_wrap
+
+fn Body.value_repr(mut self, mut lo: Lowering, value: nir::Value) -> Repr {
+    expect usize.widen(value.index) < self.slots.len() and usize.widen(value.index) < self.types.len()
+    if self.slots[usize.widen(value.index)] {
+        return Repr.Address
+    }
+    let nty = self.types[usize.widen(value.index)]
+    return mut lo.repr(nty)
+} Body.value_repr
+
+fn Body.nty(self, value: nir::Value) -> nir::NTy {
+    expect usize.widen(value.index) < self.types.len()
+    return self.types[usize.widen(value.index)]
+} Body.nty
+
+fn Body.held(self, value: nir::Value) -> Held {
+    expect usize.widen(value.index) < self.values.len()
+    let Some(held) = self.values[usize.widen(value.index)] else {
+        expect false
+        return Held.Empty
+    }
+    return held
+} Body.held
+
+fn Body.define(mut self, value: nir::Value, held: Held) {
+    expect usize.widen(value.index) < self.values.len()
+    self.values[usize.widen(value.index)] = Some(held)
+} Body.define
+
+/// Binds the function's parameters: the environment of a closure and its captures, the
+/// result and failure addresses, then each parameter adapted to its NIR type.
+fn Body.entry(mut self, mut lo: Lowering, mut fx: Fx) {
+    expect self.blocks.len() > 0
+    let entry = self.blocks[0]
+    mut fx.b.switch_to_block(entry)
+    mut fx.b.append_block_params_for_function_params(entry)
+    mut fx.mark_ran()
+    let params = fx.b.block_params(entry, alloc: lo.alloc)
+    var next: usize = 0
+    var env: Option[clif::Value] = None
+    if self.abi.env {
+        expect next < params.len()
+        env = Some(params[next])
+        next += 1
+    }
+    if self.abi.returned == Returned.Indirect {
+        if next < params.len() {
+            self.sret = Some(params[next])
+            next += 1
+        }
+    }
+    if self.abi.flagged {
+        if next < params.len() {
+            self.failure = Some(params[next])
+            next += 1
+        }
+    }
+    let unit = self.unit.share()
+    expect self.function_index < unit.contents().functions.len()
+    let function = unit.contents().functions[self.function_index]
+    var captures: usize = 0
+    if env.is_some() and function.role == nir::Role.Closure {
+        captures = lo.closure_captures(unit.contents(), index: function.index)
+    }
+    let Some(own_parts) = function.params.view().split_at(captures) else {
+        expect false
+        return
+    }
+    match env {
+        Some(environment) => if captures > 0 {
+            mut self.bind_captures(mut lo, mut fx, env: environment, captured: own_parts.head)
+        }
+        None => {}
+    }
+    let own = own_parts.tail
+    for position in 0..<own.len() {
+        if position >= self.abi.params.len() {
+            break
+        }
+        let param = own[position]
+        let abi_param = self.abi.params[position]
+        var received = Held.Empty
+        if abi_param.repr != Repr.Empty {
+            expect next < params.len()
+            received = held_as(abi_param.repr, value: params[next])
+            next += 1
+        }
+        let wanted = mut self.value_repr(mut lo, value: param.value)
+        let held = mut self.adapt(mut lo, mut fx, held: received, nty: abi_param.nty, wanted)
+        mut self.define(param.value, held)
+    }
+} Body.entry
+
+/// Binds the captures of a closure from its environment.
+fn Body.bind_captures(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    env: clif::Value,
+    captured: Slice[nir::Param],
+    ) {
+    let task = match self.function().closure {
+        Some(head) => head.task
+        None => false
+    }
+    var start: u64 = 0
+    if task {
+        start = ENV_HEADER
+    }
+    let fields = mut lo.capture_layout(self.types.view(), params: captured, start)
+    for position in 0..<captured.len() {
+        if position >= fields.len() {
+            break
+        }
+        let param = captured[position]
+        let field = fields[position]
+        let reference = self.nty(param.value).is_reference()
+        let held = match mut self.value_repr(mut lo, value: param.value) {
+            Repr.Empty => Held.Empty
+            Repr.Scalar(scalar) => if reference {
+                Held.Address(mut fx.load(PTR, addr: env, offset: field))
+            } else {
+                Held.Scalar(mut fx.load(scalar, addr: env, offset: field))
+            }
+            Repr.Address => if reference {
+                Held.Address(mut fx.load(PTR, addr: env, offset: field))
+            } else {
+                Held.Address(mut fx.offset(env, offset: field))
+            }
+        }
+        mut self.define(param.value, held)
+    }
+} Body.bind_captures
+
+/// A value held one way, held as `wanted`: a scalar spilled to a slot for an address, or
+/// loaded from its address for a register.
+fn Body.adapt(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    nty: nir::NTy,
+    wanted: Repr,
+    ) -> Held {
+    match wanted {
+        Repr.Address => match held {
+            Held.Scalar(value) => {
+                let ty = nty.ty()
+                let laid = mut lo.layout_of(ty)
+                let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+                mut self.store_scalar(mut lo, mut fx, value, address: slot, offset: 0, ty)
+                return Held.Address(slot)
+            }
+            Held.Empty => {
+                let laid = mut lo.layout_of(nty.ty())
+                return Held.Address(mut fx.slot(laid.contents().size, align: laid.contents().align))
+            }
+            Held.Address(_) => return held
+        }
+        Repr.Scalar(_) => match held {
+            Held.Address(address) => return Held.Scalar(mut self.load_scalar(mut lo, mut fx, address, offset: 0, ty: nty.ty()))
+            else => return held
+        }
+        Repr.Empty => return Held.Empty
+    }
+} Body.adapt
+
+fn Body.block(mut self, mut lo: Lowering, mut fx: Fx, block: nir::BlockId) {
+    let unit = self.unit.share()
+    expect self.function_index < unit.contents().functions.len()
+    expect usize.widen(block.index) < unit.contents().functions[self.function_index].blocks.len() and usize.widen(block.index) < self.blocks.len()
+    let data = unit.contents().functions[self.function_index].blocks[usize.widen(block.index)]
+    let ir_block = self.blocks[usize.widen(block.index)]
+    if block.index != 0 {
+        mut fx.b.switch_to_block(ir_block)
+        let params = fx.b.block_params(ir_block, alloc: lo.alloc)
+        var next: usize = 0
+        for param in data.params {
+            let repr = mut self.value_repr(mut lo, value: param)
+            var held = Held.Empty
+            if repr != Repr.Empty {
+                expect next < params.len()
+                held = held_as(repr, value: params[next])
+                next += 1
+            }
+            mut self.define(param, held)
+        }
+    }
+    for position in 0..<data.insts.len() {
+        let inst = data.insts[position]
+        mut lo.locate(mut fx, item: self.item, span: inst.span)
+        self.current = inst.span
+        mut self.inst(mut lo, mut fx, block, position, inst)
+    }
+    mut lo.locate(mut fx, item: self.item, span: data.term_span)
+    self.current = data.term_span
+    mut self.terminator(mut lo, mut fx, block, position: data.insts.len(), term: data.term)
+} Body.block
+
+fn Body.status(self, block: nir::BlockId, position: usize) -> check::Status {
+    let Some(statuses) = self.statuses else {
+        return check::Status.Checked
+    }
+    let Some(status) = statuses.get(SiteKey(block: block, position: position)) else {
+        return check::Status.Checked
+    }
+    return status
+} Body.status
+
+/// Whether the obligation of a site is checked at run time.
+fn Body.checked(self, block: nir::BlockId, position: usize) -> bool {
+    return self.status(block, position) == check::Status.Checked
+} Body.checked
+
+/// The type of an instruction's result.
+fn Body.result_ty(self, inst: nir::Inst) -> ty::Ty {
+    let Some(result) = inst.result else {
+        expect false
+        return ty::Ty.unit()
+    }
+    return self.nty(result).ty()
+} Body.result_ty
+
+fn Body.inst(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    block: nir::BlockId,
+    position: usize,
+    inst: nir::Inst,
+    )
+    waive length "one arm per operation, as NIR defines them"
+{
+    var held: Option[Held] = None
+    match inst.op {
+        nir::Op.Slot(name: _, ty: slot_ty) => {
+            let ty = self.subst.ty(lo.ck.types(), ty: slot_ty)
+            let laid = mut lo.layout_of(ty)
+            held = Some(Held.Address(mut fx.slot(laid.contents().size, align: laid.contents().align)))
+        }
+        nir::Op.Load(place) or nir::Op.Move(place) => {
+            held = Some(mut self.read_place(mut lo, mut fx, place))
+        }
+        nir::Op.Ref(place) or nir::Op.RefMut(place) => {
+            held = Some(Held.Address(mut self.place_address(mut lo, mut fx, place)))
+        }
+        nir::Op.Init(place: place, operand: operand) => mut self.store_place(mut lo, mut fx, place, operand, assign: false, block, position)
+        nir::Op.Assign(place: place, operand: operand) => mut self.store_place(mut lo, mut fx, place, operand, assign: true, block, position)
+        nir::Op.Release(place) => {
+            let ty = mut self.place_type(mut lo, mut fx, place)
+            let address = mut self.place_address(mut lo, mut fx, place)
+            mut lo.release(mut fx, ty, address)
+        }
+        nir::Op.FnRef(fn_ref) => {
+            held = Some(mut self.fn_value(mut lo, mut fx, fn_ref))
+        }
+        nir::Op.Constant(constant) => {
+            let ty = self.result_ty(inst)
+            held = Some(mut self.constant(mut lo, mut fx, constant, ty))
+        }
+        nir::Op.Construct(ty: construct_ty, fields: fields) => {
+            let ty = self.subst.ty(lo.ck.types(), ty: construct_ty)
+            held = Some(mut self.construct(mut lo, mut fx, ty, fields: fields.view(), block, position))
+        }
+        nir::Op.Variant(ty: _, variant: variant, payload: payload) => {
+            let Some(result) = inst.result else {
+                expect false
+                return
+            }
+            let ty = self.nty(result).ty()
+            let wrapped = self.wrapping(lo, value: result)
+            held = Some(mut self.variant(mut lo, mut fx, ty, variant: variant.as_str(), payload, wrapped))
+        }
+        nir::Op.Is(place: place, ty: _, variant: variant) => {
+            let storage = mut self.place_storage(mut lo, mut fx, place)
+            held = Some(Held.Scalar(mut lo.variant_is(mut fx, address: storage.address, ty: storage.ty, variant: variant.as_str())))
+        }
+        nir::Op.Closure(index: index, captures: captures) => {
+            held = Some(mut self.closure(mut lo, mut fx, index, captures: captures.view()))
+        }
+        nir::Op.Convert(value: value, to: to, via: via) => {
+            let target = self.subst.ty(lo.ck.types(), ty: to)
+            let via_name = match via {
+                Some(name) => Some(name.as_str())
+                None => None
+            }
+            held = Some(mut self.convert(mut lo, mut fx, operand: value, to: target, via: via_name))
+        }
+        nir::Op.Unary(op: op, operand: operand) => {
+            let ty = self.result_ty(inst)
+            held = Some(mut self.unary(mut lo, mut fx, op, operand, ty, block, position))
+        }
+        nir::Op.Binary(op: op, left: left, right: right) => {
+            held = Some(mut self.binary(mut lo, mut fx, op, left, right, block, position))
+        }
+        nir::Op.Call(call) => {
+            held = mut self.call(mut lo, mut fx, call, result: inst.result, block, position, targets: None)
+        }
+        nir::Op.Check(kind: kind, operand: operand, open: open) => mut self.check(mut lo, mut fx, kind, operand, open, block, position)
+        nir::Op.Assume(_) => {}
+        nir::Op.Dbg(operand) => {
+            let operated = mut self.operand(mut lo, mut fx, operand)
+            if lo.seeded() {
+                dbg_line(mut self, mut lo, mut fx, held: operated.held, nty: operated.nty)
+            }
+            held = Some(operated.held)
+        }
+        nir::Op.Quantifier(all: all, low: low, high: high, inclusive: inclusive, region: region) => {
+            held = Some(mut self.quantifier(mut lo, mut fx, all, low, high, inclusive, region))
+        }
+        nir::Op.When(attempted: attempted, accesses: accesses, region: region) => {
+            scheduling_point(mut lo, mut fx)
+            held = Some(mut self.lower_when(mut lo, mut fx, attempted, accesses: accesses.view(), region, result: inst.result))
+        }
+    }
+    let Some(result) = inst.result else {
+        return
+    }
+    let Some(defined) = held else {
+        return
+    }
+    mut self.define(result, held: defined)
+} Body.inst
+
+/// Lowers a `check`: unless it is open, a `decreases` or proven, a trap when its operand does
+/// not hold.
+fn Body.check(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    kind: nir::CheckKind,
+    operand: nir::Operand,
+    open: bool,
+    block: nir::BlockId,
+    position: usize,
+    ) {
+    if open or kind == nir::CheckKind.Decreases or not self.checked(block, position) {
+        return
+    }
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let holds = operated.held.scalar_value()
+    let condition = match operand {
+        nir::Operand.Value(value) => Some(value)
+        else => None
+    }
+    let trap_kind = check_kind(kind, alloc: lo.alloc)
+    mut self.trap_unless(mut lo, mut fx, holds, kind: trap_kind.as_str(), operands: Operands.Condition(condition))
+} Body.check
+
+fn Body.terminator(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    block: nir::BlockId,
+    position: usize,
+    term: nir::Terminator,
+    ) {
+    match term {
+        nir::Terminator.Jump(jump) => mut self.jump(mut lo, mut fx, from: block, jump)
+        nir::Terminator.Branch(operand: condition, then: then, otherwise: otherwise) => mut self.branch(mut lo, mut fx, block, condition, then, otherwise)
+        nir::Terminator.Call(call: call, ok: ok, failure: failure) => {
+            discard mut self.call(mut lo, mut fx, call, result: None, block, position, targets: Some(CallExits(ok: ok, failure: failure)))
+        }
+        nir::Terminator.Return(operand) => if self.sides {
+            mut self.return_sides(mut lo, mut fx, operand)
+        } else {
+            mut self.return_value(mut lo, mut fx, operand)
+        }
+        nir::Terminator.Fail(operand) => mut self.lower_fail(mut lo, mut fx, operand)
+        nir::Terminator.Todo(_) => mut self.trap_now(mut lo, mut fx, kind: "trap.todo", operands: Operands.None)
+        nir::Terminator.Unreachable => mut fx.b.trap(clif::TrapCode(user: 1))
+        nir::Terminator.Yield(operand) => mut self.lower_yield(mut lo, mut fx, block, operand)
+    }
+} Body.terminator
+
+/// Lowers a branch on a condition to two jumps' targets.
+fn Body.branch(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    block: nir::BlockId,
+    condition: nir::Operand,
+    then: nir::Jump,
+    otherwise: nir::Jump,
+    ) {
+    let operated = mut self.operand(mut lo, mut fx, operand: condition)
+    let flag = operated.held.scalar_value()
+    let then_args = mut self.jump_args(mut lo, mut fx, jump: then)
+    let otherwise_args = mut self.jump_args(mut lo, mut fx, jump: otherwise)
+    let then_block = mut self.exit_block(mut lo, mut fx, from: block, to: then.block, args: take then_args)
+    let otherwise_block = mut self.exit_block(mut lo, mut fx, from: block, to: otherwise.block, args: take otherwise_args)
+    mut fx.b.brif(flag, then: then_block.block, then_args: then_block.args.view(), otherwise: otherwise_block.block, otherwise_args: otherwise_block.args.view())
+} Body.branch
+
+/// Returns from a `Sides` instance: the bits of the two sides of the comparison the function
+/// returns, kept in the record at the result address.
+fn Body.return_sides(mut self, mut lo: Lowering, mut fx: Fx, operand: Option[nir::Operand]) {
+    let found = match operand {
+        Some(nir::Operand.Value(value)) => comparison(self.function(), value, alloc: lo.alloc)
+        else => None
+    }
+    match found {
+        Some(compared) => mut self.keep_sides(mut lo, mut fx, sides: compared.sides.view())
+        None => {}
+    }
+    mut fx.b.ret(mem::List[clif::Value].empty(lo.alloc).view())
+} Body.return_sides
+
+/// Keeps the bits of the two sides of a comparison in the record at the result address.
+fn Body.keep_sides(mut self, mut lo: Lowering, mut fx: Fx, sides: Slice[nir::Operand]) {
+    let unit = self.unit.share()
+    expect self.function_index < unit.contents().functions.len()
+    let function = unit.contents().functions[self.function_index]
+    let types = side_types(lo, function, subst: self.subst, sides)
+    let laid_out = sides_layout(mut lo, types)
+    let Some(record) = self.sret else {
+        expect false
+        return
+    }
+    for index in 0..<sides.len() {
+        if index >= 2 {
+            break
+        }
+        let operated = mut self.operand(mut lo, mut fx, operand: sides[index])
+        keep_side(mut self, mut lo, mut fx, held: operated.held, nty: operated.nty, ty: types[index], record, offset: laid_out.offsets[index])
+    }
+} Body.keep_sides
+
+/// Returns a value, owned unless the function is a projection returning a wrapped part.
+fn Body.return_value(mut self, mut lo: Lowering, mut fx: Fx, operand: Option[nir::Operand]) {
+    let wraps = self.wraps_result(lo).is_some()
+    var held: Option[HeldValue] = None
+    match operand {
+        Some(returned) => if wraps {
+            held = Some(mut self.operand(mut lo, mut fx, operand: returned))
+        } else {
+            held = Some(mut self.owned_operand(mut lo, mut fx, operand: returned))
+        }
+        None => {}
+    }
+    mut self.ret(mut lo, mut fx, held)
+} Body.return_value
+
+/// Fails with a value: a test body's failure escapes, any other function's is written at the
+/// failure address and returned as a failure.
+fn Body.lower_fail(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) {
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let ty = operated.nty.ty()
+    if self.test_body(lo) {
+        test_image_escape(mut lo, mut fx, held: operated.held, ty)
+    } else {
+        let Some(failure) = self.failure else {
+            expect false
+            return
+        }
+        mut self.write_value(mut lo, mut fx, address: failure, held: operated.held, ty)
+    }
+    let failed = mut fx.int(clif::Type.Int8, value: 1)
+    var returns = mem::List[clif::Value].empty(lo.alloc)
+    mut returns.push(failed)
+    match self.abi.returned {
+        Returned.Scalar(scalar) => mut returns.push(body_zero(mut fx, ty: scalar))
+        Returned.Part => mut returns.push(mut fx.ptr(0))
+        else => {}
+    }
+    mut fx.b.ret(returns.view())
+} Body.lower_fail
+
+/// Yields a value from a region to the block its `yield` jumps to.
+fn Body.lower_yield(mut self, mut lo: Lowering, mut fx: Fx, block: nir::BlockId, operand: nir::Operand) {
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let held = operated.held
+    let Some(region) = self.region_of.get(block) else {
+        expect false
+        return
+    }
+    let Some(exit) = self.exits.get(region) else {
+        expect false
+        return
+    }
+    let target = exit.yield_to
+    let args = held.values(lo.alloc)
+    mut fx.b.jump(target, args: args.view())
+} Body.lower_yield
+
+/// The registers a jump passes to its target's parameters.
+fn Body.jump_args(mut self, mut lo: Lowering, mut fx: Fx, jump: nir::Jump) -> mem::List[clif::Value] {
+    let unit = self.unit.share()
+    expect self.function_index < unit.contents().functions.len()
+    expect usize.widen(jump.block.index) < unit.contents().functions[self.function_index].blocks.len()
+    let params = unit.contents().functions[self.function_index].blocks[usize.widen(jump.block.index)].params
+    var args = mem::List[clif::Value].empty(lo.alloc)
+    for position in 0..<params.len() {
+        if position >= jump.args.len() {
+            break
+        }
+        let param = params[position]
+        let operand = jump.args[position]
+        let operated = match self.wrapping(lo, value: param) {
+            Some(_) => mut self.operand(mut lo, mut fx, operand)
+            None => mut self.owned_operand(mut lo, mut fx, operand)
+        }
+        let wanted = mut self.value_repr(mut lo, value: param)
+        let adapted = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted)
+        let values = adapted.values(lo.alloc)
+        for value in values {
+            mut args.push(value)
+        }
+    }
+    return args
+} Body.jump_args
+
+fn Body.jump(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    from: nir::BlockId,
+    jump: nir::Jump,
+    ) {
+    let args = mut self.jump_args(mut lo, mut fx, jump)
+    let entered = mut self.exit_block(mut lo, mut fx, from, to: jump.block, args: take args)
+    mut fx.b.jump(entered.block, args: entered.args.view())
+} Body.jump
+
+/// The block a jump from `from` to `to` enters: `to` itself, or a block releasing the cowns
+/// of each `when` region the jump leaves before entering it.
+fn Body.exit_block(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    from: nir::BlockId,
+    to: nir::BlockId,
+    take args: mem::List[clif::Value],
+    ) -> clif::BlockCall {
+    expect usize.widen(to.index) < self.blocks.len()
+    let target = self.blocks[usize.widen(to.index)]
+    var left = mem::List[clif::Value].empty(lo.alloc)
+    let leaving = self.regions_left(from, to, alloc: lo.alloc)
+    for region in leaving {
+        let Some(exit) = self.exits.get(region) else {
+            continue
+        }
+        let Some(held) = exit.held else {
+            continue
+        }
+        mut left.push(held)
+    }
+    if left.len() == 0 {
+        return clif::BlockCall(block: target, args: take args)
+    }
+    let Some(current) = fx.b.current_block() else {
+        expect false
+        return clif::BlockCall(block: target, args: take args)
+    }
+    let release = mut fx.b.create_block()
+    var types = mem::List[clif::Type].empty(lo.alloc)
+    for value in args {
+        mut types.push(fx.b.value_type(value))
+    }
+    for ty in types {
+        discard mut fx.b.append_block_param(release, ty)
+    }
+    mut fx.b.switch_to_block(release)
+    let passed = fx.b.block_params(release, alloc: lo.alloc)
+    for held in left {
+        discard mut lo.call_routine(mut fx, routine: Routine.CownRelease, args: Array[clif::Value, 1].filled(held).view())
+    }
+    mut fx.b.jump(target, args: passed.view())
+    mut fx.b.switch_to_block(current)
+    return clif::BlockCall(block: release, args: take args)
+} Body.exit_block
+
+/// The `when` regions holding `from` that do not hold `to`, innermost first.
+fn Body.regions_left(self, from: nir::BlockId, to: nir::BlockId, alloc: mem::Alloc) -> mem::List[nir::BlockId] {
+    var left = mem::List[nir::BlockId].empty(alloc)
+    var current: Option[nir::BlockId] = self.region_of.get(from)
+    loop {
+        let Some(region) = current else {
+            break
+        }
+        if self.region_holds(region, block: to) {
+            break
+        }
+        mut left.push(region)
+        current = self.enclosing_region(region)
+    }
+    return left
+} Body.regions_left
+
+fn Body.region_holds(self, region: nir::BlockId, block: nir::BlockId) -> bool {
+    var current: Option[nir::BlockId] = self.region_of.get(block)
+    loop {
+        let Some(found) = current else {
+            return false
+        }
+        if found == region {
+            return true
+        }
+        current = self.enclosing_region(found)
+    }
+} Body.region_holds
+
+/// The region holding the instruction that opens a region.
+fn Body.enclosing_region(self, region: nir::BlockId) -> Option[nir::BlockId] {
+    let function = self.function()
+    for index in 0..<function.blocks.len() {
+        for inst in function.blocks[index].insts {
+            if opened_region(inst.op) == Some(region) {
+                return self.region_of.get(nir::BlockId(index: u32.fit(index)))
+            }
+        }
+    }
+    return None
+} Body.enclosing_region
+
+/// The first block of the region an operation opens, none when it opens none.
+fn opened_region(op: nir::Op) -> Option[nir::BlockId] {
+    return match op {
+        nir::Op.Quantifier(all: _, low: _, high: _, inclusive: _, region: region) or nir::Op.When(attempted: _, accesses: _, region: region) => region.blocks.get(0)
+        else => None
+    }
+} opened_region
+
+/// Returns a value, or `Unit`.
+fn Body.ret(mut self, mut lo: Lowering, mut fx: Fx, held: Option[HeldValue]) {
+    var returns = mem::List[clif::Value].empty(lo.alloc)
+    if self.abi.flagged {
+        mut returns.push(mut fx.int(clif::Type.Int8, value: 0))
+    }
+    match held {
+        Some(returned) => match self.abi.returned {
+            Returned.Scalar(_) => {
+                let repr = mut lo.owned_repr(returned.nty.ty())
+                let adapted = mut self.adapt(mut lo, mut fx, held: returned.held, nty: returned.nty, wanted: repr)
+                mut returns.push(adapted.scalar_value())
+            }
+            Returned.Indirect => {
+                let Some(sret) = self.sret else {
+                    expect false
+                    return
+                }
+                let ty = self.abi.result
+                let adapted = mut self.adapt(mut lo, mut fx, held: returned.held, nty: returned.nty, wanted: Repr.Address)
+                mut self.copy_to(mut lo, mut fx, address: sret, held: adapted, ty)
+            }
+            Returned.Part => {
+                let adapted = mut self.adapt(mut lo, mut fx, held: returned.held, nty: returned.nty, wanted: Repr.Address)
+                mut returns.push(adapted.address_value())
+            }
+            Returned.Empty => {}
+        }
+        None => {}
+    }
+    mut fx.b.ret(returns.view())
+} Body.ret
+
+/// The value and NIR type of an operand.
+fn Body.operand(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -> HeldValue {
+    match operand {
+        nir::Operand.Value(value) => return HeldValue(held: self.held(value), nty: self.nty(value))
+        nir::Operand.Literal(literal) => return mut self.literal(mut lo, mut fx, literal)
+        nir::Operand.Place(mode: mode, place: place) => {
+            let ty = mut self.place_type(mut lo, mut fx, place)
+            match mode {
+                ast::Mode.Take => {
+                    let held = mut self.take_place(mut lo, mut fx, place, ty)
+                    return HeldValue(held: held, nty: nir::NTy.Owned(ty))
+                }
+                ast::Mode.Mut => return HeldValue(held: Held.Address(mut self.place_address(mut lo, mut fx, place)), nty: nir::NTy.RefMut(ty))
+                ast::Mode.Read => return HeldValue(held: Held.Address(mut self.place_address(mut lo, mut fx, place)), nty: nir::NTy.Ref(ty))
+            }
+        }
+    }
+} Body.operand
+
+fn Body.literal(mut self, mut lo: Lowering, mut fx: Fx, literal: nir::Literal) -> HeldValue {
+    match literal {
+        nir::Literal.Int(value: value, scalar: scalar) => {
+            let ty = scalar_type(scalar)
+            let held = Held.Scalar(mut fx.b.iconst(ty, imm: i64.from_bits(value.low_bits())))
+            return HeldValue(held: held, nty: nir::NTy.Owned(ty::Ty.scalar(scalar)))
+        }
+        nir::Literal.Float(bits: bits, scalar: scalar) => {
+            var held = Held.Empty
+            if scalar == ty::Scalar.Float32 {
+                held = Held.Scalar(mut fx.b.f32const(u32.truncate(bits)))
+            } else {
+                held = Held.Scalar(mut fx.b.f64const(bits))
+            }
+            return HeldValue(held: held, nty: nir::NTy.Owned(ty::Ty.scalar(scalar)))
+        }
+        nir::Literal.Bool(value) => return HeldValue(held: Held.Scalar(mut fx.int(clif::Type.Int8, value: flag_number(value))), nty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)))
+        nir::Literal.Char(c) => return HeldValue(held: Held.Scalar(mut fx.int(clif::Type.Int32, value: i64.widen(c.to_bits()))), nty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Char)))
+        nir::Literal.Unit => return HeldValue(held: Held.Empty, nty: nir::NTy.Owned(ty::Ty.unit()))
+        nir::Literal.Text(written) => {
+            let ty = lo.std_ty("core", type_name: "Str", args: mem::List[ty::Ty].empty(lo.alloc))
+            let held = mut lo.view_literal(mut fx, contents: written.as_bytes())
+            return HeldValue(held: held, nty: nir::NTy.Owned(ty))
+        }
+        nir::Literal.Bytes(data) => {
+            let ty = lo.slice_of(ty::Ty.scalar(ty::Scalar.Unsigned8))
+            let held = mut lo.view_literal(mut fx, contents: data.view())
+            return HeldValue(held: held, nty: nir::NTy.Owned(ty))
+        }
+    }
+} Body.literal
+
+/// The number a flag is in lowered code: 1 when it holds.
+fn flag_number(flag: bool) -> i64 {
+    if flag {
+        return 1
+    }
+    return 0
+} flag_number
+
+/// Stores an operand's value at a place: `init` into an empty place, `assign` releasing
+/// what it holds first; a ranged or rest field of a layout checks that the value fits.
+fn Body.store_place(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    place: nir::Place,
+    operand: nir::Operand,
+    assign: bool,
+    block: nir::BlockId,
+    position: usize,
+    ) {
+    let operated = mut self.owned_operand(mut lo, mut fx, operand)
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    let bits = match location {
+        PlaceLocation.Bits(container: _, bit: _, mask: _, ty: _) => true
+        else => false
+    }
+    if bits {
+        let adapted = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted: Repr.Scalar(clif::Type.Int64))
+        let value = adapted.scalar_value()
+        let fits = mut self.bits_fit(mut fx, location, value)
+        match fits {
+            Some(fitting) => if self.checked(block, position) {
+                expect place.steps.len() > 0
+                let field = place.steps[place.steps.len() - 1]
+                let operands = field_operands(field.as_str(), operand, operated, alloc: lo.alloc)
+                mut self.trap_unless(mut lo, mut fx, holds: fitting, kind: "trap.conversion", operands: take operands)
+            }
+            None => {}
+        }
+        mut self.write_location(mut lo, mut fx, location, held: Held.Scalar(value), nty: operated.nty)
+        return
+    }
+    if assign {
+        let ty = self.location_type(location)
+        let address = mut self.location_address(mut lo, mut fx, location)
+        mut lo.release(mut fx, ty, address)
+    }
+    mut self.write_location(mut lo, mut fx, location, held: operated.held, nty: operated.nty)
+} Body.store_place
+
+/// The operands a report of a value not fitting a field shows: the value stored, shown as the
+/// source stores it into the field.
+fn field_operands(field: Str, operand: nir::Operand, operated: HeldValue, alloc: mem::Alloc) -> Operands {
+    var stored = mem::List[HeldOperand].empty(alloc)
+    mut stored.push(HeldOperand(operand: operand.copy(alloc), held: operated.held, nty: operated.nty))
+    return Operands.Values(form: TrapForm.Field(text::String.of(field, alloc)), values: take stored)
+} field_operands
+
+/// Lowers the rest of a function after a call that never returns.
+fn Body.unreachable_after(mut self, mut fx: Fx) {
+    mut fx.b.trap(clif::TrapCode(user: 1))
+    let next = mut fx.b.create_block()
+    mut fx.b.switch_to_block(next)
+} Body.unreachable_after
+
+fn Body.quantifier(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    all: bool,
+    low: nir::Operand,
+    high: nir::Operand,
+    inclusive: bool,
+    region: nir::Region,
+    ) -> Held {
+    let low_operated = mut self.operand(mut lo, mut fx, operand: low)
+    let high_operated = mut self.operand(mut lo, mut fx, operand: high)
+    let high_held = high_operated.held
+    let Some(scalar) = low_operated.nty.ty().interned_scalar() else {
+        expect false
+        return Held.Empty
+    }
+    let low_value = low_operated.held.scalar_value()
+    let high_value = high_held.scalar_value()
+    let ty = scalar_type(scalar)
+    var less = clif::IntCC.UnsignedLessThan
+    var less_or_equal = clif::IntCC.UnsignedLessThanOrEqual
+    if scalar.is_signed() {
+        less = clif::IntCC.SignedLessThan
+        less_or_equal = clif::IntCC.SignedLessThanOrEqual
+    }
+    let header = mut fx.b.create_block()
+    let yielded = mut fx.b.create_block()
+    let done = mut fx.b.create_block()
+    discard mut fx.b.append_block_param(header, ty)
+    discard mut fx.b.append_block_param(yielded, ty: clif::Type.Int8)
+    discard mut fx.b.append_block_param(done, ty: clif::Type.Int8)
+    expect region.blocks.len() > 0 and usize.widen(region.blocks[0].index) < self.blocks.len()
+    let entry = self.blocks[usize.widen(region.blocks[0].index)]
+    discard mut self.exits.insert(region.blocks[0], value: RegionExit(yield_to: yielded, held: None))
+    let counter = mut fx.b.declare_var(ty)
+    mut fx.b.def_var(counter, val: low_value)
+    mut fx.b.jump(header, args: Array[clif::Value, 1].filled(low_value).view())
+    mut fx.b.switch_to_block(header)
+    let header_params = fx.b.block_params(header, alloc: lo.alloc)
+    expect header_params.len() > 0
+    let current = header_params[0]
+    mut fx.b.def_var(counter, val: current)
+    var inside = clif::Value(index: 0)
+    if inclusive {
+        inside = mut fx.b.icmp(less_or_equal, x: current, y: high_value)
+    } else {
+        inside = mut fx.b.icmp(less, x: current, y: high_value)
+    }
+    let decided_none = mut fx.int(clif::Type.Int8, value: flag_number(all))
+    mut fx.b.brif(inside, then: entry, then_args: Array[clif::Value, 1].filled(current).view(), otherwise: done, otherwise_args: Array[clif::Value, 1].filled(decided_none).view())
+    mut fx.b.switch_to_block(yielded)
+    let yielded_params = fx.b.block_params(yielded, alloc: lo.alloc)
+    expect yielded_params.len() > 0
+    let result = yielded_params[0]
+    let wanted = mut fx.int(clif::Type.Int8, value: flag_number(all))
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: result, y: wanted)
+    let at = mut fx.b.use_var(counter)
+    let one = mut fx.b.iconst(ty, imm: 1)
+    let next = mut fx.b.iadd(at, y: one)
+    let decided = mut fx.int(clif::Type.Int8, value: flag_number(not all))
+    if inclusive {
+        let last = mut fx.b.icmp(clif::IntCC.Equal, x: at, y: high_value)
+        let go_on = mut fx.b.create_block()
+        let no_args = mem::List[clif::Value].empty(lo.alloc)
+        mut fx.b.brif(same, then: go_on, then_args: no_args.view(), otherwise: done, otherwise_args: Array[clif::Value, 1].filled(decided).view())
+        mut fx.b.switch_to_block(go_on)
+        let finished = mut fx.int(clif::Type.Int8, value: flag_number(all))
+        mut fx.b.brif(last, then: done, then_args: Array[clif::Value, 1].filled(finished).view(), otherwise: header, otherwise_args: Array[clif::Value, 1].filled(next).view())
+    } else {
+        mut fx.b.brif(same, then: header, then_args: Array[clif::Value, 1].filled(next).view(), otherwise: done, otherwise_args: Array[clif::Value, 1].filled(decided).view())
+    }
+    mut fx.b.switch_to_block(done)
+    let done_params = fx.b.block_params(done, alloc: lo.alloc)
+    expect done_params.len() > 0
+    return Held.Scalar(done_params[0])
+} Body.quantifier
+
+fn Body.lower_when(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    attempted: bool,
+    accesses: Slice[nir::Operand],
+    region: nir::Region,
+    result: Option[nir::Value],
+    ) -> Held {
+    return cowns_when(mut self, mut lo, mut fx, attempted, accesses, region, result)
+} Body.lower_when
+
+/// Opens a region whose `yield` jumps to `yield_to`, holding the cowns at `held`.
+fn Body.open_region(mut self, region: nir::Region, yield_to: clif::Block, held: Option[clif::Value]) {
+    expect region.blocks.len() > 0
+    discard mut self.exits.insert(region.blocks[0], value: RegionExit(yield_to: yield_to, held: held))
+} Body.open_region
+
+fn Body.region_entry(self, region: nir::Region) -> clif::Block {
+    expect region.blocks.len() > 0 and usize.widen(region.blocks[0].index) < self.blocks.len()
+    return self.blocks[usize.widen(region.blocks[0].index)]
+} Body.region_entry
+
+fn Body.unary(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::UnaryOp,
+    operand: nir::Operand,
+    ty: ty::Ty,
+    block: nir::BlockId,
+    position: usize,
+    ) -> Held {
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let repr = mut lo.owned_repr(ty)
+    let adapted = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted: repr)
+    let value = adapted.scalar_value()
+    let scalar = ty.interned_scalar()
+    if op == nir::UnaryOp.Not or (op == nir::UnaryOp.Inv and scalar == Some(ty::Scalar.Bool)) {
+        return Held.Scalar(mut fx.b.bxor_imm_s(value, y: 1))
+    }
+    if op == nir::UnaryOp.Inv {
+        return Held.Scalar(mut fx.b.bnot(value))
+    }
+    let Some(number) = scalar else {
+        expect false
+        return Held.Empty
+    }
+    if number.is_float() {
+        return Held.Scalar(mut fx.b.fneg(value))
+    }
+    let value_ty = fx.b.value_type(value)
+    let zero = body_zero(mut fx, ty: value_ty)
+    let negated = mut fx.b.ssub_overflow(zero, y: value)
+    if self.checked(block, position) {
+        let fits = mut fx.b.bxor_imm_s(negated.flag, y: 1)
+        var stored = mem::List[HeldOperand].empty(lo.alloc)
+        mut stored.push(HeldOperand(operand: operand.copy(lo.alloc), held: operated.held, nty: operated.nty))
+        mut self.trap_unless(mut lo, mut fx, holds: fits, kind: "trap.overflow", operands: Operands.Values(form: TrapForm.Unary, values: take stored))
+    }
+    return Held.Scalar(negated.value)
+} Body.unary
+
+fn Body.binary(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::BinaryOp,
+    left: nir::Operand,
+    right: nir::Operand,
+    block: nir::BlockId,
+    position: usize,
+    ) -> Held {
+    let left_operated = mut self.operand(mut lo, mut fx, operand: left)
+    let right_operated = mut self.operand(mut lo, mut fx, operand: right)
+    let operand_ty = left_operated.nty.ty()
+    if op.is_comparison() and operand_ty.interned_scalar().is_none() {
+        let equal = mut lo.views_equal(mut fx, left: left_operated.held, right: right_operated.held)
+        if op == nir::BinaryOp.Eq {
+            return Held.Scalar(equal)
+        }
+        return Held.Scalar(mut fx.b.bxor_imm_s(equal, y: 1))
+    }
+    let Some(scalar) = operand_ty.interned_scalar() else {
+        expect false
+        return Held.Empty
+    }
+    let repr = mut lo.owned_repr(operand_ty)
+    let left_adapted = mut self.adapt(mut lo, mut fx, held: left_operated.held, nty: left_operated.nty, wanted: repr)
+    let a = left_adapted.scalar_value()
+    let right_adapted = mut self.adapt(mut lo, mut fx, held: right_operated.held, nty: right_operated.nty, wanted: repr)
+    let b = right_adapted.scalar_value()
+    var stored = mem::List[HeldOperand].empty(lo.alloc)
+    mut stored.push(HeldOperand(operand: left.copy(lo.alloc), held: Held.Scalar(a), nty: nir::NTy.Owned(operand_ty)))
+    mut stored.push(HeldOperand(operand: right.copy(lo.alloc), held: Held.Scalar(b), nty: nir::NTy.Owned(operand_ty)))
+    let operands = Operands.Values(form: TrapForm.Binary(op), values: take stored)
+    let checked = self.checked(block, position)
+    if scalar.is_float() {
+        return Held.Scalar(mut self.float_binary(mut lo, mut fx, op, a, b))
+    }
+    let signed = scalar.is_signed()
+    match op {
+        nir::BinaryOp.Eq or nir::BinaryOp.Ne or nir::BinaryOp.Lt or nir::BinaryOp.Le or nir::BinaryOp.Gt or nir::BinaryOp.Ge => return Held.Scalar(mut fx.b.icmp(int_cc(op, signed), x: a, y: b))
+        nir::BinaryOp.Add or nir::BinaryOp.Sub or nir::BinaryOp.Mul => return Held.Scalar(mut self.arithmetic(mut lo, mut fx, op, a, b, signed, checked, operands: take operands))
+        nir::BinaryOp.Div or nir::BinaryOp.Rem => return Held.Scalar(mut self.division(mut lo, mut fx, op, a, b, operands: take operands))
+        nir::BinaryOp.Shl or nir::BinaryOp.Shr => {
+            let right_signed = match right_operated.nty.ty().interned_scalar() {
+                Some(right_scalar) => right_scalar.is_signed()
+                None => false
+            }
+            return Held.Scalar(mut self.shift(mut lo, mut fx, op, a, b, signed, right_signed, checked, operands: take operands))
+        }
+        nir::BinaryOp.Band => return Held.Scalar(mut fx.b.band(a, y: b))
+        nir::BinaryOp.Bor => return Held.Scalar(mut fx.b.bor(a, y: b))
+        nir::BinaryOp.Bxor => return Held.Scalar(mut fx.b.bxor(a, y: b))
+    }
+} Body.binary
+
+/// An addition, subtraction or multiplication of integers, checked for overflow when its
+/// obligation site is checked.
+fn Body.arithmetic(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::BinaryOp,
+    a: clif::Value,
+    b: clif::Value,
+    signed: bool,
+    checked: bool,
+    take operands: Operands,
+    ) -> clif::Value {
+    var computed = clif::Overflowed(value: a, flag: a)
+    if op == nir::BinaryOp.Add {
+        if signed {
+            computed = mut fx.b.sadd_overflow(a, y: b)
+        } else {
+            computed = mut fx.b.uadd_overflow(a, y: b)
+        }
+    } else if op == nir::BinaryOp.Sub {
+        if signed {
+            computed = mut fx.b.ssub_overflow(a, y: b)
+        } else {
+            computed = mut fx.b.usub_overflow(a, y: b)
+        }
+    } else if signed {
+        computed = mut fx.b.smul_overflow(a, y: b)
+    } else {
+        computed = mut fx.b.umul_overflow(a, y: b)
+    }
+    if checked {
+        let fits = mut fx.b.bxor_imm_s(computed.flag, y: 1)
+        mut self.trap_unless(mut lo, mut fx, holds: fits, kind: "trap.overflow", operands: take operands)
+    }
+    return computed.value
+} Body.arithmetic
+
+/// A division or remainder of unsigned integers, trapping when the divisor is zero.
+fn Body.division(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::BinaryOp,
+    a: clif::Value,
+    b: clif::Value,
+    take operands: Operands,
+    ) -> clif::Value {
+    let ty = fx.b.value_type(b)
+    let zero = body_zero(mut fx, ty)
+    let nonzero = mut fx.b.icmp(clif::IntCC.NotEqual, x: b, y: zero)
+    mut self.trap_unless(mut lo, mut fx, holds: nonzero, kind: "trap.division-by-zero", operands: take operands)
+    if op == nir::BinaryOp.Div {
+        return mut fx.b.udiv(a, y: b)
+    }
+    return mut fx.b.urem(a, y: b)
+} Body.division
+
+/// A shift of an integer, checked for an amount outside its width and for a signed left shift
+/// that is not exact when its obligation site is checked.
+fn Body.shift(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::BinaryOp,
+    a: clif::Value,
+    b: clif::Value,
+    signed: bool,
+    right_signed: bool,
+    checked: bool,
+    take operands: Operands,
+    ) -> clif::Value {
+    let ty = fx.b.value_type(a)
+    let width = i64.widen(ty.bits())
+    let amount = body_widen(mut fx, value: b)
+    let limit = mut fx.int(clif::Type.Int64, value: width)
+    let below = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: amount, y: limit)
+    var valid = below
+    if right_signed {
+        let amount_ty = fx.b.value_type(b)
+        let zero = body_zero(mut fx, ty: amount_ty)
+        let negative = mut fx.b.icmp(clif::IntCC.SignedLessThan, x: b, y: zero)
+        let positive = mut fx.b.bxor_imm_s(negative, y: 1)
+        valid = mut fx.b.band(below, y: positive)
+    }
+    if checked {
+        mut self.trap_unless(mut lo, mut fx, holds: valid, kind: "trap.shift", operands: operands.copy(lo.alloc))
+    }
+    if op == nir::BinaryOp.Shr {
+        if signed {
+            return mut fx.b.sshr(a, y: b)
+        }
+        return mut fx.b.ushr(a, y: b)
+    }
+    if not signed {
+        return mut fx.b.ishl(a, y: b)
+    }
+    let shifted = mut fx.b.ishl(a, y: b)
+    let back = mut fx.b.sshr(shifted, y: b)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: back, y: a)
+    if checked {
+        mut self.trap_unless(mut lo, mut fx, holds: same, kind: "trap.overflow", operands: take operands)
+    }
+    return shifted
+} Body.shift
+
+fn Body.float_binary(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    op: nir::BinaryOp,
+    a: clif::Value,
+    b: clif::Value,
+    ) -> clif::Value {
+    match op {
+        nir::BinaryOp.Add => return mut fx.b.fadd(a, y: b)
+        nir::BinaryOp.Sub => return mut fx.b.fsub(a, y: b)
+        nir::BinaryOp.Mul => return mut fx.b.fmul(a, y: b)
+        nir::BinaryOp.Div => return mut fx.b.fdiv(a, y: b)
+        nir::BinaryOp.Rem => return floats_remainder(mut lo, mut fx, a, b)
+        nir::BinaryOp.Eq => return mut fx.b.fcmp(clif::FloatCC.Equal, x: a, y: b)
+        nir::BinaryOp.Ne => return mut fx.b.fcmp(clif::FloatCC.NotEqual, x: a, y: b)
+        nir::BinaryOp.Lt => return mut fx.b.fcmp(clif::FloatCC.LessThan, x: a, y: b)
+        nir::BinaryOp.Le => return mut fx.b.fcmp(clif::FloatCC.LessThanOrEqual, x: a, y: b)
+        nir::BinaryOp.Gt => return mut fx.b.fcmp(clif::FloatCC.GreaterThan, x: a, y: b)
+        nir::BinaryOp.Ge => return mut fx.b.fcmp(clif::FloatCC.GreaterThanOrEqual, x: a, y: b)
+        else => {
+            expect false
+            return a
+        }
+    }
+} Body.float_binary
+
+/// Traps with `kind` unless `holds` is nonzero.
+fn Body.trap_unless(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    holds: clif::Value,
+    kind: Str,
+    take operands: Operands,
+    ) {
+    let failing = mut fx.b.create_block()
+    let next = mut fx.b.create_block()
+    mut fx.b.set_cold_block(failing)
+    let no_args = mem::List[clif::Value].empty(lo.alloc)
+    mut fx.b.brif(holds, then: next, then_args: no_args.view(), otherwise: failing, otherwise_args: no_args.view())
+    mut fx.b.switch_to_block(failing)
+    mut self.trap_now(mut lo, mut fx, kind, operands: take operands)
+    mut fx.b.switch_to_block(next)
+} Body.trap_unless
+
+/// Traps with `kind` here.
+fn Body.trap_now(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    kind: Str,
+    take operands: Operands,
+    ) {
+    trap_raise(mut self, mut lo, mut fx, kind, operands: take operands)
+} Body.trap_now
+
+/// The comparison of integers an operator makes.
+fn int_cc(op: nir::BinaryOp, signed: bool) -> clif::IntCC {
+    match op {
+        nir::BinaryOp.Eq => return clif::IntCC.Equal
+        nir::BinaryOp.Ne => return clif::IntCC.NotEqual
+        nir::BinaryOp.Lt => if signed {
+            return clif::IntCC.SignedLessThan
+        }
+        nir::BinaryOp.Le => if signed {
+            return clif::IntCC.SignedLessThanOrEqual
+        }
+        nir::BinaryOp.Gt => if signed {
+            return clif::IntCC.SignedGreaterThan
+        }
+        nir::BinaryOp.Ge => if signed {
+            return clif::IntCC.SignedGreaterThanOrEqual
+        }
+        else => {
+            expect false
+            return clif::IntCC.Equal
+        }
+    }
+    return match op {
+        nir::BinaryOp.Lt => clif::IntCC.UnsignedLessThan
+        nir::BinaryOp.Le => clif::IntCC.UnsignedLessThanOrEqual
+        nir::BinaryOp.Gt => clif::IntCC.UnsignedGreaterThan
+        else => clif::IntCC.UnsignedGreaterThanOrEqual
+    }
+} int_cc
+
+/// An integer register widened to 64 bits without its sign.
+fn body_widen(mut fx: Fx, value: clif::Value) -> clif::Value {
+    if fx.b.value_type(value) == clif::Type.Int64 {
+        return value
+    }
+    return mut fx.b.uextend(clif::Type.Int64, x: value)
+} body_widen
+
+/// The zero of a register type.
+fn body_zero(mut fx: Fx, ty: clif::Type) -> clif::Value {
+    return match ty {
+        clif::Type.Float32 => mut fx.b.f32const(0)
+        clif::Type.Float64 => mut fx.b.f64const(0)
+        else => mut fx.b.iconst(ty, imm: 0)
+    }
+} body_zero
+
+/// The operands of a variant's payload, copied.
+fn payload_operands(payload: nir::Payload, alloc: mem::Alloc) -> mem::List[nir::Operand] {
+    var operands = mem::List[nir::Operand].empty(alloc)
+    match payload {
+        nir::Payload.None => {}
+        nir::Payload.Single(operand) => mut operands.push(operand.copy(alloc))
+        nir::Payload.Labelled(fields) => {
+            for field in fields {
+                mut operands.push(field.operand.copy(alloc))
+            }
+        }
+    }
+    return operands
+} payload_operands

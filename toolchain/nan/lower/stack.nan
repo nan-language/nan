@@ -1,0 +1,435 @@
+//! Stack limits: the frame size and call sites of each lowered function, the `stack N` demands on lowered functions and function values, and the final build's judging of each demand.
+
+/// The stub call bound of `x86_64-host`: the most of its caller's stack a call of a support
+/// routine or compiler stub uses.
+const STUB_CALL_BOUND: u64 = 256
+
+/// Where in source a call or a use lies.
+pkg struct At derives Copy {
+    item: ty::ItemId
+    span: nir::Span
+} At
+
+/// A call site of a lowered function.
+struct Site {
+    kind: StackKind
+    at: Option[At]
+} Site
+
+enum StackKind {
+    /// A direct call, with what it passes for the callee's function-typed parameters, by
+    /// position.
+    Direct(callee: object::FuncId, bindings: mem::List[ParamBinding])
+    /// A call through the function's own function-typed parameter at a position.
+    Param(usize)
+    /// A call the `stack N` of its type or head bounds; none for an unbounded one.
+    Bounded(Option[u64])
+    /// A call of a support routine, a compiler stub or the C library.
+    Stub
+} StackKind
+
+/// What a direct call passes for the function-typed parameter of its callee at a position.
+struct ParamBinding derives Copy {
+    position: usize
+    binding: Binding
+} ParamBinding
+
+/// What a direct call passes for a function-typed parameter of its callee.
+enum Binding derives Copy {
+    /// A closure or a named function, by the lowered function its value calls.
+    Function(object::FuncId)
+    /// The calling function's own parameter at a position.
+    Param(usize)
+    /// Another function value, bounded by the `stack N` its type demands.
+    Bounded(Option[u64])
+} Binding
+
+/// A lowered function: its frame size, the `stack N` the type of each of its function-typed
+/// parameters demands, by position, and its call sites.
+pkg struct Frame {
+    function: object::FuncId
+    /// The canonical path naming it in reasons; empty for code lowering writes itself.
+    name: text::String
+    size: u64
+    params: mem::List[ParamStack]
+    sites: mem::List[Site]
+} Frame
+
+/// The `stack N` the type of a function-typed parameter at a position demands, if any.
+struct ParamStack derives Copy {
+    position: usize
+    stack: Option[u64]
+} ParamStack
+
+/// A `stack N` demanded of a lowered function or of a function value, and where a breach is
+/// reported.
+pkg struct Demand derives Copy {
+    judged: Judged
+    stack: u64
+    report: StackReport
+} Demand
+
+enum Judged derives Copy {
+    Function(object::FuncId)
+    /// A function value, whose stack use is the `stack N` its own type demands, if any.
+    Value(Option[u64])
+} Judged
+
+enum StackReport derives Copy {
+    /// A demand of its own limits, of the interface method it implements or of the function
+    /// type a closure is written for: at each unbounded call site in its text, or on the line
+    /// of its head, at `head`, for an exceeded bound.
+    Own(head: At)
+    /// A demand of a function type that a named function or function value fits: at the use.
+    Fit(At)
+} StackReport
+
+/// A call of a call path: the function making it and the index of its site.
+struct CallStep derives Copy {
+    function: object::FuncId
+    index: usize
+} CallStep
+
+/// A stack use in bytes with its deepest call path, or none with the path of calls down to
+/// the unbounded call site; each call is a function and the index of its site.
+enum Use {
+    Bounded(bytes: u64, path: mem::List[CallStep])
+    Unbounded(mem::List[CallStep])
+} Use
+
+fn Use.copy(self, alloc: mem::Alloc) -> Use {
+    return match self {
+        Use.Bounded(bytes: used_bytes, path: calls) => Use.Bounded(bytes: used_bytes, path: copied_steps(calls.view(), alloc))
+        Use.Unbounded(calls) => Use.Unbounded(copied_steps(calls.view(), alloc))
+    }
+} Use.copy
+
+fn copied_steps(steps: Slice[CallStep], alloc: mem::Alloc) -> mem::List[CallStep] {
+    var copied = mem::List[CallStep].empty(alloc)
+    for step in steps {
+        mut copied.push(step)
+    }
+    return copied
+} copied_steps
+
+/// The use of a call bounded by a `stack N`, unbounded for none.
+fn bounded_use(stack_bound: Option[u64], alloc: mem::Alloc) -> Use {
+    return match stack_bound {
+        Some(used_bytes) => Use.Bounded(bytes: used_bytes, path: mem::List[CallStep].empty(alloc))
+        None => Use.Unbounded(mem::List[CallStep].empty(alloc))
+    }
+} bounded_use
+
+/// The bound of a function's parameter at a position, none past its bounds.
+fn param_bound(bounds: Slice[Option[u64]], position: usize) -> Option[u64] {
+    if position < bounds.len() {
+        return bounds[position]
+    }
+    return None
+} param_bound
+
+/// An unbounded call site of a frame: its index and the path of calls below it.
+struct UnboundedCall {
+    index: usize
+    path: mem::List[CallStep]
+} UnboundedCall
+
+/// Judges every demand against the frames of a final build's lowered functions.
+pkg fn stack_judge(ck: check::Checker, all_frames: Slice[Frame], demands: Slice[Demand], alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var judge = Judge.of(all_frames, alloc)
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for demand in demands {
+        mut judge.demand(ck, all_frames, demand, mut found)
+    }
+    return found
+} stack_judge
+
+/// What judging the frames of a final build's lowered functions keeps: the index of each
+/// function's frame, the stack uses known so far and the functions being judged.
+struct Judge {
+    positions: mem::HashMap[object::FuncId, usize]
+    known: mem::HashMap[UseKey, Use]
+    active: mem::List[object::FuncId]
+    alloc: mem::Alloc
+} Judge
+
+/// A function and the bounds of its function-typed parameters, by position.
+struct UseKey derives Eq, Hash {
+    function: object::FuncId
+    bounds: mem::List[Option[u64]]
+} UseKey
+
+/// A judge of frames, each found by its function.
+fn Judge.of(all_frames: Slice[Frame], alloc: mem::Alloc) -> Judge {
+    var positions = mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc)
+    for index in 0..<all_frames.len() {
+        discard mut positions.insert(all_frames[index].function, value: index)
+    }
+    return Judge(positions: take positions, known: mem::HashMap[UseKey, Use].empty(seed: 0, alloc), active: mem::List[object::FuncId].empty(alloc), alloc: alloc)
+} Judge.of
+
+/// The bounds a function's parameters have when it is judged on its own, none for a function
+/// without a frame.
+fn Judge.own_of(self, all_frames: Slice[Frame], function: object::FuncId) -> mem::List[Option[u64]] {
+    let Some(position) = self.positions.get(function) else {
+        return mem::List[Option[u64]].empty(self.alloc)
+    }
+    expect position < all_frames.len()
+    return own_bounds(all_frames[position], alloc: self.alloc)
+} Judge.own_of
+
+fn Judge.demand(mut self, ck: check::Checker, all_frames: Slice[Frame], demand: Demand, mut found: mem::List[diagnostic::Diagnostic]) {
+    let function = match demand.judged {
+        Judged.Function(judged) => judged
+        Judged.Value(bound) => {
+            self.judge_value(ck, demand, bound, mut found)
+            return
+        }
+    }
+    let Some(position) = self.positions.get(function) else {
+        expect false
+        return
+    }
+    expect position < all_frames.len()
+    let frame = all_frames[position]
+    let bounds = own_bounds(frame, alloc: self.alloc)
+    mut self.active.push(function)
+    var deepest_bytes: u64 = 0
+    var deepest_path = mem::List[CallStep].empty(self.alloc)
+    var unbounded = mem::List[UnboundedCall].empty(self.alloc)
+    for index in 0..<frame.sites.len() {
+        match mut self.site(all_frames, site: frame.sites[index], bounds: bounds.view()) {
+            Use.Unbounded(calls) => mut unbounded.push(UnboundedCall(index: index, path: take calls))
+            Use.Bounded(bytes: used_bytes, path: calls) => {
+                if used_bytes > deepest_bytes {
+                    deepest_bytes = used_bytes
+                    deepest_path = prepend(CallStep(function: function, index: index), rest: take calls)
+                }
+            }
+        }
+    }
+    discard mut self.active.pop()
+    if unbounded.len() == 0 {
+        if frame.size + deepest_bytes > demand.stack {
+            let reasons = self.because(ck, all_frames, call_path: deepest_path.view(), unbounded: false)
+            let at = match demand.report {
+                StackReport.Own(head: head_at) => head_at
+                StackReport.Fit(fit_at) => fit_at
+            }
+            extend_found(mut found, reported: stack_diagnostic(ck, at, code: diagnostic::Code.LimitStackExceeded, because: take reasons))
+        }
+        return
+    }
+    for unbounded_call in take unbounded {
+        let calls = prepend(CallStep(function: function, index: unbounded_call.index), rest: take unbounded_call.path)
+        let reasons = self.because(ck, all_frames, call_path: calls.view(), unbounded: true)
+        expect unbounded_call.index < frame.sites.len()
+        let at = match demand.report {
+            StackReport.Own(head: head_at) => match frame.sites[unbounded_call.index].at {
+                Some(site_at) => site_at
+                None => head_at
+            }
+            StackReport.Fit(fit_at) => fit_at
+        }
+        extend_found(mut found, reported: stack_diagnostic(ck, at, code: diagnostic::Code.LimitStackUnbounded, because: take reasons))
+    }
+} Judge.demand
+
+/// Judges a demand of a function value, whose stack use is the `stack N` its own type demands,
+/// none for an unbounded one.
+fn Judge.judge_value(self, ck: check::Checker, demand: Demand, bound: Option[u64], mut found: mem::List[diagnostic::Diagnostic]) {
+    let at = match demand.report {
+        StackReport.Fit(fit_at) => fit_at
+        StackReport.Own(head: head_at) => head_at
+    }
+    var code = diagnostic::Code.LimitStackUnbounded
+    match bound {
+        Some(bytes_bound) => {
+            if bytes_bound <= demand.stack {
+                return
+            }
+            code = diagnostic::Code.LimitStackExceeded
+        }
+        None => {}
+    }
+    extend_found(mut found, reported: stack_diagnostic(ck, at, code, because: mem::List[diagnostic::Reason].empty(self.alloc)))
+} Judge.judge_value
+
+/// Adds a diagnostic, when there is one.
+fn extend_found(mut found: mem::List[diagnostic::Diagnostic], take reported: Option[diagnostic::Diagnostic]) {
+    let Some(diagnostic_found) = reported else {
+        return
+    }
+    mut found.push(take diagnostic_found)
+} extend_found
+
+/// The stack use of a function whose function-typed parameters have bounds, by position.
+fn Judge.function(mut self, all_frames: Slice[Frame], function: object::FuncId, bounds: Slice[Option[u64]]) -> Use {
+    if self.active.position(fn(value: object::FuncId) => value == function).is_some() {
+        return Use.Unbounded(mem::List[CallStep].empty(self.alloc))
+    }
+    var key_bounds = mem::List[Option[u64]].empty(self.alloc)
+    for bound in bounds {
+        mut key_bounds.push(bound)
+    }
+    let key = UseKey(function: function, bounds: take key_bounds)
+    match self.known.get(key) {
+        Some(known) => return known.copy(self.alloc)
+        None => {}
+    }
+    let Some(position) = self.positions.get(function) else {
+        return Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
+    }
+    expect position < all_frames.len()
+    let frame = all_frames[position]
+    mut self.active.push(function)
+    var deepest_bytes: u64 = 0
+    var deepest_path = mem::List[CallStep].empty(self.alloc)
+    var unbounded: Option[mem::List[CallStep]] = None
+    for index in 0..<frame.sites.len() {
+        match mut self.site(all_frames, site: frame.sites[index], bounds) {
+            Use.Unbounded(calls) => {
+                unbounded = Some(prepend(CallStep(function: function, index: index), rest: take calls))
+                break
+            }
+            Use.Bounded(bytes: used_bytes, path: calls) => {
+                if used_bytes > deepest_bytes {
+                    deepest_bytes = used_bytes
+                    deepest_path = prepend(CallStep(function: function, index: index), rest: take calls)
+                }
+            }
+        }
+    }
+    discard mut self.active.pop()
+    let used = settled_use(take unbounded, own_size: frame.size, deepest_bytes, deepest_path: take deepest_path)
+    discard mut self.known.insert(take key, value: used.copy(self.alloc))
+    return used
+} Judge.function
+
+/// The stack use of a function judged: unbounded along the path down to an unbounded call
+/// site, otherwise its frame and its deepest call.
+fn settled_use(take unbounded: Option[mem::List[CallStep]], own_size: u64, deepest_bytes: u64, take deepest_path: mem::List[CallStep]) -> Use {
+    let Some(calls) = unbounded else {
+        return Use.Bounded(bytes: own_size + deepest_bytes, path: take deepest_path)
+    }
+    return Use.Unbounded(take calls)
+} settled_use
+
+/// The stack use of a call site under the bounds of its function's parameters.
+fn Judge.site(mut self, all_frames: Slice[Frame], site: Site, bounds: Slice[Option[u64]]) -> Use {
+    match site.kind {
+        StackKind.Stub => return Use.Bounded(bytes: STUB_CALL_BOUND, path: mem::List[CallStep].empty(self.alloc))
+        StackKind.Bounded(stack_bound) => return bounded_use(stack_bound, alloc: self.alloc)
+        StackKind.Param(position) => return bounded_use(param_bound(bounds, position), alloc: self.alloc)
+        StackKind.Direct(callee: callee, bindings: bindings) => {
+            var callee_bounds = self.own_of(all_frames, function: callee)
+            for passing in bindings {
+                let passed = mut self.passed_bound(all_frames, binding: passing.binding, bounds)
+                while callee_bounds.len() <= passing.position {
+                    mut callee_bounds.push(None)
+                }
+                callee_bounds[passing.position] = passed
+            }
+            return mut self.function(all_frames, function: callee, bounds: callee_bounds.view())
+        }
+    }
+} Judge.site
+
+/// What a direct call passes for a function-typed parameter, as a bound under the bounds of the
+/// calling function's parameters: a function's stack use, none for an unbounded one.
+fn Judge.passed_bound(mut self, all_frames: Slice[Frame], binding: Binding, bounds: Slice[Option[u64]]) -> Option[u64] {
+    match binding {
+        Binding.Function(passed_function) => {
+            let own = self.own_of(all_frames, function: passed_function)
+            return match mut self.function(all_frames, function: passed_function, bounds: own.view()) {
+                Use.Bounded(bytes: used_bytes, path: _) => Some(used_bytes)
+                Use.Unbounded(_) => None
+            }
+        }
+        Binding.Param(own_position) => return param_bound(bounds, position: own_position)
+        Binding.Bounded(stack_bound) => return stack_bound
+    }
+} Judge.passed_bound
+
+/// The because-chain of a call path: a `called` reason per call, and for an unbounded path
+/// a `raised` reason for its last call site, the unbounded one. Calls of code lowering
+/// writes itself, support routines and compiler stubs among them, have no reason.
+fn Judge.because(self, ck: check::Checker, all_frames: Slice[Frame], call_path: Slice[CallStep], unbounded: bool) -> mem::List[diagnostic::Reason] {
+    var reasons = mem::List[diagnostic::Reason].empty(self.alloc)
+    for step in 0..<call_path.len() {
+        let step_call = call_path[step]
+        let Some(position) = self.positions.get(step_call.function) else {
+            expect false
+            continue
+        }
+        expect position < all_frames.len() and step_call.index < all_frames[position].sites.len()
+        let site = all_frames[position].sites[step_call.index]
+        var role = diagnostic::Role.Called
+        if unbounded and step + 1 == call_path.len() {
+            role = diagnostic::Role.Raised
+        }
+        let subject = match site.kind {
+            StackKind.Direct(callee: callee, bindings: _) => self.name(all_frames, function: callee)
+            StackKind.Param(_) => text::String.of("function parameter", alloc: self.alloc)
+            StackKind.Bounded(_) => text::String.of("function value", alloc: self.alloc)
+            StackKind.Stub => text::String.empty(self.alloc)
+        }
+        if subject.is_empty() {
+            continue
+        }
+        let reason_at = match site.at {
+            Some(site_at) => Some(stack_location(ck, at: site_at, alloc: self.alloc))
+            None => None
+        }
+        mut reasons.push(diagnostic::Reason(role: role, subject: take subject, at: take reason_at))
+    }
+    return reasons
+} Judge.because
+
+fn Judge.name(self, all_frames: Slice[Frame], function: object::FuncId) -> text::String {
+    let Some(position) = self.positions.get(function) else {
+        return text::String.empty(self.alloc)
+    }
+    expect position < all_frames.len()
+    return text::String.of(all_frames[position].name.as_str(), alloc: self.alloc)
+} Judge.name
+
+/// The bounds a function's parameters have when it is judged on its own.
+fn own_bounds(frame: Frame, alloc: mem::Alloc) -> mem::List[Option[u64]] {
+    var len: usize = 0
+    for param in frame.params {
+        if param.position + 1 > len {
+            len = param.position + 1
+        }
+    }
+    var bounds = mem::List[Option[u64]].empty(alloc)
+    while bounds.len() < len {
+        mut bounds.push(None)
+    }
+    for param in frame.params {
+        expect param.position < bounds.len()
+        bounds[param.position] = param.stack
+    }
+    return bounds
+} own_bounds
+
+fn prepend(head: CallStep, take rest: mem::List[CallStep]) -> mem::List[CallStep] {
+    mut rest.insert(0, value: head)
+    return rest
+} prepend
+
+/// The workspace file and line of a place in source.
+fn stack_location(ck: check::Checker, at: At, alloc: mem::Alloc) -> diagnostic::At {
+    let db = ck.db()
+    return diagnostic::At(path: text::String.of(db.item_file(at.item).path.as_str(), alloc), line: db.line(at.item, token: at.span.head))
+} stack_location
+
+/// A diagnostic of a final build reported on a place in source; none on the carried std.
+fn stack_diagnostic(ck: check::Checker, at: At, code: diagnostic::Code, take because: mem::List[diagnostic::Reason]) -> Option[diagnostic::Diagnostic] {
+    let Some(found) = ck.diagnostic_on(at.item, construct: at.span, code) else {
+        return None
+    }
+    var reported = found
+    reported.because = because
+    return Some(take reported)
+} stack_diagnostic

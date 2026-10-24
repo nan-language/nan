@@ -1,0 +1,271 @@
+//! The CPU-facing operations of `hw`: the context of an interrupt fn, the privileged intrinsics of `hw::Ring0`, the interrupt descriptor table `hw::Idt.of_vectors` builds, the interrupted state an exception's `hw::TrapFrame` names, and copies from user memory through `hw::UserAddr`. Only an interrupt fn's context exists on the host, where no interrupt fires.
+
+/// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
+/// machine target completing one writes the local APIC's end-of-interrupt register, and its
+/// vector is the one the running CPU serves.
+fn irq_context(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "complete" => {
+            if lo.machine() {
+                mut lo.apic_eoi(mut fx)
+            }
+            supply.done(mut lo, mut fx)
+        }
+        "vector" => {
+            let vector = match lo.machine() {
+                true => mut lo.current_vector(mut fx)
+                false => mut fx.int(clif::Type.Int8, value: 0)
+            }
+            supply.ret(mut lo, mut fx, held: Held.Scalar(vector))
+        }
+        "irqs_disabled" => supply.ret(mut lo, mut fx, held: Held.Empty)
+        else => {
+            expect false
+        }
+    }
+} irq_context
+
+/// The privileged intrinsics, each one compiler stub on the running CPU. `load_idt` loads the
+/// table the box holds and keeps the box in its token; `write_cr3` installs a root and gives the
+/// one it replaces, which the CPU's record keeps, none for the entry root.
+fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "load_idt" => {
+            let table = cpu_word(mut fx, held: supply.param(1))
+            mut lo.load_idt(mut fx, table)
+            word_result(mut lo, mut fx, supply, value: table)
+        }
+        "write_cr3" => {
+            let root = cpu_word(mut fx, held: supply.param(1))
+            let replaced = mut lo.swap_root(mut fx, root)
+            let option = supply.abi.result
+            let entry_root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: replaced, y: 0)
+            mut fx.if_true(entry_root, then: fn[mut lo](mut fx1: Fx) {
+                let none = mut lo.none_value(mut fx1, option)
+                supply.ret(mut lo, fx: mut fx1, held: none)
+            })
+            let held = mut fx.slot(8, align: 8)
+            mut fx.store(replaced, addr: held, offset: 0)
+            let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(held)).view(), wrapped: None)
+            supply.ret(mut lo, mut fx, held: some)
+        }
+        "invalidate_page" => {
+            let page = cpu_word(mut fx, held: supply.param(1))
+            discard mut lo.call_stub(mut fx, stub: Stub.Invlpg, args: Array[clif::Value, 1].filled(page).view())
+            supply.done(mut lo, mut fx)
+        }
+        "read_msr" => {
+            let msr_number = supply.param(1).scalar_value()
+            let msr = mut fx.b.uextend(PTR, x: msr_number)
+            let read = mut lo.call_stub(mut fx, stub: Stub.Rdmsr, args: Array[clif::Value, 1].filled(msr).view())
+            expect read.len() > 0
+            supply.ret(mut lo, mut fx, held: Held.Scalar(read[0]))
+        }
+        "write_msr" => {
+            let msr_number = supply.param(1).scalar_value()
+            let msr = mut fx.b.uextend(PTR, x: msr_number)
+            let value = supply.param(2).scalar_value()
+            var args = Array[clif::Value, 2].filled(msr)
+            args[1] = value
+            discard mut lo.call_stub(mut fx, stub: Stub.Wrmsr, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} cpu_ring0
+
+/// `hw::Idt.of_vectors()`: the table whose gate n enters the vector seam's stub for n.
+fn cpu_idt(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut lo.fill_idt(mut fx, table: sret)
+    supply.ret(mut lo, mut fx, held: Held.Address(sret))
+} cpu_idt
+
+/// `hw::TrapFrame[V]`, which names the state the seam saved for an exception: `info` holds the
+/// error code the CPU pushed and, for a page fault, the faulting address; `ip` and `set_ip` read
+/// and replace the interrupted instruction pointer.
+fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let trap_frame = supply.param(0).address_value()
+    let Some(owner) = supply.owner else {
+        expect false
+        return
+    }
+    let saved_field = mut lo.layouts.field(lo.ck, ty: owner, variant: None, label: "saved")
+    let fault_field = mut lo.layouts.field(lo.ck, ty: owner, variant: None, label: "fault")
+    let saved = mut fx.load(PTR, addr: trap_frame, offset: saved_field.offset)
+    match supply.member() {
+        "info" => {
+            let info_ty = supply.type_arg(lo, index: 0)
+            let laid = mut lo.layout_of(info_ty)
+            let info = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+            var canonical = text::String.empty(lo.alloc)
+            match lo.ck.types().kind(info_ty) {
+                ty::TyKind.Item(item: info_item, args: _) => {
+                    canonical = lo.ck.db().canonical(info_item)
+                }
+                else => {}
+            }
+            if canonical.as_str() != "hw::NoCode" {
+                let code = mut fx.load(PTR, addr: saved, offset: FRAME_CODE)
+                let code_field = mut lo.layouts.field(lo.ck, ty: info_ty, variant: None, label: "code")
+                mut fx.store(code, addr: info, offset: code_field.offset)
+            }
+            if canonical.as_str() == "hw::PageFault" {
+                let address = mut fx.load(PTR, addr: trap_frame, offset: fault_field.offset)
+                let address_field = mut lo.layouts.field(lo.ck, ty: info_ty, variant: None, label: "address")
+                mut fx.store(address, addr: info, offset: address_field.offset)
+            }
+            let held = mut lo.held_at(mut fx, ty: info_ty, address: info)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "ip" => {
+            let ip = mut fx.load(PTR, addr: saved, offset: FRAME_RIP)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(ip))
+        }
+        "set_ip" => {
+            let ip = supply.param(1).scalar_value()
+            mut fx.store(ip, addr: saved, offset: FRAME_RIP)
+            supply.done(mut lo, mut fx)
+        }
+        "irqs_disabled" => supply.ret(mut lo, mut fx, held: Held.Empty)
+        else => {
+            expect false
+        }
+    }
+} cpu_trap_frame
+
+/// The user address space's upper end, the bit of a page-table entry granting user mode access,
+/// and the mask of an entry's frame address.
+const USER_END: i64 = 0x0000_8000_0000_0000
+
+const CPU_USER: i64 = 0x4
+
+const FRAME_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000
+
+/// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
+/// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
+/// mapped readable for user mode in the running CPU's page tables; otherwise it copies the bytes
+/// once each.
+fn user_addr(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "of" => word_result(mut lo, mut fx, supply, value: supply.param(0).scalar_value())
+        "value" => {
+            let value = cpu_word(mut fx, held: supply.param(0))
+            supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+        }
+        "copy_in" => copy_in(mut lo, mut fx, supply)
+        else => {
+            expect false
+        }
+    }
+} user_addr
+
+fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let start = cpu_word(mut fx, held: supply.param(0))
+    let value_ty = supply.type_arg(lo, index: 0)
+    let value_layout = mut lo.layout_of(value_ty)
+    let size = value_layout.contents().size
+    let size_value = mut fx.ptr(size)
+    let summed = mut fx.b.uadd_overflow(start, y: size_value)
+    let end = summed.value
+    let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: end, y: USER_END)
+    let outside = mut fx.b.bor(beyond, y: summed.flag)
+    mut fx.if_true(outside, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "OutsideUser")
+    })
+    let head = mut fx.b.band_imm_s(start, y: ~0xFFF)
+    let past_end = mut fx.b.iadd_imm_s(end, y: 0xFFF)
+    let spanned = mut fx.b.isub(past_end, y: head)
+    let pages = mut fx.b.ushr_imm_s(spanned, y: 12)
+    let laid = mut lo.layout_of(value_ty)
+    let copied = mut fx.slot(at_least_one(size), align: at_least_one(laid.contents().align))
+    let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let roots = mut lo.call_stub(mut fx, stub: Stub.ReadCr3, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0 and roots.len() > 0
+    let root = roots[0]
+    let yes = mut fx.int(clif::Type.Int8, value: 1)
+    let mapped_var = mut fx.variable(clif::Type.Int8, initial: yes)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: pages, body: fn(mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.ishl_imm_s(index, y: 12)
+        let page = mut fx1.b.iadd(head, y: offset)
+        let readable = user_readable(mut fx1, root, page)
+        let so_far = mut fx1.b.use_var(mapped_var)
+        let still = mut fx1.b.band(so_far, y: readable)
+        mut fx1.b.def_var(mapped_var, val: still)
+    })
+    let mapped = mut fx.b.use_var(mapped_var)
+    mut fx.if_true(mapped, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.copy(mut fx1, dst: copied, src: start, size, align: 1)
+    })
+    discard mut lo.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved[0]).view())
+    let unmapped = mut fx.b.bxor_imm_s(mapped, y: 1)
+    mut fx.if_true(unmapped, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Unmapped")
+    })
+    let held = mut lo.held_at(mut fx, ty: supply.abi.result, address: copied)
+    supply.ret(mut lo, mut fx, held)
+} copy_in
+
+/// Whether the page tables from `root` map the page at `page` present and user-accessible at
+/// every level, a large page ending the walk; the tables lie at their physical addresses.
+fn user_readable(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
+    let table = mut fx.b.band_imm_s(root, y: FRAME_ADDRESS)
+    let top = mut fx.ptr(1)
+    let readable = mut fx.int(clif::Type.Int8, value: 1)
+    var initial = Array[clif::Value, 3].filled(table)
+    initial[1] = top
+    initial[2] = readable
+    let walked = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 2
+        let level_table = current[0]
+        let level = current[1]
+        let readable_so_far = current[2]
+        let scaled = mut fx1.b.imul_imm_s(level, y: -9)
+        let shift = mut fx1.b.iadd_imm_s(scaled, y: 48)
+        let shifted = mut fx1.b.ushr(page, y: shift)
+        let index = mut fx1.b.band_imm_s(shifted, y: 0x1FF)
+        let slot_offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(level_table, y: slot_offset)
+        let entry = mut fx1.load(PTR, addr: slot, offset: 0)
+        let flags = mut fx1.b.band_imm_s(entry, y: i64.fit(MACHINE_PRESENT) | CPU_USER)
+        let allowed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: flags, y: i64.fit(MACHINE_PRESENT) | CPU_USER)
+        let still_readable = mut fx1.b.band(readable_so_far, y: allowed)
+        let large_bit = mut fx1.b.band_imm_s(entry, y: i64.fit(MACHINE_LARGE))
+        let large = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: large_bit, y: 0)
+        let leaf = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: 4)
+        let final_level = mut fx1.b.bor(large, y: leaf)
+        let ended = mut fx1.b.bxor_imm_s(allowed, y: 1)
+        let last = mut fx1.b.bor(final_level, y: ended)
+        let more = mut fx1.b.bxor_imm_s(last, y: 1)
+        let next = mut fx1.b.band_imm_s(entry, y: FRAME_ADDRESS)
+        let next_level = mut fx1.b.iadd_imm_s(level, y: 1)
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(next)
+        mut state.push(next_level)
+        mut state.push(still_readable)
+        return Pass(again: more, next: take state)
+    })
+    return walked[2]
+} user_readable
+
+/// The word a one-word value holds, whether held by address or as a scalar.
+fn cpu_word(mut fx: Fx, held: Held) -> clif::Value {
+    return match held {
+        Held.Address(address) => mut fx.load(PTR, addr: address, offset: 0)
+        else => held.scalar_value()
+    }
+} cpu_word
+
+/// Returns the operation's one-word result holding `value`.
+fn word_result(mut lo: Lowering, mut fx: Fx, supply: Supply, value: clif::Value) {
+    let slot = mut fx.slot(8, align: 8)
+    mut fx.store(value, addr: slot, offset: 0)
+    let held = mut lo.held_at(mut fx, ty: supply.abi.result, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} word_result

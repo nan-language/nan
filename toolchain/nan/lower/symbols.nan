@@ -1,0 +1,434 @@
+//! Host symbol names: the name of each lowered function in the object's symbol table, as the specification composes it from the package, its code root prefix, the canonical path, the role and the instantiation key; generated glue is named apart under `_NX`.
+
+/// Where a canonical path splits into its package and the segments after it.
+struct PathSplit derives Copy {
+    package_end: usize
+    rest_start: usize
+} PathSplit
+
+/// The symbol of an instance.
+fn symbols_name(mut lo: Lowering, instance: Instance) -> text::String {
+    match instance {
+        Instance.Nir(item: item, role: role, index: index, args: args) => return item_symbol(lo, item, role, index, args)
+        Instance.Supplied(item: item, args: args) => return item_symbol(lo, item, role: nir::Role.Body, index: 0, args)
+        else => {
+            expect lo.glue < 0xFFFF_FFFF
+            lo.glue += 1
+            var symbol = text::String.of("_NX", alloc: lo.alloc)
+            mut symbol.append(glue_word(instance, alloc: lo.alloc).as_str())
+            mut symbol.write(text::fmt("_{glue}", glue: lo.glue), budget: 32)
+            return symbol
+        }
+    }
+} symbols_name
+
+/// An instance as a diagnostic names it: its item's canonical path with its generic arguments,
+/// then the role and index of a NIR function other than a body.
+fn entity(ck: check::Checker, instance: Instance) -> text::String {
+    return match instance {
+        Instance.Nir(item: item, role: role, index: index, args: args) => item_entity(ck, item, role, index, args)
+        Instance.Supplied(item: item, args: args) => item_entity(ck, item, role: nir::Role.Body, index: 0, args)
+        else => glue_word(instance, alloc: ck.alloc())
+    }
+} entity
+
+/// A NIR function of an item as a diagnostic names it.
+fn item_entity(ck: check::Checker, item: ty::ItemId, role: nir::Role, index: u32, args: ty::Args) -> text::String {
+    let alloc = ck.alloc()
+    let module = ck.db().module_of(item)
+    var shown = ck.db().canonical(item)
+    mut shown.append(ck.show_args(ck.types().arg_list(args), from: module).as_str())
+    if role != nir::Role.Body {
+        mut shown.push(' ')
+        mut shown.append(role_word(role, alloc).as_str())
+        mut shown.write(text::fmt(" {index}", index), budget: 32)
+    }
+    return shown
+} item_entity
+
+fn glue_word(instance: Instance, alloc: mem::Alloc) -> text::String {
+    let word = match instance {
+        Instance.Derived(owner: _, method: _, args: _) => "derived"
+        Instance.Conformance(ty: _, method: _, args: _) => "conformance"
+        Instance.Release(_) => "release"
+        Instance.Value(_) => "value"
+        Instance.Dyn(ty: _, interface_item: _, args: _, method: _) => "dyn"
+        Instance.Sides(_) => "sides"
+        Instance.Nir(item: _, role: _, index: _, args: _) or Instance.Supplied(item: _, args: _) => "item"
+    }
+    return text::String.of(word, alloc)
+} glue_word
+
+/// Where a canonical path splits at its first `::`: its package, then the segments after it,
+/// none when it has no `::`.
+fn path_split(canonical: Str) -> PathSplit {
+    let Some(at) = canonical.find("::") else {
+        return PathSplit(package_end: canonical.byte_len(), rest_start: canonical.byte_len())
+    }
+    expect at <= canonical.byte_len() and canonical.byte_len() - at >= 2
+    return PathSplit(package_end: at, rest_start: at + 2)
+} path_split
+
+/// The host symbol name of a NIR function of an item.
+fn item_symbol(lo: Lowering, item: ty::ItemId, role: nir::Role, index: u32, args: ty::Args) -> text::String {
+    let alloc = lo.alloc
+    let path = match lo.ck.canonical_path(item) {
+        Some(found) => found
+        None => lo.ck.db().canonical(item)
+    }
+    let split = path_split(path.as_str())
+    let Some(package_name) = path.slice_bytes(0, end: split.package_end) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let Some(rest) = path.slice_bytes(split.rest_start, end: path.byte_len()) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    var prefix = text::String.of("aaaaaaaaaaaa", alloc)
+    match lo.prefixes.get(text::String.of(package_name, alloc)) {
+        Some(found) => {
+            prefix = text::String.of(found.as_str(), alloc)
+        }
+        None => {}
+    }
+    var symbol = text::String.of("_N", alloc)
+    mut symbol.write(text::fmt("{length}", length: package_name.byte_len()), budget: 32)
+    mut symbol.append(package_name)
+    mut symbol.push('_')
+    mut symbol.append(prefix.as_str())
+    mut symbol.push('_')
+    mut symbol.append(symbols_segments(rest, alloc).as_str())
+    mut symbol.push('E')
+    if role != nir::Role.Body {
+        let word = role_word(role, alloc)
+        mut symbol.push('F')
+        mut symbol.write(text::fmt("{length}{word}{index}", length: word.byte_len(), word: word.as_str(), index), budget: 64)
+    }
+    if lo.ck.types().arg_list(args).len() > 0 {
+        let key = instantiation_key(lo, item, args)
+        let Some(digest) = key.bytes.view().split_at(1) else {
+            expect false
+            return symbol
+        }
+        let encoded = hashing::checksummed_base32(digest.tail, alloc)
+        let Some(kept) = encoded.slice_bytes(0, end: 16) else {
+            expect false
+            return symbol
+        }
+        mut symbol.push('_')
+        mut symbol.append(kept)
+    }
+    return symbol
+} item_symbol
+
+/// The segments of a canonical path after its package: each preceded by its length, a member
+/// after `.` also by `D`, an impl segment as `I` and the nested forms of its type and interface.
+fn symbols_segments(rest: Str, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    let bytes = rest.as_bytes()
+    var at: usize = 0
+    while at < bytes.len() {
+        let Some(remaining) = rest.slice_bytes(at, end: bytes.len()) else {
+            expect false
+            return out
+        }
+        if remaining.starts_with("impl[") {
+            expect bytes.len() - at >= 5
+            at = impl_segment(mut out, rest, start: at + 5, alloc)
+            continue
+        }
+        let member = bytes[at] == b'.'
+        var start = at
+        while start < bytes.len() and bytes[start] == b'.' {
+            start += 1
+        }
+        var end = start
+        while end < bytes.len() and bytes[end] != b'.' and bytes[end] != b':' {
+            end += 1
+        }
+        let Some(segment) = rest.slice_bytes(start, end: end) else {
+            expect false
+            return out
+        }
+        if member {
+            mut out.push('D')
+        }
+        mut out.write(text::fmt("{length}", length: end - start), budget: 32)
+        mut out.append(segment)
+        at = colons_end(bytes, from: end)
+    }
+    return out
+} symbols_segments
+
+/// Writes an impl segment whose brackets' inside starts at `start`: `I` and the nested forms
+/// of its type and interface; gives the offset of the segment after it.
+fn impl_segment(mut out: text::String, rest: Str, start: usize, alloc: mem::Alloc) -> usize {
+    let bytes = rest.as_bytes()
+    let Some(inside) = rest.slice_bytes(start, end: bytes.len()) else {
+        expect false
+        return bytes.len()
+    }
+    let close = matching_bracket(inside)
+    expect close < inside.byte_len()
+    let Some(within) = inside.slice_bytes(0, end: close) else {
+        expect false
+        return bytes.len()
+    }
+    let Some(colon) = within.find(": ") else {
+        expect false
+        return bytes.len()
+    }
+    let Some(target) = within.slice_bytes(0, end: colon) else {
+        expect false
+        return bytes.len()
+    }
+    expect colon <= within.byte_len() and within.byte_len() - colon >= 2
+    let Some(interface_path) = within.slice_bytes(colon + 2, end: within.byte_len()) else {
+        expect false
+        return bytes.len()
+    }
+    mut out.push('I')
+    mut out.append(symbols_nested(target, alloc).as_str())
+    mut out.append(symbols_nested(interface_path, alloc).as_str())
+    return colons_end(bytes, from: start + close + 1)
+} impl_segment
+
+/// The offset past the `::` separators starting at `from`.
+fn colons_end(bytes: Slice[u8], from: usize) -> usize {
+    var at = from
+    while at + 1 < bytes.len() and bytes[at] == b':' and bytes[at + 1] == b':' {
+        at += 2
+    }
+    return at
+} colons_end
+
+fn matching_bracket(text: Str) -> usize {
+    let bytes = text.as_bytes()
+    var depth: u32 = 0
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'[' {
+            expect depth < 0xFFFF_FFFF
+            depth += 1
+        } else if bytes[at] == b']' {
+            if depth == 0 {
+                return at
+            }
+            depth -= 1
+        }
+    }
+    return bytes.len()
+} matching_bracket
+
+/// The nested form of a canonical path: `N`, its package and later segments, `E`.
+fn symbols_nested(canonical: Str, alloc: mem::Alloc) -> text::String {
+    let split = path_split(canonical)
+    let Some(package_name) = canonical.slice_bytes(0, end: split.package_end) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    let Some(rest) = canonical.slice_bytes(split.rest_start, end: canonical.byte_len()) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    var nested = text::String.of("N", alloc)
+    mut nested.write(text::fmt("{length}", length: package_name.byte_len()), budget: 32)
+    mut nested.append(package_name)
+    mut nested.append(symbols_segments(rest, alloc).as_str())
+    mut nested.push('E')
+    return nested
+} symbols_nested
+
+fn role_word(role: nir::Role, alloc: mem::Alloc) -> text::String {
+    let word = match role {
+        nir::Role.Body => "body"
+        nir::Role.Entry => "entry"
+        nir::Role.Closure => "closure"
+        nir::Role.Requires => "requires"
+        nir::Role.Ensures => "ensures"
+        nir::Role.Old => "old"
+        nir::Role.Example => "example"
+        nir::Role.Decreases => "decreases"
+        nir::Role.Invariant => "invariant"
+        nir::Role.Assume => "assume"
+        nir::Role.Predicate => "predicate"
+        nir::Role.Where => "where"
+        nir::Role.Default => "default"
+    }
+    return text::String.of(word, alloc)
+} role_word
+
+/// The instantiation key of an item with its generic arguments.
+fn instantiation_key(lo: Lowering, item: ty::ItemId, args: ty::Args) -> hashing::HashValue {
+    var keyed = text::String.of("instance\n", alloc: lo.alloc)
+    mut keyed.append(lo.ck.hashes(item).item.full(lo.alloc).as_str())
+    mut keyed.push('\n')
+    for arg in lo.ck.types().arg_list(args) {
+        mut keyed.append(arg_line(lo, arg).as_str())
+        mut keyed.push('\n')
+    }
+    return hashing::HashValue.of(keyed.as_bytes())
+} instantiation_key
+
+/// The line an instantiation key writes for a generic argument.
+fn arg_line(lo: Lowering, arg: ty::Arg) -> text::String {
+    var line = text::String.empty(lo.alloc)
+    match arg {
+        ty::Arg.Const(ty::Const.Int(value)) => {
+            mut line.write(text::fmt("{value}", value), budget: 64)
+        }
+        ty::Arg.Const(ty::Const.Bool(value)) => {
+            mut line.write(text::fmt("{value}", value), budget: 32)
+        }
+        ty::Arg.Const(ty::Const.Param(_)) or ty::Arg.Const(ty::Const.Error) => {
+            mut line.push('_')
+        }
+        ty::Arg.Ty(arg_ty) => {
+            mut line.append(type_hash(lo, ty: arg_ty).full(lo.alloc).as_str())
+        }
+    }
+    return line
+} arg_line
+
+/// The type hash of a type.
+fn type_hash(lo: Lowering, ty: ty::Ty) -> hashing::HashValue {
+    let alloc = lo.alloc
+    var hashed = text::String.of("type\n", alloc)
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Fn(id) => {
+            mut hashed.append(fn_text(lo, fn_ty: lo.ck.types().fn_of(id)).as_str())
+        }
+        ty::TyKind.Item(item: item, args: args) => {
+            var name = text::String.empty(alloc)
+            if lo.ck.db().is_std(item) and lo.ck.db().package_data(lo.ck.db().package_of(item)).name.as_str() == "core" {
+                match lo.ck.db().declaration(item).name(alloc) {
+                    Some(declared) => {
+                        name = declared
+                    }
+                    None => {}
+                }
+            } else {
+                name = lo.ck.hashes(item).item.full(alloc)
+            }
+            mut hashed.append(name.as_str())
+            mut hashed.push('\n')
+            for arg in lo.ck.types().arg_list(args) {
+                mut hashed.append(arg_line(lo, arg).as_str())
+                mut hashed.push('\n')
+            }
+        }
+        ty::TyKind.Dyn(bound) => {
+            mut hashed.append("Dyn\n")
+            mut hashed.append(lo.ck.hashes(bound.item).item.full(alloc).as_str())
+            mut hashed.push('\n')
+            for arg in lo.ck.types().arg_list(bound.args) {
+                mut hashed.append(arg_line(lo, arg).as_str())
+                mut hashed.push('\n')
+            }
+        }
+        else => {
+            mut hashed.append(ty_text(lo, ty).as_str())
+            mut hashed.push('\n')
+        }
+    }
+    return hashing::HashValue.of(hashed.as_bytes())
+} type_hash
+
+/// The normalised text of a type, its paths canonical.
+fn ty_text(lo: Lowering, ty: ty::Ty) -> text::String {
+    let alloc = lo.alloc
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return text::String.of(scalar.name(), alloc)
+        ty::TyKind.Unit => return text::String.of("Unit", alloc)
+        ty::TyKind.Never => return text::String.of("Never", alloc)
+        ty::TyKind.Item(item: item, args: args) => {
+            var shown = lo.ck.db().canonical(item)
+            let given = lo.ck.types().arg_list(args)
+            if given.len() == 0 {
+                return shown
+            }
+            mut shown.push('[')
+            for position in 0..<given.len() {
+                if position > 0 {
+                    mut shown.append(", ")
+                }
+                mut shown.append(arg_text(lo, arg: given[position]).as_str())
+            }
+            mut shown.push(']')
+            return shown
+        }
+        ty::TyKind.Fn(id) => return fn_text(lo, fn_ty: lo.ck.types().fn_of(id))
+        ty::TyKind.Dyn(bound) => {
+            var shown = text::String.of("Dyn[", alloc)
+            mut shown.append(lo.ck.db().canonical(bound.item).as_str())
+            mut shown.push(']')
+            return shown
+        }
+        ty::TyKind.Param(param) => {
+            var shown = text::String.empty(alloc)
+            mut shown.write(text::fmt("Param(Param {{ owner: ItemId({owner}), index: {index} }})", owner: param.owner.index, index: param.index), budget: 96)
+            return shown
+        }
+        ty::TyKind.Registers(item) => {
+            var shown = text::String.empty(alloc)
+            mut shown.write(text::fmt("Registers(ItemId({index}))", index: item.index), budget: 64)
+            return shown
+        }
+        ty::TyKind.Error => return text::String.of("Error", alloc)
+    }
+} ty_text
+
+fn arg_text(lo: Lowering, arg: ty::Arg) -> text::String {
+    var shown = text::String.empty(lo.alloc)
+    match arg {
+        ty::Arg.Ty(arg_ty) => return ty_text(lo, ty: arg_ty)
+        ty::Arg.Const(ty::Const.Int(value)) => {
+            mut shown.write(text::fmt("{value}", value), budget: 64)
+        }
+        ty::Arg.Const(ty::Const.Bool(value)) => {
+            mut shown.write(text::fmt("{value}", value), budget: 32)
+        }
+        ty::Arg.Const(ty::Const.Param(_)) or ty::Arg.Const(ty::Const.Error) => {
+            mut shown.push('_')
+        }
+    }
+    return shown
+} arg_text
+
+fn fn_text(lo: Lowering, fn_ty: ty::FnTy) -> text::String {
+    var shown = text::String.of("fn(", alloc: lo.alloc)
+    for position in 0..<fn_ty.params.len() {
+        let param = fn_ty.params[position]
+        if position > 0 {
+            mut shown.append(", ")
+        }
+        match param.mode {
+            ast::Mode.Read => {}
+            ast::Mode.Mut => {
+                mut shown.append("mut ")
+            }
+            ast::Mode.Take => {
+                mut shown.append("take ")
+            }
+        }
+        mut shown.append(param.name.as_str())
+        mut shown.append(": ")
+        mut shown.append(ty_text(lo, ty: param.ty).as_str())
+    }
+    mut shown.push(')')
+    if fn_ty.result != ty::Ty.unit() {
+        mut shown.append(" -> ")
+        mut shown.append(ty_text(lo, ty: fn_ty.result).as_str())
+    }
+    match fn_ty.failure {
+        Some(failure) => {
+            mut shown.append(" fails ")
+            mut shown.append(ty_text(lo, ty: failure).as_str())
+        }
+        None => {}
+    }
+    if fn_ty.wait {
+        mut shown.append(" uses wait")
+    }
+    return shown
+} fn_text

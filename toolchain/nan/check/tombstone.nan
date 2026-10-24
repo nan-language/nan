@@ -9,7 +9,7 @@ struct PathRewrite derives Copy {
 
 /// The aliases tombstones give the keys of a type's fields and variants: each old key, by
 /// the key its rewrite reaches through further tombstones.
-fn Checker.key_aliases(self, item: ty::ItemId) -> mem::HashMap[mem::Bytes, mem::Bytes] {
+pkg fn Checker.key_aliases(self, item: ty::ItemId) -> mem::HashMap[mem::Bytes, mem::Bytes] {
     let db = self.db()
     let alloc = self.alloc()
     var prefix = db.type_path(TypeKey.Item(item))
@@ -194,7 +194,7 @@ fn Checker.head_exports(self, package_id: ty::PackageId) -> Option[mem::Shared[m
         Some(entries) => {
             for entry in entries {
                 if entry.root(alloc) == head {
-                    exported = Some(mem::Shared.of(release_exports(entry.artefact.view(), grammar: self.session().grammar.contents(), alloc), alloc))
+                    exported = Some(mem::Shared.of(release::exported(entry.artefact.view(), grammar: self.session().grammar.contents(), alloc), alloc))
                     break
                 }
             }
@@ -337,6 +337,7 @@ fn Checker.field_or_variant(self, owner: ty::ItemId, member: Str) -> Option[ast:
 fn Checker.named_members(self, typed: TExpr, mut named: mem::List[ast::Visibility]) {
     var count: usize = 0
     typed.each_child(fn[mut count](child: TExpr) {
+        expect count < ~0usize
         count += 1
     })
     var index = count
@@ -348,6 +349,7 @@ fn Checker.named_members(self, typed: TExpr, mut named: mem::List[ast::Visibilit
             if at == wanted {
                 self.named_member(child, mut named)
             }
+            expect at < count
             at += 1
         })
     }
@@ -463,6 +465,7 @@ fn head_param_texts(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
         invariant depth >= 0
         let byte = bytes[at]
         if byte == b'(' or byte == b'[' {
+            expect depth < 0x7FFF_FFFF
             depth += 1
         } else if byte == b')' or byte == b']' {
             depth -= 1
@@ -481,6 +484,7 @@ fn head_param_texts(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
         invariant depth >= 0
         let byte = bytes[at]
         if byte == b'(' or byte == b'[' {
+            expect depth < 0x7FFF_FFFF
             depth += 1
         } else if byte == b')' or byte == b']' {
             depth -= 1
@@ -834,93 +838,3 @@ fn trimmed_copy(written: Str, alloc: mem::Alloc) -> text::String {
     let run = platform::trimmed_run(written)
     return sliced(written, start: run.start, end: run.end, alloc)
 } trimmed_copy
-
-/// The exported items of a release, by canonical path: the entries its interface records with
-/// an interface hash.
-fn release_exports(artefact_bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::Map[text::String, machine::ApiEntry] {
-    var found = mem::Map[text::String, machine::ApiEntry].empty(alloc)
-    let Ok(decoded) = artefact::decode(artefact_bytes, alloc) else {
-        return found
-    }
-    for written in interface_texts(decoded.code_root.view(), alloc) {
-        if written.is_empty() {
-            continue
-        }
-        var file = text::String.of(written.as_str(), alloc)
-        mut file.append("check \"")
-        mut file.append(hashing::HashValue.of(written.as_bytes()).full(alloc).as_str())
-        mut file.append("\"\n")
-        let Ok(snapshot) = machine::Snapshot.read(file.as_bytes(), grammar, alloc) else {
-            continue
-        }
-        for entry in take snapshot.entries {
-            if entry.interface_hash.is_some() {
-                discard mut found.insert(text::String.of(entry.path.as_str(), alloc), value: take entry)
-            }
-        }
-    }
-    return found
-} release_exports
-
-/// The interface texts of a code root's interface part, one per module.
-fn interface_texts(code_root: Slice[u8], alloc: mem::Alloc) -> mem::List[text::String] {
-    var found = mem::List[text::String].empty(alloc)
-    let Some(content) = root_part(code_root, wanted: 3) else {
-        return found
-    }
-    expect content.start <= content.next
-    let Some(parts) = code_root.split_at(content.start) else {
-        return found
-    }
-    let Some(held) = parts.tail.prefix(content.next - content.start) else {
-        return found
-    }
-    let Some(pairs) = artefact::read_uvar(held, at: 0) else {
-        return found
-    }
-    let count = match pairs.value.to_u64() {
-        Some(small) => small
-        None => 0xFFFF_FFFF_FFFF_FFFF
-    }
-    var at = pairs.next
-    var index: u64 = 0
-    while index < count {
-        let Some(module) = artefact::read_bytes(held, at) else {
-            return found
-        }
-        let Some(written) = artefact::read_bytes(held, at: module.next) else {
-            return found
-        }
-        at = written.next
-        mut found.push(output::lossy(written.copy(held, alloc).view(), alloc))
-        index += 1
-    }
-    return found
-} interface_texts
-
-/// The content of the part of a code root with the key `wanted`.
-fn root_part(code_root: Slice[u8], wanted: u64) -> Option[artefact::Chunk] {
-    let Some(count) = artefact::read_uvar(code_root, at: 0) else {
-        return None
-    }
-    let total = match count.value.to_u64() {
-        Some(small) => small
-        None => 0xFFFF_FFFF_FFFF_FFFF
-    }
-    var at = count.next
-    var index: u64 = 0
-    while index < total {
-        let Some(key) = artefact::read_uvar(code_root, at) else {
-            return None
-        }
-        let Some(content) = artefact::read_bytes(code_root, at: key.next) else {
-            return None
-        }
-        if key.value == wide::Wide.of_u64(wanted) {
-            return Some(content)
-        }
-        at = content.next
-        index += 1
-    }
-    return None
-} root_part

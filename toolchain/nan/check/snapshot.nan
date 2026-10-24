@@ -1,0 +1,693 @@
+//! API snapshots as `nan api update` writes them: per module of a package, an entry for each item consumers see with its interface text, promises, interface hash, digests and public docs, each item's accepted spec and pending weakening, and the seals of its items.
+
+/// An item as one checker holds it: the target the checker checks under, the item, and the path
+/// of the file holding it.
+pkg struct Variant {
+    pkg target: workspace::Target
+    pkg ck: Checker
+    pkg item: ty::ItemId
+    pkg file: text::String
+} Variant
+
+/// A package of a checker's database, with the checker.
+pkg struct CheckedPackage {
+    pkg id: ty::PackageId
+    pkg ck: Checker
+} CheckedPackage
+
+/// The items of a package across the checkers of its targets, by canonical path, each with the
+/// variants holding it under each target, in byte order of file path, then of target.
+pkg struct Items {
+    pkg by_path: mem::Map[text::String, mem::List[Variant]]
+    /// The package item's hashes and ledger under the first checker.
+    pkg checked_package: Option[CheckedPackage]
+} Items
+
+fn Items.of(checkers: Slice[TargetChecker], package_name: Str, alloc: mem::Alloc) -> Items {
+    var by_path = mem::Map[text::String, mem::List[Variant]].empty(alloc)
+    var found_package: Option[CheckedPackage] = None
+    for held in checkers {
+        let ck = held.checker
+        let Some(id) = ck.package_named(package_name) else {
+            continue
+        }
+        if found_package.is_none() {
+            found_package = Some(CheckedPackage(id: id, ck: ck.share()))
+        }
+        let db = ck.db()
+        for module in db.package_data(id).modules {
+            for item in db.module(module).items {
+                let Some(path) = ck.canonical_path(item) else {
+                    continue
+                }
+                var variants = match mut by_path.remove(path) {
+                    Some(known) => known
+                    None => mem::List[Variant].empty(alloc)
+                }
+                let file = db.item_file(item).path.as_str()
+                let at = match variants.position(fn(known: Variant) => variant_after(known, file, target: held.target)) {
+                    Some(found) => found
+                    None => variants.len()
+                }
+                mut variants.insert(at, value: Variant(target: held.target, ck: ck.share(), item: item, file: text::String.of(file, alloc)))
+                discard mut by_path.insert(take path, value: take variants)
+            }
+        }
+    }
+    return Items(by_path: take by_path, checked_package: take found_package)
+} Items.of
+
+/// Whether a variant comes after one of a file and target: in byte order of file path, then of
+/// target.
+fn variant_after(variant: Variant, file: Str, target: workspace::Target) -> bool {
+    let files = variant.file.as_str().cmp(file)
+    if files != core::Ordering.Equal {
+        return files == core::Ordering.Greater
+    }
+    return variant.target.name() > target.name()
+} variant_after
+
+/// The variants of an item, by canonical path.
+pkg proj fn Items.variants(self, path: Str) -> Option[mem::List[Variant]] {
+    return self.by_path.get_by(fn(key: text::String) => key.as_str().cmp(path))
+} Items.variants
+
+/// The variant of an item whose text and docs its entry holds: the first by file path.
+pkg proj fn Items.first_variant(self, path: Str) -> Option[Variant] {
+    let Some(variants) = self.variants(path) else {
+        return None
+    }
+    return variants.get(0)
+} Items.first_variant
+
+/// The sealed item hash of an item: its item hash, or for an item that two or more target
+/// variants hold, the hash of `variants`, LF and each variant's item hash in full form and LF,
+/// in byte order of its directory's path.
+pkg fn Items.sealed_hash(self, path: Str, alloc: mem::Alloc) -> Option[hashing::HashValue] {
+    if self.is_package_path(path) {
+        let Some(held) = self.checked_package else {
+            return None
+        }
+        let Some(hashes) = held.ck.package_hashes(held.id) else {
+            return None
+        }
+        return Some(hashes.item)
+    }
+    let Some(variants) = self.variants(path) else {
+        return None
+    }
+    var dirs = mem::List[text::String].empty(alloc)
+    var hashes = mem::List[hashing::HashValue].empty(alloc)
+    for variant in variants {
+        let dir = match last_slash(variant.file.as_str()) {
+            Some(at) => variant.file.slice_bytes(0, end: at)
+            None => Some("")
+        }
+        let Some(held) = dir else {
+            expect false
+            continue
+        }
+        if not holds_text(dirs.view(), text: held) {
+            mut dirs.push(text::String.of(held, alloc))
+            mut hashes.push(variant.ck.hashes(variant.item).item)
+        }
+    }
+    if hashes.len() < 2 {
+        return hashes.get(0)
+    }
+    var written = text::String.of("variants\n", alloc)
+    for hash in hashes {
+        mut written.append(hash.full(alloc).as_str())
+        mut written.push('\n')
+    }
+    return Some(hashing::HashValue.of(written.as_bytes()))
+} Items.sealed_hash
+
+/// The closure entries of an item: the union of its variants'.
+pkg fn Items.closure_entries(self, path: Str, alloc: mem::Alloc) -> mem::Set[machine::ClosureEntry] {
+    var entries = mem::Set[machine::ClosureEntry].empty(alloc)
+    let Some(variants) = self.variants(path) else {
+        return entries
+    }
+    for variant in variants {
+        for entry in take variant.ck.closure_entries(variant.item) {
+            discard mut entries.insert(take entry)
+        }
+    }
+    return entries
+} Items.closure_entries
+
+/// Whether a seal of an item is current: it holds no signature and the item's sealed item
+/// hash and closure hash are those it records.
+pkg fn Items.seal_current(self, path: Str, seal: machine::Seal, alloc: mem::Alloc) -> bool {
+    return seal.signature.is_none() and self.sealed_hash(path, alloc) == Some(seal.item) and closure_hash(self.closure_entries(path, alloc), alloc) == seal.closure
+} Items.seal_current
+
+/// Whether an item holds a trust escape: the package item through its grants.
+pkg fn Items.holds_escape(self, path: Str) -> bool {
+    if self.is_package_path(path) {
+        let Some(held) = self.checked_package else {
+            return false
+        }
+        return held.ck.grant_ledger(held.id).len() > 0
+    }
+    let Some(variant) = self.first_variant(path) else {
+        return false
+    }
+    return variant.ck.holds_escape(variant.item)
+} Items.holds_escape
+
+/// The canonical path of the package item: the package name.
+pkg fn Items.package_path(self, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(held) = self.checked_package else {
+        return None
+    }
+    return Some(text::String.of(held.ck.db().package_data(held.id).name.as_str(), alloc))
+} Items.package_path
+
+/// Whether a canonical path is the package item's.
+pkg fn Items.is_package_path(self, path: Str) -> bool {
+    let Some(held) = self.checked_package else {
+        return false
+    }
+    return held.ck.db().package_data(held.id).name.as_str() == path
+} Items.is_package_path
+
+/// A pending weakening `nan api update` records: the item's canonical path, file and first
+/// line, and its weakened parts.
+pkg struct Recorded {
+    pkg path: text::String
+    pkg file: text::String
+    pkg line: u32
+    pkg parts: mem::List[text::String]
+} Recorded
+
+/// The entries of a module's snapshot, none when its snapshot holds no entry.
+pkg struct ModuleSnapshot {
+    pkg name: text::String
+    pkg entries: mem::List[machine::ApiEntry]
+} ModuleSnapshot
+
+/// The snapshot a module's entries make, none for no entry.
+pkg fn ModuleSnapshot.into_snapshot(take self) -> Option[machine::Snapshot] {
+    let ModuleSnapshot(name: _, entries: entries) = self
+    if entries.len() == 0 {
+        return None
+    }
+    return Some(machine::Snapshot(entries: take entries))
+} ModuleSnapshot.into_snapshot
+
+/// The snapshots of a package's modules, by module name, and the pending weakenings recorded.
+pkg struct Snapshots {
+    pkg modules: mem::List[ModuleSnapshot]
+    pkg recorded: mem::List[Recorded]
+} Snapshots
+
+/// Where an entry lies among the snapshots: its module's index and its own.
+struct EntryAt derives Copy {
+    module: usize
+    entry: usize
+} EntryAt
+
+/// The entry of an item, by canonical path.
+pkg proj fn Snapshots.entry(self, path: Str) -> Option[machine::ApiEntry] {
+    let Some(at) = self.entry_at(path) else {
+        return None
+    }
+    expect at.module < self.modules.len()
+    return self.modules[at.module].entries.get(at.entry)
+} Snapshots.entry
+
+fn Snapshots.entry_at(self, path: Str) -> Option[EntryAt] {
+    for module in 0..<self.modules.len() {
+        let entries = self.modules[module].entries
+        for entry in 0..<entries.len() {
+            if entries[entry].path.as_str() == path {
+                return Some(EntryAt(module: module, entry: entry))
+            }
+        }
+    }
+    return None
+} Snapshots.entry_at
+
+/// The snapshots `nan api update` computes for a package from its source, its snapshots and,
+/// for each item of `confirmed`, the bound hashes of its public docs set to its interface hash.
+pkg fn Items.snapshots(self, source: workspace::Package, confirmed: Slice[text::String], alloc: mem::Alloc) -> Snapshots {
+    var modules = mem::Map[text::String, mem::List[machine::ApiEntry]].empty(alloc)
+    var recorded = mem::List[Recorded].empty(alloc)
+    for module in source.modules {
+        if not modules.contains(module.name) {
+            discard mut modules.insert(text::String.of(module.name.as_str(), alloc), value: mem::List[machine::ApiEntry].empty(alloc))
+        }
+    }
+    for listed in self.by_path {
+        let path = listed.key().as_str()
+        let Some(first_variant) = listed.value().get(0) else {
+            expect false
+            continue
+        }
+        let ck = first_variant.ck
+        let db = ck.db()
+        match db.ast(first_variant.item).kind {
+            ast::ItemKind.Retired(_) or ast::ItemKind.Package => continue
+            else => {}
+        }
+        let module = text::String.of(db.module(db.module_of(first_variant.item)).name.as_str(), alloc)
+        let made = self.entry(path, old: source.machine.entry(module.as_str(), path), confirm: holds_text(confirmed, text: path), alloc)
+        let EntryMade(entry: entry, pending: pending) = made
+        match pending {
+            Some(parts) => {
+                mut recorded.push(Recorded(path: text::String.of(path, alloc), file: text::String.of(db.item_file(first_variant.item).path.as_str(), alloc), line: db.head_line(first_variant.item), parts: take parts))
+            }
+            None => {}
+        }
+        match entry {
+            Some(kept) => add_entry(mut modules, module: take module, entry: take kept, alloc)
+            None => {}
+        }
+    }
+    self.package_entry(source, mut modules, alloc)
+    var computed = mem::List[ModuleSnapshot].empty(alloc)
+    for held in take modules {
+        let mem::KeyValue(key: name, value: entries) = held
+        mut computed.push(ModuleSnapshot(name: take name, entries: take entries))
+    }
+    return Snapshots(modules: take computed, recorded: take recorded)
+} Items.snapshots
+
+/// Adds the entry of the package item to its root module's entries, when it keeps seals.
+fn Items.package_entry(self, source: workspace::Package, mut modules: mem::Map[text::String, mem::List[machine::ApiEntry]], alloc: mem::Alloc) {
+    let Some(held) = self.checked_package else {
+        return
+    }
+    let db = held.ck.db()
+    let Some(root_module) = db.package_data(held.id).root else {
+        return
+    }
+    let Some(path) = self.package_path(alloc) else {
+        return
+    }
+    let root = text::String.of(db.module(root_module).name.as_str(), alloc)
+    let seals = self.kept_seals(path.as_str(), old: source.machine.entry(root.as_str(), path: path.as_str()), pending: false, alloc)
+    if seals.len() == 0 {
+        return
+    }
+    var entries = match mut modules.remove(root) {
+        Some(known) => known
+        None => mem::List[machine::ApiEntry].empty(alloc)
+    }
+    var entry = machine::ApiEntry.empty(path.as_str(), alloc)
+    entry.seals = seals
+    mut entries.push(take entry)
+    mut entries.sort_by(fn(left: machine::ApiEntry, right: machine::ApiEntry) => left.path.as_str().cmp(right.path.as_str()))
+    discard mut modules.insert(take root, value: take entries)
+} Items.package_entry
+
+fn add_entry(mut modules: mem::Map[text::String, mem::List[machine::ApiEntry]], take module: text::String, take entry: machine::ApiEntry, alloc: mem::Alloc) {
+    var entries = match mut modules.remove(module) {
+        Some(known) => known
+        None => mem::List[machine::ApiEntry].empty(alloc)
+    }
+    mut entries.push(take entry)
+    discard mut modules.insert(take module, value: take entries)
+} add_entry
+
+/// Why `nan seal` writes nothing: the item needs no seal, its module's snapshot is not current,
+/// or the seal would break the author rule, sharing this author.
+pkg enum Unsealed {
+    Unneeded
+    Stale
+    SameAuthor(text::String)
+} Unsealed
+
+/// A seal `nan seal` writes: the name of the module whose snapshot records it, that snapshot, the
+/// seal, and the spec it accepts when the item has a pending weakening.
+pkg struct Sealed {
+    pkg module: text::String
+    pkg snapshot: machine::Snapshot
+    pkg seal: machine::Seal
+    pkg accepted: Option[machine::Accepted]
+} Sealed
+
+/// The snapshot of the module recording the item at `path` once `principal` seals it, from the
+/// snapshots `nan api update` computes: the seal replaces an earlier one of the principal and
+/// accepts the item's pending weakening.
+pkg fn Items.sealed(self, source: workspace::Package, take computed: Snapshots, path: Str, principal: Str, alloc: mem::Alloc) -> Result[Sealed, Unsealed] {
+    let Some(module) = self.sealed_module(path, alloc) else {
+        return Err(Unsealed.Unneeded)
+    }
+    var current: Option[machine::Snapshot] = None
+    let Snapshots(modules: modules, recorded: _) = computed
+    for held in take modules {
+        if held.name == module {
+            current = take held.into_snapshot()
+            break
+        }
+    }
+    if current != source.machine.snapshot(module.as_str()) {
+        return Err(Unsealed.Stale)
+    }
+    var snapshot = machine::Snapshot.empty(alloc)
+    match current {
+        Some(held) => {
+            snapshot = held
+        }
+        None => {}
+    }
+    let at = entry_position(mut snapshot, path, alloc)
+    expect at < snapshot.entries.len()
+    let held_entry = snapshot.entries[at]
+    var pending = held_entry.pending.len() > 0
+    for method in held_entry.accepted.methods {
+        if method.pending.len() > 0 {
+            pending = true
+        }
+    }
+    if not pending and not self.holds_escape(path) {
+        return Err(Unsealed.Unneeded)
+    }
+    var accepted: Option[machine::Accepted] = None
+    if pending {
+        match self.first_variant(path) {
+            Some(first_variant) => {
+                let spec = first_variant.ck.spec(first_variant.item)
+                accepted = Some(spec.copy(alloc))
+                snapshot.entries[at].accepted = spec
+                expect at < snapshot.entries.len()
+                mut snapshot.entries[at].pending.truncate(0)
+            }
+            None => {}
+        }
+    }
+    let entries = self.closure_entries(path, alloc)
+    let Some(item_hash) = self.sealed_hash(path, alloc) else {
+        return Err(Unsealed.Unneeded)
+    }
+    let closure = closure_hash(entries, alloc)
+    var listed = mem::List[machine::ClosureEntry].empty(alloc)
+    for entry in take entries {
+        mut listed.push(take entry)
+    }
+    let seal = machine::Seal(principal: text::String.of(principal, alloc), item: item_hash, closure: closure, entries: take listed, signature: None)
+    expect at < snapshot.entries.len()
+    mut snapshot.entries[at].seals.retain(fn(kept: machine::Seal) => kept.principal.as_str() != principal)
+    var seal_at: usize = 0
+    expect at < snapshot.entries.len()
+    let seals = snapshot.entries[at].seals
+    while seal_at < seals.len() and seals[seal_at].principal.as_str() < principal {
+        seal_at += 1
+    }
+    mut snapshot.entries[at].seals.insert(seal_at, value: seal.copy(alloc))
+    return Ok(Sealed(module: take module, snapshot: take snapshot, seal: take seal, accepted: take accepted))
+} Items.sealed
+
+/// The name of the module whose snapshot records the item at `path`: the root module for the
+/// package item.
+fn Items.sealed_module(self, path: Str, alloc: mem::Alloc) -> Option[text::String] {
+    if self.is_package_path(path) {
+        let Some(held) = self.checked_package else {
+            return None
+        }
+        let db = held.ck.db()
+        let Some(root) = db.package_data(held.id).root else {
+            return None
+        }
+        return Some(text::String.of(db.module(root).name.as_str(), alloc))
+    }
+    let Some(first_variant) = self.first_variant(path) else {
+        return None
+    }
+    let db = first_variant.ck.db()
+    return Some(text::String.of(db.module(db.module_of(first_variant.item)).name.as_str(), alloc))
+} Items.sealed_module
+
+/// The position of the entry of `path` in a snapshot, an empty entry inserted in byte order of
+/// path when it holds none.
+fn entry_position(mut snapshot: machine::Snapshot, path: Str, alloc: mem::Alloc) -> usize {
+    match snapshot.entries.position(fn(entry: machine::ApiEntry) => entry.path.as_str() == path) {
+        Some(at) => return at
+        None => {}
+    }
+    var at: usize = 0
+    while at < snapshot.entries.len() and snapshot.entries[at].path.as_str() < path {
+        at += 1
+    }
+    mut snapshot.entries.insert(at, value: machine::ApiEntry.empty(path, alloc))
+    return at
+} entry_position
+
+/// An item's entry and the weakened parts it records as pending, if any.
+struct EntryMade {
+    entry: Option[machine::ApiEntry]
+    pending: Option[mem::List[text::String]]
+} EntryMade
+
+/// The entry of an item and the weakened parts it records as pending, if any.
+fn Items.entry(self, path: Str, old: Option[machine::ApiEntry], confirm: bool, alloc: mem::Alloc) -> EntryMade {
+    let Some(first_variant) = self.first_variant(path) else {
+        expect false
+        return EntryMade(entry: None, pending: None)
+    }
+    let ck = first_variant.ck
+    let item = first_variant.item
+    var entry = machine::ApiEntry.empty(path, alloc)
+    if ck.consumers_see(item) {
+        self.consumer_entry(path, old, confirm, mut entry, alloc)
+    }
+    let current = ck.spec(item)
+    var accepted = machine::Accepted.empty(alloc)
+    match old {
+        Some(held) => {
+            accepted = held.accepted.copy(alloc)
+        }
+        None => {}
+    }
+    var pending: Option[mem::List[text::String]] = None
+    if not current.is_empty() or not accepted.is_empty() {
+        pending = accept_spec(ck, item, take accepted, take current, mut entry, alloc)
+    }
+    entry.seals = self.kept_seals(path, old, pending: pending.is_some(), alloc)
+    let kept = ck.consumers_see(item) or not entry.accepted.is_empty() or pending.is_some() or entry.seals.len() > 0
+    if not kept {
+        return EntryMade(entry: None, pending: take pending)
+    }
+    return EntryMade(entry: Some(take entry), pending: take pending)
+} Items.entry
+
+/// Fills what consumers see of an item into its entry: its interface text, promises, interface
+/// hash, digests and public docs, each doc keeping its old bound hash unless `confirm`.
+fn Items.consumer_entry(self, path: Str, old: Option[machine::ApiEntry], confirm: bool, mut entry: machine::ApiEntry, alloc: mem::Alloc) {
+    let Some(first_variant) = self.first_variant(path) else {
+        expect false
+        return
+    }
+    let ck = first_variant.ck
+    let item = first_variant.item
+    let hashes = ck.hashes(item)
+    entry.text = ck.interface_text(item, viewer: None)
+    entry.promises = ck.promises(item)
+    entry.interface_hash = hashes.interface_hash
+    match ck.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => {
+            entry.digests = self.digests(path, alloc)
+        }
+        else => {}
+    }
+    let bound_hash = match hashes.interface_hash {
+        Some(hash) => hash
+        None => hashes.item
+    }
+    var docs = mem::List[machine::Doc].empty(alloc)
+    for doc in take ck.public_docs(item) {
+        let PublicDoc(key: key, text: written, line: _) = doc
+        var bound = bound_hash
+        match old {
+            Some(held) => {
+                for known in held.docs {
+                    if known.key == key and known.text == written and not confirm {
+                        bound = known.bound
+                        break
+                    }
+                }
+            }
+            None => {}
+        }
+        mut docs.push(machine::Doc(key: take key, bound: bound, text: take written))
+    }
+    entry.docs = docs
+} Items.consumer_entry
+
+/// A function's digest line per declared target, in byte order of target.
+fn Items.digests(self, path: Str, alloc: mem::Alloc) -> mem::List[machine::TargetDigest] {
+    var digests = mem::List[machine::TargetDigest].empty(alloc)
+    let Some(variants) = self.variants(path) else {
+        return digests
+    }
+    for variant in variants {
+        let target = variant.target.name()
+        if digests.position(fn(known: machine::TargetDigest) => known.target.as_str() == target).is_some() {
+            continue
+        }
+        mut digests.push(machine::TargetDigest(target: text::String.of(target, alloc), digest: variant.ck.digest_text(variant.item)))
+    }
+    mut digests.sort_by(fn(left: machine::TargetDigest, right: machine::TargetDigest) -> core::Ordering {
+        let targets = left.target.as_str().cmp(right.target.as_str())
+        if targets != core::Ordering.Equal {
+            return targets
+        }
+        return left.digest.as_str().cmp(right.digest.as_str())
+    })
+    return digests
+} Items.digests
+
+/// Sets an entry's accepted spec: the current one when it weakens nothing of the accepted one,
+/// else the accepted one with its weakened parts pending. Returns the weakened parts, if any.
+fn accept_spec(ck: Checker, item: ty::ItemId, take accepted: machine::Accepted, take current: machine::Accepted, mut entry: machine::ApiEntry, alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    let item_hash = ck.hashes(item).item
+    match ck.db().ast(item).kind {
+        ast::ItemKind.Interface(_) => {
+            let weakened = ck.weakened_methods(accepted, current)
+            if weakened.len() == 0 {
+                entry.accepted = current
+                return None
+            }
+            entry.accepted = accepted
+            var all = mem::List[text::String].empty(alloc)
+            for method in mut entry.accepted.methods {
+                var method_pending = mem::List[machine::Pending].empty(alloc)
+                match weakened.get(method.name) {
+                    Some(parts) => {
+                        for part in parts {
+                            mut method_pending.push(machine::Pending(hash: item_hash, part: text::String.of(part.as_str(), alloc)))
+                            mut all.push(text::String.of(part.as_str(), alloc))
+                        }
+                    }
+                    None => {}
+                }
+                method.pending = method_pending
+            }
+            return Some(take all)
+        }
+        else => {
+            let weakened = ck.weakened(item, accepted, current)
+            if weakened.len() == 0 {
+                entry.accepted = current
+                return None
+            }
+            entry.accepted = accepted
+            var item_pending = mem::List[machine::Pending].empty(alloc)
+            for part in weakened {
+                mut item_pending.push(machine::Pending(hash: item_hash, part: text::String.of(part.as_str(), alloc)))
+            }
+            entry.pending = item_pending
+            return Some(take weakened)
+        }
+    }
+} accept_spec
+
+/// The seals of an item's entry that `nan api update` keeps: all, but the lapsed ones of an item
+/// that needs no seal.
+fn Items.kept_seals(self, path: Str, old: Option[machine::ApiEntry], pending: bool, alloc: mem::Alloc) -> mem::List[machine::Seal] {
+    let needs = pending or self.holds_escape(path)
+    var seals = mem::List[machine::Seal].empty(alloc)
+    let Some(held) = old else {
+        return seals
+    }
+    for seal in held.seals {
+        if needs or self.seal_current(path, seal, alloc) {
+            mut seals.push(seal.copy(alloc))
+        }
+    }
+    return seals
+} Items.kept_seals
+
+/// The promises a `pub` struct or enum states: those of `Copy`, `Send`, `Inert` and `AnyBits`
+/// consumers see, each with the generic parameters it rests on.
+fn Checker.promises(self, item: ty::ItemId) -> mem::List[machine::Promise] {
+    let alloc = self.alloc()
+    var promised = mem::List[machine::Promise].empty(alloc)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => {}
+        else => return promised
+    }
+    let seen = self.consumer_props(item)
+    let sig = self.sig(item)
+    let generics = sig.contents().generics
+    self.add_promise(item, name: "Copy", holds: seen.copy, property: Property.Copy, generics: generics.view(), mut promised)
+    self.add_promise(item, name: "Send", holds: seen.send, property: Property.Send, generics: generics.view(), mut promised)
+    self.add_promise(item, name: "Inert", holds: seen.inert, property: Property.Inert, generics: generics.view(), mut promised)
+    self.add_promise(item, name: "AnyBits", holds: seen.any_bits, property: Property.AnyBits, generics: generics.view(), mut promised)
+    return promised
+} Checker.promises
+
+fn Checker.add_promise(self, item: ty::ItemId, name: Str, holds: bool, property: Property, generics: Slice[GenericDef], mut promised: mem::List[machine::Promise]) {
+    if not holds {
+        return
+    }
+    let alloc = self.alloc()
+    var resting = mem::List[text::String].empty(alloc)
+    let dependent = self.dependent_params(item, property)
+    for index in dependent {
+        if index < generics.len() {
+            mut resting.push(text::String.of(generics[index].name.as_str(), alloc))
+        }
+    }
+    mut promised.push(machine::Promise(property: text::String.of(name, alloc), params: take resting))
+} Checker.add_promise
+
+/// The entries of a snapshot that differ from another's, absence included, by canonical path.
+pkg fn differing(current: Option[machine::Snapshot], written: Option[machine::Snapshot], alloc: mem::Alloc) -> mem::List[text::String] {
+    var paths = mem::Set[text::String].empty(alloc)
+    add_entry_paths(mut paths, snapshot: current, alloc)
+    add_entry_paths(mut paths, snapshot: written, alloc)
+    var differing_paths = mem::List[text::String].empty(alloc)
+    for path in paths {
+        if not same_last_entry(current, other: written, path: path.as_str()) {
+            mut differing_paths.push(text::String.of(path.as_str(), alloc))
+        }
+    }
+    return differing_paths
+} differing
+
+fn add_entry_paths(mut paths: mem::Set[text::String], snapshot: Option[machine::Snapshot], alloc: mem::Alloc) {
+    let Some(held) = snapshot else {
+        return
+    }
+    for entry in held.entries {
+        discard mut paths.insert(text::String.of(entry.path.as_str(), alloc))
+    }
+} add_entry_paths
+
+/// The position of the last entry of a path in a snapshot, as a map by path keeps it.
+fn last_entry_at(snapshot: Option[machine::Snapshot], path: Str) -> Option[usize] {
+    let Some(held) = snapshot else {
+        return None
+    }
+    var found: Option[usize] = None
+    for at in 0..<held.entries.len() {
+        if held.entries[at].path.as_str() == path {
+            found = Some(at)
+        }
+    }
+    return found
+} last_entry_at
+
+/// Whether two snapshots hold equal last entries of a path, or neither holds one.
+fn same_last_entry(snapshot: Option[machine::Snapshot], other: Option[machine::Snapshot], path: Str) -> bool {
+    let at = last_entry_at(snapshot, path)
+    let other_at = last_entry_at(other, path)
+    let Some(position) = at else {
+        return other_at.is_none()
+    }
+    let Some(other_position) = other_at else {
+        return false
+    }
+    let Some(held) = snapshot else {
+        return false
+    }
+    let Some(other_held) = other else {
+        return false
+    }
+    expect position < held.entries.len() and other_position < other_held.entries.len()
+    return held.entries[position] == other_held.entries[other_position]
+} same_last_entry

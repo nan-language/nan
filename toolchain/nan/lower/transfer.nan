@@ -1,0 +1,275 @@
+//! Transfer: what moving a value into another domain's reach does: the chunks of its memory that domains nested in the target own pass to it, its holdings pass to their new owner, and storage several handles reach records its reach, the innermost domain enclosing every domain reaching it, which a walk enters only when it widens.
+
+/// The owner of holdings that leaves every holding as it is.
+const TRANSFER_KEEP: i64 = -1
+
+/// The bit of an owner that passes only holdings domains nested in it own.
+const TRANSFER_RAISE: i64 = 1
+
+/// The bytes of a task closure's environment before its captures: the address of the walk
+/// moving them, zero when moving them does nothing.
+const ENV_HEADER: u64 = 8
+
+/// An owned capture of a task closure: its type and its offset in the closure's environment.
+struct Capture derives Copy {
+    ty: ty::Ty
+    offset: u64
+} Capture
+
+/// Whether moving a value of a type into another domain's reach does anything.
+fn Lowering.transfers(mut self, ty: ty::Ty) -> bool {
+    match self.transferring.get(ty) {
+        Some(known) => return known
+        None => {}
+    }
+    discard mut self.transferring.insert(ty, value: false)
+    let moves = mut self.compute_transfers(ty)
+    discard mut self.transferring.insert(ty, value: moves)
+    return moves
+} Lowering.transfers
+
+fn Lowering.compute_transfers(mut self, ty: ty::Ty) -> bool {
+    match self.ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if not self.ck.has(ty, property: check::Property.Send) or self.ck.has(ty, property: check::Property.Copy) {
+                return false
+            }
+            if self.ck.db().is_std(item) {
+                let owner_path = self.ck.db().canonical(item)
+                match base_transfers(mut self, owner_path: owner_path.as_str(), ty) {
+                    Some(moves) => return moves
+                    None => {}
+                }
+                let sig = self.ck.sig(item)
+                let base = match sig.contents().kind {
+                    check::SigKind.Struct(fields: fields) => fields.len() == 0
+                    else => false
+                }
+                let named = owner_path.as_str()
+                let structural = named == "core::Array" or named == "core::Untrusted" or named == "core::ArrayCursor" or owner_path.starts_with("core::atomic::")
+                if base and not structural {
+                    let base_laid = mut self.layout_of(ty)
+                    if base_laid.contents().size > 0 {
+                        expect false
+                    }
+                }
+            }
+            let laid = mut self.layout_of(ty)
+            let parts = laid_parts(laid.contents(), alloc: self.alloc)
+            for part in parts {
+                if mut self.transfers(part) {
+                    return true
+                }
+            }
+            return false
+        }
+        ty::TyKind.Fn(id) => return self.ck.types().fn_of(id).kind == ast::FnKind.Task
+        else => return false
+    }
+} Lowering.compute_transfers
+
+/// Moves the value of a type at an address into another domain's reach: the chunks of its
+/// memory pass to `lift` unless it is zero, and its holdings to `owner`.
+fn Lowering.transfer(mut self, mut fx: Fx, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    if not mut self.transfers(ty) {
+        return
+    }
+    let glue = transfer_walker(mut self, ty)
+    let reference = mut self.func_ref(mut fx, id: glue)
+    var walk_args = Array[clif::Value, 3].filled(address)
+    walk_args[1] = lift
+    walk_args[2] = owner
+    discard mut fx.b.call(reference, args: walk_args.view())
+} Lowering.transfer
+
+/// The address of the glue moving a value of a type, zero when moving one does nothing.
+fn Lowering.walker_address(mut self, mut fx: Fx, ty: ty::Ty) -> clif::Value {
+    if not mut self.transfers(ty) {
+        return mut fx.ptr(0)
+    }
+    let glue = transfer_walker(mut self, ty)
+    let reference = mut self.func_ref(mut fx, id: glue)
+    return mut fx.b.func_addr(PTR, func_ref: reference)
+} Lowering.walker_address
+
+/// The signature of a walk: the value's address, the target of its chunks and the new owner of
+/// its holdings.
+fn transfer_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    return signature
+} transfer_signature
+
+/// Calls a walk through its address, which is not zero.
+fn call_walker(mut fx: Fx, walker: clif::Value, args: Slice[clif::Value]) {
+    let signature = mut fx.b.import_signature(transfer_signature(fx.alloc))
+    discard mut fx.b.call_indirect(signature, callee: walker, args)
+} call_walker
+
+/// Passes the chunks an allocation lies in to `lift` unless it is zero; gives whether they
+/// passed.
+fn transfer_lift(mut lo: Lowering, mut fx: Fx, address: clif::Value, lift: clif::Value) -> clif::Value {
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    let passed = mut fx.choose_in(mut lo, condition: lifting, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var lift_args = Array[clif::Value, 2].filled(address)
+        lift_args[1] = lift
+        return mut cx.call_routine(mut yes_fx, routine: Routine.Lift, args: lift_args.view())
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        var unlifted = mem::List[clif::Value].empty(no_fx.alloc)
+        mut unlifted.push(mut no_fx.int(clif::Type.Int8, value: 0))
+        return unlifted
+    })
+    return passed[0]
+} transfer_lift
+
+/// Passes the holding a word at an address names to `owner` unless it is `TRANSFER_KEEP`.
+fn rehome(mut lo: Lowering, mut fx: Fx, address: clif::Value, owner: clif::Value) {
+    let moves = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: TRANSFER_KEEP)
+    mut fx.if_true(moves, then: fn[mut lo](mut then_fx: Fx) {
+        let holding = mut then_fx.load(PTR, addr: address, offset: 0)
+        var rehome_args = Array[clif::Value, 2].filled(holding)
+        rehome_args[1] = owner
+        discard mut lo.call_routine(mut then_fx, routine: Routine.Rehome, args: rehome_args.view())
+    })
+} rehome
+
+/// The owner raising the holdings in storage whose reach is a domain.
+fn transfer_raised(mut fx: Fx, reach: clif::Value) -> clif::Value {
+    return mut fx.b.bor_imm_s(reach, y: TRANSFER_RAISE)
+} transfer_raised
+
+/// Widens the reach a word holds to a domain enclosing it, atomically; gives whether this call
+/// widened it.
+fn transfer_widen(mut fx: Fx, reach_at: clif::Value, to: clif::Value) -> clif::Value {
+    let flags = clif::MemFlags.owned()
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let widened = mut fx.repeat(Array[clif::Value, 1].filled(none).view(), body: fn(mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        let reach = mut pass_fx.b.atomic_load(PTR, flags, p: reach_at)
+        let inside = nested_in(mut pass_fx, inner: reach, outer: to)
+        var outcome_types = Array[clif::Type, 2].filled(clif::Type.Int8)
+        let outcome = mut pass_fx.choose(inside, results: outcome_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+            let seen = mut yes_fx.b.atomic_cas(flags, p: reach_at, e: reach, x: to)
+            let swapped = mut yes_fx.b.icmp(clif::IntCC.Equal, x: seen, y: reach)
+            var tried = mem::List[clif::Value].empty(yes_fx.alloc)
+            mut tried.push(mut yes_fx.b.bxor_imm_s(swapped, y: 1))
+            mut tried.push(swapped)
+            return tried
+        }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+            var unchanged = mem::List[clif::Value].empty(no_fx.alloc)
+            mut unchanged.push(mut no_fx.int(clif::Type.Int8, value: 0))
+            mut unchanged.push(mut no_fx.int(clif::Type.Int8, value: 0))
+            return unchanged
+        })
+        var carried = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut carried.push(outcome[1])
+        return Pass(again: outcome[0], next: take carried)
+    })
+    return widened[0]
+} transfer_widen
+
+/// The address of the walk moving the owned captures of a task closure, each of a type at an
+/// offset of its environment; zero when moving them does nothing.
+fn transfer_captures(mut lo: Lowering, mut fx: Fx, take closure: Instance, take captures: mem::List[Capture]) -> clif::Value {
+    var moved = mem::List[Capture].empty(lo.alloc)
+    for capture in take captures {
+        if mut lo.transfers(capture.ty) {
+            mut moved.push(capture)
+        }
+    }
+    if moved.len() == 0 {
+        return mut fx.ptr(0)
+    }
+    let walk_signature = transfer_signature(lo.alloc)
+    let glue = mut lo.glue_function(Glue.Captures(take closure), signature: take walk_signature, build: fn(mut glue_lo: Lowering, mut glue_fx: Fx) {
+        let incoming = mut glue_fx.entry()
+        expect incoming.len() > 2
+        for capture in moved {
+            let at = mut glue_fx.offset(incoming[0], offset: capture.offset)
+            mut glue_lo.transfer(mut glue_fx, ty: capture.ty, address: at, lift: incoming[1], owner: incoming[2])
+        }
+        mut glue_fx.b.ret(mem::List[clif::Value].empty(glue_fx.alloc).view())
+    })
+    let reference = mut lo.func_ref(mut fx, id: glue)
+    return mut fx.b.func_addr(PTR, func_ref: reference)
+} transfer_captures
+
+fn transfer_walker(mut lo: Lowering, ty: ty::Ty) -> object::FuncId {
+    let walk_signature = transfer_signature(lo.alloc)
+    return mut lo.glue_function(Glue.Transfer(ty), signature: take walk_signature, build: fn(mut glue_lo: Lowering, mut glue_fx: Fx) {
+        let incoming = mut glue_fx.entry()
+        expect incoming.len() > 2
+        transfer_define(mut glue_lo, fx: mut glue_fx, ty, address: incoming[0], lift: incoming[1], owner: incoming[2])
+        mut glue_fx.b.ret(mem::List[clif::Value].empty(glue_fx.alloc).view())
+    })
+} transfer_walker
+
+fn transfer_define(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Item(item: item, args: _) => {
+            if lo.ck.db().is_std(item) and transfer_base(mut lo, mut fx, ty, address, lift, owner) {
+                return
+            }
+        }
+        ty::TyKind.Fn(_) => {
+            let env = mut fx.load(PTR, addr: address, offset: 8)
+            let has_env = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: env, y: 0)
+            mut fx.if_true(has_env, then: fn(mut then_fx: Fx) {
+                let walker = mut then_fx.load(PTR, addr: env, offset: 0)
+                let walks = mut then_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: walker, y: 0)
+                mut then_fx.if_true(walks, then: fn(mut walk_fx: Fx) {
+                    var walk_args = Array[clif::Value, 3].filled(env)
+                    walk_args[1] = lift
+                    walk_args[2] = owner
+                    call_walker(mut walk_fx, walker, args: walk_args.view())
+                })
+            })
+            return
+        }
+        else => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Record(fields) or LayoutShape.Bytes(fields: fields, big: _) => {
+            for field in fields {
+                let at = mut fx.offset(address, offset: field.offset)
+                mut lo.transfer(mut fx, ty: field.ty, address: at, lift, owner)
+            }
+        }
+        LayoutShape.Array(element: element, count: count) => {
+            if mut lo.transfers(element) {
+                let element_laid = mut lo.layout_of(element)
+                let size = element_laid.contents().size
+                let start = mut fx.ptr(0)
+                let end = mut fx.ptr(count)
+                mut fx.each(start, end, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
+                    let offset = mut pass_fx.b.imul_imm_s(index, y: i64.fit(size))
+                    let at = mut pass_fx.b.iadd(address, y: offset)
+                    mut lo.transfer(mut pass_fx, ty: element, address: at, lift, owner)
+                })
+            }
+        }
+        LayoutShape.Enum(shape) => {
+            for variant in shape.variants {
+                var fields = mem::List[Field].empty(lo.alloc)
+                for field in variant.fields {
+                    if mut lo.transfers(field.ty) {
+                        mut fields.push(field.copy(lo.alloc))
+                    }
+                }
+                if fields.len() == 0 {
+                    continue
+                }
+                let is = mut lo.variant_is(mut fx, address, ty, variant: variant.name.as_str())
+                mut fx.if_true(is, then: fn[mut lo](mut then_fx: Fx) {
+                    for field in fields {
+                        let at = mut then_fx.offset(address, offset: field.offset)
+                        mut lo.transfer(mut then_fx, ty: field.ty, address: at, lift, owner)
+                    }
+                })
+            }
+        }
+        else => {}
+    }
+} transfer_define

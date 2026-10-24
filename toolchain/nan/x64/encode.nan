@@ -1,0 +1,831 @@
+//! The encoder: machine code for instructions of physical registers, with the labels it binds, the displacements that wait for them and the relocations it records.
+
+/// Code being encoded.
+pkg struct Assembler {
+    pkg code: mem::Bytes
+    /// The offset each label is bound at, `UNBOUND` until it is.
+    labels: mem::List[u32]
+    fixups: mem::List[Fixup]
+    pkg relocs: mem::List[Reloc]
+} Assembler
+
+/// A displacement to a label at `at`, of one byte when `short` and four otherwise: the label's
+/// offset plus `disp`, relative to `end`.
+struct Fixup derives Copy, Eq {
+    at: u32
+    label: u32
+    end: u32
+    disp: i32
+    short: bool
+} Fixup
+
+const UNBOUND: u32 = 0xFFFF_FFFF
+
+pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc), relocs: mem::List[Reloc].empty(alloc))
+
+pkg fn Assembler.offset(self) -> u32 {
+    return u32.fit(self.code.len())
+} Assembler.offset
+
+pkg fn Assembler.new_label(mut self) -> u32 {
+    let label = u32.fit(self.labels.len())
+    mut self.labels.push(UNBOUND)
+    return label
+} Assembler.new_label
+
+pkg fn Assembler.bind(mut self, label: u32) {
+    let at = self.offset()
+    expect usize.widen(label) < self.labels.len()
+    self.labels[usize.widen(label)] = at
+} Assembler.bind
+
+/// Encoded code: its bytes and the relocations they need.
+pkg struct Encoded {
+    pkg bytes: mem::Bytes
+    pkg relocs: mem::List[Reloc]
+} Encoded
+
+/// The code, each displacement written to its label once every label it names is bound.
+pkg fn Assembler.finish(take self) -> Encoded {
+    mut self.patch()
+    let Assembler(code: code, labels: _, fixups: _, relocs: relocs) = self
+    return Encoded(bytes: take code, relocs: take relocs)
+} Assembler.finish
+
+fn Assembler.patch(mut self) {
+    for fixup in self.fixups {
+        expect usize.widen(fixup.label) < self.labels.len() and usize.widen(fixup.at) < self.code.len()
+        let target = self.labels[usize.widen(fixup.label)]
+        expect target != UNBOUND
+        let value = i64.widen(target) - i64.widen(fixup.end) + i64.widen(fixup.disp)
+        let at = usize.widen(fixup.at)
+        if fixup.short {
+            expect value >= -128 and value <= 127
+            self.code[at] = u8.truncate(value)
+            continue
+        }
+        var field = mut self.code.view_mut()
+        mut field.write_u32_le(at, value: i32.truncate(value).to_bits())
+    }
+} Assembler.patch
+
+fn Assembler.put8(mut self, value: u8) {
+    mut self.code.push(value)
+} Assembler.put8
+
+fn Assembler.put16(mut self, value: u16) {
+    mut self.put8(u8.truncate(value))
+    mut self.put8(u8.truncate(value >> 8))
+} Assembler.put16
+
+fn Assembler.put32(mut self, value: u32) {
+    for byte in 0u32..<4 {
+        mut self.put8(u8.truncate(value >> (8 * byte)))
+    }
+} Assembler.put32
+
+fn Assembler.put64(mut self, value: u64) {
+    mut self.put32(u32.truncate(value))
+    mut self.put32(u32.truncate(value >> 32))
+} Assembler.put64
+
+/// A four-byte displacement to a label, relative to the end of the field and `trailing` bytes
+/// after it.
+fn Assembler.label32(mut self, label: u32, disp: i32, trailing: u32) {
+    let at = self.offset()
+    mut self.fixups.push(Fixup(at: at, label: label, end: at + 4 + trailing, disp: disp, short: false))
+    mut self.put32(0)
+} Assembler.label32
+
+fn Assembler.label8(mut self, label: u32) {
+    let at = self.offset()
+    mut self.fixups.push(Fixup(at: at, label: label, end: at + 1, disp: 0, short: true))
+    mut self.put8(0)
+} Assembler.label8
+
+/// A four-byte field the relocation of a symbol fills.
+fn Assembler.reloc32(mut self, kind: RelocKind, symbol: Symbol, addend: i64) {
+    let at = self.offset()
+    mut self.relocs.push(Reloc(offset: at, kind: kind, target: symbol, addend: addend))
+    mut self.put32(0)
+} Assembler.reloc32
+
+/// Writes an opcode of `len` bytes, held in the low bytes of `opcode` in order.
+fn Assembler.opcode(mut self, opcode: u32, len: u32) {
+    if len == 3 {
+        mut self.put8(u8.truncate(opcode >> 16))
+    }
+    if len >= 2 {
+        mut self.put8(u8.truncate(opcode >> 8))
+    }
+    mut self.put8(u8.truncate(opcode))
+} Assembler.opcode
+
+/// Whether a register number names `spl`, `bpl`, `sil` or `dil` as a byte register, which only a
+/// REX prefix reaches.
+fn is_high_byte(number: u8) -> bool = number >= 4 and number < 8
+
+/// Writes the REX prefix an instruction needs: W for a 64-bit operation, R, X and B extending the
+/// registers its ModRM and SIB fields name, and an empty one when `force` asks for it.
+fn Assembler.rex(mut self, w: bool, reg: u8, index: u8, base: u8, force: bool) {
+    var rex: u8 = 0x40
+    if w {
+        rex = rex | 0x08
+    }
+    if reg >= 8 {
+        rex = rex | 0x04
+    }
+    if index >= 8 {
+        rex = rex | 0x02
+    }
+    if base >= 8 {
+        rex = rex | 0x01
+    }
+    if rex != 0x40 or force {
+        mut self.put8(rex)
+    }
+} Assembler.rex
+
+/// Writes the operand-size prefix of a 16-bit operation, giving whether the operation needs
+/// REX.W.
+fn Assembler.sized(mut self, size: Size) -> bool {
+    if size == Size.Word {
+        mut self.put8(0x66)
+    }
+    return size == Size.Qword
+} Assembler.sized
+
+/// Writes REX, the opcode and a ModRM naming two registers: `reg` in its reg field and `rm` in
+/// its r/m field.
+fn Assembler.reg_reg(mut self, w: bool, opcode: u32, len: u32, reg: u8, rm: u8, force: bool) {
+    mut self.rex(w, reg: reg, index: 0, base: rm, force: force)
+    mut self.opcode(opcode, len: len)
+    mut self.put8(0xC0 | ((reg & 7) << 3) | (rm & 7))
+} Assembler.reg_reg
+
+/// Writes REX, the opcode, ModRM, SIB and displacement for `reg` and a memory operand; a
+/// RIP-relative displacement is relative to the end of the instruction, `trailing` immediate
+/// bytes after it.
+fn Assembler.reg_mem(mut self, w: bool, opcode: u32, len: u32, reg: u8, mem: Amode, trailing: u32, force: bool) {
+    match mem {
+        Amode.Mem(base: base, index: index, shift: shift, disp: disp) => {
+            var index_number: u8 = 0
+            match index {
+                Some(held) => {
+                    index_number = held.hw()
+                }
+                None => {}
+            }
+            mut self.rex(w, reg: reg, index: index_number, base: base.hw(), force: force)
+            mut self.opcode(opcode, len: len)
+            mut self.address(reg, base: base.hw(), index: index, shift: shift, disp: disp)
+        }
+        Amode.Rip(target: target, disp: disp) => {
+            mut self.rex(w, reg: reg, index: 0, base: 0, force: force)
+            mut self.opcode(opcode, len: len)
+            mut self.put8(((reg & 7) << 3) | 5)
+            let addend = i64.widen(disp) - 4 - i64.widen(trailing)
+            match target {
+                RipTarget.Label(label) => mut self.label32(label, disp: disp, trailing: trailing)
+                RipTarget.Direct(symbol) => mut self.reloc32(RelocKind.Relative4, symbol: symbol, addend: addend)
+                RipTarget.Got(symbol) => mut self.reloc32(RelocKind.GotRelative4, symbol: symbol, addend: addend)
+            }
+        }
+    }
+} Assembler.reg_mem
+
+/// Writes ModRM, SIB and displacement for `reg` and `base + index * 2^shift + disp`.
+fn Assembler.address(mut self, reg: u8, base: u8, index: Option[Reg], shift: u8, disp: i32) {
+    let field = (reg & 7) << 3
+    let low = base & 7
+    var mode: u8 = 0x80
+    if disp == 0 and low != 5 {
+        mode = 0x00
+    } else if disp >= -128 and disp <= 127 {
+        mode = 0x40
+    }
+    match index {
+        Some(held) => {
+            mut self.put8(mode | field | 4)
+            mut self.put8((shift << 6) | ((held.hw() & 7) << 3) | low)
+        }
+        None => {
+            if low == 4 {
+                mut self.put8(mode | field | 4)
+                mut self.put8(0x24)
+            } else {
+                mut self.put8(mode | field | low)
+            }
+        }
+    }
+    if mode == 0x40 {
+        mut self.put8(u8.truncate(disp))
+    } else if mode == 0x80 {
+        mut self.put32(disp.to_bits())
+    }
+} Assembler.address
+
+/// Encodes an instruction whose registers are all physical.
+pkg fn Assembler.emit(mut self, inst: Inst) {
+    match inst {
+        Inst.Mov(dst: dst, src: src) => mut self.mov(dst, src)
+        Inst.MovImm(dst: dst, imm: imm) => mut self.mov_imm(dst, imm)
+        Inst.MovSymbol(dst: dst, symbol: symbol, addend: addend) => mut self.mov_symbol(dst, symbol, addend)
+        Inst.Load(kind: kind, dst: dst, src: src) => mut self.load(kind, dst, src)
+        Inst.Store(size: size, src: src, dst: dst) => mut self.store(size, src, dst)
+        Inst.StoreImm(size: size, imm: imm, dst: dst) => mut self.store_imm(size, imm, dst)
+        Inst.Lea(dst: dst, src: src) => mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: dst.hw(), mem: src, trailing: 0, force: false)
+        Inst.Alu(op: op, size: size, dst: dst, src: src) => mut self.op_rr(op.code() * 8, size: size, rm: dst.hw(), reg: src.hw())
+        Inst.AluImm(op: op, size: size, dst: dst, imm: imm) => mut self.op_imm(op.code(), size: size, dst: dst, imm: imm)
+        Inst.Cmp(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x38, size: size, rm: lhs.hw(), reg: rhs.hw())
+        Inst.CmpImm(size: size, lhs: lhs, imm: imm) => mut self.op_imm(7, size: size, dst: lhs, imm: imm)
+        Inst.Test(size: size, lhs: lhs, rhs: rhs) => mut self.op_rr(0x84, size: size, rm: lhs.hw(), reg: rhs.hw())
+        Inst.Unary(op: op, size: size, reg: reg) => mut self.group3(unary_code(op), size: size, reg: reg)
+        Inst.Imul(size: size, dst: dst, src: src) => mut self.imul(size, dst, src)
+        Inst.ImulImm(size: size, dst: dst, src: src, imm: imm) => mut self.imul_imm(size, dst, src, imm)
+        Inst.MulWide(signed: signed, size: size, src: src) => mut self.group3(signed_code(signed, unsigned: 4), size: size, reg: src)
+        Inst.Div(signed: signed, size: size, divisor: divisor) => mut self.group3(signed_code(signed, unsigned: 6), size: size, reg: divisor)
+        Inst.CheckedSrem(size: size, divisor: divisor) => mut self.srem_or_zero(size, divisor)
+        Inst.SignExtendData(size: size) => mut self.sign_extend_data(size)
+        Inst.Shift(op: op, size: size, dst: dst, amount: amount) => mut self.shift(op, size, dst, amount)
+        Inst.ShiftCl(op: op, size: size, dst: dst) => mut self.shift_cl(op, size, dst)
+        Inst.Setcc(cond: cond, dst: dst) => mut self.reg_reg(false, opcode: 0x0F90 + u32.widen(cond.code()), len: 2, reg: 0, rm: dst.hw(), force: is_high_byte(dst.hw()))
+        Inst.Cmov(cond: cond, size: size, dst: dst, src: src) => mut self.cmov(cond, size, dst, src)
+        Inst.Extend(kind: kind, dst: dst, src: src) => mut self.extend(kind, dst, src)
+        Inst.BitScan(reverse: reverse, size: size, dst: dst, src: src) => mut self.bit_scan(reverse, size, dst, src)
+        Inst.Bswap(size: size, reg: reg) => mut self.bswap(size, reg)
+        Inst.LockXadd(size: size, reg: reg, mem: mem) => mut self.locked(size, opcode: 0x0FC0, reg: reg, mem: mem)
+        Inst.Xchg(size: size, reg: reg, mem: mem) => mut self.xchg(size, reg, mem)
+        Inst.LockCmpxchg(size: size, replacement: replacement, mem: mem) => mut self.locked(size, opcode: 0x0FB0, reg: replacement, mem: mem)
+        Inst.AtomicRmwLoop(op: op, size: size, operand: operand, mem: mem, temp: temp) => mut self.atomic_rmw_loop(op, size, operand, mem, temp)
+        Inst.Mfence => mut self.opcode(0x0FAEF0, len: 3)
+        Inst.Ud2 => mut self.opcode(0x0F0B, len: 2)
+        Inst.Call(target: target, args: _, results: _, clobbers: _) => mut self.call(target)
+        Inst.Jmp(label: label) => mut self.jmp(label)
+        Inst.Jcc(cond: cond, label: label) => mut self.jcc(cond, label)
+        Inst.Ret(results: _) => mut self.put8(0xC3)
+        Inst.Push(reg: reg) => mut self.push_pop(0x50, reg: reg)
+        Inst.Pop(reg: reg) => mut self.push_pop(0x58, reg: reg)
+        Inst.Args(params: _) => {}
+        Inst.StackSwitch(store: store, load: load, temp: temp, other: other) => mut self.stack_switch(store, load, temp, other)
+        Inst.TlsGetAddr(symbol: symbol) => mut self.tls_get_addr(symbol)
+        Inst.FloatArith(op: op, size: size, dst: dst, src: src) => mut self.scalar(size, opcode: float_code(op), reg: dst.hw(), rm: src.hw())
+        Inst.FloatSqrt(size: size, dst: dst, src: src) => mut self.scalar(size, opcode: 0x51, reg: dst.hw(), rm: src.hw())
+        Inst.FloatConvert(source: source, dst: dst, src: src) => mut self.scalar(source, opcode: 0x5A, reg: dst.hw(), rm: src.hw())
+        Inst.FloatBits(op: op, dst: dst, src: src) => mut self.reg_reg(false, opcode: 0x0F00 + bits_code(op), len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+        Inst.Ucomis(size: size, lhs: lhs, rhs: rhs) => mut self.ucomis(size, lhs, rhs)
+        Inst.CvtIntToFloat(int_size: int_size, size: size, dst: dst, src: src) => mut self.convert(size, w: int_size == Size.Qword, opcode: 0x2A, reg: dst, rm: src)
+        Inst.CvtFloatToInt(size: size, int_size: int_size, dst: dst, src: src) => mut self.convert(size, w: int_size == Size.Qword, opcode: 0x2C, reg: dst, rm: src)
+        Inst.MovToXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F6E, xmm: dst, gpr: src)
+        Inst.MovFromXmm(size: size, dst: dst, src: src) => mut self.movd(size, opcode: 0x0F7E, xmm: src, gpr: dst)
+        Inst.FloatToIntSat(signed: signed, size: size, dst: dst, src: src, temp: temp) => mut self.float_to_int_sat(signed, size, dst, src, temp)
+        Inst.UintToFloat(size: size, dst: dst, src: src, temp: temp) => mut self.uint_to_float(size, dst, src, temp)
+        Inst.CanonNan(size: size, reg: reg, temp: temp) => mut self.canon_nan(size, reg, temp)
+        Inst.XmmCmov(cond: cond, dst: dst, src: src) => mut self.xmm_cmov(cond, dst, src)
+    }
+} Assembler.emit
+
+fn unary_code(op: UnaryOp) -> u8 {
+    return match op {
+        UnaryOp.Not => 2
+        UnaryOp.Neg => 3
+    }
+} unary_code
+
+/// The ModRM extension of an unsigned operation, or of its signed form, one above it.
+fn signed_code(signed: bool, unsigned: u8) -> u8
+    requires unsigned < 7
+{
+    if signed {
+        return unsigned + 1
+    }
+    return unsigned
+} signed_code
+
+fn float_code(op: FloatOp) -> u8 {
+    return match op {
+        FloatOp.Add => 0x58
+        FloatOp.Sub => 0x5C
+        FloatOp.Mul => 0x59
+        FloatOp.Div => 0x5E
+    }
+} float_code
+
+fn bits_code(op: BitOp) -> u32
+    ensures result <= 0x57
+{
+    return match op {
+        BitOp.And => 0x54
+        BitOp.AndNot => 0x55
+        BitOp.Or => 0x56
+        BitOp.Xor => 0x57
+    }
+} bits_code
+
+fn Assembler.mov(mut self, dst: Reg, src: Reg) {
+    if dst.is_xmm() {
+        mut self.reg_reg(false, opcode: 0x0F28, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+        return
+    }
+    mut self.reg_reg(true, opcode: 0x89, len: 1, reg: src.hw(), rm: dst.hw(), force: false)
+} Assembler.mov
+
+fn Assembler.mov_imm(mut self, dst: Reg, imm: u64) {
+    let number = dst.hw()
+    if imm <= 0xFFFF_FFFF {
+        mut self.rex(false, reg: 0, index: 0, base: number, force: false)
+        mut self.put8(0xB8 + (number & 7))
+        mut self.put32(u32.truncate(imm))
+        return
+    }
+    let signed = i64.from_bits(imm)
+    if signed < 0 and signed >= -2_147_483_648 {
+        mut self.reg_reg(true, opcode: 0xC7, len: 1, reg: 0, rm: number, force: false)
+        mut self.put32(u32.truncate(imm))
+        return
+    }
+    mut self.rex(true, reg: 0, index: 0, base: number, force: false)
+    mut self.put8(0xB8 + (number & 7))
+    mut self.put64(imm)
+} Assembler.mov_imm
+
+fn Assembler.mov_symbol(mut self, dst: Reg, symbol: Symbol, addend: i64) {
+    let number = dst.hw()
+    mut self.rex(true, reg: 0, index: 0, base: number, force: false)
+    mut self.put8(0xB8 + (number & 7))
+    let at = self.offset()
+    mut self.relocs.push(Reloc(offset: at, kind: RelocKind.Absolute8, target: symbol, addend: addend))
+    mut self.put64(0)
+} Assembler.mov_symbol
+
+fn Assembler.load(mut self, kind: LoadKind, dst: Reg, src: Amode) {
+    let number = dst.hw()
+    match kind {
+        LoadKind.Zx8 => mut self.reg_mem(false, opcode: 0x0FB6, len: 2, reg: number, mem: src, trailing: 0, force: false)
+        LoadKind.Zx16 => mut self.reg_mem(false, opcode: 0x0FB7, len: 2, reg: number, mem: src, trailing: 0, force: false)
+        LoadKind.Dword => mut self.reg_mem(false, opcode: 0x8B, len: 1, reg: number, mem: src, trailing: 0, force: false)
+        LoadKind.Qword => mut self.reg_mem(true, opcode: 0x8B, len: 1, reg: number, mem: src, trailing: 0, force: false)
+        LoadKind.Float32 => {
+            mut self.put8(0xF3)
+            mut self.reg_mem(false, opcode: 0x0F10, len: 2, reg: number, mem: src, trailing: 0, force: false)
+        }
+        LoadKind.Float64 => {
+            mut self.put8(0xF2)
+            mut self.reg_mem(false, opcode: 0x0F10, len: 2, reg: number, mem: src, trailing: 0, force: false)
+        }
+    }
+} Assembler.load
+
+fn Assembler.store(mut self, size: Size, src: Reg, dst: Amode) {
+    let number = src.hw()
+    if src.is_xmm() {
+        if size == Size.Dword {
+            mut self.put8(0xF3)
+        } else {
+            mut self.put8(0xF2)
+        }
+        mut self.reg_mem(false, opcode: 0x0F11, len: 2, reg: number, mem: dst, trailing: 0, force: false)
+        return
+    }
+    if size == Size.Byte {
+        mut self.reg_mem(false, opcode: 0x88, len: 1, reg: number, mem: dst, trailing: 0, force: is_high_byte(number))
+        return
+    }
+    let w = mut self.sized(size)
+    mut self.reg_mem(w, opcode: 0x89, len: 1, reg: number, mem: dst, trailing: 0, force: false)
+} Assembler.store
+
+fn Assembler.store_imm(mut self, size: Size, imm: i32, dst: Amode) {
+    if size == Size.Byte {
+        mut self.reg_mem(false, opcode: 0xC6, len: 1, reg: 0, mem: dst, trailing: 1, force: false)
+        mut self.put8(u8.truncate(imm))
+        return
+    }
+    let w = mut self.sized(size)
+    if size == Size.Word {
+        mut self.reg_mem(w, opcode: 0xC7, len: 1, reg: 0, mem: dst, trailing: 2, force: false)
+        mut self.put16(u16.truncate(imm))
+        return
+    }
+    mut self.reg_mem(w, opcode: 0xC7, len: 1, reg: 0, mem: dst, trailing: 4, force: false)
+    mut self.put32(imm.to_bits())
+} Assembler.store_imm
+
+/// `op r/m, r` of a family whose byte form is `base` and whose wider forms are `base + 1`.
+fn Assembler.op_rr(mut self, base: u8, size: Size, rm: u8, reg: u8)
+    requires base < 0xFF
+{
+    if size == Size.Byte {
+        mut self.reg_reg(false, opcode: u32.widen(base), len: 1, reg: reg, rm: rm, force: is_high_byte(reg) or is_high_byte(rm))
+        return
+    }
+    let w = mut self.sized(size)
+    mut self.reg_reg(w, opcode: u32.widen(base + 1), len: 1, reg: reg, rm: rm, force: false)
+} Assembler.op_rr
+
+/// `op r/m, imm` of the immediate group, ModRM extension `ext`, with the accumulator's short
+/// forms.
+fn Assembler.op_imm(mut self, ext: u8, size: Size, dst: Reg, imm: i32)
+    requires ext < 8
+{
+    let number = dst.hw()
+    if size == Size.Byte {
+        if dst == RAX {
+            mut self.put8((ext * 8) + 4)
+        } else {
+            mut self.reg_reg(false, opcode: 0x80, len: 1, reg: ext, rm: number, force: is_high_byte(number))
+        }
+        mut self.put8(u8.truncate(imm))
+        return
+    }
+    let w = mut self.sized(size)
+    if imm >= -128 and imm <= 127 {
+        mut self.reg_reg(w, opcode: 0x83, len: 1, reg: ext, rm: number, force: false)
+        mut self.put8(u8.truncate(imm))
+        return
+    }
+    if dst == RAX {
+        mut self.rex(w, reg: 0, index: 0, base: 0, force: false)
+        mut self.put8((ext * 8) + 5)
+    } else {
+        mut self.reg_reg(w, opcode: 0x81, len: 1, reg: ext, rm: number, force: false)
+    }
+    if size == Size.Word {
+        mut self.put16(u16.truncate(imm))
+    } else {
+        mut self.put32(imm.to_bits())
+    }
+} Assembler.op_imm
+
+/// An instruction of group 3, `F6` or `F7` with the ModRM extension `ext`.
+fn Assembler.group3(mut self, ext: u8, size: Size, reg: Reg) {
+    let number = reg.hw()
+    if size == Size.Byte {
+        mut self.reg_reg(false, opcode: 0xF6, len: 1, reg: ext, rm: number, force: is_high_byte(number))
+        return
+    }
+    let w = mut self.sized(size)
+    mut self.reg_reg(w, opcode: 0xF7, len: 1, reg: ext, rm: number, force: false)
+} Assembler.group3
+
+fn Assembler.imul(mut self, size: Size, dst: Reg, src: Reg) {
+    let w = mut self.sized(size)
+    mut self.reg_reg(w, opcode: 0x0FAF, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+} Assembler.imul
+
+fn Assembler.imul_imm(mut self, size: Size, dst: Reg, src: Reg, imm: i32) {
+    let w = mut self.sized(size)
+    if imm >= -128 and imm <= 127 {
+        mut self.reg_reg(w, opcode: 0x6B, len: 1, reg: dst.hw(), rm: src.hw(), force: false)
+        mut self.put8(u8.truncate(imm))
+        return
+    }
+    mut self.reg_reg(w, opcode: 0x69, len: 1, reg: dst.hw(), rm: src.hw(), force: false)
+    if size == Size.Word {
+        mut self.put16(u16.truncate(imm))
+    } else {
+        mut self.put32(imm.to_bits())
+    }
+} Assembler.imul_imm
+
+fn Assembler.jcc_short(mut self, cond: Cond, label: u32) {
+    mut self.put8(0x70 + cond.code())
+    mut self.label8(label)
+} Assembler.jcc_short
+
+fn Assembler.jmp_short(mut self, label: u32) {
+    mut self.put8(0xEB)
+    mut self.label8(label)
+} Assembler.jmp_short
+
+fn Assembler.jmp(mut self, label: u32) {
+    mut self.put8(0xE9)
+    mut self.label32(label, disp: 0, trailing: 0)
+} Assembler.jmp
+
+fn Assembler.jcc(mut self, cond: Cond, label: u32) {
+    mut self.put8(0x0F)
+    mut self.put8(0x80 + cond.code())
+    mut self.label32(label, disp: 0, trailing: 0)
+} Assembler.jcc
+
+fn Assembler.srem_or_zero(mut self, size: Size, divisor: Reg) {
+    let divide = mut self.new_label()
+    let done = mut self.new_label()
+    mut self.op_imm(7, size: size, dst: divisor, imm: -1)
+    mut self.jcc_short(Cond.NotEqual, label: divide)
+    mut self.op_rr(0x30, size: Size.Dword, rm: RDX.hw(), reg: RDX.hw())
+    mut self.jmp_short(done)
+    mut self.bind(divide)
+    mut self.group3(7, size: size, reg: divisor)
+    mut self.bind(done)
+} Assembler.srem_or_zero
+
+fn Assembler.sign_extend_data(mut self, size: Size) {
+    match size {
+        Size.Byte => mut self.opcode(0x6698, len: 2)
+        Size.Word => mut self.opcode(0x6699, len: 2)
+        Size.Dword => mut self.put8(0x99)
+        Size.Qword => mut self.opcode(0x4899, len: 2)
+    }
+} Assembler.sign_extend_data
+
+fn Assembler.shift(mut self, op: ShiftOp, size: Size, dst: Reg, amount: u8) {
+    let number = dst.hw()
+    let byte = size == Size.Byte
+    let w = mut self.sized(size)
+    var opcode: u32 = 0xC1
+    if amount == 1 {
+        opcode = 0xD1
+    }
+    if byte {
+        opcode -= 1
+    }
+    mut self.reg_reg(w, opcode: opcode, len: 1, reg: op.code(), rm: number, force: byte and is_high_byte(number))
+    if amount != 1 {
+        mut self.put8(amount)
+    }
+} Assembler.shift
+
+fn Assembler.shift_cl(mut self, op: ShiftOp, size: Size, dst: Reg) {
+    let number = dst.hw()
+    let byte = size == Size.Byte
+    let w = mut self.sized(size)
+    var opcode: u32 = 0xD3
+    if byte {
+        opcode = 0xD2
+    }
+    mut self.reg_reg(w, opcode: opcode, len: 1, reg: op.code(), rm: number, force: byte and is_high_byte(number))
+} Assembler.shift_cl
+
+fn Assembler.cmov(mut self, cond: Cond, size: Size, dst: Reg, src: Reg) {
+    let w = mut self.sized(size)
+    mut self.reg_reg(w, opcode: 0x0F40 + u32.widen(cond.code()), len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+} Assembler.cmov
+
+fn Assembler.extend(mut self, kind: ExtendKind, dst: Reg, src: Reg) {
+    let to = dst.hw()
+    let source = src.hw()
+    match kind {
+        ExtendKind.Zx8 => mut self.reg_reg(false, opcode: 0x0FB6, len: 2, reg: to, rm: source, force: is_high_byte(source))
+        ExtendKind.Zx16 => mut self.reg_reg(false, opcode: 0x0FB7, len: 2, reg: to, rm: source, force: false)
+        ExtendKind.Zx32 => mut self.reg_reg(false, opcode: 0x89, len: 1, reg: source, rm: to, force: false)
+        ExtendKind.Sx8 => mut self.reg_reg(true, opcode: 0x0FBE, len: 2, reg: to, rm: source, force: false)
+        ExtendKind.Sx16 => mut self.reg_reg(true, opcode: 0x0FBF, len: 2, reg: to, rm: source, force: false)
+        ExtendKind.Sx32 => mut self.reg_reg(true, opcode: 0x63, len: 1, reg: to, rm: source, force: false)
+    }
+} Assembler.extend
+
+fn Assembler.bit_scan(mut self, reverse: bool, size: Size, dst: Reg, src: Reg) {
+    var opcode: u32 = 0x0FBC
+    if reverse {
+        opcode = 0x0FBD
+    }
+    let w = mut self.sized(size)
+    mut self.reg_reg(w, opcode: opcode, len: 2, reg: dst.hw(), rm: src.hw(), force: false)
+} Assembler.bit_scan
+
+fn Assembler.bswap(mut self, size: Size, reg: Reg) {
+    let number = reg.hw()
+    mut self.rex(size == Size.Qword, reg: 0, index: 0, base: number, force: false)
+    mut self.put8(0x0F)
+    mut self.put8(0xC8 + (number & 7))
+} Assembler.bswap
+
+/// A `lock`-prefixed instruction with a memory destination, whose byte form is `opcode` and
+/// whose wider forms are `opcode + 1`.
+fn Assembler.locked(mut self, size: Size, opcode: u32, reg: Reg, mem: Amode)
+    requires opcode < 0x1_0000
+{
+    let number = reg.hw()
+    let w = mut self.sized(size)
+    mut self.put8(0xF0)
+    if size == Size.Byte {
+        mut self.reg_mem(w, opcode: opcode, len: 2, reg: number, mem: mem, trailing: 0, force: is_high_byte(number))
+        return
+    }
+    mut self.reg_mem(w, opcode: opcode + 1, len: 2, reg: number, mem: mem, trailing: 0, force: false)
+} Assembler.locked
+
+fn Assembler.xchg(mut self, size: Size, reg: Reg, mem: Amode) {
+    let number = reg.hw()
+    let w = mut self.sized(size)
+    if size == Size.Byte {
+        mut self.reg_mem(w, opcode: 0x86, len: 1, reg: number, mem: mem, trailing: 0, force: is_high_byte(number))
+        return
+    }
+    mut self.reg_mem(w, opcode: 0x87, len: 1, reg: number, mem: mem, trailing: 0, force: false)
+} Assembler.xchg
+
+fn Assembler.atomic_rmw_loop(mut self, op: AluOp, size: Size, operand: Reg, mem: Amode, temp: Reg) {
+    let kind = match size {
+        Size.Byte => LoadKind.Zx8
+        Size.Word => LoadKind.Zx16
+        Size.Dword => LoadKind.Dword
+        Size.Qword => LoadKind.Qword
+    }
+    mut self.load(kind, dst: RAX, src: mem)
+    let again = mut self.new_label()
+    mut self.bind(again)
+    mut self.mov(temp, src: RAX)
+    var wide = Size.Dword
+    if size == Size.Qword {
+        wide = Size.Qword
+    }
+    mut self.op_rr(op.code() * 8, size: wide, rm: temp.hw(), reg: operand.hw())
+    mut self.locked(size, opcode: 0x0FB0, reg: temp, mem: mem)
+    mut self.jcc_short(Cond.NotEqual, label: again)
+} Assembler.atomic_rmw_loop
+
+fn Assembler.call(mut self, target: CallTarget) {
+    match target {
+        CallTarget.Direct(symbol: symbol, kind: kind) => {
+            mut self.put8(0xE8)
+            mut self.reloc32(kind, symbol: symbol, addend: -4)
+        }
+        CallTarget.Indirect(reg) => mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 2, rm: reg.hw(), force: false)
+    }
+} Assembler.call
+
+fn Assembler.push_pop(mut self, opcode: u8, reg: Reg)
+    requires opcode == 0x50 or opcode == 0x58
+{
+    let number = reg.hw()
+    mut self.rex(false, reg: 0, index: 0, base: number, force: false)
+    mut self.put8(opcode + (number & 7))
+} Assembler.push_pop
+
+fn Assembler.stack_switch(mut self, store: Reg, load: Reg, temp: Reg, other: Reg) {
+    let resume = mut self.new_label()
+    mut self.exchange(store, load: load, temp: temp, disp: 0, reg: RSP)
+    mut self.exchange(store, load: load, temp: temp, disp: 8, reg: RBP)
+    mut self.load(LoadKind.Qword, dst: temp, src: Amode.at(load, disp: 16))
+    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: other.hw(), mem: Amode.Rip(target: RipTarget.Label(resume), disp: 0), trailing: 0, force: false)
+    mut self.store(Size.Qword, src: other, dst: Amode.at(store, disp: 16))
+    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: temp.hw(), force: false)
+    mut self.bind(resume)
+} Assembler.stack_switch
+
+/// Loads a register's new value from `load + disp`, saves its current one at `store + disp` and
+/// sets it.
+fn Assembler.exchange(mut self, store: Reg, load: Reg, temp: Reg, disp: i32, reg: Reg) {
+    mut self.load(LoadKind.Qword, dst: temp, src: Amode.at(load, disp: disp))
+    mut self.store(Size.Qword, src: reg, dst: Amode.at(store, disp: disp))
+    mut self.mov(reg, src: temp)
+} Assembler.exchange
+
+fn Assembler.tls_get_addr(mut self, symbol: Symbol) {
+    mut self.opcode(0x66488D, len: 3)
+    mut self.put8(0x3D)
+    mut self.reloc32(RelocKind.TlsGeneralDynamic, symbol: symbol, addend: -4)
+    mut self.opcode(0x666648, len: 3)
+    mut self.put8(0xE8)
+    mut self.reloc32(RelocKind.CallPlt4, symbol: Symbol.TlsGetAddr, addend: -4)
+} Assembler.tls_get_addr
+
+/// An SSE scalar instruction: `F3` for `Dword` or `F2` for `Qword`, then `0F` and the opcode.
+fn Assembler.scalar(mut self, size: Size, opcode: u8, reg: u8, rm: u8) {
+    mut self.scalar_prefix(size)
+    mut self.reg_reg(false, opcode: 0x0F00 + u32.widen(opcode), len: 2, reg: reg, rm: rm, force: false)
+} Assembler.scalar
+
+fn Assembler.scalar_prefix(mut self, size: Size) {
+    if size == Size.Dword {
+        mut self.put8(0xF3)
+    } else {
+        mut self.put8(0xF2)
+    }
+} Assembler.scalar_prefix
+
+fn Assembler.ucomis(mut self, size: Size, lhs: Reg, rhs: Reg) {
+    if size == Size.Qword {
+        mut self.put8(0x66)
+    }
+    mut self.reg_reg(false, opcode: 0x0F2E, len: 2, reg: lhs.hw(), rm: rhs.hw(), force: false)
+} Assembler.ucomis
+
+/// A conversion between an SSE scalar of `size` and an integer register, REX.W for a 64-bit
+/// integer.
+fn Assembler.convert(mut self, size: Size, w: bool, opcode: u8, reg: Reg, rm: Reg) {
+    mut self.scalar_prefix(size)
+    mut self.reg_reg(w, opcode: 0x0F00 + u32.widen(opcode), len: 2, reg: reg.hw(), rm: rm.hw(), force: false)
+} Assembler.convert
+
+/// `movd` or `movq` between an SSE and a general-purpose register.
+fn Assembler.movd(mut self, size: Size, opcode: u32, xmm: Reg, gpr: Reg) {
+    mut self.put8(0x66)
+    mut self.reg_reg(size == Size.Qword, opcode: opcode, len: 2, reg: xmm.hw(), rm: gpr.hw(), force: false)
+} Assembler.movd
+
+/// Loads float bits into an SSE register through a general-purpose one.
+fn Assembler.float_const(mut self, size: Size, dst: Reg, scratch: Reg, bits: u64) {
+    mut self.mov_imm(scratch, imm: bits)
+    mut self.movd(size, opcode: 0x0F6E, xmm: dst, gpr: scratch)
+} Assembler.float_const
+
+fn Assembler.float_to_int_sat(mut self, signed: bool, size: Size, dst: Reg, src: Reg, temp: Reg) {
+    if signed {
+        mut self.float_to_sint_sat(size, dst, src, temp)
+    } else {
+        mut self.float_to_uint_sat(size, dst, src, temp)
+    }
+} Assembler.float_to_int_sat
+
+/// Truncates to `i64`; the conversion's indefinite result marks a NaN, which gives 0, or an
+/// overflow, which saturates by the sign of the source.
+fn Assembler.float_to_sint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+    let done = mut self.new_label()
+    let not_nan = mut self.new_label()
+    mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: src)
+    mut self.op_imm(7, size: Size.Qword, dst: dst, imm: 1)
+    mut self.jcc_short(Cond.NoOverflow, label: done)
+    mut self.ucomis(size, lhs: src, rhs: src)
+    mut self.jcc_short(Cond.NoParity, label: not_nan)
+    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.jmp_short(done)
+    mut self.bind(not_nan)
+    mut self.reg_reg(false, opcode: 0x0F57, len: 2, reg: temp.hw(), rm: temp.hw(), force: false)
+    mut self.ucomis(size, lhs: temp, rhs: src)
+    mut self.jcc_short(Cond.AboveOrEqual, label: done)
+    mut self.mov_imm(dst, imm: 0x7FFF_FFFF_FFFF_FFFF)
+    mut self.bind(done)
+} Assembler.float_to_sint_sat
+
+/// Truncates to `u64`: below 2^63 as a signed conversion, from it by converting the source less
+/// 2^63 and setting the top bit; NaN and negative sources give 0, too large ones saturate.
+fn Assembler.float_to_uint_sat(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+    let large = mut self.new_label()
+    let not_nan = mut self.new_label()
+    let next = mut self.new_label()
+    let done = mut self.new_label()
+    var half: u64 = 0x43E0_0000_0000_0000
+    var minus_half: u64 = 0xC3E0_0000_0000_0000
+    if size == Size.Dword {
+        half = 0x5F00_0000
+        minus_half = 0xDF00_0000
+    }
+    mut self.float_const(size, dst: temp, scratch: dst, bits: half)
+    mut self.ucomis(size, lhs: src, rhs: temp)
+    mut self.jcc_short(Cond.AboveOrEqual, label: large)
+    mut self.jcc_short(Cond.NoParity, label: not_nan)
+    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.jmp_short(done)
+    mut self.bind(not_nan)
+    mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: src)
+    mut self.op_imm(7, size: Size.Qword, dst: dst, imm: 0)
+    mut self.jcc_short(Cond.GreaterOrEqual, label: done)
+    mut self.op_rr(0x30, size: Size.Dword, rm: dst.hw(), reg: dst.hw())
+    mut self.jmp_short(done)
+    mut self.bind(large)
+    mut self.float_const(size, dst: temp, scratch: dst, bits: minus_half)
+    mut self.scalar(size, opcode: 0x58, reg: temp.hw(), rm: src.hw())
+    mut self.convert(size, w: true, opcode: 0x2C, reg: dst, rm: temp)
+    mut self.op_imm(7, size: Size.Qword, dst: dst, imm: 0)
+    mut self.jcc_short(Cond.GreaterOrEqual, label: next)
+    mut self.mov_imm(dst, imm: 0xFFFF_FFFF_FFFF_FFFF)
+    mut self.jmp_short(done)
+    mut self.bind(next)
+    mut self.reg_reg(true, opcode: 0x0FBA, len: 2, reg: 5, rm: dst.hw(), force: false)
+    mut self.put8(63)
+    mut self.bind(done)
+} Assembler.float_to_uint_sat
+
+/// Converts a `u64`: a non-negative one as signed, any other halved with its low bit kept,
+/// converted and doubled.
+fn Assembler.uint_to_float(mut self, size: Size, dst: Reg, src: Reg, temp: Reg) {
+    let negative = mut self.new_label()
+    let even = mut self.new_label()
+    let done = mut self.new_label()
+    mut self.op_rr(0x84, size: Size.Qword, rm: src.hw(), reg: src.hw())
+    mut self.jcc_short(Cond.Sign, label: negative)
+    mut self.convert(size, w: true, opcode: 0x2A, reg: dst, rm: src)
+    mut self.jmp_short(done)
+    mut self.bind(negative)
+    mut self.mov(temp, src: src)
+    mut self.shift(ShiftOp.Shr, size: Size.Qword, dst: temp, amount: 1)
+    mut self.jcc_short(Cond.AboveOrEqual, label: even)
+    mut self.op_imm(1, size: Size.Qword, dst: temp, imm: 1)
+    mut self.bind(even)
+    mut self.convert(size, w: true, opcode: 0x2A, reg: dst, rm: temp)
+    mut self.scalar(size, opcode: 0x58, reg: dst.hw(), rm: dst.hw())
+    mut self.bind(done)
+} Assembler.uint_to_float
+
+fn Assembler.canon_nan(mut self, size: Size, reg: Reg, temp: Reg) {
+    let done = mut self.new_label()
+    mut self.ucomis(size, lhs: reg, rhs: reg)
+    mut self.jcc_short(Cond.NoParity, label: done)
+    var bits: u64 = 0x7FF8_0000_0000_0000
+    if size == Size.Dword {
+        bits = 0x7FC0_0000
+    }
+    mut self.float_const(size, dst: reg, scratch: temp, bits: bits)
+    mut self.bind(done)
+} Assembler.canon_nan
+
+fn Assembler.xmm_cmov(mut self, cond: Cond, dst: Reg, src: Reg) {
+    let skip = mut self.new_label()
+    mut self.jcc_short(cond.invert(), label: skip)
+    mut self.mov(dst, src: src)
+    mut self.bind(skip)
+} Assembler.xmm_cmov

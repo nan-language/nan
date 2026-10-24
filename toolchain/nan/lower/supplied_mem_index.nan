@@ -1,0 +1,284 @@
+//! The hash index by which `mem::HashMap` and `mem::OnceMap` find their keys: an open-addressing table of 64-bit slots probed linearly, each 0 when vacant or a key's 32-bit hash fragment above the index of its entry plus 1. A key's fragment folds the state of a `mem::KeyHasher` its `hash` writes to, started from the FNV basis and the map's seed. A table record is two words, the table's address and its slot count, both 0 before the first entry; the table, drawn through the map's allocator, has at least twice as many slots as entries.
+
+const INDEX_TABLE: u64 = 0
+
+const INDEX_SLOTS: u64 = 8
+
+/// The slot count of a first table.
+const INDEX_FIRST: u64 = 8
+
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325
+
+/// Where a search ends: the index of the entry it found or reached, and whether it found one.
+struct Lookup derives Copy {
+    index: clif::Value
+    found: clif::Value
+} Lookup
+
+/// The hash fragment of the key of type `key` at an address, under a map's seed.
+fn index_fragment(mut lo: Lowering, mut fx: Fx, key: ty::Ty, at: clif::Value, seed: clif::Value) -> clif::Value {
+    let no_args = mem::List[ty::Ty].empty(lo.alloc)
+    let hasher = lo.std_ty("mem", type_name: "KeyHasher", args: take no_args)
+    let state = mut fx.slot(8, align: 8)
+    let basis = mut fx.b.iconst(clif::Type.Int64, imm: i64.from_bits(FNV_BASIS))
+    let start = mut fx.b.bxor(basis, y: seed)
+    mut fx.store(start, addr: state, offset: 0)
+    let held = mut lo.held_at(mut fx, ty: key, address: at)
+    var hasher_arg = mem::List[ty::Arg].empty(lo.alloc)
+    mut hasher_arg.push(ty::Arg.Ty(hasher))
+    var hash_args = Array[Held, 2].filled(held)
+    hash_args[1] = Held.Address(state)
+    discard mut lo.call_method(mut fx, ty: key, interface_name: "Hash", own: take hasher_arg, args: hash_args.view())
+    let hashed = mut fx.load(clif::Type.Int64, addr: state, offset: 0)
+    let high = mut fx.b.ushr_imm_s(hashed, y: 32)
+    let folded = mut fx.b.bxor(hashed, y: high)
+    return mut fx.b.band_imm_s(folded, y: 0xFFFF_FFFF)
+} index_fragment
+
+/// The entry of a key's fragment that `matches` accepts, `matches` telling whether the entry of
+/// an index holds the sought key: its index and 1, or an unspecified index and 0.
+fn index_find(mut lo: Lowering, mut fx: Fx, record: clif::Value, fragment: clif::Value, matches: fn(mut lo: Lowering, mut fx: Fx, index: clif::Value) -> clif::Value) -> Lookup {
+    let table = mut fx.load(PTR, addr: record, offset: INDEX_TABLE)
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let none = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: slots, y: 0)
+    let results = fx.types2(PTR, b: clif::Type.Int8)
+    let found = mut fx.choose_in(mut lo, condition: none, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let index = mut fx1.ptr(0)
+        let missed = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list2(index, b: missed)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let mask = mut fx1.b.iadd_imm_s(slots, y: -1)
+        let start = mut fx1.b.band(fragment, y: mask)
+        let zero = mut fx1.ptr(0)
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        let initial = fx1.list3(start, b: zero, c: no)
+        let state = mut fx1.repeat(initial.view(), body: fn[mut lo1](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 3
+            let slot = index_slot_at(mut fx2, table, position: current[0])
+            let vacant = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: slot, y: 0)
+            let high = mut fx2.b.ushr_imm_s(slot, y: 32)
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: high, y: fragment)
+            let held = mut fx2.b.bxor_imm_s(vacant, y: 1)
+            let candidate = mut fx2.b.band(same, y: held)
+            let low = mut fx2.b.band_imm_s(slot, y: 0xFFFF_FFFF)
+            let index = mut fx2.b.iadd_imm_s(low, y: -1)
+            let hit_results = fx2.types1(clif::Type.Int8)
+            let hits = mut fx2.choose(candidate, results: hit_results.view(), then: fn[mut lo1](mut fx3: Fx) -> mem::List[clif::Value] {
+                let matched = matches(mut lo1, fx: mut fx3, index)
+                return fx3.list1(matched)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let missed = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(missed)
+            })
+            expect hits.len() == 1
+            let hit = hits[0]
+            let stepped = mut fx2.b.iadd_imm_s(current[0], y: 1)
+            let next = mut fx2.b.band(stepped, y: mask)
+            let stop = mut fx2.b.bor(vacant, y: hit)
+            let again = mut fx2.b.bxor_imm_s(stop, y: 1)
+            return Pass(again: again, next: fx2.list3(next, b: index, c: hit))
+        })
+        expect state.len() == 3
+        return fx1.list2(state[1], b: state[2])
+    })
+    expect found.len() == 2
+    return Lookup(index: found[0], found: found[1])
+} index_find
+
+/// Makes room for `needed` entries, drawing a table twice as large as needed through an
+/// allocator and moving the slots into it: nonzero when there is room, zero on exhaustion,
+/// which leaves the table unchanged.
+fn index_reserve(mut lo: Lowering, mut fx: Fx, record: clif::Value, alloc: clif::Value, needed: clif::Value) -> clif::Value {
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let wanted = mut fx.b.ishl_imm_s(needed, y: 1)
+    let enough = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: wanted, y: slots)
+    let results = fx.types1(clif::Type.Int8)
+    let room = mut fx.choose_in(mut lo, condition: enough, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(held)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let drawn = index_regrow(mut lo1, fx: mut fx1, record, alloc, slots, wanted)
+        return fx1.list1(drawn)
+    })
+    expect room.len() == 1
+    return room[0]
+} index_reserve
+
+/// Draws a table of at least `wanted` slots, twice the previous size from `INDEX_FIRST`, and
+/// moves the slots into it: nonzero when drawn, zero on exhaustion.
+fn index_regrow(mut lo: Lowering, mut fx: Fx, record: clif::Value, alloc: clif::Value, slots: clif::Value, wanted: clif::Value) -> clif::Value {
+    let first_slots = mut fx.ptr(INDEX_FIRST)
+    let base = mut fx.b.umax(slots, y: first_slots)
+    let initial = fx.list1(base)
+    let sizes = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let short = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: current[0], y: wanted)
+        let doubled = mut fx1.b.ishl_imm_s(current[0], y: 1)
+        let next = mut fx1.b.select(short, x: doubled, y: current[0])
+        return Pass(again: short, next: fx1.list1(next))
+    })
+    expect sizes.len() == 1
+    let size = sizes[0]
+    let bytes = mut fx.b.ishl_imm_s(size, y: 3)
+    let align = mut fx.ptr(8)
+    let alloc_args = fx.list3(alloc, b: bytes, c: align)
+    let drawn_values = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect drawn_values.len() == 1
+    let fresh = drawn_values[0]
+    let drawn = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: fresh, y: 0)
+    mut fx.if_true(drawn, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        let fill_args = fx1.list3(fresh, b: zero, c: bytes)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Fill, args: fill_args.view())
+        let table = mut fx1.load(PTR, addr: record, offset: INDEX_TABLE)
+        let mask = mut fx1.b.iadd_imm_s(size, y: -1)
+        let first_position = mut fx1.ptr(0)
+        mut fx1.each(first_position, end: slots, body: fn(mut fx2: Fx, position: clif::Value) {
+            let slot = index_slot_at(mut fx2, table, position)
+            let held = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: slot, y: 0)
+            mut fx2.if_true(held, then: fn(mut fx3: Fx) {
+                let fragment = mut fx3.b.ushr_imm_s(slot, y: 32)
+                index_place(mut fx3, table: fresh, mask, fragment, slot)
+            })
+        })
+        index_free(mut lo, fx: mut fx1, record)
+        mut fx1.store(fresh, addr: record, offset: INDEX_TABLE)
+        mut fx1.store(size, addr: record, offset: INDEX_SLOTS)
+    })
+    return drawn
+} index_regrow
+
+/// Records entry `index` under its fragment, in a table with room for it.
+fn index_insert(mut fx: Fx, record: clif::Value, fragment: clif::Value, index: clif::Value) {
+    let table = mut fx.load(PTR, addr: record, offset: INDEX_TABLE)
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let mask = mut fx.b.iadd_imm_s(slots, y: -1)
+    let shifted = mut fx.b.ishl_imm_s(fragment, y: 32)
+    let tagged = mut fx.b.iadd_imm_s(index, y: 1)
+    let slot = mut fx.b.bor(shifted, y: tagged)
+    index_place(mut fx, table, mask, fragment, slot)
+} index_insert
+
+/// Drops the slot of entry `removed`, which the table holds under `fragment`, shifting back
+/// each slot whose probe passed it, then numbers each later entry one lower, as removing the
+/// entry moves the later ones down.
+fn index_remove(mut fx: Fx, record: clif::Value, fragment: clif::Value, removed: clif::Value) {
+    let table = mut fx.load(PTR, addr: record, offset: INDEX_TABLE)
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let mask = mut fx.b.iadd_imm_s(slots, y: -1)
+    let tagged = mut fx.b.iadd_imm_s(removed, y: 1)
+    let start = mut fx.b.band(fragment, y: mask)
+    let probe = fx.list1(start)
+    let holes = mut fx.repeat(probe.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let slot = index_slot_at(mut fx1, table, position: current[0])
+        let low = mut fx1.b.band_imm_s(slot, y: 0xFFFF_FFFF)
+        let other = mut fx1.b.icmp(clif::IntCC.NotEqual, x: low, y: tagged)
+        let stepped = mut fx1.b.iadd_imm_s(current[0], y: 1)
+        let next = mut fx1.b.band(stepped, y: mask)
+        let position = mut fx1.b.select(other, x: next, y: current[0])
+        return Pass(again: other, next: fx1.list1(position))
+    })
+    expect holes.len() == 1
+    let hole = holes[0]
+    let stepped = mut fx.b.iadd_imm_s(hole, y: 1)
+    let next = mut fx.b.band(stepped, y: mask)
+    let shift_start = fx.list2(hole, b: next)
+    let ends = mut fx.repeat(shift_start.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let gap_at = current[0]
+        let scanned = current[1]
+        let slot = index_slot_at(mut fx1, table, position: scanned)
+        let held = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: slot, y: 0)
+        let slot_fragment = mut fx1.b.ushr_imm_s(slot, y: 32)
+        let ideal = mut fx1.b.band(slot_fragment, y: mask)
+        let travel = mut fx1.b.isub(scanned, y: ideal)
+        let travelled = mut fx1.b.band(travel, y: mask)
+        let distance = mut fx1.b.isub(scanned, y: gap_at)
+        let gap = mut fx1.b.band(distance, y: mask)
+        let passed = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: travelled, y: gap)
+        let moves = mut fx1.b.band(held, y: passed)
+        mut fx1.if_true(moves, then: fn(mut fx2: Fx) {
+            let to = index_slot_address(mut fx2, table, position: gap_at)
+            mut fx2.store(slot, addr: to, offset: 0)
+        })
+        let moved_gap = mut fx1.b.select(moves, x: scanned, y: gap_at)
+        let scan_step = mut fx1.b.iadd_imm_s(scanned, y: 1)
+        let scan_next = mut fx1.b.band(scan_step, y: mask)
+        return Pass(again: held, next: fx1.list2(moved_gap, b: scan_next))
+    })
+    expect ends.len() == 2
+    let vacated = index_slot_address(mut fx, table, position: ends[0])
+    let vacant = mut fx.int(clif::Type.Int64, value: 0)
+    mut fx.store(vacant, addr: vacated, offset: 0)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: slots, body: fn(mut fx1: Fx, position: clif::Value) {
+        let at = index_slot_address(mut fx1, table, position)
+        let slot = mut fx1.load(clif::Type.Int64, addr: at, offset: 0)
+        let low = mut fx1.b.band_imm_s(slot, y: 0xFFFF_FFFF)
+        let later = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThan, x: low, y: tagged)
+        mut fx1.if_true(later, then: fn(mut fx2: Fx) {
+            let lower = mut fx2.b.iadd_imm_s(slot, y: -1)
+            mut fx2.store(lower, addr: at, offset: 0)
+        })
+    })
+} index_remove
+
+/// Empties the table, keeping its slots.
+fn index_clear(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let table = mut fx.load(PTR, addr: record, offset: INDEX_TABLE)
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let bytes = mut fx.b.ishl_imm_s(slots, y: 3)
+    let zero = mut fx.ptr(0)
+    let fill_args = fx.list3(table, b: zero, c: bytes)
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+} index_clear
+
+/// Frees the table when there is one.
+fn index_free(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let drawn = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: slots, y: 0)
+    mut fx.if_true(drawn, then: fn[mut lo](mut fx1: Fx) {
+        let table = mut fx1.load(PTR, addr: record, offset: INDEX_TABLE)
+        let free_args = fx1.list1(table)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: free_args.view())
+    })
+} index_free
+
+/// Moves the table into another domain's reach.
+fn index_lift(mut lo: Lowering, mut fx: Fx, record: clif::Value, lift: clif::Value) {
+    let slots = mut fx.load(PTR, addr: record, offset: INDEX_SLOTS)
+    let drawn = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: slots, y: 0)
+    mut fx.if_true(drawn, then: fn[mut lo](mut fx1: Fx) {
+        let table = mut fx1.load(PTR, addr: record, offset: INDEX_TABLE)
+        discard transfer_lift(mut lo, fx: mut fx1, address: table, lift)
+    })
+} index_lift
+
+/// Writes a slot at the first vacant position from its fragment.
+fn index_place(mut fx: Fx, table: clif::Value, mask: clif::Value, fragment: clif::Value, slot: clif::Value) {
+    let start = mut fx.b.band(fragment, y: mask)
+    let probe = fx.list1(start)
+    let positions = mut fx.repeat(probe.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let held = index_slot_at(mut fx1, table, position: current[0])
+        let taken = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+        let stepped = mut fx1.b.iadd_imm_s(current[0], y: 1)
+        let next = mut fx1.b.band(stepped, y: mask)
+        let position = mut fx1.b.select(taken, x: next, y: current[0])
+        return Pass(again: taken, next: fx1.list1(position))
+    })
+    expect positions.len() == 1
+    let at = index_slot_address(mut fx, table, position: positions[0])
+    mut fx.store(slot, addr: at, offset: 0)
+} index_place
+
+fn index_slot_address(mut fx: Fx, table: clif::Value, position: clif::Value) -> clif::Value {
+    let offset = mut fx.b.ishl_imm_s(position, y: 3)
+    return mut fx.b.iadd(table, y: offset)
+} index_slot_address
+
+fn index_slot_at(mut fx: Fx, table: clif::Value, position: clif::Value) -> clif::Value {
+    let at = index_slot_address(mut fx, table, position)
+    return mut fx.load(clif::Type.Int64, addr: at, offset: 0)
+} index_slot_at

@@ -1,0 +1,138 @@
+//! Hardware primitives, by kind: the synchronisation primitives, register windows and DMA buffers, the CPU-facing operations, and physical memory.
+
+fn hw_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let written = supply.path.as_str()
+    let spelling = written.as_bytes()
+    var owner_end = spelling.len()
+    var at = spelling.len()
+    while at > 0 {
+        invariant at <= spelling.len()
+        at -= 1
+        if spelling[at] == b'.' {
+            owner_end = at
+            break
+        }
+    }
+    let Some(owner) = written.slice_bytes(0, end: owner_end) else {
+        return false
+    }
+    match owner {
+        "hw::Anchor" => anchor_with(mut lo, mut fx, supply)
+        "hw::without_irqs" => without_irqs(mut lo, mut fx, supply)
+        "hw::SpinLock" => spin_lock(mut lo, mut fx, supply)
+        "hw::IrqShared" => irq_shared(mut lo, mut fx, supply)
+        "hw::PerCpu" => per_cpu(mut lo, mut fx, supply)
+        "hw::Signal" => sync_signal(mut lo, mut fx, supply)
+        "hw::Dma" or "hw::DmaShared" => dma(mut lo, mut fx, supply)
+        "hw::dma_fence" => {
+            if lo.machine() {
+                discard mut lo.call_stub(mut fx, stub: Stub.Mfence, args: mem::List[clif::Value].empty(fx.alloc).view())
+            }
+            supply.done(mut lo, mut fx)
+        }
+        "hw::Mmio" or "hw::Ports" => windows_window(mut lo, mut fx, supply)
+        "hw::sim::Registers" => windows_registers(mut lo, mut fx, supply)
+        "hw::IrqContext" => irq_context(mut lo, mut fx, supply)
+        "hw::Ring0" => cpu_ring0(mut lo, mut fx, supply)
+        "hw::Idt" => cpu_idt(mut lo, mut fx, supply)
+        "hw::TrapFrame" => cpu_trap_frame(mut lo, mut fx, supply)
+        "hw::UserAddr" => user_addr(mut lo, mut fx, supply)
+        "hw::Region" => lower_region(mut lo, mut fx, supply)
+        "hw::PhysFrame" => lower_frame(mut lo, mut fx, supply)
+        "hw::PageTableRoot" => page_table_root(mut lo, mut fx, supply)
+        // Only the kernel executor creates the values these take, and it switches threads
+        // through its own routines, so their code never runs.
+        "hw::SavedContext" or "hw::switch_to" or "hw::SpinGuard" => mut fx.b.trap(clif::TrapCode(user: 1))
+        else => return false
+    }
+    return true
+} hw_lower
+
+/// Returns a called body's result as the operation's, its failure becoming the operation's.
+fn hw_forward(mut lo: Lowering, mut fx: Fx, supply: Supply, called: Called) {
+    supply.forward_failure(mut lo, mut fx, called)
+    supply.ret(mut lo, mut fx, held: called.result)
+} hw_forward
+
+/// Whether moving an hw type into another domain's reach does anything, none for a type std
+/// declares in full.
+fn hw_transfers(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    match owner_path {
+        "hw::Signal" or "hw::SpinLock" or "hw::IrqShared" => {
+            let wrapped = hw_wrapped(lo, ty)
+            let moves = mut lo.transfers(wrapped)
+            return Some(moves)
+        }
+        "hw::PerCpu" or "hw::Dma" or "hw::DmaShared" or "hw::IdtInstalled" => return Some(true)
+        "hw::Mmio" or "hw::Ports" or "hw::Idt" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" or "hw::SpinGuard" => return Some(false)
+        else => return None
+    }
+} hw_transfers
+
+/// Moves an hw type at an address into another domain's reach; false for a type std declares in
+/// full.
+fn hw_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) -> bool {
+    match owner_path {
+        "hw::Signal" => transfer_signal(mut lo, mut fx, ty, address, lift, owner)
+        "hw::SpinLock" => {
+            let value_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "value")
+            let value = mut fx.offset(address, offset: value_field.offset)
+            let wrapped = hw_wrapped(lo, ty)
+            mut lo.transfer(mut fx, ty: wrapped, address: value, lift, owner)
+        }
+        "hw::IrqShared" => {
+            let record = mut fx.load(PTR, addr: address, offset: 0)
+            let wrapped = hw_wrapped(lo, ty)
+            let value_at = device_value(mut lo, value_ty: wrapped)
+            let value = mut fx.offset(record, offset: value_at)
+            mut lo.transfer(mut fx, ty: wrapped, address: value, lift, owner)
+        }
+        "hw::PerCpu" => transfer_per_cpu(mut lo, mut fx, value_ty: hw_wrapped(lo, ty), address, lift, owner)
+        "hw::Dma" or "hw::DmaShared" or "hw::IdtInstalled" => {
+            let contents = mut fx.load(PTR, addr: address, offset: 0)
+            discard transfer_lift(mut lo, mut fx, address: contents, lift)
+        }
+        else => return false
+    }
+    return true
+} hw_transfer
+
+/// Whether releasing an hw type does anything, none for a type std declares in full. A linear
+/// type's values end only through its own operations.
+fn hw_needs_release(mut lo: Lowering, owner_path: Str, ty: ty::Ty) -> Option[bool] {
+    match owner_path {
+        "hw::Signal" or "hw::SpinLock" => {
+            let wrapped = hw_wrapped(lo, ty)
+            let releases = mut lo.needs_release(wrapped)
+            return Some(releases)
+        }
+        "hw::PerCpu" => return Some(true)
+        "hw::Mmio" or "hw::Ports" or "hw::Dma" or "hw::DmaShared" or "hw::Idt" or "hw::IdtInstalled" or "hw::Region" or "hw::PhysFrame" or "hw::PageTableRoot" or "hw::SpinGuard" or "hw::IrqShared" => return Some(false)
+        else => return None
+    }
+} hw_needs_release
+
+/// Releases an hw type at an address; false for a type std declares in full.
+fn hw_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) -> bool {
+    match owner_path {
+        "hw::Signal" => release_signal(mut lo, mut fx, ty, address)
+        "hw::SpinLock" => {
+            let value_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "value")
+            let value = mut fx.offset(address, offset: value_field.offset)
+            let wrapped = hw_wrapped(lo, ty)
+            mut lo.release(mut fx, ty: wrapped, address: value)
+        }
+        "hw::PerCpu" => release_per_cpu(mut lo, mut fx, value_ty: hw_wrapped(lo, ty), address)
+        else => return false
+    }
+    return true
+} hw_release
+
+/// The type a wrapping hw type holds: its first type argument.
+fn hw_wrapped(lo: Lowering, ty: ty::Ty) -> ty::Ty {
+    let Some(wrapped) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return ty::Ty.error()
+    }
+    return wrapped
+} hw_wrapped

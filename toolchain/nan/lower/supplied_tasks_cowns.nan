@@ -1,0 +1,632 @@
+//! Cowns and `await when`. A cown's record is its count of handles, its rank, whether it is poisoned, its lock, whether an `await when` holds it, the first and last of the requests waiting for it, its reach, then its value. A request is a node on the requesting task's stack: the task, the next request, whether the cown was granted to it and whether it waits in the cown's queue. The cowns an `await when` holds are its count, then for each cown its record, the address of its value and the walk moving its value; its requests follow on its stack, one per cown in the same order, and its task's wait record names both.
+
+const COWN_COUNT: u64 = 0
+
+const COWN_RANK: u64 = 8
+
+const COWN_POISONED: u64 = 16
+
+const COWN_LOCK: u64 = 24
+
+const COWN_HOLDER: u64 = 32
+
+const COWN_HEAD: u64 = 40
+
+const COWN_TAIL: u64 = 48
+
+const COWN_REACH: u64 = 56
+
+const COWN_VALUE: u64 = 64
+
+/// The offsets of the words of a cown an `await when` holds, after the count.
+const HELD_RECORD: u64 = 0
+
+const HELD_VALUE: u64 = 8
+
+const HELD_WALK: u64 = 16
+
+const HELD_SIZE: u64 = 24
+
+const REQUEST_TASK: u64 = 0
+
+const REQUEST_NEXT: u64 = 8
+
+const REQUEST_GRANTED: u64 = 16
+
+const REQUEST_QUEUED: u64 = 24
+
+const REQUEST_SIZE: u64 = 32
+
+/// The offset of a cown's value of a type.
+fn cowns_value_at(mut lo: Lowering, value: ty::Ty) -> u64 {
+    let laid = mut lo.layout_of(value)
+    return next_multiple_of(COWN_VALUE, multiple: at_least_one(laid.contents().align))
+} cowns_value_at
+
+fn cowns_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    match supply.member() {
+        "of" or "try_of" => {
+            let value = supply.param(0)
+            let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            let at = cowns_value_at(mut lo, value: value_ty)
+            let laid = mut lo.layout_of(value_ty)
+            let size = mut fx.ptr(at + laid.contents().size)
+            var aligned: u64 = 8
+            if laid.contents().align > 8 {
+                aligned = laid.contents().align
+            }
+            let align = mut fx.ptr(aligned)
+            var alloc_args = Array[clif::Value, 3].filled(cell)
+            alloc_args[1] = size
+            alloc_args[2] = align
+            let record_values = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+            expect record_values.len() == 1
+            let record = record_values[0]
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                supply.exhausted(mut lo, fx: mut fx1, taken: Array[Taken, 1].filled(Taken(held: value, ty: value_ty)).view())
+            })
+            let zero = mut fx.ptr(0)
+            let header = mut fx.ptr(COWN_VALUE)
+            var fill_args = Array[clif::Value, 3].filled(record)
+            fill_args[1] = zero
+            fill_args[2] = header
+            discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
+            let one = mut fx.ptr(1)
+            mut fx.store(one, addr: record, offset: COWN_COUNT)
+            let reach = current_domain(mut lo, mut fx)
+            mut fx.store(reach, addr: record, offset: COWN_REACH)
+            let state_address = mut lo.state(mut fx)
+            let ranks = mut fx.offset(state_address, offset: STATE_RANKS)
+            let previous_rank = fetch_add(mut fx, address: ranks, amount: one)
+            let rank = mut fx.b.iadd_imm_s(previous_rank, y: 1)
+            mut fx.store(rank, addr: record, offset: COWN_RANK)
+            let stored = mut fx.offset(record, offset: at)
+            mut lo.store_held(mut fx, address: stored, held: value, ty: value_ty)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(record, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "share" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let count = mut fx.offset(record, offset: COWN_COUNT)
+            let one = mut fx.ptr(1)
+            discard fetch_add(mut fx, address: count, amount: one)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(record, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} cowns_lower
+
+/// Releases a cown handle: the last one releases the value of a cown not poisoned, and frees
+/// the cown.
+fn cowns_release(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) {
+    let Some(value_ty) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return
+    }
+    let record = mut fx.load(PTR, addr: address, offset: 0)
+    let count = mut fx.offset(record, offset: COWN_COUNT)
+    let minus = mut fx.ptr(0xFFFF_FFFF_FFFF_FFFF)
+    let previous = fetch_add(mut fx, address: count, amount: minus)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 1)
+    mut fx.if_true(last, then: fn[mut lo](mut fx1: Fx) {
+        let poisoned = mut fx1.load(PTR, addr: record, offset: COWN_POISONED)
+        let healthy = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: poisoned, y: 0)
+        mut fx1.if_true(healthy, then: fn[mut lo](mut fx2: Fx) {
+            let at = cowns_value_at(mut lo, value: value_ty)
+            let value = mut fx2.offset(record, offset: at)
+            mut lo.release(mut fx2, ty: value_ty, address: value)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Free, args: Array[clif::Value, 1].filled(record).view())
+        })
+    })
+} cowns_release
+
+/// The address of the words of the cown at an index of those an `await when` holds.
+fn cowns_held_at(mut fx: Fx, held: clif::Value, index: clif::Value) -> clif::Value {
+    let scaled = mut fx.b.imul_imm_s(index, y: i64.from_bits(HELD_SIZE))
+    let at = mut fx.b.iadd(held, y: scaled)
+    return mut fx.offset(at, offset: 8)
+} cowns_held_at
+
+/// `CownRelease(held)`: releases every cown an `await when` holds, each granted to the next
+/// request waiting for it. A cown whose reach passes the running task's domain first takes the
+/// value into its reach, again until the reach stays as the value was moved to.
+fn release_routine(mut lo: Lowering, mut fx: Fx) {
+    let params = mut fx.entry()
+    expect params.len() == 1
+    let held = params[0]
+    let count = mut fx.load(PTR, addr: held, offset: 0)
+    let domain = current_domain(mut lo, mut fx)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let entry = cowns_held_at(mut fx1, held, index)
+        let record = mut fx1.load(PTR, addr: entry, offset: HELD_RECORD)
+        let value = mut fx1.load(PTR, addr: entry, offset: HELD_VALUE)
+        let walk = mut fx1.load(PTR, addr: entry, offset: HELD_WALK)
+        let lock = mut fx1.offset(record, offset: COWN_LOCK)
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(domain).view(), body: fn[mut lo](mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let moved = walk_state[0]
+            discard mut lo.call_routine(mut fx2, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+            let reach = mut fx2.load(PTR, addr: record, offset: COWN_REACH)
+            let walks = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: walk, y: 0)
+            let wider = mut fx2.b.icmp(clif::IntCC.NotEqual, x: reach, y: moved)
+            let pending = mut fx2.b.band(walks, y: wider)
+            let settled = mut fx2.b.bxor_imm_s(pending, y: 1)
+            mut fx2.if_true(settled, then: fn[mut lo](mut fx3: Fx) {
+                grant_next_locked(mut lo, fx: mut fx3, record)
+            })
+            mut fx2.if_true(pending, then: fn[mut lo](mut fx3: Fx) {
+                discard mut lo.call_routine(mut fx3, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+                let owner = transfer_raised(mut fx3, reach)
+                var walk_args = Array[clif::Value, 3].filled(value)
+                walk_args[1] = reach
+                walk_args[2] = owner
+                call_walker(mut fx3, walker: walk, args: walk_args.view())
+            })
+            var reached = mem::List[clif::Value].empty(fx2.alloc)
+            mut reached.push(reach)
+            return Pass(again: pending, next: take reached)
+        })
+    })
+    let current = current_task(mut lo, mut fx)
+    let cleared = mut fx.ptr(0)
+    mut fx.store(cleared, addr: current, offset: TASK_HELD)
+    leave_wait(mut lo, mut fx)
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} release_routine
+
+/// Poisons the cowns an `await when` of a stopped task of a domain holds, each passed on to the
+/// next request waiting for it. The holdings in the value of a cown whose reach passes the
+/// domain stay with that reach.
+fn poison(mut lo: Lowering, mut fx: Fx, held: clif::Value, domain: clif::Value) {
+    let count = mut fx.load(PTR, addr: held, offset: 0)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let entry = cowns_held_at(mut fx1, held, index)
+        let record = mut fx1.load(PTR, addr: entry, offset: HELD_RECORD)
+        let one = mut fx1.ptr(1)
+        let flag = mut fx1.offset(record, offset: COWN_POISONED)
+        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: one, p: flag)
+        let reach = mut fx1.load(PTR, addr: record, offset: COWN_REACH)
+        let walk = mut fx1.load(PTR, addr: entry, offset: HELD_WALK)
+        let walking = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: walk, y: 0)
+        let wider = mut fx1.b.icmp(clif::IntCC.NotEqual, x: reach, y: domain)
+        let walks = mut fx1.b.band(walking, y: wider)
+        mut fx1.if_true(walks, then: fn(mut fx2: Fx) {
+            let value = mut fx2.load(PTR, addr: entry, offset: HELD_VALUE)
+            let none = mut fx2.ptr(0)
+            let owner = transfer_raised(mut fx2, reach)
+            var walk_args = Array[clif::Value, 3].filled(value)
+            walk_args[1] = none
+            walk_args[2] = owner
+            call_walker(mut fx2, walker: walk, args: walk_args.view())
+        })
+        grant_next(mut lo, fx: mut fx1, record)
+    })
+} poison
+
+/// Moves a cown handle into another domain's reach: when the cown's reach widens, its record
+/// follows, and its value, holdings raised to the new reach, when no `await when` holds it and it
+/// is not poisoned; an `await when` holding it moves the value as it releases the cown.
+fn cowns_transfer(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, lift: clif::Value) {
+    let Some(value_ty) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return
+    }
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        let record = mut fx1.load(PTR, addr: address, offset: 0)
+        let lock = mut fx1.offset(record, offset: COWN_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let reach = mut fx1.load(PTR, addr: record, offset: COWN_REACH)
+        let widened = nested_in(mut fx1, inner: reach, outer: lift)
+        mut fx1.if_true(widened, then: fn(mut fx2: Fx) {
+            mut fx2.store(lift, addr: record, offset: COWN_REACH)
+        })
+        let holder = mut fx1.load(PTR, addr: record, offset: COWN_HOLDER)
+        let head = mut fx1.load(PTR, addr: record, offset: COWN_HEAD)
+        let poisoned = mut fx1.load(PTR, addr: record, offset: COWN_POISONED)
+        let queued = mut fx1.b.bor(holder, y: head)
+        let busy = mut fx1.b.bor(queued, y: poisoned)
+        let idle = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: busy, y: 0)
+        let free = mut fx1.b.band(widened, y: idle)
+        mut fx1.if_true(free, then: fn(mut fx2: Fx) {
+            let one = mut fx2.ptr(1)
+            mut fx2.store(one, addr: record, offset: COWN_HOLDER)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.if_true(widened, then: fn[mut lo](mut fx2: Fx) {
+            discard transfer_lift(mut lo, fx: mut fx2, address: record, lift)
+        })
+        mut fx1.if_true(free, then: fn[mut lo](mut fx2: Fx) {
+            let at = cowns_value_at(mut lo, value: value_ty)
+            let value = mut fx2.offset(record, offset: at)
+            let owner = transfer_raised(mut fx2, reach: lift)
+            mut lo.transfer(mut fx2, ty: value_ty, address: value, lift, owner)
+            grant_next(mut lo, fx: mut fx2, record)
+        })
+    })
+} cowns_transfer
+
+/// Withdraws the requests of an `await when` whose body has not started: a cown already
+/// granted passes on unpoisoned, and a request waiting in a cown's queue leaves it.
+fn withdraw_when(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawWhen, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let wait_record = params[0]
+        let record = params[1]
+        let held = mut fx1.load(PTR, addr: wait_record, offset: WAIT_OBJECT)
+        let requests = mut fx1.load(PTR, addr: wait_record, offset: WAIT_NODE)
+        let running = mut fx1.load(PTR, addr: record, offset: TASK_HELD)
+        let started = mut fx1.b.icmp(clif::IntCC.Equal, x: running, y: held)
+        let pending = mut fx1.b.bxor_imm_s(started, y: 1)
+        mut fx1.if_true(pending, then: fn[mut lo1](mut fx2: Fx) {
+            let count = mut fx2.load(PTR, addr: held, offset: 0)
+            let zero = mut fx2.ptr(0)
+            mut fx2.each(zero, end: count, body: fn[mut lo1](mut fx3: Fx, index: clif::Value) {
+                let entry = cowns_held_at(mut fx3, held, index)
+                let cown_record = mut fx3.load(PTR, addr: entry, offset: HELD_RECORD)
+                let at = mut fx3.b.imul_imm_s(index, y: i64.from_bits(REQUEST_SIZE))
+                let node = mut fx3.b.iadd(requests, y: at)
+                let lock = mut fx3.offset(cown_record, offset: COWN_LOCK)
+                discard mut lo1.call_routine(mut fx3, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+                let granted_word = mut fx3.load(PTR, addr: node, offset: REQUEST_GRANTED)
+                let granted = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: granted_word, y: 0)
+                let queued_word = mut fx3.load(PTR, addr: node, offset: REQUEST_QUEUED)
+                let queued = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: queued_word, y: 0)
+                let ungranted = mut fx3.b.bxor_imm_s(granted, y: 1)
+                let waits = mut fx3.b.band(queued, y: ungranted)
+                mut fx3.if_true(waits, then: fn(mut fx4: Fx) {
+                    dequeue(mut fx4, record: cown_record, node)
+                })
+                discard mut lo1.call_routine(mut fx3, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+                mut fx3.if_true(granted, then: fn[mut lo1](mut fx4: Fx) {
+                    grant_next(mut lo1, fx: mut fx4, record: cown_record)
+                })
+            })
+        })
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_when
+
+/// Takes a waiting request out of a cown's queue. The caller holds the cown's lock.
+fn dequeue(mut fx: Fx, record: clif::Value, node: clif::Value) {
+    let head = mut fx.load(PTR, addr: record, offset: COWN_HEAD)
+    let next = mut fx.load(PTR, addr: node, offset: REQUEST_NEXT)
+    let is_head = mut fx.b.icmp(clif::IntCC.Equal, x: head, y: node)
+    let previous_values = mut fx.choose(is_head, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: record, offset: COWN_HEAD)
+        var none = mem::List[clif::Value].empty(fx1.alloc)
+        mut none.push(mut fx1.ptr(0))
+        return none
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let before_values = mut fx1.repeat(Array[clif::Value, 1].filled(head).view(), body: fn(mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let current = walk_state[0]
+            let after_current = mut fx2.load(PTR, addr: current, offset: REQUEST_NEXT)
+            let found = mut fx2.b.icmp(clif::IntCC.Equal, x: after_current, y: node)
+            let more = mut fx2.b.bxor_imm_s(found, y: 1)
+            let step = mut fx2.b.select(found, x: current, y: after_current)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(step)
+            return Pass(again: more, next: take stepped)
+        })
+        expect before_values.len() == 1
+        let before = before_values[0]
+        mut fx1.store(next, addr: before, offset: REQUEST_NEXT)
+        var found_before = mem::List[clif::Value].empty(fx1.alloc)
+        mut found_before.push(before)
+        return found_before
+    })
+    expect previous_values.len() == 1
+    let previous = previous_values[0]
+    let tail = mut fx.load(PTR, addr: record, offset: COWN_TAIL)
+    let last = mut fx.b.icmp(clif::IntCC.Equal, x: tail, y: node)
+    mut fx.if_true(last, then: fn(mut fx1: Fx) {
+        mut fx1.store(previous, addr: record, offset: COWN_TAIL)
+    })
+} dequeue
+
+/// Passes a cown on to its oldest waiting request, or leaves it free.
+fn grant_next(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let lock = mut fx.offset(record, offset: COWN_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    grant_next_locked(mut lo, mut fx, record)
+} grant_next
+
+/// Passes a cown on to its oldest waiting request, or leaves it free, then releases the cown's
+/// lock, which the caller holds.
+fn grant_next_locked(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let lock = mut fx.offset(record, offset: COWN_LOCK)
+    let head = mut fx.load(PTR, addr: record, offset: COWN_HEAD)
+    let waiting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    let next_values = mut fx.choose(waiting, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var after_head = mem::List[clif::Value].empty(fx1.alloc)
+        mut after_head.push(mut fx1.load(PTR, addr: head, offset: REQUEST_NEXT))
+        return after_head
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var none = mem::List[clif::Value].empty(fx1.alloc)
+        mut none.push(mut fx1.ptr(0))
+        return none
+    })
+    expect next_values.len() == 1
+    let next = next_values[0]
+    mut fx.store(next, addr: record, offset: COWN_HEAD)
+    let emptied = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+    mut fx.if_true(emptied, then: fn(mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: COWN_TAIL)
+    })
+    let holder = mut fx.b.uextend(PTR, x: waiting)
+    mut fx.store(holder, addr: record, offset: COWN_HOLDER)
+    let task_values = mut fx.choose(waiting, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let head_task = mut fx1.load(PTR, addr: head, offset: REQUEST_TASK)
+        let granted = mut fx1.offset(head, offset: REQUEST_GRANTED)
+        let one = mut fx1.ptr(1)
+        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: one, p: granted)
+        var woken = mem::List[clif::Value].empty(fx1.alloc)
+        mut woken.push(head_task)
+        return woken
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var none = mem::List[clif::Value].empty(fx1.alloc)
+        mut none.push(mut fx1.ptr(0))
+        return none
+    })
+    expect task_values.len() == 1
+    let task = task_values[0]
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    mut fx.if_true(waiting, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
+    })
+} grant_next_locked
+
+/// Requests a cown for the running task through a request node, suspending until it is
+/// granted.
+fn cowns_acquire(mut lo: Lowering, mut fx: Fx, record: clif::Value, node: clif::Value) {
+    let current = current_task(mut lo, mut fx)
+    let zero = mut fx.ptr(0)
+    mut fx.store(current, addr: node, offset: REQUEST_TASK)
+    mut fx.store(zero, addr: node, offset: REQUEST_NEXT)
+    mut fx.store(zero, addr: node, offset: REQUEST_GRANTED)
+    mut fx.store(zero, addr: node, offset: REQUEST_QUEUED)
+    let lock = mut fx.offset(record, offset: COWN_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let holder = mut fx.load(PTR, addr: record, offset: COWN_HOLDER)
+    let head = mut fx.load(PTR, addr: record, offset: COWN_HEAD)
+    let busy = mut fx.b.bor(holder, y: head)
+    let free = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: busy, y: 0)
+    discard mut fx.choose(free, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: record, offset: COWN_HOLDER)
+        mut fx1.store(one, addr: node, offset: REQUEST_GRANTED)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let tail = mut fx1.load(PTR, addr: record, offset: COWN_TAIL)
+        let has_tail = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+        discard mut fx1.choose(has_tail, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(node, addr: tail, offset: REQUEST_NEXT)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(node, addr: record, offset: COWN_HEAD)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        mut fx1.store(node, addr: record, offset: COWN_TAIL)
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: node, offset: REQUEST_QUEUED)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        let granted_at = mut fx1.offset(node, offset: REQUEST_GRANTED)
+        let granted = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: granted_at)
+        let waiting = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: granted, y: 0)
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Park, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} cowns_acquire
+
+/// `await when`: acquires the cowns its accesses name in increasing rank, checks for poisoning,
+/// runs the region with a reference to each cown's value, and releases them as the region
+/// yields or any exit leaves it.
+fn cowns_when(mut body: Body, mut lo: Lowering, mut fx: Fx, attempted: bool, accesses: Slice[nir::Operand], region: nir::Region, result: Option[nir::Value]) -> Held {
+    let alloc = fx.alloc
+    var cowns = mem::List[clif::Value].empty(alloc)
+    var values = mem::List[ty::Ty].empty(alloc)
+    for access in accesses {
+        let accessed = mut body.operand(mut lo, mut fx, operand: access)
+        let handle = tasks_address_of(mut lo, mut fx, ty: accessed.nty.ty(), held: accessed.held)
+        mut cowns.push(mut fx.load(PTR, addr: handle, offset: 0))
+        let Some(value_ty) = lo.ck.types().type_arg(accessed.nty.ty(), index: 0) else {
+            expect false
+            return Held.Empty
+        }
+        mut values.push(value_ty)
+    }
+    expect values.len() == cowns.len() and cowns.len() < 0xFFFF_FFFF
+    for index in 0..<cowns.len() {
+        for second in (index + 1)..<cowns.len() {
+            let distinct = mut fx.b.icmp(clif::IntCC.NotEqual, x: cowns[index], y: cowns[second])
+            mut body.trap_unless(mut lo, mut fx, holds: distinct, kind: "trap.duplicate-access", operands: Operands.None)
+        }
+    }
+    let held = mut fx.slot(8 + HELD_SIZE * u64.widen(cowns.len()), align: 8)
+    let count = mut fx.ptr(u64.widen(cowns.len()))
+    mut fx.store(count, addr: held, offset: 0)
+    var ordered = mem::List[Array[clif::Value, 3]].empty(alloc)
+    for index in 0..<cowns.len() {
+        let at = cowns_value_at(mut lo, value: values[index])
+        var words = Array[clif::Value, 3].filled(cowns[index])
+        words[1] = mut fx.offset(cowns[index], offset: at)
+        words[2] = mut lo.walker_address(mut fx, ty: values[index])
+        mut ordered.push(words)
+    }
+    for pass in 0..<ordered.len() {
+        for index in 0..<ordered.len().saturating_sub(pass + 1) {
+            expect index + 1 < ordered.len()
+            let left = ordered[index]
+            let right = ordered[index + 1]
+            let left_rank = mut fx.load(PTR, addr: left[0], offset: COWN_RANK)
+            let right_rank = mut fx.load(PTR, addr: right[0], offset: COWN_RANK)
+            let swap = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: left_rank, y: right_rank)
+            var lower_words = left
+            var higher_words = right
+            for word in 0..<3usize {
+                lower_words[word] = mut fx.b.select(swap, x: right[word], y: left[word])
+                higher_words[word] = mut fx.b.select(swap, x: left[word], y: right[word])
+            }
+            ordered[index] = lower_words
+            expect index + 1 < ordered.len()
+            ordered[index + 1] = higher_words
+        }
+    }
+    expect ordered.len() == cowns.len()
+    let requests = mut fx.slot(REQUEST_SIZE * u64.widen(cowns.len()), align: 8)
+    for index in 0..<ordered.len() {
+        let entry = 8 + HELD_SIZE * u64.widen(index)
+        mut fx.store(ordered[index][0], addr: held, offset: entry + HELD_RECORD)
+        mut fx.store(ordered[index][1], addr: held, offset: entry + HELD_VALUE)
+        mut fx.store(ordered[index][2], addr: held, offset: entry + HELD_WALK)
+    }
+    let withdraw = withdraw_when(mut lo)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: held, node: requests)
+    for index in 0..<ordered.len() {
+        let node = mut fx.offset(requests, offset: REQUEST_SIZE * u64.widen(index))
+        cowns_acquire(mut lo, mut fx, record: ordered[index][0], node)
+    }
+    let current = current_task(mut lo, mut fx)
+    mut fx.store(held, addr: current, offset: TASK_HELD)
+    var poisoned_words = mut fx.ptr(0)
+    for words in ordered {
+        let flag = mut fx.load(PTR, addr: words[0], offset: COWN_POISONED)
+        poisoned_words = mut fx.b.bor(poisoned_words, y: flag)
+    }
+    let poisoned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: poisoned_words, y: 0)
+    return when_region(mut body, mut lo, mut fx, attempted, region, result, held, cowns: cowns.view(), values: values.view(), poisoned)
+} cowns_when
+
+/// The blocks of an `await when` once its cowns are held: a poisoned cown releases them and
+/// fails the attempt or traps; otherwise the region runs on the cowns' values, and its yield
+/// releases them and gives its value, as `Ok` of an attempt.
+fn when_region(
+    mut body: Body,
+    mut lo: Lowering,
+    mut fx: Fx,
+    attempted: bool,
+    region: nir::Region,
+    result: Option[nir::Value],
+    held: clif::Value,
+    cowns: Slice[clif::Value],
+    values: Slice[ty::Ty],
+    poisoned: clif::Value,
+    ) -> Held
+    requires values.len() == cowns.len()
+    waive length "the poisoned and the running paths of one region, built in the order of their blocks"
+{
+    let alloc = fx.alloc
+    let result_ty = match result {
+        Some(value) => body.nty(value).ty()
+        None => ty::Ty.unit()
+    }
+    var yielded_ty = result_ty
+    if attempted {
+        let Some(attempted_ty) = lo.ck.types().type_arg(result_ty, index: 0) else {
+            expect false
+            return Held.Empty
+        }
+        yielded_ty = attempted_ty
+    }
+    let done = mut fx.b.create_block()
+    match mut lo.owned_repr(result_ty) {
+        Repr.Scalar(scalar) => {
+            discard mut fx.b.append_block_param(done, ty: scalar)
+        }
+        Repr.Address => {
+            discard mut fx.b.append_block_param(done, ty: PTR)
+        }
+        Repr.Empty => {}
+    }
+    let healthy = mut fx.b.create_block()
+    let sick = mut fx.b.create_block()
+    let no_args = mem::List[clif::Value].empty(alloc)
+    mut fx.b.brif(poisoned, then: sick, then_args: no_args.view(), otherwise: healthy, otherwise_args: no_args.view())
+    mut fx.b.switch_to_block(sick)
+    mut fx.b.seal_block(sick)
+    discard mut lo.call_routine(mut fx, routine: Routine.CownRelease, args: Array[clif::Value, 1].filled(held).view())
+    if attempted {
+        let err = mut lo.variant_value(mut fx, ty: result_ty, variant: "Err", payload_values: Array[Held, 1].filled(Held.Empty).view(), wrapped: None)
+        mut fx.b.jump(done, args: err.values(alloc).view())
+    } else {
+        mut body.trap_now(mut lo, mut fx, kind: "trap.poisoned", operands: Operands.None)
+    }
+    mut fx.b.switch_to_block(healthy)
+    mut fx.b.seal_block(healthy)
+    let release = mut fx.b.create_block()
+    match mut lo.owned_repr(yielded_ty) {
+        Repr.Scalar(scalar) => {
+            discard mut fx.b.append_block_param(release, ty: scalar)
+        }
+        Repr.Address => {
+            discard mut fx.b.append_block_param(release, ty: PTR)
+        }
+        Repr.Empty => {}
+    }
+    mut body.open_region(region, yield_to: release, held: Some(held))
+    var args = mem::List[clif::Value].empty(alloc)
+    for index in 0..<cowns.len() {
+        let at = cowns_value_at(mut lo, value: values[index])
+        mut args.push(mut fx.offset(cowns[index], offset: at))
+    }
+    let entry = body.region_entry(region)
+    mut fx.b.jump(entry, args: args.view())
+    mut fx.b.switch_to_block(release)
+    let release_params = fx.b.block_params(release, alloc)
+    var value = Held.Empty
+    match mut lo.owned_repr(yielded_ty) {
+        Repr.Scalar(_) => {
+            expect release_params.len() == 1
+            value = Held.Scalar(release_params[0])
+        }
+        Repr.Address => {
+            expect release_params.len() == 1
+            value = Held.Address(release_params[0])
+        }
+        Repr.Empty => {}
+    }
+    discard mut lo.call_routine(mut fx, routine: Routine.CownRelease, args: Array[clif::Value, 1].filled(held).view())
+    var outcome = value
+    if attempted {
+        outcome = mut lo.variant_value(mut fx, ty: result_ty, variant: "Ok", payload_values: Array[Held, 1].filled(value).view(), wrapped: None)
+    }
+    mut fx.b.jump(done, args: outcome.values(alloc).view())
+    mut fx.b.switch_to_block(done)
+    mut fx.b.seal_block(done)
+    let done_params = fx.b.block_params(done, alloc)
+    match mut lo.owned_repr(result_ty) {
+        Repr.Scalar(_) => {
+            expect done_params.len() == 1
+            return Held.Scalar(done_params[0])
+        }
+        Repr.Address => {
+            expect done_params.len() == 1
+            return Held.Address(done_params[0])
+        }
+        Repr.Empty => return Held.Empty
+    }
+} when_region

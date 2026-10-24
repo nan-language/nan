@@ -1,0 +1,825 @@
+//! Resolution: the greatest acceptable assignment of releases to the dependency sources of a package, and the lock `nan dep sync` and `nan upgrade` write from it, appending the path releases it locks to the local store. `nan upgrade` also forwards the package's uses of retired forms.
+
+/// A package whose locked release changes: its name, its old and new code roots and the class of
+/// the new release with the old as its parent.
+pkg struct Change {
+    pkg package_name: text::String
+    pkg old: Option[hashing::HashValue]
+    pkg new: Option[hashing::HashValue]
+    pkg class: store::Class
+} Change
+
+/// What resolution decides.
+pkg enum Outcome {
+    /// The lock to write, the packages whose locked release changes, the package's source files
+    /// that forwarding rewrites, and its uses that stay moved.
+    Resolved(lock: machine::Lock, changes: mem::List[Change], sources: mem::Map[text::String, mem::Bytes], moved: mem::List[diagnostic::Diagnostic])
+    /// No assignment is acceptable: the diagnostics the newest one fails with.
+    Unresolved(mem::List[diagnostic::Diagnostic])
+} Outcome
+
+/// A source a `dep` directive of the closure names: as the locking package's lock writes it, with
+/// the package it reaches and, for a path, the package's directory.
+struct Source derives Eq {
+    written: text::String
+    package_name: text::String
+    dir: Option[text::String]
+} Source
+
+fn Source.copy(self, alloc: mem::Alloc) -> Source {
+    var dir: Option[text::String] = None
+    match self.dir {
+        Some(held) => {
+            dir = Some(text::String.of(held.as_str(), alloc))
+        }
+        None => {}
+    }
+    return Source(written: text::String.of(self.written.as_str(), alloc), package_name: text::String.of(self.package_name.as_str(), alloc), dir: take dir)
+} Source.copy
+
+/// The order of sources by package, then source as written.
+fn source_order(left: Source, right: Source) -> core::Ordering {
+    let by_package = left.package_name.as_str().cmp(right.package_name.as_str())
+    if by_package != core::Ordering.Equal {
+        return by_package
+    }
+    return left.written.as_str().cmp(right.written.as_str())
+} source_order
+
+/// A candidate release of a source: the current state of a path source's workspace package, or
+/// a release of the store.
+enum Candidate {
+    Current(usize)
+    Stored(mem::Shared[store::Entry])
+} Candidate
+
+fn Candidate.copy(self) -> Candidate {
+    return match self {
+        Candidate.Current(index) => Candidate.Current(index)
+        Candidate.Stored(entry) => Candidate.Stored(entry.share())
+    }
+} Candidate.copy
+
+/// A source and the candidate assigned to it.
+struct Assigned {
+    source: Source
+    candidate: Candidate
+} Assigned
+
+/// A copy of an assignment.
+fn copied_assignment(assigned: Slice[Assigned], alloc: mem::Alloc) -> mem::List[Assigned] {
+    var copy = mem::List[Assigned].empty(alloc)
+    for pair in assigned {
+        mut copy.push(Assigned(source: pair.source.copy(alloc), candidate: pair.candidate.copy()))
+    }
+    return copy
+} copied_assignment
+
+/// The root a lock line names for the current state of a path source while candidates are
+/// checked, before that state's code root is computed.
+fn pending_root(dir: Str, alloc: mem::Alloc) -> hashing::HashValue {
+    var keyed = text::String.of("current\n", alloc)
+    mut keyed.append(dir)
+    return hashing::HashValue.of(keyed.as_bytes())
+} pending_root
+
+/// A store entry with its code root, standing for the current state of a path source's package
+/// while candidates are checked.
+struct CurrentEntry {
+    root: hashing::HashValue
+    entry: mem::Shared[store::Entry]
+} CurrentEntry
+
+struct Resolver {
+    session: check::Session
+    package_index: usize
+    entries: mem::List[mem::Shared[store::Entry]]
+    /// The code root of each entry, by its position in `entries`.
+    roots: mem::List[hashing::HashValue]
+    /// The failures of the first assignment judged, the newest.
+    newest: Option[mem::List[diagnostic::Diagnostic]]
+    /// Whether the package's own errors make an assignment unacceptable: until no assignment is
+    /// acceptable with them.
+    own_errors: bool
+    /// Whether the package is checked with each use matching a `preserves` or `changes`
+    /// tombstone replaced by its forwarding fix, `name.moved` accepted.
+    forwarding: bool
+    alloc: mem::Alloc
+} Resolver
+
+/// Resolves the dependency closure of the workspace package at `package_index`, forwarding its
+/// uses of retired forms when `forwarding`.
+pkg fn resolve(session: check::Session, package_index: usize, local: store::Store, user_cache: cache::Cache, forwarding: bool) -> Result[Outcome, cache::Exposed] fails platform::IoError {
+    let alloc = session.alloc
+    let read = match try local.entries() {
+        Ok(found) => found
+        Err(exposed) => return Err(take exposed)
+    }
+    var entries = mem::List[mem::Shared[store::Entry]].empty(alloc)
+    var roots = mem::List[hashing::HashValue].empty(alloc)
+    for entry in take read {
+        mut roots.push(entry.root(alloc))
+        mut entries.push(mem::Shared.of(take entry, alloc))
+    }
+    var resolver = Resolver(session: session.share(), package_index: package_index, entries: take entries, roots: take roots, newest: None, own_errors: true, forwarding: forwarding, alloc: alloc)
+    let held = session.workspace.contents()
+    let Some(root) = held.packages.get(package_index) else {
+        expect false
+        return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+    }
+    let direct = resolver.sources_of(root.dir.as_str(), deps: workspace::manifest_deps(root, alloc).view())
+    var assigned = mem::List[Assigned].empty(alloc)
+    var found = try mut resolver.search(assigned: mut assigned, pending: copied_sources(direct.view(), alloc), user_cache)
+    if found.is_none() {
+        resolver.own_errors = false
+        found = try mut resolver.search(assigned: mut assigned, pending: take direct, user_cache)
+    }
+    let Some(assignment) = found else {
+        let Some(manifest) = root.manifest else {
+            expect false
+            return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+        }
+        var path = text::String.of(root.dir.as_str(), alloc)
+        mut path.append("/package.nan")
+        var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+        mut diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: manifest.line, alloc))
+        match mut resolver.newest.extract() {
+            Some(newest) => {
+                for reported in take newest {
+                    mut diagnostics.push(take reported)
+                }
+            }
+            None => {}
+        }
+        return Ok(Outcome.Unresolved(take diagnostics))
+    }
+    return try resolver.lock(local, assigned: assignment.view())
+} resolve
+
+/// Copies of sources.
+fn copied_sources(sources: Slice[Source], alloc: mem::Alloc) -> mem::List[Source] {
+    var copy = mem::List[Source].empty(alloc)
+    for source in sources {
+        mut copy.push(source.copy(alloc))
+    }
+    return copy
+} copied_sources
+
+/// The workspace package being resolved.
+proj fn Resolver.root(self) -> workspace::Package {
+    let Some(root) = self.session.workspace.contents().packages.get(self.package_index) else {
+        expect false
+        loop {
+        }
+    }
+    return root
+} Resolver.root
+
+/// The sources of `dep` directives written in the package directory `dir`, as the locking
+/// package writes them.
+fn Resolver.sources_of(self, dir: Str, deps: Slice[workspace::DepSource]) -> mem::List[Source] {
+    let alloc = self.alloc
+    let held = self.session.workspace.contents()
+    var sources = mem::List[Source].empty(alloc)
+    for dep in deps {
+        if dep.path {
+            let target = workspace::resolve_source(dir, source: dep.written.as_str(), alloc)
+            let Some(at) = held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == target.as_str()) else {
+                continue
+            }
+            let Some(pack) = held.packages.get(at) else {
+                expect false
+                continue
+            }
+            let Some(name) = pack.name() else {
+                continue
+            }
+            let written = workspace::relative_source(self.root().dir.as_str(), to: target.as_str(), alloc)
+            mut sources.push(Source(written: take written, package_name: text::String.of(name, alloc), dir: Some(take target)))
+            continue
+        }
+        let Some(at) = self.entries.position(fn(entry: mem::Shared[store::Entry]) => named_as(entry.contents(), name: dep.written.as_str())) else {
+            continue
+        }
+        let package_name = text::String.of(self.entries[at].contents().package_name.as_str(), alloc)
+        mut sources.push(Source(written: text::String.of(dep.written.as_str(), alloc), package_name: take package_name, dir: None))
+    }
+    return sources
+} Resolver.sources_of
+
+/// Whether a store entry is a named release of a store name.
+fn named_as(entry: store::Entry, name: Str) -> bool {
+    let Some(held) = entry.name else {
+        return false
+    }
+    return held.as_str() == name
+} named_as
+
+/// The code root of the entry holding a release, by its position.
+fn Resolver.root_at(self, at: usize) -> hashing::HashValue {
+    let Some(root) = self.roots.get(at) else {
+        expect false
+        return hashing::HashValue(bytes: Array[u8, 33].filled(0))
+    }
+    return root
+} Resolver.root_at
+
+/// A source's candidates, newest first.
+fn Resolver.candidates(self, source: Source) -> mem::List[Candidate] {
+    let alloc = self.alloc
+    var found = mem::List[Candidate].empty(alloc)
+    let held = self.session.workspace.contents()
+    match source.dir {
+        Some(dir) => {
+            match held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir.as_str()) {
+                Some(index) => mut found.push(Candidate.Current(index))
+                None => {}
+            }
+            return found
+        }
+        None => {}
+    }
+    var locked: Option[hashing::HashValue] = None
+    match self.root().machine.lock() {
+        Some(lock) => {
+            for line in lock.deps {
+                if line.source.as_str() == source.written.as_str() {
+                    locked = Some(line.root)
+                    break
+                }
+            }
+        }
+        None => {}
+    }
+    var named = mem::List[usize].empty(alloc)
+    for at in 0..<self.entries.len() {
+        if named_as(self.entries[at].contents(), name: source.written.as_str()) {
+            mut named.push(at)
+        }
+    }
+    for position in 0..<named.len() {
+        let at = named[named.len() - 1 - position]
+        let kept = match locked {
+            Some(ancestor) => self.descends(named.view(), at, ancestor)
+            None => true
+        }
+        if kept {
+            expect at < self.entries.len()
+            mut found.push(Candidate.Stored(self.entries[at].share()))
+        }
+    }
+    return found
+} Resolver.candidates
+
+/// Whether the named release at `at` is `ancestor` or descends from it through parents among
+/// the releases `named`.
+fn Resolver.descends(self, named: Slice[usize], at: usize, ancestor: hashing::HashValue) -> bool {
+    var current = Some(at)
+    while current.is_some() {
+        let Some(held) = current else {
+            return false
+        }
+        if self.root_at(held) == ancestor {
+            return true
+        }
+        current = None
+        expect held < self.entries.len()
+        let Some(parent) = self.entries[held].contents().parent else {
+            return false
+        }
+        for other in named {
+            if self.root_at(other) == parent {
+                current = Some(other)
+                break
+            }
+        }
+    }
+    return false
+} Resolver.descends
+
+/// The dependency sources a candidate's manifest names.
+fn Resolver.reached(self, candidate: Candidate, source: Source) -> mem::List[Source] {
+    let alloc = self.alloc
+    let held = self.session.workspace.contents()
+    match candidate {
+        Candidate.Current(index) => {
+            let Some(pack) = held.packages.get(index) else {
+                expect false
+                return mem::List[Source].empty(alloc)
+            }
+            return self.sources_of(pack.dir.as_str(), deps: workspace::manifest_deps(pack, alloc).view())
+        }
+        Candidate.Stored(entry) => {
+            let Some(at) = entry.contents().sources.position(fn(file: artefact::SourceFile) => file.path.as_str() == "package.nan") else {
+                return mem::List[Source].empty(alloc)
+            }
+            var manifest = mem::Bytes.empty(alloc)
+            mut manifest.append(entry.contents().sources[at].content.view())
+            let file = syntax::parse(take manifest, grammar: self.session.grammar.contents(), alloc)
+            let dir = match source.dir {
+                Some(held_dir) => text::String.of(held_dir.as_str(), alloc)
+                None => text::String.of(source.package_name.as_str(), alloc)
+            }
+            let deps = workspace::read_deps(file, dir: dir.as_str(), alloc)
+            return self.sources_of(dir.as_str(), deps: deps.view())
+        }
+    }
+} Resolver.reached
+
+/// The greatest acceptable assignment extending `assigned` to the sources of `pending`.
+fn Resolver.search(mut self, mut assigned: mem::List[Assigned], take pending: mem::List[Source], user_cache: cache::Cache) -> Option[mem::List[Assigned]] fails platform::IoError {
+    let alloc = self.alloc
+    var waiting = pending
+    mut waiting.retain(fn(source: Source) => assigned.position(fn(known: Assigned) => known.source == source).is_none())
+    mut waiting.sort_by(fn(left: Source, right: Source) => source_order(left, right))
+    var sources = mem::List[Source].empty(alloc)
+    for source in take waiting {
+        let count = sources.len()
+        if count > 0 and sources[count - 1] == source {
+            continue
+        }
+        mut sources.push(take source)
+    }
+    if sources.len() == 0 {
+        match try self.judge(assigned.view(), user_cache) {
+            None => return Some(copied_assignment(assigned.view(), alloc))
+            Some(failures) => {
+                if self.newest.is_none() {
+                    self.newest = Some(take failures)
+                }
+                return None
+            }
+        }
+    }
+    let next = sources[0].copy(alloc)
+    let root_name = match self.root().name() {
+        Some(name) => name
+        None => ""
+    }
+    let split = assigned.position(fn(known: Assigned) => known.source.package_name == next.package_name and known.source.written != next.written).is_some()
+    if split or next.package_name.as_str() == root_name {
+        return None
+    }
+    for candidate in take self.candidates(next) {
+        var rest = mem::List[Source].empty(alloc)
+        for index in 1..<sources.len() {
+            mut rest.push(sources[index].copy(alloc))
+        }
+        for reached in take self.reached(candidate, source: next) {
+            mut rest.push(take reached)
+        }
+        mut assigned.push(Assigned(source: next.copy(alloc), candidate: take candidate))
+        match try mut self.search(assigned: mut assigned, pending: take rest, user_cache) {
+            Some(found) => return Some(take found)
+            None => {}
+        }
+        discard mut assigned.pop()
+    }
+    return None
+} Resolver.search
+
+/// The root a candidate lock line names for a candidate.
+fn Resolver.candidate_root(self, source: Source, candidate: Candidate) -> hashing::HashValue {
+    match candidate {
+        Candidate.Current(_) => {
+            let dir = match source.dir {
+                Some(held) => held.as_str()
+                None => ""
+            }
+            return pending_root(dir, alloc: self.alloc)
+        }
+        Candidate.Stored(entry) => return entry.contents().root(self.alloc)
+    }
+} Resolver.candidate_root
+
+/// The candidate lock of an assignment: path lines name the pending roots of current
+/// states.
+fn Resolver.candidate_lock(self, assigned: Slice[Assigned]) -> machine::Lock {
+    let alloc = self.alloc
+    let deps_written = workspace::manifest_deps(self.root(), alloc)
+    var deps = mem::List[machine::Locked].empty(alloc)
+    for pair in assigned {
+        var alias: Option[text::String] = None
+        for dep in deps_written {
+            if dep.written == pair.source.written {
+                alias = Some(text::String.of(dep.alias.as_str(), alloc))
+            }
+        }
+        mut deps.push(machine::Locked(package_name: text::String.of(pair.source.package_name.as_str(), alloc), alias: take alias, source: text::String.of(pair.source.written.as_str(), alloc), root: self.candidate_root(pair.source, candidate: pair.candidate), line: 0))
+    }
+    mut deps.sort_by(fn(left: machine::Locked, right: machine::Locked) => left.package_name.as_str().cmp(right.package_name.as_str()))
+    var snapshot: u64 = 0
+    if self.entries.len() > 0 {
+        snapshot = self.entries[self.entries.len() - 1].contents().index
+    }
+    return machine::Lock(snapshot: snapshot, deps: take deps, approved: mem::List[machine::Approval].empty(alloc), epochs: mem::List[machine::ApprovedEpoch].empty(alloc))
+} Resolver.candidate_lock
+
+/// The session of an assignment's candidate lock, the package's uses of retired forms
+/// forwarded when resolving so, with the files forwarding rewrites.
+struct Forwarded {
+    session: check::Session
+    sources: mem::Map[text::String, mem::Bytes]
+} Forwarded
+
+fn Resolver.assigned(self, lock: machine::Lock) -> Forwarded fails platform::IoError {
+    let alloc = self.alloc
+    let locked = try self.locked_session(lock, changed: mem::Map[text::String, mem::Bytes].empty(alloc))
+    if not self.forwarding {
+        return Forwarded(session: take locked, sources: mem::Map[text::String, mem::Bytes].empty(alloc))
+    }
+    let sources = forwarded(locked, package_index: self.package_index)
+    if sources.len() == 0 {
+        return Forwarded(session: take locked, sources: take sources)
+    }
+    let rewritten = try self.locked_session(lock, changed: copied_files(sources, alloc))
+    return Forwarded(session: take rewritten, sources: take sources)
+} Resolver.assigned
+
+/// A copy of files by path.
+fn copied_files(files: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+    var copy = mem::Map[text::String, mem::Bytes].empty(alloc)
+    for file in files {
+        var content = mem::Bytes.empty(alloc)
+        mut content.append(file.value().view())
+        discard mut copy.insert(text::String.of(file.key().as_str(), alloc), value: take content)
+    }
+    return copy
+} copied_files
+
+/// The session of the workspace with the candidate lock of an assignment and changed source
+/// files.
+fn Resolver.locked_session(self, lock: machine::Lock, take changed: mem::Map[text::String, mem::Bytes]) -> check::Session fails platform::IoError {
+    let alloc = self.alloc
+    let held = self.session.workspace.contents()
+    var current = mem::List[CurrentEntry].empty(alloc)
+    for pack in held.packages {
+        let package_name = match pack.name() {
+            Some(name) => name
+            None => ""
+        }
+        let entry = store::Entry(index: 0, package_name: text::String.of(package_name, alloc), name: None, parent: None, summary: None, artefact: mem::Bytes.empty(alloc), sources: check::package_files(pack, alloc))
+        mut current.push(CurrentEntry(root: pending_root(pack.dir.as_str(), alloc), entry: mem::Shared.of(take entry, alloc)))
+    }
+    var path = text::String.of(self.root().dir.as_str(), alloc)
+    mut path.append("/.nan/lock.nan")
+    let grammar = self.session.grammar.contents()
+    let Some(bytes) = lock.bytes(grammar, alloc) else {
+        expect false
+        return self.session.share()
+    }
+    var files = changed
+    discard mut files.insert(take path, value: take bytes)
+    let rebuilt = try held.rebuilt(files, store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+        for held_entry in current {
+            if held_entry.root == root {
+                return Some(held_entry.entry.share())
+            }
+        }
+        for at in 0..<self.entries.len() {
+            if self.root_at(at) == root {
+                return Some(self.entries[at].share())
+            }
+        }
+        return None
+    }, grammar, alloc)
+    return check::Session.of(mem::Shared.of(take rebuilt, alloc), std: self.session.std.share(), grammar: self.session.grammar.share(), home: cache::copied_override(self.session.home, alloc), alloc)
+} Resolver.locked_session
+
+/// Whether a diagnostic lies in a file under a directory.
+fn lies_within(reported: diagnostic::Diagnostic, dir: Str) -> bool {
+    let Some(path) = reported.path else {
+        return false
+    }
+    if not path.starts_with(dir) {
+        return false
+    }
+    let Some(rest) = path.as_str().slice_bytes(dir.byte_len(), end: path.byte_len()) else {
+        return false
+    }
+    return rest.starts_with("/")
+} lies_within
+
+/// Why an assignment is not acceptable, none when it is: the errors checking the closure
+/// finds on the package, the current states and the releases, and its failing tests.
+fn Resolver.judge(self, assigned: Slice[Assigned], user_cache: cache::Cache) -> Option[mem::List[diagnostic::Diagnostic]] fails platform::IoError {
+    let alloc = self.alloc
+    let lock = self.candidate_lock(assigned)
+    let judged = try self.assigned(lock)
+    let workspace_held = judged.session.workspace.contents()
+    let Some(root) = workspace_held.packages.get(self.package_index) else {
+        expect false
+        return Some(mem::List[diagnostic::Diagnostic].empty(alloc))
+    }
+    let root_dir = root.dir.as_str()
+    let Some(closure) = workspace_held.closure_of(self.package_index) else {
+        return Some(mem::List[diagnostic::Diagnostic].empty(alloc))
+    }
+    var dirs = mem::List[text::String].empty(alloc)
+    for pair in assigned {
+        match pair.candidate {
+            Candidate.Current(_) => {
+                match pair.source.dir {
+                    Some(dir) => mut dirs.push(text::String.of(dir.as_str(), alloc))
+                    None => mut dirs.push(text::String.empty(alloc))
+                }
+            }
+            Candidate.Stored(_) => mut dirs.push(text::String.of(pair.source.package_name.as_str(), alloc))
+        }
+    }
+    var errors = judged.session.closure_errors(closure)
+    for reported in take workspace_held.diagnostics(alloc) {
+        mut errors.push(take reported)
+    }
+    var own = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var failures = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in take errors {
+        if reported.code.class() != diagnostic::Class.Error {
+            continue
+        }
+        if self.forwarding and reported.code == diagnostic::Code.NameMoved {
+            continue
+        }
+        if lies_within(reported, dir: root_dir) {
+            mut own.push(take reported)
+            continue
+        }
+        let related = reported.path.is_none() or dirs.position(fn(dir: text::String) => lies_within(reported, dir: dir.as_str())).is_some()
+        if related {
+            mut failures.push(take reported)
+        }
+    }
+    if own.len() == 0 {
+        let changed = self.changed(lock)
+        match try test_runs::run(judged.session, scope: scope::Scope.Package(self.package_index), runs: test_runs::Runs.Reaching(take changed), user_cache) {
+            Ok(report) => {
+                for failure in report.failures {
+                    mut failures.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: failure.path.as_str(), line: failure.line, alloc))
+                }
+                for reported in take report.diagnostics {
+                    mut failures.push(take reported)
+                }
+            }
+            Err(exposed) => {
+                var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildCacheExposed, alloc)
+                reported.path = Some(take exposed.path)
+                mut failures.push(take reported)
+            }
+        }
+    } else if self.own_errors {
+        for reported in take own {
+            mut failures.push(take reported)
+        }
+    }
+    if failures.len() == 0 {
+        return None
+    }
+    return Some(take failures)
+} Resolver.judge
+
+/// The packages whose release a candidate lock assigns differently from the current lock: a
+/// path source's current state counting as changed.
+fn Resolver.changed(self, candidate: machine::Lock) -> mem::List[text::String] {
+    let alloc = self.alloc
+    var changed = mem::List[text::String].empty(alloc)
+    for line in candidate.deps {
+        if not self.unchanged(line) {
+            mut changed.push(text::String.of(line.package_name.as_str(), alloc))
+        }
+    }
+    return changed
+} Resolver.changed
+
+/// Whether the current lock assigns a candidate lock line's package the same release: the same
+/// root, or for the pending root of a path source's current state, a release holding its files.
+fn Resolver.unchanged(self, line: machine::Locked) -> bool {
+    let alloc = self.alloc
+    let Some(current) = self.root().machine.lock() else {
+        return false
+    }
+    let Some(at) = current.deps.position(fn(known: machine::Locked) => known.package_name == line.package_name) else {
+        return false
+    }
+    let known_root = current.deps[at].root
+    if known_root == line.root {
+        return true
+    }
+    let held = self.session.workspace.contents()
+    let dir = workspace::resolve_source(self.root().dir.as_str(), source: line.source.as_str(), alloc)
+    if line.root != pending_root(dir.as_str(), alloc) {
+        return false
+    }
+    let Some(source_at) = held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir.as_str()) else {
+        return false
+    }
+    let Some(pack) = held.packages.get(source_at) else {
+        expect false
+        return false
+    }
+    for at_entry in 0..<self.entries.len() {
+        if self.root_at(at_entry) == known_root and workspace::holds_sources(self.entries[at_entry].contents(), pack, alloc) {
+            return true
+        }
+    }
+    return false
+} Resolver.unchanged
+
+/// The position of the pair assigning a package, by name.
+fn assigned_at(assigned: Slice[Assigned], package_name: Str) -> Option[usize] {
+    for at in 0..<assigned.len() {
+        if assigned[at].source.package_name.as_str() == package_name {
+            return Some(at)
+        }
+    }
+    return None
+} assigned_at
+
+/// The lock of an acceptable assignment, appending the path releases it locks.
+fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result[Outcome, cache::Exposed] fails platform::IoError {
+    let alloc = self.alloc
+    let candidate = self.candidate_lock(assigned)
+    let judged = try self.assigned(candidate)
+    let workspace_held = judged.session.workspace.contents()
+    let Some(closure) = workspace_held.closure_of(self.package_index) else {
+        expect false
+        return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+    }
+    var deps = mem::List[machine::Locked].empty(alloc)
+    for line in candidate.deps {
+        var locked = line.copy(alloc)
+        let Some(at) = assigned_at(assigned, package_name: line.package_name.as_str()) else {
+            mut deps.push(take locked)
+            continue
+        }
+        expect at < assigned.len()
+        let Candidate.Current(index) = assigned[at].candidate else {
+            mut deps.push(take locked)
+            continue
+        }
+        let built = judged.session.build(closure, member: workspace::Member.Source(index))
+        let check::Built(artefact: artefact_bytes, sources: sources) = built
+        let appended = try local.append(store::Append(package_name: text::String.of(line.package_name.as_str(), alloc), name: None, parent: None, summary: None, artefact: take artefact_bytes, sources: take sources))
+        match appended {
+            Ok(entry) => {
+                locked.root = entry.root(alloc)
+            }
+            Err(exposed) => return Err(take exposed)
+        }
+        mut deps.push(take locked)
+    }
+    let published = match try local.index() {
+        Ok(index) => index
+        Err(exposed) => return Err(take exposed)
+    }
+    var snapshot: u64 = 0
+    if published.len() > 0 {
+        snapshot = published[published.len() - 1].index
+    }
+    var lock = match self.root().machine.lock() {
+        Some(current) => current.copy(alloc)
+        None => machine::Lock.empty(alloc)
+    }
+    lock.snapshot = snapshot
+    lock.deps = deps
+    let unlocked = self.root().machine.lock_file.is_none()
+    let approved = judged.session.approvals(self.package_index, take lock, all: unlocked)
+    let changes = self.changes(approved)
+    var moved = mem::List[diagnostic::Diagnostic].empty(alloc)
+    if self.forwarding {
+        for reported in take judged.session.reported(scope::Scope.Package(self.package_index)) {
+            if reported.code == diagnostic::Code.NameMoved {
+                mut moved.push(take reported)
+            }
+        }
+    }
+    let Forwarded(session: _, sources: sources) = judged
+    return Ok(Outcome.Resolved(lock: take approved, changes: take changes, sources: take sources, moved: take moved))
+} Resolver.lock
+
+/// The position of the entry holding a release, by its code root.
+fn Resolver.entry_at(self, root: Option[hashing::HashValue]) -> Option[usize] {
+    let Some(wanted) = root else {
+        return None
+    }
+    for at in 0..<self.entries.len() {
+        if self.root_at(at) == wanted {
+            return Some(at)
+        }
+    }
+    return None
+} Resolver.entry_at
+
+/// The code root a lock assigns a package, by name.
+fn root_of(lock: Option[machine::Lock], package_name: Str) -> Option[hashing::HashValue] {
+    let Some(held) = lock else {
+        return None
+    }
+    for line in held.deps {
+        if line.package_name.as_str() == package_name {
+            return Some(line.root)
+        }
+    }
+    return None
+} root_of
+
+/// The packages whose locked release a new lock changes, by name.
+fn Resolver.changes(self, lock: machine::Lock) -> mem::List[Change] {
+    let alloc = self.alloc
+    let current = self.root().machine.lock()
+    var names = mem::List[text::String].empty(alloc)
+    match current {
+        Some(held) => {
+            for line in held.deps {
+                mut names.push(text::String.of(line.package_name.as_str(), alloc))
+            }
+        }
+        None => {}
+    }
+    for line in lock.deps {
+        mut names.push(text::String.of(line.package_name.as_str(), alloc))
+    }
+    mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var changes = mem::List[Change].empty(alloc)
+    for index in 0..<names.len() {
+        let name = names[index].as_str()
+        if index > 0 and names[index - 1].as_str() == name {
+            continue
+        }
+        let old = root_of(current, package_name: name)
+        let new = root_of(Some(lock), package_name: name)
+        if old == new {
+            continue
+        }
+        mut changes.push(Change(package_name: text::String.of(name, alloc), old: old, new: new, class: self.change_class(old, new)))
+    }
+    return changes
+} Resolver.changes
+
+/// The class of a package's new release with its old one as its parent: the class its publish
+/// summary records when it was published on that parent, else as their exported items compare.
+fn Resolver.change_class(self, old: Option[hashing::HashValue], new: Option[hashing::HashValue]) -> store::Class {
+    let alloc = self.alloc
+    let grammar = self.session.grammar.contents()
+    let new_at = self.entry_at(new)
+    let old_at = self.entry_at(old)
+    match new_at {
+        Some(at) => {
+            expect at < self.entries.len()
+            let entry = self.entries[at].contents()
+            if entry.parent == old {
+                match entry.summary {
+                    Some(summary) => return summary.class
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+    let Some(parent_at) = old_at else {
+        return store::Class.Additive
+    }
+    let Some(release_at) = new_at else {
+        return store::Class.Additive
+    }
+    expect parent_at < self.entries.len()
+    let parent = self.entries[parent_at].contents()
+    let release = self.entries[release_at].contents()
+    let classes = release::classes(release::exported(parent.artefact.view(), grammar, alloc), release: release::exported(release.artefact.view(), grammar, alloc), epochs: fn(path: Str) -> release::EpochPair {
+        return release::EpochPair(old: release::epoch(parent.summary, path), new: release::epoch(release.summary, path))
+    }, forwarded: release::forwards(release.artefact.view(), alloc), compatible: mem::Set[text::String].empty(alloc), alloc)
+    return release::release_class(classes, parented: true)
+} Resolver.change_class
+
+/// The source files of a workspace package once each use matching a `preserves` or `changes`
+/// tombstone is replaced by its forwarding fix, the first of overlapping fixes alone.
+fn forwarded(session: check::Session, package_index: usize) -> mem::Map[text::String, mem::Bytes] {
+    let alloc = session.alloc
+    let diagnostics = session.reported(scope::Scope.Package(package_index))
+    var kept = mem::List[diagnostic::Fix].empty(alloc)
+    for reported in diagnostics {
+        if reported.code != diagnostic::Code.RetiredForwardedUse and reported.code != diagnostic::Code.NameMoved {
+            continue
+        }
+        let Some(fix) = reported.fixes.get(0) else {
+            continue
+        }
+        if not overlaps_kept(kept.view(), fix) {
+            mut kept.push(fix::copied_fix(fix, alloc))
+        }
+    }
+    return fix::apply(session.workspace.contents(), fixes: kept.view(), alloc)
+} forwarded
+
+/// Whether a fix replaces bytes that one of the kept fixes replaces.
+fn overlaps_kept(kept: Slice[diagnostic::Fix], fix: diagnostic::Fix) -> bool {
+    for other in kept {
+        for held in other.edits {
+            for edit in fix.edits {
+                if edit.path == held.path and edit.replacement.start < held.replacement.end and held.replacement.start < edit.replacement.end {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+} overlaps_kept

@@ -1,0 +1,211 @@
+//! Writes `x86_64-uefi` images: PE32+ EFI applications with one section per segment and the base relocations of every 64-bit absolute address, so the firmware may load them anywhere.
+
+/// The address an image is linked for; its headers occupy its first page.
+const IMAGE_BASE: u64 = 0x0040_0000
+
+/// The address of an image's first section, after its headers.
+const PE_BASE: u64 = IMAGE_BASE + PAGE
+
+const FILE_ALIGNMENT: u64 = 0x200
+
+/// The headers before the section table: the DOS header, whose field at `E_LFANEW` gives the
+/// offset of the PE signature following it, the signature, the file header and the PE32+
+/// optional header with its data directories.
+const DOS_HEADER: u64 = 0x40
+const E_LFANEW: usize = 0x3C
+const SIGNATURE: Slice[u8] = b"PE\0\0"
+const FILE_HEADER: u64 = 20
+const OPTIONAL_HEADER: u64 = 240
+const PE_HEADERS: u64 = DOS_HEADER + FILE_HEADER + OPTIONAL_HEADER + u64.widen(SIGNATURE.len())
+const PE_SECTION_HEADER: u64 = 40
+
+const MACHINE_X86_64: u16 = 0x8664
+const EXECUTABLE_LARGE_ADDRESS_AWARE: u16 = 0x0022
+const PE32_PLUS: u16 = 0x020B
+const SUBSYSTEM_EFI_APPLICATION: u16 = 10
+const DIRECTORIES: u32 = 16
+const BASE_RELOCATION_DIRECTORY: u32 = 5
+const DIR64: u16 = 10
+
+const CODE: u32 = 0x0000_0020
+const INITIALIZED: u32 = 0x0000_0040
+const MEM_DISCARDABLE: u32 = 0x0200_0000
+const MEM_EXECUTE: u32 = 0x2000_0000
+const MEM_READ: u32 = 0x4000_0000
+const MEM_WRITE: u32 = 0x8000_0000
+
+/// A section of the image: its name, its RVA, its bytes, its size in memory and its flags.
+struct PeSection {
+    name: text::String
+    rva: u64
+    bytes: mem::Bytes
+    size: u64
+    flags: u32
+} PeSection
+
+/// The base relocation blocks of the 64-bit absolute addresses at the given RVAs: per page, its
+/// RVA, the block's size and an entry per address, padded to 4 bytes.
+fn base_relocations(rvas: Slice[u64], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    var index: usize = 0
+    while index < rvas.len() {
+        let block = rvas[index] & ~(PAGE - 1)
+        var entries = mem::List[u16].empty(alloc)
+        while index < rvas.len() and (rvas[index] & ~(PAGE - 1)) == block {
+            mut entries.push((DIR64 << 12) | u16.truncate(rvas[index] & (PAGE - 1)))
+            index += 1
+        }
+        if entries.len() % 2 == 1 {
+            mut entries.push(0)
+        }
+        object::append_u32(mut out, value: u32.truncate(block))
+        object::append_u32(mut out, value: 8 + 2 * u32.fit(entries.len()))
+        for entry in entries {
+            object::append_u16(mut out, value: entry)
+        }
+    }
+    return out
+} base_relocations
+
+/// The sections of the linked object's segments.
+fn pe_sections(linked: Linked, alloc: mem::Alloc) -> mem::List[PeSection] {
+    var sections = mem::List[PeSection].empty(alloc)
+    for segment in linked.segments {
+        let name = match segment.access {
+            Access.Execute => ".text"
+            Access.Read => ".rdata"
+            Access.Write => ".data"
+        }
+        let flags = match segment.access {
+            Access.Execute => CODE | MEM_EXECUTE | MEM_READ
+            Access.Read => INITIALIZED | MEM_READ
+            Access.Write => INITIALIZED | MEM_READ | MEM_WRITE
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        mut bytes.append(segment.bytes.view())
+        expect segment.address >= IMAGE_BASE
+        mut sections.push(PeSection(name: text::String.of(name, alloc), rva: segment.address - IMAGE_BASE, bytes: take bytes, size: segment.size, flags: flags))
+    }
+    return sections
+} pe_sections
+
+/// The total of the sizes, rounded up to the file alignment, of the sections with a flag.
+fn sum(sections: Slice[PeSection], flag: u32) -> u32 {
+    var total: u32 = 0
+    for section in sections {
+        if (section.flags & flag) != 0 {
+            total += u32.truncate(next_multiple_of(section.size, multiple: FILE_ALIGNMENT))
+        }
+    }
+    return total
+} sum
+
+/// What the optional header gives beside the sections: the entry's address, the sizes of the
+/// image and of its headers, and the RVA and size of the base relocations.
+struct Sizes derives Copy {
+    entry: u64
+    image: u64
+    headers: u64
+    relocation_rva: u64
+    relocation_size: u64
+} Sizes
+
+/// The bytes of a PE32+ EFI application holding the linked object's segments, linked at
+/// `IMAGE_BASE` and entered at the address `entry`.
+fn pe_write(linked: Linked, entry: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var sections = pe_sections(linked, alloc)
+    var relocations = mem::List[u64].empty(alloc)
+    for absolute in linked.absolute {
+        expect absolute.width == 8 and absolute.address >= IMAGE_BASE
+        mut relocations.push(absolute.address - IMAGE_BASE)
+    }
+    let end = linked.end()
+    expect end >= IMAGE_BASE
+    let relocation_rva = next_multiple_of(end - IMAGE_BASE, multiple: PAGE)
+    let relocation_bytes = base_relocations(relocations.view(), alloc)
+    let relocation_size = u64.widen(relocation_bytes.len())
+    var relocation_memory = relocation_size
+    if relocation_memory == 0 {
+        relocation_memory = 1
+    }
+    mut sections.push(PeSection(name: text::String.of(".reloc", alloc), rva: relocation_rva, bytes: take relocation_bytes, size: relocation_memory, flags: INITIALIZED | MEM_DISCARDABLE | MEM_READ))
+    let image_size = next_multiple_of(relocation_rva + relocation_memory, multiple: PAGE)
+    let headers_size = next_multiple_of(PE_HEADERS + PE_SECTION_HEADER * u64.widen(sections.len()), multiple: FILE_ALIGNMENT)
+    var out = mem::Bytes.empty(alloc)
+    write_headers(mut out, sections: sections.view(), sizes: Sizes(entry: entry, image: image_size, headers: headers_size, relocation_rva: relocation_rva, relocation_size: relocation_size))
+    var raw = headers_size
+    var placed = mem::List[u64].empty(alloc)
+    for section in sections {
+        var name = Array[u8, 8].filled(0)
+        let spelt = section.name.as_bytes()
+        expect spelt.len() <= 8
+        for index in 0..<spelt.len() {
+            name[index] = spelt[index]
+        }
+        let length = next_multiple_of(u64.widen(section.bytes.len()), multiple: FILE_ALIGNMENT)
+        mut out.append(name.view())
+        object::append_u32(mut out, value: u32.truncate(section.size))
+        object::append_u32(mut out, value: u32.truncate(section.rva))
+        object::append_u32(mut out, value: u32.truncate(length))
+        var pointer: u64 = 0
+        if length > 0 {
+            pointer = raw
+        }
+        object::append_u32(mut out, value: u32.truncate(pointer))
+        object::resize(mut out, length: out.len() + 12)
+        object::append_u32(mut out, value: section.flags)
+        mut placed.push(raw)
+        raw += length
+    }
+    expect placed.len() == sections.len()
+    for index in 0..<sections.len() {
+        object::resize(mut out, length: usize.widen(placed[index]))
+        mut out.append(sections[index].bytes.view())
+    }
+    object::resize(mut out, length: usize.widen(raw))
+    return out
+} pe_write
+
+/// Writes the DOS header, the signature, the file header and the optional header.
+fn write_headers(mut out: mem::Bytes, sections: Slice[PeSection], sizes: Sizes)
+    requires sections.len() > 0 and sizes.entry >= IMAGE_BASE
+{
+    mut out.append(b"MZ")
+    object::resize(mut out, length: E_LFANEW)
+    object::append_u32(mut out, value: u32.fit(DOS_HEADER))
+    mut out.append(SIGNATURE)
+    object::append_u16(mut out, value: MACHINE_X86_64)
+    object::append_u16(mut out, value: u16.fit(sections.len()))
+    object::resize(mut out, length: out.len() + 12)
+    object::append_u16(mut out, value: u16.fit(OPTIONAL_HEADER))
+    object::append_u16(mut out, value: EXECUTABLE_LARGE_ADDRESS_AWARE)
+    object::append_u16(mut out, value: PE32_PLUS)
+    object::resize(mut out, length: out.len() + 2)
+    object::append_u32(mut out, value: sum(sections, flag: CODE))
+    object::append_u32(mut out, value: sum(sections, flag: INITIALIZED))
+    object::append_u32(mut out, value: 0)
+    object::append_u32(mut out, value: u32.truncate(sizes.entry - IMAGE_BASE))
+    object::append_u32(mut out, value: u32.truncate(sections[0].rva))
+    object::append_u64(mut out, value: IMAGE_BASE)
+    object::append_u32(mut out, value: u32.fit(PAGE))
+    object::append_u32(mut out, value: u32.fit(FILE_ALIGNMENT))
+    object::resize(mut out, length: out.len() + 16)
+    object::append_u32(mut out, value: u32.truncate(sizes.image))
+    object::append_u32(mut out, value: u32.truncate(sizes.headers))
+    object::append_u32(mut out, value: 0)
+    object::append_u16(mut out, value: SUBSYSTEM_EFI_APPLICATION)
+    object::append_u16(mut out, value: 0)
+    object::resize(mut out, length: out.len() + 32)
+    object::append_u32(mut out, value: 0)
+    object::append_u32(mut out, value: DIRECTORIES)
+    for directory in 0..<DIRECTORIES {
+        var rva: u32 = 0
+        var size: u32 = 0
+        if directory == BASE_RELOCATION_DIRECTORY {
+            rva = u32.truncate(sizes.relocation_rva)
+            size = u32.truncate(sizes.relocation_size)
+        }
+        object::append_u32(mut out, value: rva)
+        object::append_u32(mut out, value: size)
+    }
+} write_headers

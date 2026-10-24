@@ -222,16 +222,13 @@ impl Checker<'_> {
 /// The candidates near a written name, closest first: those within a third of the length of the
 /// longer folded form, at most as many as a diagnostic lists.
 pub fn near(written: &str, candidates: Vec<String>) -> Vec<String> {
+    let ranker = Ranker::new(written);
     let mut near: Vec<(usize, String)> = candidates
         .into_iter()
         .filter(|candidate| candidate != written)
         .filter_map(|candidate| {
-            let distance = distance(written, &candidate);
-            let longer = fold_path(written)
-                .chars()
-                .count()
-                .max(fold_path(&candidate).chars().count());
-            (distance <= longer.div_ceil(3)).then_some((distance, candidate))
+            let distance = ranker.distance_within(&candidate)?;
+            Some((distance, candidate))
         })
         .collect();
     near.sort();
@@ -245,29 +242,52 @@ fn fold_path(path: &str) -> String {
     path.split("::").map(fold).collect::<Vec<_>>().join("::")
 }
 
-/// The distance between a use and a candidate: 0 when replacing a run of the use's words that
-/// the controlled vocabulary lists as a synonym by its verb gives the candidate, and otherwise the
-/// fewest insertions, deletions, substitutions and transpositions of adjacent characters turning
-/// one folded form into the other, no character edited twice.
-fn distance(written: &str, candidate: &str) -> usize {
-    let words: Vec<&str> = written.split('_').collect();
-    for start in 0..words.len() {
-        for end in start + 1..=words.len() {
-            let run = words[start..end].join("_");
-            for (verb, synonyms) in SYNONYMS {
-                if synonyms.contains(&run.as_str()) {
-                    let replaced = [&words[..start], &[verb], &words[end..]].concat().join("_");
-                    if replaced == candidate {
-                        return 0;
+/// A written name compared with candidates: its folded form and the names that replacing a run of
+/// its words that the controlled vocabulary lists as a synonym by its verb gives.
+struct Ranker {
+    folded: Vec<char>,
+    synonyms: Vec<String>,
+}
+
+impl Ranker {
+    fn new(written: &str) -> Ranker {
+        let words: Vec<&str> = written.split('_').collect();
+        let mut synonyms = Vec::new();
+        for start in 0..words.len() {
+            for end in start + 1..=words.len() {
+                let run = words[start..end].join("_");
+                for (verb, listed) in SYNONYMS {
+                    if listed.contains(&run.as_str()) {
+                        synonyms.push([&words[..start], &[verb], &words[end..]].concat().join("_"));
                     }
                 }
             }
         }
+        Ranker {
+            folded: fold_path(written).chars().collect(),
+            synonyms,
+        }
     }
-    let (left, right): (Vec<char>, Vec<char>) = (
-        fold_path(written).chars().collect(),
-        fold_path(candidate).chars().collect(),
-    );
+
+    /// The distance to a candidate when it is within a third of the length of the longer folded
+    /// form: 0 when a synonym's replacement gives the candidate, and otherwise the fewest edits
+    /// turning one folded form into the other.
+    fn distance_within(&self, candidate: &str) -> Option<usize> {
+        let other: Vec<char> = fold_path(candidate).chars().collect();
+        let bound = self.folded.len().max(other.len()).div_ceil(3);
+        if self.synonyms.iter().any(|synonym| synonym == candidate) {
+            return Some(0);
+        }
+        if self.folded.len().abs_diff(other.len()) > bound {
+            return None;
+        }
+        Some(edits(&self.folded, &other)).filter(|distance| *distance <= bound)
+    }
+}
+
+/// The fewest insertions, deletions, substitutions and transpositions of adjacent characters
+/// turning one text into the other, no character edited twice.
+fn edits(left: &[char], right: &[char]) -> usize {
     let mut table = vec![vec![0usize; right.len() + 1]; left.len() + 1];
     for (at, row) in table.iter_mut().enumerate() {
         row[0] = at;

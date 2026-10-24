@@ -3,7 +3,7 @@
 //! each module declares, the functions named after each type and the tombstones of retired forms.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ty::Scalar;
 use crate::syntax::ast;
@@ -97,7 +97,7 @@ pub struct Db<'a> {
     /// The package each std alias names.
     pub std: HashMap<&'static str, PackageId>,
     /// The functions named after each type, by member name.
-    pub members: HashMap<TypeKey, HashMap<String, Vec<ItemId>>>,
+    pub members: HashMap<TypeKey, BTreeMap<String, Vec<ItemId>>>,
     /// The type each function named after one is named after.
     pub owners: HashMap<ItemId, TypeKey>,
     /// The tombstones, by the canonical path of their old form.

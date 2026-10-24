@@ -1,0 +1,224 @@
+//! The gate codes of the release gate: API snapshots that are not current, pending weakenings, and trust escapes without a current seal.
+
+/// A module's computed snapshot, none when it holds no entry.
+struct ComputedModule {
+    name: text::String
+    snapshot: Option[machine::Snapshot]
+} ComputedModule
+
+/// The seals an item's computed entry holds, by its canonical path.
+struct EntrySeals {
+    path: text::String
+    seals: mem::List[machine::Seal]
+} EntrySeals
+
+/// The diagnostics the release gate reports on a workspace package beyond its checks and tests.
+pkg fn Session.gate(self, package_index: usize) -> mem::List[diagnostic::Diagnostic] {
+    let alloc = self.alloc
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let held = self.workspace.contents()
+    if held.closure_of(package_index).is_none() {
+        return found
+    }
+    let source = held.packages[package_index]
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    let checkers = self.package_checkers(package_index)
+    let items = Items.of(checkers.view(), package_name, alloc)
+    let computed = self.computed_snapshots(package_index, items, confirmed: mem::List[text::String].empty(alloc).view())
+    let Snapshots(modules: modules, recorded: recorded) = computed
+    var entry_seals = mem::List[EntrySeals].empty(alloc)
+    for module in modules {
+        for entry in module.entries {
+            var seals = mem::List[machine::Seal].empty(alloc)
+            for seal in entry.seals {
+                mut seals.push(seal.copy(alloc))
+            }
+            mut entry_seals.push(EntrySeals(path: text::String.of(entry.path.as_str(), alloc), seals: take seals))
+        }
+    }
+    var current = mem::List[ComputedModule].empty(alloc)
+    for module in take modules {
+        let name = text::String.of(module.name.as_str(), alloc)
+        mut current.push(ComputedModule(name: take name, snapshot: take module.into_snapshot()))
+    }
+    self.stale_snapshots(source, items, current: current.view(), found: mut found)
+    for pending in take recorded {
+        let Recorded(path: path, file: file, line: line, parts: parts) = pending
+        var reported = diagnostic::Diagnostic.at(diagnostic::Code.ApiWeakeningPending, path: file.as_str(), line, alloc)
+        for part in parts {
+            mut reported.because.push(diagnostic::Reason.note(part.as_str(), alloc))
+        }
+        reported.item = Some(take path)
+        mut found.push(take reported)
+    }
+    var escaping = mem::List[text::String].empty(alloc)
+    for entry in items.by_path {
+        if items.holds_escape(entry.key().as_str()) {
+            mut escaping.push(text::String.of(entry.key().as_str(), alloc))
+        }
+    }
+    match items.package_path(alloc) {
+        Some(path) => {
+            if items.holds_escape(path.as_str()) {
+                mut escaping.push(take path)
+            }
+        }
+        None => {}
+    }
+    match History.open(self) {
+        Some(history) => {
+            var sealed_escapes = mem::List[text::String].empty(alloc)
+            for path in escaping {
+                if is_sealed(entry_seals.view(), items, path: path.as_str(), alloc) {
+                    mut sealed_escapes.push(text::String.of(path.as_str(), alloc))
+                }
+            }
+            for reported in take history.same_author(package_index, items, escaping: sealed_escapes.view()) {
+                mut found.push(take reported)
+            }
+            for reported in take history.acceptances(package_index, items) {
+                mut found.push(take reported)
+            }
+        }
+        None => {}
+    }
+    for path in take escaping {
+        if is_sealed(entry_seals.view(), items, path: path.as_str(), alloc) {
+            continue
+        }
+        mut found.push(unsealed_escape(source, items, take path, alloc))
+    }
+    return found
+} Session.gate
+
+/// Adds an `api.stale` diagnostic per item whose computed snapshot entry differs from the one
+/// its module's written snapshot holds, once per location.
+fn Session.stale_snapshots(self, source: workspace::Package, items: Items, current: Slice[ComputedModule], mut found: mem::List[diagnostic::Diagnostic]) {
+    let alloc = self.alloc
+    var names = mem::List[text::String].empty(alloc)
+    for module in current {
+        mut names.push(text::String.of(module.name.as_str(), alloc))
+    }
+    for written in source.machine.snapshots {
+        mut names.push(text::String.of(written.module.as_str(), alloc))
+    }
+    mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    for index in 0..<names.len() {
+        let module = names[index].as_str()
+        if index > 0 and names[index - 1].as_str() == module {
+            continue
+        }
+        var computed_at: Option[usize] = None
+        for at in 0..<current.len() {
+            if current[at].name.as_str() == module {
+                computed_at = Some(at)
+                break
+            }
+        }
+        let paths = match computed_at {
+            Some(at) => differing(current[at].snapshot, written: source.machine.snapshot(module), alloc)
+            None => differing(None, written: source.machine.snapshot(module), alloc)
+        }
+        for path in take paths {
+            let at = stale_location(source, items, module, path: path.as_str(), alloc)
+            let reported = diagnostic::Diagnostic.at(diagnostic::Code.ApiStale, path: at.path.as_str(), line: at.line, alloc)
+            if found.position(fn(known: diagnostic::Diagnostic) => same_diagnostic(known, earlier: reported, spanned: true)).is_none() {
+                mut found.push(take reported)
+            }
+        }
+    }
+} Session.stale_snapshots
+
+/// Where a stale entry is reported: on its item's head, on the `package` line for the package
+/// item, else on its module's summary file.
+fn stale_location(source: workspace::Package, items: Items, module: Str, path: Str, alloc: mem::Alloc) -> diagnostic::At {
+    match items.first_variant(path) {
+        Some(variant) => return diagnostic::At(path: text::String.of(variant.file.as_str(), alloc), line: variant.ck.db().head_line(variant.item))
+        None => {}
+    }
+    var manifest_path = text::String.of(source.dir.as_str(), alloc)
+    mut manifest_path.append("/package.nan")
+    if items.is_package_path(path) {
+        return diagnostic::At(path: take manifest_path, line: manifest_line(source))
+    }
+    for held in source.modules {
+        if held.name.as_str() != module {
+            continue
+        }
+        let Some(dir) = held.dirs.get(0) else {
+            break
+        }
+        return diagnostic::At(path: text::String.of(dir.first_file.as_str(), alloc), line: 1)
+    }
+    return diagnostic::At(path: take manifest_path, line: 1)
+} stale_location
+
+/// Whether an item's computed entry holds a current seal.
+fn is_sealed(entry_seals: Slice[EntrySeals], items: Items, path: Str, alloc: mem::Alloc) -> bool {
+    for held in entry_seals {
+        if held.path.as_str() != path {
+            continue
+        }
+        for seal in held.seals {
+            if items.seal_current(path, seal, alloc) {
+                return true
+            }
+        }
+        return false
+    }
+    return false
+} is_sealed
+
+/// The `trust.unsealed` incompleteness of an item holding trust escapes, listing them.
+fn unsealed_escape(source: workspace::Package, items: Items, take path: text::String, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    var escapes = mem::List[text::String].empty(alloc)
+    var reported = diagnostic::Diagnostic.new(diagnostic::Code.TrustUnsealed, alloc)
+    match items.first_variant(path.as_str()) {
+        Some(variant) => {
+            for entry in take variant.ck.ledger(variant.item) {
+                if entry.escape {
+                    var written = text::String.of(entry.kind.word(), alloc)
+                    mut written.push(' ')
+                    mut written.append(entry.path.as_str())
+                    mut written.write(text::fmt(":{line}", line: entry.line), budget: 100)
+                    mut escapes.push(take written)
+                }
+            }
+            reported.path = Some(text::String.of(variant.ck.db().item_file(variant.item).path.as_str(), alloc))
+            reported.line = Some(variant.ck.db().head_line(variant.item))
+        }
+        None => {
+            match items.checked_package {
+                Some(held) => {
+                    for entry in take held.ck.grant_ledger(held.id) {
+                        var written = text::String.of("grant ", alloc)
+                        mut written.append(entry.path.as_str())
+                        mut written.write(text::fmt(":{line}", line: entry.line), budget: 100)
+                        mut escapes.push(take written)
+                    }
+                }
+                None => {}
+            }
+            var manifest_path = text::String.of(source.dir.as_str(), alloc)
+            mut manifest_path.append("/package.nan")
+            reported.path = Some(take manifest_path)
+            reported.line = Some(manifest_line(source))
+        }
+    }
+    for escape in escapes {
+        mut reported.because.push(diagnostic::Reason.note(escape.as_str(), alloc))
+    }
+    reported.item = Some(take path)
+    return reported
+} unsealed_escape
+
+/// The line of a package's `package` keyword.
+fn manifest_line(source: workspace::Package) -> u32 {
+    let Some(manifest) = source.manifest else {
+        return 1
+    }
+    return manifest.line
+} manifest_line

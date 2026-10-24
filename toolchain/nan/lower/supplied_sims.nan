@@ -1,0 +1,544 @@
+//! Simulated capabilities: in a test image every capability is a sim, as only `testing::world()` and the `sys::sim` constructors mint them there, so each target-dependent operation of a sys capability or resource acts on the sim its entry or holding names. The run's world, minted before its test starts, holds a root cell and an entry per capability. A sim is an object of the sim table, named by its index, which an entry's first state word or a resource's holding holds: a file system, an open file, a network, a listener, a connection's endpoint, a random stream or an input. An awaited operation that the sim's state does not decide waits in it: its operation record lies in the sim's waiter slot until the sim completes it, or until its cancellation withdraws it.
+
+/// The kinds of sim objects, each object's first word.
+const SIMS_OBJECT_FS: i64 = 1
+
+const SIMS_OBJECT_FILE: i64 = 2
+
+const SIMS_OBJECT_NET: i64 = 3
+
+const SIMS_OBJECT_LISTENER: i64 = 4
+
+const SIMS_OBJECT_ENDPOINT: i64 = 5
+
+const SIMS_OBJECT_RANDOM: i64 = 6
+
+const SIMS_OBJECT_INPUT: i64 = 7
+
+const SIMS_OBJECT_KIND: u64 = 0
+
+/// The offsets of the sim table's fields: its records' addresses, their count and capacity.
+const TABLE_RECORDS: u64 = 0
+
+const TABLE_COUNT: u64 = 8
+
+const TABLE_CAPACITY: u64 = 16
+
+const TABLE_SIZE: u64 = 24
+
+/// The offsets of a random stream's fields: its seed and the index of its next byte.
+const RANDOM_SEED: u64 = 8
+
+const RANDOM_NEXT: u64 = 16
+
+const RANDOM_SIZE: u64 = 24
+
+/// The offsets of an input's fields: its bytes, their count and the count read.
+const INPUT_DATA: u64 = 8
+
+const INPUT_LEN: u64 = 16
+
+const INPUT_READ: u64 = 24
+
+const INPUT_SIZE: u64 = 32
+
+/// The stream of random bytes.
+const RANDOM_STREAM: u64 = 2
+
+/// The render budget of a log record's value.
+const SIMS_LOG_BUDGET: u64 = 1_024
+
+/// The bytes of a log record's line buffer.
+const SIMS_LINE: u64 = 4_096
+
+/// A new sim object: its index in the sim table and its record.
+struct SimObject derives Copy {
+    index: clif::Value
+    record: clif::Value
+} SimObject
+
+/// A capability minted into the run's world: its handle and the record of its entry.
+struct WorldEntry derives Copy {
+    handle: clif::Value
+    record: clif::Value
+} WorldEntry
+
+fn sims_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    match supply.path.as_str() {
+        "testing::world" => {
+            let world_ty = lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(lo.alloc))
+            let laid = mut lo.layout_of(world_ty)
+            let world = test_image_world(mut lo, mut fx)
+            let Some(sret) = supply.sret else {
+                expect false
+                return true
+            }
+            mut lo.copy(mut fx, dst: sret, src: world, size: laid.contents().size, align: laid.contents().align)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "sys::sim::fs" => {
+            let limit = supply.param(0).scalar_value()
+            let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            let sim = fs_new(mut lo, mut fx, limit, cell)
+            sims_capability(mut lo, mut fx, supply, entry_kind: TABLES_KIND_FS, sim)
+        }
+        "sys::sim::net" => {
+            let sim = net_new(mut lo, mut fx)
+            sims_capability(mut lo, mut fx, supply, entry_kind: TABLES_KIND_NET, sim)
+        }
+        "sys::sim::random" => {
+            let sim = sims_random_stream(mut lo, mut fx, seed: supply.param(0).scalar_value())
+            sims_capability(mut lo, mut fx, supply, entry_kind: TABLES_KIND_RANDOM, sim)
+        }
+        "sys::sim::stdio" => {
+            let contents = sys_view(mut fx, held: supply.param(0))
+            let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            let sim = new_input(mut lo, mut fx, start: contents.start, len: contents.len, cell)
+            sims_capability(mut lo, mut fx, supply, entry_kind: TABLES_KIND_STDIO, sim)
+        }
+        else => return false
+    }
+    return true
+} sims_lower
+
+/// Returns a new capability of a kind whose entry names a sim.
+fn sims_capability(mut lo: Lowering, mut fx: Fx, supply: Supply, entry_kind: i64, sim: clif::Value) {
+    let kind_value = mut fx.ptr(entry_kind.to_bits())
+    let handle = mint(mut lo, mut fx, kind: kind_value)
+    let record = entry_at(mut lo, mut fx, handle)
+    mut fx.store(sim, addr: record, offset: TABLES_ENTRY_STATE)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(handle, addr: sret, offset: 0)
+    supply.done(mut lo, mut fx)
+} sims_capability
+
+/// Mints the run's world in runtime memory: its address. Its file system has no size limit
+/// and stores through its allocator, whose root cell has none either; its random stream is the
+/// run's.
+fn mint_world(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let world_ty = lo.std_ty("host", type_name: "World", args: mem::List[ty::Ty].empty(lo.alloc))
+    let laid = mut lo.layout_of(world_ty)
+    let size = mut fx.ptr(laid.contents().size)
+    let world = mut lo.record_alloc(mut fx, size)
+    let limit = mut fx.int(PTR, value: -1)
+    let parent = mut fx.int(PTR, value: -1)
+    let cell = new_cell(mut lo, mut fx, limit, parent)
+    let unlimited = mut fx.int(PTR, value: -1)
+    let state_address = mut lo.state(mut fx)
+    let seed = mut fx.load(PTR, addr: state_address, offset: STATE_SEED)
+    let fs = fs_new(mut lo, mut fx, limit: unlimited, cell)
+    let net = net_new(mut lo, mut fx)
+    let random = sims_random_stream(mut lo, mut fx, seed)
+    let none = mut fx.ptr(0)
+    discard world_entry(mut lo, mut fx, world_ty, world, field: "fs", entry_kind: TABLES_KIND_FS, sim: fs)
+    discard world_entry(mut lo, mut fx, world_ty, world, field: "net", entry_kind: TABLES_KIND_NET, sim: net)
+    let clock = world_entry(mut lo, mut fx, world_ty, world, field: "clock", entry_kind: TABLES_KIND_CLOCK, sim: none)
+    discard world_entry(mut lo, mut fx, world_ty, world, field: "random", entry_kind: TABLES_KIND_RANDOM, sim: random)
+    discard world_entry(mut lo, mut fx, world_ty, world, field: "log", entry_kind: TABLES_KIND_LOG, sim: none)
+    discard world_entry(mut lo, mut fx, world_ty, world, field: "stdio", entry_kind: TABLES_KIND_STDIO, sim: none)
+    let exec = world_entry(mut lo, mut fx, world_ty, world, field: "exec", entry_kind: TABLES_KIND_EXECUTOR, sim: cell)
+    mut fx.store(clock.handle, addr: exec.record, offset: TABLES_ENTRY_STATE + 8)
+    grant_memory(mut lo, mut fx, world, cell)
+    return world
+} mint_world
+
+/// Mints the entry of a world's field, of a kind and naming a sim, and stores its handle in the
+/// world.
+fn world_entry(mut lo: Lowering, mut fx: Fx, world_ty: ty::Ty, world: clif::Value, field: Str, entry_kind: i64, sim: clif::Value) -> WorldEntry {
+    let kind_value = mut fx.ptr(entry_kind.to_bits())
+    let handle = mint(mut lo, mut fx, kind: kind_value)
+    let record = entry_at(mut lo, mut fx, handle)
+    mut fx.store(sim, addr: record, offset: TABLES_ENTRY_STATE)
+    let field_at = mut lo.layouts.field(lo.ck, ty: world_ty, variant: None, label: field)
+    mut fx.store(handle, addr: world, offset: field_at.offset)
+    return WorldEntry(handle: handle, record: record)
+} world_entry
+
+/// The address of the sim table.
+fn sims_table(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    if lo.sims.is_none() {
+        let id = mut lo.module.declare_data("_NSreplay_sims", linkage: object::Linkage.Local, writable: true, tls: false)
+        var description = object::DataDescription.new(lo.alloc)
+        mut description.define_zeroinit(TABLE_SIZE)
+        mut description.set_align(8)
+        mut lo.module.define_data(id, take description)
+        lo.sims = Some(id)
+    }
+    let Some(id) = lo.sims else {
+        expect false
+        return mut fx.ptr(0)
+    }
+    let global = mut lo.data_ref(mut fx, id)
+    return mut fx.b.symbol_value(PTR, global_value: global)
+} sims_table
+
+/// A new zeroed sim object of a kind and size in runtime memory: its index and record.
+fn new_object(mut lo: Lowering, mut fx: Fx, object_kind: i64, size: u64) -> SimObject {
+    let bytes = mut fx.ptr(size)
+    let record = mut lo.record_alloc(mut fx, size: bytes)
+    exhausted_unless(mut lo, mut fx, address: record)
+    let kind_value = mut fx.ptr(object_kind.to_bits())
+    mut fx.store(kind_value, addr: record, offset: SIMS_OBJECT_KIND)
+    let sims = sims_table(mut lo, mut fx)
+    let count = mut fx.load(PTR, addr: sims, offset: TABLE_COUNT)
+    let capacity = mut fx.load(PTR, addr: sims, offset: TABLE_CAPACITY)
+    let full = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: count, y: capacity)
+    mut fx.if_true(full, then: fn[mut lo](mut fx1: Fx) {
+        let doubled = mut fx1.b.ishl_imm_s(capacity, y: 1)
+        let least = mut fx1.ptr(16)
+        let grown = mut fx1.b.umax(doubled, y: least)
+        let grown_bytes = mut fx1.b.imul_imm_s(grown, y: 8)
+        let records = mut fx1.load(PTR, addr: sims, offset: TABLE_RECORDS)
+        let moved = mut lo.record_resize(mut fx1, address: records, size: grown_bytes)
+        exhausted_unless(mut lo, fx: mut fx1, address: moved)
+        mut fx1.store(moved, addr: sims, offset: TABLE_RECORDS)
+        mut fx1.store(grown, addr: sims, offset: TABLE_CAPACITY)
+    })
+    let records = mut fx.load(PTR, addr: sims, offset: TABLE_RECORDS)
+    let offset = mut fx.b.imul_imm_s(count, y: 8)
+    let slot = mut fx.b.iadd(records, y: offset)
+    mut fx.store(record, addr: slot, offset: 0)
+    let next = mut fx.b.iadd_imm_s(count, y: 1)
+    mut fx.store(next, addr: sims, offset: TABLE_COUNT)
+    return SimObject(index: next, record: record)
+} new_object
+
+/// The record of the sim object an index names.
+fn object_at(mut lo: Lowering, mut fx: Fx, index: clif::Value) -> clif::Value {
+    let sims = sims_table(mut lo, mut fx)
+    let records = mut fx.load(PTR, addr: sims, offset: TABLE_RECORDS)
+    let position = mut fx.b.iadd_imm_s(index, y: -1)
+    let offset = mut fx.b.imul_imm_s(position, y: 8)
+    let slot = mut fx.b.iadd(records, y: offset)
+    return mut fx.load(PTR, addr: slot, offset: 0)
+} object_at
+
+/// Traps with `trap.exhausted` when runtime memory could not be drawn.
+fn exhausted_unless(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+} exhausted_unless
+
+/// Draws `size` bytes through a cell for storage a sim keeps whatever domain draws it,
+/// trapping on exhaustion; zero for no bytes.
+fn sims_draw(mut lo: Lowering, mut fx: Fx, cell: clif::Value, size: clif::Value) -> clif::Value {
+    let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: size, y: 0)
+    let results = fx.types1(PTR)
+    let drawn = mut fx.choose_in(mut lo, condition: empty, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let state_address = mut lo1.state(mut fx1)
+        let process = mut fx1.load(PTR, addr: state_address, offset: STATE_PROCESS)
+        let one = mut fx1.ptr(1)
+        let alloc_args = fx1.list4(cell, b: size, c: one, d: process)
+        let allocated = mut lo1.call_routine(mut fx1, routine: Routine.AllocIn, args: alloc_args.view())
+        expect allocated.len() == 1
+        exhausted_unless(mut lo1, fx: mut fx1, address: allocated[0])
+        return fx1.list1(allocated[0])
+    })
+    expect drawn.len() == 1
+    return drawn[0]
+} sims_draw
+
+/// Waits at a cancellation point for the operation that `enqueue` records in a sim, or in the
+/// virtual clock without a waiter slot, the running task parking until it completes; gives
+/// whether the wait ended by the cancellation of the call. A call cancelled at its start waits
+/// for nothing.
+fn sims_wait(mut lo: Lowering, mut fx: Fx, slot: Option[clif::Value], enqueue: fn(mut lo: Lowering, mut fx: Fx, op: clif::Value)) -> clif::Value {
+    let record = current_task(mut lo, mut fx)
+    let region = mut fx.load(PTR, addr: record, offset: TASKS_TASK_REGION)
+    let origin = regions_origin(mut fx, region)
+    let early = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    let results = fx.types1(clif::Type.Int8)
+    let ended = mut fx.choose_in(mut lo, condition: early, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let cancelled = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(cancelled)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let op = mut fx1.slot(OPERATION_SIZE, align: 8)
+        let zero = mut fx1.ptr(0)
+        let size = mut fx1.ptr(OPERATION_SIZE)
+        let fill_args = fx1.list3(op, b: zero, c: size)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Fill, args: fill_args.view())
+        mut fx1.store(record, addr: op, offset: OPERATION_TASK)
+        let wait_kind = mut fx1.ptr(TASKS_KIND_WAIT.to_bits())
+        mut fx1.store(wait_kind, addr: op, offset: OPERATION_KIND)
+        match slot {
+            Some(waiter) => {
+                mut fx1.store(waiter, addr: op, offset: OPERATION_WAITER)
+                let withdraw_id = withdraw_glue(mut lo1)
+                let withdraw_ref = mut lo1.func_ref(mut fx1, id: withdraw_id)
+                let withdraw_address = mut fx1.b.func_addr(PTR, func_ref: withdraw_ref)
+                mut fx1.store(withdraw_address, addr: op, offset: OPERATION_WITHDRAW)
+            }
+            None => {}
+        }
+        mut fx1.store(op, addr: record, offset: TASK_IO)
+        enqueue(mut lo1, fx: mut fx1, op)
+        let stopped = regions_origin(mut fx1, region)
+        let cancelled = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: stopped, y: 0)
+        mut fx1.if_true(cancelled, then: fn[mut lo1](mut fx2: Fx) {
+            mut lo1.cancel_operation(mut fx2, op)
+        })
+        wait_delivered(mut lo1, fx: mut fx1, op)
+        let current = current_task(mut lo1, fx: mut fx1)
+        let cleared = mut fx1.ptr(0)
+        mut fx1.store(cleared, addr: current, offset: TASK_IO)
+        let result = mut fx1.load(clif::Type.Int32, addr: op, offset: OPERATION_RESULT)
+        let withdrawn = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: CANCELED)
+        return fx1.list1(withdrawn)
+    })
+    expect ended.len() == 1
+    return ended[0]
+} sims_wait
+
+/// The glue withdrawing a waiting operation from the waiter slot its record names.
+fn withdraw_glue(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.SimWithdraw, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let op = params[0]
+        let slot = mut fx1.load(PTR, addr: op, offset: OPERATION_WAITER)
+        let waiting = mut fx1.load(PTR, addr: slot, offset: 0)
+        let same = mut fx1.b.icmp(clif::IntCC.Equal, x: waiting, y: op)
+        mut fx1.if_true(same, then: fn(mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: slot, offset: 0)
+        })
+        let none = mem::List[clif::Value].empty(fx1.alloc)
+        mut fx1.b.ret(none.view())
+    })
+} withdraw_glue
+
+/// Records a waiting operation in a waiter slot.
+fn sims_enqueue(mut fx: Fx, slot: clif::Value, op: clif::Value) {
+    mut fx.store(op, addr: slot, offset: 0)
+} sims_enqueue
+
+/// Completes the operation waiting in a waiter slot, if any: its task becomes ready.
+fn sims_wake(mut lo: Lowering, mut fx: Fx, slot: clif::Value) {
+    let op = mut fx.load(PTR, addr: slot, offset: 0)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: slot, offset: 0)
+        let ready = mut fx1.int(clif::Type.Int32, value: 0)
+        seeded_complete(mut lo, fx: mut fx1, op, result: ready)
+    })
+} sims_wake
+
+/// Fails an operation with the cancellation of its failure type.
+fn sims_fail_cancelled(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let origin = tasks_origin(mut lo, mut fx)
+    tasks_fail_cancelled(mut lo, mut fx, supply, origin)
+} sims_fail_cancelled
+
+/// Fails an operation with the cancellation of its failure type when its call is cancelled at
+/// its start: the cancellation point of an operation its sim decides at once.
+fn cancellation_point(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let early = tasks_origin(mut lo, mut fx)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: early, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        sims_fail_cancelled(mut lo, fx: mut fx1, supply)
+    })
+} cancellation_point
+
+/// Writes byte ranges to the test trace as one entry.
+fn trace(mut lo: Lowering, mut fx: Fx, parts: Slice[Stretch]) {
+    write_frame(mut lo, mut fx, kind: FRAME_TRACE, parts)
+} trace
+
+/// `sys::Clock.sleep` on the virtual clock: a timer due `ms` milliseconds from now wakes the
+/// task, or its cancellation fails the call.
+fn sleep(mut lo: Lowering, mut fx: Fx, supply: Supply, ms: clif::Value) {
+    let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
+        arm(mut lo1, fx: mut fx1, op, ms)
+    })
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        sims_fail_cancelled(mut lo, fx: mut fx1, supply)
+    })
+    supply.done(mut lo, mut fx)
+} sleep
+
+/// A new random stream of a seed: its index.
+fn sims_random_stream(mut lo: Lowering, mut fx: Fx, seed: clif::Value) -> clif::Value {
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_RANDOM, size: RANDOM_SIZE)
+    mut fx.store(seed, addr: created.record, offset: RANDOM_SEED)
+    return created.index
+} sims_random_stream
+
+/// `sys::Random.fill`: the stream's next bytes, least significant first of each value.
+fn random_fill(mut lo: Lowering, mut fx: Fx, entry_record: clif::Value, buf: Held) {
+    let index = mut fx.load(PTR, addr: entry_record, offset: TABLES_ENTRY_STATE)
+    let record = object_at(mut lo, mut fx, index)
+    let seed = mut fx.load(PTR, addr: record, offset: RANDOM_SEED)
+    let first_byte = mut fx.load(PTR, addr: record, offset: RANDOM_NEXT)
+    let target = sys_view(mut fx, held: buf)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: target.len, body: fn[mut lo](mut fx1: Fx, offset: clif::Value) {
+        let at = mut fx1.b.iadd(first_byte, y: offset)
+        let word = mut fx1.b.ushr_imm_s(at, y: 3)
+        let stream = mut fx1.ptr(RANDOM_STREAM)
+        let stream_args = fx1.list3(seed, b: stream, c: word)
+        let values = mut lo.call_routine(mut fx1, routine: Routine.Stream, args: stream_args.view())
+        let byte_index = mut fx1.b.band_imm_s(at, y: 7)
+        let shift = mut fx1.b.imul_imm_s(byte_index, y: 8)
+        expect values.len() == 1
+        let shifted = mut fx1.b.ushr(values[0], y: shift)
+        let byte = mut fx1.b.ireduce(clif::Type.Int8, x: shifted)
+        let written = mut fx1.b.iadd(target.start, y: offset)
+        mut fx1.store(byte, addr: written, offset: 0)
+    })
+    let next = mut fx.b.iadd(first_byte, y: target.len)
+    mut fx.store(next, addr: record, offset: RANDOM_NEXT)
+} random_fill
+
+/// Appends a text to a line buffer of `SIMS_LINE` bytes from `at`, each line feed as `\n`: the
+/// line's new length, which stays within the buffer.
+fn append_escaped(mut fx: Fx, line: clif::Value, at: clif::Value, text: clif::Value, len: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let initial = fx.list2(zero, b: at)
+    let done = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let index = current[0]
+        let end = current[1]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+        let room = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: end, y: i64.from_bits(SIMS_LINE - 2))
+        let going = mut fx1.b.band(inside, y: room)
+        let results = fx1.types2(PTR, b: PTR)
+        let next = mut fx1.choose(going, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let place = mut fx2.b.iadd(text, y: index)
+            let byte = mut fx2.load(clif::Type.Int8, addr: place, offset: 0)
+            let feed = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'\n'))
+            let target = mut fx2.b.iadd(line, y: end)
+            let written_results = fx2.types1(PTR)
+            let written = mut fx2.choose(feed, results: written_results.view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let slash = mut fx3.int(clif::Type.Int8, value: i64.widen(b'\\'))
+                let letter = mut fx3.int(clif::Type.Int8, value: i64.widen(b'n'))
+                mut fx3.store(slash, addr: target, offset: 0)
+                mut fx3.store(letter, addr: target, offset: 1)
+                let two = mut fx3.ptr(2)
+                return fx3.list1(two)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                mut fx3.store(byte, addr: target, offset: 0)
+                let one = mut fx3.ptr(1)
+                return fx3.list1(one)
+            })
+            let next_index = mut fx2.b.iadd_imm_s(index, y: 1)
+            expect written.len() == 1
+            let next_end = mut fx2.b.iadd(end, y: written[0])
+            return fx2.list2(next_index, b: next_end)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(index, b: end)
+        })
+        return Pass(again: going, next: take next)
+    })
+    expect done.len() == 2
+    return done[1]
+} append_escaped
+
+/// Writes a log record to the test trace: the level, `: `, the message, a space and the
+/// rendering of its value, each line feed written as `\n`, then a line feed.
+fn log_line(mut lo: Lowering, mut fx: Fx, level: Str, message: Held, value_ty: ty::Ty, value: Held) {
+    let rendered = render_value(mut lo, mut fx, ty: value_ty, value, budget: SIMS_LOG_BUDGET)
+    let line = mut fx.slot(SIMS_LINE + 1, align: 8)
+    var at = mut fx.ptr(0)
+    let message_part = sys_view(mut fx, held: message)
+    var separator = text::String.of(level, alloc: lo.alloc)
+    mut separator.append(": ")
+    let separator_part = sims_literal(mut lo, mut fx, bytes: separator.as_bytes())
+    let space_part = sims_literal(mut lo, mut fx, bytes: b" ")
+    var parts = Array[Stretch, 4].filled(separator_part)
+    parts[1] = message_part
+    parts[2] = space_part
+    parts[3] = Stretch(start: rendered.buffer, len: rendered.len)
+    for part in parts {
+        at = append_escaped(mut fx, line, at, text: part.start, len: part.len)
+    }
+    let end = mut fx.b.iadd(line, y: at)
+    let feed = mut fx.int(clif::Type.Int8, value: i64.widen(b'\n'))
+    mut fx.store(feed, addr: end, offset: 0)
+    let len = mut fx.b.iadd_imm_s(at, y: 1)
+    let traced = Array[Stretch, 1].filled(Stretch(start: line, len: len))
+    trace(mut lo, mut fx, parts: traced.view())
+} log_line
+
+/// The start and length of a literal's bytes.
+fn sims_literal(mut lo: Lowering, mut fx: Fx, bytes: Slice[u8]) -> Stretch {
+    let held = mut lo.view_literal(mut fx, contents: bytes)
+    let view = held.address_value()
+    let start = mut fx.load(PTR, addr: view, offset: 0)
+    let len = mut fx.load(PTR, addr: view, offset: 8)
+    return Stretch(start: start, len: len)
+} sims_literal
+
+/// A new input holding a copy of bytes drawn through a cell: its index.
+fn new_input(mut lo: Lowering, mut fx: Fx, start: clif::Value, len: clif::Value, cell: clif::Value) -> clif::Value {
+    let created = new_object(mut lo, mut fx, object_kind: SIMS_OBJECT_INPUT, size: INPUT_SIZE)
+    let copy = sims_draw(mut lo, mut fx, cell, size: len)
+    let copy_args = fx.list3(copy, b: start, c: len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    mut fx.store(copy, addr: created.record, offset: INPUT_DATA)
+    mut fx.store(len, addr: created.record, offset: INPUT_LEN)
+    return created.index
+} new_input
+
+/// `sys::Stdio.read_in`: the next bytes of the input, none once it has ended or for the
+/// world's empty input.
+fn stdio_read(mut lo: Lowering, mut fx: Fx, supply: Supply, entry_record: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let index = mut fx.load(PTR, addr: entry_record, offset: TABLES_ENTRY_STATE)
+    let has_input = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: index, y: 0)
+    let results = fx.types1(PTR)
+    let counts = mut fx.choose_in(mut lo, condition: has_input, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let record = object_at(mut lo1, fx: mut fx1, index)
+        let target = sys_view(mut fx1, held: supply.param(1))
+        let data = mut fx1.load(PTR, addr: record, offset: INPUT_DATA)
+        let len = mut fx1.load(PTR, addr: record, offset: INPUT_LEN)
+        let read = mut fx1.load(PTR, addr: record, offset: INPUT_READ)
+        let left = mut fx1.b.isub(len, y: read)
+        let copied = mut fx1.b.umin(left, y: target.len)
+        let from = mut fx1.b.iadd(data, y: read)
+        let copy_args = fx1.list3(target.start, b: from, c: copied)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        let total_read = mut fx1.b.iadd(read, y: copied)
+        mut fx1.store(total_read, addr: record, offset: INPUT_READ)
+        return fx1.list1(copied)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    expect counts.len() == 1
+    supply.ret(mut lo, mut fx, held: Held.Scalar(counts[0]))
+} stdio_read
+
+/// `sys::Stdio.write_out` and `write_err`: the bytes enter the test trace.
+fn stdio_write(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    cancellation_point(mut lo, mut fx, supply)
+    let written = sys_view(mut fx, held: supply.param(1))
+    let traced = Array[Stretch, 1].filled(written)
+    trace(mut lo, mut fx, parts: traced.view())
+    supply.done(mut lo, mut fx)
+} stdio_write
+
+/// Releases the open file or listener a holding's payload names, as its end of scope does.
+fn sims_release(mut lo: Lowering, mut fx: Fx, index: clif::Value) {
+    let record = object_at(mut lo, mut fx, index)
+    let object_kind = mut fx.load(PTR, addr: record, offset: SIMS_OBJECT_KIND)
+    let listener = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: object_kind, y: SIMS_OBJECT_LISTENER)
+    mut fx.if_true(listener, then: fn[mut lo](mut fx1: Fx) {
+        close_listener(mut lo, fx: mut fx1, record)
+    })
+} sims_release
+
+/// Abandons the connection a holding's payload names: its peer is reset.
+fn sims_abandon(mut lo: Lowering, mut fx: Fx, index: clif::Value) {
+    let record = object_at(mut lo, mut fx, index)
+    net_end(mut lo, mut fx, record, how: ENDED_RESET)
+} sims_abandon

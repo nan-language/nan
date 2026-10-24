@@ -1,0 +1,251 @@
+//! Growable vectors: the storage, length, capacity and allocator handle that lists, bytes, strings and the entries of maps and sets keep, grown as growth states. An empty vector's storage is a non-null address its elements' alignment gives, holding no allocation.
+
+const VECTOR_DATA: u64 = 0
+
+const VECTOR_LEN: u64 = 8
+
+const VECTOR_CAPACITY: u64 = 16
+
+const VECTOR_ALLOC: u64 = 24
+
+/// The size and alignment of a vector's elements.
+struct Element derives Copy {
+    size: u64
+    align: u64
+} Element
+
+fn Element.of(mut lo: Lowering, ty: ty::Ty) -> Element {
+    let laid = mut lo.layout_of(ty)
+    let align = if laid.contents().align > 1 {
+        laid.contents().align
+    } else {
+        1
+    }
+    return Element(size: laid.contents().size, align: align)
+} Element.of
+
+/// The address of element `index` of the storage at `data`.
+fn Element.at(self, mut fx: Fx, data: clif::Value, index: clif::Value) -> clif::Value {
+    let offset = mut fx.b.imul_imm_s(index, y: i64.from_bits(self.size))
+    return mut fx.b.iadd(data, y: offset)
+} Element.at
+
+/// The bytes of `count` elements.
+fn Element.bytes(self, mut fx: Fx, count: clif::Value) -> clif::Value {
+    return mut fx.b.imul_imm_s(count, y: i64.from_bits(self.size))
+} Element.bytes
+
+/// Writes an empty vector drawing through an allocator handle at an address.
+fn vector_empty(mut fx: Fx, address: clif::Value, alloc: clif::Value, element: Element) {
+    let dangling = mut fx.ptr(element.align)
+    mut fx.store(dangling, addr: address, offset: VECTOR_DATA)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: address, offset: VECTOR_LEN)
+    mut fx.store(zero, addr: address, offset: VECTOR_CAPACITY)
+    mut fx.store(alloc, addr: address, offset: VECTOR_ALLOC)
+} vector_empty
+
+/// Makes room for `needed` elements in the vector at an address: nonzero when it has room,
+/// zero on exhaustion, which leaves the vector unchanged. A new capacity is the largest of
+/// twice the old one, the needed length and 4.
+fn vector_reserve(mut lo: Lowering, mut fx: Fx, address: clif::Value, needed: clif::Value, element: Element) -> clif::Value {
+    let capacity = mut fx.load(PTR, addr: address, offset: VECTOR_CAPACITY)
+    let enough = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: needed, y: capacity)
+    let results = fx.types1(clif::Type.Int8)
+    let room = mut fx.choose(enough, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(one)
+    }, otherwise: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let doubled = mut fx1.b.ishl_imm_s(capacity, y: 1)
+        let wanted = mut fx1.b.umax(doubled, y: needed)
+        let four = mut fx1.ptr(4)
+        let grown = mut fx1.b.umax(wanted, y: four)
+        let resized = vector_resize(mut lo, fx: mut fx1, address, capacity: grown, element)
+        return fx1.list1(resized)
+    })
+    expect room.len() == 1
+    return room[0]
+} vector_reserve
+
+/// Moves the vector's elements to a new allocation of `capacity` elements, freeing the old
+/// one: nonzero on success, zero on exhaustion, which leaves the vector unchanged.
+fn vector_resize(mut lo: Lowering, mut fx: Fx, address: clif::Value, capacity: clif::Value, element: Element) -> clif::Value {
+    let size = mut fx.ptr(element.size)
+    let product = mut fx.b.umul_overflow(capacity, y: size)
+    let results = fx.types1(clif::Type.Int8)
+    let resized = mut fx.choose(product.flag, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let failed = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(failed)
+    }, otherwise: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        let bytes = mut fx1.b.umax(product.value, y: one)
+        let alloc = mut fx1.load(PTR, addr: address, offset: VECTOR_ALLOC)
+        let align = mut fx1.ptr(element.align)
+        let alloc_args = fx1.list3(alloc, b: bytes, c: align)
+        let drawn_values = mut lo.call_routine(mut fx1, routine: Routine.Alloc, args: alloc_args.view())
+        expect drawn_values.len() == 1
+        let fresh = drawn_values[0]
+        let drawn = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: fresh, y: 0)
+        mut fx1.if_true(drawn, then: fn[mut lo](mut fx2: Fx) {
+            let data = mut fx2.load(PTR, addr: address, offset: VECTOR_DATA)
+            let len = mut fx2.load(PTR, addr: address, offset: VECTOR_LEN)
+            let used = element.bytes(mut fx2, count: len)
+            let copy_args = fx2.list3(fresh, b: data, c: used)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Copy, args: copy_args.view())
+            free_storage(mut lo, fx: mut fx2, address)
+            mut fx2.store(fresh, addr: address, offset: VECTOR_DATA)
+            mut fx2.store(capacity, addr: address, offset: VECTOR_CAPACITY)
+        })
+        return fx1.list1(drawn)
+    })
+    expect resized.len() == 1
+    return resized[0]
+} vector_resize
+
+/// Frees a vector's storage when it holds an allocation.
+fn free_storage(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
+    let capacity = mut fx.load(PTR, addr: address, offset: VECTOR_CAPACITY)
+    let allocated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: capacity, y: 0)
+    mut fx.if_true(allocated, then: fn[mut lo](mut fx1: Fx) {
+        let data = mut fx1.load(PTR, addr: address, offset: VECTOR_DATA)
+        let free_args = fx1.list1(data)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Free, args: free_args.view())
+    })
+} free_storage
+
+/// Releases each element of a type from `from` to the length, then the storage.
+fn vector_release(mut lo: Lowering, mut fx: Fx, address: clif::Value, element: ty::Ty, from: clif::Value) {
+    release_elements(mut lo, mut fx, address, element, from)
+    free_storage(mut lo, mut fx, address)
+} vector_release
+
+/// Releases each element of a type from `from` to the length.
+fn release_elements(mut lo: Lowering, mut fx: Fx, address: clif::Value, element: ty::Ty, from: clif::Value) {
+    if not mut lo.needs_release(element) {
+        return
+    }
+    let shape = Element.of(mut lo, ty: element)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    mut fx.each(from, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data, index)
+        mut lo.release(mut fx1, ty: element, address: at)
+    })
+} release_elements
+
+/// Moves a vector into another domain's reach: its storage, and each element from `from`, or
+/// from the first.
+fn vector_transfer(mut lo: Lowering, mut fx: Fx, address: clif::Value, element: ty::Ty, from: Option[clif::Value], lift: clif::Value, owner: clif::Value) {
+    let capacity = mut fx.load(PTR, addr: address, offset: VECTOR_CAPACITY)
+    let allocated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: capacity, y: 0)
+    mut fx.if_true(allocated, then: fn[mut lo](mut fx1: Fx) {
+        let data = mut fx1.load(PTR, addr: address, offset: VECTOR_DATA)
+        discard transfer_lift(mut lo, fx: mut fx1, address: data, lift)
+    })
+    if not mut lo.transfers(element) {
+        return
+    }
+    let shape = Element.of(mut lo, ty: element)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let first_index = match from {
+        Some(position) => position
+        None => mut fx.ptr(0)
+    }
+    mut fx.each(first_index, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = shape.at(mut fx1, data, index)
+        mut lo.transfer(mut fx1, ty: element, address: at, lift, owner)
+    })
+} vector_transfer
+
+/// Appends a value as the last element, in room already reserved.
+fn push_reserved(mut lo: Lowering, mut fx: Fx, address: clif::Value, value: Held, element: ty::Ty) {
+    let shape = Element.of(mut lo, ty: element)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let at = shape.at(mut fx, data, index: len)
+    mut lo.store_held(mut fx, address: at, held: value, ty: element)
+    let grown = mut fx.b.iadd_imm_s(len, y: 1)
+    mut fx.store(grown, addr: address, offset: VECTOR_LEN)
+} push_reserved
+
+/// Opens a gap of one element at `index`, in room already reserved: the elements from it move
+/// up by one and the length grows by one. Gives the gap's address.
+fn open_gap(mut lo: Lowering, mut fx: Fx, address: clif::Value, index: clif::Value, element: Element) -> clif::Value {
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let at = element.at(mut fx, data, index)
+    let after = mut fx.b.iadd_imm_s(at, y: i64.from_bits(element.size))
+    let count = mut fx.b.isub(len, y: index)
+    let moved = element.bytes(mut fx, count)
+    let copy_args = fx.list3(after, b: at, c: moved)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let grown = mut fx.b.iadd_imm_s(len, y: 1)
+    mut fx.store(grown, addr: address, offset: VECTOR_LEN)
+    return at
+} open_gap
+
+/// Closes the element at `index`, whose value has moved out: the elements after it move down
+/// by one and the length shrinks by one.
+fn close_gap(mut lo: Lowering, mut fx: Fx, address: clif::Value, index: clif::Value, element: Element) {
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let at = element.at(mut fx, data, index)
+    let after = mut fx.b.iadd_imm_s(at, y: i64.from_bits(element.size))
+    let rest = mut fx.b.isub(len, y: index)
+    let following = mut fx.b.iadd_imm_s(rest, y: -1)
+    let moved = element.bytes(mut fx, count: following)
+    let copy_args = fx.list3(at, b: after, c: moved)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let shrunk = mut fx.b.iadd_imm_s(len, y: -1)
+    mut fx.store(shrunk, addr: address, offset: VECTOR_LEN)
+} close_gap
+
+/// Writes the view of a vector's elements at an address.
+fn vector_write_view(mut fx: Fx, view: clif::Value, address: clif::Value) {
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    mut fx.store(data, addr: view, offset: 0)
+    mut fx.store(len, addr: view, offset: 8)
+} vector_write_view
+
+/// Keeps the elements a predicate keeps, in order, releasing the others; `keep` receives each
+/// element's address and gives whether to keep it.
+fn retain(mut lo: Lowering, mut fx: Fx, address: clif::Value, element: ty::Ty, keep: fn(mut lo: Lowering, mut fx: Fx, at: clif::Value) -> clif::Value) {
+    let shape = Element.of(mut lo, ty: element)
+    let data = mut fx.load(PTR, addr: address, offset: VECTOR_DATA)
+    let len = mut fx.load(PTR, addr: address, offset: VECTOR_LEN)
+    let zero = mut fx.ptr(0)
+    let start = fx.list2(zero, b: zero)
+    let end = mut fx.repeat(start.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let index = current[0]
+        let kept = current[1]
+        let more = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+        let results = fx1.types2(PTR, b: PTR)
+        let next = mut fx1.choose(more, results: results.view(), then: fn[mut lo](mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = shape.at(mut fx2, data, index)
+            let keeps = keep(mut lo, fx: mut fx2, at)
+            let kept_results = fx2.types1(PTR)
+            let kept_next = mut fx2.choose_in(mut lo, condition: keeps, results: kept_results.view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let target = shape.at(mut fx3, data, index: kept)
+                let size = mut fx3.ptr(shape.size)
+                let copy_args = fx3.list3(target, b: at, c: size)
+                discard mut lo3.call_routine(mut fx3, routine: Routine.Copy, args: copy_args.view())
+                let counted = mut fx3.b.iadd_imm_s(kept, y: 1)
+                return fx3.list1(counted)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                mut lo3.release(mut fx3, ty: element, address: at)
+                return fx3.list1(kept)
+            })
+            let next_index = mut fx2.b.iadd_imm_s(index, y: 1)
+            expect kept_next.len() == 1
+            return fx2.list2(next_index, b: kept_next[0])
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(index, b: kept)
+        })
+        return Pass(again: more, next: take next)
+    })
+    expect end.len() == 2
+    mut fx.store(end[1], addr: address, offset: VECTOR_LEN)
+} retain

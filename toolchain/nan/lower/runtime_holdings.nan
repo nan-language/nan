@@ -1,0 +1,217 @@
+//! Holdings: what a domain owns that settlement releases once the domain is abandoned, each a record linked in its owner's list, which the lock of the cell and capability tables guards: a file or listener, whose descriptor closes; a connection, which is abandoned; a revoker, which revokes; a budget or an allocator's revoker, whose cell closes; and a channel's sender or receiver, which counts as released. A holding's record is its links, its owner, zero while no domain owns it, its kind and what it holds: a descriptor, a capability or cell handle, or a channel's record.
+
+const HOLDING_NEXT: u64 = 0
+
+const HOLDING_PREVIOUS: u64 = 8
+
+const HOLDING_OWNER: u64 = 16
+
+const HOLDING_KIND: u64 = 24
+
+const HOLDING_PAYLOAD: u64 = 32
+
+const HOLDING_SIZE: u64 = 40
+
+const HOLDINGS_KIND_CLOSE: i64 = 0
+
+const HOLDINGS_KIND_ABANDON: i64 = 1
+
+const HOLDINGS_KIND_REVOKE: i64 = 2
+
+const HOLDINGS_KIND_CLOSE_CELL: i64 = 3
+
+const HOLDINGS_KIND_SENDER: i64 = 4
+
+const HOLDINGS_KIND_RECEIVER: i64 = 5
+
+fn holdings_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let params = mut fx.entry()
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    match routine {
+        Routine.Hold => {
+            expect params.len() > 1
+            let size = mut fx.ptr(HOLDING_SIZE)
+            let record = mut lo.record_alloc(mut fx, size)
+            let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            mut fx.store(params[0], addr: record, offset: HOLDING_KIND)
+            mut fx.store(params[1], addr: record, offset: HOLDING_PAYLOAD)
+            let owner = current_domain(mut lo, mut fx)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            holdings_link(mut fx, record, owner)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(fx.list1(record).view())
+        }
+        Routine.Unhold => {
+            expect params.len() > 0
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            holdings_unlink(mut fx, record: params[0])
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut lo.record_free(mut fx, address: params[0])
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Rehome => {
+            expect params.len() > 1
+            let record = params[0]
+            let owner = params[1]
+            let raise_bit = mut fx.b.band_imm_s(owner, y: TRANSFER_RAISE)
+            let raise = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: raise_bit, y: 0)
+            let to = mut fx.b.band_imm_s(owner, y: ~TRANSFER_RAISE)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+            let current = mut fx.load(PTR, addr: record, offset: HOLDING_OWNER)
+            let inside = nested_in(mut fx, inner: current, outer: to)
+            let outside = mut fx.b.bxor_imm_s(inside, y: 1)
+            let kept = mut fx.b.band(raise, y: outside)
+            let moves = mut fx.b.bxor_imm_s(kept, y: 1)
+            mut fx.if_true(moves, then: fn(mut fx1: Fx) {
+                holdings_unlink(mut fx1, record)
+                holdings_link(mut fx1, record, owner: to)
+            })
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        else => {
+            expect false
+        }
+    }
+} holdings_define
+
+/// What a holding holds, from the address of the word naming its record.
+fn holdings_payload(mut fx: Fx, address: clif::Value) -> clif::Value {
+    let record = mut fx.load(PTR, addr: address, offset: 0)
+    return mut fx.load(PTR, addr: record, offset: HOLDING_PAYLOAD)
+} holdings_payload
+
+/// Links a holding first in its owner's list, or leaves it unowned for a zero owner. The
+/// caller holds the lock.
+fn holdings_link(mut fx: Fx, record: clif::Value, owner: clif::Value) {
+    mut fx.store(owner, addr: record, offset: HOLDING_OWNER)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: HOLDING_PREVIOUS)
+    mut fx.store(zero, addr: record, offset: HOLDING_NEXT)
+    let owned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
+    mut fx.if_true(owned, then: fn(mut fx1: Fx) {
+        let head = mut fx1.load(PTR, addr: owner, offset: DOMAIN_HOLDINGS)
+        mut fx1.store(head, addr: record, offset: HOLDING_NEXT)
+        let has_head = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        mut fx1.if_true(has_head, then: fn(mut fx2: Fx) {
+            mut fx2.store(record, addr: head, offset: HOLDING_PREVIOUS)
+        })
+        mut fx1.store(record, addr: owner, offset: DOMAIN_HOLDINGS)
+    })
+} holdings_link
+
+/// Takes a holding out of its owner's list. The caller holds the lock.
+fn holdings_unlink(mut fx: Fx, record: clif::Value) {
+    let owner = mut fx.load(PTR, addr: record, offset: HOLDING_OWNER)
+    let owned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
+    mut fx.if_true(owned, then: fn(mut fx1: Fx) {
+        let next = mut fx1.load(PTR, addr: record, offset: HOLDING_NEXT)
+        let previous = mut fx1.load(PTR, addr: record, offset: HOLDING_PREVIOUS)
+        let has_previous = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+        discard mut fx1.choose(has_previous, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: previous, offset: HOLDING_NEXT)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: owner, offset: DOMAIN_HOLDINGS)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        let has_next = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        mut fx1.if_true(has_next, then: fn(mut fx2: Fx) {
+            mut fx2.store(previous, addr: next, offset: HOLDING_PREVIOUS)
+        })
+    })
+} holdings_unlink
+
+/// Takes every holding out of a domain's list, giving the first of them, still linked to the
+/// next.
+fn take_all(mut lo: Lowering, mut fx: Fx, domain: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let head = mut fx.load(PTR, addr: domain, offset: DOMAIN_HOLDINGS)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: domain, offset: DOMAIN_HOLDINGS)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    return head
+} take_all
+
+/// Runs `visit` on each holding of a chain from `head`, reading each one's link first.
+fn holdings_each(mut fx: Fx, head: clif::Value, visit: fn(mut fx: Fx, record: clif::Value)) {
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+    mut fx.if_true(any, then: fn(mut fx1: Fx) {
+        discard mut fx1.repeat(fx1.list1(head).view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 0
+            let record = current[0]
+            let next = mut fx2.load(PTR, addr: record, offset: HOLDING_NEXT)
+            visit(mut fx2, record)
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+            return Pass(again: more, next: fx2.list1(next))
+        })
+    })
+} holdings_each
+
+/// Releases every holding of an abandoned domain as settlement does, with no wait.
+fn release_all(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {
+    let head = take_all(mut lo, mut fx, domain)
+    holdings_each(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
+        let kind = mut fx1.load(PTR, addr: record, offset: HOLDING_KIND)
+        let payload = mut fx1.load(PTR, addr: record, offset: HOLDING_PAYLOAD)
+        release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_CLOSE, platform: "release")
+        release_descriptor(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_ABANDON, platform: "conn_abandon")
+        release_handle(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_REVOKE, routine: Routine.Revoke)
+        release_handle(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_CLOSE_CELL, routine: Routine.Close)
+        release_end(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_SENDER, sender: true)
+        release_end(mut lo, fx: mut fx1, kind, payload, wanted: HOLDINGS_KIND_RECEIVER, sender: false)
+        mut lo.record_free(mut fx1, address: record)
+    })
+} release_all
+
+/// Releases a holding of kind `wanted` whose descriptor closes or whose connection is abandoned,
+/// through the platform function named `platform` or, on the seeded scheduler, its sim.
+fn release_descriptor(mut lo: Lowering, mut fx: Fx, kind: clif::Value, payload: clif::Value, wanted: i64, platform: Str) {
+    let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: wanted)
+    mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+        if lo.seeded() {
+            if wanted == HOLDINGS_KIND_CLOSE {
+                sims_release(mut lo, fx: mut fx1, index: payload)
+            } else {
+                sims_abandon(mut lo, fx: mut fx1, index: payload)
+            }
+            return
+        }
+        let descriptor = mut fx1.b.ireduce(clif::Type.Int32, x: payload)
+        discard mut lo.platform_call(mut fx1, name: platform, args: Array[Held, 1].filled(Held.Scalar(descriptor)).view())
+    })
+} release_descriptor
+
+/// Releases a holding of kind `wanted` by calling `routine` on its handle.
+fn release_handle(mut lo: Lowering, mut fx: Fx, kind: clif::Value, payload: clif::Value, wanted: i64, routine: Routine) {
+    let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: wanted)
+    mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine, args: fx1.list1(payload).view())
+    })
+} release_handle
+
+/// Releases a holding of kind `wanted`, a channel's sender or receiver, as ended.
+fn release_end(mut lo: Lowering, mut fx: Fx, kind: clif::Value, payload: clif::Value, wanted: i64, sender: bool) {
+    let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: wanted)
+    mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+        settle_end(mut lo, fx: mut fx1, record: payload, sender)
+    })
+} release_end
+
+/// Passes every holding of a domain that has ended to another.
+fn pass_all(mut lo: Lowering, mut fx: Fx, from: clif::Value, to: clif::Value) {
+    let head = take_all(mut lo, mut fx, domain: from)
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    holdings_each(mut fx, head, visit: fn(mut fx1: Fx, record: clif::Value) {
+        holdings_link(mut fx1, record, owner: to)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+} pass_all

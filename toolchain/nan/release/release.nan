@@ -1,0 +1,506 @@
+//! Releases compared: the exported items of a release from its code root's interface, and each item's class relative to the release's parent.
+
+/// The exported items of a release, by canonical path: the entries its interface records with an
+/// interface hash.
+pkg fn exported(artefact_bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::Map[text::String, machine::ApiEntry] {
+    var found = mem::Map[text::String, machine::ApiEntry].empty(alloc)
+    let Ok(decoded) = artefact::decode(artefact_bytes, alloc) else {
+        return found
+    }
+    for written in interface_texts(decoded.code_root.view(), alloc) {
+        if written.is_empty() {
+            continue
+        }
+        var file = text::String.of(written.as_str(), alloc)
+        mut file.append("check \"")
+        mut file.append(hashing::HashValue.of(written.as_bytes()).full(alloc).as_str())
+        mut file.append("\"\n")
+        let Ok(snapshot) = machine::Snapshot.read(file.as_bytes(), grammar, alloc) else {
+            continue
+        }
+        for entry in take snapshot.entries {
+            if entry.interface_hash.is_some() {
+                discard mut found.insert(text::String.of(entry.path.as_str(), alloc), value: take entry)
+            }
+        }
+    }
+    return found
+} exported
+
+/// How a `preserves` tombstone of a release forwards its old form.
+pkg enum Forward derives Eq {
+    /// Through its forwarding function, which has the old head.
+    Head
+    /// To what this canonical path names.
+    Path(text::String)
+} Forward
+
+/// The old forms that the `preserves` tombstones of a release's code root forward, from their
+/// normalised forms, by canonical path.
+pkg fn forwards(artefact_bytes: Slice[u8], alloc: mem::Alloc) -> mem::Map[text::String, Forward] {
+    var found = mem::Map[text::String, Forward].empty(alloc)
+    let Ok(decoded) = artefact::decode(artefact_bytes, alloc) else {
+        return found
+    }
+    let code_root = decoded.code_root.view()
+    for key in 6u64..=7 {
+        let Some(content) = part(code_root, wanted: key) else {
+            continue
+        }
+        for form in take texts(content.copy(code_root, alloc).view(), alloc) {
+            let trimmed = platform::trimmed_run(form.as_str())
+            let Some(kept) = form.as_str().slice_bytes(0, end: trimmed.end) else {
+                continue
+            }
+            if not kept.starts_with("retired ") or not kept.ends_with(" preserves") or kept.byte_len() < 18 {
+                continue
+            }
+            let Some(rewrite) = kept.slice_bytes(8, end: kept.byte_len() - 10) else {
+                continue
+            }
+            let Some(arrow) = rewrite.find(" => ") else {
+                continue
+            }
+            let Some(old) = rewrite.slice_bytes(0, end: arrow) else {
+                continue
+            }
+            let Some(new) = rewrite.slice_bytes(arrow + 4, end: rewrite.byte_len()) else {
+                continue
+            }
+            match old.find("(") {
+                Some(open) => {
+                    let Some(path) = old.slice_bytes(0, end: open) else {
+                        continue
+                    }
+                    discard mut found.insert(text::String.of(path, alloc), value: Forward.Head)
+                }
+                None => {
+                    discard mut found.insert(text::String.of(old, alloc), value: Forward.Path(text::String.of(new, alloc)))
+                }
+            }
+        }
+    }
+    return found
+} forwards
+
+/// The content of a code root's part by its key.
+fn part(code_root: Slice[u8], wanted: u64) -> Option[artefact::Chunk] {
+    let Some(count) = artefact::read_uvar(code_root, at: 0) else {
+        return None
+    }
+    let total = match count.value.to_u64() {
+        Some(small) => small
+        None => 0xFFFF_FFFF_FFFF_FFFF
+    }
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(key) = artefact::read_uvar(code_root, at) else {
+            return None
+        }
+        let Some(content) = artefact::read_bytes(code_root, at: key.next) else {
+            return None
+        }
+        if key.value == wide::Wide.of_u64(wanted) {
+            return Some(content)
+        }
+        at = content.next
+        index += 1
+    }
+    return None
+} part
+
+/// The package name the manifest of a code root declares.
+pkg fn package_name(code_root: Slice[u8], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(content) = part(code_root, wanted: 2) else {
+        return None
+    }
+    expect content.start <= content.next
+    let Some(parts) = code_root.split_at(content.start) else {
+        return None
+    }
+    let Some(held) = parts.tail.prefix(content.next - content.start) else {
+        return None
+    }
+    let Some(manifest) = artefact::read_bytes(held, at: 0) else {
+        return None
+    }
+    let written = output::lossy(manifest.copy(held, alloc).view(), alloc)
+    let text_held = written.as_str()
+    let bytes = text_held.as_bytes()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b'\n' {
+            end += 1
+        }
+        expect end <= bytes.len() and bytes.len() < ~0usize
+        var line_end = end
+        if line_end > start and bytes[line_end - 1] == b'\r' {
+            line_end -= 1
+        }
+        let Some(line) = text_held.slice_bytes(start, end: line_end) else {
+            return None
+        }
+        if line.starts_with("package ") {
+            let Some(rest) = line.slice_bytes(8, end: line.byte_len()) else {
+                return None
+            }
+            let cut = match rest.find(" ") {
+                Some(at) => at
+                None => rest.byte_len()
+            }
+            let Some(name) = rest.slice_bytes(0, end: cut) else {
+                return None
+            }
+            return Some(text::String.of(name, alloc))
+        }
+        start = end + 1
+    }
+    return None
+} package_name
+
+/// The elements of a list of texts.
+fn texts(list: Slice[u8], alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    let Some(count) = artefact::read_uvar(list, at: 0) else {
+        return found
+    }
+    let total = match count.value.to_u64() {
+        Some(small) => small
+        None => 0xFFFF_FFFF_FFFF_FFFF
+    }
+    var at = count.next
+    var index: u64 = 0
+    while index < total {
+        let Some(element) = artefact::read_bytes(list, at) else {
+            return found
+        }
+        at = element.next
+        mut found.push(output::lossy(element.copy(list, alloc).view(), alloc))
+        index += 1
+    }
+    return found
+} texts
+
+/// The snapshot texts of a code root's interface part, one per module.
+fn interface_texts(code_root: Slice[u8], alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    let Some(content) = part(code_root, wanted: 3) else {
+        return found
+    }
+    expect content.start <= content.next
+    let Some(parts) = code_root.split_at(content.start) else {
+        return found
+    }
+    let Some(held) = parts.tail.prefix(content.next - content.start) else {
+        return found
+    }
+    let Some(pairs) = artefact::read_uvar(held, at: 0) else {
+        return found
+    }
+    let count = match pairs.value.to_u64() {
+        Some(small) => small
+        None => 0xFFFF_FFFF_FFFF_FFFF
+    }
+    var at = pairs.next
+    var index: u64 = 0
+    while index < count {
+        let Some(module) = artefact::read_bytes(held, at) else {
+            return found
+        }
+        let Some(written) = artefact::read_bytes(held, at: module.next) else {
+            return found
+        }
+        at = written.next
+        mut found.push(output::lossy(written.copy(held, alloc).view(), alloc))
+        index += 1
+    }
+    return found
+} interface_texts
+
+/// The facts a digest line states: its effects and authority entries, may-trap and terminates.
+struct Facts {
+    entries: mem::List[text::String]
+    may_trap: bool
+    terminates: bool
+} Facts
+
+/// The words of a digest line's part after its name, `none` left out.
+fn words(part_text: Option[text::String], prefix: Str, mut entries: mem::List[text::String], alloc: mem::Alloc) {
+    let Some(held) = part_text else {
+        return
+    }
+    if not held.starts_with(prefix) {
+        return
+    }
+    let Some(rest) = held.as_str().slice_bytes(prefix.byte_len(), end: held.byte_len()) else {
+        return
+    }
+    for word in take split_text(rest, separator: " ", alloc) {
+        if word.as_str() != "none" {
+            mut entries.push(take word)
+        }
+    }
+} words
+
+fn facts_of(line: Str, alloc: mem::Alloc) -> Facts {
+    let parts = split_text(line, separator: " | ", alloc)
+    var entries = mem::List[text::String].empty(alloc)
+    words(copied_part(parts.view(), index: 0, alloc), prefix: "effects ", entries: mut entries, alloc)
+    words(copied_part(parts.view(), index: 1, alloc), prefix: "authority ", entries: mut entries, alloc)
+    let may_trap = parts.len() > 2 and parts[2].as_str() == "may-trap yes"
+    let terminates = parts.len() > 3 and parts[3].as_str() == "terminates"
+    return Facts(entries: take entries, may_trap: may_trap, terminates: terminates)
+} facts_of
+
+/// A copy of the part at `index`, when there is one.
+fn copied_part(parts: Slice[text::String], index: usize, alloc: mem::Alloc) -> Option[text::String] {
+    if index >= parts.len() {
+        return None
+    }
+    return Some(text::String.of(parts[index].as_str(), alloc))
+} copied_part
+
+/// The pieces of a text between the occurrences of a separator, as Rust's `split` gives them.
+fn split_text(written: Str, separator: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var pieces = mem::List[text::String].empty(alloc)
+    var start: usize = 0
+    loop {
+        let Some(rest) = written.slice_bytes(start, end: written.byte_len()) else {
+            return pieces
+        }
+        let Some(at) = rest.find(separator) else {
+            mut pieces.push(text::String.of(rest, alloc))
+            return pieces
+        }
+        let Some(piece) = rest.slice_bytes(0, end: at) else {
+            return pieces
+        }
+        mut pieces.push(text::String.of(piece, alloc))
+        expect at <= ~0usize - separator.byte_len() and start <= ~0usize - (at + separator.byte_len())
+        start += at + separator.byte_len()
+    }
+} split_text
+
+/// Whether a list of texts holds one.
+fn holds(texts_held: Slice[text::String], wanted: Str) -> bool {
+    for held in texts_held {
+        if held.as_str() == wanted {
+            return true
+        }
+    }
+    return false
+} holds
+
+/// Whether a digest gains a fact or set element over another, or loses terminates.
+fn widens(old: Str, new: Str, alloc: mem::Alloc) -> bool {
+    let before = facts_of(old, alloc)
+    let after = facts_of(new, alloc)
+    if holds(after.entries.view(), wanted: "any") and not holds(before.entries.view(), wanted: "any") {
+        return true
+    }
+    for entry in after.entries {
+        if not holds(before.entries.view(), wanted: entry.as_str()) {
+            return true
+        }
+    }
+    return (after.may_trap and not before.may_trap) or (before.terminates and not after.terminates)
+} widens
+
+/// Where the last name of a canonical path starts: after its last `.` or `:`.
+fn name_start(path: Str) -> usize {
+    let bytes = path.as_bytes()
+    var start = bytes.len()
+    while start > 0 {
+        invariant start <= bytes.len()
+        if bytes[start - 1] == b'.' or bytes[start - 1] == b':' {
+            break
+        }
+        start -= 1
+    }
+    return start
+} name_start
+
+/// Whether a character belongs to a word: an ASCII letter or digit, or `_`.
+fn is_word(c: char) -> bool = c.is_ascii_alphabetic() or c.is_ascii_digit() or c == '_'
+
+/// A line with each word `new_name` written `old_name`.
+fn renamed_line(line: Str, old_name: Str, new_name: Str, alloc: mem::Alloc) -> text::String {
+    var renamed = text::String.empty(alloc)
+    var start: usize = 0
+    var at: usize = 0
+    for c in line {
+        let width = c.utf8_len()
+        expect at <= line.byte_len() and width <= line.byte_len() - at
+        at += width
+        if is_word(c) {
+            continue
+        }
+        let Some(piece) = line.slice_bytes(start, end: at) else {
+            return renamed
+        }
+        renamed_piece(mut renamed, piece, old_name, new_name)
+        start = at
+    }
+    if start < line.byte_len() {
+        let Some(piece) = line.slice_bytes(start, end: line.byte_len()) else {
+            return renamed
+        }
+        renamed_piece(mut renamed, piece, old_name, new_name)
+    }
+    return renamed
+} renamed_line
+
+/// Appends a piece of a line, a word and the character ending it, with the word written
+/// `old_name` when it is `new_name`.
+fn renamed_piece(mut renamed: text::String, piece: Str, old_name: Str, new_name: Str) {
+    if piece.starts_with(new_name) {
+        let Some(rest) = piece.slice_bytes(new_name.byte_len(), end: piece.byte_len()) else {
+            mut renamed.append(piece)
+            return
+        }
+        var plain = true
+        for c in rest {
+            if is_word(c) {
+                plain = false
+            }
+        }
+        if plain {
+            mut renamed.append(old_name)
+            mut renamed.append(rest)
+            return
+        }
+    }
+    mut renamed.append(piece)
+} renamed_piece
+
+/// Whether an item's replacement, read as if it had the item's name, keeps its interface text and
+/// promises and gains no digest fact.
+pkg fn replaces(old: machine::ApiEntry, new: machine::ApiEntry, old_path: Str, new_path: Str, alloc: mem::Alloc) -> bool {
+    let Some(old_name) = old_path.slice_bytes(name_start(old_path), end: old_path.byte_len()) else {
+        return false
+    }
+    let Some(new_name) = new_path.slice_bytes(name_start(new_path), end: new_path.byte_len()) else {
+        return false
+    }
+    if new.text.len() != old.text.len() {
+        return false
+    }
+    for index in 0..<new.text.len() {
+        if renamed_line(new.text[index].as_str(), old_name, new_name, alloc).as_str() != old.text[index].as_str() {
+            return false
+        }
+    }
+    if new.promises != old.promises {
+        return false
+    }
+    for digest in new.digests {
+        let Some(at) = old.digests.position(fn(known: machine::TargetDigest) => known.target == digest.target) else {
+            return false
+        }
+        if widens(old.digests[at].digest.as_str(), new: digest.digest.as_str(), alloc) {
+            return false
+        }
+    }
+    return true
+} replaces
+
+/// An item's behaviour epochs in a release's parent and in the release.
+pkg struct EpochPair derives Copy {
+    pkg old: u64
+    pkg new: u64
+} EpochPair
+
+/// The class of each exported item of a release relative to its parent's, by canonical path,
+/// removed items included: identical when its interface hash, epoch and digests are unchanged;
+/// additive when it is new, when its interface changes only as `compatible` holds it and its
+/// digests gain no fact, or when it is removed while a `preserves` tombstone forwards it to a
+/// replacement that keeps its interface; breaking otherwise.
+pkg fn classes(
+    parent: mem::Map[text::String, machine::ApiEntry],
+    release: mem::Map[text::String, machine::ApiEntry],
+    epochs: fn(path: Str) -> EpochPair,
+    forwarded: mem::Map[text::String, Forward],
+    compatible: mem::Set[text::String],
+    alloc: mem::Alloc,
+    ) -> mem::Map[text::String, store::Class] {
+    var found = mem::Map[text::String, store::Class].empty(alloc)
+    for held in release {
+        let path = held.key().as_str()
+        let class = match parent.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+            None => store::Class.Additive
+            Some(old) => changed_class(old, entry: held.value(), path, epochs: epochs(path), compatible, alloc)
+        }
+        discard mut found.insert(text::String.of(path, alloc), value: class)
+    }
+    for held in parent {
+        let path = held.key().as_str()
+        if release.get_by(fn(key: text::String) => key.as_str().cmp(path)).is_some() {
+            continue
+        }
+        var kept = false
+        match forwarded.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+            Some(Forward.Head) => {
+                kept = true
+            }
+            Some(Forward.Path(new)) => {
+                match release.get_by(fn(key: text::String) => key.as_str().cmp(new.as_str())) {
+                    Some(entry) => {
+                        kept = replaces(held.value(), new: entry, old_path: path, new_path: new.as_str(), alloc)
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        var class = store::Class.Breaking
+        if kept {
+            class = store::Class.Additive
+        }
+        discard mut found.insert(text::String.of(path, alloc), value: class)
+    }
+    return found
+} classes
+
+/// The class of an exported item its release's parent also exports.
+fn changed_class(old: machine::ApiEntry, entry: machine::ApiEntry, path: Str, epochs: EpochPair, compatible: mem::Set[text::String], alloc: mem::Alloc) -> store::Class {
+    let changed = old.interface_hash != entry.interface_hash
+    if epochs.old != epochs.new or (changed and not compatible.contains_by(fn(value: text::String) => value.as_str().cmp(path))) {
+        return store::Class.Breaking
+    }
+    if not changed and old.digests == entry.digests {
+        return store::Class.Identical
+    }
+    for digest in entry.digests {
+        let Some(at) = old.digests.position(fn(known: machine::TargetDigest) => known.target == digest.target) else {
+            return store::Class.Breaking
+        }
+        if widens(old.digests[at].digest.as_str(), new: digest.digest.as_str(), alloc) {
+            return store::Class.Breaking
+        }
+    }
+    return store::Class.Additive
+} changed_class
+
+/// The class of a release: the worst of its items' classes, additive without a parent.
+pkg fn release_class(classes_held: mem::Map[text::String, store::Class], parented: bool) -> store::Class {
+    if not parented {
+        return store::Class.Additive
+    }
+    var worst = store::Class.Identical
+    for held in classes_held {
+        if held.value() > worst {
+            worst = held.value()
+        }
+    }
+    return worst
+} release_class
+
+/// The epoch an item has in a release: its summary's, 0 without one.
+pkg fn epoch(summary: Option[store::Summary], path: Str) -> u64 {
+    let Some(held) = summary else {
+        return 0
+    }
+    return held.epoch(path)
+} epoch

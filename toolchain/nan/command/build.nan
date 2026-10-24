@@ -1,0 +1,224 @@
+//! `nan build` and `nan run`: final builds, and starting the image built.
+
+/// What a command ends with: its output, the program `nan run` starts, or the status `nan run`
+/// ends with when the emulator cannot start.
+enum Outcome {
+    Output(output::Output)
+    Launch(emulator::Launch)
+    Ended(u8)
+} Outcome
+
+/// `nan build` and `nan run`: the output, or for `nan run` of a built program, the program to
+/// start in its place.
+fn build_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        let written = match invocation.scope() {
+            Some(given) => given
+            None => "."
+        }
+        return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc))
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let programs = programs_of(held, scope: resolved.scope, alloc)
+    var single = programs.len() == 1
+    match resolved.scope {
+        scope::Scope.Package(_) or scope::Scope.Workspace => {}
+        else => {
+            single = false
+        }
+    }
+    let compared_with = invocation.value("--compare-with")
+    let unusable = programs.len() == 0 or (invocation.name == Name.Run and not single) or (compared_with.is_some() and (not single or not all_host(held, programs: programs.view())))
+    if unusable {
+        return Outcome.Output(invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc))
+    }
+    var compared: Option[final_build::Compared] = None
+    match compared_with {
+        Some(image) => {
+            compared = Some(final_build::Compared(path: platform::join(current, name: image, alloc), written: text::String.of(image, alloc)))
+        }
+        None => {}
+    }
+    var built = try build_all(session, programs: programs.view(), compared, alloc)
+    if invocation.name == Name.Run and built.errors == 0 {
+        let Some(image) = mut built.images.pop() else {
+            expect false
+            return Outcome.Ended(emulator::OTHER_END)
+        }
+        return try launched(invocation, held, program: programs[0], image: image.as_str(), alloc)
+    }
+    mut built.images.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    let std = session.std.contents()
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in built.diagnostics {
+        mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+    }
+    for image in built.images {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(image.as_str(), alloc))
+        mut records.push(output::Record(word: text::String.of("wrote", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("files", alloc), value: built.images.len()))
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: built.errors))
+    mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: built.incomplete))
+    var verdict = output::Verdict.Ok
+    if built.errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    return Outcome.Output(output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records))
+} build_run
+
+/// Whether every program declares `x86_64-host`.
+fn all_host(held: workspace::Workspace, programs: Slice[usize]) -> bool {
+    for program in programs {
+        let Some(source) = held.packages.get(program) else {
+            expect false
+            return false
+        }
+        let Some(manifest) = source.manifest else {
+            return false
+        }
+        if manifest.targets.position(fn(declared: workspace::Target) => declared == workspace::Target.Host).is_none() {
+            return false
+        }
+    }
+    return true
+} all_host
+
+/// What the final builds of a command report and the images they write: the diagnostics by path,
+/// line and code, each once, with their counts of errors and incompleteness.
+struct Builds {
+    diagnostics: mem::List[diagnostic::Diagnostic]
+    images: mem::List[text::String]
+    errors: usize
+    incomplete: usize
+} Builds
+
+/// Performs the final build of each program, comparing its code roots with those of the image
+/// `compared` gives, when given.
+fn build_all(session: check::Session, programs: Slice[usize], compared: Option[final_build::Compared], alloc: mem::Alloc) -> Builds fails platform::IoError {
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var images = mem::List[text::String].empty(alloc)
+    for program in programs {
+        let built = try final_build::build(session, program, compared, alloc)
+        let final_build::Build(diagnostics: reported, image: image) = built
+        for found in take reported {
+            mut diagnostics.push(take found)
+        }
+        let Some(written) = image else {
+            continue
+        }
+        mut images.push(take written)
+    }
+    mut diagnostics.sort_by(fn(left: diagnostic::Diagnostic, right: diagnostic::Diagnostic) => check::located_order(left, right))
+    var distinct = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var errors: usize = 0
+    var incomplete: usize = 0
+    let total = diagnostics.len()
+    for reported in take diagnostics {
+        invariant errors < total and incomplete < total
+        let count = distinct.len()
+        if count > 0 and check::same_diagnostic(reported, earlier: distinct[count - 1], spanned: true) {
+            continue
+        }
+        let class = reported.code.class()
+        if class == diagnostic::Class.Error {
+            errors += 1
+        } else if class == diagnostic::Class.Incompleteness {
+            incomplete += 1
+        }
+        mut distinct.push(take reported)
+    }
+    return Builds(diagnostics: take distinct, images: take images, errors: errors, incomplete: incomplete)
+} build_all
+
+/// What `nan run` starts once the image of the program at index `program` is built at `image`,
+/// relative to the workspace root: the image on `x86_64-host`, the emulator booting it on a
+/// machine target; or the status it ends with when the emulator cannot start.
+fn launched(invocation: Invocation, held: workspace::Workspace, program: usize, image: Str, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+    let path = platform::join(held.root.as_str(), name: image, alloc)
+    let Some(source) = held.packages.get(program) else {
+        expect false
+        return Outcome.Ended(emulator::OTHER_END)
+    }
+    let target = source.program_target()
+    if target.is_machine() and not emulator::available(target, alloc) {
+        return Outcome.Ended(emulator::OTHER_END)
+    }
+    if target == workspace::Target.Uefi {
+        let files = volume_files(held, image: path.as_str(), alloc)
+        return Outcome.Launch(try emulator::launch(target, image: path.as_str(), files: files.view(), writes: emulator::Writes.Kept, alloc))
+    }
+    if target == workspace::Target.Bare {
+        let none = mem::List[text::String].empty(alloc)
+        return Outcome.Launch(try emulator::launch(target, image: path.as_str(), files: none.view(), writes: emulator::Writes.Kept, alloc))
+    }
+    var args = mem::List[text::String].empty(alloc)
+    for arg in invocation.passed {
+        mut args.push(text::String.of(arg.as_str(), alloc))
+    }
+    return Outcome.Launch(emulator::Launch(program: take path, args: take args, emulated: false))
+} launched
+
+/// The image files of the workspace's machine programs other than `image`, which the boot volume
+/// of an `x86_64-uefi` image holds under `nan run`.
+fn volume_files(held: workspace::Workspace, image: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var files = mem::List[text::String].empty(alloc)
+    var targets = mem::List[workspace::Target].empty(alloc)
+    mut targets.push(workspace::Target.Uefi)
+    mut targets.push(workspace::Target.Bare)
+    for target in targets {
+        var directory = platform::join(held.root.as_str(), name: ".nan/images", alloc)
+        directory = platform::join(directory.as_str(), name: target.name(), alloc)
+        let Ok(entries) = attempt platform::list_dir(directory.as_str(), alloc) else {
+            continue
+        }
+        for listed in entries {
+            let name = output::lossy(listed.name.view(), alloc)
+            let path = platform::join(directory.as_str(), name: name.as_str(), alloc)
+            let Ok(held_file) = attempt platform::metadata(path.as_str()) else {
+                continue
+            }
+            if held_file.is_file() and path.as_str() != image {
+                mut files.push(take path)
+            }
+        }
+    }
+    mut files.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    return files
+} volume_files
+
+/// The indexes of the programs a scope holds: every program of the workspace, or the program
+/// holding a narrower scope.
+fn programs_of(held: workspace::Workspace, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[usize] {
+    var found = mem::List[usize].empty(alloc)
+    var candidates = mem::List[usize].empty(alloc)
+    match scope {
+        scope::Scope.Workspace => {
+            for index in 0..<held.packages.len() {
+                mut candidates.push(index)
+            }
+        }
+        else => {
+            match scope.package_index(held) {
+                Some(index) => mut candidates.push(index)
+                None => {}
+            }
+        }
+    }
+    for index in candidates {
+        let Some(source) = held.packages.get(index) else {
+            expect false
+            continue
+        }
+        let Some(manifest) = source.manifest else {
+            continue
+        }
+        if manifest.entry.is_some() {
+            mut found.push(index)
+        }
+    }
+    return found
+} programs_of

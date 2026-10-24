@@ -1,0 +1,253 @@
+//! Pointers and atomics: the members of `hw::Ptr`, memory fences, and the atomic integers and flag of `core::atomic`, each atomic laid out as its value.
+
+fn pointers_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    let owner_end = match check::last_dot(path) {
+        Some(dot) => dot
+        None => path.byte_len()
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        expect false
+        return false
+    }
+    match owner {
+        "hw::Ptr" => pointers_pointer(mut lo, mut fx, supply)
+        "hw::fence" => {
+            mut fx.b.fence()
+            supply.done(mut lo, mut fx)
+        }
+        "hw::cpu_count" => {
+            let state_address = mut lo.state(mut fx)
+            let loaded = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+            let count = mut fx.b.ireduce(clif::Type.Int32, x: loaded)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(count))
+        }
+        else => {
+            if not owner.starts_with("core::atomic::") {
+                return false
+            }
+            atomic(mut lo, mut fx, supply)
+        }
+    }
+    return true
+} pointers_lower
+
+/// The register type of an atomic or pointee of a scalar layout.
+fn pointers_register(mut lo: Lowering, ty: ty::Ty) -> clif::Type {
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Scalar(ty: register, big: _) => return register
+        else => {}
+    }
+    expect false
+    return PTR
+} pointers_register
+
+fn pointers_pointer(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let element = supply.type_arg(lo, index: 0)
+    let laid = mut lo.layout_of(element)
+    match supply.member() {
+        "of_addr" or "addr" or "cast" => supply.ret(mut lo, mut fx, held: supply.param(0))
+        "of" or "of_mut" => {
+            let address = supply.param(0).address_value()
+            supply.ret(mut lo, mut fx, held: Held.Scalar(address))
+        }
+        "of_view" or "of_view_mut" => {
+            let start = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(start))
+        }
+        "is_aligned" => {
+            let address = supply.param(0).scalar_value()
+            var align = laid.contents().align
+            if align < 1 {
+                align = 1
+            }
+            let mask = i64.fit(align) - 1
+            let low = mut fx.b.band_imm_s(address, y: mask)
+            let aligned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: low, y: 0)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(aligned))
+        }
+        "read" => {
+            let address = supply.param(0).scalar_value()
+            let held = mut lo.held_at(mut fx, ty: element, address)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "write" => {
+            let address = supply.param(0).scalar_value()
+            mut lo.store_held(mut fx, address, held: supply.param(1), ty: element)
+            supply.done(mut lo, mut fx)
+        }
+        "offset" => {
+            let address = supply.param(0).scalar_value()
+            let count = supply.param(1).scalar_value()
+            let bytes = mut fx.b.imul_imm_s(count, y: i64.fit(laid.contents().size))
+            let moved = mut fx.b.iadd(address, y: bytes)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(moved))
+        }
+        "copy" => {
+            let from = supply.param(0).scalar_value()
+            let to = supply.param(1).scalar_value()
+            let count = supply.param(2).scalar_value()
+            let bytes = mut fx.b.imul_imm_s(count, y: i64.fit(laid.contents().size))
+            let args = fx.list3(to, b: from, c: bytes)
+            discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            let address = supply.param(0).scalar_value()
+            let ty = pointers_register(mut lo, ty: element)
+            let member = supply.member()
+            var skipped: usize = 0
+            if member.starts_with("atomic_") {
+                skipped = "atomic_".byte_len()
+            }
+            let Some(operation) = member.slice_bytes(skipped, end: member.byte_len()) else {
+                expect false
+                return
+            }
+            let result = atomic_op(mut lo, mut fx, supply, member: operation, address, ty, element)
+            supply.ret(mut lo, mut fx, held: result)
+        }
+    }
+} pointers_pointer
+
+/// The atomic operation `member` on the value of register type `ty` at an address, its
+/// operands from the operation's second parameter on; a scheduling point of the seeded
+/// scheduler.
+fn atomic_op(mut lo: Lowering, mut fx: Fx, supply: Supply, member: Str, address: clif::Value, ty: clif::Type, element: ty::Ty) -> Held {
+    scheduling_point(mut lo, mut fx)
+    let flags = clif::MemFlags.owned()
+    match member {
+        "load" => return Held.Scalar(mut fx.b.atomic_load(ty, flags, p: address))
+        "store" => {
+            mut fx.b.atomic_store(flags, x: supply.param(1).scalar_value(), p: address)
+            return Held.Empty
+        }
+        "swap" => {
+            let previous = mut fx.b.atomic_rmw(ty, flags, op: clif::AtomicRmwOp.Xchg, p: address, x: supply.param(1).scalar_value())
+            return Held.Scalar(previous)
+        }
+        "wrapping_add" => {
+            let previous = mut fx.b.atomic_rmw(ty, flags, op: clif::AtomicRmwOp.Add, p: address, x: supply.param(1).scalar_value())
+            return Held.Scalar(previous)
+        }
+        "fetch_and" or "fetch_or" or "fetch_xor" => {
+            let op = match member {
+                "fetch_and" => clif::AtomicRmwOp.And
+                "fetch_or" => clif::AtomicRmwOp.Or
+                else => clif::AtomicRmwOp.Xor
+            }
+            return Held.Scalar(mut fx.b.atomic_rmw(ty, flags, op, p: address, x: supply.param(1).scalar_value()))
+        }
+        "compare_swap" => return compare_swap(mut lo, mut fx, supply, address)
+        "fetch_add" or "fetch_sub" => return fetch_arithmetic(mut lo, mut fx, supply, member, address, ty, element)
+        else => {}
+    }
+    expect false
+    return Held.Empty
+} atomic_op
+
+/// `compare_swap`: the previous value, `Ok` when it was the expected one and the replacement
+/// was stored, `Err` otherwise.
+fn compare_swap(mut lo: Lowering, mut fx: Fx, supply: Supply, address: clif::Value) -> Held {
+    let flags = clif::MemFlags.owned()
+    let expected = supply.param(1).scalar_value()
+    let replacement = supply.param(2).scalar_value()
+    let previous = mut fx.b.atomic_cas(flags, p: address, e: expected, x: replacement)
+    let swapped = mut fx.b.icmp(clif::IntCC.Equal, x: previous, y: expected)
+    let result = supply.abi.result
+    let laid = mut lo.layout_of(result)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let payload = Array[Held, 1].filled(Held.Scalar(previous))
+    let ok = mut lo.variant_value(mut fx, ty: result, variant: "Ok", payload_values: payload.view(), wrapped: None)
+    let err = mut lo.variant_value(mut fx, ty: result, variant: "Err", payload_values: payload.view(), wrapped: None)
+    let chosen = mut fx.b.select(swapped, x: ok.address_value(), y: err.address_value())
+    mut lo.copy(mut fx, dst: slot, src: chosen, size: laid.contents().size, align: laid.contents().align)
+    return mut lo.held_at(mut fx, ty: result, address: slot)
+} compare_swap
+
+/// `fetch_add` and `fetch_sub`: compare-and-swap of the checked result until no other access
+/// races it, then the previous value when the operation fits, none when it overflows.
+fn fetch_arithmetic(mut lo: Lowering, mut fx: Fx, supply: Supply, member: Str, address: clif::Value, ty: clif::Type, element: ty::Ty) -> Held {
+    let flags = clif::MemFlags.owned()
+    let amount = supply.param(1).scalar_value()
+    let current = mut fx.b.atomic_load(ty, flags, p: address)
+    let signed = match lo.ck.types().scalar_of(element) {
+        Some(scalar) => scalar.is_signed()
+        None => false
+    }
+    let initial = fx.list1(current)
+    let last = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, carried: Slice[clif::Value]) -> Pass {
+        expect carried.len() == 1
+        let previous = carried[0]
+        let stepped = fetch_step(mut fx1, member, signed, x: previous, y: amount)
+        let fits = mut fx1.b.bxor_imm_s(stepped.flag, y: 1)
+        let results = fx1.types1(ty)
+        let swapped = mut fx1.choose(fits, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let exchanged = mut fx2.b.atomic_cas(flags, p: address, e: previous, x: stepped.value)
+            return fx2.list1(exchanged)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(previous)
+        })
+        expect swapped.len() == 1
+        let seen = swapped[0]
+        let raced = mut fx1.b.icmp(clif::IntCC.NotEqual, x: seen, y: previous)
+        let again = mut fx1.b.band(fits, y: raced)
+        return Pass(again: again, next: fx1.list1(seen))
+    })
+    expect last.len() == 1
+    let previous = last[0]
+    let checked = fetch_step(mut fx, member, signed, x: previous, y: amount)
+    let present = mut fx.b.bxor_imm_s(checked.flag, y: 1)
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    mut lo.write_option(mut fx, option, address: slot, presence: present, value: Held.Scalar(previous))
+    return mut lo.held_at(mut fx, ty: option, address: slot)
+} fetch_arithmetic
+
+/// The sum of `fetch_add` or difference of `fetch_sub`, signed or not, with whether it
+/// overflows.
+fn fetch_step(mut fx: Fx, member: Str, signed: bool, x: clif::Value, y: clif::Value) -> clif::Overflowed {
+    if member == "fetch_add" {
+        if signed {
+            return mut fx.b.sadd_overflow(x, y)
+        }
+        return mut fx.b.uadd_overflow(x, y)
+    }
+    if signed {
+        return mut fx.b.ssub_overflow(x, y)
+    }
+    return mut fx.b.usub_overflow(x, y)
+} fetch_step
+
+fn atomic(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(atomic_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let value_field = mut lo.layouts.field(lo.ck, ty: atomic_ty, variant: None, label: "value")
+    let value_ty = value_field.ty
+    let ty = pointers_register(mut lo, ty: value_ty)
+    match supply.member() {
+        "of" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut lo.store_held(mut fx, address: sret, held: supply.param(0), ty: value_ty)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            let address = supply.param(0).address_value()
+            let result = atomic_op(mut lo, mut fx, supply, member: supply.member(), address, ty, element: value_ty)
+            supply.ret(mut lo, mut fx, held: result)
+        }
+    }
+} atomic

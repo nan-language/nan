@@ -1,0 +1,845 @@
+//! Places and values: where a NIR place lies, how values are read from and written to it, and the values that constructions, variants, failure conversions, function values and closures build.
+
+/// Where a place lies.
+enum PlaceLocation {
+    /// The bytes of a value of `ty` at an address; the scalars of a bytes layout's fields may be
+    /// unaligned and big-endian.
+    Memory(address: clif::Value, ty: ty::Ty, unaligned: bool, big: bool)
+    /// A wrapped part of type `ty` at an address, laid out as `ty`'s wrapped type.
+    Wrapped(address: clif::Value, ty: ty::Ty, wrap: Wrap)
+    /// A value held in a register.
+    Register(value: clif::Value, ty: ty::Ty)
+    /// The bits `mask << bit` of an integer layout held at `container`, a field of type `ty`.
+    Bits(container: mem::Box[PlaceLocation], bit: u32, mask: u64, ty: ty::Ty)
+} PlaceLocation
+
+/// A copy of the location.
+fn PlaceLocation.copy(self, alloc: mem::Alloc) -> PlaceLocation {
+    return match self {
+        PlaceLocation.Memory(address: address, ty: ty, unaligned: unaligned, big: big) => PlaceLocation.Memory(address: address, ty: ty, unaligned: unaligned, big: big)
+        PlaceLocation.Wrapped(address: address, ty: ty, wrap: wrap) => PlaceLocation.Wrapped(address: address, ty: ty, wrap: wrap)
+        PlaceLocation.Register(value: value, ty: ty) => PlaceLocation.Register(value: value, ty: ty)
+        PlaceLocation.Bits(container: container, bit: bit, mask: mask, ty: ty) => PlaceLocation.Bits(container: mem::Heap.of(alloc).boxed(container.contents().copy(alloc)), bit: bit, mask: mask, ty: ty)
+    }
+} PlaceLocation.copy
+
+/// The address of a value and the type it is laid out as.
+struct LaidOut derives Copy {
+    address: clif::Value
+    ty: ty::Ty
+} LaidOut
+
+/// The type of the value at a place.
+fn Body.place_type(mut self, mut lo: Lowering, mut fx: Fx, place: nir::Place) -> ty::Ty {
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    return self.location_type(location)
+} Body.place_type
+
+fn Body.location_type(self, location: PlaceLocation) -> ty::Ty {
+    return match location {
+        PlaceLocation.Memory(address: _, ty: ty, unaligned: _, big: _) => ty
+        PlaceLocation.Wrapped(address: _, ty: ty, wrap: _) => ty
+        PlaceLocation.Register(value: _, ty: ty) => ty
+        PlaceLocation.Bits(container: _, bit: _, mask: _, ty: ty) => ty
+    }
+} Body.location_type
+
+/// Where a place lies: its root's storage, then each step's field or payload, a step
+/// reaching a reference continuing at the place it designates.
+fn Body.locate_place(mut self, mut lo: Lowering, mut fx: Fx, place: nir::Place) -> PlaceLocation {
+    let root = place.root
+    let held = self.held(root)
+    let nty = self.nty(root)
+    let wrapped = self.wrapping(lo, value: root)
+    let ty = nty.ty()
+    var location = match held {
+        Held.Address(address) => match wrapped {
+            Some(wrap) => PlaceLocation.Wrapped(address: address, ty: ty, wrap: wrap)
+            None => PlaceLocation.Memory(address: address, ty: ty, unaligned: false, big: false)
+        }
+        Held.Scalar(value) => PlaceLocation.Register(value: value, ty: ty)
+        Held.Empty => PlaceLocation.Memory(address: mut fx.slot(0, align: 1), ty: ty, unaligned: false, big: false)
+    }
+    var index: usize = 0
+    while index < place.steps.len() {
+        let step = place.steps[index].as_str()
+        index += 1
+        if nir::is_variant_step(step) {
+            var label = text::String.empty(lo.alloc)
+            if mut self.payload_labelled(lo, location, variant: step) {
+                expect index < place.steps.len()
+                index += 1
+                label = text::String.of(place.steps[index - 1].as_str(), alloc: lo.alloc)
+            }
+            location = mut self.payload_step(mut lo, mut fx, take location, variant: step, label: label.as_str())
+        } else {
+            location = mut self.field_step(mut lo, mut fx, take location, name: step)
+        }
+    }
+    return location
+} Body.locate_place
+
+/// Whether a variant's payload of the enum at a location is labelled.
+fn Body.payload_labelled(mut self, lo: Lowering, location: PlaceLocation, variant: Str) -> bool {
+    let ty = self.location_type(location)
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        return false
+    }
+    let sig = lo.ck.sig(item)
+    let check::SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return false
+    }
+    for candidate in variants {
+        if candidate.name.as_str() != variant {
+            continue
+        }
+        match candidate.payload {
+            check::Payload.Labelled(_) => return true
+            else => {}
+        }
+    }
+    return false
+} Body.payload_labelled
+
+/// The payload field of a variant of the enum at a location; in a wrapped part, a payload
+/// that is a part is reached through the address the wrapped part holds.
+fn Body.payload_step(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    take location: PlaceLocation,
+    variant: Str,
+    label: Str,
+    ) -> PlaceLocation {
+    var base = LaidOut(address: clif::Value(index: 0), ty: ty::Ty.unit())
+    var wrapped: Option[Wrap] = None
+    match location {
+        PlaceLocation.Memory(address: memory_address, ty: memory_ty, unaligned: _, big: _) => {
+            base = LaidOut(address: memory_address, ty: memory_ty)
+        }
+        PlaceLocation.Wrapped(address: part_address, ty: part_ty, wrap: wrap) => {
+            base = LaidOut(address: part_address, ty: part_ty)
+            wrapped = Some(wrap)
+        }
+        else => {
+            expect false
+        }
+    }
+    let field = mut lo.layouts.field(lo.ck, ty: base.ty, variant: Some(variant), label)
+    match wrapped {
+        Some(wrap) => {
+            let stored_ty = lo.wrapped_type(base.ty, wrap)
+            let stored = mut lo.layouts.field(lo.ck, ty: stored_ty, variant: Some(variant), label)
+            let at = mut fx.offset(base.address, offset: stored.offset)
+            var address = at
+            if lo.is_part(field.ty, wrap) {
+                address = mut fx.load(PTR, addr: at, offset: 0)
+            }
+            return PlaceLocation.Memory(address: address, ty: field.ty, unaligned: false, big: false)
+        }
+        None => {}
+    }
+    return PlaceLocation.Memory(address: mut fx.offset(base.address, offset: field.offset), ty: field.ty, unaligned: false, big: false)
+} Body.payload_step
+
+fn Body.field_step(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    take location: PlaceLocation,
+    name: Str,
+    ) -> PlaceLocation {
+    let ty = self.location_type(location)
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Scalar(ty: _, big: _) => {
+            let bits = lo.bit_field(ty, field_name: name)
+            match location {
+                PlaceLocation.Bits(container: container, bit: outer, mask: _, ty: _) => {
+                    expect outer < 64 and bits.low < 64
+                    return PlaceLocation.Bits(container: take container, bit: outer + bits.low, mask: bits.mask, ty: bits.ty)
+                }
+                else => return PlaceLocation.Bits(container: mem::Heap.of(lo.alloc).boxed(take location), bit: bits.low, mask: bits.mask, ty: bits.ty)
+            }
+        }
+        LayoutShape.Bytes(fields: fields, big: big) => {
+            let PlaceLocation.Memory(address: address, ty: _, unaligned: _, big: _) = location else {
+                expect false
+                return location
+            }
+            let field = fields[place_find(fields.view(), name)]
+            return PlaceLocation.Memory(address: mut fx.offset(address, offset: field.offset), ty: field.ty, unaligned: true, big: big)
+        }
+        LayoutShape.Record(fields) => {
+            let PlaceLocation.Memory(address: address, ty: _, unaligned: unaligned, big: big) = location else {
+                expect false
+                return location
+            }
+            let field = fields[place_find(fields.view(), name)]
+            return PlaceLocation.Memory(address: mut fx.offset(address, offset: field.offset), ty: field.ty, unaligned: unaligned, big: big)
+        }
+        else => {
+            expect false
+            return location
+        }
+    }
+} Body.field_step
+
+/// The address of the value at a place and the type it is laid out as: a wrapped part's
+/// wrapped type.
+fn Body.place_storage(mut self, mut lo: Lowering, mut fx: Fx, place: nir::Place) -> LaidOut {
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    match location {
+        PlaceLocation.Wrapped(address: address, ty: ty, wrap: wrap) => return LaidOut(address: address, ty: lo.wrapped_type(ty, wrap))
+        else => {}
+    }
+    let ty = self.location_type(location)
+    return LaidOut(address: mut self.location_address(mut lo, mut fx, location), ty: ty)
+} Body.place_storage
+
+/// The address of a place, spilling a value held in a register.
+fn Body.place_address(mut self, mut lo: Lowering, mut fx: Fx, place: nir::Place) -> clif::Value {
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    return mut self.location_address(mut lo, mut fx, location)
+} Body.place_address
+
+fn Body.location_address(mut self, mut lo: Lowering, mut fx: Fx, location: PlaceLocation) -> clif::Value {
+    match location {
+        PlaceLocation.Memory(address: address, ty: _, unaligned: _, big: _) => return address
+        PlaceLocation.Wrapped(address: address, ty: _, wrap: _) => return address
+        PlaceLocation.Register(value: value, ty: ty) => {
+            let laid = mut lo.layout_of(ty)
+            let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            mut self.store_scalar(mut lo, mut fx, value, address: slot, offset: 0, ty)
+            return slot
+        }
+        PlaceLocation.Bits(container: _, bit: _, mask: _, ty: _) => {
+            let ty = self.location_type(location)
+            let value = mut self.read_location(mut lo, mut fx, location)
+            let laid = mut lo.layout_of(ty)
+            let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            mut self.copy_to(mut lo, mut fx, address: slot, held: value, ty)
+            return slot
+        }
+    }
+} Body.location_address
+
+/// The value at a place, copied: a scalar loaded, any other value copied to new storage.
+fn Body.read_place(mut self, mut lo: Lowering, mut fx: Fx, place: nir::Place) -> Held {
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    return mut self.read_location(mut lo, mut fx, location)
+} Body.read_place
+
+fn Body.read_location(mut self, mut lo: Lowering, mut fx: Fx, location: PlaceLocation) -> Held {
+    match location {
+        PlaceLocation.Register(value: value, ty: _) => return Held.Scalar(value)
+        PlaceLocation.Wrapped(address: address, ty: ty, wrap: wrap) => {
+            let wrapped_ty = lo.wrapped_type(ty, wrap)
+            let laid = mut lo.layout_of(wrapped_ty)
+            let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            mut lo.copy(mut fx, dst: slot, src: address, size: laid.contents().size, align: laid.contents().align)
+            return Held.Address(slot)
+        }
+        PlaceLocation.Bits(container: container, bit: bit, mask: mask, ty: ty) => {
+            let container_held = mut self.read_location(mut lo, mut fx, location: container.contents())
+            let whole = container_held.scalar_value()
+            let field = mut self.extract_bits(mut lo, mut fx, whole, bit, mask, ty)
+            return match mut lo.owned_repr(ty) {
+                Repr.Scalar(_) => Held.Scalar(field)
+                else => Held.Empty
+            }
+        }
+        PlaceLocation.Memory(address: address, ty: ty, unaligned: unaligned, big: big) => {
+            let laid = mut lo.layout_of(ty)
+            match laid.contents().shape {
+                LayoutShape.Scalar(ty: scalar, big: own) => return Held.Scalar(mut fx.load_ordered(scalar, addr: address, offset: 0, unaligned_access: unaligned, big: big or own))
+                LayoutShape.Empty => return Held.Empty
+                else => {
+                    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+                    mut lo.copy(mut fx, dst: slot, src: address, size: laid.contents().size, align: laid.contents().align)
+                    return Held.Address(slot)
+                }
+            }
+        }
+    }
+} Body.read_location
+
+/// The value at a place passed by `take`: a scalar loaded, any other value by the address of
+/// its storage, which the receiver takes over.
+fn Body.take_place(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    place: nir::Place,
+    ty: ty::Ty,
+    ) -> Held {
+    let location = mut self.locate_place(mut lo, mut fx, place)
+    let repr = mut lo.owned_repr(ty)
+    match location {
+        PlaceLocation.Memory(address: address, ty: _, unaligned: _, big: _) => if repr == Repr.Address {
+            return Held.Address(address)
+        }
+        else => {}
+    }
+    return mut self.read_location(mut lo, mut fx, location)
+} Body.take_place
+
+/// Writes a value to a location.
+fn Body.write_location(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    location: PlaceLocation,
+    held: Held,
+    nty: nir::NTy,
+    ) {
+    match location {
+        PlaceLocation.Memory(address: address, ty: ty, unaligned: unaligned, big: big) => {
+            let laid = mut lo.layout_of(ty)
+            match laid.contents().shape {
+                LayoutShape.Scalar(ty: _, big: own) => {
+                    let adapted = mut self.adapt(mut lo, mut fx, held, nty, wanted: Repr.Scalar(clif::Type.Int64))
+                    let value = adapted.scalar_value()
+                    mut fx.store_ordered(value, addr: address, offset: 0, unaligned_access: unaligned, big: big or own)
+                }
+                LayoutShape.Empty => {}
+                else => {
+                    let adapted = mut self.adapt(mut lo, mut fx, held, nty, wanted: Repr.Address)
+                    let source = adapted.address_value()
+                    mut lo.copy(mut fx, dst: address, src: source, size: laid.contents().size, align: laid.contents().align)
+                }
+            }
+        }
+        PlaceLocation.Bits(container: container, bit: bit, mask: mask, ty: _) => {
+            var value = clif::Value(index: 0)
+            match held {
+                Held.Scalar(scalar) => {
+                    value = scalar
+                }
+                else => {
+                    let adapted = mut self.adapt(mut lo, mut fx, held, nty, wanted: Repr.Scalar(clif::Type.Int64))
+                    value = adapted.scalar_value()
+                }
+            }
+            let container_held = mut self.read_location(mut lo, mut fx, location: container.contents())
+            let whole = container_held.scalar_value()
+            let updated = mut self.insert_bits(mut fx, whole, value, bit, mask)
+            mut self.write_location(mut lo, mut fx, location: container.contents(), held: Held.Scalar(updated), nty)
+        }
+        else => {
+            expect false
+        }
+    }
+} Body.write_location
+
+/// Writes a value of `ty` at an address.
+fn Body.write_value(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    address: clif::Value,
+    held: Held,
+    ty: ty::Ty,
+    ) {
+    let location = PlaceLocation.Memory(address: address, ty: ty, unaligned: false, big: false)
+    mut self.write_location(mut lo, mut fx, location, held, nty: nir::NTy.Owned(ty))
+} Body.write_value
+
+/// Copies a value of `ty` to an address.
+fn Body.copy_to(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    address: clif::Value,
+    held: Held,
+    ty: ty::Ty,
+    ) {
+    mut self.write_value(mut lo, mut fx, address, held, ty)
+} Body.copy_to
+
+fn Body.load_scalar(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    address: clif::Value,
+    offset: u64,
+    ty: ty::Ty,
+    ) -> clif::Value {
+    let laid = mut lo.layout_of(ty)
+    let LayoutShape.Scalar(ty: scalar, big: big) = laid.contents().shape else {
+        expect false
+        return address
+    }
+    return mut fx.load_ordered(scalar, addr: address, offset, unaligned_access: false, big)
+} Body.load_scalar
+
+fn Body.store_scalar(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    value: clif::Value,
+    address: clif::Value,
+    offset: u64,
+    ty: ty::Ty,
+    ) {
+    let laid = mut lo.layout_of(ty)
+    let big = match laid.contents().shape {
+        LayoutShape.Scalar(ty: _, big: own) => own
+        else => false
+    }
+    mut fx.store_ordered(value, addr: address, offset, unaligned_access: false, big)
+} Body.store_scalar
+
+fn Body.extract_bits(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    whole: clif::Value,
+    bit: u32,
+    mask: u64,
+    ty: ty::Ty,
+    ) -> clif::Value {
+    let container = fx.b.value_type(whole)
+    var shifted = whole
+    if bit != 0 {
+        shifted = mut fx.b.ushr_imm_s(whole, y: i64.widen(bit))
+    }
+    expect container.bits() <= 64
+    let full = 0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - container.bits())
+    var masked = shifted
+    if (mask & full) != full {
+        masked = mut fx.b.band_imm_s(shifted, y: i64.from_bits(mask))
+    }
+    let Repr.Scalar(target) = mut lo.owned_repr(ty) else {
+        return masked
+    }
+    return place_resize(mut fx, value: masked, target)
+} Body.extract_bits
+
+fn Body.insert_bits(
+    mut self,
+    mut fx: Fx,
+    whole: clif::Value,
+    value: clif::Value,
+    bit: u32,
+    mask: u64,
+    ) -> clif::Value {
+    let container = fx.b.value_type(whole)
+    let resized = place_resize(mut fx, value, target: container)
+    let placed_mask = mask << bit
+    let cleared = mut fx.b.band_imm_s(whole, y: i64.from_bits(~placed_mask))
+    var shifted = resized
+    if bit != 0 {
+        shifted = mut fx.b.ishl_imm_s(resized, y: i64.widen(bit))
+    }
+    let placed = mut fx.b.band_imm_s(shifted, y: i64.from_bits(placed_mask))
+    return mut fx.b.bor(cleared, y: placed)
+} Body.insert_bits
+
+/// Whether a value fits the ranged `bit` or `rest` field at a location, none for a field that
+/// takes every value of its type.
+fn Body.bits_fit(mut self, mut fx: Fx, location: PlaceLocation, value: clif::Value) -> Option[clif::Value] {
+    let PlaceLocation.Bits(container: _, bit: _, mask: mask, ty: _) = location else {
+        return None
+    }
+    let ty = fx.b.value_type(value)
+    expect ty.bits() <= 64
+    let outside = (~mask) & (0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - ty.bits()))
+    if outside == 0 {
+        return None
+    }
+    let stray = mut fx.b.band_imm_s(value, y: i64.from_bits(outside))
+    return Some(mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: stray, y: 0))
+} Body.bits_fit
+
+/// A struct or layout value from its fields' operands.
+fn Body.construct(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    ty: ty::Ty,
+    fields: Slice[nir::Labelled],
+    block: nir::BlockId,
+    position: usize,
+    ) -> Held {
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Scalar(ty: scalar, big: _) => return mut self.construct_bits(mut lo, mut fx, ty, scalar, fields, block, position)
+        LayoutShape.Empty => {
+            for field in fields {
+                discard mut self.operand(mut lo, mut fx, operand: field.operand)
+            }
+            return Held.Empty
+        }
+        else => {}
+    }
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let target = PlaceLocation.Memory(address: slot, ty: ty, unaligned: false, big: false)
+    for field in fields {
+        let operated = mut self.owned_operand(mut lo, mut fx, operand: field.operand)
+        let location = mut self.field_step(mut lo, mut fx, location: target.copy(lo.alloc), name: field.name.as_str())
+        mut self.write_location(mut lo, mut fx, location, held: operated.held, nty: operated.nty)
+    }
+    return Held.Address(slot)
+} Body.construct
+
+/// A layout value held in a register of type `scalar`, each field's value inserted at its bits
+/// and checked to fit a ranged or rest field.
+fn Body.construct_bits(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    ty: ty::Ty,
+    scalar: clif::Type,
+    fields: Slice[nir::Labelled],
+    block: nir::BlockId,
+    position: usize,
+    ) -> Held {
+    var whole = mut fx.b.iconst(scalar, imm: 0)
+    for field in fields {
+        let operated = mut self.operand(mut lo, mut fx, operand: field.operand)
+        let Held.Scalar(value) = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted: Repr.Scalar(clif::Type.Int64)) else {
+            continue
+        }
+        let bits = lo.bit_field(ty, field_name: field.name.as_str())
+        let location = PlaceLocation.Bits(container: mem::Heap.of(lo.alloc).boxed(PlaceLocation.Register(value: whole, ty: ty)), bit: bits.low, mask: bits.mask, ty: operated.nty.ty())
+        let fits = mut self.bits_fit(mut fx, location, value)
+        match fits {
+            Some(fitting) => if self.checked(block, position) {
+                let operands = field_operands(field.name.as_str(), operand: field.operand, operated, alloc: lo.alloc)
+                mut self.trap_unless(mut lo, mut fx, holds: fitting, kind: "trap.conversion", operands: take operands)
+            }
+            None => {}
+        }
+        whole = mut self.insert_bits(mut fx, whole, value, bit: bits.low, mask: bits.mask)
+    }
+    return Held.Scalar(whole)
+} Body.construct_bits
+
+/// An enum value of a variant with its payload's operands; a wrapped part stores the address
+/// of each payload that is a part, which a place operand gives.
+fn Body.variant(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    ty: ty::Ty,
+    variant: Str,
+    payload: nir::Payload,
+    wrapped: Option[Wrap],
+    ) -> Held {
+    let operands = payload_operands(payload, alloc: lo.alloc)
+    var held = mem::List[Held].empty(lo.alloc)
+    for operand in operands {
+        mut held.push(mut self.payload_held(mut lo, mut fx, operand, wrapped))
+    }
+    return mut lo.variant_value(mut fx, ty, variant, payload_values: held.view(), wrapped)
+} Body.variant
+
+/// The value a payload operand gives a variant: a part's address in a wrapped part, the
+/// operand's value in a wrapped part otherwise, and an owned value anywhere else.
+fn Body.payload_held(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    operand: nir::Operand,
+    wrapped: Option[Wrap],
+    ) -> Held {
+    let Some(wrap) = wrapped else {
+        let owned = mut self.owned_operand(mut lo, mut fx, operand)
+        return owned.held
+    }
+    match operand {
+        nir::Operand.Place(mode: _, place: place) => {
+            let part_ty = mut self.place_type(mut lo, mut fx, place)
+            if lo.is_part(part_ty, wrap) {
+                return Held.Address(mut self.place_address(mut lo, mut fx, place))
+            }
+        }
+        else => {}
+    }
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    return operated.held
+} Body.payload_held
+
+/// Failure conversion: the value unchanged, or wrapped in a from variant; a cancellation
+/// keeps its place at the top of a cancellable target.
+fn Body.convert(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    operand: nir::Operand,
+    to: ty::Ty,
+    via: Option[Str],
+    ) -> Held {
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let from = operated.nty.ty()
+    let repr = mut lo.owned_repr(from)
+    let held = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted: repr)
+    return mut lo.convert_failure(mut fx, held, from, to, via)
+} Body.convert
+
+/// The value a `constant` names.
+fn Body.constant(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    constant: nir::Constant,
+    ty: ty::Ty,
+    ) -> Held {
+    match constant {
+        nir::Constant.Item(item) => return mut lo.const_item(mut fx, item, ty)
+        nir::Constant.Param(param) => {
+            var value: i64 = 0
+            match self.subst.get(param) {
+                Some(ty::Arg.Const(ty::Const.Int(number))) => {
+                    value = i64.from_bits(number.low_bits())
+                }
+                Some(ty::Arg.Const(ty::Const.Bool(truth))) => {
+                    value = flag_number(truth)
+                }
+                else => {
+                    expect false
+                }
+            }
+            let Repr.Scalar(scalar) = mut lo.owned_repr(ty) else {
+                expect false
+                return Held.Empty
+            }
+            return Held.Scalar(mut fx.b.iconst(scalar, imm: value))
+        }
+        nir::Constant.Register(block: _, register: index) => return Held.Scalar(mut fx.int(clif::Type.Int64, value: i64.widen(index)))
+    }
+} Body.constant
+
+/// A function value naming a function: the code calling it through the ABI of function
+/// values, without an environment.
+fn Body.fn_value(mut self, mut lo: Lowering, mut fx: Fx, fn_ref: nir::FnRef) -> Held {
+    let named = nir::FnRef(callable: fn_ref.callable.copy(lo.alloc), args: self.subst.args(lo.ck.types(), args: fn_ref.args))
+    let instance = mut lo.callable_instance(named, as_value: true)
+    let instance_fn_ty = mut lo.instance_fn_ty(instance)
+    let own_stack = instance_fn_ty.limit_set.stack
+    var inner = mem::List[Instance].empty(lo.alloc)
+    mut inner.push(take instance)
+    let glue = mut lo.instance(Instance.Value(take inner))
+    mut lo.entry_stack(glue, own: own_stack)
+    let reference = mut lo.func_ref(mut fx, id: glue)
+    let code = mut fx.b.func_addr(PTR, func_ref: reference)
+    let slot = mut fx.slot(16, align: 8)
+    mut fx.store(code, addr: slot, offset: 0)
+    let no_env = mut fx.ptr(0)
+    mut fx.store(no_env, addr: slot, offset: 8)
+    return Held.Address(slot)
+} Body.fn_value
+
+/// A closure value: its code and an environment holding its captures, in this frame for a
+/// closure and in runtime memory for a task closure, which outlives the frame.
+fn Body.closure(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    index: u32,
+    captures: Slice[nir::Operand],
+    ) -> Held {
+    let instance = Instance.Nir(item: self.item, role: nir::Role.Closure, index: index, args: self.args)
+    let unit = self.unit.share()
+    let Some(function) = unit.contents().function(nir::Role.Closure, index) else {
+        expect false
+        return Held.Empty
+    }
+    let task = match function.closure {
+        Some(head) => head.task
+        None => false
+    }
+    var types = mem::List[nir::NTy].empty(lo.alloc)
+    for nty in function.types {
+        mut types.push(substituted(self.subst, types: lo.ck.types(), nty))
+    }
+    let Some(params) = function.params.view().prefix(captures.len()) else {
+        expect false
+        return Held.Empty
+    }
+    var start: u64 = 0
+    if task {
+        start = ENV_HEADER
+    }
+    let offsets = mut lo.capture_layout(types.view(), params, start)
+    let size = mut lo.capture_size(types.view(), params, start)
+    var env = clif::Value(index: 0)
+    if task {
+        var env_size = size
+        if env_size < 8 {
+            env_size = 8
+        }
+        let size_value = mut fx.ptr(env_size)
+        let call = mut lo.call_routine(mut fx, routine: Routine.TaskEnv, args: Array[clif::Value, 1].filled(size_value).view())
+        expect call.len() > 0
+        env = call[0]
+    } else {
+        env = mut fx.slot(size, align: 8)
+    }
+    mut self.write_captures(mut lo, mut fx, env, captures, params, offsets: offsets.view(), types: types.view())
+    if task {
+        var owned = mem::List[Capture].empty(lo.alloc)
+        for position in 0..<params.len() {
+            if position >= offsets.len() {
+                break
+            }
+            expect usize.widen(params[position].value.index) < types.len()
+            match types[usize.widen(params[position].value.index)] {
+                nir::NTy.Owned(owned_ty) => mut owned.push(Capture(ty: owned_ty, offset: offsets[position]))
+                else => {}
+            }
+        }
+        let walk = transfer_captures(mut lo, mut fx, closure: instance.copy(lo.alloc), captures: take owned)
+        mut fx.store(walk, addr: env, offset: 0)
+    }
+    let own_stack = match function.closure {
+        Some(head) => head.limit_set.stack
+        None => None
+    }
+    let code_id = mut lo.instance(take instance)
+    if task {
+        mut lo.entry_stack(code_id, own: own_stack)
+    }
+    let reference = mut lo.func_ref(mut fx, id: code_id)
+    let code = mut fx.b.func_addr(PTR, func_ref: reference)
+    let slot = mut fx.slot(16, align: 8)
+    mut fx.store(code, addr: slot, offset: 0)
+    mut fx.store(env, addr: slot, offset: 8)
+    return Held.Address(slot)
+} Body.closure
+
+/// Writes the captures of a closure into its environment: the address of a captured place,
+/// or the value of a captured value.
+fn Body.write_captures(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    env: clif::Value,
+    captures: Slice[nir::Operand],
+    params: Slice[nir::Param],
+    offsets: Slice[u64],
+    types: Slice[nir::NTy],
+    ) {
+    for position in 0..<captures.len() {
+        if position >= params.len() or position >= offsets.len() {
+            break
+        }
+        let operated = mut self.operand(mut lo, mut fx, operand: captures[position])
+        expect usize.widen(params[position].value.index) < types.len()
+        let param_nty = types[usize.widen(params[position].value.index)]
+        let at = mut fx.offset(env, offset: offsets[position])
+        if param_nty.is_reference() {
+            let adapted = mut self.adapt(mut lo, mut fx, held: operated.held, nty: operated.nty, wanted: Repr.Address)
+            let address = adapted.address_value()
+            mut fx.store(address, addr: at, offset: 0)
+        } else {
+            mut self.write_value(mut lo, mut fx, address: at, held: operated.held, ty: param_nty.ty())
+        }
+    }
+} Body.write_captures
+
+/// How a value holds a wrapped part, none when it holds none.
+fn Body.wrapping(self, lo: Lowering, value: nir::Value) -> Option[Wrap] {
+    let nty = self.nty(value)
+    if nty.is_reference() or not lo.wraps(nty.ty()) {
+        return None
+    }
+    return self.wrapped_flag(value)
+} Body.wrapping
+
+/// An operand as an owned value, as `plain` gives a wrapped part.
+fn Body.owned_operand(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -> HeldValue {
+    let operated = mut self.operand(mut lo, mut fx, operand)
+    let value = self.operand_value(operand)
+    let held = mut self.plain(mut lo, mut fx, held: operated.held, value, ty: operated.nty.ty())
+    return HeldValue(held: held, nty: operated.nty)
+} Body.owned_operand
+
+/// A value as an owned one: a wrapped part becomes a value whose payloads are copies of the
+/// parts it points at, as a read argument, which the callee only reads, or a Copy value.
+fn Body.plain(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    value: Option[nir::Value],
+    ty: ty::Ty,
+    ) -> Held {
+    let Some(defined) = value else {
+        return held
+    }
+    let Some(wrap) = self.wrapping(lo, value: defined) else {
+        return held
+    }
+    let wrapped_ty = lo.wrapped_type(ty, wrap)
+    let laid = mut lo.layout_of(ty)
+    let wrapped_laid = mut lo.layout_of(wrapped_ty)
+    let LayoutShape.Enum(shape) = laid.contents().shape else {
+        return held
+    }
+    let LayoutShape.Enum(wrapped_shape) = wrapped_laid.contents().shape else {
+        return held
+    }
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    let source = held.address_value()
+    for index in 0..<shape.variants.len() {
+        if index >= wrapped_shape.variants.len() {
+            break
+        }
+        let variant = shape.variants[index]
+        let wrapped_variant = wrapped_shape.variants[index]
+        let selected = mut lo.variant_is(mut fx, address: source, ty: wrapped_ty, variant: variant.name.as_str())
+        mut fx.if_true(selected, then: fn[mut lo](mut fx1: Fx) {
+            for position in 0..<variant.fields.len() {
+                if position >= wrapped_variant.fields.len() {
+                    break
+                }
+                let field = variant.fields[position]
+                let wrapped_field = wrapped_variant.fields[position]
+                let from = mut fx1.offset(source, offset: wrapped_field.offset)
+                let to = mut fx1.offset(slot, offset: field.offset)
+                var origin = from
+                if lo.is_part(field.ty, wrap) {
+                    origin = mut fx1.load(PTR, addr: from, offset: 0)
+                }
+                let field_laid = mut lo.layout_of(field.ty)
+                mut lo.copy(mut fx1, dst: to, src: origin, size: field_laid.contents().size, align: field_laid.contents().align)
+            }
+            write_tag(mut fx1, address: slot, tag: shape.tag, index)
+        })
+    }
+    return Held.Address(slot)
+} Body.plain
+
+fn Body.operand_value(self, operand: nir::Operand) -> Option[nir::Value] {
+    return match operand {
+        nir::Operand.Value(value) => Some(value)
+        else => None
+    }
+} Body.operand_value
+
+/// An integer register resized to another integer type, without its sign.
+fn place_resize(mut fx: Fx, value: clif::Value, target: clif::Type) -> clif::Value {
+    let ty = fx.b.value_type(value)
+    if ty.bits() == target.bits() {
+        return value
+    }
+    if ty.bits() < target.bits() {
+        return mut fx.b.uextend(target, x: value)
+    }
+    return mut fx.b.ireduce(target, x: value)
+} place_resize
+
+/// The position of the field `name`.
+fn place_find(fields: Slice[Field], name: Str) -> usize
+    ensures result < fields.len()
+{
+    for position in 0..<fields.len() {
+        if fields[position].name.as_str() == name {
+            return position
+        }
+    }
+    expect false
+    return 0
+} place_find

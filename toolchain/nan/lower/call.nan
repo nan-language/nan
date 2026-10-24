@@ -1,0 +1,1369 @@
+//! Calls: direct calls of lowered instances, calls through function values and `Dyn` values, calls of foreign fns, and the glue that lets a named function be a function value and an implementing function be a `Dyn` method.
+
+/// What a call calls.
+enum CallTarget {
+    Direct(id: object::FuncId, abi: Abi)
+    /// Through a function value: its code address and environment, and how its stack use is
+    /// bounded.
+    Indirect(code: clif::Value, env: clif::Value, abi: Abi, kind: StackKind)
+    /// Through the method table of a `Dyn` value: the method's code address, which takes the
+    /// address of the value as its receiver, and how its stack use is bounded.
+    Dyn(code: clif::Value, data: clif::Value, abi: Abi, kind: StackKind)
+    /// An external symbol under the C convention of the host, with the `stack N` its head
+    /// demands.
+    Foreign(id: object::FuncId, params: mem::List[Repr], returned: Returned, stack: Option[u64])
+} CallTarget
+
+/// Where a function value an operand passes comes from.
+enum FnSource {
+    /// A closure written there, by index.
+    Closure(u32)
+    /// A named function written there.
+    Named(nir::FnRef)
+    /// The function's own parameter at a position.
+    Param(usize)
+    /// Any other value, with the `stack N` its type demands.
+    Other(Option[u64])
+} FnSource
+
+/// The blocks a failing call ending a block continues at: with its result, or with its
+/// failure.
+struct CallExits derives Copy {
+    ok: nir::BlockId
+    failure: nir::BlockId
+} CallExits
+
+/// The head of an interface method as a function type, and how it gives its result when it is
+/// a projection.
+struct MethodHead {
+    fn_ty: ty::FnTy
+    given: Option[Given]
+} MethodHead
+
+/// The external function of a foreign fn and the registers of its parameters and result.
+struct ForeignFn {
+    id: object::FuncId
+    params: mem::List[Repr]
+    returned: Returned
+} ForeignFn
+
+/// Lowers a call: its result as `result` defines, or, for a failing call ending a block, a
+/// branch to `targets` with its result or its failure.
+fn Body.call(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    call: nir::Call,
+    result: Option[nir::Value],
+    block: nir::BlockId,
+    position: usize,
+    targets: Option[CallExits],
+    ) -> Option[Held] {
+    if call.awaited {
+        scheduling_point(mut lo, mut fx)
+    }
+    match call.callee {
+        nir::Callee.Fn(called) => {
+            let fn_ref = nir::FnRef(callable: called.callable.copy(lo.alloc), args: self.subst.args(lo.ck.types(), args: called.args))
+            match lo.called_target(fn_ref.callable) {
+                Some(slot) => mut lo.mark_ran(mut fx, slot)
+                None => {}
+            }
+            match fn_ref.callable {
+                nir::Callable.Builtin(builtin) => return Some(supplied_builtin(mut self, mut lo, mut fx, builtin, args: fn_ref.args, operands: call.args.view(), result, block, position))
+                else => {}
+            }
+            if is_spawn(lo, fn_ref) {
+                return Some(spawn_at(mut self, mut lo, mut fx, operands: call.args.view()))
+            }
+            mut self.bounds_check(mut lo, mut fx, fn_ref, operands: call.args.view(), block, position)
+            operand_checks(mut self, mut lo, mut fx, fn_ref, operands: call.args.view())
+            let target = mut self.direct_target(mut lo, fn_ref)
+            return mut self.emit_call(mut lo, mut fx, take target, operands: call.args.view(), targets)
+        }
+        nir::Callee.Value(value) => {
+            let target = mut self.value_target(mut lo, mut fx, value)
+            return mut self.emit_call(mut lo, mut fx, take target, operands: call.args.view(), targets)
+        }
+        nir::Callee.Dyn(place: place, item: interface_item, method: method) => {
+            let target = mut self.dyn_target(mut lo, mut fx, place, interface_item, method)
+            return mut self.emit_call(mut lo, mut fx, take target, operands: call.args.view(), targets)
+        }
+    }
+} Body.call
+
+/// The target of a call through a function value: its code and environment, called as values
+/// of its function type are.
+fn Body.value_target(mut self, mut lo: Lowering, mut fx: Fx, value: nir::Value) -> CallTarget {
+    let fn_ty = value_fn_ty(lo, ty: self.nty(value).ty())
+    let function = self.held(value).address_value()
+    let code = mut fx.load(PTR, addr: function, offset: 0)
+    let env = mut fx.load(PTR, addr: function, offset: 8)
+    let abi = mut lo.fn_abi(fn_ty)
+    let kind = match self.own_param(lo, value) {
+        Some(position) => StackKind.Param(position)
+        None => StackKind.Bounded(fn_ty.limit_set.stack)
+    }
+    return CallTarget.Indirect(code: code, env: env, abi: take abi, kind: take kind)
+} Body.value_target
+
+/// The function type of a function value's type.
+fn value_fn_ty(lo: Lowering, ty: ty::Ty) -> ty::FnTy {
+    let types = lo.ck.types()
+    let ty::TyKind.Fn(id) = types.kind(ty) else {
+        expect false
+        return unit_fn_ty(lo.alloc)
+    }
+    return ty::copy_fn_ty(types.fn_of(id), alloc: lo.alloc)
+} value_fn_ty
+
+/// A function type without parameters giving `Unit`, which impossible paths give.
+fn unit_fn_ty(alloc: mem::Alloc) -> ty::FnTy {
+    return ty::FnTy(kind: ast::FnKind.Plain, params: mem::List[ty::FnParam].empty(alloc), result: ty::Ty.unit(), failure: None, wait: false, limit_set: ty::LimitSet.none(), convention: None)
+} unit_fn_ty
+
+/// The target of a call through the method table of the `Dyn` value at a place.
+fn Body.dyn_target(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    place: nir::Place,
+    interface_item: ty::ItemId,
+    method: u32,
+    ) -> CallTarget {
+    let dynamic = mut self.place_address(mut lo, mut fx, place)
+    let data = mut fx.load(PTR, addr: dynamic, offset: 0)
+    let table = mut fx.load(PTR, addr: dynamic, offset: 8)
+    let code = mut fx.load(PTR, addr: table, offset: 8 * (u64.widen(method) + 3))
+    let dyn_ty = mut self.place_type(mut lo, mut fx, place)
+    let args = match lo.ck.types().kind(dyn_ty) {
+        ty::TyKind.Dyn(bound) => bound.args
+        else => lo.box_dyn_args(dyn_ty)
+    }
+    let abi = mut lo.dyn_abi(interface_item, args, method)
+    let head = mut lo.method_head(ty::Ty.unit(), interface_item, args, method)
+    return CallTarget.Dyn(code: code, data: data, abi: take abi, kind: StackKind.Bounded(head.fn_ty.limit_set.stack))
+} Body.dyn_target
+
+/// Checks the index of an `at` or `at_mut` call of an array, slice, list, bytes or bounded
+/// list against the length, when its obligation site is checked.
+fn Body.bounds_check(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    fn_ref: nir::FnRef,
+    operands: Slice[nir::Operand],
+    block: nir::BlockId,
+    position: usize,
+    ) {
+    let nir::Callable.Item(item: item, role: nir::Role.Body, index: _) = fn_ref.callable else {
+        return
+    }
+    let path = lo.ck.db().canonical(item)
+    let Some(dot) = last_dot(path.as_str()) else {
+        return
+    }
+    let Some(owner) = path.slice_bytes(0, end: dot) else {
+        return
+    }
+    let Some(name) = path.slice_bytes(dot + 1, end: path.byte_len()) else {
+        return
+    }
+    if name != "at" and name != "at_mut" {
+        return
+    }
+    if not self.checked(block, position) {
+        return
+    }
+    expect operands.len() > 0
+    let receiver = mut self.operand(mut lo, mut fx, operand: operands[0])
+    let ty = receiver.nty.ty()
+    var len = clif::Value(index: 0)
+    match owner {
+        "core::Array" => {
+            let array_args = lo.ck.types().arg_list(lo.ck.types().args_of(ty))
+            expect array_args.len() > 1
+            let count = const_arg(array_args[1]).low_bits()
+            len = mut fx.ptr(count)
+        }
+        "core::Slice" or "core::SliceMut" or "mem::List" or "mem::Bytes" => {
+            len = mut fx.load(PTR, addr: receiver.held.address_value(), offset: 8)
+        }
+        "mem::Bounded" => {
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            len = mut fx.load(PTR, addr: receiver.held.address_value(), offset: len_field.offset)
+        }
+        else => return
+    }
+    expect operands.len() > 1
+    let index_operated = mut self.operand(mut lo, mut fx, operand: operands[1])
+    let index_adapted = mut self.adapt(mut lo, mut fx, held: index_operated.held, nty: index_operated.nty, wanted: Repr.Scalar(PTR))
+    let index = index_adapted.scalar_value()
+    let inside = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: len)
+    let bounds = Operands.Bounds(index: operands[1].copy(lo.alloc), at: index, len: len)
+    mut self.trap_unless(mut lo, mut fx, holds: inside, kind: "trap.bounds", operands: take bounds)
+} Body.bounds_check
+
+/// The position of the last `.` of a path, none when it has none.
+fn last_dot(path: Str) -> Option[usize]
+    ensures match result {
+        Some(found) => found < path.as_bytes().len()
+        None => true
+    }
+{
+    let bytes = path.as_bytes()
+    var at = bytes.len()
+    while at > 0 {
+        invariant at <= bytes.len()
+        at -= 1
+        if bytes[at] == b'.' {
+            return Some(at)
+        }
+    }
+    return None
+} last_dot
+
+/// The function a direct call reaches.
+fn Body.direct_target(mut self, mut lo: Lowering, fn_ref: nir::FnRef) -> CallTarget {
+    match fn_ref.callable {
+        nir::Callable.Item(item: item, role: nir::Role.Body, index: _) => if lo.ck.is_foreign(item) {
+            let external = mut lo.foreign_fn(item)
+            var stack: Option[u64] = None
+            match lo.ck.fn_sig(item) {
+                Some(sig) => {
+                    stack = sig.limit_set.stack
+                }
+                None => {}
+            }
+            return CallTarget.Foreign(id: external.id, params: take external.params, returned: external.returned, stack: stack)
+        }
+        else => {}
+    }
+    let instance = mut lo.callable_instance(fn_ref, as_value: false)
+    let abi = mut lo.abi(instance)
+    let id = mut lo.instance(take instance)
+    return CallTarget.Direct(id: id, abi: take abi)
+} Body.direct_target
+
+fn Body.emit_call(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    take target: CallTarget,
+    operands: Slice[nir::Operand],
+    targets: Option[CallExits],
+    ) -> Option[Held] {
+    let abi = call_abi(target, alloc: lo.alloc)
+    let foreign_call = match target {
+        CallTarget.Foreign(id: _, params: _, returned: _, stack: _) => true
+        else => false
+    }
+    var args = mem::List[clif::Value].empty(lo.alloc)
+    match target {
+        CallTarget.Indirect(code: _, env: env, abi: _, kind: _) => mut args.push(env)
+        else => {}
+    }
+    var result_slot: Option[clif::Value] = None
+    if abi.returned == Returned.Indirect {
+        let laid = mut lo.layout_of(abi.result)
+        let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+        mut args.push(slot)
+        result_slot = Some(slot)
+    }
+    var failure_slot: Option[clif::Value] = None
+    if abi.flagged {
+        let slot = mut lo.failure_slot(mut fx, abi)
+        mut args.push(slot)
+        failure_slot = Some(slot)
+    }
+    let passed = mut self.call_passed(mut lo, mut fx, target, operands, abi, foreign_call)
+    for value in passed {
+        mut args.push(value)
+    }
+    let inst = call_inst(mut lo, mut fx, target, args: args.view())
+    let kind = mut self.call_kind(mut lo, mut fx, take target, operands)
+    mut self.record_site(mut fx, inst, take kind)
+    let returns = fx.b.inst_results(inst, alloc: lo.alloc)
+    var next: usize = 0
+    var flag: Option[clif::Value] = None
+    if abi.flagged {
+        expect next < returns.len()
+        flag = Some(returns[next])
+        next += 1
+    }
+    var value = Held.Empty
+    match abi.returned {
+        Returned.Scalar(_) => {
+            expect next < returns.len()
+            value = Held.Scalar(returns[next])
+        }
+        Returned.Part => {
+            expect next < returns.len()
+            value = Held.Address(returns[next])
+        }
+        Returned.Indirect => {
+            let Some(slot) = result_slot else {
+                expect false
+                return None
+            }
+            value = Held.Address(slot)
+        }
+        Returned.Empty => {}
+    }
+    if abi.result == ty::Ty.never() and targets.is_none() {
+        mut self.unreachable_after(mut fx)
+        return Some(Held.Empty)
+    }
+    let Some(exits) = targets else {
+        return Some(value)
+    }
+    return mut self.call_exits(mut lo, mut fx, abi, exits, flag, failure_slot, value)
+} Body.emit_call
+
+/// The calling form a call's target takes its arguments in: its own, or for a foreign fn one
+/// passing each parameter as the C convention of the host does.
+fn call_abi(target: CallTarget, alloc: mem::Alloc) -> Abi {
+    match target {
+        CallTarget.Direct(id: _, abi: abi) => return abi.copy(alloc)
+        CallTarget.Indirect(code: _, env: _, abi: abi, kind: _) => return abi.copy(alloc)
+        CallTarget.Dyn(code: _, data: _, abi: abi, kind: _) => return abi.copy(alloc)
+        CallTarget.Foreign(id: _, params: params, returned: returned, stack: _) => {
+            var abi_params = mem::List[ParamRepr].empty(alloc)
+            for repr in params {
+                mut abi_params.push(ParamRepr(nty: nir::NTy.Owned(ty::Ty.unit()), repr: repr))
+            }
+            return Abi(env: false, params: take abi_params, result: ty::Ty.unit(), returned: returned, failure: None, flagged: false)
+        }
+    }
+} call_abi
+
+/// The values a call passes for its operands: for a `Dyn` call, the value's address first and
+/// then the method's other operands.
+fn Body.call_passed(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    target: CallTarget,
+    operands: Slice[nir::Operand],
+    abi: Abi,
+    foreign_call: bool,
+    ) -> mem::List[clif::Value] {
+    let CallTarget.Dyn(code: _, data: data, abi: _, kind: _) = target else {
+        return mut self.passed(mut lo, mut fx, operands, params: abi.params.view(), foreign_call)
+    }
+    var passed = mem::List[clif::Value].empty(lo.alloc)
+    mut passed.push(data)
+    let Some(operand_parts) = operands.split_at(1) else {
+        expect false
+        return passed
+    }
+    let Some(param_parts) = abi.params.view().split_at(1) else {
+        expect false
+        return passed
+    }
+    let rest = mut self.passed(mut lo, mut fx, operands: operand_parts.tail, params: param_parts.tail, foreign_call: false)
+    for value in rest {
+        mut passed.push(value)
+    }
+    return passed
+} Body.call_passed
+
+/// The call instruction of a call's target with its arguments.
+fn call_inst(mut lo: Lowering, mut fx: Fx, target: CallTarget, args: Slice[clif::Value]) -> clif::Inst {
+    match target {
+        CallTarget.Direct(id: id, abi: _) or CallTarget.Foreign(id: id, params: _, returned: _, stack: _) => {
+            let reference = mut lo.func_ref(mut fx, id)
+            return mut fx.b.call(reference, args)
+        }
+        CallTarget.Indirect(code: code, env: _, abi: abi, kind: _) or CallTarget.Dyn(code: code, data: _, abi: abi, kind: _) => {
+            let signature = mut fx.b.import_signature(abi.signature(lo.alloc))
+            return mut fx.b.call_indirect(signature, callee: code, args)
+        }
+    }
+} call_inst
+
+/// How a call's stack use is bounded: by what a direct call passes for its callee's
+/// function-typed parameters, by a foreign fn's `stack N`, or as its target's.
+fn Body.call_kind(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    take target: CallTarget,
+    operands: Slice[nir::Operand],
+    ) -> StackKind {
+    match target {
+        CallTarget.Direct(id: callee, abi: abi) => {
+            var bindings = mem::List[ParamBinding].empty(lo.alloc)
+            for position in 0..<operands.len() {
+                if position >= abi.params.len() {
+                    break
+                }
+                let ty::TyKind.Fn(_) = lo.ck.types().kind(abi.params[position].nty.ty()) else {
+                    continue
+                }
+                let binding = mut self.binding(mut lo, mut fx, operand: operands[position])
+                mut bindings.push(ParamBinding(position: position, binding: binding))
+            }
+            return StackKind.Direct(callee: callee, bindings: take bindings)
+        }
+        CallTarget.Foreign(id: _, params: _, returned: _, stack: stack) => return StackKind.Bounded(stack)
+        CallTarget.Indirect(code: _, env: _, abi: _, kind: kind) or CallTarget.Dyn(code: _, data: _, abi: _, kind: kind) => return kind
+    }
+} Body.call_kind
+
+/// Ends a block with a failing call's continuation: to `ok` with its result, or, when it may
+/// fail, a branch to the failure block with its failure when it failed.
+fn Body.call_exits(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    abi: Abi,
+    exits: CallExits,
+    flag: Option[clif::Value],
+    failure_slot: Option[clif::Value],
+    value: Held,
+    ) -> Option[Held] {
+    let Some(failed) = flag else {
+        if abi.result == ty::Ty.never() {
+            mut self.unreachable_after(mut fx)
+            return None
+        }
+        let ok_args = mut self.target_args(mut lo, mut fx, target: exits.ok, held: value, nty: nir::NTy.Owned(abi.result))
+        let ok_block = self.block_of(exits.ok)
+        mut fx.b.jump(ok_block, args: ok_args.view())
+        return None
+    }
+    let Some(failure) = failure_slot else {
+        expect false
+        return None
+    }
+    let Some(failure_ty) = abi.failure else {
+        expect false
+        return None
+    }
+    let failure_held = match mut lo.owned_repr(failure_ty) {
+        Repr.Scalar(_) => Held.Scalar(mut self.load_scalar(mut lo, mut fx, address: failure, offset: 0, ty: failure_ty))
+        Repr.Address => Held.Address(failure)
+        Repr.Empty => Held.Empty
+    }
+    let ok_args = mut self.target_args(mut lo, mut fx, target: exits.ok, held: value, nty: nir::NTy.Owned(abi.result))
+    let fail_args = mut self.target_args(mut lo, mut fx, target: exits.failure, held: failure_held, nty: nir::NTy.Owned(failure_ty))
+    let ok_block = self.block_of(exits.ok)
+    let fail_block = self.block_of(exits.failure)
+    mut fx.b.brif(failed, then: fail_block, then_args: fail_args.view(), otherwise: ok_block, otherwise_args: ok_args.view())
+    return None
+} Body.call_exits
+
+/// The values passing operands as the parameters `params` describe, as the C convention of
+/// the host passes them when `foreign_call`.
+fn Body.passed(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    operands: Slice[nir::Operand],
+    params: Slice[ParamRepr],
+    foreign_call: bool,
+    ) -> mem::List[clif::Value] {
+    var args = mem::List[clif::Value].empty(lo.alloc)
+    for position in 0..<operands.len() {
+        if position >= params.len() {
+            break
+        }
+        let operand = operands[position]
+        let param = params[position]
+        let operated = mut self.operand(mut lo, mut fx, operand)
+        var held = operated.held
+        if not foreign_call {
+            let value = self.operand_value(operand)
+            held = mut self.plain(mut lo, mut fx, held: operated.held, value, ty: param.nty.ty())
+        }
+        let adapted = mut self.adapt(mut lo, mut fx, held, nty: operated.nty, wanted: param.repr)
+        let values = adapted.values(lo.alloc)
+        for passed in values {
+            mut args.push(passed)
+        }
+    }
+    for position in 0..<operands.len() {
+        if position >= params.len() {
+            break
+        }
+        mut self.fit(mut lo, mut fx, operand: operands[position], wanted: params[position].nty.ty())
+    }
+    return args
+} Body.passed
+
+/// The record of `size` bytes keeping the two sides of the comparison a contract
+/// function's result is, computed again from the operands of a call of it.
+fn Body.call_sides(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    fn_ref: nir::FnRef,
+    operands: Slice[nir::Operand],
+    size: u64,
+    ) -> clif::Value {
+    let nir::Callable.Item(item: item, role: role, index: index) = fn_ref.callable else {
+        expect false
+        return clif::Value(index: 0)
+    }
+    let args = self.subst.args(lo.ck.types(), args: fn_ref.args)
+    var inner = mem::List[Instance].empty(lo.alloc)
+    mut inner.push(Instance.Nir(item: item, role: role, index: index, args: args))
+    let instance = Instance.Sides(take inner)
+    let abi = mut lo.abi(instance)
+    let id = mut lo.instance(take instance)
+    let record = mut fx.slot(size, align: 8)
+    var call_args = mem::List[clif::Value].empty(lo.alloc)
+    mut call_args.push(record)
+    let passed = mut self.passed(mut lo, mut fx, operands, params: abi.params.view(), foreign_call: false)
+    for value in passed {
+        mut call_args.push(value)
+    }
+    let reference = mut lo.func_ref(mut fx, id)
+    discard mut fx.b.call(reference, args: call_args.view())
+    return record
+} Body.call_sides
+
+/// Records a call site of the function, at the instruction being lowered.
+fn Body.record_site(mut self, mut fx: Fx, inst: clif::Inst, take kind: StackKind) {
+    let at = At(item: self.item, span: self.current)
+    mut fx.sites.push(CallSite(inst: inst, site: Site(kind: take kind, at: Some(at))))
+} Body.record_site
+
+/// The position among the function's parameters of a value that is one of its own
+/// function-typed parameters, a closure's captures excluded.
+fn Body.own_param(self, lo: Lowering, value: nir::Value) -> Option[usize] {
+    let function = self.function()
+    var found: Option[usize] = None
+    for position in 0..<function.params.len() {
+        if function.params[position].value == value {
+            found = Some(position)
+            break
+        }
+    }
+    let Some(position) = found else {
+        return None
+    }
+    var captures: usize = 0
+    if function.role == nir::Role.Closure {
+        captures = lo.closure_captures(self.unit.contents(), index: function.index)
+    }
+    let Some(own) = position.checked_sub(captures) else {
+        return None
+    }
+    let ty::TyKind.Fn(_) = lo.ck.types().kind(self.nty(value).ty()) else {
+        return None
+    }
+    return Some(own)
+} Body.own_param
+
+/// Where the function value an operand passes comes from: a closure or named function
+/// written there, through the temporary holding it, or one of the function's own
+/// parameters.
+fn Body.fn_source(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -> FnSource {
+    var ty: Option[ty::Ty] = None
+    match operand {
+        nir::Operand.Value(operand_value) => {
+            ty = Some(self.nty(operand_value).ty())
+        }
+        nir::Operand.Place(mode: _, place: place) => {
+            ty = Some(mut self.place_type(mut lo, mut fx, place))
+        }
+        else => {}
+    }
+    var bound: Option[u64] = None
+    match ty {
+        Some(operand_ty) => match lo.ck.types().kind(operand_ty) {
+            ty::TyKind.Fn(id) => {
+                bound = lo.ck.types().fn_of(id).limit_set.stack
+            }
+            else => {}
+        }
+        None => {}
+    }
+    var value = nir::Value(index: 0)
+    match operand {
+        nir::Operand.Value(operand_value) => {
+            value = operand_value
+        }
+        nir::Operand.Place(mode: _, place: place) => if place.steps.len() == 0 {
+            value = place.root
+        } else {
+            return FnSource.Other(bound)
+        }
+        else => return FnSource.Other(bound)
+    }
+    match self.own_param(lo, value) {
+        Some(position) => return FnSource.Param(position)
+        None => {}
+    }
+    return self.traced_source(lo, value, bound)
+} Body.fn_source
+
+/// Where the function value a value of the function holds comes from, followed through one
+/// temporary: a closure or named function written there, or any other value with `bound`.
+fn Body.traced_source(self, lo: Lowering, value: nir::Value, bound: Option[u64]) -> FnSource {
+    var traced = value
+    for _ in 0..<2usize {
+        let Some(defining) = self.definition(traced) else {
+            return FnSource.Other(bound)
+        }
+        match defining {
+            nir::Op.Closure(index: index, captures: _) => return FnSource.Closure(index)
+            nir::Op.FnRef(fn_ref) => return FnSource.Named(fn_ref.copy(lo.alloc))
+            nir::Op.Load(place) or nir::Op.Move(place) => {
+                if place.steps.len() != 0 {
+                    return FnSource.Other(bound)
+                }
+                let Some(nir::Operand.Value(initial)) = self.initializer(place.root) else {
+                    return FnSource.Other(bound)
+                }
+                traced = initial
+            }
+            else => return FnSource.Other(bound)
+        }
+    }
+    return FnSource.Other(bound)
+} Body.traced_source
+
+/// The operation defining a value of the function.
+proj fn Body.definition(self, value: nir::Value) -> Option[nir::Op] {
+    for block in self.function().blocks {
+        for inst in block.insts {
+            if inst.result == Some(value) {
+                return Some(inst.op)
+            }
+        }
+    }
+    return None
+} Body.definition
+
+/// The operand initialising a slot, when the function initialises it once and never
+/// assigns it.
+proj fn Body.initializer(self, slot: nir::Value) -> Option[nir::Operand] {
+    if slot_writes(self.function(), slot) != 1 {
+        return None
+    }
+    for block in self.function().blocks {
+        for inst in block.insts {
+            if not writes_slot(inst.op, slot) {
+                continue
+            }
+            match inst.op {
+                nir::Op.Init(place: place, operand: operand) or nir::Op.Assign(place: place, operand: operand) => if place.steps.len() == 0 {
+                    return Some(operand)
+                }
+                else => {}
+            }
+            return None
+        }
+    }
+    return None
+} Body.initializer
+
+/// Whether an operation initialises or assigns a place rooted at a slot.
+fn writes_slot(op: nir::Op, slot: nir::Value) -> bool {
+    return match op {
+        nir::Op.Init(place: place, operand: _) or nir::Op.Assign(place: place, operand: _) => place.root == slot
+        else => false
+    }
+} writes_slot
+
+/// How many operations of a function initialise or assign a place rooted at a slot.
+fn slot_writes(function: nir::Function, slot: nir::Value) -> usize {
+    var count: usize = 0
+    for block in function.blocks {
+        for inst in block.insts {
+            if writes_slot(inst.op, slot) {
+                expect count < 0xFFFF_FFFF_FFFF_FFFF
+                count += 1
+            }
+        }
+    }
+    return count
+} slot_writes
+
+/// What an operand passes for a function-typed parameter of a direct call's callee.
+fn Body.binding(mut self, mut lo: Lowering, mut fx: Fx, operand: nir::Operand) -> Binding {
+    return match mut self.fn_source(mut lo, mut fx, operand) {
+        FnSource.Closure(index) => Binding.Function(mut self.closure_function(mut lo, index))
+        FnSource.Named(fn_ref) => Binding.Function(mut self.named_function(mut lo, fn_ref))
+        FnSource.Param(position) => Binding.Param(position)
+        FnSource.Other(bound) => Binding.Bounded(bound)
+    }
+} Body.binding
+
+/// Records the `stack N` demand a function type `wanted` makes of the function value an
+/// operand passes where it fits that type.
+fn Body.fit(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    operand: nir::Operand,
+    wanted: ty::Ty,
+    ) {
+    let ty::TyKind.Fn(wanted_fn) = lo.ck.types().kind(wanted) else {
+        return
+    }
+    let Some(stack) = lo.ck.types().fn_of(wanted_fn).limit_set.stack else {
+        return
+    }
+    let at = At(item: self.item, span: self.current)
+    var judged = Judged.Value(None)
+    var report = StackReport.Fit(at)
+    match mut self.fn_source(mut lo, mut fx, operand) {
+        FnSource.Closure(index) => {
+            let unit = self.unit.share()
+            let Some(closure_function) = unit.contents().function(nir::Role.Closure, index) else {
+                expect false
+                return
+            }
+            let head = At(item: self.item, span: closure_function.span)
+            judged = Judged.Function(mut self.closure_function(mut lo, index))
+            report = StackReport.Own(head: head)
+        }
+        FnSource.Named(fn_ref) => {
+            judged = Judged.Function(mut self.named_function(mut lo, fn_ref))
+        }
+        FnSource.Param(position) => {
+            var bound: Option[u64] = None
+            expect position < self.abi.params.len()
+            match lo.ck.types().kind(self.abi.params[position].nty.ty()) {
+                ty::TyKind.Fn(param_fn) => {
+                    bound = lo.ck.types().fn_of(param_fn).limit_set.stack
+                }
+                else => {}
+            }
+            judged = Judged.Value(bound)
+        }
+        FnSource.Other(bound) => {
+            judged = Judged.Value(bound)
+        }
+    }
+    mut lo.demands.push(Demand(judged: judged, stack: stack, report: report))
+} Body.fit
+
+/// The lowered function of a closure of the unit.
+fn Body.closure_function(mut self, mut lo: Lowering, index: u32) -> object::FuncId {
+    return mut lo.instance(Instance.Nir(item: self.item, role: nir::Role.Closure, index: index, args: self.args))
+} Body.closure_function
+
+/// The lowered function a value naming a function calls.
+fn Body.named_function(mut self, mut lo: Lowering, fn_ref: nir::FnRef) -> object::FuncId {
+    let named = nir::FnRef(callable: fn_ref.callable.copy(lo.alloc), args: self.subst.args(lo.ck.types(), args: fn_ref.args))
+    let instance = mut lo.callable_instance(named, as_value: true)
+    var inner = mem::List[Instance].empty(lo.alloc)
+    mut inner.push(take instance)
+    return mut lo.instance(Instance.Value(take inner))
+} Body.named_function
+
+/// The registers a failing call passes to a target block's parameter.
+fn Body.target_args(
+    mut self,
+    mut lo: Lowering,
+    mut fx: Fx,
+    target: nir::BlockId,
+    held: Held,
+    nty: nir::NTy,
+    ) -> mem::List[clif::Value] {
+    expect usize.widen(target.index) < self.function().blocks.len()
+    let params = self.function().blocks[usize.widen(target.index)].params
+    expect params.len() > 0
+    let param = params[0]
+    let wanted = mut self.value_repr(mut lo, value: param)
+    let adapted = mut self.adapt(mut lo, mut fx, held, nty, wanted)
+    return adapted.values(lo.alloc)
+} Body.target_args
+
+/// The instance a function reference calls: a NIR function, a supplied std function, a
+/// derived method or a supplied conformance, a method through a bound resolved to its
+/// implementation; as a value, a function with a checking entry is called through it.
+fn Lowering.callable_instance(mut self, fn_ref: nir::FnRef, as_value: bool) -> Instance {
+    match fn_ref.callable {
+        nir::Callable.Item(item: item, role: role, index: index) => return mut self.item_instance(item, role, index, args: fn_ref.args, as_value)
+        nir::Callable.Derived(owner: owner, method: method) => return Instance.Derived(owner: owner, method: text::String.of(method.as_str(), alloc: self.alloc), args: fn_ref.args)
+        nir::Callable.Method(item: interface_item, method: method) => return mut self.method_instance(interface_item, method, args: fn_ref.args)
+        nir::Callable.Builtin(_) => {
+            expect false
+            return Instance.Supplied(item: ty::ItemId(index: 0), args: fn_ref.args)
+        }
+    }
+} Lowering.callable_instance
+
+/// The instance a function reference to a NIR function of an item calls.
+fn Lowering.item_instance(
+    mut self,
+    item: ty::ItemId,
+    role: nir::Role,
+    index: u32,
+    args: ty::Args,
+    as_value: bool,
+    ) -> Instance {
+    if role == nir::Role.Body and index == 0 and as_value and self.entry_role(item) == nir::Role.Entry {
+        let entry = nir::FnRef(callable: nir::Callable.Item(item: item, role: nir::Role.Entry, index: 0), args: args)
+        return mut self.callable_instance(entry, as_value: false)
+    }
+    var has_function = false
+    match self.ck.unit(item) {
+        Some(unit) => {
+            has_function = unit.contents().function(role, index).is_some()
+        }
+        None => {}
+    }
+    if has_function {
+        return Instance.Nir(item: item, role: role, index: index, args: args)
+    }
+    if role == nir::Role.Entry {
+        return mut self.callable_instance(nir::FnRef.item(item, args), as_value: false)
+    }
+    if not self.ck.db().is_std(item) {
+        expect false
+    }
+    return Instance.Supplied(item: item, args: args)
+} Lowering.item_instance
+
+/// The instance a call of an interface method through a bound calls: the implementing
+/// function, or the conformance the toolchain supplies.
+fn Lowering.method_instance(mut self, interface_item: ty::ItemId, method: u32, args: ty::Args) -> Instance {
+    let interface_args = self.ck.types().arg_list(args)
+    if interface_args.len() == 0 {
+        expect false
+        return Instance.Supplied(item: interface_item, args: args)
+    }
+    let Some(self_ty) = interface_args[0].ty() else {
+        expect false
+        return Instance.Supplied(item: interface_item, args: args)
+    }
+    let name = self.method_name(interface_item, method)
+    match self.ck.implementation(self_ty, interface_item, method: name.as_str()) {
+        Some(implementation) => {
+            let through_bound = match implementation.callable {
+                nir::Callable.Method(item: _, method: _) => true
+                else => false
+            }
+            if not through_bound {
+                let implemented = self.ck.call_implementation(take implementation, interface_item, args: self.ck.types().arg_list(args))
+                return mut self.callable_instance(implemented, as_value: false)
+            }
+        }
+        None => {}
+    }
+    var rest = mem::List[ty::Arg].empty(self.alloc)
+    let all = self.ck.types().arg_list(args)
+    for position in 1..<all.len() {
+        mut rest.push(all[position])
+    }
+    return Instance.Conformance(ty: self_ty, method: take name, args: self.ck.types().args(take rest))
+} Lowering.method_instance
+
+fn Lowering.method_name(self, interface_item: ty::ItemId, method: u32) -> text::String {
+    let sig = self.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        return text::String.empty(self.alloc)
+    }
+    expect usize.widen(method) < methods.len()
+    return text::String.of(methods[usize.widen(method)].name.as_str(), alloc: self.alloc)
+} Lowering.method_name
+
+/// How calls of a callable give their result, none unless it is a projection.
+fn Lowering.callable_given(self, callable: nir::Callable) -> Option[Given] {
+    match callable {
+        nir::Callable.Item(item: item, role: role, index: index) => {
+            if role == nir::Role.Body or role == nir::Role.Entry {
+                let Some(sig) = self.ck.fn_sig(item) else {
+                    return None
+                }
+                return self.sig_given(sig)
+            }
+            if role == nir::Role.Default {
+                return self.default_given(item, index)
+            }
+            return None
+        }
+        nir::Callable.Method(item: interface_item, method: method) => return self.method_given(interface_item, method)
+        else => return None
+    }
+} Lowering.callable_given
+
+/// How an interface's method `method` gives its result, none unless it is a projection.
+fn Lowering.method_given(self, interface_item: ty::ItemId, method: u32) -> Option[Given] {
+    let sig = self.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return None
+    }
+    expect usize.widen(method) < methods.len()
+    return self.sig_given(methods[usize.widen(method)].sig)
+} Lowering.method_given
+
+/// How the default body of an interface's `index`th defaulted method gives its result, none
+/// unless it is a projection.
+fn Lowering.default_given(self, interface_item: ty::ItemId, index: u32) -> Option[Given] {
+    let sig = self.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return None
+    }
+    var seen: u32 = 0
+    for method in methods {
+        invariant seen <= index
+        if not method.default {
+            continue
+        }
+        if seen == index {
+            return self.sig_given(method.sig)
+        }
+        seen += 1
+    }
+    return None
+} Lowering.default_given
+
+/// How a function head gives its result, none unless it is a projection: in the form its
+/// declared result type fixes, a wrapped part of a mut projection holding its Copy payloads
+/// as parts.
+fn Lowering.sig_given(self, sig: check::FnSig) -> Option[Given] {
+    if not sig.is_proj() {
+        return None
+    }
+    let writable = sig.params.len() > 0 and sig.params[0].mode == ast::Mode.Mut
+    return match self.ck.declared_form(sig.result) {
+        check::Form.Part => Some(Given.Part)
+        check::Form.Wrapped => Some(Given.Wrapped(Wrap(writable: writable)))
+        check::Form.View => Some(Given.View)
+    }
+} Lowering.sig_given
+
+/// The head of an instance as a function type, its types concrete.
+fn Lowering.instance_fn_ty(mut self, instance: Instance) -> ty::FnTy {
+    match instance {
+        Instance.Nir(item: item, role: role, index: index, args: args) => {
+            let subst = self.subst(item, args)
+            if role == nir::Role.Default {
+                let head = mut self.default_head(item, index, args)
+                return head.fn_ty
+            }
+            let Some(sig) = self.ck.fn_sig(item) else {
+                expect false
+                return unit_fn_ty(self.alloc)
+            }
+            return subst.fn_ty(self.ck.types(), fn_ty: sig.fn_ty(self.alloc))
+        }
+        Instance.Supplied(item: item, args: args) => {
+            let Some(sig) = self.ck.fn_sig(item) else {
+                expect false
+                return unit_fn_ty(self.alloc)
+            }
+            var params = mem::List[ty::Param].empty(self.alloc)
+            for def in sig.generics {
+                mut params.push(def.param)
+            }
+            let subst = ty::Subst.of(params.view(), args: self.ck.types().arg_list(args), alloc: self.alloc)
+            return subst.fn_ty(self.ck.types(), fn_ty: sig.fn_ty(self.alloc))
+        }
+        Instance.Derived(owner: owner, method: method, args: args) => return mut self.derived_head(owner, method: method.as_str(), args)
+        Instance.Conformance(ty: ty, method: method, args: args) => return mut self.conformance_head(ty, method: method.as_str(), own: args)
+        else => {
+            expect false
+            return unit_fn_ty(self.alloc)
+        }
+    }
+} Lowering.instance_fn_ty
+
+/// The head of an interface method with `Self`, then the interface's arguments and any of
+/// the method's own given, and whether it is a projection.
+fn Lowering.method_head(
+    mut self,
+    self_ty: ty::Ty,
+    interface_item: ty::ItemId,
+    args: ty::Args,
+    method: u32,
+    ) -> MethodHead {
+    let sig = self.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        return MethodHead(fn_ty: unit_fn_ty(self.alloc), given: None)
+    }
+    expect usize.widen(method) < methods.len()
+    let declared = methods[usize.widen(method)]
+    var params = mem::List[ty::Param].empty(self.alloc)
+    for def in sig.contents().generics {
+        if not def.param.is_self() {
+            mut params.push(def.param)
+        }
+    }
+    for def in declared.sig.own_generics() {
+        mut params.push(def.param)
+    }
+    var subst = ty::Subst.of(params.view(), args: self.ck.types().arg_list(args), alloc: self.alloc)
+    mut subst.insert(ty::Param(owner: interface_item, index: ty::SELF_INDEX), arg: ty::Arg.Ty(self_ty))
+    return MethodHead(fn_ty: subst.fn_ty(self.ck.types(), fn_ty: declared.sig.fn_ty(self.alloc)), given: self.sig_given(declared.sig))
+} Lowering.method_head
+
+/// The head of an interface's default body numbered `index`, given the interface's
+/// arguments, `Self`, then the method's own.
+fn Lowering.default_head(mut self, interface_item: ty::ItemId, index: u32, args: ty::Args) -> MethodHead {
+    let sig = self.ck.sig(interface_item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        expect false
+        return MethodHead(fn_ty: unit_fn_ty(self.alloc), given: None)
+    }
+    var position: usize = 0
+    var seen: u32 = 0
+    var found = false
+    for at in 0..<methods.len() {
+        invariant seen <= index
+        if not methods[at].default {
+            continue
+        }
+        if seen == index {
+            position = at
+            found = true
+            break
+        }
+        seen += 1
+    }
+    expect found
+    var count: usize = 0
+    for def in sig.contents().generics {
+        if not def.param.is_self() {
+            expect count < 0xFFFF_FFFF_FFFF_FFFF
+            count += 1
+        }
+    }
+    let all = self.ck.types().arg_list(args)
+    if count >= all.len() {
+        expect false
+        return MethodHead(fn_ty: unit_fn_ty(self.alloc), given: None)
+    }
+    let Some(self_ty) = all[count].ty() else {
+        expect false
+        return MethodHead(fn_ty: unit_fn_ty(self.alloc), given: None)
+    }
+    var rest = mem::List[ty::Arg].empty(self.alloc)
+    for at in 0..<all.len() {
+        if at != count {
+            mut rest.push(all[at])
+        }
+    }
+    let rest_args = self.ck.types().args(take rest)
+    return mut self.method_head(self_ty, interface_item, args: rest_args, method: u32.fit(position))
+} Lowering.default_head
+
+/// The calling form of a `Dyn` method: the value's address, then the method's parameters.
+fn Lowering.dyn_abi(mut self, interface_item: ty::ItemId, args: ty::Args, method: u32) -> Abi {
+    let head = mut self.method_head(ty::Ty.unit(), interface_item, args, method)
+    var params = mem::List[ParamRepr].empty(self.alloc)
+    mut params.push(ParamRepr(nty: nir::NTy.Ref(ty::Ty.unit()), repr: Repr.Address))
+    for position in 1..<head.fn_ty.params.len() {
+        let param = head.fn_ty.params[position]
+        let nty = self.param_nty(param.mode, ty: param.ty)
+        let repr = mut self.repr(nty)
+        mut params.push(ParamRepr(nty: nty, repr: repr))
+    }
+    let form = mut self.result_form(head.fn_ty.result, given: head.given)
+    let failure = abi_failure(head.fn_ty.failure)
+    return Abi(env: false, params: take params, result: form.result, returned: form.returned, failure: failure, flagged: failure.is_some())
+} Lowering.dyn_abi
+
+/// The interface arguments of a boxed `Dyn` type.
+fn Lowering.box_dyn_args(self, ty: ty::Ty) -> ty::Args {
+    let types = self.ck.types()
+    let Some(boxed) = types.type_arg(ty, index: 0) else {
+        expect false
+        return ty::Args.none()
+    }
+    let ty::TyKind.Dyn(bound) = types.kind(boxed) else {
+        expect false
+        return ty::Args.none()
+    }
+    return bound.args
+} Lowering.box_dyn_args
+
+/// The external function of a foreign fn and the registers of its parameters and result.
+fn Lowering.foreign_fn(mut self, item: ty::ItemId) -> ForeignFn {
+    let Some(sig) = self.ck.fn_sig(item) else {
+        expect false
+        return ForeignFn(id: object::FuncId(index: 0), params: mem::List[Repr].empty(self.alloc), returned: Returned.Empty)
+    }
+    var params = mem::List[Repr].empty(self.alloc)
+    for param in sig.params {
+        mut params.push(mut self.owned_repr(param.ty))
+    }
+    var returned = Returned.Empty
+    match mut self.owned_repr(sig.result) {
+        Repr.Scalar(scalar) => {
+            returned = Returned.Scalar(scalar)
+        }
+        Repr.Empty => {}
+        Repr.Address => {
+            expect false
+        }
+    }
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for repr in params {
+        match repr {
+            Repr.Scalar(scalar) => mut signature.params.push(clif::AbiParam(value_type: scalar))
+            else => {}
+        }
+    }
+    match returned {
+        Returned.Scalar(scalar) => mut signature.returns.push(clif::AbiParam(value_type: scalar))
+        else => {}
+    }
+    let name = match self.ck.db().declaration(item).name(self.alloc) {
+        Some(written) => written
+        None => text::String.empty(self.alloc)
+    }
+    let id = mut self.module.declare_function(name.as_str(), linkage: object::Linkage.Import, signature)
+    return ForeignFn(id: id, params: take params, returned: returned)
+} Lowering.foreign_fn
+
+/// What a call from code lowering writes itself calls.
+enum Invoked derives Copy {
+    Direct(object::FuncId)
+    /// A function value at an address, with the `stack N` its type demands.
+    Value(function: clif::Value, bound: Option[u64])
+} Invoked
+
+/// What such a call gives: whether it failed, when it may fail, the address of its failure, and
+/// its result.
+struct Called derives Copy {
+    failed: Option[clif::Value]
+    failure: Option[clif::Value]
+    result: Held
+} Called
+
+/// Calls a function of a calling form with values held as its parameters take them.
+fn Lowering.invoke(
+    mut self,
+    mut fx: Fx,
+    invoked: Invoked,
+    abi: Abi,
+    args: Slice[Held],
+    ) -> Called {
+    var values = mem::List[clif::Value].empty(self.alloc)
+    match invoked {
+        Invoked.Value(function: function, bound: _) => mut values.push(mut fx.load(PTR, addr: function, offset: 8))
+        else => {}
+    }
+    var sret: Option[clif::Value] = None
+    if abi.returned == Returned.Indirect {
+        let laid = mut self.layout_of(abi.result)
+        let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+        mut values.push(slot)
+        sret = Some(slot)
+    }
+    var failure: Option[clif::Value] = None
+    if abi.flagged {
+        let slot = mut self.failure_slot(mut fx, abi)
+        mut values.push(slot)
+        failure = Some(slot)
+    }
+    for position in 0..<abi.params.len() {
+        if position >= args.len() {
+            break
+        }
+        let param = abi.params[position]
+        let adapted = adapt_value(mut self, mut fx, held: args[position], nty: param.nty, wanted: param.repr)
+        let passed_values = adapted.values(self.alloc)
+        for value in passed_values {
+            mut values.push(value)
+        }
+    }
+    let inst = mut self.invoked_inst(mut fx, invoked, abi, values: values.view())
+    let results = fx.b.inst_results(inst, alloc: self.alloc)
+    var next: usize = 0
+    var failed: Option[clif::Value] = None
+    if abi.flagged {
+        expect next < results.len()
+        failed = Some(results[next])
+        next += 1
+    }
+    var result = Held.Empty
+    match abi.returned {
+        Returned.Scalar(_) => {
+            expect next < results.len()
+            result = Held.Scalar(results[next])
+        }
+        Returned.Part => {
+            expect next < results.len()
+            result = Held.Address(results[next])
+        }
+        Returned.Indirect => {
+            let Some(slot) = sret else {
+                expect false
+                return Called(failed: failed, failure: failure, result: result)
+            }
+            result = Held.Address(slot)
+        }
+        Returned.Empty => {}
+    }
+    return Called(failed: failed, failure: failure, result: result)
+} Lowering.invoke
+
+/// The call instruction of what a call from code lowering writes calls, with its arguments; a
+/// call of a function value records its call site.
+fn Lowering.invoked_inst(mut self, mut fx: Fx, invoked: Invoked, abi: Abi, values: Slice[clif::Value]) -> clif::Inst {
+    match invoked {
+        Invoked.Direct(id) => {
+            let reference = mut self.func_ref(mut fx, id)
+            return mut fx.b.call(reference, args: values)
+        }
+        Invoked.Value(function: function, bound: bound) => {
+            let code = mut fx.load(PTR, addr: function, offset: 0)
+            let signature = mut fx.b.import_signature(abi.signature(self.alloc))
+            let inst = mut fx.b.call_indirect(signature, callee: code, args: values)
+            let kind = match fx.fn_params.get(function) {
+                Some(position) => StackKind.Param(position)
+                None => StackKind.Bounded(bound)
+            }
+            mut fx.sites.push(CallSite(inst: inst, site: Site(kind: take kind, at: None)))
+            return inst
+        }
+    }
+} Lowering.invoked_inst
+
+/// A slot for the failure a call of a calling form writes, of its failure type, or a word
+/// for a function value that cannot fail.
+fn Lowering.failure_slot(mut self, mut fx: Fx, abi: Abi) -> clif::Value {
+    match abi.failure {
+        Some(failure) => {
+            let laid = mut self.layout_of(failure)
+            return mut fx.slot(laid.contents().size, align: laid.contents().align)
+        }
+        None => return mut fx.slot(8, align: 8)
+    }
+} Lowering.failure_slot
+
+/// Calls the function value at an address, of a function type.
+fn Lowering.call_value(
+    mut self,
+    mut fx: Fx,
+    fn_ty: ty::FnTy,
+    function: clif::Value,
+    args: Slice[Held],
+    ) -> Called {
+    let abi = mut self.fn_abi(fn_ty)
+    return mut self.invoke(mut fx, invoked: Invoked.Value(function: function, bound: fn_ty.limit_set.stack), abi, args)
+} Lowering.call_value
+
+/// The code of a function value naming `inner`: receives the environment and the parameters as
+/// function values pass them, and calls `inner` as it takes them.
+fn value_glue(mut lo: Lowering, mut fx: Fx, abi: Abi, inner: Instance) {
+    let inner_abi = mut lo.abi(inner)
+    let id = mut lo.instance(inner.copy(lo.alloc))
+    call_forward(mut lo, mut fx, outer: abi, inner: inner_abi, callee: id, env: true)
+} value_glue
+
+/// The code a `Dyn` value calls for a method: receives the value's address first and calls the
+/// implementing function.
+fn dyn_glue(
+    mut lo: Lowering,
+    mut fx: Fx,
+    abi: Abi,
+    ty: ty::Ty,
+    interface_item: ty::ItemId,
+    args: ty::Args,
+    method: u32,
+    ) {
+    var fn_args = mem::List[ty::Arg].empty(lo.alloc)
+    mut fn_args.push(ty::Arg.Ty(ty))
+    for arg in lo.ck.types().arg_list(args) {
+        mut fn_args.push(arg)
+    }
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: method), args: lo.ck.types().args(take fn_args))
+    let inner = mut lo.callable_instance(fn_ref, as_value: false)
+    let inner_abi = mut lo.abi(inner)
+    let id = mut lo.instance(take inner)
+    var outer = abi.copy(lo.alloc)
+    expect outer.params.len() > 0
+    outer.params[0] = ParamRepr(nty: nir::NTy.Ref(ty), repr: Repr.Address)
+    call_forward(mut lo, mut fx, outer, inner: inner_abi, callee: id, env: false)
+} dyn_glue
+
+/// Calls `callee` with the incoming parameters adapted from `outer`'s form to `inner`'s, and
+/// returns what it returns as `outer` returns; a function that cannot fail may stand for a
+/// function type that may.
+fn call_forward(
+    mut lo: Lowering,
+    mut fx: Fx,
+    outer: Abi,
+    inner: Abi,
+    callee: object::FuncId,
+    env: bool,
+    ) {
+    let params = mut fx.entry()
+    var next: usize = 0
+    if env {
+        next += 1
+    }
+    var args = mem::List[clif::Value].empty(lo.alloc)
+    if outer.returned == Returned.Indirect {
+        expect next < params.len()
+        mut args.push(params[next])
+        next += 1
+    }
+    var failure: Option[clif::Value] = None
+    if outer.flagged {
+        expect next < params.len()
+        failure = Some(params[next])
+        next += 1
+    }
+    if inner.flagged {
+        let Some(address) = failure else {
+            expect false
+            return
+        }
+        mut args.push(address)
+    }
+    for position in 0..<outer.params.len() {
+        if position >= inner.params.len() {
+            break
+        }
+        let outer_param = outer.params[position]
+        var held = Held.Empty
+        if outer_param.repr != Repr.Empty {
+            expect next < params.len()
+            held = held_as(outer_param.repr, value: params[next])
+            next += 1
+        }
+        let adapted = adapt_value(mut lo, mut fx, held, nty: outer_param.nty, wanted: inner.params[position].repr)
+        let passed_values = adapted.values(lo.alloc)
+        for value in passed_values {
+            mut args.push(value)
+        }
+    }
+    let reference = mut lo.func_ref(mut fx, id: callee)
+    let inst = mut fx.b.call(reference, args: args.view())
+    var returns = fx.b.inst_results(inst, alloc: lo.alloc)
+    if outer.flagged and not inner.flagged {
+        mut returns.insert(0, value: mut fx.int(clif::Type.Int8, value: 0))
+    }
+    mut fx.b.ret(returns.view())
+} call_forward
+
+/// A value held one way, held as `wanted`.
+fn adapt_value(
+    mut lo: Lowering,
+    mut fx: Fx,
+    held: Held,
+    nty: nir::NTy,
+    wanted: Repr,
+    ) -> Held {
+    match wanted {
+        Repr.Address => match held {
+            Held.Scalar(_) => {
+                let laid = mut lo.layout_of(nty.ty())
+                let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+                mut lo.store_held(mut fx, address: slot, held, ty: nty.ty())
+                return Held.Address(slot)
+            }
+            Held.Empty => return Held.Address(mut fx.slot(1, align: 1))
+            Held.Address(_) => return held
+        }
+        Repr.Scalar(_) => match held {
+            Held.Address(address) => return mut lo.held_at(mut fx, ty: nty.ty(), address)
+            else => return held
+        }
+        Repr.Empty => return Held.Empty
+    }
+} adapt_value

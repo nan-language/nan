@@ -1,0 +1,487 @@
+//! The object lowering writes: the functions and data objects it declares and defines, compiled by the code generator, and the ELF relocatable object holding them.
+
+/// A function declared in a module, by its index in declaration order.
+pkg struct FuncId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} FuncId
+
+/// A data object declared in a module, by its index in declaration order.
+pkg struct DataId derives Copy, Eq, Ord, Hash {
+    pkg index: u32
+} DataId
+
+/// How a symbol is bound: defined elsewhere, defined here and seen only here, or defined here
+/// and seen by the linker's other inputs.
+pkg enum Linkage derives Copy, Eq, Hash {
+    Import
+    Local
+    Export
+} Linkage
+
+/// The linkage of a name declared twice: the stronger of the two, an export over a local over an
+/// import.
+fn Linkage.merge(self, other: Linkage) -> Linkage {
+    return match self {
+        Linkage.Export => Linkage.Export
+        Linkage.Local => match other {
+            Linkage.Export => Linkage.Export
+            else => Linkage.Local
+        }
+        Linkage.Import => other
+    }
+} Linkage.merge
+
+/// A symbol a relocation names.
+pkg enum RelocTarget derives Copy, Eq, Hash {
+    Function(FuncId)
+    Data(DataId)
+} RelocTarget
+
+/// A relocation of code or data: at `offset`, the value `kind` computes from the target's
+/// address plus `addend`.
+pkg struct ModuleReloc derives Copy, Eq, Hash {
+    pkg offset: u32
+    pkg kind: x64::RelocKind
+    pkg target: RelocTarget
+    pkg addend: i64
+} ModuleReloc
+
+/// What a compiled function gives lowering: its code size, its frame size from the return
+/// address down, and the code offset at which each run of code with one source location starts,
+/// with that location, in offset order.
+pkg struct Compiled {
+    pkg size: u32
+    pkg frame: u64
+    pkg locations: mem::List[codegen::Located]
+} Compiled
+
+/// The symbol a relocation of a definition names: a declared function or data object, or the
+/// C library's function returning the address of a thread-local variable.
+enum Target derives Copy, Eq {
+    Declared(RelocTarget)
+    TlsGetAddr
+} Target
+
+/// A relocation of a definition: its offset from the definition's start, its ELF type, its
+/// target and its addend.
+struct Record derives Copy {
+    offset: u32
+    kind: u32
+    target: Target
+    addend: i64
+} Record
+
+/// The relocations of a definition, with its section and its offset there.
+struct Relocations {
+    section: u32
+    offset: u64
+    records: mem::List[Record]
+} Relocations
+
+/// The ELF type of a relocation kind.
+fn elf_type(kind: x64::RelocKind) -> u32 {
+    return match kind {
+        x64::RelocKind.Absolute4 => R_X86_64_32
+        x64::RelocKind.Absolute8 => R_X86_64_64
+        x64::RelocKind.Relative4 => R_X86_64_PC32
+        x64::RelocKind.CallPlt4 => R_X86_64_PLT32
+        x64::RelocKind.GotRelative4 => R_X86_64_GOTPCREL
+        x64::RelocKind.TlsGeneralDynamic => R_X86_64_TLSGD
+    }
+} elf_type
+
+/// How a data object starts: undefined yet, as zeros of a size, or as bytes.
+enum Init {
+    Uninitialized
+    Zeros(u64)
+    Bytes(mem::Bytes)
+} Init
+
+fn Init.is_defined(self) -> bool {
+    return match self {
+        Init.Uninitialized => false
+        else => true
+    }
+} Init.is_defined
+
+/// An address a data object holds, at an offset: of a function or a data object by reference,
+/// plus an addend.
+struct Address derives Copy {
+    offset: u32
+    reference: u32
+    addend: i64
+} Address
+
+/// A data object's contents as lowering describes them: its bytes or its size in zeros, its
+/// alignment, and the addresses of functions and data objects written into it.
+pkg struct DataDescription {
+    init: Init
+    align: Option[u64]
+    /// The functions and data objects whose addresses the data holds, by reference.
+    functions: mem::List[FuncId]
+    data_objects: mem::List[DataId]
+    function_addresses: mem::List[Address]
+    data_addresses: mem::List[Address]
+} DataDescription
+
+pkg fn DataDescription.new(alloc: mem::Alloc) -> DataDescription {
+    return DataDescription(init: Init.Uninitialized, align: None, functions: mem::List[FuncId].empty(alloc), data_objects: mem::List[DataId].empty(alloc), function_addresses: mem::List[Address].empty(alloc), data_addresses: mem::List[Address].empty(alloc))
+} DataDescription.new
+
+pkg fn DataDescription.define(mut self, take bytes: mem::Bytes) {
+    expect not self.init.is_defined()
+    self.init = Init.Bytes(take bytes)
+} DataDescription.define
+
+pkg fn DataDescription.define_zeroinit(mut self, size: u64) {
+    expect not self.init.is_defined()
+    self.init = Init.Zeros(size)
+} DataDescription.define_zeroinit
+
+pkg fn DataDescription.set_align(mut self, align: u64) {
+    expect align > 0 and (align & (align - 1)) == 0
+    self.align = Some(align)
+} DataDescription.set_align
+
+/// Declares a function whose address the data holds, giving the reference its relocations name.
+pkg fn DataDescription.import_function(mut self, id: FuncId) -> u32 {
+    mut self.functions.push(id)
+    return u32.fit(self.functions.len() - 1)
+} DataDescription.import_function
+
+/// Declares a data object whose address the data holds, giving the reference its relocations
+/// name.
+pkg fn DataDescription.import_data(mut self, id: DataId) -> u32 {
+    mut self.data_objects.push(id)
+    return u32.fit(self.data_objects.len() - 1)
+} DataDescription.import_data
+
+pkg fn DataDescription.write_function_addr(mut self, offset: u32, function: u32) {
+    mut self.function_addresses.push(Address(offset: offset, reference: function, addend: 0))
+} DataDescription.write_function_addr
+
+pkg fn DataDescription.write_data_addr(mut self, offset: u32, data: u32, addend: i64) {
+    mut self.data_addresses.push(Address(offset: offset, reference: data, addend: addend))
+} DataDescription.write_data_addr
+
+/// The relocations writing the addresses the data holds, the functions' first.
+fn DataDescription.records(self, alloc: mem::Alloc) -> mem::List[Record] {
+    var records = mem::List[Record].empty(alloc)
+    for address in self.function_addresses {
+        expect usize.widen(address.reference) < self.functions.len()
+        let target = Target.Declared(RelocTarget.Function(self.functions[usize.widen(address.reference)]))
+        mut records.push(Record(offset: address.offset, kind: R_X86_64_64, target: target, addend: address.addend))
+    }
+    for address in self.data_addresses {
+        expect usize.widen(address.reference) < self.data_objects.len()
+        let target = Target.Declared(RelocTarget.Data(self.data_objects[usize.widen(address.reference)]))
+        mut records.push(Record(offset: address.offset, kind: R_X86_64_64, target: target, addend: address.addend))
+    }
+    return records
+} DataDescription.records
+
+/// A declared function: its linkage and signature, its symbol, and whether it is defined.
+struct FunctionDeclaration {
+    linkage: Linkage
+    signature: clif::Signature
+    symbol: u32
+    defined: bool
+} FunctionDeclaration
+
+/// A declared data object: its linkage, whether it is writable and thread-local, its symbol,
+/// and whether it is defined.
+struct DataDeclaration {
+    linkage: Linkage
+    writable: bool
+    tls: bool
+    symbol: u32
+    defined: bool
+} DataDeclaration
+
+/// What a declared name names.
+enum Declared derives Copy, Eq {
+    Function(FuncId)
+    Data(DataId)
+} Declared
+
+/// The functions and data objects of one object, compiled for one target.
+pkg struct Module {
+    pkg target: workspace::Target
+    functions: mem::List[FunctionDeclaration]
+    data_objects: mem::List[DataDeclaration]
+    names: mem::Map[text::String, Declared]
+    elf: Elf
+    /// The relocations of each definition, in order of definition.
+    relocations: mem::List[Relocations]
+    alloc: mem::Alloc
+} Module
+
+pkg fn Module.new(target: workspace::Target, alloc: mem::Alloc) -> Module {
+    return Module(target: target, functions: mem::List[FunctionDeclaration].empty(alloc), data_objects: mem::List[DataDeclaration].empty(alloc), names: mem::Map[text::String, Declared].empty(alloc), elf: Elf.new("nan", alloc), relocations: mem::List[Relocations].empty(alloc), alloc: alloc)
+} Module.new
+
+fn Module.declared(self, name: Str) -> Option[Declared] {
+    return self.names.get_by(fn(key: text::String) => key.as_str().cmp(name))
+} Module.declared
+
+/// Declares a function, or declares a function declared before again, merging the linkages;
+/// both declarations have the same signature.
+pkg fn Module.declare_function(mut self, name: Str, linkage: Linkage, signature: clif::Signature) -> FuncId {
+    match self.declared(name) {
+        Some(Declared.Function(id)) => {
+            let at = usize.widen(id.index)
+            expect at < self.functions.len()
+            var declaration = mut self.functions.at_mut(at)
+            let merged = declaration.linkage.merge(linkage)
+            declaration.linkage = merged
+            expect declaration.signature == signature
+            let symbol = usize.widen(declaration.symbol)
+            expect symbol < self.elf.symbols.len()
+            self.elf.symbols[symbol].local = merged == Linkage.Local
+            return id
+        }
+        Some(Declared.Data(_)) => {
+            expect false
+            return FuncId(index: 0)
+        }
+        None => {
+            let id = FuncId(index: u32.fit(self.functions.len()))
+            let symbol = mut self.elf.add_symbol(name, kind: SymbolKind.Text, local: linkage == Linkage.Local)
+            mut self.functions.push(FunctionDeclaration(linkage: linkage, signature: copied(signature, alloc: self.alloc), symbol: symbol, defined: false))
+            discard mut self.names.insert(text::String.of(name, alloc: self.alloc), value: Declared.Function(id))
+            return id
+        }
+    }
+} Module.declare_function
+
+/// Declares a data object, or declares a data object declared before again, merging the
+/// linkages and writability; both declarations agree on whether it is thread-local.
+pkg fn Module.declare_data(mut self, name: Str, linkage: Linkage, writable: bool, tls: bool) -> DataId {
+    var kind = SymbolKind.Data
+    if tls {
+        kind = SymbolKind.Tls
+    }
+    match self.declared(name) {
+        Some(Declared.Data(id)) => {
+            let at = usize.widen(id.index)
+            expect at < self.data_objects.len()
+            var declaration = mut self.data_objects.at_mut(at)
+            let merged = declaration.linkage.merge(linkage)
+            declaration.linkage = merged
+            declaration.writable = declaration.writable or writable
+            expect declaration.tls == tls
+            let symbol = usize.widen(declaration.symbol)
+            expect symbol < self.elf.symbols.len()
+            var entry = mut self.elf.symbols.at_mut(symbol)
+            entry.kind = kind
+            entry.local = merged == Linkage.Local
+            return id
+        }
+        Some(Declared.Function(_)) => {
+            expect false
+            return DataId(index: 0)
+        }
+        None => {
+            let id = DataId(index: u32.fit(self.data_objects.len()))
+            let symbol = mut self.elf.add_symbol(name, kind, local: linkage == Linkage.Local)
+            mut self.data_objects.push(DataDeclaration(linkage: linkage, writable: writable, tls: tls, symbol: symbol, defined: false))
+            discard mut self.names.insert(text::String.of(name, alloc: self.alloc), value: Declared.Data(id))
+            return id
+        }
+    }
+} Module.declare_data
+
+/// Compiles a built function into the definition of a declared one.
+pkg fn Module.define_function(mut self, id: FuncId, take func: clif::Function) -> Compiled {
+    let code = codegen::compile(take func, isa: codegen::Isa.of(self.target), alloc: self.alloc)
+    var records = mem::List[Record].empty(self.alloc)
+    for reloc in code.relocs {
+        mut records.push(Record(offset: reloc.offset, kind: elf_type(reloc.kind), target: symbol_target(reloc.target), addend: reloc.addend))
+    }
+    mut self.define_code(id, align: u64.widen(code.align), bytes: code.bytes.view(), take records)
+    let codegen::Code(bytes: bytes, align: _, relocs: _, frame: frame, locations: locations) = code
+    return Compiled(size: u32.fit(bytes.len()), frame: frame, locations: take locations)
+} Module.define_function
+
+/// The target of a relocation of compiled code: a declared function or data object, named by
+/// namespace 0 or 1 and its index, or the C library's `__tls_get_addr`.
+fn symbol_target(symbol: x64::Symbol) -> Target {
+    match symbol {
+        x64::Symbol.Name(name) => {
+            if name.namespace == 0 {
+                return Target.Declared(RelocTarget.Function(FuncId(index: name.index)))
+            }
+            expect name.namespace == 1
+            return Target.Declared(RelocTarget.Data(DataId(index: name.index)))
+        }
+        x64::Symbol.TlsGetAddr => return Target.TlsGetAddr
+    }
+} symbol_target
+
+/// Defines a declared function as fixed machine code with its relocations.
+pkg fn Module.define_function_bytes(mut self, id: FuncId, align: u64, bytes: Slice[u8], relocs: Slice[ModuleReloc]) {
+    var records = mem::List[Record].empty(self.alloc)
+    for reloc in relocs {
+        mut records.push(Record(offset: reloc.offset, kind: elf_type(reloc.kind), target: Target.Declared(reloc.target), addend: reloc.addend))
+    }
+    mut self.define_code(id, align, bytes, take records)
+} Module.define_function_bytes
+
+/// Defines a declared function as code appended to the text section, at its alignment.
+fn Module.define_code(mut self, id: FuncId, align: u64, bytes: Slice[u8], take records: mem::List[Record]) {
+    let at = usize.widen(id.index)
+    expect at < self.functions.len()
+    var declaration = mut self.functions.at_mut(at)
+    expect declaration.linkage != Linkage.Import
+    expect not declaration.defined
+    declaration.defined = true
+    let symbol = declaration.symbol
+    let section = mut self.elf.section(SectionKind.Text)
+    let offset = mut self.elf.define(symbol, section, data: bytes, align: at_least_one(align))
+    mut self.add_relocations(section, offset, take records)
+} Module.define_code
+
+/// Defines a declared data object, in the section its contents, writability and thread-locality
+/// choose.
+pkg fn Module.define_data(mut self, id: DataId, take description: DataDescription) {
+    let at = usize.widen(id.index)
+    expect at < self.data_objects.len()
+    var declaration = mut self.data_objects.at_mut(at)
+    expect declaration.linkage != Linkage.Import
+    expect not declaration.defined
+    declaration.defined = true
+    let tls = declaration.tls
+    let symbol = declaration.symbol
+    let writable = declaration.writable
+    let records = description.records(self.alloc)
+    let align = description.align.value_or(1)
+    let DataDescription(init: init, align: _, functions: _, data_objects: _, function_addresses: _, data_addresses: _) = description
+    match init {
+        Init.Zeros(size) => {
+            var kind = SectionKind.Zeroed
+            if tls {
+                kind = SectionKind.ZeroedTls
+            }
+            let section = mut self.elf.section(kind)
+            let offset = mut self.elf.define_zeros(symbol, section, size, align)
+            mut self.add_relocations(section, offset, take records)
+        }
+        Init.Bytes(bytes) => {
+            var kind = SectionKind.ReadOnlyRelocated
+            if tls {
+                kind = SectionKind.Tls
+            } else if writable {
+                kind = SectionKind.Data
+            } else if records.len() == 0 {
+                kind = SectionKind.ReadOnly
+            }
+            let section = mut self.elf.section(kind)
+            let offset = mut self.elf.define(symbol, section, data: bytes.view(), align)
+            mut self.add_relocations(section, offset, take records)
+        }
+        Init.Uninitialized => {
+            expect false
+        }
+    }
+} Module.define_data
+
+/// Records the relocations of a definition at an offset of a section, when it has any.
+fn Module.add_relocations(mut self, section: u32, offset: u64, take records: mem::List[Record]) {
+    if records.len() > 0 {
+        mut self.relocations.push(Relocations(section: section, offset: offset, records: take records))
+    }
+} Module.add_relocations
+
+fn at_least_one(align: u64) -> u64 {
+    if align == 0 {
+        return 1
+    }
+    return align
+} at_least_one
+
+/// A reference to a declared function from the function a builder builds.
+pkg fn Module.declare_func_in_func(self, id: FuncId, mut b: clif::Builder) -> clif::FuncRef {
+    expect usize.widen(id.index) < self.functions.len()
+    let declaration = self.functions[usize.widen(id.index)]
+    let signature = mut b.import_signature(copied(declaration.signature, alloc: self.alloc))
+    let name = clif::ExternalName(namespace: 0, index: id.index)
+    return mut b.import_function(clif::ExtFuncData(name: name, signature: signature, colocated: declaration.linkage != Linkage.Import))
+} Module.declare_func_in_func
+
+/// A reference to a declared data object's address from the function a builder builds.
+pkg fn Module.declare_data_in_func(self, id: DataId, mut b: clif::Builder) -> clif::GlobalValue {
+    expect usize.widen(id.index) < self.data_objects.len()
+    let declaration = self.data_objects[usize.widen(id.index)]
+    let name = clif::ExternalName(namespace: 1, index: id.index)
+    return mut b.create_global_value(clif::GlobalValueData(name: name, colocated: declaration.linkage != Linkage.Import, tls: declaration.tls))
+} Module.declare_data_in_func
+
+pkg proj fn Module.function_name(self, id: FuncId) -> Str {
+    let at = usize.widen(id.index)
+    expect at < self.functions.len() and usize.widen(self.functions[at].symbol) < self.elf.symbols.len()
+    return self.elf.symbols[usize.widen(self.functions[at].symbol)].name.as_str()
+} Module.function_name
+
+pkg fn Module.function_linkage(self, id: FuncId) -> Linkage {
+    expect usize.widen(id.index) < self.functions.len()
+    return self.functions[usize.widen(id.index)].linkage
+} Module.function_linkage
+
+/// The ELF relocatable object of every definition, holding a `.nan` section with `section`
+/// when given.
+pkg fn Module.finish(take self, section: Option[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    for declaration in self.functions {
+        expect declaration.linkage == Linkage.Import or declaration.defined
+    }
+    for declaration in self.data_objects {
+        expect declaration.linkage == Linkage.Import or declaration.defined
+    }
+    let Module(target: _, functions: functions, data_objects: data_objects, names: _, elf: elf, relocations: relocations, alloc: _) = self
+    var written = elf
+    for definition in relocations {
+        for record in definition.records {
+            let symbol = match record.target {
+                Target.Declared(reloc_target) => declared_symbol(functions, data_objects, target: reloc_target)
+                Target.TlsGetAddr => mut written.library_symbol("__tls_get_addr")
+            }
+            let relocation = Relocation(offset: definition.offset + u64.widen(record.offset), kind: record.kind, symbol: symbol, addend: record.addend)
+            expect usize.widen(definition.section) < written.sections.len()
+            mut written.sections[usize.widen(definition.section)].relocations.push(relocation)
+        }
+    }
+    discard mut written.section(SectionKind.GnuStack)
+    match section {
+        Some(bytes) => {
+            let artefacts = mut written.section(SectionKind.Artefacts)
+            discard mut written.sections[usize.widen(artefacts)].append_data(bytes, align: 1)
+        }
+        None => {}
+    }
+    return written.write(alloc)
+} Module.finish
+
+/// The symbol of a declared function or data object.
+fn declared_symbol(functions: mem::List[FunctionDeclaration], data_objects: mem::List[DataDeclaration], target: RelocTarget) -> u32 {
+    match target {
+        RelocTarget.Function(id) => {
+            expect usize.widen(id.index) < functions.len()
+            return functions[usize.widen(id.index)].symbol
+        }
+        RelocTarget.Data(id) => {
+            expect usize.widen(id.index) < data_objects.len()
+            return data_objects[usize.widen(id.index)].symbol
+        }
+    }
+} declared_symbol
+
+/// A copy of a signature.
+fn copied(signature: clif::Signature, alloc: mem::Alloc) -> clif::Signature {
+    var copy = clif::Signature.new(signature.call_conv, alloc)
+    for param in signature.params {
+        mut copy.params.push(param)
+    }
+    for returned in signature.returns {
+        mut copy.returns.push(returned)
+    }
+    return copy
+} copied

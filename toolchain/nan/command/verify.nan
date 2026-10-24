@@ -1,0 +1,228 @@
+//! `nan verify`: the release gate over the packages holding its scope and those they reach through chains of relative-path sources: their checks, their tests, their API snapshots, pending weakenings and seals.
+
+/// `nan verify`.
+fn verify_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let Some(resolved) = scope::Scope.resolve(held, current, written: invocation.scope(), alloc) else {
+        let unknown = match invocation.scope() {
+            Some(written) => written
+            None => "."
+        }
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: unknown, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let packages = gated(held, scope: resolved.scope, alloc)
+    let verdict_of = try judged(session, packages: packages.view())
+    let Judged(diagnostics: diagnostics, report: report) = verdict_of
+    var errors: usize = 0
+    var incomplete: usize = 0
+    for reported in diagnostics {
+        invariant errors < diagnostics.len() and incomplete < diagnostics.len()
+        let class = reported.code.class()
+        if class == diagnostic::Class.Error {
+            errors += 1
+        } else if class == diagnostic::Class.Incompleteness {
+            incomplete += 1
+        }
+    }
+    let std = session.std.contents()
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+    }
+    for failing in take fail_records(held, scope: resolved.scope, report, alloc) {
+        mut records.push(take failing)
+    }
+    let failed = report.failures.len()
+    var verdict = output::Verdict.Failed
+    if diagnostics.len() == 0 and failed == 0 {
+        verdict = output::Verdict.Ok
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
+    mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: incomplete))
+    mut summary.push(output::Count(name: text::String.of("tests", alloc), value: report.tests))
+    mut summary.push(output::Count(name: text::String.of("failed", alloc), value: failed))
+    return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} verify_run
+
+/// What the release gate reports on packages: their diagnostics and their tests' report.
+struct Judged {
+    diagnostics: mem::List[diagnostic::Diagnostic]
+    report: test_runs::Report
+} Judged
+
+/// What the release gate reports on packages: their check diagnostics, then, when none is an
+/// error, their tests' report, and their gate diagnostics; by path, line and code.
+fn judged(session: check::Session, packages: Slice[usize]) -> Judged fails platform::IoError {
+    let alloc = session.alloc
+    let held = session.workspace.contents()
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in take session.reported(scope::Scope.Workspace) {
+        if within(held, packages, reported) {
+            mut diagnostics.push(take reported)
+        }
+    }
+    var report = test_runs::Report.empty(alloc)
+    let errors = diagnostics.position(fn(reported: diagnostic::Diagnostic) => reported.code.class() == diagnostic::Class.Error).is_some()
+    if not errors {
+        try tested(session, packages, diagnostics: mut diagnostics, report: mut report)
+    }
+    for index in packages {
+        for reported in take session.gate(index) {
+            mut diagnostics.push(take reported)
+        }
+    }
+    mut diagnostics.sort_by(fn(left: diagnostic::Diagnostic, right: diagnostic::Diagnostic) => judged_order(left, right))
+    var deduplicated = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for reported in take diagnostics {
+        let count = deduplicated.len()
+        if count > 0 and check::same_diagnostic(reported, earlier: deduplicated[count - 1], spanned: true) {
+            continue
+        }
+        mut deduplicated.push(take reported)
+    }
+    return Judged(diagnostics: take deduplicated, report: take report)
+} judged
+
+/// Runs the tests of each package, adding what they find to a report and to diagnostics.
+fn tested(session: check::Session, packages: Slice[usize], mut diagnostics: mem::List[diagnostic::Diagnostic], mut report: test_runs::Report) fails platform::IoError {
+    let alloc = session.alloc
+    let user_cache = match try cache::Cache.open(cache::copied_override(session.home, alloc), alloc) {
+        Ok(opened) => opened
+        Err(exposed) => {
+            mut diagnostics.push(exposed_diagnostic(take exposed, alloc))
+            return
+        }
+    }
+    for index in packages {
+        match try test_runs::run(session, scope: scope::Scope.Package(index), runs: test_runs::Runs.All, user_cache) {
+            Ok(ran) => {
+                let test_runs::Report(tests: tests, failures: failures, diagnostics: found) = ran
+                expect report.tests <= ~0usize - tests
+                report.tests += tests
+                for failure in take failures {
+                    mut report.failures.push(take failure)
+                }
+                for reported in take found {
+                    mut diagnostics.push(take reported)
+                }
+            }
+            Err(exposed) => mut diagnostics.push(exposed_diagnostic(take exposed, alloc))
+        }
+    }
+} tested
+
+/// The diagnostic of an exposed part of the user directory.
+fn exposed_diagnostic(take exposed: cache::Exposed, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildCacheExposed, alloc)
+    let cache::Exposed(path: path) = exposed
+    reported.path = Some(take path)
+    return reported
+} exposed_diagnostic
+
+/// The order of diagnostics by path, line and code, an absent path or line first.
+fn judged_order(left: diagnostic::Diagnostic, right: diagnostic::Diagnostic) -> core::Ordering {
+    let by_path = match left.path {
+        None => match right.path {
+            None => core::Ordering.Equal
+            Some(_) => core::Ordering.Less
+        }
+        Some(path) => match right.path {
+            None => core::Ordering.Greater
+            Some(other) => path.as_str().cmp(other.as_str())
+        }
+    }
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    let by_line = match left.line {
+        None => match right.line {
+            None => core::Ordering.Equal
+            Some(_) => core::Ordering.Less
+        }
+        Some(line) => match right.line {
+            None => core::Ordering.Greater
+            Some(other) => line.cmp(other)
+        }
+    }
+    if by_line != core::Ordering.Equal {
+        return by_line
+    }
+    return left.code.name().cmp(right.code.name())
+} judged_order
+
+/// The packages the gate judges: each holding part of the scope, and each those reach through a
+/// chain of `dep` directives with relative-path sources, by index.
+fn gated(workspace: workspace::Workspace, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[usize] {
+    var found = mem::List[usize].empty(alloc)
+    for index in 0..<workspace.packages.len() {
+        let Some(pack) = workspace.packages.get(index) else {
+            expect false
+            continue
+        }
+        let holds = pack.files.position(fn(file: workspace::File) => scope.holds(workspace, path: file.path.as_str(), line: None) or holds_lines(scope, path: file.path.as_str())).is_some()
+        if holds {
+            mut found.push(index)
+        }
+    }
+    var next: usize = 0
+    while next < found.len() {
+        let index = found[next]
+        next += 1
+        let Some(pack) = workspace.packages.get(index) else {
+            expect false
+            continue
+        }
+        let Some(manifest) = pack.manifest else {
+            continue
+        }
+        for dep in manifest.deps {
+            if not dep.path {
+                continue
+            }
+            let Some(dir) = dep.source else {
+                continue
+            }
+            let Some(reached) = workspace.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir.as_str()) else {
+                continue
+            }
+            if found.position(fn(known: usize) => known == reached).is_none() {
+                mut found.push(reached)
+            }
+        }
+    }
+    mut found.sort_by(fn(left: usize, right: usize) => left.cmp(right))
+    return found
+} gated
+
+/// Whether a scope of lines lies in a file.
+fn holds_lines(scope: scope::Scope, path: Str) -> bool {
+    return match scope {
+        scope::Scope.Lines(path: scoped, lines: _) => scoped.as_str() == path
+        else => false
+    }
+} holds_lines
+
+/// Whether a diagnostic lies in one of the packages, or in no file.
+fn within(workspace: workspace::Workspace, packages: Slice[usize], reported: diagnostic::Diagnostic) -> bool {
+    let Some(path) = reported.path else {
+        return true
+    }
+    for index in packages {
+        let Some(pack) = workspace.packages.get(index) else {
+            expect false
+            continue
+        }
+        let dir = pack.dir.as_str()
+        if path.starts_with(dir) and path.byte_len() > dir.byte_len() {
+            let Some(rest) = path.as_str().slice_bytes(dir.byte_len(), end: path.byte_len()) else {
+                continue
+            }
+            if rest.starts_with("/") {
+                return true
+            }
+        }
+    }
+    return false
+} within

@@ -1,0 +1,343 @@
+//! Specs: an item's clauses, field and invariant lines and targeting tests as API snapshots accept them, and the parts of an accepted spec that a current spec weakens.
+
+/// Whether a clause of a spec, by its flat text, is of a kind: its first word.
+fn has_kind(clause: Str, kind: Str) -> bool {
+    let end = match clause.find(" ") {
+        Some(at) => at
+        None => clause.byte_len()
+    }
+    return clause.slice_bytes(0, end) == Some(kind)
+} has_kind
+
+/// The last token of a head: of its parameters' closer, result, failure, `uses` and limits.
+fn head_last(head: ast::Head) -> u32 {
+    var last = head.close
+    match head.result {
+        Some(result) => {
+            if result.last > last {
+                last = result.last
+            }
+        }
+        None => {}
+    }
+    match head.failure {
+        Some(failure) => {
+            if failure.last > last {
+                last = failure.last
+            }
+        }
+        None => {}
+    }
+    match head.usage {
+        Some(usage) => {
+            if usage.word.token > last {
+                last = usage.word.token
+            }
+        }
+        None => {}
+    }
+    match head.limit_set {
+        Some(limit_set) => {
+            for limit in limit_set.entries {
+                let end = match limit.size {
+                    Some(size) => size
+                    None => limit.token
+                }
+                if end > last {
+                    last = end
+                }
+            }
+        }
+        None => {}
+    }
+    return last
+} head_last
+
+/// The spec of an item: for a function, its head, its clauses that are not disputed and its
+/// targeting tests; for an interface, each method's head and clauses; for a struct, each field
+/// line with a `where` predicate and each invariant line. Empty for any other item.
+pkg fn Checker.spec(self, item: ty::ItemId) -> machine::Accepted {
+    let alloc = self.alloc()
+    let declared = self.db().ast(item)
+    match declared.kind {
+        ast::ItemKind.Fn(function) => {
+            let clauses = self.clause_texts(item, clauses: function.clauses.view())
+            let tests = self.targeting_tests(item)
+            if clauses.len() == 0 and tests.len() == 0 {
+                return machine::Accepted.empty(alloc)
+            }
+            let head = self.flat(item, range: nir::Span(head: declared.token, last: head_last(function.head)))
+            return machine::Accepted(head: Some(take head), clauses: take clauses, tests: take tests, methods: mem::List[machine::Method].empty(alloc))
+        }
+        ast::ItemKind.Interface(interface_item) => {
+            var methods = mem::List[machine::Method].empty(alloc)
+            for method in interface_item.methods {
+                let clauses = self.clause_texts(item, clauses: method.clauses.view())
+                if clauses.len() == 0 {
+                    continue
+                }
+                let head = self.flat(item, range: nir::Span(head: method.token, last: head_last(method.head)))
+                mut methods.push(machine::Method(name: text::String.of(method.name.text.as_str(), alloc), head: take head, clauses: take clauses, pending: mem::List[machine::Pending].empty(alloc)))
+            }
+            mut methods.sort_by(fn(left: machine::Method, right: machine::Method) => left.name.as_str().cmp(right.name.as_str()))
+            var accepted = machine::Accepted.empty(alloc)
+            accepted.methods = methods
+            return accepted
+        }
+        ast::ItemKind.Struct(structure) => {
+            let syntax = self.db().syntax(item)
+            var clauses = mem::List[text::String].empty(alloc)
+            for member in structure.members {
+                match member {
+                    ast::StructMember.Field(field) => {
+                        if field.where_clause.is_some() {
+                            mut clauses.push(self.flat(item, range: nir::Span(head: field.token, last: line_end_token(syntax, token: field.token))))
+                        }
+                    }
+                    ast::StructMember.Invariant(condition) => {
+                        expect condition.token > 0
+                        let keyword = condition.token - 1
+                        mut clauses.push(self.flat(item, range: nir::Span(head: keyword, last: line_end_token(syntax, token: keyword))))
+                    }
+                }
+            }
+            var accepted = machine::Accepted.empty(alloc)
+            accepted.clauses = clauses
+            return accepted
+        }
+        else => return machine::Accepted.empty(alloc)
+    }
+} Checker.spec
+
+/// The last token of the line holding a token, before its `NL`.
+fn line_end_token(syntax: syntax::SourceFile, token: u32) -> u32 {
+    var at = usize.widen(token)
+    while at + 1 < syntax.tokens.len() and syntax.tokens[at + 1].kind != syntax::TokenKind.Nl {
+        at += 1
+    }
+    return u32.fit(at)
+} line_end_token
+
+/// The flat texts of the requires, ensures and example clauses that are not disputed, in
+/// clause order.
+fn Checker.clause_texts(self, item: ty::ItemId, clauses: Slice[ast::Clause]) -> mem::List[text::String] {
+    var texts = mem::List[text::String].empty(self.alloc())
+    for clause in clauses {
+        if clause.disputed {
+            continue
+        }
+        match clause.kind {
+            ast::ClauseKind.Requires(expr) or ast::ClauseKind.Ensures(expr) or ast::ClauseKind.Example(expr) => {
+                mut texts.push(self.flat(item, range: nir::Span(head: clause.token, last: expr.last)))
+            }
+            else => {}
+        }
+    }
+    return texts
+} Checker.clause_texts
+
+/// The targeting tests of a function: the tests of its package that are not disputed and
+/// whose target it is, each with its parameter types and expect hashes, in byte order of
+/// canonical path.
+pkg fn Checker.targeting_tests(self, function: ty::ItemId) -> mem::List[machine::AcceptedTest] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var tests = mem::List[machine::AcceptedTest].empty(alloc)
+    for module in db.package_data(db.package_of(function)).modules {
+        for item in db.module(module).items {
+            let ast::ItemKind.Test(tested) = db.ast(item).kind else {
+                continue
+            }
+            let targets = self.test_target(item, tested) == Some(TestTarget.Function(function))
+            if tested.disputed or not targets {
+                continue
+            }
+            let Some(path) = self.canonical_path(item) else {
+                continue
+            }
+            let params = self.test_param_types(item, params: tested.params)
+            var expects = self.expect_hashes(item)
+            mut expects.sort_by(fn(left: hashing::HashValue, right: hashing::HashValue) => left.cmp(right))
+            mut tests.push(machine::AcceptedTest(path: take path, params: take params, expects: take expects))
+        }
+    }
+    mut tests.sort_by(fn(left: machine::AcceptedTest, right: machine::AcceptedTest) => left.path.as_str().cmp(right.path.as_str()))
+    return tests
+} Checker.targeting_tests
+
+/// The flat texts of a test's parameter types, joined by `, `.
+fn Checker.test_param_types(self, item: ty::ItemId, params: Option[mem::List[ast::Param]]) -> text::String {
+    var written = text::String.empty(self.alloc())
+    let Some(listed) = params else {
+        return written
+    }
+    var count: usize = 0
+    for param in listed {
+        invariant count < listed.len()
+        let ast::ParamKind.Named(name: _, ty: param_ty) = param.kind else {
+            continue
+        }
+        if count > 0 {
+            mut written.append(", ")
+        }
+        mut written.append(self.flat(item, range: nir::Span(head: param_ty.token, last: param_ty.last)).as_str())
+        count += 1
+    }
+    return written
+} Checker.test_param_types
+
+/// The expect hashes of a test: one per `expect` statement at any depth, the hash of
+/// `expect`, LF and the statement's text in the test's normalised form with the bindings it
+/// names numbered from 1.
+fn Checker.expect_hashes(self, tested: ty::ItemId) -> mem::List[hashing::HashValue] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let syntax = db.syntax(tested)
+    let data = db.item(tested)
+    expect data.index < syntax.items.len()
+    let span = syntax.items[data.index]
+    expect span.end <= syntax.tokens.len()
+    var hashes = mem::List[hashing::HashValue].empty(alloc)
+    for token in span.head..<span.end {
+        if syntax.tokens[token].kind != syntax::TokenKind.Keyword(syntax::Keyword.Expect) {
+            continue
+        }
+        let last = line_end_token(syntax, token: u32.fit(token))
+        var written = text::String.of("expect\n", alloc)
+        mut written.append(self.fragment(tested, range: nir::Span(head: u32.fit(token), last: last), numbering: format::Numbering.Named).as_str())
+        mut hashes.push(hashing::HashValue.of(written.as_bytes()))
+    }
+    return hashes
+} Checker.expect_hashes
+
+/// The weakened parts of an item's accepted spec that its current spec has: for a function,
+/// `requires` when the accepted requires do not hold each current requires, each accepted
+/// ensures and example the current spec lacks, and `test` with the path of each accepted test
+/// no current targeting test covers; for a struct, `predicates` when an accepted field or
+/// invariant line is gone. In byte order.
+pkg fn Checker.weakened(self, item: ty::ItemId, accepted: machine::Accepted, current: machine::Accepted) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var parts = mem::List[text::String].empty(alloc)
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(_) => {
+            for clause in accepted.clauses {
+                if not holds_text(current.clauses.view(), text: clause.as_str()) {
+                    mut parts.push(text::String.of("predicates", alloc))
+                    break
+                }
+            }
+        }
+        else => {
+            for part in take weakened_clauses(accepted.clauses.view(), current: current.clauses.view(), alloc) {
+                mut parts.push(take part)
+            }
+            for accepted_test in accepted.tests {
+                if not spec_covers(current.tests.view(), wanted: accepted_test, alloc) {
+                    var part = text::String.of("test ", alloc)
+                    mut part.append(accepted_test.path.as_str())
+                    mut parts.push(take part)
+                }
+            }
+        }
+    }
+    return sorted_distinct(take parts, alloc)
+} Checker.weakened
+
+/// The weakened parts of each accepted method of an interface, by method name.
+pkg fn Checker.weakened_methods(self, accepted: machine::Accepted, current: machine::Accepted) -> mem::Map[text::String, mem::List[text::String]] {
+    let alloc = self.alloc()
+    var parts = mem::Map[text::String, mem::List[text::String]].empty(alloc)
+    for method in accepted.methods {
+        let weakened = sorted_distinct(method_weakened(method, current, alloc), alloc)
+        if weakened.len() > 0 {
+            discard mut parts.insert(text::String.of(method.name.as_str(), alloc), value: take weakened)
+        }
+    }
+    return parts
+} Checker.weakened_methods
+
+/// The weakened clauses of an accepted method that a current spec's method of its name has, all
+/// of them when it has none.
+fn method_weakened(method: machine::Method, current: machine::Accepted, alloc: mem::Alloc) -> mem::List[text::String] {
+    for candidate in current.methods {
+        if candidate.name == method.name {
+            return weakened_clauses(method.clauses.view(), current: candidate.clauses.view(), alloc)
+        }
+    }
+    return weakened_clauses(method.clauses.view(), current: mem::List[text::String].empty(alloc).view(), alloc)
+} method_weakened
+
+/// Whether a spec taken as the current spec keeps an accepted spec: it weakens no clause, test
+/// or method of it.
+pkg fn spec_keeps(current: machine::Accepted, accepted: machine::Accepted, alloc: mem::Alloc) -> bool {
+    for accepted_test in accepted.tests {
+        if not spec_covers(current.tests.view(), wanted: accepted_test, alloc) {
+            return false
+        }
+    }
+    for method in accepted.methods {
+        if method_weakened(method, current, alloc).len() > 0 {
+            return false
+        }
+    }
+    return weakened_clauses(accepted.clauses.view(), current: current.clauses.view(), alloc).len() == 0
+} spec_keeps
+
+/// Whether one of the current tests covers an accepted test: the same parameter types, and
+/// expect hashes including the accepted ones.
+fn spec_covers(current: Slice[machine::AcceptedTest], wanted: machine::AcceptedTest, alloc: mem::Alloc) -> bool {
+    for candidate in current {
+        if candidate.params == wanted.params and includes(candidate.expects.view(), part: wanted.expects.view(), alloc) {
+            return true
+        }
+    }
+    return false
+} spec_covers
+
+/// The weakened parts among clauses: `requires` when a current requires is not among the
+/// accepted ones, and each accepted ensures or example the current clauses lack.
+fn weakened_clauses(accepted: Slice[text::String], current: Slice[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var parts = mem::List[text::String].empty(alloc)
+    for clause in current {
+        if has_kind(clause.as_str(), kind: "requires") and not holds_text(accepted, text: clause.as_str()) {
+            mut parts.push(text::String.of("requires", alloc))
+            break
+        }
+    }
+    for clause in accepted {
+        if not has_kind(clause.as_str(), kind: "requires") and not holds_text(current, text: clause.as_str()) {
+            mut parts.push(text::String.of(clause.as_str(), alloc))
+        }
+    }
+    return parts
+} weakened_clauses
+
+/// Whether a multiset of hashes includes another, counted with repetition.
+fn includes(whole: Slice[hashing::HashValue], part: Slice[hashing::HashValue], alloc: mem::Alloc) -> bool {
+    var left = mem::List[hashing::HashValue].empty(alloc)
+    for hash in whole {
+        mut left.push(hash)
+    }
+    for hash in part {
+        let Some(at) = left.position(fn(known: hashing::HashValue) => known == hash) else {
+            return false
+        }
+        discard mut left.remove(at)
+    }
+    return true
+} includes
+
+/// Texts in byte order, each once.
+fn sorted_distinct(take texts: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var sorted = texts
+    mut sorted.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var distinct = mem::List[text::String].empty(alloc)
+    for held in take sorted {
+        let count = distinct.len()
+        if count > 0 and distinct[count - 1].as_str() == held.as_str() {
+            continue
+        }
+        mut distinct.push(take held)
+    }
+    return distinct
+} sorted_distinct

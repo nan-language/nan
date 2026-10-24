@@ -50,10 +50,11 @@ struct DocMember {
     name: text::String
 } DocMember
 
-/// A doc reference: its path, the bytes of its last segment, and the member it names through
-/// that path with the offset of its name.
+/// A doc reference: its path, the bytes of the whole path and of its last segment, and the
+/// member it names through that path with the offset of its name.
 struct DocReference {
     path: ast::Path
+    whole: diagnostic::Span
     last: diagnostic::Span
     member: Option[DocMember]
 } DocReference
@@ -89,6 +90,58 @@ fn RenameTarget.names_member(self, member: Member) -> bool {
         }
     }
 } RenameTarget.names_member
+
+/// What lines of a workspace file declare: the item whose head they hold, or the field, variant
+/// or interface method they hold the name of.
+fn Checker.target_at(self, path: Str, lines: core::Range[u32]) -> Option[RenameTarget] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var found: Option[ty::ItemId] = None
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if not db.is_reported(item) or db.item_file(item).path.as_str() != path {
+            continue
+        }
+        let syntax = db.syntax(item)
+        let data = db.item(item)
+        expect data.index < syntax.items.len()
+        if syntax.item_lines(syntax.items[data.index]).contains(lines.low) {
+            found = Some(item)
+            break
+        }
+    }
+    let Some(item) = found else {
+        return None
+    }
+    if lines.contains(db.head_line(item)) {
+        return Some(RenameTarget.Item(item))
+    }
+    match db.ast(item).kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                if lines.contains(db.line(item, token: field.name.token)) {
+                    return Some(RenameTarget.Field(owner: item, name: text::String.of(field.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                if lines.contains(db.line(item, token: variant.name.token)) {
+                    return Some(RenameTarget.Variant(owner: item, name: text::String.of(variant.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        ast::ItemKind.Interface(interface_item) => {
+            for method in interface_item.methods {
+                if lines.contains(db.line(item, token: method.name.token)) {
+                    return Some(RenameTarget.Method(owner: item, name: text::String.of(method.name.text.as_str(), alloc)))
+                }
+            }
+        }
+        else => {}
+    }
+    return None
+} Checker.target_at
 
 /// The spans writing a target's name: its declaration, the labels naming it, and each path,
 /// member name and doc reference of the workspace naming it. Renaming an
@@ -434,6 +487,7 @@ fn Checker.doc_references(self, holder: HolderItem, target: RenameTarget, mut sp
                 continue
             }
             start = member.offset
+            expect member.name.byte_len() <= usize.widen(~0u32 - member.offset)
             end = member.offset + u32.fit(member.name.byte_len())
         }
         discard mut spans.insert(Span(path: text::String.of(file_path, alloc: self.alloc()), start: start, end: end))
@@ -609,6 +663,333 @@ fn declares_generic_at(tree: syntax::Tree, token: u32, alloc: mem::Alloc) -> boo
     return false
 } declares_generic_at
 
+/// A move's edit, and where each item it moves lands.
+pkg struct Move {
+    pkg fix: diagnostic::Fix
+    pkg relocated: mem::List[Relocated]
+} Move
+
+/// The lines of a moved item: the path and first line it leaves and lands at, and their number.
+pkg struct Relocated {
+    pkg from: diagnostic::At
+    pkg to: diagnostic::At
+    pkg lines: u32
+} Relocated
+
+/// A rewritten path of a moved item: its bytes and the text replacing them.
+struct Rewrite derives Eq, Ord {
+    start: u32
+    end: u32
+    spelt: text::String
+} Rewrite
+
+/// A path of a moved item to rewrite: the item and the rewrite.
+struct InsideRewrite {
+    item: ty::ItemId
+    rewrite: Rewrite
+} InsideRewrite
+
+/// What a move rewrites: the replacements of files staying in place, the rewrites inside moved
+/// items, and the private items a module other than theirs names once moved.
+struct MoveEdits {
+    in_place: mem::List[diagnostic::Edit]
+    inside: mem::List[InsideRewrite]
+    raised: mem::Set[ty::ItemId]
+} MoveEdits
+
+/// The edit moving an item, with the functions named after it and the impl lines naming it in
+/// its module, to the end of the summary file of another module of its package; none when
+/// that move is invalid: of a member, of a function named after a type, or into a missing
+/// module.
+fn Checker.moving(self, target: RenameTarget, module: Str) -> Option[Move] {
+    let RenameTarget.Item(item) = target else {
+        return None
+    }
+    let db = self.db()
+    let alloc = self.alloc()
+    if db.owners.contains(item) {
+        return None
+    }
+    let from = db.module_of(item)
+    let package_id = db.package_of(item)
+    let Some(to) = db.module_named(package_id, name: module) else {
+        return None
+    }
+    let target_module = db.module(to)
+    let Some(first_file) = target_module.files.get(0) else {
+        return None
+    }
+    let first_path = db.file(first_file).path.as_str()
+    let Some(slash) = last_slash(first_path) else {
+        return None
+    }
+    let Some(dir) = first_path.slice_bytes(0, end: slash) else {
+        return None
+    }
+    var summary = text::String.of(dir, alloc)
+    mut summary.push('/')
+    mut summary.append(target_module.name.as_str())
+    mut summary.append(".nan")
+    var moved = mem::List[ty::ItemId].empty(alloc)
+    mut moved.push(item)
+    for other in db.module(from).items {
+        let named_after = db.owners.get(other) == Some(TypeKey.Item(item))
+        let sig = self.sig(other)
+        var naming = false
+        match sig.contents().kind {
+            SigKind.Impl(target: impl_target, target_ty: _, bound: bound) => {
+                naming = impl_target == Some(TypeKey.Item(item))
+                match bound {
+                    Some(interface_bound) => {
+                        if interface_bound.item == item {
+                            naming = true
+                        }
+                    }
+                    None => {}
+                }
+            }
+            else => {}
+        }
+        if named_after or naming {
+            mut moved.push(other)
+        }
+    }
+    var edits = MoveEdits(in_place: mem::List[diagnostic::Edit].empty(alloc), inside: mem::List[InsideRewrite].empty(alloc), raised: mem::Set[ty::ItemId].empty(alloc))
+    for holder in self.holders() {
+        self.move_holder(holder, moved: moved.view(), to, package_id, mut edits)
+    }
+    for named in self.state.contents().members_named.cursor() {
+        let Member.Function(function) = named.member else {
+            continue
+        }
+        if holds_item(moved.view(), item: function) and self.lands(named.item, moved: moved.view(), to) != to and db.ast(function).visibility == ast::Visibility.Private {
+            discard mut edits.raised.insert(function)
+        }
+    }
+    return self.relocated(take edits, moved: take moved, summary: take summary)
+} Checker.moving
+
+/// Adds what a move rewrites in a holder: its paths and doc references naming a moved item, or
+/// naming an item of the package from a moved holder, spelt as their reader writes them.
+fn Checker.move_holder(self, holder: HolderItem, moved: Slice[ty::ItemId], to: ty::ModuleId, package_id: ty::PackageId, mut edits: MoveEdits) {
+    let db = self.db()
+    let alloc = self.alloc()
+    let reader = match holder.item {
+        Some(held) => self.lands(held, moved, to)
+        None => holder.module
+    }
+    let holder_moves = match holder.item {
+        Some(held) => holds_item(moved, item: held)
+        None => false
+    }
+    let source = self.holder_syntax(holder)
+    for written in holder.paths(self) {
+        if written.member.is_some() {
+            continue
+        }
+        let Ok(Named.Item(named)) = db.resolve(holder.module, path: written.path) else {
+            continue
+        }
+        let landed = self.lands(named, moved, to)
+        if db.package_of(named) != package_id or not (holder_moves or holds_item(moved, item: named)) {
+            continue
+        }
+        let spelt = self.spelling(reader, to: landed, name: declared_name_of(db.ast(named), alloc).as_str())
+        if landed != reader and db.ast(named).visibility == ast::Visibility.Private {
+            discard mut edits.raised.insert(named)
+        }
+        expect written.path.segments.len() > 0
+        let first_token = written.path.segments[0].token
+        let last_token = written.path.last().token
+        expect usize.widen(first_token) < source.tokens.len() and usize.widen(last_token) < source.tokens.len()
+        let start = source.tokens[usize.widen(first_token)].start
+        let end = source.tokens[usize.widen(last_token)].end
+        if source.source_bytes(start, end) == spelt.as_bytes() {
+            continue
+        }
+        add_move_rewrite(mut edits, holder, holder_moves, path: db.file(holder.file).path.as_str(), rewrite: Rewrite(start: start, end: end, spelt: take spelt), alloc)
+    }
+    for reference in holder.doc_references(self) {
+        let Ok(Named.Item(named)) = db.resolve(holder.module, path: reference.path) else {
+            continue
+        }
+        if db.package_of(named) != package_id or not (holder_moves or holds_item(moved, item: named)) {
+            continue
+        }
+        let spelt = self.spelling(reader, to: self.lands(named, moved, to), name: declared_name_of(db.ast(named), alloc).as_str())
+        add_move_rewrite(mut edits, holder, holder_moves, path: db.file(holder.file).path.as_str(), rewrite: Rewrite(start: reference.whole.start, end: reference.whole.end, spelt: take spelt), alloc)
+    }
+} Checker.move_holder
+
+/// Adds a rewrite of a holder: inside the moved holder's text, or in place.
+fn add_move_rewrite(mut edits: MoveEdits, holder: HolderItem, holder_moves: bool, path: Str, take rewrite: Rewrite, alloc: mem::Alloc) {
+    match holder.item {
+        Some(held) => {
+            if holder_moves {
+                mut edits.inside.push(InsideRewrite(item: held, rewrite: take rewrite))
+                return
+            }
+        }
+        None => {}
+    }
+    let Rewrite(start: start, end: end, spelt: spelt) = rewrite
+    mut edits.in_place.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: start, end: end, text: take spelt)))
+} add_move_rewrite
+
+/// The name an item declares, empty for none.
+fn declared_name_of(declared: ast::Item, alloc: mem::Alloc) -> text::String {
+    return match declared.name(alloc) {
+        Some(name) => name
+        None => text::String.empty(alloc)
+    }
+} declared_name_of
+
+/// The module an item lies in once moved.
+fn Checker.lands(self, other: ty::ItemId, moved: Slice[ty::ItemId], to: ty::ModuleId) -> ty::ModuleId {
+    if holds_item(moved, item: other) {
+        return to
+    }
+    return self.db().module_of(other)
+} Checker.lands
+
+/// The move's edit once its rewrites are known: each moved item, rewritten, appended to the
+/// target module's summary file and removed from its own with the blank line after it, and
+/// `pkg ` before each private item another module names; none when the summary file is
+/// missing.
+fn Checker.relocated(self, take edits: MoveEdits, take moved: mem::List[ty::ItemId], take summary: text::String) -> Option[Move] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let MoveEdits(in_place: in_place, inside: inside, raised: raised) = edits
+    var replacements = in_place
+    let Some(summary_file) = self.summary_file(summary.as_str()) else {
+        return None
+    }
+    var landed_line = landing_line(summary_file.syntax.source.view())
+    var relocated = mem::List[Relocated].empty(alloc)
+    var appended = text::String.empty(alloc)
+    var ordered_items = mem::List[ty::ItemId].empty(alloc)
+    for held in moved {
+        mut ordered_items.push(held)
+    }
+    mut ordered_items.sort_by(fn(left: ty::ItemId, right: ty::ItemId) -> core::Ordering {
+        let paths = db.item_file(left).path.as_str().cmp(db.item_file(right).path.as_str())
+        if paths != core::Ordering.Equal {
+            return paths
+        }
+        return db.head_line(left).cmp(db.head_line(right))
+    })
+    for item in ordered_items {
+        let syntax = db.syntax(item)
+        let data = db.item(item)
+        expect data.index < syntax.items.len()
+        let lines = syntax.item_lines(syntax.items[data.index])
+        expect lines.low > 0 and lines.low <= lines.high and lines.high < 0xFFFF_FFFF and usize.widen(lines.low) <= syntax.lines.len()
+        let start = syntax.lines[usize.widen(lines.low) - 1].start
+        let end = line_start_after(syntax, line: lines.high)
+        let head_token = usize.widen(db.ast(item).token)
+        expect head_token < syntax.tokens.len()
+        let head = syntax.tokens[head_token].start
+        var rewrites = mem::List[Rewrite].empty(alloc)
+        for rewrite in inside {
+            if rewrite.item == item {
+                mut rewrites.push(Rewrite(start: rewrite.rewrite.start, end: rewrite.rewrite.end, spelt: text::String.of(rewrite.rewrite.spelt.as_str(), alloc)))
+            }
+        }
+        if raised.contains(item) {
+            mut rewrites.push(Rewrite(start: head, end: head, spelt: text::String.of("pkg ", alloc)))
+        }
+        mut rewrites.sort_by(fn(left: Rewrite, right: Rewrite) => left.cmp(right))
+        var written = text::String.empty(alloc)
+        var at = start
+        for rewrite in rewrites {
+            mut written.append(output::lossy(syntax.source_bytes(at, end: rewrite.start), alloc).as_str())
+            mut written.append(rewrite.spelt.as_str())
+            at = rewrite.end
+        }
+        mut written.append(output::lossy(syntax.source_bytes(at, end), alloc).as_str())
+        mut appended.push('\n')
+        mut appended.append(written.as_str())
+        let count = lines.high - lines.low + 1
+        let path = db.item_file(item).path.as_str()
+        mut relocated.push(Relocated(from: diagnostic::At(path: text::String.of(path, alloc), line: lines.low), to: diagnostic::At(path: text::String.of(summary.as_str(), alloc), line: landed_line), lines: count))
+        landed_line += count + 1
+        var removed_end = end
+        if usize.widen(lines.high) < syntax.lines.len() {
+            let next = syntax.lines[usize.widen(lines.high)]
+            if next.start == next.end {
+                removed_end = line_start_after(syntax, line: lines.high + 1)
+            }
+        }
+        mut replacements.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: start, end: removed_end, text: text::String.empty(alloc))))
+    }
+    for item in raised {
+        if holds_item(moved.view(), item) {
+            continue
+        }
+        let syntax = db.syntax(item)
+        let head_token = usize.widen(db.ast(item).token)
+        expect head_token < syntax.tokens.len()
+        let head = syntax.tokens[head_token].start
+        mut replacements.push(diagnostic::Edit(path: text::String.of(db.item_file(item).path.as_str(), alloc), replacement: diagnostic::Replacement(start: head, end: head, text: text::String.of("pkg ", alloc))))
+    }
+    let summary_end = u32.fit(summary_file.syntax.source.len())
+    mut replacements.push(diagnostic::Edit(path: take summary, replacement: diagnostic::Replacement(start: summary_end, end: summary_end, text: take appended)))
+    return Some(Move(fix: diagnostic::Fix(edits: take replacements), relocated: take relocated))
+} Checker.relocated
+
+/// The line that text appended to a source after a blank line starts on.
+fn landing_line(source: Slice[u8]) -> u32 {
+    var line: u32 = 2
+    for byte in source {
+        if byte == b'\n' {
+            expect line < 0xFFFF_FFFF
+            line += 1
+        }
+    }
+    return line
+} landing_line
+
+/// The offset of the start of the line after `line`, or the end of the source.
+fn line_start_after(syntax: syntax::SourceFile, line: u32) -> u32 {
+    if usize.widen(line) < syntax.lines.len() {
+        return syntax.lines[usize.widen(line)].start
+    }
+    return u32.fit(syntax.source.len())
+} line_start_after
+
+/// The file of a package of the database at a path.
+proj fn Checker.summary_file(self, path: Str) -> Option[workspace::File] {
+    let db = self.db()
+    for index in 0..<db.packages.len() {
+        let source = db.source(ty::PackageId(index: u32.fit(index)))
+        for file in source.files {
+            if file.path.as_str() == path {
+                return Some(file)
+            }
+        }
+    }
+    return None
+} Checker.summary_file
+
+/// The path code in module `from` writes for an item of module `to` named `name`.
+fn Checker.spelling(self, from: ty::ModuleId, to: ty::ModuleId, name: Str) -> text::String {
+    let alloc = self.alloc()
+    if from == to {
+        return text::String.of(name, alloc)
+    }
+    let db = self.db()
+    let module = db.module(to)
+    var written = text::String.empty(alloc)
+    if module.root {
+        mut written.append(db.package_data(module.package_id).name.as_str())
+    } else {
+        mut written.append(module.name.as_str())
+    }
+    mut written.append("::")
+    mut written.append(name)
+    return written
+} Checker.spelling
+
 /// The syntax of a holder's file.
 proj fn Checker.holder_syntax(self, holder: HolderItem) -> syntax::SourceFile {
     return self.db().file(holder.file).syntax
@@ -680,6 +1061,7 @@ fn HolderItem.doc_references(self, ck: Checker) -> mem::List[DocReference] {
             let Some(reference) = doc_text.slice_bytes(range.low, end: range.high) else {
                 continue
             }
+            expect range.low <= usize.widen(~0u32 - start)
             mut found.push(doc_reference(reference, at: start + u32.fit(range.low), alloc))
         }
     }
@@ -687,7 +1069,7 @@ fn HolderItem.doc_references(self, ck: Checker) -> mem::List[DocReference] {
 } HolderItem.doc_references
 
 /// The doc reference written `reference` at byte `at` of its file: its path, split at `::`, the
-/// bytes of its last segment, and the member after its last `.`.
+/// bytes of the whole path and of its last segment, and the member after its last `.`.
 fn doc_reference(reference: Str, at: u32, alloc: mem::Alloc) -> DocReference {
     let bytes = reference.as_bytes()
     var dot = bytes.len()
@@ -733,8 +1115,10 @@ fn doc_reference(reference: Str, at: u32, alloc: mem::Alloc) -> DocReference {
             break
         }
     }
+    expect dot <= usize.widen(~0u32 - at) and last_segment <= usize.widen(~0u32 - at)
+    let whole = diagnostic::Span(start: at, end: at + u32.fit(dot))
     let last = diagnostic::Span(start: at + u32.fit(last_segment), end: at + u32.fit(dot))
-    return DocReference(path: ast::Path(segments: take segments), last: last, member: take member)
+    return DocReference(path: ast::Path(segments: take segments), whole: whole, last: last, member: take member)
 } doc_reference
 
 /// A segment of a doc reference's path, by its bytes, as a name without a token.

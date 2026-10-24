@@ -1,0 +1,640 @@
+//! Tests of the function builder and the text form, against the texts Cranelift writes for the same calls.
+
+fn expect_text(func: Function, expected: Str, alloc: mem::Alloc) {
+    var wanted = text::String.of(expected, alloc)
+    mut wanted.push('\n')
+    let written = func.display(alloc)
+    expect written.as_str() == wanted.as_str()
+} expect_text
+
+fn one_value(value: Value, alloc: mem::Alloc) -> mem::List[Value] {
+    var list = mem::List[Value].empty(alloc)
+    mut list.push(value)
+    return list
+} one_value
+
+fn two_values(left: Value, right: Value, alloc: mem::Alloc) -> mem::List[Value] {
+    var list = one_value(left, alloc)
+    mut list.push(right)
+    return list
+} two_values
+
+fn signature_of(params: Slice[Type], returns: Slice[Type], call_conv: CallConv, alloc: mem::Alloc) -> Signature {
+    var signature = Signature.new(call_conv, alloc)
+    for param in params {
+        mut signature.params.push(AbiParam(value_type: param))
+    }
+    for returned in returns {
+        mut signature.returns.push(AbiParam(value_type: returned))
+    }
+    return signature
+} signature_of
+
+fn one_type(ty: Type, alloc: mem::Alloc) -> mem::List[Type] {
+    var list = mem::List[Type].empty(alloc)
+    mut list.push(ty)
+    return list
+} one_type
+
+fn two_types(left: Type, right: Type, alloc: mem::Alloc) -> mem::List[Type] {
+    var list = one_type(left, alloc)
+    mut list.push(right)
+    return list
+} two_types
+
+/// A function named `u0:<index>`, through a builder.
+fn builder_of(index: u32, take signature: Signature, alloc: mem::Alloc) -> Builder {
+    return Builder.new(Function.new(ExternalName(namespace: 0, index: index), take signature, alloc), alloc)
+} builder_of
+
+/// The entry block, holding the function's parameters, current and sealed.
+fn entry_of(mut b: Builder) -> Block {
+    let entry = mut b.create_block()
+    mut b.append_block_params_for_function_params(entry)
+    mut b.switch_to_block(entry)
+    mut b.seal_block(entry)
+    return entry
+} entry_of
+
+/// The one result of a call.
+fn call_result(b: Builder, call: Inst, alloc: mem::Alloc) -> Value {
+    let results = b.inst_results(call, alloc)
+    expect results.len() == 1
+    return results[0]
+} call_result
+
+fn ext_func_of(mut b: Builder, index: u32, take signature: Signature, colocated: bool) -> FuncRef {
+    let sig_ref = mut b.import_signature(take signature)
+    return mut b.import_function(ExtFuncData(name: ExternalName(namespace: 0, index: index), signature: sig_ref, colocated: colocated))
+} ext_func_of
+
+fn symbol_of(mut b: Builder, namespace: u32, index: u32, colocated: bool, tls: bool) -> GlobalValue {
+    return mut b.create_global_value(GlobalValueData(name: ExternalName(namespace: namespace, index: index), colocated: colocated, tls: tls))
+} symbol_of
+
+const LOOPS: Str =
+    \\function u0:1(i64) -> i64 system_v {
+    \\block0(v0: i64):
+    \\    v1 = iconst.i64 0
+    \\    jump block1(v1, v0, v1)  ; v1 = 0, v1 = 0
+    \\
+    \\block1(v2: i64, v3: i64, v7: i64):
+    \\    v9 -> v2
+    \\    v12 -> v3
+    \\    v4 = icmp ult v2, v3
+    \\    brif v4, block2, block5
+    \\
+    \\block2:
+    \\    v5 = iconst.i64 1
+    \\    v6 = band.i64 v2, v5  ; v5 = 1
+    \\    brif v6, block3, block4(v7)
+    \\
+    \\block3:
+    \\    v8 = iadd.i64 v7, v2
+    \\    jump block4(v8)
+    \\
+    \\block4(v13: i64):
+    \\    v10 = iconst.i64 1
+    \\    v11 = iadd.i64 v9, v10  ; v10 = 1
+    \\    jump block1(v11, v12, v13)
+    \\
+    \\block5:
+    \\    return v7
+    \\}
+
+/// A counting loop with a conditional inside, its header sealed last, and its join sealed last too
+/// or else before the header.
+fn counting_loop(seal_join_early: bool, alloc: mem::Alloc) -> Function {
+    let int64 = one_type(Type.Int64, alloc)
+    var b = builder_of(1, signature: signature_of(int64.view(), returns: int64.view(), call_conv: CallConv.SystemV, alloc), alloc)
+    let none = mem::List[Value].empty(alloc)
+    let entry = entry_of(mut b)
+    let entry_params = b.block_params(entry, alloc)
+    expect entry_params.len() == 1
+    let n = entry_params[0]
+    let i = mut b.declare_var(Type.Int64)
+    let sum = mut b.declare_var(Type.Int64)
+    let limit = mut b.declare_var(Type.Int64)
+    let zero = mut b.iconst(Type.Int64, imm: 0)
+    mut b.def_var(i, val: zero)
+    mut b.def_var(sum, val: zero)
+    mut b.def_var(limit, val: n)
+    let header = mut b.create_block()
+    let body = mut b.create_block()
+    let odd = mut b.create_block()
+    let join = mut b.create_block()
+    let exit = mut b.create_block()
+    mut b.jump(header, args: none.view())
+    mut b.switch_to_block(header)
+    let index = mut b.use_var(i)
+    let bound = mut b.use_var(limit)
+    let more = mut b.icmp(IntCC.UnsignedLessThan, x: index, y: bound)
+    mut b.brif(more, then: body, then_args: none.view(), otherwise: exit, otherwise_args: none.view())
+    mut b.switch_to_block(body)
+    mut b.seal_block(body)
+    let counted = mut b.use_var(i)
+    let bit = mut b.band_imm_s(counted, y: 1)
+    mut b.brif(bit, then: odd, then_args: none.view(), otherwise: join, otherwise_args: none.view())
+    mut b.switch_to_block(odd)
+    mut b.seal_block(odd)
+    let total = mut b.use_var(sum)
+    let added = mut b.iadd(total, y: counted)
+    mut b.def_var(sum, val: added)
+    mut b.jump(join, args: none.view())
+    mut b.switch_to_block(join)
+    let current = mut b.use_var(i)
+    let next = mut b.iadd_imm_s(current, y: 1)
+    mut b.def_var(i, val: next)
+    mut b.jump(header, args: none.view())
+    if seal_join_early {
+        mut b.seal_block(join)
+    }
+    mut b.switch_to_block(exit)
+    mut b.seal_block(exit)
+    let result = mut b.use_var(sum)
+    mut b.ret(one_value(result, alloc).view())
+    mut b.seal_all_blocks()
+    return take b.finalize()
+} counting_loop
+
+const CHAINED: Str =
+    \\function u0:1(i64) -> i64 system_v {
+    \\block0(v0: i64):
+    \\    v3 -> v0
+    \\    v12 -> v3
+    \\    v1 = iconst.i64 0
+    \\    jump block1(v1, v1)  ; v1 = 0, v1 = 0
+    \\
+    \\block1(v2: i64, v7: i64):
+    \\    v9 -> v2
+    \\    v4 = icmp ult v2, v3
+    \\    brif v4, block2, block5
+    \\
+    \\block2:
+    \\    v5 = iconst.i64 1
+    \\    v6 = band.i64 v2, v5  ; v5 = 1
+    \\    brif v6, block3, block4(v7)
+    \\
+    \\block3:
+    \\    v8 = iadd.i64 v7, v2
+    \\    jump block4(v8)
+    \\
+    \\block4(v13: i64):
+    \\    v10 = iconst.i64 1
+    \\    v11 = iadd.i64 v9, v10  ; v10 = 1
+    \\    jump block1(v11, v13)
+    \\
+    \\block5:
+    \\    return v7
+    \\}
+
+test variables_merge_where_blocks_are_sealed for Builder.seal_all_blocks {
+    let alloc = testing::world().alloc
+    expect_text(counting_loop(false, alloc), expected: LOOPS, alloc)
+    expect_text(counting_loop(true, alloc), expected: CHAINED, alloc)
+} variables_merge_where_blocks_are_sealed
+
+const UNREACHABLE: Str =
+    \\function u0:2() -> i64 system_v {
+    \\block0:
+    \\    v0 = iconst.i64 1
+    \\    return v0  ; v0 = 1
+    \\
+    \\block1:
+    \\    v13 = f32const 0.0
+    \\    v12 -> v13
+    \\    v11 = f64const 0.0
+    \\    v10 -> v11
+    \\    v7 = iconst.i64 0
+    \\    v8 = uextend.i128 v7  ; v7 = 0
+    \\    v6 -> v8
+    \\    v3 = iconst.i64 0
+    \\    v2 -> v3
+    \\    v1 = iconst.i64 7
+    \\    v4 = iadd v3, v2  ; v3 = 0, v2 = 0
+    \\    v5 = iadd v4, v1  ; v1 = 7
+    \\    v9 = ireduce.i64 v8
+    \\    v14 = fpromote.f64 v13  ; v13 = 0.0
+    \\    v15 = fmul v11, v14  ; v11 = 0.0
+    \\    v16 = bitcast.i64 v15
+    \\    v17 = bxor v9, v16
+    \\    v18 = iadd v5, v17
+    \\    return v18
+    \\
+    \\block2:
+    \\    v20 = iconst.i64 0
+    \\    v19 -> v20
+    \\    return v20  ; v20 = 0
+    \\}
+
+test unreachable_uses_read_zero for Builder.use_var {
+    let alloc = testing::world().alloc
+    let none = mem::List[Type].empty(alloc)
+    var b = builder_of(2, signature: signature_of(none.view(), returns: one_type(Type.Int64, alloc).view(), call_conv: CallConv.SystemV, alloc), alloc)
+    let x = mut b.declare_var(Type.Int64)
+    let wide = mut b.declare_var(Type.Int128)
+    let real = mut b.declare_var(Type.Float64)
+    let single = mut b.declare_var(Type.Float32)
+    discard entry_of(mut b)
+    let one = mut b.iconst(Type.Int64, imm: 1)
+    mut b.ret(one_value(one, alloc).view())
+    let dead = mut b.create_block()
+    mut b.switch_to_block(dead)
+    mut b.seal_block(dead)
+    let seven = mut b.iconst(Type.Int64, imm: 7)
+    let read = mut b.use_var(x)
+    let again = mut b.use_var(x)
+    let added = mut b.iadd(read, y: again)
+    let total = mut b.iadd(added, y: seven)
+    let w = mut b.use_var(wide)
+    let low = mut b.ireduce(Type.Int64, x: w)
+    let r = mut b.use_var(real)
+    let s = mut b.use_var(single)
+    let promoted = mut b.fpromote(Type.Float64, x: s)
+    let product = mut b.fmul(r, y: promoted)
+    let bits = mut b.bitcast(Type.Int64, flags: MemFlags.new(), x: product)
+    let mixed = mut b.bxor(low, y: bits)
+    let result = mut b.iadd(total, y: mixed)
+    mut b.ret(one_value(result, alloc).view())
+    let empty = mut b.create_block()
+    mut b.switch_to_block(empty)
+    mut b.seal_block(empty)
+    let unset = mut b.use_var(x)
+    mut b.ret(one_value(unset, alloc).view())
+    mut b.seal_all_blocks()
+    expect_text(take b.finalize(), expected: UNREACHABLE, alloc)
+} unreachable_uses_read_zero
+
+const FORMATS: Str =
+    \\function u0:3(i64, i64, f64, i128) -> i64, f64 system_v {
+    \\    ss0 = explicit_slot 24, align = 8
+    \\    ss1 = explicit_slot 1
+    \\    gv0 = symbol colocated userextname2
+    \\    gv1 = symbol tls userextname3
+    \\    gv2 = symbol userextname1
+    \\    sig0 = (i64, i64) -> i64 system_v
+    \\    sig1 = () windows_fastcall
+    \\    sig2 = (i64, i64) -> i64 system_v
+    \\    sig3 = (i64, i64) -> i64 system_v
+    \\    fn0 = colocated u0:5 sig0
+    \\    fn1 = u0:9 sig1
+    \\    fn2 = colocated u0:5 sig2
+    \\
+    \\block0(v0: i64, v1: i64, v2: f64, v3: i128):
+    \\    v4 = iconst.i8 -1
+    \\    v5 = iconst.i32 5
+    \\    v6 = iconst.i64 0x0001_1170
+    \\    v7 = iconst.i64 -70000
+    \\    v8 = iconst.i16 -25536
+    \\    v9 = iconst.i64 9999
+    \\    v10 = iconst.i64 -9223372036854775808
+    \\    v11 = f32const 0x1.800000p0
+    \\    v12 = f64const -0.0
+    \\    v13 = f64const +Inf
+    \\    v14 = f64const +NaN
+    \\    v15 = f64const 0x0.0000000000001p-1022
+    \\    v16 = f32const +sNaN:0x1
+    \\    v17 = f64const +NaN:0x2
+    \\    v18 = f64const 0x1.999999999999ap-4
+    \\    v19 = f32const -Inf
+    \\    v20 = iadd v0, v1
+    \\    v21 = isub v20, v9  ; v9 = 9999
+    \\    v22 = imul v21, v6  ; v6 = 0x0001_1170
+    \\    v23 = ineg v22
+    \\    v24 = udiv v23, v0
+    \\    v25 = sdiv v24, v0
+    \\    v26 = urem v25, v0
+    \\    v27 = srem v26, v0
+    \\    v28 = umulhi v27, v0
+    \\    v29 = smulhi v28, v7  ; v7 = -70000
+    \\    v30 = band v29, v0
+    \\    v31 = bor v30, v0
+    \\    v32 = bxor v31, v10  ; v10 = -9223372036854775808
+    \\    v33 = bnot v32
+    \\    v34 = bnot v1
+    \\    v35 = band v33, v34
+    \\    v36 = ishl v35, v5  ; v5 = 5
+    \\    v37 = ushr v36, v4  ; v4 = -1
+    \\    v38 = sshr v37, v8  ; v8 = -25536
+    \\    v39 = iconst.i64 3
+    \\    v40 = rotr v38, v39  ; v39 = 3
+    \\    v41 = clz v40
+    \\    v42 = ctz v41
+    \\    v43 = popcnt v42
+    \\    v44 = bswap v43
+    \\    v45 = umin v44, v0
+    \\    v46 = umax v45, v1
+    \\    v47 = iconst.i64 -1
+    \\    v48 = iadd v46, v47  ; v47 = -1
+    \\    v49 = iconst.i64 0x0001_1170
+    \\    v50 = imul v48, v49  ; v49 = 0x0001_1170
+    \\    v51 = iconst.i64 255
+    \\    v52 = band v50, v51  ; v51 = 255
+    \\    v53 = iconst.i64 256
+    \\    v54 = bor v52, v53  ; v53 = 256
+    \\    v55 = iconst.i64 -2
+    \\    v56 = bxor v54, v55  ; v55 = -2
+    \\    v57 = iconst.i64 2
+    \\    v58 = ishl v56, v57  ; v57 = 2
+    \\    v59 = iconst.i64 1
+    \\    v60 = ushr v58, v59  ; v59 = 1
+    \\    v61 = iconst.i64 4
+    \\    v62 = sshr v60, v61  ; v61 = 4
+    \\    v63 = ireduce.i8 v62
+    \\    v64 = iconst.i8 44
+    \\    v65 = iadd v63, v64  ; v64 = 44
+    \\    v66 = iconst.i64 -1
+    \\    v67 = sextend.i128 v66  ; v66 = -1
+    \\    v68 = band v3, v67
+    \\    v69 = iconst.i64 -5
+    \\    v70 = sextend.i128 v69  ; v69 = -5
+    \\    v71 = icmp slt v68, v70
+    \\    v72 = iconst.i64 0
+    \\    v73 = icmp eq v62, v72  ; v72 = 0
+    \\    v74 = icmp slt v0, v1
+    \\    v75 = select v74, v0, v1
+    \\    v76 = uextend.i64 v65
+    \\    v77 = sextend.i64 v73
+    \\    v78 = ireduce.i32 v75
+    \\    v79 = iconcat v76, v77
+    \\    v80, v81 = isplit v79
+    \\    v82 = bitcast.i64 v2
+    \\    v83, v84 = uadd_overflow v80, v81
+    \\    v85, v86 = sadd_overflow v83, v82
+    \\    v87, v88 = usub_overflow v83, v82
+    \\    v89, v90 = ssub_overflow v78, v78
+    \\    v91, v92 = umul_overflow v83, v82
+    \\    v93, v94 = smul_overflow v83, v82
+    \\    v95 = fadd v2, v2
+    \\    v96 = fsub v95, v2
+    \\    v97 = fmul v96, v2
+    \\    v98 = fdiv v97, v2
+    \\    v99 = sqrt v98
+    \\    v100 = fabs v99
+    \\    v101 = fneg v100
+    \\    v102 = fcopysign v101, v2
+    \\    v103 = fcmp lt v102, v2
+    \\    v104 = fcmp uge v102, v2
+    \\    v105 = fdemote.f32 v102
+    \\    v106 = fpromote.f64 v105
+    \\    v107 = fcvt_to_sint_sat.i64 v106
+    \\    v108 = fcvt_to_uint_sat.i32 v106
+    \\    v109 = fcvt_from_sint.f64 v107
+    \\    v110 = fcvt_from_uint.f32 v108
+    \\    v111 = load.i64 notrap aligned v0+8
+    \\    v112 = load.i32 notrap v0-4
+    \\    v113 = load.i8 v0+0x0001_1170
+    \\    store notrap aligned v111, v1
+    \\    store notrap v112, v1-0x0001_1170
+    \\    store v113, v1+3
+    \\    v114 = atomic_load.i64 notrap aligned v0
+    \\    atomic_store notrap aligned v114, v1
+    \\    v115 = atomic_rmw.i64 add v0, v114
+    \\    v116 = atomic_rmw.i32 xchg v0, v78
+    \\    v117 = atomic_cas v0, v115, v114
+    \\    fence\x20
+    \\    v118 = stack_addr.i64 ss0
+    \\    v119 = stack_addr.i64 ss0+16
+    \\    v120 = stack_addr.i64 ss1
+    \\    v121 = symbol_value.i64 gv0
+    \\    v122 = tls_value.i64 gv1
+    \\    v123 = symbol_value.i64 gv2
+    \\    v124 = func_addr.i64 fn0
+    \\    v125 = get_frame_pointer.i64\x20
+    \\    v126 = call fn0(v118, v119)
+    \\    call fn1()
+    \\    v127 = call fn2(v120, v121)
+    \\    v128 = call_indirect sig3, v124(v122, v123)
+    \\    v129 = stack_switch v125, v126, v127
+    \\    v130 = bxor v129, v128
+    \\    v131 = iadd v130, v117
+    \\    v132 = bor v84, v103
+    \\    v133 = bor v132, v104
+    \\    v134 = bor v133, v71
+    \\    brif v134, block2(v131), block3
+    \\
+    \\block3 cold:
+    \\    trap user1
+    \\
+    \\block2(v135: i64):
+    \\    v138 = iadd v135, v0
+    \\    v139 = iadd v138, v76
+    \\    v140 = icmp.i64 ne v76, v139
+    \\    brif v140, block4(v139, v109), block4(v0, v2)
+    \\
+    \\block4(v136: i64, v137: f64):
+    \\    return v136, v137
+    \\}
+
+test every_format_reads_as_cranelift_writes_it for Function.display {
+    let alloc = testing::world().alloc
+    var params = two_types(Type.Int64, right: Type.Int64, alloc)
+    mut params.push(Type.Float64)
+    mut params.push(Type.Int128)
+    let returns = two_types(Type.Int64, right: Type.Float64, alloc)
+    var b = builder_of(3, signature: signature_of(params.view(), returns: returns.view(), call_conv: CallConv.SystemV, alloc), alloc)
+    let entry = entry_of(mut b)
+    let entry_params = b.block_params(entry, alloc)
+    expect entry_params.len() == 4
+    let a = entry_params[0]
+    let c = entry_params[1]
+    let x = entry_params[2]
+    let w = entry_params[3]
+    let wide_slot = mut b.create_sized_stack_slot(StackSlotData(size: 24, align_shift: 3))
+    let byte_slot = mut b.create_sized_stack_slot(StackSlotData(size: 1, align_shift: 0))
+    let pair_of_int64 = two_types(Type.Int64, right: Type.Int64, alloc)
+    let int64 = one_type(Type.Int64, alloc)
+    let no_types = mem::List[Type].empty(alloc)
+    let callee = ext_func_of(mut b, index: 5, signature: signature_of(pair_of_int64.view(), returns: int64.view(), call_conv: CallConv.SystemV, alloc), colocated: true)
+    let firmware = ext_func_of(mut b, index: 9, signature: signature_of(no_types.view(), returns: no_types.view(), call_conv: CallConv.WindowsFastcall, alloc), colocated: false)
+    let data = symbol_of(mut b, namespace: 1, index: 3, colocated: true, tls: false)
+    let tls = symbol_of(mut b, namespace: 1, index: 4, colocated: false, tls: true)
+    let again = ext_func_of(mut b, index: 5, signature: signature_of(pair_of_int64.view(), returns: int64.view(), call_conv: CallConv.SystemV, alloc), colocated: true)
+    let named = symbol_of(mut b, namespace: 0, index: 9, colocated: false, tls: false)
+    let indirect = mut b.import_signature(signature_of(pair_of_int64.view(), returns: int64.view(), call_conv: CallConv.SystemV, alloc))
+    discard mut b.create_block()
+
+    let byte = mut b.iconst(Type.Int8, imm: -1)
+    let masked = mut b.iconst(Type.Int32, imm: 0x1_0000_0005)
+    let big = mut b.iconst(Type.Int64, imm: 70_000)
+    let negative = mut b.iconst(Type.Int64, imm: -70_000)
+    let half = mut b.iconst(Type.Int16, imm: 40_000)
+    let small = mut b.iconst(Type.Int64, imm: 9_999)
+    let min = mut b.iconst(Type.Int64, imm: -9_223_372_036_854_775_807 - 1)
+    discard mut b.f32const(1.5f32.to_bits())
+    discard mut b.f64const((-0.0f64).to_bits())
+    discard mut b.f64const(0x7FF0_0000_0000_0000)
+    discard mut b.f64const(0x7FF8_0000_0000_0000)
+    discard mut b.f64const(1)
+    discard mut b.f32const(0x7F80_0001)
+    discard mut b.f64const(0x7FF8_0000_0000_0002)
+    discard mut b.f64const(0.1f64.to_bits())
+    discard mut b.f32const(0xFF80_0000)
+
+    let v20 = mut b.iadd(a, y: c)
+    let v21 = mut b.isub(v20, y: small)
+    let v22 = mut b.imul(v21, y: big)
+    let v23 = mut b.ineg(v22)
+    let v24 = mut b.udiv(v23, y: a)
+    let v25 = mut b.sdiv(v24, y: a)
+    let v26 = mut b.urem(v25, y: a)
+    let v27 = mut b.srem(v26, y: a)
+    let v28 = mut b.umulhi(v27, y: a)
+    let v29 = mut b.smulhi(v28, y: negative)
+    let v30 = mut b.band(v29, y: a)
+    let v31 = mut b.bor(v30, y: a)
+    let v32 = mut b.bxor(v31, y: min)
+    let v33 = mut b.bnot(v32)
+    let v35 = mut b.band_not(v33, y: c)
+    let v36 = mut b.ishl(v35, y: masked)
+    let v37 = mut b.ushr(v36, y: byte)
+    let v38 = mut b.sshr(v37, y: half)
+    let v40 = mut b.rotr_imm_s(v38, y: 3)
+    let v41 = mut b.clz(v40)
+    let v42 = mut b.ctz(v41)
+    let v43 = mut b.popcnt(v42)
+    let v44 = mut b.bswap(v43)
+    let v45 = mut b.umin(v44, y: a)
+    let v46 = mut b.umax(v45, y: c)
+    let v48 = mut b.iadd_imm_s(v46, y: -1)
+    let v50 = mut b.imul_imm_s(v48, y: 70_000)
+    let v52 = mut b.band_imm_s(v50, y: 0xFF)
+    let v54 = mut b.bor_imm_s(v52, y: 0x100)
+    let v56 = mut b.bxor_imm_s(v54, y: -2)
+    let v58 = mut b.ishl_imm_s(v56, y: 2)
+    let v60 = mut b.ushr_imm_s(v58, y: 1)
+    let v62 = mut b.sshr_imm_s(v60, y: 4)
+    let reduced8 = mut b.ireduce(Type.Int8, x: v62)
+    let narrow = mut b.iadd_imm_s(reduced8, y: 300)
+    let wide_and = mut b.band_imm_s(w, y: -1)
+    let wide_test = mut b.icmp_imm_s(IntCC.SignedLessThan, x: wide_and, y: -5)
+    let eq = mut b.icmp_imm_s(IntCC.Equal, x: v62, y: 0)
+    let lt = mut b.icmp(IntCC.SignedLessThan, x: a, y: c)
+    let picked = mut b.select(lt, x: a, y: c)
+    let ext = mut b.uextend(Type.Int64, x: narrow)
+    let sext = mut b.sextend(Type.Int64, x: eq)
+    let reduced = mut b.ireduce(Type.Int32, x: picked)
+    let pair = mut b.iconcat(ext, hi: sext)
+    let halves = mut b.isplit(pair)
+    let raw = mut b.bitcast(Type.Int64, flags: MemFlags.new(), x)
+    let sum = mut b.uadd_overflow(halves.low, y: halves.high)
+    discard mut b.sadd_overflow(sum.value, y: raw)
+    discard mut b.usub_overflow(sum.value, y: raw)
+    discard mut b.ssub_overflow(reduced, y: reduced)
+    discard mut b.umul_overflow(sum.value, y: raw)
+    discard mut b.smul_overflow(sum.value, y: raw)
+    let f95 = mut b.fadd(x, y: x)
+    let f96 = mut b.fsub(f95, y: x)
+    let f97 = mut b.fmul(f96, y: x)
+    let f98 = mut b.fdiv(f97, y: x)
+    let f99 = mut b.sqrt(f98)
+    let f100 = mut b.fabs(f99)
+    let f101 = mut b.fneg(f100)
+    let f102 = mut b.fcopysign(f101, y: x)
+    let below = mut b.fcmp(FloatCC.LessThan, x: f102, y: x)
+    let unordered = mut b.fcmp(FloatCC.UnorderedOrGreaterThanOrEqual, x: f102, y: x)
+    let demoted = mut b.fdemote(Type.Float32, x: f102)
+    let promoted = mut b.fpromote(Type.Float64, x: demoted)
+    let to_signed = mut b.fcvt_to_sint_sat(Type.Int64, x: promoted)
+    let to_unsigned = mut b.fcvt_to_uint_sat(Type.Int32, x: promoted)
+    let from_signed = mut b.fcvt_from_sint(Type.Float64, x: to_signed)
+    discard mut b.fcvt_from_uint(Type.Float32, x: to_unsigned)
+    let loaded = mut b.load(Type.Int64, flags: MemFlags.owned(), p: a, offset: 8)
+    let loaded32 = mut b.load(Type.Int32, flags: MemFlags.unaligned(), p: a, offset: -4)
+    let loaded8 = mut b.load(Type.Int8, flags: MemFlags.new(), p: a, offset: 70_000)
+    mut b.store(MemFlags.owned(), x: loaded, p: c, offset: 0)
+    mut b.store(MemFlags.unaligned(), x: loaded32, p: c, offset: -70_000)
+    mut b.store(MemFlags.new(), x: loaded8, p: c, offset: 3)
+    let atomic = mut b.atomic_load(Type.Int64, flags: MemFlags.owned(), p: a)
+    mut b.atomic_store(MemFlags.owned(), x: atomic, p: c)
+    let added = mut b.atomic_rmw(Type.Int64, flags: MemFlags.owned(), op: AtomicRmwOp.Add, p: a, x: atomic)
+    discard mut b.atomic_rmw(Type.Int32, flags: MemFlags.owned(), op: AtomicRmwOp.Xchg, p: a, x: reduced)
+    let exchanged = mut b.atomic_cas(MemFlags.owned(), p: a, e: added, x: atomic)
+    mut b.fence()
+    let slot = mut b.stack_addr(Type.Int64, slot: wide_slot, offset: 0)
+    let slot_end = mut b.stack_addr(Type.Int64, slot: wide_slot, offset: 16)
+    let byte_addr = mut b.stack_addr(Type.Int64, slot: byte_slot, offset: 0)
+    let data_addr = mut b.symbol_value(Type.Int64, global_value: data)
+    let tls_addr = mut b.tls_value(Type.Int64, global_value: tls)
+    let named_addr = mut b.symbol_value(Type.Int64, global_value: named)
+    let function = mut b.func_addr(Type.Int64, func_ref: callee)
+    let frame = mut b.get_frame_pointer(Type.Int64)
+    let first_call = mut b.call(callee, args: two_values(slot, right: slot_end, alloc).view())
+    let called = call_result(b, call: first_call, alloc)
+    let none = mem::List[Value].empty(alloc)
+    discard mut b.call(firmware, args: none.view())
+    let second_call = mut b.call(again, args: two_values(byte_addr, right: data_addr, alloc).view())
+    let called_again = call_result(b, call: second_call, alloc)
+    let indirect_call = mut b.call_indirect(indirect, callee: function, args: two_values(tls_addr, right: named_addr, alloc).view())
+    let indirect_result = call_result(b, call: indirect_call, alloc)
+    let switched = mut b.stack_switch(frame, load_context_ptr: called, in_payload0: called_again)
+    let xored = mut b.bxor(switched, y: indirect_result)
+    let mixed = mut b.iadd(xored, y: exchanged)
+    let flags = mut b.bor(sum.flag, y: below)
+    let more_flags = mut b.bor(flags, y: unordered)
+    let all_flags = mut b.bor(more_flags, y: wide_test)
+    let then = mut b.create_block()
+    let otherwise = mut b.create_block()
+    let done = mut b.create_block()
+    discard mut b.append_block_param(then, ty: Type.Int64)
+    discard mut b.append_block_param(done, ty: Type.Int64)
+    discard mut b.append_block_param(done, ty: Type.Float64)
+    mut b.brif(all_flags, then, then_args: one_value(mixed, alloc).view(), otherwise, otherwise_args: none.view())
+    mut b.switch_to_block(otherwise)
+    mut b.seal_block(otherwise)
+    mut b.set_cold_block(otherwise)
+    mut b.trap(TrapCode(user: 1))
+    mut b.switch_to_block(then)
+    mut b.seal_block(then)
+    let then_params = b.block_params(then, alloc)
+    expect then_params.len() == 1
+    let param = then_params[0]
+    let moved = mut b.iadd(param, y: a)
+    let moved_again = mut b.iadd(moved, y: ext)
+    let differs = mut b.icmp(IntCC.NotEqual, x: ext, y: moved_again)
+    mut b.brif(differs, then: done, then_args: two_values(moved_again, right: from_signed, alloc).view(), otherwise: done, otherwise_args: two_values(a, right: x, alloc).view())
+    mut b.switch_to_block(done)
+    mut b.seal_block(done)
+    let results = b.block_params(done, alloc)
+    mut b.ret(results.view())
+    mut b.seal_all_blocks()
+    expect_text(take b.finalize(), expected: FORMATS, alloc)
+} every_format_reads_as_cranelift_writes_it
+
+const SRCLOCS: Str =
+    \\function u0:4() system_v {
+    \\                                block0:
+    \\@0020                               v0 = iconst.i64 1
+    \\                                    v1 = iconst.i64 2
+    \\                                    v2 = iadd v0, v1  ; v0 = 1, v1 = 2
+    \\@123456                             jump block1(v2)
+    \\
+    \\                                block1(v3: i64) cold:
+    \\@123456                             return
+    \\}
+
+test source_locations_lead_their_instructions for Builder.set_srcloc {
+    let alloc = testing::world().alloc
+    let none = mem::List[Type].empty(alloc)
+    var b = builder_of(4, signature: signature_of(none.view(), returns: none.view(), call_conv: CallConv.SystemV, alloc), alloc)
+    let entry = mut b.create_block()
+    let next = mut b.create_block()
+    mut b.switch_to_block(entry)
+    mut b.seal_block(entry)
+    mut b.set_srcloc(SourceLoc(bits: 0x20))
+    let one = mut b.iconst(Type.Int64, imm: 1)
+    mut b.set_srcloc(DEFAULT_LOC)
+    let two = mut b.iconst(Type.Int64, imm: 2)
+    mut b.set_srcloc(SourceLoc(bits: 0x1F))
+    let sum = mut b.iadd(one, y: two)
+    mut b.set_srcloc(SourceLoc(bits: 0x0012_3456))
+    discard mut b.append_block_param(next, ty: Type.Int64)
+    mut b.jump(next, args: one_value(sum, alloc).view())
+    mut b.switch_to_block(next)
+    mut b.seal_block(next)
+    mut b.set_cold_block(next)
+    let no_values = mem::List[Value].empty(alloc)
+    mut b.ret(no_values.view())
+    mut b.seal_all_blocks()
+    expect_text(take b.finalize(), expected: SRCLOCS, alloc)
+} source_locations_lead_their_instructions

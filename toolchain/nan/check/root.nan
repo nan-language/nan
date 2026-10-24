@@ -1,4 +1,488 @@
-//! The canonical NIR stream of each workspace package, from its checkers under each target it declares, for the comparison of the NaN front end with the bootstrap.
+//! Code roots: the artefact of a package's current state in a closure, from its checkers under each target it declares, with the files its attestation hashes.
+
+/// The artefact of a package's current state and the source and machine files its attestation
+/// hashes, by path within the package.
+pkg struct Built {
+    pkg artefact: mem::Bytes
+    pkg sources: mem::List[artefact::SourceFile]
+} Built
+
+/// What checking a package gives its artefact: its code root, and the seals its attestation
+/// records as `artefact::seal_list` encodes them.
+struct Coded {
+    code_root: mem::Bytes
+    seals: mem::Bytes
+} Coded
+
+/// The artefact of the current state of a closure's member. Its code root and seals are kept in
+/// the build cache, under the toolchain, the member's name and the states of the closure's
+/// members.
+pkg fn Session.build(self, closure: workspace::Closure, member: workspace::Member) -> Built {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let source = held.member(member)
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    let toolchain_hash = self.toolchain_hash()
+    var key = text::String.of("coded\n", alloc)
+    mut key.append(toolchain_hash.full(alloc).as_str())
+    mut key.push('\n')
+    mut key.append(package_name)
+    mut key.push('\n')
+    for entry in closure.members {
+        let state = match entry.value() {
+            workspace::Member.Source(_) => coded_state(held.member(entry.value()), alloc)
+            workspace::Member.Release(at) => held.releases[at].root
+        }
+        mut key.append(entry.key().as_str())
+        mut key.push(' ')
+        mut key.append(state.full(alloc).as_str())
+        mut key.push('\n')
+    }
+    let keyed = hashing::HashValue.of(key.as_bytes())
+    let opened = open_proof_cache(self.home, alloc)
+    var found = cached_coded(opened, key: keyed, alloc)
+    if found.is_none() {
+        let computed = self.coded(closure, member)
+        match opened {
+            Some(user_cache) => {
+                discard attempt user_cache.put(keyed, contents: computed.encoded(alloc).view())
+            }
+            None => {}
+        }
+        found = Some(take computed)
+    }
+    let Some(coded) = found else {
+        expect false
+        return Built(artefact: mem::Bytes.empty(alloc), sources: package_files(source, alloc))
+    }
+    return assemble(source, coded, toolchain_hash, alloc)
+} Session.build
+
+/// The toolchain hash of language version 1.
+fn Session.toolchain_hash(self) -> hashing::HashValue {
+    let Some(tree) = self.toolchain_tree() else {
+        expect false
+        return hashing::HashValue.of(b"")
+    }
+    return toolchain::hash(1, tree, alloc: self.alloc)
+} Session.toolchain_hash
+
+/// The state of a workspace package its code root and seals depend on: the hash of its files but
+/// its lock, which its closure's members stand for.
+fn coded_state(source: workspace::Package, alloc: mem::Alloc) -> hashing::HashValue {
+    var files = package_files(source, alloc)
+    mut files.retain(fn(file: artefact::SourceFile) => file.path.as_str() != ".nan/lock.nan")
+    return artefact::source_tree_hash(files.view(), alloc)
+} coded_state
+
+fn Coded.encoded(self, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::bytes(mut out, value: self.code_root.view())
+    encoding::bytes(mut out, value: self.seals.view())
+    return out
+} Coded.encoded
+
+/// The code root and seals a build cache entry holds; none for one that does not decode.
+fn Coded.decoded(held: Slice[u8], alloc: mem::Alloc) -> Option[Coded] {
+    let Some(code_root) = artefact::read_bytes(held, at: 0) else {
+        return None
+    }
+    let Some(seals) = artefact::read_bytes(held, at: code_root.next) else {
+        return None
+    }
+    if seals.next != held.len() {
+        return None
+    }
+    return Some(Coded(code_root: code_root.copy(held, alloc), seals: seals.copy(held, alloc)))
+} Coded.decoded
+
+/// The code root and seals the build cache holds under a key; none without a cache or an entry.
+fn cached_coded(opened: Option[cache::Cache], key: hashing::HashValue, alloc: mem::Alloc) -> Option[Coded] {
+    let Some(user_cache) = opened else {
+        return None
+    }
+    let Ok(found) = attempt user_cache.entry(key) else {
+        return None
+    }
+    let Ok(Some(held)) = found else {
+        return None
+    }
+    return Coded.decoded(held.view(), alloc)
+} cached_coded
+
+/// The artefact of a package's current state from its code root and seals.
+fn assemble(source: workspace::Package, coded: Coded, toolchain_hash: hashing::HashValue, alloc: mem::Alloc) -> Built {
+    let sources = package_files(source, alloc)
+    let attested = artefact::attestation(toolchain_hash, source_tree: artefact::source_tree_hash(sources.view(), alloc), seals: coded.seals.view(), alloc)
+    return Built(artefact: artefact::artefact(coded.code_root.view(), attested: attested.view(), alloc), sources: take sources)
+} assemble
+
+/// The code root and seals of the current state of a closure's member.
+fn Session.coded(self, closure: workspace::Closure, member: workspace::Member) -> Coded {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let source = held.member(member)
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    var checkers = mem::List[TargetChecker].empty(alloc)
+    for target in check_targets(source, alloc) {
+        let checker = self.unchecked(closure, target)
+        checker.db().record()
+        match checker.package_named(package_name) {
+            Some(id) => checker.check_whole(id)
+            None => {}
+        }
+        mut checkers.push(TargetChecker(target: target, checker: take checker))
+    }
+    let items = Items.of(checkers.view(), package_name, alloc)
+    let computed = match member {
+        workspace::Member.Source(index) => self.computed_snapshots(index, items, confirmed: mem::List[text::String].empty(alloc).view())
+        workspace::Member.Release(_) => items.snapshots(source, confirmed: mem::List[text::String].empty(alloc).view(), alloc)
+    }
+    let stream = package_stream(checkers.view(), package_name, alloc)
+    let Some(leading) = checkers.get(0) else {
+        expect false
+        return Coded(code_root: mem::Bytes.empty(alloc), seals: mem::Bytes.empty(alloc))
+    }
+    let Some(id) = leading.checker.package_named(package_name) else {
+        expect false
+        return Coded(code_root: mem::Bytes.empty(alloc), seals: mem::Bytes.empty(alloc))
+    }
+    let manifest = match source.files.get(0) {
+        Some(file) => output::lossy(format::source_file(file.syntax, only: None, alloc).view(), alloc)
+        None => text::String.empty(alloc)
+    }
+    let snapshots = interface_snapshots(computed, grammar: self.grammar.contents(), alloc)
+    let required = self.required(closure, checkers: checkers.view(), package_name)
+    let source_tombstones = leading.checker.tombstone_forms(id, history: false)
+    let history_tombstones = leading.checker.tombstone_forms(id, history: true)
+    let ledger = ledger_records(source, package_name, entries: leading.checker.package_ledger(id).view(), alloc)
+    let lines = span_lines(source, lines: stream.lines, alloc)
+    let NirStream(bytes: nir, lines: _) = stream
+    let parts = artefact::Parts(language: 1, manifest: take manifest, snapshots: take snapshots, nir: take nir, required: take required, source_tombstones: take source_tombstones, history_tombstones: take history_tombstones, ledger: take ledger, lines: take lines, schemas: leading.checker.state_schemas(id))
+    let code_root = artefact::code_root(parts, alloc)
+    return Coded(code_root: take code_root, seals: artefact::seal_list(attested_seals(computed, alloc).view(), alloc))
+} Session.coded
+
+/// The text of each module's API snapshot a code root's interface part holds, empty for a module
+/// without one: its entries' lines but seals, closures and signatures, of each entry holding more
+/// than its path.
+fn interface_snapshots(computed: Snapshots, grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::List[artefact::Snapshot] {
+    var found = mem::List[artefact::Snapshot].empty(alloc)
+    for module in computed.modules {
+        var written = text::String.empty(alloc)
+        if module.entries.len() > 0 {
+            mut written.append("nan api 1\n")
+            for entry in module.entries {
+                add_interface_lines(mut written, entry, grammar, alloc)
+            }
+        }
+        mut found.push(artefact::Snapshot(module: text::String.of(module.name.as_str(), alloc), text: take written))
+    }
+    return found
+} interface_snapshots
+
+/// Adds an entry's lines but seals, closures and signatures to a snapshot's interface text, when
+/// it holds more than its path.
+fn add_interface_lines(mut written: text::String, entry: machine::ApiEntry, grammar: syntax::Grammar, alloc: mem::Alloc) {
+    var lines = entry.lines(grammar, alloc)
+    mut lines.retain(fn(line: text::String) => not line.starts_with("seal ") and not line.starts_with("closure ") and not line.starts_with("signature "))
+    if lines.len() <= 1 {
+        return
+    }
+    for line in lines {
+        mut written.append(line.as_str())
+        mut written.push('\n')
+    }
+} add_interface_lines
+
+/// The encoded requires-set of a package across the checkers of its targets, each entry's
+/// roles, relied facts, methods and implementers joined, by path.
+fn Session.required(self, closure: workspace::Closure, checkers: Slice[TargetChecker], package_name: Str) -> mem::List[mem::Bytes] {
+    let alloc = self.alloc
+    var joined = mem::Map[text::String, RequiresEntry].empty(alloc)
+    for held in checkers {
+        let Some(id) = held.checker.package_named(package_name) else {
+            continue
+        }
+        for entry in take held.checker.requires_set(id, epoch_of_path: fn(path: Str) -> u64 {
+            return self.epoch_of(closure, path)
+        }) {
+            join_required(mut joined, take entry, alloc)
+        }
+    }
+    var encoded = mem::List[mem::Bytes].empty(alloc)
+    for entry in joined {
+        mut encoded.push(entry.value().encoded(alloc))
+    }
+    return encoded
+} Session.required
+
+/// Joins an entry to those of a requires-set with its path.
+fn join_required(mut joined: mem::Map[text::String, RequiresEntry], take entry: RequiresEntry, alloc: mem::Alloc) {
+    if not joined.contains(entry.path) {
+        let path = text::String.of(entry.path.as_str(), alloc)
+        discard mut joined.insert(take path, value: take entry)
+        return
+    }
+    var known = mut joined.at_mut(entry.path)
+    let RequiresEntry(path: _, roles: roles, interface_hash: _, epoch: _, relied: relied, methods: methods, item_hash: item_hash, implementers: implementers) = entry
+    for role in take roles {
+        discard mut known.roles.insert(role)
+    }
+    for fact in take relied {
+        discard mut known.relied.insert(take fact)
+    }
+    for method in take methods {
+        let mem::KeyValue(key: name, value: reference) = method
+        discard mut known.methods.insert(take name, value: take reference)
+    }
+    for name in take implementers {
+        discard mut known.implementers.insert(take name)
+    }
+    if known.item_hash.is_none() {
+        known.item_hash = item_hash
+    }
+} join_required
+
+/// The behaviour epoch of a foreign item in the release a closure reads: from the publish
+/// summary of a release of the store, 0 otherwise.
+fn Session.epoch_of(self, closure: workspace::Closure, path: Str) -> u64 {
+    let cut = match path.find("::") {
+        Some(at) => at
+        None => path.byte_len()
+    }
+    let Some(package_name) = path.slice_bytes(0, end: cut) else {
+        return 0
+    }
+    let Some(workspace::Member.Release(index)) = closure.member(package_name) else {
+        return 0
+    }
+    let Some(release) = self.workspace.contents().releases.get(index) else {
+        expect false
+        return 0
+    }
+    let Some(summary) = release.entry.contents().summary else {
+        return 0
+    }
+    return summary.epoch(path)
+} Session.epoch_of
+
+/// The ledger kind's position in the order of kinds.
+fn Kind.position(self) -> u64 {
+    return match self {
+        Kind.Trusted => 0
+        Kind.Assume => 1
+        Kind.Foreign => 2
+        Kind.Landing => 3
+        Kind.Validator => 4
+        Kind.Decoder => 5
+        Kind.Grant => 6
+        Kind.Waiver => 7
+        Kind.Todo => 8
+        Kind.Dbg => 9
+    }
+} Kind.position
+
+/// The ledger records of a package's ledger entries.
+fn ledger_records(source: workspace::Package, package_name: Str, entries: Slice[Entry], alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    var records = mem::List[mem::Bytes].empty(alloc)
+    for entry in entries {
+        var record = encoding::Record.empty(alloc)
+        var item = mem::Bytes.empty(alloc)
+        encoding::bytes(mut item, value: entry.item.as_bytes())
+        mut record.field(1, content: take item)
+        var kind = mem::Bytes.empty(alloc)
+        encoding::uvar(mut kind, value: entry.kind.position())
+        mut record.field(2, content: take kind)
+        var path = mem::Bytes.empty(alloc)
+        encoding::bytes(mut path, value: span_path(source, package_name, path: entry.path.as_str(), alloc).as_bytes())
+        mut record.field(3, content: take path)
+        var line = mem::Bytes.empty(alloc)
+        encoding::uvar(mut line, value: u64.widen(entry.line))
+        mut record.field(4, content: take line)
+        var texts = mem::Bytes.empty(alloc)
+        encoding::uvar(mut texts, value: u64.widen(entry.texts.len()))
+        for written in entry.texts {
+            encoding::bytes(mut texts, value: written.as_bytes())
+        }
+        mut record.field(5, content: take texts)
+        mut records.push(take record.finish(alloc))
+    }
+    return records
+} ledger_records
+
+/// A file's path as spans write it: the package name, then its path within the package.
+fn span_path(source: workspace::Package, package_name: Str, path: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(package_name, alloc)
+    mut written.push('/')
+    var prefix = text::String.of(source.dir.as_str(), alloc)
+    mut prefix.push('/')
+    if path.starts_with(prefix.as_str()) {
+        match path.slice_bytes(prefix.byte_len(), end: path.byte_len()) {
+            Some(within) => mut written.append(within)
+            None => mut written.append(path)
+        }
+        return written
+    }
+    mut written.append(path)
+    return written
+} span_path
+
+/// Each file holding the first line of a span, by path as spans write it, with each such line's
+/// number and text.
+fn span_lines(source: workspace::Package, lines: mem::Map[text::String, mem::Set[u32]], alloc: mem::Alloc) -> mem::List[artefact::FileLines] {
+    var found = mem::List[artefact::FileLines].empty(alloc)
+    for entry in lines {
+        let path = entry.key().as_str()
+        var wanted = text::String.of(source.dir.as_str(), alloc)
+        mut wanted.push('/')
+        match path.find("/") {
+            Some(at) => {
+                expect at < path.byte_len()
+                match path.slice_bytes(at + 1, end: path.byte_len()) {
+                    Some(within) => mut wanted.append(within)
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        let file = source.files.position(fn(held: workspace::File) => held.path.as_str() == wanted.as_str())
+        var texts = mem::List[artefact::Line].empty(alloc)
+        for line in entry.value() {
+            let written = match file {
+                Some(at) => output::lossy(source.files[at].syntax.line_text(line), alloc)
+                None => text::String.empty(alloc)
+            }
+            mut texts.push(artefact::Line(number: line, text: take written))
+        }
+        mut found.push(artefact::FileLines(path: text::String.of(path, alloc), lines: take texts))
+    }
+    return found
+} span_lines
+
+/// The seals of a package's computed snapshots as an attestation records them.
+fn attested_seals(computed: Snapshots, alloc: mem::Alloc) -> mem::List[artefact::AttestedSeal] {
+    var found = mem::List[artefact::AttestedSeal].empty(alloc)
+    for module in computed.modules {
+        for entry in module.entries {
+            for seal in entry.seals {
+                var entries = mem::List[artefact::SealEntry].empty(alloc)
+                for closure_entry in seal.entries {
+                    mut entries.push(artefact::SealEntry(body: closure_entry.body, path: text::String.of(closure_entry.path.as_str(), alloc), hash: closure_entry.hash))
+                }
+                mut found.push(artefact::AttestedSeal(principal: text::String.of(seal.principal.as_str(), alloc), item: text::String.of(entry.path.as_str(), alloc), sealed: seal.item, closure: seal.closure, entries: take entries))
+            }
+        }
+    }
+    return found
+} attested_seals
+
+/// The normalised forms of the tombstones in a package's history, or else in its source.
+fn Checker.tombstone_forms(self, package_id: ty::PackageId, history: bool) -> mem::List[text::String] {
+    let db = self.db()
+    var forms = mem::List[text::String].empty(self.alloc())
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            let ast::ItemKind.Retired(_) = db.ast(item).kind else {
+                continue
+            }
+            if db.in_history(item) == history {
+                mut forms.push(self.forms(item).normalised)
+            }
+        }
+    }
+    return forms
+} Checker.tombstone_forms
+
+/// Each component state a package declares, the target of an impl line naming
+/// `sys::Component`, with its canonical path and schema hash.
+fn Checker.state_schemas(self, package_id: ty::PackageId) -> mem::List[artefact::Schema] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var states = mem::List[ty::ItemId].empty(alloc)
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            let sig = self.sig(item)
+            let SigKind.Impl(target: Some(TypeKey.Item(target)), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+                continue
+            }
+            if db.canonical(bound.item).as_str() == "sys::Component" {
+                mut states.push(target)
+            }
+        }
+    }
+    mut states.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => state_order(db, left, right))
+    var found = mem::List[artefact::Schema].empty(alloc)
+    for index in 0..<states.len() {
+        if index > 0 and states[index - 1] == states[index] {
+            continue
+        }
+        let target = states[index]
+        let ty = self.types().item(target, args: mem::List[ty::Arg].empty(alloc))
+        mut found.push(artefact::Schema(path: db.canonical(target), hash: self.schema(ty).hash(alloc)))
+    }
+    return found
+} Checker.state_schemas
+
+/// The order of component states by canonical path, then item.
+fn state_order(db: Db, left: ty::ItemId, right: ty::ItemId) -> core::Ordering {
+    let by_path = db.canonical(left).as_str().cmp(db.canonical(right).as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    return left.cmp(right)
+} state_order
+
+/// A package's source and machine files, by path within the package.
+pkg fn package_files(source: workspace::Package, alloc: mem::Alloc) -> mem::List[artefact::SourceFile] {
+    var prefix = text::String.of(source.dir.as_str(), alloc)
+    mut prefix.push('/')
+    var files = mem::List[artefact::SourceFile].empty(alloc)
+    for file in source.files {
+        add_within(mut files, path: file.path.as_str(), content: file.syntax.source.view(), prefix: prefix.as_str(), alloc)
+    }
+    match source.machine.lock_file {
+        Some(loaded) => add_within(mut files, path: loaded.path.as_str(), content: loaded.bytes.view(), prefix: prefix.as_str(), alloc)
+        None => {}
+    }
+    match source.machine.history_file {
+        Some(loaded) => add_within(mut files, path: loaded.path.as_str(), content: loaded.bytes.view(), prefix: prefix.as_str(), alloc)
+        None => {}
+    }
+    for snapshot in source.machine.snapshots {
+        add_within(mut files, path: snapshot.loaded.path.as_str(), content: snapshot.loaded.bytes.view(), prefix: prefix.as_str(), alloc)
+    }
+    mut files.sort_by(fn(left: artefact::SourceFile, right: artefact::SourceFile) => file_order(left, right))
+    return files
+} package_files
+
+/// Adds a file whose path lies under `prefix`, by its path after it.
+fn add_within(mut files: mem::List[artefact::SourceFile], path: Str, content: Slice[u8], prefix: Str, alloc: mem::Alloc) {
+    if not path.starts_with(prefix) {
+        return
+    }
+    let Some(within) = path.slice_bytes(prefix.byte_len(), end: path.byte_len()) else {
+        return
+    }
+    var held = mem::Bytes.empty(alloc)
+    mut held.append(content)
+    mut files.push(artefact::SourceFile(path: text::String.of(within, alloc), content: take held))
+} add_within
+
+/// The order of files by path, then content.
+fn file_order(left: artefact::SourceFile, right: artefact::SourceFile) -> core::Ordering {
+    let by_path = left.path.as_str().cmp(right.path.as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    return left.content.view().cmp(right.content.view())
+} file_order
 
 /// The canonical NIR stream of each workspace package's current state, or of the one named
 /// `wanted` when it is not empty, each after a line holding the package's name and the stream's

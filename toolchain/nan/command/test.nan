@@ -1,0 +1,131 @@
+//! `nan test`: checks its scope as `nan check` does and, when no diagnostic is an error, runs the tests the scope selects, the affected ones or the run a replay token names, printing a `fail` record per test failing on a run target.
+
+/// `nan test`.
+fn test_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let held = session.workspace.contents()
+    let std = session.std.contents()
+    var replay_location: Option[text::String] = None
+    var runs = test_runs::Runs.All
+    match invocation.value("--replay") {
+        Some(written) => {
+            let Some(token) = test_runs::Token.read(written, alloc) else {
+                return replay_unknown(invocation, session, alloc)
+            }
+            let Some(location) = token.location(session) else {
+                return replay_unknown(invocation, session, alloc)
+            }
+            replay_location = Some(take location)
+            runs = test_runs::Runs.Replay(take token)
+        }
+        None => {
+            if invocation.flag("--affected") {
+                runs = test_runs::Runs.Affected
+            }
+        }
+    }
+    var scoped = invocation.scope()
+    match replay_location {
+        Some(location) => {
+            scoped = Some(location.as_str())
+        }
+        None => {}
+    }
+    let Some(resolved) = scope::Scope.resolve(held, current, written: scoped, alloc) else {
+        let written = match scoped {
+            Some(given) => given
+            None => "."
+        }
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    var diagnostics = session.reported(resolved.scope)
+    fix::offer(session, current, written: scoped, diagnostics: mut diagnostics)
+    var errors: usize = 0
+    var incomplete: usize = 0
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        invariant errors < diagnostics.len() and incomplete < diagnostics.len()
+        let class = reported.code.class()
+        if class == diagnostic::Class.Error {
+            errors += 1
+        } else if class == diagnostic::Class.Incompleteness {
+            incomplete += 1
+        }
+        mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+    }
+    var report = test_runs::Report.empty(alloc)
+    if errors == 0 {
+        match try ran_tests(session, scope: resolved.scope, runs, alloc) {
+            Ok(ran) => {
+                report = ran
+            }
+            Err(exposed) => {
+                var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildCacheExposed, alloc)
+                reported.path = Some(text::String.of(exposed.path.as_str(), alloc))
+                mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+                errors += 1
+            }
+        }
+    }
+    expect errors <= ~0usize - report.diagnostics.len()
+    errors += report.diagnostics.len()
+    for reported in report.diagnostics {
+        mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
+    }
+    for failed in take fail_records(held, scope: resolved.scope, report, alloc) {
+        mut records.push(take failed)
+    }
+    return test_output(invocation, written: resolved.written.as_str(), take records, errors, incomplete, report, alloc)
+} test_run
+
+/// The runs of the tests a scope selects, with the build cache of the running user; a part of it
+/// that is exposed ends them before any run.
+fn ran_tests(session: check::Session, scope: scope::Scope, runs: test_runs::Runs, alloc: mem::Alloc) -> Result[test_runs::Report, cache::Exposed] fails platform::IoError {
+    return match try cache::Cache.open(session.home, alloc) {
+        Ok(user_cache) => try test_runs::run(session, scope, runs, user_cache)
+        Err(exposed) => Err(take exposed)
+    }
+} ran_tests
+
+/// The output of `nan test --replay` with a token that names no run: `test.replay-token`.
+fn replay_unknown(invocation: Invocation, session: check::Session, alloc: mem::Alloc) -> output::Output {
+    let reported = diagnostic::Diagnostic.new(diagnostic::Code.TestReplayToken, alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    mut records.push(record(session.workspace.contents(), std: session.std.contents(), scope: scope::Scope.Workspace, reported, alloc))
+    return test_output(invocation, written: "", take records, errors: 1, incomplete: 0, report: test_runs::Report.empty(alloc), alloc)
+} replay_unknown
+
+/// A `fail` record per failing test of a report.
+fn fail_records(workspace: workspace::Workspace, scope: scope::Scope, report: test_runs::Report, alloc: mem::Alloc) -> mem::List[output::Record] {
+    let writer = writer_of(workspace, scope, alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    for failure in report.failures {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(written_for(failure.item.as_str(), writer, alloc))
+        mut fields.push(located(failure.path.as_str(), line: failure.line, alloc))
+        mut fields.push(text::String.of(failure.target.name(), alloc))
+        mut fields.push(text::String.of(failure.cause.as_str(), alloc))
+        var lines = mem::List[text::String].empty(alloc)
+        for line in failure.lines {
+            mut lines.push(text::String.of(line.as_str(), alloc))
+        }
+        mut records.push(output::Record(word: text::String.of("fail", alloc), fields: take fields, lines: take lines))
+    }
+    return records
+} fail_records
+
+/// The output of a test command: its records, its counts of errors and incompleteness, and what
+/// its runs found.
+fn test_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], errors: usize, incomplete: usize, report: test_runs::Report, alloc: mem::Alloc) -> output::Output {
+    let failed = report.failures.len()
+    var verdict = output::Verdict.Ok
+    if errors > 0 or failed > 0 {
+        verdict = output::Verdict.Failed
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
+    mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: incomplete))
+    mut summary.push(output::Count(name: text::String.of("tests", alloc), value: report.tests))
+    mut summary.push(output::Count(name: text::String.of("failed", alloc), value: failed))
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} test_output

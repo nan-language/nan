@@ -1,0 +1,577 @@
+//! The synchronisation primitives of `hw`: `hw::without_irqs`, spin locks, devices behind an IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of the CPU holding it plus one, each executor thread being a CPU on `x86_64-host`, so a CPU acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and vectors to bind a device to.
+
+/// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it on
+/// a machine target and their state restored after.
+fn without_irqs(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let flags = irq_save(mut lo, mut fx)
+    let body_ty = fn_param(lo, supply, index: 0)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(0).address_value(), args: Array[Held, 1].filled(Held.Empty).view())
+    irq_restore(mut lo, mut fx, flags)
+    hw_forward(mut lo, mut fx, supply, called)
+} without_irqs
+
+/// Disables maskable interrupts on a machine target, giving the flags to restore.
+fn irq_save(mut lo: Lowering, mut fx: Fx) -> Option[clif::Value] {
+    if not lo.machine() {
+        return None
+    }
+    let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect saved.len() > 0
+    return Some(saved[0])
+} irq_save
+
+fn irq_restore(mut lo: Lowering, mut fx: Fx, flags: Option[clif::Value]) {
+    let Some(saved) = flags else {
+        return
+    }
+    discard mut lo.call_stub(mut fx, stub: Stub.IrqRestore, args: Array[clif::Value, 1].filled(saved).view())
+} irq_restore
+
+/// Acquires a lock word for the running CPU, spinning while another CPU holds it; when the
+/// running CPU holds it already the kernel halts, located at the operation's call when `located`
+/// holds.
+fn sync_acquire(mut lo: Lowering, mut fx: Fx, lock_word: clif::Value, located: bool) {
+    let index = running_index(mut lo, mut fx)
+    let holder = mut fx.b.iadd_imm_s(index, y: 1)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let free = mut fx1.ptr(0)
+        let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: lock_word, e: free, x: holder)
+        let held = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+        mut fx1.if_true(held, then: fn[mut lo](mut fx2: Fx) {
+            let again = mut fx2.b.icmp(clif::IntCC.Equal, x: seen, y: holder)
+            mut fx2.if_true(again, then: fn[mut lo](mut fx3: Fx) {
+                let location = match located {
+                    true => caller_location(mut lo, fx: mut fx3)
+                    false => mut fx3.ptr(0)
+                }
+                discard mut lo.call_routine(mut fx3, routine: Routine.Reacquired, args: Array[clif::Value, 1].filled(location).view())
+            })
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: held, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} sync_acquire
+
+fn release_word(mut fx: Fx, lock_word: clif::Value) {
+    let free = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: free, p: lock_word)
+} release_word
+
+/// The number of the CPU, or executor thread, running the caller.
+fn running_index(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let record = mut lo.thread(mut fx)
+    return mut fx.load(PTR, addr: record, offset: THREAD_INDEX)
+} running_index
+
+/// The offset of a field of the operation's owner type.
+fn owner_field(mut lo: Lowering, supply: Supply, field_name: Str) -> u64 {
+    let Some(owner) = supply.owner else {
+        expect false
+        return 0
+    }
+    let named = mut lo.layouts.field(lo.ck, ty: owner, variant: None, label: field_name)
+    return named.offset
+} owner_field
+
+/// The spin lock: its lock word, then its value.
+fn spin_lock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let lock_at = owner_field(mut lo, supply, field_name: "lock")
+    let value_at = owner_field(mut lo, supply, field_name: "value")
+    match supply.member() {
+        "of" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let free = mut fx.ptr(0)
+            mut fx.store(free, addr: sret, offset: lock_at)
+            let value = mut fx.offset(sret, offset: value_at)
+            mut lo.store_held(mut fx, address: value, held: supply.param(0), ty: value_ty)
+            supply.done(mut lo, mut fx)
+        }
+        "with" => {
+            let lock = supply.param(0).address_value()
+            let lock_word = mut fx.offset(lock, offset: lock_at)
+            let value = mut fx.offset(lock, offset: value_at)
+            sync_acquire(mut lo, mut fx, lock_word, located: true)
+            let body_ty = fn_param(lo, supply, index: 2)
+            let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: Array[Held, 1].filled(Held.Address(value)).view())
+            release_word(mut fx, lock_word)
+            hw_forward(mut lo, mut fx, supply, called)
+        }
+        else => {
+            expect false
+        }
+    }
+} spin_lock
+
+/// The offset of a device's value in its record, past the record's fields at its alignment.
+fn device_value(mut lo: Lowering, value_ty: ty::Ty) -> u64 {
+    let laid = mut lo.layout_of(value_ty)
+    return next_multiple_of(DEVICE_RECORD_VALUE, multiple: at_least_one(laid.contents().align))
+} device_value
+
+/// A device behind an IRQ-safe lock, which is the address of a runtime record holding it:
+/// `install` moves the device into a new record, and on a machine target binds its vector to
+/// it, unless the final build or another installation binds that vector; `with` takes the
+/// record's lock around its body; `uninstall` unbinds the vector and waits until no CPU runs the
+/// interrupt fn for it, then moves the device out of the freed record.
+fn irq_shared(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let value_at = device_value(mut lo, value_ty)
+    match supply.member() {
+        "install" => {
+            let laid = mut lo.layout_of(value_ty)
+            let size = mut fx.ptr(value_at + laid.contents().size)
+            let record = mut lo.record_alloc(mut fx, size)
+            let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            let value = mut fx.offset(record, offset: value_at)
+            mut lo.store_held(mut fx, address: value, held: supply.param(0), ty: value_ty)
+            if lo.machine() {
+                bind(mut lo, mut fx, supply, value_ty, record)
+            }
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(record, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "with" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let lock_word = mut fx.offset(record, offset: DEVICE_RECORD_LOCK)
+            let value = mut fx.offset(record, offset: value_at)
+            sync_acquire(mut lo, mut fx, lock_word, located: true)
+            let body_ty = fn_param(lo, supply, index: 2)
+            let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: Array[Held, 1].filled(Held.Address(value)).view())
+            release_word(mut fx, lock_word)
+            hw_forward(mut lo, mut fx, supply, called)
+        }
+        "uninstall" => {
+            let record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            if lo.machine() {
+                unbind(mut lo, mut fx, record)
+            }
+            let laid = mut lo.layout_of(value_ty)
+            let kept = mut fx.slot(laid.contents().size, align: laid.contents().align)
+            let value = mut fx.offset(record, offset: value_at)
+            mut lo.copy(mut fx, dst: kept, src: value, size: laid.contents().size, align: laid.contents().align)
+            mut lo.record_free(mut fx, address: record)
+            let held = mut lo.held_at(mut fx, ty: value_ty, address: kept)
+            supply.ret(mut lo, mut fx, held)
+        }
+        else => {
+            expect false
+        }
+    }
+} irq_shared
+
+/// Binds the vector `install` names to a device record, trapping when the final build or
+/// another installation binds that vector.
+fn bind(mut lo: Lowering, mut fx: Fx, supply: Supply, value_ty: ty::Ty, record: clif::Value) {
+    let vector_byte = supply.param(1).scalar_value()
+    let vector = mut fx.b.uextend(PTR, x: vector_byte)
+    let statically = mut lo.statically_bound()
+    for bound in statically {
+        let same = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound)
+        mut fx.if_true(same, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
+        })
+    }
+    expect supply.abi.params.len() > 2
+    let handler_fn_ty = supply.abi.params[2].nty.ty()
+    let ty::TyKind.Fn(handler_ty) = lo.ck.types().kind(handler_fn_ty) else {
+        expect false
+        return
+    }
+    let handler_layout = mut lo.layout_of(handler_fn_ty)
+    let handler_at = mut fx.offset(record, offset: DEVICE_RECORD_HANDLER)
+    mut lo.copy(mut fx, dst: handler_at, src: supply.param(2).address_value(), size: handler_layout.contents().size, align: handler_layout.contents().align)
+    let glue_id = device_glue(mut lo, value_ty, handler_ty)
+    let glue_ref = mut lo.func_ref(mut fx, id: glue_id)
+    let glue = mut fx.b.func_addr(PTR, func_ref: glue_ref)
+    mut fx.store(glue, addr: record, offset: DEVICE_RECORD_GLUE)
+    mut fx.store(vector, addr: record, offset: DEVICE_RECORD_VECTOR)
+    let slot = mut lo.irq_binding(mut fx, vector)
+    let unbound = mut fx.ptr(0)
+    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: slot, e: unbound, x: record)
+    let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
+    mut fx.if_true(taken, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.duplicate-access")
+    })
+} bind
+
+/// Unbinds a device record's vector and waits until no CPU runs its interrupt fn.
+fn unbind(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let vector = mut fx.load(PTR, addr: record, offset: DEVICE_RECORD_VECTOR)
+    let slot = mut lo.irq_binding(mut fx, vector)
+    let unbound = mut fx.ptr(0)
+    mut fx.b.atomic_store(clif::MemFlags.owned(), x: unbound, p: slot)
+    let running = mut fx.offset(slot, offset: BINDING_RUNNING)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let count = mut fx1.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: running)
+        let busy = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+        mut fx1.if_true(busy, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.relax(mut fx2)
+        })
+        return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} unbind
+
+/// The glue the dispatcher calls with a device's record when its vector fires: it takes the
+/// record's lock, calls the interrupt fn with the device and a new `hw::IrqContext`, releases
+/// the lock and gives whether the fn's `hw::IrqExit` is `Reschedule`.
+fn device_glue(mut lo: Lowering, value_ty: ty::Ty, handler_ty: ty::FnTyId) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+    let glue = Glue.IrqDevice(device: value_ty, handler: handler_ty)
+    return mut lo.glue_function(take glue, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let entry_params = mut fx1.entry()
+        expect entry_params.len() > 0
+        let record = entry_params[0]
+        let value_at = device_value(mut lo1, value_ty)
+        let lock_word = mut fx1.offset(record, offset: DEVICE_RECORD_LOCK)
+        sync_acquire(mut lo1, fx: mut fx1, lock_word, located: false)
+        let handler = mut fx1.offset(record, offset: DEVICE_RECORD_HANDLER)
+        let value = mut fx1.offset(record, offset: value_at)
+        let handler_fn = ty::copy_fn_ty(lo1.ck.types().fn_of(handler_ty), alloc: lo1.alloc)
+        var args = Array[Held, 2].filled(Held.Address(value))
+        args[1] = Held.Empty
+        let called = mut lo1.call_value(mut fx1, fn_ty: handler_fn, function: handler, args: args.view())
+        let reschedule = mut lo1.reschedules(mut fx1, exit_ty: handler_fn.result, exit: called.result)
+        release_word(mut fx1, lock_word)
+        mut fx1.b.ret(Array[clif::Value, 1].filled(reschedule).view())
+    })
+} device_glue
+
+/// Where each CPU's value of a per-CPU value lies: the bytes each CPU's slot takes, and the
+/// offset of its value in the slot.
+struct PerCpuSlot derives Copy {
+    stride: u64
+    value_at: u64
+} PerCpuSlot
+
+/// The bytes each CPU's slot of a per-CPU value takes, and the offset of its value in the slot,
+/// after a word set while its CPU is inside its `with`.
+fn per_cpu_slot(mut lo: Lowering, value_ty: ty::Ty) -> PerCpuSlot {
+    let laid = mut lo.layout_of(value_ty)
+    var value_at = laid.contents().align
+    if value_at < 8 {
+        value_at = 8
+    }
+    let stride = next_multiple_of(value_at + laid.contents().size, multiple: value_at)
+    return PerCpuSlot(stride: stride, value_at: value_at)
+} per_cpu_slot
+
+/// A per-CPU value: a slot for each CPU, drawn through the allocator, holding its value.
+fn per_cpu(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let placed = per_cpu_slot(mut lo, value_ty)
+    match supply.member() {
+        "of" => {
+            let state_address = mut lo.state(mut fx)
+            let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+            let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+            let size = mut fx.b.imul_imm_s(count, y: i64.fit(placed.stride))
+            let align = mut fx.ptr(placed.value_at)
+            var alloc_args = Array[clif::Value, 3].filled(cell)
+            alloc_args[1] = size
+            alloc_args[2] = align
+            let allocated = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+            expect allocated.len() > 0
+            let storage = allocated[0]
+            let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: storage, y: 0)
+            mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            let init_ty = fn_param(lo, supply, index: 0)
+            let zero_value = mut fx.ptr(0)
+            mut fx.each(zero_value, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let slot_offset = mut fx1.b.imul_imm_s(index, y: i64.fit(placed.stride))
+                let slot = mut fx1.b.iadd(storage, y: slot_offset)
+                let outside = mut fx1.ptr(0)
+                mut fx1.store(outside, addr: slot, offset: 0)
+                let cpu = mut fx1.b.ireduce(clif::Type.Int32, x: index)
+                let called = mut lo.call_value(mut fx1, fn_ty: init_ty, function: supply.param(0).address_value(), args: Array[Held, 1].filled(Held.Scalar(cpu)).view())
+                let value = mut fx1.offset(slot, offset: placed.value_at)
+                mut lo.store_held(mut fx1, address: value, held: called.result, ty: value_ty)
+            })
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut fx.store(storage, addr: sret, offset: 0)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "with" => {
+            let storage = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+            let index = running_index(mut lo, mut fx)
+            let slot_offset = mut fx.b.imul_imm_s(index, y: i64.fit(placed.stride))
+            let slot = mut fx.b.iadd(storage, y: slot_offset)
+            let inside = mut fx.load(PTR, addr: slot, offset: 0)
+            let again = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: inside, y: 0)
+            mut fx.if_true(again, then: fn[mut lo](mut fx1: Fx) {
+                let location = caller_location(mut lo, fx: mut fx1)
+                discard mut lo.call_routine(mut fx1, routine: Routine.Reacquired, args: Array[clif::Value, 1].filled(location).view())
+            })
+            let one = mut fx.ptr(1)
+            mut fx.store(one, addr: slot, offset: 0)
+            let value = mut fx.offset(slot, offset: placed.value_at)
+            let body_ty = fn_param(lo, supply, index: 2)
+            let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(2).address_value(), args: Array[Held, 1].filled(Held.Address(value)).view())
+            let outside = mut fx.ptr(0)
+            mut fx.store(outside, addr: slot, offset: 0)
+            hw_forward(mut lo, mut fx, supply, called)
+        }
+        else => {
+            expect false
+        }
+    }
+} per_cpu
+
+/// Calls `visit` with the address of every CPU's value of the per-CPU value at `address`, and
+/// gives its storage.
+fn each_per_cpu(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, address: clif::Value, visit: fn(mut lo: Lowering, mut fx: Fx, value: clif::Value)) -> clif::Value {
+    let placed = per_cpu_slot(mut lo, value_ty)
+    let storage = mut fx.load(PTR, addr: address, offset: 0)
+    let state_address = mut lo.state(mut fx)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let zero_value = mut fx.ptr(0)
+    mut fx.each(zero_value, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let slot_offset = mut fx1.b.imul_imm_s(index, y: i64.fit(placed.stride))
+        let slot = mut fx1.b.iadd(storage, y: slot_offset)
+        let value = mut fx1.offset(slot, offset: placed.value_at)
+        visit(mut lo, fx: mut fx1, value)
+    })
+    return storage
+} each_per_cpu
+
+/// Releases a per-CPU value at an address: holdings_each CPU's value, then its storage.
+fn release_per_cpu(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, address: clif::Value) {
+    let storage = each_per_cpu(mut lo, mut fx, value_ty, address, visit: fn(mut lo1: Lowering, mut fx1: Fx, value: clif::Value) {
+        mut lo1.release(mut fx1, ty: value_ty, address: value)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(storage).view())
+} release_per_cpu
+
+/// Moves a per-CPU value at an address into another domain's reach: its storage, then each
+/// CPU's value.
+fn transfer_per_cpu(mut lo: Lowering, mut fx: Fx, value_ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    let storage = mut fx.load(PTR, addr: address, offset: 0)
+    discard transfer_lift(mut lo, mut fx, address: storage, lift)
+    discard each_per_cpu(mut lo, mut fx, value_ty, address, visit: fn(mut lo1: Lowering, mut fx1: Fx, value: clif::Value) {
+        mut lo1.transfer(mut fx1, ty: value_ty, address: value, lift, owner)
+    })
+} transfer_per_cpu
+
+/// `hw::Anchor[S].with(body)`: calls `body` with the installed anchor and returns `Some` of its
+/// result, or `None` when none is installed, which on the host is always. An anchor is installed
+/// only on a machine kernel, in storage the image reserves, whose address the runtime records.
+fn anchor_with(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let option = supply.abi.result
+    if lo.machine() {
+        let state_address = mut lo.state(mut fx)
+        let anchor = mut fx.load(PTR, addr: state_address, offset: STATE_ANCHOR)
+        let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: anchor, y: 0)
+        mut fx.if_true(installed, then: fn[mut lo](mut fx1: Fx) {
+            let body_ty = fn_param(lo, supply, index: 0)
+            let called = mut lo.call_value(mut fx1, fn_ty: body_ty, function: supply.param(0).address_value(), args: Array[Held, 1].filled(Held.Address(anchor)).view())
+            supply.forward_failure(mut lo, fx: mut fx1, called)
+            let some = mut lo.variant_value(mut fx1, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(called.result).view(), wrapped: None)
+            supply.ret(mut lo, fx: mut fx1, held: some)
+        })
+    }
+    let none = mut lo.none_value(mut fx, option)
+    supply.ret(mut lo, mut fx, held: none)
+} anchor_with
+
+/// The field offsets of a `hw::Signal[T]`: its lock word, whether it holds a value, its waiting
+/// task and its value.
+struct SignalFields derives Copy {
+    lock: u64
+    stored: u64
+    waiter: u64
+    value: u64
+} SignalFields
+
+fn sync_signal_fields(mut lo: Lowering, ty: ty::Ty) -> SignalFields {
+    let lock_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "lock")
+    let stored_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "stored")
+    let waiter_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "waiter")
+    let value_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "value")
+    return SignalFields(lock: lock_field.offset, stored: stored_field.offset, waiter: waiter_field.offset, value: value_field.offset)
+} sync_signal_fields
+
+/// A one-slot signal: `post` stores a value, replacing one it holds, and wakes the task waiting
+/// on it; `wait` takes the value, or else becomes the signal's waiter, reachable by
+/// cancellation, until a post or a cancellation wakes it. A wait cancelled at its start fails at
+/// once, and a second task waiting traps.
+fn sync_signal(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let Some(signal_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let fields = sync_signal_fields(mut lo, ty: signal_ty)
+    match supply.member() {
+        "empty" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let zero_value = mut fx.ptr(0)
+            mut fx.store(zero_value, addr: sret, offset: fields.lock)
+            mut fx.store(zero_value, addr: sret, offset: fields.waiter)
+            let absent = mut fx.int(clif::Type.Int8, value: 0)
+            mut fx.store(absent, addr: sret, offset: fields.stored)
+            supply.ret(mut lo, mut fx, held: Held.Address(sret))
+        }
+        "post" => {
+            let address = supply.param(0).address_value()
+            let lock_word = mut fx.offset(address, offset: fields.lock)
+            let flags = irq_save(mut lo, mut fx)
+            sync_acquire(mut lo, mut fx, lock_word, located: true)
+            let value_at = mut fx.offset(address, offset: fields.value)
+            if mut lo.needs_release(value_ty) {
+                let stored = mut fx.load(clif::Type.Int8, addr: address, offset: fields.stored)
+                let replaced = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stored, y: 0)
+                mut fx.if_true(replaced, then: fn[mut lo](mut fx1: Fx) {
+                    mut lo.release(mut fx1, ty: value_ty, address: value_at)
+                })
+            }
+            mut lo.store_held(mut fx, address: value_at, held: supply.param(2), ty: value_ty)
+            let present = mut fx.int(clif::Type.Int8, value: 1)
+            mut fx.store(present, addr: address, offset: fields.stored)
+            let waiter = mut fx.load(PTR, addr: address, offset: fields.waiter)
+            let none = mut fx.ptr(0)
+            mut fx.store(none, addr: address, offset: fields.waiter)
+            release_word(mut fx, lock_word)
+            irq_restore(mut lo, mut fx, flags)
+            let waiting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+            mut fx.if_true(waiting, then: fn[mut lo](mut fx1: Fx) {
+                discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(waiter).view())
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "wait" => sync_wait(mut lo, mut fx, supply, signal_ty, fields)
+        else => {
+            expect false
+        }
+    }
+} sync_signal
+
+/// `signal.wait()`, as `signal` describes it.
+fn sync_wait(mut lo: Lowering, mut fx: Fx, supply: Supply, signal_ty: ty::Ty, fields: SignalFields) {
+    let value_ty = supply.type_arg(lo, index: 0)
+    let address = supply.param(0).address_value()
+    let lock_word = mut fx.offset(address, offset: fields.lock)
+    let early = tasks_origin(mut lo, mut fx)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: early, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: early)
+    })
+    let current = current_task(mut lo, mut fx)
+    let laid = mut lo.layout_of(value_ty)
+    let taken = mut fx.slot(at_least_one(laid.contents().size), align: at_least_one(laid.contents().align))
+    let withdraw = withdraw_waiter(mut lo, signal_ty)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let flags = irq_save(mut lo, fx: mut fx1)
+        sync_acquire(mut lo, fx: mut fx1, lock_word, located: true)
+        let stored = mut fx1.load(clif::Type.Int8, addr: address, offset: fields.stored)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: stored, y: 0)
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            let value_at = mut fx2.offset(address, offset: fields.value)
+            mut lo.copy(mut fx2, dst: taken, src: value_at, size: laid.contents().size, align: laid.contents().align)
+            let absent = mut fx2.int(clif::Type.Int8, value: 0)
+            mut fx2.store(absent, addr: address, offset: fields.stored)
+            release_word(mut fx2, lock_word)
+            irq_restore(mut lo, fx: mut fx2, flags)
+            let held = mut lo.held_at(mut fx2, ty: value_ty, address: taken)
+            supply.ret(mut lo, fx: mut fx2, held)
+        })
+        let waiter = mut fx1.load(PTR, addr: address, offset: fields.waiter)
+        let other = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
+        mut fx1.if_true(other, then: fn[mut lo](mut fx2: Fx) {
+            release_word(mut fx2, lock_word)
+            irq_restore(mut lo, fx: mut fx2, flags)
+            raise_kind(mut lo, fx: mut fx2, kind: "trap.duplicate-access")
+        })
+        mut fx1.store(current, addr: address, offset: fields.waiter)
+        waiting_on(mut lo, fx: mut fx1, what: REGIONS_WAITING)
+        release_word(mut fx1, lock_word)
+        irq_restore(mut lo, fx: mut fx1, flags)
+        enter_wait(mut lo, fx: mut fx1, glue: withdraw, object: address, node: current)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        leave_wait(mut lo, fx: mut fx1)
+        waiting_on(mut lo, fx: mut fx1, what: 0)
+        let origin = tasks_origin(mut lo, fx: mut fx1)
+        let stopped = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+        mut fx1.if_true(stopped, then: fn[mut lo](mut fx2: Fx) {
+            let cancel_flags = irq_save(mut lo, fx: mut fx2)
+            sync_acquire(mut lo, fx: mut fx2, lock_word, located: true)
+            let current_waiter = mut fx2.load(PTR, addr: address, offset: fields.waiter)
+            let ours = mut fx2.b.icmp(clif::IntCC.Equal, x: current_waiter, y: current)
+            mut fx2.if_true(ours, then: fn(mut fx3: Fx) {
+                let none = mut fx3.ptr(0)
+                mut fx3.store(none, addr: address, offset: fields.waiter)
+            })
+            release_word(mut fx2, lock_word)
+            irq_restore(mut lo, fx: mut fx2, flags: cancel_flags)
+            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
+        })
+        let again = mut fx1.int(clif::Type.Int8, value: 1)
+        return Pass(again: again, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} sync_wait
+
+/// The glue withdrawing a stopped task's wait on a signal of a type, which the wait records.
+fn withdraw_waiter(mut lo: Lowering, signal_ty: ty::Ty) -> object::FuncId {
+    return mut lo.glue_function(Glue.WithdrawSignal(signal_ty), signature: withdraw_signature(lo.alloc), build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let param_values = mut fx1.entry()
+        expect param_values.len() > 1
+        let fields = sync_signal_fields(mut lo1, ty: signal_ty)
+        let address = mut fx1.load(PTR, addr: param_values[0], offset: WAIT_OBJECT)
+        let lock_word = mut fx1.offset(address, offset: fields.lock)
+        let flags = irq_save(mut lo1, fx: mut fx1)
+        sync_acquire(mut lo1, fx: mut fx1, lock_word, located: false)
+        let waiter = mut fx1.load(PTR, addr: address, offset: fields.waiter)
+        let stopped = mut fx1.b.icmp(clif::IntCC.Equal, x: waiter, y: param_values[1])
+        mut fx1.if_true(stopped, then: fn(mut fx2: Fx) {
+            let none = mut fx2.ptr(0)
+            mut fx2.store(none, addr: address, offset: fields.waiter)
+        })
+        release_word(mut fx1, lock_word)
+        irq_restore(mut lo1, fx: mut fx1, flags)
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_waiter
+
+/// Releases a signal at an address: its value, when it holds one.
+fn release_signal(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) {
+    let value_ty = hw_wrapped(lo, ty)
+    let fields = sync_signal_fields(mut lo, ty)
+    let stored = mut fx.load(clif::Type.Int8, addr: address, offset: fields.stored)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stored, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let value = mut fx1.offset(address, offset: fields.value)
+        mut lo.release(mut fx1, ty: value_ty, address: value)
+    })
+} release_signal
+
+/// Moves a signal at an address into another domain's reach: its value, when it holds one.
+fn transfer_signal(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    let value_ty = hw_wrapped(lo, ty)
+    let fields = sync_signal_fields(mut lo, ty)
+    let stored = mut fx.load(clif::Type.Int8, addr: address, offset: fields.stored)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stored, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let value = mut fx1.offset(address, offset: fields.value)
+        mut lo.transfer(mut fx1, ty: value_ty, address: value, lift, owner)
+    })
+} transfer_signal

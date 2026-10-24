@@ -1,0 +1,606 @@
+//! Instruction selection: the blocks of machine instructions over virtual registers that compute a function, in the order emission lays them out, with the frame they need.
+
+/// The state of selection: the code selected so far and what it knows of the function's values.
+struct Selector {
+    isa: Isa
+    alloc: mem::Alloc
+    code: VCode
+    /// Each value's register, its low half for a 128-bit integer, `NO_REG` until it has one.
+    lows: mem::List[x64::Reg]
+    /// The high half of each 128-bit integer value.
+    highs: mem::List[x64::Reg]
+    /// How many times each value is used.
+    use_counts: mem::List[u32]
+    /// The index of the instruction defining each value, `NONE` for a block parameter.
+    defs: mem::List[u32]
+    /// Each block's index in the code, `NONE` for one no path from the entry reaches.
+    positions: mem::List[u32]
+    /// For each block ending in a conditional branch, the index of the block each edge passing
+    /// arguments goes through, `NONE` for an edge without arguments.
+    then_edges: mem::List[u32]
+    else_edges: mem::List[u32]
+    /// Each stack slot's offset from the stack pointer.
+    slot_offsets: mem::List[u32]
+    /// The block being selected.
+    current: VBlock
+    /// The source location of the instruction being selected.
+    loc: clif::SourceLoc
+} Selector
+
+/// The machine code of a function.
+fn select(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> VCode {
+    var selector = Selector.new(func, isa, alloc)
+    let order = selector.order(func)
+    for block in order {
+        mut selector.select_block(func, block)
+        let at = usize.widen(block.index)
+        expect at < selector.then_edges.len() and at < selector.else_edges.len()
+        let then_edge = selector.then_edges[at]
+        let else_edge = selector.else_edges[at]
+        if then_edge != NONE {
+            mut selector.edge_block(func, block, then: true)
+        }
+        if else_edge != NONE {
+            mut selector.edge_block(func, block, then: false)
+        }
+    }
+    selector.code.hints = selector.code.edge_hints(alloc)
+    return selector.code
+} select
+
+fn filled[T: Copy](count: usize, value: T, alloc: mem::Alloc) -> mem::List[T] {
+    var list = mem::List[T].empty(alloc)
+    for _ in 0..<count {
+        mut list.push(value)
+    }
+    return list
+} filled
+
+fn Selector.new(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> Selector {
+    let values = usize.widen(func.value_count())
+    let blocks = block_count(func, alloc)
+    var selector = Selector(
+        isa: isa,
+        alloc: alloc,
+        code: VCode.empty(alloc),
+        lows: filled(values, value: NO_REG, alloc),
+        highs: filled(values, value: NO_REG, alloc),
+        use_counts: filled(values, value: 0u32, alloc),
+        defs: filled(values, value: NONE, alloc),
+        positions: filled(blocks, value: NONE, alloc),
+        then_edges: filled(blocks, value: NONE, alloc),
+        else_edges: filled(blocks, value: NONE, alloc),
+        slot_offsets: mem::List[u32].empty(alloc),
+        current: VBlock(begin: 0, end: 0, param_start: 0, param_count: 0, arg_start: 0, arg_count: 0, succ_start: 0, succ_count: 0),
+        loc: clif::DEFAULT_LOC,
+    )
+    mut selector.place_blocks(func)
+    mut selector.count_values(func)
+    mut selector.lay_out_frame(func)
+    return selector
+} Selector.new
+
+/// One more than the highest block index the layout holds.
+fn block_count(func: clif::Function, alloc: mem::Alloc) -> usize {
+    var count: usize = 0
+    for block in func.layout_blocks(alloc) {
+        if usize.widen(block.index) >= count {
+            count = usize.widen(block.index) + 1
+        }
+    }
+    return count
+} block_count
+
+/// The blocks a block's terminator branches to.
+fn successors(func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var found = mem::List[clif::Block].empty(alloc)
+    let insts = func.block_insts(block, alloc)
+    if insts.len() == 0 {
+        return found
+    }
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => mut found.push(destination.block)
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            mut found.push(then_call.block)
+            mut found.push(else_call.block)
+        }
+        else => {}
+    }
+    return found
+} successors
+
+/// Whether a path from the entry reaches each block.
+fn reachable(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List[bool] {
+    var seen = filled(count, value: false, alloc)
+    var pending = mem::List[clif::Block].empty(alloc)
+    let Some(entry) = func.entry_block() else {
+        return seen
+    }
+    expect usize.widen(entry.index) < seen.len()
+    seen[usize.widen(entry.index)] = true
+    mut pending.push(entry)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        for next in successors(func, block, alloc) {
+            let at = usize.widen(next.index)
+            expect at < seen.len()
+            if not seen[at] {
+                seen[at] = true
+                mut pending.push(next)
+            }
+        }
+    }
+    return seen
+} reachable
+
+/// The reachable blocks in the order emission lays them out: those not cold in layout order,
+/// then the cold ones.
+fn Selector.order(self, func: clif::Function) -> mem::List[clif::Block] {
+    var order = mem::List[clif::Block].empty(self.alloc)
+    let laid_out = func.layout_blocks(self.alloc)
+    for block in laid_out {
+        if self.position_of(block) != NONE and not func.is_cold(block) {
+            mut order.push(block)
+        }
+    }
+    for block in laid_out {
+        if self.position_of(block) != NONE and func.is_cold(block) {
+            mut order.push(block)
+        }
+    }
+    return order
+} Selector.order
+
+/// A block's index in the code, `NONE` for one no path from the entry reaches.
+fn Selector.position_of(self, block: clif::Block) -> u32 {
+    let at = usize.widen(block.index)
+    expect at < self.positions.len()
+    return self.positions[at]
+} Selector.position_of
+
+/// Numbers the reachable blocks in emission order, each followed by the blocks its conditional
+/// branch's edges with arguments go through.
+fn Selector.place_blocks(mut self, func: clif::Function) {
+    let seen = reachable(func, count: self.positions.len(), alloc: self.alloc)
+    for index in 0..<seen.len() {
+        if seen[index] {
+            expect index < self.positions.len()
+            self.positions[index] = 0
+        }
+    }
+    var next: u32 = 0
+    for block in self.order(func) {
+        let at = usize.widen(block.index)
+        expect at < self.positions.len() and at < self.then_edges.len() and at < self.else_edges.len()
+        self.positions[at] = next
+        next += 1
+        let insts = func.block_insts(block, alloc: self.alloc)
+        if insts.len() == 0 {
+            continue
+        }
+        let clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+            continue
+        }
+        if then_call.args.len() > 0 {
+            self.then_edges[at] = next
+            next += 1
+        }
+        if else_call.args.len() > 0 {
+            self.else_edges[at] = next
+            next += 1
+        }
+    }
+} Selector.place_blocks
+
+/// Records which instruction defines each value and how often reachable code uses it.
+fn Selector.count_values(mut self, func: clif::Function) {
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            for result in func.inst_results(inst, alloc: self.alloc) {
+                expect usize.widen(result.index) < self.defs.len()
+                self.defs[usize.widen(result.index)] = inst.index
+            }
+            each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                expect at < self.use_counts.len()
+                self.use_counts[at] += 1
+            })
+        }
+    }
+} Selector.count_values
+
+/// Shows `visit` each value an instruction reads, branch arguments included.
+fn each_operand(data: clif::InstructionData, visit: fn(value: clif::Value)) {
+    match data {
+        clif::InstructionData.Unary(opcode: _, arg: arg) or clif::InstructionData.Load(opcode: _, flags: _, arg: arg, offset: _) or clif::InstructionData.LoadNoOffset(opcode: _, flags: _, arg: arg) => visit(arg)
+        clif::InstructionData.Binary(opcode: _, x: x, y: y) or clif::InstructionData.IntCompare(opcode: _, cond: _, x: x, y: y) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: x, y: y) => {
+            visit(x)
+            visit(y)
+        }
+        clif::InstructionData.Store(opcode: _, flags: _, x: x, p: p, offset: _) or clif::InstructionData.StoreNoOffset(opcode: _, flags: _, x: x, p: p) or clif::InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: p, x: x) => {
+            visit(x)
+            visit(p)
+        }
+        clif::InstructionData.Ternary(opcode: _, x: x, y: y, z: z) or clif::InstructionData.AtomicCas(opcode: _, flags: _, p: x, e: y, x: z) => {
+            visit(x)
+            visit(y)
+            visit(z)
+        }
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: args) or clif::InstructionData.MultiAry(opcode: _, args: args) => each_value(args.view(), visit)
+        clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: callee, args: args) => {
+            visit(callee)
+            each_value(args.view(), visit)
+        }
+        clif::InstructionData.Jump(opcode: _, destination: destination) => each_value(destination.args.view(), visit)
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            visit(arg)
+            each_value(then_call.args.view(), visit)
+            each_value(else_call.args.view(), visit)
+        }
+        else => {}
+    }
+} each_operand
+
+fn each_value(values: Slice[clif::Value], visit: fn(value: clif::Value)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+/// Lays out the outgoing argument area the calls need and the stack slots above it, each aligned
+/// as it asks and at least to 8 bytes.
+fn Selector.lay_out_frame(mut self, func: clif::Function) {
+    var outgoing: u32 = 0
+    var calls = false
+    for block in self.order(func) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            match func.inst_data(inst) {
+                clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => {
+                    let sig = func.imported_signature(func.ext_func(func_ref).signature)
+                    outgoing = larger(outgoing, other: places(sig, floats: self.isa.floats, alloc: self.alloc).stack)
+                    calls = true
+                }
+                clif::InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: _, args: _) => {
+                    outgoing = larger(outgoing, other: places(func.imported_signature(sig_ref), floats: self.isa.floats, alloc: self.alloc).stack)
+                    calls = true
+                }
+                clif::InstructionData.UnaryGlobalValue(opcode: clif::Opcode.TlsValue, global_value: _) => {
+                    calls = true
+                }
+                else => {}
+            }
+        }
+    }
+    var align: u32 = 16
+    for index in 0u32..<func.stack_slot_count() {
+        align = larger(align, other: slot_align(func.stack_slot_data(clif::StackSlot(index: index))))
+    }
+    var end = round_up(outgoing, to: align)
+    for index in 0u32..<func.stack_slot_count() {
+        let data = func.stack_slot_data(clif::StackSlot(index: index))
+        let start = round_up(end, to: slot_align(data))
+        mut self.slot_offsets.push(start)
+        end = start + data.size
+    }
+    self.code.slots_end = end
+    self.code.align = align
+    self.code.calls = calls
+} Selector.lay_out_frame
+
+fn slot_align(data: clif::StackSlotData) -> u32
+    ensures result >= 8
+{
+    return larger(8, other: 1u32 << u32.widen(data.align_shift))
+} slot_align
+
+fn larger(value: u32, other: u32) -> u32
+    ensures result >= value and result >= other
+{
+    if value > other {
+        return value
+    }
+    return other
+} larger
+
+/// The least multiple of `to`, a power of two, at or above `value`.
+fn round_up(value: u32, to: u32) -> u32
+    requires to > 0 and value <= 0xFFFF_FFFF - to
+{
+    return (value + to - 1) & ~(to - 1)
+} round_up
+
+fn Selector.emit(mut self, inst: x64::Inst) {
+    mut self.code.insts.push(VInst(inst: inst, loc: self.loc))
+} Selector.emit
+
+fn Selector.temp(mut self, float: bool) -> x64::Reg {
+    return mut self.code.new_vreg(float)
+} Selector.temp
+
+/// A move between registers of one class, the destination preferring the source's register.
+fn Selector.mov(mut self, dst: x64::Reg, src: x64::Reg) {
+    prefer(mut self.code.hints, reg: dst, preferred: src)
+    prefer(mut self.code.hints, reg: src, preferred: dst)
+    mut self.emit(x64::Inst.Mov(dst: dst, src: src))
+} Selector.mov
+
+/// A new register holding a copy of `src`.
+fn Selector.copy(mut self, src: x64::Reg) -> x64::Reg {
+    let float = self.code.is_float(src)
+    let dst = mut self.temp(float)
+    mut self.mov(dst, src: src)
+    return dst
+} Selector.copy
+
+/// The register of a value, its low half for a 128-bit integer: a new virtual register the first
+/// time an instruction names the value.
+fn Selector.reg(mut self, value: clif::Value, func: clif::Function) -> x64::Reg {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.lows.len() and at < self.highs.len()
+    let existing = self.lows[at]
+    if existing != NO_REG {
+        return existing
+    }
+    let ty = func.value_type(resolved)
+    let low = mut self.code.new_vreg(in_xmm(ty, floats: self.isa.floats))
+    self.lows[at] = low
+    if ty == clif::Type.Int128 {
+        let high = mut self.code.new_vreg(false)
+        self.highs[at] = high
+    }
+    return low
+} Selector.reg
+
+/// The register of a 128-bit value's high half.
+fn Selector.high(mut self, value: clif::Value, func: clif::Function) -> x64::Reg {
+    discard mut self.reg(value, func)
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.highs.len()
+    return self.highs[at]
+} Selector.high
+
+/// Makes a value's registers those of another value, or copies them when the value already has
+/// its own.
+fn Selector.alias(mut self, value: clif::Value, func: clif::Function, low: x64::Reg, high: x64::Reg) {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.lows.len() and at < self.highs.len()
+    if self.lows[at] == NO_REG {
+        self.lows[at] = low
+        self.highs[at] = high
+        return
+    }
+    let existing = self.lows[at]
+    let existing_high = self.highs[at]
+    mut self.mov(existing, src: low)
+    if high != NO_REG {
+        mut self.mov(existing_high, src: high)
+    }
+} Selector.alias
+
+/// The constant a value is, when an `iconst`, `f32const` or `f64const` defines it: its bits.
+fn Selector.constant(self, value: clif::Value, func: clif::Function) -> Option[u64] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE {
+        return None
+    }
+    match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: imm) => return Some(imm.to_bits())
+        clif::InstructionData.UnaryIeee32(opcode: _, bits: bits) => return Some(u64.widen(bits))
+        clif::InstructionData.UnaryIeee64(opcode: _, bits: bits) => return Some(bits)
+        else => return None
+    }
+} Selector.constant
+
+/// The constant a value is as the 32-bit immediate of an operation on its type: sign-extended
+/// from a narrower integer type, and for a 64-bit one only when it fits.
+fn Selector.imm(self, value: clif::Value, func: clif::Function) -> Option[i32] {
+    let Some(bits) = self.constant(value, func) else {
+        return None
+    }
+    let ty = func.value_type(value)
+    if not ty.is_int() or ty == clif::Type.Int128 {
+        return None
+    }
+    return imm32(bits, width: ty.bits())
+} Selector.imm
+
+fn imm32(bits: u64, width: u32) -> Option[i32] {
+    if width >= 64 {
+        return i32.checked_fit(i64.from_bits(bits))
+    }
+    let shift = 64 - width
+    return Some(i32.truncate(i64.from_bits(bits << shift).shr_arith(shift)))
+} imm32
+
+/// The register holding a value for an instruction to read; a constant is written into a new
+/// register for each read.
+fn Selector.src(mut self, value: clif::Value, func: clif::Function) -> x64::Reg {
+    let Some(bits) = self.constant(value, func) else {
+        return mut self.reg(value, func)
+    }
+    let ty = func.value_type(value)
+    if in_xmm(ty, floats: self.isa.floats) {
+        return mut self.float_constant(ty, bits)
+    }
+    let reg = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: reg, imm: bits))
+    return reg
+} Selector.src
+
+/// The register holding a 128-bit value's high half for an instruction to read.
+fn Selector.src_high(mut self, value: clif::Value, func: clif::Function) -> x64::Reg {
+    let Some(bits) = self.constant(value, func) else {
+        return mut self.high(value, func)
+    }
+    let reg = mut self.temp(false)
+    var high: u64 = 0
+    if i64.from_bits(bits) < 0 {
+        high = 0xFFFF_FFFF_FFFF_FFFF
+    }
+    mut self.emit(x64::Inst.MovImm(dst: reg, imm: high))
+    return reg
+} Selector.src_high
+
+/// A new SSE register holding float bits.
+fn Selector.float_constant(mut self, ty: clif::Type, bits: u64) -> x64::Reg {
+    let reg = mut self.temp(true)
+    if bits == 0 {
+        mut self.emit(x64::Inst.FloatBits(op: x64::BitOp.Xor, dst: reg, src: reg))
+        return reg
+    }
+    let int = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: int, imm: bits))
+    mut self.emit(x64::Inst.MovToXmm(size: x64::Size.of_bits(ty.bits()), dst: reg, src: int))
+    return reg
+} Selector.float_constant
+
+/// The first result of an instruction.
+fn result_of(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> clif::Value {
+    let results = func.inst_results(inst, alloc)
+    expect results.len() > 0
+    return results[0]
+} result_of
+
+/// The second result of an instruction.
+fn second_result_of(func: clif::Function, inst: clif::Inst, alloc: mem::Alloc) -> clif::Value {
+    let results = func.inst_results(inst, alloc)
+    expect results.len() > 1
+    return results[1]
+} second_result_of
+
+fn Selector.start_block(mut self) {
+    self.current = VBlock(begin: u32.fit(self.code.insts.len()), end: 0, param_start: u32.fit(self.code.params.len()), param_count: 0, arg_start: u32.fit(self.code.args.len()), arg_count: 0, succ_start: u32.fit(self.code.succs.len()), succ_count: 0)
+} Selector.start_block
+
+fn Selector.finish_block(mut self) {
+    self.current.end = u32.fit(self.code.insts.len())
+    let params = u32.fit(self.code.params.len())
+    let args = u32.fit(self.code.args.len())
+    let succs = u32.fit(self.code.succs.len())
+    expect self.current.param_start <= params and self.current.arg_start <= args and self.current.succ_start <= succs
+    self.current.param_count = params - self.current.param_start
+    self.current.arg_count = args - self.current.arg_start
+    self.current.succ_count = succs - self.current.succ_start
+    mut self.code.blocks.push(self.current)
+} Selector.finish_block
+
+fn Selector.select_block(mut self, func: clif::Function, block: clif::Block) {
+    mut self.start_block()
+    let params = func.block_params(block, alloc: self.alloc)
+    if func.entry_block() == Some(block) {
+        mut self.entry_params(func, params: params.view())
+    } else {
+        for param in params {
+            let low = mut self.reg(param, func)
+            mut self.code.params.push(low)
+            if func.value_type(param) == clif::Type.Int128 {
+                let high = mut self.high(param, func)
+                mut self.code.params.push(high)
+            }
+        }
+    }
+    for inst in func.block_insts(block, alloc: self.alloc) {
+        self.loc = func.srcloc(inst)
+        mut self.select_inst(func, block, inst)
+    }
+    mut self.finish_block()
+} Selector.select_block
+
+/// The entry's parameters, received where the function's signature places them.
+fn Selector.entry_params(mut self, func: clif::Function, params: Slice[clif::Value]) {
+    let placed = places(func.signature, floats: self.isa.floats, alloc: self.alloc)
+    var regs = x64::RegSet.empty()
+    for place in placed.params {
+        match place {
+            Place.Reg(reg) => {
+                regs = regs.plus(reg)
+            }
+            Place.Stack(_) => {}
+        }
+    }
+    mut self.emit(x64::Inst.Args(params: regs))
+    var at: usize = 0
+    for param in params {
+        let low = mut self.reg(param, func)
+        expect at < placed.params.len()
+        mut self.receive(low, place: placed.params[at])
+        at += 1
+        if func.value_type(param) == clif::Type.Int128 {
+            let high = mut self.high(param, func)
+            expect at < placed.params.len()
+            mut self.receive(high, place: placed.params[at])
+            at += 1
+        }
+    }
+} Selector.entry_params
+
+/// Moves a parameter from where it arrives into its register.
+fn Selector.receive(mut self, reg: x64::Reg, place: Place) {
+    match place {
+        Place.Reg(arrived) => mut self.mov(reg, src: arrived)
+        Place.Stack(offset) => {
+            let src = x64::Amode.at(x64::RBP, disp: i32.fit(offset + 16))
+            let kind = load_kind(self.code.is_float(reg), size: x64::Size.Qword)
+            mut self.emit(x64::Inst.Load(kind: kind, dst: reg, src: src))
+        }
+    }
+} Selector.receive
+
+/// The load of a value of a size into a register of its class.
+fn load_kind(float: bool, size: x64::Size) -> x64::LoadKind {
+    if float {
+        if size == x64::Size.Dword {
+            return x64::LoadKind.Float32
+        }
+        return x64::LoadKind.Float64
+    }
+    return match size {
+        x64::Size.Byte => x64::LoadKind.Zx8
+        x64::Size.Word => x64::LoadKind.Zx16
+        x64::Size.Dword => x64::LoadKind.Dword
+        x64::Size.Qword => x64::LoadKind.Qword
+    }
+} load_kind
+
+/// A block holding only the jump of one edge of a block's conditional branch, passing its
+/// arguments.
+fn Selector.edge_block(mut self, func: clif::Function, block: clif::Block, then: bool) {
+    mut self.start_block()
+    let insts = func.block_insts(block, alloc: self.alloc)
+    expect insts.len() > 0
+    let last = insts[insts.len() - 1]
+    self.loc = func.srcloc(last)
+    match func.inst_data(last) {
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            if then {
+                mut self.jump(func, target: then_call.block, args: then_call.args.view())
+            } else {
+                mut self.jump(func, target: else_call.block, args: else_call.args.view())
+            }
+        }
+        else => {
+            expect false
+        }
+    }
+    mut self.finish_block()
+} Selector.edge_block
+
+/// A jump passing arguments to a block's parameters.
+fn Selector.jump(mut self, func: clif::Function, target: clif::Block, args: Slice[clif::Value]) {
+    for arg in args {
+        let low = mut self.src(arg, func)
+        mut self.code.args.push(low)
+        if func.value_type(arg) == clif::Type.Int128 {
+            let high = mut self.src_high(arg, func)
+            mut self.code.args.push(high)
+        }
+    }
+    let position = self.position_of(target)
+    mut self.code.succs.push(position)
+    mut self.emit(x64::Inst.Jmp(label: position))
+} Selector.jump

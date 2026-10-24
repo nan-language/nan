@@ -89,7 +89,7 @@ The reserved sections record of an artefact reserves keys 1 signature, 2 native 
 
 Every image of an `x86_64-host` [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state.
 
-No code reads the section at run time. `x86_64-uefi` and `x86_64-bare` images hold no artefact.
+The runtime never reads the section; a toolchain written in NaN reads its own image's section for its [toolchain hash](36-builds.md#toolchain-hash). `x86_64-uefi` and `x86_64-bare` images hold no artefact.
 
 ## Reuse
 

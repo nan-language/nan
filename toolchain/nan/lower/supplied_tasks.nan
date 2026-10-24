@@ -1,0 +1,151 @@
+//! Tasks: scopes, joins, deadlines and races, cowns and `await when`, channels, and domains.
+
+/// The cell of an executor, and whether the handle naming it is live.
+struct ExecutorCell derives Copy {
+    live: clif::Value
+    cell: clif::Value
+} ExecutorCell
+
+fn tasks_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    var end = path.byte_len()
+    match check::last_dot(path) {
+        Some(dot) => {
+            end = dot
+        }
+        None => {}
+    }
+    let Some(owner) = path.slice_bytes(0, end) else {
+        expect false
+        return false
+    }
+    match owner {
+        "task::scope" or "task::Scope" or "task::Join" or "task::within" or "task::race" => scopes_lower(mut lo, mut fx, supply)
+        "task::Cown" => cowns_lower(mut lo, mut fx, supply)
+        "task::Channel" or "task::Sender" or "task::Receiver" => channels_lower(mut lo, mut fx, supply)
+        "sys::Domain" or "sys::Trap" => domains_lower(mut lo, mut fx, supply)
+        "host::Runner" or "sys::Cx" or "sys::Outbox" => components_lower(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} tasks_lower
+
+/// The cell of the executor whose handle is at an address, and whether the handle is live.
+fn tasks_executor(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> ExecutorCell {
+    let handle = mut fx.load(PTR, addr: address, offset: 0)
+    let record_values = mut lo.call_routine(mut fx, routine: Routine.Check, args: Array[clif::Value, 1].filled(handle).view())
+    expect record_values.len() == 1
+    let record = record_values[0]
+    let live = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let zero = mut fx.ptr(0)
+    let cell_values = mut fx.choose(live, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(mut fx1.load(PTR, addr: record, offset: TABLES_ENTRY_STATE))
+        return state
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var none = mem::List[clif::Value].empty(fx1.alloc)
+        mut none.push(zero)
+        return none
+    })
+    expect cell_values.len() == 1
+    let cell = cell_values[0]
+    return ExecutorCell(live: live, cell: cell)
+} tasks_executor
+
+/// The signature of glue given a task's record.
+fn record_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    return signature
+} record_signature
+
+/// The usable bytes of the stack of a task whose entry has a function type.
+fn stack_size(fn_ty: ty::FnTy) -> u64 {
+    return fn_ty.limit_set.stack.value_or(TASKS_STACK)
+} stack_size
+
+/// Fails the operation with the cancellation of its failure type holding an origin.
+fn tasks_fail_cancelled(mut lo: Lowering, mut fx: Fx, supply: Supply, origin: clif::Value) {
+    let Some(failure_ty) = supply.abi.failure else {
+        expect false
+        return
+    }
+    let value = mut lo.cancellation(mut fx, failure_ty, origin)
+    let Some(failure) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: failure, held: value, ty: failure_ty)
+    supply.raise_failure(mut fx)
+} tasks_fail_cancelled
+
+/// The origin of a cancellation of the running call.
+fn tasks_origin(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let returned = mut lo.call_routine(mut fx, routine: Routine.Origin, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect returned.len() == 1
+    return returned[0]
+} tasks_origin
+
+/// Whether releasing a task type does anything, none for a type std declares in full.
+fn tasks_needs_release(owner_path: Str) -> Option[bool] {
+    return match owner_path {
+        "task::Join" or "task::Cown" or "task::Sender" or "task::Receiver" or "sys::Trap" => Some(true)
+        "task::Scope" or "task::Executor" or "task::Cancelled" or "task::Poisoned" or "sys::Cx" or "sys::Outbox" => Some(false)
+        else => None
+    }
+} tasks_needs_release
+
+/// Whether moving a task type into another domain's reach does anything, none for a type std
+/// declares in full.
+fn tasks_transfers(owner_path: Str) -> Option[bool] {
+    return match owner_path {
+        "task::Cown" or "task::Sender" or "task::Receiver" or "sys::Trap" => Some(true)
+        "task::Cancelled" or "task::Poisoned" => Some(false)
+        else => None
+    }
+} tasks_transfers
+
+/// Moves a value of a task type at an address into another domain's reach; false for a type
+/// std declares in full.
+fn tasks_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) -> bool {
+    match owner_path {
+        "task::Cown" => cowns_transfer(mut lo, mut fx, ty, address, lift)
+        "task::Sender" or "task::Receiver" => channels_transfer(mut lo, mut fx, owner_path, ty, address, lift, owner)
+        "sys::Trap" => {
+            let record = mut fx.load(PTR, addr: address, offset: 0)
+            discard transfer_lift(mut lo, mut fx, address: record, lift)
+        }
+        else => return false
+    }
+    return true
+} tasks_transfer
+
+/// Releases a value of a task type at an address; false for a type std declares in full.
+fn tasks_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) -> bool {
+    match owner_path {
+        "task::Join" => {
+            let Some(result) = lo.ck.types().type_arg(ty, index: 0) else {
+                expect false
+                return true
+            }
+            release_join(mut lo, mut fx, address, result)
+        }
+        "task::Cown" => cowns_release(mut lo, mut fx, ty, address)
+        "task::Sender" or "task::Receiver" => channels_release(mut lo, mut fx, owner_path, ty, address)
+        "sys::Trap" => release_trap(mut lo, mut fx, address)
+        else => return false
+    }
+    return true
+} tasks_release
+
+/// A held value's address, the value stored in a new slot when held in a register.
+fn tasks_address_of(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, held: Held) -> clif::Value {
+    match held {
+        Held.Address(address) => return address
+        else => {}
+    }
+    let laid = mut lo.layout_of(ty)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.store_held(mut fx, address: slot, held, ty)
+    return slot
+} tasks_address_of

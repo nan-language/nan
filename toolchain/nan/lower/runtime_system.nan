@@ -1,0 +1,195 @@
+//! The system the runtime runs on: the memory of its records and of the chunks cells draw, task stacks, idling, its standard streams, its start and its exit. On `x86_64-host` the host module provides them over the C library and Linux; on a machine target the machine module does, over the boot heap, the serial and exit ports and the CPUs.
+
+/// The text written when the runtime cannot start.
+const RUNTIME_SYSTEM_UNAVAILABLE: Str = "nan: runtime unavailable\n"
+
+/// A table `Init` sets up.
+enum SystemTable derives Copy, Eq {
+    Cells
+    ChunkMap
+    Entries
+    Process
+    Root
+} SystemTable
+
+/// The tables `Init` sets up, by the field of the runtime state addressing each, its size and
+/// the name of the data a machine image reserves for it.
+const RUNTIME_SYSTEM_TABLES: Array[SystemTable, 5] = system_tables()
+
+fn system_tables() -> Array[SystemTable, 5] {
+    var listed = Array[SystemTable, 5].filled(SystemTable.Cells)
+    listed[1] = SystemTable.ChunkMap
+    listed[2] = SystemTable.Entries
+    listed[3] = SystemTable.Process
+    listed[4] = SystemTable.Root
+    return listed
+} system_tables
+
+fn SystemTable.field(self) -> u64 {
+    return match self {
+        SystemTable.Cells => STATE_CELLS
+        SystemTable.ChunkMap => STATE_CHUNK_MAP
+        SystemTable.Entries => STATE_ENTRIES
+        SystemTable.Process => STATE_PROCESS
+        SystemTable.Root => STATE_ROOT
+    }
+} SystemTable.field
+
+fn SystemTable.size(self) -> u64 {
+    return match self {
+        SystemTable.Cells => MEMORY_CELLS * CELL_RECORD
+        SystemTable.ChunkMap => MAP_ROOTS * 8
+        SystemTable.Entries => TABLES_ENTRIES * TABLES_ENTRY_RECORD
+        SystemTable.Process => DOMAIN_SIZE
+        SystemTable.Root => REGIONS_REGION_SIZE
+    }
+} SystemTable.size
+
+proj fn SystemTable.name(self) -> Str {
+    return match self {
+        SystemTable.Cells => "_NScells"
+        SystemTable.ChunkMap => "_NSchunk_map"
+        SystemTable.Entries => "_NSentries"
+        SystemTable.Process => "_NSprocess"
+        SystemTable.Root => "_NSroot_region"
+    }
+} SystemTable.name
+
+/// Defines `Init`, `Exit` and the record routines.
+fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    if routine == Routine.Init {
+        init(mut lo, mut fx)
+    } else if routine == Routine.Exit and lo.machine() {
+        let params = mut fx.entry()
+        expect params.len() > 0
+        mut lo.exit_machine(mut fx, status: params[0])
+    } else if lo.machine() {
+        heap_define(mut lo, mut fx, routine)
+    } else {
+        host_define(mut lo, mut fx, routine)
+    }
+} system_define
+
+/// `Init()`: the cell, chunk and capability tables, the process domain and the root region,
+/// which a machine image reserves, then the executors of the platform; nonzero when the runtime
+/// cannot start.
+fn init(mut lo: Lowering, mut fx: Fx) {
+    discard mut fx.entry()
+    let state_address = mut lo.state(mut fx)
+    for table in RUNTIME_SYSTEM_TABLES {
+        if lo.machine() {
+            let address = mut lo.reserved(mut fx, data_name: table.name(), size: table.size(), align: 64)
+            mut fx.store(address, addr: state_address, offset: table.field())
+        } else {
+            let size = mut fx.ptr(table.size())
+            let address = mut lo.record_alloc(mut fx, size)
+            unavailable_unless(mut fx, address)
+            mut fx.store(address, addr: state_address, offset: table.field())
+        }
+    }
+    let one = mut fx.ptr(1)
+    let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+    mut fx.store(one, addr: root, offset: REGIONS_REGION_ID)
+    mut fx.store(one, addr: state_address, offset: STATE_REGIONS)
+    if lo.machine() {
+        mut lo.machine_init(mut fx)
+    } else {
+        start_threads(mut lo, mut fx)
+    }
+    let zero = mut fx.ptr(0)
+    mut fx.b.ret(fx.list1(zero).view())
+} init
+
+/// Returns 1 from `Init` when an address is zero.
+fn unavailable_unless(mut fx: Fx, address: clif::Value) {
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: address, y: 0)
+    mut fx.if_true(missing, then: fn(mut fx1: Fx) {
+        let one = mut fx1.ptr(1)
+        mut fx1.b.ret(fx1.list1(one).view())
+    })
+} unavailable_unless
+
+/// Writes that the runtime is unavailable and ends with status 71.
+fn system_unavailable(mut lo: Lowering, mut fx: Fx) {
+    let literal = mut lo.view_literal(mut fx, contents: RUNTIME_SYSTEM_UNAVAILABLE.as_bytes())
+    let text = literal.address_value()
+    let start = mut fx.load(PTR, addr: text, offset: 0)
+    let len = mut fx.load(PTR, addr: text, offset: 8)
+    discard mut lo.call_routine(mut fx, routine: Routine.WriteErr, args: fx.list2(start, b: len).view())
+    let status = mut fx.ptr(71)
+    discard mut lo.call_routine(mut fx, routine: Routine.Exit, args: fx.list1(status).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} system_unavailable
+
+/// Writes a byte range to a standard stream: on `x86_64-host` to its descriptor, on a machine
+/// target to the serial port, which carries both streams.
+fn write_stream(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
+    if lo.machine() {
+        mut lo.serial_write(mut fx, text, len)
+    } else {
+        host_write_all(mut lo, mut fx, fd, text, len)
+    }
+} write_stream
+
+/// `count` zero-filled chunks aligned to their size, zero when the supply runs out.
+fn system_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    if lo.machine() {
+        return heap_map_chunks(mut lo, mut fx, count)
+    }
+    return host_map_chunks(mut lo, mut fx, count)
+} system_map_chunks
+
+/// Returns `count` chunks from `base` to the supply.
+fn system_unmap_chunks(mut lo: Lowering, mut fx: Fx, base: clif::Value, count: clif::Value) {
+    if lo.machine() {
+        heap_unmap_chunks(mut lo, mut fx, base, count)
+    } else {
+        let len = mut fx.b.imul_imm_s(count, y: i64.fit(MEMORY_CHUNK))
+        unmap(mut lo, mut fx, address: base, len)
+    }
+} system_unmap_chunks
+
+/// A task stack of `len` bytes whose lowest page is an inaccessible guard on `x86_64-host`, zero
+/// when the system refuses; a machine target draws it as a runtime record, its guard region
+/// unprotected since its stacks have static bounds.
+fn system_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value) -> clif::Value {
+    if lo.machine() {
+        return mut lo.record_alloc(mut fx, size: len)
+    }
+    return host_map_stack(mut lo, mut fx, len)
+} system_map_stack
+
+/// Returns a task stack `system_map_stack` gave.
+fn unmap_stack(mut lo: Lowering, mut fx: Fx, stack: clif::Value, len: clif::Value) {
+    if lo.machine() {
+        mut lo.record_free(mut fx, address: stack)
+    } else {
+        unmap(mut lo, mut fx, address: stack, len)
+    }
+} unmap_stack
+
+/// Makes the guard region at the base of a stack drawn through a cell inaccessible, or
+/// accessible again, on `x86_64-host`.
+fn system_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
+    if not lo.machine() {
+        host_protect_guard(mut lo, mut fx, base, accessible)
+    }
+} system_protect_guard
+
+/// Waits until a task may be ready: on `x86_64-host` in the running thread's ring, handling the
+/// completions that arrive; on a machine target the CPU halts until an interrupt.
+fn system_idle(mut lo: Lowering, mut fx: Fx) {
+    if lo.machine() {
+        discard mut lo.call_stub(mut fx, stub: Stub.IdleWait, args: mem::List[clif::Value].empty(fx.alloc).view())
+    } else {
+        host_idle(mut lo, mut fx)
+    }
+} system_idle
+
+/// Wakes an executor thread waiting idle, other than the running one, so a task made ready
+/// runs; a machine CPU waiting idle wakes on its own timer.
+fn system_wake_idle(mut lo: Lowering, mut fx: Fx) {
+    if not lo.machine() {
+        host_wake_idle(mut lo, mut fx)
+    }
+} system_wake_idle

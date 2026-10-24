@@ -1,8 +1,10 @@
 //! The units of a package in the canonical NIR encoding, as its code root's NIR stream holds them: each unit's path, kind, targets, visibility, head, declaration, properties, functions, digests under each target, premises, statuses and spans; and the encoding of const values.
 
-/// A package's NIR stream.
+/// A package's NIR stream, with the lines its spans start on.
 struct NirStream {
     bytes: mem::Bytes
+    /// The first line of each span, by file path as spans write it.
+    lines: mem::Map[text::String, mem::Set[u32]]
 } NirStream
 
 /// A part of an encoded unit, by its key.
@@ -24,6 +26,7 @@ struct EncodedUnit {
     parts: mem::List[EncodedPart]
     /// The digest of each function part 9 covers, by its role and index.
     covered: mem::List[CoveredFunction]
+    lines: mem::Map[text::String, mem::Set[u32]]
 } EncodedUnit
 
 /// The encoded functions of a unit under one target.
@@ -73,16 +76,32 @@ fn package_stream(checkers: Slice[TargetChecker], package_name: Str, alloc: mem:
         }
     }
     mut units.sort_by(fn(left: StreamUnit, right: StreamUnit) => unit_order(left, right))
+    var lines = mem::Map[text::String, mem::Set[u32]].empty(alloc)
     var out = mem::Bytes.empty(alloc)
     mut out.append(b"NIR\x00")
     encode_number(mut out, value: 1)
     encode_number(mut out, value: u64.widen(units.len()))
     for unit in take units {
+        add_lines(mut lines, added: unit.encoded.lines, alloc)
         let record = stream_record(take unit, alloc)
         mut out.append(record.view())
     }
-    return NirStream(bytes: take out)
+    return NirStream(bytes: take out, lines: take lines)
 } package_stream
+
+/// Adds the first lines of a unit's spans to those of a stream, by file path.
+fn add_lines(mut lines: mem::Map[text::String, mem::Set[u32]], added: mem::Map[text::String, mem::Set[u32]], alloc: mem::Alloc) {
+    for entry in added {
+        let path = entry.key()
+        if not lines.contains(path) {
+            discard mut lines.insert(text::String.of(path.as_str(), alloc), value: mem::Set[u32].empty(alloc))
+        }
+        var held = mut lines.at_mut(path)
+        for line in entry.value() {
+            discard mut held.insert(line)
+        }
+    }
+} add_lines
 
 /// The index of the unit already in the stream with an encoded unit's path and parts.
 fn same_unit(units: Slice[StreamUnit], by_path: mem::HashMap[text::String, mem::List[usize]], encoded: EncodedUnit) -> Option[usize]
@@ -438,6 +457,7 @@ fn Checker.generic_positions(self, item: ty::ItemId) -> mem::HashMap[ty::Param, 
                     own += 1
                 }
             }
+            expect own < ~0u64
             match held.kind {
                 SigKind.Interface(methods: methods) => {
                     for method in methods {
@@ -459,6 +479,7 @@ fn Checker.generic_positions(self, item: ty::ItemId) -> mem::HashMap[ty::Param, 
 /// Places generic parameters at positions from `from` on.
 fn add_positions(mut positions: mem::HashMap[ty::Param, u64], defs: Slice[GenericDef], from: u64) {
     for offset in 0..<defs.len() {
+        expect from <= ~0u64 - u64.widen(offset)
         discard mut positions.insert(defs[offset].param, value: from + u64.widen(offset))
     }
 } add_positions
@@ -510,8 +531,9 @@ fn Checker.encoded_unit(self, item: ty::ItemId) -> Option[EncodedUnit] {
         }
         mut parts.push(EncodedPart(key: 11, bytes: take content))
     }
+    var lines = mem::Map[text::String, mem::Set[u32]].empty(alloc)
     if held.functions.len() > 0 {
-        mut parts.push(EncodedPart(key: 12, bytes: self.spans(item, unit: held)))
+        mut parts.push(EncodedPart(key: 12, bytes: self.spans(item, unit: held, lines: mut lines)))
     }
     var covered = mem::List[CoveredFunction].empty(alloc)
     for function in held.functions {
@@ -520,7 +542,7 @@ fn Checker.encoded_unit(self, item: ty::ItemId) -> Option[EncodedUnit] {
             else => {}
         }
     }
-    return Some(EncodedUnit(path: take path, parts: take parts, covered: take covered))
+    return Some(EncodedUnit(path: take path, parts: take parts, covered: take covered, lines: take lines))
 } Checker.encoded_unit
 
 /// Adds a part unless it is empty.
@@ -1056,7 +1078,7 @@ fn add_premise(mut premises: mem::HashMap[u32, text::String], expr: ast::Expr, a
 
 /// Part 12: for each function, its span, its parameters' spans with their names, then each
 /// block's instructions' spans, a slot's with its name, and its terminator's span.
-fn Checker.spans(self, item: ty::ItemId, unit: nir::NirUnit) -> mem::Bytes {
+fn Checker.spans(self, item: ty::ItemId, unit: nir::NirUnit, mut lines: mem::Map[text::String, mem::Set[u32]]) -> mem::Bytes {
     let alloc = self.alloc()
     let db = self.db()
     let file = db.item_file(item)
@@ -1075,38 +1097,40 @@ fn Checker.spans(self, item: ty::ItemId, unit: nir::NirUnit) -> mem::Bytes {
     }
     let syntax = file.syntax
     var out = mem::Bytes.empty(alloc)
+    var held = mem::Set[u32].empty(alloc)
     encode_number(mut out, value: u64.widen(unit.functions.len()))
     for function in unit.functions {
-        write_span(mut out, syntax, path: path.as_str(), span: function.span)
+        write_span(mut out, syntax, path: path.as_str(), span: function.span, lines: mut held)
         encode_number(mut out, value: u64.widen(function.params.len()))
         for param in function.params {
-            write_span(mut out, syntax, path: path.as_str(), span: param.span)
+            write_span(mut out, syntax, path: path.as_str(), span: param.span, lines: mut held)
             encode_text(mut out, value: param.name.as_str())
         }
         encode_number(mut out, value: u64.widen(function.blocks.len()))
         for block in function.blocks {
-            write_block_spans(mut out, syntax, path: path.as_str(), block)
+            write_block_spans(mut out, syntax, path: path.as_str(), block, lines: mut held)
         }
     }
+    discard mut lines.insert(take path, value: take held)
     return out
 } Checker.spans
 
 /// The spans of a block's instructions, a slot's with its name, and its terminator's span.
-fn write_block_spans(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, block: nir::Block) {
+fn write_block_spans(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, block: nir::Block, mut lines: mem::Set[u32]) {
     encode_number(mut out, value: u64.widen(block.insts.len()))
     for inst in block.insts {
-        write_span(mut out, syntax, path, span: inst.span)
+        write_span(mut out, syntax, path, span: inst.span, lines: mut lines)
         match inst.op {
             nir::Op.Slot(name: Some(name), ty: _) => encode_text(mut out, value: name.as_str())
             else => {}
         }
     }
-    write_span(mut out, syntax, path, span: block.term_span)
+    write_span(mut out, syntax, path, span: block.term_span, lines: mut lines)
 } write_block_spans
 
 /// A span: its file path, then the line and column of its first token's start and of its
-/// last token's end.
-fn write_span(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, span: nir::Span) {
+/// last token's end; adds the line of its first token to `lines`.
+fn write_span(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, span: nir::Span, mut lines: mem::Set[u32]) {
     expect usize.widen(span.head) < syntax.tokens.len() and usize.widen(span.last) < syntax.tokens.len()
     let head = syntax.tokens[usize.widen(span.head)]
     let last = syntax.tokens[usize.widen(span.last)]
@@ -1115,6 +1139,7 @@ fn write_span(mut out: mem::Bytes, syntax: syntax::SourceFile, path: Str, span: 
     encode_number(mut out, value: column(syntax, line: head.line, at: head.start))
     encode_number(mut out, value: u64.widen(last.line))
     encode_number(mut out, value: column(syntax, line: last.line, at: last.end))
+    discard mut lines.insert(head.line)
 } write_span
 
 /// The column of a byte on a line: its distance from the line's start.

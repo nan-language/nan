@@ -1,0 +1,97 @@
+//! Writes `x86_64-bare` images: static ELF64 executables whose segments load at their physical addresses, with a `XEN_ELFNOTE_PHYS32_ENTRY` note naming the entry a PVH loader enters.
+
+/// The physical address at which an image's first segment loads.
+const ELF_BASE: u64 = 0x0010_0000
+
+const ELF_HEADER: u64 = 64
+const ELF_PROGRAM_HEADER: u64 = 56
+const ELF_SECTION_HEADER: u16 = 64
+
+const ET_EXEC: u16 = 2
+const EM_X86_64: u16 = 62
+const EV_CURRENT: u32 = 1
+const PT_LOAD: u32 = 1
+const PT_NOTE: u32 = 4
+const PF_X: u32 = 1
+const PF_W: u32 = 2
+const PF_R: u32 = 4
+
+/// The type of the note naming the 32-bit PVH entry, and its owner's name.
+const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18
+const XEN: Slice[u8] = b"Xen\0"
+
+/// The note: the lengths of its name and description, its type, its name and the entry address
+/// as 8 bytes.
+fn note(entry: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var written = mem::Bytes.empty(alloc)
+    object::append_u32(mut written, value: u32.fit(XEN.len()))
+    object::append_u32(mut written, value: 8)
+    object::append_u32(mut written, value: XEN_ELFNOTE_PHYS32_ENTRY)
+    mut written.append(XEN)
+    object::append_u64(mut written, value: entry)
+    return written
+} note
+
+/// Where a segment loads, and its sizes in the file and in memory.
+struct Extent derives Copy {
+    address: u64
+    file: u64
+    memory: u64
+} Extent
+
+fn program_header(mut out: mem::Bytes, kind: u32, flags: u32, offset: u64, extent: Extent, align: u64) {
+    object::append_u32(mut out, value: kind)
+    object::append_u32(mut out, value: flags)
+    object::append_u64(mut out, value: offset)
+    object::append_u64(mut out, value: extent.address)
+    object::append_u64(mut out, value: extent.address)
+    object::append_u64(mut out, value: extent.file)
+    object::append_u64(mut out, value: extent.memory)
+    object::append_u64(mut out, value: align)
+} program_header
+
+/// The bytes of a static ELF64 executable loading the linked object's segments at their
+/// addresses, entered at the address `entry`, which its note also names.
+fn elf_write(linked: Linked, entry: u64, alloc: mem::Alloc) -> mem::Bytes {
+    let count = u64.widen(linked.segments.len()) + 1
+    let note_offset = ELF_HEADER + ELF_PROGRAM_HEADER * count
+    let entry_note = note(entry, alloc)
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(b"\x7fELF\x02\x01\x01")
+    object::resize(mut out, length: 16)
+    object::append_u16(mut out, value: ET_EXEC)
+    object::append_u16(mut out, value: EM_X86_64)
+    object::append_u32(mut out, value: EV_CURRENT)
+    object::append_u64(mut out, value: entry)
+    object::append_u64(mut out, value: ELF_HEADER)
+    object::append_u64(mut out, value: 0)
+    object::append_u32(mut out, value: 0)
+    object::append_u16(mut out, value: u16.fit(ELF_HEADER))
+    object::append_u16(mut out, value: u16.fit(ELF_PROGRAM_HEADER))
+    object::append_u16(mut out, value: u16.fit(count))
+    object::append_u16(mut out, value: ELF_SECTION_HEADER)
+    object::append_u16(mut out, value: 0)
+    object::append_u16(mut out, value: 0)
+    var offset = next_multiple_of(note_offset + u64.widen(entry_note.len()), multiple: PAGE)
+    var placed = mem::List[u64].empty(alloc)
+    for segment in linked.segments {
+        let flags = match segment.access {
+            Access.Execute => PF_R | PF_X
+            Access.Read => PF_R
+            Access.Write => PF_R | PF_W
+        }
+        let extent = Extent(address: segment.address, file: u64.widen(segment.bytes.len()), memory: segment.size)
+        program_header(mut out, kind: PT_LOAD, flags, offset, extent, align: PAGE)
+        mut placed.push(offset)
+        offset = next_multiple_of(offset + u64.widen(segment.bytes.len()), multiple: PAGE)
+    }
+    let length = u64.widen(entry_note.len())
+    program_header(mut out, kind: PT_NOTE, flags: PF_R, offset: note_offset, extent: Extent(address: 0, file: length, memory: 0), align: 4)
+    mut out.append(entry_note.view())
+    expect placed.len() == linked.segments.len()
+    for index in 0..<linked.segments.len() {
+        object::resize(mut out, length: usize.widen(placed[index]))
+        mut out.append(linked.segments[index].bytes.view())
+    }
+    return out
+} elf_write

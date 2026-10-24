@@ -1,0 +1,702 @@
+//! Channels: a bounded queue of values between tasks, written through senders and read through one receiver. A channel's record, in runtime memory, is its lock, its capacity, the number of values it buffers and the position of the oldest, its unreleased senders, whether its receiver is unreleased, the senders waiting for room, the receiver waiting for a value, its buffer, drawn through the channel's allocator, and its reach. A sender or receiver is the holding of the record. A waiting sender is a node on its stack: its task and the next waiting sender.
+
+const CHANNEL_LOCK: u64 = 0
+
+const CHANNEL_CAPACITY: u64 = 8
+
+const CHANNEL_LEN: u64 = 16
+
+const CHANNEL_HEAD: u64 = 24
+
+const CHANNEL_SENDERS: u64 = 32
+
+const CHANNEL_RECEIVER: u64 = 40
+
+const CHANNEL_WAITING_SENDERS: u64 = 48
+
+const CHANNEL_WAITING_RECEIVER: u64 = 56
+
+const CHANNEL_BUFFER: u64 = 64
+
+const CHANNEL_REACH: u64 = 72
+
+const CHANNEL_SIZE: u64 = 80
+
+const NODE_TASK: u64 = 0
+
+const NODE_NEXT: u64 = 8
+
+const CHANNELS_NODE_SIZE: u64 = 16
+
+/// What each pass of a send's loop reads: the channel's record and lock, the value sent with
+/// its type and shape, whether such values are linear and whether moving them does anything,
+/// and the sender's waiting node.
+struct Sending derives Copy {
+    record: clif::Value
+    lock: clif::Value
+    value: Held
+    element: ty::Ty
+    shape: Element
+    linear_values: bool
+    moves: bool
+    waiter: clif::Value
+} Sending
+
+fn channels_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let element = supply.type_arg(lo, index: 0)
+    match supply.path.as_str() {
+        "task::Channel.bounded" or "task::Channel.try_bounded" => channels_bounded(mut lo, mut fx, supply, element)
+        "task::Sender.split" => {
+            let record = holdings_payload(mut fx, address: supply.param(0).address_value())
+            let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+            discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+            let senders = mut fx.load(PTR, addr: record, offset: CHANNEL_SENDERS)
+            let more = mut fx.b.iadd_imm_s(senders, y: 1)
+            mut fx.store(more, addr: record, offset: CHANNEL_SENDERS)
+            discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let holding = hold(mut lo, mut fx, record, kind: HOLDINGS_KIND_SENDER)
+            mut fx.store(holding, addr: sret, offset: 0)
+            supply.done(mut lo, mut fx)
+        }
+        "task::Sender.send" => send(mut lo, mut fx, supply, element)
+        "task::Receiver.receive" => receive(mut lo, mut fx, supply, element)
+        "task::Receiver.drain" => drain(mut lo, mut fx, supply, element)
+        else => {
+            expect false
+        }
+    }
+} channels_lower
+
+/// Whether values of a type are linear, which channels never release.
+fn channels_linear(lo: Lowering, ty: ty::Ty) -> bool {
+    return lo.ck.has(ty, property: check::Property.Linear)
+} channels_linear
+
+/// `Channel.bounded(capacity, alloc)` and `try_bounded`.
+fn channels_bounded(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let capacity = supply.param(0).scalar_value()
+    let cell = mut fx.load(PTR, addr: supply.param(1).address_value(), offset: 0)
+    let shape = Element.of(mut lo, ty: element)
+    let bytes = shape.bytes(mut fx, count: capacity)
+    let one = mut fx.ptr(1)
+    let drawn = mut fx.b.umax(bytes, y: one)
+    let align = mut fx.ptr(shape.align)
+    var alloc_args = Array[clif::Value, 3].filled(cell)
+    alloc_args[1] = drawn
+    alloc_args[2] = align
+    let buffer_values = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect buffer_values.len() == 1
+    let buffer = buffer_values[0]
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: buffer, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        supply.exhausted(mut lo, fx: mut fx1, taken: mem::List[Taken].empty(fx1.alloc).view())
+    })
+    let size = mut fx.ptr(CHANNEL_SIZE)
+    let record = mut lo.record_alloc(mut fx, size)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    mut fx.store(capacity, addr: record, offset: CHANNEL_CAPACITY)
+    mut fx.store(one, addr: record, offset: CHANNEL_SENDERS)
+    mut fx.store(one, addr: record, offset: CHANNEL_RECEIVER)
+    mut fx.store(buffer, addr: record, offset: CHANNEL_BUFFER)
+    let reach = current_domain(mut lo, mut fx)
+    mut fx.store(reach, addr: record, offset: CHANNEL_REACH)
+    let channel_ty = supply.abi.result
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let sender_field = mut lo.layouts.field(lo.ck, ty: channel_ty, variant: None, label: "sender")
+    let sender_at = sender_field.offset
+    let sender = hold(mut lo, mut fx, record, kind: HOLDINGS_KIND_SENDER)
+    mut fx.store(sender, addr: sret, offset: sender_at)
+    let receiver_field = mut lo.layouts.field(lo.ck, ty: channel_ty, variant: None, label: "receiver")
+    let receiver_at = receiver_field.offset
+    let receiver = hold(mut lo, mut fx, record, kind: HOLDINGS_KIND_RECEIVER)
+    mut fx.store(receiver, addr: sret, offset: receiver_at)
+    supply.done(mut lo, mut fx)
+} channels_bounded
+
+/// A new holding of a channel's record as a sender or its receiver.
+fn hold(mut lo: Lowering, mut fx: Fx, record: clif::Value, kind: i64) -> clif::Value {
+    let kind_value = mut fx.ptr(u64.fit(kind))
+    var hold_args = Array[clif::Value, 2].filled(kind_value)
+    hold_args[1] = record
+    let returned = mut lo.call_routine(mut fx, routine: Routine.Hold, args: hold_args.view())
+    expect returned.len() == 1
+    return returned[0]
+} hold
+
+/// The address of the buffer slot at a position counted from the oldest value.
+fn channels_slot_at(mut fx: Fx, record: clif::Value, shape: Element, position: clif::Value) -> clif::Value {
+    let head = mut fx.load(PTR, addr: record, offset: CHANNEL_HEAD)
+    let capacity = mut fx.load(PTR, addr: record, offset: CHANNEL_CAPACITY)
+    let counted = mut fx.b.iadd(head, y: position)
+    let index = mut fx.b.urem(counted, y: capacity)
+    let buffer = mut fx.load(PTR, addr: record, offset: CHANNEL_BUFFER)
+    return shape.at(mut fx, data: buffer, index)
+} channels_slot_at
+
+/// Passes the holdings of a value just received to the receiving task's domain.
+fn receive_into(mut lo: Lowering, mut fx: Fx, element: ty::Ty, address: clif::Value) {
+    if mut lo.transfers(element) {
+        let none = mut fx.ptr(0)
+        let domain = current_domain(mut lo, mut fx)
+        mut lo.transfer(mut fx, ty: element, address, lift: none, owner: domain)
+    }
+} receive_into
+
+/// Removes the oldest value into an address, waking one waiting sender. The caller holds the
+/// lock.
+fn take_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, element: ty::Ty, target: clif::Value) {
+    let shape = Element.of(mut lo, ty: element)
+    let zero = mut fx.ptr(0)
+    let oldest = channels_slot_at(mut fx, record, shape, position: zero)
+    let held = mut lo.held_at(mut fx, ty: element, address: oldest)
+    mut lo.store_held(mut fx, address: target, held, ty: element)
+    let head = mut fx.load(PTR, addr: record, offset: CHANNEL_HEAD)
+    let capacity = mut fx.load(PTR, addr: record, offset: CHANNEL_CAPACITY)
+    let advanced = mut fx.b.iadd_imm_s(head, y: 1)
+    let wrapped = mut fx.b.urem(advanced, y: capacity)
+    mut fx.store(wrapped, addr: record, offset: CHANNEL_HEAD)
+    let len = mut fx.load(PTR, addr: record, offset: CHANNEL_LEN)
+    let shrunk = mut fx.b.iadd_imm_s(len, y: -1)
+    mut fx.store(shrunk, addr: record, offset: CHANNEL_LEN)
+    let sender = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_SENDERS)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: sender, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let next = mut fx1.load(PTR, addr: sender, offset: NODE_NEXT)
+        mut fx1.store(next, addr: record, offset: CHANNEL_WAITING_SENDERS)
+        let task = mut fx1.load(PTR, addr: sender, offset: NODE_TASK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
+    })
+} take_oldest
+
+/// Whether the running call is cancelled, with the origin a cancellation then holds.
+fn channels_cancelled(mut lo: Lowering, mut fx: Fx) -> CancellationOrigin {
+    let origin = tasks_origin(mut lo, mut fx)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
+    return CancellationOrigin(cancelled: cancelled, origin: origin)
+} channels_cancelled
+
+/// `sender.send(v)`: appends `v`, waiting while the buffer is full; for droppable values a
+/// cancellation point failing with `SendError.Closed` once the receiver is released. A value
+/// in the buffer is owned by no domain, and its memory lies in chunks of the channel's reach.
+fn send(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let record = holdings_payload(mut fx, address: supply.param(0).address_value())
+    let value = supply.param(1)
+    let shape = Element.of(mut lo, ty: element)
+    let linear_values = channels_linear(lo, ty: element)
+    if not linear_values {
+        let asked = channels_cancelled(mut lo, mut fx)
+        mut fx.if_true(asked.cancelled, then: fn[mut lo](mut fx1: Fx) {
+            match value {
+                Held.Address(address) => mut lo.release(mut fx1, ty: element, address)
+                else => {}
+            }
+            tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: asked.origin)
+        })
+    }
+    let moves = mut lo.transfers(element)
+    let domain = current_domain(mut lo, mut fx)
+    if moves {
+        let none = mut fx.ptr(0)
+        mut lo.transfer(mut fx, ty: element, address: value.address_value(), lift: none, owner: none)
+    }
+    let waiter = mut fx.slot(CHANNELS_NODE_SIZE, align: 8)
+    let current = current_task(mut lo, mut fx)
+    mut fx.store(current, addr: waiter, offset: NODE_TASK)
+    let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+    let sending = Sending(record: record, lock: lock, value: value, element: element, shape: shape, linear_values: linear_values, moves: moves, waiter: waiter)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(domain).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        expect walk_state.len() == 1
+        return send_pass(mut lo, fx: mut fx1, supply, sending, walked: walk_state[0])
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} send
+
+/// One pass of a send's loop, under the channel's lock: the send ends once the receiver is
+/// released or the value enters the buffer; otherwise the walk moving the value follows the
+/// channel's reach, or the sender waits for room.
+fn send_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, sending: Sending, walked: clif::Value) -> Pass {
+    let lock = sending.lock
+    let record = sending.record
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let receiver = mut fx.load(PTR, addr: record, offset: CHANNEL_RECEIVER)
+    let closed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: receiver, y: 0)
+    let len = mut fx.load(PTR, addr: record, offset: CHANNEL_LEN)
+    let capacity = mut fx.load(PTR, addr: record, offset: CHANNEL_CAPACITY)
+    let room = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: len, y: capacity)
+    if sending.linear_values {
+        mut fx.if_true(closed, then: fn[mut lo](mut fx1: Fx) {
+            discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            supply.done(mut lo, fx: mut fx1)
+        })
+    } else {
+        mut fx.if_true(closed, then: fn[mut lo](mut fx1: Fx) {
+            discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            match sending.value {
+                Held.Address(address) => mut lo.release(mut fx1, ty: sending.element, address)
+                else => {}
+            }
+            channels_fail_closed(mut lo, fx: mut fx1, supply)
+        })
+    }
+    let reach = mut fx.load(PTR, addr: record, offset: CHANNEL_REACH)
+    var placed = reach
+    if sending.moves {
+        placed = mut fx.b.icmp(clif::IntCC.Equal, x: reach, y: walked)
+    } else {
+        placed = mut fx.int(clif::Type.Int8, value: 1)
+    }
+    let ready = mut fx.b.band(room, y: placed)
+    mut fx.if_true(ready, then: fn[mut lo](mut fx1: Fx) {
+        let slot = channels_slot_at(mut fx1, record, shape: sending.shape, position: len)
+        mut lo.store_held(mut fx1, address: slot, held: sending.value, ty: sending.element)
+        let grown = mut fx1.b.iadd_imm_s(len, y: 1)
+        mut fx1.store(grown, addr: record, offset: CHANNEL_LEN)
+        let receiving = mut fx1.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiving, y: 0)
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(receiving).view())
+        })
+        supply.done(mut lo, fx: mut fx1)
+    })
+    let next = mut fx.choose_in(mut lo, condition: room, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        if sending.moves {
+            let keep = mut fx1.int(PTR, value: TRANSFER_KEEP)
+            mut lo1.transfer(mut fx1, ty: sending.element, address: sending.value.address_value(), lift: reach, owner: keep)
+        }
+        var reached = mem::List[clif::Value].empty(fx1.alloc)
+        mut reached.push(reach)
+        return reached
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        send_wait(mut lo1, fx: mut fx1, supply, sending)
+        var unmoved = mem::List[clif::Value].empty(fx1.alloc)
+        mut unmoved.push(walked)
+        return unmoved
+    })
+    let again = mut fx.int(clif::Type.Int8, value: 1)
+    return Pass(again: again, next: take next)
+} send_pass
+
+/// Waits for room in a send's channel, whose lock the caller holds: the sender's node joins
+/// the waiting senders until a receiver wakes it; for droppable values a cancellation point.
+fn send_wait(mut lo: Lowering, mut fx: Fx, supply: Supply, sending: Sending) {
+    let lock = sending.lock
+    let record = sending.record
+    let waiter = sending.waiter
+    let head = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_SENDERS)
+    mut fx.store(head, addr: waiter, offset: NODE_NEXT)
+    mut fx.store(waiter, addr: record, offset: CHANNEL_WAITING_SENDERS)
+    if not sending.linear_values {
+        waiting_on(mut lo, mut fx, what: REGIONS_WAITING)
+    }
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let withdraw = withdraw_sender(mut lo)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: waiter)
+    discard mut lo.call_routine(mut fx, routine: Routine.Park, args: mem::List[clif::Value].empty(fx.alloc).view())
+    leave_wait(mut lo, mut fx)
+    if not sending.linear_values {
+        waiting_on(mut lo, mut fx, what: 0)
+        let asked = channels_cancelled(mut lo, mut fx)
+        mut fx.if_true(asked.cancelled, then: fn[mut lo](mut fx1: Fx) {
+            discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+            channels_unlink(mut fx1, record, waiter)
+            discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            match sending.value {
+                Held.Address(address) => mut lo.release(mut fx1, ty: sending.element, address)
+                else => {}
+            }
+            tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: asked.origin)
+        })
+    }
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    channels_unlink(mut fx, record, waiter)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+} send_wait
+
+/// Takes a stopped sender's node out of the list of its channel's waiting senders.
+fn withdraw_sender(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawSender, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = mut fx1.load(PTR, addr: params[0], offset: WAIT_OBJECT)
+        let waiter = mut fx1.load(PTR, addr: params[0], offset: WAIT_NODE)
+        let lock = mut fx1.offset(record, offset: CHANNEL_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        channels_unlink(mut fx1, record, waiter)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_sender
+
+/// Ends a stopped receiver's wait for a value in its channel.
+fn withdraw_receiver(mut lo: Lowering) -> object::FuncId {
+    let signature = withdraw_signature(lo.alloc)
+    return mut lo.glue_function(Glue.WithdrawReceiver, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = mut fx1.load(PTR, addr: params[0], offset: WAIT_OBJECT)
+        let lock = mut fx1.offset(record, offset: CHANNEL_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let receiving = mut fx1.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        let stopped = mut fx1.b.icmp(clif::IntCC.Equal, x: receiving, y: params[1])
+        mut fx1.if_true(stopped, then: fn(mut fx2: Fx) {
+            let zero = mut fx2.ptr(0)
+            mut fx2.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        })
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} withdraw_receiver
+
+/// Removes a waiting sender's node from its channel's list when it is still there. The caller
+/// holds the lock.
+fn channels_unlink(mut fx: Fx, record: clif::Value, waiter: clif::Value) {
+    let head = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_SENDERS)
+    let is_head = mut fx.b.icmp(clif::IntCC.Equal, x: head, y: waiter)
+    discard mut fx.choose(is_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let next = mut fx1.load(PTR, addr: waiter, offset: NODE_NEXT)
+        mut fx1.store(next, addr: record, offset: CHANNEL_WAITING_SENDERS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(head).view(), body: fn(mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let current = walk_state[0]
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+            let next = mut fx2.choose(present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let after_current = mut fx3.load(PTR, addr: current, offset: NODE_NEXT)
+                let found = mut fx3.b.icmp(clif::IntCC.Equal, x: after_current, y: waiter)
+                mut fx3.if_true(found, then: fn(mut fx4: Fx) {
+                    let after_waiter = mut fx4.load(PTR, addr: waiter, offset: NODE_NEXT)
+                    mut fx4.store(after_waiter, addr: current, offset: NODE_NEXT)
+                })
+                let zero = mut fx3.ptr(0)
+                var stepped = mem::List[clif::Value].empty(fx3.alloc)
+                mut stepped.push(mut fx3.b.select(found, x: zero, y: after_current))
+                return stepped
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                var ended = mem::List[clif::Value].empty(fx3.alloc)
+                mut ended.push(mut fx3.ptr(0))
+                return ended
+            })
+            expect next.len() == 1
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next[0], y: 0)
+            return Pass(again: more, next: take next)
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} channels_unlink
+
+/// Fails a send with `SendError.Closed`.
+fn channels_fail_closed(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(failure_ty) = supply.abi.failure else {
+        expect false
+        return
+    }
+    let value = mut lo.variant_value(mut fx, ty: failure_ty, variant: "Closed", payload_values: mem::List[Held].empty(lo.alloc).view(), wrapped: None)
+    let Some(failure) = supply.failure else {
+        expect false
+        return
+    }
+    mut lo.store_held(mut fx, address: failure, held: value, ty: failure_ty)
+    supply.raise_failure(mut fx)
+} channels_fail_closed
+
+/// `receiver.receive()`: the oldest value, waiting while none is buffered and a sender is
+/// unreleased; `None` once every sender has been released. A cancellation point.
+fn receive(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let record = holdings_payload(mut fx, address: supply.param(0).address_value())
+    let asked = channels_cancelled(mut lo, mut fx)
+    mut fx.if_true(asked.cancelled, then: fn[mut lo](mut fx1: Fx) {
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: asked.origin)
+    })
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let result = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+    let current = current_task(mut lo, mut fx)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        return receive_pass(mut lo, fx: mut fx1, supply, element, record, lock, current, result)
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} receive
+
+/// One pass of a receive's loop: the oldest value, or `None` once every sender has been
+/// released, or else a wait for a value.
+fn receive_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty, record: clif::Value, lock: clif::Value, current: clif::Value, result: clif::Value) -> Pass {
+    let option = supply.abi.result
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    let len = mut fx.load(PTR, addr: record, offset: CHANNEL_LEN)
+    let buffered = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    mut fx.if_true(buffered, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.write_option_with(mut fx1, layout_ty: option, address: result, presence: buffered, write_payload: fn(mut lo2: Lowering, mut fx2: Fx, at: clif::Value) {
+            take_oldest(mut lo2, fx: mut fx2, record, element, target: at)
+            receive_into(mut lo2, fx: mut fx2, element, address: at)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let held = mut lo.held_at(mut fx1, ty: option, address: result)
+        supply.ret(mut lo, fx: mut fx1, held)
+    })
+    let senders = mut fx.load(PTR, addr: record, offset: CHANNEL_SENDERS)
+    let ended = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: senders, y: 0)
+    mut fx.if_true(ended, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let none = mut lo.none_value(mut fx1, option)
+        mut lo.store_held(mut fx1, address: result, held: none, ty: option)
+        let held = mut lo.held_at(mut fx1, ty: option, address: result)
+        supply.ret(mut lo, fx: mut fx1, held)
+    })
+    mut fx.store(current, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+    waiting_on(mut lo, mut fx, what: REGIONS_WAITING)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    let withdraw = withdraw_receiver(mut lo)
+    enter_wait(mut lo, mut fx, glue: withdraw, object: record, node: current)
+    discard mut lo.call_routine(mut fx, routine: Routine.Park, args: mem::List[clif::Value].empty(fx.alloc).view())
+    leave_wait(mut lo, mut fx)
+    waiting_on(mut lo, mut fx, what: 0)
+    let asked = channels_cancelled(mut lo, mut fx)
+    mut fx.if_true(asked.cancelled, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: asked.origin)
+    })
+    let again = mut fx.int(clif::Type.Int8, value: 1)
+    return Pass(again: again, next: mem::List[clif::Value].empty(fx.alloc))
+} receive_pass
+
+/// `take receiver.drain(visit: f)`: passes every value, oldest first, to `f` until every sender
+/// has been released, then releases the receiver.
+fn drain(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty) {
+    let receiver = supply.param(0).address_value()
+    let record = holdings_payload(mut fx, address: receiver)
+    let visit = supply.param(1).address_value()
+    let visit_ty = fn_param(lo, supply, index: 1)
+    let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+    let current = current_task(mut lo, mut fx)
+    let laid = mut lo.layout_of(element)
+    let value = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let len = mut fx1.load(PTR, addr: record, offset: CHANNEL_LEN)
+        let buffered = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+        let senders = mut fx1.load(PTR, addr: record, offset: CHANNEL_SENDERS)
+        let ended = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: senders, y: 0)
+        let again_values = mut fx1.choose_in(mut lo, condition: buffered, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            take_oldest(mut lo2, fx: mut fx2, record, element, target: value)
+            discard mut lo2.call_routine(mut fx2, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+            receive_into(mut lo2, fx: mut fx2, element, address: value)
+            let held = mut lo2.held_at(mut fx2, ty: element, address: value)
+            discard mut lo2.call_value(mut fx2, fn_ty: visit_ty, function: visit, args: Array[Held, 1].filled(held).view())
+            var more = mem::List[clif::Value].empty(fx2.alloc)
+            mut more.push(mut fx2.int(clif::Type.Int8, value: 1))
+            return more
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return drain_empty(mut lo2, fx: mut fx2, receiver, record, lock, current, ended)
+        })
+        expect again_values.len() == 1
+        let again = again_values[0]
+        return Pass(again: again, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    supply.done(mut lo, mut fx)
+} drain
+
+/// What a drain does when no value is buffered, under the channel's lock: once every sender has
+/// been released it releases the receiver and gives 0, else it waits for a value and gives 1.
+fn drain_empty(mut lo: Lowering, mut fx: Fx, receiver: clif::Value, record: clif::Value, lock: clif::Value, current: clif::Value, ended: clif::Value) -> mem::List[clif::Value] {
+    return mut fx.choose_in(mut lo, condition: ended, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: record, offset: CHANNEL_RECEIVER)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let holding = mut fx1.load(PTR, addr: receiver, offset: 0)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+        free_channel(mut lo1, fx: mut fx1, record)
+        var done = mem::List[clif::Value].empty(fx1.alloc)
+        mut done.push(mut fx1.int(clif::Type.Int8, value: 0))
+        return done
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(current, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        let withdraw = withdraw_receiver(mut lo1)
+        enter_wait(mut lo1, fx: mut fx1, glue: withdraw, object: record, node: current)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Park, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        leave_wait(mut lo1, fx: mut fx1)
+        var waited = mem::List[clif::Value].empty(fx1.alloc)
+        mut waited.push(mut fx1.int(clif::Type.Int8, value: 1))
+        return waited
+    })
+} drain_empty
+
+/// Frees a channel's buffer and record once no handle of it is unreleased.
+fn free_channel(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let buffer = mut fx.load(PTR, addr: record, offset: CHANNEL_BUFFER)
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(buffer).view())
+    mut lo.record_free(mut fx, address: record)
+} free_channel
+
+/// Releases a sender or a receiver: a receiver of droppable values releases those it buffers
+/// and lets waiting senders fail; the last handle frees the channel.
+fn channels_release(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value) {
+    let Some(element) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return
+    }
+    let holding = mut fx.load(PTR, addr: address, offset: 0)
+    let record = mut fx.load(PTR, addr: holding, offset: HOLDING_PAYLOAD)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unhold, args: Array[clif::Value, 1].filled(holding).view())
+    channels_end(mut lo, mut fx, record, sender: owner_path == "task::Sender", buffered: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        if mut lo1.needs_release(element) {
+            let shape = Element.of(mut lo1, ty: element)
+            let len = mut fx1.load(PTR, addr: record, offset: CHANNEL_LEN)
+            mut fx1.each(zero, end: len, body: fn[mut lo1](mut fx2: Fx, position: clif::Value) {
+                let slot = channels_slot_at(mut fx2, record, shape, position)
+                mut lo1.release(mut fx2, ty: element, address: slot)
+            })
+        }
+        mut fx1.store(zero, addr: record, offset: CHANNEL_LEN)
+    })
+} channels_release
+
+/// Counts a sender or the receiver of a channel as released, as settlement does, releasing
+/// none of the values it buffers; the last handle frees the channel.
+fn settle_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool) {
+    channels_end(mut lo, mut fx, record, sender, buffered: fn(mut lo1: Lowering, mut fx1: Fx) {})
+} settle_end
+
+/// Ends a sender or the receiver of a channel: the last sender wakes the waiting receiver, and
+/// the receiver, once `buffered` has run on its buffer, wakes every waiting sender; the last
+/// handle frees the channel.
+fn channels_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool, buffered: fn(mut lo: Lowering, mut fx: Fx)) {
+    let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+    var woken: Option[clif::Value] = None
+    if sender {
+        let senders = mut fx.load(PTR, addr: record, offset: CHANNEL_SENDERS)
+        let fewer = mut fx.b.iadd_imm_s(senders, y: -1)
+        mut fx.store(fewer, addr: record, offset: CHANNEL_SENDERS)
+        let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: fewer, y: 0)
+        let receiving = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        let zero = mut fx.ptr(0)
+        woken = Some(mut fx.b.select(last, x: receiving, y: zero))
+    } else {
+        let zero = mut fx.ptr(0)
+        mut fx.store(zero, addr: record, offset: CHANNEL_RECEIVER)
+        buffered(mut lo, mut fx)
+        let waiting = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_SENDERS)
+        mut fx.store(zero, addr: record, offset: CHANNEL_WAITING_SENDERS)
+        discard mut fx.repeat(Array[clif::Value, 1].filled(waiting).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let current = walk_state[0]
+            let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+            let next = mut fx1.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                let after_current = mut fx2.load(PTR, addr: current, offset: NODE_NEXT)
+                let task = mut fx2.load(PTR, addr: current, offset: NODE_TASK)
+                discard mut lo2.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
+                var stepped = mem::List[clif::Value].empty(fx2.alloc)
+                mut stepped.push(after_current)
+                return stepped
+            }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+                var ended = mem::List[clif::Value].empty(fx2.alloc)
+                mut ended.push(mut fx2.ptr(0))
+                return ended
+            })
+            return Pass(again: present, next: take next)
+        })
+    }
+    let senders_left = mut fx.load(PTR, addr: record, offset: CHANNEL_SENDERS)
+    let receiver = mut fx.load(PTR, addr: record, offset: CHANNEL_RECEIVER)
+    let handles = mut fx.b.bor(senders_left, y: receiver)
+    let unused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: handles, y: 0)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+    match woken {
+        Some(task) => {
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: task, y: 0)
+            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+                discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
+            })
+        }
+        None => {}
+    }
+    mut fx.if_true(unused, then: fn[mut lo](mut fx1: Fx) {
+        free_channel(mut lo, fx: mut fx1, record)
+    })
+} channels_end
+
+/// Moves a sender or receiver into another domain's reach: its holding passes to `owner`, and
+/// when the channel's reach widens its buffer follows, with the values buffered when the
+/// receiver moves, which the walk reads from a copy taken under the lock.
+fn channels_transfer(mut lo: Lowering, mut fx: Fx, owner_path: Str, ty: ty::Ty, address: clif::Value, lift: clif::Value, owner: clif::Value) {
+    rehome(mut lo, mut fx, address, owner)
+    let Some(element) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return
+    }
+    let buffered = owner_path == "task::Receiver" and mut lo.transfers(element)
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        let record = holdings_payload(mut fx1, address)
+        let lock = mut fx1.offset(record, offset: CHANNEL_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let reach = mut fx1.load(PTR, addr: record, offset: CHANNEL_REACH)
+        let widened = nested_in(mut fx1, inner: reach, outer: lift)
+        mut fx1.if_true(widened, then: fn(mut fx2: Fx) {
+            mut fx2.store(lift, addr: record, offset: CHANNEL_REACH)
+        })
+        let shape = Element.of(mut lo, ty: element)
+        var copied: Option[Stretch] = None
+        if buffered {
+            let len = mut fx1.load(PTR, addr: record, offset: CHANNEL_LEN)
+            let zero = mut fx1.ptr(0)
+            let moved = mut fx1.b.select(widened, x: len, y: zero)
+            let bytes = shape.bytes(mut fx1, count: moved)
+            let one = mut fx1.ptr(1)
+            let drawn = mut fx1.b.umax(bytes, y: one)
+            let copy = mut lo.record_alloc(mut fx1, size: drawn)
+            let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
+            mut fx1.if_true(missing, then: fn[mut lo](mut fx2: Fx) {
+                raise_kind(mut lo, fx: mut fx2, kind: "trap.exhausted")
+            })
+            mut fx1.each(zero, end: moved, body: fn[mut lo](mut fx2: Fx, position: clif::Value) {
+                let from = channels_slot_at(mut fx2, record, shape, position)
+                let to = shape.at(mut fx2, data: copy, index: position)
+                mut lo.copy(mut fx2, dst: to, src: from, size: shape.size, align: shape.align)
+            })
+            copied = Some(Stretch(start: copy, len: moved))
+        }
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.if_true(widened, then: fn[mut lo](mut fx2: Fx) {
+            let buffer = mut fx2.load(PTR, addr: record, offset: CHANNEL_BUFFER)
+            discard transfer_lift(mut lo, fx: mut fx2, address: buffer, lift)
+        })
+        match copied {
+            Some(copy) => {
+                let keep = mut fx1.int(PTR, value: TRANSFER_KEEP)
+                let zero = mut fx1.ptr(0)
+                mut fx1.each(zero, end: copy.len, body: fn[mut lo](mut fx2: Fx, position: clif::Value) {
+                    let at = shape.at(mut fx2, data: copy.start, index: position)
+                    mut lo.transfer(mut fx2, ty: element, address: at, lift, owner: keep)
+                })
+                mut lo.record_free(mut fx1, address: copy.start)
+            }
+            None => {}
+        }
+    })
+} channels_transfer

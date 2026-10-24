@@ -172,10 +172,11 @@ fn m6() {
     verified(&copied("m6"));
 }
 
-/// The NaN front end's files generated from the repository: the grammar text its parser's tables
-/// are built from, and the std sources it carries.
+/// The NaN toolchain's files generated from the repository: the grammar text its parser's tables
+/// are built from, the std sources it carries and the primer chapter `nan primer` prints from.
 const EBNF_FILE: &str = "toolchain/nan/syntax/ebnf.nan";
 const STD_FILE: &str = "toolchain/nan/stdlib/sources.nan";
+const PRIMER_FILE: &str = "toolchain/nan/command/primer.nan";
 
 /// A line of a text run indented once: `\\` and the line, each backslash doubled.
 fn run_line(line: &str) -> String {
@@ -212,6 +213,19 @@ fn ebnf_source(repository: &Path) -> String {
          /// ending with a line feed.\n\
          pkg const EBNF: Str =\n{}",
         text_run(&grammar)
+    )
+}
+
+/// The source of the toolchain's primer text: the primer chapter, each line ending with a line
+/// feed.
+fn primer_source(repository: &Path) -> String {
+    let chapter =
+        fs::read_to_string(repository.join("docs/spec/39-primer.md")).expect("the primer");
+    format!(
+        "//! The primer chapter of the specification, whose sections `nan primer` prints.\n\n\
+         /// The lines of the primer chapter of the specification, each ending with a line feed.\n\
+         const PRIMER: Str =\n{}",
+        text_run(&chapter)
     )
 }
 
@@ -316,14 +330,15 @@ fn std_source(repository: &Path) -> String {
     out
 }
 
-/// The front end carries the current grammar text and std sources. With `NAN_BLESS` set, the
-/// test writes them instead.
+/// The toolchain carries the current grammar text, std sources and primer chapter. With
+/// `NAN_BLESS` set, the test writes them instead.
 #[test]
 fn m5_embedded_sources() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for (file, source) in [
         (EBNF_FILE, ebnf_source(&repository)),
         (STD_FILE, std_source(&repository)),
+        (PRIMER_FILE, primer_source(&repository)),
     ] {
         let path = repository.join(file);
         if std::env::var_os("NAN_BLESS").is_some() {

@@ -21,6 +21,11 @@ fn scratch(source: &str) -> Scratch {
 
 /// The NIR of an item of a one-file package, in the text notation.
 fn unit_text(source: &str, item: &str) -> String {
+    unit_of(source, item).expect("a unit")
+}
+
+/// The NIR of an item of a one-file package in the text notation, when the item has a unit.
+fn unit_of(source: &str, item: &str) -> Option<String> {
     let scratch = scratch(source);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
@@ -29,12 +34,12 @@ fn unit_text(source: &str, item: &str) -> String {
         .map(|index| crate::check::db::ItemId(index as u32))
         .find(|id| !checker.db.is_std(*id) && checker.db.canonical(*id) == item)
         .expect("the item");
-    let unit = checker.unit(id).expect("a unit");
+    let unit = checker.unit(id)?;
     let names = UnitNames {
         ck: &checker,
         package: checker.db.package_of(id),
     };
-    crate::nir::written(&unit, &names)
+    Some(crate::nir::written(&unit, &names))
 }
 
 #[test]
@@ -59,6 +64,12 @@ fn a_for_loop_holds_its_cursor_in_a_slot() {
         text,
         "unit example::total\n\nfn body (read %0: Slice[u32]) -> u64\n^0:\n    %1 = slot sum: u64\n    init %1, 0u64\n    %2 = slot core::SliceCursor[u32]\n    %3 = call Slice.cursor[u32](%0)\n    init %2, %3\n    jump ^1\n^1:\n    %4 = call core::SliceCursor.next[u32](mut %2)\n    %5 = is %4, Option.Some\n    branch %5, ^2, ^3\n^2:\n    %6 = load %4.Some\n    %7 = call u64.widen(%6)\n    %8 = load %1\n    %9 = add %8, %7\n    assign %1, %9\n    jump ^1\n^3:\n    %10 = load %1\n    return %10\n"
     );
+}
+
+#[test]
+fn a_for_loop_over_a_registry_of_an_unknown_type_has_no_unit() {
+    let source = "pub registry commands: Command keyed by opcode\n\npub fn count() -> u32 {\n    var total: u32 = 0\n    for command in commands {\n        total = total.saturating_add(1)\n    }\n    return total\n} count\n";
+    assert_eq!(unit_of(source, "example::count"), None);
 }
 
 const LABELS: &str = "pub closed struct Token {\n    pub size: u32\n} Token\n\npub closed enum Label {\n    Short(Token)\n    Long(Token)\n    Blank\n} Label\n\npub closed struct Pair {\n    pub kind: u32\n    pub token: Token\n} Pair\n\nconst LIMIT: u32 = 2 * 5\n\n";

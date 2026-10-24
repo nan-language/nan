@@ -1,0 +1,581 @@
+//! Conformances lowering writes: the methods derives write and the conformances the toolchain supplies, of `Eq`, `Ord`, `Hash`, `Default` and `Render`, and the calls generated code makes of interface methods.
+
+/// The type a derived method is of and the method's own type arguments.
+struct DerivedParts derives Copy {
+    ty: ty::Ty
+    own: ty::Args
+} DerivedParts
+
+/// The parameters of a conformance method being defined: the address its result is written
+/// at when it returns it indirectly, and each parameter as it is held.
+struct MethodParams {
+    sret: Option[clif::Value]
+    held: mem::List[Held]
+} MethodParams
+
+/// A core interface by name.
+fn Lowering.core_interface(self, interface_name: Str) -> ty::ItemId {
+    let Some(found) = self.ck.db().core_item(interface_name) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    return found
+} Lowering.core_interface
+
+/// The head of a derived method for its owner applied to `args`, and whether it is a
+/// projection.
+fn Lowering.derived_head(mut self, owner: ty::ItemId, method: Str, args: ty::Args) -> ty::FnTy {
+    let parts = derived_parts(self, owner, args)
+    return mut self.conformance_head(parts.ty, method, own: parts.own)
+} Lowering.derived_head
+
+/// The head of an interface method a type implements through a conformance, with the
+/// method's own type arguments.
+fn Lowering.conformance_head(mut self, ty: ty::Ty, method: Str, own: ty::Args) -> ty::FnTy {
+    let interface_item = self.core_interface(method_interface(method, alloc: self.alloc).as_str())
+    let head = mut self.method_head(ty, interface_item, args: own, method: 0)
+    return head.fn_ty
+} Lowering.conformance_head
+
+/// Calls method `method` of a core interface on a value of a concrete type, with `own`
+/// type arguments of the method, giving its result.
+fn Lowering.call_method(mut self, mut fx: Fx, ty: ty::Ty, interface_name: Str, take own: mem::List[ty::Arg], args: Slice[Held]) -> Held {
+    let interface_item = self.core_interface(interface_name)
+    var fn_args = mem::List[ty::Arg].empty(self.alloc)
+    mut fn_args.push(ty::Arg.Ty(ty))
+    for arg in take own {
+        mut fn_args.push(arg)
+    }
+    let fn_ref = nir::FnRef(callable: nir::Callable.Method(item: interface_item, method: 0), args: self.ck.types().args(take fn_args))
+    let instance = mut self.callable_instance(fn_ref, as_value: false)
+    let abi = mut self.abi(instance)
+    let id = mut self.instance(take instance)
+    let called = mut self.invoke(mut fx, invoked: Invoked.Direct(id), abi, args)
+    return called.result
+} Lowering.call_method
+
+/// Whether two values of a type at addresses are equal by `Eq.eq`.
+fn Lowering.equal(mut self, mut fx: Fx, ty: ty::Ty, left_at: clif::Value, right_at: clif::Value) -> clif::Value {
+    var pair = Array[Held, 2].filled(mut self.held_at(mut fx, ty, address: left_at))
+    pair[1] = mut self.held_at(mut fx, ty, address: right_at)
+    let no_args = mem::List[ty::Arg].empty(self.alloc)
+    let compared = mut self.call_method(mut fx, ty, interface_name: "Eq", own: take no_args, args: pair.view())
+    return compared.scalar_value()
+} Lowering.equal
+
+/// The order of two values of a type at addresses by `Ord.cmp`: 0 less, 1 equal, 2 greater.
+fn Lowering.order(mut self, mut fx: Fx, ty: ty::Ty, left_at: clif::Value, right_at: clif::Value) -> clif::Value {
+    var pair = Array[Held, 2].filled(mut self.held_at(mut fx, ty, address: left_at))
+    pair[1] = mut self.held_at(mut fx, ty, address: right_at)
+    let no_args = mem::List[ty::Arg].empty(self.alloc)
+    let ordering = mut self.call_method(mut fx, ty, interface_name: "Ord", own: take no_args, args: pair.view())
+    return mut self.ordering_index(mut fx, ordering)
+} Lowering.order
+
+/// The variant index of a `core::Ordering` value.
+fn Lowering.ordering_index(mut self, mut fx: Fx, ordering: Held) -> clif::Value {
+    return match ordering {
+        Held.Scalar(value) => value
+        Held.Address(address) => mut fx.load(clif::Type.Int8, addr: address, offset: 0)
+        Held.Empty => mut fx.int(clif::Type.Int8, value: 1)
+    }
+} Lowering.ordering_index
+
+/// The core interface a conformance method belongs to.
+fn method_interface(method: Str, alloc: mem::Alloc) -> text::String {
+    let interface_name = match method {
+        "eq" => "Eq"
+        "cmp" => "Ord"
+        "hash" => "Hash"
+        "default" => "Default"
+        "render" => "Render"
+        "write" => "Encode"
+        "generate" => "Generate"
+        else => ""
+    }
+    expect interface_name != ""
+    return text::String.of(interface_name, alloc)
+} method_interface
+
+/// Defines a method a derive writes.
+fn conform_derived(mut lo: Lowering, mut fx: Fx, abi: Abi, owner: ty::ItemId, method: Str, args: ty::Args) {
+    let parts = derived_parts(lo, owner, args)
+    match method {
+        "render" => define_render(mut lo, mut fx, abi, ty: parts.ty)
+        "generate" => generate_derived(mut lo, mut fx, abi, ty: parts.ty)
+        else => composite(mut lo, mut fx, abi, ty: parts.ty, method)
+    }
+} conform_derived
+
+/// The type a derived method is of and the method's own type arguments, from the arguments of
+/// its instance: its owner's, then its own.
+fn derived_parts(lo: Lowering, owner: ty::ItemId, args: ty::Args) -> DerivedParts {
+    let types = lo.ck.types()
+    let all = types.arg_list(args)
+    var count = lo.ck.sig(owner).contents().generics.len()
+    if all.len() < count {
+        count = all.len()
+    }
+    var type_args = mem::List[ty::Arg].empty(lo.alloc)
+    var own = mem::List[ty::Arg].empty(lo.alloc)
+    for index in 0..<all.len() {
+        if index < count {
+            mut type_args.push(all[index])
+        } else {
+            mut own.push(all[index])
+        }
+    }
+    return DerivedParts(ty: types.item(owner, args: take type_args), own: types.args(take own))
+} derived_parts
+
+/// Defines a conformance the toolchain supplies.
+fn supplied(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty, method: Str) {
+    if method == "render" {
+        define_render(mut lo, mut fx, abi, ty)
+        return
+    }
+    if method == "generate" {
+        generate_conformance(mut lo, mut fx, abi, ty)
+        return
+    }
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Scalar(_) or ty::TyKind.Unit => {
+            conform_scalar(mut lo, mut fx, abi, ty, method)
+            return
+        }
+        ty::TyKind.Item(item: item, args: _) => {
+            let sig = lo.ck.sig(item)
+            match sig.contents().kind {
+                check::SigKind.Layout(fields: _, tags: _, bits: Some(bits)) => {
+                    conform_layout(mut lo, mut fx, abi, bits, method)
+                    return
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    if mem_conformance(mut lo, mut fx, abi, ty, method) {
+        return
+    }
+    composite(mut lo, mut fx, abi, ty, method)
+} supplied
+
+/// The parameters of a conformance method being defined.
+fn conform_params(mut fx: Fx, abi: Abi) -> MethodParams {
+    let incoming = mut fx.entry()
+    var next: usize = 0
+    var sret: Option[clif::Value] = None
+    if abi.returned == Returned.Indirect {
+        expect incoming.len() > 0
+        sret = Some(incoming[next])
+        next += 1
+    }
+    var held = mem::List[Held].empty(fx.alloc)
+    for param in abi.params {
+        match param.repr {
+            Repr.Scalar(_) => {
+                expect next < incoming.len()
+                mut held.push(Held.Scalar(incoming[next]))
+                next += 1
+            }
+            Repr.Address => {
+                expect next < incoming.len()
+                mut held.push(Held.Address(incoming[next]))
+                next += 1
+            }
+            Repr.Empty => mut held.push(Held.Empty)
+        }
+    }
+    return MethodParams(sret: sret, held: take held)
+} conform_params
+
+/// Returns a result as the conformance's form gives it.
+fn conform_finish(mut lo: Lowering, mut fx: Fx, abi: Abi, sret: Option[clif::Value], held: Held) {
+    match abi.returned {
+        Returned.Scalar(_) => {
+            let nty = nir::NTy.Owned(abi.result)
+            let repr = mut lo.owned_repr(abi.result)
+            let returned = adapt_value(mut lo, mut fx, held, nty, wanted: repr).scalar_value()
+            mut fx.b.ret(Array[clif::Value, 1].filled(returned).view())
+        }
+        Returned.Indirect => {
+            let laid = mut lo.layout_of(abi.result)
+            let Some(target) = sret else {
+                expect false
+                return
+            }
+            match held {
+                Held.Address(source) => {
+                    if source != target {
+                        mut lo.copy(mut fx, dst: target, src: source, size: laid.contents().size, align: laid.contents().align)
+                    }
+                }
+                else => {}
+            }
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        else => mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+    }
+} conform_finish
+
+/// A parameter of a conformance method on a scalar type as a scalar, none for `Unit`.
+fn scalar_operand(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, held: Held) -> Option[clif::Value] {
+    let nty = nir::NTy.Owned(ty)
+    let repr = mut lo.owned_repr(ty)
+    return match adapt_value(mut lo, mut fx, held, nty, wanted: repr) {
+        Held.Scalar(value) => Some(value)
+        else => None
+    }
+} scalar_operand
+
+/// The conformances of scalars and `Unit`.
+fn conform_scalar(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty, method: Str) {
+    let incoming = conform_params(mut fx, abi)
+    let signed = match lo.ck.types().scalar_of(ty) {
+        Some(found) => found.is_signed()
+        None => false
+    }
+    var held = Held.Empty
+    if method == "eq" {
+        expect incoming.held.len() > 1
+        let a = scalar_operand(mut lo, mut fx, ty, held: incoming.held[0])
+        let b = scalar_operand(mut lo, mut fx, ty, held: incoming.held[1])
+        held = Held.Scalar(scalar_equal(mut fx, a, b))
+    } else if method == "cmp" {
+        expect incoming.held.len() > 1
+        let a = scalar_operand(mut lo, mut fx, ty, held: incoming.held[0])
+        let b = scalar_operand(mut lo, mut fx, ty, held: incoming.held[1])
+        held = scalar_order(mut lo, mut fx, a, b, signed)
+    } else if method == "default" {
+        match mut lo.owned_repr(ty) {
+            Repr.Scalar(scalar_ty) => {
+                held = Held.Scalar(body_zero(mut fx, ty: scalar_ty))
+            }
+            else => {}
+        }
+    } else if method == "hash" {
+        expect incoming.held.len() > 1 and abi.params.len() > 1
+        match scalar_operand(mut lo, mut fx, ty, held: incoming.held[0]) {
+            Some(a) => {
+                let width = u64.widen(fx.b.value_type(a).bytes())
+                let buffer = mut fx.slot(8, align: 8)
+                mut fx.store(a, addr: buffer, offset: 0)
+                let hasher_ty = abi.params[1].nty.ty()
+                write_hasher(mut lo, mut fx, hasher_ty, hasher: incoming.held[1], bytes_at: buffer, len: width)
+            }
+            None => {}
+        }
+    } else {
+        expect false
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held)
+} conform_scalar
+
+/// `Eq.eq` of two scalars, true when either is of an empty type.
+fn scalar_equal(mut fx: Fx, a: Option[clif::Value], b: Option[clif::Value]) -> clif::Value {
+    match a {
+        Some(left_value) => match b {
+            Some(right_value) => return mut fx.b.icmp(clif::IntCC.Equal, x: left_value, y: right_value)
+            None => {}
+        }
+        None => {}
+    }
+    return mut fx.int(clif::Type.Int8, value: 1)
+} scalar_equal
+
+/// `Ord.cmp` of two scalars, signed or not, equal when either is of an empty type.
+fn scalar_order(mut lo: Lowering, mut fx: Fx, a: Option[clif::Value], b: Option[clif::Value], signed: bool) -> Held {
+    match a {
+        Some(left_value) => match b {
+            Some(right_value) => {
+                var less_cc = clif::IntCC.UnsignedLessThan
+                var greater_cc = clif::IntCC.UnsignedGreaterThan
+                if signed {
+                    less_cc = clif::IntCC.SignedLessThan
+                    greater_cc = clif::IntCC.SignedGreaterThan
+                }
+                let less = mut fx.b.icmp(less_cc, x: left_value, y: right_value)
+                let greater = mut fx.b.icmp(greater_cc, x: left_value, y: right_value)
+                return mut lo.ordering(mut fx, less, greater)
+            }
+            None => {}
+        }
+        None => {}
+    }
+    let no = mut fx.int(clif::Type.Int8, value: 0)
+    return mut lo.ordering(mut fx, less: no, greater: no)
+} scalar_order
+
+/// The conformances of a layout, by its bits value of type `bits`.
+fn conform_layout(mut lo: Lowering, mut fx: Fx, abi: Abi, bits: ty::Ty, method: Str) {
+    let incoming = conform_params(mut fx, abi)
+    var own = mem::List[ty::Arg].empty(lo.alloc)
+    if method == "hash" {
+        expect abi.params.len() > 1
+        mut own.push(ty::Arg.Ty(abi.params[1].nty.ty()))
+    }
+    let interface_name = method_interface(method, alloc: lo.alloc)
+    let held = mut lo.call_method(mut fx, ty: bits, interface_name: interface_name.as_str(), own: take own, args: incoming.held.view())
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held)
+} conform_layout
+
+/// Writes `len` bytes at an address to a hasher of a type.
+fn write_hasher(mut lo: Lowering, mut fx: Fx, hasher_ty: ty::Ty, hasher: Held, bytes_at: clif::Value, len: u64) {
+    let view_slot = mut fx.slot(16, align: 8)
+    mut fx.store(bytes_at, addr: view_slot, offset: 0)
+    let len_value = mut fx.ptr(len)
+    mut fx.store(len_value, addr: view_slot, offset: 8)
+    var pair = Array[Held, 2].filled(hasher)
+    pair[1] = Held.Address(view_slot)
+    let no_args = mem::List[ty::Arg].empty(lo.alloc)
+    discard mut lo.call_method(mut fx, ty: hasher_ty, interface_name: "Hasher", own: take no_args, args: pair.view())
+} write_hasher
+
+/// The conformances of structs and enums, field by field, and their derived methods.
+fn composite(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty, method: Str) {
+    let incoming = conform_params(mut fx, abi)
+    let laid = mut lo.layout_of(ty)
+    match laid.contents().shape {
+        LayoutShape.Record(fields) => {
+            if method == "eq" {
+                record_equal(mut lo, mut fx, abi, incoming, fields: fields.view())
+                return
+            }
+            if method == "cmp" {
+                record_order(mut lo, mut fx, abi, incoming, fields: fields.view())
+                return
+            }
+            if method == "hash" {
+                record_hash(mut lo, mut fx, abi, incoming, fields: fields.view())
+                return
+            }
+            if method == "default" {
+                record_default(mut lo, mut fx, abi, incoming, fields: fields.view())
+                return
+            }
+        }
+        LayoutShape.Enum(shape) => {
+            if method == "eq" or method == "cmp" or method == "hash" {
+                expect incoming.held.len() > 0
+                let a = incoming.held[0].address_value()
+                let index_a = mut lo.variant_index(mut fx, ty, address: a)
+                if method == "hash" {
+                    enum_hash(mut lo, mut fx, abi, incoming, variants: shape.variants.view(), index_a)
+                } else {
+                    enum_compare(mut lo, mut fx, abi, incoming, ty, variants: shape.variants.view(), method, index_a)
+                }
+                return
+            }
+        }
+        LayoutShape.Empty => {
+            if method == "eq" or method == "cmp" or method == "hash" {
+                var held = Held.Empty
+                if method == "eq" {
+                    held = Held.Scalar(mut fx.int(clif::Type.Int8, value: 1))
+                } else if method == "cmp" {
+                    let no = mut fx.int(clif::Type.Int8, value: 0)
+                    held = mut lo.ordering(mut fx, less: no, greater: no)
+                }
+                conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held)
+                return
+            }
+            if method == "default" {
+                conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: Held.Empty)
+                return
+            }
+        }
+        else => {}
+    }
+    expect false
+} composite
+
+/// `Eq.eq` of a struct: whether every field is equal.
+fn record_equal(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, fields: Slice[Field]) {
+    expect incoming.held.len() > 1
+    let a = incoming.held[0].address_value()
+    let b = incoming.held[1].address_value()
+    var result = mut fx.int(clif::Type.Int8, value: 1)
+    for field in fields {
+        let left_at = mut fx.offset(a, offset: field.offset)
+        let right_at = mut fx.offset(b, offset: field.offset)
+        let same = mut lo.equal(mut fx, ty: field.ty, left_at, right_at)
+        result = mut fx.b.band(result, y: same)
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: Held.Scalar(result))
+} record_equal
+
+/// `Ord.cmp` of a struct: the order of the first field that is not equal.
+fn record_order(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, fields: Slice[Field]) {
+    expect incoming.held.len() > 1
+    let a = incoming.held[0].address_value()
+    let b = incoming.held[1].address_value()
+    var result = mut fx.int(clif::Type.Int8, value: 1)
+    for field in fields {
+        let left_at = mut fx.offset(a, offset: field.offset)
+        let right_at = mut fx.offset(b, offset: field.offset)
+        let undecided = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: 1)
+        let decided = result
+        let order = mut fx.choose(undecided, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn[mut lo](mut yes_fx: Fx) -> mem::List[clif::Value] {
+            var compared = mem::List[clif::Value].empty(yes_fx.alloc)
+            mut compared.push(mut lo.order(mut yes_fx, ty: field.ty, left_at, right_at))
+            return compared
+        }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+            var kept_order = mem::List[clif::Value].empty(no_fx.alloc)
+            mut kept_order.push(decided)
+            return kept_order
+        })
+        result = order[0]
+    }
+    let less = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: 0)
+    let greater = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: 2)
+    let ordering = mut lo.ordering(mut fx, less, greater)
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: ordering)
+} record_order
+
+/// `Hash.hash` of a struct: holdings_each field's, in the order of their names.
+fn record_hash(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, fields: Slice[Field]) {
+    expect incoming.held.len() > 1 and abi.params.len() > 1
+    let value = incoming.held[0].address_value()
+    let hasher_ty = abi.params[1].nty.ty()
+    let sorted = by_name(fields, alloc: lo.alloc)
+    for field in sorted {
+        let at = mut fx.offset(value, offset: field.offset)
+        let held = mut lo.held_at(mut fx, ty: field.ty, address: at)
+        var own = mem::List[ty::Arg].empty(lo.alloc)
+        mut own.push(ty::Arg.Ty(hasher_ty))
+        var pair = Array[Held, 2].filled(held)
+        pair[1] = incoming.held[1]
+        discard mut lo.call_method(mut fx, ty: field.ty, interface_name: "Hash", own: take own, args: pair.view())
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: Held.Empty)
+} record_hash
+
+/// `Default.default` of a struct: holdings_each field's default.
+fn record_default(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, fields: Slice[Field]) {
+    let Some(target) = incoming.sret else {
+        expect false
+        return
+    }
+    for field in fields {
+        let no_args = mem::List[ty::Arg].empty(lo.alloc)
+        let no_held = mem::List[Held].empty(lo.alloc)
+        let value = mut lo.call_method(mut fx, ty: field.ty, interface_name: "Default", own: take no_args, args: no_held.view())
+        let at = mut fx.offset(target, offset: field.offset)
+        match value {
+            Held.Scalar(default_value) => mut fx.store(default_value, addr: at, offset: 0)
+            Held.Address(source) => {
+                let field_laid = mut lo.layout_of(field.ty)
+                mut lo.copy(mut fx, dst: at, src: source, size: field_laid.contents().size, align: field_laid.contents().align)
+            }
+            Held.Empty => {}
+        }
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: Held.Empty)
+} record_default
+
+/// Copies of fields in the order of their names.
+fn by_name(fields: Slice[Field], alloc: mem::Alloc) -> mem::List[Field] {
+    var sorted = mem::List[Field].empty(alloc)
+    for field in fields {
+        mut sorted.push(field.copy(alloc))
+    }
+    mut sorted.sort_by(fn(one: Field, other: Field) => one.name.as_str().cmp(other.name.as_str()))
+    return sorted
+} by_name
+
+/// `Hash.hash` of an enum whose variant index is `index_a`: its variant's name, then the
+/// fields of its payload in the order of their names.
+fn enum_hash(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, variants: Slice[Variant], index_a: clif::Value) {
+    expect incoming.held.len() > 1 and abi.params.len() > 1
+    let a = incoming.held[0].address_value()
+    let hasher_ty = abi.params[1].nty.ty()
+    for index in 0..<variants.len() {
+        let variant = variants[index]
+        let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index_a, y: i64.fit(index))
+        let hasher = incoming.held[1]
+        mut fx.if_true(is, then: fn[mut lo](mut then_fx: Fx) {
+            let name_bytes = variant.name.as_bytes()
+            let len_bytes = mut then_fx.slot(8, align: 8)
+            let name_len = mut then_fx.int(clif::Type.Int64, value: i64.fit(name_bytes.len()))
+            mut then_fx.store(name_len, addr: len_bytes, offset: 0)
+            write_hasher(mut lo, fx: mut then_fx, hasher_ty, hasher, bytes_at: len_bytes, len: 8)
+            let name_view = mut lo.view_literal(mut then_fx, contents: name_bytes)
+            let text = name_view.address_value()
+            let start = mut then_fx.load(PTR, addr: text, offset: 0)
+            write_hasher(mut lo, fx: mut then_fx, hasher_ty, hasher, bytes_at: start, len: u64.widen(name_bytes.len()))
+            let sorted = by_name(variant.fields.view(), alloc: lo.alloc)
+            for field in sorted {
+                let at = mut then_fx.offset(a, offset: field.offset)
+                let held = mut lo.held_at(mut then_fx, ty: field.ty, address: at)
+                var own = mem::List[ty::Arg].empty(lo.alloc)
+                mut own.push(ty::Arg.Ty(hasher_ty))
+                var pair = Array[Held, 2].filled(held)
+                pair[1] = hasher
+                discard mut lo.call_method(mut then_fx, ty: field.ty, interface_name: "Hash", own: take own, args: pair.view())
+            }
+        })
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held: Held.Empty)
+} enum_hash
+
+/// `Eq.eq` or `Ord.cmp` of an enum whose variant index is `index_a`: by variant index, then
+/// field by field within one variant.
+fn enum_compare(mut lo: Lowering, mut fx: Fx, abi: Abi, incoming: MethodParams, ty: ty::Ty, variants: Slice[Variant], method: Str, index_a: clif::Value) {
+    expect incoming.held.len() > 1
+    let a = incoming.held[0].address_value()
+    let b = incoming.held[1].address_value()
+    let index_b = mut lo.variant_index(mut fx, ty, address: b)
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: index_a, y: index_b)
+    let result = mut fx.b.declare_var(clif::Type.Int8)
+    var initial = same
+    if method == "eq" {
+        initial = mut fx.b.bxor_imm_s(same, y: 0)
+    } else {
+        let less = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: index_a, y: index_b)
+        let two = mut fx.int(clif::Type.Int8, value: 2)
+        let zero_flag = mut fx.int(clif::Type.Int8, value: 0)
+        let one = mut fx.int(clif::Type.Int8, value: 1)
+        let differs = mut fx.b.select(less, x: zero_flag, y: two)
+        initial = mut fx.b.select(same, x: one, y: differs)
+    }
+    mut fx.b.def_var(result, val: initial)
+    for index in 0..<variants.len() {
+        let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index_a, y: i64.fit(index))
+        let here = mut fx.b.band(is, y: same)
+        let fields = variants[index].fields.view()
+        mut fx.if_true(here, then: fn[mut lo](mut then_fx: Fx) {
+            for field in fields {
+                let left_at = mut then_fx.offset(a, offset: field.offset)
+                let right_at = mut then_fx.offset(b, offset: field.offset)
+                let current = mut then_fx.b.use_var(result)
+                var next = current
+                if method == "eq" {
+                    let equal = mut lo.equal(mut then_fx, ty: field.ty, left_at, right_at)
+                    next = mut then_fx.b.band(current, y: equal)
+                } else {
+                    let undecided = mut then_fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: 1)
+                    let order = mut then_fx.choose(undecided, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn[mut lo](mut yes_fx: Fx) -> mem::List[clif::Value] {
+                        var compared = mem::List[clif::Value].empty(yes_fx.alloc)
+                        mut compared.push(mut lo.order(mut yes_fx, ty: field.ty, left_at, right_at))
+                        return compared
+                    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+                        var kept_order = mem::List[clif::Value].empty(no_fx.alloc)
+                        mut kept_order.push(current)
+                        return kept_order
+                    })
+                    next = order[0]
+                }
+                mut then_fx.b.def_var(result, val: next)
+            }
+        })
+    }
+    let value = mut fx.b.use_var(result)
+    var held = Held.Scalar(value)
+    if method != "eq" {
+        let less = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: 0)
+        let greater = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: 2)
+        held = mut lo.ordering(mut fx, less, greater)
+    }
+    conform_finish(mut lo, mut fx, abi, sret: incoming.sret, held)
+} enum_compare

@@ -490,6 +490,9 @@ impl Elab<'_, '_> {
         invariants: &[TExpr],
         body: &TBlock,
     ) -> Elaborated<()> {
+        if cursor.has_error() {
+            return Err(Fault::Failed);
+        }
         let span = Self::span(token);
         self.scopes.push(Scope::default());
         let slot = self.emit_value(

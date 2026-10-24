@@ -2,6 +2,7 @@
 //! heads that their names promise.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use super::Checker;
 use super::db::{ItemId, ModuleId, PackageId, TypeKey};
@@ -33,6 +34,30 @@ pub fn in_values_namespace(item: &ast::Item) -> bool {
         &item.kind,
         ItemKind::Const(_) | ItemKind::Registry(_) | ItemKind::Contribute(_) | ItemKind::Test(_)
     ) || matches!(&item.kind, ItemKind::Fn(function) if function.label.owner.is_none())
+}
+
+impl Checker<'_> {
+    /// The folded names of a module's items in the values namespace, which no local may fold to.
+    pub fn module_values(&self, module: ModuleId) -> Rc<HashSet<String>> {
+        if let Some(known) = self.module_values.borrow().get(&module) {
+            return known.clone();
+        }
+        let names: HashSet<String> = self
+            .db
+            .module(module)
+            .items
+            .iter()
+            .map(|item| self.db.declaration(*item))
+            .filter(|ast| in_values_namespace(ast))
+            .filter_map(declared_name)
+            .map(|declared| fold(&declared.text))
+            .collect();
+        let names = Rc::new(names);
+        self.module_values
+            .borrow_mut()
+            .insert(module, names.clone());
+        names
+    }
 }
 
 /// A name written in a convention: split into words at underscores and before each uppercase

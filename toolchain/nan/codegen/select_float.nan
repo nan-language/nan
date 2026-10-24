@@ -1,0 +1,167 @@
+//! Instruction selection of float arithmetic, with NaN results canonicalized as Cranelift's pass does, float sign operations, and the conversions between floats and integers.
+
+/// A float arithmetic operation, its NaN result made the canonical NaN.
+fn Selector.float_arith(mut self, func: clif::Function, inst: clif::Inst, op: x64::FloatOp, x: clif::Value, y: clif::Value) {
+    expect self.isa.floats
+    let size = exact_size(func.value_type(x))
+    let dst = mut self.dst_of(func, inst)
+    let a = mut self.src(x, func)
+    mut self.mov(dst, src: a)
+    let b = mut self.src(y, func)
+    mut self.emit(x64::Inst.FloatArith(op: op, size: size, dst: dst, src: b))
+    mut self.canonicalize(size, reg: dst)
+} Selector.float_arith
+
+fn Selector.canonicalize(mut self, size: x64::Size, reg: x64::Reg) {
+    let temp = mut self.temp(false)
+    mut self.emit(x64::Inst.CanonNan(size: size, reg: reg, temp: temp))
+} Selector.canonicalize
+
+/// `sqrt`, `fpromote` and `fdemote`, each canonicalizing a NaN result.
+fn Selector.float_unary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) {
+    expect self.isa.floats
+    let source = exact_size(func.value_type(arg))
+    let dst = mut self.dst_of(func, inst)
+    let src = mut self.src(arg, func)
+    match opcode {
+        clif::Opcode.Sqrt => {
+            mut self.emit(x64::Inst.FloatSqrt(size: source, dst: dst, src: src))
+            mut self.canonicalize(source, reg: dst)
+        }
+        else => {
+            mut self.emit(x64::Inst.FloatConvert(source: source, dst: dst, src: src))
+            var target = x64::Size.Qword
+            if source == x64::Size.Qword {
+                target = x64::Size.Dword
+            }
+            mut self.canonicalize(target, reg: dst)
+        }
+    }
+} Selector.float_unary
+
+/// A new SSE register holding a constant bit pattern.
+fn Selector.float_mask(mut self, size: x64::Size, bits: u64) -> x64::Reg {
+    let int = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: int, imm: bits))
+    let reg = mut self.temp(true)
+    mut self.emit(x64::Inst.MovToXmm(size: size, dst: reg, src: int))
+    return reg
+} Selector.float_mask
+
+/// The sign bit of a float of a size.
+fn sign_bit(size: x64::Size) -> u64
+    ensures result >= 0x8000_0000
+{
+    if size == x64::Size.Dword {
+        return 0x8000_0000
+    }
+    return 0x8000_0000_0000_0000
+} sign_bit
+
+/// `fabs`, clearing the sign bit, or `fneg`, flipping it.
+fn Selector.float_sign(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) {
+    expect self.isa.floats
+    let size = exact_size(func.value_type(arg))
+    let sign = sign_bit(size)
+    var op = x64::BitOp.Xor
+    var bits = sign
+    if opcode == clif::Opcode.Fabs {
+        op = x64::BitOp.And
+        bits = sign - 1
+    }
+    let mask = mut self.float_mask(size, bits: bits)
+    let dst = mut self.dst_of(func, inst)
+    let src = mut self.src(arg, func)
+    mut self.mov(dst, src: src)
+    mut self.emit(x64::Inst.FloatBits(op: op, dst: dst, src: mask))
+} Selector.float_sign
+
+/// `x`'s magnitude with `y`'s sign.
+fn Selector.fcopysign(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    expect self.isa.floats
+    let size = exact_size(func.value_type(x))
+    let mask = mut self.float_mask(size, bits: sign_bit(size))
+    let dst = mut self.dst_of(func, inst)
+    let signed = mut self.src(y, func)
+    mut self.mov(dst, src: signed)
+    mut self.emit(x64::Inst.FloatBits(op: x64::BitOp.And, dst: dst, src: mask))
+    let magnitude = mut self.src(x, func)
+    mut self.emit(x64::Inst.FloatBits(op: x64::BitOp.AndNot, dst: mask, src: magnitude))
+    mut self.emit(x64::Inst.FloatBits(op: x64::BitOp.Or, dst: dst, src: mask))
+} Selector.fcopysign
+
+/// A float converted to an integer, truncating and saturating, NaN giving 0: through a 64-bit
+/// conversion, signed for a narrower result, clamped to the result's bounds.
+fn Selector.float_to_int(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
+    expect self.isa.floats
+    let size = exact_size(func.value_type(arg))
+    let ty = func.value_type(result_of(func, inst, alloc: self.alloc))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    let temp = mut self.temp(true)
+    if ty.bits() == 64 {
+        mut self.emit(x64::Inst.FloatToIntSat(signed: signed, size: size, dst: dst, src: src, temp: temp))
+        return
+    }
+    let wide = mut self.temp(false)
+    mut self.emit(x64::Inst.FloatToIntSat(signed: true, size: size, dst: wide, src: src, temp: temp))
+    expect ty.bits() < 64
+    var low: i64 = 0
+    var high = i64.fit(0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - ty.bits()))
+    if signed {
+        high = i64.fit(0xFFFF_FFFF_FFFF_FFFFu64 >> (65 - ty.bits()))
+        low = -high - 1
+    }
+    mut self.clamp(wide, bound: high, cond: x64::Cond.Greater)
+    mut self.clamp(wide, bound: low, cond: x64::Cond.Less)
+    mut self.mov(dst, src: wide)
+} Selector.float_to_int
+
+/// Replaces a 64-bit value by `bound` when it compares to it as `cond` says.
+fn Selector.clamp(mut self, reg: x64::Reg, bound: i64, cond: x64::Cond) {
+    let limit = mut self.temp(false)
+    mut self.emit(x64::Inst.MovImm(dst: limit, imm: bound.to_bits()))
+    mut self.emit(x64::Inst.Cmp(size: x64::Size.Qword, lhs: reg, rhs: limit))
+    mut self.emit(x64::Inst.Cmov(cond: cond, size: x64::Size.Qword, dst: reg, src: limit))
+} Selector.clamp
+
+/// An integer converted to a float, rounding to nearest: a narrow one extended to 64 bits, an
+/// unsigned 64-bit one by the sequence for its top bit.
+fn Selector.int_to_float(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
+    expect self.isa.floats
+    let source = func.value_type(arg)
+    let size = exact_size(func.value_type(result_of(func, inst, alloc: self.alloc)))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if signed and source.bits() >= 32 {
+        mut self.emit(x64::Inst.CvtIntToFloat(int_size: op_size(source), size: size, dst: dst, src: src))
+        return
+    }
+    if source.bits() < 64 {
+        let wide = mut self.extended(src, ty: source, signed: signed)
+        mut self.emit(x64::Inst.CvtIntToFloat(int_size: x64::Size.Qword, size: size, dst: dst, src: wide))
+        return
+    }
+    let temp = mut self.temp(false)
+    mut self.emit(x64::Inst.UintToFloat(size: size, dst: dst, src: src, temp: temp))
+} Selector.int_to_float
+
+/// A bit pattern taken as another type: no code between registers of one class, else a move
+/// between an SSE and a general-purpose register.
+fn Selector.bitcast(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let result = result_of(func, inst, alloc: self.alloc)
+    let to = func.value_type(result)
+    let source = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let to_xmm = in_xmm(to, floats: self.isa.floats)
+    if to_xmm == in_xmm(source, floats: self.isa.floats) {
+        mut self.alias(result, func, low: src, high: NO_REG)
+        return
+    }
+    let dst = mut self.reg(result, func)
+    if to_xmm {
+        mut self.emit(x64::Inst.MovToXmm(size: exact_size(to), dst: dst, src: src))
+    } else {
+        mut self.emit(x64::Inst.MovFromXmm(size: exact_size(source), dst: dst, src: src))
+    }
+} Selector.bitcast

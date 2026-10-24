@@ -1,0 +1,248 @@
+//! Seals: the closure entries an item's seal covers, the closure hash, and whether an item needs a seal.
+
+/// The closure hash of closure entries: the hash of `closure`, LF and one line per entry, in
+/// their order: the kind, the path and the full form of the hash.
+pkg fn closure_hash(entries: mem::Set[machine::ClosureEntry], alloc: mem::Alloc) -> hashing::HashValue {
+    var written = text::String.of("closure\n", alloc)
+    for entry in entries {
+        mut written.append(entry.kind())
+        mut written.push(' ')
+        mut written.append(entry.path.as_str())
+        mut written.push(' ')
+        mut written.append(entry.hash.full(alloc).as_str())
+        mut written.push('\n')
+    }
+    return hashing::HashValue.of(written.as_bytes())
+} closure_hash
+
+/// The closure entries of an item: an `interface` entry for each other item its unit names
+/// or a body it unfolds names, a `body` entry for each transparent function whose calls it
+/// unfolds, and, for an item holding a declassifying validator or decoder, a `body` entry for
+/// each function of its package its unit reaches through functions of its package.
+pkg fn Checker.closure_entries(self, item: ty::ItemId) -> mem::Set[machine::ClosureEntry] {
+    let alloc = self.alloc()
+    var entries = mem::Set[machine::ClosureEntry].empty(alloc)
+    let Some(unit) = self.unit(item) else {
+        return entries
+    }
+    let types = self.types()
+    var unfolded = mem::List[ty::ItemId].empty(alloc)
+    var pending = named_items(types, unit: unit.contents(), alloc)
+    var seen = mem::List[ty::ItemId].empty(alloc)
+    mut seen.push(item)
+    loop {
+        let Some(named) = mut pending.pop() else {
+            break
+        }
+        if seen.position(fn(known: ty::ItemId) => known == named).is_some() {
+            continue
+        }
+        mut seen.push(named)
+        match self.canonical_path(named) {
+            Some(path) => {
+                match self.hashes(named).interface_hash {
+                    Some(hash) => {
+                        discard mut entries.insert(machine::ClosureEntry(path: take path, body: false, hash: hash))
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        if self.transparent_function(named) and self.unfolds(named, holder: item) {
+            mut unfolded.push(named)
+            match self.unit(named) {
+                Some(body) => {
+                    for reached in take named_items(types, unit: body.contents(), alloc) {
+                        mut pending.push(reached)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    for function in unfolded {
+        match self.canonical_path(function) {
+            Some(path) => {
+                discard mut entries.insert(machine::ClosureEntry(path: take path, body: true, hash: self.hashes(function).item))
+            }
+            None => {}
+        }
+    }
+    if self.declassifies(item) {
+        self.reached_bodies(item, unit: unit.contents(), mut entries)
+    }
+    return entries
+} Checker.closure_entries
+
+/// Adds a `body` entry for each function of an item's package that its unit reaches through
+/// functions of its package, transparent functions excepted.
+fn Checker.reached_bodies(self, item: ty::ItemId, unit: nir::NirUnit, mut entries: mem::Set[machine::ClosureEntry]) {
+    let alloc = self.alloc()
+    let types = self.types()
+    let db = self.db()
+    let package_id = db.package_of(item)
+    var reached = mem::List[ty::ItemId].empty(alloc)
+    var pending = named_items(types, unit, alloc)
+    loop {
+        let Some(named) = mut pending.pop() else {
+            return
+        }
+        let function = match db.ast(named).kind {
+            ast::ItemKind.Fn(_) => true
+            else => false
+        }
+        let own = db.package_of(named) == package_id and function and not self.transparent_function(named)
+        if not own or reached.position(fn(known: ty::ItemId) => known == named).is_some() or named == item {
+            continue
+        }
+        mut reached.push(named)
+        match self.canonical_path(named) {
+            Some(path) => {
+                discard mut entries.insert(machine::ClosureEntry(path: take path, body: true, hash: self.hashes(named).item))
+            }
+            None => {}
+        }
+        match self.unit(named) {
+            Some(body) => {
+                for next in take named_items(types, unit: body.contents(), alloc) {
+                    mut pending.push(next)
+                }
+            }
+            None => {}
+        }
+    }
+} Checker.reached_bodies
+
+/// Whether an item holds a declassifying validator or the declassifying decoder of a type.
+fn Checker.declassifies(self, item: ty::ItemId) -> bool {
+    for entry in self.ledger(item) {
+        if entry.escape and (entry.kind == Kind.Validator or entry.kind == Kind.Decoder) {
+            return true
+        }
+    }
+    return false
+} Checker.declassifies
+
+/// Whether a function's body is transparent: written after `=`.
+fn Checker.transparent_function(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    return match function.body {
+        ast::FnBody.Expr(_) => true
+        else => false
+    }
+} Checker.transparent_function
+
+/// Whether an item holds a trust escape.
+pkg fn Checker.holds_escape(self, item: ty::ItemId) -> bool {
+    for entry in self.ledger(item) {
+        if entry.escape {
+            return true
+        }
+    }
+    return false
+} Checker.holds_escape
+
+/// The items a unit names: its types, function references, constants, registers blocks and
+/// `Dyn` interfaces, each once.
+fn named_items(types: ty::Types, unit: nir::NirUnit, alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    var found = mem::List[ty::ItemId].empty(alloc)
+    for function in unit.functions {
+        for value in function.types {
+            visit_ty(types, visited: value.ty(), mut found)
+        }
+        visit_ty(types, visited: function.result, mut found)
+        match function.failure {
+            Some(failure) => visit_ty(types, visited: failure, mut found)
+            None => {}
+        }
+        for block in function.blocks {
+            for inst in block.insts {
+                op_items(types, op: inst.op, mut found)
+            }
+            match block.term {
+                nir::Terminator.Call(call: call, ok: _, failure: _) => call_items(types, call, mut found)
+                else => {}
+            }
+        }
+    }
+    return found
+} named_items
+
+/// Adds the items an instruction's operation names.
+fn op_items(types: ty::Types, op: nir::Op, mut found: mem::List[ty::ItemId]) {
+    match op {
+        nir::Op.FnRef(callee) => callable_items(types, callable: callee.callable, args: callee.args, mut found)
+        nir::Op.Call(call) => call_items(types, call, mut found)
+        nir::Op.Constant(nir::Constant.Item(named)) => add_item(mut found, item: named)
+        nir::Op.Constant(nir::Constant.Register(block: named, register: _)) => add_item(mut found, item: named)
+        nir::Op.Slot(name: _, ty: slot) => visit_ty(types, visited: slot, mut found)
+        nir::Op.Construct(ty: built, fields: _) => visit_ty(types, visited: built, mut found)
+        nir::Op.Variant(ty: built, variant: _, payload: _) => visit_ty(types, visited: built, mut found)
+        nir::Op.Is(place: _, ty: built, variant: _) => visit_ty(types, visited: built, mut found)
+        nir::Op.Convert(value: _, to: converted, via: _) => visit_ty(types, visited: converted, mut found)
+        else => {}
+    }
+} op_items
+
+fn add_item(mut found: mem::List[ty::ItemId], item: ty::ItemId) {
+    if found.position(fn(known: ty::ItemId) => known == item).is_none() {
+        mut found.push(item)
+    }
+} add_item
+
+fn call_items(types: ty::Types, call: nir::Call, mut found: mem::List[ty::ItemId]) {
+    match call.callee {
+        nir::Callee.Fn(callee) => callable_items(types, callable: callee.callable, args: callee.args, mut found)
+        nir::Callee.Dyn(place: _, item: interface_item, method: _) => add_item(mut found, item: interface_item)
+        nir::Callee.Value(_) => {}
+    }
+} call_items
+
+fn callable_items(types: ty::Types, callable: nir::Callable, args: ty::Args, mut found: mem::List[ty::ItemId]) {
+    match first callable {
+        nir::Callable.Item(item: named, role: _, index: _) => add_item(mut found, item: named)
+        nir::Callable.Method(item: interface_item, method: _) => add_item(mut found, item: interface_item)
+        nir::Callable.Derived(owner: owner, method: _) => add_item(mut found, item: owner)
+        nir::Callable.Builtin(nir::Builtin.Bits(conversion: _, owner: nir::BitsOwner.Layout(laid))) => add_item(mut found, item: laid)
+        nir::Callable.Builtin(_) => {}
+    }
+    visit_args(types, args, mut found)
+} callable_items
+
+fn visit_ty(types: ty::Types, visited: ty::Ty, mut found: mem::List[ty::ItemId]) {
+    match types.kind(visited) {
+        ty::TyKind.Item(item: named, args: args) => {
+            add_item(mut found, item: named)
+            visit_args(types, args, mut found)
+        }
+        ty::TyKind.Fn(id) => {
+            let function = types.fn_of(id)
+            for param in function.params {
+                visit_ty(types, visited: param.ty, mut found)
+            }
+            visit_ty(types, visited: function.result, mut found)
+            match function.failure {
+                Some(failure) => visit_ty(types, visited: failure, mut found)
+                None => {}
+            }
+        }
+        ty::TyKind.Dyn(bound) => {
+            add_item(mut found, item: bound.item)
+            visit_args(types, args: bound.args, mut found)
+        }
+        ty::TyKind.Registers(block) => add_item(mut found, item: block)
+        else => {}
+    }
+} visit_ty
+
+fn visit_args(types: ty::Types, args: ty::Args, mut found: mem::List[ty::ItemId]) {
+    for arg in types.arg_list(args) {
+        match arg {
+            ty::Arg.Ty(argument) => visit_ty(types, visited: argument, mut found)
+            ty::Arg.Const(_) => {}
+        }
+    }
+} visit_args

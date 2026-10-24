@@ -1,0 +1,259 @@
+//! Domains: `sys::Domain.run`, which runs a body as the first task of a new domain, and the trap that abandons one. The body's captures pass to the domain; when the body returns or fails, its result or failure passes to the caller's domain with every holding the domain still owns, and the domain's other chunks are freed.
+
+fn domains_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.path.as_str() {
+        "sys::Domain.run" => domains_run(mut lo, mut fx, supply)
+        "sys::Trap.kind" => {
+            let record = trap_record(mut fx, trap: supply.param(0))
+            let kind = mut fx.load(PTR, addr: record, offset: TRAP_RECORD_KIND)
+            let kind_ty = supply.abi.result
+            let laid = mut lo.layout_of(kind_ty)
+            let slot = match supply.sret {
+                Some(sret) => sret
+                None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+            }
+            let names = lo.variant_names(trap_kind_item(lo, ty: kind_ty))
+            for index in 0..<names.len() {
+                let name = names[index].as_str()
+                let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: i64.fit(index))
+                mut fx.if_true(this, then: fn[mut lo](mut fx1: Fx) {
+                    let value = mut lo.variant_value(mut fx1, ty: kind_ty, variant: name, payload_values: mem::List[Held].empty(fx1.alloc).view(), wrapped: None)
+                    mut lo.store_held(mut fx1, address: slot, held: value, ty: kind_ty)
+                })
+            }
+            let held = mut lo.held_at(mut fx, ty: kind_ty, address: slot)
+            supply.ret(mut lo, mut fx, held)
+        }
+        "sys::Trap.render" => {
+            let record = trap_record(mut fx, trap: supply.param(0))
+            let len = mut fx.load(PTR, addr: record, offset: TRAP_RECORD_LEN)
+            let bytes = mut fx.offset(record, offset: TRAP_RECORD_BYTES)
+            let renderer = supply.param(1).address_value()
+            render_append(mut lo, mut fx, renderer_value: renderer, text: bytes, len)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} domains_lower
+
+/// The trap record a `sys::Trap` value names.
+fn trap_record(mut fx: Fx, trap: Held) -> clif::Value {
+    return match trap {
+        Held.Scalar(record) => record
+        else => mut fx.load(PTR, addr: trap.address_value(), offset: 0)
+    }
+} trap_record
+
+/// The enum item of `sys::TrapKind`.
+fn trap_kind_item(lo: Lowering, ty: ty::Ty) -> ty::ItemId {
+    let ty::TyKind.Item(item: item, args: _) = lo.ck.types().kind(ty) else {
+        expect false
+        return ty::ItemId(index: 0)
+    }
+    return item
+} trap_kind_item
+
+/// `sys::Domain.run(body, exec, alloc)`: runs `body` as the first task of a new domain nested in
+/// the caller's and waits for it to end, or once a trap abandons it, for its settlement.
+fn domains_run(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let result_ty = supply.type_arg(lo, index: 0)
+    let failure_ty = supply.type_arg(lo, index: 1)
+    let body_ty = fn_param(lo, supply, index: 0)
+    let executor = tasks_executor(mut lo, mut fx, address: supply.param(1).address_value())
+    let stale = mut fx.b.bxor_imm_s(executor.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        let none = mut fx1.ptr(0)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin: none)
+    })
+    let cell = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let caller_domain = current_domain(mut lo, mut fx)
+    let nested = run_nested(mut lo, mut fx, body_ty, function: supply.param(0).address_value(), cell, point: true)
+    let record = nested.record
+    let first_task = nested.first_task
+    let trap = nested.trap
+    let option = supply.abi.result
+    let laid = mut lo.layout_of(option)
+    let slot = match supply.sret {
+        Some(sret) => sret
+        None => mut fx.slot(laid.contents().size, align: laid.contents().align)
+    }
+    let abandoned_word = mut fx.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
+    let abandoned = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: abandoned_word, y: 0)
+    mut fx.if_true(abandoned, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Settle, args: Array[clif::Value, 1].filled(record).view())
+        mut lo.record_free(mut fx1, address: record)
+        let value = mut fx1.slot(8, align: 8)
+        mut fx1.store(trap, addr: value, offset: 0)
+        let err = mut lo.variant_value(mut fx1, ty: option, variant: "Err", payload_values: Array[Held, 1].filled(Held.Address(value)).view(), wrapped: None)
+        mut lo.store_held(mut fx1, address: slot, held: err, ty: option)
+        let held = mut lo.held_at(mut fx1, ty: option, address: slot)
+        supply.ret(mut lo, fx: mut fx1, held)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(trap).view())
+    let outcome = mut fx.load(PTR, addr: first_task, offset: TASK_OUTCOME)
+    let returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
+    let Some(target) = supply.failure else {
+        expect false
+        return
+    }
+    discard mut fx.choose_in(mut lo, condition: returned, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let result = mut fx1.load(PTR, addr: first_task, offset: TASK_RESULT)
+        let held = mut lo1.held_at(mut fx1, ty: result_ty, address: result)
+        let ok = mut lo1.variant_value(mut fx1, ty: option, variant: "Ok", payload_values: Array[Held, 1].filled(held).view(), wrapped: None)
+        mut lo1.store_held(mut fx1, address: slot, held: ok, ty: option)
+        mut lo1.transfer(mut fx1, ty: option, address: slot, lift: caller_domain, owner: caller_domain)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let failure = mut fx1.load(PTR, addr: first_task, offset: TASK_FAILURE)
+        let held = mut lo1.held_at(mut fx1, ty: failure_ty, address: failure)
+        mut lo1.store_held(mut fx1, address: target, held, ty: failure_ty)
+        mut lo1.transfer(mut fx1, ty: failure_ty, address: target, lift: caller_domain, owner: caller_domain)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    domains_end_nested(mut lo, mut fx, record, first_task, parent: caller_domain)
+    let failed = mut fx.b.bxor_imm_s(returned, y: 1)
+    mut fx.if_true(failed, then: fn(mut fx1: Fx) {
+        supply.raise_failure(mut fx1)
+    })
+    let held = mut lo.held_at(mut fx, ty: option, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} domains_run
+
+/// A domain `run_nested` ran: its record, its first task and its trap record.
+struct Nested derives Copy {
+    record: clif::Value
+    first_task: clif::Value
+    trap: clif::Value
+} Nested
+
+/// Runs the `task fn` value of a type held at `function` as the first task of a new domain
+/// nested in the running task's, its stack and trap record drawn through a cell, and waits
+/// until that task ends or a trap abandons the domain; the spawn is a scheduling point when
+/// `point` holds.
+fn run_nested(mut lo: Lowering, mut fx: Fx, body_ty: ty::FnTy, function: clif::Value, cell: clif::Value, point: bool) -> Nested {
+    let caller_domain = current_domain(mut lo, mut fx)
+    let size = mut fx.ptr(TRAP_RECORD_BYTES + REPORT_REPORT)
+    let align = mut fx.ptr(8)
+    var alloc_args = Array[clif::Value, 4].filled(cell)
+    alloc_args[1] = size
+    alloc_args[2] = align
+    alloc_args[3] = caller_domain
+    let trap_values = mut lo.call_routine(mut fx, routine: Routine.AllocIn, args: alloc_args.view())
+    expect trap_values.len() == 1
+    let trap = trap_values[0]
+    let record_size = mut fx.ptr(DOMAIN_SIZE)
+    let record = mut lo.record_alloc(mut fx, size: record_size)
+    let no_record = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+    let no_trap = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: trap, y: 0)
+    let missing = mut fx.b.bor(no_record, y: no_trap)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    mut fx.store(trap, addr: record, offset: DOMAIN_TRAP)
+    mut fx.store(caller_domain, addr: record, offset: DOMAIN_PARENT)
+    let current = current_task(mut lo, mut fx)
+    mut fx.store(current, addr: record, offset: DOMAIN_WAITER)
+    let parent_lock = mut fx.offset(caller_domain, offset: DOMAIN_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(parent_lock).view())
+    let siblings = mut fx.load(PTR, addr: caller_domain, offset: DOMAIN_CHILDREN)
+    mut fx.store(siblings, addr: record, offset: DOMAIN_SIBLING)
+    mut fx.store(record, addr: caller_domain, offset: DOMAIN_CHILDREN)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(parent_lock).view())
+    let region = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+    let none = mut fx.ptr(0)
+    let copied = ty::Subst.empty(lo.alloc).fn_ty(lo.ck.types(), fn_ty: body_ty)
+    let function_ty = lo.ck.types().intern(ty::TyKind.Fn(lo.ck.types().fn_ty(take copied)))
+    mut lo.transfer(mut fx, ty: function_ty, address: function, lift: none, owner: record)
+    let done = domain_done(mut lo)
+    let first_task = start_task(mut lo, mut fx, fn_ty: body_ty, function, cell, domain: record, region_record: region, owner: record, end: None, done)
+    if point {
+        spawned(mut lo, mut fx, record: first_task)
+    } else {
+        discard mut lo.call_routine(mut fx, routine: Routine.Wake, args: Array[clif::Value, 1].filled(first_task).view())
+    }
+    let lock = mut fx.offset(record, offset: DOMAIN_LOCK)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let flags = mut fx1.load(PTR, addr: first_task, offset: TASK_FLAGS)
+        let done_bit = mut fx1.b.band_imm_s(flags, y: FLAG_DONE)
+        let ended = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done_bit, y: 0)
+        let abandoned_word = mut fx1.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
+        let abandoned = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: abandoned_word, y: 0)
+        let over = mut fx1.b.bor(ended, y: abandoned)
+        let waiting = mut fx1.b.bxor_imm_s(over, y: 1)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        mut fx1.if_true(waiting, then: fn[mut lo](mut fx2: Fx) {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Park, args: mem::List[clif::Value].empty(fx2.alloc).view())
+        })
+        return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(parent_lock).view())
+    unlink_child(mut fx, parent: caller_domain, child: record)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(parent_lock).view())
+    return Nested(record: record, first_task: first_task, trap: trap)
+} run_nested
+
+/// Ends a domain whose first task ended: the holdings it still owns pass to `parent`, its other
+/// chunks are freed, and its records with them.
+fn domains_end_nested(mut lo: Lowering, mut fx: Fx, record: clif::Value, first_task: clif::Value, parent: clif::Value) {
+    pass_all(mut lo, mut fx, from: record, to: parent)
+    free_chunks(mut lo, mut fx, domain: record)
+    mut lo.record_free(mut fx, address: first_task)
+    mut lo.record_free(mut fx, address: record)
+} domains_end_nested
+
+/// Takes a domain out of the list of the domains nested in its parent; the caller holds the
+/// parent's lock.
+fn unlink_child(mut fx: Fx, parent: clif::Value, child: clif::Value) {
+    let head = mut fx.load(PTR, addr: parent, offset: DOMAIN_CHILDREN)
+    let sibling = mut fx.load(PTR, addr: child, offset: DOMAIN_SIBLING)
+    let is_head = mut fx.b.icmp(clif::IntCC.Equal, x: head, y: child)
+    discard mut fx.choose(is_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(sibling, addr: parent, offset: DOMAIN_CHILDREN)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(head).view(), body: fn(mut fx2: Fx, walk_state: Slice[clif::Value]) -> Pass {
+            expect walk_state.len() == 1
+            let current = walk_state[0]
+            let next = mut fx2.load(PTR, addr: current, offset: DOMAIN_SIBLING)
+            let found = mut fx2.b.icmp(clif::IntCC.Equal, x: next, y: child)
+            mut fx2.if_true(found, then: fn(mut fx3: Fx) {
+                mut fx3.store(sibling, addr: current, offset: DOMAIN_SIBLING)
+            })
+            let more = mut fx2.b.bxor_imm_s(found, y: 1)
+            var stepped = mem::List[clif::Value].empty(fx2.alloc)
+            mut stepped.push(next)
+            return Pass(again: more, next: take stepped)
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} unlink_child
+
+/// What the executor thread does once a domain's first task has ended: the caller of
+/// `sys::Domain.run` wakes.
+fn domain_done(mut lo: Lowering) -> object::FuncId {
+    let signature = record_signature(lo.alloc)
+    return mut lo.glue_function(Glue.DomainDone, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let first_task = params[0]
+        let record = mut fx1.load(PTR, addr: first_task, offset: TASK_OWNER)
+        let lock = mut fx1.offset(record, offset: DOMAIN_LOCK)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
+        let flags = mut fx1.load(PTR, addr: first_task, offset: TASK_FLAGS)
+        let done_flags = mut fx1.b.bor_imm_s(flags, y: FLAG_DONE)
+        mut fx1.store(done_flags, addr: first_task, offset: TASK_FLAGS)
+        let waiter = mut fx1.load(PTR, addr: record, offset: DOMAIN_WAITER)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(waiter).view())
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} domain_done
+
+/// Releases a trap: frees its record.
+fn release_trap(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
+    let record = mut fx.load(PTR, addr: address, offset: 0)
+    discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(record).view())
+} release_trap

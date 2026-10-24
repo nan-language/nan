@@ -1,0 +1,371 @@
+//! The function builder lowering uses: the clif builder with the structured control flow, memory accesses and stack storage that lowered code and support routines are written with.
+
+/// The type of addresses and sizes.
+const PTR: clif::Type = clif::POINTER
+
+struct Fx {
+    b: clif::Builder
+    /// The call sites lowering has classified, by call instruction.
+    sites: mem::List[CallSite]
+    /// The addresses of the function's own function-typed parameters, with their positions.
+    fn_params: mem::HashMap[clif::Value, usize]
+    /// In a test image, the bytes recording which targets ran and the slot of the target this
+    /// function's calls run, which its entry marks.
+    mark: Option[TargetMark]
+    alloc: mem::Alloc
+} Fx
+
+/// A call instruction lowering has classified, with its site.
+struct CallSite {
+    inst: clif::Inst
+    site: Site
+} CallSite
+
+/// The bytes recording which targets ran, and the slot of the target a function's calls run.
+struct TargetMark derives Copy {
+    ran: clif::GlobalValue
+    slot: u32
+} TargetMark
+
+/// What a pass of a loop `Fx.repeat` builds gives: whether the loop runs again, and the state
+/// the next pass receives.
+struct Pass {
+    again: clif::Value
+    next: mem::List[clif::Value]
+} Pass
+
+/// The flags of a scalar access, possibly unaligned.
+fn fx_access(unaligned_access: bool) -> clif::MemFlags {
+    if unaligned_access {
+        return clif::MemFlags.unaligned()
+    }
+    return clif::MemFlags.owned()
+} fx_access
+
+fn Fx.new(take b: clif::Builder, alloc: mem::Alloc) -> Fx {
+    return Fx(b: take b, sites: mem::List[CallSite].empty(alloc), fn_params: mem::HashMap[clif::Value, usize].empty(seed: 0, alloc), mark: None, alloc: alloc)
+} Fx.new
+
+/// Starts the function: its entry block holding its parameters, current and sealed, which
+/// marks the target the function's calls run.
+fn Fx.entry(mut self) -> mem::List[clif::Value] {
+    let entry = mut self.b.create_block()
+    mut self.b.append_block_params_for_function_params(entry)
+    mut self.b.switch_to_block(entry)
+    mut self.b.seal_block(entry)
+    mut self.mark_ran()
+    return self.b.block_params(entry, alloc: self.alloc)
+} Fx.entry
+
+/// Marks, at the function's entry, the target its calls run.
+fn Fx.mark_ran(mut self) {
+    let Some(mark) = mut self.mark.extract() else {
+        return
+    }
+    let base = mut self.b.symbol_value(PTR, global_value: mark.ran)
+    let one = mut self.int(clif::Type.Int8, value: 1)
+    mut self.store(one, addr: base, offset: u64.widen(mark.slot))
+} Fx.mark_ran
+
+fn Fx.int(mut self, ty: clif::Type, value: i64) -> clif::Value {
+    return mut self.b.iconst(ty, imm: value)
+} Fx.int
+
+fn Fx.ptr(mut self, value: u64) -> clif::Value {
+    return mut self.b.iconst(PTR, imm: i64.from_bits(value))
+} Fx.ptr
+
+fn Fx.load(mut self, ty: clif::Type, addr: clif::Value, offset: u64) -> clif::Value {
+    return mut self.b.load(ty, flags: clif::MemFlags.owned(), p: addr, offset: i32.truncate(offset))
+} Fx.load
+
+fn Fx.store(mut self, value: clif::Value, addr: clif::Value, offset: u64) {
+    mut self.b.store(clif::MemFlags.owned(), x: value, p: addr, offset: i32.truncate(offset))
+} Fx.store
+
+/// The scalar of type `ty` at `offset` past `addr`, possibly unaligned, held in big-endian
+/// byte order when `big` holds.
+fn Fx.load_ordered(mut self, ty: clif::Type, addr: clif::Value, offset: u64, unaligned_access: bool, big: bool) -> clif::Value {
+    let value = mut self.b.load(ty, flags: fx_access(unaligned_access), p: addr, offset: i32.truncate(offset))
+    return mut self.ordered(value, big)
+} Fx.load_ordered
+
+/// Stores a scalar at `offset` past `addr`, possibly unaligned, in big-endian byte order
+/// when `big` holds.
+fn Fx.store_ordered(mut self, value: clif::Value, addr: clif::Value, offset: u64, unaligned_access: bool, big: bool) {
+    let stored = mut self.ordered(value, big)
+    mut self.b.store(fx_access(unaligned_access), x: stored, p: addr, offset: i32.truncate(offset))
+} Fx.store_ordered
+
+/// A scalar with its bytes reversed when `big` holds, which turns a value into its
+/// big-endian memory form and back.
+fn Fx.ordered(mut self, value: clif::Value, big: bool) -> clif::Value {
+    if not big or self.b.value_type(value).bytes() == 1 {
+        return value
+    }
+    return mut self.b.bswap(value)
+} Fx.ordered
+
+/// The address `offset` bytes past `addr`.
+fn Fx.offset(mut self, addr: clif::Value, offset: u64) -> clif::Value {
+    if offset == 0 {
+        return addr
+    }
+    let amount = mut self.ptr(offset)
+    return mut self.b.iadd(addr, y: amount)
+} Fx.offset
+
+/// A new stack area of `size` bytes aligned to `align`, by its address.
+fn Fx.slot(mut self, size: u64, align: u64) -> clif::Value {
+    var area_align = align
+    if area_align == 0 {
+        area_align = 1
+    }
+    var area_size = size
+    if area_size == 0 {
+        area_size = 1
+    }
+    let shift = u8.truncate(area_align.trailing_zeros())
+    let slot = mut self.b.create_sized_stack_slot(clif::StackSlotData(size: u32.truncate(area_size), align_shift: shift))
+    return mut self.b.stack_addr(PTR, slot, offset: 0)
+} Fx.slot
+
+/// Copies `size` bytes between non-overlapping areas, word by word when both are aligned to
+/// 8, by bytes otherwise; used for sizes known small.
+fn Fx.copy_small(mut self, dst: clif::Value, src: clif::Value, size: u64, align: u64) {
+    var widths = Array[clif::Type, 4].filled(clif::Type.Int64)
+    widths[1] = clif::Type.Int32
+    widths[2] = clif::Type.Int16
+    widths[3] = clif::Type.Int8
+    var offset: u64 = 0
+    for ty in widths {
+        let width = u64.widen(ty.bytes())
+        if align < width {
+            continue
+        }
+        while offset + width <= size {
+            let value = mut self.b.load(ty, flags: clif::MemFlags.owned(), p: src, offset: i32.truncate(offset))
+            mut self.b.store(clif::MemFlags.owned(), x: value, p: dst, offset: i32.truncate(offset))
+            offset += width
+        }
+    }
+    while offset < size {
+        let value = mut self.b.load(clif::Type.Int8, flags: clif::MemFlags.unaligned(), p: src, offset: i32.truncate(offset))
+        mut self.b.store(clif::MemFlags.unaligned(), x: value, p: dst, offset: i32.truncate(offset))
+        offset += 1
+    }
+} Fx.copy_small
+
+/// Runs `then` when `condition` is nonzero, continuing after it either way.
+fn Fx.if_true(mut self, condition: clif::Value, then: fn(mut fx: Fx)) {
+    let body = mut self.b.create_block()
+    let next = mut self.b.create_block()
+    let none = mem::List[clif::Value].empty(self.alloc)
+    mut self.b.brif(condition, then: body, then_args: none.view(), otherwise: next, otherwise_args: none.view())
+    mut self.b.switch_to_block(body)
+    mut self.b.seal_block(body)
+    then(mut self)
+    if not self.is_filled() {
+        mut self.b.jump(next, args: none.view())
+    }
+    mut self.b.switch_to_block(next)
+    mut self.b.seal_block(next)
+} Fx.if_true
+
+/// Runs `then` or `otherwise` as `condition` is nonzero or not, each yielding values of
+/// `results`' types, and gives the values the one run yields.
+fn Fx.choose(mut self, condition: clif::Value, results: Slice[clif::Type], then: fn(mut fx: Fx) -> mem::List[clif::Value], otherwise: fn(mut fx: Fx) -> mem::List[clif::Value]) -> mem::List[clif::Value]
+    ensures result.len() == results.len()
+{
+    var nothing = Unit
+    return mut self.choose_in(mut nothing, condition, results, then: fn(mut cx: Unit, mut fx1: Fx) -> mem::List[clif::Value] {
+        return then(mut fx1)
+    }, otherwise: fn(mut cx: Unit, mut fx1: Fx) -> mem::List[clif::Value] {
+        return otherwise(mut fx1)
+    })
+} Fx.choose
+
+/// `choose`, with a context both branches use.
+fn Fx.choose_in[C](mut self, mut cx: C, condition: clif::Value, results: Slice[clif::Type], then: fn(mut cx: C, mut fx: Fx) -> mem::List[clif::Value], otherwise: fn(mut cx: C, mut fx: Fx) -> mem::List[clif::Value]) -> mem::List[clif::Value]
+    ensures result.len() == results.len()
+{
+    let yes = mut self.b.create_block()
+    let no = mut self.b.create_block()
+    let next = mut self.b.create_block()
+    for ty in results {
+        discard mut self.b.append_block_param(next, ty)
+    }
+    let none = mem::List[clif::Value].empty(self.alloc)
+    mut self.b.brif(condition, then: yes, then_args: none.view(), otherwise: no, otherwise_args: none.view())
+    mut self.b.switch_to_block(yes)
+    mut self.b.seal_block(yes)
+    let produced = then(mut cx, fx: mut self)
+    mut self.jump_unless_filled(next, args: produced.view())
+    mut self.b.switch_to_block(no)
+    mut self.b.seal_block(no)
+    let other = otherwise(mut cx, fx: mut self)
+    mut self.jump_unless_filled(next, args: other.view())
+    mut self.b.switch_to_block(next)
+    mut self.b.seal_block(next)
+    return self.b.block_params(next, alloc: self.alloc)
+} Fx.choose_in
+
+/// Ends the current block with a jump to `target` passing `args`, unless it already ends.
+fn Fx.jump_unless_filled(mut self, target: clif::Block, args: Slice[clif::Value]) {
+    if not self.is_filled() {
+        mut self.b.jump(target, args)
+    }
+} Fx.jump_unless_filled
+
+/// A loop whose body runs while it returns a nonzero value, with `state` carried from each
+/// pass to the next; gives the state after the last pass.
+fn Fx.repeat(mut self, state: Slice[clif::Value], body: fn(mut fx: Fx, current: Slice[clif::Value]) -> Pass) -> mem::List[clif::Value]
+    ensures result.len() == state.len()
+{
+    var types = mem::List[clif::Type].empty(self.alloc)
+    for value in state {
+        mut types.push(self.b.value_type(value))
+    }
+    let header = mut self.b.create_block()
+    let exit = mut self.b.create_block()
+    for ty in types {
+        discard mut self.b.append_block_param(header, ty)
+        discard mut self.b.append_block_param(exit, ty)
+    }
+    mut self.b.jump(header, args: state)
+    mut self.b.switch_to_block(header)
+    let current = self.b.block_params(header, alloc: self.alloc)
+    let pass = body(mut self, current: current.view())
+    mut self.b.brif(pass.again, then: header, then_args: pass.next.view(), otherwise: exit, otherwise_args: pass.next.view())
+    mut self.b.seal_block(header)
+    mut self.b.switch_to_block(exit)
+    mut self.b.seal_block(exit)
+    return self.b.block_params(exit, alloc: self.alloc)
+} Fx.repeat
+
+/// A loop over `start..end`, `body` receiving each index.
+fn Fx.each(mut self, start: clif::Value, end: clif::Value, body: fn(mut fx: Fx, index: clif::Value)) {
+    let header = mut self.b.create_block()
+    let pass = mut self.b.create_block()
+    let exit = mut self.b.create_block()
+    discard mut self.b.append_block_param(header, ty: PTR)
+    let entered = self.list1(start)
+    mut self.b.jump(header, args: entered.view())
+    mut self.b.switch_to_block(header)
+    let params = self.b.block_params(header, alloc: self.alloc)
+    expect params.len() > 0
+    let index = params[0]
+    let more = mut self.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: end)
+    let none = mem::List[clif::Value].empty(self.alloc)
+    mut self.b.brif(more, then: pass, then_args: none.view(), otherwise: exit, otherwise_args: none.view())
+    mut self.b.switch_to_block(pass)
+    mut self.b.seal_block(pass)
+    body(mut self, index)
+    if not self.is_filled() {
+        let one = mut self.ptr(1)
+        let next = mut self.b.iadd(index, y: one)
+        let again = self.list1(next)
+        mut self.b.jump(header, args: again.view())
+    }
+    mut self.b.seal_block(header)
+    mut self.b.switch_to_block(exit)
+    mut self.b.seal_block(exit)
+} Fx.each
+
+/// Whether the current block already ends in a terminator.
+fn Fx.is_filled(self) -> bool {
+    return self.b.is_filled()
+} Fx.is_filled
+
+/// A new block, not yet sealed.
+fn Fx.block(mut self) -> clif::Block {
+    return mut self.b.create_block()
+} Fx.block
+
+fn Fx.variable(mut self, ty: clif::Type, initial: clif::Value) -> clif::Variable {
+    let variable = mut self.b.declare_var(ty)
+    mut self.b.def_var(variable, val: initial)
+    return variable
+} Fx.variable
+
+/// A list of the values given, in order.
+fn Fx.list1(self, a: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 1
+{
+    var listed = mem::List[clif::Value].empty(self.alloc)
+    mut listed.push(a)
+    return listed
+} Fx.list1
+
+fn Fx.list2(self, a: clif::Value, b: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 2
+{
+    var listed = self.list1(a)
+    mut listed.push(b)
+    return listed
+} Fx.list2
+
+fn Fx.list3(self, a: clif::Value, b: clif::Value, c: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 3
+{
+    var listed = self.list2(a, b)
+    mut listed.push(c)
+    return listed
+} Fx.list3
+
+fn Fx.list4(self, a: clif::Value, b: clif::Value, c: clif::Value, d: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 4
+{
+    var listed = self.list3(a, b, c)
+    mut listed.push(d)
+    return listed
+} Fx.list4
+
+fn Fx.list5(self, a: clif::Value, b: clif::Value, c: clif::Value, d: clif::Value, e: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 5
+{
+    var listed = self.list4(a, b, c, d)
+    mut listed.push(e)
+    return listed
+} Fx.list5
+
+fn Fx.list6(self, a: clif::Value, b: clif::Value, c: clif::Value, d: clif::Value, e: clif::Value, f: clif::Value) -> mem::List[clif::Value]
+    ensures result.len() == 6
+{
+    var listed = self.list5(a, b, c, d, e)
+    mut listed.push(f)
+    return listed
+} Fx.list6
+
+/// A list of the types given, in order.
+fn Fx.types1(self, a: clif::Type) -> mem::List[clif::Type]
+    ensures result.len() == 1
+{
+    var listed = mem::List[clif::Type].empty(self.alloc)
+    mut listed.push(a)
+    return listed
+} Fx.types1
+
+fn Fx.types2(self, a: clif::Type, b: clif::Type) -> mem::List[clif::Type]
+    ensures result.len() == 2
+{
+    var listed = self.types1(a)
+    mut listed.push(b)
+    return listed
+} Fx.types2
+
+fn Fx.types3(self, a: clif::Type, b: clif::Type, c: clif::Type) -> mem::List[clif::Type]
+    ensures result.len() == 3
+{
+    var listed = self.types2(a, b)
+    mut listed.push(c)
+    return listed
+} Fx.types3
+
+fn Fx.types4(self, a: clif::Type, b: clif::Type, c: clif::Type, d: clif::Type) -> mem::List[clif::Type]
+    ensures result.len() == 4
+{
+    var listed = self.types3(a, b, c)
+    mut listed.push(d)
+    return listed
+} Fx.types4

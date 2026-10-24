@@ -1,0 +1,663 @@
+//! Numbers: the named conversions and bit conversions, lowered where they are called, and the scalar members std supplies: wrapping arithmetic, bit counts, truncating division and arithmetic shifts, wide products, square roots, fused multiply-adds and total float order.
+
+/// A converted value, and whether the conversion kept the value exactly.
+struct Fitted derives Copy {
+    converted: clif::Value
+    fits: clif::Value
+} Fitted
+
+/// Checks, at a call outside std of a scalar's division or shift method, the conditions on its
+/// operands that the method's rules trap on, so that the report names the call and shows its
+/// receiver and argument.
+fn operand_checks(mut body: Body, mut lo: Lowering, mut fx: Fx, fn_ref: nir::FnRef, operands: Slice[nir::Operand]) {
+    let nir::Callable.Item(item: item, role: _, index: _) = fn_ref.callable else {
+        return
+    }
+    let Some(check::TypeKey.Scalar(scalar)) = lo.ck.db().owners.get(item) else {
+        return
+    }
+    if lo.ck.db().is_std(body.item) or not lo.ck.db().is_std(item) {
+        return
+    }
+    let path = lo.ck.db().canonical(item)
+    let member_start = match check::last_dot(path.as_str()) {
+        Some(dot) => dot + 1
+        None => path.byte_len()
+    }
+    let Some(member) = path.as_str().slice_bytes(member_start, end: path.byte_len()) else {
+        expect false
+        return
+    }
+    let checked = match member {
+        "div_trunc" or "div_floor" or "rem_trunc" or "mod_floor" or "shr_arith" or "wrapping_shl" => true
+        else => false
+    }
+    if not checked {
+        return
+    }
+    var values = mem::List[HeldOperand].empty(lo.alloc)
+    for operand in operands {
+        let found = mut body.operand(mut lo, mut fx, operand)
+        mut values.push(HeldOperand(operand: operand.copy(lo.alloc), held: found.held, nty: found.nty))
+    }
+    if values.len() != 2 {
+        return
+    }
+    let left_repr = mut lo.owned_repr(values[0].nty.ty())
+    let value_held = mut body.adapt(mut lo, mut fx, held: values[0].held, nty: values[0].nty, wanted: left_repr)
+    let value = value_held.scalar_value()
+    let right_repr = mut lo.owned_repr(values[1].nty.ty())
+    let other_held = mut body.adapt(mut lo, mut fx, held: values[1].held, nty: values[1].nty, wanted: right_repr)
+    let other = other_held.scalar_value()
+    match member {
+        "div_trunc" or "div_floor" => {
+            operand_check(mut body, mut lo, mut fx, kind: "trap.division-by-zero", scalar, value, other, values: values.view())
+            operand_check(mut body, mut lo, mut fx, kind: "trap.overflow", scalar, value, other, values: values.view())
+        }
+        "rem_trunc" or "mod_floor" => operand_check(mut body, mut lo, mut fx, kind: "trap.division-by-zero", scalar, value, other, values: values.view())
+        else => operand_check(mut body, mut lo, mut fx, kind: "trap.shift", scalar, value, other, values: values.view())
+    }
+} operand_checks
+
+/// One check of `operand_checks`: the condition of a trap kind on a scalar method's receiver
+/// `value` and argument `other`, trapping with the operands shown when it fails.
+fn operand_check(mut body: Body, mut lo: Lowering, mut fx: Fx, kind: Str, scalar: ty::Scalar, value: clif::Value, other: clif::Value, values: Slice[HeldOperand]) {
+    var holds = value
+    match kind {
+        "trap.division-by-zero" => {
+            holds = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: other, y: 0)
+        }
+        "trap.overflow" => {
+            let minimum = i64.from_bits(scalar.range().low.low_bits())
+            let is_minimum = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: value, y: minimum)
+            let minus_one = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: other, y: -1)
+            let overflows = mut fx.b.band(is_minimum, y: minus_one)
+            holds = mut fx.b.bxor_imm_s(overflows, y: 1)
+        }
+        else => {
+            let amount = body_widen(mut fx, value: other)
+            let width = i64.widen(scalar.bits())
+            holds = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: amount, y: width)
+        }
+    }
+    var copies = mem::List[HeldOperand].empty(lo.alloc)
+    for held_operand in values {
+        mut copies.push(HeldOperand(operand: held_operand.operand.copy(lo.alloc), held: held_operand.held, nty: held_operand.nty))
+    }
+    mut body.trap_unless(mut lo, mut fx, holds, kind, operands: Operands.Values(form: TrapForm.Call, values: take copies))
+} operand_check
+
+/// A named conversion of an operand to a scalar type.
+fn numbers_conversion(mut body: Body, mut lo: Lowering, mut fx: Fx, conversion: nir::Conversion, target: ty::Scalar, operand: nir::Operand, block: nir::BlockId, position: usize) -> Held {
+    let found = mut body.operand(mut lo, mut fx, operand)
+    let Some(source) = lo.ck.types().scalar_of(found.nty.ty()) else {
+        expect false
+        return found.held
+    }
+    let repr = mut lo.owned_repr(found.nty.ty())
+    let value_held = mut body.adapt(mut lo, mut fx, held: found.held, nty: found.nty, wanted: repr)
+    let value = value_held.scalar_value()
+    let target_ty = scalar_type(target)
+    let checked = body.checked(block, position)
+    match conversion {
+        nir::Conversion.Widen => return Held.Scalar(numbers_widen(mut fx, value, source, target))
+        nir::Conversion.Truncate => return Held.Scalar(place_resize(mut fx, value, target: target_ty))
+        nir::Conversion.Saturate => return Held.Scalar(saturate(mut fx, value, source, target))
+        nir::Conversion.Nearest => return Held.Scalar(nearest(mut fx, value, source, target))
+        nir::Conversion.Fit or nir::Conversion.CheckedFit => {}
+    }
+    let fitted = fit(mut fx, value, source, target)
+    if conversion == nir::Conversion.Fit {
+        if checked {
+            var shown = mem::List[HeldOperand].empty(lo.alloc)
+            mut shown.push(HeldOperand(operand: operand.copy(lo.alloc), held: Held.Scalar(value), nty: found.nty))
+            mut body.trap_unless(mut lo, mut fx, holds: fitted.fits, kind: "trap.conversion", operands: Operands.Values(form: TrapForm.Call, values: take shown))
+        }
+        return Held.Scalar(fitted.converted)
+    }
+    var option_args = mem::List[ty::Ty].empty(lo.alloc)
+    mut option_args.push(ty::Ty.scalar(target))
+    let option = lo.std_ty("core", type_name: "Option", args: take option_args)
+    return option_of(mut lo, mut fx, option, is_some: fitted.fits, value: Held.Scalar(fitted.converted))
+} numbers_conversion
+
+/// An `Option` of a type: `Some(value)` when `is_some`, else `None`.
+fn option_of(mut lo: Lowering, mut fx: Fx, option: ty::Ty, is_some: clif::Value, value: Held) -> Held {
+    let laid = mut lo.layout_of(option)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut lo.write_option(mut fx, option, address: slot, presence: is_some, value)
+    return mut lo.held_at(mut fx, ty: option, address: slot)
+} option_of
+
+fn numbers_widen(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
+    let ty = scalar_type(target)
+    if not source.is_float() and not target.is_float() {
+        if source.bits() < target.bits() {
+            if source.is_signed() {
+                return mut fx.b.sextend(ty, x: value)
+            }
+            return mut fx.b.uextend(ty, x: value)
+        }
+        return value
+    }
+    if not source.is_float() {
+        let widened = integer64(mut fx, value, scalar: source)
+        if source.is_signed() {
+            return mut fx.b.fcvt_from_sint(ty, x: widened)
+        }
+        return mut fx.b.fcvt_from_uint(ty, x: widened)
+    }
+    if target.is_float() {
+        return mut fx.b.fpromote(ty, x: value)
+    }
+    expect false
+    return value
+} numbers_widen
+
+/// An integer register widened to 64 bits by its own sign.
+fn integer64(mut fx: Fx, value: clif::Value, scalar: ty::Scalar) -> clif::Value {
+    if scalar.bits() == 64 {
+        return value
+    }
+    if scalar.is_signed() {
+        return mut fx.b.sextend(clif::Type.Int64, x: value)
+    }
+    return mut fx.b.uextend(clif::Type.Int64, x: value)
+} integer64
+
+/// A conversion that keeps the value exactly, with whether it did.
+fn fit(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> Fitted {
+    let ty = scalar_type(target)
+    if not source.is_float() and not target.is_float() {
+        let range = target.range()
+        let widened = integer64(mut fx, value, scalar: source)
+        let fits = numbers_in_range(mut fx, value: widened, signed: source.is_signed(), low: range.low, high: range.high)
+        return Fitted(converted: place_resize(mut fx, value, target: ty), fits: fits)
+    }
+    if not source.is_float() {
+        let widened = integer64(mut fx, value, scalar: source)
+        var converted = value
+        if source.is_signed() {
+            converted = mut fx.b.fcvt_from_sint(ty, x: widened)
+        } else {
+            converted = mut fx.b.fcvt_from_uint(ty, x: widened)
+        }
+        let exact = float_to_int_exact(mut fx, converted, original: widened, source)
+        return Fitted(converted: converted, fits: exact)
+    }
+    if not target.is_float() {
+        let integral = trunc(mut fx, value)
+        let whole = mut fx.b.fcmp(clif::FloatCC.Equal, x: integral, y: value)
+        let range = target.range()
+        let float_ty = fx.b.value_type(value)
+        let low_bound = float_const(mut fx, ty: float_ty, value: range.low.to_f64())
+        let above_low = mut fx.b.fcmp(clif::FloatCC.GreaterThanOrEqual, x: value, y: low_bound)
+        let high_limit = float_const(mut fx, ty: float_ty, value: range.high.to_f64() + 1.0)
+        let below_high = mut fx.b.fcmp(clif::FloatCC.LessThan, x: value, y: high_limit)
+        let whole_above = mut fx.b.band(whole, y: above_low)
+        let fits = mut fx.b.band(whole_above, y: below_high)
+        var converted = value
+        if target.is_signed() {
+            converted = mut fx.b.fcvt_to_sint_sat(ty, x: value)
+        } else {
+            converted = mut fx.b.fcvt_to_uint_sat(ty, x: value)
+        }
+        return Fitted(converted: converted, fits: fits)
+    }
+    let demoted = mut fx.b.fdemote(ty, x: value)
+    let back = mut fx.b.fpromote(clif::Type.Float64, x: demoted)
+    let same = mut fx.b.fcmp(clif::FloatCC.Equal, x: back, y: value)
+    let unordered = mut fx.b.fcmp(clif::FloatCC.Unordered, x: value, y: value)
+    let fits = mut fx.b.bor(same, y: unordered)
+    return Fitted(converted: demoted, fits: fits)
+} fit
+
+/// Whether a float converted from the 64-bit integer `original` of `source` converts back to
+/// it exactly.
+fn float_to_int_exact(mut fx: Fx, converted: clif::Value, original: clif::Value, source: ty::Scalar) -> clif::Value {
+    let float_ty = fx.b.value_type(converted)
+    let range = source.range()
+    let low_bound = float_const(mut fx, ty: float_ty, value: range.low.to_f64())
+    let high_limit = float_const(mut fx, ty: float_ty, value: range.high.to_f64() + 1.0)
+    let above = mut fx.b.fcmp(clif::FloatCC.GreaterThanOrEqual, x: converted, y: low_bound)
+    let below = mut fx.b.fcmp(clif::FloatCC.LessThan, x: converted, y: high_limit)
+    var back = converted
+    if source.is_signed() {
+        back = mut fx.b.fcvt_to_sint_sat(clif::Type.Int64, x: converted)
+    } else {
+        back = mut fx.b.fcvt_to_uint_sat(clif::Type.Int64, x: converted)
+    }
+    let same = mut fx.b.icmp(clif::IntCC.Equal, x: back, y: original)
+    let inside = mut fx.b.band(above, y: below)
+    return mut fx.b.band(inside, y: same)
+} float_to_int_exact
+
+fn float_const(mut fx: Fx, ty: clif::Type, value: f64) -> clif::Value {
+    if ty == clif::Type.Float32 {
+        return mut fx.b.f32const(f32.nearest(value).to_bits())
+    }
+    return mut fx.b.f64const(value.to_bits())
+} float_const
+
+/// Whether a 64-bit integer, read as signed or unsigned, lies in `low..=high`.
+fn numbers_in_range(mut fx: Fx, value: clif::Value, signed: bool, low: wide::Wide, high: wide::Wide) -> clif::Value {
+    var min = wide::Wide.zero()
+    var max = wide::Wide.of_u64(~0u64)
+    var at_least = clif::IntCC.UnsignedGreaterThanOrEqual
+    var at_most = clif::IntCC.UnsignedLessThanOrEqual
+    if signed {
+        min = wide::Wide.of_i64(-9_223_372_036_854_775_807 - 1)
+        max = wide::Wide.of_i64(9_223_372_036_854_775_807)
+        at_least = clif::IntCC.SignedGreaterThanOrEqual
+        at_most = clif::IntCC.SignedLessThanOrEqual
+    }
+    var above = value
+    if low.le(min) {
+        above = mut fx.int(clif::Type.Int8, value: 1)
+    } else {
+        above = mut fx.b.icmp_imm_s(at_least, x: value, y: i64.from_bits(low.low_bits()))
+    }
+    var below = value
+    if max.le(high) {
+        below = mut fx.int(clif::Type.Int8, value: 1)
+    } else {
+        below = mut fx.b.icmp_imm_s(at_most, x: value, y: i64.from_bits(high.low_bits()))
+    }
+    return mut fx.b.band(above, y: below)
+} numbers_in_range
+
+/// A float rounded toward zero to an integral value, without the C library: through a 64-bit
+/// integer below the magnitude at which the format holds no fraction, the sign kept.
+fn trunc(mut fx: Fx, value: clif::Value) -> clif::Value {
+    let ty = fx.b.value_type(value)
+    let limit = float_const(mut fx, ty, value: 4_503_599_627_370_496.0)
+    let magnitude = mut fx.b.fabs(value)
+    let small = mut fx.b.fcmp(clif::FloatCC.LessThan, x: magnitude, y: limit)
+    let whole = mut fx.b.fcvt_to_sint_sat(clif::Type.Int64, x: value)
+    let back = mut fx.b.fcvt_from_sint(ty, x: whole)
+    let signed = mut fx.b.fcopysign(back, y: value)
+    return mut fx.b.select(small, x: signed, y: value)
+} trunc
+
+fn saturate(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
+    let ty = scalar_type(target)
+    if source.is_float() {
+        if target.is_signed() {
+            return mut fx.b.fcvt_to_sint_sat(ty, x: value)
+        }
+        return mut fx.b.fcvt_to_uint_sat(ty, x: value)
+    }
+    let range = target.range()
+    let widened = integer64(mut fx, value, scalar: source)
+    let fits = numbers_in_range(mut fx, value: widened, signed: source.is_signed(), low: range.low, high: range.high)
+    var negative = value
+    if source.is_signed() {
+        negative = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: widened, y: 0)
+    } else {
+        negative = mut fx.int(clif::Type.Int8, value: 0)
+    }
+    let low_value = mut fx.b.iconst(ty, imm: i64.from_bits(range.low.low_bits()))
+    let high_value = mut fx.b.iconst(ty, imm: i64.from_bits(range.high.low_bits()))
+    let bound = mut fx.b.select(negative, x: low_value, y: high_value)
+    let kept = place_resize(mut fx, value, target: ty)
+    return mut fx.b.select(fits, x: kept, y: bound)
+} saturate
+
+fn nearest(mut fx: Fx, value: clif::Value, source: ty::Scalar, target: ty::Scalar) -> clif::Value {
+    let ty = scalar_type(target)
+    if not source.is_float() and target.is_float() {
+        let widened = integer64(mut fx, value, scalar: source)
+        if source.is_signed() {
+            return mut fx.b.fcvt_from_sint(ty, x: widened)
+        }
+        return mut fx.b.fcvt_from_uint(ty, x: widened)
+    }
+    if source.is_float() and target.is_float() {
+        return mut fx.b.fdemote(ty, x: value)
+    }
+    if source.is_float() {
+        let rounded = round_even(mut fx, value)
+        if target.is_signed() {
+            return mut fx.b.fcvt_to_sint_sat(ty, x: rounded)
+        }
+        return mut fx.b.fcvt_to_uint_sat(ty, x: rounded)
+    }
+    expect false
+    return value
+} nearest
+
+/// A float rounded to an integral value, ties to even, by adding and subtracting the power of
+/// two at which the format holds no fraction.
+fn round_even(mut fx: Fx, value: clif::Value) -> clif::Value {
+    let ty = fx.b.value_type(value)
+    var magic = value
+    if ty == clif::Type.Float32 {
+        magic = mut fx.b.f32const((8_388_608.0f32).to_bits())
+    } else {
+        magic = mut fx.b.f64const((4_503_599_627_370_496.0f64).to_bits())
+    }
+    let magnitude = mut fx.b.fabs(value)
+    let large = mut fx.b.fcmp(clif::FloatCC.GreaterThanOrEqual, x: magnitude, y: magic)
+    let shifted = mut fx.b.fadd(magnitude, y: magic)
+    let rounded = mut fx.b.fsub(shifted, y: magic)
+    let signed = mut fx.b.fcopysign(rounded, y: value)
+    return mut fx.b.select(large, x: value, y: signed)
+} round_even
+
+/// A bit conversion of an operand.
+fn numbers_bits(mut body: Body, mut lo: Lowering, mut fx: Fx, conversion: nir::BitConversion, owner: nir::BitsOwner, operand: nir::Operand, result: Option[nir::Value]) -> Held {
+    let found = mut body.operand(mut lo, mut fx, operand)
+    let repr = mut lo.owned_repr(found.nty.ty())
+    let value = mut body.adapt(mut lo, mut fx, held: found.held, nty: found.nty, wanted: repr)
+    let owner_ty = match owner {
+        nir::BitsOwner.Scalar(scalar) => ty::Ty.scalar(scalar)
+        nir::BitsOwner.Layout(item) => lo.ck.types().item(item, args: mem::List[ty::Arg].empty(lo.alloc))
+    }
+    let result_ty = match result {
+        Some(produced) => body.nty(produced).ty()
+        None => ty::Ty.unit()
+    }
+    match conversion {
+        nir::BitConversion.To => {
+            return match value {
+                Held.Scalar(raw) => Held.Scalar(bits_of(mut fx, value: raw))
+                else => value
+            }
+        }
+        nir::BitConversion.From => {
+            return match mut lo.owned_repr(owner_ty) {
+                Repr.Scalar(ty) => Held.Scalar(from_bits(mut fx, value: value.scalar_value(), target: ty))
+                else => value
+            }
+        }
+        nir::BitConversion.CheckedFrom => {
+            let Repr.Scalar(target) = mut lo.owned_repr(owner_ty) else {
+                expect false
+                return value
+            }
+            let converted = from_bits(mut fx, value: value.scalar_value(), target)
+            let valid = valid_bits(mut lo, mut fx, ty: owner_ty, bits: value.scalar_value())
+            return option_of(mut lo, mut fx, option: result_ty, is_some: valid, value: Held.Scalar(converted))
+        }
+    }
+} numbers_bits
+
+fn bits_of(mut fx: Fx, value: clif::Value) -> clif::Value {
+    return match fx.b.value_type(value) {
+        clif::Type.Float32 => mut fx.b.bitcast(clif::Type.Int32, flags: clif::MemFlags.new(), x: value)
+        clif::Type.Float64 => mut fx.b.bitcast(clif::Type.Int64, flags: clif::MemFlags.new(), x: value)
+        else => value
+    }
+} bits_of
+
+fn from_bits(mut fx: Fx, value: clif::Value, target: clif::Type) -> clif::Value {
+    return match target {
+        clif::Type.Float32 or clif::Type.Float64 => mut fx.b.bitcast(target, flags: clif::MemFlags.new(), x: value)
+        else => value
+    }
+} from_bits
+
+/// Whether bits form a value of a type: not one of its niches.
+fn valid_bits(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, bits: clif::Value) -> clif::Value {
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Scalar(ty::Scalar.Bool) => return mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: bits, y: 1)
+        ty::TyKind.Scalar(ty::Scalar.Char) => {
+            let below = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: bits, y: 0x11_0000)
+            let surrogate_low = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: bits, y: 0xD800)
+            let surrogate_high = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: bits, y: 0xDFFF)
+            let surrogate = mut fx.b.band(surrogate_low, y: surrogate_high)
+            let not_surrogate = mut fx.b.bxor_imm_s(surrogate, y: 1)
+            return mut fx.b.band(below, y: not_surrogate)
+        }
+        ty::TyKind.Item(item: item, args: _) => {
+            match lo.ck.layout_shape(item) {
+                Some(check::LayoutShape.Tags(values)) => {
+                    var valid = mut fx.int(clif::Type.Int8, value: 0)
+                    for value in values {
+                        let same = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: bits, y: i64.from_bits(value))
+                        valid = mut fx.b.bor(valid, y: same)
+                    }
+                    return valid
+                }
+                Some(check::LayoutShape.Fields(fields)) => return valid_field_bits(mut lo, mut fx, item, fields: fields.view(), bits)
+                None => return mut fx.int(clif::Type.Int8, value: 1)
+            }
+        }
+        else => return mut fx.int(clif::Type.Int8, value: 1)
+    }
+} valid_bits
+
+/// Whether the bits of an integer layout's fields form values of their types, each field of a
+/// layout type checked at its bits.
+fn valid_field_bits(mut lo: Lowering, mut fx: Fx, item: ty::ItemId, fields: Slice[check::LayoutBits], bits: clif::Value) -> clif::Value {
+    var types = mem::List[ty::Ty].empty(lo.alloc)
+    let sig = lo.ck.sig(item)
+    match sig.contents().kind {
+        check::SigKind.Layout(fields: declared, tags: _, bits: _) => {
+            for field in declared {
+                mut types.push(field.ty)
+            }
+        }
+        else => {}
+    }
+    var valid = mut fx.int(clif::Type.Int8, value: 1)
+    for index in 0..<fields.len() {
+        if index >= types.len() {
+            break
+        }
+        let field = fields[index]
+        let field_ty = types[index]
+        let typed_item = match lo.ck.types().kind(field_ty) {
+            ty::TyKind.Item(item: _, args: _) => true
+            else => false
+        }
+        if field.kind != check::BitsKind.Typed or not typed_item {
+            continue
+        }
+        var shifted = bits
+        if field.low != 0 {
+            shifted = mut fx.b.ushr_imm_s(bits, y: i64.widen(field.low))
+        }
+        var field_bits = shifted
+        if field.width < 64 {
+            field_bits = mut fx.b.band_imm_s(shifted, y: i64.from_bits((1u64 << field.width) - 1))
+        }
+        let held = valid_bits(mut lo, mut fx, ty: field_ty, bits: field_bits)
+        valid = mut fx.b.band(valid, y: held)
+    }
+    return valid
+} valid_field_bits
+
+/// Defines a scalar member std supplies.
+fn numbers_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let owner_scalar = match supply.owner {
+        Some(owner) => lo.ck.types().scalar_of(owner)
+        None => None
+    }
+    let Some(scalar) = owner_scalar else {
+        let path = supply.path.as_str()
+        if path == "core::TotalF64.cmp" or path == "core::TotalF32.cmp" {
+            total_cmp(mut lo, mut fx, supply)
+            return true
+        }
+        return false
+    }
+    var held = Held.Empty
+    match supply.member() {
+        "wrapping_add" => {
+            held = Held.Scalar(mut fx.b.iadd(supply.param(0).scalar_value(), y: supply.param(1).scalar_value()))
+        }
+        "wrapping_sub" => {
+            held = Held.Scalar(mut fx.b.isub(supply.param(0).scalar_value(), y: supply.param(1).scalar_value()))
+        }
+        "wrapping_mul" => {
+            held = Held.Scalar(mut fx.b.imul(supply.param(0).scalar_value(), y: supply.param(1).scalar_value()))
+        }
+        "count_ones" => {
+            held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "popcnt")
+        }
+        "leading_zeros" => {
+            held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "clz")
+        }
+        "trailing_zeros" => {
+            held = numbers_count(mut fx, value: supply.param(0).scalar_value(), op: "ctz")
+        }
+        "div_trunc" or "rem_trunc" => {
+            held = division(mut lo, mut fx, supply, scalar)
+        }
+        "shr_arith" or "wrapping_shl" or "checked_shl" => {
+            held = numbers_shift(mut lo, mut fx, supply, scalar)
+        }
+        "wide_mul" => {
+            wide_mul(mut lo, mut fx, supply, scalar)
+            return true
+        }
+        "sqrt" => {
+            held = Held.Scalar(mut fx.b.sqrt(supply.param(0).scalar_value()))
+        }
+        "fused_mul_add" => {
+            held = Held.Scalar(fused_mul_add(mut lo, mut fx, a: supply.param(0).scalar_value(), b: supply.param(1).scalar_value(), c: supply.param(2).scalar_value()))
+        }
+        else => return false
+    }
+    supply.ret(mut lo, mut fx, held)
+    return true
+} numbers_lower
+
+fn numbers_count(mut fx: Fx, value: clif::Value, op: Str) -> Held {
+    var counted = value
+    match op {
+        "popcnt" => {
+            counted = mut fx.b.popcnt(value)
+        }
+        "clz" => {
+            counted = mut fx.b.clz(value)
+        }
+        else => {
+            counted = mut fx.b.ctz(value)
+        }
+    }
+    return Held.Scalar(place_resize(mut fx, value: counted, target: clif::Type.Int32))
+} numbers_count
+
+fn division(mut lo: Lowering, mut fx: Fx, supply: Supply, scalar: ty::Scalar) -> Held {
+    let a = supply.param(0).scalar_value()
+    let b = supply.param(1).scalar_value()
+    let ty = scalar_type(scalar)
+    let zero_divisor = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: b, y: 0)
+    mut fx.if_true(zero_divisor, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.division-by-zero")
+    })
+    let minimum = mut fx.b.iconst(ty, imm: i64.from_bits(scalar.range().low.low_bits()))
+    let is_minimum = mut fx.b.icmp(clif::IntCC.Equal, x: a, y: minimum)
+    let minus_one = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: b, y: -1)
+    let overflow = mut fx.b.band(is_minimum, y: minus_one)
+    if supply.member() == "div_trunc" {
+        mut fx.if_true(overflow, then: fn[mut lo](mut fx1: Fx) {
+            raise_kind(mut lo, fx: mut fx1, kind: "trap.overflow")
+        })
+        return Held.Scalar(mut fx.b.sdiv(a, y: b))
+    }
+    let one = mut fx.b.iconst(ty, imm: 1)
+    let divisor = mut fx.b.select(overflow, x: one, y: b)
+    let rest = mut fx.b.srem(a, y: divisor)
+    let zero = mut fx.b.iconst(ty, imm: 0)
+    return Held.Scalar(mut fx.b.select(overflow, x: zero, y: rest))
+} division
+
+fn numbers_shift(mut lo: Lowering, mut fx: Fx, supply: Supply, scalar: ty::Scalar) -> Held {
+    let a = supply.param(0).scalar_value()
+    let amount = supply.param(1).scalar_value()
+    let width = i64.widen(scalar.bits())
+    let widened = body_widen(mut fx, value: amount)
+    let too_far = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: widened, y: width)
+    let member = supply.member()
+    if member == "checked_shl" {
+        let shifted = mut fx.b.ishl(a, y: amount)
+        let back = mut fx.b.sshr(shifted, y: amount)
+        let kept = mut fx.b.icmp(clif::IntCC.Equal, x: back, y: a)
+        let in_width = mut fx.b.bxor_imm_s(too_far, y: 1)
+        let valid = mut fx.b.band(kept, y: in_width)
+        let option = supply.abi.result
+        let Some(slot) = supply.sret else {
+            expect false
+            return Held.Empty
+        }
+        mut lo.write_option(mut fx, option, address: slot, presence: valid, value: Held.Scalar(shifted))
+        return Held.Address(slot)
+    }
+    mut fx.if_true(too_far, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.shift")
+    })
+    if member == "shr_arith" {
+        return Held.Scalar(mut fx.b.sshr(a, y: amount))
+    }
+    return Held.Scalar(mut fx.b.ishl(a, y: amount))
+} numbers_shift
+
+/// `wide_mul`: the high and low halves of the full product, written at the result's address.
+fn wide_mul(mut lo: Lowering, mut fx: Fx, supply: Supply, scalar: ty::Scalar) {
+    let a = supply.param(0).scalar_value()
+    let b = supply.param(1).scalar_value()
+    var high = a
+    if scalar.is_signed() {
+        high = mut fx.b.smulhi(a, y: b)
+    } else {
+        high = mut fx.b.umulhi(a, y: b)
+    }
+    let low = mut fx.b.imul(a, y: b)
+    let result = supply.abi.result
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let high_field = mut lo.layouts.field(lo.ck, ty: result, variant: None, label: "high")
+    let low_field = mut lo.layouts.field(lo.ck, ty: result, variant: None, label: "low")
+    mut fx.store(high, addr: sret, offset: high_field.offset)
+    mut fx.store(low, addr: sret, offset: low_field.offset)
+    supply.done(mut lo, mut fx)
+} wide_mul
+
+/// `TotalF64.cmp` and `TotalF32.cmp`: the order of the bit patterns as totalOrder gives it.
+fn total_cmp(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let left = supply.param(0).address_value()
+    let right = supply.param(1).address_value()
+    var float = clif::Type.Int64
+    if supply.path.as_str() == "core::TotalF32.cmp" {
+        float = clif::Type.Int32
+    }
+    let a = mut fx.load(float, addr: left, offset: 0)
+    let b = mut fx.load(float, addr: right, offset: 0)
+    let a_key = total_key(mut fx, bits: a, float)
+    let b_key = total_key(mut fx, bits: b, float)
+    let less = mut fx.b.icmp(clif::IntCC.SignedLessThan, x: a_key, y: b_key)
+    let greater = mut fx.b.icmp(clif::IntCC.SignedGreaterThan, x: a_key, y: b_key)
+    let ordering = mut lo.ordering(mut fx, less, greater)
+    supply.ret(mut lo, mut fx, held: ordering)
+} total_cmp
+
+/// A float's bits as a signed integer that orders as totalOrder orders the floats: the bits
+/// other than the sign flipped when the sign is set.
+fn total_key(mut fx: Fx, bits: clif::Value, float: clif::Type) -> clif::Value {
+    let sign = mut fx.b.sshr_imm_s(bits, y: i64.widen(float.bits() - 1))
+    let mask = mut fx.b.ushr_imm_s(sign, y: 1)
+    return mut fx.b.bxor(bits, y: mask)
+} total_key
+
+/// A `core::Ordering` value from whether the left side is less or greater.
+fn Lowering.ordering(mut self, mut fx: Fx, less: clif::Value, greater: clif::Value) -> Held {
+    let ordering = self.std_ty("core", type_name: "Ordering", args: mem::List[ty::Ty].empty(self.alloc))
+    let laid = mut self.layout_of(ordering)
+    let two = mut fx.int(clif::Type.Int8, value: 2)
+    let one = mut fx.int(clif::Type.Int8, value: 1)
+    let zero = mut fx.int(clif::Type.Int8, value: 0)
+    let above = mut fx.b.select(greater, x: two, y: one)
+    let index = mut fx.b.select(less, x: zero, y: above)
+    match laid.contents().shape {
+        LayoutShape.Scalar(ty: _, big: _) => return Held.Scalar(index)
+        else => {}
+    }
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    mut fx.store(index, addr: slot, offset: 0)
+    return Held.Address(slot)
+} Lowering.ordering

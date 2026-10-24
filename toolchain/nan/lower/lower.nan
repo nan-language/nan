@@ -1,0 +1,717 @@
+//! Lowering: the translation of the NIR of a final closure to an object of its target, with the support routines, compiler stubs, read-only data and line tables the image needs; each function lowered is an instance, and lowering lowers every instance the program's entry reaches.
+
+/// What a lowered function computes.
+enum Instance derives Eq, Hash {
+    /// A NIR function of an item's unit, with the arguments of the item's generic parameters.
+    Nir(item: ty::ItemId, role: nir::Role, index: u32, args: ty::Args)
+    /// A std function without a body, which the toolchain supplies.
+    Supplied(item: ty::ItemId, args: ty::Args)
+    /// A method a derive writes for its owner applied to `args`.
+    Derived(owner: ty::ItemId, method: text::String, args: ty::Args)
+    /// A method of an interface that a type implements through a conformance the toolchain
+    /// supplies; `args` are the method's own type arguments.
+    Conformance(ty: ty::Ty, method: text::String, args: ty::Args)
+    /// The release of a value of a type.
+    Release(ty::Ty)
+    /// The code of a function value naming a function: the instance its list holds, called
+    /// through the ABI of function values.
+    Value(mem::List[Instance])
+    /// The code a `Dyn[I]` value calls for method `method` of `interface_item` on a value of
+    /// `ty`.
+    Dyn(ty: ty::Ty, interface_item: ty::ItemId, args: ty::Args, method: u32)
+    /// A contract function, the instance its list holds, computing the two sides of the
+    /// comparison its result is, which the report of its failing check shows.
+    Sides(mem::List[Instance])
+} Instance
+
+/// Code lowering writes for runtime use that no instance names, once per key: the rendering of
+/// a template, and the code tasks run around their entries.
+enum Glue derives Eq, Hash {
+    /// Renders a template over the record of its arguments' addresses.
+    Template(pieces: mem::List[Piece], types: mem::List[ty::Ty])
+    /// Runs a task's entry, a function value of a type, and records how it ended.
+    Entry(ty::FnTyId)
+    /// What a scope's child does once its entry ends: records its failure in the scope, the
+    /// scope's failure type converting it when the spawn is lexical.
+    ChildEnd(entry: ty::FnTyId, scope_failure: Option[ty::Ty])
+    /// What the executor thread does once a scope's child has ended.
+    ChildDone
+    /// What a race's task does once its entry ends: decides the race when first.
+    RaceEnd
+    /// What the executor thread does once a race's task has ended.
+    RaceDone
+    /// What the executor thread does once a domain's first task has ended.
+    DomainDone
+    /// What the executor thread does once a kernel anchor's first task has ended.
+    AnchorDone
+    /// A runner's component task, for its state, Env and message types.
+    Component(state: ty::Ty, env: ty::Ty, message: ty::Ty)
+    /// What the executor thread does once a component task has ended.
+    ComponentDone
+    /// What the executor thread does once a keyed task has ended.
+    KeyedDone
+    /// The remainder of two floats of a width.
+    FloatRemainder(Width)
+    /// The fused multiply-add of floats of a width.
+    FusedMulAdd(Width)
+    /// Writes a value of a type in a codec's format.
+    Encode(format: Format, ty: ty::Ty)
+    /// Reads a value of a type in a codec's format.
+    Decode(format: Format, ty: ty::Ty)
+    /// Reads a uvar of the wire format.
+    WireUvar
+    /// Reads a JSON number's text.
+    JsonNumber
+    /// Reads a JSON string.
+    JsonString
+    /// Passes over a JSON value.
+    JsonSkip
+    /// Decodes base64 text.
+    Base64
+    /// Whether bytes are well-formed UTF-8.
+    Utf8Valid
+    /// Writes a value of a type in a trap report.
+    Written(ty::Ty)
+    /// Withdraws a stopped sender's wait for room in a channel.
+    WithdrawSender
+    /// Withdraws a stopped receiver's wait for a value in a channel.
+    WithdrawReceiver
+    /// Withdraws a stopped task's requests of the cowns of an `await when`.
+    WithdrawWhen
+    /// Settles a runner whose run a stopped task makes.
+    WithdrawRun
+    /// Withdraws a stopped poster's entry from a runner's intake.
+    WithdrawPost
+    /// Withdraws a waiting operation from the sim waiter slot its record names.
+    SimWithdraw
+    /// Withdraws a stopped task's wait on an `hw::Signal` of a type.
+    WithdrawSignal(ty::Ty)
+    /// Compares two values of a type structurally, for `testing::same`.
+    Same(ty::Ty)
+    /// Calls the interrupt fn of a device of a type behind an IRQ-safe lock, the interrupt fn
+    /// being of a function type, with the device's record.
+    IrqDevice(device: ty::Ty, handler: ty::FnTyId)
+    /// Moves a value of a type into another domain's reach.
+    Transfer(ty::Ty)
+    /// Moves the captures of a task closure, the closure function's instance, into another
+    /// domain's reach.
+    Captures(Instance)
+} Glue
+
+/// Whether a stopping task does not stop inside the glue: one completing the end of a
+/// task or of a construct.
+fn Glue.critical(self) -> bool {
+    return match self {
+        Glue.ChildEnd(entry: _, scope_failure: _) or Glue.ChildDone or Glue.RaceEnd or Glue.RaceDone or Glue.DomainDone or Glue.AnchorDone or Glue.ComponentDone or Glue.KeyedDone or Glue.WithdrawSender or Glue.WithdrawReceiver or Glue.WithdrawWhen or Glue.WithdrawRun or Glue.WithdrawPost or Glue.SimWithdraw or Glue.WithdrawSignal(_) => true
+        else => false
+    }
+} Glue.critical
+
+/// The std types whose operations a stopping task completes before it stops, beside those
+/// with interior mutability.
+const CRITICAL_OWNERS: Str = "sys::Domain task::Sender task::Receiver task::Scope sys::Cx sys::Outbox mem::Shared task::Cown"
+
+/// The outcome of lowering a final closure.
+pkg struct Lowered {
+    pkg object: mem::Bytes
+    /// The frame and call sites of each function lowered, and the `stack N` demands on them,
+    /// for the stack limits check.
+    pkg frames: mem::List[Frame]
+    pkg demands: mem::List[Demand]
+    /// The two entities of each pair lowered with one host symbol name, as diagnostics name them.
+    pkg collisions: mem::List[Collision]
+    /// When the program asked for it, the symbol name and text of each function defined, in order.
+    pkg dumped: mem::List[LoweredFunction]
+} Lowered
+
+/// Two entities lowered with one host symbol name, as diagnostics name them: the one named
+/// first and the one colliding with it.
+pkg struct Collision {
+    pkg named: text::String
+    pkg colliding: text::String
+} Collision
+
+/// The symbol name of a function lowered, and its text as Cranelift writes it before compiling it.
+pkg struct LoweredFunction {
+    pkg name: text::String
+    pkg text: text::String
+} LoweredFunction
+
+/// What a final build lowers: the program's entry function and its target's entry landing fn,
+/// for the final-link roots whose contributions its registries admit.
+pkg struct Program {
+    pkg entry: ty::ItemId
+    pkg landing_fn: ty::ItemId
+    pkg roots: mem::List[ty::PackageId]
+    /// The package names of the final closure with the prefix their symbols carry.
+    pkg prefixes: mem::HashMap[text::String, text::String]
+    /// The content of the image's `.nan` section.
+    pkg section: mem::Bytes
+    /// Whether lowering keeps the symbol name and text of each function it defines, for the
+    /// comparison of the NaN toolchain's lowering with the bootstrap's.
+    pkg dump: bool
+} Program
+
+struct Lowering {
+    ck: check::Checker
+    module: object::Module
+    layouts: Layouts
+    prefixes: mem::HashMap[text::String, text::String]
+    roots: mem::List[ty::PackageId]
+    instances: mem::HashMap[Instance, object::FuncId]
+    /// The instance each host symbol name names.
+    named: mem::HashMap[text::String, Instance]
+    /// The distinct instances lowered with one host symbol name.
+    collisions: mem::List[InstanceCollision]
+    routines: mem::HashMap[Routine, object::FuncId]
+    /// The instances and routines declared and not yet defined.
+    queue: mem::List[Pending]
+    releases: mem::HashMap[ty::Ty, bool]
+    /// Whether moving a value of each type into another domain's reach does anything, once
+    /// known.
+    transferring: mem::HashMap[ty::Ty, bool]
+    glues: mem::HashMap[Glue, object::FuncId]
+    /// The number of glue functions and tables named so far.
+    glue: u32
+    state_id: Option[object::DataId]
+    thread_id: Option[object::DataId]
+    /// A machine image's compiler stubs, its vector seam, the data objects it reserves by name,
+    /// and the sizes of its interrupt stacks once declared.
+    machine_stubs: mem::HashMap[Stub, object::FuncId]
+    vector_seam_id: Option[object::FuncId]
+    reservations: mem::HashMap[text::String, object::DataId]
+    irq_stacks: Option[object::DataId]
+    data: Data
+    lines: Lines
+    /// The task entries whose own `limits stack N` passes the default task stack, by the code a
+    /// function value naming them holds, and the table of them that spawns read.
+    entry_stacks: mem::List[TaskEntryStack]
+    entry_table_id: Option[object::DataId]
+    frames: mem::List[Frame]
+    demands: mem::List[Demand]
+    /// For a test image, what its tests' runs need, and the sim table once declared.
+    test_runtime: Option[Runtime]
+    sims: Option[object::DataId]
+    /// Whether the symbol name and text of each function defined are kept, and those kept.
+    dumping: bool
+    dumped: mem::List[LoweredFunction]
+    alloc: mem::Alloc
+} Lowering
+
+/// Two distinct instances lowered with one host symbol name: the one named first and the one
+/// colliding with it.
+struct InstanceCollision {
+    named: Instance
+    colliding: Instance
+} InstanceCollision
+
+/// A task entry whose own `limits stack N` passes the default task stack: the code a function
+/// value naming it holds, and its stack.
+struct TaskEntryStack derives Copy, Eq {
+    code: object::FuncId
+    stack: u64
+} TaskEntryStack
+
+/// A function declared and not yet defined.
+enum Pending {
+    Instance(instance: Instance, id: object::FuncId)
+    Routine(routine: Routine, id: object::FuncId)
+} Pending
+
+/// A copy of an instance.
+fn Instance.copy(self, alloc: mem::Alloc) -> Instance {
+    match self {
+        Instance.Nir(item: item, role: role, index: index, args: args) => return Instance.Nir(item: item, role: role, index: index, args: args)
+        Instance.Supplied(item: item, args: args) => return Instance.Supplied(item: item, args: args)
+        Instance.Derived(owner: owner, method: method, args: args) => return Instance.Derived(owner: owner, method: text::String.of(method.as_str(), alloc), args: args)
+        Instance.Conformance(ty: ty, method: method, args: args) => return Instance.Conformance(ty: ty, method: text::String.of(method.as_str(), alloc), args: args)
+        Instance.Release(ty) => return Instance.Release(ty)
+        Instance.Value(inner) => {
+            expect inner.len() > 0
+            return Instance.value_of(inner[0].copy(alloc), alloc)
+        }
+        Instance.Dyn(ty: ty, interface_item: interface_item, args: args, method: method) => return Instance.Dyn(ty: ty, interface_item: interface_item, args: args, method: method)
+        Instance.Sides(inner) => {
+            expect inner.len() > 0
+            return Instance.sides_of(inner[0].copy(alloc), alloc)
+        }
+    }
+} Instance.copy
+
+/// The code of a function value naming the function `inner` lowers.
+fn Instance.value_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
+    var held = mem::List[Instance].empty(alloc)
+    mut held.push(take inner)
+    return Instance.Value(take held)
+} Instance.value_of
+
+/// The contract function `inner` computing the two sides of its comparison.
+fn Instance.sides_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
+    var held = mem::List[Instance].empty(alloc)
+    mut held.push(take inner)
+    return Instance.Sides(take held)
+} Instance.sides_of
+
+/// Lowers the reach of a program's final build.
+pkg fn lower_lower(ck: check::Checker, program: Program) -> Lowered {
+    let alloc = ck.alloc()
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    lowering.dumping = program.dump
+    entry_seam(mut lowering, program)
+    mut lowering.drain()
+    return take lowering.finish(Some(program.section.view()))
+} lower_lower
+
+/// Lowers the reach of an `x86_64-uefi` or `x86_64-bare` program's final build: the entry
+/// function and the target's entry landing fn behind the machine entry seam, into an object the
+/// image writer turns into an image.
+pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
+    let alloc = ck.alloc()
+    var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
+    lowering.dumping = program.dump
+    let boot = mut lowering.boot_glue(program)
+    let stack = lowering.boot_stack(program)
+    mut lowering.entry_seam(boot, stack_bytes: stack)
+    mut lowering.drain()
+    return take lowering.finish(None)
+} lower_machine
+
+/// A copy of the package names of a final closure with the prefix their symbols carry.
+fn copied_prefixes(prefixes: mem::HashMap[text::String, text::String], alloc: mem::Alloc) -> mem::HashMap[text::String, text::String] {
+    var copied = mem::HashMap[text::String, text::String].empty(seed: 0, alloc)
+    for entry in prefixes {
+        discard mut copied.insert(text::String.of(entry.key().as_str(), alloc), value: text::String.of(entry.value().as_str(), alloc))
+    }
+    return copied
+} copied_prefixes
+
+/// A copy of the final-link roots of a program.
+fn copied_roots(roots: Slice[ty::PackageId], alloc: mem::Alloc) -> mem::List[ty::PackageId] {
+    var copied = mem::List[ty::PackageId].empty(alloc)
+    for root in roots {
+        mut copied.push(root)
+    }
+    return copied
+} copied_roots
+
+/// A lowering into a new object, of a test image when `test_runtime` is given.
+fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::String, text::String], take roots: mem::List[ty::PackageId], take test_runtime: Option[Runtime]) -> Lowering {
+    let alloc = ck.alloc()
+    let target = ck.db().target
+    return Lowering(
+        ck: take ck,
+        module: object::Module.new(target, alloc),
+        layouts: Layouts.new(alloc),
+        prefixes: take prefixes,
+        roots: take roots,
+        instances: mem::HashMap[Instance, object::FuncId].empty(seed: 0, alloc),
+        named: mem::HashMap[text::String, Instance].empty(seed: 0, alloc),
+        collisions: mem::List[InstanceCollision].empty(alloc),
+        routines: mem::HashMap[Routine, object::FuncId].empty(seed: 0, alloc),
+        queue: mem::List[Pending].empty(alloc),
+        releases: mem::HashMap[ty::Ty, bool].empty(seed: 0, alloc),
+        transferring: mem::HashMap[ty::Ty, bool].empty(seed: 0, alloc),
+        glues: mem::HashMap[Glue, object::FuncId].empty(seed: 0, alloc),
+        glue: 0,
+        state_id: None,
+        thread_id: None,
+        machine_stubs: mem::HashMap[Stub, object::FuncId].empty(seed: 0, alloc),
+        vector_seam_id: None,
+        reservations: mem::HashMap[text::String, object::DataId].empty(seed: 0, alloc),
+        irq_stacks: None,
+        data: Data.empty(alloc),
+        lines: Lines.empty(alloc),
+        entry_stacks: mem::List[TaskEntryStack].empty(alloc),
+        entry_table_id: None,
+        frames: mem::List[Frame].empty(alloc),
+        demands: mem::List[Demand].empty(alloc),
+        test_runtime: take test_runtime,
+        sims: None,
+        dumping: false,
+        dumped: mem::List[LoweredFunction].empty(alloc),
+        alloc: alloc,
+    )
+} Lowering.new
+
+/// Whether the image runs on a machine target, `x86_64-uefi` or `x86_64-bare`.
+fn Lowering.machine(self) -> bool {
+    return self.ck.db().target.is_machine()
+} Lowering.machine
+
+/// Whether the image runs a kernel's executor, under interrupts: a machine image other than
+/// a test image, whose runs keep interrupts disabled.
+fn Lowering.kernel(self) -> bool {
+    return self.machine() and not self.seeded()
+} Lowering.kernel
+
+/// The function lowering an instance, declared now and lowered later when new.
+fn Lowering.instance(mut self, take instance: Instance) -> object::FuncId {
+    let known = self.instances.get(instance)
+    match known {
+        Some(id) => return id
+        None => {}
+    }
+    let abi = mut self.abi(instance)
+    var name = symbols_name(mut self, instance)
+    var collided: Option[Instance] = None
+    match self.named.get(name) {
+        Some(named) => {
+            collided = Some(named.copy(self.alloc))
+        }
+        None => {}
+    }
+    let Some(named) = collided else {
+        discard mut self.named.insert(text::String.of(name.as_str(), alloc: self.alloc), value: instance.copy(self.alloc))
+        return mut self.declare_instance(take instance, name: name.as_str(), abi)
+    }
+    mut self.collisions.push(InstanceCollision(named: take named, colliding: instance.copy(self.alloc)))
+    expect self.glue < 0xFFFF_FFFF
+    self.glue += 1
+    name = numbered("_NXcollision_", number: self.glue, alloc: self.alloc)
+    return mut self.declare_instance(take instance, name: name.as_str(), abi)
+} Lowering.instance
+
+/// Declares the function of a new instance under a host symbol name, queued for lowering.
+fn Lowering.declare_instance(mut self, take instance: Instance, name: Str, abi: Abi) -> object::FuncId {
+    let id = mut self.module.declare_function(name, linkage: object::Linkage.Local, signature: abi.signature(self.alloc))
+    discard mut self.instances.insert(instance.copy(self.alloc), value: id)
+    mut self.queue.push(Pending.Instance(instance: take instance, id: id))
+    return id
+} Lowering.declare_instance
+
+/// `prefix` followed by `number` in decimal.
+fn numbered(prefix: Str, number: u32, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(prefix, alloc)
+    mut written.write(text::fmt("{number}", number), budget: 32)
+    return written
+} numbered
+
+/// Defines every function declared until none is left.
+fn Lowering.drain(mut self) {
+    loop {
+        let Some(pending) = mut self.queue.pop() else {
+            return
+        }
+        match pending {
+            Pending.Instance(instance: instance, id: id) => mut self.define_instance(instance, id)
+            Pending.Routine(routine: routine, id: id) => {
+                var flags = LINES_HIDDEN | LINES_CRITICAL
+                if routine == Routine.TaskStart {
+                    flags = LINES_HIDDEN
+                }
+                mut self.define(id, signature: routine.signature(self.alloc), flags, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+                    runtime_define(mut lo1, fx: mut fx1, routine)
+                })
+            }
+        }
+    }
+} Lowering.drain
+
+/// Defines the function of a queued instance and describes its frame.
+fn Lowering.define_instance(mut self, instance: Instance, id: object::FuncId) {
+    let abi = mut self.abi(instance)
+    let flags = self.frame_flags(instance)
+    let ran = self.target_slot(instance)
+    mut self.define(id, signature: abi.signature(self.alloc), flags, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        match ran {
+            Some(slot) => {
+                let ran_data = mut lo1.ran_data()
+                let global = mut lo1.data_ref(mut fx1, id: ran_data)
+                fx1.mark = Some(TargetMark(ran: global, slot: slot))
+            }
+            None => {}
+        }
+        mut lo1.lower_instance(mut fx1, instance, abi)
+    })
+    mut self.describe_frame(instance, abi, id)
+} Lowering.define_instance
+
+fn Lowering.lower_instance(mut self, mut fx: Fx, instance: Instance, abi: Abi) {
+    match instance {
+        Instance.Nir(item: item, role: role, index: index, args: args) => body_lower(mut self, mut fx, abi, item, role, index, args, sides: false)
+        Instance.Supplied(item: item, args: args) => supplied_lower(mut self, mut fx, abi, item, args)
+        Instance.Derived(owner: owner, method: method, args: args) => conform_derived(mut self, mut fx, abi, owner, method: method.as_str(), args)
+        Instance.Conformance(ty: ty, method: method, args: _) => supplied(mut self, mut fx, abi, ty, method: method.as_str())
+        Instance.Release(ty) => release_define(mut self, mut fx, ty)
+        Instance.Value(inner) => {
+            expect inner.len() > 0
+            value_glue(mut self, mut fx, abi, inner: inner[0])
+        }
+        Instance.Dyn(ty: ty, interface_item: interface_item, args: args, method: method) => dyn_glue(mut self, mut fx, abi, ty, interface_item, args, method)
+        Instance.Sides(inner) => {
+            expect inner.len() > 0
+            let Instance.Nir(item: item, role: role, index: index, args: args) = inner[0] else {
+                expect false
+                return
+            }
+            body_lower(mut self, mut fx, abi, item, role, index, args, sides: true)
+        }
+    }
+} Lowering.lower_instance
+
+/// Names the frame of an instance just defined and the `stack N` its function-typed
+/// parameters' types demand, and records the demands of its own limits and of the interface
+/// method it implements.
+fn Lowering.describe_frame(mut self, instance: Instance, abi: Abi, id: object::FuncId) {
+    let types = self.ck.types()
+    var params = mem::List[ParamStack].empty(self.alloc)
+    for position in 0..<abi.params.len() {
+        match types.kind(abi.params[position].nty.ty()) {
+            ty::TyKind.Fn(fn_ty) => {
+                mut params.push(ParamStack(position: position, stack: types.fn_of(fn_ty).limit_set.stack))
+            }
+            else => {}
+        }
+    }
+    expect self.frames.len() > 0
+    let last = self.frames.len() - 1
+    self.frames[last].params = params
+    let item = match instance {
+        Instance.Nir(item: item, role: _, index: _, args: _) => item
+        Instance.Supplied(item: item, args: _) => item
+        else => return
+    }
+    expect last < self.frames.len()
+    self.frames[last].name = self.ck.db().canonical(item)
+    let Instance.Nir(item: _, role: role, index: index, args: _) = instance else {
+        return
+    }
+    let Some(unit) = self.ck.unit(item) else {
+        expect false
+        return
+    }
+    let Some(function) = unit.contents().function(role, index) else {
+        expect false
+        return
+    }
+    var demanded = mem::List[u64].empty(self.alloc)
+    var head = function.span
+    match role {
+        nir::Role.Closure => {
+            match function.closure {
+                Some(closure_head) => push_stack(mut demanded, stack: closure_head.limit_set.stack)
+                None => {}
+            }
+        }
+        nir::Role.Body => {
+            self.body_demands(mut demanded, item)
+            head = nir::Span.at(self.ck.db().ast(item).token)
+        }
+        else => return
+    }
+    for stack in demanded {
+        mut self.demands.push(Demand(judged: Judged.Function(id), stack: stack, report: StackReport.Own(head: At(item: item, span: head))))
+    }
+} Lowering.describe_frame
+
+/// Adds the `stack N` a function's body demands: that of its own limits, then that of the
+/// interface method it implements.
+fn Lowering.body_demands(self, mut demanded: mem::List[u64], item: ty::ItemId) {
+    match self.ck.fn_sig(item) {
+        Some(sig) => push_stack(mut demanded, stack: sig.limit_set.stack)
+        None => {}
+    }
+    let Some(implemented) = self.ck.implemented_method(item) else {
+        return
+    }
+    let sig = self.ck.sig(implemented.item)
+    let check::SigKind.Interface(methods: methods) = sig.contents().kind else {
+        return
+    }
+    expect implemented.method < methods.len()
+    push_stack(mut demanded, stack: methods[implemented.method].sig.limit_set.stack)
+} Lowering.body_demands
+
+/// Adds a `stack N`, if any.
+fn push_stack(mut demanded: mem::List[u64], stack: Option[u64]) {
+    let Some(bytes) = stack else {
+        return
+    }
+    mut demanded.push(bytes)
+} push_stack
+
+/// The line table flags of an instance's function: trap reports leave out the frames of
+/// std items and of the code lowering writes itself, and a stopping task does not stop
+/// inside a std function of a type with interior mutability or of `task::Sender`,
+/// `task::Receiver`, `task::Scope`, `sys::Cx`, `sys::Outbox`, `mem::Shared` or
+/// `task::Cown`.
+fn Lowering.frame_flags(self, instance: Instance) -> u32 {
+    var hidden = true
+    var critical = false
+    match instance {
+        Instance.Nir(item: item, role: _, index: _, args: args) => {
+            hidden = self.ck.db().is_std(item)
+            critical = hidden and self.critical_owner(item, args)
+        }
+        Instance.Supplied(item: item, args: args) => {
+            hidden = self.ck.db().is_std(item)
+            critical = hidden and self.critical_owner(item, args)
+        }
+        else => {}
+    }
+    var flags: u32 = 0
+    if hidden {
+        flags = LINES_HIDDEN
+    }
+    if critical {
+        flags = flags | LINES_CRITICAL
+    }
+    return flags
+} Lowering.frame_flags
+
+/// Whether a std function's owner is a type whose operations a stopping task completes.
+fn Lowering.critical_owner(self, item: ty::ItemId, args: ty::Args) -> bool {
+    let Some(key) = self.ck.db().owners.get(item) else {
+        return false
+    }
+    let check::TypeKey.Item(owner) = key else {
+        return false
+    }
+    let path = self.ck.db().canonical(owner)
+    let generics = self.ck.sig(owner).contents().generics.len()
+    let given = self.ck.types().arg_list(args)
+    var owner_args = mem::List[ty::Arg].empty(self.alloc)
+    for position in 0..<given.len() {
+        if position >= generics {
+            break
+        }
+        mut owner_args.push(given[position])
+    }
+    let owner_ty = self.ck.types().item(owner, args: take owner_args)
+    return check::is_listed(CRITICAL_OWNERS, word: path.as_str()) or self.ck.has_interior(owner_ty)
+} Lowering.critical_owner
+
+/// Builds and compiles a function's body, with its line table flags.
+fn Lowering.define(mut self, id: object::FuncId, take signature: clif::Signature, flags: u32, build: fn(mut lo: Lowering, mut fx: Fx)) {
+    let func = clif::Function.new(clif::ExternalName(namespace: 0, index: id.index), take signature, alloc: self.alloc)
+    var fx = Fx.new(clif::Builder.new(take func, alloc: self.alloc), alloc: self.alloc)
+    build(mut self, mut fx)
+    mut fx.b.seal_all_blocks()
+    let Fx(b: b, sites: recorded, fn_params: _, mark: _, alloc: _) = fx
+    let built = take b.finalize()
+    if self.dumping {
+        let dumped_name = text::String.of(self.module.function_name(id), alloc: self.alloc)
+        let dumped_text = built.display(self.alloc)
+        mut self.dumped.push(LoweredFunction(name: take dumped_name, text: take dumped_text))
+    }
+    let sites = self.sites(built, take recorded)
+    let compiled = mut self.module.define_function(id, func: take built)
+    var locations = mem::List[LineEntry].empty(self.alloc)
+    for located in compiled.locations {
+        if not located.loc.is_default() {
+            mut locations.push(LineEntry(offset: located.offset, location: located.loc.bits))
+        }
+    }
+    mut self.lines.function(id, flags, size: compiled.size, entries: take locations)
+    mut self.frames.push(Frame(function: id, name: text::String.empty(self.alloc), size: compiled.frame, params: mem::List[ParamStack].empty(self.alloc), sites: take sites))
+} Lowering.define
+
+/// The call sites of a function built: those lowering classified as it emitted them, a
+/// direct call of a routine or the C library bounded by the stub call bound, of another
+/// lowered function direct, and an unclassified call through an address unbounded.
+fn Lowering.sites(self, func: clif::Function, take recorded: mem::List[CallSite]) -> mem::List[Site] {
+    var classified = mem::HashMap[clif::Inst, Site].empty(seed: 0, alloc: self.alloc)
+    for call_site in take recorded {
+        let CallSite(inst: inst, site: site) = call_site
+        discard mut classified.insert(inst, value: take site)
+    }
+    var sites = mem::List[Site].empty(self.alloc)
+    for block in func.layout_blocks(self.alloc) {
+        for inst in func.block_insts(block, alloc: self.alloc) {
+            let removed = mut classified.remove(inst)
+            let Some(site) = removed else {
+                let Some(kind) = self.unclassified_kind(func, inst) else {
+                    continue
+                }
+                mut sites.push(Site(kind: take kind, at: None))
+                continue
+            }
+            mut sites.push(take site)
+        }
+    }
+    return sites
+} Lowering.sites
+
+/// How a call lowering did not classify reaches its callee: directly for another lowered
+/// function, as a stub for an imported function or a routine, or unbounded through an
+/// address; none for an instruction that calls nothing.
+fn Lowering.unclassified_kind(self, func: clif::Function, inst: clif::Inst) -> Option[StackKind] {
+    match func.inst_data(inst) {
+        clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) => {
+            let callee = object::FuncId(index: func.ext_func(func_ref).name.index)
+            if self.module.function_linkage(callee) == object::Linkage.Import or self.is_routine(callee) {
+                return Some(StackKind.Stub)
+            }
+            return Some(StackKind.Direct(callee: callee, bindings: mem::List[ParamBinding].empty(self.alloc)))
+        }
+        clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => return Some(StackKind.Bounded(None))
+        else => return None
+    }
+} Lowering.unclassified_kind
+
+/// Whether a declared function is a routine's.
+fn Lowering.is_routine(self, callee: object::FuncId) -> bool {
+    for entry in self.routines {
+        if entry.value() == callee {
+            return true
+        }
+    }
+    return false
+} Lowering.is_routine
+
+/// The function of a glue, declared and defined when first asked for.
+fn Lowering.glue_function(mut self, take glue: Glue, take signature: clif::Signature, build: fn(mut lo: Lowering, mut fx: Fx)) -> object::FuncId {
+    let known = self.glues.get(glue)
+    match known {
+        Some(id) => return id
+        None => {}
+    }
+    expect self.glue < 0xFFFF_FFFF
+    self.glue += 1
+    let name = numbered("_NXglue_", number: self.glue, alloc: self.alloc)
+    let id = mut self.module.declare_function(name.as_str(), linkage: object::Linkage.Local, signature)
+    var flags = LINES_HIDDEN
+    if glue.critical() {
+        flags = LINES_HIDDEN | LINES_CRITICAL
+    }
+    discard mut self.glues.insert(take glue, value: id)
+    mut self.define(id, take signature, flags, build)
+    return id
+} Lowering.glue_function
+
+/// Marks the code `fx` emits next as coming from a span of an item's file.
+fn Lowering.locate(mut self, mut fx: Fx, item: ty::ItemId, span: nir::Span) {
+    let location = mut self.lines.location(self.ck, item, span)
+    mut fx.b.set_srcloc(clif::SourceLoc(bits: location))
+} Lowering.locate
+
+/// A reference to a function from the function being built.
+fn Lowering.func_ref(mut self, mut fx: Fx, id: object::FuncId) -> clif::FuncRef {
+    return self.module.declare_func_in_func(id, b: mut fx.b)
+} Lowering.func_ref
+
+/// A reference to data from the function being built.
+fn Lowering.data_ref(mut self, mut fx: Fx, id: object::DataId) -> clif::GlobalValue {
+    return self.module.declare_data_in_func(id, b: mut fx.b)
+} Lowering.data_ref
+
+/// The layout of a type.
+fn Lowering.layout_of(mut self, ty: ty::Ty) -> mem::Shared[Layout] {
+    return mut self.layouts.of(self.ck, ty)
+} Lowering.layout_of
+
+/// The object of the lowering, holding a `.nan` section with `section` when given.
+fn Lowering.finish(take self, section: Option[Slice[u8]]) -> Lowered {
+    lines_emit(mut self)
+    emit_entry_stacks(mut self)
+    mut self.finish_interrupts()
+    var collisions = mem::List[Collision].empty(self.alloc)
+    for collision in self.collisions {
+        mut collisions.push(Collision(named: entity(self.ck, instance: collision.named), colliding: entity(self.ck, instance: collision.colliding)))
+    }
+    let image_bytes = take self.module.finish(section, alloc: self.alloc)
+    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped)
+} Lowering.finish
+
+/// The calling convention of every lowered function.
+const CALL_CONV: clif::CallConv = clif::CallConv.SystemV

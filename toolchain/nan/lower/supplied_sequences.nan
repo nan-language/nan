@@ -1,0 +1,658 @@
+//! Sequences: arrays, slices and their cursors, texts and char cursors, ranges, the supplied members of `Option`, and the content-blind operations of `Untrusted`. A slice, text or slice cursor is the address of its first element and its length; an array cursor is its position and the array.
+
+/// How an integer reader such as `u32_le` reads: its width in bytes, and its byte order,
+/// big-endian when `big`.
+struct IntegerForm derives Copy {
+    width: u64
+    big: bool
+} IntegerForm
+
+fn sequences_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let path = supply.path.as_str()
+    let owner_end = match check::last_dot(path) {
+        Some(dot) => dot
+        None => 0
+    }
+    let Some(owner) = path.slice_bytes(0, end: owner_end) else {
+        expect false
+        return false
+    }
+    match owner {
+        "core::Array" => sequences_array(mut lo, mut fx, supply)
+        "core::Slice" or "core::SliceMut" or "core::Str" => slice(mut lo, mut fx, supply)
+        "core::SliceCursor" or "core::SliceCursorMut" => slice_next(mut lo, mut fx, supply)
+        "core::ArrayCursor" => array_next(mut lo, mut fx, supply)
+        "core::CharCursor" => char_next(mut lo, mut fx, supply)
+        "core::Range" => range_next(mut lo, mut fx, supply)
+        "core::Option" => sequences_option(mut lo, mut fx, supply)
+        "core::Untrusted" => untrusted(mut lo, mut fx, supply)
+        else => return false
+    }
+    return true
+} sequences_lower
+
+/// The element type of a sequence type: an array's, a slice's, or `u8` for a text.
+fn sequences_element(lo: Lowering, ty: ty::Ty) -> ty::Ty {
+    if lo.ck.is_std(ty, path: "core::Str") {
+        return ty::Ty.scalar(ty::Scalar.Unsigned8)
+    }
+    let Some(element) = lo.ck.types().type_arg(ty, index: 0) else {
+        expect false
+        return ty::Ty.unit()
+    }
+    return element
+} sequences_element
+
+/// The const argument at `index` of a type, as a count.
+fn const_count(lo: Lowering, ty: ty::Ty, index: usize) -> u64 {
+    let listed = lo.ck.types().arg_list(lo.ck.types().args_of(ty))
+    expect index < listed.len()
+    let arg = listed[index]
+    return const_arg(arg).low_bits()
+} const_count
+
+/// Writes a view of `len` elements from `start` at an address.
+fn sequences_write_view(mut fx: Fx, address: clif::Value, start: clif::Value, len: clif::Value) {
+    mut fx.store(start, addr: address, offset: 0)
+    mut fx.store(len, addr: address, offset: 8)
+} sequences_write_view
+
+fn sequences_array(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(array_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element = sequences_element(lo, ty: array_ty)
+    let count = const_count(lo, ty: array_ty, index: 1)
+    match supply.member() {
+        "filled" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let value = supply.param(0)
+            let start = mut fx.ptr(0)
+            let end = mut fx.ptr(count)
+            let element_laid = mut lo.layout_of(element)
+            let size = element_laid.contents().size
+            mut fx.each(start, end, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(size))
+                let at = mut fx1.b.iadd(sret, y: offset)
+                mut lo.store_held(fx: mut fx1, address: at, held: value, ty: element)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "at" or "at_mut" => {
+            let base = supply.param(0).address_value()
+            let index = supply.param(1).scalar_value()
+            let at = element_at(mut lo, mut fx, element, start: base, index)
+            supply.ret(mut lo, mut fx, held: Held.Address(at))
+        }
+        "view" or "view_mut" or "cursor" or "cursor_mut" => {
+            let base = supply.param(0).address_value()
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let len = mut fx.ptr(count)
+            sequences_write_view(mut fx, address: sret, start: base, len)
+            supply.done(mut lo, mut fx)
+        }
+        "into_cursor" => {
+            let source = supply.param(0).address_value()
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            let cursor = supply.abi.result
+            let position_field = mut lo.layouts.field(lo.ck, ty: cursor, variant: None, label: "position")
+            let position = position_field.offset
+            let array_at_field = mut lo.layouts.field(lo.ck, ty: cursor, variant: None, label: "array")
+            let array_at = array_at_field.offset
+            let zero = mut fx.ptr(0)
+            mut fx.store(zero, addr: sret, offset: position)
+            let target = mut fx.offset(sret, offset: array_at)
+            let laid = mut lo.layout_of(array_ty)
+            mut lo.copy(mut fx, dst: target, src: source, size: laid.contents().size, align: laid.contents().align)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} sequences_array
+
+/// `prefix` and `split_at` of `len` elements of a type from `start`: the views of the parts,
+/// none past the end.
+fn sequences_parts(mut lo: Lowering, mut fx: Fx, supply: Supply, element: ty::Ty, start: clif::Value, len: clif::Value) {
+    let at = supply.param(1).scalar_value()
+    let fits = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: at, y: len)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let option = supply.abi.result
+    if supply.member().starts_with("prefix") {
+        mut lo.write_option_with(mut fx, layout_ty: option, address: sret, presence: fits, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+            sequences_write_view(mut fx1, address: payload, start, len: at)
+        })
+    } else {
+        let Some(parts) = lo.ck.types().type_arg(option, index: 0) else {
+            expect false
+            return
+        }
+        let head_field = mut lo.layouts.field(lo.ck, ty: parts, variant: None, label: "head")
+        let head = head_field.offset
+        let tail_field = mut lo.layouts.field(lo.ck, ty: parts, variant: None, label: "tail")
+        let tail = tail_field.offset
+        let tail_start = element_at(mut lo, mut fx, element, start, index: at)
+        let tail_len = mut fx.b.isub(len, y: at)
+        mut lo.write_option_with(mut fx, layout_ty: option, address: sret, presence: fits, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+            let head_at = mut fx1.offset(payload, offset: head)
+            sequences_write_view(mut fx1, address: head_at, start, len: at)
+            let tail_at = mut fx1.offset(payload, offset: tail)
+            sequences_write_view(mut fx1, address: tail_at, start: tail_start, len: tail_len)
+        })
+    }
+    supply.done(mut lo, mut fx)
+} sequences_parts
+
+fn slice(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(slice_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element = sequences_element(lo, ty: slice_ty)
+    let view = supply.param(0).address_value()
+    let start = mut fx.load(PTR, addr: view, offset: 0)
+    let len = mut fx.load(PTR, addr: view, offset: 8)
+    let member = supply.member()
+    match member {
+        "len" or "byte_len" => supply.ret(mut lo, mut fx, held: Held.Scalar(len))
+        "at" or "at_mut" => {
+            let index = supply.param(1).scalar_value()
+            let at = element_at(mut lo, mut fx, element, start, index)
+            supply.ret(mut lo, mut fx, held: Held.Address(at))
+        }
+        "as_bytes" or "view" or "cursor" or "cursor_mut" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            sequences_write_view(mut fx, address: sret, start, len)
+            supply.done(mut lo, mut fx)
+        }
+        "prefix" or "prefix_mut" or "split_at" or "split_at_mut" => sequences_parts(mut lo, mut fx, supply, element, start, len)
+        "slice_bytes" => slice_bytes(mut lo, mut fx, supply, start, len)
+        "fill" => {
+            let value = supply.param(1)
+            let zero = mut fx.ptr(0)
+            let element_laid = mut lo.layout_of(element)
+            let size = element_laid.contents().size
+            mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+                let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(size))
+                let at = mut fx1.b.iadd(start, y: offset)
+                mut lo.store_held(fx: mut fx1, address: at, held: value, ty: element)
+            })
+            supply.done(mut lo, mut fx)
+        }
+        "copy_from" => {
+            let source = supply.param(1).address_value()
+            let from = mut fx.load(PTR, addr: source, offset: 0)
+            let count = mut fx.load(PTR, addr: source, offset: 8)
+            let element_laid = mut lo.layout_of(element)
+            let size = element_laid.contents().size
+            let bytes = mut fx.b.imul_imm_s(count, y: i64.fit(size))
+            let args = fx.list3(start, b: from, c: bytes)
+            discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: args.view())
+            supply.done(mut lo, mut fx)
+        }
+        else => slice_integer(mut lo, mut fx, supply, member, start)
+    }
+} slice
+
+/// `slice_bytes(from, to)` of a text of `len` bytes from `start`: the text between the two
+/// byte positions when they are ordered, within it and at char boundaries, none otherwise.
+fn slice_bytes(mut lo: Lowering, mut fx: Fx, supply: Supply, start: clif::Value, len: clif::Value) {
+    let from = supply.param(1).scalar_value()
+    let to = supply.param(2).scalar_value()
+    let ordered = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: from, y: to)
+    let inside = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: to, y: len)
+    let in_order = mut fx.b.band(ordered, y: inside)
+    let at_from = boundary(mut fx, start, len, at: from)
+    let at_to = boundary(mut fx, start, len, at: to)
+    let from_valid = mut fx.b.band(in_order, y: at_from)
+    let valid = mut fx.b.band(from_valid, y: at_to)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let option = supply.abi.result
+    let begin = mut fx.b.iadd(start, y: from)
+    let count = mut fx.b.isub(to, y: from)
+    mut lo.write_option_with(mut fx, layout_ty: option, address: sret, presence: valid, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        sequences_write_view(mut fx1, address: payload, start: begin, len: count)
+    })
+    supply.done(mut lo, mut fx)
+} slice_bytes
+
+/// The integer readers and writers of a slice of bytes from `start`, such as `u32_le` and
+/// `write_u16_be`.
+fn slice_integer(mut lo: Lowering, mut fx: Fx, supply: Supply, member: Str, start: clif::Value) {
+    if member.starts_with("write_u") {
+        let Some(reader) = member.slice_bytes("write_".byte_len(), end: member.byte_len()) else {
+            expect false
+            return
+        }
+        let form = integer_access(reader)
+        let at = supply.param(1).scalar_value()
+        let value = supply.param(2).scalar_value()
+        let address = mut fx.b.iadd(start, y: at)
+        mut fx.store_ordered(value, addr: address, offset: 0, unaligned_access: true, big: form.big)
+        supply.done(mut lo, mut fx)
+        return
+    }
+    if not member.starts_with("u") {
+        expect false
+        return
+    }
+    let form = integer_access(member)
+    let at = supply.param(1).scalar_value()
+    let address = mut fx.b.iadd(start, y: at)
+    let ty = match form.width {
+        2 => clif::Type.Int16
+        4 => clif::Type.Int32
+        else => clif::Type.Int64
+    }
+    let value = mut fx.load_ordered(ty, addr: address, offset: 0, unaligned_access: true, big: form.big)
+    supply.ret(mut lo, mut fx, held: Held.Scalar(value))
+} slice_integer
+
+/// Whether byte `at` of a text of `len` bytes starts a char or ends the text.
+fn boundary(mut fx: Fx, start: clif::Value, len: clif::Value, at: clif::Value) -> clif::Value {
+    let at_end = mut fx.b.icmp(clif::IntCC.Equal, x: at, y: len)
+    let inside = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: at, y: len)
+    let results = fx.types1(clif::Type.Int8)
+    let starts = mut fx.choose(inside, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let address = mut fx1.b.iadd(start, y: at)
+        let byte = mut fx1.load(clif::Type.Int8, addr: address, offset: 0)
+        let high = mut fx1.b.band_imm_s(byte, y: 0xC0)
+        let lead = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: high, y: 0x80)
+        return fx1.list1(lead)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let past = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(past)
+    })
+    expect starts.len() == 1
+    return mut fx.b.bor(at_end, y: starts[0])
+} boundary
+
+/// The width in bytes and byte order of an integer reader such as `u32_le`.
+fn integer_access(reader: Str) -> IntegerForm {
+    let Some(underscore) = reader.find("_") else {
+        expect false
+        return IntegerForm(width: 8, big: false)
+    }
+    let Some(width) = reader.slice_bytes(0, end: underscore) else {
+        expect false
+        return IntegerForm(width: 8, big: false)
+    }
+    expect underscore < reader.byte_len()
+    let Some(order) = reader.slice_bytes(underscore + 1, end: reader.byte_len()) else {
+        expect false
+        return IntegerForm(width: 8, big: false)
+    }
+    let bytes: u64 = match width {
+        "u16" => 2
+        "u32" => 4
+        else => 8
+    }
+    return IntegerForm(width: bytes, big: order == "be")
+} integer_access
+
+/// Writes `Some` of the element at `element` (its address held when the option is a wrapped
+/// part and the element a part), or `None`.
+fn write_option_element(mut lo: Lowering, mut fx: Fx, option: ty::Ty, address: clif::Value, is_some: clif::Value, element: clif::Value, wrapped: Option[Wrap]) {
+    let Some(element_ty) = lo.ck.types().type_arg(option, index: 0) else {
+        expect false
+        return
+    }
+    let held_as_address = match wrapped {
+        Some(wrap) => lo.is_part(payload_ty: element_ty, wrap)
+        None => false
+    }
+    let layout_ty = match wrapped {
+        Some(wrap) => lo.wrapped_type(option, wrap)
+        None => option
+    }
+    mut lo.write_option_with(mut fx, layout_ty, address, presence: is_some, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, payload: clif::Value) {
+        if held_as_address {
+            mut fx1.store(element, addr: payload, offset: 0)
+        } else {
+            let held = mut lo1.held_at(fx: mut fx1, ty: element_ty, address: element)
+            mut lo1.store_held(fx: mut fx1, address: payload, held, ty: element_ty)
+        }
+    })
+} write_option_element
+
+fn slice_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(cursor_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element_ty = sequences_element(lo, ty: cursor_ty)
+    let cursor = supply.param(0).address_value()
+    let start = mut fx.load(PTR, addr: cursor, offset: 0)
+    let len = mut fx.load(PTR, addr: cursor, offset: 8)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    let element_ty_laid = mut lo.layout_of(element_ty)
+    let size = element_ty_laid.contents().size
+    mut fx.if_true(present, then: fn(mut fx1: Fx) {
+        let next = mut fx1.b.iadd_imm_s(start, y: i64.fit(size))
+        let rest = mut fx1.b.iadd_imm_s(len, y: -1)
+        sequences_write_view(mut fx1, address: cursor, start: next, len: rest)
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    var option_args = mem::List[ty::Ty].empty(lo.alloc)
+    mut option_args.push(element_ty)
+    let option = lo.std_ty("core", type_name: "Option", args: take option_args)
+    write_option_element(mut lo, mut fx, option, address: sret, is_some: present, element: start, wrapped: supply.wrap)
+    supply.done(mut lo, mut fx)
+} slice_next
+
+fn array_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(cursor_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element_ty = sequences_element(lo, ty: cursor_ty)
+    let count = i64.fit(const_count(lo, ty: cursor_ty, index: 1))
+    let cursor = supply.param(0).address_value()
+    let position_at_field = mut lo.layouts.field(lo.ck, ty: cursor_ty, variant: None, label: "position")
+    let position_at = position_at_field.offset
+    let array_at_field = mut lo.layouts.field(lo.ck, ty: cursor_ty, variant: None, label: "array")
+    let array_at = array_at_field.offset
+    let position = mut fx.load(PTR, addr: cursor, offset: position_at)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: position, y: count)
+    let array = mut fx.offset(cursor, offset: array_at)
+    let element = element_at(mut lo, mut fx, element: element_ty, start: array, index: position)
+    let next = mut fx.b.iadd_imm_s(position, y: 1)
+    let kept = mut fx.b.select(present, x: next, y: position)
+    mut fx.store(kept, addr: cursor, offset: position_at)
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let option = supply.abi.result
+    write_option_element(mut lo, mut fx, option, address: sret, is_some: present, element, wrapped: None)
+    supply.done(mut lo, mut fx)
+} array_next
+
+/// `CharCursor.next`: decodes the char its bytes start with, which are valid UTF-8.
+fn char_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let cursor = supply.param(0).address_value()
+    let start = mut fx.load(PTR, addr: cursor, offset: 0)
+    let len = mut fx.load(PTR, addr: cursor, offset: 8)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    let results = fx.types2(clif::Type.Int32, b: PTR)
+    let decoded = mut fx.choose(present, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return decode_cursor_char(mut fx1, cursor, start, len)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let no_char = mut fx1.int(clif::Type.Int32, value: 0)
+        let no_count = mut fx1.ptr(0)
+        return fx1.list2(no_char, b: no_count)
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let option = supply.abi.result
+    expect decoded.len() == 2
+    mut lo.write_option(mut fx, option, address: sret, presence: present, value: Held.Scalar(decoded[0]))
+    supply.done(mut lo, mut fx)
+} char_next
+
+/// Decodes the char the `len` bytes from `start` begin with, which are valid UTF-8, moves the
+/// cursor at an address past it, and gives the char and its byte count.
+fn decode_cursor_char(mut fx: Fx, cursor: clif::Value, start: clif::Value, len: clif::Value) -> mem::List[clif::Value] {
+    let byte = mut fx.load(clif::Type.Int8, addr: start, offset: 0)
+    let lead = mut fx.b.uextend(clif::Type.Int32, x: byte)
+    let one_count = mut fx.b.iconst(PTR, imm: 1)
+    let two = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: lead, y: 0xC0)
+    let three = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: lead, y: 0xE0)
+    let four = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: lead, y: 0xF0)
+    let two_count = mut fx.b.iconst(PTR, imm: 2)
+    let three_count = mut fx.b.iconst(PTR, imm: 3)
+    let four_count = mut fx.b.iconst(PTR, imm: 4)
+    let at_two = mut fx.b.select(two, x: two_count, y: one_count)
+    let at_three = mut fx.b.select(three, x: three_count, y: at_two)
+    let count = mut fx.b.select(four, x: four_count, y: at_three)
+    let mask1 = mut fx.b.iconst(clif::Type.Int32, imm: 0x7F)
+    let mask2 = mut fx.b.iconst(clif::Type.Int32, imm: 0x1F)
+    let mask3 = mut fx.b.iconst(clif::Type.Int32, imm: 0x0F)
+    let mask4 = mut fx.b.iconst(clif::Type.Int32, imm: 0x07)
+    let mask_two = mut fx.b.select(two, x: mask2, y: mask1)
+    let mask_three = mut fx.b.select(three, x: mask3, y: mask_two)
+    let mask = mut fx.b.select(four, x: mask4, y: mask_three)
+    let leading = mut fx.b.band(lead, y: mask)
+    let one = mut fx.ptr(1)
+    let initial = fx.list2(leading, b: one)
+    let decoded = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, carried: Slice[clif::Value]) -> Pass {
+        expect carried.len() == 2
+        let value = carried[0]
+        let at = carried[1]
+        let more = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: at, y: count)
+        let results = fx1.types2(clif::Type.Int32, b: PTR)
+        let next = mut fx1.choose(more, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let address = mut fx2.b.iadd(start, y: at)
+            let continuation = mut fx2.load(clif::Type.Int8, addr: address, offset: 0)
+            let widened = mut fx2.b.uextend(clif::Type.Int32, x: continuation)
+            let bits = mut fx2.b.band_imm_s(widened, y: 0x3F)
+            let shifted = mut fx2.b.ishl_imm_s(value, y: 6)
+            let grown = mut fx2.b.bor(shifted, y: bits)
+            let following = mut fx2.b.iadd_imm_s(at, y: 1)
+            return fx2.list2(grown, b: following)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(value, b: at)
+        })
+        return Pass(again: more, next: take next)
+    })
+    let rest = mut fx.b.isub(len, y: count)
+    let past = mut fx.b.iadd(start, y: count)
+    sequences_write_view(mut fx, address: cursor, start: past, len: rest)
+    expect decoded.len() == 2
+    return fx.list2(decoded[0], b: count)
+} decode_cursor_char
+
+/// `Range.next`: the low bound, then the range past it.
+fn range_next(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(range_ty) = supply.owner else {
+        expect false
+        return
+    }
+    let element_ty = sequences_element(lo, ty: range_ty)
+    let Some(scalar) = lo.ck.types().scalar_of(element_ty) else {
+        expect false
+        return
+    }
+    let range = supply.param(0).address_value()
+    let low_at_field = mut lo.layouts.field(lo.ck, ty: range_ty, variant: None, label: "low")
+    let low_at = low_at_field.offset
+    let high_at_field = mut lo.layouts.field(lo.ck, ty: range_ty, variant: None, label: "high")
+    let high_at = high_at_field.offset
+    let inclusive_at_field = mut lo.layouts.field(lo.ck, ty: range_ty, variant: None, label: "inclusive")
+    let inclusive_at = inclusive_at_field.offset
+    let ty = scalar_type(scalar)
+    let low = mut fx.load(ty, addr: range, offset: low_at)
+    let high = mut fx.load(ty, addr: range, offset: high_at)
+    let inclusive_byte = mut fx.load(clif::Type.Int8, addr: range, offset: inclusive_at)
+    var less = clif::IntCC.UnsignedLessThan
+    var less_or_equal = clif::IntCC.UnsignedLessThanOrEqual
+    if scalar.is_signed() {
+        less = clif::IntCC.SignedLessThan
+        less_or_equal = clif::IntCC.SignedLessThanOrEqual
+    }
+    let below = mut fx.b.icmp(less, x: low, y: high)
+    let at_most = mut fx.b.icmp(less_or_equal, x: low, y: high)
+    let inclusive = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: inclusive_byte, y: 0)
+    let reaches = mut fx.b.band(inclusive, y: at_most)
+    let present = mut fx.b.bor(below, y: reaches)
+    mut fx.if_true(present, then: fn(mut fx1: Fx) {
+        let next = mut fx1.b.iadd_imm_s(low, y: 1)
+        let results = mem::List[clif::Type].empty(fx1.alloc)
+        discard mut fx1.choose(below, results: results.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: range, offset: low_at)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let closed = mut fx2.int(clif::Type.Int8, value: 0)
+            mut fx2.store(closed, addr: range, offset: inclusive_at)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    let option = supply.abi.result
+    mut lo.write_option(mut fx, option, address: sret, presence: present, value: Held.Scalar(low))
+    supply.done(mut lo, mut fx)
+} range_next
+
+fn sequences_option(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(option) = supply.owner else {
+        expect false
+        return
+    }
+    let Some(payload) = lo.ck.types().type_arg(option, index: 0) else {
+        expect false
+        return
+    }
+    let address = supply.param(0).address_value()
+    let present = mut lo.variant_is(mut fx, address, ty: option, variant: "Some")
+    let laid = mut lo.layout_of(option)
+    var payload_at: u64 = 0
+    match laid.contents().shape {
+        LayoutShape.Enum(shape) => {
+            expect shape.variants.len() > 0
+            let fields = shape.variants[0].fields
+            if fields.len() > 0 {
+                payload_at = fields[0].offset
+            }
+        }
+        else => {}
+    }
+    match supply.member() {
+        "value_or" => {
+            let value = mut fx.offset(address, offset: payload_at)
+            option_value_or(mut lo, mut fx, supply, payload, address: value, present)
+        }
+        "extract" => {
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            mut lo.copy(mut fx, dst: sret, src: address, size: laid.contents().size, align: laid.contents().align)
+            let none = mut lo.none_value(mut fx, option)
+            mut lo.store_held(mut fx, address, held: none, ty: option)
+            supply.done(mut lo, mut fx)
+        }
+        else => {
+            expect false
+        }
+    }
+} sequences_option
+
+/// `Option.value_or`: the payload at an address when the option is `Some`, else the fallback.
+fn option_value_or(mut lo: Lowering, mut fx: Fx, supply: Supply, payload: ty::Ty, address: clif::Value, present: clif::Value) {
+    let fallback = supply.param(1)
+    match mut lo.owned_repr(payload) {
+        Repr.Scalar(ty) => {
+            let held = mut fx.load(ty, addr: address, offset: 0)
+            let other = match fallback {
+                Held.Scalar(value) => value
+                Held.Address(at) => mut fx.load(ty, addr: at, offset: 0)
+                Held.Empty => held
+            }
+            let chosen = mut fx.b.select(present, x: held, y: other)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(chosen))
+        }
+        Repr.Address => {
+            let other = fallback.address_value()
+            let chosen = mut fx.b.select(present, x: address, y: other)
+            supply.ret(mut lo, mut fx, held: Held.Address(chosen))
+        }
+        Repr.Empty => supply.done(mut lo, mut fx)
+    }
+} option_value_or
+
+fn untrusted(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let Some(owner) = supply.owner else {
+        expect false
+        return
+    }
+    let Some(inner) = lo.ck.types().type_arg(owner, index: 0) else {
+        expect false
+        return
+    }
+    match supply.member() {
+        "of" or "inspect" => supply.ret(mut lo, mut fx, held: supply.param(0))
+        "into_cleared" => {
+            let address = supply.param(0).address_value()
+            let contents = content_bytes(mut lo, mut fx, ty: inner, address)
+            let zero = mut fx.ptr(0)
+            let args = fx.list3(contents.start, b: zero, c: contents.len)
+            discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: args.view())
+            supply.ret(mut lo, mut fx, held: supply.param(0))
+        }
+        "byte_len" => {
+            let address = supply.param(0).address_value()
+            let contents = content_bytes(mut lo, mut fx, ty: inner, address)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(contents.len))
+        }
+        "view" or "view_mut" => {
+            let address = supply.param(0).address_value()
+            let contents = content_bytes(mut lo, mut fx, ty: inner, address)
+            let Some(sret) = supply.sret else {
+                expect false
+                return
+            }
+            sequences_write_view(mut fx, address: sret, start: contents.start, len: contents.len)
+            supply.done(mut lo, mut fx)
+        }
+        "prefix" or "split_at" => {
+            let address = supply.param(0).address_value()
+            let contents = content_bytes(mut lo, mut fx, ty: inner, address)
+            sequences_parts(mut lo, mut fx, supply, element: ty::Ty.scalar(ty::Scalar.Unsigned8), start: contents.start, len: contents.len)
+        }
+        "append" or "try_append" => append_untrusted(mut lo, mut fx, supply)
+        "copy_prefix" or "try_copy_prefix" => {
+            let address = supply.param(0).address_value()
+            let contents = content_bytes(mut lo, mut fx, ty: inner, address)
+            copy_prefix(mut lo, mut fx, supply, start: contents.start)
+        }
+        else => {
+            expect false
+        }
+    }
+} untrusted
+
+/// The address and length in bytes of the contents of a value holding bytes: a slice, text,
+/// array of bytes, list or byte string.
+fn content_bytes(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, address: clif::Value) -> Stretch {
+    if lo.ck.is_std(ty, path: "core::Array") {
+        let Some(element) = lo.ck.types().type_arg(ty, index: 0) else {
+            expect false
+            return Stretch(start: address, len: address)
+        }
+        let count = const_count(lo, ty, index: 1)
+        let element_laid = mut lo.layout_of(element)
+        let size = element_laid.contents().size
+        return Stretch(start: address, len: mut fx.ptr(count * size))
+    }
+    let start = mut fx.load(PTR, addr: address, offset: 0)
+    let len = mut fx.load(PTR, addr: address, offset: 8)
+    return Stretch(start: start, len: len)
+} content_bytes

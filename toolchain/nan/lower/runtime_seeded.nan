@@ -1,0 +1,553 @@
+//! The seeded scheduler of test images: one executor thread runs one task at a time, each scheduling point taking the ready task at position w mod k among the k ready tasks, in the order they became ready, w being the next value of the run's scheduling stream; its virtual clock starts at 0 and advances only when no task is ready, to the earliest pending deadline, the run stalling with none pending. Value n of stream s is the first 8 bytes, little-endian, of the BLAKE3 hash of the run's seed, s and n as 8 bytes little-endian each. The pending deadlines are the virtual clock's timers, ordered by when they are due and then by when they were armed. A completion, of a timer or of a wait in a sim, is queued and delivered when the scheduler next reaps, as a ring's would be.
+
+/// The stream serving scheduling choices.
+const SEEDED_SCHEDULING: u64 = 1
+
+/// BLAKE3's initial chaining value and message word permutation.
+const IV: Array[u32, 8] = blake3_iv()
+
+const PERMUTATION: Array[usize, 16] = blake3_permutation()
+
+/// The flags of a block that starts and ends the root chunk.
+const ROOT_BLOCK: i64 = 1i64 | 2 | 8
+
+fn blake3_iv() -> Array[u32, 8] {
+    var chaining = Array[u32, 8].filled(0x6A09_E667)
+    chaining[1] = 0xBB67_AE85
+    chaining[2] = 0x3C6E_F372
+    chaining[3] = 0xA54F_F53A
+    chaining[4] = 0x510E_527F
+    chaining[5] = 0x9B05_688C
+    chaining[6] = 0x1F83_D9AB
+    chaining[7] = 0x5BE0_CD19
+    return chaining
+} blake3_iv
+
+fn blake3_permutation() -> Array[usize, 16] {
+    var order = Array[usize, 16].filled(2)
+    order[1] = 6
+    order[2] = 3
+    order[3] = 10
+    order[4] = 7
+    order[5] = 0
+    order[6] = 4
+    order[7] = 13
+    order[8] = 1
+    order[9] = 11
+    order[10] = 12
+    order[11] = 5
+    order[12] = 9
+    order[13] = 14
+    order[14] = 15
+    order[15] = 8
+    return order
+} blake3_permutation
+
+fn seeded_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let params = mut fx.entry()
+    match routine {
+        Routine.Yield => {
+            yield_point(mut lo, mut fx)
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Stream => {
+            expect params.len() > 2
+            let value = stream_value(mut fx, seed: params[0], stream: params[1], index: params[2])
+            mut fx.b.ret(fx.list1(value).view())
+        }
+        else => {
+            expect false
+        }
+    }
+} seeded_define
+
+/// Value `index` of stream `stream` of the run's seed.
+fn seeded_stream(mut lo: Lowering, mut fx: Fx, stream: clif::Value, index: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let seed = mut fx.load(PTR, addr: state_address, offset: STATE_SEED)
+    let values = mut lo.call_routine(mut fx, routine: Routine.Stream, args: fx.list3(seed, b: stream, c: index).view())
+    expect values.len() > 0
+    return values[0]
+} seeded_stream
+
+/// The first 8 bytes of the BLAKE3 hash of three 8-byte words: one compression of the one
+/// block of the root chunk.
+fn stream_value(mut fx: Fx, seed: clif::Value, stream: clif::Value, index: clif::Value) -> clif::Value {
+    var message = mem::List[clif::Value].empty(fx.alloc)
+    let words = fx.list3(seed, b: stream, c: index)
+    for word in words {
+        mut message.push(mut fx.b.ireduce(clif::Type.Int32, x: word))
+        let high = mut fx.b.ushr_imm_s(word, y: 32)
+        mut message.push(mut fx.b.ireduce(clif::Type.Int32, x: high))
+    }
+    while message.len() < 16 {
+        mut message.push(mut fx.int(clif::Type.Int32, value: 0))
+    }
+    var v = Array[clif::Value, 16].filled(mut fx.int(clif::Type.Int32, value: i64.widen(IV[0])))
+    for position in 1usize..<8 {
+        v[position] = mut fx.int(clif::Type.Int32, value: i64.widen(IV[position]))
+    }
+    for position in 0usize..<4 {
+        v[8 + position] = mut fx.int(clif::Type.Int32, value: i64.widen(IV[position]))
+    }
+    v[12] = mut fx.int(clif::Type.Int32, value: 0)
+    v[13] = mut fx.int(clif::Type.Int32, value: 0)
+    v[14] = mut fx.int(clif::Type.Int32, value: 24)
+    v[15] = mut fx.int(clif::Type.Int32, value: ROOT_BLOCK)
+    for round in 0usize..<7 {
+        invariant message.len() == 16
+        for column in 0usize..<8 {
+            mix(mut fx, mut v, quarter: quarter_round(column), x: message[2 * column], y: message[2 * column + 1])
+        }
+        if round < 6 {
+            var permuted = mem::List[clif::Value].empty(fx.alloc)
+            for source in PERMUTATION {
+                expect source < 16
+                mut permuted.push(message[source])
+            }
+            message = permuted
+        }
+    }
+    let low_word = mut fx.b.bxor(v[0], y: v[8])
+    let high_word = mut fx.b.bxor(v[1], y: v[9])
+    let low = mut fx.b.uextend(PTR, x: low_word)
+    let high_wide = mut fx.b.uextend(PTR, x: high_word)
+    let high = mut fx.b.ishl_imm_s(high_wide, y: 32)
+    return mut fx.b.bor(low, y: high)
+} stream_value
+
+/// The positions of the four state words a quarter-round mixes.
+struct QuarterRound derives Copy {
+    a: usize
+    b: usize
+    c: usize
+    d: usize
+} QuarterRound
+
+/// The quarter-round of a column of a round: the four columns, then the four diagonals.
+fn quarter_round(column: usize) -> QuarterRound
+    ensures result.a < 16 and result.b < 16 and result.c < 16 and result.d < 16
+{
+    return match column {
+        0 => QuarterRound(a: 0, b: 4, c: 8, d: 12)
+        1 => QuarterRound(a: 1, b: 5, c: 9, d: 13)
+        2 => QuarterRound(a: 2, b: 6, c: 10, d: 14)
+        3 => QuarterRound(a: 3, b: 7, c: 11, d: 15)
+        4 => QuarterRound(a: 0, b: 5, c: 10, d: 15)
+        5 => QuarterRound(a: 1, b: 6, c: 11, d: 12)
+        6 => QuarterRound(a: 2, b: 7, c: 8, d: 13)
+        else => QuarterRound(a: 3, b: 4, c: 9, d: 14)
+    }
+} quarter_round
+
+/// BLAKE3's mixing function on four words of the state.
+fn mix(mut fx: Fx, mut v: Array[clif::Value, 16], quarter: QuarterRound, x: clif::Value, y: clif::Value)
+    requires quarter.a < 16 and quarter.b < 16 and quarter.c < 16 and quarter.d < 16
+{
+    for half in 0usize..<2 {
+        let word = if half == 0 {
+            x
+        } else {
+            y
+        }
+        let first_rotation: i64 = if half == 0 {
+            16
+        } else {
+            8
+        }
+        let second_rotation: i64 = if half == 0 {
+            12
+        } else {
+            7
+        }
+        let sum = mut fx.b.iadd(v[quarter.a], y: v[quarter.b])
+        v[quarter.a] = mut fx.b.iadd(sum, y: word)
+        let crossed = mut fx.b.bxor(v[quarter.d], y: v[quarter.a])
+        v[quarter.d] = mut fx.b.rotr_imm_s(crossed, y: first_rotation)
+        v[quarter.c] = mut fx.b.iadd(v[quarter.c], y: v[quarter.d])
+        let crossed_again = mut fx.b.bxor(v[quarter.b], y: v[quarter.c])
+        v[quarter.b] = mut fx.b.rotr_imm_s(crossed_again, y: second_rotation)
+    }
+} mix
+
+/// The next order in which a task becomes ready or a timer is armed.
+fn next_order(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let last = mut fx.load(PTR, addr: state_address, offset: STATE_ORDER)
+    let order = mut fx.b.iadd_imm_s(last, y: 1)
+    mut fx.store(order, addr: state_address, offset: STATE_ORDER)
+    return order
+} next_order
+
+/// Appends a task that became ready to the run queue, last in order.
+fn seeded_push_ready(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let order = next_order(mut lo, mut fx)
+    mut fx.store(order, addr: record, offset: TASK_ORDER)
+    let state_address = mut lo.state(mut fx)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: TASK_NEXT)
+    let tail = mut fx.load(PTR, addr: state_address, offset: STATE_READY_TAIL)
+    let has_tail = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+    discard mut fx.choose(has_tail, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(record, addr: tail, offset: TASK_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(record, addr: state_address, offset: STATE_READY_HEAD)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.store(record, addr: state_address, offset: STATE_READY_TAIL)
+} seeded_push_ready
+
+/// The number of ready tasks.
+fn ready_count(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_READY_HEAD)
+    let zero = mut fx.ptr(0)
+    let counted = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let count = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            let more = mut fx2.b.iadd_imm_s(count, y: 1)
+            return fx2.list2(following, b: more)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: count)
+        })
+        return Pass(again: present, next: take next)
+    })
+    return counted[1]
+} ready_count
+
+/// The choice of a scheduling point among `count` ready tasks: the position the next value of
+/// the scheduling stream gives, which records that the run met two ready tasks at once.
+fn seeded_choose(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let picks = mut fx.load(PTR, addr: state_address, offset: STATE_PICKS)
+    let next = mut fx.b.iadd_imm_s(picks, y: 1)
+    mut fx.store(next, addr: state_address, offset: STATE_PICKS)
+    let several = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: count, y: 1)
+    let chosen = mut fx.choose_in(mut lo, condition: several, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        let contended = mut lo1.state(mut fx1)
+        mut fx1.store(one, addr: contended, offset: STATE_CONTENDED)
+        let scheduling = mut fx1.ptr(SEEDED_SCHEDULING)
+        let value = seeded_stream(mut lo1, fx: mut fx1, stream: scheduling, index: picks)
+        let position = mut fx1.b.urem(value, y: count)
+        return fx1.list1(position)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let only = mut fx1.ptr(0)
+        return fx1.list1(only)
+    })
+    return chosen[0]
+} seeded_choose
+
+/// Takes the ready task a scheduling point chooses out of the run queue, zero when none is
+/// ready.
+fn seeded_pick(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let count = ready_count(mut lo, mut fx)
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: 0)
+    let picked = mut fx.choose_in(mut lo, condition: any, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let position = seeded_choose(mut lo1, fx: mut fx1, count)
+        let state_address = mut lo1.state(mut fx1)
+        let head = mut fx1.load(PTR, addr: state_address, offset: STATE_READY_HEAD)
+        let zero = mut fx1.ptr(0)
+        let found = mut fx1.repeat(fx1.list3(head, b: zero, c: position).view(), body: fn(mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 2
+            let current = state[0]
+            let previous = state[1]
+            let left = state[2]
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: left, y: 0)
+            let next = mut fx2.choose(more, results: fx2.types3(PTR, b: PTR, c: PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let following = mut fx3.load(PTR, addr: current, offset: TASK_NEXT)
+                let fewer = mut fx3.b.iadd_imm_s(left, y: -1)
+                return fx3.list3(following, b: current, c: fewer)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list3(current, b: previous, c: left)
+            })
+            return Pass(again: more, next: take next)
+        })
+        let chosen = found[0]
+        let previous = found[1]
+        let next = mut fx1.load(PTR, addr: chosen, offset: TASK_NEXT)
+        let at_head = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+        discard mut fx1.choose(at_head, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: state_address, offset: STATE_READY_HEAD)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            mut fx2.store(next, addr: previous, offset: TASK_NEXT)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+        mut fx1.if_true(last, then: fn(mut fx2: Fx) {
+            mut fx2.store(previous, addr: state_address, offset: STATE_READY_TAIL)
+        })
+        return fx1.list1(chosen)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.ptr(0)
+        return fx1.list1(none)
+    })
+    return picked[0]
+} seeded_pick
+
+/// Puts the running task back among the ready tasks at the place of the order in which it
+/// became ready.
+fn requeue(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let order = mut fx.load(PTR, addr: record, offset: TASK_ORDER)
+    let state_address = mut lo.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_READY_HEAD)
+    let zero = mut fx.ptr(0)
+    let found = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let previous = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let compared = mut fx1.choose(present, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let other = mut fx2.load(PTR, addr: current, offset: TASK_ORDER)
+            let sooner = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: other, y: order)
+            return fx2.list1(sooner)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        let earlier = compared[0]
+        let next = mut fx1.choose(earlier, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: TASK_NEXT)
+            return fx2.list2(following, b: current)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: previous)
+        })
+        return Pass(again: earlier, next: take next)
+    })
+    let after = found[0]
+    let before = found[1]
+    mut fx.store(after, addr: record, offset: TASK_NEXT)
+    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 0)
+    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(record, addr: state_address, offset: STATE_READY_HEAD)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(record, addr: before, offset: TASK_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: after, y: 0)
+    mut fx.if_true(last, then: fn(mut fx1: Fx) {
+        mut fx1.store(record, addr: state_address, offset: STATE_READY_TAIL)
+    })
+} requeue
+
+/// A scheduling point of the running task, which stays ready: the completions due are
+/// delivered, then, when another task is ready, the task goes back among the ready ones and the
+/// scheduler chooses; otherwise the choice of the one ready task is made in place.
+fn yield_point(mut lo: Lowering, mut fx: Fx) {
+    let record = current_task(mut lo, mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    mut fx.if_true(inside, then: fn[mut lo](mut fx1: Fx) {
+        seeded_reap(mut lo, fx: mut fx1)
+        let others = ready_count(mut lo, fx: mut fx1)
+        let alone = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: others, y: 0)
+        discard mut fx1.choose_in(mut lo, condition: alone, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let one = mut fx2.ptr(1)
+            discard seeded_choose(mut lo2, fx: mut fx2, count: one)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let ready = mut fx2.int(clif::Type.Int32, value: RUN_READY)
+            let word = mut fx2.offset(record, offset: TASK_STATE)
+            mut fx2.b.atomic_store(clif::MemFlags.owned(), x: ready, p: word)
+            requeue(mut lo2, fx: mut fx2, record)
+            let thread = mut lo2.thread(mut fx2)
+            let scheduler = mut fx2.offset(thread, offset: THREAD_CONTEXT)
+            let context = mut fx2.offset(record, offset: TASK_CONTEXT)
+            discard mut fx2.b.stack_switch(context, load_context_ptr: scheduler, in_payload0: record)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+    })
+} yield_point
+
+/// Makes a scheduling point of the running task.
+fn scheduling_point(mut lo: Lowering, mut fx: Fx) {
+    if lo.seeded() {
+        discard mut lo.call_routine(mut fx, routine: Routine.Yield, args: mem::List[clif::Value].empty(fx.alloc).view())
+    }
+} scheduling_point
+
+/// The virtual clock's milliseconds.
+fn seeded_now(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    return mut fx.load(PTR, addr: state_address, offset: RUNTIME_STATE_NOW)
+} seeded_now
+
+/// Arms a timer due `ms` milliseconds from now, after every timer due no later.
+fn arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, ms: clif::Value) {
+    let clock = seeded_now(mut lo, mut fx)
+    let sum = mut fx.b.uadd_overflow(clock, y: ms)
+    let latest = mut fx.int(PTR, value: -1)
+    let due = mut fx.b.select(sum.flag, x: latest, y: sum.value)
+    mut fx.store(due, addr: op, offset: OPERATION_DUE)
+    let order = next_order(mut lo, mut fx)
+    mut fx.store(order, addr: op, offset: OPERATION_ORDER)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: op, offset: OPERATION_WITHDRAW)
+    mut fx.store(zero, addr: op, offset: OPERATION_DONE)
+    let state_address = mut lo.state(mut fx)
+    let head = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let found = mut fx.repeat(fx.list2(head, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let previous = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let compared = mut fx1.choose(present, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let other = mut fx2.load(PTR, addr: current, offset: OPERATION_DUE)
+            let no_later = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: other, y: due)
+            return fx2.list1(no_later)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        let earlier = compared[0]
+        let next = mut fx1.choose(earlier, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let following = mut fx2.load(PTR, addr: current, offset: OPERATION_NEXT)
+            return fx2.list2(following, b: current)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: previous)
+        })
+        return Pass(again: earlier, next: take next)
+    })
+    let after = found[0]
+    let before = found[1]
+    mut fx.store(after, addr: op, offset: OPERATION_NEXT)
+    mut fx.store(before, addr: op, offset: OPERATION_PREVIOUS)
+    let has_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: after, y: 0)
+    mut fx.if_true(has_after, then: fn(mut fx1: Fx) {
+        mut fx1.store(op, addr: after, offset: OPERATION_PREVIOUS)
+    })
+    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 0)
+    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(op, addr: state_address, offset: STATE_TIMERS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(op, addr: before, offset: OPERATION_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} arm
+
+/// Takes a timer out of the virtual clock's timers.
+fn disarm(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let next = mut fx.load(PTR, addr: op, offset: OPERATION_NEXT)
+    let previous = mut fx.load(PTR, addr: op, offset: OPERATION_PREVIOUS)
+    let at_head = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+    discard mut fx.choose(at_head, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: state_address, offset: STATE_TIMERS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(next, addr: previous, offset: OPERATION_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+    mut fx.if_true(has_next, then: fn(mut fx1: Fx) {
+        mut fx1.store(previous, addr: next, offset: OPERATION_PREVIOUS)
+    })
+} disarm
+
+/// Completes an operation in flight with a result, delivered when the scheduler next reaps.
+fn seeded_complete(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
+    let done = mut fx.ptr(u64.fit(OPERATION_COMPLETED))
+    mut fx.store(done, addr: op, offset: OPERATION_DONE)
+    let narrow = if fx.b.value_type(result) == clif::Type.Int32 {
+        result
+    } else {
+        mut fx.b.ireduce(clif::Type.Int32, x: result)
+    }
+    mut fx.store(narrow, addr: op, offset: OPERATION_RESULT)
+    let state_address = mut lo.state(mut fx)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: op, offset: OPERATION_NEXT)
+    let tail = mut fx.load(PTR, addr: state_address, offset: STATE_COMPLETIONS_TAIL)
+    let has_tail = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+    discard mut fx.choose(has_tail, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(op, addr: tail, offset: OPERATION_NEXT)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(op, addr: state_address, offset: STATE_COMPLETIONS)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+    mut fx.store(op, addr: state_address, offset: STATE_COMPLETIONS_TAIL)
+} seeded_complete
+
+/// Cancels an operation in flight: a timer leaves the virtual clock and a wait leaves its sim,
+/// and it completes cancelled.
+fn seeded_cancel(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let done = mut fx.load(PTR, addr: op, offset: OPERATION_DONE)
+    let in_flight = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+    mut fx.if_true(in_flight, then: fn[mut lo](mut fx1: Fx) {
+        let withdraw = mut fx1.load(PTR, addr: op, offset: OPERATION_WITHDRAW)
+        let waits = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: withdraw, y: 0)
+        discard mut fx1.choose_in(mut lo, condition: waits, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let signature = mut fx2.b.import_signature(record_signature(fx2.alloc))
+            discard mut fx2.b.call_indirect(signature, callee: withdraw, args: fx2.list1(op).view())
+            return mem::List[clif::Value].empty(fx2.alloc)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            disarm(mut lo2, fx: mut fx2, op)
+            return mem::List[clif::Value].empty(fx2.alloc)
+        })
+        let cancelled = mut fx1.int(clif::Type.Int32, value: CANCELED)
+        seeded_complete(mut lo, fx: mut fx1, op, result: cancelled)
+    })
+} seeded_cancel
+
+/// Delivers the queued completions, oldest first.
+fn seeded_reap(mut lo: Lowering, mut fx: Fx) {
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let state_address = mut lo.state(mut fx1)
+        let op = mut fx1.load(PTR, addr: state_address, offset: STATE_COMPLETIONS)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: op, y: 0)
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            let next = mut fx2.load(PTR, addr: op, offset: OPERATION_NEXT)
+            mut fx2.store(next, addr: state_address, offset: STATE_COMPLETIONS)
+            let last = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: next, y: 0)
+            mut fx2.if_true(last, then: fn(mut fx3: Fx) {
+                let zero = mut fx3.ptr(0)
+                mut fx3.store(zero, addr: state_address, offset: STATE_COMPLETIONS_TAIL)
+            })
+            let result = mut fx2.load(clif::Type.Int32, addr: op, offset: OPERATION_RESULT)
+            deliver(mut lo, fx: mut fx2, op, result)
+        })
+        return Pass(again: present, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} seeded_reap
+
+/// What the scheduler does when no task is ready: the virtual clock advances to the earliest
+/// pending deadline and every timer then due expires, in the order they were armed; with none
+/// pending the run stalls.
+fn seeded_idle(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let earliest = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let none = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: earliest, y: 0)
+    mut fx.if_true(none, then: fn[mut lo](mut fx1: Fx) {
+        stalled(mut lo, fx: mut fx1)
+    })
+    let due = mut fx.load(PTR, addr: earliest, offset: OPERATION_DUE)
+    mut fx.store(due, addr: state_address, offset: RUNTIME_STATE_NOW)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let head = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        let expiring = mut fx1.choose(present, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let due_at = mut fx2.load(PTR, addr: head, offset: OPERATION_DUE)
+            let now_due = mut fx2.b.icmp(clif::IntCC.Equal, x: due_at, y: due)
+            return fx2.list1(now_due)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        let expires = expiring[0]
+        mut fx1.if_true(expires, then: fn[mut lo](mut fx2: Fx) {
+            disarm(mut lo, fx: mut fx2, op: head)
+            let expired = mut fx2.int(clif::Type.Int32, value: TASKS_EXPIRED)
+            seeded_complete(mut lo, fx: mut fx2, op: head, result: expired)
+        })
+        return Pass(again: expires, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    seeded_reap(mut lo, mut fx)
+} seeded_idle

@@ -1,0 +1,255 @@
+//! `nan merge <base> <ours> <theirs> [--path <path>]`: the merge driver, merging three versions of the workspace, or with `--path` of one file, into `<ours>`.
+
+/// What a merge found and wrote: its diagnostics, the records of those its checks report, the
+/// number of files it wrote and their paths as its records print them.
+struct MergeFound {
+    diagnostics: mem::List[diagnostic::Diagnostic]
+    checked: mem::List[output::Record]
+    files: usize
+    wrote: mem::List[text::String]
+} MergeFound
+
+/// What checking a version needs besides its workspace: the std packages, the grammar and the
+/// home directory.
+struct Checking {
+    std: mem::Shared[workspace::Workspace]
+    grammar: mem::Shared[syntax::Grammar]
+    home: Option[cache::HomeOverride]
+} Checking
+
+/// The session of a loaded workspace.
+fn Checking.session(self, take loaded: workspace::Workspace, alloc: mem::Alloc) -> check::Session {
+    return check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: self.std.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+} Checking.session
+
+/// The session of the workspace at `root`, none when it holds no package.
+fn Checking.version(self, root: Str, alloc: mem::Alloc) -> Option[check::Session] fails platform::IoError {
+    if not try workspace::holds_package(root, alloc) {
+        return None
+    }
+    var read = mem::List[text::String].empty(alloc)
+    let loaded = try workspace::Workspace.load(root, read: mut read, given: self.home, grammar: self.grammar.contents(), alloc)
+    return Some(self.session(take loaded, alloc))
+} Checking.version
+
+/// `nan merge`, which runs outside a workspace.
+fn merge_run(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 3 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let base = platform::join(current, name: invocation.operands[0].as_str(), alloc)
+    let ours_path = platform::join(current, name: invocation.operands[1].as_str(), alloc)
+    let theirs = platform::join(current, name: invocation.operands[2].as_str(), alloc)
+    let grammar = syntax::Grammar.load(alloc)
+    let std = workspace::Workspace.of_std(grammar, alloc)
+    let checking = Checking(std: mem::Shared.of(take std, alloc: alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(home, alloc))
+    var merging = MergeFound(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), checked: mem::List[output::Record].empty(alloc), files: 0, wrote: mem::List[text::String].empty(alloc))
+    match invocation.value("--path") {
+        Some(path) => try merge_file(path, ours: invocation.operands[1].as_str(), base: base.as_str(), ours_path: ours_path.as_str(), theirs: theirs.as_str(), current, checking, mut merging, alloc)
+        None => try merge_workspaces(base.as_str(), ours_path: ours_path.as_str(), theirs: theirs.as_str(), checking, mut merging, alloc)
+    }
+    var conflicts: usize = 0
+    var errors: usize = 0
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in merging.diagnostics {
+        invariant conflicts < merging.diagnostics.len() and errors < merging.diagnostics.len()
+        if reported.code == diagnostic::Code.MergeConflict {
+            conflicts += 1
+            mut records.push(conflict_record(reported, alloc))
+        }
+        if reported.code.class() == diagnostic::Class.Error {
+            errors += 1
+        }
+    }
+    for record_checked in take merging.checked {
+        mut records.push(take record_checked)
+    }
+    for path in merging.wrote {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(path.as_str(), alloc))
+        mut records.push(output::Record(word: text::String.of("wrote", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    var verdict = output::Verdict.Ok
+    if errors > 0 {
+        verdict = output::Verdict.Failed
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("files", alloc), value: merging.files))
+    mut summary.push(output::Count(name: text::String.of("conflicts", alloc), value: conflicts))
+    mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
+    return output::Output(command: invocation.command(written.as_str(), skip: true, alloc), elision: invocation.command(written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+} merge_run
+
+/// The file form: merges three versions of the file at `path` into `ours_path`, reporting the
+/// semantic conflicts of the file when the current directory's workspace holds it.
+fn merge_file(path: Str, ours: Str, base: Str, ours_path: Str, theirs: Str, current: Str, checking: Checking, mut merging: MergeFound, alloc: mem::Alloc) fails platform::IoError {
+    let base_content = read_version(base, alloc)
+    let ours_content = read_version(ours_path, alloc)
+    let theirs_content = read_version(theirs, alloc)
+    let grammar = checking.grammar.contents()
+    let merged = merge::merge(path, base: base_content, ours: ours_content, theirs: theirs_content, grammar, alloc)
+    for line in merged.conflicts {
+        mut merging.diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.MergeConflict, path, line, alloc))
+    }
+    let root = workspace::root_of(current, alloc)
+    match try checking.version(root.as_str(), alloc) {
+        Some(session) => {
+            if session.workspace.contents().file(path).is_some() {
+                let base_session = version_session(session, path, content: base_content, alloc)
+                let ours_session = version_session(session, path, content: ours_content, alloc)
+                let theirs_session = version_session(session, path, content: theirs_content, alloc)
+                let result = version_session(session, path, content: merged.content, alloc)
+                for reported in take check::semantic_conflicts(base_session, ours: ours_session, theirs: theirs_session, merged: result, file: Some(path)) {
+                    mut merging.checked.push(record(result.workspace.contents(), std: checking.std.contents(), scope: scope::Scope.Workspace, reported, alloc))
+                    mut merging.diagnostics.push(take reported)
+                }
+            }
+        }
+        None => {}
+    }
+    try replace(ours_path, content: merged.content, alloc)
+    merging.files = 1
+    mut merging.wrote.push(text::String.of(ours, alloc))
+} merge_file
+
+/// The session of a workspace whose file at `path` holds a version, empty when it is absent.
+fn version_session(session: check::Session, path: Str, content: Option[mem::Bytes], alloc: mem::Alloc) -> check::Session {
+    return match content {
+        Some(bytes) => overlaid_session(session, path, contents: bytes.view(), alloc)
+        None => overlaid_session(session, path, contents: b"", alloc)
+    }
+} version_session
+
+/// The workspace form: merges every file of the three versions into `ours_path`, then checks
+/// the merged workspace and reports its diagnostics and the semantic conflicts of the merge.
+fn merge_workspaces(base: Str, ours_path: Str, theirs: Str, checking: Checking, mut merging: MergeFound, alloc: mem::Alloc) fails platform::IoError {
+    let base_session = try checking.version(base, alloc)
+    let ours_session = try checking.version(ours_path, alloc)
+    let theirs_session = try checking.version(theirs, alloc)
+    var paths = mem::Set[text::String].empty(alloc)
+    try walk(base, dir: "", found: mut paths, alloc)
+    try walk(ours_path, dir: "", found: mut paths, alloc)
+    try walk(theirs, dir: "", found: mut paths, alloc)
+    let grammar = checking.grammar.contents()
+    for path in paths {
+        let ours_content = read_version(platform::join(ours_path, name: path.as_str(), alloc).as_str(), alloc)
+        let merged = merge::merge(path.as_str(), base: read_version(platform::join(base, name: path.as_str(), alloc).as_str(), alloc), ours: ours_content, theirs: read_version(platform::join(theirs, name: path.as_str(), alloc).as_str(), alloc), grammar, alloc)
+        for line in merged.conflicts {
+            mut merging.diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.MergeConflict, path: path.as_str(), line, alloc))
+        }
+        if merged.content != ours_content {
+            try replace(platform::join(ours_path, name: path.as_str(), alloc).as_str(), content: merged.content, alloc)
+            expect merging.files < ~0usize
+            merging.files += 1
+            mut merging.wrote.push(text::String.of(path.as_str(), alloc))
+        }
+    }
+    var read = mem::List[text::String].empty(alloc)
+    let loaded = try workspace::Workspace.load(ours_path, read: mut read, given: checking.home, grammar, alloc)
+    let merged_session = checking.session(take loaded, alloc)
+    var found = merged_session.reported(scope::Scope.Workspace)
+    match base_session {
+        Some(base_version) => {
+            match ours_session {
+                Some(ours_version) => {
+                    match theirs_session {
+                        Some(theirs_version) => {
+                            for reported in take check::semantic_conflicts(base_version, ours: ours_version, theirs: theirs_version, merged: merged_session, file: None) {
+                                mut found.push(take reported)
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    for reported in take found {
+        mut merging.checked.push(record(merged_session.workspace.contents(), std: checking.std.contents(), scope: scope::Scope.Workspace, reported, alloc))
+        mut merging.diagnostics.push(take reported)
+    }
+} merge_workspaces
+
+/// The bytes of a version's file, none when it cannot be read.
+fn read_version(path: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Ok(bytes) = attempt platform::read_file(path, alloc) else {
+        return None
+    }
+    return Some(take bytes)
+} read_version
+
+/// The record of a conflict, which lies in a version outside any workspace and quotes no line.
+fn conflict_record(reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> output::Record {
+    var location = text::String.of("-", alloc)
+    match reported.path {
+        Some(path) => {
+            match reported.line {
+                Some(line) => {
+                    location = located(path.as_str(), line, alloc)
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(text::String.of(reported.code.name(), alloc))
+    mut fields.push(take location)
+    mut fields.push(text::String.of("-", alloc))
+    return output::Record(word: text::String.of(reported.code.class().word(), alloc), fields: take fields, lines: mem::List[text::String].empty(alloc))
+} conflict_record
+
+/// Collects the files under `dir`, relative to the version's root, skipping `.git` and the
+/// root's `.nan`, which holds what commands build.
+fn walk(root: Str, dir: Str, mut found: mem::Set[text::String], alloc: mem::Alloc) fails platform::IoError {
+    let absolute = platform::join(root, name: dir, alloc)
+    let Ok(listed) = attempt platform::list_dir(absolute.as_str(), alloc) else {
+        return
+    }
+    for listed_entry in listed {
+        let name = output::lossy(listed_entry.name.view(), alloc)
+        var path = text::String.of(name.as_str(), alloc)
+        if not dir.is_empty() {
+            path = text::String.of(dir, alloc)
+            mut path.push('/')
+            mut path.append(name.as_str())
+        }
+        let skipped = name.as_str() == ".git" or (dir.is_empty() and name.as_str() == ".nan")
+        if listed_entry.kind == platform::FileKind.Directory and not skipped {
+            try walk(root, dir: path.as_str(), mut found, alloc)
+        } else if listed_entry.kind == platform::FileKind.Regular {
+            discard mut found.insert(take path)
+        }
+    }
+} walk
+
+/// Replaces a file whole with new content, renaming a new file into place, or deletes it.
+fn replace(path: Str, content: Option[mem::Bytes], alloc: mem::Alloc) fails platform::IoError {
+    let Some(bytes) = content else {
+        match first attempt platform::remove_file(path) {
+            Ok(_) => {}
+            Err(platform::IoError.NotFound) => {}
+            Err(error) => fail error
+        }
+        return
+    }
+    let parent = match platform::parent(path, alloc) {
+        Some(above) => above
+        None => text::String.empty(alloc)
+    }
+    try platform::create_dir_all(parent.as_str(), alloc)
+    let name = match platform::file_name(path, alloc) {
+        Some(last) => last
+        None => text::String.empty(alloc)
+    }
+    var fresh_name = text::String.of(".", alloc)
+    mut fresh_name.append(name.as_str())
+    mut fresh_name.write(text::fmt(".{id}.new", id: platform::process_id()), budget: 32)
+    let fresh = platform::join(parent.as_str(), name: fresh_name.as_str(), alloc)
+    try platform::write_file(fresh.as_str(), contents: bytes.view())
+    try platform::rename_path(fresh.as_str(), to: path)
+} replace

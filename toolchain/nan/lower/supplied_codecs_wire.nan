@@ -1,0 +1,347 @@
+//! The `mem::wire` format's writing and reading of each kind; a reading gives its values and the code of its failure, zero for none.
+
+/// Text or bytes read: their first byte's address and length, and the code of the failure.
+struct FramedReading derives Copy {
+    start: clif::Value
+    len: clif::Value
+    failed: clif::Value
+} FramedReading
+
+/// A record field's key read: its first byte's address and length, the end of the field's
+/// value, and the code of the failure.
+struct KeyReading derives Copy {
+    start: clif::Value
+    len: clif::Value
+    end: clif::Value
+    failed: clif::Value
+} KeyReading
+
+/// A variant's payload flag read: whether a payload follows, its end when it does, and the
+/// code of the failure.
+struct PayloadReading derives Copy {
+    follows: clif::Value
+    end: clif::Value
+    failed: clif::Value
+} PayloadReading
+
+/// Writes a uvar: 7 bits per byte, least significant group first.
+fn put_uvar(mut fx: Fx, state: clif::Value, value: clif::Value) {
+    let initial = fx.list1(value)
+    discard mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let rest = current[0]
+        let group = mut fx1.b.band_imm_s(rest, y: 0x7F)
+        let later = mut fx1.b.ushr_imm_s(rest, y: 7)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: later, y: 0)
+        let flagged = mut fx1.b.bor_imm_s(group, y: 0x80)
+        let byte = mut fx1.b.select(more, x: flagged, y: group)
+        put_byte(mut fx1, state, byte)
+        return Pass(again: more, next: fx1.list1(later))
+    })
+} put_uvar
+
+/// Writes text or bytes: the byte length as a uvar, then the bytes.
+fn put_text(mut lo: Lowering, mut fx: Fx, state: clif::Value, start: clif::Value, len: clif::Value) {
+    put_uvar(mut fx, state, value: len)
+    put_bytes(mut lo, mut fx, state, start, count: len)
+} put_text
+
+/// Writes a literal text: its byte length as a uvar, then its bytes.
+fn put_literal_text(mut lo: Lowering, mut fx: Fx, state: clif::Value, bytes: Slice[u8]) {
+    let len = mut fx.ptr(u64.widen(bytes.len()))
+    put_uvar(mut fx, state, value: len)
+    put_literal(mut lo, mut fx, state, bytes)
+} put_literal_text
+
+/// The bytes left in the input.
+fn wire_left(mut fx: Fx, state: clif::Value) -> clif::Value {
+    let pos = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let end = mut fx.load(PTR, addr: state, offset: READER_END)
+    return mut fx.b.isub(end, y: pos)
+} wire_left
+
+fn wire_code(mut fx: Fx, code: i64) -> clif::Value {
+    return mut fx.int(clif::Type.Int32, value: code)
+} wire_code
+
+/// The next byte: `Truncated` at the end of the input.
+fn read_byte(mut fx: Fx, state: clif::Value) -> Reading {
+    let pos = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let end = mut fx.load(PTR, addr: state, offset: READER_END)
+    let present = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: pos, y: end)
+    let results = fx.types2(clif::Type.Int64, b: clif::Type.Int32)
+    let parts = mut fx.choose(present, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let loaded = mut fx1.load(clif::Type.Int8, addr: pos, offset: 0)
+        let byte = mut fx1.b.uextend(clif::Type.Int64, x: loaded)
+        let next = mut fx1.b.iadd_imm_s(pos, y: 1)
+        mut fx1.store(next, addr: state, offset: READER_POS)
+        let none = wire_code(mut fx1, code: 0)
+        return fx1.list2(byte, b: none)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zero = mut fx1.ptr(0)
+        let truncated = wire_code(mut fx1, code: FAILURE_TRUNCATED)
+        return fx1.list2(zero, b: truncated)
+    })
+    expect parts.len() == 2
+    return Reading(value: parts[0], failed: parts[1])
+} read_byte
+
+/// A uvar: `Malformed` when it is not minimal or exceeds 2^64 − 1.
+fn read_uvar(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> Reading {
+    var signature = clif::Signature.new(CALL_CONV, alloc: lo.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int64))
+    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int32))
+    let function = mut lo.glue_function(Glue.WireUvar, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 1
+        let reader_state = params[0]
+        let zero = mut fx1.ptr(0)
+        let initial = fx1.list2(zero, b: zero)
+        discard mut fx1.repeat(initial.view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 2
+            return uvar_group(mut fx2, state: reader_state, index: current[0], value: current[1])
+        })
+        let none = mut fx1.ptr(0)
+        let malformed = wire_code(mut fx1, code: FAILURE_MALFORMED)
+        let returned = fx1.list2(none, b: malformed)
+        mut fx1.b.ret(returned.view())
+    })
+    let reference = mut lo.func_ref(mut fx, id: function)
+    let call_args = fx.list1(state)
+    let call = mut fx.b.call(reference, args: call_args.view())
+    let results = fx.b.inst_results(call, alloc: fx.alloc)
+    expect results.len() == 2
+    return Reading(value: results[0], failed: results[1])
+} read_uvar
+
+/// A pass of the loop reading a uvar: one more group read into `value`, returning from the
+/// reading function at the last group or on failure.
+fn uvar_group(mut fx: Fx, state: clif::Value, index: clif::Value, value: clif::Value) -> Pass {
+    let read = read_byte(mut fx, state)
+    let byte = read.value
+    let failed = read.failed
+    let truncated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed, y: 0)
+    mut fx.if_true(truncated, then: fn(mut fx1: Fx) {
+        let returned = fx1.list2(value, b: failed)
+        mut fx1.b.ret(returned.view())
+    })
+    let last_group = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: 9)
+    let too_large = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: byte, y: 1)
+    let overflow = mut fx.b.band(last_group, y: too_large)
+    mut fx.if_true(overflow, then: fn(mut fx1: Fx) {
+        let malformed = wire_code(mut fx1, code: FAILURE_MALFORMED)
+        let returned = fx1.list2(value, b: malformed)
+        mut fx1.b.ret(returned.view())
+    })
+    let group = mut fx.b.band_imm_s(byte, y: 0x7F)
+    let shift = mut fx.b.imul_imm_s(index, y: 7)
+    let shifted = mut fx.b.ishl(group, y: shift)
+    let gathered = mut fx.b.bor(value, y: shifted)
+    let continued = mut fx.b.band_imm_s(byte, y: 0x80)
+    let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: continued, y: 0)
+    mut fx.if_true(last, then: fn(mut fx1: Fx) {
+        let empty = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        let later = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: index, y: 0)
+        let padded = mut fx1.b.band(empty, y: later)
+        let malformed = wire_code(mut fx1, code: FAILURE_MALFORMED)
+        let ok = wire_code(mut fx1, code: 0)
+        let result = mut fx1.b.select(padded, x: malformed, y: ok)
+        let returned = fx1.list2(gathered, b: result)
+        mut fx1.b.ret(returned.view())
+    })
+    let next = mut fx.b.iadd_imm_s(index, y: 1)
+    let more = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: 10)
+    return Pass(again: more, next: fx.list2(next, b: gathered))
+} uvar_group
+
+/// A count of elements, fields or entries: `Truncated` when it exceeds the bytes left, each
+/// taking at least one.
+fn read_count(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> Reading {
+    let read = read_uvar(mut lo, mut fx, state)
+    let count = read.value
+    let failed = read.failed
+    let left = wire_left(mut fx, state)
+    let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: count, y: left)
+    let truncated = wire_code(mut fx, code: FAILURE_TRUNCATED)
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+    let beyond_code = mut fx.b.select(beyond, x: truncated, y: failed)
+    let code = mut fx.b.select(ok, x: beyond_code, y: failed)
+    return Reading(value: count, failed: code)
+} read_count
+
+/// The end of a value of a byte length read here: `Truncated` when it lies past the input.
+fn read_length_end(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> Reading {
+    let read = read_uvar(mut lo, mut fx, state)
+    let len = read.value
+    let failed = read.failed
+    let left = wire_left(mut fx, state)
+    let beyond = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: len, y: left)
+    let truncated = wire_code(mut fx, code: FAILURE_TRUNCATED)
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+    let beyond_code = mut fx.b.select(beyond, x: truncated, y: failed)
+    let code = mut fx.b.select(ok, x: beyond_code, y: failed)
+    let pos = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let end = mut fx.b.iadd(pos, y: len)
+    return Reading(value: end, failed: code)
+} read_length_end
+
+/// Text or bytes: their first byte's address and length, the input passing over them.
+fn read_framed(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> FramedReading {
+    let read = read_length_end(mut lo, mut fx, state)
+    let end = read.value
+    let failed = read.failed
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+    let pos = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let len = mut fx.b.isub(end, y: pos)
+    mut fx.if_true(ok, then: fn(mut fx1: Fx) {
+        mut fx1.store(end, addr: state, offset: READER_POS)
+    })
+    return FramedReading(start: pos, len: len, failed: failed)
+} read_framed
+
+/// A record field's key and the end of its value: `DuplicateKey` for a key equal to the last
+/// one, kept at `last` as its address and length (-1 before the first), and `Malformed` for
+/// a key less than it.
+fn wire_read_key(mut lo: Lowering, mut fx: Fx, state: clif::Value, last: clif::Value) -> KeyReading {
+    let framed = read_framed(mut lo, mut fx, state)
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: framed.failed, y: 0)
+    let results = fx.types2(clif::Type.Int64, b: clif::Type.Int32)
+    let parts = mut fx.choose_in(mut lo, condition: ok, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let read = read_length_end(mut lo1, fx: mut fx1, state)
+        let end = read.value
+        let failed = read.failed
+        let end_ok = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+        let order_types = fx1.types1(clif::Type.Int32)
+        let order = mut fx1.choose_in(mut lo1, condition: end_ok, results: order_types.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let compared = compare_last(mut lo2, fx: mut fx2, last, start: framed.start, len: framed.len)
+            return fx2.list1(compared)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(failed)
+        })
+        expect order.len() == 1
+        return fx1.list2(end, b: order[0])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let zero = mut fx1.ptr(0)
+        return fx1.list2(zero, b: framed.failed)
+    })
+    expect parts.len() == 2
+    return KeyReading(start: framed.start, len: framed.len, end: parts[0], failed: parts[1])
+} wire_read_key
+
+/// Compares a key with the last one kept, failing on an equal or lesser key, and keeps it.
+fn compare_last(mut lo: Lowering, mut fx: Fx, last: clif::Value, start: clif::Value, len: clif::Value) -> clif::Value {
+    let last_start = mut fx.load(PTR, addr: last, offset: 0)
+    let last_len = mut fx.load(PTR, addr: last, offset: 8)
+    mut fx.store(start, addr: last, offset: 0)
+    mut fx.store(len, addr: last, offset: 8)
+    let first_key = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: last_len, y: -1)
+    let results = fx.types1(clif::Type.Int32)
+    let compared = mut fx.choose_in(mut lo, condition: first_key, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = wire_code(mut fx1, code: 0)
+        return fx1.list1(none)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let shorter = mut fx1.b.umin(len, y: last_len)
+        let compare_args = fx1.list3(start, b: last_start, c: shorter)
+        let orders = mut lo1.call_routine(mut fx1, routine: Routine.Compare, args: compare_args.view())
+        expect orders.len() == 1
+        let order = orders[0]
+        let less = mut fx1.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: order, y: 0)
+        let tie = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: order, y: 0)
+        let shorter_key = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: len, y: last_len)
+        let same_len = mut fx1.b.icmp(clif::IntCC.Equal, x: len, y: last_len)
+        let less_by_len = mut fx1.b.band(tie, y: shorter_key)
+        let lesser = mut fx1.b.bor(less, y: less_by_len)
+        let equal = mut fx1.b.band(tie, y: same_len)
+        let malformed = wire_code(mut fx1, code: FAILURE_MALFORMED)
+        let duplicate = wire_code(mut fx1, code: FAILURE_DUPLICATE_KEY)
+        let ok = wire_code(mut fx1, code: 0)
+        let result = mut fx1.b.select(lesser, x: malformed, y: ok)
+        let chosen = mut fx1.b.select(equal, x: duplicate, y: result)
+        return fx1.list1(chosen)
+    })
+    expect compared.len() == 1
+    return compared[0]
+} compare_last
+
+/// Whether a variant's payload follows, and its end when it does: `Malformed` on a byte other
+/// than 0 and 1.
+fn read_payload_flag(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> PayloadReading {
+    let read = read_byte(mut fx, state)
+    let byte = read.value
+    let failed = read.failed
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+    let results = fx.types3(clif::Type.Int8, b: clif::Type.Int64, c: clif::Type.Int32)
+    let parts = mut fx.choose_in(mut lo, condition: ok, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let absent = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 1)
+        let flag_types = fx1.types3(clif::Type.Int8, b: clif::Type.Int64, c: clif::Type.Int32)
+        return mut fx1.choose_in(mut lo1, condition: present, results: flag_types.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let end_read = read_length_end(mut lo2, fx: mut fx2, state)
+            let yes = mut fx2.int(clif::Type.Int8, value: 1)
+            return fx2.list3(yes, b: end_read.value, c: end_read.failed)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let malformed = wire_code(mut fx2, code: FAILURE_MALFORMED)
+            let none = wire_code(mut fx2, code: 0)
+            let result = mut fx2.b.select(absent, x: none, y: malformed)
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            let zero = mut fx2.ptr(0)
+            return fx2.list3(no, b: zero, c: result)
+        })
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        let zero = mut fx1.ptr(0)
+        return fx1.list3(no, b: zero, c: failed)
+    })
+    expect parts.len() == 3
+    return PayloadReading(follows: parts[0], end: parts[1], failed: parts[2])
+} read_payload_flag
+
+/// A bool: `Malformed` on a byte other than 0 and 1.
+fn wire_read_bool(mut fx: Fx, state: clif::Value) -> Reading {
+    let read = read_byte(mut fx, state)
+    let byte = read.value
+    let failed = read.failed
+    let valid = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: byte, y: 1)
+    let malformed = wire_code(mut fx, code: FAILURE_MALFORMED)
+    let ok = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: failed, y: 0)
+    let checked = mut fx.b.select(valid, x: failed, y: malformed)
+    let code = mut fx.b.select(ok, x: checked, y: failed)
+    let flag = mut fx.b.ireduce(clif::Type.Int8, x: byte)
+    return Reading(value: flag, failed: code)
+} wire_read_bool
+
+/// An unsigned value, or a signed one from its zigzag uvar, in 64 bits.
+fn wire_read_integer(mut lo: Lowering, mut fx: Fx, state: clif::Value, signed: bool) -> Reading {
+    let read = read_uvar(mut lo, mut fx, state)
+    if not signed {
+        return read
+    }
+    let half = mut fx.b.ushr_imm_s(read.value, y: 1)
+    let low = mut fx.b.band_imm_s(read.value, y: 1)
+    let mask = mut fx.b.ineg(low)
+    let value = mut fx.b.bxor(half, y: mask)
+    return Reading(value: value, failed: read.failed)
+} wire_read_integer
+
+/// A float: the 8 bytes of an f64 bit pattern, little-endian.
+fn wire_read_float(mut fx: Fx, state: clif::Value) -> Reading {
+    let pos = mut fx.load(PTR, addr: state, offset: READER_POS)
+    let left = wire_left(mut fx, state)
+    let enough = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: left, y: 8)
+    let results = fx.types2(clif::Type.Float64, b: clif::Type.Int32)
+    let parts = mut fx.choose(enough, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let bits = mut fx1.b.load(clif::Type.Int64, flags: clif::MemFlags.unaligned(), p: pos, offset: 0)
+        let next = mut fx1.b.iadd_imm_s(pos, y: 8)
+        mut fx1.store(next, addr: state, offset: READER_POS)
+        let value = mut fx1.b.bitcast(clif::Type.Float64, flags: clif::MemFlags.new(), x: bits)
+        let none = wire_code(mut fx1, code: 0)
+        return fx1.list2(value, b: none)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let zero = mut fx1.b.f64const(0)
+        let truncated = wire_code(mut fx1, code: FAILURE_TRUNCATED)
+        return fx1.list2(zero, b: truncated)
+    })
+    expect parts.len() == 2
+    return Reading(value: parts[0], failed: parts[1])
+} wire_read_float

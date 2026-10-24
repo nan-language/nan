@@ -1,0 +1,415 @@
+//! The firmware services of `x86_64-uefi`, reached through the system table the program entry seam recorded and called under the Microsoft x64 convention on the boot stack: console output, files of the volume the image was loaded from, and the end of boot services, after which the image runs on its own entry root and descriptor tables.
+
+/// The offsets in the system table of its console-output protocol and its boot services; in
+/// the console-output protocol of its string output; in the boot services of `GetMemoryMap`,
+/// `HandleProtocol` and `ExitBootServices`.
+const CONSOLE_OUT: u64 = 64
+
+const BOOT_SERVICES: u64 = 96
+
+const OUTPUT_STRING: u64 = 8
+
+const GET_MEMORY_MAP: u64 = 56
+
+const FIRMWARE_HANDLE_PROTOCOL: u64 = 152
+
+const EXIT_BOOT_SERVICES: u64 = 232
+
+/// The offsets of a loaded image protocol's device handle, of a simple file system protocol's
+/// `OpenVolume`, and of a file protocol's functions.
+const DEVICE_HANDLE: u64 = 24
+
+const FIRMWARE_OPEN_VOLUME: u64 = 8
+
+const FILE_OPEN: u64 = 8
+
+const FILE_CLOSE: u64 = 16
+
+const FILE_READ: u64 = 32
+
+const FILE_GET_POSITION: u64 = 48
+
+const FILE_SET_POSITION: u64 = 56
+
+/// The protocols the services open, by GUID.
+const FIRMWARE_LOADED_IMAGE: Slice[u8] = b"\xa1\x31\x1b\x5b\x62\x95\xd2\x11\x8e\x3f\x00\xa0\xc9\x69\x72\x3b"
+
+const SIMPLE_FILE_SYSTEM: Slice[u8] = b"\x22\x5b\x4e\x96\x59\x64\xd2\x11\x8e\x39\x00\xa0\xc9\x69\x72\x3b"
+
+/// The statuses the services tell apart, an error's having its high bit set; the mode opening a
+/// file for reading; and the file position past its end.
+const EFI_SUCCESS: i64 = 0
+
+const EFI_BUFFER_TOO_SMALL: i64 = i64.from_bits(0x8000_0000_0000_0005)
+
+const EFI_NOT_FOUND: i64 = i64.from_bits(0x8000_0000_0000_000E)
+
+const EFI_OUT_OF_RESOURCES: i64 = i64.from_bits(0x8000_0000_0000_0009)
+
+const READ_MODE: u64 = 1
+
+const END_OF_FILE: i64 = -1
+
+/// The descriptors of slack a memory map buffer holds for the entries the firmware adds before
+/// the map is read into it.
+const MAP_SLACK: i64 = 8
+
+/// `m.with_services(body)`: calls `body` with the firmware's services, a view, and returns its
+/// result or forwards its failure.
+fn firmware_with_services(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let body_ty = fn_param(lo, supply, index: 1)
+    let called = mut lo.call_value(mut fx, fn_ty: body_ty, function: supply.param(1).address_value(), args: Array[Held, 1].filled(Held.Empty).view())
+    hw_forward(mut lo, mut fx, supply, called)
+} firmware_with_services
+
+/// `services.write_console(text)`: writes `text` to the firmware's console output in UTF-16,
+/// each line feed preceded by a carriage return.
+fn write_console(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let text = supply.param(1).address_value()
+    let start = mut fx.load(PTR, addr: text, offset: 0)
+    let len = mut fx.load(PTR, addr: text, offset: 8)
+    let units = utf16(mut lo, mut fx, supply, start, len, put: fn(mut fx1: Fx, unit: clif::Value, written: clif::Variable, buffer: clif::Value) {
+        let newline = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: unit, y: i64.widen(b'\n'))
+        mut fx1.if_true(newline, then: fn(mut fx2: Fx) {
+            let carriage = mut fx2.int(clif::Type.Int16, value: i64.widen(b'\r'))
+            put_unit(mut fx2, units: buffer, written, unit: carriage)
+        })
+        put_unit(mut fx1, units: buffer, written, unit)
+    })
+    let table = system_table(mut lo, mut fx)
+    let conout = mut fx.load(PTR, addr: table, offset: CONSOLE_OUT)
+    let output = mut fx.load(PTR, addr: conout, offset: OUTPUT_STRING)
+    var call_args = Array[clif::Value, 2].filled(conout)
+    call_args[1] = units
+    let status = win64_call(mut fx, code: output, args: call_args.view())
+    mut lo.record_free(mut fx, address: units)
+    fail_unless(mut lo, mut fx, supply, status, cleanup: fn(mut lo1: Lowering, mut fx1: Fx) {})
+    supply.done(mut lo, mut fx)
+} write_console
+
+/// `services.read_file(path, alloc)`: reads the file `path` names from the root directory of
+/// the volume the image was loaded from, through the loaded image's device and its simple file
+/// system, into bytes drawn through `alloc`.
+fn read_file(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "each firmware call checked as it returns, in the order reading a file makes them"
+{
+    let path = supply.param(1).address_value()
+    let cell = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let table = system_table(mut lo, mut fx)
+    let services = mut fx.load(PTR, addr: table, offset: BOOT_SERVICES)
+    let handle_protocol = mut fx.load(PTR, addr: services, offset: FIRMWARE_HANDLE_PROTOCOL)
+    let found = mut fx.slot(8, align: 8)
+    let state_address = mut lo.state(mut fx)
+    let image = mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM)
+    let loaded_image = firmware_guid(mut lo, mut fx, octets: FIRMWARE_LOADED_IMAGE)
+    var image_args = Array[clif::Value, 3].filled(image)
+    image_args[1] = loaded_image
+    image_args[2] = found
+    let image_status = win64_call(mut fx, code: handle_protocol, args: image_args.view())
+    fail_unless(mut lo, mut fx, supply, status: image_status, cleanup: fn(mut lo1: Lowering, mut fx1: Fx) {})
+    let loaded = mut fx.load(PTR, addr: found, offset: 0)
+    let device = mut fx.load(PTR, addr: loaded, offset: DEVICE_HANDLE)
+    let file_system = firmware_guid(mut lo, mut fx, octets: SIMPLE_FILE_SYSTEM)
+    var system_args = Array[clif::Value, 3].filled(device)
+    system_args[1] = file_system
+    system_args[2] = found
+    let system_status = win64_call(mut fx, code: handle_protocol, args: system_args.view())
+    fail_unless(mut lo, mut fx, supply, status: system_status, cleanup: fn(mut lo1: Lowering, mut fx1: Fx) {})
+    let volume = mut fx.load(PTR, addr: found, offset: 0)
+    let open_volume = mut fx.load(PTR, addr: volume, offset: FIRMWARE_OPEN_VOLUME)
+    var volume_args = Array[clif::Value, 2].filled(volume)
+    volume_args[1] = found
+    let volume_status = win64_call(mut fx, code: open_volume, args: volume_args.view())
+    fail_unless(mut lo, mut fx, supply, status: volume_status, cleanup: fn(mut lo1: Lowering, mut fx1: Fx) {})
+    let root = mut fx.load(PTR, addr: found, offset: 0)
+    let start = mut fx.load(PTR, addr: path, offset: 0)
+    let len = mut fx.load(PTR, addr: path, offset: 8)
+    let file_name = utf16(mut lo, mut fx, supply, start, len, put: fn(mut fx1: Fx, unit: clif::Value, written: clif::Variable, buffer: clif::Value) {
+        let slash = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: unit, y: i64.widen(b'/'))
+        let backslash = mut fx1.int(clif::Type.Int16, value: i64.widen(b'\\'))
+        let separated = mut fx1.b.select(slash, x: backslash, y: unit)
+        put_unit(mut fx1, units: buffer, written, unit: separated)
+    })
+    let open = mut fx.load(PTR, addr: root, offset: FILE_OPEN)
+    let mode = mut fx.ptr(READ_MODE)
+    let attributes = mut fx.ptr(0)
+    var open_args = Array[clif::Value, 5].filled(root)
+    open_args[1] = found
+    open_args[2] = file_name
+    open_args[3] = mode
+    open_args[4] = attributes
+    let open_status = win64_call(mut fx, code: open, args: open_args.view())
+    mut lo.record_free(mut fx, address: file_name)
+    fail_unless(mut lo, mut fx, supply, status: open_status, cleanup: fn(mut lo1: Lowering, mut fx1: Fx) {
+        firmware_close(mut fx1, opened: Array[clif::Value, 1].filled(root).view())
+    })
+    let file = mut fx.load(PTR, addr: found, offset: 0)
+    let set_position = mut fx.load(PTR, addr: file, offset: FILE_SET_POSITION)
+    let end = mut fx.int(PTR, value: END_OF_FILE)
+    var end_args = Array[clif::Value, 2].filled(file)
+    end_args[1] = end
+    discard win64_call(mut fx, code: set_position, args: end_args.view())
+    let get_position = mut fx.load(PTR, addr: file, offset: FILE_GET_POSITION)
+    var position_args = Array[clif::Value, 2].filled(file)
+    position_args[1] = found
+    discard win64_call(mut fx, code: get_position, args: position_args.view())
+    let size = mut fx.load(PTR, addr: found, offset: 0)
+    let zero_value = mut fx.ptr(0)
+    var start_args = Array[clif::Value, 2].filled(file)
+    start_args[1] = zero_value
+    discard win64_call(mut fx, code: set_position, args: start_args.view())
+    let Some(contents) = supply.sret else {
+        expect false
+        return
+    }
+    let element = Element(size: 1, align: 1)
+    vector_empty(mut fx, address: contents, alloc: cell, element)
+    let room = vector_reserve(mut lo, mut fx, address: contents, needed: size, element)
+    let short = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+    var pair = Array[clif::Value, 2].filled(file)
+    pair[1] = root
+    mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
+        firmware_close(mut fx1, opened: pair.view())
+        fail_with(mut lo, fx: mut fx1, supply, variant: "OutOfMemory")
+    })
+    let data = mut fx.load(PTR, addr: contents, offset: VECTOR_DATA)
+    let read = mut fx.load(PTR, addr: file, offset: FILE_READ)
+    let filled = mut fx.repeat(Array[clif::Value, 1].filled(zero_value).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let offset = current[0]
+        let left = mut fx1.b.isub(size, y: offset)
+        mut fx1.store(left, addr: found, offset: 0)
+        let at = mut fx1.b.iadd(data, y: offset)
+        var read_args = Array[clif::Value, 3].filled(file)
+        read_args[1] = found
+        read_args[2] = at
+        let read_status = win64_call(mut fx1, code: read, args: read_args.view())
+        fail_unless(mut lo, fx: mut fx1, supply, status: read_status, cleanup: fn(mut lo2: Lowering, mut fx2: Fx) {
+            firmware_close(mut fx2, opened: pair.view())
+            free_storage(mut lo2, fx: mut fx2, address: contents)
+        })
+        let got = mut fx1.load(PTR, addr: found, offset: 0)
+        let advanced = mut fx1.b.iadd(offset, y: got)
+        let more = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: advanced, y: size)
+        let progress = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: got, y: 0)
+        let again = mut fx1.b.band(more, y: progress)
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(advanced)
+        return Pass(again: again, next: take state)
+    })
+    mut fx.store(filled[0], addr: contents, offset: VECTOR_LEN)
+    firmware_close(mut fx, opened: pair.view())
+    supply.ret(mut lo, mut fx, held: Held.Address(contents))
+} read_file
+
+/// `take m.exit_services()`: reads the firmware's final memory map into a runtime record the
+/// runtime state keeps, in a record grown while the map does not fit it, and ends boot services
+/// with its key, reading the map again while they refuse; then installs the entry root and the
+/// boot CPU's descriptor tables with maskable interrupts disabled, enables AVX when the CPU has
+/// it, and gives the machine's `boot::Kernel`, which holds what the `boot::Machine` held.
+fn exit_services(mut lo: Lowering, mut fx: Fx, supply: Supply)
+    waive length "the final memory map, the end of boot services and the switch to the entry root, in order"
+{
+    let machine = supply.param(0).address_value()
+    let table = system_table(mut lo, mut fx)
+    let services = mut fx.load(PTR, addr: table, offset: BOOT_SERVICES)
+    let get_map = mut fx.load(PTR, addr: services, offset: GET_MEMORY_MAP)
+    let exit = mut fx.load(PTR, addr: services, offset: EXIT_BOOT_SERVICES)
+    let size = mut fx.slot(8, align: 8)
+    let key = mut fx.slot(8, align: 8)
+    let stride = mut fx.slot(8, align: 8)
+    let version = mut fx.slot(8, align: 8)
+    let platform_state = mut lo.state(mut fx)
+    let image = mut fx.load(PTR, addr: platform_state, offset: STATE_PLATFORM)
+    let zero_value = mut fx.ptr(0)
+    let ended = mut fx.repeat(Array[clif::Value, 2].filled(zero_value).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 1
+        let map = current[0]
+        let room = current[1]
+        mut fx1.store(room, addr: size, offset: 0)
+        var map_args = Array[clif::Value, 5].filled(size)
+        map_args[1] = map
+        map_args[2] = key
+        map_args[3] = stride
+        map_args[4] = version
+        let status = win64_call(mut fx1, code: get_map, args: map_args.view())
+        let short = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: EFI_BUFFER_TOO_SMALL)
+        var results = Array[clif::Type, 3].filled(PTR)
+        results[2] = clif::Type.Int8
+        let next = mut fx1.choose_in(mut lo, condition: short, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            mut lo2.record_free(mut fx2, address: map)
+            let needed = mut fx2.load(PTR, addr: size, offset: 0)
+            let described = mut fx2.load(PTR, addr: stride, offset: 0)
+            let slack = mut fx2.b.imul_imm_s(described, y: MAP_SLACK)
+            let grown_room = mut fx2.b.iadd(needed, y: slack)
+            let grown_map = mut lo2.record_alloc(mut fx2, size: grown_room)
+            let missing = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: grown_map, y: 0)
+            mut fx2.if_true(missing, then: fn[mut lo2](mut fx3: Fx) {
+                raise_kind(mut lo2, fx: mut fx3, kind: "trap.exhausted")
+            })
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(grown_map)
+            mut produced.push(grown_room)
+            mut produced.push(mut fx2.int(clif::Type.Int8, value: 1))
+            return produced
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let current_key = mut fx2.load(PTR, addr: key, offset: 0)
+            var exit_args = Array[clif::Value, 2].filled(image)
+            exit_args[1] = current_key
+            let exit_status = win64_call(mut fx2, code: exit, args: exit_args.view())
+            let refused = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: exit_status, y: EFI_SUCCESS)
+            var produced = mem::List[clif::Value].empty(fx2.alloc)
+            mut produced.push(map)
+            mut produced.push(room)
+            mut produced.push(refused)
+            return produced
+        })
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(next[0])
+        mut state.push(next[1])
+        return Pass(again: next[2], next: take state)
+    })
+    let map = ended[0]
+    discard mut lo.call_stub(mut fx, stub: Stub.Cli, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(map, addr: state_address, offset: STATE_MEMORY_MAP)
+    let used = mut fx.load(PTR, addr: size, offset: 0)
+    mut fx.store(used, addr: state_address, offset: STATE_MAP_SIZE)
+    let described = mut fx.load(PTR, addr: stride, offset: 0)
+    mut fx.store(described, addr: state_address, offset: STATE_MAP_STRIDE)
+    let root_data = mut lo.entry_root()
+    let root = mut lo.data_address(mut fx, id: root_data)
+    discard mut lo.call_stub(mut fx, stub: Stub.WriteCr3, args: Array[clif::Value, 1].filled(root).view())
+    let boot = mut lo.cpu_records(mut fx)
+    mut lo.load_cpu_tables(mut fx, record: boot)
+    mut lo.enable_avx(mut fx, record: boot)
+    let Some(kernel) = supply.sret else {
+        expect false
+        return
+    }
+    let Some(grant) = supply.owner else {
+        expect false
+        return
+    }
+    let laid = mut lo.layout_of(grant)
+    mut lo.copy(mut fx, dst: kernel, src: machine, size: laid.contents().size, align: laid.contents().align)
+    supply.ret(mut lo, mut fx, held: Held.Address(kernel))
+} exit_services
+
+/// The system table the program entry seam recorded.
+fn system_table(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    return mut fx.load(PTR, addr: state_address, offset: STATE_PLATFORM_TABLE)
+} system_table
+
+/// The address of a GUID in the image's read-only data.
+fn firmware_guid(mut lo: Lowering, mut fx: Fx, octets: Slice[u8]) -> clif::Value {
+    let literal = mut lo.view_literal(mut fx, contents: octets)
+    return mut fx.load(PTR, addr: literal.address_value(), offset: 0)
+} firmware_guid
+
+/// A NUL-terminated UTF-16 text in a runtime record, built from the UTF-8 text of `len` bytes at
+/// `start`: a code point above U+FFFF as its surrogate pair, any other as the code unit given to
+/// `put`. The service fails with `OutOfMemory` when no record can be drawn.
+fn utf16(mut lo: Lowering, mut fx: Fx, supply: Supply, start: clif::Value, len: clif::Value, put: fn(mut fx: Fx, unit: clif::Value, written: clif::Variable, units: clif::Value)) -> clif::Value {
+    let doubled = mut fx.b.imul_imm_s(len, y: 4)
+    let room = mut fx.b.iadd_imm_s(doubled, y: 4)
+    let units = mut lo.record_alloc(mut fx, size: room)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: units, y: 0)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "OutOfMemory")
+    })
+    let zero_value = mut fx.ptr(0)
+    let written = mut fx.variable(PTR, initial: zero_value)
+    let any = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: len, y: 0)
+    mut fx.if_true(any, then: fn(mut fx1: Fx) {
+        discard mut fx1.repeat(Array[clif::Value, 1].filled(zero_value).view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() > 0
+            let place = mut fx2.b.iadd(start, y: current[0])
+            let head_byte = mut fx2.load(clif::Type.Int8, addr: place, offset: 0)
+            let head = mut fx2.b.uextend(PTR, x: head_byte)
+            let decoded = decode_utf8(mut fx2, place, head)
+            let paired = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: decoded.point, y: 0x1_0000)
+            discard mut fx2.choose(paired, results: mem::List[clif::Type].empty(fx2.alloc).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let offset = mut fx3.b.iadd_imm_s(decoded.point, y: -0x1_0000)
+                let high_bits = mut fx3.b.ushr_imm_s(offset, y: 10)
+                let high = mut fx3.b.iadd_imm_s(high_bits, y: 0xD800)
+                let low_bits = mut fx3.b.band_imm_s(offset, y: 0x3FF)
+                let low = mut fx3.b.iadd_imm_s(low_bits, y: 0xDC00)
+                var surrogates = Array[clif::Value, 2].filled(high)
+                surrogates[1] = low
+                for surrogate in surrogates {
+                    let unit = mut fx3.b.ireduce(clif::Type.Int16, x: surrogate)
+                    put_unit(mut fx3, units, written, unit)
+                }
+                return mem::List[clif::Value].empty(fx3.alloc)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let unit = mut fx3.b.ireduce(clif::Type.Int16, x: decoded.point)
+                put(mut fx3, unit, written, units)
+                return mem::List[clif::Value].empty(fx3.alloc)
+            })
+            let next = mut fx2.b.iadd(current[0], y: decoded.len)
+            let more = mut fx2.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: len)
+            var state = mem::List[clif::Value].empty(fx2.alloc)
+            mut state.push(next)
+            return Pass(again: more, next: take state)
+        })
+    })
+    let nul = mut fx.int(clif::Type.Int16, value: 0)
+    put_unit(mut fx, units, written, unit: nul)
+    return units
+} utf16
+
+/// Appends a UTF-16 code unit to a buffer, advancing the count held in a variable.
+fn put_unit(mut fx: Fx, units: clif::Value, written: clif::Variable, unit: clif::Value) {
+    let at = mut fx.b.use_var(written)
+    let offset = mut fx.b.imul_imm_s(at, y: 2)
+    let slot = mut fx.b.iadd(units, y: offset)
+    mut fx.b.store(clif::MemFlags.unaligned(), x: unit, p: slot, offset: 0)
+    let next = mut fx.b.iadd_imm_s(at, y: 1)
+    mut fx.b.def_var(written, val: next)
+} put_unit
+
+/// Closes file protocol handles.
+fn firmware_close(mut fx: Fx, opened: Slice[clif::Value]) {
+    for handle in opened {
+        let close = mut fx.load(PTR, addr: handle, offset: FILE_CLOSE)
+        discard win64_call(mut fx, code: close, args: Array[clif::Value, 1].filled(handle).view())
+    }
+} firmware_close
+
+/// Fails the service with the error a status names when it is an error, after `cleanup`:
+/// `NotFound` for `EFI_NOT_FOUND`, `OutOfMemory` for `EFI_OUT_OF_RESOURCES` and `DeviceError` for
+/// any other error.
+fn fail_unless(mut lo: Lowering, mut fx: Fx, supply: Supply, status: clif::Value, cleanup: fn(mut lo: Lowering, mut fx: Fx)) {
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: status, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        cleanup(mut lo, fx: mut fx1)
+        let not_found = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: EFI_NOT_FOUND)
+        mut fx1.if_true(not_found, then: fn[mut lo](mut fx2: Fx) {
+            fail_with(mut lo, fx: mut fx2, supply, variant: "NotFound")
+        })
+        let exhausted = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: status, y: EFI_OUT_OF_RESOURCES)
+        mut fx1.if_true(exhausted, then: fn[mut lo](mut fx2: Fx) {
+            fail_with(mut lo, fx: mut fx2, supply, variant: "OutOfMemory")
+        })
+        fail_with(mut lo, fx: mut fx1, supply, variant: "DeviceError")
+    })
+} fail_unless
+
+/// Calls a firmware function at an address under the Microsoft x64 convention, giving its
+/// status. The firmware runs on the boot stack, outside the task-stack accounting, as a stub
+/// does.
+fn win64_call(mut fx: Fx, code: clif::Value, args: Slice[clif::Value]) -> clif::Value {
+    var signature = clif::Signature.new(clif::CallConv.WindowsFastcall, alloc: fx.alloc)
+    for _ in 0..<args.len() {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: PTR))
+    let sig_ref = mut fx.b.import_signature(take signature)
+    let firmware_call = mut fx.b.call_indirect(sig_ref, callee: code, args)
+    mut fx.sites.push(CallSite(inst: firmware_call, site: Site(kind: StackKind.Stub, at: None)))
+    let results = fx.b.inst_results(firmware_call, alloc: fx.alloc)
+    expect results.len() > 0
+    return results[0]
+} win64_call

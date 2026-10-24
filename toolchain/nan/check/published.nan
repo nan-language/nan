@@ -1,0 +1,112 @@
+//! What a publish summary records of a package under each target it declares: the capability methods each exported function reaches with its trap sites, and the package's authority summary.
+
+/// The trap kind of an obligation kept as a run-time check.
+proj fn Obligation.trap_kind(self) -> Str {
+    return match self {
+        Obligation.Check(nir::CheckKind.Requires) => "trap.requires"
+        Obligation.Check(nir::CheckKind.Ensures) => "trap.ensures"
+        Obligation.Check(nir::CheckKind.Predicate) => "trap.predicate"
+        Obligation.Check(nir::CheckKind.Expect) or Obligation.Check(nir::CheckKind.Invariant) or Obligation.Check(nir::CheckKind.Decreases) => "trap.expect"
+        Obligation.Overflow => "trap.overflow"
+        Obligation.DivisionByZero => "trap.division-by-zero"
+        Obligation.Shift => "trap.shift"
+        Obligation.Conversion => "trap.conversion"
+        Obligation.Bounds => "trap.bounds"
+    }
+} Obligation.trap_kind
+
+/// The function summaries and authority summary a publish summary records of a package.
+pkg struct PublishSummaries {
+    pkg functions: mem::List[store::FunctionSummary]
+    pkg authority: mem::List[text::String]
+} PublishSummaries
+
+/// The function summaries and authority summary of a closure's workspace package: per exported
+/// function and target, the capability methods it reaches and its kept checks; and each entry of
+/// its authority summary as a lock writes it.
+pkg fn Session.publish_summaries(self, closure: workspace::Closure, package_index: usize) -> PublishSummaries {
+    let alloc = self.alloc
+    let Some(source) = self.workspace.contents().packages.get(package_index) else {
+        expect false
+        return PublishSummaries(functions: mem::List[store::FunctionSummary].empty(alloc), authority: mem::List[text::String].empty(alloc))
+    }
+    let package_name = match source.name() {
+        Some(name) => name
+        None => ""
+    }
+    let grammar = self.grammar.contents()
+    var functions = mem::List[store::FunctionSummary].empty(alloc)
+    var authority = mem::Set[text::String].empty(alloc)
+    for target in check_targets(source, alloc) {
+        let checker = self.checked(closure, target)
+        let Some(package_id) = checker.package_named(package_name) else {
+            continue
+        }
+        for entry in take checker.authority_summary(package_id) {
+            discard mut authority.insert(entry.written(grammar, alloc))
+        }
+        let db = checker.db()
+        for module in db.package_data(package_id).modules {
+            for item in db.module(module).items {
+                match checker.function_summary(item, target) {
+                    Some(summary) => mut functions.push(take summary)
+                    None => {}
+                }
+            }
+        }
+    }
+    mut functions.sort_by(fn(left: store::FunctionSummary, right: store::FunctionSummary) => summary_order(left, right))
+    var written = mem::List[text::String].empty(alloc)
+    for entry in take authority {
+        mut written.push(take entry)
+    }
+    return PublishSummaries(functions: take functions, authority: take written)
+} Session.publish_summaries
+
+/// The summary of an exported function under a checker's target; none for another item.
+fn Checker.function_summary(self, item: ty::ItemId, target: workspace::Target) -> Option[store::FunctionSummary] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let declared = db.ast(item)
+    let ast::ItemKind.Fn(_) = declared.kind else {
+        return None
+    }
+    if declared.visibility != ast::Visibility.Pub {
+        return None
+    }
+    var methods = mem::List[text::String].empty(alloc)
+    for method in take self.methods_reached(item) {
+        mut methods.push(db.canonical(method))
+    }
+    mut methods.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    var distinct = mem::List[text::String].empty(alloc)
+    for method in take methods {
+        let count = distinct.len()
+        if count > 0 and distinct[count - 1].as_str() == method.as_str() {
+            continue
+        }
+        mut distinct.push(take method)
+    }
+    let path = db.item_file(item).path.as_str()
+    var traps = mem::List[store::TrapSite].empty(alloc)
+    for site in self.obligations(item).contents() {
+        if site.status != Status.Checked or site.role.is_contract() {
+            continue
+        }
+        mut traps.push(store::TrapSite(kind: text::String.of(site.obligation.trap_kind(), alloc), path: text::String.of(path, alloc), line: db.line(item, token: site.span.head)))
+    }
+    let canonical = match self.canonical_path(item) {
+        Some(known) => known
+        None => text::String.empty(alloc)
+    }
+    return Some(store::FunctionSummary(path: take canonical, target: text::String.of(target.name(), alloc), methods: take distinct, traps: take traps))
+} Checker.function_summary
+
+/// The order of function summaries by path, then target.
+fn summary_order(left: store::FunctionSummary, right: store::FunctionSummary) -> core::Ordering {
+    let by_path = left.path.as_str().cmp(right.path.as_str())
+    if by_path != core::Ordering.Equal {
+        return by_path
+    }
+    return left.target.as_str().cmp(right.target.as_str())
+} summary_order

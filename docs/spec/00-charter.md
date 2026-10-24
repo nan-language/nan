@@ -407,6 +407,7 @@ Each term links to its home, whose definition governs.
 | [module](03-packages-modules.md#modules) | Directory of sources sharing a namespace. |
 | [move](07-ownership.md#ownership) | Transfer of ownership. |
 | [named conversion](09-numbers.md#conversions) | Built-in function changing a value's type, as `T.fit(x)`. |
+| [NaN toolchain](38-self-hosting.md#nan-toolchain) | Toolchain written in NaN, checked against the bootstrap once it builds itself. |
 | [nanbench](37-evolution.md#nanbench) | Benchmark gating language versions. |
 | [niche](04-types.md#niches) | Bit pattern a type never holds. |
 | [NIR](19-nir.md#nir) | Specified checked intermediate representation. |

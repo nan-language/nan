@@ -175,24 +175,16 @@ fn Checker.member_candidates(self, module: ty::ModuleId, ty: ty::Ty) -> mem::Lis
 /// The candidates near a written name, closest first: those within a third of the length of the
 /// longer folded form, at most as many as a diagnostic lists.
 fn near_candidates(written: Str, take candidates: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    let ranker = Ranker.of(written, alloc)
     var near = mem::List[NearCandidate].empty(alloc)
-    let folded = fold_path(written, alloc).as_str().char_count()
     for candidate in take candidates {
         if candidate.as_str() == written {
             continue
         }
-        let distance = name_distance(written, candidate: candidate.as_str(), alloc)
-        var longer = fold_path(candidate.as_str(), alloc).as_str().char_count()
-        if folded > longer {
-            longer = folded
+        let Some(distance) = ranker.distance_within(candidate.as_str(), alloc) else {
+            continue
         }
-        var third = longer / 3
-        if longer % 3 > 0 {
-            third += 1
-        }
-        if distance <= third {
-            mut near.push(NearCandidate(distance: distance, candidate: take candidate))
-        }
+        mut near.push(NearCandidate(distance: distance, candidate: take candidate))
     }
     mut near.sort_by(fn(left: NearCandidate, right: NearCandidate) => near_order(left, right))
     var listed = mem::List[text::String].empty(alloc)
@@ -235,16 +227,50 @@ fn fold_path(path: Str, alloc: mem::Alloc) -> text::String {
     return folded
 } fold_path
 
-/// The distance between a use and a candidate: 0 when replacing a run of the use's words that
-/// the controlled vocabulary lists as a synonym by its verb gives the candidate, and otherwise the
-/// fewest insertions, deletions, substitutions and transpositions of adjacent characters turning
-/// one folded form into the other, no character edited twice.
-fn name_distance(written: Str, candidate: Str, alloc: mem::Alloc) -> usize {
-    if synonym_of(written, candidate, alloc) {
-        return 0
+/// A written name compared with candidates: its folded form and the names that replacing a run of
+/// its words that the controlled vocabulary lists as a synonym by its verb gives.
+struct Ranker {
+    folded: mem::List[char]
+    synonyms: mem::List[text::String]
+} Ranker
+
+fn Ranker.of(written: Str, alloc: mem::Alloc) -> Ranker {
+    return Ranker(folded: chars_of(fold_path(written, alloc).as_str(), alloc), synonyms: synonym_replacements(written, alloc))
+} Ranker.of
+
+/// The distance to a candidate when it is within a third of the length of the longer folded
+/// form: 0 when a synonym's replacement gives the candidate, and otherwise the fewest edits
+/// turning one folded form into the other.
+fn Ranker.distance_within(self, candidate: Str, alloc: mem::Alloc) -> Option[usize] {
+    let other = chars_of(fold_path(candidate, alloc).as_str(), alloc)
+    var longer = self.folded.len()
+    var shorter = other.len()
+    if shorter > longer {
+        longer = other.len()
+        shorter = self.folded.len()
     }
-    let left = chars_of(fold_path(written, alloc).as_str(), alloc)
-    let right = chars_of(fold_path(candidate, alloc).as_str(), alloc)
+    var bound = longer / 3
+    if longer % 3 > 0 {
+        bound += 1
+    }
+    for synonym in self.synonyms {
+        if synonym.as_str() == candidate {
+            return Some(0)
+        }
+    }
+    if longer - shorter > bound {
+        return None
+    }
+    let distance = edit_distance(self.folded.view(), right: other.view(), alloc)
+    if distance > bound {
+        return None
+    }
+    return Some(distance)
+} Ranker.distance_within
+
+/// The fewest insertions, deletions, substitutions and transpositions of adjacent characters
+/// turning one text into the other, no character edited twice.
+fn edit_distance(left: Slice[char], right: Slice[char], alloc: mem::Alloc) -> usize {
     var before = mem::List[usize].empty(alloc)
     var above = mem::List[usize].empty(alloc)
     for other in 0..=right.len() {
@@ -278,7 +304,7 @@ fn name_distance(written: Str, candidate: Str, alloc: mem::Alloc) -> usize {
     }
     expect above.len() > right.len()
     return above[right.len()]
-} name_distance
+} edit_distance
 
 /// A candidate near a written name, with its distance.
 struct NearCandidate {
@@ -312,9 +338,10 @@ fn chars_of(written: Str, alloc: mem::Alloc) -> mem::List[char] {
     return chars
 } chars_of
 
-/// Whether replacing a run of a written name's `_`-separated words that the controlled
-/// vocabulary lists as a synonym by its verb gives the candidate.
-fn synonym_of(written: Str, candidate: Str, alloc: mem::Alloc) -> bool {
+/// The names that replacing a run of a written name's `_`-separated words that the controlled
+/// vocabulary lists as a synonym by its verb gives.
+fn synonym_replacements(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var replacements = mem::List[text::String].empty(alloc)
     let bytes = written.as_bytes()
     var starts = mem::List[usize].empty(alloc)
     var ends = mem::List[usize].empty(alloc)
@@ -333,17 +360,15 @@ fn synonym_of(written: Str, candidate: Str, alloc: mem::Alloc) -> bool {
             let Some(run) = written.slice_bytes(starts[head], end: ends[last]) else {
                 continue
             }
-            if synonym_replaced(written, run_start: starts[head], run_end: ends[last], run, candidate, alloc) {
-                return true
-            }
+            push_replacements(mut replacements, written, run_start: starts[head], run_end: ends[last], run, alloc)
         }
     }
-    return false
-} synonym_of
+    return replacements
+} synonym_replacements
 
-/// Whether replacing the run of a written name at `run_start..run_end` by the verb of the
-/// vocabulary entry listing it as a synonym gives the candidate.
-fn synonym_replaced(written: Str, run_start: usize, run_end: usize, run: Str, candidate: Str, alloc: mem::Alloc) -> bool {
+/// Pushes the name that replacing the run of a written name at `run_start..run_end` by the verb
+/// of each vocabulary entry listing it as a synonym gives.
+fn push_replacements(mut replacements: mem::List[text::String], written: Str, run_start: usize, run_end: usize, run: Str, alloc: mem::Alloc) {
     for entry in Words(list: SYNONYMS, at: 0) {
         let bytes = entry.as_bytes()
         var equals: usize = 0
@@ -369,12 +394,9 @@ fn synonym_replaced(written: Str, run_start: usize, run_end: usize, run: Str, ca
         var replaced = text::String.of(before, alloc)
         mut replaced.append(verb)
         mut replaced.append(after)
-        if replaced.as_str() == candidate {
-            return true
-        }
+        mut replacements.push(take replaced)
     }
-    return false
-} synonym_replaced
+} push_replacements
 
 /// Whether a comma-separated list of synonyms holds one.
 fn lists_synonym(alternatives: Str, wanted: Str) -> bool {

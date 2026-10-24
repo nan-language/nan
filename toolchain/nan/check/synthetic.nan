@@ -1,0 +1,139 @@
+//! Functions a package's modules gain only to be checked, each judged by whether it checks without error and by the statuses of its obligation sites.
+
+/// A function to judge: the directory of the module it joins, its canonical path and its text.
+pkg struct Synthetic {
+    pkg dir: text::String
+    pkg path: text::String
+    pkg text: text::String
+} Synthetic
+
+/// A function of an item's module, named `name` there.
+pkg fn Synthetic.beside(ck: Checker, item: ty::ItemId, name: Str, take text: text::String) -> Synthetic {
+    let alloc = ck.alloc()
+    let db = ck.db()
+    let data = db.item(item)
+    let module = db.module(data.module)
+    let file = db.file(data.file).path.as_str()
+    var dir = text::String.empty(alloc)
+    match last_slash(file) {
+        Some(at) => {
+            match file.slice_bytes(0, end: at) {
+                Some(held) => {
+                    dir = text::String.of(held, alloc)
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    var path = text::String.of(db.package_data(module.package_id).name.as_str(), alloc)
+    mut path.append("::")
+    if not module.root {
+        mut path.append(module.name.as_str())
+        mut path.append("::")
+    }
+    mut path.append(name)
+    return Synthetic(dir: take dir, path: take path, text: take text)
+} Synthetic.beside
+
+/// The position of the last `/` of a path.
+fn last_slash(path: Str) -> Option[usize] {
+    let bytes = path.as_bytes()
+    for step in 0..<bytes.len() {
+        let at = bytes.len() - 1 - step
+        if bytes[at] == b'/' {
+            return Some(at)
+        }
+    }
+    return None
+} last_slash
+
+/// What checking a synthetic function gives: whether an error lies on its lines, and its
+/// obligation sites with their statuses.
+pkg struct Judged {
+    pkg failed: bool
+    pkg sites: mem::Shared[mem::List[Obligated]]
+} Judged
+
+/// Judges functions added to the modules of the workspace package at `index`, under the first
+/// target it is checked for: none for a function the check does not find.
+pkg fn Session.judge(self, index: usize, functions: Slice[Synthetic]) -> mem::List[Option[Judged]] {
+    let alloc = self.alloc
+    var judged = mem::List[Option[Judged]].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return judged
+    }
+    let Some(target) = check_targets(source, alloc).get(0) else {
+        return none_judged(functions.len(), alloc)
+    }
+    var sources = mem::Map[text::String, text::String].empty(alloc)
+    for function in functions {
+        var path = text::String.of(function.dir.as_str(), alloc)
+        mut path.append("/.judged.nan")
+        var written = match mut sources.remove(path) {
+            Some(known) => known
+            None => text::String.of("//! Judged functions.\n", alloc)
+        }
+        mut written.append(function.text.as_str())
+        discard mut sources.insert(take path, value: take written)
+    }
+    var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
+    for entry in take sources {
+        let mem::KeyValue(key: path, value: written) = entry
+        discard mut changed.insert(take path, value: take written.into_bytes())
+    }
+    let overlaid = held.overlaid(changed, grammar: self.grammar.contents(), alloc)
+    let session = Session.of(mem::Shared.of(take overlaid, alloc: alloc), std: self.std.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+    let Some(closure) = session.workspace.contents().closure_of(index) else {
+        return none_judged(functions.len(), alloc)
+    }
+    let checker = session.checked(closure, target)
+    let found = checker.found_diagnostics()
+    let db = checker.db()
+    var items = mem::Map[text::String, ty::ItemId].empty(alloc)
+    for position in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(position))
+        if not db.item_file(item).path.as_str().ends_with("/.judged.nan") {
+            continue
+        }
+        let Some(path) = checker.canonical_path(item) else {
+            continue
+        }
+        discard mut items.insert(take path, value: item)
+    }
+    for function in functions {
+        let Some(item) = items.get(function.path) else {
+            mut judged.push(None)
+            continue
+        }
+        mut judged.push(Some(Judged(failed: errs_on(found.view(), checker, item), sites: checker.obligations(item))))
+    }
+    return judged
+} Session.judge
+
+/// A judgement of none of `count` functions.
+fn none_judged(count: usize, alloc: mem::Alloc) -> mem::List[Option[Judged]] {
+    var judged = mem::List[Option[Judged]].empty(alloc)
+    for _ in 0..<count {
+        mut judged.push(None)
+    }
+    return judged
+} none_judged
+
+/// Whether an error among those found lies on the lines of an item.
+fn errs_on(found: Slice[diagnostic::Diagnostic], checker: Checker, item: ty::ItemId) -> bool {
+    let db = checker.db()
+    let syntax = db.syntax(item)
+    let data = db.item(item)
+    expect data.index < syntax.items.len()
+    let lines = syntax.item_lines(syntax.items[data.index])
+    let path = db.item_file(item).path.as_str()
+    for reported in found {
+        if errs_within(reported, path, lines) {
+            return true
+        }
+    }
+    return false
+} errs_on

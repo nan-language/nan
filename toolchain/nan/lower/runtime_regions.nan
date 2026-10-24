@@ -1,0 +1,170 @@
+//! Cancelling constructs: the region record of each task scope, `within` and `race` call and of the program's termination requests, which tasks run in; cancelling one, and the origin of a cancellation. A region record is the construct's id, which no other construct takes, the region enclosing it, whether it has cancelled, and its kind; a construct's own record follows. A task's region is the innermost one holding the call it runs. A cancellation's origin is the id of the outermost cancelled construct holding it, zero for none.
+
+const REGIONS_REGION_ID: u64 = 0
+
+const REGIONS_REGION_PARENT: u64 = 8
+
+const REGIONS_REGION_CANCELLED: u64 = 16
+
+/// What the construct waits on: the task to wake when its tasks end.
+const REGIONS_REGION_WAITER: u64 = 24
+
+/// The count of its tasks that have not ended.
+const REGIONS_REGION_LIVE: u64 = 32
+
+const REGIONS_REGION_SIZE: u64 = 40
+
+/// The value a waiting task's `IO` field holds while it waits at a cancellation point for
+/// something no kernel operation completes.
+const REGIONS_WAITING: i64 = 1
+
+fn regions_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let params = mut fx.entry()
+    match routine {
+        Routine.RegionOpen => {
+            expect params.len() > 0
+            let size = params[0]
+            let record = mut lo.record_alloc(mut fx, size)
+            let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: record, y: 0)
+            mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+                raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+            })
+            let state_address = mut lo.state(mut fx)
+            let counter = mut fx.offset(state_address, offset: STATE_REGIONS)
+            let one = mut fx.ptr(1)
+            let previous = fetch_add(mut fx, address: counter, amount: one)
+            let id = mut fx.b.iadd_imm_s(previous, y: 1)
+            mut fx.store(id, addr: record, offset: REGIONS_REGION_ID)
+            let current = current_task(mut lo, mut fx)
+            let parent = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+            mut fx.store(parent, addr: record, offset: REGIONS_REGION_PARENT)
+            mut fx.b.ret(fx.list1(record).view())
+        }
+        Routine.Cancel => {
+            expect params.len() > 0
+            regions_cancel(mut lo, mut fx, target: params[0])
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Origin => {
+            let current = current_task(mut lo, mut fx)
+            let region = mut fx.load(PTR, addr: current, offset: TASKS_TASK_REGION)
+            let origin = regions_origin(mut fx, region)
+            mut fx.b.ret(fx.list1(origin).view())
+        }
+        else => {
+            expect false
+        }
+    }
+} regions_define
+
+/// The id of the outermost cancelled construct among a region and those enclosing it, zero when
+/// none has cancelled.
+fn regions_origin(mut fx: Fx, region: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let walked = mut fx.repeat(fx.list2(region, b: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let found = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types2(PTR, b: PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let flag = mut fx2.offset(current, offset: REGIONS_REGION_CANCELLED)
+            let loaded = mut fx2.b.atomic_load(clif::Type.Int64, flags: clif::MemFlags.owned(), p: flag)
+            let cancelled = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: loaded, y: 0)
+            let id = mut fx2.load(PTR, addr: current, offset: REGIONS_REGION_ID)
+            let outermost = mut fx2.b.select(cancelled, x: id, y: found)
+            let parent = mut fx2.load(PTR, addr: current, offset: REGIONS_REGION_PARENT)
+            return fx2.list2(parent, b: outermost)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: found)
+        })
+        return Pass(again: present, next: take next)
+    })
+    return walked[1]
+} regions_origin
+
+/// Cancels the operation a task waits on in the region of `target`, claiming its record first
+/// so the task keeps it while the cancellation reads it; nothing when the task has left that
+/// operation, whatever operation it waits on since.
+fn cancel_claimed(mut lo: Lowering, mut fx: Fx, record: clif::Value, op: clif::Value, target: clif::Value) {
+    let word = mut fx.offset(record, offset: TASK_IO)
+    let claimed = mut fx.b.bor_imm_s(op, y: TASKS_CLAIMED)
+    let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: word, e: op, x: claimed)
+    let held = mut fx.b.icmp(clif::IntCC.Equal, x: seen, y: op)
+    mut fx.if_true(held, then: fn[mut lo](mut fx1: Fx) {
+        let region = mut fx1.load(PTR, addr: record, offset: TASKS_TASK_REGION)
+        let reached = regions_within(mut fx1, region, target)
+        mut fx1.if_true(reached, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.cancel_operation(mut fx2, op)
+        })
+        mut fx1.b.atomic_store(clif::MemFlags.owned(), x: op, p: word)
+    })
+} cancel_claimed
+
+/// Whether a region is `target` or lies within it.
+fn regions_within(mut fx: Fx, region: clif::Value, target: clif::Value) -> clif::Value {
+    let no = mut fx.int(clif::Type.Int8, value: 0)
+    let walked = mut fx.repeat(fx.list2(region, b: no).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let found = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: current, y: 0)
+        let next = mut fx1.choose(present, results: fx1.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: current, y: target)
+            let found_here = mut fx2.b.bor(found, y: same)
+            let parent = mut fx2.load(PTR, addr: current, offset: REGIONS_REGION_PARENT)
+            return fx2.list2(parent, b: found_here)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(current, b: found)
+        })
+        let open = mut fx1.b.bxor_imm_s(next[1], y: 1)
+        let again = mut fx1.b.band(present, y: open)
+        return Pass(again: again, next: take next)
+    })
+    return walked[1]
+} regions_within
+
+/// Cancels a construct once: every task in its region waiting at a cancellation point has its
+/// operation cancelled, or is woken when it waits for no operation.
+fn regions_cancel(mut lo: Lowering, mut fx: Fx, target: clif::Value) {
+    let flag = mut fx.offset(target, offset: REGIONS_REGION_CANCELLED)
+    let zero = mut fx.ptr(0)
+    let one = mut fx.ptr(1)
+    let previous = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero, x: one)
+    let first_cancel = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+    mut fx.if_true(first_cancel, then: fn[mut lo](mut fx1: Fx) {
+        let state_address = mut lo.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_TASKS_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let head = mut fx1.load(PTR, addr: state_address, offset: STATE_TASKS)
+        discard mut fx1.repeat(fx1.list1(head).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            expect state.len() > 0
+            let record = state[0]
+            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+            let next = mut fx2.choose_in(mut lo, condition: present, results: fx2.types1(PTR).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let waiting = mut fx3.load(PTR, addr: record, offset: TASK_IO)
+                let waits = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiting, y: 0)
+                let region = mut fx3.load(PTR, addr: record, offset: TASKS_TASK_REGION)
+                let held = regions_within(mut fx3, region, target)
+                let reached = mut fx3.b.band(waits, y: held)
+                mut fx3.if_true(reached, then: fn[mut lo3](mut fx4: Fx) {
+                    let plain = mut fx4.b.icmp_imm_s(clif::IntCC.Equal, x: waiting, y: REGIONS_WAITING)
+                    discard mut fx4.choose_in(mut lo3, condition: plain, results: mem::List[clif::Type].empty(fx4.alloc).view(), then: fn(mut lo5: Lowering, mut fx5: Fx) -> mem::List[clif::Value] {
+                        tasks_wake(mut lo5, fx: mut fx5, record)
+                        return mem::List[clif::Value].empty(fx5.alloc)
+                    }, otherwise: fn(mut lo5: Lowering, mut fx5: Fx) -> mem::List[clif::Value] {
+                        cancel_claimed(mut lo5, fx: mut fx5, record, op: waiting, target)
+                        return mem::List[clif::Value].empty(fx5.alloc)
+                    })
+                })
+                let following = mut fx3.load(PTR, addr: record, offset: TASK_ALL_NEXT)
+                return fx3.list1(following)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let ended = mut fx3.ptr(0)
+                return fx3.list1(ended)
+            })
+            let more = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: next[0], y: 0)
+            return Pass(again: more, next: take next)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+    })
+} regions_cancel

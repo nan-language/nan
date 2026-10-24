@@ -1,0 +1,139 @@
+//! Storage whose elements never move, for the stores that give parts through a read receiver: segment k holds 4 × 2^k elements and is drawn through the allocator when first needed. Its header, in runtime memory, is its length, its allocator handle, each segment's address, the lock its insertions hold, and for a once map its seed and its hash index's table record; reads by position take no lock, an element being written before the length grows past it.
+
+const SEGMENTS_LEN: u64 = 0
+
+const SEGMENTS_ALLOC: u64 = 8
+
+const SEGMENTS: u64 = 16
+
+const SEGMENTS_COUNT: u64 = 58
+
+const SEGMENTS_LOCK: u64 = SEGMENTS + 8 * SEGMENTS_COUNT
+
+const SEGMENTS_SEED: u64 = SEGMENTS_LOCK + 8
+
+const SEGMENTS_INDEX: u64 = SEGMENTS_SEED + 8
+
+const SEGMENTS_SIZE: u64 = SEGMENTS_INDEX + 16
+
+/// A new empty header drawing through an allocator handle.
+fn segments_header(mut lo: Lowering, mut fx: Fx, alloc: clif::Value) -> clif::Value {
+    let size = mut fx.ptr(SEGMENTS_SIZE)
+    let header = mut lo.record_alloc(mut fx, size)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: header, y: 0)
+    mut fx.if_true(failed, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    mut fx.store(alloc, addr: header, offset: SEGMENTS_ALLOC)
+    return header
+} segments_header
+
+/// The segment holding element `index`.
+fn segment_of(mut fx: Fx, index: clif::Value) -> clif::Value {
+    let quarter = mut fx.b.ushr_imm_s(index, y: 2)
+    let q = mut fx.b.iadd_imm_s(quarter, y: 1)
+    let zeros = mut fx.b.clz(q)
+    let top = mut fx.ptr(63)
+    return mut fx.b.isub(top, y: zeros)
+} segment_of
+
+/// The address of element `index`, in a segment already drawn.
+fn segments_at(mut fx: Fx, header: clif::Value, index: clif::Value, element: Element) -> clif::Value {
+    let segment = segment_of(mut fx, index)
+    let one = mut fx.ptr(1)
+    let size = mut fx.b.ishl(one, y: segment)
+    let last = mut fx.b.iadd_imm_s(size, y: -1)
+    let before = mut fx.b.ishl_imm_s(last, y: 2)
+    let position = mut fx.b.isub(index, y: before)
+    let offset = mut fx.b.ishl_imm_s(segment, y: 3)
+    let slot = mut fx.b.iadd(header, y: offset)
+    let base = mut fx.load(PTR, addr: slot, offset: SEGMENTS)
+    return element.at(mut fx, data: base, index: position)
+} segments_at
+
+/// Makes room for one more element: nonzero when there is room, zero on exhaustion.
+fn reserve_one(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: Element) -> clif::Value {
+    let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+    let segment = segment_of(mut fx, index: len)
+    let offset = mut fx.b.ishl_imm_s(segment, y: 3)
+    let slot = mut fx.b.iadd(header, y: offset)
+    let base = mut fx.load(PTR, addr: slot, offset: SEGMENTS)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: 0)
+    let results = fx.types1(clif::Type.Int8)
+    let room = mut fx.choose(missing, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        let segment_size = mut fx1.b.ishl(one, y: segment)
+        let count = mut fx1.b.ishl_imm_s(segment_size, y: 2)
+        let wanted = element.bytes(mut fx1, count)
+        let bytes = mut fx1.b.umax(wanted, y: one)
+        let alloc = mut fx1.load(PTR, addr: header, offset: SEGMENTS_ALLOC)
+        let align = mut fx1.ptr(element.align)
+        let alloc_args = fx1.list3(alloc, b: bytes, c: align)
+        let drawn_values = mut lo.call_routine(mut fx1, routine: Routine.Alloc, args: alloc_args.view())
+        expect drawn_values.len() == 1
+        let drawn = drawn_values[0]
+        mut fx1.store(drawn, addr: slot, offset: SEGMENTS)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: drawn, y: 0)
+        return fx1.list1(present)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(held)
+    })
+    expect room.len() == 1
+    return room[0]
+} reserve_one
+
+/// Releases every element, the segments and the header.
+fn segments_release(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: ty::Ty) {
+    let shape = Element.of(mut lo, ty: element)
+    if mut lo.needs_release(element) {
+        let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+        let zero = mut fx.ptr(0)
+        mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+            let address = segments_at(mut fx1, header, index, element: shape)
+            mut lo.release(mut fx1, ty: element, address)
+        })
+    }
+    let zero = mut fx.ptr(0)
+    let count = mut fx.ptr(SEGMENTS_COUNT)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, segment: clif::Value) {
+        let offset = mut fx1.b.ishl_imm_s(segment, y: 3)
+        let slot = mut fx1.b.iadd(header, y: offset)
+        let base = mut fx1.load(PTR, addr: slot, offset: SEGMENTS)
+        let drawn = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+        mut fx1.if_true(drawn, then: fn[mut lo](mut fx2: Fx) {
+            let free_args = fx2.list1(base)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Free, args: free_args.view())
+        })
+    })
+    mut lo.record_free(mut fx, address: header)
+} segments_release
+
+/// Moves every element and the segments into another domain's reach.
+fn segments_transfer(mut lo: Lowering, mut fx: Fx, header: clif::Value, element: ty::Ty, lift: clif::Value, owner: clif::Value) {
+    let shape = Element.of(mut lo, ty: element)
+    if mut lo.transfers(element) {
+        let len = mut fx.load(PTR, addr: header, offset: SEGMENTS_LEN)
+        let zero = mut fx.ptr(0)
+        mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+            let address = segments_at(mut fx1, header, index, element: shape)
+            mut lo.transfer(mut fx1, ty: element, address, lift, owner)
+        })
+    }
+    let zero = mut fx.ptr(0)
+    let count = mut fx.ptr(SEGMENTS_COUNT)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, segment: clif::Value) {
+        let offset = mut fx1.b.ishl_imm_s(segment, y: 3)
+        let slot = mut fx1.b.iadd(header, y: offset)
+        let base = mut fx1.load(PTR, addr: slot, offset: SEGMENTS)
+        let drawn = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+        mut fx1.if_true(drawn, then: fn[mut lo](mut fx2: Fx) {
+            discard transfer_lift(mut lo, fx: mut fx2, address: base, lift)
+        })
+    })
+} segments_transfer
+
+/// The allocator handle the storage draws through.
+fn segments_allocator(mut fx: Fx, header: clif::Value) -> clif::Value {
+    return mut fx.load(PTR, addr: header, offset: SEGMENTS_ALLOC)
+} segments_allocator

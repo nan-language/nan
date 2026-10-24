@@ -45,6 +45,8 @@ const DT_REG: u8 = 8
 
 const DT_LNK: u8 = 10
 
+const STDIN: i32 = 0
+
 const STDOUT: i32 = 1
 
 /// The bytes a read asks for at least, before the file's size is known.
@@ -118,6 +120,8 @@ foreign fn readdir(dir: hw::Ptr[u8]) -> hw::Ptr[Dirent] convention "sysv"
 foreign fn closedir(dir: hw::Ptr[u8]) -> i32 convention "sysv"
 
 foreign fn getcwd(buf: hw::Ptr[u8], size: usize) -> hw::Ptr[u8] convention "sysv"
+
+foreign fn realpath(path: hw::Ptr[u8], resolved: hw::Ptr[u8]) -> hw::Ptr[u8] convention "sysv"
 
 /// What kind of file a path names.
 pkg enum FileKind derives Copy, Eq {
@@ -226,8 +230,18 @@ pkg fn File.unlock(self) fails IoError {
 
 /// The rest of the file from its position.
 pkg fn File.read_to_end(self, alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    return try read_all(self.fd, alloc)
+} File.read_to_end
+
+/// What standard input holds up to its end.
+pkg fn read_stdin(alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    return try read_all(STDIN, alloc)
+} read_stdin
+
+/// The rest of an open descriptor's file from its position.
+fn read_all(fd: i32, alloc: mem::Alloc) -> mem::Bytes fails IoError {
     var room = READ_CHUNK
-    let held = fd_status(self.fd)
+    let held = fd_status(fd)
     if held.size > 0 {
         room = usize.fit(held.size) + 1
     }
@@ -239,7 +253,7 @@ pkg fn File.read_to_end(self, alloc: mem::Alloc) -> mem::Bytes fails IoError {
             mut data.append(extra.view())
         }
         let start = hw::Ptr.of_view_mut(mut data.view_mut())
-        let count = trusted "start addresses the len bytes of data, of which filled are behind" { read(self.fd, buf: start.offset(isize.fit(filled)), count: data.len() - filled) }
+        let count = trusted "start addresses the len bytes of data, of which filled are behind" { read(fd, buf: start.offset(isize.fit(filled)), count: data.len() - filled) }
         if count == 0 {
             mut data.truncate(filled)
             return data
@@ -253,7 +267,7 @@ pkg fn File.read_to_end(self, alloc: mem::Alloc) -> mem::Bytes fails IoError {
             fail error_of(code)
         }
     }
-} File.read_to_end
+} read_all
 
 /// The status of an open file, all zero when the system gives none.
 fn fd_status(fd: i32) -> Stat {
@@ -546,3 +560,20 @@ pkg fn current_dir(alloc: mem::Alloc) -> mem::Bytes fails IoError {
         size = size * 2
     }
 } current_dir
+
+/// The absolute path naming what a path names, once every symbolic link and every `.` and `..`
+/// component is resolved; `InvalidData` when it is not well-formed UTF-8.
+pkg fn canonicalize(path: Str, alloc: mem::Alloc) -> text::String fails IoError {
+    let name = try c_text(path.as_bytes())
+    var buffer = mem::Bytes.zeroed(PATH_MAX, alloc)
+    let start = hw::Ptr.of_view_mut(mut buffer.view_mut())
+    let found = trusted "name holds a NUL-terminated path and start addresses PATH_MAX bytes" { realpath(hw::Ptr.of_view(name.bytes.view()), resolved: start) }
+    if found.addr() == 0 {
+        fail last_error()
+    }
+    let resolved = copied_text(start, alloc)
+    let Ok(written) = attempt text::String.try_from_utf8(resolved.view(), alloc) else {
+        fail IoError.InvalidData
+    }
+    return written
+} canonicalize

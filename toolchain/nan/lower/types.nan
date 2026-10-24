@@ -1,0 +1,310 @@
+//! The types lowering builds or inspects: std types by path, the wrapped form of projection results, tag values, layout bit fields, cancellation variants and closure environments.
+
+/// How a wrapped part holds its payloads: a mut projection's results hold its Copy payloads as
+/// parts too, writable places of the receiver.
+struct Wrap derives Copy, Eq {
+    writable: bool
+} Wrap
+
+/// The bits of a field of an integer layout: its first bit, the mask of its bits from there and
+/// its type.
+struct BitField derives Copy {
+    low: u32
+    mask: u64
+    ty: ty::Ty
+} BitField
+
+/// The size and alignment of a capture in a closure's environment.
+struct CaptureSize derives Copy {
+    size: u64
+    align: u64
+} CaptureSize
+
+/// A std type by its module path and name, with its arguments.
+fn Lowering.std_ty(self, module: Str, type_name: Str, take args: mem::List[ty::Ty]) -> ty::Ty {
+    var found = self.ck.db().std_item(module, name: type_name)
+    if found.is_none() and module == "core" {
+        found = self.ck.db().core_item(type_name)
+    }
+    let Some(item) = found else {
+        expect false
+        return ty::Ty.error()
+    }
+    var type_args = mem::List[ty::Arg].empty(self.alloc)
+    for arg in take args {
+        mut type_args.push(ty::Arg.Ty(arg))
+    }
+    return self.ck.types().item(item, args: take type_args)
+} Lowering.std_ty
+
+/// The root grant of the target lowered for.
+fn Lowering.root_grant(self) -> ty::Ty {
+    let Some(grant) = self.ck.db().target.root_grant() else {
+        expect false
+        return ty::Ty.error()
+    }
+    return self.std_ty(grant.module, type_name: grant.name, args: mem::List[ty::Ty].empty(self.alloc))
+} Lowering.root_grant
+
+fn Lowering.slice_of(self, element: ty::Ty) -> ty::Ty {
+    var args = mem::List[ty::Ty].empty(self.alloc)
+    mut args.push(element)
+    return self.std_ty("core", type_name: "Slice", take args)
+} Lowering.slice_of
+
+/// The type a wrapped part of an `Option` or `Result` is laid out as: each payload that is
+/// a part held as the part's address.
+fn Lowering.wrapped_type(self, ty: ty::Ty, wrap: Wrap) -> ty::Ty {
+    let types = self.ck.types()
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return ty
+    }
+    var wrapped = mem::List[ty::Arg].empty(self.alloc)
+    for arg in types.arg_list(args) {
+        match first arg {
+            ty::Arg.Ty(payload_ty) if self.is_part(payload_ty, wrap) => {
+                var pointed = mem::List[ty::Ty].empty(self.alloc)
+                mut pointed.push(payload_ty)
+                mut wrapped.push(ty::Arg.Ty(self.std_ty("hw", type_name: "Ptr", args: take pointed)))
+            }
+            else => {
+                mut wrapped.push(arg)
+            }
+        }
+    }
+    return types.item(item, args: take wrapped)
+} Lowering.wrapped_type
+
+/// Whether a payload of a wrapped part is a part, held by address: not a view, whose values
+/// a projection builds, nor Copy outside a mut projection's result, whose values are copied.
+fn Lowering.is_part(self, payload_ty: ty::Ty, wrap: Wrap) -> bool {
+    return not self.ck.nir_view(payload_ty) and (wrap.writable or not self.ck.nir_copy(payload_ty))
+} Lowering.is_part
+
+/// The value of a layout's tag, or the index of an enum's variant held in a register.
+fn Lowering.tag_value(self, ty: ty::Ty, variant: Str) -> u64 {
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        expect false
+        return 0
+    }
+    match self.ck.layout_shape(item) {
+        Some(check::LayoutShape.Tags(values)) => {
+            let sig = self.ck.sig(item)
+            match sig.contents().kind {
+                check::SigKind.Layout(fields: _, tags: tags, bits: _) => {
+                    let Some(index) = tag_position(tags.view(), variant) else {
+                        expect false
+                        return 0
+                    }
+                    expect index < values.len()
+                    return values[index]
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    let sig = self.ck.sig(item)
+    let check::SigKind.Enum(variants: variants) = sig.contents().kind else {
+        expect false
+        return 0
+    }
+    for index in 0..<variants.len() {
+        if variants[index].name.as_str() == variant {
+            return u64.widen(index)
+        }
+    }
+    expect false
+    return 0
+} Lowering.tag_value
+
+/// The position of a tag among a layout's tags, none when it has no such tag.
+fn tag_position(tags: Slice[text::String], variant: Str) -> Option[usize] {
+    for index in 0..<tags.len() {
+        if tags[index].as_str() == variant {
+            return Some(index)
+        }
+    }
+    return None
+} tag_position
+
+/// The bits of a field of an integer layout: its first bit, the mask of its bits from there
+/// and its type. A `rest` field holds every bit no other field covers.
+fn Lowering.bit_field(self, ty: ty::Ty, field_name: Str) -> BitField {
+    let missing = BitField(low: 0, mask: 0, ty: ty::Ty.error())
+    let ty::TyKind.Item(item: item, args: _) = self.ck.types().kind(ty) else {
+        expect false
+        return missing
+    }
+    let ast::ItemKind.Layout(laid) = self.ck.db().ast(item).kind else {
+        expect false
+        return missing
+    }
+    let Some(check::LayoutShape.Fields(bits)) = self.ck.layout_shape(item) else {
+        expect false
+        return missing
+    }
+    let sig = self.ck.sig(item)
+    let check::SigKind.Layout(fields: fields, tags: _, bits: _) = sig.contents().kind else {
+        expect false
+        return missing
+    }
+    let Some(index) = laid.fields.position(fn(declared: ast::LayoutField) => declared.name.text.as_str() == field_name) else {
+        expect false
+        return missing
+    }
+    expect index < bits.len() and index < fields.len()
+    let field = bits[index]
+    let field_ty = fields[index].ty
+    if field.kind != check::BitsKind.Rest {
+        return BitField(low: field.low, mask: width_mask(field.width), ty: field_ty)
+    }
+    var covered: u64 = 0
+    for other in bits {
+        if other.kind != check::BitsKind.Rest {
+            covered = covered | (width_mask(other.width) << other.low)
+        }
+    }
+    return BitField(low: 0, mask: width_mask(self.layout_width(ty)) & ~covered, ty: field_ty)
+} Lowering.bit_field
+
+fn Lowering.layout_width(self, ty: ty::Ty) -> u32 {
+    let Some(size) = self.layouts_peek(ty) else {
+        return 64
+    }
+    return size * 8
+} Lowering.layout_width
+
+fn Lowering.layouts_peek(self, ty: ty::Ty) -> Option[u32] {
+    let Some(size) = self.ck.fixed_size(ty) else {
+        return None
+    }
+    return Some(u32.truncate(size))
+} Lowering.layouts_peek
+
+/// The cancellation variant of a cancellable failure type: none inside for `task::Cancelled`
+/// itself, its variant's name for an enum with one; none outside for any other type.
+fn Lowering.cancellation_variant(self, ty: ty::Ty) -> Option[Option[text::String]] {
+    if self.ck.is_std(ty, path: "task::Cancelled") {
+        return Some(None)
+    }
+    let ty::TyKind.Item(item: item, args: args) = self.ck.types().kind(ty) else {
+        return None
+    }
+    let sig = self.ck.sig(item)
+    let check::SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return None
+    }
+    let params = check::generic_params(sig.contents().generics.view(), alloc: self.alloc)
+    let subst = ty::Subst.of(params.view(), args: self.ck.types().arg_list(args), alloc: self.alloc)
+    for variant in variants {
+        let check::Payload.Single(payload_ty) = variant.payload else {
+            continue
+        }
+        if variant.from and self.ck.is_std(subst.ty(self.ck.types(), ty: payload_ty), path: "task::Cancelled") {
+            return Some(Some(text::String.of(variant.name.as_str(), alloc: self.alloc)))
+        }
+    }
+    return None
+} Lowering.cancellation_variant
+
+/// The number of captures of a unit's closure: the operands of the instruction creating it.
+fn Lowering.closure_captures(self, unit: nir::NirUnit, index: u32) -> usize {
+    for function in unit.functions {
+        for block in function.blocks {
+            for inst in block.insts {
+                let nir::Op.Closure(index: created, captures: captures) = inst.op else {
+                    continue
+                }
+                if created == index {
+                    return captures.len()
+                }
+            }
+        }
+    }
+    return 0
+} Lowering.closure_captures
+
+/// A closure's function type: its own parameters, result and failure.
+fn Lowering.closure_type(self, function: nir::Function, captures: usize, subst: ty::Subst) -> ty::FnTy {
+    let types = self.ck.types()
+    var params = mem::List[ty::FnParam].empty(self.alloc)
+    for position in captures..<function.params.len() {
+        let param = function.params[position]
+        mut params.push(ty::FnParam(mode: param.mode, name: text::String.of(param.name.as_str(), alloc: self.alloc), ty: subst.ty(types, ty: function.ty(param.value).ty())))
+    }
+    var kind = ast::FnKind.Plain
+    match function.closure {
+        Some(head) => {
+            if head.task {
+                kind = ast::FnKind.Task
+            }
+        }
+        None => {}
+    }
+    let result = subst.ty(types, ty: function.result)
+    var failure: Option[ty::Ty] = None
+    match function.failure {
+        Some(written) => {
+            failure = Some(subst.ty(types, ty: written))
+        }
+        None => {}
+    }
+    return ty::FnTy(kind: kind, params: take params, result: result, failure: failure, wait: function.wait, limit_set: ty::LimitSet.none(), convention: None)
+} Lowering.closure_type
+
+/// The offset of each capture in a closure's environment, from `start`: a reference as its
+/// address, any other value as its bytes.
+fn Lowering.capture_layout(mut self, types: Slice[nir::NTy], params: Slice[nir::Param], start: u64) -> mem::List[u64] {
+    var offset = start
+    var offsets = mem::List[u64].empty(self.alloc)
+    for param in params {
+        expect usize.widen(param.value.index) < types.len()
+        let footprint = mut self.capture_size_align(types[usize.widen(param.value.index)])
+        offset = next_multiple_of(offset, multiple: footprint.align)
+        mut offsets.push(offset)
+        offset += footprint.size
+    }
+    return offsets
+} Lowering.capture_layout
+
+/// The size of a closure's environment whose captures follow `start` bytes.
+fn Lowering.capture_size(mut self, types: Slice[nir::NTy], params: Slice[nir::Param], start: u64) -> u64 {
+    var offset = start
+    for param in params {
+        expect usize.widen(param.value.index) < types.len()
+        let footprint = mut self.capture_size_align(types[usize.widen(param.value.index)])
+        offset = next_multiple_of(offset, multiple: footprint.align) + footprint.size
+    }
+    return next_multiple_of(offset, multiple: 8)
+} Lowering.capture_size
+
+fn Lowering.capture_size_align(mut self, nty: nir::NTy) -> CaptureSize {
+    match nty {
+        nir::NTy.Ref(_) or nir::NTy.RefMut(_) => return CaptureSize(size: 8, align: 8)
+        nir::NTy.Owned(ty) => {
+            let laid = mut self.layout_of(ty)
+            return CaptureSize(size: laid.contents().size, align: laid.contents().align)
+        }
+    }
+} Lowering.capture_size_align
+
+/// The role and index of the checking entry of a function, or of its body.
+fn Lowering.entry_role(self, item: ty::ItemId) -> nir::Role {
+    let Some(unit) = self.ck.unit(item) else {
+        return nir::Role.Body
+    }
+    if unit.contents().function(nir::Role.Entry, index: 0).is_some() {
+        return nir::Role.Entry
+    }
+    return nir::Role.Body
+} Lowering.entry_role
+
+/// The mask of the low `width` bits of a 64-bit integer.
+fn width_mask(width: u32) -> u64 {
+    if width >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF
+    }
+    expect (1u64 << width) > 0
+    return (1u64 << width) - 1
+} width_mask

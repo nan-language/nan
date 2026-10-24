@@ -1,0 +1,587 @@
+//! Derived code: the impl lines and implementing functions that the derives of `Eq`, `Ord`, `Hash`, `Default` and `Render` write for a struct or enum, in canonical format.
+
+/// A member of a struct or enum the derived code reaches: a field, or a variant with its payload.
+enum DerivedMember {
+    Field(name: text::String, ty: text::String)
+    Variant(name: text::String, payload: DerivedPayload)
+} DerivedMember
+
+enum DerivedPayload {
+    Bare
+    Single
+    /// The labels, in declaration order.
+    Labelled(mem::List[text::String])
+} DerivedPayload
+
+/// The pattern binding a variant's payload, each value named with `prefix`.
+fn DerivedPayload.pattern(self, variant: Str, prefix: Str, alloc: mem::Alloc) -> text::String {
+    var written = text::String.of(variant, alloc)
+    match self {
+        DerivedPayload.Bare => {}
+        DerivedPayload.Single => {
+            mut written.push('(')
+            mut written.append(prefix)
+            mut written.push(')')
+        }
+        DerivedPayload.Labelled(labels) => {
+            mut written.push('(')
+            for index in 0..<labels.len() {
+                if index > 0 {
+                    mut written.append(", ")
+                }
+                mut written.append(labels[index].as_str())
+                mut written.append(": ")
+                mut written.append(prefix)
+                mut written.push('_')
+                mut written.append(labels[index].as_str())
+            }
+            mut written.push(')')
+        }
+    }
+    return written
+} DerivedPayload.pattern
+
+/// The names a pattern of `pattern` binds, labels sorted when `sorted`.
+fn DerivedPayload.bound(self, prefix: Str, sorted: bool, alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    match self {
+        DerivedPayload.Bare => {}
+        DerivedPayload.Single => {
+            mut names.push(text::String.of(prefix, alloc))
+        }
+        DerivedPayload.Labelled(labels) => {
+            var ordered = mem::List[text::String].empty(alloc)
+            for label in labels {
+                mut ordered.push(text::String.of(label.as_str(), alloc))
+            }
+            if sorted {
+                mut ordered.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+            }
+            for label in ordered {
+                var name = text::String.of(prefix, alloc)
+                mut name.push('_')
+                mut name.append(label.as_str())
+                mut names.push(take name)
+            }
+        }
+    }
+    return names
+} DerivedPayload.bound
+
+/// The type a derived item is written for.
+struct Derived {
+    /// Its name as its module writes it, and its type with its parameters.
+    name: text::String
+    own: text::String
+    /// Its type parameters.
+    params: mem::List[text::String]
+    visibility: text::String
+    members: mem::List[DerivedMember]
+} Derived
+
+/// An item a derive writes: its canonical path, text and hashes.
+pkg struct DerivedItem {
+    pkg path: text::String
+    pkg text: text::String
+    pkg hashes: Hashes
+} DerivedItem
+
+/// The items a struct's or enum's derives write, with the paths and hashes their texts have in
+/// its module.
+fn Checker.derived(self, item: ty::ItemId) -> mem::List[DerivedItem] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let module = db.module_of(item)
+    let owner = db.canonical(item)
+    var derived = mem::List[DerivedItem].empty(alloc)
+    for written in take self.derived_items(item) {
+        var source = mem::Bytes.empty(alloc)
+        mut source.append(written.as_bytes())
+        let file = syntax::parse(take source, grammar: self.session().grammar.contents(), alloc)
+        let Some(position) = file.items.position(fn(candidate: syntax::ItemSyntax) => candidate.tree.is_some()) else {
+            expect false
+            continue
+        }
+        let path = derived_path(written.as_str(), owner: owner.as_str(), module_path: db.module_path(module).as_str(), alloc)
+        var own: Option[text::String] = None
+        if not written.starts_with("impl ") {
+            own = Some(text::String.of(path.as_str(), alloc))
+        }
+        let known = format::Known(own: take own, transparent: false, fields: format::Reach.Module, facts: None)
+        let hashes = Hashes.of(format::Forms.of(file, item: file.items[position], known, resolve: fn(segments: Slice[text::String]) => self.canonically(module, segments), alloc), alloc)
+        mut derived.push(DerivedItem(path: take path, text: take written, hashes: hashes))
+    }
+    return derived
+} Checker.derived
+
+/// The canonical path of a derived item: of an impl line, the impl of its interface in core for
+/// the owner; of a function, the owner's member it names.
+fn derived_path(written: Str, owner: Str, module_path: Str, alloc: mem::Alloc) -> text::String {
+    let kept = platform::trimmed_run(written)
+    let Some(trimmed) = written.slice_bytes(0, end: kept.end) else {
+        return text::String.empty(alloc)
+    }
+    if trimmed.starts_with("impl ") {
+        var path = text::String.of(module_path, alloc)
+        mut path.append("::impl[")
+        mut path.append(owner)
+        mut path.append(": core::")
+        mut path.append(after_last(trimmed, separator: ": ", alloc).as_str())
+        mut path.push(']')
+        return path
+    }
+    var path = text::String.of(owner, alloc)
+    mut path.push('.')
+    mut path.append(after_last(after_last(trimmed, separator: " ", alloc).as_str(), separator: ".", alloc).as_str())
+    return path
+} derived_path
+
+/// The text after the last separator, the whole text without one.
+fn after_last(written: Str, separator: Str, alloc: mem::Alloc) -> text::String {
+    var start: usize = 0
+    var at: usize = 0
+    while at + separator.byte_len() <= written.byte_len() {
+        let Some(part) = written.slice_bytes(at, end: at + separator.byte_len()) else {
+            break
+        }
+        if part == separator {
+            start = at + separator.byte_len()
+        }
+        expect at < written.byte_len()
+        at += 1
+    }
+    let Some(rest) = written.slice_bytes(start, end: written.byte_len()) else {
+        return text::String.of(written, alloc)
+    }
+    return text::String.of(rest, alloc)
+} after_last
+
+/// The texts of the items a struct's or enum's derives write, for each derive in its clause's
+/// order: the impl line, then the implementing function.
+fn Checker.derived_items(self, item: ty::ItemId) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var items = mem::List[text::String].empty(alloc)
+    let declared = self.db().ast(item)
+    let derive_entries = match declared.kind {
+        ast::ItemKind.Struct(structure) => structure.derived.view()
+        ast::ItemKind.Enum(enumeration) => enumeration.derived.view()
+        else => return items
+    }
+    let derived = self.derived_type(item)
+    for entry in derive_entries {
+        let function = match entry.text.as_str() {
+            "Eq" => derived.eq(alloc)
+            "Ord" => derived.cmp(alloc)
+            "Hash" => derived.hash(alloc)
+            "Default" => derived.default(alloc)
+            "Render" => derived.render(alloc)
+            else => continue
+        }
+        mut items.push(derived.impl_line(entry.text.as_str(), alloc))
+        mut items.push(take function)
+    }
+    return items
+} Checker.derived_items
+
+/// The type a struct's or enum's derived items are written for.
+fn Checker.derived_type(self, item: ty::ItemId) -> Derived {
+    let alloc = self.alloc()
+    let declared = self.db().ast(item)
+    var name = text::String.empty(alloc)
+    var params = mem::List[text::String].empty(alloc)
+    var members = mem::List[DerivedMember].empty(alloc)
+    match declared.kind {
+        ast::ItemKind.Struct(structure) => {
+            name = text::String.of(structure.name.text.as_str(), alloc)
+            for param in structure.generics {
+                mut params.push(text::String.of(param.name.text.as_str(), alloc))
+            }
+            for field in structure.fields() {
+                mut members.push(DerivedMember.Field(name: text::String.of(field.name.text.as_str(), alloc), ty: self.written(item, head: field.ty.token, last: field.ty.last)))
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            name = text::String.of(enumeration.name.text.as_str(), alloc)
+            for param in enumeration.generics {
+                mut params.push(text::String.of(param.name.text.as_str(), alloc))
+            }
+            for variant in enumeration.variants {
+                var path = text::String.of(name.as_str(), alloc)
+                mut path.push('.')
+                mut path.append(variant.name.text.as_str())
+                mut members.push(DerivedMember.Variant(name: take path, payload: self.derived_payload(item, variant)))
+            }
+        }
+        else => {}
+    }
+    var own = text::String.of(name.as_str(), alloc)
+    if params.len() > 0 {
+        mut own.push('[')
+        mut own.append(separated(params.view(), separator: ", ", alloc).as_str())
+        mut own.push(']')
+    }
+    let visibility = match declared.visibility {
+        ast::Visibility.Pub => "pub "
+        ast::Visibility.Pkg => "pkg "
+        ast::Visibility.Private => ""
+    }
+    return Derived(name: take name, own: take own, params: take params, visibility: text::String.of(visibility, alloc), members: take members)
+} Checker.derived_type
+
+/// A variant's payload as derived code binds it: labelled when every field has a label.
+fn Checker.derived_payload(self, item: ty::ItemId, variant: ast::Variant) -> DerivedPayload {
+    let Some(fields) = variant.payload else {
+        return DerivedPayload.Bare
+    }
+    var labels = mem::List[text::String].empty(self.alloc())
+    for field in fields {
+        let Some(label) = field.label else {
+            return DerivedPayload.Single
+        }
+        mut labels.push(self.written(item, head: label.token, last: label.last))
+    }
+    return DerivedPayload.Labelled(take labels)
+} Checker.derived_payload
+
+/// Texts joined by a separator.
+fn separated(parts: Slice[text::String], separator: Str, alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    for index in 0..<parts.len() {
+        if index > 0 {
+            mut joined.append(separator)
+        }
+        mut joined.append(parts[index].as_str())
+    }
+    return joined
+} separated
+
+/// The text a template renders.
+fn templated(template: Dyn[Render], alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    mut written.write(template, budget: 1_000_000)
+    return written
+} templated
+
+fn Derived.impl_line(self, interface_name: Str, alloc: mem::Alloc) -> text::String {
+    if self.params.len() == 0 {
+        return templated(text::fmt("impl {name}: {interface_name}\n", name: self.name.as_str(), interface_name), alloc)
+    }
+    var bounded = mem::List[text::String].empty(alloc)
+    for param in self.params {
+        mut bounded.push(templated(text::fmt("{param}: {interface_name}", param: param.as_str(), interface_name), alloc))
+    }
+    return templated(text::fmt("impl {name}[{params}]: {interface_name}\n", name: self.name.as_str(), params: separated(bounded.view(), separator: ", ", alloc).as_str(), interface_name), alloc)
+} Derived.impl_line
+
+/// A function named after the type, with its head after the name and its body lines.
+fn Derived.function(self, method: Str, head: Str, body: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var written = templated(text::fmt("{visibility}fn {name}.{method}{head} {{\n", visibility: self.visibility.as_str(), name: self.name.as_str(), method, head), alloc)
+    for line in body {
+        mut written.append("    ")
+        mut written.append(line.as_str())
+        mut written.push('\n')
+    }
+    mut written.write(text::fmt("}} {name}.{method}\n", name: self.name.as_str(), method), budget: 1_000_000)
+    return written
+} Derived.function
+
+/// The names of the struct's fields, in order.
+fn Derived.field_names(self, alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    for member in self.members {
+        match member {
+            DerivedMember.Field(name: name, ty: _) => mut names.push(text::String.of(name.as_str(), alloc))
+            DerivedMember.Variant(name: _, payload: _) => {}
+        }
+    }
+    return names
+} Derived.field_names
+
+fn Derived.is_enum(self) -> bool {
+    return self.variant_count() > 0
+} Derived.is_enum
+
+fn Derived.variant_count(self) -> usize {
+    var count: usize = 0
+    for member in self.members {
+        invariant count < self.members.len()
+        match member {
+            DerivedMember.Variant(name: _, payload: _) => {
+                count += 1
+            }
+            DerivedMember.Field(name: _, ty: _) => {}
+        }
+    }
+    return count
+} Derived.variant_count
+
+fn Derived.eq(self, alloc: mem::Alloc) -> text::String {
+    let head = templated(text::fmt("(self, other: {own}) -> bool limits pure, notrap, terminates", own: self.own.as_str()), alloc)
+    var body = mem::List[text::String].empty(alloc)
+    if self.is_enum() {
+        let several = self.variant_count() > 1
+        mut body.push(text::String.of("return match self {", alloc))
+        for member in self.members {
+            let DerivedMember.Variant(name: variant, payload: payload) = member else {
+                continue
+            }
+            let lefts = payload.bound("left", sorted: false, alloc)
+            let rights = payload.bound("right", sorted: false, alloc)
+            expect rights.len() == lefts.len()
+            var compared = mem::List[text::String].empty(alloc)
+            for index in 0..<lefts.len() {
+                mut compared.push(templated(text::fmt("{left} == {right}", left: lefts[index].as_str(), right: rights[index].as_str()), alloc))
+            }
+            var equal = text::String.of("true", alloc)
+            if compared.len() > 0 {
+                equal = separated(compared.view(), separator: " and ", alloc)
+            }
+            mut body.push(templated(text::fmt("    {pattern} => match other {{", pattern: payload.pattern(variant.as_str(), prefix: "left", alloc).as_str()), alloc))
+            mut body.push(templated(text::fmt("        {pattern} => {equal}", pattern: payload.pattern(variant.as_str(), prefix: "right", alloc).as_str(), equal: equal.as_str()), alloc))
+            if several {
+                mut body.push(text::String.of("        else => false", alloc))
+            }
+            mut body.push(text::String.of("    }", alloc))
+        }
+        mut body.push(text::String.of("}", alloc))
+    } else {
+        var compared = mem::List[text::String].empty(alloc)
+        for name in self.field_names(alloc) {
+            mut compared.push(templated(text::fmt("self.{name} == other.{name}", name: name.as_str()), alloc))
+        }
+        if compared.len() == 0 {
+            mut body.push(text::String.of("return true", alloc))
+        } else {
+            mut body.push(templated(text::fmt("return {compared}", compared: separated(compared.view(), separator: " and ", alloc).as_str()), alloc))
+        }
+    }
+    return self.function("eq", head: head.as_str(), body: body.view(), alloc)
+} Derived.eq
+
+fn Derived.cmp(self, alloc: mem::Alloc) -> text::String {
+    let head = templated(text::fmt("(self, other: {own}) -> core::Ordering limits pure, notrap, terminates", own: self.own.as_str()), alloc)
+    var body = mem::List[text::String].empty(alloc)
+    if self.is_enum() {
+        self.cmp_positions(mut body, side: "self_position", value: "self", alloc)
+        self.cmp_positions(mut body, side: "other_position", value: "other", alloc)
+        mut body.push(text::String.of("if self_position != other_position {", alloc))
+        mut body.push(text::String.of("    return self_position.cmp(other_position)", alloc))
+        mut body.push(text::String.of("}", alloc))
+        let several = self.variant_count() > 1
+        mut body.push(text::String.of("return match self {", alloc))
+        for member in self.members {
+            let DerivedMember.Variant(name: variant, payload: payload) = member else {
+                continue
+            }
+            cmp_arm(mut body, variant: variant.as_str(), payload, several, alloc)
+        }
+        mut body.push(text::String.of("}", alloc))
+    } else {
+        let fields = self.field_names(alloc)
+        for index in 0..<fields.len() {
+            let name = fields[index].as_str()
+            if index + 1 == fields.len() {
+                mut body.push(templated(text::fmt("return self.{name}.cmp(other.{name})", name), alloc))
+                continue
+            }
+            mut body.push(templated(text::fmt("let by_{name} = self.{name}.cmp(other.{name})", name), alloc))
+            mut body.push(templated(text::fmt("if by_{name} != core::Ordering.Equal {{", name), alloc))
+            mut body.push(templated(text::fmt("    return by_{name}", name), alloc))
+            mut body.push(text::String.of("}", alloc))
+        }
+        if fields.len() == 0 {
+            mut body.push(text::String.of("return core::Ordering.Equal", alloc))
+        }
+    }
+    return self.function("cmp", head: head.as_str(), body: body.view(), alloc)
+} Derived.cmp
+
+/// The lines binding the position of the variant a value holds.
+fn Derived.cmp_positions(self, mut body: mem::List[text::String], side: Str, value: Str, alloc: mem::Alloc) {
+    mut body.push(templated(text::fmt("let {side} = match {value} {{", side, value), alloc))
+    var position: usize = 0
+    for member in self.members {
+        invariant position < self.members.len()
+        let DerivedMember.Variant(name: variant, payload: payload) = member else {
+            continue
+        }
+        var ignored = text::String.of(variant.as_str(), alloc)
+        match payload {
+            DerivedPayload.Bare => {}
+            DerivedPayload.Single => {
+                mut ignored.append("(_)")
+            }
+            DerivedPayload.Labelled(labels) => {
+                var fields = mem::List[text::String].empty(alloc)
+                for label in labels {
+                    mut fields.push(templated(text::fmt("{label}: _", label: label.as_str()), alloc))
+                }
+                mut ignored.write(text::fmt("({fields})", fields: separated(fields.view(), separator: ", ", alloc).as_str()), budget: 1_000_000)
+            }
+        }
+        mut body.push(templated(text::fmt("    {ignored} => {position}u32", ignored: ignored.as_str(), position), alloc))
+        position += 1
+    }
+    mut body.push(text::String.of("}", alloc))
+} Derived.cmp_positions
+
+/// The arm of `cmp`'s match for a variant: comparing its payloads' values in order.
+fn cmp_arm(mut body: mem::List[text::String], variant: Str, payload: DerivedPayload, several: bool, alloc: mem::Alloc) {
+    let lefts = payload.bound("left", sorted: false, alloc)
+    let rights = payload.bound("right", sorted: false, alloc)
+    let count = lefts.len()
+    expect rights.len() == count
+    if count == 0 {
+        mut body.push(templated(text::fmt("    {variant} => core::Ordering.Equal", variant), alloc))
+        return
+    }
+    mut body.push(templated(text::fmt("    {pattern} => match other {{", pattern: payload.pattern(variant, prefix: "left", alloc).as_str()), alloc))
+    let right = payload.pattern(variant, prefix: "right", alloc)
+    let last_left = lefts[count - 1].as_str()
+    let last_right = rights[count - 1].as_str()
+    if count == 1 {
+        mut body.push(templated(text::fmt("        {right} => {last_left}.cmp({last_right})", right: right.as_str(), last_left, last_right), alloc))
+    } else {
+        mut body.push(templated(text::fmt("        {right} => {{", right: right.as_str()), alloc))
+        for index in 0..<(count - 1) {
+            let left = lefts[index].as_str()
+            mut body.push(templated(text::fmt("            let by_{left} = {left}.cmp({right})", left, right: rights[index].as_str()), alloc))
+            mut body.push(templated(text::fmt("            if by_{left} != core::Ordering.Equal {{", left), alloc))
+            mut body.push(templated(text::fmt("                return by_{left}", left), alloc))
+            mut body.push(text::String.of("            }", alloc))
+        }
+        mut body.push(templated(text::fmt("            return {last_left}.cmp({last_right})", last_left, last_right), alloc))
+        mut body.push(text::String.of("        }", alloc))
+    }
+    if several {
+        mut body.push(text::String.of("        else => core::Ordering.Equal", alloc))
+    }
+    mut body.push(text::String.of("    }", alloc))
+} cmp_arm
+
+fn Derived.hash(self, alloc: mem::Alloc) -> text::String {
+    let head = "[H: core::Hasher](self, mut hasher: H) limits pure, notrap, terminates"
+    var body = mem::List[text::String].empty(alloc)
+    if self.is_enum() {
+        mut body.push(text::String.of("match self {", alloc))
+        for member in self.members {
+            let DerivedMember.Variant(name: variant, payload: payload) = member else {
+                continue
+            }
+            let write = templated(text::fmt("mut hasher.write({bytes})", bytes: expand_name_bytes(after_last(variant.as_str(), separator: ".", alloc).as_str(), alloc).as_str()), alloc)
+            let hashed = payload.bound("value", sorted: true, alloc)
+            let pattern = payload.pattern(variant.as_str(), prefix: "value", alloc)
+            if hashed.len() == 0 {
+                mut body.push(templated(text::fmt("    {pattern} => {write}", pattern: pattern.as_str(), write: write.as_str()), alloc))
+                continue
+            }
+            mut body.push(templated(text::fmt("    {pattern} => {{", pattern: pattern.as_str()), alloc))
+            mut body.push(templated(text::fmt("        {write}", write: write.as_str()), alloc))
+            for value in hashed {
+                mut body.push(templated(text::fmt("        {value}.hash(mut hasher)", value: value.as_str()), alloc))
+            }
+            mut body.push(text::String.of("    }", alloc))
+        }
+        mut body.push(text::String.of("}", alloc))
+    } else {
+        var names = self.field_names(alloc)
+        mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        for name in names {
+            mut body.push(templated(text::fmt("self.{name}.hash(mut hasher)", name: name.as_str()), alloc))
+        }
+    }
+    return self.function("hash", head, body: body.view(), alloc)
+} Derived.hash
+
+fn Derived.default(self, alloc: mem::Alloc) -> text::String {
+    let head = templated(text::fmt("() -> {own} limits pure, terminates", own: self.own.as_str()), alloc)
+    var values = mem::List[text::String].empty(alloc)
+    for member in self.members {
+        let DerivedMember.Field(name: name, ty: field_ty) = member else {
+            continue
+        }
+        mut values.push(templated(text::fmt("{name}: {field_ty}.default()", name: name.as_str(), field_ty: field_ty.as_str()), alloc))
+    }
+    var body = mem::List[text::String].empty(alloc)
+    mut body.push(templated(text::fmt("return {name}({values})", name: self.name.as_str(), values: separated(values.view(), separator: ", ", alloc).as_str()), alloc))
+    return self.function("default", head: head.as_str(), body: body.view(), alloc)
+} Derived.default
+
+fn Derived.render(self, alloc: mem::Alloc) -> text::String {
+    let head = "(self, mut out: core::Renderer) limits pure, terminates"
+    var body = mem::List[text::String].empty(alloc)
+    if self.is_enum() {
+        mut body.push(text::String.of("match self {", alloc))
+        for member in self.members {
+            let DerivedMember.Variant(name: variant, payload: payload) = member else {
+                continue
+            }
+            render_arm(mut body, variant: variant.as_str(), payload, alloc)
+        }
+        mut body.push(text::String.of("}", alloc))
+    } else {
+        let fields = self.field_names(alloc)
+        if fields.len() == 0 {
+            mut body.push(templated(text::fmt("mut out.write(\"{name}()\")", name: self.name.as_str()), alloc))
+        }
+        for index in 0..<fields.len() {
+            let name = fields[index].as_str()
+            if index == 0 {
+                mut body.push(templated(text::fmt("mut out.write(\"{owner}({name}: \")", owner: self.name.as_str(), name), alloc))
+            } else {
+                mut body.push(templated(text::fmt("mut out.write(\", {name}: \")", name), alloc))
+            }
+            mut body.push(templated(text::fmt("self.{name}.render(mut out)", name), alloc))
+            if index + 1 == fields.len() {
+                mut body.push(text::String.of("mut out.write(\")\")", alloc))
+            }
+        }
+    }
+    return self.function("render", head, body: body.view(), alloc)
+} Derived.render
+
+/// The arm of `render`'s match for a variant: its path, then its payload's values.
+fn render_arm(mut body: mem::List[text::String], variant: Str, payload: DerivedPayload, alloc: mem::Alloc) {
+    match payload {
+        DerivedPayload.Bare => {
+            mut body.push(templated(text::fmt("    {variant} => mut out.write(\"{variant}\")", variant), alloc))
+        }
+        DerivedPayload.Single => {
+            mut body.push(templated(text::fmt("    {pattern} => {{", pattern: payload.pattern(variant, prefix: "value", alloc).as_str()), alloc))
+            mut body.push(templated(text::fmt("        mut out.write(\"{variant}(\")", variant), alloc))
+            mut body.push(text::String.of("        value.render(mut out)", alloc))
+            mut body.push(text::String.of("        mut out.write(\")\")", alloc))
+            mut body.push(text::String.of("    }", alloc))
+        }
+        DerivedPayload.Labelled(labels) => {
+            mut body.push(templated(text::fmt("    {pattern} => {{", pattern: payload.pattern(variant, prefix: "value", alloc).as_str()), alloc))
+            for index in 0..<labels.len() {
+                let label = labels[index].as_str()
+                if index == 0 {
+                    mut body.push(templated(text::fmt("        mut out.write(\"{variant}({label}: \")", variant, label), alloc))
+                } else {
+                    mut body.push(templated(text::fmt("        mut out.write(\", {label}: \")", label), alloc))
+                }
+                mut body.push(templated(text::fmt("        value_{label}.render(mut out)", label), alloc))
+            }
+            mut body.push(text::String.of("        mut out.write(\")\")", alloc))
+            mut body.push(text::String.of("    }", alloc))
+        }
+    }
+} render_arm
+
+/// A byte-string literal holding a name's byte length in 8 bytes little-endian, then its bytes.
+fn expand_name_bytes(name: Str, alloc: mem::Alloc) -> text::String {
+    var literal = text::String.of("b\"", alloc)
+    var length = u64.widen(name.byte_len())
+    for _ in 0..<8u32 {
+        let byte = u8.truncate(length)
+        mut literal.append("\\x")
+        mut literal.push(upper_hex_digit(byte >> 4))
+        mut literal.push(upper_hex_digit(byte & 15))
+        length = length >> 8
+    }
+    mut literal.append(name)
+    mut literal.push('"')
+    return literal
+} expand_name_bytes

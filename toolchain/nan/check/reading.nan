@@ -1,11 +1,348 @@
-//! What prefix checking and context packs read of the workspace: holes, and the api records of items, each listed once across the targets they are checked under.
+//! What the reading commands print of the workspace: declarations, contributions, holes, items with their hashes and api records, each listed once across the targets they are checked under, and a function's explanation or a type's derived items.
 
-/// A hole: its location and expected type.
+/// A hole as `nan holes` lists it: its location, expected type and producers.
 pkg struct Listed {
     pkg path: text::String
     pkg line: u32
     pkg expected: text::String
+    pkg producers: mem::List[text::String]
 } Listed
+
+/// A declaration `nan find` lists: its canonical path, file and line, and whether a workspace
+/// package declares it.
+pkg struct Declared {
+    pkg path: text::String
+    pkg file: text::String
+    pkg line: u32
+    /// The declaration's first line.
+    pkg text: text::String
+    pkg workspace: bool
+} Declared
+
+/// The items and members of the workspace and its packages' dependency closures whose folded
+/// name is `name` folded, under each target, each once: workspace ones first, then by file and
+/// line.
+pkg fn Session.declared(self, name: Str) -> mem::List[Declared] {
+    let alloc = self.alloc
+    let wanted = fold(name, alloc)
+    var found = mem::List[Declared].empty(alloc)
+    for entry in self.checkers() {
+        let checker = entry.checker
+        let db = checker.db()
+        for index in 0..<db.items.len() {
+            let item = ty::ItemId(index: u32.fit(index))
+            let named = match db.ast(item).name(alloc) {
+                Some(written) => written
+                None => text::String.empty(alloc)
+            }
+            let member = last_member(named.as_str(), alloc)
+            if not member.as_str().is_empty() and fold(member.as_str(), alloc).as_str() == wanted.as_str() {
+                add_declared(mut found, db, item, path: db.canonical(item), token: db.ast(item).token, alloc)
+            }
+            for declared in checker.members_declared(item) {
+                if fold(declared.text.as_str(), alloc).as_str() != wanted.as_str() {
+                    continue
+                }
+                var path = db.canonical(item)
+                mut path.push('.')
+                mut path.append(declared.text.as_str())
+                add_declared(mut found, db, item, path: take path, token: declared.token, alloc)
+            }
+        }
+    }
+    mut found.sort_by(fn(left: Declared, right: Declared) => declared_order(left, right))
+    return found
+} Session.declared
+
+/// The text after the last `.` of a name, the whole name without one.
+fn last_member(named: Str, alloc: mem::Alloc) -> text::String {
+    let bytes = named.as_bytes()
+    var start: usize = 0
+    for step in 0..<bytes.len() {
+        let at = bytes.len() - step
+        if bytes[at - 1] == b'.' {
+            start = at
+            break
+        }
+    }
+    let Some(member) = named.slice_bytes(start, end: bytes.len()) else {
+        return text::String.of(named, alloc)
+    }
+    return text::String.of(member, alloc)
+} last_member
+
+/// Adds the declaration of an item, or of a member, at one of the item's tokens, unless one with
+/// the same file, line and path is listed.
+fn add_declared(mut found: mem::List[Declared], db: Db, item: ty::ItemId, take path: text::String, token: u32, alloc: mem::Alloc) {
+    let line = db.line(item, token)
+    let file = db.item_file(item)
+    if found.position(fn(other: Declared) => other.file.as_str() == file.path.as_str() and other.line == line and other.path.as_str() == path.as_str()).is_some() {
+        return
+    }
+    mut found.push(Declared(path: take path, file: text::String.of(file.path.as_str(), alloc), line: line, text: output::printable(file.syntax.line_text(line), alloc), workspace: db.is_reported(item)))
+} add_declared
+
+/// Workspace declarations first, then by file and line.
+fn declared_order(left: Declared, right: Declared) -> core::Ordering {
+    if left.workspace != right.workspace {
+        if left.workspace {
+            return core::Ordering.Less
+        }
+        return core::Ordering.Greater
+    }
+    return location_order(left.file.as_str(), left_line: left.line, right_file: right.file.as_str(), right_line: right.line)
+} declared_order
+
+/// The order of two locations by file, then line.
+fn location_order(left_file: Str, left_line: u32, right_file: Str, right_line: u32) -> core::Ordering {
+    let files = left_file.cmp(right_file)
+    if files != core::Ordering.Equal {
+        return files
+    }
+    return left_line.cmp(right_line)
+} location_order
+
+/// A contribution `nan find --contributors` lists: its registry's and its own canonical paths,
+/// file and line, and whether the judging root admits it.
+pkg struct Contributed {
+    pkg registry_path: text::String
+    pkg entry: text::String
+    pkg file: text::String
+    pkg line: u32
+    pkg admitted: bool
+} Contributed
+
+/// The contributions to the registry written `written` in the dependency closure of the
+/// workspace package `root`, judged with it as judging root, under each target it is checked
+/// under, each once; none when `written` names no registry from its root module.
+pkg fn Session.contributed(self, root: usize, written: Str) -> Option[mem::List[Contributed]] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    var found = mem::List[Contributed].empty(alloc)
+    var named = false
+    let Some(closure) = held.closure_of(root) else {
+        return None
+    }
+    let Some(source) = held.packages.get(root) else {
+        expect false
+        return None
+    }
+    for target in check_targets(source, alloc) {
+        let checker = self.unchecked(closure, target)
+        let Some(package_id) = checker.checked_package(root) else {
+            continue
+        }
+        let Ok(wanted) = checker.granted_registry(package_id, written) else {
+            continue
+        }
+        named = true
+        let db = checker.db()
+        for contribution in checker.contributions(package_id) {
+            if contribution.registry_item != wanted {
+                continue
+            }
+            let file = db.item_file(contribution.item).path.as_str()
+            let line = db.head_line(contribution.item)
+            if found.position(fn(other: Contributed) => other.file.as_str() == file and other.line == line).is_some() {
+                continue
+            }
+            mut found.push(Contributed(registry_path: db.canonical(wanted), entry: db.canonical(contribution.item), file: text::String.of(file, alloc), line: line, admitted: contribution.admitted))
+        }
+    }
+    if not named {
+        return None
+    }
+    mut found.sort_by(fn(left: Contributed, right: Contributed) => location_order(left.file.as_str(), left_line: left.line, right_file: right.file.as_str(), right_line: right.line))
+    return Some(take found)
+} Session.contributed
+
+/// The id of the workspace package at `index` among the packages a checker checks.
+fn Checker.checked_package(self, index: usize) -> Option[ty::PackageId] {
+    let db = self.db()
+    for package_id in self.packages_checked() {
+        match db.package_data(package_id).member {
+            Some(workspace::Member.Source(source)) => {
+                if source == index {
+                    return Some(package_id)
+                }
+            }
+            else => {}
+        }
+    }
+    return None
+} Checker.checked_package
+
+/// The holes of the workspace's items under each target their packages are checked for, each
+/// once, by path and line: their expected types, and as producers the bindings in scope of
+/// that type and the functions their module may name whose result is that type.
+pkg fn Session.holes(self) -> mem::List[Listed] {
+    let alloc = self.alloc
+    var listed = mem::List[Listed].empty(alloc)
+    for entry in self.closures_checked() {
+        let checker = entry.checker
+        let db = checker.db()
+        for hole in checker.state.contents().holes.cursor() {
+            let data = db.item(hole.item)
+            let module = data.module
+            var producers = mem::List[text::String].empty(alloc)
+            for binding in hole.bindings {
+                mut producers.push(text::String.of(binding.as_str(), alloc))
+            }
+            for produced in take checker.producers(module, ty: hole.expected) {
+                mut producers.push(take produced)
+            }
+            let path = db.file(data.file).path.as_str()
+            let line = db.line(hole.item, token: hole.token)
+            let expected = checker.show(hole.expected, from: module)
+            if listed.position(fn(other: Listed) => other.path.as_str() == path and other.line == line).is_some() {
+                continue
+            }
+            mut listed.push(Listed(path: text::String.of(path, alloc), line: line, expected: take expected, producers: take producers))
+        }
+    }
+    mut listed.sort_by(fn(left: Listed, right: Listed) => location_order(left.path.as_str(), left_line: left.line, right_file: right.path.as_str(), right_line: right.line))
+    return listed
+} Session.holes
+
+/// The functions a module may name whose result is a type, as it writes them, in byte order.
+fn Checker.producers(self, module: ty::ModuleId, ty: ty::Ty) -> mem::List[text::String] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var found = mem::List[text::String].empty(alloc)
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        let ast::ItemKind.Fn(_) = db.ast(item).kind else {
+            continue
+        }
+        if not db.visible(module, item) {
+            continue
+        }
+        let Some(sig) = self.fn_sig(item) else {
+            continue
+        }
+        if sig.own_generics().len() == 0 and sig.result == ty {
+            mut found.push(self.item_written(item, from: module))
+        }
+    }
+    mut found.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    return distinct_texts(take found, alloc)
+} Checker.producers
+
+/// Sorted texts without repeats.
+fn distinct_texts(take sorted: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var distinct = mem::List[text::String].empty(alloc)
+    for written in take sorted {
+        let count = distinct.len()
+        if count > 0 and distinct[count - 1].as_str() == written.as_str() {
+            continue
+        }
+        mut distinct.push(take written)
+    }
+    return distinct
+} distinct_texts
+
+/// A parsed item of a workspace package as `nan show` prints it.
+pkg struct Shown {
+    /// Its canonical path, if it has one.
+    pkg path: Option[text::String]
+    pkg file: text::String
+    /// The line of its head.
+    pkg line: u32
+    /// Its lines, doc comments included.
+    pkg lines: core::Range[u32]
+    pkg hashes: Hashes
+} Shown
+
+/// A parsed item `nan show` may print: its file, its index among the file's items, the item of
+/// the database it is, none for a `package` item, and its package.
+struct ShownAt derives Copy {
+    file: FileRef
+    index: usize
+    item: Option[ty::ItemId]
+    package_id: ty::PackageId
+} ShownAt
+
+/// The parsed items of the workspace's packages whose heads lie in a scope, each once, by path and
+/// line.
+pkg fn Session.shown(self, scope: scope::Scope) -> mem::List[Shown] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    var shown = mem::List[Shown].empty(alloc)
+    var listed = mem::Set[HeadAt].empty(alloc)
+    for entry in self.checkers() {
+        let checker = entry.checker
+        let db = checker.db()
+        for at in shown_items(db, alloc) {
+            let file = db.file(at.file)
+            expect at.index < file.syntax.items.len()
+            let lines = file.syntax.item_lines(file.syntax.items[at.index])
+            let head = match at.item {
+                Some(item) => db.head_line(item)
+                None => manifest_head(file, index: at.index, lines, alloc)
+            }
+            if not scope.holds(held, path: file.path.as_str(), line: Some(head)) {
+                continue
+            }
+            if not mut listed.insert(HeadAt(path: text::String.of(file.path.as_str(), alloc), line: head)) {
+                continue
+            }
+            match at.item {
+                Some(item) => {
+                    mut shown.push(Shown(path: checker.canonical_path(item), file: text::String.of(file.path.as_str(), alloc), line: head, lines: lines, hashes: checker.hashes(item)))
+                }
+                None => {
+                    let Some(hashes) = checker.package_hashes(at.package_id) else {
+                        expect false
+                        continue
+                    }
+                    let name = text::String.of(db.package_data(at.package_id).name.as_str(), alloc)
+                    mut shown.push(Shown(path: Some(take name), file: text::String.of(file.path.as_str(), alloc), line: head, lines: lines, hashes: hashes))
+                }
+            }
+        }
+    }
+    mut shown.sort_by(fn(left: Shown, right: Shown) => location_order(left.file.as_str(), left_line: left.line, right_file: right.file.as_str(), right_line: right.line))
+    return shown
+} Session.shown
+
+/// The parsed items of a database's packages it reports on: each one's `package` item, then the
+/// items it reports on.
+fn shown_items(db: Db, alloc: mem::Alloc) -> mem::List[ShownAt] {
+    var found = mem::List[ShownAt].empty(alloc)
+    for index in 0..<db.packages.len() {
+        let data = db.packages[index]
+        if data.carried or data.quiet {
+            continue
+        }
+        let manifest = FileRef(source: data.source, history: false, index: 0)
+        let Some(position) = db.file(manifest).syntax.items.position(fn(candidate: syntax::ItemSyntax) => candidate.tree.is_some() and not candidate.abandoned) else {
+            continue
+        }
+        mut found.push(ShownAt(file: manifest, index: position, item: None, package_id: ty::PackageId(index: u32.fit(index))))
+    }
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.is_reported(item) {
+            let data = db.item(item)
+            mut found.push(ShownAt(file: data.file, index: data.index, item: Some(item), package_id: db.package_of(item)))
+        }
+    }
+    return found
+} shown_items
+
+/// The head line of a manifest's `package` item: the line of its lowered head token, or its
+/// first line.
+fn manifest_head(file: workspace::File, index: usize, lines: core::Range[u32], alloc: mem::Alloc) -> u32 {
+    let lowered = file.lowered(alloc)
+    if index >= lowered.len() {
+        return lines.low
+    }
+    let Some(lowered_item) = lowered[index] else {
+        return lines.low
+    }
+    expect usize.widen(lowered_item.token) < file.syntax.tokens.len()
+    return file.syntax.tokens[usize.widen(lowered_item.token)].line
+} manifest_head
 
 /// An item consumers see, as `nan show --api` prints it.
 pkg struct ApiItem {
@@ -17,34 +354,75 @@ pkg struct ApiItem {
     pkg lines: mem::List[text::String]
 } ApiItem
 
-/// The holes of the workspace's items under each target their packages are checked for, each
-/// once, by path and line, with their expected types.
-pkg fn Session.holes(self) -> mem::List[Listed] {
+/// The items of a scope that consumers see, with the functions named after a type the scope
+/// names, each once, by path and line; a function's record ends with its digest line under each
+/// target its package declares, in byte order, each followed by its target when there are several.
+pkg fn Session.api(self, scope: scope::Scope) -> mem::List[ApiItem] {
     let alloc = self.alloc
-    var listed = mem::List[Listed].empty(alloc)
-    for entry in self.closures_checked() {
+    let held = self.workspace.contents()
+    let checkers = self.checkers()
+    var found = mem::List[ApiItem].empty(alloc)
+    var listed = mem::Set[HeadAt].empty(alloc)
+    for entry in checkers {
         let checker = entry.checker
         let db = checker.db()
-        for hole in checker.state.contents().holes.cursor() {
-            let data = db.item(hole.item)
-            let path = db.file(data.file).path.as_str()
-            let line = db.line(hole.item, token: hole.token)
-            let expected = checker.show(hole.expected, from: data.module)
-            if listed.position(fn(other: Listed) => other.path.as_str() == path and other.line == line).is_some() {
+        for item in take scoped_items(db, held, scope, alloc) {
+            let path = db.item_file(item).path.as_str()
+            let head = db.head_line(item)
+            if not checker.consumers_see(item) {
                 continue
             }
-            mut listed.push(Listed(path: text::String.of(path, alloc), line: line, expected: take expected))
+            if not mut listed.insert(HeadAt(path: text::String.of(path, alloc), line: head)) {
+                continue
+            }
+            var lines = checker.api_lines(item, docs: true, viewer: None)
+            for digest in take checker.digest_lines(checkers.view(), item) {
+                mut lines.push(take digest)
+            }
+            let canonical = match checker.canonical_path(item) {
+                Some(written) => written
+                None => text::String.empty(alloc)
+            }
+            let package_name = text::String.of(db.package_data(db.package_of(item)).name.as_str(), alloc)
+            mut found.push(ApiItem(path: take canonical, package_name: take package_name, file: text::String.of(path, alloc), line: head, lines: take lines))
         }
     }
-    mut listed.sort_by(fn(left: Listed, right: Listed) -> core::Ordering {
-        let paths = left.path.as_str().cmp(right.path.as_str())
-        if paths != core::Ordering.Equal {
-            return paths
+    mut found.sort_by(fn(left: ApiItem, right: ApiItem) => location_order(left.file.as_str(), left_line: left.line, right_file: right.file.as_str(), right_line: right.line))
+    return found
+} Session.api
+
+/// The items a database reports on whose heads lie in a scope, each followed, for a struct, enum
+/// or layout of a scope of lines, by the functions named after it.
+fn scoped_items(db: Db, held: workspace::Workspace, scope: scope::Scope, alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    let lines_scope = match scope {
+        scope::Scope.Lines(path: _, lines: _) => true
+        else => false
+    }
+    var items = mem::List[ty::ItemId].empty(alloc)
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if not db.is_reported(item) or not scope.holds(held, path: db.item_file(item).path.as_str(), line: Some(db.head_line(item))) {
+            continue
         }
-        return left.line.cmp(right.line)
-    })
-    return listed
-} Session.holes
+        mut items.push(item)
+        let is_type = match db.ast(item).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) or ast::ItemKind.Layout(_) => true
+            else => false
+        }
+        if not lines_scope or not is_type {
+            continue
+        }
+        let Some(members) = db.member_table.get(TypeKey.Item(item)) else {
+            continue
+        }
+        for named in members {
+            for member in named.value() {
+                mut items.push(member)
+            }
+        }
+    }
+    return items
+} scoped_items
 
 /// A function's digest lines under each target its package declares, in byte order, each
 /// followed by its target when there are several; none for another item.
@@ -82,3 +460,245 @@ fn Checker.digest_lines(self, checkers: Slice[TargetChecker], item: ty::ItemId) 
     }
     return lines
 } Checker.digest_lines
+
+/// What `nan explain` prints of a function: its digest lines, each fact a line of its text raises
+/// directly or through a call, and the methods of primitive capabilities it reaches.
+pkg struct Explained {
+    pkg digests: mem::List[text::String]
+    /// Each fact with the file and line raising it, by line.
+    pkg facts: mem::List[Raised]
+    pkg methods: mem::List[text::String]
+    pkg obligations: mem::List[Explanation]
+} Explained
+
+/// A digest fact a line raises.
+pkg enum DigestFact derives Copy, Eq, Ord {
+    Wait
+    Alloc
+    Device
+    Priv
+    Sync
+    Float
+} DigestFact
+
+pkg proj fn DigestFact.word(self) -> Str {
+    return match self {
+        DigestFact.Wait => "wait"
+        DigestFact.Alloc => "alloc"
+        DigestFact.Device => "device"
+        DigestFact.Priv => "priv"
+        DigestFact.Sync => "sync"
+        DigestFact.Float => "float"
+    }
+} DigestFact.word
+
+/// A digest fact with the file and line raising it.
+pkg struct Raised {
+    pkg fact: DigestFact
+    pkg path: text::String
+    pkg line: u32
+} Raised
+
+/// An obligation of an explained function: its file and line, its kind, its status or, without
+/// a trap kind, its outcome, and the labelled values of a refuted one's counterexample.
+pkg struct Explanation {
+    pkg path: text::String
+    pkg line: u32
+    pkg kind: text::String
+    pkg status: text::String
+    pkg counterexample: mem::List[text::String]
+} Explanation
+
+/// What `nan explain` prints of the function whose head lies in a scope, under each target its
+/// package declares; none for another item.
+pkg fn Session.explained(self, scope: scope::Scope) -> Option[Explained] {
+    let alloc = self.alloc
+    let held = self.workspace.contents()
+    let checkers = self.closures_checked()
+    for entry in checkers {
+        let checker = entry.checker
+        let db = checker.db()
+        let Some(item) = db.headed_in(held, scope) else {
+            continue
+        }
+        let Some(body) = checker.typed_body(item) else {
+            return None
+        }
+        let facts = checker.raised_facts(item, body)
+        var methods = mem::List[text::String].empty(alloc)
+        for method in checker.methods_reached(item) {
+            mut methods.push(db.canonical(method))
+        }
+        mut methods.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        let obligations = checker.explanations(item)
+        return Some(Explained(digests: checker.digest_lines(checkers.view(), item), facts: take facts, methods: distinct_texts(take methods, alloc), obligations: take obligations))
+    }
+    return None
+} Session.explained
+
+/// Each fact a line of a function's text raises, directly or through a call, by line.
+fn Checker.raised_facts(self, item: ty::ItemId, body: mem::Shared[TBody]) -> mem::List[Raised] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let path = db.item_file(item).path.as_str()
+    var facts = mem::List[Raised].empty(alloc)
+    for site in self.text_sites(item, body) {
+        let line = db.line(item, token: site.token)
+        let digest = site.facts
+        add_raised(mut facts, fact: DigestFact.Wait, holds: digest.wait, path, line, alloc)
+        add_raised(mut facts, fact: DigestFact.Alloc, holds: digest.alloc, path, line, alloc)
+        add_raised(mut facts, fact: DigestFact.Device, holds: digest.device, path, line, alloc)
+        add_raised(mut facts, fact: DigestFact.Priv, holds: digest.privileged, path, line, alloc)
+        add_raised(mut facts, fact: DigestFact.Sync, holds: digest.sync, path, line, alloc)
+        add_raised(mut facts, fact: DigestFact.Float, holds: digest.float, path, line, alloc)
+    }
+    mut facts.sort_by(fn(left: Raised, right: Raised) -> core::Ordering {
+        if left.line != right.line {
+            return left.line.cmp(right.line)
+        }
+        return left.fact.cmp(right.fact)
+    })
+    return facts
+} Checker.raised_facts
+
+/// Adds a fact a line raises, unless listed.
+fn add_raised(mut facts: mem::List[Raised], fact: DigestFact, holds: bool, path: Str, line: u32, alloc: mem::Alloc) {
+    if not holds {
+        return
+    }
+    if facts.position(fn(other: Raised) => other.fact == fact and other.line == line and other.path.as_str() == path).is_some() {
+        return
+    }
+    mut facts.push(Raised(fact: fact, path: text::String.of(path, alloc), line: line))
+} add_raised
+
+/// The first item the database reports on whose head lies in a scope.
+fn Db.headed_in(self, held: workspace::Workspace, scope: scope::Scope) -> Option[ty::ItemId] {
+    for index in 0..<self.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if self.is_reported(item) and scope.holds(held, path: self.item_file(item).path.as_str(), line: Some(self.head_line(item))) {
+            return Some(item)
+        }
+    }
+    return None
+} Db.headed_in
+
+/// The ledger entries of a scope, by path and line: of a package, its ledger; of the lines of an
+/// item, the item's.
+pkg fn Session.ledgered(self, scope: scope::Scope) -> mem::List[Entry] {
+    let held = self.workspace.contents()
+    for entry in self.checkers() {
+        let checker = entry.checker
+        let db = checker.db()
+        match scope {
+            scope::Scope.Package(index) => {
+                let source = PackageSource.Member(workspace::Member.Source(index))
+                let Some(id) = db.packages.position(fn(data: PackageData) => data.source == source and not data.quiet) else {
+                    continue
+                }
+                return checker.package_ledger(ty::PackageId(index: u32.fit(id)))
+            }
+            else => {}
+        }
+        match db.headed_in(held, scope) {
+            Some(item) => return checker.ledger(item)
+            None => {}
+        }
+    }
+    return mem::List[Entry].empty(self.alloc)
+} Session.ledgered
+
+/// The obligations of a function, in site order, each as `nan explain` prints it.
+fn Checker.explanations(self, item: ty::ItemId) -> mem::List[Explanation] {
+    let alloc = self.alloc()
+    var explanations = mem::List[Explanation].empty(alloc)
+    let Some(unit) = self.unit(item) else {
+        return explanations
+    }
+    let db = self.db()
+    let path = db.item_file(item).path.as_str()
+    let obligations = self.obligations(item)
+    for site in obligations.contents() {
+        let trap_kind = not site.role.is_contract() and site.obligation != Obligation.Check(nir::CheckKind.Decreases)
+        var status = text::String.of(site.status.word(), alloc)
+        var counterexample = mem::List[text::String].empty(alloc)
+        if not trap_kind {
+            match site.unproved {
+                None => {
+                    status = text::String.of("proved", alloc)
+                }
+                Some(Unproved.Refuted(values)) => {
+                    status = text::String.of("refuted", alloc)
+                    for value in values {
+                        mut counterexample.push(text::String.of(value.as_str(), alloc))
+                    }
+                }
+                Some(Unproved.Unknown(_)) => {
+                    status = text::String.of("unknown", alloc)
+                }
+            }
+        }
+        mut explanations.push(Explanation(path: text::String.of(path, alloc), line: db.line(item, token: site.span.head), kind: obligation_kind(unit.contents(), site, alloc), status: take status, counterexample: take counterexample))
+    }
+    return explanations
+} Checker.explanations
+
+/// An obligation's kind as `nan explain` names it: its row's name with `-` for spaces, or for
+/// an arithmetic, shift, division or conversion obligation the operation's word.
+fn obligation_kind(unit: nir::NirUnit, site: Obligated, alloc: mem::Alloc) -> text::String {
+    if site.role.is_contract() {
+        return text::String.of("well-definedness", alloc)
+    }
+    return match first site.obligation {
+        Obligation.Check(nir::CheckKind.Invariant) => text::String.of("loop-invariant", alloc)
+        Obligation.Check(kind) => text::String.of(kind.word(), alloc)
+        Obligation.Bounds => text::String.of("index-bound", alloc)
+        else => match operation_word(unit, site, alloc) {
+            Some(word) => word
+            None => text::String.of("layout-field", alloc)
+        }
+    }
+} obligation_kind
+
+/// The word of the operation an obligation site checks: a binary operation's, `neg`, or a named
+/// conversion's; none for another instruction.
+fn operation_word(unit: nir::NirUnit, site: Obligated, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(function) = unit.function(site.role, index: site.index) else {
+        return None
+    }
+    let Some(inst) = function.block(site.block).insts.get(site.position) else {
+        return None
+    }
+    match inst.op {
+        nir::Op.Binary(op: op, left: _, right: _) => return Some(text::String.of(op.word(), alloc))
+        nir::Op.Unary(op: nir::UnaryOp.Neg, operand: _) => return Some(text::String.of("neg", alloc))
+        nir::Op.Call(call) => {
+            let nir::Callee.Fn(fn_ref) = call.callee else {
+                return None
+            }
+            let nir::Callable.Builtin(nir::Builtin.Conversion(conversion: conversion, scalar: _)) = fn_ref.callable else {
+                return None
+            }
+            return Some(text::String.of(conversion.word(), alloc))
+        }
+        else => return None
+    }
+} operation_word
+
+/// The items the derives of the struct or enum whose head lies in a scope write; none when the
+/// scope names no struct or enum.
+pkg fn Session.expanded(self, scope: scope::Scope) -> Option[mem::List[DerivedItem]] {
+    let held = self.workspace.contents()
+    for entry in self.checkers() {
+        let checker = entry.checker
+        let db = checker.db()
+        let Some(item) = db.headed_in(held, scope) else {
+            continue
+        }
+        return match db.ast(item).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => Some(checker.derived(item))
+            else => None
+        }
+    }
+    return None
+} Session.expanded

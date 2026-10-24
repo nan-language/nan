@@ -1,0 +1,505 @@
+//! `nan publish --local <dir>`: runs the release gate on the package in `<dir>`, moves the tombstones of its source into its history, builds its artefact and appends it to the local store as a named release whose parent is the history head.
+
+/// `nan publish`.
+fn publish_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    let held = session.workspace.contents()
+    let local = match invocation.value("--local") {
+        Some(given) => given
+        None => ""
+    }
+    let local_bytes = local.as_bytes()
+    var dir_end: usize = 0
+    for step in 0..<local_bytes.len() {
+        let at = local_bytes.len() - step
+        if local_bytes[at - 1] != b'/' {
+            dir_end = at
+            break
+        }
+    }
+    let Some(dir) = local.slice_bytes(0, end: dir_end) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let Some(index) = held.packages.position(fn(candidate: workspace::Package) => candidate.dir.as_str() == dir) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    var breaking = invocation.listed("--breaking", alloc)
+    let reason = mut breaking.pop()
+    if invocation.listed("--breaking", alloc).len() == 1 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    let Some(manifest) = source.manifest else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    var manifest_path = text::String.of(source.dir.as_str(), alloc)
+    mut manifest_path.append("/package.nan")
+    var packages = mem::List[usize].empty(alloc)
+    mut packages.push(index)
+    let gate = try judged(session, packages: packages.view())
+    if gate.diagnostics.len() > 0 or gate.report.failures.len() > 0 {
+        let std = session.std.contents()
+        var records = mem::List[output::Record].empty(alloc)
+        for reported in gate.diagnostics {
+            mut records.push(record(held, std, scope: scope::Scope.Package(index), reported, alloc))
+        }
+        for failing in take fail_records(held, scope: scope::Scope.Package(index), report: gate.report, alloc) {
+            mut records.push(take failing)
+        }
+        return publish_output(invocation, written: written.as_str(), take records, diagnostics: gate.diagnostics.view(), changes: mem::List[journal::Change].empty(alloc).view(), alloc)
+    }
+    var refused = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for dep in manifest.deps {
+        if dep.path {
+            mut refused.push(diagnostic::Diagnostic.at(diagnostic::Code.VersionPathDependency, path: manifest_path.as_str(), line: dep.line, alloc))
+        }
+    }
+    let user_cache = match try cache::Cache.open(cache::copied_override(session.home, alloc), alloc) {
+        Ok(opened) => opened
+        Err(exposed) => {
+            mut refused.push(exposed_diagnostic(take exposed, alloc))
+            return refusal(invocation, written: written.as_str(), session, index, diagnostics: refused.view(), alloc)
+        }
+    }
+    let local_store = store::Store.new(user_cache.store())
+    let read = match try local_store.entries() {
+        Ok(found) => found
+        Err(exposed) => {
+            mut refused.push(exposed_diagnostic(take exposed, alloc))
+            return refusal(invocation, written: written.as_str(), session, index, diagnostics: refused.view(), alloc)
+        }
+    }
+    let staged = staged_release(invocation, source, take read, take breaking, take reason, refused: mut refused, alloc)
+    if refused.len() > 0 {
+        return refusal(invocation, written: written.as_str(), session, index, diagnostics: refused.view(), alloc)
+    }
+    return try published(invocation, written: written.as_str(), session, index, take staged, local_store, alloc)
+} publish_run
+
+/// What a publish decides from the local store before building its release, adding to
+/// `refused` a parent the store does not hold and a store name another package holds.
+fn staged_release(invocation: Invocation, source: workspace::Package, take read: mem::List[store::Entry], take breaking: mem::List[text::String], take reason: Option[text::String], mut refused: mem::List[diagnostic::Diagnostic], alloc: mem::Alloc) -> Staged {
+    var manifest_path = text::String.of(source.dir.as_str(), alloc)
+    mut manifest_path.append("/package.nan")
+    var manifest_line: u32 = 1
+    var package_name = text::String.empty(alloc)
+    match source.manifest {
+        Some(manifest) => {
+            manifest_line = manifest.line
+            package_name = text::String.of(manifest.name.as_str(), alloc)
+        }
+        None => {}
+    }
+    var entries = mem::List[mem::Shared[store::Entry]].empty(alloc)
+    var roots = mem::List[hashing::HashValue].empty(alloc)
+    for stored in take read {
+        mut roots.push(stored.root(alloc))
+        mut entries.push(mem::Shared.of(take stored, alloc))
+    }
+    let history = source.machine.history()
+    var parent: Option[usize] = None
+    match history_head(history) {
+        Some(head) => {
+            parent = roots.position(fn(root: hashing::HashValue) => root == head)
+            if parent.is_none() {
+                mut refused.push(diagnostic::Diagnostic.at(diagnostic::Code.VersionParentMissing, path: manifest_path.as_str(), line: manifest_line, alloc))
+            }
+        }
+        None => {}
+    }
+    let name = store_name(invocation, history, package_name: package_name.as_str(), alloc)
+    for stored in entries {
+        let held_entry = stored.contents()
+        let Some(entry_name) = held_entry.name else {
+            continue
+        }
+        if entry_name.as_str() == name.as_str() and held_entry.package_name.as_str() != package_name.as_str() {
+            mut refused.push(diagnostic::Diagnostic.at(diagnostic::Code.VersionStoreNameTaken, path: manifest_path.as_str(), line: manifest_line, alloc))
+            break
+        }
+    }
+    return Staged(name: take name, breaking: take breaking, reason: take reason, parent: parent, entries: take entries, roots: take roots)
+} staged_release
+
+/// The store name of a release: the one `--name` gives, else its history's, else its package's.
+fn store_name(invocation: Invocation, history: Option[machine::History], package_name: Str, alloc: mem::Alloc) -> text::String {
+    match invocation.value("--name") {
+        Some(given) => return text::String.of(given, alloc)
+        None => {}
+    }
+    match history {
+        Some(recorded) => return text::String.of(recorded.name.as_str(), alloc)
+        None => {}
+    }
+    return text::String.of(package_name, alloc)
+} store_name
+
+/// What a publish decided before building its release: the store name, the items `--breaking`
+/// names and its reason, the store entry of the parent, and the store's entries with their code
+/// roots.
+struct Staged {
+    name: text::String
+    breaking: mem::List[text::String]
+    reason: Option[text::String]
+    parent: Option[usize]
+    entries: mem::List[mem::Shared[store::Entry]]
+    roots: mem::List[hashing::HashValue]
+} Staged
+
+/// Builds the release of a package whose tombstones move into its history, judges its classes
+/// against its parent, appends it to the local store and records it as the history head.
+fn published(invocation: Invocation, written: Str, session: check::Session, index: usize, take staged: Staged, local_store: store::Store, alloc: mem::Alloc) -> output::Output fails platform::IoError
+    waive length "one pass over the steps of a publish, in the bootstrap's order"
+{
+    let held = session.workspace.contents()
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    let grammar = session.grammar.contents()
+    let Some(manifest) = source.manifest else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    var manifest_path = text::String.of(source.dir.as_str(), alloc)
+    mut manifest_path.append("/package.nan")
+    let moved = moved_tombstones(session, index, alloc)
+    let history = source.machine.history()
+    var history_path = text::String.of(source.dir.as_str(), alloc)
+    mut history_path.append("/.nan/history.nan")
+    let staged_history = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: history_head(history), modules: moved_modules(history, moved: moved.tombstones.view(), alloc))
+    var files = mem::Map[text::String, mem::Bytes].empty(alloc)
+    for file in moved.changed {
+        var content = mem::Bytes.empty(alloc)
+        mut content.append(file.content.view())
+        discard mut files.insert(text::String.of(file.path.as_str(), alloc), value: take content)
+    }
+    let history_bytes = match staged_history.bytes(grammar, alloc) {
+        Some(bytes) => bytes
+        None => mem::Bytes.empty(alloc)
+    }
+    discard mut files.insert(text::String.of(history_path.as_str(), alloc), value: take history_bytes)
+    let moved_workspace = try held.rebuilt(files, store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+        let Some(at) = staged.roots.position(fn(known: hashing::HashValue) => known == root) else {
+            return None
+        }
+        expect at < staged.entries.len()
+        return Some(staged.entries[at].share())
+    }, grammar, alloc)
+    let moved_session = check::Session.of(mem::Shared.of(take moved_workspace, alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    let Some(closure) = moved_session.workspace.contents().closure_of(index) else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written, alloc)
+    }
+    let built = moved_session.build(closure, member: workspace::Member.Source(index))
+    let exported = release::exported(built.artefact.view(), grammar, alloc)
+    var parent_exported = mem::Map[text::String, machine::ApiEntry].empty(alloc)
+    var held_forwards = mem::Map[text::String, release::Forward].empty(alloc)
+    var parent_entry: Option[mem::Shared[store::Entry]] = None
+    match staged.parent {
+        Some(at) => {
+            expect at < staged.entries.len()
+            parent_exported = release::exported(staged.entries[at].contents().artefact.view(), grammar, alloc)
+            held_forwards = release::forwards(staged.entries[at].contents().artefact.view(), alloc)
+            parent_entry = Some(staged.entries[at].share())
+        }
+        None => {}
+    }
+    var breaking = mem::List[text::String].empty(alloc)
+    for item in staged.breaking {
+        mut breaking.push(publish_canonical(held, named: item.as_str(), alloc))
+    }
+    for item in breaking {
+        let exports = exported.get_by(fn(key: text::String) => key.as_str().cmp(item.as_str())).is_some()
+        let parent_exports = parent_exported.get_by(fn(key: text::String) => key.as_str().cmp(item.as_str())).is_some()
+        if not exports or not parent_exports {
+            var targeted = mem::List[diagnostic::Diagnostic].empty(alloc)
+            mut targeted.push(diagnostic::Diagnostic.at(diagnostic::Code.VersionBreakingTarget, path: manifest_path.as_str(), line: manifest.line, alloc))
+            return refusal(invocation, written, session, index, diagnostics: targeted.view(), alloc)
+        }
+    }
+    let unpreserved = session.not_preserved(index, parent: parent_exported, held: held_forwards, release_exported: exported)
+    if unpreserved.len() > 0 {
+        return refusal(invocation, written, session, index, diagnostics: unpreserved.view(), alloc)
+    }
+    let compatible = moved_session.compatible(index, parent: parent_exported, release_exported: exported)
+    let release_forwards = release::forwards(built.artefact.view(), alloc)
+    let classes = release::classes(parent_exported, release: exported, epochs: fn(path: Str) -> release::EpochPair {
+        return release::EpochPair(old: parent_epoch(staged, path), new: bumped_epoch(staged, breaking: breaking.view(), path))
+    }, forwarded: release_forwards, compatible, alloc)
+    let class = release::release_class(classes, parented: staged.parent.is_some())
+    let encode = moved_session.encode_class(index, parent: parent_entry)
+    let summaries = moved_session.publish_summaries(closure, package_index: index)
+    let summary = publish_summary(class, encode, exported, classes, staged, breaking: breaking.view(), take summaries, alloc)
+    var parent_root: Option[hashing::HashValue] = None
+    match staged.parent {
+        Some(at) => {
+            expect at < staged.roots.len()
+            parent_root = Some(staged.roots[at])
+        }
+        None => {}
+    }
+    let check::Built(artefact: artefact_bytes, sources: sources) = built
+    let appending = try local_store.append(store::Append(package_name: text::String.of(manifest.name.as_str(), alloc), name: Some(text::String.of(staged.name.as_str(), alloc)), parent: parent_root, summary: Some(take summary), artefact: take artefact_bytes, sources: take sources))
+    let added = match appending {
+        Ok(stored) => stored
+        Err(exposed) => {
+            var exposure = mem::List[diagnostic::Diagnostic].empty(alloc)
+            mut exposure.push(exposed_diagnostic(take exposed, alloc))
+            return refusal(invocation, written, session, index, diagnostics: exposure.view(), alloc)
+        }
+    }
+    let root = added.root(alloc)
+    let recorded = machine::History(name: text::String.of(staged.name.as_str(), alloc), head: Some(root), modules: moved_modules(history, moved: moved.tombstones.view(), alloc))
+    let recorded_bytes = match recorded.bytes(grammar, alloc) {
+        Some(bytes) => bytes
+        None => mem::Bytes.empty(alloc)
+    }
+    discard mut files.insert(take history_path, value: take recorded_bytes)
+    var changes = mem::List[journal::Change].empty(alloc)
+    for file in take files {
+        let mem::KeyValue(key: path, value: content) = file
+        let unchanged = match held.bytes(path.as_str()) {
+            Some(bytes) => bytes == content.view()
+            None => false
+        }
+        if not unchanged {
+            mut changes.push(journal::Change(path: take path, content: Some(take content)))
+        }
+    }
+    try journal::apply(held.root.as_str(), changes: changes.view(), alloc)
+    var records = mem::List[output::Record].empty(alloc)
+    var fields = mem::List[text::String].empty(alloc)
+    mut fields.push(text::String.of(staged.name.as_str(), alloc))
+    mut fields.push(root.short(alloc))
+    mut fields.push(text::String.of(class.word(), alloc))
+    mut fields.push(text::String.of(encode.word(), alloc))
+    mut records.push(output::Record(word: text::String.of("published", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    for change in changes {
+        var wrote = mem::List[text::String].empty(alloc)
+        mut wrote.push(text::String.of(change.path.as_str(), alloc))
+        mut records.push(output::Record(word: text::String.of("wrote", alloc), fields: take wrote, lines: mem::List[text::String].empty(alloc)))
+    }
+    return publish_output(invocation, written, take records, diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc).view(), changes: changes.view(), alloc)
+} published
+
+/// The history head a history records, none without a history.
+fn history_head(history: Option[machine::History]) -> Option[hashing::HashValue] {
+    let Some(recorded) = history else {
+        return None
+    }
+    return recorded.head
+} history_head
+
+/// The behaviour epoch of an item in the parent release, 0 without one.
+fn parent_epoch(staged: Staged, path: Str) -> u64 {
+    let Some(at) = staged.parent else {
+        return 0
+    }
+    expect at < staged.entries.len()
+    return release::epoch(staged.entries[at].contents().summary, path)
+} parent_epoch
+
+/// The behaviour epoch of an item in the release: its parent's, one more when `--breaking` names
+/// it.
+fn bumped_epoch(staged: Staged, breaking: Slice[text::String], path: Str) -> u64 {
+    let kept = parent_epoch(staged, path)
+    for item in breaking {
+        if item.as_str() == path {
+            expect kept < ~0u64
+            return kept + 1
+        }
+    }
+    return kept
+} bumped_epoch
+
+/// The publish summary of a release.
+fn publish_summary(class: store::Class, encode: store::Class, exported: mem::Map[text::String, machine::ApiEntry], classes: mem::Map[text::String, store::Class], staged: Staged, breaking: Slice[text::String], take summaries: check::PublishSummaries, alloc: mem::Alloc) -> store::Summary {
+    var items = mem::List[store::ExportedItem].empty(alloc)
+    for exported_item in exported {
+        let path = exported_item.key().as_str()
+        let item_class = match classes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+            Some(held) => held
+            None => store::Class.Additive
+        }
+        mut items.push(store::ExportedItem(path: text::String.of(path, alloc), class: item_class, epoch: bumped_epoch(staged, breaking, path)))
+    }
+    var bumps = mem::List[store::EpochBump].empty(alloc)
+    for item in breaking {
+        let written = match staged.reason {
+            Some(held) => text::String.of(held.as_str(), alloc)
+            None => text::String.empty(alloc)
+        }
+        mut bumps.push(store::EpochBump(path: text::String.of(item.as_str(), alloc), reason: take written))
+    }
+    let check::PublishSummaries(functions: functions, authority: authority) = summaries
+    return store::Summary(class: class, encode: encode, items: take items, bumps: take bumps, authority: take authority, functions: take functions)
+} publish_summary
+
+/// The canonical path of an item named as commands name one.
+fn publish_canonical(workspace: workspace::Workspace, named: Str, alloc: mem::Alloc) -> text::String {
+    let Some(resolved) = scope::Scope.resolve(workspace, current: workspace.root.as_str(), written: Some(named), alloc) else {
+        return text::String.of(named, alloc)
+    }
+    let scope::Scope.Lines(path: path, lines: lines) = resolved.scope else {
+        return text::String.of(named, alloc)
+    }
+    let Some(item) = workspace.item_at(path.as_str(), line: lines.low, alloc) else {
+        return text::String.of(named, alloc)
+    }
+    return item.canonical(alloc)
+} publish_canonical
+
+/// The tombstones publishing moves out of a package's source: its source files without them, by
+/// path, and each tombstone's module and text in canonical format.
+struct MovedTombstones {
+    changed: mem::List[artefact::SourceFile]
+    tombstones: mem::List[ModuleTombstone]
+} MovedTombstones
+
+/// A tombstone's module and text.
+struct ModuleTombstone {
+    module: text::String
+    text: text::String
+} ModuleTombstone
+
+/// The tombstones of a module of a package's history once a publish adds those it moves out of
+/// the package's source, each module's in byte order.
+fn moved_modules(history: Option[machine::History], moved: Slice[ModuleTombstone], alloc: mem::Alloc) -> mem::List[machine::ModuleTombstones] {
+    var modules = mem::Map[text::String, mem::List[text::String]].empty(alloc)
+    match history {
+        Some(recorded) => {
+            for held in recorded.modules {
+                var tombstones = mem::List[text::String].empty(alloc)
+                for tombstone in held.tombstones {
+                    mut tombstones.push(text::String.of(tombstone.as_str(), alloc))
+                }
+                discard mut modules.insert(text::String.of(held.module.as_str(), alloc), value: take tombstones)
+            }
+        }
+        None => {}
+    }
+    for tombstone in moved {
+        if not modules.contains(tombstone.module) {
+            discard mut modules.insert(text::String.of(tombstone.module.as_str(), alloc), value: mem::List[text::String].empty(alloc))
+        }
+        var held = mut modules.at_mut(tombstone.module)
+        if held.position(fn(known: text::String) => known == tombstone.text).is_none() {
+            mut held.push(text::String.of(tombstone.text.as_str(), alloc))
+        }
+    }
+    var found = mem::List[machine::ModuleTombstones].empty(alloc)
+    for held_module in take modules {
+        let mem::KeyValue(key: module, value: tombstones) = held_module
+        var sorted = tombstones
+        mut sorted.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+        mut found.push(machine::ModuleTombstones(module: take module, tombstones: take sorted))
+    }
+    return found
+} moved_modules
+
+/// The tombstones of a package's source to move into its history: all but those keeping an
+/// `Encode` key of a type deriving `Encode`.
+fn moved_tombstones(session: check::Session, index: usize, alloc: mem::Alloc) -> MovedTombstones {
+    let held = session.workspace.contents()
+    var changed = mem::List[artefact::SourceFile].empty(alloc)
+    var moved = mem::List[ModuleTombstone].empty(alloc)
+    let Some(source) = held.packages.get(index) else {
+        expect false
+        return MovedTombstones(changed: take changed, tombstones: take moved)
+    }
+    let encoded = session.encode_key_tombstones(index)
+    for file in source.files {
+        let Some(module) = file.module else {
+            continue
+        }
+        let syntax = file.syntax
+        var removed = mem::List[core::Range[u32]].empty(alloc)
+        for position in 0..<syntax.items.len() {
+            let item = syntax.items[position]
+            let Some(tree) = item.tree else {
+                continue
+            }
+            let is_tombstone = match tree.kind() {
+                Some(kind) => kind.rule == syntax::Rule.RetiredItem
+                None => false
+            }
+            let lines = syntax.item_lines(item)
+            if not is_tombstone or item.abandoned or keeps_key(encoded.view(), path: file.path.as_str(), line: lines.low) {
+                continue
+            }
+            expect module < source.modules.len()
+            mut moved.push(ModuleTombstone(module: text::String.of(source.modules[module].name.as_str(), alloc), text: format::item_text(syntax, item, alloc)))
+            mut removed.push(lines)
+        }
+        if removed.len() == 0 {
+            continue
+        }
+        var kept = mem::Bytes.empty(alloc)
+        var first_kept = true
+        for number in 1..=u32.fit(syntax.lines.len()) {
+            if removed.position(fn(range: core::Range[u32]) => range.contains(number)).is_some() {
+                continue
+            }
+            if not first_kept {
+                mut kept.push(b'\n')
+            }
+            first_kept = false
+            mut kept.append(syntax.line_text(number))
+        }
+        mut kept.push(b'\n')
+        let parsed = syntax::parse(take kept, grammar: session.grammar.contents(), alloc)
+        mut changed.push(artefact::SourceFile(path: text::String.of(file.path.as_str(), alloc), content: format::source_file(parsed, only: None, alloc)))
+    }
+    return MovedTombstones(changed: take changed, tombstones: take moved)
+} moved_tombstones
+
+/// Whether a tombstone keeping an `Encode` key starts at a file's line.
+fn keeps_key(encoded: Slice[diagnostic::At], path: Str, line: u32) -> bool {
+    for at in encoded {
+        if at.path.as_str() == path and at.line == line {
+            return true
+        }
+    }
+    return false
+} keeps_key
+
+/// The output of a refused publish: its diagnostics.
+fn refusal(invocation: Invocation, written: Str, session: check::Session, index: usize, diagnostics: Slice[diagnostic::Diagnostic], alloc: mem::Alloc) -> output::Output {
+    let held = session.workspace.contents()
+    let std = session.std.contents()
+    var records = mem::List[output::Record].empty(alloc)
+    for reported in diagnostics {
+        mut records.push(record(held, std, scope: scope::Scope.Package(index), reported, alloc))
+    }
+    return publish_output(invocation, written, take records, diagnostics, changes: mem::List[journal::Change].empty(alloc).view(), alloc)
+} refusal
+
+fn publish_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], diagnostics: Slice[diagnostic::Diagnostic], changes: Slice[journal::Change], alloc: mem::Alloc) -> output::Output {
+    var errors: usize = 0
+    var incomplete: usize = 0
+    for reported in diagnostics {
+        invariant errors < diagnostics.len() and incomplete < diagnostics.len()
+        let class = reported.code.class()
+        if class == diagnostic::Class.Error {
+            errors += 1
+        } else if class == diagnostic::Class.Incompleteness {
+            incomplete += 1
+        }
+    }
+    var refused = diagnostics.len() > 0
+    for held in records {
+        if held.word.as_str() == "fail" {
+            refused = true
+        }
+    }
+    var verdict = output::Verdict.Ok
+    if refused {
+        verdict = output::Verdict.Failed
+    }
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: written_summary(files: changes.len(), errors, incomplete, alloc), records: take records)
+} publish_output

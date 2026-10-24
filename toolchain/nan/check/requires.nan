@@ -1,0 +1,443 @@
+//! Requires-sets: what a package's acceptance relies on in other packages, one entry per foreign item a rule consults while checking it, from the reads its checker recorded.
+
+/// A way of using an item, in the role table's order.
+pkg enum RequiresRole derives Copy, Eq, Ord {
+    Call
+    Build
+    Implement
+    Dispatch
+    Name
+} RequiresRole
+
+/// The role's position in the role table.
+fn RequiresRole.position(self) -> u64 {
+    return match self {
+        RequiresRole.Call => 0
+        RequiresRole.Build => 1
+        RequiresRole.Implement => 2
+        RequiresRole.Dispatch => 3
+        RequiresRole.Name => 4
+    }
+} RequiresRole.position
+
+/// A digest fact relied on: its field's key in the digest encoding and the path of a set's
+/// capability or validator, empty for a field that is not a set.
+pkg struct ReliedFact derives Eq, Ord {
+    pkg key: u64
+    pkg path: text::String
+} ReliedFact
+
+/// An entry of a requires-set.
+pkg struct RequiresEntry {
+    pkg path: text::String
+    pkg roles: mem::Set[RequiresRole]
+    pkg interface_hash: hashing::HashValue
+    pkg epoch: u64
+    /// The digest facts relied on.
+    pkg relied: mem::Set[ReliedFact]
+    /// Each method name resolved on the item as a type, with the function reference found as
+    /// the NIR encoding writes it.
+    pkg methods: mem::Map[text::String, mem::Bytes]
+    pkg item_hash: Option[hashing::HashValue]
+    /// For an interface the package implements, the names of the functions named after an impl
+    /// line's target in its module that are not its methods.
+    pkg implementers: mem::Set[text::String]
+} RequiresEntry
+
+/// The entry as a code root's requires-set records it.
+pkg fn RequiresEntry.encoded(self, alloc: mem::Alloc) -> mem::Bytes {
+    var record = encoding::Record.empty(alloc)
+    var path = mem::Bytes.empty(alloc)
+    encoding::bytes(mut path, value: self.path.as_bytes())
+    mut record.field(1, content: take path)
+    var roles = mem::Bytes.empty(alloc)
+    encoding::uvar(mut roles, value: u64.widen(self.roles.len()))
+    for role in self.roles {
+        encoding::uvar(mut roles, value: role.position())
+    }
+    mut record.field(3, content: take roles)
+    var interface_bytes = mem::Bytes.empty(alloc)
+    encoding::bytes(mut interface_bytes, value: self.interface_hash.bytes.view())
+    mut record.field(4, content: take interface_bytes)
+    var epoch_bytes = mem::Bytes.empty(alloc)
+    encoding::uvar(mut epoch_bytes, value: self.epoch)
+    mut record.field(5, content: take epoch_bytes)
+    if self.relied.len() > 0 {
+        var relied = mem::Bytes.empty(alloc)
+        encoding::uvar(mut relied, value: u64.widen(self.relied.len()))
+        for fact in self.relied {
+            encoding::uvar(mut relied, value: fact.key)
+            encoding::bytes(mut relied, value: fact.path.as_bytes())
+        }
+        mut record.field(6, content: take relied)
+    }
+    if self.methods.len() > 0 {
+        var methods = mem::Bytes.empty(alloc)
+        encoding::uvar(mut methods, value: u64.widen(self.methods.len()))
+        for method in self.methods {
+            encoding::bytes(mut methods, value: method.key().as_bytes())
+            mut methods.append(method.value().view())
+        }
+        mut record.field(7, content: take methods)
+    }
+    match self.item_hash {
+        Some(hash) => {
+            var held = mem::Bytes.empty(alloc)
+            encoding::bytes(mut held, value: hash.bytes.view())
+            mut record.field(8, content: take held)
+        }
+        None => {}
+    }
+    if self.implementers.len() > 0 {
+        var implementers = mem::Bytes.empty(alloc)
+        encoding::uvar(mut implementers, value: u64.widen(self.implementers.len()))
+        for name in self.implementers {
+            encoding::bytes(mut implementers, value: name.as_bytes())
+        }
+        mut record.field(9, content: take implementers)
+    }
+    return take record.finish(alloc)
+} RequiresEntry.encoded
+
+/// A foreign item an item's unit uses in a role other than `name`, and whether it instantiates
+/// the item or unfolds its body.
+struct RequiresUse derives Copy {
+    item: ty::ItemId
+    role: RequiresRole
+    instance: bool
+} RequiresUse
+
+/// A foreign function an item's body calls, with the digest facts its limits rely on in it.
+struct Relied {
+    callee: ty::ItemId
+    facts: mem::List[ReliedFact]
+} Relied
+
+/// The requires-set of a package from what its checker recorded checking it, each entry's
+/// epoch given by `epoch_of_path`, in byte order of the entries' encodings.
+pkg fn Checker.requires_set(self, package_id: ty::PackageId, epoch_of_path: fn(path: Str) -> u64) -> mem::List[RequiresEntry] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var entries = mem::Map[text::String, RequiresEntry].empty(alloc)
+    var foreign_items = mem::List[ty::ItemId].empty(alloc)
+    var own = mem::List[ty::ItemId].empty(alloc)
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            mut own.push(item)
+        }
+    }
+    for item in own {
+        for read in db.read_by(item) {
+            if db.package_of(read) != package_id and foreign_items.position(fn(known: ty::ItemId) => known == read).is_none() {
+                mut foreign_items.push(read)
+            }
+        }
+    }
+    for item in foreign_items {
+        match self.requires_entry(item, entries: mut entries, epoch_of_path) {
+            Some(path) => {
+                discard mut (mut entries.at_mut(path)).roles.insert(RequiresRole.Name)
+            }
+            None => {}
+        }
+    }
+    for item in own {
+        for used in take self.record_uses(item, package_id) {
+            let Some(path) = self.requires_entry(used.item, entries: mut entries, epoch_of_path) else {
+                continue
+            }
+            var found = mut entries.at_mut(path)
+            discard mut found.roles.insert(used.role)
+            if used.instance {
+                found.item_hash = Some(self.hashes(used.item).item)
+            }
+        }
+        for relied in take self.relied_facts(item, package_id) {
+            let Some(path) = self.requires_entry(relied.callee, entries: mut entries, epoch_of_path) else {
+                continue
+            }
+            var found = mut entries.at_mut(path)
+            for fact in take relied.facts {
+                discard mut found.relied.insert(take fact)
+            }
+        }
+        self.record_implements(item, package_id, entries: mut entries, epoch_of_path)
+    }
+    self.record_methods(package_id, own: own.view(), entries: mut entries, epoch_of_path)
+    var found = mem::List[RequiresEntry].empty(alloc)
+    for entry in take entries {
+        let mem::KeyValue(key: _, value: held) = entry
+        mut found.push(take held)
+    }
+    mut found.sort_by(fn(left: RequiresEntry, right: RequiresEntry) => left.encoded(alloc).view().cmp(right.encoded(alloc).view()))
+    return found
+} Checker.requires_set
+
+/// Records the entry of an item in a requires-set, giving its canonical path.
+fn Checker.requires_entry(self, item: ty::ItemId, mut entries: mem::Map[text::String, RequiresEntry], epoch_of_path: fn(path: Str) -> u64) -> Option[text::String] {
+    let alloc = self.alloc()
+    let Some(path) = self.canonical_path(item) else {
+        return None
+    }
+    if not entries.contains(path) {
+        let hashes = self.hashes(item)
+        let interface_hash = match hashes.interface_hash {
+            Some(held) => held
+            None => hashes.item
+        }
+        let entry = RequiresEntry(path: text::String.of(path.as_str(), alloc), roles: mem::Set[RequiresRole].empty(alloc), interface_hash: interface_hash, epoch: epoch_of_path(path.as_str()), relied: mem::Set[ReliedFact].empty(alloc), methods: mem::Map[text::String, mem::Bytes].empty(alloc), item_hash: None, implementers: mem::Set[text::String].empty(alloc))
+        discard mut entries.insert(text::String.of(path.as_str(), alloc), value: take entry)
+    }
+    return Some(take path)
+} Checker.requires_entry
+
+/// Records each method name the package's items resolve on a foreign type, with the function
+/// reference found.
+fn Checker.record_methods(self, package_id: ty::PackageId, own: Slice[ty::ItemId], mut entries: mem::Map[text::String, RequiresEntry], epoch_of_path: fn(path: Str) -> u64) {
+    let alloc = self.alloc()
+    let db = self.db()
+    for named in self.state.contents().members_named.cursor() {
+        let Member.Function(function) = named.member else {
+            continue
+        }
+        if not holds_item(own, item: named.item) {
+            continue
+        }
+        let Some(TypeKey.Item(owner)) = db.owners.get(function) else {
+            continue
+        }
+        if db.package_of(owner) == package_id {
+            continue
+        }
+        let Some(path) = self.requires_entry(owner, entries: mut entries, epoch_of_path) else {
+            continue
+        }
+        let canonical = db.canonical(function)
+        var name = text::String.empty(alloc)
+        let bytes = canonical.as_bytes()
+        var dot: usize = 0
+        for step in 0..<bytes.len() {
+            let at = bytes.len() - step
+            if bytes[at - 1] == b'.' {
+                dot = at
+                break
+            }
+        }
+        if dot > 0 {
+            match canonical.as_str().slice_bytes(dot, end: canonical.byte_len()) {
+                Some(rest) => mut name.append(rest)
+                None => {}
+            }
+        }
+        let names = ItemNames.new(self, item: named.item)
+        let encoder = nir::Encoder(names: Dyn[nir::Names].view(names), alloc: alloc)
+        var reference = mem::Bytes.empty(alloc)
+        encoder.fn_ref(mut reference, types: self.types(), callee: nir::FnRef.item(function, args: ty::Args.none()))
+        discard mut (mut entries.at_mut(path)).methods.insert(take name, value: take reference)
+    }
+} Checker.record_methods
+
+/// The foreign items an item's unit uses in a role other than `name`, and whether it
+/// instantiates the item or unfolds its body, in the order of its instructions.
+fn Checker.record_uses(self, item: ty::ItemId, package_id: ty::PackageId) -> mem::List[RequiresUse] {
+    let alloc = self.alloc()
+    var found_uses = mem::List[RequiresUse].empty(alloc)
+    let Some(unit) = self.unit(item) else {
+        return found_uses
+    }
+    for function in unit.contents().functions {
+        for block in function.blocks {
+            for inst in block.insts {
+                self.inst_uses(item, package_id, op: inst.op, found_uses: mut found_uses)
+            }
+            let nir::Terminator.Call(call: call, ok: _, failure: _) = block.term else {
+                continue
+            }
+            let nir::Callee.Fn(reference) = call.callee else {
+                continue
+            }
+            self.callable_uses(item, package_id, reference, found_uses: mut found_uses)
+        }
+    }
+    return found_uses
+} Checker.record_uses
+
+/// Adds the uses of an instruction of an item's unit.
+fn Checker.inst_uses(self, item: ty::ItemId, package_id: ty::PackageId, op: nir::Op, mut found_uses: mem::List[RequiresUse]) {
+    let db = self.db()
+    let types = self.types()
+    match op {
+        nir::Op.FnRef(reference) => self.callable_uses(item, package_id, reference, found_uses: mut found_uses)
+        nir::Op.Call(call) => {
+            match call.callee {
+                nir::Callee.Fn(reference) => self.callable_uses(item, package_id, reference, found_uses: mut found_uses)
+                nir::Callee.Dyn(place: _, item: interface_item, method: _) => {
+                    if db.package_of(interface_item) != package_id {
+                        mut found_uses.push(RequiresUse(item: interface_item, role: RequiresRole.Dispatch, instance: false))
+                    }
+                }
+                nir::Callee.Value(_) => {}
+            }
+        }
+        nir::Op.Construct(ty: built_ty, fields: _) => {
+            let ty::TyKind.Item(item: built, args: args) = types.kind(built_ty) else {
+                return
+            }
+            if db.package_of(built) != package_id and self.closed(built) {
+                mut found_uses.push(RequiresUse(item: built, role: RequiresRole.Build, instance: types.arg_list(args).len() > 0))
+            }
+        }
+        else => {}
+    }
+} Checker.inst_uses
+
+/// Adds the use of a function reference: a call of a foreign item, or a dispatch of a foreign
+/// interface's method.
+fn Checker.callable_uses(self, item: ty::ItemId, package_id: ty::PackageId, reference: nir::FnRef, mut found_uses: mem::List[RequiresUse]) {
+    let db = self.db()
+    match reference.callable {
+        nir::Callable.Item(item: callee, role: _, index: _) => {
+            if db.package_of(callee) == package_id {
+                return
+            }
+            let unfolded = self.is_expression_fn(callee) and self.unfolds(callee, holder: item)
+            let instance = self.types().arg_list(reference.args).len() > 0 or unfolded
+            mut found_uses.push(RequiresUse(item: callee, role: RequiresRole.Call, instance: instance))
+        }
+        nir::Callable.Method(item: interface_item, method: _) => {
+            if db.package_of(interface_item) != package_id {
+                mut found_uses.push(RequiresUse(item: interface_item, role: RequiresRole.Dispatch, instance: false))
+            }
+        }
+        else => {}
+    }
+} Checker.callable_uses
+
+/// Whether an item is a function whose body is an expression.
+fn Checker.is_expression_fn(self, item: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(function) = self.db().ast(item).kind else {
+        return false
+    }
+    return match function.body {
+        ast::FnBody.Expr(_) => true
+        else => false
+    }
+} Checker.is_expression_fn
+
+/// Whether a struct or enum is closed.
+fn Checker.closed(self, item: ty::ItemId) -> bool {
+    return self.db().ast(item).has_modifier(ast::TypeModifier.Closed)
+} Checker.closed
+
+/// The digest facts an item's limits rely on in each foreign function its body calls: the
+/// absence of what `pure`, `noalloc` and `notrap` exclude, and terminates.
+fn Checker.relied_facts(self, item: ty::ItemId, package_id: ty::PackageId) -> mem::List[Relied] {
+    let alloc = self.alloc()
+    var found = mem::List[Relied].empty(alloc)
+    let Some(head) = self.fn_sig(item) else {
+        return found
+    }
+    let demanded = head.limit_set
+    var keys = mem::List[u64].empty(alloc)
+    if demanded.pure {
+        for key in 1u64..=5 {
+            mut keys.push(key)
+        }
+    } else if demanded.noalloc {
+        mut keys.push(2)
+    }
+    if demanded.notrap {
+        mut keys.push(6)
+    }
+    if demanded.terminates {
+        mut keys.push(7)
+    }
+    if keys.len() == 0 {
+        return found
+    }
+    let Some(unit) = self.unit(item) else {
+        return found
+    }
+    let db = self.db()
+    for function in unit.contents().functions {
+        for block in function.blocks {
+            for inst in block.insts {
+                let nir::Op.Call(call) = inst.op else {
+                    continue
+                }
+                add_relied(mut found, db, call, package_id, keys: keys.view(), alloc)
+            }
+            let nir::Terminator.Call(call: call, ok: _, failure: _) = block.term else {
+                continue
+            }
+            add_relied(mut found, db, call, package_id, keys: keys.view(), alloc)
+        }
+    }
+    return found
+} Checker.relied_facts
+
+/// Adds the facts relied on in a call's callee when it is a foreign item.
+fn add_relied(mut found: mem::List[Relied], db: Db, call: nir::Call, package_id: ty::PackageId, keys: Slice[u64], alloc: mem::Alloc) {
+    let nir::Callee.Fn(reference) = call.callee else {
+        return
+    }
+    let nir::Callable.Item(item: callee, role: _, index: _) = reference.callable else {
+        return
+    }
+    if db.package_of(callee) == package_id {
+        return
+    }
+    var facts = mem::List[ReliedFact].empty(alloc)
+    for key in keys {
+        mut facts.push(ReliedFact(key: key, path: text::String.empty(alloc)))
+    }
+    mut found.push(Relied(callee: callee, facts: take facts))
+} add_relied
+
+/// For an impl line naming a foreign interface: the `implement` role and the names of the
+/// functions named after its target in its module that are not methods of the interface.
+fn Checker.record_implements(self, item: ty::ItemId, package_id: ty::PackageId, mut entries: mem::Map[text::String, RequiresEntry], epoch_of_path: fn(path: Str) -> u64) {
+    let alloc = self.alloc()
+    let db = self.db()
+    let sig = self.sig(item)
+    let SigKind.Impl(target: Some(target), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
+        return
+    }
+    if db.package_of(bound.item) == package_id {
+        return
+    }
+    let Some(path) = self.requires_entry(bound.item, entries: mut entries, epoch_of_path) else {
+        return
+    }
+    var methods = mem::List[text::String].empty(alloc)
+    let interface_sig = self.sig(bound.item)
+    match interface_sig.contents().kind {
+        SigKind.Interface(methods: declared) => {
+            for method in declared {
+                mut methods.push(text::String.of(method.name.as_str(), alloc))
+            }
+        }
+        else => {}
+    }
+    let module = db.module_of(item)
+    var implementers = mem::List[text::String].empty(alloc)
+    match db.member_table.get(target) {
+        Some(members) => {
+            for member in members {
+                let name = member.key().as_str()
+                if methods.position(fn(method: text::String) => method.as_str() == name).is_some() {
+                    continue
+                }
+                if member.value().position(fn(function: ty::ItemId) => db.module_of(function) == module).is_some() {
+                    mut implementers.push(text::String.of(name, alloc))
+                }
+            }
+        }
+        None => {}
+    }
+    var found = mut entries.at_mut(path)
+    discard mut found.roles.insert(RequiresRole.Implement)
+    for name in take implementers {
+        discard mut found.implementers.insert(take name)
+    }
+} Checker.record_implements

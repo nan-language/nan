@@ -1,6 +1,6 @@
 # Self-hosting and milestones
 
-This chapter defines the bootstrap and the NaN front end, the milestones on which language 1 freezes, and the measurements the freeze requires.
+This chapter defines the bootstrap, the NaN toolchain and the check of its first self-built toolchain, the milestones on which language 1 freezes, and the measurements the freeze requires.
 
 ## Bootstrap
 
@@ -12,12 +12,27 @@ The **bootstrap** is the [implementation](00-charter.md#conformance) written in 
 - On `x86_64-host`, the bootstrap's `stack_switch` [support routine](27-program-model.md#runtime-support) switches task stacks with Cranelift's stack switching.
 - Cranelift is the backend whose reported frame sizes the [stack limits](10-effects-digests.md#stack-limits) check reads.
 
-### NaN front end
+### NaN toolchain
 
-The **NaN front end** is a program written in NaN that implements `nan check`: lexing, parsing, every checking rule, elaboration to NIR, the prover and the interpreter. It targets `x86_64-host`, is built by the bootstrap and implements no other command.
+The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. It targets `x86_64-host`, and its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
+
+- For every workspace and command line, the NaN toolchain prints what the bootstrap prints, exits with the same status and writes the same source and machine files; each image it writes behaves as the bootstrap's image of that build does.
+
+#### NaN front end
+
+The **NaN front end** is the part of the NaN toolchain that implements `nan check`: lexing, parsing, every checking rule, elaboration to NIR, the prover and the interpreter.
 
 - For every workspace and scope, the NaN front end prints, byte for byte, the output of the bootstrap's `nan check`.
 - For every item and target it checks, it produces NIR whose [canonical encoding](19-nir.md#encoding) is identical to the bootstrap's when both carry the same [advisories](37-evolution.md#prover-monotonicity).
+
+### Self-hosting
+
+The NaN toolchain built by the bootstrap builds the NaN toolchain: the image it writes is the **first self-built toolchain**. The first self-built toolchain is checked against the bootstrap by two checks:
+
+- **Diverse double-compiling:** the first self-built toolchain builds the NaN toolchain into an image equal, byte for byte, to itself.
+- **Stage comparison:** the bootstrap's `nan build --compare-with` against the first self-built toolchain reports no error ([stage comparison](36-builds.md#stage-comparison)).
+
+Each later NaN toolchain is built by its checked predecessor.
 
 ## Milestones
 

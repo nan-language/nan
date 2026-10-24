@@ -1,0 +1,926 @@
+//! Rendering: renderers and their budgets, the renderings of scalars, std types and derived `Render`, `text::fmt` templates, and `Dyn` views, a `Dyn[I]` value being the address of the value and of its method table: the release of the value's type, its size and alignment, then each of `I`'s methods.
+
+/// The bytes of the buffer the host platform writes a float's text into.
+const FLOAT_TEXT: u64 = 40
+
+/// The words of the state a renderer is the address of: the buffer kept bytes go to (zero while
+/// measuring), the render budget, the bytes the full rendering holds so far, the bytes kept, the
+/// position in the full rendering where keeping starts, and the most bytes kept, at most the
+/// budget. Finishing a rendering elides what passed the budget.
+const RENDERER_BUFFER: u64 = 0
+
+const RENDERER_BUDGET: u64 = 8
+
+const RENDERER_WRITTEN: u64 = 16
+
+const RENDERER_KEPT: u64 = 24
+
+const RENDERER_SKIP: u64 = 32
+
+const RENDERER_LIMIT: u64 = 40
+
+const RENDERER_SIZE: u64 = 48
+
+/// A rendering in a buffer on the stack: the buffer's address and the rendering's length.
+struct Rendered derives Copy {
+    buffer: clif::Value
+    len: clif::Value
+} Rendered
+
+/// A piece of a template: a literal text, or the index of the argument a hole names.
+enum Piece derives Eq, Hash {
+    Text(text::String)
+    Hole(usize)
+} Piece
+
+fn Piece.copy(self, alloc: mem::Alloc) -> Piece {
+    return match self {
+        Piece.Text(literal) => Piece.Text(text::String.of(literal.as_str(), alloc))
+        Piece.Hole(index) => Piece.Hole(index)
+    }
+} Piece.copy
+
+/// A renderer value over a new state, keeping bytes in `buffer` (zero to measure).
+fn new_renderer(mut fx: Fx, buffer: clif::Value, budget: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    return window_renderer(mut fx, buffer, budget, skip: zero, limit: budget)
+} new_renderer
+
+/// A renderer value over a new state with a budget, keeping in `buffer` at most `limit` bytes
+/// of the full rendering from position `skip` on.
+fn window_renderer(mut fx: Fx, buffer: clif::Value, budget: clif::Value, skip: clif::Value, limit: clif::Value) -> clif::Value {
+    let state = mut fx.slot(RENDERER_SIZE, align: 8)
+    mut fx.store(buffer, addr: state, offset: RENDERER_BUFFER)
+    mut fx.store(budget, addr: state, offset: RENDERER_BUDGET)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: state, offset: RENDERER_WRITTEN)
+    mut fx.store(zero, addr: state, offset: RENDERER_KEPT)
+    mut fx.store(skip, addr: state, offset: RENDERER_SKIP)
+    mut fx.store(limit, addr: state, offset: RENDERER_LIMIT)
+    let value = mut fx.slot(8, align: 8)
+    mut fx.store(state, addr: value, offset: 0)
+    return value
+} window_renderer
+
+/// The bytes the full rendering of a renderer holds so far.
+fn render_written(mut fx: Fx, renderer_value: clif::Value) -> clif::Value {
+    let state = mut fx.load(PTR, addr: renderer_value, offset: 0)
+    return mut fx.load(PTR, addr: state, offset: RENDERER_WRITTEN)
+} render_written
+
+/// Ends a rendering: when it passed its budget, keeps the longest prefix ending at a char
+/// boundary that leaves room for `...` cut to the budget, then that marker. Gives the length.
+fn render_finish(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value) -> clif::Value {
+    let state = mut fx.load(PTR, addr: renderer_value, offset: 0)
+    let buffer = mut fx.load(PTR, addr: state, offset: RENDERER_BUFFER)
+    let budget = mut fx.load(PTR, addr: state, offset: RENDERER_BUDGET)
+    let written = mut fx.load(PTR, addr: state, offset: RENDERER_WRITTEN)
+    let kept = mut fx.load(PTR, addr: state, offset: RENDERER_KEPT)
+    let elided = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: written, y: budget)
+    let results = fx.types1(PTR)
+    let finished = mut fx.choose(elided, results: results.view(), then: fn[mut lo](mut fx1: Fx) -> mem::List[clif::Value] {
+        let three = mut fx1.ptr(3)
+        let small = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: budget, y: three)
+        let marker = mut fx1.b.select(small, x: budget, y: three)
+        let room = mut fx1.b.isub(budget, y: marker)
+        let fits = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: kept, y: room)
+        let cut = mut fx1.b.select(fits, x: kept, y: room)
+        let initial = fx1.list1(cut)
+        let ended = mut fx1.repeat(initial.view(), body: fn(mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
+            expect current.len() == 1
+            let candidate = current[0]
+            let positive = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: candidate, y: 0)
+            let flag = fx2.types1(clif::Type.Int8)
+            let continuations = mut fx2.choose(positive, results: flag.view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let at = mut fx3.b.iadd(buffer, y: candidate)
+                let byte = mut fx3.load(clif::Type.Int8, addr: at, offset: 0)
+                let high = mut fx3.b.band_imm_s(byte, y: 0xC0)
+                let continuing = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: high, y: 0x80)
+                return fx3.list1(continuing)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let no = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(no)
+            })
+            expect continuations.len() == 1
+            let continuation = continuations[0]
+            let back = mut fx2.b.iadd_imm_s(candidate, y: -1)
+            let next = mut fx2.b.select(continuation, x: back, y: candidate)
+            return Pass(again: continuation, next: fx2.list1(next))
+        })
+        expect ended.len() == 1
+        let end = ended[0]
+        let dots_view = mut lo.view_literal(mut fx1, contents: b"...")
+        let dots = dots_view.address_value()
+        let dots_start = mut fx1.load(PTR, addr: dots, offset: 0)
+        let target = mut fx1.b.iadd(buffer, y: end)
+        let copy_args = fx1.list3(target, b: dots_start, c: marker)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        let length = mut fx1.b.iadd(end, y: marker)
+        return fx1.list1(length)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        return fx1.list1(kept)
+    })
+    expect finished.len() == 1
+    return finished[0]
+} render_finish
+
+/// Renders a value of a type within a budget into a buffer on the stack: its address and the
+/// rendering's length.
+fn render_value(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held, budget: u64) -> Rendered {
+    var size = budget
+    if size < 1 {
+        size = 1
+    }
+    let buffer = mut fx.slot(size, align: 8)
+    let limit = mut fx.ptr(budget)
+    let renderer_value = new_renderer(mut fx, buffer, budget: limit)
+    render_via(mut lo, mut fx, ty, value, renderer_value)
+    let len = render_finish(mut lo, mut fx, renderer_value)
+    return Rendered(buffer: buffer, len: len)
+} render_value
+
+/// Appends bytes to a rendering: the bytes within its limit from its skip position on are
+/// kept, all are counted.
+fn render_append(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, text: clif::Value, len: clif::Value) {
+    let state = mut fx.load(PTR, addr: renderer_value, offset: 0)
+    let buffer = mut fx.load(PTR, addr: state, offset: RENDERER_BUFFER)
+    let limit = mut fx.load(PTR, addr: state, offset: RENDERER_LIMIT)
+    let written = mut fx.load(PTR, addr: state, offset: RENDERER_WRITTEN)
+    let kept = mut fx.load(PTR, addr: state, offset: RENDERER_KEPT)
+    let skip = mut fx.load(PTR, addr: state, offset: RENDERER_SKIP)
+    let total = mut fx.b.iadd(written, y: len)
+    mut fx.store(total, addr: state, offset: RENDERER_WRITTEN)
+    let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: skip, y: written)
+    let gap = mut fx.b.isub(skip, y: written)
+    let zero = mut fx.ptr(0)
+    let skipped = mut fx.b.select(ahead, x: gap, y: zero)
+    let dropped = mut fx.b.umin(skipped, y: len)
+    let from = mut fx.b.iadd(text, y: dropped)
+    let rest = mut fx.b.isub(len, y: dropped)
+    let room = mut fx.b.isub(limit, y: kept)
+    let fits = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: rest, y: room)
+    let count = mut fx.b.select(fits, x: rest, y: room)
+    let has_room = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: kept, y: limit)
+    let keeping = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: buffer, y: 0)
+    let copying = mut fx.b.band(has_room, y: keeping)
+    mut fx.if_true(copying, then: fn[mut lo](mut fx1: Fx) {
+        let target = mut fx1.b.iadd(buffer, y: kept)
+        let copy_args = fx1.list3(target, b: from, c: count)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+    })
+    let copied = mut fx.b.select(has_room, x: count, y: zero)
+    let now_kept = mut fx.b.iadd(kept, y: copied)
+    mut fx.store(now_kept, addr: state, offset: RENDERER_KEPT)
+} render_append
+
+/// Appends a literal text to a rendering.
+fn render_append_text(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, text: Str) {
+    if text.is_empty() {
+        return
+    }
+    let viewed = mut lo.view_literal(mut fx, contents: text.as_bytes())
+    let view = viewed.address_value()
+    let start = mut fx.load(PTR, addr: view, offset: 0)
+    let len = mut fx.ptr(u64.widen(text.byte_len()))
+    render_append(mut lo, mut fx, renderer_value, text: start, len)
+} render_append_text
+
+/// Appends the decimal digits of an unsigned 64-bit value.
+fn append_decimal(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, value: clif::Value) {
+    let digits = mut fx.slot(24, align: 8)
+    let end = mut fx.ptr(24)
+    let initial = fx.list2(value, b: end)
+    let state = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let remaining = current[0]
+        let position = current[1]
+        let ten = mut fx1.ptr(10)
+        let digit = mut fx1.b.urem(remaining, y: ten)
+        let rest = mut fx1.b.udiv(remaining, y: ten)
+        let at = mut fx1.b.iadd_imm_s(position, y: -1)
+        let shifted = mut fx1.b.iadd_imm_s(digit, y: i64.widen(b'0'))
+        let ascii = mut fx1.b.ireduce(clif::Type.Int8, x: shifted)
+        let place = mut fx1.b.iadd(digits, y: at)
+        mut fx1.store(ascii, addr: place, offset: 0)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
+        return Pass(again: more, next: fx1.list2(rest, b: at))
+    })
+    expect state.len() == 2
+    let start = mut fx.b.iadd(digits, y: state[1])
+    let len = mut fx.b.isub(end, y: state[1])
+    render_append(mut lo, mut fx, renderer_value, text: start, len)
+} append_decimal
+
+/// Appends the UTF-8 encoding of a char.
+fn append_char(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, c: clif::Value) {
+    let buffer = mut fx.slot(4, align: 4)
+    let wide = body_widen(mut fx, value: c)
+    let len = encode_utf8(mut fx, c: wide, buffer)
+    render_append(mut lo, mut fx, renderer_value, text: buffer, len)
+} append_char
+
+/// Writes the UTF-8 encoding of a scalar value at an address: its length.
+fn encode_utf8(mut fx: Fx, c: clif::Value, buffer: clif::Value) -> clif::Value {
+    let one = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: c, y: 0x80)
+    let two = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: c, y: 0x800)
+    let three = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: c, y: 0x1_0000)
+    let results = fx.types1(PTR)
+    let encoded = mut fx.choose(one, results: results.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        utf8_byte(mut fx1, buffer, value: c, at: 0)
+        let count = mut fx1.ptr(1)
+        return fx1.list1(count)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let wider = fx1.types1(PTR)
+        return mut fx1.choose(two, results: wider.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let lead_bits = mut fx2.b.ushr_imm_s(c, y: 6)
+            let lead = mut fx2.b.bor_imm_s(lead_bits, y: 0xC0)
+            utf8_byte(mut fx2, buffer, value: lead, at: 0)
+            let tail_bits = mut fx2.b.band_imm_s(c, y: 0x3F)
+            let tail = mut fx2.b.bor_imm_s(tail_bits, y: 0x80)
+            utf8_byte(mut fx2, buffer, value: tail, at: 1)
+            let count = mut fx2.ptr(2)
+            return fx2.list1(count)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let widest = fx2.types1(PTR)
+            return mut fx2.choose(three, results: widest.view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                utf8_part(mut fx3, c, buffer, at: 0, shift: 12, mark: 0xE0)
+                utf8_part(mut fx3, c, buffer, at: 1, shift: 6, mark: 0x80)
+                utf8_part(mut fx3, c, buffer, at: 2, shift: 0, mark: 0x80)
+                let count = mut fx3.ptr(3)
+                return fx3.list1(count)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                utf8_part(mut fx3, c, buffer, at: 0, shift: 18, mark: 0xF0)
+                utf8_part(mut fx3, c, buffer, at: 1, shift: 12, mark: 0x80)
+                utf8_part(mut fx3, c, buffer, at: 2, shift: 6, mark: 0x80)
+                utf8_part(mut fx3, c, buffer, at: 3, shift: 0, mark: 0x80)
+                let count = mut fx3.ptr(4)
+                return fx3.list1(count)
+            })
+        })
+    })
+    expect encoded.len() == 1
+    return encoded[0]
+} encode_utf8
+
+/// Writes the low byte of a value `at` bytes past `buffer`.
+fn utf8_byte(mut fx: Fx, buffer: clif::Value, value: clif::Value, at: u64) {
+    let narrow = mut fx.b.ireduce(clif::Type.Int8, x: value)
+    mut fx.store(narrow, addr: buffer, offset: at)
+} utf8_byte
+
+/// Writes the byte of a scalar value's UTF-8 encoding `at` bytes past `buffer`: its bits from
+/// `shift` on, the lead byte's whole, a continuation byte's low six, marked with `mark`.
+fn utf8_part(mut fx: Fx, c: clif::Value, buffer: clif::Value, at: u64, shift: i64, mark: i64) {
+    let shifted = mut fx.b.ushr_imm_s(c, y: shift)
+    var part = shifted
+    if at != 0 {
+        part = mut fx.b.band_imm_s(shifted, y: 0x3F)
+    }
+    let marked = mut fx.b.bor_imm_s(part, y: mark)
+    utf8_byte(mut fx, buffer, value: marked, at)
+} utf8_part
+
+/// The supplied members of `core::Renderer`.
+fn render_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
+    let written_path = supply.path.as_str()
+    let prefix = "core::Renderer."
+    if not written_path.starts_with(prefix) {
+        return false
+    }
+    let Some(member) = written_path.slice_bytes(prefix.byte_len(), end: written_path.byte_len()) else {
+        return false
+    }
+    let renderer_value = supply.param(0).address_value()
+    match member {
+        "write" => {
+            let text = supply.param(1).address_value()
+            let start = mut fx.load(PTR, addr: text, offset: 0)
+            let len = mut fx.load(PTR, addr: text, offset: 8)
+            render_append(mut lo, mut fx, renderer_value, text: start, len)
+            supply.done(mut lo, mut fx)
+        }
+        "write_char" => {
+            let c = supply.param(1).scalar_value()
+            append_char(mut lo, mut fx, renderer_value, c)
+            supply.done(mut lo, mut fx)
+        }
+        "remaining" or "is_elided" => {
+            let state = mut fx.load(PTR, addr: renderer_value, offset: 0)
+            let budget = mut fx.load(PTR, addr: state, offset: RENDERER_BUDGET)
+            let written = mut fx.load(PTR, addr: state, offset: RENDERER_WRITTEN)
+            let over = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: written, y: budget)
+            var held = Held.Scalar(over)
+            if member != "is_elided" {
+                let left = mut fx.b.isub(budget, y: written)
+                let zero = mut fx.ptr(0)
+                held = Held.Scalar(mut fx.b.select(over, x: zero, y: left))
+            }
+            supply.ret(mut lo, mut fx, held)
+        }
+        else => return false
+    }
+    return true
+} render_lower
+
+/// Defines `render` for a type: its rendering written to the renderer it receives.
+fn define_render(mut lo: Lowering, mut fx: Fx, abi: Abi, ty: ty::Ty) {
+    let incoming = mut fx.entry()
+    expect abi.params.len() == 2 and incoming.len() > 0
+    let value = match abi.params[0].repr {
+        Repr.Scalar(_) => Held.Scalar(incoming[0])
+        Repr.Address => Held.Address(incoming[0])
+        Repr.Empty => Held.Empty
+    }
+    let renderer_value = incoming[incoming.len() - 1]
+    render_to(mut lo, mut fx, ty, value, renderer_value)
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} define_render
+
+/// Writes the rendering of a value of a type to a renderer.
+fn render_to(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held, renderer_value: clif::Value) {
+    match lo.ck.types().kind(ty) {
+        ty::TyKind.Unit => render_append_text(mut lo, mut fx, renderer_value, text: "Unit")
+        ty::TyKind.Scalar(scalar) => render_scalar(mut lo, mut fx, scalar, value: value.scalar_value(), renderer_value)
+        ty::TyKind.Item(item: item, args: args) => render_item(mut lo, mut fx, ty, item, args, value, renderer_value)
+        ty::TyKind.Dyn(_) => {
+            let address = value.address_value()
+            render_dyn(mut fx, address, renderer_value)
+        }
+        else => {
+            expect false
+        }
+    }
+} render_to
+
+/// Writes the rendering of a value of an item type to a renderer: a std type's rendering, or
+/// the derived one.
+fn render_item(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, args: ty::Args, value: Held, renderer_value: clif::Value) {
+    let path = lo.ck.db().canonical(item)
+    match path.as_str() {
+        "core::Str" or "text::String" => {
+            let address = value.address_value()
+            let start = mut fx.load(PTR, addr: address, offset: 0)
+            let len = mut fx.load(PTR, addr: address, offset: 8)
+            render_append(mut lo, mut fx, renderer_value, text: start, len)
+        }
+        "text::Fixed" => {
+            let address = value.address_value()
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let bytes_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "bytes")
+            let len_at = len_field.offset
+            let bytes_at = bytes_field.offset
+            let len = mut fx.load(PTR, addr: address, offset: len_at)
+            let start = mut fx.offset(address, offset: bytes_at)
+            render_append(mut lo, mut fx, renderer_value, text: start, len)
+        }
+        "core::Slice" or "core::SliceMut" or "mem::List" or "mem::Set" => {
+            let element = arg_type(lo, args, index: 0)
+            let address = value.address_value()
+            let start = mut fx.load(PTR, addr: address, offset: 0)
+            let len = mut fx.load(PTR, addr: address, offset: 8)
+            render_elements(mut lo, mut fx, element, start, len, renderer_value)
+        }
+        "core::Array" => {
+            let element = arg_type(lo, args, index: 0)
+            let listed = lo.ck.types().arg_list(args)
+            expect listed.len() > 1
+            let count = const_arg(listed[1]).low_bits()
+            let len = mut fx.ptr(count)
+            render_elements(mut lo, mut fx, element, start: value.address_value(), len, renderer_value)
+        }
+        "mem::Bounded" => {
+            let element = arg_type(lo, args, index: 0)
+            let address = value.address_value()
+            let len_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "len")
+            let items_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: "items")
+            let len_at = len_field.offset
+            let items_at = items_field.offset
+            let len = mut fx.load(PTR, addr: address, offset: len_at)
+            let start = mut fx.offset(address, offset: items_at)
+            render_elements(mut lo, mut fx, element, start, len, renderer_value)
+        }
+        "mem::Bytes" => render_bytes(mut lo, mut fx, address: value.address_value(), renderer_value)
+        "mem::Map" => {
+            let key = arg_type(lo, args, index: 0)
+            let mapped = arg_type(lo, args, index: 1)
+            var pair = mem::List[ty::Ty].empty(lo.alloc)
+            mut pair.push(key)
+            mut pair.push(mapped)
+            let entry = lo.std_ty("mem", type_name: "KeyValue", args: take pair)
+            let address = value.address_value()
+            let start = mut fx.load(PTR, addr: address, offset: 0)
+            let len = mut fx.load(PTR, addr: address, offset: 8)
+            render_entries(mut lo, mut fx, entry, start, len, renderer_value)
+        }
+        "mem::Box" or "mem::Shared" => {
+            let inner = arg_type(lo, args, index: 0)
+            let address = value.address_value()
+            let first_word = mut fx.load(PTR, addr: address, offset: 0)
+            let contents = contents_address(mut lo, mut fx, ty, pointer: first_word)
+            let held = mut lo.held_at(mut fx, ty: inner, address: contents)
+            render_via(mut lo, mut fx, ty: inner, value: held, renderer_value)
+        }
+        else => render_composite(mut lo, mut fx, ty, item, args, value, renderer_value)
+    }
+} render_item
+
+/// The type argument at `index` of an argument list.
+fn arg_type(lo: Lowering, args: ty::Args, index: usize) -> ty::Ty {
+    let listed = lo.ck.types().arg_list(args)
+    expect index < listed.len()
+    let Some(found) = listed[index].ty() else {
+        expect false
+        return ty::Ty.error()
+    }
+    return found
+} arg_type
+
+/// Renders a value through its type's `Render` conformance.
+fn render_via(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, value: Held, renderer_value: clif::Value) {
+    let own = mem::List[ty::Arg].empty(lo.alloc)
+    var operands = mem::List[Held].empty(lo.alloc)
+    mut operands.push(value)
+    mut operands.push(Held.Address(renderer_value))
+    discard mut lo.call_method(mut fx, ty, interface_name: "Render", take own, args: operands.view())
+} render_via
+
+fn render_scalar(mut lo: Lowering, mut fx: Fx, scalar: ty::Scalar, value: clif::Value, renderer_value: clif::Value) {
+    match scalar {
+        ty::Scalar.Bool => {
+            let truth = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: value, y: 0)
+            let nothing = mem::List[clif::Type].empty(fx.alloc)
+            discard mut fx.choose_in(mut lo, condition: truth, results: nothing.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                render_append_text(mut lo1, fx: mut fx1, renderer_value, text: "true")
+                return mem::List[clif::Value].empty(fx1.alloc)
+            }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                render_append_text(mut lo1, fx: mut fx1, renderer_value, text: "false")
+                return mem::List[clif::Value].empty(fx1.alloc)
+            })
+        }
+        ty::Scalar.Char => append_char(mut lo, mut fx, renderer_value, c: value)
+        ty::Scalar.Float32 or ty::Scalar.Float64 => {
+            let buffer = mut fx.slot(FLOAT_TEXT, align: 8)
+            var name = "f64_text"
+            if scalar == ty::Scalar.Float32 {
+                name = "f32_text"
+            }
+            var args = mem::List[Held].empty(lo.alloc)
+            mut args.push(Held.Scalar(value))
+            mut args.push(Held.Address(buffer))
+            let called = mut lo.platform_call(mut fx, name, args: args.view())
+            let len = called.result.scalar_value()
+            render_append(mut lo, mut fx, renderer_value, text: buffer, len)
+        }
+        else => {
+            var wide = value
+            if scalar.bits() < 64 {
+                if scalar.is_signed() {
+                    wide = mut fx.b.sextend(clif::Type.Int64, x: value)
+                } else {
+                    wide = mut fx.b.uextend(clif::Type.Int64, x: value)
+                }
+            }
+            if scalar.is_signed() {
+                let negative = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: wide, y: 0)
+                mut fx.if_true(negative, then: fn[mut lo](mut fx1: Fx) {
+                    render_append_text(mut lo, fx: mut fx1, renderer_value, text: "-")
+                })
+                let flipped = mut fx.b.ineg(wide)
+                let magnitude = mut fx.b.select(negative, x: flipped, y: wide)
+                append_decimal(mut lo, mut fx, renderer_value, value: magnitude)
+            } else {
+                append_decimal(mut lo, mut fx, renderer_value, value: wide)
+            }
+        }
+    }
+} render_scalar
+
+/// `[a, b]`: elements of a type from an address, separated by `, `.
+fn render_elements(mut lo: Lowering, mut fx: Fx, element: ty::Ty, start: clif::Value, len: clif::Value, renderer_value: clif::Value) {
+    render_append_text(mut lo, mut fx, renderer_value, text: "[")
+    let laid = mut lo.layout_of(element)
+    let size = laid.contents().size
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let not_first = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: index, y: 0)
+        mut fx1.if_true(not_first, then: fn[mut lo](mut fx2: Fx) {
+            render_append_text(mut lo, fx: mut fx2, renderer_value, text: ", ")
+        })
+        let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(size))
+        let at = mut fx1.b.iadd(start, y: offset)
+        let held = mut lo.held_at(mut fx1, ty: element, address: at)
+        render_via(mut lo, fx: mut fx1, ty: element, value: held, renderer_value)
+    })
+    render_append_text(mut lo, mut fx, renderer_value, text: "]")
+} render_elements
+
+/// `{k: v, k: v}`: key-value entries from an address.
+fn render_entries(mut lo: Lowering, mut fx: Fx, entry: ty::Ty, start: clif::Value, len: clif::Value, renderer_value: clif::Value) {
+    render_append_text(mut lo, mut fx, renderer_value, text: "{")
+    let laid = mut lo.layout_of(entry)
+    let size = laid.contents().size
+    let key = mut lo.layouts.field(lo.ck, ty: entry, variant: None, label: "key")
+    let value = mut lo.layouts.field(lo.ck, ty: entry, variant: None, label: "value")
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let not_first = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: index, y: 0)
+        mut fx1.if_true(not_first, then: fn[mut lo](mut fx2: Fx) {
+            render_append_text(mut lo, fx: mut fx2, renderer_value, text: ", ")
+        })
+        let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(size))
+        let at = mut fx1.b.iadd(start, y: offset)
+        let key_at = mut fx1.offset(at, offset: key.offset)
+        let key_held = mut lo.held_at(mut fx1, ty: key.ty, address: key_at)
+        render_via(mut lo, fx: mut fx1, ty: key.ty, value: key_held, renderer_value)
+        render_append_text(mut lo, fx: mut fx1, renderer_value, text: ": ")
+        let value_at = mut fx1.offset(at, offset: value.offset)
+        let value_held = mut lo.held_at(mut fx1, ty: value.ty, address: value_at)
+        render_via(mut lo, fx: mut fx1, ty: value.ty, value: value_held, renderer_value)
+    })
+    render_append_text(mut lo, mut fx, renderer_value, text: "}")
+} render_entries
+
+/// `b"..."`: printable ASCII as itself but `"` and `\`, the named escapes, `\xHH` otherwise.
+fn render_bytes(mut lo: Lowering, mut fx: Fx, address: clif::Value, renderer_value: clif::Value) {
+    render_append_text(mut lo, mut fx, renderer_value, text: "b\"")
+    let start = mut fx.load(PTR, addr: address, offset: 0)
+    let len = mut fx.load(PTR, addr: address, offset: 8)
+    let zero = mut fx.ptr(0)
+    let scratch = mut fx.slot(8, align: 8)
+    mut fx.each(zero, end: len, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let at = mut fx1.b.iadd(start, y: index)
+        let loaded = mut fx1.load(clif::Type.Int8, addr: at, offset: 0)
+        let byte = mut fx1.b.uextend(clif::Type.Int64, x: loaded)
+        let unhandled = mut fx1.int(clif::Type.Int8, value: 0)
+        let after_quote = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: b'"', text: "\\\"", handled: unhandled)
+        let after_backslash = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: b'\\', text: "\\\\", handled: after_quote)
+        let after_newline = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: b'\n', text: "\\n", handled: after_backslash)
+        let after_return = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: b'\r', text: "\\r", handled: after_newline)
+        let after_tab = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: b'\t', text: "\\t", handled: after_return)
+        let handled = render_escape(mut lo, fx: mut fx1, renderer_value, byte, value: 0, text: "\\0", handled: after_tab)
+        let printable_low = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: byte, y: 0x20)
+        let printable_high = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThanOrEqual, x: byte, y: 0x7E)
+        let printable = mut fx1.b.band(printable_low, y: printable_high)
+        let plain = mut fx1.b.bxor_imm_s(handled, y: 1)
+        let as_itself = mut fx1.b.band(printable, y: plain)
+        mut fx1.if_true(as_itself, then: fn[mut lo](mut fx2: Fx) {
+            let narrow = mut fx2.b.ireduce(clif::Type.Int8, x: byte)
+            mut fx2.store(narrow, addr: scratch, offset: 0)
+            let one = mut fx2.ptr(1)
+            render_append(mut lo, fx: mut fx2, renderer_value, text: scratch, len: one)
+        })
+        let not_printable = mut fx1.b.bxor_imm_s(printable, y: 1)
+        let hex = mut fx1.b.band(not_printable, y: plain)
+        mut fx1.if_true(hex, then: fn[mut lo](mut fx2: Fx) {
+            render_append_text(mut lo, fx: mut fx2, renderer_value, text: "\\x")
+            render_nibble(mut fx2, byte, scratch, at: 0, shift: 4)
+            render_nibble(mut fx2, byte, scratch, at: 1, shift: 0)
+            let two = mut fx2.ptr(2)
+            render_append(mut lo, fx: mut fx2, renderer_value, text: scratch, len: two)
+        })
+    })
+    render_append_text(mut lo, mut fx, renderer_value, text: "\"")
+} render_bytes
+
+/// Appends `text` when `byte` is `value`: whether a byte was handled, `handled` or this test.
+fn render_escape(mut lo: Lowering, mut fx: Fx, renderer_value: clif::Value, byte: clif::Value, value: u8, text: Str, handled: clif::Value) -> clif::Value {
+    let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(value))
+    mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+        render_append_text(mut lo, fx: mut fx1, renderer_value, text)
+    })
+    return mut fx.b.bor(handled, y: is)
+} render_escape
+
+/// Writes the uppercase hexadecimal digit of a byte's bits from `shift` on `at` bytes past
+/// `scratch`.
+fn render_nibble(mut fx: Fx, byte: clif::Value, scratch: clif::Value, at: u64, shift: i64) {
+    let shifted = mut fx.b.ushr_imm_s(byte, y: shift)
+    let nibble = mut fx.b.band_imm_s(shifted, y: 0xF)
+    let letter = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: nibble, y: 10)
+    let digit = mut fx.b.iadd_imm_s(nibble, y: i64.widen(b'0'))
+    let upper = mut fx.b.iadd_imm_s(nibble, y: i64.widen(b'A') - 10)
+    let ascii = mut fx.b.select(letter, x: upper, y: digit)
+    let narrow = mut fx.b.ireduce(clif::Type.Int8, x: ascii)
+    mut fx.store(narrow, addr: scratch, offset: at)
+} render_nibble
+
+/// The derived rendering of a struct or enum: its name and fields, or `Name.Variant` and its
+/// payload; the variants of `Option` and `Result` render without their type's name.
+fn render_composite(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, item: ty::ItemId, args: ty::Args, value: Held, renderer_value: clif::Value) {
+    let name = match lo.ck.db().declaration(item).name(lo.alloc) {
+        Some(found) => found
+        None => text::String.empty(lo.alloc)
+    }
+    let sig = lo.ck.sig(item)
+    var params = mem::List[ty::Param].empty(lo.alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: lo.ck.types().arg_list(args), alloc: lo.alloc)
+    match sig.contents().kind {
+        check::SigKind.Struct(fields: fields) => {
+            let address = value.address_value()
+            var opening = text::String.of(name.as_str(), alloc: lo.alloc)
+            mut opening.append("(")
+            render_append_text(mut lo, mut fx, renderer_value, text: opening.as_str())
+            for index in 0..<fields.len() {
+                let field = fields[index]
+                if index > 0 {
+                    render_append_text(mut lo, mut fx, renderer_value, text: ", ")
+                }
+                var label = text::String.of(field.name.as_str(), alloc: lo.alloc)
+                mut label.append(": ")
+                render_append_text(mut lo, mut fx, renderer_value, text: label.as_str())
+                let field_ty = subst.ty(lo.ck.types(), ty: field.ty)
+                let laid_field = mut lo.layouts.field(lo.ck, ty, variant: None, label: field.name.as_str())
+                let field_at = mut fx.offset(address, offset: laid_field.offset)
+                let held = mut lo.held_at(mut fx, ty: field_ty, address: field_at)
+                render_via(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
+            }
+            render_append_text(mut lo, mut fx, renderer_value, text: ")")
+        }
+        check::SigKind.Enum(variants: variants) => {
+            let address = value.address_value()
+            let index = mut lo.variant_index(mut fx, ty, address)
+            let core = lo.wraps(ty)
+            for position in 0..<variants.len() {
+                let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+                let variant = variants[position]
+                mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+                    render_variant(mut lo, fx: mut fx1, ty, name: name.as_str(), core, variant, subst, address, renderer_value)
+                })
+            }
+        }
+        else => render_append_text(mut lo, mut fx, renderer_value, text: "_")
+    }
+} render_composite
+
+/// The derived rendering of a variant of an enum value at an address: `Name.Variant`, or
+/// `Variant` alone for a core enum, and its payload.
+fn render_variant(mut lo: Lowering, mut fx: Fx, ty: ty::Ty, name: Str, core: bool, variant: check::VariantSig, subst: ty::Subst, address: clif::Value, renderer_value: clif::Value) {
+    var prefix = text::String.empty(lo.alloc)
+    if not core {
+        mut prefix.append(name)
+        mut prefix.append(".")
+    }
+    mut prefix.append(variant.name.as_str())
+    render_append_text(mut lo, mut fx, renderer_value, text: prefix.as_str())
+    match variant.payload {
+        check::Payload.None => {}
+        check::Payload.Single(payload) => {
+            render_append_text(mut lo, mut fx, renderer_value, text: "(")
+            let payload_ty = subst.ty(lo.ck.types(), ty: payload)
+            let laid_field = mut lo.layouts.field(lo.ck, ty, variant: Some(variant.name.as_str()), label: "")
+            let field_at = mut fx.offset(address, offset: laid_field.offset)
+            let held = mut lo.held_at(mut fx, ty: payload_ty, address: field_at)
+            render_via(mut lo, mut fx, ty: payload_ty, value: held, renderer_value)
+            render_append_text(mut lo, mut fx, renderer_value, text: ")")
+        }
+        check::Payload.Labelled(fields) => {
+            render_append_text(mut lo, mut fx, renderer_value, text: "(")
+            for index in 0..<fields.len() {
+                let field = fields[index]
+                if index > 0 {
+                    render_append_text(mut lo, mut fx, renderer_value, text: ", ")
+                }
+                var label = text::String.of(field.name.as_str(), alloc: lo.alloc)
+                mut label.append(": ")
+                render_append_text(mut lo, mut fx, renderer_value, text: label.as_str())
+                let field_ty = subst.ty(lo.ck.types(), ty: field.ty)
+                let laid_field = mut lo.layouts.field(lo.ck, ty, variant: Some(variant.name.as_str()), label: field.name.as_str())
+                let field_at = mut fx.offset(address, offset: laid_field.offset)
+                let held = mut lo.held_at(mut fx, ty: field_ty, address: field_at)
+                render_via(mut lo, mut fx, ty: field_ty, value: held, renderer_value)
+            }
+            render_append_text(mut lo, mut fx, renderer_value, text: ")")
+        }
+    }
+} render_variant
+
+/// Renders a `Dyn[Render]` value through its method table.
+fn render_dyn(mut fx: Fx, address: clif::Value, renderer_value: clif::Value) {
+    let data = mut fx.load(PTR, addr: address, offset: 0)
+    let table = mut fx.load(PTR, addr: address, offset: 8)
+    let code = mut fx.load(PTR, addr: table, offset: 24)
+    var signature = clif::Signature.new(CALL_CONV, alloc: fx.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    let imported = mut fx.b.import_signature(take signature)
+    let call_args = fx.list2(data, b: renderer_value)
+    discard mut fx.b.call_indirect(imported, callee: code, args: call_args.view())
+} render_dyn
+
+/// `text::fmt("template", label: value, ...)`: a `Dyn[Render]` of the template and the
+/// addresses of its arguments.
+fn template(mut body: Body, mut lo: Lowering, mut fx: Fx, args: ty::Args, operands: Slice[nir::Operand]) -> Held {
+    expect operands.len() > 0 and operands.len() < 0xFFFF_FFFF
+    let nir::Operand.Literal(nir::Literal.Text(written)) = operands[0] else {
+        expect false
+        return Held.Empty
+    }
+    var names = mem::List[text::String].empty(lo.alloc)
+    var types = mem::List[ty::Ty].empty(lo.alloc)
+    var record_size = 8 * u64.widen(operands.len())
+    if record_size < 8 {
+        record_size = 8
+    }
+    let record = mut fx.slot(record_size, align: 8)
+    var position: usize = 0
+    var at: usize = 1
+    while at < operands.len() {
+        invariant position < at
+        let nir::Operand.Literal(nir::Literal.Text(name)) = operands[at] else {
+            expect false
+            return Held.Empty
+        }
+        mut names.push(text::String.of(name.as_str(), alloc: lo.alloc))
+        let arg_ty = arg_type(lo, args, index: 2 + 2 * position)
+        expect at + 1 < operands.len()
+        let operand_value = mut body.operand(mut lo, mut fx, operand: operands[at + 1])
+        let adapted = mut body.adapt(mut lo, mut fx, held: operand_value.held, nty: operand_value.nty, wanted: Repr.Address)
+        mut fx.store(adapted.address_value(), addr: record, offset: 8 * u64.widen(position))
+        mut types.push(arg_ty)
+        position += 1
+        at += 2
+    }
+    let pieces = parse(written.as_str(), names: names.view(), allocator: lo.alloc)
+    let glue = mut lo.template_glue(take pieces, types: take types)
+    let table = mut lo.method_table(glue, release: None)
+    let global = mut lo.data_ref(mut fx, id: table)
+    let table_address = mut fx.b.symbol_value(PTR, global_value: global)
+    let value = mut fx.slot(16, align: 8)
+    mut fx.store(record, addr: value, offset: 0)
+    mut fx.store(table_address, addr: value, offset: 8)
+    return Held.Address(value)
+} template
+
+fn parse(text: Str, names: Slice[text::String], allocator: mem::Alloc) -> mem::List[Piece] {
+    var pieces = mem::List[Piece].empty(allocator)
+    var literal = text::String.empty(allocator)
+    var chars = text.cursor()
+    var pending = mut chars.next()
+    loop {
+        let Some(c) = pending else {
+            break
+        }
+        pending = mut chars.next()
+        if c == '{' and pending == Some('{') {
+            pending = mut chars.next()
+            mut literal.push('{')
+            continue
+        }
+        if c == '}' and pending == Some('}') {
+            pending = mut chars.next()
+            mut literal.push('}')
+            continue
+        }
+        if c != '{' {
+            mut literal.push(c)
+            continue
+        }
+        if not literal.is_empty() {
+            mut pieces.push(Piece.Text(take literal))
+            literal = text::String.empty(allocator)
+        }
+        var name = text::String.empty(allocator)
+        loop {
+            let Some(inner) = pending else {
+                break
+            }
+            pending = mut chars.next()
+            if inner == '}' {
+                break
+            }
+            mut name.push(inner)
+        }
+        var found: Option[usize] = None
+        for index in 0..<names.len() {
+            if names[index].as_str() == name.as_str() {
+                found = Some(index)
+                break
+            }
+        }
+        let Some(index) = found else {
+            expect false
+            return pieces
+        }
+        mut pieces.push(Piece.Hole(index))
+    }
+    if not literal.is_empty() {
+        mut pieces.push(Piece.Text(take literal))
+    }
+    return pieces
+} parse
+
+/// The rendering glue of a template: receives the record of its arguments' addresses and a
+/// renderer.
+fn Lowering.template_glue(mut self, take pieces: mem::List[Piece], take types: mem::List[ty::Ty]) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    var piece_copies = mem::List[Piece].empty(self.alloc)
+    for piece in pieces {
+        mut piece_copies.push(piece.copy(self.alloc))
+    }
+    var type_copies = mem::List[ty::Ty].empty(self.alloc)
+    for each_ty in types {
+        mut type_copies.push(each_ty)
+    }
+    let glue = Glue.Template(pieces: take piece_copies, types: take type_copies)
+    return mut self.glue_function(take glue, take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {
+        let params = mut fx1.entry()
+        expect params.len() == 2
+        let record = params[0]
+        let renderer_value = params[1]
+        expect types.len() < 0xFFFF_FFFF
+        for piece in pieces {
+            match piece {
+                Piece.Text(literal) => render_append_text(mut lo1, fx: mut fx1, renderer_value, text: literal.as_str())
+                Piece.Hole(index) => {
+                    expect index < types.len()
+                    let address = mut fx1.load(PTR, addr: record, offset: 8 * u64.widen(index))
+                    let held = mut lo1.held_at(mut fx1, ty: types[index], address)
+                    render_via(mut lo1, fx: mut fx1, ty: types[index], value: held, renderer_value)
+                }
+            }
+        }
+        mut fx1.b.ret(mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} Lowering.template_glue
+
+/// The method table of a `Dyn` value: its release, its size and alignment, and its methods'
+/// code.
+fn Lowering.method_table(mut self, head: object::FuncId, release: Option[object::FuncId]) -> object::DataId {
+    expect self.glue < 0xFFFF_FFFF
+    self.glue += 1
+    var name = text::String.of("_NXtable_", alloc: self.alloc)
+    mut name.write(text::fmt("{glue}", glue: self.glue), budget: 32)
+    let id = mut self.module.declare_data(name.as_str(), linkage: object::Linkage.Local, writable: false, tls: false)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(mem::Bytes.zeroed(32, alloc: self.alloc))
+    mut description.set_align(8)
+    match release {
+        Some(released) => {
+            let reference = mut description.import_function(released)
+            mut description.write_function_addr(0, function: reference)
+        }
+        None => {}
+    }
+    let reference = mut description.import_function(head)
+    mut description.write_function_addr(24, function: reference)
+    mut self.module.define_data(id, take description)
+    return id
+} Lowering.method_table
+
+/// `Dyn[I].view(x)`: the value's address with the method table of its type for `I`.
+fn dyn_view(mut body: Body, mut lo: Lowering, mut fx: Fx, args: ty::Args, operand: nir::Operand) -> Held {
+    let viewed = arg_type(lo, args, index: 0)
+    let source = arg_type(lo, args, index: 1)
+    let ty::TyKind.Dyn(bound) = lo.ck.types().kind(viewed) else {
+        expect false
+        return Held.Empty
+    }
+    let operand_value = mut body.operand(mut lo, mut fx, operand)
+    let adapted = mut body.adapt(mut lo, mut fx, held: operand_value.held, nty: operand_value.nty, wanted: Repr.Address)
+    let address = adapted.address_value()
+    let table = mut lo.dyn_table(source, interface_item: bound.item, args: bound.args)
+    let global = mut lo.data_ref(mut fx, id: table)
+    let table_address = mut fx.b.symbol_value(PTR, global_value: global)
+    let value = mut fx.slot(16, align: 8)
+    mut fx.store(address, addr: value, offset: 0)
+    mut fx.store(table_address, addr: value, offset: 8)
+    return Held.Address(value)
+} dyn_view
+
+/// The method table of a type for an interface.
+fn Lowering.dyn_table(mut self, ty: ty::Ty, interface_item: ty::ItemId, args: ty::Args) -> object::DataId {
+    let methods = match self.ck.sig(interface_item).contents().kind {
+        check::SigKind.Interface(methods: listed) => listed.len()
+        else => 0
+    }
+    expect methods < 0x1000_0000
+    let laid = mut self.layout_of(ty)
+    expect self.glue < 0xFFFF_FFFF
+    self.glue += 1
+    var name = text::String.of("_NXtable_", alloc: self.alloc)
+    mut name.write(text::fmt("{glue}", glue: self.glue), budget: 32)
+    let id = mut self.module.declare_data(name.as_str(), linkage: object::Linkage.Local, writable: false, tls: false)
+    var bytes = mem::Bytes.zeroed(24 + 8 * methods, alloc: self.alloc)
+    mut bytes.view_mut().write_u64_le(8, value: laid.contents().size)
+    mut bytes.view_mut().write_u64_le(16, value: laid.contents().align)
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take bytes)
+    mut description.set_align(8)
+    if mut self.needs_release(ty) {
+        let release = mut self.instance(Instance.Release(ty))
+        let reference = mut description.import_function(release)
+        mut description.write_function_addr(0, function: reference)
+    }
+    for method in 0..<methods {
+        let glue = mut self.instance(Instance.Dyn(ty: ty, interface_item: interface_item, args: args, method: u32.fit(method)))
+        let reference = mut description.import_function(glue)
+        mut description.write_function_addr(24 + 8 * u32.fit(method), function: reference)
+    }
+    mut self.module.define_data(id, take description)
+    return id
+} Lowering.dyn_table

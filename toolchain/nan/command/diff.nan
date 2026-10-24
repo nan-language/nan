@@ -1,0 +1,108 @@
+//! `nan diff <old> <new> [--path <path>]`: the items changed between two versions of the workspace, or with `--path` of one file, with their change classes; and `nan diff --green [<scope>] [--agent <name>]`: the items of the scope whose interface hash differs from the agent's last-green entry.
+
+/// The workspace form, comparing two versions of a workspace, each relative to the current
+/// directory.
+fn diff_workspaces(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], mut trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
+    let written = invocation.joined_args(alloc)
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let old = platform::join(current, name: invocation.operands[0].as_str(), alloc)
+    let new = platform::join(current, name: invocation.operands[1].as_str(), alloc)
+    if not try workspace::holds_package(old.as_str(), alloc) or not try workspace::holds_package(new.as_str(), alloc) {
+        return invocation.tool_error(diagnostic::Code.ToolNoWorkspace, scope: written.as_str(), alloc)
+    }
+    let grammar = syntax::Grammar.load(alloc)
+    let std = workspace::Workspace.of_std(grammar, alloc)
+    let checking = Checking(std: mem::Shared.of(take std, alloc: alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(home, alloc))
+    let Some(old_session) = try checking.version(old.as_str(), alloc) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolNoWorkspace, scope: written.as_str(), alloc)
+    }
+    let Some(new_session) = try checking.version(new.as_str(), alloc) else {
+        expect false
+        return invocation.tool_error(diagnostic::Code.ToolNoWorkspace, scope: written.as_str(), alloc)
+    }
+    return diff_output(invocation, written: written.as_str(), changes: check::changes(old_session, new: new_session, file: None), alloc)
+} diff_workspaces
+
+/// The file form, comparing two versions, relative to the current directory, of the workspace
+/// file at `--path`; and the `--green` form.
+fn diff_run(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    if invocation.flag("--green") {
+        return diff_green(invocation, session, current, trace: mut trace, alloc)
+    }
+    let written = invocation.joined_args(alloc)
+    let Some(path) = invocation.value("--path") else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    if invocation.operands.len() != 2 {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: written.as_str(), alloc)
+    }
+    trace.scope = Some(text::String.of(written.as_str(), alloc))
+    let old = file_version(session, path, file: platform::join(current, name: invocation.operands[0].as_str(), alloc).as_str(), alloc)
+    let new = file_version(session, path, file: platform::join(current, name: invocation.operands[1].as_str(), alloc).as_str(), alloc)
+    return diff_output(invocation, written: written.as_str(), changes: check::changes(old, new, file: invocation.value("--path")), alloc)
+} diff_run
+
+/// The session of the workspace whose file at `path` holds the bytes of `file`, empty when it
+/// cannot be read.
+fn file_version(session: check::Session, path: Str, file: Str, alloc: mem::Alloc) -> check::Session {
+    let Ok(bytes) = attempt platform::read_file(file, alloc) else {
+        return overlaid_session(session, path, contents: b"", alloc)
+    }
+    return overlaid_session(session, path, contents: bytes.view(), alloc)
+} file_version
+
+fn diff_green(invocation: Invocation, session: check::Session, current: Str, mut trace: Trace, alloc: mem::Alloc) -> output::Output {
+    let held = session.workspace.contents()
+    var operand: Option[Str] = None
+    match invocation.operands.get(0) {
+        Some(first_operand) => {
+            operand = Some(first_operand.as_str())
+        }
+        None => {}
+    }
+    let Some(resolved) = scope::Scope.resolve(held, current, written: operand, alloc) else {
+        let scope_text = match operand {
+            Some(named) => named
+            None => "."
+        }
+        return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: scope_text, alloc)
+    }
+    trace.scope = Some(text::String.of(resolved.written.as_str(), alloc))
+    let Some(agent) = invocation.agent_name() else {
+        return invocation.tool_error(diagnostic::Code.ToolUsage, scope: resolved.written.as_str(), alloc)
+    }
+    let writer = writer_of(held, scope: resolved.scope, alloc)
+    let greens = session.greens(Some(resolved.scope.copied(alloc)), lines: mem::List[diagnostic::At].empty(alloc).view())
+    let records = changed_since(green_entries(held.root.as_str(), agent, alloc), greens: greens.view(), writer, alloc)
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("records", alloc), value: records.len()))
+    return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: output::Verdict.Ok, summary: take summary, records: take records)
+} diff_green
+
+/// A `changed` record per changed item: its location, its change classes and whether it is a
+/// weakening or a widening, holding its old and new texts merged.
+fn diff_output(invocation: Invocation, written: Str, take changes: mem::List[check::Change], alloc: mem::Alloc) -> output::Output {
+    var records = mem::List[output::Record].empty(alloc)
+    for change in take changes {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(change.path.as_str(), alloc))
+        mut fields.push(located(change.file.as_str(), line: change.line, alloc))
+        for class in change.classes {
+            mut fields.push(text::String.of(class.as_str(), alloc))
+        }
+        if change.weakening {
+            mut fields.push(text::String.of("weakening", alloc))
+        }
+        if change.widening {
+            mut fields.push(text::String.of("widening", alloc))
+        }
+        mut records.push(output::Record(word: text::String.of("changed", alloc), fields: take fields, lines: diff::merged(change.old.view(), new: change.new.view(), alloc)))
+    }
+    var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("records", alloc), value: records.len()))
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: output::Verdict.Ok, summary: take summary, records: take records)
+} diff_output

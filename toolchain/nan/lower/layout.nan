@@ -1,0 +1,1006 @@
+//! Type layout: the size, alignment and parts of every type an image's code uses; fixed layouts, empty types and niche packing follow the specification, and the representation of every other type is the ABI this lowering chooses.
+
+/// The machine form of a type.
+struct Layout {
+    size: u64
+    align: u64
+    shape: LayoutShape
+    /// The invalid bit patterns an enclosing packed enum may use, none when it has none.
+    niche: Option[Niche]
+} Layout
+
+enum LayoutShape {
+    /// A value held in a register: a scalar, `hw::Ptr` or an integer layout, whose memory form
+    /// is big-endian when `big` holds.
+    Scalar(ty: clif::Type, big: bool)
+    /// No bytes.
+    Empty
+    /// Fields at offsets.
+    Record(mem::List[Field])
+    Enum(EnumShape)
+    Array(element: ty::Ty, count: u64)
+    /// A bytes layout: fields at byte offsets, whatever their alignment.
+    Bytes(fields: mem::List[Field], big: bool)
+} LayoutShape
+
+struct Field {
+    name: text::String
+    ty: ty::Ty
+    offset: u64
+} Field
+
+struct EnumShape {
+    variants: mem::List[Variant]
+    tag: Tag
+} EnumShape
+
+struct Variant {
+    name: text::String
+    /// The payload's fields: one unnamed for `V(T)`, the labels of a labelled payload.
+    fields: mem::List[Field]
+} Variant
+
+enum Tag {
+    /// The variant's index at offset 0.
+    Index(clif::Type)
+    /// A packed enum: the variant `payload` is its payload; each other variant is the niche
+    /// value at its position in `values`.
+    Packed(payload: usize, niche: Niche, values: mem::List[wide::Wide])
+} Tag
+
+/// Invalid bit patterns of a value: those of the bits `bit..bit + width` of the integer of type
+/// `ty` at `offset` that its kind leaves invalid, past the `used` first ones.
+struct Niche {
+    offset: u64
+    ty: clif::Type
+    big: bool
+    bit: u32
+    width: u32
+    used: wide::Wide
+    kind: NicheKind
+} Niche
+
+enum NicheKind {
+    /// The values from `start`, `count` of them.
+    Range(start: wide::Wide, count: wide::Wide)
+    /// Every value of the width but these.
+    Except(mem::Shared[mem::List[wide::Wide]])
+} NicheKind
+
+/// A field as a struct or payload declares it: its name and type.
+struct DeclaredField {
+    name: text::String
+    ty: ty::Ty
+} DeclaredField
+
+/// A variant as an enum declares it: its name and its payload's fields.
+struct DeclaredVariant {
+    name: text::String
+    fields: mem::List[DeclaredField]
+} DeclaredVariant
+
+/// The niche value of a unit variant of a packed enum.
+fn Tag.value_of(self, variant: usize) -> Option[wide::Wide] {
+    let Tag.Packed(payload: payload, niche: _, values: values) = self else {
+        return None
+    }
+    var position = variant
+    if variant >= payload {
+        let Some(before) = variant.checked_sub(1) else {
+            return None
+        }
+        position = before
+    }
+    if variant == payload {
+        return None
+    }
+    expect position < values.len()
+    return Some(values[position])
+} Tag.value_of
+
+/// The invalid patterns left.
+fn Niche.count(self) -> wide::Wide {
+    let total = match self.kind {
+        NicheKind.Range(start: _, count: count) => count
+        NicheKind.Except(valid) => wide::Wide.one().shift_left(self.width).wrapping_sub(wide::Wide.of_u64(u64.widen(valid.contents().len())))
+    }
+    return total.wrapping_sub(self.used)
+} Niche.count
+
+/// The `n`th invalid pattern left.
+fn Niche.nth(self, n: wide::Wide) -> wide::Wide {
+    let wanted = n.wrapping_add(self.used)
+    match self.kind {
+        NicheKind.Range(start: start, count: _) => return start.wrapping_add(wanted)
+        NicheKind.Except(valid) => {
+            var seen = wide::Wide.zero()
+            var value = wide::Wide.zero()
+            loop {
+                if valid.contents().position(fn(held: wide::Wide) => held == value).is_none() {
+                    if seen == wanted {
+                        return value
+                    }
+                    seen = seen.wrapping_add(wide::Wide.one())
+                }
+                value = value.wrapping_add(wide::Wide.one())
+            }
+        }
+    }
+} Niche.nth
+
+fn Niche.at(self, offset: u64) -> Niche {
+    var moved = self.copy()
+    moved.offset = self.offset + offset
+    return moved
+} Niche.at
+
+fn Niche.after(self, used: wide::Wide) -> Niche {
+    var reduced = self.copy()
+    reduced.used = self.used.wrapping_add(used)
+    return reduced
+} Niche.after
+
+/// Whether the niche has more invalid patterns left than `best`, or `best` is none.
+fn Niche.beats(self, best: Option[Niche]) -> bool {
+    let Some(known) = best else {
+        return true
+    }
+    return known.count().lt(self.count())
+} Niche.beats
+
+/// A copy of a niche.
+fn Niche.copy(self) -> Niche {
+    let kind = match self.kind {
+        NicheKind.Range(start: start, count: count) => NicheKind.Range(start: start, count: count)
+        NicheKind.Except(valid) => NicheKind.Except(valid.share())
+    }
+    return Niche(offset: self.offset, ty: self.ty, big: self.big, bit: self.bit, width: self.width, used: self.used, kind: take kind)
+} Niche.copy
+
+/// A copy of a niche, if any.
+fn Niche.copy_option(niche: Option[Niche]) -> Option[Niche] {
+    let Some(held) = niche else {
+        return None
+    }
+    return Some(held.copy())
+} Niche.copy_option
+
+/// A copy of a field.
+fn Field.copy(self, alloc: mem::Alloc) -> Field {
+    return Field(name: text::String.of(self.name.as_str(), alloc), ty: self.ty, offset: self.offset)
+} Field.copy
+
+fn DeclaredField.of(name: Str, ty: ty::Ty, alloc: mem::Alloc) -> DeclaredField {
+    return DeclaredField(name: text::String.of(name, alloc), ty: ty)
+} DeclaredField.of
+
+fn LayoutShape.is_empty(self) -> bool {
+    return match self {
+        LayoutShape.Empty => true
+        else => false
+    }
+} LayoutShape.is_empty
+
+/// The std base types this lowering gives a representation, by canonical path.
+const VIEW_PAIRS: Str = "core::Slice core::SliceMut core::Str core::SliceCursor core::SliceCursorMut core::CharCursor"
+
+/// The base types holding one pointer to state the runtime keeps.
+const POINTERS: Str = "core::Renderer core::Choices mem::Budget mem::Arena mem::Shared mem::OnceMap text::Interner task::Cown task::Sender task::Receiver task::Join task::Scope sys::Revoker sys::Cx sys::Trap"
+
+/// The base types that are generational handles: a slot index and its generation.
+const LAYOUT_HANDLES: Str = "mem::Alloc mem::Heap mem::Handle task::Executor sys::Fs sys::Net sys::Clock sys::Random sys::Log sys::Stdio sys::Outbox"
+
+/// The base types holding storage, its length, its capacity and its allocator.
+const VECTORS: Str = "mem::List mem::Bytes mem::Map mem::Set text::String"
+
+/// The cursors owning the storage of a vector, with their position after it.
+const OWNING_CURSORS: Str = "mem::ListCursor mem::MapIntoCursor mem::HashMapIntoCursor mem::SetIntoCursor"
+
+/// The cursors viewing the entries of a map or set: the address of the next and the count
+/// left.
+const VIEW_CURSORS: Str = "mem::MapCursor mem::MapCursorMut mem::HashMapCursor mem::HashMapCursorMut mem::SetCursor"
+
+/// The cursors of stores: the store's address and the next index.
+const INDEX_CURSORS: Str = "mem::ArenaCursor mem::PoolCursor"
+
+/// The resources a platform opens: a capability table handle and the holding of the platform's
+/// descriptor.
+const RESOURCES: Str = "sys::fs::File sys::net::Listener sys::net::Conn"
+
+const LAYOUT_POINTER: u64 = 8
+
+/// The layouts of one final closure, computed once per type.
+struct Layouts {
+    computed: mem::HashMap[ty::Ty, mem::Shared[Layout]]
+} Layouts
+
+fn Layouts.new(alloc: mem::Alloc) -> Layouts {
+    return Layouts(computed: mem::HashMap[ty::Ty, mem::Shared[Layout]].empty(seed: 0, alloc))
+} Layouts.new
+
+fn Layouts.of(mut self, ck: check::Checker, ty: ty::Ty) -> mem::Shared[Layout] {
+    match self.computed.get(ty) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    let computed = mut self.compute(ck, ty)
+    let laid = mem::Shared.of(take computed, alloc: ck.alloc())
+    discard mut self.computed.insert(ty, value: laid.share())
+    return laid
+} Layouts.of
+
+fn Layouts.compute(mut self, ck: check::Checker, ty: ty::Ty) -> Layout {
+    let alloc = ck.alloc()
+    match ck.types().kind(ty) {
+        ty::TyKind.Scalar(scalar) => return scalar_layout(scalar)
+        ty::TyKind.Unit or ty::TyKind.Never => return layout_empty()
+        ty::TyKind.Fn(_) => return layout_pointers(2, null: None, alloc)
+        ty::TyKind.Dyn(_) => return layout_pointers(2, null: Some(0), alloc)
+        ty::TyKind.Item(item: item, args: args) => return mut self.item(ck, item, args: ck.types().arg_list(args))
+        ty::TyKind.Param(_) or ty::TyKind.Registers(_) or ty::TyKind.Error => {
+            expect false
+            return layout_empty()
+        }
+    }
+} Layouts.compute
+
+fn Layouts.item(mut self, ck: check::Checker, item: ty::ItemId, args: Slice[ty::Arg]) -> Layout {
+    let alloc = ck.alloc()
+    if ck.db().is_std(item) {
+        let path = ck.db().canonical(item)
+        match mut self.base(ck, canonical: path.as_str(), args) {
+            Some(laid) => return laid
+            None => {}
+        }
+    }
+    match ck.db().ast(item).kind {
+        ast::ItemKind.Layout(laid) => return mut self.layout_item(ck, item, repr: laid.repr)
+        else => {}
+    }
+    let sig = ck.sig(item)
+    let params = check::generic_params(sig.contents().generics.view(), alloc)
+    let subst = ty::Subst.of(params.view(), args, alloc)
+    let types = ck.types()
+    match sig.contents().kind {
+        check::SigKind.Struct(fields: fields) => {
+            var declared = mem::List[DeclaredField].empty(alloc)
+            for field in fields {
+                mut declared.push(DeclaredField.of(field.name.as_str(), ty: subst.ty(types, ty: field.ty), alloc))
+            }
+            return mut self.record(ck, types: declared.view())
+        }
+        check::SigKind.Enum(variants: variants) => {
+            var declared = mem::List[DeclaredVariant].empty(alloc)
+            for variant in variants {
+                var fields = mem::List[DeclaredField].empty(alloc)
+                match variant.payload {
+                    check::Payload.None => {}
+                    check::Payload.Single(payload_ty) => {
+                        mut fields.push(DeclaredField.of("", ty: subst.ty(types, ty: payload_ty), alloc))
+                    }
+                    check::Payload.Labelled(labelled) => {
+                        for label in labelled {
+                            mut fields.push(DeclaredField.of(label.name.as_str(), ty: subst.ty(types, ty: label.ty), alloc))
+                        }
+                    }
+                }
+                mut declared.push(DeclaredVariant(name: text::String.of(variant.name.as_str(), alloc), fields: take fields))
+            }
+            return mut self.enumeration(ck, variants: take declared)
+        }
+        else => return layout_empty()
+    }
+} Layouts.item
+
+/// The type argument at `index`, none past the arguments or for a const argument.
+fn type_arg_at(args: Slice[ty::Arg], index: usize) -> Option[ty::Ty] {
+    if index >= args.len() {
+        return None
+    }
+    return args[index].ty()
+} type_arg_at
+
+/// The count a const argument at `index` gives, 0 past the arguments or for any other argument.
+fn count_at(args: Slice[ty::Arg], index: usize) -> u64 {
+    if index >= args.len() {
+        return 0
+    }
+    return match args[index] {
+        ty::Arg.Const(ty::Const.Int(count)) => count.low_bits()
+        else => 0
+    }
+} count_at
+
+/// `core::Array` of an element type and a count argument.
+fn core_array(ck: check::Checker, element: ty::Ty, count: ty::Arg) -> ty::Ty {
+    let alloc = ck.alloc()
+    let Some(array) = ck.db().core_item("Array") else {
+        expect false
+        return ty::Ty.error()
+    }
+    var args = mem::List[ty::Arg].empty(alloc)
+    mut args.push(ty::Arg.Ty(element))
+    mut args.push(count)
+    return ck.types().item(array, take args)
+} core_array
+
+/// The layout the lowering gives a std base type by its canonical path, none for a type std
+/// declares in full.
+fn Layouts.base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Arg]) -> Option[Layout] {
+    let alloc = ck.alloc()
+    if check::is_listed(VIEW_PAIRS, word: canonical) {
+        var null: Option[u64] = None
+        if canonical == "core::Slice" or canonical == "core::SliceMut" or canonical == "core::Str" {
+            null = Some(0)
+        }
+        return Some(layout_pointers(2, null, alloc))
+    }
+    if check::is_listed(POINTERS, word: canonical) {
+        return Some(layout_pointers(1, null: None, alloc))
+    }
+    if check::is_listed(LAYOUT_HANDLES, word: canonical) {
+        let unsigned32 = ty::Ty.scalar(ty::Scalar.Unsigned32)
+        var fields = mem::List[Field].empty(alloc)
+        mut fields.push(layout_field("index", ty: unsigned32, offset: 0, alloc))
+        mut fields.push(layout_field("generation", ty: unsigned32, offset: 4, alloc))
+        return Some(Layout(size: 8, align: 4, shape: LayoutShape.Record(take fields), niche: None))
+    }
+    if check::is_listed(VECTORS, word: canonical) {
+        return Some(layout_words("data len capacity alloc", alloc))
+    }
+    if check::is_listed(OWNING_CURSORS, word: canonical) {
+        return Some(layout_words("data len capacity alloc position", alloc))
+    }
+    if check::is_listed(VIEW_CURSORS, word: canonical) {
+        return Some(layout_pointers(2, null: None, alloc))
+    }
+    if check::is_listed(INDEX_CURSORS, word: canonical) {
+        return Some(layout_words("store position", alloc))
+    }
+    if canonical == "mem::HashMap" {
+        return Some(layout_words("data len capacity alloc seed index slots", alloc))
+    }
+    if canonical == "mem::Pool" {
+        return Some(layout_words("data len capacity alloc count", alloc))
+    }
+    if check::is_listed(RESOURCES, word: canonical) {
+        let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
+        var fields = mem::List[Field].empty(alloc)
+        mut fields.push(layout_field("entry", ty: unsigned64, offset: 0, alloc))
+        mut fields.push(layout_field("holding", ty: unsigned64, offset: 8, alloc))
+        return Some(Layout(size: 16, align: 8, shape: LayoutShape.Record(take fields), niche: None))
+    }
+    match mut self.std_base(ck, canonical, args) {
+        Some(laid) => return Some(take laid)
+        None => {}
+    }
+    return mut self.machine_base(ck, canonical, args)
+} Layouts.base
+
+/// The layout the lowering gives a std base type of the core, mem, text and task modules
+/// named one by one, none for any other type.
+fn Layouts.std_base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Arg]) -> Option[Layout] {
+    let alloc = ck.alloc()
+    let word = ty::Ty.scalar(ty::Scalar.UnsignedSize)
+    match canonical {
+        "core::Array" => {
+            let Some(element) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            let count = count_at(args, index: 1)
+            let held = mut self.of(ck, ty: element)
+            let laid = held.contents()
+            var niche: Option[Niche] = None
+            if count > 0 {
+                niche = Niche.copy_option(laid.niche)
+            }
+            return Some(Layout(size: laid.size * count, align: laid.align, shape: LayoutShape.Array(element: element, count: count), niche: take niche))
+        }
+        "core::ArrayCursor" => {
+            let Some(element) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            var fields = mem::List[DeclaredField].empty(alloc)
+            mut fields.push(DeclaredField.of("position", ty: word, alloc))
+            expect args.len() > 1
+            mut fields.push(DeclaredField.of("array", ty: core_array(ck, element, count: args[1]), alloc))
+            return Some(mut self.record(ck, types: fields.view()))
+        }
+        "core::Untrusted" => {
+            let Some(inner) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            return Some(mut self.transparent(ck, inner))
+        }
+        "hw::Ptr" => return Some(Layout(size: 8, align: 8, shape: LayoutShape.Scalar(ty: clif::Type.Int64, big: false), niche: None))
+        // A register value is its register's index in its block, which a volatile call reads.
+        "hw::Register" => return Some(Layout(size: 8, align: 8, shape: LayoutShape.Scalar(ty: clif::Type.Int64, big: false), niche: None))
+        "mem::Box" => {
+            let boxed_dyn = match type_arg_at(args, index: 0) {
+                Some(boxed) => match ck.types().kind(boxed) {
+                    ty::TyKind.Dyn(_) => true
+                    else => false
+                }
+                None => false
+            }
+            if boxed_dyn {
+                return Some(layout_pointers(2, null: Some(0), alloc))
+            }
+            return Some(layout_pointers(1, null: Some(0), alloc))
+        }
+        "mem::Id" => {
+            var fields = mem::List[Field].empty(alloc)
+            mut fields.push(layout_field("index", ty: ty::Ty.scalar(ty::Scalar.Unsigned32), offset: 0, alloc))
+            return Some(Layout(size: 4, align: 4, shape: LayoutShape.Record(take fields), niche: None))
+        }
+        "mem::Entry" => return Some(layout_pointers(2, null: None, alloc))
+        "mem::BoundedCursor" => {
+            let Some(bounded_item) = ck.db().std_item("mem", name: "Bounded") else {
+                expect false
+                return None
+            }
+            var bounded_args = mem::List[ty::Arg].empty(alloc)
+            for arg in args {
+                mut bounded_args.push(arg)
+            }
+            var fields = mem::List[DeclaredField].empty(alloc)
+            mut fields.push(DeclaredField.of("position", ty: word, alloc))
+            mut fields.push(DeclaredField.of("bounded", ty: ck.types().item(bounded_item, args: take bounded_args), alloc))
+            return Some(mut self.record(ck, types: fields.view()))
+        }
+        else => return mut self.collection_base(ck, canonical, args)
+    }
+} Layouts.std_base
+
+/// The layout the lowering gives `mem::Bounded`, `text::Fixed`, `task::Cancelled`, the atomics
+/// and the std types holding no bytes, none for any other type.
+fn Layouts.collection_base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Arg]) -> Option[Layout] {
+    let alloc = ck.alloc()
+    let word = ty::Ty.scalar(ty::Scalar.UnsignedSize)
+    match canonical {
+        "mem::Bounded" => {
+            let Some(element) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            var fields = mem::List[DeclaredField].empty(alloc)
+            mut fields.push(DeclaredField.of("len", ty: word, alloc))
+            expect args.len() > 1
+            mut fields.push(DeclaredField.of("items", ty: core_array(ck, element, count: args[1]), alloc))
+            return Some(mut self.record(ck, types: fields.view()))
+        }
+        "text::Fixed" => {
+            var fields = mem::List[DeclaredField].empty(alloc)
+            mut fields.push(DeclaredField.of("len", ty: word, alloc))
+            expect args.len() > 0
+            mut fields.push(DeclaredField.of("bytes", ty: core_array(ck, element: ty::Ty.scalar(ty::Scalar.Unsigned8), count: args[0]), alloc))
+            return Some(mut self.record(ck, types: fields.view()))
+        }
+        "task::Cancelled" => return Some(layout_pointers(1, null: None, alloc))
+        "task::Poisoned" or "sys::Domain" or "host::Runner" or "hw::Anchor" or "hw::IrqContext" => return Some(layout_empty())
+        else => {}
+    }
+    if not canonical.starts_with("core::atomic::") {
+        return None
+    }
+    let scalar = match canonical {
+        "core::atomic::AtomicU8" => ty::Scalar.Unsigned8
+        "core::atomic::AtomicU16" => ty::Scalar.Unsigned16
+        "core::atomic::AtomicU32" => ty::Scalar.Unsigned32
+        "core::atomic::AtomicU64" => ty::Scalar.Unsigned64
+        "core::atomic::AtomicUsize" => ty::Scalar.UnsignedSize
+        else => ty::Scalar.Bool
+    }
+    let inner = scalar_layout(scalar)
+    var fields = mem::List[Field].empty(alloc)
+    mut fields.push(layout_field("value", ty: ty::Ty.scalar(scalar), offset: 0, alloc))
+    return Some(Layout(size: inner.size, align: inner.align, shape: LayoutShape.Record(take fields), niche: None))
+} Layouts.collection_base
+
+/// The layout the lowering gives a std base type of the boot and hw modules named one by one,
+/// none for any other type.
+fn Layouts.machine_base(mut self, ck: check::Checker, canonical: Str, args: Slice[ty::Arg]) -> Option[Layout] {
+    let alloc = ck.alloc()
+    let word = ty::Ty.scalar(ty::Scalar.UnsignedSize)
+    let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
+    var fields = mem::List[DeclaredField].empty(alloc)
+    match canonical {
+        // A machine root grant: the handles of its root allocator and executor, and whether
+        // its regions and its `hw::Ring0` were taken; `boot::Machine` carries them into the
+        // `boot::Kernel` its `exit_services` returns.
+        "boot::Kernel" or "boot::Machine" => {
+            mut fields.push(DeclaredField.of("alloc", ty: unsigned64, alloc))
+            mut fields.push(DeclaredField.of("exec", ty: unsigned64, alloc))
+            mut fields.push(DeclaredField.of("regions", ty: ty::Ty.scalar(ty::Scalar.Bool), alloc))
+            mut fields.push(DeclaredField.of("ring0", ty: ty::Ty.scalar(ty::Scalar.Bool), alloc))
+        }
+        // A physical frame, a page-table root owning one, and a user address are one
+        // address; an installed table's token holds the table's box.
+        "hw::PhysFrame" or "hw::PageTableRoot" or "hw::UserAddr" => {
+            mut fields.push(DeclaredField.of("address", ty: unsigned64, alloc))
+        }
+        "hw::IdtInstalled" => return Some(layout_pointers(1, null: Some(0), alloc))
+        // An exception's trap frame: the address of the state its seam saved, and a page
+        // fault's faulting address.
+        "hw::TrapFrame" => {
+            mut fields.push(DeclaredField.of("saved", ty: unsigned64, alloc))
+            mut fields.push(DeclaredField.of("fault", ty: unsigned64, alloc))
+        }
+        // An interrupt descriptor table, as words.
+        "hw::Idt" => {
+            let gates = core_array(ck, element: unsigned64, count: ty::Arg.Const(ty::Const.Int(wide::Wide.of_u64(IDT_BYTES / 8))))
+            mut fields.push(DeclaredField.of("gates", ty: gates, alloc))
+        }
+        // A region of physical memory: its base and its length in bytes.
+        "hw::Region" => {
+            mut fields.push(DeclaredField.of("base", ty: unsigned64, alloc))
+            mut fields.push(DeclaredField.of("len", ty: unsigned64, alloc))
+        }
+        // A register window and a simulated register block each hold one pointer: the sim
+        // block its window reaches, or on a machine target the mapped address or port.
+        "hw::Mmio" or "hw::Ports" or "hw::sim::Registers" => return Some(layout_pointers(1, null: None, alloc))
+        // A DMA buffer holds its box, whose contents never move.
+        "hw::Dma" or "hw::DmaShared" => return Some(layout_pointers(1, null: Some(0), alloc))
+        // A device behind an IRQ-safe lock is the address of its record, and a per-CPU value
+        // that of its storage.
+        "hw::IrqShared" or "hw::PerCpu" => return Some(layout_pointers(1, null: None, alloc))
+        // A spin lock is its lock word, then its value; a guard, which no code holds, its
+        // value.
+        "hw::SpinLock" => {
+            let Some(value) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            mut fields.push(DeclaredField.of("lock", ty: word, alloc))
+            mut fields.push(DeclaredField.of("value", ty: value, alloc))
+        }
+        "hw::SpinGuard" => {
+            let Some(value) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            mut fields.push(DeclaredField.of("value", ty: value, alloc))
+        }
+        // A one-slot mailbox: its lock word, whether it holds a value, the waiting task and
+        // the value.
+        "hw::Signal" => {
+            let Some(value) = type_arg_at(args, index: 0) else {
+                expect false
+                return None
+            }
+            mut fields.push(DeclaredField.of("lock", ty: word, alloc))
+            mut fields.push(DeclaredField.of("stored", ty: ty::Ty.scalar(ty::Scalar.Bool), alloc))
+            mut fields.push(DeclaredField.of("waiter", ty: word, alloc))
+            mut fields.push(DeclaredField.of("value", ty: value, alloc))
+        }
+        else => return None
+    }
+    return Some(mut self.record(ck, types: fields.view()))
+} Layouts.machine_base
+
+/// The layout of a type wrapping another without changing its representation.
+fn Layouts.transparent(mut self, ck: check::Checker, inner: ty::Ty) -> Layout {
+    let alloc = ck.alloc()
+    let held = mut self.of(ck, ty: inner)
+    let laid = held.contents()
+    var shape = LayoutShape.Empty
+    match laid.shape {
+        LayoutShape.Scalar(ty: scalar, big: big) => {
+            shape = LayoutShape.Scalar(ty: scalar, big: big)
+        }
+        LayoutShape.Empty => {}
+        else => {
+            var fields = mem::List[Field].empty(alloc)
+            mut fields.push(layout_field("value", ty: inner, offset: 0, alloc))
+            shape = LayoutShape.Record(take fields)
+        }
+    }
+    return Layout(size: laid.size, align: laid.align, shape: take shape, niche: Niche.copy_option(laid.niche))
+} Layouts.transparent
+
+/// Fields laid out in declaration order, each at the next offset its alignment allows.
+fn Layouts.record(mut self, ck: check::Checker, types: Slice[DeclaredField]) -> Layout {
+    let alloc = ck.alloc()
+    var offset: u64 = 0
+    var align: u64 = 1
+    var fields = mem::List[Field].empty(alloc)
+    var niche: Option[Niche] = None
+    var nonempty = false
+    for declared in types {
+        let held = mut self.of(ck, ty: declared.ty)
+        let laid = held.contents()
+        offset = next_multiple_of(offset, multiple: laid.align)
+        if laid.align > align {
+            align = laid.align
+        }
+        nonempty = nonempty or not laid.shape.is_empty()
+        match laid.niche {
+            Some(found) => {
+                if found.beats(niche) {
+                    niche = Some(found.at(offset))
+                }
+            }
+            None => {}
+        }
+        mut fields.push(layout_field(declared.name.as_str(), ty: declared.ty, offset, alloc))
+        offset += laid.size
+    }
+    var shape = LayoutShape.Empty
+    if nonempty {
+        shape = LayoutShape.Record(take fields)
+    }
+    return Layout(size: next_multiple_of(offset, multiple: align), align: align, shape: take shape, niche: take niche)
+} Layouts.record
+
+fn Layouts.enumeration(mut self, ck: check::Checker, take variants: mem::List[DeclaredVariant]) -> Layout {
+    let alloc = ck.alloc()
+    var payloads = mem::List[Layout].empty(alloc)
+    for variant in variants {
+        mut payloads.push(mut self.record(ck, types: variant.fields.view()))
+    }
+    var carrying = mem::List[usize].empty(alloc)
+    for index in 0..<payloads.len() {
+        if not payloads[index].shape.is_empty() {
+            mut carrying.push(index)
+        }
+    }
+    let units = wide::Wide.of_u64(u64.widen(variants.len())).wrapping_sub(wide::Wide.one())
+    if carrying.len() == 1 {
+        let payload = carrying[0]
+        expect payload < payloads.len()
+        match payloads[payload].niche {
+            Some(niche) => {
+                if units.le(niche.count()) {
+                    return packed_enumeration(take variants, payloads: payloads.view(), payload, niche, units, alloc)
+                }
+            }
+            None => {}
+        }
+    }
+    var tag = clif::Type.Int32
+    if variants.len() <= 256 {
+        tag = clif::Type.Int8
+    } else if variants.len() <= 65_536 {
+        tag = clif::Type.Int16
+    }
+    let tag_size = u64.widen(tag.bytes())
+    var payload_align: u64 = 1
+    var largest: u64 = 0
+    for laid in payloads {
+        if laid.align > payload_align {
+            payload_align = laid.align
+        }
+        if laid.size > largest {
+            largest = laid.size
+        }
+    }
+    let start = next_multiple_of(tag_size, multiple: payload_align)
+    var align = payload_align
+    if tag_size > align {
+        align = tag_size
+    }
+    var laid_variants = mem::List[Variant].empty(alloc)
+    var index: usize = 0
+    for variant in take variants {
+        let DeclaredVariant(name: name, fields: declared) = variant
+        expect index < payloads.len()
+        mut laid_variants.push(Variant(name: take name, fields: variant_fields(declared.view(), payload_layout: payloads[index], start, alloc)))
+        index += 1
+    }
+    let shape = EnumShape(variants: take laid_variants, tag: Tag.Index(tag))
+    return Layout(size: next_multiple_of(start + largest, multiple: align), align: align, shape: LayoutShape.Enum(take shape), niche: None)
+} Layouts.enumeration
+
+/// The layout of an enum packed in the niche of its one payload holding bytes: its `units` unit
+/// variants are the first invalid patterns left of `niche`.
+fn packed_enumeration(take variants: mem::List[DeclaredVariant], payloads: Slice[Layout], payload: usize, niche: Niche, units: wide::Wide, alloc: mem::Alloc) -> Layout
+    requires payload < payloads.len()
+{
+    var values = mem::List[wide::Wide].empty(alloc)
+    var n = wide::Wide.zero()
+    while n.lt(units) {
+        mut values.push(niche.nth(n))
+        n = n.wrapping_add(wide::Wide.one())
+    }
+    let laid = payloads[payload]
+    var laid_variants = mem::List[Variant].empty(alloc)
+    var index: usize = 0
+    for variant in take variants {
+        let DeclaredVariant(name: name, fields: declared) = variant
+        expect index < payloads.len()
+        mut laid_variants.push(Variant(name: take name, fields: variant_fields(declared.view(), payload_layout: payloads[index], start: 0, alloc)))
+        index += 1
+    }
+    let shape = EnumShape(variants: take laid_variants, tag: Tag.Packed(payload: payload, niche: niche.copy(), values: take values))
+    return Layout(size: laid.size, align: laid.align, shape: LayoutShape.Enum(take shape), niche: Some(niche.after(units)))
+} packed_enumeration
+
+fn Layouts.layout_item(mut self, ck: check::Checker, item: ty::ItemId, repr: ast::LayoutRepr) -> Layout {
+    let ast::ItemKind.Layout(laid) = ck.db().ast(item).kind else {
+        expect false
+        return layout_empty()
+    }
+    match repr {
+        ast::LayoutRepr.Integer(ty: written, order: order) => {
+            let Some(scalar) = ty::Scalar.from_name(written.text.as_str()) else {
+                expect false
+                return layout_empty()
+            }
+            let big = is_big_endian(order)
+            let base = scalar_layout(scalar)
+            let LayoutShape.Scalar(ty: integer, big: _) = base.shape else {
+                expect false
+                return layout_empty()
+            }
+            let width = scalar.bits()
+            var niche: Option[Niche] = None
+            match ck.layout_shape(item) {
+                Some(check::LayoutShape.Tags(values)) => {
+                    var valid = mem::List[wide::Wide].empty(ck.alloc())
+                    for value in values {
+                        mut valid.push(wide::Wide.of_u64(value))
+                    }
+                    niche = Some(Niche(offset: 0, ty: integer, big: big, bit: 0, width: width, used: wide::Wide.zero(), kind: NicheKind.Except(mem::Shared.of(take valid, alloc: ck.alloc()))))
+                }
+                else => {
+                    niche = mut self.layout_fields_niche(ck, item, laid, repr: integer, big)
+                }
+            }
+            return Layout(size: base.size, align: base.align, shape: LayoutShape.Scalar(ty: integer, big: big), niche: take niche)
+        }
+        ast::LayoutRepr.Bytes(size: size, order: order) => return mut self.bytes_layout(ck, item, laid, size, big: is_big_endian(order))
+    }
+} Layouts.layout_item
+
+/// The layout of a bytes layout item of `size` bytes held in big-endian byte order when `big`
+/// holds: each typed field at its byte offset.
+fn Layouts.bytes_layout(mut self, ck: check::Checker, item: ty::ItemId, laid: ast::LayoutItem, size: u32, big: bool) -> Layout {
+    let alloc = ck.alloc()
+    var types = mem::List[DeclaredField].empty(alloc)
+    match ck.sig(item).contents().kind {
+        check::SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut types.push(DeclaredField.of(field.name.as_str(), ty: field.ty, alloc))
+            }
+        }
+        else => {}
+    }
+    var fields = mem::List[Field].empty(alloc)
+    var niche: Option[Niche] = None
+    var index: usize = 0
+    while index < laid.fields.len() and index < types.len() {
+        let declared = laid.fields[index]
+        let typed = types[index]
+        index += 1
+        let ast::LayoutFieldKind.Typed(ty: _, at: at) = declared.kind else {
+            continue
+        }
+        let offset = layout_number(ck, item, token: at)
+        let held = mut self.of(ck, ty: typed.ty)
+        match held.contents().niche {
+            Some(found) => {
+                if found.beats(niche) {
+                    niche = Some(found.at(offset))
+                }
+            }
+            None => {}
+        }
+        mut fields.push(layout_field(typed.name.as_str(), ty: typed.ty, offset, alloc))
+    }
+    return Layout(size: layout_number(ck, item, token: size), align: 1, shape: LayoutShape.Bytes(fields: take fields, big: big), niche: take niche)
+} Layouts.bytes_layout
+
+/// Whether a layout's written byte order is big-endian.
+fn is_big_endian(order: Option[ast::Name]) -> bool {
+    return match order {
+        Some(written) => written.text.as_str() == "be"
+        None => false
+    }
+} is_big_endian
+
+/// The number a literal token of a layout item writes.
+fn layout_number(ck: check::Checker, item: ty::ItemId, token: u32) -> u64 {
+    let Some(value) = check::int_literal(ck.db().text(item, token)) else {
+        expect false
+        return 0
+    }
+    return value.low_bits()
+} layout_number
+
+/// The niche of an integer layout of fields: that of its field of a layout or array type
+/// with the most invalid patterns, at that field's bits.
+fn Layouts.layout_fields_niche(mut self, ck: check::Checker, item: ty::ItemId, laid: ast::LayoutItem, repr: clif::Type, big: bool) -> Option[Niche] {
+    var types = mem::List[ty::Ty].empty(ck.alloc())
+    match ck.sig(item).contents().kind {
+        check::SigKind.Layout(fields: fields, tags: _, bits: _) => {
+            for field in fields {
+                mut types.push(field.ty)
+            }
+        }
+        else => return None
+    }
+    var best: Option[Niche] = None
+    var index: usize = 0
+    while index < laid.fields.len() and index < types.len() {
+        let declared = laid.fields[index]
+        let field_ty = types[index]
+        index += 1
+        let ast::LayoutFieldKind.Typed(ty: _, at: at) = declared.kind else {
+            continue
+        }
+        let held = mut self.of(ck, ty: field_ty)
+        let Some(found) = Niche.copy_option(held.contents().niche) else {
+            continue
+        }
+        let bit = u32.truncate(layout_number(ck, item, token: at))
+        if found.beats(best) {
+            best = Some(Niche(offset: 0, ty: repr, big: big, bit: bit + found.bit, width: found.width, used: found.used, kind: take found.kind))
+        }
+    }
+    return best
+} Layouts.layout_fields_niche
+
+/// The position of the field named `label`, none when no field has that name.
+fn field_position(fields: Slice[Field], label: Str) -> Option[usize]
+    ensures match result {
+        Some(found) => found < fields.len()
+        None => true
+    }
+{
+    for index in 0..<fields.len() {
+        if fields[index].name.as_str() == label {
+            return Some(index)
+        }
+    }
+    return None
+} field_position
+
+/// The offset and type of a struct field or of a field of a variant's payload.
+fn Layouts.field(mut self, ck: check::Checker, ty: ty::Ty, variant: Option[Str], label: Str) -> Field {
+    let alloc = ck.alloc()
+    let held = mut self.of(ck, ty)
+    match held.contents().shape {
+        LayoutShape.Record(fields) => {
+            if variant.is_none() {
+                match field_position(fields.view(), label) {
+                    Some(at) => return fields[at].copy(alloc)
+                    None => {}
+                }
+            }
+        }
+        LayoutShape.Bytes(fields: fields, big: _) => {
+            if variant.is_none() {
+                match field_position(fields.view(), label) {
+                    Some(at) => return fields[at].copy(alloc)
+                    None => {}
+                }
+            }
+        }
+        LayoutShape.Enum(shape) => return variant_field(shape, variant, label, alloc)
+        else => {}
+    }
+    expect false
+    return layout_field(label, ty, offset: 0, alloc)
+} Layouts.field
+
+/// The field named `label` of the payload of the first variant of `shape` named `variant`.
+fn variant_field(shape: EnumShape, variant: Option[Str], label: Str, alloc: mem::Alloc) -> Field {
+    let Some(wanted) = variant else {
+        expect false
+        return layout_field(label, ty: ty::Ty.error(), offset: 0, alloc)
+    }
+    for candidate in shape.variants {
+        if candidate.name.as_str() == wanted {
+            let Some(at) = field_position(candidate.fields.view(), label) else {
+                break
+            }
+            return candidate.fields[at].copy(alloc)
+        }
+    }
+    expect false
+    return layout_field(label, ty: ty::Ty.error(), offset: 0, alloc)
+} variant_field
+
+/// The fields of a variant's payload laid out as `payload_layout` from `start`; a payload
+/// holding no bytes keeps its declared fields, all at `start`.
+fn variant_fields(declared_fields: Slice[DeclaredField], payload_layout: Layout, start: u64, alloc: mem::Alloc) -> mem::List[Field] {
+    var fields = mem::List[Field].empty(alloc)
+    match payload_layout.shape {
+        LayoutShape.Record(laid_fields) => {
+            for field in laid_fields {
+                mut fields.push(Field(name: text::String.of(field.name.as_str(), alloc), ty: field.ty, offset: field.offset + start))
+            }
+        }
+        else => {
+            for declared in declared_fields {
+                mut fields.push(layout_field(declared.name.as_str(), ty: declared.ty, offset: start, alloc))
+            }
+        }
+    }
+    return fields
+} variant_fields
+
+fn layout_field(label: Str, ty: ty::Ty, offset: u64, alloc: mem::Alloc) -> Field {
+    return Field(name: text::String.of(label, alloc), ty: ty, offset: offset)
+} layout_field
+
+/// Words of 8 bytes with the given names, separated by single spaces.
+fn layout_words(names: Str, alloc: mem::Alloc) -> Layout {
+    let unsigned64 = ty::Ty.scalar(ty::Scalar.Unsigned64)
+    let bytes = names.as_bytes()
+    var fields = mem::List[Field].empty(alloc)
+    var start: usize = 0
+    for at in 0..<(bytes.len() + 1) {
+        if at == bytes.len() or bytes[at] == b' ' {
+            let Some(word) = names.slice_bytes(start, end: at) else {
+                expect false
+                return layout_empty()
+            }
+            mut fields.push(layout_field(word, ty: unsigned64, offset: 8 * u64.widen(fields.len()), alloc))
+            start = at + 1
+        }
+    }
+    return Layout(size: 8 * u64.widen(fields.len()), align: 8, shape: LayoutShape.Record(take fields), niche: None)
+} layout_words
+
+fn layout_empty() -> Layout {
+    return Layout(size: 0, align: 1, shape: LayoutShape.Empty, niche: None)
+} layout_empty
+
+/// `count` pointers, the one at index `null` having the zero address as its niche.
+fn layout_pointers(count: u64, null: Option[u64], alloc: mem::Alloc) -> Layout {
+    var fields = mem::List[Field].empty(alloc)
+    for index in 0..<count {
+        var name = text::String.empty(alloc)
+        mut name.write(text::fmt("word{index}", index), budget: 32)
+        mut fields.push(Field(name: take name, ty: ty::Ty.scalar(ty::Scalar.UnsignedSize), offset: index * 8))
+    }
+    var niche: Option[Niche] = None
+    match null {
+        Some(index) => {
+            niche = Some(Niche(offset: index * LAYOUT_POINTER, ty: clif::Type.Int64, big: false, bit: 0, width: 64, used: wide::Wide.zero(), kind: NicheKind.Range(start: wide::Wide.zero(), count: wide::Wide.one())))
+        }
+        None => {}
+    }
+    return Layout(size: count * LAYOUT_POINTER, align: LAYOUT_POINTER, shape: LayoutShape.Record(take fields), niche: take niche)
+} layout_pointers
+
+/// The least multiple of `multiple` not below `value`.
+fn next_multiple_of(value: u64, multiple: u64) -> u64 {
+    let rest = value % multiple
+    if rest == 0 {
+        return value
+    }
+    return value + (multiple - rest)
+} next_multiple_of
+
+fn scalar_type(scalar: ty::Scalar) -> clif::Type {
+    return match scalar {
+        ty::Scalar.Unsigned8 or ty::Scalar.Signed8 or ty::Scalar.Bool => clif::Type.Int8
+        ty::Scalar.Unsigned16 or ty::Scalar.Signed16 => clif::Type.Int16
+        ty::Scalar.Unsigned32 or ty::Scalar.Signed32 or ty::Scalar.Char => clif::Type.Int32
+        ty::Scalar.Unsigned64 or ty::Scalar.Signed64 or ty::Scalar.UnsignedSize or ty::Scalar.SignedSize => clif::Type.Int64
+        ty::Scalar.Float32 => clif::Type.Float32
+        ty::Scalar.Float64 => clif::Type.Float64
+    }
+} scalar_type
+
+fn scalar_layout(scalar: ty::Scalar) -> Layout {
+    let scalar_ty = scalar_type(scalar)
+    let size = u64.widen(scalar_ty.bytes())
+    var niche: Option[Niche] = None
+    match scalar {
+        ty::Scalar.Bool => {
+            niche = Some(Niche(offset: 0, ty: scalar_ty, big: false, bit: 0, width: scalar.bits(), used: wide::Wide.zero(), kind: NicheKind.Range(start: wide::Wide.of_u64(2), count: wide::Wide.of_u64(254))))
+        }
+        ty::Scalar.Char => {
+            let lowest = wide::Wide.of_u64(0x11_0000)
+            niche = Some(Niche(offset: 0, ty: scalar_ty, big: false, bit: 0, width: scalar.bits(), used: wide::Wide.zero(), kind: NicheKind.Range(start: lowest, count: wide::Wide.one().shift_left(32).wrapping_sub(lowest))))
+        }
+        else => {}
+    }
+    return Layout(size: size, align: size, shape: LayoutShape.Scalar(ty: scalar_ty, big: false), niche: take niche)
+} scalar_layout

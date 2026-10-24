@@ -1,0 +1,693 @@
+//! Schema trees: the description of a type's encoded structure, and the schema hash, the hash of the `mem::wire` encoding of a tree's root node.
+
+/// A node of a schema tree.
+pkg enum SchemaNode {
+    Bool
+    Char
+    Text
+    Bytes
+    Unsigned(u64)
+    Signed(u64)
+    Float(u64)
+    BoundedText(u64)
+    Sequence(element: mem::Box[SchemaNode], length: Option[u64], capacity: Option[u64], unique: bool)
+    Map(key: mem::Box[SchemaNode], value: mem::Box[SchemaNode])
+    Record(open: bool, fields: mem::List[SchemaField])
+    Variant(open: bool, variants: mem::List[SchemaVariant])
+    Back(u64)
+} SchemaNode
+
+pkg struct SchemaField {
+    pkg key: text::String
+    pkg aliases: mem::List[text::String]
+    pkg defaulted: bool
+    pkg value: SchemaNode
+} SchemaField
+
+pkg struct SchemaVariant {
+    pkg key: text::String
+    pkg aliases: mem::List[text::String]
+    pkg payload: Option[SchemaNode]
+} SchemaVariant
+
+/// The position of a node's kind among the kinds of nodes.
+fn SchemaNode.kind_position(self) -> u32 {
+    return match self {
+        SchemaNode.Bool => 0
+        SchemaNode.Char => 1
+        SchemaNode.Text => 2
+        SchemaNode.Bytes => 3
+        SchemaNode.Unsigned(_) => 4
+        SchemaNode.Signed(_) => 5
+        SchemaNode.Float(_) => 6
+        SchemaNode.BoundedText(_) => 7
+        SchemaNode.Sequence(element: _, length: _, capacity: _, unique: _) => 8
+        SchemaNode.Map(key: _, value: _) => 9
+        SchemaNode.Record(open: _, fields: _) => 10
+        SchemaNode.Variant(open: _, variants: _) => 11
+        SchemaNode.Back(_) => 12
+    }
+} SchemaNode.kind_position
+
+/// Whether this tree, a type's new one, accepts an old one: nodes of one kind whose parts
+/// accept the old parts, a record matching each old field by key or alias, keeping one only
+/// when open and defaulting each new one, and a variant node matching each old variant.
+pkg fn SchemaNode.accepts(self, old: SchemaNode) -> bool {
+    match self {
+        SchemaNode.Unsigned(new) => {
+            let SchemaNode.Unsigned(held) = old else {
+                return false
+            }
+            return new == held
+        }
+        SchemaNode.Signed(new) => {
+            let SchemaNode.Signed(held) = old else {
+                return false
+            }
+            return new == held
+        }
+        SchemaNode.Float(new) => {
+            let SchemaNode.Float(held) = old else {
+                return false
+            }
+            return new == held
+        }
+        SchemaNode.Back(new) => {
+            let SchemaNode.Back(held) = old else {
+                return false
+            }
+            return new == held
+        }
+        SchemaNode.BoundedText(new) => {
+            let SchemaNode.BoundedText(held) = old else {
+                return false
+            }
+            return new >= held
+        }
+        SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: unique) => {
+            let SchemaNode.Sequence(element: old_element, length: old_length, capacity: old_capacity, unique: old_unique) = old else {
+                return false
+            }
+            let fits = match capacity {
+                None => true
+                Some(room) => match old_capacity {
+                    Some(held) => room >= held
+                    None => false
+                }
+            }
+            return element.contents().accepts(old_element.contents()) and length == old_length and fits and (not unique or old_unique)
+        }
+        SchemaNode.Map(key: key, value: value) => {
+            let SchemaNode.Map(key: old_key, value: old_value) = old else {
+                return false
+            }
+            return key.contents().accepts(old_key.contents()) and value.contents().accepts(old_value.contents())
+        }
+        SchemaNode.Record(open: open, fields: fields) => {
+            let SchemaNode.Record(open: _, fields: old_fields) = old else {
+                return false
+            }
+            return schema_record_accepts(open, fields: fields.view(), old_fields: old_fields.view())
+        }
+        SchemaNode.Variant(open: _, variants: variants) => {
+            let SchemaNode.Variant(open: _, variants: old_variants) = old else {
+                return false
+            }
+            return schema_variants_accept(variants.view(), old_variants: old_variants.view())
+        }
+        else => return self.kind_position() == old.kind_position()
+    }
+} SchemaNode.accepts
+
+/// Whether a field's key or one of its aliases is `key`.
+fn schema_field_matches(field: SchemaField, key: Str) -> bool {
+    if field.key.as_str() == key {
+        return true
+    }
+    return field.aliases.position(fn(alias: text::String) => alias.as_str() == key).is_some()
+} schema_field_matches
+
+/// Whether a record's fields accept old ones: each old field kept by a matching field accepting
+/// it, or dropped from an open record, and each field matching an old one or defaulted.
+fn schema_record_accepts(open: bool, fields: Slice[SchemaField], old_fields: Slice[SchemaField]) -> bool {
+    for held in old_fields {
+        var matched: Option[usize] = None
+        for at in 0..<fields.len() {
+            if schema_field_matches(fields[at], key: held.key.as_str()) {
+                matched = Some(at)
+                break
+            }
+        }
+        let kept = match matched {
+            Some(at) => fields[at].value.accepts(held.value)
+            None => open
+        }
+        if not kept {
+            return false
+        }
+    }
+    for field in fields {
+        if field.defaulted {
+            continue
+        }
+        var known = false
+        for held in old_fields {
+            if schema_field_matches(field, key: held.key.as_str()) {
+                known = true
+                break
+            }
+        }
+        if not known {
+            return false
+        }
+    }
+    return true
+} schema_record_accepts
+
+/// Whether variants accept old ones: each old variant matched by key or alias with a payload
+/// accepting its own.
+fn schema_variants_accept(variants: Slice[SchemaVariant], old_variants: Slice[SchemaVariant]) -> bool {
+    for held in old_variants {
+        var found = false
+        for variant in variants {
+            let matched = variant.key == held.key or variant.aliases.position(fn(alias: text::String) => alias == held.key).is_some()
+            if not matched {
+                continue
+            }
+            let accepted = match variant.payload {
+                None => held.payload.is_none()
+                Some(payload) => match held.payload {
+                    Some(old_payload) => payload.accepts(old_payload)
+                    None => false
+                }
+            }
+            if accepted {
+                found = true
+                break
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    return true
+} schema_variants_accept
+
+/// A field of a `mem::wire` record: its key and its value's encoding.
+struct WireField {
+    key: text::String
+    value: mem::Bytes
+} WireField
+
+fn schema_wire_field(key: Str, take value: mem::Bytes, alloc: mem::Alloc) -> WireField {
+    return WireField(key: text::String.of(key, alloc), value: take value)
+} schema_wire_field
+
+/// The node's `mem::wire` encoding: a variant keyed by its name, with a record of its fields
+/// as payload when it has fields.
+pkg fn SchemaNode.wire(self, alloc: mem::Alloc) -> mem::Bytes {
+    let fields = self.wire_fields(alloc)
+    var out = schema_text(self.wire_name(), alloc)
+    if fields.len() == 0 {
+        mut out.push(0)
+        return out
+    }
+    let payload = schema_record(fields.view(), alloc)
+    mut out.push(1)
+    encoding::uvar(mut out, value: u64.widen(payload.len()))
+    mut out.append(payload.view())
+    return out
+} SchemaNode.wire
+
+/// The name of the node's variant in its `mem::wire` encoding.
+proj fn SchemaNode.wire_name(self) -> Str {
+    return match self {
+        SchemaNode.Bool => "Bool"
+        SchemaNode.Char => "Char"
+        SchemaNode.Text => "Text"
+        SchemaNode.Bytes => "Bytes"
+        SchemaNode.Unsigned(_) => "Unsigned"
+        SchemaNode.Signed(_) => "Signed"
+        SchemaNode.Float(_) => "Float"
+        SchemaNode.BoundedText(_) => "BoundedText"
+        SchemaNode.Sequence(element: _, length: _, capacity: _, unique: _) => "Sequence"
+        SchemaNode.Map(key: _, value: _) => "Map"
+        SchemaNode.Record(open: _, fields: _) => "Record"
+        SchemaNode.Variant(open: _, variants: _) => "Variant"
+        SchemaNode.Back(_) => "Back"
+    }
+} SchemaNode.wire_name
+
+/// The fields of the payload of the node's variant in its `mem::wire` encoding, in byte order
+/// of keys.
+fn SchemaNode.wire_fields(self, alloc: mem::Alloc) -> mem::List[WireField] {
+    var fields = mem::List[WireField].empty(alloc)
+    match self {
+        SchemaNode.Unsigned(width) or SchemaNode.Signed(width) or SchemaNode.Float(width) => {
+            mut fields.push(schema_wire_field("width", value: schema_unsigned(width, alloc), alloc))
+        }
+        SchemaNode.BoundedText(capacity) => {
+            mut fields.push(schema_wire_field("capacity", value: schema_unsigned(capacity, alloc), alloc))
+        }
+        SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: unique) => {
+            mut fields.push(schema_wire_field("capacity", value: schema_optional_unsigned(capacity, alloc), alloc))
+            mut fields.push(schema_wire_field("element", value: element.contents().wire(alloc), alloc))
+            mut fields.push(schema_wire_field("length", value: schema_optional_unsigned(length, alloc), alloc))
+            mut fields.push(schema_wire_field("unique", value: schema_flag(unique, alloc), alloc))
+        }
+        SchemaNode.Map(key: key, value: value) => {
+            mut fields.push(schema_wire_field("key", value: key.contents().wire(alloc), alloc))
+            mut fields.push(schema_wire_field("value", value: value.contents().wire(alloc), alloc))
+        }
+        SchemaNode.Record(open: open, fields: members) => {
+            mut fields.push(schema_wire_field("fields", value: schema_fields_wire(members.view(), alloc), alloc))
+            mut fields.push(schema_wire_field("open", value: schema_flag(open, alloc), alloc))
+        }
+        SchemaNode.Variant(open: open, variants: variants) => {
+            mut fields.push(schema_wire_field("open", value: schema_flag(open, alloc), alloc))
+            mut fields.push(schema_wire_field("variants", value: schema_variants_wire(variants.view(), alloc), alloc))
+        }
+        SchemaNode.Back(depth) => {
+            mut fields.push(schema_wire_field("depth", value: schema_unsigned(depth, alloc), alloc))
+        }
+        SchemaNode.Bool or SchemaNode.Char or SchemaNode.Text or SchemaNode.Bytes => {}
+    }
+    return fields
+} SchemaNode.wire_fields
+
+pkg fn SchemaNode.hash(self, alloc: mem::Alloc) -> hashing::HashValue {
+    return hashing::HashValue.of(self.wire(alloc).view())
+} SchemaNode.hash
+
+/// The encoding of a record's fields: each field's aliases, whether it is defaulted, its key and
+/// its value's tree, in byte order of keys.
+fn schema_fields_wire(members: Slice[SchemaField], alloc: mem::Alloc) -> mem::Bytes {
+    var order = mem::List[usize].empty(alloc)
+    for at in 0..<members.len() {
+        mut order.push(at)
+    }
+    mut order.sort_by(fn(left: usize, right: usize) -> core::Ordering {
+        expect left < members.len() and right < members.len()
+        return members[left].key.as_str().cmp(members[right].key.as_str())
+    })
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for at in order {
+        expect at < members.len()
+        let field = members[at]
+        var parts = mem::List[WireField].empty(alloc)
+        mut parts.push(schema_wire_field("aliases", value: schema_aliases_wire(field.aliases.view(), alloc), alloc))
+        mut parts.push(schema_wire_field("defaulted", value: schema_flag(field.defaulted, alloc), alloc))
+        mut parts.push(schema_wire_field("key", value: schema_text(field.key.as_str(), alloc), alloc))
+        mut parts.push(schema_wire_field("value", value: field.value.wire(alloc), alloc))
+        mut elements.push(schema_record(parts.view(), alloc))
+    }
+    return schema_sequence(elements.view(), alloc)
+} schema_fields_wire
+
+/// The encoding of variants: each variant's aliases, key and payload's tree, in byte order of
+/// keys.
+fn schema_variants_wire(variants: Slice[SchemaVariant], alloc: mem::Alloc) -> mem::Bytes {
+    var order = mem::List[usize].empty(alloc)
+    for at in 0..<variants.len() {
+        mut order.push(at)
+    }
+    mut order.sort_by(fn(left: usize, right: usize) -> core::Ordering {
+        expect left < variants.len() and right < variants.len()
+        return variants[left].key.as_str().cmp(variants[right].key.as_str())
+    })
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for at in order {
+        expect at < variants.len()
+        let variant = variants[at]
+        var parts = mem::List[WireField].empty(alloc)
+        mut parts.push(schema_wire_field("aliases", value: schema_aliases_wire(variant.aliases.view(), alloc), alloc))
+        mut parts.push(schema_wire_field("key", value: schema_text(variant.key.as_str(), alloc), alloc))
+        let payload = match variant.payload {
+            Some(node) => schema_option(Some(node.wire(alloc)), alloc)
+            None => schema_option(None, alloc)
+        }
+        mut parts.push(schema_wire_field("payload", value: take payload, alloc))
+        mut elements.push(schema_record(parts.view(), alloc))
+    }
+    return schema_sequence(elements.view(), alloc)
+} schema_variants_wire
+
+fn schema_aliases_wire(aliases: Slice[text::String], alloc: mem::Alloc) -> mem::Bytes {
+    var elements = mem::List[mem::Bytes].empty(alloc)
+    for alias in aliases {
+        mut elements.push(schema_text(alias.as_str(), alloc))
+    }
+    return schema_sequence(elements.view(), alloc)
+} schema_aliases_wire
+
+fn schema_flag(value: bool, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    if value {
+        mut out.push(1)
+    } else {
+        mut out.push(0)
+    }
+    return out
+} schema_flag
+
+fn schema_unsigned(value: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    encoding::uvar(mut out, value: value)
+    return out
+} schema_unsigned
+
+fn schema_optional_unsigned(value: Option[u64], alloc: mem::Alloc) -> mem::Bytes {
+    return match value {
+        Some(held) => schema_option(Some(schema_unsigned(held, alloc)), alloc)
+        None => schema_option(None, alloc)
+    }
+} schema_optional_unsigned
+
+fn schema_text(value: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var out = schema_unsigned(u64.widen(value.byte_len()), alloc)
+    mut out.append(value.as_bytes())
+    return out
+} schema_text
+
+fn schema_sequence(elements: Slice[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    var out = schema_unsigned(u64.widen(elements.len()), alloc)
+    for element in elements {
+        mut out.append(element.view())
+    }
+    return out
+} schema_sequence
+
+/// A record: its field count, then per field its key, its value's length and its value; the
+/// fields given in ascending byte order of keys.
+fn schema_record(fields: Slice[WireField], alloc: mem::Alloc) -> mem::Bytes {
+    var out = schema_unsigned(u64.widen(fields.len()), alloc)
+    for field in fields {
+        mut out.append(schema_text(field.key.as_str(), alloc).view())
+        encoding::uvar(mut out, value: u64.widen(field.value.len()))
+        mut out.append(field.value.view())
+    }
+    return out
+} schema_record
+
+/// An `Option` value as `mem::wire` encodes it: the variant `None`, or `Some` with its payload.
+fn schema_option(take value: Option[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    let Some(payload) = value else {
+        var out = schema_text("None", alloc)
+        mut out.push(0)
+        return out
+    }
+    var out = schema_text("Some", alloc)
+    mut out.push(1)
+    encoding::uvar(mut out, value: u64.widen(payload.len()))
+    mut out.append(payload.view())
+    return out
+} schema_option
+
+/// An instantiation a schema is made inside, with the number of `Record` and `Variant` nodes
+/// made since it.
+struct SchemaEnclosing derives Copy {
+    ty: ty::Ty
+    made: u64
+} SchemaEnclosing
+
+/// The schema tree of a type implementing `Encode`.
+pkg fn Checker.schema(self, ty: ty::Ty) -> SchemaNode {
+    var enclosing = mem::List[SchemaEnclosing].empty(self.alloc())
+    return self.schema_within(ty, enclosing: mut enclosing)
+} Checker.schema
+
+/// The schema of a type inside the nodes made for `enclosing` struct and enum instantiations,
+/// each with the number of `Record` and `Variant` nodes made since it.
+fn Checker.schema_within(self, ty: ty::Ty, mut enclosing: mem::List[SchemaEnclosing]) -> SchemaNode {
+    let alloc = self.alloc()
+    let types = self.types()
+    match types.kind(ty) {
+        ty::TyKind.Scalar(scalar) => return schema_scalar_node(scalar)
+        ty::TyKind.Unit => return SchemaNode.Record(open: false, fields: mem::List[SchemaField].empty(alloc))
+        else => {}
+    }
+    let ty::TyKind.Item(item: item, args: args) = types.kind(ty) else {
+        return SchemaNode.Record(open: false, fields: mem::List[SchemaField].empty(alloc))
+    }
+    let held_args = types.arg_list(args)
+    let path = self.db().canonical(item)
+    match path.as_str() {
+        "text::String" => return SchemaNode.Text
+        "mem::Bytes" => return SchemaNode.Bytes
+        "text::Fixed" => return SchemaNode.BoundedText(schema_arg_count(held_args, index: 0).value_or(0))
+        "mem::Box" or "mem::Shared" => return self.schema_within(schema_arg_ty(held_args, index: 0), enclosing: mut enclosing)
+        "mem::Id" => return SchemaNode.Unsigned(32)
+        "core::Array" or "mem::Bounded" or "mem::Set" or "mem::List" => {
+            let element = self.schema_within(schema_arg_ty(held_args, index: 0), enclosing: mut enclosing)
+            var length: Option[u64] = None
+            if path.as_str() == "core::Array" {
+                length = schema_arg_count(held_args, index: 1)
+            }
+            var capacity: Option[u64] = None
+            if path.as_str() == "mem::Bounded" {
+                capacity = schema_arg_count(held_args, index: 1)
+            }
+            return SchemaNode.Sequence(element: mem::Heap.of(alloc).boxed(take element), length: length, capacity: capacity, unique: path.as_str() == "mem::Set")
+        }
+        "mem::Map" => {
+            let key = self.schema_within(schema_arg_ty(held_args, index: 0), enclosing: mut enclosing)
+            let value = self.schema_within(schema_arg_ty(held_args, index: 1), enclosing: mut enclosing)
+            return SchemaNode.Map(key: mem::Heap.of(alloc).boxed(take key), value: mem::Heap.of(alloc).boxed(take value))
+        }
+        else => {}
+    }
+    match enclosing.position(fn(known: SchemaEnclosing) => known.ty == ty) {
+        Some(at) => {
+            var depth: u64 = 0
+            for index in at..<enclosing.len() {
+                let made = enclosing[index].made
+                expect depth <= ~0u64 - made
+                depth += made
+            }
+            return SchemaNode.Back(depth)
+        }
+        None => {}
+    }
+    let sig = self.sig(item)
+    var params = mem::List[ty::Param].empty(alloc)
+    for def in sig.contents().generics {
+        mut params.push(def.param)
+    }
+    let subst = ty::Subst.of(params.view(), args: held_args, alloc)
+    let open = self.db().ast(item).has_modifier(ast::TypeModifier.Open)
+    mut enclosing.push(SchemaEnclosing(ty: ty, made: 1))
+    let node = match sig.contents().kind {
+        SigKind.Struct(fields: fields) => SchemaNode.Record(open: open, fields: self.field_nodes(item, fields: fields.view(), subst, open, enclosing: mut enclosing))
+        SigKind.Enum(variants: variants) => SchemaNode.Variant(open: open, variants: self.variant_nodes(item, variants: variants.view(), subst, enclosing: mut enclosing))
+        else => SchemaNode.Record(open: open, fields: mem::List[SchemaField].empty(alloc))
+    }
+    discard mut enclosing.pop()
+    return node
+} Checker.schema_within
+
+/// The node of a scalar type.
+fn schema_scalar_node(scalar: ty::Scalar) -> SchemaNode {
+    let width = u64.widen(scalar.bits())
+    if scalar == ty::Scalar.Bool {
+        return SchemaNode.Bool
+    }
+    if scalar == ty::Scalar.Char {
+        return SchemaNode.Char
+    }
+    if scalar.is_float() {
+        return SchemaNode.Float(width)
+    }
+    if scalar.is_signed() {
+        return SchemaNode.Signed(width)
+    }
+    return SchemaNode.Unsigned(width)
+} schema_scalar_node
+
+/// The type argument at an index, `Unit` without one.
+fn schema_arg_ty(args: Slice[ty::Arg], index: usize) -> ty::Ty {
+    if index >= args.len() {
+        return ty::Ty.unit()
+    }
+    return match args[index] {
+        ty::Arg.Ty(held) => held
+        ty::Arg.Const(_) => ty::Ty.unit()
+    }
+} schema_arg_ty
+
+/// The integer const argument at an index, its low 64 bits.
+fn schema_arg_count(args: Slice[ty::Arg], index: usize) -> Option[u64] {
+    if index >= args.len() {
+        return None
+    }
+    return match args[index] {
+        ty::Arg.Const(ty::Const.Int(value)) => Some(value.low_bits())
+        else => None
+    }
+} schema_arg_count
+
+/// The fields of a struct's record node.
+fn Checker.field_nodes(self, item: ty::ItemId, fields: Slice[FieldSig], subst: ty::Subst, open: bool, mut enclosing: mem::List[SchemaEnclosing]) -> mem::List[SchemaField] {
+    let alloc = self.alloc()
+    var nodes = mem::List[SchemaField].empty(alloc)
+    for field in fields {
+        let value_ty = subst.ty(self.types(), ty: field.ty)
+        let defaulted = open and self.implements_default(value_ty)
+        let aliases = self.key_aliases_of(item, member: field.name.as_str())
+        let value = self.nested(value_ty, enclosing: mut enclosing)
+        mut nodes.push(SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: take aliases, defaulted: defaulted, value: take value))
+    }
+    return nodes
+} Checker.field_nodes
+
+/// The variants of an enum's variant node.
+fn Checker.variant_nodes(self, item: ty::ItemId, variants: Slice[VariantSig], subst: ty::Subst, mut enclosing: mem::List[SchemaEnclosing]) -> mem::List[SchemaVariant] {
+    let alloc = self.alloc()
+    var nodes = mem::List[SchemaVariant].empty(alloc)
+    for variant in variants {
+        let aliases = self.key_aliases_of(item, member: variant.name.as_str())
+        var payload: Option[SchemaNode] = None
+        match variant.payload {
+            Payload.None => {}
+            Payload.Single(payload_ty) => {
+                payload = Some(self.nested(subst.ty(self.types(), ty: payload_ty), enclosing: mut enclosing))
+            }
+            Payload.Labelled(labelled_fields) => {
+                payload = Some(SchemaNode.Record(open: false, fields: self.labelled_nodes(labelled_fields.view(), subst, enclosing: mut enclosing)))
+            }
+        }
+        mut nodes.push(SchemaVariant(key: text::String.of(variant.name.as_str(), alloc), aliases: take aliases, payload: take payload))
+    }
+    return nodes
+} Checker.variant_nodes
+
+/// The fields of a labelled payload's record node.
+fn Checker.labelled_nodes(self, fields: Slice[LabelledTy], subst: ty::Subst, mut enclosing: mem::List[SchemaEnclosing]) -> mem::List[SchemaField] {
+    let alloc = self.alloc()
+    var nodes = mem::List[SchemaField].empty(alloc)
+    for field in fields {
+        let value = self.nested(subst.ty(self.types(), ty: field.ty), enclosing: mut enclosing)
+        mut nodes.push(SchemaField(key: text::String.of(field.name.as_str(), alloc), aliases: mem::List[text::String].empty(alloc), defaulted: false, value: take value))
+    }
+    return nodes
+} Checker.labelled_nodes
+
+/// The node of a constituent, counting the node made for each enclosing instantiation.
+fn Checker.nested(self, ty: ty::Ty, mut enclosing: mem::List[SchemaEnclosing]) -> SchemaNode {
+    let node = self.schema_within(ty, enclosing: mut enclosing)
+    let made = match node {
+        SchemaNode.Record(open: _, fields: _) or SchemaNode.Variant(open: _, variants: _) => true
+        else => false
+    }
+    let count = enclosing.len()
+    if made and count > 0 {
+        let instantiations = enclosing[count - 1].made
+        expect instantiations < ~0u64
+        enclosing[count - 1].made = instantiations + 1
+    }
+    return node
+} Checker.nested
+
+fn Checker.implements_default(self, ty: ty::Ty) -> bool {
+    let Some(interface_item) = self.db().core_item("Default") else {
+        return false
+    }
+    return self.implements(ty, interface_item)
+} Checker.implements_default
+
+/// The aliases of a field's or variant's key: the old names of the `preserves` tombstones of
+/// the type's package retiring a member of the type into it.
+fn Checker.key_aliases_of(self, owner: ty::ItemId, member: Str) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let owner_path = db.canonical(owner)
+    var target = text::String.of(owner_path.as_str(), alloc)
+    mut target.push('.')
+    mut target.append(member)
+    var prefix = text::String.of(owner_path.as_str(), alloc)
+    mut prefix.push('.')
+    var aliases = mem::List[text::String].empty(alloc)
+    for entry in db.tombstones.cursor() {
+        let old = entry.key()
+        if not old.starts_with(prefix.as_str()) {
+            continue
+        }
+        let Some(old_member) = old.as_str().slice_bytes(prefix.byte_len(), end: old.byte_len()) else {
+            continue
+        }
+        if self.renames_into(entry.value().view(), target: target.as_str()) {
+            mut aliases.push(text::String.of(old_member, alloc))
+        }
+    }
+    mut aliases.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    return aliases
+} Checker.key_aliases_of
+
+/// Whether one of tombstones is a `preserves` tombstone whose rewrite names a member by its
+/// canonical path.
+fn Checker.renames_into(self, tombstones: Slice[ty::ItemId], target: Str) -> bool {
+    let db = self.db()
+    for tombstone in tombstones {
+        let ast::ItemKind.Retired(retired_item) = db.ast(tombstone).kind else {
+            continue
+        }
+        let ast::RetiredNew.Rewrite(expr: rewrite, preserves: preserves) = retired_item.new else {
+            continue
+        }
+        if preserves and self.rewrite_names(tombstone, rewrite, target) {
+            return true
+        }
+    }
+    return false
+} Checker.renames_into
+
+/// Whether a tombstone's rewrite names a member by its canonical path.
+fn Checker.rewrite_names(self, tombstone: ty::ItemId, rewrite: ast::Expr, target: Str) -> bool {
+    let alloc = self.alloc()
+    let db = self.db()
+    var written = text::String.empty(alloc)
+    for token in rewrite.token..=rewrite.last {
+        mut written.append(db.text(tombstone, token))
+    }
+    let bytes = written.as_bytes()
+    var dot = bytes.len()
+    while dot > 0 {
+        invariant dot <= bytes.len()
+        if bytes[dot - 1] == b'.' {
+            break
+        }
+        dot -= 1
+    }
+    if dot == 0 {
+        return false
+    }
+    let Some(owner) = written.as_str().slice_bytes(0, end: dot - 1) else {
+        return false
+    }
+    let Some(member) = written.as_str().slice_bytes(dot, end: written.byte_len()) else {
+        return false
+    }
+    var segments = mem::List[text::String].empty(alloc)
+    var start: usize = 0
+    loop {
+        let Some(rest) = owner.slice_bytes(start, end: owner.byte_len()) else {
+            break
+        }
+        let Some(at) = rest.find("::") else {
+            mut segments.push(text::String.of(rest, alloc))
+            break
+        }
+        let Some(segment) = rest.slice_bytes(0, end: at) else {
+            break
+        }
+        mut segments.push(text::String.of(segment, alloc))
+        expect at <= ~0usize - 2 and start <= ~0usize - 2 - at
+        start += at + 2
+    }
+    let Some(path) = self.canonically(db.item(tombstone).module, segments: segments.view()) else {
+        return false
+    }
+    var named = text::String.of(path.as_str(), alloc)
+    mut named.push('.')
+    mut named.append(member)
+    return named.as_str() == target
+} Checker.rewrite_names

@@ -225,3 +225,21 @@ fn diagnostics_are_per_line() {
         [(2, "lex.indentation"), (3, "lex.trailing-whitespace")]
     );
 }
+
+#[test]
+fn the_textmate_grammar_highlights_the_hard_keywords() {
+    let grammar = include_str!("../../../../../editors/textmate/nan.tmLanguage.json");
+    let mut highlighted: Vec<&str> = grammar
+        .split(r#""match": "(?:"#)
+        .skip(1)
+        .filter_map(|rule| rule.split('"').next()?.strip_suffix("(?![A-Za-z0-9_])"))
+        .flat_map(|words| words.strip_suffix(')').expect("a group").split('|'))
+        .collect();
+    highlighted.sort_unstable();
+    let mut keywords: Vec<&str> = Keyword::ALL
+        .iter()
+        .map(|keyword| keyword.spelling())
+        .collect();
+    keywords.sort_unstable();
+    assert_eq!(highlighted, keywords);
+}

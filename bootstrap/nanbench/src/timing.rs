@@ -1,4 +1,4 @@
-//! The times the freeze measures, taken by the benchmark programs of `nanbench/bench/` on the
+//! The times the freeze measures, taken by the benchmark programs of `bootstrap/nanbench/bench/` on the
 //! reference machine's 8 hardware threads: the host runtime's allocation and generation check,
 //! the kernel runtime's generation check, seam and thread switch under the emulator, and the
 //! extended-state save and restore its seams and switches perform.
@@ -60,7 +60,7 @@ fn pinned(program: &Path, dir: &Path) -> Result<String, String> {
 /// directory is set.
 pub fn take(repository: &Path, dir: &Path) -> Result<Times, String> {
     let fault = |error: std::io::Error| error.to_string();
-    let bench = repository.join("nanbench/bench");
+    let bench = repository.join("bootstrap/nanbench/bench");
     let work = dir.join("timing");
     let host = work.join("host");
     copy_tree(&bench.join("host"), &host).map_err(fault)?;

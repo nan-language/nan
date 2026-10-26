@@ -76,13 +76,13 @@ const PUNCT_NAMES: &[(&str, &str)] = &[
 /// The files the toolchain is built from, relative to the repository root: directories stand for
 /// every file under them whose path holds no name starting with `.`.
 const SOURCE_TREE: &[&str] = &[
-    "Cargo.lock",
-    "Cargo.toml",
+    "bootstrap/Cargo.lock",
+    "bootstrap/Cargo.toml",
     "bootstrap/nan/Cargo.toml",
     "bootstrap/nan/build.rs",
     "bootstrap/nan/src",
+    "bootstrap/rust-toolchain.toml",
     "docs/spec",
-    "rust-toolchain.toml",
     "std",
 ];
 

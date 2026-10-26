@@ -8,7 +8,7 @@ The language is specified in [docs/spec](docs/spec/00-charter.md), starting with
 
 ## Installation
 
-Requires [rustup](https://rustup.rs) and a C compiler available as `cc`; running and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU 10.2 or later (`qemu-system-x86_64`) and OVMF. From the repository root:
+Requires [rustup](https://rustup.rs) and a C compiler available as `cc`; running and testing programs for `x86_64-uefi` and `x86_64-bare` also requires QEMU 10.2 or later (`qemu-system-x86_64`) and OVMF. From `bootstrap/`:
 
 ```bash
 rustup toolchain install
@@ -19,13 +19,13 @@ The first command installs the Rust toolchain pinned in `rust-toolchain.toml`. T
 
 ## Usage
 
-Build the compiler with `cargo build`, then run it from a directory of NaN packages:
+Build the compiler with `cargo build` in `bootstrap/`, then run it from a directory of NaN packages:
 
 ```bash
-target/debug/nan check
-target/debug/nan fmt
-target/debug/nan run
-target/debug/nan test
+bootstrap/target/debug/nan check
+bootstrap/target/debug/nan fmt
+bootstrap/target/debug/nan run
+bootstrap/target/debug/nan test
 ```
 
 `nan check` reports the diagnostics of the package holding the current directory, or of every package from the workspace root; `nan fmt` rewrites their files into canonical format. Each takes a narrower scope: a package, module or item path, a file, or `file:line`. `nan build` writes the image of a program under `.nan/images/<target>/`, and `nan run` builds and runs it, booting an `x86_64-uefi` or `x86_64-bare` image under QEMU with its serial port on the terminal. `nan test` runs the tests of its scope, `--affected` only those changed since they last passed, and `--replay <token>` reruns the run a failing test's report names.
@@ -40,9 +40,11 @@ Pushing a tag `vX.Y.Z` on a commit of `main` publishes a GitHub release. Its ass
 
 ## Commands
 
+They run from `bootstrap/`.
+
 | Command | Purpose |
 | --- | --- |
-| `cargo build` | Build the compiler to `target/debug/nan` |
+| `cargo build` | Build the compiler to `bootstrap/target/debug/nan` |
 | `cargo fmt --all` | Format all code |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint; any warning fails |
 | `cargo nextest run` | Run all tests |
@@ -52,4 +54,4 @@ Pushing a tag `vX.Y.Z` on a commit of `main` publishes a GitHub release. Its ass
 | `cargo nextest run -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones` (`m2`) |
 | `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN toolchain of `toolchain/` with the bootstrap on one chapter, std package, program or the toolchain, which it then builds twice to check itself (`toolchain`) |
 | `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenario and the NaN toolchain against the bound of the freeze |
-| `cargo run -p nanbench -- tokens`, `measure`, `corpus`, `run <model>`, `report` | Nanbench: the primer tiers' token counts, the measurements of the freeze, a check of the task corpus, a model's run of it (`ANTHROPIC_API_KEY`) and the metrics, written under `nanbench/results/` |
+| `cargo run -p nanbench -- tokens`, `measure`, `corpus`, `run <model>`, `report` | Nanbench: the primer tiers' token counts, the measurements of the freeze, a check of the task corpus, a model's run of it (`ANTHROPIC_API_KEY`) and the metrics, written under `bootstrap/nanbench/results/` |

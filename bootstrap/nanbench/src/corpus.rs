@@ -1,4 +1,4 @@
-//! The task corpus: each directory of `nanbench/tasks/` is a task, its `task.md` giving its kind,
+//! The task corpus: each directory of `bootstrap/nanbench/tasks/` is a task, its `task.md` giving its kind,
 //! its area and the prompt an agent reads; `workspace/` holds the workspace it starts from,
 //! `accept/` the files its acceptance tests add, `solution/` the files of a reference solution,
 //! and `answers.txt` a read task's expected answers, one `<question> <answer>` per line.

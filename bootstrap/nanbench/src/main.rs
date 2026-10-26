@@ -1,6 +1,6 @@
 //! Nanbench, the benchmark that gates NaN language versions: the token counts of the primer
 //! tiers, the measurements of the freeze, and the runs of named models over the task corpus with
-//! the metrics they give. Each command writes its results under `nanbench/results/`.
+//! the metrics they give. Each command writes its results under `bootstrap/nanbench/results/`.
 
 mod agent;
 mod corpus;
@@ -18,7 +18,7 @@ use model::Model;
 
 /// The repository's root.
 fn repository() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// Where nanbench publishes its results.
@@ -33,7 +33,7 @@ fn tasks() -> PathBuf {
 
 /// Where nanbench keeps what it fetches and builds.
 fn cache() -> PathBuf {
-    repository().join("target/nanbench")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/nanbench")
 }
 
 /// Writes a results file and says so.
@@ -43,7 +43,7 @@ fn publish(name: &str, text: &str) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(&path, text).map_err(|error| error.to_string())?;
-    println!("wrote nanbench/results/{name}");
+    println!("wrote bootstrap/nanbench/results/{name}");
     Ok(())
 }
 

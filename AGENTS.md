@@ -12,7 +12,7 @@ Its parser runs on tables that `build.rs` generates from the `ebnf` blocks of `d
 
 `toolchain/nan` is the NaN toolchain: a NaN program that implements every command, its modules mirroring those of the bootstrap (syntax, workspace, check with elaboration, the interpreter and the prover, fixes, output, the commands, final builds, test runs and lowering), so that it prints what the bootstrap prints, gives the same NIR and builds each function into the same Cranelift IR; a change to the bootstrap is ported there in the same change. Each command runs in a domain of its own, so that a trap of the toolchain's code is an internal error whose reproducer the command's caller writes. Worker tasks, one per other processor up to seven, share with the command's task the per-item work its checks post as batches, and the parsing ahead of its workspace load. Its build cache also keeps a snapshot of each check of a closure under a target, from which a check of a state differing in function bodies checks again only the items those reach. Its code generator stands in for Cranelift: `clif` holds the IR and its builder with Cranelift's numbering and text, `codegen` selects x86-64 instructions, allocates registers and lays out frames, `x64` encodes them, `object` writes the relocatable object as cranelift-object does, and `image` ports the image writer. The self-check harness builds it with a root file of its own, which gives it the harnesses' home directory and makes it dump its NIR or a program's lowering, and compares it with the bootstrap on every command the conformance harness runs for each `nan` example of the specification, with each final build's lowering and what each `x86_64-host` program writes, on every std package with its tests, on the programs of `tests/programs`, and on the toolchain workspace, which must check without a diagnostic and pass `nan verify`. Its toolchain test then checks the first self-built toolchain: the NaN toolchain the bootstrap built builds the toolchain, which builds it again into the same bytes, and the bootstrap's stage comparison accepts it.
 
-`nanbench` is the benchmark that gates language versions, a Rust binary of the workspace that reads the bootstrap through its library. It counts each primer tier's `nan primer` text under three tokenizers, Llama 3's ranks fetched once into the target directory; takes the measurements of the freeze over each milestone's scenario, through what checking, final builds and test images give and through the benchmark programs of `nanbench/bench`; and runs named models through the Messages API over the tasks of `nanbench/tasks`, each in a fresh copy of its workspace, by a text protocol whose `nan` commands run in-process, then scores first-compile success, fix rates per diagnostic code and comprehension. Each command writes its results under `nanbench/results`; a reference solver checks the corpus.
+`nanbench` is the benchmark that gates language versions, a Rust binary of the workspace that reads the bootstrap through its library. It counts each primer tier's `nan primer` text under three tokenizers, Llama 3's ranks fetched once into the target directory; takes the measurements of the freeze over each milestone's scenario, through what checking, final builds and test images give and through the benchmark programs of `bootstrap/nanbench/bench`; and runs named models through the Messages API over the tasks of `bootstrap/nanbench/tasks`, each in a fresh copy of its workspace, by a text protocol whose `nan` commands run in-process, then scores first-compile success, fix rates per diagnostic code and comprehension. Each command writes its results under `bootstrap/nanbench/results`; a reference solver checks the corpus.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 
@@ -20,16 +20,15 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 
 | Path | Holds |
 | --- | --- |
-| `bootstrap/` | The bootstrap compiler, one Cargo workspace crate per directory |
+| `bootstrap/` | The Rust code: a Cargo workspace (with its lock, pinned Rust toolchain and nextest configuration in `.config/`) of one crate per directory, the bootstrap compiler in `nan/` and nanbench in `nanbench/` |
 | `bootstrap/nan/src/` | Source of the `nan` binary; a module's unit tests live in `<module>/tests.rs` beside it |
 | `bootstrap/nan/tests/` | The conformance, program, milestone and self-check harnesses; `programs/` holds one program per directory with its `expected` output, `milestones/` one scenario workspace per milestone |
 | `std/` | The std packages, one directory per package |
 | `toolchain/` | The NaN toolchain, a workspace of one package, `nan` |
-| `nanbench/` | The benchmark gating language versions: its crate in `src/`, the task corpus in `tasks/` (one directory per task), the benchmark programs in `bench/` and the published results in `results/` |
+| `bootstrap/nanbench/` | The benchmark gating language versions: its crate in `src/`, the task corpus in `tasks/` (one directory per task), the benchmark programs in `bench/` and the published results in `results/` |
 | `docs/spec/` | The NaN 1.0 language specification, one chapter per file |
 | `docs/decisions/` | Architecture decision records |
 | `editors/` | Editor support: the TextMate grammar of `.nan` files in `textmate/` |
-| `.config/` | nextest configuration |
 | `.github/` | The CI workflow and the release workflow |
 | `.agents/skills/` | Agent skills; `.claude/skills` links here |
 
@@ -37,11 +36,13 @@ One row per top-level directory; deeper only where the tree alone would not tell
 
 ## Commands
 
+Commands run from `bootstrap/`, except those this table runs from elsewhere.
+
 | Command | Purpose |
 | --- | --- |
 | `rustup toolchain install` | Install the Rust toolchain pinned in `rust-toolchain.toml` |
 | `cargo install --locked cargo-nextest@0.9.148` | Install the pinned test runner |
-| `cargo build -q` | Build the compiler to `target/debug/nan` |
+| `cargo build -q` | Build the compiler to `bootstrap/target/debug/nan` |
 | `cargo fmt --all` | Format all code |
 | `cargo clippy -q --workspace --all-targets -- -D warnings` | Lint; any warning fails |
 | `cargo nextest run --cargo-quiet -p nan -E 'test(/^<module>::/)'` | Run the tests of one module, given by its path in the crate (`a::b`) |
@@ -50,14 +51,14 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `cargo nextest run --cargo-quiet -p nan --test milestones -E 'test(/<milestone>/)'` | Run the scenario of one milestone of `bootstrap/nan/tests/milestones`, given by its directory name (`m2`) |
 | `cargo nextest run --cargo-quiet -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN toolchain with the bootstrap on one chapter (`06-statements`), std package (`std_package::mem`), program (`program::files`) or the toolchain workspace, then double-compile it (`toolchain`); or check that a trap of its own code is an internal error (`internal_error`) |
 | `cargo nextest run --cargo-quiet -p nan --test measurements` | Check the prover's discharge of bounds and overflow obligations on M4 and M5 against its bound |
-| `cargo run -q -p nanbench -- tokens` | Count each primer tier's tokens into `nanbench/results/primer.md`; fails when a tier passes its cap |
-| `cargo run -q -p nanbench -- measure` | Take the measurements of the freeze into `nanbench/results/` |
-| `cargo run -q -p nanbench -- corpus` | Run every task of `nanbench/tasks` with the reference solver; fails on an unsound task |
-| `cargo run -q -p nanbench -- run <model> [<task>...]` | Run tasks with a model of the Messages API, the key in `ANTHROPIC_API_KEY`, into `nanbench/results/runs/` |
-| `cargo run -q -p nanbench -- report` | Write `nanbench/results/nanbench.md` from the recorded runs |
-| `../target/debug/nan check <package>` | Check one std package, from `std/`, with the compiler built last |
-| `../target/debug/nan test <package>` | Run the tests of one std package, from `std/`, with the compiler built last |
-| `../target/debug/nan check nan` | Check the NaN toolchain, from `toolchain/`, with the compiler built last |
+| `cargo run -q -p nanbench -- tokens` | Count each primer tier's tokens into `bootstrap/nanbench/results/primer.md`; fails when a tier passes its cap |
+| `cargo run -q -p nanbench -- measure` | Take the measurements of the freeze into `bootstrap/nanbench/results/` |
+| `cargo run -q -p nanbench -- corpus` | Run every task of `bootstrap/nanbench/tasks` with the reference solver; fails on an unsound task |
+| `cargo run -q -p nanbench -- run <model> [<task>...]` | Run tasks with a model of the Messages API, the key in `ANTHROPIC_API_KEY`, into `bootstrap/nanbench/results/runs/` |
+| `cargo run -q -p nanbench -- report` | Write `bootstrap/nanbench/results/nanbench.md` from the recorded runs |
+| `../bootstrap/target/debug/nan check <package>` | Check one std package, from `std/`, with the compiler built last |
+| `../bootstrap/target/debug/nan test <package>` | Run the tests of one std package, from `std/`, with the compiler built last |
+| `../bootstrap/target/debug/nan check nan` | Check the NaN toolchain, from `toolchain/`, with the compiler built last |
 
 Design each command for who runs it: agent-facing commands run without interaction, accept a scope where one applies and print only what an agent needs. Agent-facing commands are listed here, human-facing ones in README.md, shared ones in both.
 
@@ -116,7 +117,7 @@ Every document except ADRs is listed here. Read one only when the task needs it.
 | --- | --- |
 | `docs/spec/00-charter.md` | The NaN 1.0 specification: its guarantees, glossary and the map of every chapter in `docs/spec/` |
 | `docs/spec/39-primer.md` | The primer: what to read before writing or reviewing NaN code |
-| `nanbench/results/` | The primer tiers' token counts, the measurements of the freeze and the nanbench metrics published with language 1 |
+| `bootstrap/nanbench/results/` | The primer tiers' token counts, the measurements of the freeze and the nanbench metrics published with language 1 |
 
 ## ADR
 

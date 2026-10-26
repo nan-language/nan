@@ -1,7 +1,8 @@
 //! The `x86_64-host` target: everything Linux-specific. The program entry seam `main`, which the
 //! C library's start-up code calls; the executor threads, one per processor of the process's
-//! affinity set, each with its io_uring; termination requests read from a `signalfd`; the
-//! support routines' calls into the system; and linking the image with `cc`.
+//! affinity set, each with its io_uring; termination requests, which a thread of their own reads
+//! from a `signalfd`; the support routines' calls into the system; and linking the image with
+//! `cc`.
 //!
 //! An operation record is what a completion reaches: the task waiting on it, its result, how far its completion has been delivered, the
 //! thread whose ring holds it, how far its cancellation has gone, its kind and its links in its
@@ -42,7 +43,6 @@ mod uring {
     pub const ENTRIES: i64 = 256;
     pub const GET_EVENTS: i64 = 1;
     pub const SQES: i64 = 0x1000_0000;
-    pub const READ: i64 = 22;
     pub const TIMEOUT: i64 = 11;
     pub const ASYNC_CANCEL: i64 = 14;
     pub const MSG_RING: i64 = 40;
@@ -284,6 +284,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
         }
         Routine::Preempt => preempt(lo, fx, params[2]),
+        Routine::Terminations => terminations(lo, fx, params[0]),
         Routine::Overflow => overflow(lo, fx, params[1], params[2]),
         Routine::CpuLimit => {
             let status = fx.int(types::I32, i64::from(super::test_image::TIMED_OUT));
@@ -628,8 +629,8 @@ fn processors(lo: &mut Lowering, fx: &mut Fx) -> Value {
     fx.b.ins().umax(count, one)
 }
 
-/// Blocks the termination request signals in every thread and starts reading them from a
-/// `signalfd` through the first thread's ring.
+/// Blocks the termination request signals in every thread and starts the thread reading them
+/// from a `signalfd`, with a ring of its own.
 fn read_signals(lo: &mut Lowering, fx: &mut Fx) {
     let mask = fx.slot(128, 8);
     let zero = fx.ptr(0);
@@ -655,55 +656,78 @@ fn read_signals(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(fd, op, operation::TASK);
     let state_address = lo.state(fx);
     fx.store(op, state_address, state::SIGNALS);
-    submit_signal_read(lo, fx, op);
-}
-
-/// Submits the read of the next termination request on the running thread's ring.
-fn submit_signal_read(lo: &mut Lowering, fx: &mut Fx, op: Value) {
-    let fd = fx.load(PTR, op, operation::TASK);
-    let buffer = fx.b.ins().iadd_imm_s(op, operation::SIZE as i64);
-    let entry = fx.slot(64, 8);
+    let size = fx.ptr(thread::SIZE);
+    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
+    unavailable_unless(fx, record);
+    let ring = setup_ring(lo, fx);
+    unavailable_unless(fx, ring);
+    fx.store(ring, record, thread::RING);
+    fx.store(record, op, operation::THREAD);
+    let start = lo.routine(Routine::Terminations);
+    let start = lo.func_ref(fx, start);
+    let start = fx.b.ins().func_addr(PTR, start);
+    let id = fx.slot(8, 8);
     let zero = fx.ptr(0);
-    let size = fx.ptr(64);
-    lo.call_routine(fx, Routine::Fill, &[entry, zero, size]);
-    let opcode = fx.int(types::I8, uring::READ);
-    fx.store(opcode, entry, 0);
-    let fd = fx.b.ins().ireduce(types::I32, fd);
-    fx.store(fd, entry, 4);
-    fx.store(buffer, entry, 16);
-    let len = fx.int(types::I32, SIGINFO as i64);
-    fx.store(len, entry, 24);
-    submit(lo, fx, entry, Some(op));
+    let started = lo.call_libc(fx, "pthread_create", &[id, zero, start, op], &[types::I32])[0];
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, started, 0);
+    fx.when(failed, |fx| {
+        let one = fx.ptr(1);
+        fx.b.ins().return_(&[one]);
+    });
 }
 
-/// Handles a termination request read: the first cancels the entry task's construct, a later
-/// one ends the process at once.
-fn termination(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
-    let read = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, result, 0);
-    fx.when(read, |fx| {
-        let signal = fx.load(types::I32, op, operation::SIZE);
-        let signal = fx.b.ins().uextend(PTR, signal);
-        let state_address = lo.state(fx);
-        let earlier = fx.load(PTR, state_address, state::TERMINATION);
-        let first = fx.b.ins().icmp_imm_s(IntCC::Equal, earlier, 0);
-        fx.choose_in(
-            lo,
-            first,
-            &[],
-            |lo, fx| {
-                fx.store(signal, state_address, state::TERMINATION);
-                let root = fx.load(PTR, state_address, state::ROOT);
-                lo.call_routine(fx, Routine::Cancel, &[root]);
-                Vec::new()
-            },
-            |lo, fx| {
-                let status = fx.b.ins().iadd_imm_s(signal, 128);
-                lo.call_routine(fx, Routine::Exit, &[status]);
-                Vec::new()
-            },
-        );
+/// `Terminations(op)`: reads each termination request from the `signalfd` of `op`, then
+/// passes the first with `op` to the first executor thread's ring and ends the process at once
+/// at a later one, whatever the executor threads run.
+fn terminations(lo: &mut Lowering, fx: &mut Fx, op: Value) {
+    let record = fx.load(PTR, op, operation::THREAD);
+    let slot = lo.thread_slot(fx);
+    fx.store(record, slot, 0);
+    let fd = fx.load(PTR, op, operation::TASK);
+    let fd = fx.b.ins().ireduce(types::I32, fd);
+    let buffer = fx.b.ins().iadd_imm_s(op, operation::SIZE as i64);
+    let len = fx.ptr(SIGINFO);
+    let none = fx.int(types::I8, 0);
+    fx.repeat(&[none], |fx, state| {
+        let passed = state[0];
+        let read = lo.call_libc(fx, "read", &[fd, buffer, len], &[PTR])[0];
+        let whole = fx.b.ins().icmp_imm_s(IntCC::Equal, read, SIGINFO as i64);
+        let later = fx.b.ins().band(whole, passed);
+        fx.when(later, |fx| {
+            let signal = fx.load(types::I32, op, operation::SIZE);
+            let signal = fx.b.ins().uextend(PTR, signal);
+            let status = fx.b.ins().iadd_imm_s(signal, 128);
+            lo.call_routine(fx, Routine::Exit, &[status]);
+        });
+        let first = fx.b.ins().bxor_imm_s(passed, 1);
+        let first = fx.b.ins().band(whole, first);
+        fx.when(first, |fx| {
+            let state_address = lo.state(fx);
+            let threads = fx.load(PTR, state_address, state::THREADS);
+            let target = fx.load(PTR, threads, 0);
+            let ring = fx.load(PTR, target, thread::RING);
+            let target = fx.load(PTR, ring, ring::FD);
+            let target = fx.b.ins().ireduce(types::I32, target);
+            let read = fx.b.ins().ireduce(types::I32, read);
+            let zero = fx.ptr(0);
+            let flags = fx.int(types::I32, 0);
+            submit_built(lo, fx, uring::MSG_RING, target, zero, read, op, flags, None);
+        });
+        let passed = fx.b.ins().bor(passed, whole);
+        (fx.int(types::I8, 1), vec![passed])
     });
-    submit_signal_read(lo, fx, op);
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// Handles the first termination request, which the thread reading them passes on: it cancels
+/// the entry task's construct.
+fn termination(lo: &mut Lowering, fx: &mut Fx, op: Value) {
+    let signal = fx.load(types::I32, op, operation::SIZE);
+    let signal = fx.b.ins().uextend(PTR, signal);
+    let state_address = lo.state(fx);
+    fx.store(signal, state_address, state::TERMINATION);
+    let root = fx.load(PTR, state_address, state::ROOT);
+    lo.call_routine(fx, Routine::Cancel, &[root]);
 }
 
 /// Sets up an io_uring and gives its ring record, zero when the system refuses one.
@@ -919,30 +943,41 @@ pub fn reap(lo: &mut Lowering, fx: &mut Fx, wait: Option<Value>) {
 }
 
 /// Delivers a completion to the operation it reaches, which leaves its thread's operations in
-/// flight.
+/// flight; the first termination request, passed on by the thread reading them, is in none.
 fn complete(lo: &mut Lowering, fx: &mut Fx, op: Value, result: Value) {
-    let current = lo.thread(fx);
-    let next = fx.load(PTR, op, operation::NEXT);
-    let previous = fx.load(PTR, op, operation::PREVIOUS);
-    let has_previous = fx.b.ins().icmp_imm_s(IntCC::NotEqual, previous, 0);
-    fx.choose(
-        has_previous,
+    let kind = fx.load(PTR, op, operation::KIND);
+    let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::SIGNAL);
+    fx.choose_in(
+        lo,
+        signal,
         &[],
-        |fx| {
-            fx.store(next, previous, operation::NEXT);
+        |lo, fx| {
+            termination(lo, fx, op);
             Vec::new()
         },
-        |fx| {
-            fx.store(next, current, thread::OPERATIONS);
+        |lo, fx| {
+            let current = lo.thread(fx);
+            let next = fx.load(PTR, op, operation::NEXT);
+            let previous = fx.load(PTR, op, operation::PREVIOUS);
+            let has_previous = fx.b.ins().icmp_imm_s(IntCC::NotEqual, previous, 0);
+            fx.choose(
+                has_previous,
+                &[],
+                |fx| {
+                    fx.store(next, previous, operation::NEXT);
+                    Vec::new()
+                },
+                |fx| {
+                    fx.store(next, current, thread::OPERATIONS);
+                    Vec::new()
+                },
+            );
+            let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+            fx.when(has_next, |fx| fx.store(previous, next, operation::PREVIOUS));
+            tasks::deliver(lo, fx, op, result);
             Vec::new()
         },
     );
-    let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
-    fx.when(has_next, |fx| fx.store(previous, next, operation::PREVIOUS));
-    let kind = fx.load(PTR, op, operation::KIND);
-    let signal = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::SIGNAL);
-    fx.when(signal, |fx| termination(lo, fx, op, result));
-    tasks::deliver(lo, fx, op, result);
 }
 
 /// Submits a deadline's timeout of the relative time at `spec` on the running thread's ring.
@@ -1200,3 +1235,6 @@ pub fn link(object: &Path, image: &Path) -> Result<(), String> {
         Err(error) => Err(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests;

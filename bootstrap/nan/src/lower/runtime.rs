@@ -127,6 +127,8 @@ pub enum Routine {
     Schedule,
     /// `(thread) -> Never`: the start routine of an executor thread.
     ThreadMain,
+    /// `(operation) -> Never`: the start routine of the thread reading termination requests.
+    Terminations,
     /// `(size) -> region`: a cancelling construct's new record of `size` bytes, enclosed by
     /// the running task's region.
     RegionOpen,
@@ -203,6 +205,7 @@ impl Routine {
             Routine::IoSubmit => "_NSstack_switch_io_submit",
             Routine::Schedule => "_NSstack_switch_schedule",
             Routine::ThreadMain => "_NSstack_switch_thread_main",
+            Routine::Terminations => "_NSstack_switch_terminations",
             Routine::RegionOpen => "_NSstack_switch_region_open",
             Routine::Cancel => "_NSstack_switch_cancel",
             Routine::Origin => "_NSstack_switch_origin",
@@ -257,6 +260,7 @@ impl Routine {
             | Routine::CownRelease
             | Routine::Exit
             | Routine::ThreadMain
+            | Routine::Terminations
             | Routine::Lock
             | Routine::Unlock
             | Routine::Settle
@@ -597,7 +601,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::RecordAlloc
         | Routine::RecordFree
         | Routine::RecordResize => system::define(lo, fx, routine),
-        Routine::Preempt | Routine::Overflow | Routine::CpuLimit => {
+        Routine::Preempt | Routine::Overflow | Routine::CpuLimit | Routine::Terminations => {
             super::host::define(lo, fx, routine)
         }
     }

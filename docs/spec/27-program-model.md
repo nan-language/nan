@@ -209,7 +209,7 @@ A program run on `x86_64-host` is one Linux process:
 
 | Outcome | Exit status |
 | --- | --- |
-| the executor threads, their io_uring instances or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
+| the executor threads, the thread reading termination requests, their io_uring instances or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
 | the entry task traps | 70, after writing the [trap report](11-errors-domains.md#trap-reports) to standard error |
 | the entry task returns or fails after a termination request with signal number n | 128 + n |
 | it fails with `e` | 1, after writing `error: `, the rendering of `e` within a render budget of 4,096 bytes, and a line feed to standard error; a trap while rendering `e` is a trap of the entry task, with status 70 |
@@ -367,7 +367,7 @@ On `x86_64-host` every waiting primitive of the platform package performs its op
 - Each executor thread owns one io_uring instance. A primitive submits its operation as submission queue entries on the ring of the thread running its task, and suspends the task until the matching completion queue entries arrive on that ring.
 - Cancelling an in-flight operation submits `IORING_OP_ASYNC_CANCEL` for it on the ring holding it; the operation's own completion entry, whatever its result, is the acknowledgement.
 - Sleeps and deadlines are `IORING_OP_TIMEOUT` operations on the monotonic clock.
-- Every thread blocks the termination request signals, which the runtime reads from a `signalfd` through one executor thread's ring.
+- Every thread blocks the termination request signals. A thread of the runtime that runs no task reads them from a `signalfd` and passes the first to an executor thread's ring with `IORING_OP_MSG_RING`, so a later one ends the process whatever the executor threads run.
 - An executor thread with no ready task waits in `io_uring_enter` for a completion; making a task ready wakes such a thread with `IORING_OP_MSG_RING`.
 
 ## Images

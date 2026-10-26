@@ -1,4 +1,4 @@
-//! The `x86_64-host` target, everything Linux-specific: the program entry seam `main`, the executor threads with their io_uring rings, termination requests read from a `signalfd`, the support routines' calls into the system, and linking the image with `cc`. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
+//! The `x86_64-host` target, everything Linux-specific: the program entry seam `main`, the executor threads with their io_uring rings, termination requests, which a thread of their own reads from a `signalfd`, the support routines' calls into the system, and linking the image with `cc`. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
 
 const MMAP_READ_WRITE: i64 = 3
 
@@ -22,8 +22,6 @@ const URING_ENTRIES: i64 = 256
 const URING_GET_EVENTS: i64 = 1
 
 const URING_SQES: i64 = 0x1000_0000
-
-const URING_READ: i64 = 22
 
 const URING_TIMEOUT: i64 = 11
 
@@ -335,6 +333,10 @@ fn host_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.Overflow => {
             expect incoming.len() > 2
             host_overflow(mut lo, mut fx, info: incoming[1], context: incoming[2])
+        }
+        Routine.Terminations => {
+            expect incoming.len() > 0
+            terminations(mut lo, mut fx, op: incoming[0])
         }
         Routine.CpuLimit => {
             let status = mut fx.int(clif::Type.Int32, value: i64.widen(TIMED_OUT))
@@ -784,8 +786,8 @@ fn processors(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     return mut fx.b.umax(count, y: one)
 } processors
 
-/// Blocks the termination request signals in every thread and starts reading them from a
-/// `signalfd` through the first thread's ring.
+/// Blocks the termination request signals in every thread and starts the thread reading them
+/// from a `signalfd`, with a ring of its own.
 fn read_signals(mut lo: Lowering, mut fx: Fx) {
     let mask = mut fx.slot(128, align: 8)
     let zero_word = mut fx.ptr(0)
@@ -824,53 +826,91 @@ fn read_signals(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(fd_word, addr: op, offset: OPERATION_TASK)
     let state_address = mut lo.state(mut fx)
     mut fx.store(op, addr: state_address, offset: STATE_SIGNALS)
-    submit_signal_read(mut lo, mut fx, op)
+    let record_size = mut fx.ptr(THREAD_SIZE)
+    var record_args = Array[clif::Value, 2].filled(one)
+    record_args[1] = record_size
+    let record = first_result(mut lo.call_libc(mut fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+    unavailable_unless(mut fx, address: record)
+    let ring = setup_ring(mut lo, mut fx)
+    unavailable_unless(mut fx, address: ring)
+    mut fx.store(ring, addr: record, offset: THREAD_RING)
+    mut fx.store(record, addr: op, offset: OPERATION_THREAD)
+    let start_id = mut lo.routine(Routine.Terminations)
+    let start_ref = mut lo.func_ref(mut fx, id: start_id)
+    let start = mut fx.b.func_addr(PTR, func_ref: start_ref)
+    let thread_id = mut fx.slot(8, align: 8)
+    let null = mut fx.ptr(0)
+    var create_args = Array[clif::Value, 4].filled(thread_id)
+    create_args[1] = null
+    create_args[2] = start
+    create_args[3] = op
+    let started = first_result(mut lo.call_libc(mut fx, name: "pthread_create", args: create_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view()))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: started, y: 0)
+    mut fx.if_true(failed, then: fn(mut then_fx: Fx) {
+        let refusal = mut then_fx.ptr(1)
+        mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
+    })
 } read_signals
 
-/// Submits the read of the next termination request on the running thread's ring.
-fn submit_signal_read(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
-    let fd = mut fx.load(PTR, addr: op, offset: OPERATION_TASK)
+/// `Terminations(op)`: reads each termination request from the `signalfd` of `op`, then
+/// passes the first with `op` to the first executor thread's ring and ends the process at once
+/// at a later one, whatever the executor threads run.
+fn terminations(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let record = mut fx.load(PTR, addr: op, offset: OPERATION_THREAD)
+    let thread_slot = mut lo.thread_slot(mut fx)
+    mut fx.store(record, addr: thread_slot, offset: 0)
+    let fd_word = mut fx.load(PTR, addr: op, offset: OPERATION_TASK)
+    let fd = mut fx.b.ireduce(clif::Type.Int32, x: fd_word)
     let buffer = mut fx.b.iadd_imm_s(op, y: i64.fit(OPERATION_SIZE))
-    let prepared = mut fx.slot(64, align: 8)
-    let zero_word = mut fx.ptr(0)
-    let size = mut fx.ptr(64)
-    var fill_args = Array[clif::Value, 3].filled(prepared)
-    fill_args[1] = zero_word
-    fill_args[2] = size
-    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
-    let opcode = mut fx.int(clif::Type.Int8, value: URING_READ)
-    mut fx.store(opcode, addr: prepared, offset: 0)
-    let fd32 = mut fx.b.ireduce(clif::Type.Int32, x: fd)
-    mut fx.store(fd32, addr: prepared, offset: 4)
-    mut fx.store(buffer, addr: prepared, offset: 16)
-    let len = mut fx.int(clif::Type.Int32, value: i64.fit(SIGINFO))
-    mut fx.store(len, addr: prepared, offset: 24)
-    host_submit(mut lo, mut fx, prepared, op: Some(op))
-} submit_signal_read
-
-/// Handles a termination request read: the first cancels the entry task's construct, a later
-/// one ends the process at once.
-fn host_termination(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
-    let read = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: result, y: 0)
-    let no_types = mem::List[clif::Type].empty(fx.alloc)
-    mut fx.if_true(read, then: fn[mut lo](mut then_fx: Fx) {
-        let signal_number = mut then_fx.load(clif::Type.Int32, addr: op, offset: OPERATION_SIZE)
-        let signal_word = mut then_fx.b.uextend(PTR, x: signal_number)
-        let state_address = mut lo.state(mut then_fx)
-        let earlier = mut then_fx.load(PTR, addr: state_address, offset: STATE_TERMINATION)
-        let first_request = mut then_fx.b.icmp_imm_s(clif::IntCC.Equal, x: earlier, y: 0)
-        discard mut then_fx.choose_in(mut lo, condition: first_request, results: no_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-            mut yes_fx.store(signal_word, addr: state_address, offset: STATE_TERMINATION)
-            let root = mut yes_fx.load(PTR, addr: state_address, offset: STATE_ROOT)
-            discard mut cx.call_routine(mut yes_fx, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(root).view())
-            return mem::List[clif::Value].empty(yes_fx.alloc)
-        }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-            let status = mut no_fx.b.iadd_imm_s(signal_word, y: 128)
-            discard mut cx.call_routine(mut no_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
-            return mem::List[clif::Value].empty(no_fx.alloc)
+    let len = mut fx.ptr(SIGINFO)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    discard mut fx.repeat(Array[clif::Value, 1].filled(none).view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 0
+        let passed = current[0]
+        var read_args = Array[clif::Value, 3].filled(fd)
+        read_args[1] = buffer
+        read_args[2] = len
+        let read = first_result(mut lo.call_libc(mut pass_fx, name: "read", args: read_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
+        let whole = mut pass_fx.b.icmp_imm_s(clif::IntCC.Equal, x: read, y: i64.fit(SIGINFO))
+        let later = mut pass_fx.b.band(whole, y: passed)
+        mut pass_fx.if_true(later, then: fn[mut lo](mut then_fx: Fx) {
+            let signal_number = mut then_fx.load(clif::Type.Int32, addr: op, offset: OPERATION_SIZE)
+            let signal_word = mut then_fx.b.uextend(PTR, x: signal_number)
+            let status = mut then_fx.b.iadd_imm_s(signal_word, y: 128)
+            discard mut lo.call_routine(mut then_fx, routine: Routine.Exit, args: Array[clif::Value, 1].filled(status).view())
         })
+        let unpassed = mut pass_fx.b.bxor_imm_s(passed, y: 1)
+        let first_request = mut pass_fx.b.band(whole, y: unpassed)
+        mut pass_fx.if_true(first_request, then: fn[mut lo](mut then_fx: Fx) {
+            let state_address = mut lo.state(mut then_fx)
+            let threads = mut then_fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+            let target = mut then_fx.load(PTR, addr: threads, offset: 0)
+            let target_ring = mut then_fx.load(PTR, addr: target, offset: THREAD_RING)
+            let target_fd_word = mut then_fx.load(PTR, addr: target_ring, offset: RING_FD)
+            let target_fd = mut then_fx.b.ireduce(clif::Type.Int32, x: target_fd_word)
+            let read32 = mut then_fx.b.ireduce(clif::Type.Int32, x: read)
+            let zero_word = mut then_fx.ptr(0)
+            let flags = mut then_fx.int(clif::Type.Int32, value: 0)
+            submit_built(mut lo, fx: mut then_fx, opcode: URING_MSG_RING, fd: target_fd, address: zero_word, len: read32, offset: op, flags, op: None)
+        })
+        let now_passed = mut pass_fx.b.bor(passed, y: whole)
+        let again = mut pass_fx.int(clif::Type.Int8, value: 1)
+        var next = mem::List[clif::Value].empty(pass_fx.alloc)
+        mut next.push(now_passed)
+        return Pass(again: again, next: take next)
     })
-    submit_signal_read(mut lo, mut fx, op)
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} terminations
+
+/// Handles the first termination request, which the thread reading them passes on: it cancels
+/// the entry task's construct.
+fn host_termination(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let signal_number = mut fx.load(clif::Type.Int32, addr: op, offset: OPERATION_SIZE)
+    let signal_word = mut fx.b.uextend(PTR, x: signal_number)
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(signal_word, addr: state_address, offset: STATE_TERMINATION)
+    let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
+    discard mut lo.call_routine(mut fx, routine: Routine.Cancel, args: Array[clif::Value, 1].filled(root).view())
 } host_termination
 
 /// Stores into a ring record's field the address of a part of the rings mapped at `rings`, at
@@ -1116,30 +1156,34 @@ fn host_reap(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value]) {
 } host_reap
 
 /// Delivers a completion to the operation it reaches, which leaves its thread's operations in
-/// flight.
+/// flight; the first termination request, passed on by the thread reading them, is in none.
 fn host_complete(mut lo: Lowering, mut fx: Fx, op: clif::Value, result: clif::Value) {
-    let current = mut lo.thread(mut fx)
-    let next = mut fx.load(PTR, addr: op, offset: OPERATION_NEXT)
-    let previous = mut fx.load(PTR, addr: op, offset: OPERATION_PREVIOUS)
-    let has_previous = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
-    let no_types = mem::List[clif::Type].empty(fx.alloc)
-    discard mut fx.choose(has_previous, results: no_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
-        mut yes_fx.store(next, addr: previous, offset: OPERATION_NEXT)
-        return mem::List[clif::Value].empty(yes_fx.alloc)
-    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
-        mut no_fx.store(next, addr: current, offset: THREAD_OPERATIONS)
-        return mem::List[clif::Value].empty(no_fx.alloc)
-    })
-    let has_next = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
-    mut fx.if_true(has_next, then: fn(mut then_fx: Fx) {
-        mut then_fx.store(previous, addr: next, offset: OPERATION_PREVIOUS)
-    })
     let kind = mut fx.load(PTR, addr: op, offset: OPERATION_KIND)
     let is_signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_SIGNAL)
-    mut fx.if_true(is_signal, then: fn[mut lo](mut then_fx: Fx) {
-        host_termination(mut lo, fx: mut then_fx, op, result)
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose_in(mut lo, condition: is_signal, results: no_types.view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        host_termination(mut cx, fx: mut yes_fx, op)
+        return mem::List[clif::Value].empty(yes_fx.alloc)
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        let current = mut cx.thread(mut no_fx)
+        let next = mut no_fx.load(PTR, addr: op, offset: OPERATION_NEXT)
+        let previous = mut no_fx.load(PTR, addr: op, offset: OPERATION_PREVIOUS)
+        let has_previous = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: previous, y: 0)
+        let none = mem::List[clif::Type].empty(no_fx.alloc)
+        discard mut no_fx.choose(has_previous, results: none.view(), then: fn(mut link_fx: Fx) -> mem::List[clif::Value] {
+            mut link_fx.store(next, addr: previous, offset: OPERATION_NEXT)
+            return mem::List[clif::Value].empty(link_fx.alloc)
+        }, otherwise: fn(mut head_fx: Fx) -> mem::List[clif::Value] {
+            mut head_fx.store(next, addr: current, offset: THREAD_OPERATIONS)
+            return mem::List[clif::Value].empty(head_fx.alloc)
+        })
+        let has_next = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next, y: 0)
+        mut no_fx.if_true(has_next, then: fn(mut then_fx: Fx) {
+            mut then_fx.store(previous, addr: next, offset: OPERATION_PREVIOUS)
+        })
+        deliver(mut cx, fx: mut no_fx, op, result)
+        return mem::List[clif::Value].empty(no_fx.alloc)
     })
-    deliver(mut lo, mut fx, op, result)
 } host_complete
 
 /// Submits a deadline's timeout of the relative time at `spec` on the running thread's ring.

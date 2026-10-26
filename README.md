@@ -55,3 +55,7 @@ They run from `bootstrap/`.
 | `cargo nextest run -p nan --test self_check -E 'test(/<scope>/)'` | Compare the NaN toolchain of `toolchain/` with the bootstrap on one chapter, std package, program or the toolchain, which it then builds twice to check itself (`toolchain`) |
 | `cargo nextest run -p nan --test measurements` | Check the prover's discharge on the M4 scenario and the NaN toolchain against the bound of the freeze |
 | `cargo run -p nanbench -- tokens`, `measure`, `corpus`, `run <model>`, `report` | Nanbench: the primer tiers' token counts, the measurements of the freeze, a check of the task corpus, a model's run of it (`ANTHROPIC_API_KEY`) and the metrics, written under `bootstrap/nanbench/results/` |
+
+## License
+
+Copyright The NaN Authors. NaN is licensed under the [Apache License 2.0 with LLVM Exceptions](LICENSE): programs compiled with NaN may embed its runtime and standard library without carrying its license.

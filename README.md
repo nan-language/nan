@@ -34,6 +34,10 @@ Packages name their dependencies with `dep` directives, by relative path or by a
 
 The bootstrap implements the commands of the [toolchain](docs/spec/33-toolchain.md) for `x86_64-host`, `x86_64-uefi` and `x86_64-bare`. The NaN toolchain in `toolchain/`, written in NaN, implements the same commands; `nan build nan` run in `toolchain/` writes its image to `toolchain/.nan/images/x86_64-host/nan`.
 
+## Releases
+
+Pushing a tag `vX.Y.Z` on a commit of `main` publishes a GitHub release. Its asset is the NaN toolchain built by itself for Linux on x86_64, after the release workflow checks that it rebuilds itself into the same bytes and that the bootstrap's stage comparison accepts it; the notes give its SHA-256, its source tree hash and the subjects of the commits since the previous tag.
+
 ## Commands
 
 | Command | Purpose |

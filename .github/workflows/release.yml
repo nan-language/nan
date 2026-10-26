@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check the tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "$TAG is not vX.Y.Z"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$TAG is not on main"; exit 1; }
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Build the bootstrap
+        run: cargo build --release -q -p nan
+      # Each stage builds a fresh copy of toolchain/ with an empty user directory, so that no
+      # stage reuses another's proofs; the second and third stages must be equal byte for byte,
+      # and the bootstrap's stage comparison must accept the second.
+      - name: Build the NaN toolchain three times
+        run: |
+          stage() {
+            rm -rf ~/.nan "$RUNNER_TEMP/$2"
+            cp -r toolchain "$RUNNER_TEMP/$2"
+            (cd "$RUNNER_TEMP/$2" && "$1" build nan)
+            cp "$RUNNER_TEMP/$2/.nan/images/x86_64-host/nan" "$RUNNER_TEMP/$2.image"
+          }
+          stage "$PWD/target/release/nan" first
+          stage "$RUNNER_TEMP/first.image" second
+          stage "$RUNNER_TEMP/second.image" third
+          cmp "$RUNNER_TEMP/second.image" "$RUNNER_TEMP/third.image"
+          rm -rf ~/.nan "$RUNNER_TEMP/compared"
+          cp -r toolchain "$RUNNER_TEMP/compared"
+          (cd "$RUNNER_TEMP/compared" && "$GITHUB_WORKSPACE/target/release/nan" build nan --compare-with "$RUNNER_TEMP/second.image")
+      - name: Write the release notes
+        run: |
+          image="nan-$TAG-x86_64-linux"
+          cp "$RUNNER_TEMP/second.image" "$image"
+          sha256sum "$image" > "$image.sha256"
+          objcopy --dump-section .nan.tree="$RUNNER_TEMP/tree" "$image"
+          previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          {
+            echo "The NaN toolchain built by itself, for Linux on x86_64 (it links the system C library)."
+            echo
+            echo "- SHA-256: \`$(cut -d' ' -f1 "$image.sha256")\`"
+            echo "- Source tree hash (\`.nan.tree\`, hexadecimal): \`$(od -An -tx1 -v "$RUNNER_TEMP/tree" | tr -d ' \n')\`"
+            echo
+            echo "## Changes"
+            echo
+            git log --format='- %s' "${previous:+$previous..}$TAG"
+          } > "$RUNNER_TEMP/notes.md"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="nan-$TAG-x86_64-linux"
+          gh release create "$TAG" "$image" "$image.sha256" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag

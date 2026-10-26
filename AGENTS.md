@@ -30,7 +30,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `docs/decisions/` | Architecture decision records |
 | `editors/` | Editor support: the TextMate grammar of `.nan` files in `textmate/` |
 | `.config/` | nextest configuration |
-| `.github/` | The CI workflow |
+| `.github/` | The CI workflow and the release workflow |
 | `.agents/skills/` | Agent skills; `.claude/skills` links here |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.

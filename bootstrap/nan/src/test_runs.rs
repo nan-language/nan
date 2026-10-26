@@ -7,7 +7,8 @@ mod outcome;
 mod setup;
 mod shrink;
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use crate::cache::{Cache, Exposed};
@@ -196,6 +197,7 @@ fn run_target(
     report: &mut Report,
 ) -> io::Result<Result<(), Exposed>> {
     let target = checker.db.target;
+    let hashes = ItemHashes::default();
     let mut by_package: BTreeMap<u32, Vec<Selected>> = BTreeMap::new();
     for selected in select(checker, workspace, scope) {
         let package = checker.db.package_of(selected.item);
@@ -215,7 +217,7 @@ fn run_target(
                         Ok(record) => record,
                         Err(exposed) => return Ok(Err(exposed)),
                     };
-                    if record != Some(pass_record(checker, test.item)) {
+                    if record != Some(pass_record(checker, &hashes, test.item)) {
                         affected.push(test);
                     }
                 }
@@ -247,7 +249,15 @@ fn run_target(
     }
     for (package, tests) in planned {
         report.tests += tests.len();
-        run_package(checker, workspace, package, &tests, (runs, cache), report)?;
+        run_package(
+            checker,
+            &hashes,
+            workspace,
+            package,
+            &tests,
+            (runs, cache),
+            report,
+        )?;
     }
     Ok(Ok(()))
 }
@@ -260,13 +270,28 @@ fn record_name(checker: &Checker, test: ItemId) -> String {
     format!("pass-{}", Hash::of(&key).full())
 }
 
+/// The item hashes of a checker's items that the runs of its tests read, each computed once.
+#[derive(Default)]
+struct ItemHashes(RefCell<HashMap<ItemId, Hash>>);
+
+impl ItemHashes {
+    fn item(&self, checker: &Checker, item: ItemId) -> Hash {
+        if let Some(hash) = self.0.borrow().get(&item) {
+            return *hash;
+        }
+        let hash = checker.hashes(item).item;
+        self.0.borrow_mut().insert(item, hash);
+        hash
+    }
+}
+
 /// The record of a test passing on a checker's target: the toolchain hash, the target's name,
 /// then the canonical path and item hash of each item of the test's reach, in path order.
-fn pass_record(checker: &Checker, test: ItemId) -> Vec<u8> {
+fn pass_record(checker: &Checker, hashes: &ItemHashes, test: ItemId) -> Vec<u8> {
     let mut reach: Vec<(String, [u8; 33])> = checker
         .test_reach(test)
         .into_iter()
-        .map(|item| (checker.db.canonical(item), checker.hashes(item).item.0))
+        .map(|item| (checker.db.canonical(item), hashes.item(checker, item).0))
         .collect();
     reach.sort();
     let mut record = Vec::new();
@@ -374,6 +399,7 @@ fn run_targets(package: &Package) -> Vec<Target> {
 /// unless replaying; every run fails on a machine target whose emulator cannot start.
 fn run_package(
     checker: &Checker,
+    hashes: &ItemHashes,
     workspace: &Workspace,
     package: PackageId,
     tests: &[Selected],
@@ -405,7 +431,7 @@ fn run_package(
         let indexed: Vec<(u64, u64)> = match runs {
             Runs::Replay(token) => vec![(token.index, token.seed)],
             Runs::All | Runs::Affected | Runs::Reaching(_) => {
-                let hash = checker.hashes(test.item).item;
+                let hash = hashes.item(checker, test.item);
                 let count = if test.property { CASES } else { SCHEDULES };
                 (0..count)
                     .map(|index| (index, seed(&hash, target, index)))
@@ -447,7 +473,7 @@ fn run_package(
         }
         if report.failures.len() == failures && !matches!(runs, Runs::Replay(_)) {
             let name = record_name(checker, test.item);
-            cache.replace(&name, &pass_record(checker, test.item))?;
+            cache.replace(&name, &pass_record(checker, hashes, test.item))?;
         }
     }
     image.discard()

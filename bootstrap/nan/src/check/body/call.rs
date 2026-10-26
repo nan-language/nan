@@ -1769,7 +1769,7 @@ impl Body<'_, '_> {
         }
         match self.ck.db.canonical(*item).as_str() {
             "task::scope" if param == "body" => Written::ScopeBody,
-            "task::Scope.spawn" => receiver
+            "task::Scope.spawn" | "task::Scope.spawn_sized" => receiver
                 .first()
                 .and_then(|receiver| self.lexical_scope(&receiver.expr))
                 .map_or(Written::Other, Written::Lent),
@@ -1805,7 +1805,12 @@ impl Body<'_, '_> {
         let Callee::Function { item, .. } = &callable.callee else {
             return;
         };
-        if !self.ck.db.is_std(*item) || self.ck.db.canonical(*item) != "task::Scope.spawn" {
+        if !self.ck.db.is_std(*item)
+            || !matches!(
+                self.ck.db.canonical(*item).as_str(),
+                "task::Scope.spawn" | "task::Scope.spawn_sized"
+            )
+        {
             return;
         }
         let Some(Arg::Ty(failure)) = callable

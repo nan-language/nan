@@ -111,8 +111,8 @@ The **user directory** is the directory `.nan` in the home directory that the sy
 
 The build cache holds:
 
-- **cache entries**, which are content-addressed: each is a value stored under the hash of its key, and the key holds the entry's kind, the toolchain hash and the hashes of every input its value depends on. They are the results of the [proof cache](20-prover.md#proof-cache) and of the [query engine](33-toolchain.md#query-engine). An entry's value equals what computing it again gives, so entries change no output that [Reproducibility](#reproducibility) lists.
-- **cache records**, which later runs replace: the test pass records of [affected tests](22-testing.md#affected-tests). They decide only which tests `nan test --affected` and [resolution](29-identity-versioning.md#resolution) run.
+- **cache entries**, which are content-addressed: each is a value stored under the hash of its key, and the key holds the entry's kind, the toolchain hash and the hashes of every input its value depends on. They are the results of the [proof cache](20-prover.md#proof-cache) and of the [query engine](33-toolchain.md#query-engine), and may be the syntax of source files and the machine code of the functions a final build or a test image compiles. An entry's value equals what computing it again gives, so entries change no output that [Reproducibility](#reproducibility) lists.
+- **cache records**, which later runs replace: the test pass records of [affected tests](22-testing.md#affected-tests), which decide only which tests `nan test --affected` and [resolution](29-identity-versioning.md#resolution) run, the key of the entry holding the query engine's results for the state of each closure last checked under each target in a workspace, and the key of the entry holding the machine code of the latest final build of each program and test image of each package under each target in a workspace, which decide nothing a command outputs.
 
 Every process of the user shares the cache without locks.
 

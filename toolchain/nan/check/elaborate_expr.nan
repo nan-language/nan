@@ -95,7 +95,7 @@ fn Elab.read_operand(mut self, take place: nir::Place, ty: ty::Ty, span: nir::Sp
     if self.ck.nir_copy(ty) or self.ck.nir_view(ty) {
         return nir::Operand.Value(mut self.emit_value(nir::Op.Load(take place), ty: nir::NTy.Owned(ty), span))
     }
-    return nir::Operand.Place(mode: ast::Mode.Read, place: take place)
+    return nir::Operand.place(mode: ast::Mode.Read, place: take place, alloc: self.ck.alloc())
 } Elab.read_operand
 
 /// An expression read in place: a place is passed as itself, however small its type, and any
@@ -107,7 +107,7 @@ fn Elab.borrowed(mut self, expr: TExpr) -> Option[nir::Operand] fails Fault {
             if self.owned_root(place) {
                 return Some(nir::Operand.Value(place.root))
             }
-            return Some(nir::Operand.Place(mode: ast::Mode.Read, place: take place))
+            return Some(nir::Operand.place(mode: ast::Mode.Read, place: take place, alloc: self.ck.alloc()))
         }
         else => return mut self.argument(take out, expr, mode: ast::Mode.Read)
     }
@@ -172,8 +172,8 @@ fn Elab.expr(mut self, expr: TExpr) -> Out fails Fault {
     let span = Elab.spanning(expr)
     match expr.kind {
         TKind.Failed => fail Fault.Failed
-        TKind.Literal(lit) => return Out.Operand(nir::Operand.Literal(try self.literal(lit, ty: expr.ty)))
-        TKind.Unit => return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+        TKind.Literal(lit) => return Out.Operand(nir::Operand.literal(try self.literal(lit, ty: expr.ty), alloc: alloc))
+        TKind.Unit => return Out.Operand(nir::Operand.unit(alloc))
         TKind.Result => {
             let Some(result) = self.result else {
                 fail Fault.Unsupported(text::String.of("`result` outside an ensures clause", alloc))
@@ -188,7 +188,7 @@ fn Elab.expr(mut self, expr: TExpr) -> Out fails Fault {
         }
         TKind.Local(local) => {
             match self.held.get(local) {
-                Some(Held.Literal(literal)) => return Out.Operand(nir::Operand.Literal(literal.copy(alloc)))
+                Some(Held.Literal(literal)) => return Out.Operand(nir::Operand.literal(literal.copy(alloc), alloc: alloc))
                 else => {}
             }
             return Out.Place(try mut self.local_place(local))
@@ -277,7 +277,7 @@ fn Elab.control_expr(mut self, expr: TExpr) -> Out fails Fault {
 fn Elab.block_expr(mut self, block: TBlock, ty: ty::Ty) -> Out fails Fault {
     let yields = ty != ty::Ty.unit() and ty != ty::Ty.never()
     mut self.scopes.push(ElabScope.empty(self.ck.alloc()))
-    var out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    var out = Out.Operand(nir::Operand.unit(self.ck.alloc()))
     let count = block.stmts.len()
     var last: usize = 0
     if count > 0 {
@@ -491,7 +491,7 @@ fn Elab.range_value(mut self, expr: TExpr, inclusive: bool, left: TExpr, right: 
     var fields = mem::List[nir::Labelled].empty(alloc)
     mut fields.push(nir::Labelled(name: text::String.of("low", alloc), operand: take low))
     mut fields.push(nir::Labelled(name: text::String.of("high", alloc), operand: take high))
-    mut fields.push(nir::Labelled(name: text::String.of("inclusive", alloc), operand: nir::Operand.Literal(nir::Literal.Bool(inclusive))))
+    mut fields.push(nir::Labelled(name: text::String.of("inclusive", alloc), operand: nir::Operand.literal(nir::Literal.Bool(inclusive), alloc: alloc)))
     let value = mut self.emit_value(nir::Op.Construct(ty: expr.ty, fields: take fields), ty: nir::NTy.Owned(expr.ty), span: Elab.spanning(expr))
     return Out.Operand(nir::Operand.Value(value))
 } Elab.range_value
@@ -648,7 +648,7 @@ fn Elab.logical(
     let join = mut self.b.block()
     let result = mut self.b.block_param(join, ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)))
     var decided_args = mem::List[nir::Operand].empty(alloc)
-    mut decided_args.push(nir::Operand.Literal(nir::Literal.Bool(not conjunction)))
+    mut decided_args.push(nir::Operand.literal(nir::Literal.Bool(not conjunction), alloc: alloc))
     let decided = nir::Jump(block: join, args: take decided_args)
     if conjunction {
         mut self.end(nir::Terminator.Branch(operand: take left_value, then: nir::Jump.to(compute, alloc), otherwise: take decided), span)
@@ -710,14 +710,14 @@ fn Elab.if_expr(
         mut self.end(nir::Terminator.Branch(operand: take tested, then: nir::Jump.to(then_block, alloc), otherwise: nir::Jump.to(join, alloc)), span)
         self.moved = entry_moved
         mut self.b.at(join)
-        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+        return Out.Operand(nir::Operand.unit(alloc))
     }
     let else_block = mut self.b.block()
     mut self.b.at(entry)
     mut self.end(nir::Terminator.Branch(operand: take tested, then: nir::Jump.to(then_block, alloc), otherwise: nir::Jump.to(else_block, alloc)), span)
     mut self.b.at(else_block)
     self.moved = entry_moved
-    var else_out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    var else_out = Out.Operand(nir::Operand.unit(alloc))
     match otherwise {
         Some(other) => {
             else_out = try mut self.expr(other.contents())
@@ -747,7 +747,7 @@ fn Elab.when_expr(
         let Some(place) = try mut self.place(access.place) else {
             return Out.Never
         }
-        mut operands.push(nir::Operand.Place(mode: access.mode, place: take place))
+        mut operands.push(nir::Operand.place(mode: access.mode, place: take place, alloc: alloc))
     }
     let Some(outer) = self.b.current_block() else {
         expect false
@@ -782,7 +782,7 @@ fn Elab.when_expr(
     let region = mut self.b.close_region()
     mut self.b.at(outer)
     let op = nir::Op.When(attempted: attempted, accesses: take operands, region: take region)
-    var out = Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+    var out = Out.Operand(nir::Operand.unit(alloc))
     if expr.ty == ty::Ty.unit() {
         mut self.emit(take op, span)
     } else {
@@ -871,7 +871,7 @@ fn Elab.closure_value(mut self, expr: TExpr, closure: TClosure) -> Out fails Fau
     for capture in closure_captures(closure, alloc) {
         match self.held.get(capture.outer) {
             Some(Held.Literal(literal)) => {
-                mut operands.push(nir::Operand.Literal(literal.copy(alloc)))
+                mut operands.push(nir::Operand.literal(literal.copy(alloc), alloc: alloc))
                 continue
             }
             else => {}
@@ -880,7 +880,7 @@ fn Elab.closure_value(mut self, expr: TExpr, closure: TClosure) -> Out fails Fau
         let place = try mut self.local_place(capture.outer)
         let operand = match capture.mode {
             ast::Mode.Read => mut self.read_operand(take place, ty: outer_ty, span)
-            ast::Mode.Mut => nir::Operand.Place(mode: ast::Mode.Mut, place: take place)
+            ast::Mode.Mut => nir::Operand.place(mode: ast::Mode.Mut, place: take place, alloc: alloc)
             ast::Mode.Take => mut self.moved_operand(take place)
         }
         mut operands.push(take operand)
@@ -895,7 +895,7 @@ fn Elab.closure_value(mut self, expr: TExpr, closure: TClosure) -> Out fails Fau
 /// The operand moving a place, which counts as moved afterwards.
 fn Elab.moved_operand(mut self, take place: nir::Place) -> nir::Operand {
     discard mut self.moved.insert(place.copy(self.ck.alloc()))
-    return nir::Operand.Place(mode: ast::Mode.Take, place: take place)
+    return nir::Operand.place(mode: ast::Mode.Take, place: take place, alloc: self.ck.alloc())
 } Elab.moved_operand
 
 /// The operand an argument passes for a parameter in a mode.
@@ -934,7 +934,7 @@ fn Elab.operand_argument(mut self, take operand: nir::Operand, expr: TExpr, mode
             expect at < self.scopes.len()
             var scope = mut self.scopes.at_mut(at)
             mut scope.slots.push(slot)
-            return nir::Operand.Place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc: self.ck.alloc()))
+            return nir::Operand.place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc: self.ck.alloc()), alloc: self.ck.alloc())
         }
         ast::Mode.Take => return operand
     }
@@ -945,7 +945,7 @@ fn Elab.place_argument(mut self, take place: nir::Place, expr: TExpr, mode: ast:
     let span = Elab.spanning(expr)
     match mode {
         ast::Mode.Read => return mut self.read_operand(take place, ty: expr.ty, span)
-        ast::Mode.Mut => return nir::Operand.Place(mode: ast::Mode.Mut, place: take place)
+        ast::Mode.Mut => return nir::Operand.place(mode: ast::Mode.Mut, place: take place, alloc: self.ck.alloc())
         ast::Mode.Take => {
             if self.ck.nir_copy(expr.ty) or self.owned_root(place) {
                 return mut self.take_place(take place, ty: expr.ty, span)

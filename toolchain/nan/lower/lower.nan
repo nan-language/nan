@@ -122,6 +122,9 @@ pkg struct Lowered {
     pkg collisions: mem::List[Collision]
     /// When the program asked for it, the symbol name and text of each function defined, in order.
     pkg dumped: mem::List[LoweredFunction]
+    /// A build cache entry holding the code of every function compiled, when some was compiled
+    /// anew.
+    pkg codes: Option[object::CodesEntry]
 } Lowered
 
 /// Two entities lowered with one host symbol name, as diagnostics name them: the one named
@@ -150,6 +153,8 @@ pkg struct Program {
     /// Whether lowering keeps the symbol name and text of each function it defines, for the
     /// comparison of the NaN toolchain's lowering with the bootstrap's.
     pkg dump: bool
+    /// The code an earlier lowering compiled, as its build cache entry holds it.
+    pkg kept: mem::Bytes
 } Program
 
 struct Lowering {
@@ -195,6 +200,8 @@ struct Lowering {
     /// Whether the symbol name and text of each function defined are kept, and those kept.
     dumping: bool
     dumped: mem::List[LoweredFunction]
+    /// The full form of each item hash symbol names read, once computed.
+    item_hashes: mem::OnceMap[ty::ItemId, text::String]
     alloc: mem::Alloc
 } Lowering
 
@@ -252,14 +259,16 @@ fn Instance.sides_of(take inner: Instance, alloc: mem::Alloc) -> Instance {
     return Instance.Sides(take held)
 } Instance.sides_of
 
-/// Lowers the reach of a program's final build.
-pkg fn lower_lower(ck: check::Checker, program: Program) -> Lowered {
+/// Lowers the reach of a program's final build, `tree` being the hash of the code roots of the
+/// artefacts of its `.nan` section.
+pkg fn lower_lower(ck: check::Checker, program: Program, tree: hashing::HashValue) -> Lowered {
     let alloc = ck.alloc()
     var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
     lowering.dumping = program.dump
+    mut lowering.module.hold_codes(program.kept.view())
     entry_seam(mut lowering, program)
     mut lowering.drain()
-    return take lowering.finish(Some(program.section.view()))
+    return take lowering.finish(Some(object::ClosureSections(artefacts: program.section.view(), tree: tree.bytes.view())))
 } lower_lower
 
 /// Lowers the reach of an `x86_64-uefi` or `x86_64-bare` program's final build: the entry
@@ -269,6 +278,7 @@ pkg fn lower_machine(ck: check::Checker, program: Program) -> Lowered {
     let alloc = ck.alloc()
     var lowering = Lowering.new(ck.share(), prefixes: copied_prefixes(program.prefixes, alloc), roots: copied_roots(program.roots.view(), alloc), test_runtime: None)
     lowering.dumping = program.dump
+    mut lowering.module.hold_codes(program.kept.view())
     let boot = mut lowering.boot_glue(program)
     let stack = lowering.boot_stack(program)
     mut lowering.entry_seam(boot, stack_bytes: stack)
@@ -329,6 +339,7 @@ fn Lowering.new(take ck: check::Checker, take prefixes: mem::HashMap[text::Strin
         sims: None,
         dumping: false,
         dumped: mem::List[LoweredFunction].empty(alloc),
+        item_hashes: mem::OnceMap[ty::ItemId, text::String].empty(seed: 0, alloc),
         alloc: alloc,
     )
 } Lowering.new
@@ -595,16 +606,34 @@ fn Lowering.define(mut self, id: object::FuncId, take signature: clif::Signature
         mut self.dumped.push(LoweredFunction(name: take dumped_name, text: take dumped_text))
     }
     let sites = self.sites(built, take recorded)
-    let compiled = mut self.module.define_function(id, func: take built)
-    var locations = mem::List[LineEntry].empty(self.alloc)
-    for located in compiled.locations {
-        if not located.loc.is_default() {
-            mut locations.push(LineEntry(offset: located.offset, location: located.loc.bits))
-        }
-    }
-    mut self.lines.function(id, flags, size: compiled.size, entries: take locations)
-    mut self.frames.push(Frame(function: id, name: text::String.empty(self.alloc), size: compiled.frame, params: mem::List[ParamStack].empty(self.alloc), sites: take sites))
+    mut self.lines.function(id, flags, alloc: self.alloc)
+    mut self.frames.push(Frame(function: id, name: text::String.empty(self.alloc), size: 0, params: mem::List[ParamStack].empty(self.alloc), sites: take sites))
+    mut self.module.define_function(id, func: take built, inlinable: (flags & LINES_CRITICAL) == 0)
+    mut self.take_compiled()
 } Lowering.define
+
+/// Gives the functions compiled since lowering last asked their frame sizes and the locations
+/// of their code.
+fn Lowering.take_compiled(mut self) {
+    let compiled = mut self.module.take_compiled()
+    for done in compiled {
+        var locations = mem::List[LineEntry].empty(self.alloc)
+        for located in done.locations {
+            if not located.loc.is_default() {
+                mut locations.push(LineEntry(offset: located.offset, location: located.loc.bits))
+            }
+        }
+        let at = mut self.lines.compiled(done.id, size: done.size, entries: take locations)
+        expect at < self.frames.len()
+        self.frames[at].size = done.frame
+    }
+} Lowering.take_compiled
+
+/// Compiles the functions still waiting and gives them their frame sizes and line tables.
+fn Lowering.compile_waiting(mut self) {
+    mut self.module.compile_waiting()
+    mut self.take_compiled()
+} Lowering.compile_waiting
 
 /// The call sites of a function built: those lowering classified as it emitted them, a
 /// direct call of a routine or the C library bounded by the stub call bound, of another
@@ -701,16 +730,19 @@ fn Lowering.layout_of(mut self, ty: ty::Ty) -> mem::Shared[Layout] {
 } Lowering.layout_of
 
 /// The object of the lowering, holding a `.nan` section with `section` when given.
-fn Lowering.finish(take self, section: Option[Slice[u8]]) -> Lowered {
+fn Lowering.finish(take self, closure: Option[object::ClosureSections]) -> Lowered {
+    mut self.compile_waiting()
     lines_emit(mut self)
     emit_entry_stacks(mut self)
     mut self.finish_interrupts()
+    mut self.compile_waiting()
     var collisions = mem::List[Collision].empty(self.alloc)
     for collision in self.collisions {
         mut collisions.push(Collision(named: entity(self.ck, instance: collision.named), colliding: entity(self.ck, instance: collision.colliding)))
     }
-    let image_bytes = take self.module.finish(section, alloc: self.alloc)
-    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped)
+    let codes = self.module.codes_entry()
+    let image_bytes = take self.module.finish(closure, alloc: self.alloc)
+    return Lowered(object: take image_bytes, frames: take self.frames, demands: take self.demands, collisions: take collisions, dumped: take self.dumped, codes: take codes)
 } Lowering.finish
 
 /// The calling convention of every lowered function.

@@ -1,0 +1,91 @@
+//! The compiled code an object module takes instead of compiling again: the code of each function an earlier lowering compiled, under the key of everything its compiling read, and the code this lowering compiles, kept for later ones.
+
+/// The code a module may take, as an earlier lowering's entry holds it, with where each key's
+/// code lies there; the code each function the module compiles has, encoded after its key, the
+/// keys alone, and whether any of the code was compiled anew.
+pkg struct Codes {
+    held: mem::Bytes
+    known: mem::HashMap[hashing::HashValue, Span]
+    made: mem::Bytes
+    keys: mem::Bytes
+    count: u64
+    fresh: bool
+} Codes
+
+/// Where in a held entry a function's encoded code lies.
+struct Span derives Copy, Eq {
+    start: usize
+    end: usize
+} Span
+
+/// No code held.
+pkg fn Codes.none(alloc: mem::Alloc) -> Codes {
+    return Codes(held: mem::Bytes.empty(alloc), known: mem::HashMap[hashing::HashValue, Span].empty(seed: 0, alloc), made: mem::Bytes.empty(alloc), keys: mem::Bytes.empty(alloc), count: 0, fresh: false)
+} Codes.none
+
+/// The code an entry's contents hold, written as `entry` writes them; none for contents that do
+/// not decode.
+pkg fn Codes.of(take held: mem::Bytes, alloc: mem::Alloc) -> Codes {
+    var codes = Codes.none(alloc)
+    var reader = codegen::CodeReader(held: held.view(), at: 0, failed: false)
+    let count = mut reader.uvar()
+    var index: u64 = 0
+    while index < count and reader.ok() {
+        let run = mut reader.run(alloc)
+        let Some(key) = hashing::HashValue.read(run.view()) else {
+            return Codes.none(alloc)
+        }
+        let start = reader.offset()
+        mut reader.skip_code(alloc)
+        discard mut codes.known.insert(key, value: Span(start: start, end: reader.offset()))
+        index += 1
+    }
+    if not reader.done() {
+        return Codes.none(alloc)
+    }
+    codes.held = held
+    return codes
+} Codes.of
+
+/// The code held under a key, decoded.
+fn Codes.taken(self, key: hashing::HashValue, alloc: mem::Alloc) -> Option[codegen::Code] {
+    let Some(span) = self.known.get(key) else {
+        return None
+    }
+    let Some(parts) = self.held.view().split_at(span.start) else {
+        return None
+    }
+    let Some(run) = parts.tail.prefix(span.end - span.start) else {
+        return None
+    }
+    var reader = codegen::CodeReader(held: take run, at: 0, failed: false)
+    return Some(mut reader.code(alloc))
+} Codes.taken
+
+/// Records a function's code under its key, compiled anew unless held.
+fn Codes.made_one(mut self, key: hashing::HashValue, code: codegen::Code, compiled: bool) {
+    encoding::bytes(mut self.made, value: key.bytes.view())
+    mut self.keys.append(key.bytes.view())
+    code.encode(mut self.made)
+    self.count += 1
+    if compiled {
+        self.fresh = true
+    }
+} Codes.made_one
+
+/// An entry holding the code of every function compiled, none when all of it was held.
+pkg fn Codes.entry(self, alloc: mem::Alloc) -> Option[CodesEntry] {
+    if not self.fresh {
+        return None
+    }
+    var contents = mem::Bytes.empty(alloc)
+    encoding::uvar(mut contents, value: self.count)
+    mut contents.append(self.made.view())
+    return Some(CodesEntry(inputs: hashing::HashValue.of(self.keys.view()), contents: take contents))
+} Codes.entry
+
+/// The contents of an entry of compiled code, and the hash of the keys of the functions it holds.
+pkg struct CodesEntry {
+    pkg inputs: hashing::HashValue
+    pkg contents: mem::Bytes
+} CodesEntry

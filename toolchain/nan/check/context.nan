@@ -67,8 +67,8 @@ pkg fn Session.contexts(self, scope: scope::Scope, line: Option[u32]) -> mem::Li
 fn Checker.closure(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
     let db = self.db()
     let alloc = self.alloc()
-    self.state.contents().checking.store(db.package_of(item).index)
-    db.about(Some(item), compute: fn() {
+    self.underway.contents().checking.store(db.package_of(item).index)
+    self.about(Some(item), compute: fn() {
         self.check_item(item)
         self.check_elaborated(item)
     })
@@ -239,7 +239,7 @@ fn Checker.closure_directives(self, item: ty::ItemId) -> mem::List[text::String]
         let Some(key) = directive_key(manifest, tree, inner, aliases, module_name, alloc) else {
             continue
         }
-        let Some(directive) = tree.span(inner, alloc) else {
+        let Some(directive) = tree.span(inner) else {
             expect false
             continue
         }
@@ -295,34 +295,166 @@ fn Checker.expression_types(self, expr: TExpr, starts: fn(token: u32) -> bool, m
 /// The last-green entries of the workspace's items: of those whose heads lie in a scope, if any,
 /// and of those in the closure sets of `lines`, each once, by path.
 pkg fn Session.greens(self, scope: Option[scope::Scope], lines: Slice[diagnostic::At]) -> mem::List[Green] {
+    let checkers = self.checkers()
+    return self.greens_of(checkers.view(), scope, lines)
+} Session.greens
+
+/// The last-green entries `greens` gives, from the checkers of the workspace's closures when no
+/// line is given and they reject no item, as fresh checkers then judge each item alone as they
+/// judged it with every item; otherwise from fresh checkers, which replace them.
+pkg fn Session.greens_after(self, take checked: Checked, scope: Option[scope::Scope], lines: Slice[diagnostic::At]) -> mem::List[Green] {
+    if checked.rejects() or lines.len() > 0 {
+        checked.checkers = mem::List[TargetChecker].empty(self.alloc)
+        return self.greens(scope, lines)
+    }
+    for entry in checked.checkers {
+        entry.checker.underway.contents().checking.store(NO_ID)
+    }
+    return self.greens_of(checked.checkers.view(), scope, lines)
+} Session.greens_after
+
+fn Session.greens_of(self, checkers: Slice[TargetChecker], scope: Option[scope::Scope], lines: Slice[diagnostic::At]) -> mem::List[Green] {
     let alloc = self.alloc
     let held = self.workspace.contents()
-    let checkers = self.checkers()
-    var found = mem::List[Green].empty(alloc)
-    var listed = mem::Set[HeadAt].empty(alloc)
+    var gathered = GreenTexts.empty(alloc)
+    var files = mem::Map[text::String, u32].empty(alloc)
+    var listed = mem::Set[FileLine].empty(alloc)
     for entry in checkers {
         let checker = entry.checker
         let db = checker.db()
         if lines.len() > 0 {
             db.record()
         }
+        var greened = mem::List[ty::ItemId].empty(alloc)
         for item in take checker.green_items(held, scope, lines) {
             let data = db.item(item)
-            let path = db.file(data.file).path.as_str()
+            let path = db.file(data.file).path
             let head = db.head_line(item)
-            if not mut listed.insert(HeadAt(path: text::String.of(path, alloc), line: head)) {
-                continue
+            var file = u32.fit(files.len())
+            match files.get(path) {
+                Some(number) => {
+                    file = number
+                }
+                None => {
+                    discard mut files.insert(text::String.of(path.as_str(), alloc), value: file)
+                }
             }
-            var api = checker.api_lines(item, docs: true, viewer: None)
-            for digest in take checker.digest_lines(checkers.view(), item: item) {
-                mut api.push(take digest)
+            if mut listed.insert(FileLine(file: file, line: head)) {
+                mut greened.push(item)
             }
-            mut found.push(Green(path: checker.shown_path(item), file: text::String.of(path, alloc), line: head, interface_hash: checker.hashes(item).interface_hash, api: take api))
+        }
+        checker.run_batch(Work.Greened, items: greened.view())
+        for item in greened {
+            let Greened(api: api, interface_hash: interface_hash) = checker.kept_green(item)
+            let digests = checker.digest_lines(checkers, item: item)
+            mut gathered.add(path: checker.shown_path(item).as_str(), file: db.file(db.item(item).file).path.as_str(), line: db.head_line(item), interface_hash, api: api.view(), digests: digests.view())
         }
     }
+    var found = gathered.greens(alloc)
     mut found.sort_by(fn(left: Green, right: Green) => green_order(left, right))
     return found
-} Session.greens
+} Session.greens_of
+
+/// Last-green entries while they are gathered, their texts held in one buffer so that what
+/// gathering them reads leaves no text between the entries' texts.
+struct GreenTexts {
+    texts: text::String
+    /// Where each text ends in `texts`: per entry its path, its file and its api lines.
+    ends: mem::List[usize]
+    entries: mem::List[GreenHead]
+} GreenTexts
+
+/// A gathered entry's line and interface hash, and the number of its api lines.
+struct GreenHead derives Copy {
+    line: u32
+    interface_hash: Option[hashing::HashValue]
+    api: usize
+} GreenHead
+
+/// An item's head, by the number of its file and its line.
+struct FileLine derives Copy, Eq, Ord {
+    file: u32
+    line: u32
+} FileLine
+
+fn GreenTexts.empty(alloc: mem::Alloc) -> GreenTexts {
+    return GreenTexts(texts: text::String.empty(alloc), ends: mem::List[usize].empty(alloc), entries: mem::List[GreenHead].empty(alloc))
+} GreenTexts.empty
+
+fn GreenTexts.add(
+    mut self,
+    path: Str,
+    file: Str,
+    line: u32,
+    interface_hash: Option[hashing::HashValue],
+    api: Slice[text::String],
+    digests: Slice[text::String],
+    ) {
+    mut self.text(path)
+    mut self.text(file)
+    for written in api {
+        mut self.text(written.as_str())
+    }
+    for digest in digests {
+        mut self.text(digest.as_str())
+    }
+    mut self.entries.push(GreenHead(line: line, interface_hash: interface_hash, api: api.len() + digests.len()))
+} GreenTexts.add
+
+fn GreenTexts.text(mut self, written: Str) {
+    mut self.texts.append(written)
+    mut self.ends.push(self.texts.byte_len())
+} GreenTexts.text
+
+/// The gathered entries, in order.
+fn GreenTexts.greens(self, alloc: mem::Alloc) -> mem::List[Green] {
+    var greens = mem::List[Green].empty(alloc)
+    mut greens.reserve(self.entries.len())
+    var next: usize = 0
+    for entry in self.entries {
+        let path = self.piece(next, alloc)
+        let file = self.piece(next + 1, alloc)
+        var api = mem::List[text::String].empty(alloc)
+        mut api.reserve(entry.api)
+        for index in 0..<entry.api {
+            mut api.push(self.piece(next + 2 + index, alloc))
+        }
+        next = next + 2 + entry.api
+        mut greens.push(Green(path: take path, file: take file, line: entry.line, interface_hash: entry.interface_hash, api: take api))
+    }
+    return greens
+} GreenTexts.greens
+
+/// A copy of text `index`.
+fn GreenTexts.piece(self, index: usize, alloc: mem::Alloc) -> text::String {
+    expect index < self.ends.len()
+    var start: usize = 0
+    if index > 0 {
+        start = self.ends[index - 1]
+    }
+    let Some(written) = self.texts.slice_bytes(start, end: self.ends[index]) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text::String.of(written, alloc)
+} GreenTexts.piece
+
+/// An item's api lines before its digest and its interface hash, as its last-green entry holds
+/// them.
+struct Greened {
+    api: mem::List[text::String]
+    interface_hash: Option[hashing::HashValue]
+} Greened
+
+/// An item's api lines and interface hash, its syntax read once for both.
+fn Checker.greened(self, item: ty::ItemId) -> Greened {
+    let Some(reading) = self.reading(item) else {
+        return Greened(api: self.api_lines(item, docs: true, viewer: None), interface_hash: self.hashes(item).interface_hash)
+    }
+    let interface_lines = self.read_interface_text(item, viewer: None, reading)
+    let api = self.api_lines_with(item, docs: true, viewer: None, take interface_lines)
+    return Greened(api: take api, interface_hash: self.read_interface_hash(item, take reading))
+} Checker.greened
 
 /// The items whose last-green entries a checker gives, in order and with repeats: each reported
 /// item whose head lies in a scope, if any, and each reported item holding one of `lines`
@@ -442,7 +574,7 @@ fn allowed_key(manifest: syntax::SourceFile, tree: syntax::Tree, inner: u32, mod
         expect false
         return None
     }
-    let Some(written) = tree.span(authority, alloc) else {
+    let Some(written) = tree.span(authority) else {
         expect false
         return None
     }

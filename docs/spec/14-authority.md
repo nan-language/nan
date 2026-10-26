@@ -225,7 +225,7 @@ An operation through a stale handle behaves as follows:
 | `sys::Clock` | `elapsed_ms` fails with `sys::Revoked.Stale`; `sleep` returns at once |
 | `sys::Log` | the record is discarded |
 | `mem::Alloc` | draws through it are exhaustion ([budgets](12-memory.md#budgets)) |
-| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). |
+| `task::Executor` | `task::scope`, `task::race`, the [domain runs](11-errors-domains.md#domains) and `host::Runner.run` start no task and fail at once with the cancellation of their failure type; a task that `task::Scope.spawn` or `spawn_sized` would start fails at once with it without running its closure. No cancelling construct is the origin of these cancellations ([origin and absorption](11-errors-domains.md#origin-and-absorption)). |
 
 ```nan
 pub fn read_config(fs: sys::Fs, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails sys::fs::FsError uses wait {

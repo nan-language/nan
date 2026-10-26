@@ -48,11 +48,19 @@ fn Elab.function_root(mut self, root: TExpr) fails Fault {
         TKind.Block(block) => block.end
         else => root.token
     }
-    if value == Some(nir::Operand.Literal(nir::Literal.Unit)) {
+    if returns_unit(value) {
         value = None
     }
     try mut self.exit_return(take value, token: end)
 } Elab.function_root
+
+/// Whether a returned operand is the unit literal.
+fn returns_unit(value: Option[nir::Operand]) -> bool {
+    return match value {
+        Some(operand) => operand.is_unit()
+        None => false
+    }
+} returns_unit
 
 /// The code of a function returning its root expression's value: a const, a clause, an
 /// example or a transparent body.
@@ -86,12 +94,12 @@ fn Elab.stmt(mut self, stmt: TStmt) fails Fault {
 fn Elab.stmt_kind(mut self, stmt: TStmt) fails Fault {
     let span = Elab.span(stmt.token)
     match stmt.kind {
-        TStmtKind.Let(pattern: pattern, value: value, otherwise: otherwise) => try mut self.let_stmt(stmt.token, pattern, value, otherwise)
+        TStmtKind.Let(pattern: pattern, value: value, otherwise: otherwise) => try mut self.let_stmt(stmt.token, pattern: pattern.contents(), value, otherwise)
         TStmtKind.Var(local: local, value: value) => try mut self.var_stmt(local, value, span)
         TStmtKind.Discard(value) => try mut self.discard_stmt(value, token: stmt.token, span)
         TStmtKind.While(condition: condition, invariants: invariants, body: body) => try mut self.while_stmt(stmt.token, condition: Some(condition), invariants: invariants.view(), body)
         TStmtKind.Loop(invariants: invariants, body: body) => try mut self.while_stmt(stmt.token, condition: None, invariants: invariants.view(), body)
-        TStmtKind.For(pattern: pattern, mode: mode, iterated: iterated, cursor: cursor, invariants: invariants, body: body) => try mut self.for_stmt(stmt.token, pattern, mode, iterated, cursor, invariants: invariants.view(), body)
+        TStmtKind.For(pattern: pattern, mode: mode, iterated: iterated, cursor: cursor, invariants: invariants, body: body) => try mut self.for_stmt(stmt.token, pattern: pattern.contents(), mode, iterated, cursor, invariants: invariants.view(), body)
         TStmtKind.Defer(call) => {
             let places = try mut self.deferred_places(call)
             expect self.scopes.len() > 0
@@ -410,7 +418,7 @@ fn Elab.target_operands(mut self, target: TExpr) -> Option[AssignTarget] fails F
         TKind.Index(call) => {
             var args = mem::List[nir::Operand].empty(alloc)
             for arg in call.contents().args {
-                let Some(operand) = try mut self.arg(arg.expr, mode: arg.mode) else {
+                let Some(operand) = try mut self.arg(arg.expr.contents(), mode: arg.mode) else {
                     return None
                 }
                 mut args.push(take operand)
@@ -548,7 +556,7 @@ fn Elab.for_stmt(
     let next = try self.cursor_next(cursor)
     let option = self.ck.option_ty(next.element)
     var args = mem::List[nir::Operand].empty(alloc)
-    mut args.push(nir::Operand.Place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc)))
+    mut args.push(nir::Operand.place(mode: ast::Mode.Mut, place: nir::Place.of(slot, alloc), alloc: alloc))
     let yielded = mut self.call_value(next.next.copy(alloc), take args, ty: option, span)
     let some = mut self.emit_value(nir::Op.Is(place: nir::Place.of(yielded, alloc), ty: option, variant: text::String.of("Some", alloc)), ty: nir::NTy.Owned(ty::Ty.scalar(ty::Scalar.Bool)), span)
     let start = mut self.b.block()
@@ -779,7 +787,7 @@ fn Elab.return_expr(mut self, value: Option[TExpr], token: u32) fails Fault {
     let Some(operand) = try mut self.arg(returned, mode: ast::Mode.Take) else {
         return
     }
-    if operand == nir::Operand.Literal(nir::Literal.Unit) {
+    if operand.is_unit() {
         try mut self.exit_return(None, token)
         return
     }
@@ -837,7 +845,7 @@ fn carried_out(value: Option[nir::Operand], ty: Option[ty::Ty], alloc: mem::Allo
 fn returned_operand(value: Option[nir::Operand], alloc: mem::Alloc) -> nir::Operand {
     return match value {
         Some(operand) => operand.copy(alloc)
-        None => nir::Operand.Literal(nir::Literal.Unit)
+        None => nir::Operand.unit(alloc)
     }
 } returned_operand
 
@@ -1150,7 +1158,7 @@ fn Elab.join(mut self, take arms: mem::List[ArmEnd], ty: ty::Ty, span: nir::Span
     }
     mut self.b.at(join)
     let Some(joined) = param else {
-        return Out.Operand(nir::Operand.Literal(nir::Literal.Unit))
+        return Out.Operand(nir::Operand.unit(alloc))
     }
     if parts {
         return Out.Place(nir::Place.of(joined, alloc))
@@ -1298,7 +1306,7 @@ fn returned_in_branches(value: TExpr, alloc: mem::Alloc) -> TExpr {
                 for pattern in arm.patterns {
                     mut patterns.push(pattern.copy(alloc))
                 }
-                mut returned.push(TArm(token: arm.token, patterns: take patterns, guard: TExpr.optional_copy(arm.guard, alloc), body: returned_in_branches(arm.body, alloc)))
+                mut returned.push(TArm(token: arm.token, patterns: take patterns, guard: TExpr.optional_boxed_copy(arm.guard, alloc), body: returned_in_branches(arm.body, alloc)))
             }
             return TExpr(token: value.token, last: value.last, ty: ty::Ty.never(), kind: TKind.Match(scrutinee: TExpr.boxed_copy(scrutinee, alloc), arms: take returned))
         }
@@ -1339,7 +1347,7 @@ fn Elab.deferred_places(mut self, call: TExpr) -> mem::List[nir::Place] fails Fa
         return places
     }
     for arg in called.contents().args {
-        let Some(place) = try mut self.place_path(arg.expr) else {
+        let Some(place) = try mut self.place_path(arg.expr.contents()) else {
             continue
         }
         mut places.push(take place)

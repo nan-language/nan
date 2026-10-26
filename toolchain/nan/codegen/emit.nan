@@ -1,4 +1,4 @@
-//! Emission: the frame and its prologue and epilogue, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, the parallel moves of block arguments, and the runs of source locations.
+//! Emission: the frame and its prologue and epilogue, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, and the runs of source locations.
 
 /// The frame below the saved frame pointer, from the stack pointer up: the outgoing argument
 /// area, the stack slots, the spill slots, padding, then the pushed callee-saved registers.
@@ -68,7 +68,8 @@ fn scratch(float: bool, index: u32) -> x64::Reg
     return x64::Reg(index: 11 - index)
 } scratch
 
-/// The state of emission: the code encoded so far and the runs of source locations.
+/// The state of emission: the code encoded so far, the runs of source locations, and the spill
+/// slot whose value each scratch register holds, `NONE` for none.
 struct Emitter {
     asm: x64::Assembler
     isa: Isa
@@ -76,22 +77,82 @@ struct Emitter {
     calls: bool
     locations: mem::List[Located]
     loc: clif::SourceLoc
+    held: Array[u32, SCRATCH_COUNT]
+    /// The first of the allocation's saves across calls not emitted yet.
+    next_save: usize
     alloc: mem::Alloc
 } Emitter
 
+/// The scratch registers, by the index `held` follows them at.
+fn scratch_at(index: usize) -> x64::Reg
+    requires index < SCRATCH_COUNT
+{
+    return scratch(index >= 2, index: u32.fit(index % 2))
+} scratch_at
+
+const SCRATCH_COUNT: usize = 4
+
+/// The index of a scratch register in `held`, none for another register.
+fn scratch_index(reg: x64::Reg) -> Option[usize] {
+    for index in 0..<SCRATCH_COUNT {
+        if scratch_at(index) == reg {
+            return Some(index)
+        }
+    }
+    return None
+} scratch_index
+
+/// Records the spill slot a register holds, `NONE` for none, forgetting it for any other scratch
+/// register.
+fn Emitter.hold(mut self, reg: x64::Reg, slot: u32) {
+    if slot != NONE {
+        mut self.forget_slot(slot)
+    }
+    match scratch_index(reg) {
+        Some(index) => {
+            expect index < SCRATCH_COUNT
+            self.held[index] = slot
+        }
+        None => {}
+    }
+} Emitter.hold
+
+/// Forgets that any scratch register holds a slot.
+fn Emitter.forget_slot(mut self, slot: u32) {
+    for index in 0..<SCRATCH_COUNT {
+        if self.held[index] == slot {
+            self.held[index] = NONE
+        }
+    }
+} Emitter.forget_slot
+
+/// Whether a register holds a spill slot's value.
+fn Emitter.holds(self, reg: x64::Reg, slot: u32) -> bool {
+    let Some(index) = scratch_index(reg) else {
+        return false
+    }
+    expect index < SCRATCH_COUNT
+    return self.held[index] == slot
+} Emitter.holds
+
 fn emit(code: VCode, allocation: Allocation, isa: Isa, alloc: mem::Alloc) -> Code {
-    var emitter = Emitter(asm: x64::Assembler.new(alloc), isa: isa, frame: Frame.of(code, allocation), calls: code.calls, locations: mem::List[Located].empty(alloc), loc: clif::DEFAULT_LOC, alloc: alloc)
-    for _ in 0..<code.blocks.len() {
+    var emitter = Emitter(asm: x64::Assembler.new(alloc), isa: isa, frame: Frame.of(code, allocation), calls: code.calls, locations: mem::List[Located].empty(alloc), loc: clif::DEFAULT_LOC, held: Array[u32, SCRATCH_COUNT].filled(NONE), next_save: 0, alloc: alloc)
+    for _ in 0..<(code.blocks.len() + code.table_count()) {
         discard mut emitter.asm.new_label()
     }
     mut emitter.prologue()
     for index in 0..<code.blocks.len() {
         mut emitter.block(code, allocation, block: u32.fit(index))
     }
-    let Emitter(asm: asm, isa: _, frame: frame, calls: _, locations: locations, loc: _, alloc: _) = emitter
+    mut emitter.tables(code)
+    let Emitter(asm: asm, isa: _, frame: frame, calls: _, locations: locations, loc: _, held: _, next_save: _, alloc: _) = emitter
     let encoded = take asm.finish()
-    let x64::Encoded(bytes: bytes, relocs: relocs) = encoded
-    return Code(bytes: take bytes, align: 16, relocs: take relocs, frame: frame.size, locations: take locations)
+    var moved = mem::List[Located].empty(alloc)
+    for located in locations {
+        mut moved.push(Located(offset: encoded.moved(located.offset), loc: located.loc))
+    }
+    let x64::Encoded(bytes: bytes, relocs: relocs, cuts: _) = encoded
+    return Code(bytes: take bytes, align: 16, relocs: take relocs, frame: frame.size, locations: take moved, removable: false)
 } emit
 
 fn Emitter.put(mut self, inst: x64::Inst) {
@@ -200,6 +261,7 @@ fn Emitter.block(mut self, code: VCode, allocation: Allocation, block: u32)
     let data = code.blocks[usize.widen(block)]
     expect code.holds(data)
     mut self.asm.bind(block)
+    self.held = Array[u32, SCRATCH_COUNT].filled(NONE)
     let next = block + 1
     var at = data.begin
     while at < data.end {
@@ -227,11 +289,54 @@ fn Emitter.block(mut self, code: VCode, allocation: Allocation, block: u32)
                 mut self.put(vinst.inst)
             }
             x64::Inst.Ret(results: _) => mut self.epilogue()
+            x64::Inst.JumpTable(index: index, base: base, temp: temp, table: table) => mut self.instruction(code, allocation, inst: x64::Inst.JumpTable(index: index, base: base, temp: temp, table: u32.fit(code.blocks.len()) + table))
+            x64::Inst.Call(target: _, args: _, results: _, clobbers: _) => mut self.saved_call(code, allocation, inst: vinst.inst, at)
             else => mut self.instruction(code, allocation, inst: vinst.inst)
         }
         at += 1
     }
 } Emitter.block
+
+/// The slot of a virtual register spilled or saved across calls.
+fn slot_of(allocation: Allocation, vreg: u32) -> u32 {
+    let at = usize.widen(vreg)
+    expect at < allocation.slots.len()
+    return allocation.slots[at]
+} slot_of
+
+/// A call, the registers saved across it stored to their slots before it and loaded after.
+fn Emitter.saved_call(mut self, code: VCode, allocation: Allocation, inst: x64::Inst, at: u32) {
+    let begin = self.next_save
+    var last = begin
+    while last < allocation.saves.len() and allocation.saves[last].at == at {
+        last += 1
+    }
+    for index in begin..<last {
+        let save = allocation.saves[index]
+        mut self.move_loc(Loc.Slot(slot_of(allocation, vreg: save.vreg)), src: Loc.Reg(save.reg), float: code.is_float(save.reg))
+    }
+    mut self.instruction(code, allocation, inst)
+    for index in begin..<last {
+        let save = allocation.saves[index]
+        mut self.move_loc(Loc.Reg(save.reg), src: Loc.Slot(slot_of(allocation, vreg: save.vreg)), float: code.is_float(save.reg))
+    }
+    self.next_save = last
+} Emitter.saved_call
+
+/// The jump tables after the code, each 4-byte aligned at its label, the labels of blocks after
+/// the blocks' own.
+fn Emitter.tables(mut self, code: VCode) {
+    for table in 0..<code.table_count() {
+        mut self.asm.align4()
+        let start = self.asm.offset()
+        mut self.asm.bind(u32.fit(code.blocks.len() + table))
+        expect table + 1 < code.table_starts.len()
+        for at in code.table_starts[table]..<code.table_starts[table + 1] {
+            expect usize.widen(at) < code.table_blocks.len()
+            mut self.asm.table_entry(code.table_blocks[usize.widen(at)], start)
+        }
+    }
+} Emitter.tables
 
 /// Whether the instruction before `at` in its block is a conditional jump.
 fn is_jcc(code: VCode, at: u32, begin: u32) -> bool
@@ -264,7 +369,8 @@ fn Emitter.slot(self, slot: u32) -> x64::Amode {
     return x64::Amode.at(x64::RSP, disp: i32.fit(self.frame.spills + (8 * slot)))
 } Emitter.slot
 
-/// Copies between two locations of one class, through `r10` from slot to slot.
+/// Copies between two locations of one class, through `r10` from slot to slot; a load into a
+/// scratch register holding the slot is left out.
 fn Emitter.move_loc(mut self, dst: Loc, src: Loc, float: bool) {
     if dst == src {
         return
@@ -275,20 +381,33 @@ fn Emitter.move_loc(mut self, dst: Loc, src: Loc, float: bool) {
     }
     match dst {
         Loc.Reg(to) => match src {
-            Loc.Reg(from_reg) => mut self.put(x64::Inst.Mov(dst: to, src: from_reg))
+            Loc.Reg(from_reg) => {
+                mut self.put(x64::Inst.Mov(dst: to, src: from_reg))
+                mut self.hold(to, slot: NONE)
+            }
             Loc.Slot(slot) => {
+                if self.holds(to, slot) {
+                    return
+                }
                 let mem = self.slot(slot)
                 mut self.put(x64::Inst.Load(kind: load, dst: to, src: mem))
+                mut self.hold(to, slot)
             }
         }
         Loc.Slot(to_slot) => {
             let target = self.slot(to_slot)
             match src {
-                Loc.Reg(from_reg) => mut self.put(x64::Inst.Store(size: x64::Size.Qword, src: from_reg, dst: target))
+                Loc.Reg(from_reg) => {
+                    mut self.put(x64::Inst.Store(size: x64::Size.Qword, src: from_reg, dst: target))
+                    mut self.forget_slot(to_slot)
+                    mut self.hold(from_reg, slot: to_slot)
+                }
                 Loc.Slot(slot) => {
                     let mem = self.slot(slot)
                     mut self.put(x64::Inst.Load(kind: x64::LoadKind.Qword, dst: x64::R10, src: mem))
                     mut self.put(x64::Inst.Store(size: x64::Size.Qword, src: x64::R10, dst: target))
+                    mut self.forget_slot(to_slot)
+                    mut self.hold(x64::R10, slot: to_slot)
                 }
             }
         }
@@ -399,6 +518,17 @@ fn Emitter.instruction(mut self, code: VCode, allocation: Allocation, inst: x64:
         return assigned
     })
     mut self.put(rewritten)
+    let clobbers = rewritten.clobbers()
+    for index in 0..<SCRATCH_COUNT {
+        if clobbers.contains(scratch_at(index)) {
+            self.held[index] = NONE
+        }
+    }
+    for operand in operands {
+        if operand.role != x64::Role.Use {
+            mut self.hold(operand.assigned, slot: NONE)
+        }
+    }
     for index in 0..<operands.len() {
         let operand = operands[index]
         if is_spilled(allocation, reg: operand.reg) and is_first(operands, at: index, read: false) {

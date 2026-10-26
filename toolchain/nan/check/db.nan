@@ -70,6 +70,8 @@ pkg struct Db {
     pkg packages: mem::List[PackageData]
     pkg modules: mem::List[ModuleData]
     pkg items: mem::List[ItemData]
+    /// The lowering of each item's file, by item.
+    lowerings: mem::List[mem::Shared[mem::List[Option[ast::Item]]]]
     /// The package each std alias names.
     pkg std: mem::Map[text::String, ty::PackageId]
     /// The functions named after each type, by member name.
@@ -78,6 +80,10 @@ pkg struct Db {
     pkg owners: mem::HashMap[ty::ItemId, TypeKey]
     /// The tombstones, by the canonical path of their old form.
     pkg tombstones: mem::Map[text::String, mem::List[ty::ItemId]]
+    /// The canonical paths of the items, once computed.
+    canonicals: mem::OnceMap[ty::ItemId, text::String]
+    /// The impl lines of each module, in item order, once listed.
+    module_impls: mem::OnceMap[ty::ModuleId, mem::List[ty::ItemId]]
     /// What the queries read, once recording starts.
     reads: Reads
     /// No item, which `members` views for a member no function is named after.
@@ -104,6 +110,12 @@ struct Reads {
     noted_on_lines: mem::OnceMap[LineRead, Unit]
     /// The lines of each subject's text with recorded reads, in order of first read.
     lines: mem::OnceMap[ty::ItemId, mem::Arena[u32]]
+    /// While only a code root's reads are recorded, the index of its package, and `NO_ID`
+    /// while every read is.
+    foreign_of: core::atomic::AtomicU32
+    /// While only a code root's reads are recorded, whether an item of its package read each
+    /// item of another package, by item.
+    read_outside: mem::Arena[core::atomic::AtomicBool]
 } Reads
 
 /// A subject and an item its queries read.
@@ -126,7 +138,7 @@ struct LineRead derives Copy, Eq, Hash {
 } LineRead
 
 fn Reads.empty(alloc: mem::Alloc) -> Reads {
-    return Reads(recording: core::atomic::AtomicBool.of(false), subject: core::atomic::AtomicU32.of(NO_ID), line: core::atomic::AtomicU32.of(NO_ID), read: mem::OnceMap[ty::ItemId, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted: mem::OnceMap[ItemRead, Unit].empty(seed: 0, alloc), on_lines: mem::OnceMap[LineKey, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted_on_lines: mem::OnceMap[LineRead, Unit].empty(seed: 0, alloc), lines: mem::OnceMap[ty::ItemId, mem::Arena[u32]].empty(seed: 0, alloc))
+    return Reads(recording: core::atomic::AtomicBool.of(false), subject: core::atomic::AtomicU32.of(NO_ID), line: core::atomic::AtomicU32.of(NO_ID), read: mem::OnceMap[ty::ItemId, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted: mem::OnceMap[ItemRead, Unit].empty(seed: 0, alloc), on_lines: mem::OnceMap[LineKey, mem::Arena[ty::ItemId]].empty(seed: 0, alloc), noted_on_lines: mem::OnceMap[LineRead, Unit].empty(seed: 0, alloc), lines: mem::OnceMap[ty::ItemId, mem::Arena[u32]].empty(seed: 0, alloc), foreign_of: core::atomic::AtomicU32.of(NO_ID), read_outside: mem::Arena[core::atomic::AtomicBool].empty(alloc))
 } Reads.empty
 
 /// Whether a variant selector matches a target.
@@ -144,7 +156,7 @@ fn selects(selector: Str, target: workspace::Target) -> bool {
 /// checks, its other members quiet, and each std package no member is named like, carried.
 fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Target) -> Db {
     let alloc = session.alloc
-    var db = Db(session: session.share(), target: target, packages: mem::List[PackageData].empty(alloc), modules: mem::List[ModuleData].empty(alloc), items: mem::List[ItemData].empty(alloc), std: mem::Map[text::String, ty::PackageId].empty(alloc), member_table: mem::HashMap[TypeKey, mem::Map[text::String, mem::List[ty::ItemId]]].empty(seed: 0, alloc), owners: mem::HashMap[ty::ItemId, TypeKey].empty(seed: 0, alloc), tombstones: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc), reads: Reads.empty(alloc), no_items: mem::List[ty::ItemId].empty(alloc), absent: ast::Item(token: 0, visibility: ast::Visibility.Private, type_modifiers: mem::List[ast::Word[ast::TypeModifier]].empty(alloc), kind: ast::ItemKind.Package))
+    var db = Db(session: session.share(), target: target, packages: mem::List[PackageData].empty(alloc), modules: mem::List[ModuleData].empty(alloc), items: mem::List[ItemData].empty(alloc), lowerings: mem::List[mem::Shared[mem::List[Option[ast::Item]]]].empty(alloc), std: mem::Map[text::String, ty::PackageId].empty(alloc), member_table: mem::HashMap[TypeKey, mem::Map[text::String, mem::List[ty::ItemId]]].empty(seed: 0, alloc), owners: mem::HashMap[ty::ItemId, TypeKey].empty(seed: 0, alloc), tombstones: mem::Map[text::String, mem::List[ty::ItemId]].empty(alloc), canonicals: mem::OnceMap[ty::ItemId, text::String].empty(seed: 0, alloc), module_impls: mem::OnceMap[ty::ModuleId, mem::List[ty::ItemId]].empty(seed: 0, alloc), reads: Reads.empty(alloc), no_items: mem::List[ty::ItemId].empty(alloc), absent: ast::Item(token: 0, visibility: ast::Visibility.Private, type_modifiers: mem::List[ast::Word[ast::TypeModifier]].empty(alloc), kind: ast::ItemKind.Package))
     let held = session.workspace.contents()
     var members = mem::List[workspace::Member].empty(alloc)
     for entry in closure.members {
@@ -162,7 +174,7 @@ fn Db.build(session: Session, closure: workspace::Closure, target: workspace::Ta
         }
         mut db.add_package(source, at: PackageSource.Member(member), quiet)
     }
-    let carried = session.std.contents()
+    let carried = session.std()
     for index in 0..<carried.packages.len() {
         let Some(source) = carried.packages.get(index) else {
             expect false
@@ -257,12 +269,9 @@ proj fn Db.source_of(self, source: PackageSource) -> workspace::Package {
     match source {
         PackageSource.Member(member) => return self.session.workspace.contents().member(member)
         PackageSource.Carried(index) => {
-            let Some(carried) = self.session.std.contents().packages.get(index) else {
-                expect false
-                loop {
-                }
-            }
-            return carried
+            let carried = self.session.std().packages
+            expect index < carried.len()
+            return carried[index]
         }
     }
 } Db.source_of
@@ -393,7 +402,8 @@ fn selects_dir(path: Str, selected: Slice[text::String]) -> bool {
 /// Adds the items of a module's file, lowered to abstract syntax.
 fn Db.add_items(mut self, mut data: ModuleData, module: ty::ModuleId, file: FileRef, held: workspace::File) {
     let alloc = self.session.alloc
-    let lowered = held.lowered(alloc)
+    let lowering = held.lowering_of(alloc)
+    let lowered = lowering.contents()
     expect lowered.len() == held.syntax.items.len()
     for position in 0..<held.syntax.items.len() {
         let syntax = held.syntax.items[position]
@@ -415,6 +425,7 @@ fn Db.add_items(mut self, mut data: ModuleData, module: ty::ModuleId, file: File
         }
         mut data.items.push(item_id)
         mut self.items.push(ItemData(module: module, file: file, index: position))
+        mut self.lowerings.push(lowering.share())
     }
 } Db.add_items
 
@@ -438,9 +449,10 @@ pkg proj fn Db.item(self, id: ty::ItemId) -> ItemData {
 
 /// An item's syntax read for its name and kind alone, which the names of its module show.
 pkg proj fn Db.declaration(self, id: ty::ItemId) -> ast::Item {
-    expect usize.widen(id.index) < self.items.len()
-    let data = self.items[usize.widen(id.index)]
-    let lowered = self.file(data.file).lowered(self.session.alloc)
+    let at = usize.widen(id.index)
+    expect at < self.items.len() and at < self.lowerings.len()
+    let data = self.items[at]
+    let lowered = self.lowerings[at].contents()
     expect data.index < lowered.len()
     let Some(item) = lowered[data.index] else {
         expect false
@@ -450,8 +462,12 @@ pkg proj fn Db.declaration(self, id: ty::ItemId) -> ast::Item {
 } Db.declaration
 
 /// The item of this database parsed from the same item of the same file as another
-/// database's.
-fn Db.same(self, other: ItemData) -> Option[ty::ItemId] {
+/// database's item `item`, found first at the same id when it is there.
+fn Db.same(self, item: ty::ItemId, other: ItemData) -> Option[ty::ItemId] {
+    let at = usize.widen(item.index)
+    if at < self.items.len() and self.items[at].file == other.file and self.items[at].index == other.index {
+        return Some(item)
+    }
     for index in 0..<self.items.len() {
         let data = self.items[index]
         if data.file == other.file and data.index == other.index {
@@ -466,10 +482,100 @@ fn Db.record(self) {
     self.reads.recording.store(true)
 } Db.record
 
-/// Whether the queries' reads are being recorded.
-fn Db.recording(self) -> bool {
+/// Starts recording, for the requires-set of a package's code root, only which items of other
+/// packages the package's items read: queries about its items compute as while every read is
+/// recorded, the others as while none is.
+fn Db.record_foreign(self, package_id: ty::PackageId) {
+    for _ in 0..<self.items.len() {
+        discard self.reads.read_outside.push(core::atomic::AtomicBool.of(false))
+    }
+    self.reads.foreign_of.store(package_id.index)
+    self.reads.recording.store(true)
+} Db.record_foreign
+
+/// Whether only a code root's reads are recorded.
+fn Db.records_code_root(self) -> bool {
+    return self.reads.recording.load() and self.reads.foreign_of.load() != NO_ID
+} Db.records_code_root
+
+/// Whether any reads are recorded, those of every item or a code root's.
+fn Db.records_any(self) -> bool {
     return self.reads.recording.load()
+} Db.records_any
+
+/// The items of other packages that the items of the package `record_foreign` names read, in
+/// item order.
+fn Db.foreign_reads(self) -> mem::List[ty::ItemId] {
+    var found = mem::List[ty::ItemId].empty(self.session.alloc)
+    for index in 0..<self.reads.read_outside.len() {
+        let item = u32.fit(index)
+        if self.reads.read_outside.at(mem::Id[core::atomic::AtomicBool].of(item)).load() {
+            mut found.push(ty::ItemId(index: item))
+        }
+    }
+    return found
+} Db.foreign_reads
+
+/// The index of an item's package, read without recording the read.
+fn Db.package_index(self, item: ty::ItemId) -> u32 {
+    expect usize.widen(item.index) < self.items.len()
+    return self.module(self.items[usize.widen(item.index)].module).package_id.index
+} Db.package_index
+
+/// Whether the reads of the queries computed now are recorded: while every read is, always;
+/// while only a code root's are, when the subject is an item of its package.
+fn Db.recording(self) -> bool {
+    let reads = self.reads
+    if not reads.recording.load() {
+        return false
+    }
+    let recorded = reads.foreign_of.load()
+    if recorded == NO_ID {
+        return true
+    }
+    let Some(subject) = item_of_bits(reads.subject.load()) else {
+        return false
+    }
+    return self.package_index(subject) == recorded
 } Db.recording
+
+/// The subject and line the queries' reads are recorded for, `NO_ID` for both while none are.
+struct Reading derives Copy, Eq, Hash {
+    subject: u32
+    line: u32
+} Reading
+
+/// A type asked about, with what the queries' reads were recorded for when it was asked: the
+/// answer of a computation over the type, asked again under the same reads, records nothing
+/// new.
+struct TypeAsked derives Copy, Eq, Hash {
+    reads: Reading
+    ty: ty::Ty
+} TypeAsked
+
+/// An item asked about, with what the queries' reads were recorded for when it was asked.
+struct ItemAsked derives Copy, Eq, Hash {
+    reads: Reading
+    item: ty::ItemId
+} ItemAsked
+
+/// What the queries' reads are recorded for now.
+fn Db.reading(self) -> Reading {
+    if not self.reads.recording.load() {
+        return Reading(subject: NO_ID, line: NO_ID)
+    }
+    return Reading(subject: self.reads.subject.load(), line: self.reads.line.load())
+} Db.reading
+
+/// A type asked about under what the queries' reads are recorded for now.
+fn Checker.asked(self, ty: ty::Ty) -> TypeAsked {
+    return TypeAsked(reads: self.db().reading(), ty: ty)
+} Checker.asked
+
+/// An item asked about under what the queries' reads are recorded for now.
+fn Checker.asked_item(self, item: ty::ItemId) -> ItemAsked {
+    return ItemAsked(reads: self.db().reading(), item: item)
+} Checker.asked_item
 
 /// Records that the current subject reads an item's facts.
 fn Db.note(self, item: ty::ItemId) {
@@ -481,6 +587,13 @@ fn Db.note(self, item: ty::ItemId) {
         return
     }
     if subject == item {
+        return
+    }
+    let recorded = reads.foreign_of.load()
+    if recorded != NO_ID {
+        if self.package_index(subject) == recorded and self.package_index(item) != recorded {
+            reads.read_outside.at(mem::Id[core::atomic::AtomicBool].of(item.index)).store(true)
+        }
         return
     }
     let alloc = self.session.alloc
@@ -589,6 +702,26 @@ pkg proj fn Db.module(self, id: ty::ModuleId) -> ModuleData {
     return self.modules[usize.widen(id.index)]
 } Db.module
 
+/// The impl lines of a module, in item order.
+pkg proj fn Db.impl_lines_of(self, module: ty::ModuleId) -> Slice[ty::ItemId] {
+    let held = match self.module_impls.get(module) {
+        Some(known) => known
+        None => self.module_impls.insert(module, value: self.listed_impls(module))
+    }
+    return held.view()
+} Db.impl_lines_of
+
+fn Db.listed_impls(self, module: ty::ModuleId) -> mem::List[ty::ItemId] {
+    var lines = mem::List[ty::ItemId].empty(self.session.alloc)
+    for item in self.module(module).items {
+        match self.declaration(item).kind {
+            ast::ItemKind.Impl(_) => mut lines.push(item)
+            else => {}
+        }
+    }
+    return lines
+} Db.listed_impls
+
 pkg proj fn Db.package_data(self, id: ty::PackageId) -> PackageData {
     expect usize.widen(id.index) < self.packages.len()
     return self.packages[usize.widen(id.index)]
@@ -604,19 +737,11 @@ pkg proj fn Db.source(self, id: ty::PackageId) -> workspace::Package {
 proj fn Db.file(self, file: FileRef) -> workspace::File {
     let source = self.source_of(file.source)
     if file.history {
-        let Some(retired_file) = source.history.get(file.index) else {
-            expect false
-            loop {
-            }
-        }
-        return retired_file
+        expect file.index < source.history.len()
+        return source.history[file.index]
     }
-    let Some(found) = source.files.get(file.index) else {
-        expect false
-        loop {
-        }
-    }
-    return found
+    expect file.index < source.files.len()
+    return source.files[file.index]
 } Db.file
 
 /// The file of an item.
@@ -797,6 +922,40 @@ fn Db.module_path(self, module: ty::ModuleId) -> text::String {
 
 /// The canonical path of a named item, or of a tombstone's old form.
 pkg fn Db.canonical(self, item: ty::ItemId) -> text::String {
+    return text::String.of(self.canonical_text(item), alloc: self.session.alloc)
+} Db.canonical
+
+/// The canonical path of a named item, or of a tombstone's old form, computed once; while reads
+/// are recorded, reading it records what computing it reads.
+pkg proj fn Db.canonical_text(self, item: ty::ItemId) -> Str {
+    if self.recording() {
+        self.read_canonical(item)
+    }
+    let held = match self.canonicals.get(item) {
+        Some(known) => known
+        None => self.canonicals.insert(item, value: self.computed_canonical(item))
+    }
+    return held.as_str()
+} Db.canonical_text
+
+/// Reads what computing an item's canonical path reads: the item, the old form of a tombstone,
+/// and the canonical path of the type a function is named after.
+fn Db.read_canonical(self, item: ty::ItemId) {
+    match self.ast(item).kind {
+        ast::ItemKind.Retired(tombstone) => {
+            expect usize.widen(item.index) < self.items.len()
+            discard self.old_form(self.items[usize.widen(item.index)].module, tombstone)
+            return
+        }
+        else => {}
+    }
+    match self.owners.get(item) {
+        Some(TypeKey.Item(owner)) => self.read_canonical(owner)
+        else => {}
+    }
+} Db.read_canonical
+
+fn Db.computed_canonical(self, item: ty::ItemId) -> text::String {
     let alloc = self.session.alloc
     expect usize.widen(item.index) < self.items.len()
     let data = self.items[usize.widen(item.index)]
@@ -826,7 +985,7 @@ pkg fn Db.canonical(self, item: ty::ItemId) -> text::String {
     }
     mut path.append(member)
     return path
-} Db.canonical
+} Db.computed_canonical
 
 /// Where the member name of a function named `Type.name` starts: after its last `.`.
 fn member_start(name: Str) -> usize {

@@ -5,6 +5,15 @@ const CACHED_PROVED: u8 = 0
 
 const CACHED_EXHAUSTED: u8 = 1
 
+/// The result of a query whose procedure ends in an open state, which only the checker keeps.
+const KEPT_OPEN: u8 = 2
+
+/// A query as the checker keeps its result: its language and obligation hash.
+struct QueryKey derives Copy, Eq, Hash {
+    language: u64
+    obligation: hashing::HashValue
+} QueryKey
+
 /// How an obligation holds.
 pkg enum Status derives Copy, Eq {
     Proven
@@ -81,12 +90,13 @@ proj fn Status.word(self) -> Str {
 /// examples have none.
 pkg fn Checker.obligations(self, item: ty::ItemId) -> mem::Shared[mem::List[Obligated]] {
     self.db().note(item)
+    self.trace_read(item)
     let state = self.state.contents()
     match state.obligations.get(item) {
         Some(done) => return done.share()
         None => {}
     }
-    let sites = self.db().about(Some(item), compute: fn() => self.unit_obligations(item))
+    let sites = self.about(Some(item), compute: fn() => self.unit_obligations(item))
     let decided = mem::Shared.of(take sites, alloc: self.alloc())
     return state.obligations.insert(item, value: take decided).share()
 } Checker.obligations
@@ -446,27 +456,50 @@ fn Checker.entails(self, mut terms: Terms, package_id: ty::PackageId, premises: 
     for premise in premises {
         mut listed.push(Premise(term: premise, origin: Origin.Fact))
     }
-    let canonical = self.canonical_query(mut terms, package_id, premises: listed.view(), goal)
+    var keys = KeyCache.empty(self.alloc())
+    let canonical = self.canonical_query(mut terms, mut keys, package_id, premises: listed.view(), goal)
     var solver = Solver.new(self.share(), package_id)
-    let decision = self.decided(mut solver, query: take canonical)
-    return match decision {
+    return self.proves(mut solver, query: take canonical)
+} Checker.entails
+
+/// Whether the procedure proves a canonical query, not run again for a query whose procedure
+/// ended in an open state.
+fn Checker.proves(self, mut solver: Solver, take query: CanonQuery) -> bool {
+    let state = self.state.contents()
+    let kept = QueryKey(language: self.language_of(solver.package_id), obligation: query.hash)
+    if not state.comparing.load() and state.outcomes.get(kept) == Some(KEPT_OPEN) {
+        return false
+    }
+    return match self.decided(mut solver, take query) {
         Decision.Proved => true
         else => false
     }
-} Checker.entails
+} Checker.proves
 
-/// The procedure's decision of a canonical query, read from the proof cache when it holds
-/// the query's result and recorded there when the query is proved or the fuel runs out. While
-/// the prover is compared with the cache, the procedure decides every query, and a held result
-/// that differs is recorded as a mismatch.
+/// The procedure's decision of a canonical query, not run when the checker's results or the
+/// proof cache hold the query as proved or out of fuel. The checker keeps each result, and the
+/// proof cache records a proof or the fuel running out. While the prover is compared with the
+/// cache, the procedure decides every query, and a held result that differs is recorded as a
+/// mismatch.
 fn Checker.decided(self, mut solver: Solver, take query: CanonQuery) -> Decision {
     let state = self.state.contents()
     let alloc = state.session.alloc
+    let language = self.language_of(solver.package_id)
+    let kept = QueryKey(language: language, obligation: query.hash)
+    let comparing = state.comparing.load()
+    if not comparing {
+        let result = state.outcomes.get(kept)
+        if result == Some(CACHED_PROVED) {
+            return Decision.Proved
+        }
+        if result == Some(CACHED_EXHAUSTED) {
+            return Decision.Exhausted
+        }
+    }
     let opened = match state.proof_cache.get(0) {
         Some(known) => known
         None => state.proof_cache.insert(0, value: open_proof_cache(state.session.home, alloc))
     }
-    let language = self.language_of(solver.package_id)
     var key: Option[hashing::HashValue] = None
     match self.session().toolchain_tree() {
         Some(tree) => {
@@ -479,13 +512,14 @@ fn Checker.decided(self, mut solver: Solver, take query: CanonQuery) -> Decision
         None => {}
     }
     let held = held_proof(opened, key)
-    let comparing = state.comparing.load()
     if not comparing {
         let cached = held_result(held)
         if cached == Some(CACHED_PROVED) {
+            discard state.outcomes.insert(kept, value: CACHED_PROVED)
             return Decision.Proved
         }
         if cached == Some(CACHED_EXHAUSTED) {
+            discard state.outcomes.insert(kept, value: CACHED_EXHAUSTED)
             return Decision.Exhausted
         }
     }
@@ -496,6 +530,7 @@ fn Checker.decided(self, mut solver: Solver, take query: CanonQuery) -> Decision
         Decision.Exhausted => Some(CACHED_EXHAUSTED)
         else => None
     }
+    discard state.outcomes.insert(kept, value: result.value_or(KEPT_OPEN))
     if comparing {
         match held {
             Some(bytes) => {
@@ -644,21 +679,74 @@ fn Checker.decide_unit(self, item: ty::ItemId, unit: mem::Shared[nir::NirUnit]) 
         if role == nir::Role.Example or role == nir::Role.Invariant or role == nir::Role.Assume or self.clause_disputed(item, role, index: function.index) {
             continue
         }
+        if not self.db().recording() and not self.may_give_sites(item, function) {
+            continue
+        }
         var terms = Terms.empty(alloc)
         let walked = self.walk_function(item, unit, index, mut terms)
         let demanded = self.demands_proof(item, function)
         let WalkedFunction(sites: sites, statements: statements) = walked
-        for obligated in take self.decide_function(item, role, index: function.index, take sites, demanded, mut terms) {
+        var keys = KeyCache.empty(alloc)
+        for obligated in take self.decide_function(item, role, index: function.index, take sites, demanded, mut terms, mut keys) {
             mut decided.push(take obligated)
         }
         for statement in take statements {
-            for obligated in take self.decide_function(item, role: statement.role, index: statement.index, sites: take statement.sites, demanded: true, mut terms) {
+            for obligated in take self.decide_function(item, role: statement.role, index: statement.index, sites: take statement.sites, demanded: true, mut terms, mut keys) {
                 mut decided.push(take obligated)
             }
         }
     }
     return decided
 } Checker.decide_unit
+
+/// Whether walking a function of an item's unit may give an obligation site: it holds a
+/// check, an integer negation, an arithmetic or shift operation, or a call that may give one.
+fn Checker.may_give_sites(self, item: ty::ItemId, function: nir::Function) -> bool {
+    for block in function.blocks {
+        for inst in function.insts_of(block) {
+            match inst.op {
+                nir::Op.Check(kind: _, operand: _, open: _) => return true
+                nir::Op.Unary(op: nir::UnaryOp.Neg, operand: _) => return true
+                nir::Op.Binary(op: op, left: _, right: _) => {
+                    if op == nir::BinaryOp.Add or op == nir::BinaryOp.Sub or op == nir::BinaryOp.Mul or op == nir::BinaryOp.Div or op == nir::BinaryOp.Rem or op == nir::BinaryOp.Shl or op == nir::BinaryOp.Shr {
+                        return true
+                    }
+                }
+                nir::Op.Call(call) => {
+                    if self.call_may_give_sites(item, call) {
+                        return true
+                    }
+                }
+                else => {}
+            }
+        }
+        match block.term {
+            nir::Terminator.Call(call: call, ok: _, failure: _) => {
+                if self.call_may_give_sites(item, call) {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} Checker.may_give_sites
+
+/// Whether walking a call within an item's unit may give an obligation site: a call of a
+/// built-in operation with one, of an interface method, which may resolve to one, or of an
+/// invariant or assume function of the unit, walked at its call.
+fn Checker.call_may_give_sites(self, item: ty::ItemId, call: nir::Call) -> bool {
+    let nir::Callee.Fn(fn_ref) = call.callee else {
+        return false
+    }
+    return match fn_ref.callable {
+        nir::Callable.Builtin(nir::Builtin.Conversion(conversion: nir::Conversion.Fit, scalar: _)) => true
+        nir::Callable.Item(item: callee, role: nir::Role.Body, index: _) => self.path_role(callee) == PathRole.Indexing
+        nir::Callable.Item(item: callee, role: nir::Role.Invariant, index: _) or nir::Callable.Item(item: callee, role: nir::Role.Assume, index: _) => callee == item
+        nir::Callable.Method(item: _, method: _) => true
+        else => false
+    }
+} Checker.call_may_give_sites
 
 /// Walks a function of a unit with its entry facts, returning its sites with their queries
 /// and those of the statement functions it calls.
@@ -949,6 +1037,7 @@ fn Checker.decide_function(
     take sites: mem::List[StatementSite],
     demanded: bool,
     mut terms: Terms,
+    mut keys: KeyCache,
     ) -> mem::List[Obligated] {
     let alloc = self.alloc()
     let package_id = self.db().package_of(item)
@@ -960,24 +1049,28 @@ fn Checker.decide_function(
         var unproved: Option[Unproved] = None
         var status = Status.Open
         if not site.open {
-            let canonical = self.canonical_query(mut terms, package_id, premises: query.premises.view(), goal: query.goal)
+            let canonical = self.canonical_query(mut terms, mut keys, package_id, premises: query.premises.view(), goal: query.goal)
             let assumed = assumed_origins(canonical.origins.view(), statuses: statuses.view())
             var solver = Solver.new(self.share(), package_id)
-            let decision = self.decided(mut solver, query: take canonical)
-            let proved = match decision {
-                Decision.Proved => true
-                else => false
+            var proved = false
+            if site_demanded {
+                let decision = self.decided(mut solver, query: take canonical)
+                proved = match decision {
+                    Decision.Proved => true
+                    else => false
+                }
+                if not proved {
+                    unproved = Some(self.unproved(item, role, index, site, take decision, mut solver))
+                }
+            } else {
+                proved = self.proves(mut solver, query: take canonical)
             }
+            status = Status.Checked
             if proved {
                 status = Status.Proven
                 if assumed {
                     status = Status.Assumed
                 }
-            } else {
-                if site_demanded {
-                    unproved = Some(self.unproved(item, role, index, site, take decision, mut solver))
-                }
-                status = Status.Checked
             }
         }
         mut statuses.push(status)

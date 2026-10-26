@@ -23,7 +23,7 @@ fn Checker.may_trap(self, item: ty::ItemId) -> bool {
         Some(known) => return known
         None => {}
     }
-    return db.about(Some(item), compute: fn() => self.compute_may_trap(item))
+    return self.about(Some(item), compute: fn() => self.compute_may_trap(item))
 } Checker.may_trap
 
 fn Checker.compute_may_trap(self, item: ty::ItemId) -> bool {
@@ -117,25 +117,39 @@ fn Checker.traps_through_entry(self, item: ty::ItemId) -> bool {
     return self.entry_traps(item) or self.may_trap(item)
 } Checker.traps_through_entry
 
-/// The functions of a function's cycle, itself included.
+/// The functions of a function's cycle, itself included. Outside every cycle, while reads are
+/// not recorded, or only a code root's are and the function's reach is read through, that is
+/// the function alone.
 fn Checker.cycle_of(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
     let alloc = self.alloc()
+    let state = self.state.contents()
+    let db = self.db()
+    if db.recording() and db.records_code_root() and not self.underway.contents().finding_cycles.load() and state.units_read.get(item).is_some() and state.bodies_read.get(item).is_some() {
+        return db.about(None, compute: fn() => self.cycle_of(item))
+    }
     var reachable = mem::List[ty::ItemId].empty(alloc)
-    var known = mem::Set[ty::ItemId].empty(alloc)
+    let searching = self.db().recording() or self.underway.contents().finding_cycles.load()
+    if not searching and not self.in_cycle(item) {
+        mut reachable.push(item)
+        return reachable
+    }
+    var known = ItemMarks.empty(self.alloc())
     mut reachable.push(item)
     discard mut known.insert(item)
     var index: usize = 0
     while index < reachable.len() {
         let dependencies = self.dependencies(reachable[index])
-        for dependency in dependencies {
-            if not known.contains(dependency) {
-                discard mut known.insert(dependency)
+        for dependency in dependencies.contents() {
+            if mut known.insert(dependency) {
                 mut reachable.push(dependency)
             }
         }
         index += 1
     }
     if self.db().recording() {
+        if db.records_code_root() {
+            self.read_through(state.units_read, functions: known)
+        }
         return self.recorded_cycle(item, take reachable)
     }
     var members = mem::List[ty::ItemId].empty(alloc)
@@ -165,16 +179,17 @@ fn Checker.trap_sources(self, item: ty::ItemId, unit: nir::NirUnit, role: nir::R
     let defined = defining_insts(function, alloc)
     for block in function.blocks {
         var calls = mem::List[usize].empty(alloc)
-        for position in 0..<block.insts.len() {
-            match block.insts[position].op {
+        let insts = function.insts_of(block)
+        for position in 0..<insts.len() {
+            match insts[position].op {
                 nir::Op.Call(_) => mut calls.push(position)
-                nir::Op.When(attempted: false, accesses: _, region: _) => mut sources.push(Source.Own(span: block.insts[position].span, obligation: false))
+                nir::Op.When(attempted: false, accesses: _, region: _) => mut sources.push(Source.Own(span: insts[position].span, obligation: false))
                 else => {}
             }
         }
         for position in calls {
-            expect position < block.insts.len()
-            let inst = block.insts[position]
+            expect position < insts.len()
+            let inst = insts[position]
             let nir::Op.Call(call) = inst.op else {
                 continue
             }
@@ -230,8 +245,9 @@ fn Checker.call_trap_sources(
         let Some(at) = defined.get(value) else {
             continue
         }
-        expect at.position < function.block(at.block).insts.len()
-        match function.block(at.block).insts[at.position].op {
+        let insts = function.insts_of(function.block(at.block))
+        expect at.position < insts.len()
+        match insts[at.position].op {
             nir::Op.FnRef(fn_ref) => {
                 match fn_ref.callable {
                     nir::Callable.Item(item: supplied, role: nir::Role.Body, index: _) => mut sources.push(Source.Callee(item: supplied, span: span, entry: true))
@@ -387,7 +403,7 @@ fn Checker.report_traps(
 /// terminates or has may-trap.
 fn Checker.check_contract_callees(self, item: ty::ItemId, function: nir::Function) {
     for block in function.blocks {
-        for inst in block.insts {
+        for inst in function.insts_of(block) {
             let nir::Op.Call(call) = inst.op else {
                 continue
             }
@@ -430,7 +446,7 @@ fn Checker.check_fit_traps(self, item: ty::ItemId, body: TBody, expr: TExpr) {
                 count = held.head.params.len()
             }
             for position in 0..<count {
-                self.check_fit_trap(item, body, value: held.args[position].expr, wanted: held.head.params[position].ty)
+                self.check_fit_trap(item, body, value: held.args[position].expr.contents(), wanted: held.head.params[position].ty)
             }
         }
         TKind.Construct(variant: variant, values: values, wrapped: _) => {
@@ -534,20 +550,36 @@ fn Checker.demands_notrap(self, item: ty::ItemId) -> bool {
     return self.method_limits(implemented.item, method: u32.fit(implemented.method)).notrap
 } Checker.demands_notrap
 
-/// The functions a function calls directly or supplies as function arguments.
-fn Checker.dependencies(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
-    let alloc = self.alloc()
-    var found = mem::List[ty::ItemId].empty(alloc)
-    let Some(unit) = self.unit(item) else {
-        return found
+/// The functions a function calls directly or supplies as function arguments, in order of
+/// occurrence; reading them reads the function's unit.
+fn Checker.dependencies(self, item: ty::ItemId) -> mem::Shared[mem::List[ty::ItemId]] {
+    let state = self.state.contents()
+    match state.unit_dependencies.get(item) {
+        Some(known) => {
+            self.db().note(item)
+            return known.share()
+        }
+        None => {}
     }
+    let alloc = self.alloc()
+    let found = match self.unit(item) {
+        Some(unit) => unit_callees(unit.contents(), alloc)
+        None => mem::List[ty::ItemId].empty(alloc)
+    }
+    return state.unit_dependencies.insert(item, value: mem::Shared.of(take found, alloc)).share()
+} Checker.dependencies
+
+/// The functions the body and closure functions of a unit call directly or supply as function
+/// arguments, in order of occurrence.
+fn unit_callees(unit: nir::NirUnit, alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    var found = mem::List[ty::ItemId].empty(alloc)
     var known = mem::Set[ty::ItemId].empty(alloc)
-    for function in unit.contents().functions {
+    for function in unit.functions {
         if function.role != nir::Role.Body and function.role != nir::Role.Closure {
             continue
         }
         for block in function.blocks {
-            for inst in block.insts {
+            for inst in function.insts_of(block) {
                 let callee = match inst.op {
                     nir::Op.Call(call) => body_callee(call)
                     nir::Op.FnRef(fn_ref) => body_reference(fn_ref)
@@ -562,7 +594,7 @@ fn Checker.dependencies(self, item: ty::ItemId) -> mem::List[ty::ItemId] {
         }
     }
     return found
-} Checker.dependencies
+} unit_callees
 
 /// Adds a callee to the dependencies found, once.
 fn add_dependency(mut found: mem::List[ty::ItemId], mut known: mem::Set[ty::ItemId], callee: Option[ty::ItemId]) {
@@ -580,7 +612,7 @@ fn add_dependency(mut found: mem::List[ty::ItemId], mut known: mem::Set[ty::Item
 fn defining_insts(function: nir::Function, alloc: mem::Alloc) -> mem::HashMap[nir::Value, InstAt] {
     var defined = mem::HashMap[nir::Value, InstAt].empty(seed: 0, alloc)
     for block in 0..<function.blocks.len() {
-        let insts = function.blocks[block].insts
+        let insts = function.insts_of(function.blocks[block])
         for position in 0..<insts.len() {
             match insts[position].result {
                 Some(result) => {

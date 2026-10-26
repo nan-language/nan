@@ -134,7 +134,7 @@ fn SourceFile.longest(
     self,
     rule: Rule,
     start: usize,
-    grammar: Grammar,
+    grammar: Tables,
     alloc: mem::Alloc,
     ) -> Option[usize] {
     var state = State.new(rule, alloc)
@@ -227,7 +227,8 @@ fn parse_as(take source: mem::Bytes, std: bool, grammar: Grammar, alloc: mem::Al
     let readable = source_text(source.view(), alloc)
     let parsed = SourceFile(source: take source, readable: take readable, tokens: take tokens, lines: take lines, summary: None, items: mem::List[ItemSyntax].empty(alloc), comment: take comment, diagnostics: mem::List[FileDiagnostic].empty(alloc))
     var parser = Parser(std: std, file: take parsed, alloc: alloc)
-    mut parser.run(grammar)
+    let tables = grammar.tables(alloc)
+    mut parser.run(tables.contents())
     var file = parser.file
     let blocks = conflict_blocks(file, alloc)
     for item in mut file.items {
@@ -454,7 +455,7 @@ fn Parser.report_fixed(
     mut self.file.diagnostics.push(take reported)
 } Parser.report_fixed
 
-fn Parser.run(mut self, grammar: Grammar) {
+fn Parser.run(mut self, grammar: Tables) {
     var at = self.next(0)
     let at_column_zero = self.kind(at) == TokenKind.Col0
     var head = at
@@ -505,7 +506,7 @@ fn SourceFile.described(self) -> bool {
 
 /// Reports the token at `at`, which starts no item between items, and returns the index of the
 /// token after the run it starts.
-fn Parser.stray(mut self, at: usize, grammar: Grammar) -> usize {
+fn Parser.stray(mut self, at: usize, grammar: Tables) -> usize {
     var expected = TermSet.default()
     mut expected.insert(Term.Class(Class.Col0))
     mut expected.insert(Term.Class(Class.Eof))
@@ -517,7 +518,7 @@ fn Parser.stray(mut self, at: usize, grammar: Grammar) -> usize {
 } Parser.stray
 
 /// Reads the item whose `COL0` is at `head`, and returns the index of the token after it.
-fn Parser.item(mut self, head: usize, grammar: Grammar) -> usize {
+fn Parser.item(mut self, head: usize, grammar: Tables) -> usize {
     var builder = Builder.empty(self.alloc)
     var state = State.new(Rule.Item, alloc: self.alloc)
     var at = head
@@ -526,7 +527,7 @@ fn Parser.item(mut self, head: usize, grammar: Grammar) -> usize {
             at = mut self.misplace_file_doc(at)
             continue
         }
-        let starts_doc = self.kind(at) == TokenKind.Doc or (self.kind(at) == TokenKind.Col0 and self.kind(self.next(at + 1)) == TokenKind.Doc)
+        let starts_doc = self.doc_at(at, file_doc: false)
         if starts_doc and at != head and self.doc_run(state, at, grammar) == DocRun.Misplaced {
             at = mut self.misplace_doc_run(at)
             continue
@@ -561,7 +562,7 @@ fn Parser.failed(
     state: State,
     head: usize,
     at: usize,
-    grammar: Grammar,
+    grammar: Tables,
     ) {
     match failure {
         Failure.Token(at: failing, expected: expected) => {
@@ -590,7 +591,7 @@ fn Parser.failed(
 } Parser.failed
 
 /// The parse of the item at `head` just before the token at `at`.
-fn Parser.replay(self, head: usize, at: usize, grammar: Grammar) -> State {
+fn Parser.replay(self, head: usize, at: usize, grammar: Tables) -> State {
     var state = State.new(Rule.Item, alloc: self.alloc)
     var dry = Discard()
     expect at <= self.file.comment.len()
@@ -608,7 +609,7 @@ fn Parser.replay(self, head: usize, at: usize, grammar: Grammar) -> State {
 
 /// Skips to the next item: from the failing token, or the `COL0` right before it, to `EOF` or a
 /// `COL0` followed by a token that can start an item.
-fn Parser.resync(self, failed_at: usize, grammar: Grammar) -> usize {
+fn Parser.resync(self, failed_at: usize, grammar: Tables) -> usize {
     var at = self.column_zero_before(failed_at)
     loop {
         let kind = self.kind(at)
@@ -622,13 +623,30 @@ fn Parser.resync(self, failed_at: usize, grammar: Grammar) -> usize {
     }
 } Parser.resync
 
-fn Parser.starts_item(self, at: usize, grammar: Grammar) -> bool {
+fn Parser.starts_item(self, at: usize, grammar: Tables) -> bool {
     return starts(Rule.ItemStart, lookahead: self.file.lookahead(at), source: self.file.source.view(), grammar)
 } Parser.starts_item
 
 fn Parser.starts_misplaced_file_doc(self, at: usize) -> bool {
-    return self.kind(at) == TokenKind.FileDoc or (self.kind(at) == TokenKind.Col0 and self.kind(self.next(at + 1)) == TokenKind.FileDoc)
+    return self.doc_at(at, file_doc: true)
 } Parser.starts_misplaced_file_doc
+
+/// Whether the token at `at`, or the one after it when it is a `COL0`, is a file doc comment
+/// when `file_doc` holds, and a doc comment otherwise.
+fn Parser.doc_at(self, at: usize, file_doc: bool) -> bool {
+    var kind = self.kind(at)
+    match kind {
+        TokenKind.Col0 => {
+            kind = self.kind(self.next(at + 1))
+        }
+        else => {}
+    }
+    return match kind {
+        TokenKind.Doc => not file_doc
+        TokenKind.FileDoc => file_doc
+        else => false
+    }
+} Parser.doc_at
 
 /// Reads a `FILE_DOC` line other than the file summary as a plain comment.
 fn Parser.misplace_file_doc(mut self, at: usize) -> usize {
@@ -677,7 +695,7 @@ fn Parser.doc_run_tokens(self, at: usize) -> DocLines
 
 /// Whether the run of doc comment lines at `at` documents what the parse reads next: in a std
 /// file, the next item after a function that ends at its head or its clauses.
-fn Parser.doc_run(self, state: State, at: usize, grammar: Grammar) -> DocRun {
+fn Parser.doc_run(self, state: State, at: usize, grammar: Tables) -> DocRun {
     let run = self.doc_run_tokens(at)
     var probe = mem::List[Token].empty(self.alloc)
     for index in run.tokens {
@@ -740,7 +758,7 @@ fn Parser.token_failure(
     before: State,
     at: usize,
     expected: TermSet,
-    grammar: Grammar,
+    grammar: Tables,
     ) {
     expect at < self.file.tokens.len()
     let token = self.file.tokens[at]
@@ -783,7 +801,7 @@ fn Parser.stray_column_zero(
     item: Option[usize],
     before: State,
     at: usize,
-    grammar: Grammar,
+    grammar: Tables,
     ) {
     var col0 = at
     var head = at
@@ -823,7 +841,7 @@ fn Parser.unaccepted(
     failed: State,
     at: usize,
     expected: TermSet,
-    grammar: Grammar,
+    grammar: Tables,
     ) {
     expect at < self.file.tokens.len()
     let token = self.file.tokens[at]
@@ -934,7 +952,7 @@ fn Parser.item_rule(
     item: Option[usize],
     failed: State,
     at: usize,
-    grammar: Grammar,
+    grammar: Tables,
     ) -> Option[FileDiagnostic] {
     let Some(head) = item else {
         return None

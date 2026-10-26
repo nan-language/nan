@@ -71,11 +71,14 @@ pub open struct Join[T: Any and Send, E: Send] {
 
 pub fn Scope.spawn[T: Any and Send, E: Send](self, take child: task fn() -> T fails E uses wait) -> Join[T, E]
 
+pub fn Scope.spawn_sized[T: Any and Send, E: Send](self, take child: task fn() -> T fails E uses wait, stack: usize) -> Join[T, E]
+
 pub fn Join.join(take self) -> T fails E uses wait
 ```
 
 - `spawn` never waits. It draws the child's stack and [task record](#task-closures) through the allocator of the executor that S runs its children on ([executors](#executors)), and traps when that allocator is exhausted (`trap.exhausted`). The child is ready at once, even when S has cancelled; its calls are then cancelled from its start.
-- A **lexical spawn** is a call of `spawn` whose receiver is the parameter of a body closure B and that is written in B, or in a closure nested in B that is not a task closure. At a lexical spawn, a child failure type E that does not convert to the failure type of B's `task::scope` call is an error (`error.unconvertible`). At any other spawn, an E other than `task::Cancelled` is an error (`task.unscoped-failure`).
+- `s.spawn_sized(c, stack)` spawns as `s.spawn(c)` does, except that the child's stack holds at least `stack` bytes ([task stacks](17-suspension-io.md#task-stacks)), so that a child whose depth no [stack limit](10-effects-digests.md#stack-limits) bounds, such as a recursive one, can run beside its scope's body. Every rule of this chapter on `spawn` holds for `spawn_sized`.
+- A **lexical spawn** is a call of `spawn` or `spawn_sized` whose receiver is the parameter of a body closure B and that is written in B, or in a closure nested in B that is not a task closure. At a lexical spawn, a child failure type E that does not convert to the failure type of B's `task::scope` call is an error (`error.unconvertible`). At any other spawn, an E other than `task::Cancelled` is an error (`task.unscoped-failure`).
 - A child's failure always reaches S as step 2 of [task scopes](#task-scopes) states; a join handle never yields it.
 - `take h.join()` waits until the child has ended. When the child returned t, `join` yields t, even when the joining call is cancelled. Otherwise S has cancelled, so the joining call is cancelled, and `join` fails with the cancellation of E ([cancellation](11-errors-domains.md#cancellation)). `join` is no cancellation point.
 - A `join` whose handle's `task::scope` call has returned traps (`trap.stale-handle`).
@@ -146,7 +149,7 @@ pub fn start_fetch(s: task::Scope, counter: task::Cown[Counter]) {
 A **task closure** is a closure written where a `task fn` [function type](10-effects-digests.md#function-types) is expected ([closures](07-ownership.md#closures)).
 
 - A value of a `task fn` type is linear and Send, and never a view, Copy, Inert or AnyBits.
-- Exactly these functions start a task with a `task fn` value: `task::Scope.spawn`, `task::race`, `sys::Domain.run`, `sys::Domain.run_sized`, `sys::Cx.spawn` and `boot::Kernel.anchor`. Each receives the value by `take` and runs it once, as the [entry](17-suspension-io.md#task-stacks) of a new task. Calling a `task fn` value is an error (`task.task-fn-call`).
+- Exactly these functions start a task with a `task fn` value: `task::Scope.spawn`, `task::Scope.spawn_sized`, `task::race`, `sys::Domain.run`, `sys::Domain.run_sized`, `sys::Cx.spawn` and `boot::Kernel.anchor`. Each receives the value by `take` and runs it once, as the [entry](17-suspension-io.md#task-stacks) of a new task. Calling a `task fn` value is an error (`task.task-fn-call`).
 - The value moves into the new task's **task record**, the storage the runtime keeps for the task. The entry owns each `take` capture as a `take` parameter owns its argument, and releases what remains of it when the task ends. A record keeps the task's result once the task ends, and lives until the task has ended and, for a child of a scope, until its join handle has been joined or has reaped it, or, for a task of a race, until the race call returns.
 - Every capture of a task closure has a Send type, and a view is captured only by lending; any other capture is an error (`task.capture-not-send`), reported at the capture's entry in the capture list, or at its first use in the body when it is unlisted.
 - A Copy read capture is copied when the closure is created and a `take` capture moves into it. Any other capture is lending, legal only as [lending](#lending) states.

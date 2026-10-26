@@ -24,12 +24,18 @@ pkg fn build(session: check::Session, program: usize, compared: Option[Compared]
         expect false
         return Build(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), image: None)
     }
-    var diagnostics = session.reported(scope::Scope.Workspace)
+    let closures = session.check_closures_coding(program)
+    var diagnostics = session.reported_by(closures, scope: scope::Scope.Workspace)
     let Some(checked) = held.closure_of(program) else {
         return Build(diagnostics: take diagnostics, image: None)
     }
     let target = source.program_target()
-    let checker = session.checked(checked, target)
+    let program_checker = session.checker_in(take closures, package_index: program, target)
+    let coding = program_checker.is_some() and session.codes_in_check(checked, package_index: program, target)
+    let checker = match program_checker {
+        Some(found) => found
+        None => session.checked(checked, target)
+    }
     let root = package_id(checker, program)
     let closure = closure_of(checker, root, alloc)
     mut diagnostics.retain(fn(reported: diagnostic::Diagnostic) -> bool {
@@ -45,7 +51,7 @@ pkg fn build(session: check::Session, program: usize, compared: Option[Compared]
         return Build(diagnostics: take diagnostics, image: None)
     }
     let name = text::String.of(checker.db().package_data(root).name.as_str(), alloc)
-    let artefacts = artefacts_of(session, checker, root, alloc)
+    let artefacts = artefacts_of(session, checker, root, coding, alloc)
     match compared {
         Some(image) => {
             for reported in take stage::compare(checker, artefacts, image: image.path.as_str(), written: image.written.as_str(), alloc) {
@@ -57,7 +63,9 @@ pkg fn build(session: check::Session, program: usize, compared: Option[Compared]
         }
         None => {}
     }
-    let lowered = lower_program(checker, root, artefacts, dumping: false, alloc)
+    let record = codes_record(session, checker, root, kind: "program", alloc)
+    let lowered = lower_program(checker, root, artefacts, dumping: false, kept: kept_codes(session, record: record.as_str(), alloc), alloc)
+    keep_codes(session, record: record.as_str(), lowered, alloc)
     for reported in take collisions(source, lowered, alloc) {
         mut diagnostics.push(take reported)
     }
@@ -133,8 +141,9 @@ pkg fn lines_of(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
 } lines_of
 
 /// The lowering of the program whose package is `root`, for the checker's target, with the
-/// artefacts of its final closure; keeping the text of each function it defines when `dumping`.
-fn lower_program(checker: check::Checker, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], dumping: bool, alloc: mem::Alloc) -> lower::Lowered {
+/// artefacts of its final closure; keeping the text of each function it defines when `dumping`,
+/// and taking the code an earlier lowering compiled from `kept`.
+fn lower_program(checker: check::Checker, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], dumping: bool, take kept: mem::Bytes, alloc: mem::Alloc) -> lower::Lowered {
     let db = checker.db()
     let target = db.target
     var entry: Option[ty::ItemId] = None
@@ -160,26 +169,27 @@ fn lower_program(checker: check::Checker, root: ty::PackageId, artefacts: mem::M
         }
         None => {}
     }
+    let roots = code_roots(artefacts, alloc)
     let Some(entry_fn) = entry else {
         expect false
-        return lower::lower_lower(checker, program: program_of(entry_fn: ty::ItemId(index: 0), landing_fn: ty::ItemId(index: 0), root, artefacts, dumping, alloc))
+        return lower::lower_lower(checker, program: program_of(entry_fn: ty::ItemId(index: 0), landing_fn: ty::ItemId(index: 0), root, artefacts, roots: roots.view(), dumping, take kept, alloc), tree: tree_of(roots.view(), alloc))
     }
     let Some(landing_fn) = landing_item else {
         expect false
-        return lower::lower_lower(checker, program: program_of(entry_fn, landing_fn: ty::ItemId(index: 0), root, artefacts, dumping, alloc))
+        return lower::lower_lower(checker, program: program_of(entry_fn, landing_fn: ty::ItemId(index: 0), root, artefacts, roots: roots.view(), dumping, take kept, alloc), tree: tree_of(roots.view(), alloc))
     }
-    let program = program_of(entry_fn, landing_fn, root, artefacts, dumping, alloc)
+    let program = program_of(entry_fn, landing_fn, root, artefacts, roots: roots.view(), dumping, take kept, alloc)
     if target.is_machine() {
         return lower::lower_machine(checker, program)
     }
-    return lower::lower_lower(checker, program)
+    return lower::lower_lower(checker, program, tree: tree_of(roots.view(), alloc))
 } lower_program
 
 /// What the final build of the program whose package is `root` lowers.
-fn program_of(entry_fn: ty::ItemId, landing_fn: ty::ItemId, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], dumping: bool, alloc: mem::Alloc) -> lower::Program {
-    var roots = mem::List[ty::PackageId].empty(alloc)
-    mut roots.push(root)
-    return lower::Program(entry: entry_fn, landing_fn: landing_fn, roots: take roots, prefixes: prefixes(artefacts, alloc), section: section(artefacts, alloc), dump: dumping)
+fn program_of(entry_fn: ty::ItemId, landing_fn: ty::ItemId, root: ty::PackageId, artefacts: mem::Map[text::String, mem::Bytes], roots: Slice[Option[mem::Bytes]], dumping: bool, take kept: mem::Bytes, alloc: mem::Alloc) -> lower::Program {
+    var link_roots = mem::List[ty::PackageId].empty(alloc)
+    mut link_roots.push(root)
+    return lower::Program(entry: entry_fn, landing_fn: landing_fn, roots: take link_roots, prefixes: root_prefixes(artefacts, roots, alloc), section: section(artefacts, alloc), dump: dumping, kept: take kept)
 } program_of
 
 /// The symbol name and Cranelift text of each function the final build of the program package
@@ -200,8 +210,8 @@ pkg fn lowered_functions(session: check::Session, package_name: Str, alloc: mem:
     }
     let checker = session.checked(checked, target: source.program_target())
     let root = package_id(checker, program)
-    let artefacts = artefacts_of(session, checker, root, alloc)
-    let lowered = lower_program(checker, root, artefacts, dumping: true, alloc)
+    let artefacts = artefacts_of(session, checker, root, coding: false, alloc)
+    let lowered = lower_program(checker, root, artefacts, dumping: true, kept: mem::Bytes.empty(alloc), alloc)
     for function in lowered.dumped {
         var header = text::String.of(function.name.as_str(), alloc)
         mut header.write(text::fmt(" {length}\n", length: function.text.byte_len()), budget: 100)
@@ -326,8 +336,9 @@ fn closure_of(checker: check::Checker, root: ty::PackageId, alloc: mem::Alloc) -
 
 /// The artefact of each package lowered with the workspace package `root` of a checker's
 /// closure, by package name: of the packages `root` reaches, a workspace package's of its current
-/// state and a release's from the local store, and of each std package the toolchain's.
-pkg fn artefacts_of(session: check::Session, checker: check::Checker, root: ty::PackageId, alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
+/// state and a release's from the local store, and of each std package the toolchain's; `root`'s
+/// code root from the checker when `coding`, the checker recording its reads.
+pkg fn artefacts_of(session: check::Session, checker: check::Checker, root: ty::PackageId, coding: bool, alloc: mem::Alloc) -> mem::Map[text::String, mem::Bytes] {
     let db = checker.db()
     var packages = closure_of(checker, root, alloc)
     for index in 0..<db.packages.len() {
@@ -336,13 +347,17 @@ pkg fn artefacts_of(session: check::Session, checker: check::Checker, root: ty::
         }
     }
     let held = session.workspace.contents()
-    let carried = check::Session.of(session.std.share(), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    let carried = session.over(session.carried.shared(session.grammar, given: session.home, alloc), alloc)
     var found = mem::Map[text::String, mem::Bytes].empty(alloc)
     for id in packages {
         let data = db.package_data(id)
         let built = match data.member {
             Some(workspace::Member.Release(index)) => released(held, index, alloc)
-            Some(workspace::Member.Source(index)) => built_source(session, index)
+            Some(workspace::Member.Source(index)) => if coding and id == root {
+                built_from(session, index, checker)
+            } else {
+                built_source(session, index)
+            }
             None => built_carried(carried, name: data.name.as_str())
         }
         let Some(artefact) = built else {
@@ -375,6 +390,16 @@ fn built_source(session: check::Session, index: usize) -> Option[mem::Bytes] {
     return Some(take artefact)
 } built_source
 
+/// The artefact of the current state of the package at an index of a session's workspace, its
+/// code root from a checker recording its reads.
+fn built_from(session: check::Session, index: usize, checker: check::Checker) -> Option[mem::Bytes] {
+    let Some(closure) = session.workspace.contents().closure_of(index) else {
+        return None
+    }
+    let check::Built(artefact: artefact, sources: _) = session.build_from(closure, package_index: index, checked: checker)
+    return Some(take artefact)
+} built_from
+
 /// The artefact of the std package of a name that the toolchain carries, from a session of the
 /// std workspace.
 fn built_carried(carried: check::Session, name: Str) -> Option[mem::Bytes] {
@@ -405,12 +430,37 @@ fn named_package(held: workspace::Workspace, name: Str) -> Option[usize] {
 /// The prefix the symbols of each package carry, by package name: the first 12 characters of the
 /// checksummed base32 of its code root hash's digest bytes.
 pkg fn prefixes(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::HashMap[text::String, text::String] {
-    var found = mem::HashMap[text::String, text::String].empty(seed: 0, alloc)
+    let roots = code_roots(artefacts, alloc)
+    return root_prefixes(artefacts, roots: roots.view(), alloc)
+} prefixes
+
+/// The code root of each artefact, in their order; none for one that does not decode.
+fn code_roots(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc) -> mem::List[Option[mem::Bytes]] {
+    var roots = mem::List[Option[mem::Bytes]].empty(alloc)
     for entry in artefacts {
-        let Ok(decoded) = artefact::decode(entry.value().view(), alloc) else {
+        match artefact::decode(entry.value().view(), alloc) {
+            Ok(decoded) => {
+                let artefact::Decoded(code_root: code_root) = decoded
+                mut roots.push(Some(take code_root))
+            }
+            Err(_) => mut roots.push(None)
+        }
+    }
+    return roots
+} code_roots
+
+/// The prefixes `prefixes` gives, from the code roots of the artefacts, in their order.
+fn root_prefixes(artefacts: mem::Map[text::String, mem::Bytes], roots: Slice[Option[mem::Bytes]], alloc: mem::Alloc) -> mem::HashMap[text::String, text::String] {
+    var found = mem::HashMap[text::String, text::String].empty(seed: 0, alloc)
+    var at: usize = 0
+    for entry in artefacts {
+        expect at < roots.len()
+        let held = roots[at]
+        at += 1
+        let Some(code_root) = held else {
             continue
         }
-        let root = decoded.root_hash()
+        let root = hashing::HashValue.of(code_root.view())
         let Some(digest) = root.bytes.view().split_at(1) else {
             continue
         }
@@ -421,7 +471,16 @@ pkg fn prefixes(artefacts: mem::Map[text::String, mem::Bytes], alloc: mem::Alloc
         discard mut found.insert(text::String.of(entry.key().as_str(), alloc), value: text::String.of(prefix, alloc))
     }
     return found
-} prefixes
+} root_prefixes
+
+/// The hash of the code roots of the artefacts of an image's `.nan` section, in its order.
+fn tree_of(roots: Slice[Option[mem::Bytes]], alloc: mem::Alloc) -> hashing::HashValue {
+    let Some(tree) = toolchain::roots_tree(roots, alloc) else {
+        expect false
+        return hashing::HashValue.of(b"")
+    }
+    return tree
+} tree_of
 
 /// The content of an image's `.nan` section: each package's artefact, in byte order of package
 /// name.

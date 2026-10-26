@@ -1,11 +1,13 @@
-//! Register allocation: a linear scan over the live intervals that keeps each virtual register in one physical register, or in one spill slot, for all its life.
+//! Register allocation: a linear scan over the live intervals that keeps each virtual register in one physical register, or in one spill slot, for all its life, spilling the interval whose accesses weigh least, an access in a loop weighing more; a register a call clobbers holds an interval across calls when saving it to a slot before each and loading it after weighs less.
 
 /// Where register allocation puts each virtual register, and what the frame must hold for it.
 struct Allocation {
     /// Each virtual register's physical register, `NO_REG` when it lives in a spill slot.
     regs: mem::List[x64::Reg]
-    /// Each spilled virtual register's slot, `NONE` for the others.
+    /// The slot of each virtual register spilled or saved across calls, `NONE` for the others.
     slots: mem::List[u32]
+    /// The registers saved before a call and loaded after it, in the order of the calls.
+    saves: mem::List[Save]
     slot_count: u32
     /// The callee-saved registers the code changes.
     saved: x64::RegSet
@@ -46,19 +48,33 @@ fn class_reg(float: bool, index: u32) -> x64::Reg
     }
 } class_reg
 
+/// A register a call at an instruction index clobbers that holds a virtual register's value
+/// across the call.
+struct Save derives Copy, Eq {
+    at: u32
+    reg: x64::Reg
+    vreg: u32
+} Save
+
 /// The state of the scan: the virtual register holding each physical register, and per physical
-/// register the first of its fixed ranges not yet behind the scan.
+/// register the first of its fixed ranges not yet behind the scan; the weight of each virtual
+/// register's accesses and of each instruction's position, and whether each virtual register is
+/// saved across the calls in its interval.
 struct Scan {
     holders: Array[u32, REG_COUNT]
     cursors: Array[u32, REG_COUNT]
     regs: mem::List[x64::Reg]
     spilled: mem::List[u32]
+    weights: mem::List[u64]
+    factors: mem::List[u64]
+    saved: mem::List[bool]
 } Scan
 
 fn allocate(code: VCode, alloc: mem::Alloc) -> Allocation {
     let live = Liveness.of(code, alloc)
     let count = usize.widen(code.vreg_count())
-    var scan = Scan(holders: Array[u32, REG_COUNT].filled(NONE), cursors: Array[u32, REG_COUNT].filled(0), regs: filled(count, value: NO_REG, alloc), spilled: mem::List[u32].empty(alloc))
+    let factors = position_factors(code, alloc)
+    var scan = Scan(holders: Array[u32, REG_COUNT].filled(NONE), cursors: Array[u32, REG_COUNT].filled(0), regs: filled(count, value: NO_REG, alloc), spilled: mem::List[u32].empty(alloc), weights: access_weights(code, factors: factors.view(), alloc), factors: take factors, saved: filled(count, value: false, alloc))
     for index in 0..<REG_COUNT {
         scan.cursors[index] = live.fixed_at[index]
     }
@@ -83,8 +99,10 @@ fn allocate(code: VCode, alloc: mem::Alloc) -> Allocation {
     return take scan.finish(code, live, alloc)
 } allocate
 
-/// Gives a virtual register a free register, its hint's first; or, when none is free, the
-/// register of the interval ending last, spilling that interval or this one.
+/// Gives a virtual register a free register, its hint's first; or, when none is free, a register
+/// only calls clobber in its interval, saved across them, when that weighs less than spilling;
+/// or else the register of the interval whose accesses weigh least, spilling that interval or
+/// this one, the one ending last among equal weights.
 fn Scan.place(mut self, code: VCode, live: Liveness, vreg: u32) {
     let at = usize.widen(vreg)
     let start = live.start_of(vreg)
@@ -110,12 +128,42 @@ fn Scan.place(mut self, code: VCode, live: Liveness, vreg: u32) {
         }
     }
     var victim = NO_REG
+    var lightest = self.weight(vreg)
     var furthest = end
+    var across = NO_REG
+    var cheapest = lightest
+    for index in 0u32..<class_size(float) {
+        let reg = class_reg(float, index: index)
+        if self.holders[usize.widen(reg.index)] != NONE {
+            continue
+        }
+        match mut self.save_cost(live, reg, start, end) {
+            Some(cost) => {
+                if cost < cheapest {
+                    across = reg
+                    cheapest = cost
+                }
+            }
+            None => {}
+        }
+    }
+    if across != NO_REG {
+        expect at < self.saved.len()
+        self.saved[at] = true
+        mut self.assign(vreg, reg: across)
+        return
+    }
     for index in 0u32..<class_size(float) {
         let reg = class_reg(float, index: index)
         let holder = self.holders[usize.widen(reg.index)]
-        if holder != NONE and live.end_of(holder) > furthest and mut self.is_clear(live, reg, start, end) {
+        if holder == NONE {
+            continue
+        }
+        let weight = self.weight(holder)
+        let lighter = weight < lightest or (weight == lightest and live.end_of(holder) > furthest)
+        if lighter and mut self.is_clear(live, reg, start, end) {
             victim = reg
+            lightest = weight
             furthest = live.end_of(holder)
         }
     }
@@ -125,11 +173,88 @@ fn Scan.place(mut self, code: VCode, live: Liveness, vreg: u32) {
     }
     expect victim.is_physical()
     let evicted = self.holders[usize.widen(victim.index)]
-    expect usize.widen(evicted) < self.regs.len()
+    expect usize.widen(evicted) < self.regs.len() and usize.widen(evicted) < self.saved.len()
     self.regs[usize.widen(evicted)] = NO_REG
+    self.saved[usize.widen(evicted)] = false
     mut self.spilled.push(evicted)
     mut self.assign(vreg, reg: victim)
 } Scan.place
+
+fn Scan.weight(self, vreg: u32) -> u64 {
+    let at = usize.widen(vreg)
+    expect at < self.weights.len()
+    return self.weights[at]
+} Scan.weight
+
+/// The deepest loop nesting whose accesses weigh more.
+const LOOP_DEPTH: u32 = 4
+
+/// The weight of an access at each instruction index: 1, times 8 for each loop holding it, a loop
+/// being the blocks from a jump's target to the jump in emission order.
+fn position_factors(code: VCode, alloc: mem::Alloc) -> mem::List[u64] {
+    let count = code.blocks.len()
+    var opened = filled(count + 1, value: 0u32, alloc)
+    var closed = filled(count + 1, value: 0u32, alloc)
+    for index in 0..<count {
+        for succ in code.block_succs(code.blocks[index]) {
+            let target = usize.widen(succ)
+            if target <= index {
+                expect target < opened.len() and index + 1 < closed.len()
+                opened[target] += 1
+                closed[index + 1] += 1
+            }
+        }
+    }
+    var factors = filled(code.insts.len(), value: 1u64, alloc)
+    var depth: u32 = 0
+    for index in 0..<count {
+        expect index < opened.len() and index < closed.len()
+        depth = depth.saturating_add(opened[index]).saturating_sub(closed[index])
+        var factor: u64 = 1
+        var nesting: u32 = 0
+        while nesting < depth and nesting < LOOP_DEPTH {
+            factor *= 8
+            nesting += 1
+        }
+        let block = code.blocks[index]
+        expect code.holds(block)
+        for at in block.begin..<block.end {
+            expect usize.widen(at) < factors.len()
+            factors[usize.widen(at)] = factor
+        }
+    }
+    return factors
+} position_factors
+
+/// The weight of each virtual register's accesses, each weighing its instruction's factor.
+fn access_weights(code: VCode, factors: Slice[u64], alloc: mem::Alloc) -> mem::List[u64] {
+    var weights = filled(code.floats.len(), value: 0u64, alloc)
+    for block in code.blocks {
+        expect code.holds(block)
+        for at in block.begin..<block.end {
+            expect usize.widen(at) < factors.len()
+            let factor = factors[usize.widen(at)]
+            discard code.insts[usize.widen(at)].inst.map_regs(fn[mut weights](reg: x64::Reg, role: x64::Role) -> x64::Reg {
+                if reg.is_virtual() {
+                    let held = usize.widen(reg.vreg())
+                    expect held < weights.len()
+                    weights[held] = weights[held].saturating_add(factor)
+                }
+                return reg
+            })
+        }
+        let jump = usize.widen(block.end - 1)
+        expect jump < factors.len()
+        for arg in code.block_args(block) {
+            if arg.is_virtual() {
+                let held = usize.widen(arg.vreg())
+                expect held < weights.len()
+                weights[held] = weights[held].saturating_add(factors[jump])
+            }
+        }
+    }
+    return weights
+} access_weights
 
 /// The register a virtual register's hint names, when it names one yet.
 fn Scan.preferred(self, code: VCode, vreg: u32) -> x64::Reg
@@ -159,6 +284,30 @@ fn Scan.is_free(mut self, live: Liveness, reg: x64::Reg, start: u32, end: u32) -
     return self.holders[usize.widen(reg.index)] == NONE and mut self.is_clear(live, reg, start, end)
 } Scan.is_free
 
+/// The weight of saving a register across the calls clobbering it in `start ..= end`, a store and
+/// a load at each; none when another fixed range meets them.
+fn Scan.save_cost(mut self, live: Liveness, reg: x64::Reg, start: u32, end: u32) -> Option[u64]
+    requires reg.is_physical()
+{
+    discard mut self.is_clear(live, reg, start, end)
+    let at = usize.widen(reg.index)
+    let limit = live.fixed_at[at + 1]
+    expect usize.widen(limit) <= live.fixed.len()
+    var cost: u64 = 0
+    var index = self.cursors[at]
+    while index < limit and live.fixed[usize.widen(index)].start <= end {
+        let range = live.fixed[usize.widen(index)]
+        if not range.call {
+            return None
+        }
+        let call_at = usize.widen(range.start / 2)
+        expect call_at < self.factors.len()
+        cost = cost.saturating_add(2 * self.factors[call_at])
+        index += 1
+    }
+    return Some(cost)
+} Scan.save_cost
+
 /// Whether no fixed range of a register meets `start ..= end`, the ranges ending before `start`
 /// passed for good.
 fn Scan.is_clear(mut self, live: Liveness, reg: x64::Reg, start: u32, end: u32) -> bool
@@ -178,8 +327,13 @@ fn Scan.is_clear(mut self, live: Liveness, reg: x64::Reg, start: u32, end: u32) 
 /// The allocation: spill slots shared by spilled intervals that do not overlap, and the
 /// callee-saved registers the code changes.
 fn Scan.finish(take self, code: VCode, live: Liveness, alloc: mem::Alloc) -> Allocation {
-    let Scan(holders: _, cursors: _, regs: regs, spilled: spilled) = self
+    let Scan(holders: _, cursors: _, regs: regs, spilled: spilled, weights: _, factors: _, saved: across) = self
     var by_start = spilled
+    for vreg in 0..<across.len() {
+        if across[vreg] {
+            mut by_start.push(u32.fit(vreg))
+        }
+    }
     mut by_start.sort_by(fn(left: u32, right: u32) -> core::Ordering {
         let left_start = live.start_of(left)
         let right_start = live.start_of(right)
@@ -214,5 +368,35 @@ fn Scan.finish(take self, code: VCode, live: Liveness, alloc: mem::Alloc) -> All
     for vinst in code.insts {
         saved = saved.union(vinst.inst.clobbers().minus(x64::RegSet.caller_saved()))
     }
-    return Allocation(regs: take regs, slots: take slots, slot_count: u32.fit(slot_ends.len()), saved: saved.minus(x64::RegSet(bits: 0x30)))
+    let saves = saves_of(code, live, regs: regs.view(), across: across.view(), alloc)
+    return Allocation(regs: take regs, slots: take slots, saves: take saves, slot_count: u32.fit(slot_ends.len()), saved: saved.minus(x64::RegSet(bits: 0x30)))
 } Scan.finish
+
+/// The saves across calls: for each call, in order, each virtual register saved across the calls
+/// of its interval whose register the call clobbers.
+fn saves_of(code: VCode, live: Liveness, regs: Slice[x64::Reg], across: Slice[bool], alloc: mem::Alloc) -> mem::List[Save] {
+    var saves = mem::List[Save].empty(alloc)
+    var held = mem::List[u32].empty(alloc)
+    for vreg in 0..<across.len() {
+        if across[vreg] {
+            mut held.push(u32.fit(vreg))
+        }
+    }
+    if held.len() == 0 {
+        return saves
+    }
+    for at in 0..<code.insts.len() {
+        let x64::Inst.Call(target: _, args: _, results: _, clobbers: clobbers) = code.insts[at].inst else {
+            continue
+        }
+        let position = u32.fit((2 * at) + 1)
+        for vreg in held {
+            expect usize.widen(vreg) < regs.len()
+            let reg = regs[usize.widen(vreg)]
+            if live.start_of(vreg) <= position and position <= live.end_of(vreg) and clobbers.contains(reg) {
+                mut saves.push(Save(at: u32.fit(at), reg: reg, vreg: vreg))
+            }
+        }
+    }
+    return saves
+} saves_of

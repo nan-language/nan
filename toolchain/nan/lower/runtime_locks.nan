@@ -1,4 +1,4 @@
-//! The runtime's locks: words its routines spin on until they take them, `Lock` and `Unlock`, recorded by the running executor thread so that a trap of its task releases them; on a kernel a lock is IRQ-saving, its outermost holder disabling maskable interrupts, and a lock word holds its CPU's number plus one, so a CPU reaching a lock it holds halts the kernel.
+//! The runtime's locks: words its routines spin on until they take them, on `x86_64-host` reading a busy word between pauses before yielding, `Lock` and `Unlock`, recorded by the running executor thread so that a trap of its task releases them; on a kernel a lock is IRQ-saving, its outermost holder disabling maskable interrupts, and a lock word holds its CPU's number plus one, so a CPU reaching a lock it holds halts the kernel.
 
 /// The most locks a thread holds at once that a trap of its task releases.
 const HELD_LOCKS: u64 = 8
@@ -14,7 +14,8 @@ fn locks_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } locks_define
 
-/// `Lock(lock)`: spins until the running thread takes the lock, then records it.
+/// Takes a lock word in place, as `Lock(lock)` does: spins until the running thread takes the
+/// lock, then records it.
 fn locks_acquire(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
     var flags: Option[clif::Value] = None
     if lo.kernel() {
@@ -22,7 +23,7 @@ fn locks_acquire(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
         expect saved.len() > 0
         flags = Some(saved[0])
     }
-    let thread = mut lo.thread(mut fx)
+    let thread = mut lo.thread_inline(mut fx)
     let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
     var holders = mem::List[clif::Value].empty(fx.alloc)
     if lo.kernel() {
@@ -50,7 +51,11 @@ fn locks_acquire(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
                     discard mut lo.call_routine(mut fx3, routine: Routine.Reacquired, args: fx3.list1(location).view())
                 })
             }
-            mut lo.relax(mut fx2)
+            if lo.machine() {
+                mut lo.relax(mut fx2)
+            } else {
+                discard mut lo.call_routine(mut fx2, routine: Routine.LockWait, args: fx2.list1(lock).view())
+            }
         })
         return Pass(again: busy, next: mem::List[clif::Value].empty(fx1.alloc))
     })
@@ -76,10 +81,35 @@ fn locks_acquire(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
     })
 } locks_acquire
 
-/// `Unlock(lock)`: forgets the lock the running thread holds and frees it; on a kernel, the
-/// outermost one restores the interrupt flag from before it was taken.
+/// The reads of a busy lock word `wait_free` pauses between before it yields the processor.
+const SPINS: i64 = 64
+
+/// Waits on `x86_64-host` until a lock word another thread holds reads free: pausing between
+/// reads, at most `SPINS` of them, then yielding the processor when it still reads held.
+fn wait_free(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
+    let zero = mut fx.ptr(0)
+    discard mut fx.repeat(fx.list1(zero).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 0
+        discard mut lo.call_stub(mut fx1, stub: Stub.Pause, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        let word = mut fx1.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: lock)
+        let held = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: word, y: 0)
+        let next = mut fx1.b.iadd_imm_s(state[0], y: 1)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: next, y: SPINS)
+        let again = mut fx1.b.band(held, y: more)
+        return Pass(again: again, next: fx1.list1(next))
+    })
+    let word = mut fx.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: lock)
+    let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: word, y: 0)
+    mut fx.if_true(held, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.relax(mut fx1)
+    })
+} wait_free
+
+/// Releases a lock word in place, as `Unlock(lock)` does: forgets the lock the running thread
+/// holds and frees it, on `x86_64-host` by a plain store, which x86-64 orders after every access
+/// before it; on a kernel, the outermost one restores the interrupt flag from before it was taken.
 fn locks_release(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
-    let thread = mut lo.thread(mut fx)
+    let thread = mut lo.thread_inline(mut fx)
     let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
     let counted = mut fx.choose(inside, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
         let before = mut fx1.load(PTR, addr: thread, offset: THREAD_LOCKS)
@@ -108,7 +138,11 @@ fn locks_release(mut lo: Lowering, mut fx: Fx, lock: clif::Value) {
     })
     let held = counted[0]
     let zero = mut fx.int(clif::Type.Int32, value: 0)
-    mut fx.b.atomic_store(clif::MemFlags.owned(), x: zero, p: lock)
+    if lo.machine() {
+        mut fx.b.atomic_store(clif::MemFlags.owned(), x: zero, p: lock)
+    } else {
+        mut fx.store(zero, addr: lock, offset: 0)
+    }
     if lo.kernel() {
         let outermost = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: held, y: 0)
         mut fx.if_true(outermost, then: fn[mut lo](mut fx1: Fx) {

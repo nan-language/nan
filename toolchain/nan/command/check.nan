@@ -17,12 +17,20 @@ fn check_run(invocation: Invocation, session: check::Session, current: Str, trac
     let checked = rewrite.checked.share()
     let held = checked.workspace.contents()
     try journal::write(held.root.as_str(), files: rewrite.files.view(), alloc)
-    var diagnostics = checked.reported(resolved.scope)
+    var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var green = mem::List[output::Record].empty(alloc)
+    if invocation.name == Name.Check {
+        let closures = checked.check_closures()
+        diagnostics = checked.reported_by(closures, scope: resolved.scope)
+        let failed = error_lines(diagnostics.view(), alloc)
+        green = try last_green(checked, take closures, scope: resolved.scope, agent, errors: failed.view(), alloc)
+    } else {
+        diagnostics = checked.reported(resolved.scope)
+    }
     fix::offer(checked, current, written: invocation.scope(), diagnostics: mut diagnostics)
-    let std = checked.std.contents()
+    let std = checked.std()
     var errors: usize = 0
     var incomplete: usize = 0
-    var failed = mem::List[diagnostic::At].empty(alloc)
     var records = mem::List[output::Record].empty(alloc)
     for index in 0..<diagnostics.len() {
         invariant errors <= index and incomplete <= index
@@ -30,27 +38,13 @@ fn check_run(invocation: Invocation, session: check::Session, current: Str, trac
         let class = reported.code.class()
         if class == diagnostic::Class.Error {
             errors += 1
-            match reported.path {
-                Some(path) => {
-                    match reported.line {
-                        Some(line) => {
-                            mut failed.push(diagnostic::At(path: text::String.of(path.as_str(), alloc), line: line))
-                        }
-                        None => {}
-                    }
-                }
-                None => {}
-            }
         } else if class == diagnostic::Class.Incompleteness {
             incomplete += 1
         }
         mut records.push(record(held, std, scope: resolved.scope, reported, alloc))
     }
-    if invocation.name == Name.Check {
-        let green = try last_green(checked, scope: resolved.scope, agent, errors: failed.view(), alloc)
-        for changed in take green {
-            mut records.push(take changed)
-        }
+    for changed in take green {
+        mut records.push(take changed)
     }
     if invocation.flag("--radius") {
         let measured = radii(checked, scope: resolved.scope, alloc)
@@ -70,6 +64,24 @@ fn check_run(invocation: Invocation, session: check::Session, current: Str, trac
     let summary = counted(invocation.name.counts(), files: rewrite.files.len(), errors, incomplete, alloc)
     return output::Output(command: invocation.command(resolved.written.as_str(), skip: true, alloc), elision: invocation.command(resolved.written.as_str(), skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
 } check_run
+
+/// Where each error among diagnostics lies, for those on a line of a file.
+fn error_lines(diagnostics: Slice[diagnostic::Diagnostic], alloc: mem::Alloc) -> mem::List[diagnostic::At] {
+    var failed = mem::List[diagnostic::At].empty(alloc)
+    for reported in diagnostics {
+        if reported.code.class() != diagnostic::Class.Error {
+            continue
+        }
+        let Some(path) = reported.path else {
+            continue
+        }
+        let Some(line) = reported.line else {
+            continue
+        }
+        mut failed.push(diagnostic::At(path: text::String.of(path.as_str(), alloc), line: line))
+    }
+    return failed
+} error_lines
 
 /// The scope operand, `.` when omitted.
 proj fn Invocation.scope_written(self) -> Str {
@@ -162,7 +174,7 @@ fn propagated(invocation: Invocation, base: check::Session, current: Str, alloc:
     var made = false
     loop {
         let held = fixed.workspace.contents()
-        let Some(next) = pass(fixed, current, written, keep: fn(reported: diagnostic::Diagnostic, fix: diagnostic::Fix) => is_propagated(reported.code) and not edits_interface(held, fix, alloc), alloc) else {
+        let Some(next) = pass(fixed, current, written, keep: fn(reported: diagnostic::Diagnostic, fix: diagnostic::Fix) => is_propagated(reported.code) and not edits_interface(held, fix), alloc) else {
             break
         }
         fixed = next
@@ -207,7 +219,7 @@ fn pass(session: check::Session, current: Str, written: Option[Str], keep: fn(re
         return None
     }
     let fixed = held.overlaid(fix::apply(held, fixes: chosen.view(), alloc), grammar: session.grammar.contents(), alloc)
-    return Some(check::Session.of(mem::Shared.of(take fixed, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc))
+    return Some(check::Session.of(mem::Shared.of(take fixed, alloc: alloc), std: session.carried.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc))
 } pass
 
 /// Whether a line of a file is among those taken.
@@ -221,7 +233,7 @@ fn is_taken(taken: Slice[diagnostic::At], line: diagnostic::At) -> bool {
 } is_taken
 
 /// Whether a fix edits the head of a `pkg` or `pub` function or a `pkg` or `pub` enum.
-fn edits_interface(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc: mem::Alloc) -> bool {
+fn edits_interface(workspace: workspace::Workspace, fix: diagnostic::Fix) -> bool {
     for edit in fix.edits {
         let Some(at) = workspace.file(edit.path.as_str()) else {
             continue
@@ -246,7 +258,7 @@ fn edits_interface(workspace: workspace::Workspace, fix: diagnostic::Fix, alloc:
         if kind.rule != syntax::Rule.FnItem {
             continue
         }
-        let Some(end) = tree.head_end(alloc) else {
+        let Some(end) = tree.head_end() else {
             return true
         }
         expect usize.widen(end) < file.tokens.len()
@@ -349,29 +361,37 @@ fn green_entries(root: Str, agent: Str, alloc: mem::Alloc) -> mem::Map[text::Str
 /// last empty line after a final line feed.
 fn text_lines(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     var lines = mem::List[text::String].empty(alloc)
-    let bytes = written.as_bytes()
     var start: usize = 0
-    while start < bytes.len() {
-        var end = bytes.len()
-        var next = bytes.len()
-        for at in start..<bytes.len() {
-            if bytes[at] == b'\n' {
-                end = at
-                next = at + 1
-                break
-            }
-        }
-        if end > start and bytes[end - 1] == b'\r' {
-            end -= 1
-        }
-        let Some(line) = written.slice_bytes(start, end) else {
+    while start < written.byte_len() {
+        let bounds = line_bounds(written.as_bytes(), start)
+        let Some(line) = written.slice_bytes(start, end: bounds.end) else {
             return lines
         }
         mut lines.push(text::String.of(line, alloc))
-        start = next
+        start = bounds.next
     }
     return lines
 } text_lines
+
+/// Where a line of a text ends, before its line feed and a carriage return ending it, and where
+/// the next line starts.
+struct LineBounds derives Copy {
+    end: usize
+    next: usize
+} LineBounds
+
+/// The bounds of the line of `bytes` starting at `start`.
+fn line_bounds(bytes: Slice[u8], start: usize) -> LineBounds {
+    var end = output::first_of(bytes, start, one: b'\n', other: b'\n')
+    var next = bytes.len()
+    if end < bytes.len() {
+        next = end + 1
+    }
+    if end > start and end <= bytes.len() and bytes[end - 1] == b'\r' {
+        end -= 1
+    }
+    return LineBounds(end: end, next: next)
+} line_bounds
 
 /// The parts of a text between its spaces, each space separating two.
 fn split_spaces(written: Str, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -424,15 +444,18 @@ fn changed_since(entries: mem::Map[text::String, GreenEntry], greens: Slice[chec
 /// Keeps an agent's last-green record: after a check reporting no error, replaces the entries of
 /// the items of its scope; after one reporting errors, returns a `changed` record per item of the
 /// closure sets of the lines holding one whose interface hash differs from its entry.
-fn last_green(session: check::Session, scope: scope::Scope, agent: Str, errors: Slice[diagnostic::At], alloc: mem::Alloc) -> mem::List[output::Record] fails platform::IoError {
+fn last_green(session: check::Session, take closures: check::Checked, scope: scope::Scope, agent: Str, errors: Slice[diagnostic::At], alloc: mem::Alloc) -> mem::List[output::Record] fails platform::IoError {
     let held = session.workspace.contents()
     var entries = green_entries(held.root.as_str(), agent, alloc)
     if errors.len() > 0 {
-        let greens = session.greens(None, lines: errors)
+        closures.keep()
+        let greens = session.greens_after(take closures, scope: None, lines: errors)
         return changed_since(entries, greens: greens.view(), writer: writer_of(held, scope, alloc), alloc)
     }
     mut entries.retain(fn(key: text::String, value: GreenEntry) => not located_in(scope, workspace: held, location: value.location.as_str()))
-    let greens = session.greens(Some(scope.copied(alloc)), lines: mem::List[diagnostic::At].empty(alloc).view())
+    let shared = closures.share(alloc)
+    let greens = session.greens_after(take closures, scope: Some(scope.copied(alloc)), lines: mem::List[diagnostic::At].empty(alloc).view())
+    shared.keep()
     for green in greens {
         var api = mem::List[text::String].empty(alloc)
         for line in green.api {
@@ -558,7 +581,7 @@ fn overlaid_session(session: check::Session, path: Str, contents: Slice[u8], all
     mut bytes.append(contents)
     discard mut changed.insert(text::String.of(path, alloc), value: take bytes)
     let overlaid = session.workspace.contents().overlaid(changed, grammar: session.grammar.contents(), alloc)
-    return check::Session.of(mem::Shared.of(take overlaid, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    return check::Session.of(mem::Shared.of(take overlaid, alloc: alloc), std: session.carried.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
 } overlaid_session
 
 /// `nan check --prefix`: the error at the prefix's first dead token, the diagnostics of the
@@ -613,7 +636,7 @@ fn closed_prefix(invocation: Invocation, session: check::Session, current: Str, 
     let closed = syntax::close_prefix(prefix, grammar: session.grammar.contents(), alloc)
     let fixed_session = overlaid_session(session, path, contents: closed.source.view(), alloc)
     let fixed = fixed_session.workspace.contents()
-    let std = session.std.contents()
+    let std = session.std()
     let scope = scope::Scope.File(text::String.of(path, alloc))
     let scoped = text::String.of(path, alloc)
     var diagnostics = fixed_session.reported(scope)

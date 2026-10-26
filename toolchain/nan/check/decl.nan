@@ -181,12 +181,90 @@ fn Checker.check_package(self, package_id: ty::PackageId) {
     let db = self.db()
     for module in db.package_data(package_id).modules {
         self.check_module_names(module)
-        for item in db.module(module).items {
-            self.judge_alone(item)
-        }
+    }
+    for item in self.judging_order(package_id) {
+        self.judge_alone(item)
     }
     self.check_package_whole(package_id)
 } Checker.check_package
+
+/// The items of a package in the order they are judged: each after the items of the package
+/// it names, cycles aside, so that the digests a judgment computes read bodies their own
+/// judgments typed. While reads are recorded, in declaration order. The items each item names
+/// are found as a batch, after the signatures of the package's items, whose checks report.
+fn Checker.judging_order(self, package_id: ty::PackageId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var order = mem::List[ty::ItemId].empty(alloc)
+    var placed = mem::HashMap[ty::ItemId, Unit].empty(seed: 0, alloc)
+    if not db.recording() {
+        var items = mem::List[ty::ItemId].empty(alloc)
+        for module in db.package_data(package_id).modules {
+            for item in db.module(module).items {
+                discard self.sig(item)
+                mut items.push(item)
+            }
+        }
+        discard self.member_functions()
+        self.run_batch(Work.Named, items: items.view())
+    }
+    for module in db.package_data(package_id).modules {
+        for item in db.module(module).items {
+            if db.recording() {
+                mut order.push(item)
+            } else {
+                self.place_after_named(item, package_id, mut placed, mut order)
+            }
+        }
+    }
+    return order
+} Checker.judging_order
+
+/// Places an item after the unplaced items of its package it names, depth first.
+fn Checker.place_after_named(self, root: ty::ItemId, package_id: ty::PackageId, mut placed: mem::HashMap[ty::ItemId, Unit], mut order: mem::List[ty::ItemId]) {
+    let earlier = mut placed.insert(root, value: Unit)
+    if earlier.is_some() {
+        return
+    }
+    var visits = mem::List[Placing].empty(self.alloc())
+    mut visits.push(self.placing(root, package_id))
+    loop {
+        let depth = visits.len()
+        if depth == 0 {
+            return
+        }
+        let top = depth - 1
+        if visits[top].next == visits[top].named.len() {
+            mut order.push(visits[top].item)
+            discard mut visits.pop()
+            continue
+        }
+        let named = visits[top].named[visits[top].next]
+        visits[top].next += 1
+        let unplaced = mut placed.insert(named, value: Unit)
+        if unplaced.is_none() {
+            mut visits.push(self.placing(named, package_id))
+        }
+    }
+} Checker.place_after_named
+
+/// An item being placed: the items of its package it names, and how many of them are placed.
+struct Placing {
+    item: ty::ItemId
+    named: mem::List[ty::ItemId]
+    next: usize
+} Placing
+
+fn Checker.placing(self, item: ty::ItemId, package_id: ty::PackageId) -> Placing {
+    let db = self.db()
+    var named = mem::List[ty::ItemId].empty(self.alloc())
+    for found in self.names(item).contents() {
+        if found != item and db.package_of(found) == package_id {
+            mut named.push(found)
+        }
+    }
+    return Placing(item: item, named: take named, next: 0)
+} Checker.placing
 
 fn Checker.check_case(self, item: ty::ItemId, name: ast::Name, case: Case) {
     if not case.followed_by(name.text.as_str()) {
@@ -321,8 +399,11 @@ fn Checker.check_item(self, item: ty::ItemId) {
     self.check_value_types(item)
     self.check_history_forms(item)
     let node = self.db().ast(item)
+    var lowered: Option[ast::Block] = None
     match node.kind {
-        ast::ItemKind.Fn(function) => self.check_function(item, node, function, sig)
+        ast::ItemKind.Fn(function) => {
+            lowered = self.check_function(item, node, function, sig)
+        }
         ast::ItemKind.Struct(structure) => self.check_struct_item(item, structure)
         ast::ItemKind.Enum(enumeration) => self.check_enum_item(item, enumeration)
         ast::ItemKind.Interface(declared) => self.check_interface_item(item, declared, sig)
@@ -365,14 +446,14 @@ fn Checker.check_item(self, item: ty::ItemId) {
         Some(generics) => self.where_conditions(item, generics)
         None => {}
     }
-    self.check_item_body(item)
+    self.check_item_body(item, take lowered)
     if self.is_entry(item) {
         self.check_entry_head(item)
     }
 } Checker.check_item
 
 /// The rules of a function item's name, head and modifier.
-fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast::FnItem, sig: Sig) {
+fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast::FnItem, sig: Sig) -> Option[ast::Block] {
     let modifier = match function.modifier {
         Some(written) => Some(written.kind)
         None => None
@@ -386,7 +467,7 @@ fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast
     self.check_generic_names(item, generics: function.head.generics.view())
     self.check_params(item, params: function.head.params.view())
     let SigKind.Fn(fn_sig) = sig.kind else {
-        return
+        return None
     }
     self.check_prefix(item, name: function.label.name, sig: fn_sig)
     self.check_unused_generics(item, sig: fn_sig)
@@ -424,10 +505,14 @@ fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast
     if self.is_entry(item) or fn_sig.modifier == Some(ast::FnModifier.Interrupt) or fn_sig.modifier == Some(ast::FnModifier.Landing) {
         self.check_stack_bound(item, limit_set: fn_sig.limit_set)
     }
+    var lowered: Option[ast::Block] = None
     match function.body {
-        ast::FnBody.Block(block) => self.check_thresholds(item, clauses: function.clauses.view(), body: Some(block))
-        else => self.check_thresholds(item, clauses: function.clauses.view(), body: None)
+        ast::FnBody.Block(written) => {
+            lowered = Some(self.lowered_body(item, body: written))
+        }
+        else => {}
     }
+    self.check_thresholds(item, clauses: function.clauses.view(), body: lowered)
     match modifier {
         Some(ast::FnModifier.Validator) => self.check_validator(item, sig: fn_sig)
         Some(ast::FnModifier.Landing) => {
@@ -441,6 +526,7 @@ fn Checker.check_function(self, item: ty::ItemId, node: ast::Item, function: ast
         else => {}
     }
     self.check_dma_completion(item, sig: fn_sig)
+    return lowered
 } Checker.check_function
 
 /// The rules of a struct item's derives and names.
@@ -555,8 +641,8 @@ fn Checker.check_const_item(self, item: ty::ItemId, constant: ast::ConstItem, si
 
 /// The rules of an item's typed body: its flow, float use, limits, `expect` purity, decreases
 /// clauses and property test, the body kept for the digests.
-fn Checker.check_item_body(self, item: ty::ItemId) {
-    let Some(checked) = self.check_bodies(item) else {
+fn Checker.check_item_body(self, item: ty::ItemId, take lowered: Option[ast::Block]) {
+    let Some(checked) = self.check_bodies(item, take lowered) else {
         return
     }
     let node = self.db().ast(item)
@@ -997,7 +1083,7 @@ fn Checker.check_prefix(self, item: ty::ItemId, name: ast::Name, sig: FnSig) {
 fn Checker.is_view(self, ty: ty::Ty, params: bool) -> bool {
     let db = self.db()
     return match self.types().kind(ty) {
-        ty::TyKind.Item(item: item, args: _) => is_listed("core::Slice core::SliceMut core::Str", word: db.canonical(item).as_str()) or db.ast(item).has_modifier(ast::TypeModifier.View)
+        ty::TyKind.Item(item: item, args: _) => is_listed("core::Slice core::SliceMut core::Str", word: db.canonical_text(item)) or db.ast(item).has_modifier(ast::TypeModifier.View)
         ty::TyKind.Dyn(_) => true
         else => false
     }

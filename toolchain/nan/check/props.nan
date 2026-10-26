@@ -165,7 +165,7 @@ fn Checker.base_facts(self, item: ty::ItemId) -> Option[Array[Rule, 6]] {
     if not db.is_std(item) {
         return None
     }
-    return base_type_facts(db.canonical(item).as_str())
+    return base_type_facts(db.canonical_text(item))
 } Checker.base_facts
 
 /// Whether an item is a base type, whose properties its owning chapter gives.
@@ -175,7 +175,7 @@ pkg fn Checker.is_base_type(self, item: ty::ItemId) -> bool {
 
 fn Checker.is_primitive_capability(self, item: ty::ItemId) -> bool {
     let db = self.db()
-    return db.is_std(item) and is_listed(PRIMITIVE_CAPABILITIES, word: db.canonical(item).as_str())
+    return db.is_std(item) and is_listed(PRIMITIVE_CAPABILITIES, word: db.canonical_text(item))
 } Checker.is_primitive_capability
 
 /// The properties of a type, as code of the item `from` sees them.
@@ -213,7 +213,7 @@ fn Checker.item_props(self, item: ty::ItemId, args: Slice[ty::Arg]) -> Props {
     match self.base_facts(item) {
         Some(facts) => {
             var count = type_args.len()
-            if is_listed(BRANDED_TYPES, word: db.canonical(item).as_str()) and count > 1 {
+            if is_listed(BRANDED_TYPES, word: db.canonical_text(item)) and count > 1 {
                 count = 1
             }
             let Some(considered) = type_args.view().prefix(count) else {
@@ -327,13 +327,118 @@ fn Checker.definition_props(self, item: ty::ItemId) -> Props {
         Some(known) => return known
         None => {}
     }
-    if state.deciding.get(key).is_some() {
-        return self.assumed_props(item)
+    let deciding = self.underway.contents().deciding
+    match deciding.reread(key) {
+        Some(Some(provisional)) => return provisional
+        Some(None) => return self.assumed_props(item)
+        None => {}
     }
-    state.deciding.insert(key, value: Unit)
-    let props = db.about(Some(item), compute: fn() => self.compute_definition_props(item))
-    return state.definitions.insert(key, value: props)
+    let opened = deciding.start(key, alloc: self.alloc())
+    let props = self.about(Some(item), compute: fn() => self.compute_definition_props(item))
+    if deciding.finish(opened, props, alloc: self.alloc()) {
+        discard state.definitions.insert(key, value: props)
+    }
+    return props
 } Checker.definition_props
+
+/// The definitions whose properties are being decided, as Tarjan's search over their
+/// constituents. Properties decided through a constituent that reaches a definition still being
+/// decided hold only until that one's are decided, and are decided again when next read.
+struct Deciding {
+    /// The numbers of the decisions under way, outermost first.
+    open: cell::Swap[mem::List[u32]]
+    /// Each decision, by number.
+    decisions: mem::Arena[PropsDecision]
+    /// The properties decided while a definition they read is still being decided.
+    provisional: cell::Swap[mem::List[ProvisionalProps]]
+} Deciding
+
+/// A decision: its definition, and the lowest number of a decision it read, as Tarjan's low
+/// link.
+struct PropsDecision {
+    key: DefinitionKey
+    low: core::atomic::AtomicU32
+} PropsDecision
+
+/// Properties decided provisionally, with the number of their decision.
+struct ProvisionalProps derives Copy {
+    number: u32
+    props: Props
+} ProvisionalProps
+
+fn Deciding.empty(alloc: mem::Alloc) -> Deciding {
+    return Deciding(open: cell::Swap.of(mem::List[u32].empty(alloc), alloc), decisions: mem::Arena[PropsDecision].empty(alloc), provisional: cell::Swap.of(mem::List[ProvisionalProps].empty(alloc), alloc))
+} Deciding.empty
+
+/// Records that the innermost decision read the decision numbered `number`.
+fn Deciding.read(self, number: u32) {
+    let open = self.open.get()
+    let count = open.len()
+    if count == 0 {
+        return
+    }
+    let innermost = self.decisions.at(mem::Id[PropsDecision].of(open[count - 1]))
+    if number < innermost.low.load() {
+        innermost.low.store(number)
+    }
+} Deciding.read
+
+/// For a definition being decided, none; for one decided provisionally, its properties.
+fn Deciding.reread(self, key: DefinitionKey) -> Option[Option[Props]] {
+    for number in self.open.get() {
+        if self.decisions.at(mem::Id[PropsDecision].of(number)).key == key {
+            self.read(number)
+            return Some(None)
+        }
+    }
+    for decided in self.provisional.get() {
+        if self.decisions.at(mem::Id[PropsDecision].of(decided.number)).key == key {
+            self.read(decided.number)
+            return Some(Some(decided.props))
+        }
+    }
+    return None
+} Deciding.reread
+
+/// Starts deciding a definition.
+fn Deciding.start(self, key: DefinitionKey, alloc: mem::Alloc) -> OpenedDecision {
+    let started = self.decisions.push(PropsDecision(key: key, low: core::atomic::AtomicU32.of(0)))
+    let number = started.index()
+    self.decisions.at(started).low.store(number)
+    var open = mem::List[u32].empty(alloc)
+    for held in self.open.get() {
+        mut open.push(held)
+    }
+    mut open.push(number)
+    return OpenedDecision(number: number, outer: self.open.replace(take open))
+} Deciding.start
+
+/// Ends the innermost decision with its properties, giving whether they are decided: no
+/// definition it read is still being decided. The properties decided provisionally through
+/// one decided so are dropped.
+fn Deciding.finish(self, opened: OpenedDecision, props: Props, alloc: mem::Alloc) -> bool {
+    self.open.restore(opened.outer)
+    let low = self.decisions.at(mem::Id[PropsDecision].of(opened.number)).low.load()
+    self.read(low)
+    let decided = low == opened.number
+    var kept = mem::List[ProvisionalProps].empty(alloc)
+    for held in self.provisional.get() {
+        if not decided or held.number < opened.number {
+            mut kept.push(held)
+        }
+    }
+    if not decided {
+        mut kept.push(ProvisionalProps(number: opened.number, props: props))
+    }
+    discard self.provisional.replace(take kept)
+    return decided
+} Deciding.finish
+
+/// A decision under way: its number, and the token restoring the decisions under way before it.
+struct OpenedDecision derives Copy {
+    number: u32
+    outer: u32
+} OpenedDecision
 
 /// The properties a struct or enum is taken to have while its definition is being decided,
 /// through a constituent that reaches it again: those computed from constituents hold.
@@ -562,7 +667,7 @@ fn Checker.param_props(self, param: ty::Param) -> Props {
 /// The bounds of a generic parameter in scope.
 fn Checker.param_bounds(self, param: ty::Param) -> mem::List[ty::Bound] {
     let alloc = self.alloc()
-    match defined_bounds(self.state.contents().scope.get().view(), param, alloc) {
+    match defined_bounds(self.underway.contents().scope.get().view(), param, alloc) {
         Some(bounds) => return bounds
         None => {}
     }
@@ -616,15 +721,37 @@ fn Checker.accepts_views(self, param: ty::Param) -> bool {
     let owner = db.ast(param.owner)
     return match owner.kind {
         ast::ItemKind.Interface(_) => param.index < 256
-        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => owner.has_modifier(ast::TypeModifier.View) or (db.is_std(param.owner) and is_listed("core::Array core::ArrayCursor core::Option core::Result core::Untrusted core::Slice core::SliceMut", word: db.canonical(param.owner).as_str()))
+        ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => owner.has_modifier(ast::TypeModifier.View) or (db.is_std(param.owner) and is_listed("core::Array core::ArrayCursor core::Option core::Result core::Untrusted core::Slice core::SliceMut", word: db.canonical_text(param.owner)))
         else => false
     }
 } Checker.accepts_views
 
-/// Whether a type has interior mutability: it is or contains a base type with it.
+/// Whether a type has interior mutability: it is or contains a base type with it; kept for
+/// the reads it is asked under.
 pkg fn Checker.has_interior(self, ty: ty::Ty) -> bool {
-    return self.contains(ty, test_item: fn(ck: Checker, item: ty::ItemId) => ck.db().is_std(item) and is_listed(INTERIOR_TYPES, word: ck.db().canonical(item).as_str()))
+    let asked = self.asked(ty)
+    let state = self.state.contents()
+    match state.interior.get(asked) {
+        Some(known) => return known
+        None => {}
+    }
+    let interior = self.contains(ty, test_item: fn(ck: Checker, item: ty::ItemId) => ck.is_interior_type(item))
+    return state.interior.insert(asked, value: interior)
 } Checker.has_interior
+
+/// Whether an item is a std type with interior mutability.
+fn Checker.is_interior_type(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    if not db.is_std(item) {
+        return false
+    }
+    let path = db.canonical_text(item)
+    let state = self.state.contents()
+    return match state.interior_types.get(item) {
+        Some(known) => known
+        None => state.interior_types.insert(item, value: is_listed(INTERIOR_TYPES, word: path))
+    }
+} Checker.is_interior_type
 
 /// Whether a type is a capability type: a primitive capability, or one holding one among its
 /// constituents or at an argument Inert depends on.

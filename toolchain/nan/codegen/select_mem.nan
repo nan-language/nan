@@ -70,10 +70,91 @@ fn Selector.folded_add(mut self, func: clif::Function, x: clif::Value, y: clif::
     if not indexed {
         return None
     }
-    let base = mut self.src(operands.x, func)
-    let index = mut self.src(operands.y, func)
-    return Some(x64::Amode.Mem(base: base, index: Some(index), shift: 0, disp: offset))
+    return Some(mut self.indexed(func, x: operands.x, y: operands.y, disp: offset))
 } Selector.folded_add
+
+/// The memory operand of `x + y + disp` with base and index registers, a multiplication of one
+/// operand by 1, 2, 4 or 8 or its left shift by at most 3 folded into the index's scale when
+/// only this sum reads it.
+fn Selector.indexed(mut self, func: clif::Function, x: clif::Value, y: clif::Value, disp: i32) -> x64::Amode {
+    var base_value = x
+    var index_value = y
+    var shift: u8 = 0
+    match self.scaled(func, value: y) {
+        Some(scaled) => {
+            index_value = scaled.index
+            shift = scaled.shift
+        }
+        None => {
+            match self.scaled(func, value: x) {
+                Some(scaled) => {
+                    base_value = y
+                    index_value = scaled.index
+                    shift = scaled.shift
+                }
+                None => {}
+            }
+        }
+    }
+    let base = mut self.src(base_value, func)
+    let index = mut self.src(index_value, func)
+    return x64::Amode.Mem(base: base, index: Some(index), shift: shift, disp: disp)
+} Selector.indexed
+
+/// A pointer-sized value as an index and the shift scaling it, when only one instruction reads
+/// it and a multiplication by 1, 2, 4 or 8 or a left shift by at most 3 defines it.
+fn Selector.scaled(self, func: clif::Function, value: clif::Value) -> Option[Scaled] {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.defs.len() and at < self.use_counts.len()
+    let def = self.defs[at]
+    if def == NONE or self.use_counts[at] != 1 or func.value_type(resolved) != clif::POINTER {
+        return None
+    }
+    match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.Binary(opcode: clif::Opcode.Imul, x: x, y: y) => {
+            let operands = self.commuted(func, x, y)
+            let Some(imm) = self.imm(operands.y, func) else {
+                return None
+            }
+            let Some(shift) = power_of_two(imm) else {
+                return None
+            }
+            if shift > 3 {
+                return None
+            }
+            return Some(Scaled(index: operands.x, shift: shift))
+        }
+        clif::InstructionData.Binary(opcode: clif::Opcode.Ishl, x: x, y: y) => {
+            let Some(bits) = self.constant(y, func) else {
+                return None
+            }
+            if bits > 3 {
+                return None
+            }
+            return Some(Scaled(index: x, shift: u8.truncate(bits)))
+        }
+        else => return None
+    }
+} Selector.scaled
+
+/// An index and the shift scaling it.
+struct Scaled derives Copy, Eq {
+    index: clif::Value
+    shift: u8
+} Scaled
+
+/// The exponent of a power of two.
+fn power_of_two(value: i32) -> Option[u8] {
+    if value <= 0 {
+        return None
+    }
+    let bits = value.to_bits()
+    if (bits & (bits - 1)) != 0 {
+        return None
+    }
+    return Some(u8.truncate(bits.trailing_zeros()))
+} power_of_two
 
 /// A load, zero-extending a narrow integer; a 128-bit one in two halves.
 fn Selector.load(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value, offset: i32) {

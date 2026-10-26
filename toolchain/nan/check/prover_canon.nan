@@ -108,11 +108,13 @@ struct Canon {
 } Canon
 
 /// A canonical query: its relevant clauses in term order over its own store, each with the
-/// origin of the premise it comes from.
+/// origin of the premise it comes from and its encoding, and the keys of the store's terms.
 struct CanonQuery {
     terms: Terms
+    encodings: Encodings
     clauses: mem::List[mem::List[Literal]]
     origins: mem::List[Origin]
+    keys: mem::List[mem::Shared[mem::Bytes]]
     /// The obligation hash: the hash of the concatenated encodings of its clauses.
     hash: hashing::HashValue
 } CanonQuery
@@ -173,6 +175,12 @@ struct KeyedSummand {
     key: mem::Shared[mem::Bytes]
     summand: LinearTerm
 } KeyedSummand
+
+/// A clause in term order with its encoding.
+struct KeyedClause {
+    key: mem::Bytes
+    literals: mem::List[Literal]
+} KeyedClause
 
 /// A clause with its encoding and the origin of the premise it comes from.
 struct SortedClause {
@@ -1183,7 +1191,7 @@ fn Literal.linear_terms(self, alloc: mem::Alloc) -> mem::List[LinearTerm] {
 
 /// Canonicalises a query: premises in order, then the range premises of their terms, then the
 /// negated goal.
-fn Checker.canonical_query(self, mut terms: Terms, package_id: ty::PackageId, premises: Slice[Premise], goal: u32) -> CanonQuery {
+fn Checker.canonical_query(self, mut terms: Terms, mut keys: KeyCache, package_id: ty::PackageId, premises: Slice[Premise], goal: u32) -> CanonQuery {
     let alloc = self.alloc()
     var canon = Canon.new(self.share(), package_id)
     for premise in premises {
@@ -1217,38 +1225,41 @@ fn Checker.canonical_query(self, mut terms: Terms, package_id: ty::PackageId, pr
             mut moved.push(OriginClause(clause: mut transfer.clause(terms, clause: all[index].clause.view()), origin: all[index].origin))
         }
     }
-    let store = transfer.to
-    return self.sorted_query(take store, take moved)
+    let Transfer(to: store, map: copied) = transfer
+    let query = self.sorted_query(take store, encodings: keys.seeded(copied, alloc), take moved)
+    mut keys.keep(query.encodings, copied)
+    return query
 } Checker.canonical_query
 
 /// The query of clauses over their own store: the clauses in term order, each sorted, with
 /// the hash of their concatenated encodings.
-fn Checker.sorted_query(self, take store: Terms, take moved: mem::List[OriginClause]) -> CanonQuery {
+fn Checker.sorted_query(self, take store: Terms, take encodings: Encodings, take moved: mem::List[OriginClause]) -> CanonQuery {
     let alloc = self.alloc()
-    var encodings = Encodings.empty(alloc)
     var sorted = mem::List[SortedClause].empty(alloc)
     for entry in take moved {
         let OriginClause(clause: clause, origin: origin) = entry
-        let ordered = self.sorted_clause(store, mut encodings, take clause)
-        let key = mut encodings.clause(self, terms: store, clause: ordered.view())
+        let KeyedClause(key: key, literals: ordered) = self.sorted_clause(store, mut encodings, take clause)
         mut sorted.push(SortedClause(key: take key, clause: take ordered, origin: origin))
     }
     mut sorted.sort_by(fn(left: SortedClause, right: SortedClause) => left.key.view().cmp(right.key.view()))
     var concatenated = mem::Bytes.empty(alloc)
     var clauses = mem::List[mem::List[Literal]].empty(alloc)
     var origins = mem::List[Origin].empty(alloc)
+    var keys = mem::List[mem::Shared[mem::Bytes]].empty(alloc)
     for entry in take sorted {
         let SortedClause(key: key, clause: clause, origin: origin) = entry
         mut concatenated.append(key.view())
         mut clauses.push(take clause)
         mut origins.push(origin)
+        mut keys.push(mem::Shared.of(take key, alloc))
     }
-    return CanonQuery(terms: take store, clauses: take clauses, origins: take origins, hash: hashing::HashValue.of(concatenated.view()))
+    let hash = hashing::HashValue.of(concatenated.view())
+    return CanonQuery(terms: take store, encodings: take encodings, clauses: take clauses, origins: take origins, keys: take keys, hash: hash)
 } Checker.sorted_query
 
-/// A clause in term order: the terms of each atom, then its literals, an equality whose first
-/// coefficient is negative negated.
-fn Checker.sorted_clause(self, terms: Terms, mut encodings: Encodings, take clause: mem::List[Literal]) -> mem::List[Literal] {
+/// A clause in term order, with its encoding: the terms of each atom, then its literals, an
+/// equality whose first coefficient is negative negated.
+fn Checker.sorted_clause(self, terms: Terms, mut encodings: Encodings, take clause: mem::List[Literal]) -> KeyedClause {
     let alloc = self.alloc()
     var keyed = mem::List[KeyedLiteral].empty(alloc)
     for literal in take clause {
@@ -1257,12 +1268,15 @@ fn Checker.sorted_clause(self, terms: Terms, mut encodings: Encodings, take clau
         mut keyed.push(KeyedLiteral(key: take key, literal: take ordered))
     }
     mut keyed.sort_by(fn(left: KeyedLiteral, right: KeyedLiteral) => left.key.view().cmp(right.key.view()))
+    var key = mem::Bytes.empty(alloc)
+    encoding::uvar(mut key, value: u64.widen(keyed.len()))
     var sorted = mem::List[Literal].empty(alloc)
     for entry in take keyed {
-        let KeyedLiteral(key: _, literal: literal) = entry
+        let KeyedLiteral(key: literal_key, literal: literal) = entry
+        mut key.append(literal_key.view())
         mut sorted.push(take literal)
     }
-    return sorted
+    return KeyedClause(key: take key, literals: take sorted)
 } Checker.sorted_clause
 
 /// A literal with the terms of its sum in term order, an equality whose first coefficient is
@@ -1281,23 +1295,33 @@ fn Checker.ordered_literal(self, terms: Terms, mut encodings: Encodings, take li
 /// is then negative.
 fn Checker.ordered_sum(self, terms: Terms, mut encodings: Encodings, sum: Linear, equality: bool) -> Linear {
     let alloc = self.alloc()
-    var keyed = mem::List[KeyedSummand].empty(alloc)
-    for summand in sum.terms {
-        let key = mut encodings.term(self, terms, id: summand.term)
-        mut keyed.push(KeyedSummand(key: take key, summand: summand))
+    var order = mem::List[LinearTerm].empty(alloc)
+    if sum.terms.len() < 2 {
+        for summand in sum.terms {
+            mut order.push(summand)
+        }
+    } else {
+        var keyed = mem::List[KeyedSummand].empty(alloc)
+        for summand in sum.terms {
+            let key = mut encodings.term(self, terms, id: summand.term)
+            mut keyed.push(KeyedSummand(key: take key, summand: summand))
+        }
+        mut keyed.sort_by(fn(left: KeyedSummand, right: KeyedSummand) => left.key.contents().view().cmp(right.key.contents().view()))
+        for entry in keyed {
+            mut order.push(entry.summand)
+        }
     }
-    mut keyed.sort_by(fn(left: KeyedSummand, right: KeyedSummand) => left.key.contents().view().cmp(right.key.contents().view()))
     var flip = false
-    if equality and keyed.len() > 0 {
-        flip = keyed[0].summand.coefficient.is_negative()
+    if equality and order.len() > 0 {
+        flip = order[0].coefficient.is_negative()
     }
     var ordered = mem::List[LinearTerm].empty(alloc)
-    for entry in keyed {
-        var coefficient = entry.summand.coefficient
+    for summand in order {
+        var coefficient = summand.coefficient
         if flip {
             coefficient = coefficient.wrapping_neg()
         }
-        mut ordered.push(LinearTerm(coefficient: coefficient, term: entry.summand.term))
+        mut ordered.push(LinearTerm(coefficient: coefficient, term: summand.term))
     }
     var constant = sum.constant
     if flip {
@@ -1313,73 +1337,92 @@ fn Terms.relevant(self, clauses: Slice[OriginClause]) -> mem::List[bool]
     ensures result.len() == clauses.len()
 {
     let alloc = self.alloc
-    var keys = mem::List[mem::List[u32]].empty(alloc)
-    var holding = mem::HashMap[u32, mem::List[usize]].empty(seed: 0, alloc)
+    let count = self.terms.len()
+    var marks = mem::List[usize].empty(alloc)
+    for _ in 0..<count {
+        mut marks.push(0)
+    }
+    var joined = mem::List[usize].empty(alloc)
+    for node in 0..<(count + clauses.len()) {
+        mut joined.push(node)
+    }
     var goal_keys = false
     for index in 0..<clauses.len() {
-        var seen = mem::Set[u32].empty(alloc)
+        var keyed = false
         for literal in clauses[index].clause {
             for term in literal.atom.terms(alloc) {
-                self.subterms(term, mut seen)
-            }
-        }
-        var listed = mem::List[u32].empty(alloc)
-        for key in seen {
-            mut listed.push(key)
-            if not holding.contains(key) {
-                discard mut holding.insert(key, value: mem::List[usize].empty(alloc))
-            }
-            var held = mut holding.at_mut(key)
-            mut held.push(index)
-        }
-        if clauses[index].origin == Origin.Goal and listed.len() > 0 {
-            goal_keys = true
-        }
-        mut keys.push(take listed)
-    }
-    var relevant = mem::List[bool].empty(alloc)
-    var pending = mem::List[usize].empty(alloc)
-    for index in 0..<clauses.len() {
-        let kept = clauses[index].origin == Origin.Goal or not goal_keys
-        mut relevant.push(kept)
-        if kept {
-            mut pending.push(index)
-        }
-    }
-    var reached = mem::Set[u32].empty(alloc)
-    loop {
-        let Some(index) = mut pending.pop() else {
-            break
-        }
-        expect index < keys.len()
-        for key in keys[index] {
-            if not mut reached.insert(key) {
-                continue
-            }
-            for other in holding.at(key) {
-                expect other < relevant.len()
-                if not relevant[other] {
-                    relevant[other] = true
-                    mut pending.push(other)
+                if self.join_subterms(term, clause_node: count + index, mark: index + 1, mut marks, mut joined) {
+                    keyed = true
                 }
             }
         }
+        if clauses[index].origin == Origin.Goal and keyed {
+            goal_keys = true
+        }
+    }
+    var relevant = mem::List[bool].empty(alloc)
+    if not goal_keys {
+        for _ in clauses {
+            mut relevant.push(true)
+        }
+        return relevant
+    }
+    var reached = mem::List[bool].empty(alloc)
+    for _ in joined {
+        mut reached.push(false)
+    }
+    for index in 0..<clauses.len() {
+        if clauses[index].origin == Origin.Goal {
+            let root = joined_root(mut joined, node: count + index)
+            expect root < reached.len()
+            reached[root] = true
+        }
+    }
+    for index in 0..<clauses.len() {
+        let root = joined_root(mut joined, node: count + index)
+        expect root < reached.len()
+        mut relevant.push(reached[root])
     }
     return relevant
 } Terms.relevant
 
-/// The symbols and applications within a term, itself included.
-fn Terms.subterms(self, term: u32, mut seen: mem::Set[u32]) {
+/// Joins a clause's node with the symbols and applications within a term, itself included,
+/// each marked as reached from the clause; whether the term is one.
+fn Terms.join_subterms(self, term: u32, clause_node: usize, mark: usize, mut marks: mem::List[usize], mut joined: mem::List[usize]) -> bool {
     if self.get(term).is_lit() {
-        return
+        return false
     }
-    if not mut seen.insert(term) {
-        return
+    let index = usize.widen(term)
+    expect index < marks.len()
+    if marks[index] == mark {
+        return true
     }
+    marks[index] = mark
+    let root = joined_root(mut joined, node: index)
+    let clause_root = joined_root(mut joined, node: clause_node)
+    expect root < joined.len()
+    joined[root] = clause_root
     for part in self.get(term).parts(self.alloc) {
-        self.subterms(term: part, mut seen)
+        discard self.join_subterms(term: part, clause_node, mark, mut marks, mut joined)
     }
-} Terms.subterms
+    return true
+} Terms.join_subterms
+
+/// The root of a node's set of joined nodes, each node on the way pointed at its grandparent.
+fn joined_root(mut joined: mem::List[usize], node: usize) -> usize {
+    var current = node
+    loop {
+        expect current < joined.len()
+        let parent = joined[current]
+        expect parent < joined.len()
+        if parent == current {
+            return current
+        }
+        let grandparent = joined[parent]
+        joined[current] = grandparent
+        current = grandparent
+    }
+} joined_root
 
 fn Transfer.clause(mut self, from: Terms, clause: Slice[Literal]) -> mem::List[Literal] {
     var moved = mem::List[Literal].empty(from.alloc)
@@ -1436,7 +1479,7 @@ fn Transfer.term(mut self, from: Terms, term: u32) -> u32 {
                 mut renumbered.push(mut self.term(from, term: part))
             }
             let rebuilt = from.get(term).replacing_parts(renumbered.view(), alloc)
-            moved = mut self.to.intern(take rebuilt, ty)
+            moved = mut self.to.intern_new(take rebuilt, ty)
         }
     }
     discard mut self.map.insert(term, value: moved)

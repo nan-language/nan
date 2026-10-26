@@ -1,0 +1,141 @@
+//! Parsing ahead: before a load parses a workspace's source files, or the std files the toolchain carries, one after another, the tasks of a crew parse those whose syntax the build cache does not hold and write it there, so that the load decodes it.
+
+/// The batches of source files posted to the worker tasks of a command, in order, and whether
+/// any worker task serves them.
+pkg struct Parsing {
+    batches: mem::Arena[mem::Shared[ParseBatch]]
+    served: bool
+} Parsing
+
+pkg fn Parsing.empty(served: bool, alloc: mem::Alloc) -> Parsing {
+    return Parsing(batches: mem::Arena[mem::Shared[ParseBatch]].empty(alloc), served: served)
+} Parsing.empty
+
+/// Runs the jobs of the batches posted from the one at `next`, drawing on `alloc`, and moves
+/// `next` past them.
+pkg fn Parsing.help(self, mut next: usize, alloc: mem::Alloc) {
+    while next < self.batches.len() {
+        self.batches.at(mem::Id[mem::Shared[ParseBatch]].of(u32.fit(next))).contents().help(alloc)
+        next += 1
+    }
+} Parsing.help
+
+/// Source files to parse into the build cache, by their paths relative to the workspace root, with
+/// the cache, the toolchain hash and the grammar parsing them, and how many of their jobs are
+/// taken and ended.
+struct ParseBatch {
+    root: text::String
+    cache: cache::Cache
+    toolchain: hashing::HashValue
+    grammar: mem::Shared[syntax::Grammar]
+    sources: mem::List[Source]
+    taken: core::atomic::AtomicU32
+    ended: core::atomic::AtomicU32
+} ParseBatch
+
+/// A source file's path, whether it is parsed as a std package's file, and the std file the
+/// toolchain carries that it is, if any; another is read from the workspace.
+struct Source {
+    path: text::String
+    std: bool
+    carried: Option[stdlib::StdFile]
+} Source
+
+/// Runs the batch's jobs not yet taken.
+fn ParseBatch.help(self, alloc: mem::Alloc) {
+    loop {
+        let Some(taken) = self.taken.fetch_add(1) else {
+            return
+        }
+        if usize.widen(taken) >= self.sources.len() {
+            return
+        }
+        let source = self.sources[usize.widen(taken)]
+        match attempt source_bytes(source, root: self.root.as_str(), alloc) {
+            Ok(bytes) => {
+                let key = syntax_key(self.toolchain, bytes: bytes.view(), std: source.std, alloc)
+                if not self.cache.holds(key) {
+                    let file = parsed_bytes(take bytes, std: source.std, grammar: self.grammar.contents(), alloc)
+                    discard attempt self.cache.put(key, contents: file.stored(alloc).view())
+                }
+            }
+            Err(_) => {}
+        }
+        discard self.ended.fetch_add(1)
+    }
+} ParseBatch.help
+
+/// Parses the source files of the packages found that the build cache does not hold, on the
+/// worker tasks of `parsing` beside this task, unless none serves it or the provider uses no
+/// cache.
+fn Syntaxes.ahead(self, found: Slice[Found], root: Str, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) fails platform::IoError {
+    if not parsing.served {
+        return
+    }
+    let Some(user) = self.cache else {
+        return
+    }
+    let Some(toolchain) = self.toolchain else {
+        return
+    }
+    var sources = mem::List[Source].empty(alloc)
+    for walked in found {
+        var manifest_path = text::String.of(walked.dir.as_str(), alloc)
+        mut manifest_path.append("/package.nan")
+        let parsed = self.parsed(try read_source(root, path: manifest_path.as_str(), alloc), std: false, grammar: grammar.contents(), alloc)
+        var ignored = mem::List[diagnostic::Diagnostic].empty(alloc)
+        let manifest = Manifest.read(parsed, path: manifest_path.as_str(), diagnostics: mut ignored, alloc)
+        if not language_supported(manifest) {
+            continue
+        }
+        let std = named_std(manifest)
+        for path in walked.sources {
+            mut sources.push(Source(path: text::String.of(path.as_str(), alloc), std: std, carried: None))
+        }
+    }
+    post(take sources, root, cache: user, toolchain, grammar, parsing, alloc)
+} Syntaxes.ahead
+
+/// Parses the std files the toolchain carries that the build cache does not hold, on the worker
+/// tasks of `parsing` beside this task, unless none serves it or the provider uses no cache.
+fn Syntaxes.ahead_carried(self, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) {
+    if not parsing.served {
+        return
+    }
+    let Some(user) = self.cache else {
+        return
+    }
+    let Some(toolchain) = self.toolchain else {
+        return
+    }
+    var sources = mem::List[Source].empty(alloc)
+    for file in stdlib::StdFile.all(alloc) {
+        let path = file.path()
+        mut sources.push(Source(path: text::String.of(path, alloc), std: not path.ends_with("/package.nan"), carried: Some(file)))
+    }
+    post(take sources, root: "std", cache: user, toolchain, grammar, parsing, alloc)
+} Syntaxes.ahead_carried
+
+/// Posts a batch parsing `sources` into the cache, helps run its jobs and waits for them to end.
+fn post(take sources: mem::List[Source], root: Str, cache: cache::Cache, toolchain: hashing::HashValue, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) {
+    let count = sources.len()
+    let batch = mem::Shared.of(ParseBatch(root: text::String.of(root, alloc), cache: cache.copied(alloc), toolchain: toolchain, grammar: grammar.share(), sources: take sources, taken: core::atomic::AtomicU32.of(0), ended: core::atomic::AtomicU32.of(0)), alloc)
+    discard parsing.batches.push(batch.share())
+    let posted = batch.contents()
+    posted.help(alloc)
+    while usize.widen(posted.ended.load()) < count {
+    }
+} post
+
+/// The bytes of a source file of a batch.
+fn source_bytes(source: Source, root: Str, alloc: mem::Alloc) -> mem::Bytes fails platform::IoError {
+    match source.carried {
+        Some(file) => return copied_bytes(file.text().as_bytes(), alloc)
+        None => return try read_source(root, path: source.path.as_str(), alloc)
+    }
+} source_bytes
+
+/// The bytes of a workspace file.
+fn read_source(root: Str, path: Str, alloc: mem::Alloc) -> mem::Bytes fails platform::IoError {
+    return try platform::read_file(platform::join(root, name: path, alloc).as_str(), alloc)
+} read_source

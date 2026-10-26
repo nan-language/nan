@@ -56,11 +56,15 @@ fn scopes_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
             supply.ret(mut lo, mut fx, held: Held.Scalar(cancelled))
         }
-        "task::Scope.spawn" => {
+        "task::Scope.spawn" or "task::Scope.spawn_sized" => {
             let child_ty = fn_param(lo, supply, index: 1)
             let scope_record = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
             let child = supply.param(1).address_value()
-            let handle = spawn_child(mut lo, mut fx, scope_record, child, child_ty, scope_fails: None)
+            var stack: Option[clif::Value] = None
+            if supply.path.as_str() == "task::Scope.spawn_sized" {
+                stack = Some(sized_stack(mut lo, mut fx, size: supply.param(2).scalar_value()))
+            }
+            let handle = spawn_child(mut lo, mut fx, scope_record, child, child_ty, scope_fails: None, stack)
             let Some(sret) = supply.sret else {
                 expect false
                 return
@@ -75,10 +79,10 @@ fn scopes_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } scopes_lower
 
-/// A call of `task::Scope.spawn` lowered where it is written: at a lexical spawn, the child's
-/// failure converts to the failure type of its scope's body closure.
+/// A call of `task::Scope.spawn` or `spawn_sized` lowered where it is written: at a lexical
+/// spawn, the child's failure converts to the failure type of its scope's body closure.
 fn spawn_at(mut body: Body, mut lo: Lowering, mut fx: Fx, operands: Slice[nir::Operand]) -> Held {
-    expect operands.len() == 2
+    expect operands.len() == 2 or operands.len() == 3
     let scope_fails = lexical_scope(body, lo, receiver: operands[0])
     let receiver = mut body.operand(mut lo, mut fx, operand: operands[0])
     let receiver_address = tasks_address_of(mut lo, mut fx, ty: receiver.nty.ty(), held: receiver.held)
@@ -90,25 +94,38 @@ fn spawn_at(mut body: Body, mut lo: Lowering, mut fx: Fx, operands: Slice[nir::O
     }
     let child_ty = ty::Subst.empty(lo.alloc).fn_ty(lo.ck.types(), fn_ty: lo.ck.types().fn_of(child_fn))
     let child_address = tasks_address_of(mut lo, mut fx, ty: child.nty.ty(), held: child.held)
-    let handle = spawn_child(mut lo, mut fx, scope_record, child: child_address, child_ty, scope_fails)
+    var stack: Option[clif::Value] = None
+    if operands.len() == 3 {
+        let size = mut body.operand(mut lo, mut fx, operand: operands[2])
+        let given = match size.nty {
+            nir::NTy.Owned(_) => size.held.scalar_value()
+            else => mut fx.load(PTR, addr: size.held.address_value(), offset: 0)
+        }
+        stack = Some(sized_stack(mut lo, mut fx, size: given))
+    }
+    let handle = spawn_child(mut lo, mut fx, scope_record, child: child_address, child_ty, scope_fails, stack)
     let slot = mut fx.slot(8, align: 8)
     mut fx.store(handle, addr: slot, offset: 0)
     return Held.Address(slot)
 } spawn_at
 
-/// Whether a call names `task::Scope.spawn`.
+/// Whether a call names `task::Scope.spawn` or `spawn_sized`.
 fn is_spawn(lo: Lowering, fn_ref: nir::FnRef) -> bool {
     let nir::Callable.Item(item: item, role: role, index: _) = fn_ref.callable else {
         return false
     }
-    return role == nir::Role.Body and lo.ck.db().is_std(item) and lo.ck.db().canonical(item).as_str() == "task::Scope.spawn"
+    if role != nir::Role.Body or not lo.ck.db().is_std(item) {
+        return false
+    }
+    let path = lo.ck.db().canonical(item)
+    return path.as_str() == "task::Scope.spawn" or path.as_str() == "task::Scope.spawn_sized"
 } is_spawn
 
 /// The value an operand names, as a value or a place without steps.
 fn operand_root(operand: nir::Operand) -> Option[nir::Value] {
     return match first operand {
         nir::Operand.Value(value) => Some(value)
-        nir::Operand.Place(mode: _, place: place) if place.steps.len() == 0 => Some(place.root)
+        nir::Operand.Place(mode: _, place: place) if place.contents().steps.len() == 0 => Some(place.contents().root)
         else => None
     }
 } operand_root
@@ -155,7 +172,7 @@ fn lexical_scope(body: Body, lo: Lowering, receiver: nir::Operand) -> Option[ty:
 fn capture_site(unit: nir::NirUnit, closure: u32, position: usize) -> Option[CaptureSite] {
     for function in 0..<unit.functions.len() {
         for block in unit.functions[function].blocks {
-            for inst in block.insts {
+            for inst in unit.functions[function].insts_of(block) {
                 let nir::Op.Closure(index: index, captures: captures) = inst.op else {
                     continue
                 }
@@ -181,7 +198,7 @@ fn scope_failure(body: Body, lo: Lowering, unit: nir::NirUnit, closure: u32) -> 
     for function in unit.functions {
         var created: Option[nir::Value] = None
         for block in function.blocks {
-            for inst in block.insts {
+            for inst in function.insts_of(block) {
                 let nir::Op.Closure(index: index, captures: _) = inst.op else {
                     continue
                 }
@@ -196,7 +213,7 @@ fn scope_failure(body: Body, lo: Lowering, unit: nir::NirUnit, closure: u32) -> 
         var holders = mem::List[nir::Value].empty(lo.alloc)
         mut holders.push(made)
         for block in function.blocks {
-            for inst in block.insts {
+            for inst in function.insts_of(block) {
                 let nir::Op.Init(place: place, operand: nir::Operand.Value(initial)) = inst.op else {
                     continue
                 }
@@ -206,7 +223,7 @@ fn scope_failure(body: Body, lo: Lowering, unit: nir::NirUnit, closure: u32) -> 
             }
         }
         for block in function.blocks {
-            for inst in block.insts {
+            for inst in function.insts_of(block) {
                 let nir::Op.Call(call) = inst.op else {
                     continue
                 }
@@ -241,7 +258,7 @@ fn is_scope_body_call(lo: Lowering, call: nir::Call, holders: Slice[nir::Value])
     }
     return match first argument {
         nir::Operand.Value(value) => holds_value(holders, value)
-        nir::Operand.Place(mode: _, place: place) => place.steps.len() == 0 and holds_value(holders, value: place.root)
+        nir::Operand.Place(mode: _, place: place) => place.contents().steps.len() == 0 and holds_value(holders, value: place.contents().root)
         else => false
     }
 } is_scope_body_call
@@ -567,7 +584,7 @@ fn scopes_entry_glue(mut lo: Lowering, fn_ty: ty::FnTy) -> object::FuncId {
 } scopes_entry_glue
 
 /// Spawns a scope's child running a `task fn` value: its join handle, which is its record.
-fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: clif::Value, child_ty: ty::FnTy, scope_fails: Option[ty::Ty]) -> clif::Value {
+fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: clif::Value, child_ty: ty::FnTy, scope_fails: Option[ty::Ty], stack: Option[clif::Value]) -> clif::Value {
     let cell = mut fx.load(PTR, addr: scope_record, offset: SCOPES_SCOPE_EXECUTOR)
     let domain = current_domain(mut lo, mut fx)
     let end = child_end(mut lo, child_ty, scope_fails)
@@ -581,7 +598,7 @@ fn spawn_child(mut lo: Lowering, mut fx: Fx, scope_record: clif::Value, child: c
     let more_refs = mut fx.b.iadd_imm_s(refs, y: 1)
     mut fx.store(more_refs, addr: scope_record, offset: SCOPES_SCOPE_REFS)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-    let record = start_task(mut lo, mut fx, fn_ty: child_ty, function: child, cell, domain, region_record: scope_record, owner: scope_record, stack: None, end: Some(end), done)
+    let record = start_task(mut lo, mut fx, fn_ty: child_ty, function: child, cell, domain, region_record: scope_record, owner: scope_record, stack, end: Some(end), done)
     spawned(mut lo, mut fx, record)
     return record
 } spawn_child

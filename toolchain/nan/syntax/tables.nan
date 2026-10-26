@@ -32,10 +32,57 @@ enum Tok {
     DotDot
 } Tok
 
-/// Builds the grammar's tables from the ebnf blocks, trapping when the grammar names a terminal,
+/// The grammar, its syntactic tables left to the first parse that needs them.
+pkg fn Grammar.load(alloc: mem::Alloc) -> Grammar {
+    return Grammar(lexicon: mem::Shared.of(Lexicon.load(alloc), alloc: alloc), syntactic: mem::OnceMap[u8, mem::Shared[Tables]].empty(seed: 0, alloc))
+} Grammar.load
+
+/// The grammar's syntactic tables, built at the first call.
+fn Grammar.tables(self, alloc: mem::Alloc) -> mem::Shared[Tables] {
+    match self.syntactic.get(0) {
+        Some(built) => return built.share()
+        None => {}
+    }
+    return self.syntactic.insert(0, value: mem::Shared.of(Tables.load(self.lexicon.share(), alloc), alloc: alloc)).share()
+} Grammar.tables
+
+/// Builds the lexer's tables, reading the ebnf blocks only up to the rules the rejected code
+/// points follow from.
+fn Lexicon.load(alloc: mem::Alloc) -> Lexicon {
+    var rules = mem::HashMap[text::String, mem::List[Seq]].empty(seed: 0, alloc)
+    var at: usize = 0
+    while not (resolved(rules, name: "REJECTED", alloc) and resolved(rules, name: "REJECTED_SPACE", alloc)) {
+        let toks = rule_tokens(EBNF, mut at, alloc)
+        expect toks.len() > 0
+        add_rule(mut rules, take toks, alloc)
+    }
+    return Lexicon(rejected: sorted_ranges(rules, name: "REJECTED", alloc), rejected_space: sorted_ranges(rules, name: "REJECTED_SPACE", alloc), punctuation: punctuation(alloc), keywords: keyword_table(alloc), context_words: context_table(alloc))
+} Lexicon.load
+
+/// Whether a lexical rule, and every rule it names, is among those read.
+fn resolved(rules: mem::HashMap[text::String, mem::List[Seq]], name: Str, alloc: mem::Alloc) -> bool {
+    let Some(seqs) = rules.get(text::String.of(name, alloc)) else {
+        return false
+    }
+    for seq in seqs {
+        for elem in seq.elems {
+            match elem.atom {
+                Notation.Name(inner) => {
+                    if not resolved(rules, name: inner.as_str(), alloc) {
+                        return false
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+    return true
+} resolved
+
+/// Builds the syntactic tables from the ebnf blocks, trapping when the grammar names a terminal,
 /// a rule or a rejection code the enums of the syntax layer lack, or the enums hold one the
 /// grammar does not.
-pkg fn Grammar.load(alloc: mem::Alloc) -> Grammar {
+fn Tables.load(take lexicon: mem::Shared[Lexicon], alloc: mem::Alloc) -> Tables {
     let rules = parse_grammar(EBNF, alloc)
     check_listed(spellings(rules, name: "HARD_KEYWORD", alloc), listed: keyword_spellings(alloc))
     check_listed(spellings(rules, name: "PUNCT", alloc), listed: punct_spellings(alloc))
@@ -52,11 +99,13 @@ pkg fn Grammar.load(alloc: mem::Alloc) -> Grammar {
     for name in reach.order {
         mut rule_choices.push(mut generator.choice(rules.at(name), alloc))
     }
-    var grammar = Grammar(rule_choices: take rule_choices, choices: take generator.choices, seqs: take generator.seqs, rejected: sorted_ranges(rules, name: "REJECTED", alloc), rejected_space: sorted_ranges(rules, name: "REJECTED_SPACE", alloc), analysis: Analysis.empty(alloc))
-    let analysis = Analysis.compute(grammar, alloc)
-    grammar.analysis = analysis
-    return grammar
-} Grammar.load
+    var tables = Tables(lexicon: take lexicon, rule_choices: take rule_choices, choices: take generator.choices, seqs: take generator.seqs, analysis: Analysis.empty(alloc), choosing: mem::Bytes.empty(alloc))
+    let analysis = Analysis.compute(tables, alloc)
+    tables.analysis = analysis
+    mut tables.plan_elems()
+    tables.choosing = choosing(tables, alloc)
+    return tables
+} Tables.load
 
 /// Traps unless an enum lists exactly the spellings a lexical rule or the reached rules list, in
 /// their order.
@@ -80,6 +129,51 @@ fn keyword_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
     return listed
 } keyword_spellings
 
+/// The hard keywords by the first byte of their spelling, below 128.
+fn keyword_table(alloc: mem::Alloc) -> mem::List[mem::List[Spelled[Keyword]]] {
+    var by_byte = mem::List[mem::List[Spelled[Keyword]]].empty(alloc)
+    add_bytes(mut by_byte, alloc)
+    for index in 0..<KEYWORDS {
+        let Some(keyword) = Keyword.from_index(index) else {
+            expect false
+            return by_byte
+        }
+        add_word(mut by_byte, spelling: keyword.spelling(), word: keyword, alloc)
+    }
+    return by_byte
+} keyword_table
+
+/// The context words by the first byte of their spelling, below 128.
+fn context_table(alloc: mem::Alloc) -> mem::List[mem::List[Spelled[ContextWord]]] {
+    var by_byte = mem::List[mem::List[Spelled[ContextWord]]].empty(alloc)
+    add_bytes(mut by_byte, alloc)
+    for index in 0..<CONTEXTS {
+        let Some(word) = ContextWord.from_index(index) else {
+            expect false
+            return by_byte
+        }
+        add_word(mut by_byte, spelling: word.spelling(), word, alloc)
+    }
+    return by_byte
+} context_table
+
+/// Adds an empty list of words for each byte below 128.
+fn add_bytes[T](mut by_byte: mem::List[mem::List[Spelled[T]]], alloc: mem::Alloc) {
+    for _ in 0..<128usize {
+        mut by_byte.push(mem::List[Spelled[T]].empty(alloc))
+    }
+} add_bytes
+
+/// Places a word among those its spelling's first byte starts.
+fn add_word[T](mut by_byte: mem::List[mem::List[Spelled[T]]], spelling: Str, take word: T, alloc: mem::Alloc) {
+    let bytes = spelling.as_bytes()
+    expect bytes.len() > 0 and usize.widen(bytes[0]) < by_byte.len()
+    var spelt = mem::Bytes.empty(alloc)
+    mut spelt.append(bytes)
+    var held = mut by_byte.at_mut(usize.widen(bytes[0]))
+    mut held.push(Spelled(spelling: take spelt, word: take word))
+} add_word
+
 fn punct_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
     var listed = mem::List[text::String].empty(alloc)
     for index in 0..<PUNCTS {
@@ -92,6 +186,44 @@ fn punct_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
     expect Punct.from_index(PUNCTS).is_none()
     return listed
 } punct_spellings
+
+/// The `Punct` and `Foreign` tokens by the first byte of their spelling, each byte's longest
+/// first.
+fn punctuation(alloc: mem::Alloc) -> mem::List[mem::List[PunctSpelling]] {
+    var by_byte = mem::List[mem::List[PunctSpelling]].empty(alloc)
+    for _ in 0..<128usize {
+        mut by_byte.push(mem::List[PunctSpelling].empty(alloc))
+    }
+    for index in 0..<PUNCTS {
+        let Some(punct) = Punct.from_index(index) else {
+            expect false
+            return by_byte
+        }
+        add_spelt(mut by_byte, kind: TokenKind.Punct(punct), spelling: punct.spelling(), alloc)
+    }
+    for index in 0..<FOREIGNS {
+        let Some(spelt) = Foreign.from_index(index) else {
+            expect false
+            return by_byte
+        }
+        add_spelt(mut by_byte, kind: TokenKind.Foreign(spelt), spelling: spelt.spelling(), alloc)
+    }
+    return by_byte
+} punctuation
+
+/// Places a token among those its spelling's first byte starts, after every longer or as long.
+fn add_spelt(mut by_byte: mem::List[mem::List[PunctSpelling]], kind: TokenKind, spelling: Str, alloc: mem::Alloc) {
+    let bytes = spelling.as_bytes()
+    expect bytes.len() > 0 and usize.widen(bytes[0]) < by_byte.len()
+    var spelt = mem::Bytes.empty(alloc)
+    mut spelt.append(bytes)
+    var held = mut by_byte.at_mut(usize.widen(bytes[0]))
+    var at: usize = 0
+    while at < held.len() and held[at].spelling.len() >= bytes.len() {
+        at += 1
+    }
+    mut held.insert(at, value: PunctSpelling(kind: kind, spelling: take spelt))
+} add_spelt
 
 fn foreign_spellings(alloc: mem::Alloc) -> mem::List[text::String] {
     var listed = mem::List[text::String].empty(alloc)
@@ -137,23 +269,32 @@ fn rule_ids(order: mem::List[text::String], alloc: mem::Alloc) -> mem::HashMap[t
 
 /// Parses every rule of the ebnf blocks, written in the grammar notation of the charter.
 fn parse_grammar(source: Str, alloc: mem::Alloc) -> mem::HashMap[text::String, mem::List[Seq]] {
-    var parser = EbnfParser(toks: tokenize(source, alloc), pos: 0)
     var rules = mem::HashMap[text::String, mem::List[Seq]].empty(seed: 0, alloc)
-    while parser.pos < parser.toks.len() {
-        let Tok.Name(defined) = parser.toks[parser.pos] else {
-            expect false
+    var at: usize = 0
+    loop {
+        let toks = rule_tokens(source, mut at, alloc)
+        if toks.len() == 0 {
             return rules
         }
-        let name = text::String.of(defined.as_str(), alloc)
-        parser.pos += 1
-        mut parser.expect_sym('=')
-        let body = mut parser.choice(alloc)
-        mut parser.expect_sym(';')
-        let previous = mut rules.insert(take name, value: take body)
-        expect previous.is_none()
+        add_rule(mut rules, take toks, alloc)
     }
-    return rules
 } parse_grammar
+
+/// Parses the tokens of one rule, `name = choice ;`, into the rules read.
+fn add_rule(mut rules: mem::HashMap[text::String, mem::List[Seq]], take toks: mem::List[Tok], alloc: mem::Alloc) {
+    var parser = EbnfParser(toks: take toks, pos: 1)
+    let Some(Tok.Name(defined)) = parser.toks.get(0) else {
+        expect false
+        return
+    }
+    let name = text::String.of(defined.as_str(), alloc)
+    mut parser.expect_sym('=')
+    let body = mut parser.choice(alloc)
+    mut parser.expect_sym(';')
+    expect parser.pos == parser.toks.len()
+    let previous = mut rules.insert(take name, value: take body)
+    expect previous.is_none()
+} add_rule
 
 /// Whether a character has the Unicode White_Space property.
 fn is_whitespace(c: char) -> bool {
@@ -175,48 +316,54 @@ fn is_word_char(c: char) -> bool {
     return c.is_ascii_alphabetic() or c.is_ascii_digit() or c == '_'
 } is_word_char
 
-fn tokenize(source: Str, alloc: mem::Alloc) -> mem::List[Tok] {
-    var chars = mem::List[char].empty(alloc)
-    for c in source {
-        mut chars.push(c)
-    }
+/// The tokens of the rule of grammar notation from byte `at` of `source` through its `;`, moving
+/// `at` past them; none when only white space is left.
+fn rule_tokens(source: Str, mut at: usize, alloc: mem::Alloc) -> mem::List[Tok] {
+    let bytes = source.as_bytes()
     var toks = mem::List[Tok].empty(alloc)
-    var i: usize = 0
-    while i < chars.len() {
-        let c = chars[i]
+    while at < bytes.len() {
+        let Some(c) = text::utf8::char_at(bytes, at) else {
+            expect false
+            return toks
+        }
+        let next = char_after(bytes, at, c)
         if is_whitespace(c) {
-            i += 1
-        } else if c == 'U' and i + 1 < chars.len() and chars[i + 1] == '+' {
-            i += 2
-            let from = i
-            while i < chars.len() and is_hex_digit(chars[i]) {
-                i += 1
+            at += c.utf8_len()
+        } else if c == 'U' and next == Some('+') {
+            at += 2
+            let from = at
+            skip_while(bytes, mut at, kept: fn(found: char) => is_hex_digit(found))
+            let Some(head) = bytes.prefix(at) else {
+                expect false
+                return toks
             }
-            let Some(value) = hex_value(collected(chars, from, to: i, alloc).as_bytes()) else {
+            let Some(parts) = head.split_at(from) else {
+                expect false
+                return toks
+            }
+            let Some(value) = hex_value(parts.tail) else {
                 expect false
                 return toks
             }
             mut toks.push(Tok.CodePoint(value))
         } else if c.is_ascii_alphabetic() or c == '_' {
-            let from = i
-            while i < chars.len() and is_word_char(chars[i]) {
-                i += 1
-            }
-            mut toks.push(Tok.Name(collected(chars, from, to: i, alloc)))
+            let from = at
+            skip_while(bytes, mut at, kept: fn(found: char) => is_word_char(found))
+            mut toks.push(Tok.Name(collected(source, from, to: at, alloc)))
         } else if c == '"' or c == '\'' {
-            i += 1
-            let word = take_until(chars, mut i, end: c, alloc)
+            at += 1
+            let word = take_until(source, mut at, end: c, alloc)
             if c == '"' {
                 mut toks.push(Tok.Quoted(take word))
             } else {
                 mut toks.push(Tok.Context(take word))
             }
-        } else if c == '{' and i + 1 < chars.len() and chars[i + 1] == '!' {
-            i += 2
-            mut toks.push(Tok.Rejection(take_until(chars, mut i, end: '}', alloc)))
-        } else if c == '.' and i + 1 < chars.len() and chars[i + 1] == '.' {
+        } else if c == '{' and next == Some('!') {
+            at += 2
+            mut toks.push(Tok.Rejection(take_until(source, mut at, end: '}', alloc)))
+        } else if c == '.' and next == Some('.') {
             mut toks.push(Tok.DotDot)
-            i += 2
+            at += 2
         } else {
             let symbol = match c {
                 '=' or ';' or '|' or '?' or '*' or '+' or '-' or '(' or ')' => true
@@ -224,31 +371,51 @@ fn tokenize(source: Str, alloc: mem::Alloc) -> mem::List[Tok] {
             }
             expect symbol
             mut toks.push(Tok.Sym(c))
-            i += 1
+            at += 1
+            if c == ';' {
+                return toks
+            }
         }
     }
     return toks
-} tokenize
+} rule_tokens
 
-/// The characters from `from` to before `to`.
-fn collected(chars: mem::List[char], from: usize, to: usize, alloc: mem::Alloc) -> text::String {
-    expect to <= chars.len()
-    var run = text::String.empty(alloc)
-    for index in from..<to {
-        mut run.push(chars[index])
+/// The character after `c`, which starts at byte `at`, if any.
+fn char_after(bytes: Slice[u8], at: usize, c: char) -> Option[char] {
+    expect at <= ~0usize - c.utf8_len()
+    return text::utf8::char_at(bytes, at: at + c.utf8_len())
+} char_after
+
+/// Moves `at` past the characters that `kept` holds for.
+fn skip_while(bytes: Slice[u8], mut at: usize, kept: fn(found: char) -> bool) {
+    loop {
+        let Some(c) = text::utf8::char_at(bytes, at) else {
+            return
+        }
+        if not kept(c) {
+            return
+        }
+        expect at <= ~0usize - c.utf8_len()
+        at += c.utf8_len()
     }
-    return run
+} skip_while
+
+/// The text of the bytes from `from` to before `to`.
+fn collected(source: Str, from: usize, to: usize, alloc: mem::Alloc) -> text::String {
+    let Some(run) = source.slice_bytes(from, end: to) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return text::String.of(run, alloc)
 } collected
 
-/// The characters from `i` to before the next `end`, leaving `i` after that `end`.
-fn take_until(chars: mem::List[char], mut i: usize, end: char, alloc: mem::Alloc) -> text::String {
-    let from = i
-    while i < chars.len() and chars[i] != end {
-        i += 1
-    }
-    expect i < chars.len()
-    let run = collected(chars, from, to: i, alloc)
-    i += 1
+/// The text from byte `at` to before the next `end`, leaving `at` after that `end`.
+fn take_until(source: Str, mut at: usize, end: char, alloc: mem::Alloc) -> text::String {
+    let from = at
+    skip_while(source.as_bytes(), mut at, kept: fn(found: char) => found != end)
+    expect at < source.byte_len()
+    let run = collected(source, from, to: at, alloc)
+    at += end.utf8_len()
     return run
 } take_until
 
@@ -476,8 +643,48 @@ fn Generator.elem(mut self, elem: Elem, alloc: mem::Alloc) -> ElemDef {
         Notation.Group(alts) => Atom.Group(mut self.choice(alts, alloc))
         Notation.CodePoints(low: _, high: _) => code_points_term()
     }
-    return ElemDef(atom: atom, repeat: elem.repeat)
+    return ElemDef(atom: atom, repeat: elem.repeat, choice: 0, starts: First.default(), opens: TermSet.default())
 } Generator.elem
+
+/// The alternatives each choice of a grammar offers a lookahead, as `Tables.choosing` holds them.
+fn choosing(grammar: Tables, alloc: mem::Alloc) -> mem::Bytes {
+    var table = mem::Bytes.zeroed(2 * CHOOSING_ROW * grammar.choices.len(), alloc)
+    for choice in 0..<grammar.choices.len() {
+        let row = choice * CHOOSING_ROW
+        for alt in grammar.choices[choice] {
+            expect alt < usize.widen(~0u16)
+            let reached = grammar.analysis.seq(alt)
+            let entry = u16.fit(alt) + 1
+            reached.ok.mark_first(mut table.view_mut(), offset: row, entry)
+            reached.rejected.mark_first(mut table.view_mut(), offset: row + TERMS, entry)
+            let nullable_at = 2 * (row + 2 * TERMS)
+            if reached.nullable and nullable_at + 2 <= table.len() and table.view().u16_le(nullable_at) == 0 {
+                mut table.view_mut().write_u16_le(nullable_at, value: entry)
+            }
+        }
+    }
+    return table
+} choosing
+
+/// Records in each element the choice its atom expands and what can start it.
+fn Tables.plan_elems(mut self) {
+    for seq in 0..<self.seqs.len() {
+        for at in 0..<self.seqs[seq].elems.len() {
+            let elem = self.seqs[seq].elems[at]
+            let choice = match elem.atom {
+                Atom.Rule(rule) => rule.choice(self)
+                Atom.Group(group) => group
+                Atom.Term(_) => 0
+            }
+            let reached = self.analysis.atom(elem.atom, grammar: self)
+            self.seqs[seq].elems[at].choice = choice
+            var opens = reached.ok
+            mut opens.union(reached.rejected)
+            self.seqs[seq].elems[at].starts = reached
+            self.seqs[seq].elems[at].opens = opens
+        }
+    }
+} Tables.plan_elems
 
 /// The atom a name stands for: a reached rule, or a token class.
 fn Generator.named(self, name: text::String) -> Atom {

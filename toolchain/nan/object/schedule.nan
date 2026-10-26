@@ -1,0 +1,124 @@
+//! The order defined functions compile in: each waits for the colocated functions it calls to be defined, so that its calls can take their bodies in place, while what waits stays within a bound.
+
+/// The most values the functions waiting to compile number together.
+const WAITING_VALUES: usize = 2_000_000
+
+/// A defined function waiting to compile, and how many of its calls name a function not yet
+/// defined.
+struct Waiting {
+    id: FuncId
+    func: clif::Function
+    missing: u32
+} Waiting
+
+/// The functions waiting to compile, by index; the indices of the functions that waited, in
+/// the order they were defined from `start` on, some compiled since; for each function not yet
+/// defined, the waiting functions calling it, once per call; and the values the waiting
+/// functions number.
+struct Schedule {
+    waiting: mem::HashMap[u32, Waiting]
+    defined: mem::List[u32]
+    start: usize
+    waiters: mem::HashMap[u32, mem::List[u32]]
+    values: usize
+    alloc: mem::Alloc
+} Schedule
+
+fn Schedule.empty(alloc: mem::Alloc) -> Schedule {
+    return Schedule(waiting: mem::HashMap[u32, Waiting].empty(seed: 0, alloc), defined: mem::List[u32].empty(alloc), start: 0, waiters: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), values: 0, alloc: alloc)
+} Schedule.empty
+
+fn Schedule.is_empty(self) -> bool {
+    return self.waiting.len() == 0
+} Schedule.is_empty
+
+/// The index of the function each call of a function names when that function is colocated and
+/// not yet defined.
+fn undefined_callees(func: clif::Function, functions: Slice[FunctionDeclaration], alloc: mem::Alloc) -> mem::List[u32] {
+    var callees = mem::List[u32].empty(alloc)
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            let clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) = func.inst_data(inst) else {
+                continue
+            }
+            let name = func.ext_func(func_ref).name
+            let at = usize.widen(name.index)
+            if name.namespace == 0 and at < functions.len() and functions[at].linkage != Linkage.Import and not functions[at].defined {
+                mut callees.push(name.index)
+            }
+        }
+    }
+    return callees
+} undefined_callees
+
+/// Makes a defined function wait for the functions its calls name, by index, once per call.
+fn Schedule.hold(mut self, id: FuncId, take func: clif::Function, callees: Slice[u32]) {
+    for callee in callees {
+        if not self.waiters.contains(callee) {
+            discard mut self.waiters.insert(callee, value: mem::List[u32].empty(self.alloc))
+        }
+        var callers = mut self.waiters.at_mut(callee)
+        mut callers.push(id.index)
+    }
+    self.values += usize.widen(func.value_count())
+    mut self.defined.push(id.index)
+    discard mut self.waiting.insert(id.index, value: Waiting(id: id, func: take func, missing: u32.fit(callees.len())))
+} Schedule.hold
+
+/// Takes a waiting function out of the schedule.
+fn Schedule.withdraw(mut self, index: u32) -> Option[Waiting] {
+    let removed = mut self.waiting.remove(index)
+    let Some(waiting) = removed else {
+        return None
+    }
+    expect self.values >= usize.widen(waiting.func.value_count())
+    self.values -= usize.widen(waiting.func.value_count())
+    return Some(take waiting)
+} Schedule.withdraw
+
+/// The functions that waited for a function now defined and wait for nothing else, in the order
+/// they wait for it.
+fn Schedule.released(mut self, id: FuncId) -> mem::List[Waiting] {
+    var ready = mem::List[Waiting].empty(self.alloc)
+    let removed = mut self.waiters.remove(id.index)
+    let Some(callers) = removed else {
+        return ready
+    }
+    for caller in callers {
+        if not self.waiting.contains(caller) {
+            continue
+        }
+        var held = mut self.waiting.at_mut(caller)
+        expect held.missing > 0
+        held.missing -= 1
+        if held.missing == 0 {
+            let Some(waiting) = mut self.withdraw(caller) else {
+                expect false
+                continue
+            }
+            mut ready.push(take waiting)
+        }
+    }
+    return ready
+} Schedule.released
+
+/// The function waiting longest, when the waiting functions number more values than the bound.
+fn Schedule.overflow(mut self) -> Option[Waiting] {
+    if self.values <= WAITING_VALUES {
+        return None
+    }
+    return mut self.oldest()
+} Schedule.overflow
+
+/// The function waiting longest, if any.
+fn Schedule.oldest(mut self) -> Option[Waiting] {
+    while self.start < self.defined.len() {
+        let index = self.defined[self.start]
+        self.start += 1
+        let Some(waiting) = mut self.withdraw(index) else {
+            continue
+        }
+        return Some(take waiting)
+    }
+    return None
+} Schedule.oldest

@@ -71,6 +71,12 @@ fn Checker.seen_from(self, viewer: ty::ModuleId, line: ty::ItemId) -> bool {
 /// clause followed by its status, the impl lines naming it that consumers or that code see
 /// and, for a struct or enum, its properties.
 fn Checker.api_lines(self, item: ty::ItemId, docs: bool, viewer: Option[ty::ModuleId]) -> mem::List[text::String] {
+    return self.api_lines_with(item, docs, viewer, interface_lines: self.interface_text(item, viewer))
+} Checker.api_lines
+
+/// The lines of an item's `api` record before its digest, as `api_lines` gives them, from its
+/// interface text.
+fn Checker.api_lines_with(self, item: ty::ItemId, docs: bool, viewer: Option[ty::ModuleId], take interface_lines: mem::List[text::String]) -> mem::List[text::String] {
     let alloc = self.alloc()
     let db = self.db()
     let data = db.item(item)
@@ -84,7 +90,7 @@ fn Checker.api_lines(self, item: ty::ItemId, docs: bool, viewer: Option[ty::Modu
         }
     }
     let statuses = self.ensures_statuses(item)
-    for line in take statused(self.interface_text(item, viewer), statuses: statuses.view()) {
+    for line in take statused(take interface_lines, statuses: statuses.view()) {
         mut lines.push(take line)
     }
     for other in self.naming_impls(item, viewer) {
@@ -97,50 +103,77 @@ fn Checker.api_lines(self, item: ty::ItemId, docs: bool, viewer: Option[ty::Modu
         else => {}
     }
     return lines
-} Checker.api_lines
+} Checker.api_lines_with
 
 /// The impl lines naming an item as their impl target or interface that consumers, or code
 /// in the module `viewer`, see, by file path and line.
 fn Checker.naming_impls(self, item: ty::ItemId, viewer: Option[ty::ModuleId]) -> mem::List[ty::ItemId] {
-    let db = self.db()
     var impls = mem::List[ty::ItemId].empty(self.alloc())
-    for index in 0..<db.items.len() {
-        let other = ty::ItemId(index: u32.fit(index))
-        match db.ast(other).kind {
-            ast::ItemKind.Impl(_) => {}
-            else => continue
+    let index = self.naming_index()
+    let Some(naming) = index.contents().get(item) else {
+        return impls
+    }
+    for line in naming {
+        let seen = match viewer {
+            Some(module) => self.seen_from(module, line)
+            None => self.consumers_see(line)
         }
-        var seen = false
-        match viewer {
-            Some(module) => {
-                seen = self.seen_from(module, line: other)
-            }
-            None => {
-                seen = self.consumers_see(other)
-            }
-        }
-        if seen and self.impl_names(other, item) {
-            mut impls.push(other)
+        if seen {
+            mut impls.push(line)
         }
     }
     mut impls.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => self.impl_order(left, right))
     return impls
 } Checker.naming_impls
 
-/// Whether an impl line names an item as its impl target or its interface.
-fn Checker.impl_names(self, line: ty::ItemId, item: ty::ItemId) -> bool {
-    let sig = self.sig(line)
-    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
-        return false
+/// The impl lines, in item order, by each item they name as their impl target or interface.
+fn Checker.naming_index(self) -> mem::Shared[mem::HashMap[ty::ItemId, mem::List[ty::ItemId]]] {
+    let state = self.state.contents()
+    match state.naming.get(0) {
+        Some(known) => return known.share()
+        None => {}
     }
-    if target == Some(TypeKey.Item(item)) {
-        return true
+    let db = self.db()
+    let alloc = self.alloc()
+    var index = mem::HashMap[ty::ItemId, mem::List[ty::ItemId]].empty(seed: 0, alloc)
+    for position in 0..<db.items.len() {
+        let line = ty::ItemId(index: u32.fit(position))
+        match db.ast(line).kind {
+            ast::ItemKind.Impl(_) => {}
+            else => continue
+        }
+        let sig = self.sig(line)
+        let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+            continue
+        }
+        var target_item: Option[ty::ItemId] = None
+        match target {
+            Some(TypeKey.Item(owner)) => {
+                target_item = Some(owner)
+                add_naming(mut index, item: owner, line, alloc)
+            }
+            else => {}
+        }
+        match bound {
+            Some(interface_bound) => if target_item != Some(interface_bound.item) {
+                add_naming(mut index, item: interface_bound.item, line, alloc)
+            }
+            None => {}
+        }
     }
-    let Some(interface_bound) = bound else {
-        return false
+    return state.naming.insert(0, value: mem::Shared.of(take index, alloc)).share()
+} Checker.naming_index
+
+/// Adds an impl line to those naming an item.
+fn add_naming(mut index: mem::HashMap[ty::ItemId, mem::List[ty::ItemId]], item: ty::ItemId, line: ty::ItemId, alloc: mem::Alloc) {
+    if index.contains(item) {
+        mut index.at_mut(item).push(line)
+        return
     }
-    return interface_bound.item == item
-} Checker.impl_names
+    var naming = mem::List[ty::ItemId].empty(alloc)
+    mut naming.push(line)
+    discard mut index.insert(item, value: take naming)
+} add_naming
 
 /// The order of impl lines: by file path, then by line.
 fn Checker.impl_order(self, left: ty::ItemId, right: ty::ItemId) -> core::Ordering {

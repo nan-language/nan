@@ -73,7 +73,7 @@ The table names every pub std type, interface, free function and registry with t
 | `text` | `text::Symbol`, `text::Interner` | [Interning](13-text-encode.md#interning) |
 | `text` | `text::Writer`, `text::fmt` | [Writers](13-text-encode.md#writers), [Templates](13-text-encode.md#templates) |
 | `text` | `text::json::Codec` | [JSON](13-text-encode.md#json) |
-| `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` in [Joins](16-concurrency.md#joins) |
+| `task` | `task::scope`, `task::Scope` | [Task scopes](16-concurrency.md#task-scopes); `spawn` and `spawn_sized` in [Joins](16-concurrency.md#joins) |
 | `task` | `task::Join` | [Joins](16-concurrency.md#joins) |
 | `task` | `task::within`, `task::race` | [Deadlines and races](16-concurrency.md#deadlines-and-races) |
 | `task` | `task::Cown`, `task::Poisoned` | [Cowns](16-concurrency.md#cowns), [Poisoned cowns](16-concurrency.md#poisoned-cowns) |

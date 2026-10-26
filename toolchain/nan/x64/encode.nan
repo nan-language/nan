@@ -7,21 +7,31 @@ pkg struct Assembler {
     labels: mem::List[u32]
     fixups: mem::List[Fixup]
     pkg relocs: mem::List[Reloc]
+    alloc: mem::Alloc
 } Assembler
 
 /// A displacement to a label at `at`, of one byte when `short` and four otherwise: the label's
-/// offset plus `disp`, relative to `end`.
+/// offset plus `disp`, relative to `end`; for the four-byte displacement of a `jmp` or `jcc`,
+/// `branch` is the instruction's length, 0 for any other.
 struct Fixup derives Copy, Eq {
     at: u32
     label: u32
     end: u32
     disp: i32
     short: bool
+    branch: u32
 } Fixup
+
+/// A branch shortened to its two-byte form: its offset before shortening and the bytes that
+/// shortening it and those before it removed.
+pkg struct Cut derives Copy, Eq {
+    at: u32
+    removed: u32
+} Cut
 
 const UNBOUND: u32 = 0xFFFF_FFFF
 
-pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc), relocs: mem::List[Reloc].empty(alloc))
+pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc), relocs: mem::List[Reloc].empty(alloc), alloc: alloc)
 
 pkg fn Assembler.offset(self) -> u32 {
     return u32.fit(self.code.len())
@@ -39,18 +49,122 @@ pkg fn Assembler.bind(mut self, label: u32) {
     self.labels[usize.widen(label)] = at
 } Assembler.bind
 
-/// Encoded code: its bytes and the relocations they need.
+/// Encoded code: its bytes, the relocations they need, and the branches shortened, by offset.
 pkg struct Encoded {
     pkg bytes: mem::Bytes
     pkg relocs: mem::List[Reloc]
+    pkg cuts: mem::List[Cut]
 } Encoded
 
-/// The code, each displacement written to its label once every label it names is bound.
+/// Where code at an offset of the encoding before its branches were shortened lies.
+pkg fn Encoded.moved(self, offset: u32) -> u32 {
+    var low: usize = 0
+    var high = self.cuts.len()
+    while low < high {
+        let middle = low + ((high - low) / 2)
+        if self.cuts[middle].at < offset {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    if low == 0 {
+        return offset
+    }
+    let removed = self.cuts[low - 1].removed
+    expect removed <= offset
+    return offset - removed
+} Encoded.moved
+
+/// The code with each `jmp` and `jcc` whose displacement fits a byte shortened, each
+/// displacement written to its label once every label it names is bound.
 pkg fn Assembler.finish(take self) -> Encoded {
+    let cuts = mut self.shorten()
     mut self.patch()
-    let Assembler(code: code, labels: _, fixups: _, relocs: relocs) = self
-    return Encoded(bytes: take code, relocs: take relocs)
+    let Assembler(code: code, labels: _, fixups: _, relocs: relocs, alloc: _) = self
+    return Encoded(bytes: take code, relocs: take relocs, cuts: take cuts)
 } Assembler.finish
+
+/// Shortens each branch whose displacement fits a byte before any is shortened, which only brings
+/// a branch and its target closer, moving the labels, displacements and relocations after it.
+fn Assembler.shorten(mut self) -> mem::List[Cut] {
+    var cuts = mem::List[Cut].empty(self.alloc)
+    var shortened = mem::List[bool].empty(self.alloc)
+    var removed: u32 = 0
+    for fixup in self.fixups {
+        var fits = false
+        if fixup.branch != 0 {
+            expect usize.widen(fixup.label) < self.labels.len()
+            let target = self.labels[usize.widen(fixup.label)]
+            expect target != UNBOUND
+            let value = i64.widen(target) - i64.widen(fixup.end)
+            fits = value >= -128 and value <= 127
+        }
+        if fits {
+            removed += fixup.branch - 2
+            mut cuts.push(Cut(at: fixup.end - fixup.branch, removed: removed))
+        }
+        mut shortened.push(fits)
+    }
+    if cuts.len() == 0 {
+        return cuts
+    }
+    let shortened_code = Encoded(bytes: mem::Bytes.empty(self.alloc), relocs: mem::List[Reloc].empty(self.alloc), cuts: take cuts)
+    var code = mem::Bytes.empty(self.alloc)
+    var copied: usize = 0
+    for cut in shortened_code.cuts {
+        let start = usize.widen(cut.at)
+        expect copied <= start and start + 1 < self.code.len()
+        mut code.append(self.code_between(copied, end: start))
+        if self.code[start] == 0xE9 {
+            mut code.push(0xEB)
+            copied = start + 5
+        } else {
+            expect self.code[start] == 0x0F and self.code[start + 1] >= 0x80 and self.code[start + 1] < 0x90
+            mut code.push(self.code[start + 1] - 0x10)
+            copied = start + 6
+        }
+        mut code.push(0)
+    }
+    mut code.append(self.code_between(copied, end: self.code.len()))
+    var fixups = mem::List[Fixup].empty(self.alloc)
+    expect shortened.len() == self.fixups.len()
+    for index in 0..<self.fixups.len() {
+        let fixup = self.fixups[index]
+        if shortened[index] {
+            let at = shortened_code.moved(fixup.end - fixup.branch) + 1
+            mut fixups.push(Fixup(at: at, label: fixup.label, end: at + 1, disp: 0, short: true, branch: 0))
+        } else {
+            let at = shortened_code.moved(fixup.at)
+            mut fixups.push(Fixup(at: at, label: fixup.label, end: shortened_code.moved(fixup.end), disp: fixup.disp, short: fixup.short, branch: 0))
+        }
+    }
+    for label in mut self.labels {
+        if label != UNBOUND {
+            label = shortened_code.moved(label)
+        }
+    }
+    for reloc in mut self.relocs {
+        reloc.offset = shortened_code.moved(reloc.offset)
+    }
+    self.code = code
+    self.fixups = fixups
+    let Encoded(bytes: _, relocs: _, cuts: kept) = shortened_code
+    return kept
+} Assembler.shorten
+
+/// The bytes `start ..< end` of the code.
+proj fn Assembler.code_between(self, start: usize, end: usize) -> Slice[u8] {
+    let Some(parts) = self.code.view().split_at(start) else {
+        expect false
+        return self.code.view()
+    }
+    let Some(within) = parts.tail.prefix(end - start) else {
+        expect false
+        return parts.tail
+    }
+    return within
+} Assembler.code_between
 
 fn Assembler.patch(mut self) {
     for fixup in self.fixups {
@@ -93,13 +207,20 @@ fn Assembler.put64(mut self, value: u64) {
 /// after it.
 fn Assembler.label32(mut self, label: u32, disp: i32, trailing: u32) {
     let at = self.offset()
-    mut self.fixups.push(Fixup(at: at, label: label, end: at + 4 + trailing, disp: disp, short: false))
+    mut self.fixups.push(Fixup(at: at, label: label, end: at + 4 + trailing, disp: disp, short: false, branch: 0))
     mut self.put32(0)
 } Assembler.label32
 
+/// The four-byte displacement of a `jmp` or `jcc` of `len` bytes to a label.
+fn Assembler.branch32(mut self, label: u32, len: u32) {
+    let at = self.offset()
+    mut self.fixups.push(Fixup(at: at, label: label, end: at + 4, disp: 0, short: false, branch: len))
+    mut self.put32(0)
+} Assembler.branch32
+
 fn Assembler.label8(mut self, label: u32) {
     let at = self.offset()
-    mut self.fixups.push(Fixup(at: at, label: label, end: at + 1, disp: 0, short: true))
+    mut self.fixups.push(Fixup(at: at, label: label, end: at + 1, disp: 0, short: true, branch: 0))
     mut self.put8(0)
 } Assembler.label8
 
@@ -263,6 +384,7 @@ pkg fn Assembler.emit(mut self, inst: Inst) {
         Inst.Call(target: target, args: _, results: _, clobbers: _) => mut self.call(target)
         Inst.Jmp(label: label) => mut self.jmp(label)
         Inst.Jcc(cond: cond, label: label) => mut self.jcc(cond, label)
+        Inst.JumpTable(index: index, base: base, temp: temp, table: table) => mut self.jump_table(index, base, temp, table)
         Inst.Ret(results: _) => mut self.put8(0xC3)
         Inst.Push(reg: reg) => mut self.push_pop(0x50, reg: reg)
         Inst.Pop(reg: reg) => mut self.push_pop(0x58, reg: reg)
@@ -500,14 +622,36 @@ fn Assembler.jmp_short(mut self, label: u32) {
 
 fn Assembler.jmp(mut self, label: u32) {
     mut self.put8(0xE9)
-    mut self.label32(label, disp: 0, trailing: 0)
+    mut self.branch32(label, len: 5)
 } Assembler.jmp
 
 fn Assembler.jcc(mut self, cond: Cond, label: u32) {
     mut self.put8(0x0F)
     mut self.put8(0x80 + cond.code())
-    mut self.label32(label, disp: 0, trailing: 0)
+    mut self.branch32(label, len: 6)
 } Assembler.jcc
+
+/// `lea base, [rip + table]`, `movsxd temp, [base + 4 * index]`, `add base, temp`, `jmp base`.
+fn Assembler.jump_table(mut self, index: Reg, base: Reg, temp: Reg, table: u32) {
+    mut self.reg_mem(true, opcode: 0x8D, len: 1, reg: base.hw(), mem: Amode.Rip(target: RipTarget.Label(table), disp: 0), trailing: 0, force: false)
+    mut self.reg_mem(true, opcode: 0x63, len: 1, reg: temp.hw(), mem: Amode.Mem(base: base, index: Some(index), shift: 2, disp: 0), trailing: 0, force: false)
+    mut self.op_rr(0x00, size: Size.Qword, rm: base.hw(), reg: temp.hw())
+    mut self.reg_reg(false, opcode: 0xFF, len: 1, reg: 4, rm: base.hw(), force: false)
+} Assembler.jump_table
+
+/// An entry of a jump table starting at offset `start`: the offset of a label from that start.
+pkg fn Assembler.table_entry(mut self, label: u32, start: u32) {
+    let at = self.offset()
+    mut self.fixups.push(Fixup(at: at, label: label, end: start, disp: 0, short: false, branch: 0))
+    mut self.put32(0)
+} Assembler.table_entry
+
+/// Pads the code with `int3` to a multiple of four bytes.
+pkg fn Assembler.align4(mut self) {
+    while self.code.len() % 4 != 0 {
+        mut self.put8(0xCC)
+    }
+} Assembler.align4
 
 fn Assembler.srem_or_zero(mut self, size: Size, divisor: Reg) {
     let divide = mut self.new_label()

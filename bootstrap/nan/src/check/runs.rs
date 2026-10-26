@@ -12,7 +12,8 @@ use crate::syntax::ast::{ItemKind, Tok};
 
 impl Checker<'_> {
     /// The value of a const or contribution: its const evaluation's, none when that ends
-    /// without one or needs the value it computes, as the evaluations then under way do.
+    /// without one or needs the value it computes, as the evaluations then under way do. The
+    /// item is judged before its evaluation starts.
     pub fn const_value(&self, item: ItemId) -> Option<Rc<ConstValue>> {
         self.db.note(item);
         if let Some(&needing) = self.evaluating.borrow().last() {
@@ -34,6 +35,10 @@ impl Checker<'_> {
             let cycle = self.evaluating.borrow()[position..].to_vec();
             self.cyclic.borrow_mut().extend(cycle);
             return None;
+        }
+        self.rejected(item);
+        if let Some(value) = self.const_values.borrow().get(&item) {
+            return value.clone();
         }
         self.evaluating.borrow_mut().push(item);
         let muted = self.muted.replace(0);
@@ -167,3 +172,6 @@ impl Checker<'_> {
         self.report_because(item, token, code, because);
     }
 }
+
+#[cfg(test)]
+mod tests;

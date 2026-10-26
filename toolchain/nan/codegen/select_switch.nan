@@ -1,0 +1,338 @@
+//! Instruction selection of chains of branches testing one value against constants: a jump through a table of their targets.
+
+/// The fewest constants a chain tests to become a jump table.
+const TABLE_CASES: usize = 6
+
+/// The most entries a jump table holds.
+const TABLE_ENTRIES: u64 = 4096
+
+/// A chain of branches without arguments testing one value for equality with constants: the
+/// value, each constant tested with the block it branches to, first test first, and the block
+/// reached when none matches.
+struct Switch {
+    value: clif::Value
+    keys: mem::List[u64]
+    targets: mem::List[clif::Block]
+    default: clif::Block
+} Switch
+
+/// The chains of a function becoming jump tables, and the index of the chain each block heads,
+/// `NONE` for one heading none.
+struct Switches {
+    chains: mem::List[Switch]
+    heads: mem::List[u32]
+} Switches
+
+/// A test of a value for equality with a constant, branching without arguments.
+struct Test derives Copy, Eq {
+    value: clif::Value
+    key: u64
+    then: clif::Block
+    otherwise: clif::Block
+} Test
+
+/// Where each value of a function is defined: its instruction, `NONE` for a block parameter,
+/// and its block; whether a block other than its own reads it; and the branches to each block.
+struct Defined {
+    insts: mem::List[u32]
+    blocks: mem::List[u32]
+    shared: mem::List[bool]
+    predecessors: mem::List[u32]
+} Defined
+
+fn defined_of(func: clif::Function, alloc: mem::Alloc) -> Defined {
+    let count = usize.widen(func.value_count())
+    var defined = Defined(insts: filled(count, value: NONE, alloc), blocks: filled(count, value: NONE, alloc), shared: filled(count, value: false, alloc), predecessors: predecessor_counts(func, alloc))
+    let blocks = func.layout_blocks(alloc)
+    for block in blocks {
+        for param in func.block_params(block, alloc) {
+            expect usize.widen(param.index) < count
+            defined.blocks[usize.widen(param.index)] = block.index
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                expect usize.widen(result.index) < count
+                defined.insts[usize.widen(result.index)] = inst.index
+                defined.blocks[usize.widen(result.index)] = block.index
+            }
+        }
+    }
+    for block in blocks {
+        for inst in func.block_insts(block, alloc) {
+            each_operand(func.inst_data(inst), visit: fn[mut defined](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                expect at < defined.blocks.len() and at < defined.shared.len()
+                if defined.blocks[at] != block.index {
+                    defined.shared[at] = true
+                }
+            })
+        }
+    }
+    return defined
+} defined_of
+
+fn Defined.def(self, func: clif::Function, value: clif::Value) -> u32 {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.insts.len()
+    return self.insts[at]
+} Defined.def
+
+/// The constant an `iconst` gives a value, its bits within the value's width.
+fn Defined.constant(self, func: clif::Function, value: clif::Value) -> Option[u64] {
+    let def = self.def(func, value)
+    if def == NONE {
+        return None
+    }
+    let clif::InstructionData.UnaryImm(opcode: _, imm: imm) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    return Some(within_width(imm.to_bits(), width: func.value_type(value).bits()))
+} Defined.constant
+
+fn within_width(bits: u64, width: u32) -> u64 {
+    if width >= 64 {
+        return bits
+    }
+    return bits & ((1u64 << width) - 1)
+} within_width
+
+/// The test a block's final branch makes, when it is one of a value for equality with a
+/// constant without arguments.
+fn Defined.tested(self, func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> Option[Test] {
+    let insts = func.block_insts(block, alloc)
+    if insts.len() == 0 {
+        return None
+    }
+    let clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+        return None
+    }
+    if then_call.args.len() > 0 or else_call.args.len() > 0 {
+        return None
+    }
+    let def = self.def(func, value: arg)
+    if def == NONE {
+        return None
+    }
+    let clif::InstructionData.IntCompare(opcode: _, cond: clif::IntCC.Equal, x: x, y: y) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    match self.constant(func, value: y) {
+        Some(key) => return Some(Test(value: x, key: key, then: then_call.block, otherwise: else_call.block))
+        None => {}
+    }
+    match self.constant(func, value: x) {
+        Some(key) => return Some(Test(value: y, key: key, then: then_call.block, otherwise: else_call.block))
+        None => return None
+    }
+} Defined.tested
+
+/// Whether a block only loads, makes constants and compares values none of its successors
+/// read, then branches.
+fn Defined.is_link(self, func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> bool {
+    if func.entry_block() == Some(block) or func.block_params(block, alloc).len() > 0 {
+        return false
+    }
+    expect usize.widen(block.index) < self.predecessors.len()
+    if self.predecessors[usize.widen(block.index)] != 1 {
+        return false
+    }
+    for inst in func.block_insts(block, alloc) {
+        let reads_only = match func.inst_data(inst) {
+            clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: _, offset: _) or clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.Brif(opcode: _, arg: _, then: _, otherwise: _) => true
+            else => false
+        }
+        if not reads_only {
+            return false
+        }
+        for result in func.inst_results(inst, alloc) {
+            expect usize.widen(result.index) < self.shared.len()
+            if self.shared[usize.widen(result.index)] {
+                return false
+            }
+        }
+    }
+    return true
+} Defined.is_link
+
+/// Whether a value tested in a link of a chain is the one its head tests: the same value, or a
+/// load of the same place the head's block loads it from and writes no memory after.
+fn Defined.same_value(self, func: clif::Function, head: clif::Block, leading: clif::Value, other: clif::Value, alloc: mem::Alloc) -> bool {
+    if func.resolve_aliases(leading) == func.resolve_aliases(other) {
+        return true
+    }
+    let first_def = self.def(func, value: leading)
+    let other_def = self.def(func, value: other)
+    if first_def == NONE or other_def == NONE or func.value_type(leading) != func.value_type(other) {
+        return false
+    }
+    let clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: place, offset: offset) = func.inst_data(clif::Inst(index: first_def)) else {
+        return false
+    }
+    let clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: other_place, offset: other_offset) = func.inst_data(clif::Inst(index: other_def)) else {
+        return false
+    }
+    if func.resolve_aliases(place) != func.resolve_aliases(other_place) or offset != other_offset {
+        return false
+    }
+    var after = false
+    var found = false
+    for inst in func.block_insts(head, alloc) {
+        if inst.index == first_def {
+            after = true
+            found = true
+            continue
+        }
+        if after and writes_memory(func.inst_data(inst)) {
+            return false
+        }
+    }
+    return found
+} Defined.same_value
+
+/// Whether an instruction may write memory or order accesses to it: a store, an atomic, a fence,
+/// a call or a stack switch.
+fn writes_memory(data: clif::InstructionData) -> bool {
+    return match data {
+        clif::InstructionData.Store(opcode: _, flags: _, x: _, p: _, offset: _) or clif::InstructionData.StoreNoOffset(opcode: _, flags: _, x: _, p: _) or clif::InstructionData.LoadNoOffset(opcode: _, flags: _, arg: _) => true
+        clif::InstructionData.NullAry(opcode: opcode) => opcode == clif::Opcode.Fence
+        clif::InstructionData.AtomicRmw(opcode: _, flags: _, op: _, p: _, x: _) or clif::InstructionData.AtomicCas(opcode: _, flags: _, p: _, e: _, x: _) => true
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: _) or clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => true
+        clif::InstructionData.Ternary(opcode: opcode, x: _, y: _, z: _) => opcode != clif::Opcode.Select
+        else => false
+    }
+} writes_memory
+
+/// The chains of a function's blocks dense enough to become jump tables.
+fn find_switches(func: clif::Function, count: usize, alloc: mem::Alloc) -> Switches {
+    var found = Switches(chains: mem::List[Switch].empty(alloc), heads: filled(count, value: NONE, alloc))
+    let defined = defined_of(func, alloc)
+    var absorbed = filled(count, value: false, alloc)
+    for block in func.layout_blocks(alloc) {
+        expect usize.widen(block.index) < absorbed.len()
+        if absorbed[usize.widen(block.index)] {
+            continue
+        }
+        let Some(leading) = defined.tested(func, block, alloc) else {
+            continue
+        }
+        var chain = Switch(value: leading.value, keys: mem::List[u64].empty(alloc), targets: mem::List[clif::Block].empty(alloc), default: leading.otherwise)
+        var links = mem::List[clif::Block].empty(alloc)
+        mut chain.keys.push(leading.key)
+        mut chain.targets.push(leading.then)
+        loop {
+            let link = chain.default
+            if link == block or not defined.is_link(func, block: link, alloc) {
+                break
+            }
+            let Some(next) = defined.tested(func, block: link, alloc) else {
+                break
+            }
+            if not defined.same_value(func, head: block, leading: leading.value, other: next.value, alloc) {
+                break
+            }
+            if chain.keys.position(fn(key: u64) => key == next.key).is_none() {
+                mut chain.keys.push(next.key)
+                mut chain.targets.push(next.then)
+            }
+            mut links.push(link)
+            chain.default = next.otherwise
+        }
+        if not is_dense(chain.keys.view()) {
+            continue
+        }
+        for link in links {
+            expect usize.widen(link.index) < absorbed.len()
+            absorbed[usize.widen(link.index)] = true
+        }
+        expect usize.widen(block.index) < found.heads.len()
+        found.heads[usize.widen(block.index)] = u32.fit(found.chains.len())
+        mut found.chains.push(take chain)
+    }
+    return found
+} find_switches
+
+/// Whether keys are enough and close enough for a jump table, their smallest fitting an
+/// immediate.
+fn is_dense(keys: Slice[u64]) -> bool {
+    if keys.len() < TABLE_CASES {
+        return false
+    }
+    var low = keys[0]
+    var high = keys[0]
+    for key in keys {
+        if key < low {
+            low = key
+        }
+        if key > high {
+            high = key
+        }
+    }
+    let span = high - low
+    return low <= 0x7FFF_FFFF and span < TABLE_ENTRIES and span < 4 * u64.widen(keys.len())
+} is_dense
+
+/// The index of the chain a block heads, `NONE` for one heading none.
+fn Selector.switch_of(self, block: clif::Block) -> u32 {
+    let at = usize.widen(block.index)
+    expect at < self.switches.heads.len()
+    return self.switches.heads[at]
+} Selector.switch_of
+
+/// A chain's branches: its value, zero-extended and less the smallest constant, indexing a table
+/// of the targets when within the constants' span, else a jump to the default.
+fn Selector.jump_table(mut self, func: clif::Function, index: u32) {
+    expect usize.widen(index) < self.switches.chains.len()
+    let at = usize.widen(index)
+    let tested = self.switches.chains[at].value
+    let otherwise = self.switches.chains[at].default
+    var keys = mem::List[u64].empty(self.alloc)
+    var labels = mem::List[u32].empty(self.alloc)
+    for key in self.switches.chains[at].keys {
+        mut keys.push(key)
+    }
+    for target in self.switches.chains[at].targets {
+        mut labels.push(self.position_of(self.destination(target)))
+    }
+    expect keys.len() > 0 and keys.len() == labels.len()
+    var low = keys[0]
+    var high = keys[0]
+    for key in keys {
+        if key < low {
+            low = key
+        }
+        if key > high {
+            high = key
+        }
+    }
+    let value = mut self.src(tested, func)
+    let offset_index = mut self.temp(false)
+    match func.value_type(tested).bits() {
+        8 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx8, dst: offset_index, src: value))
+        16 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx16, dst: offset_index, src: value))
+        32 => mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx32, dst: offset_index, src: value))
+        else => mut self.mov(offset_index, src: value)
+    }
+    if low != 0 {
+        mut self.emit(x64::Inst.AluImm(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: offset_index, imm: i32.fit(low)))
+    }
+    mut self.emit(x64::Inst.CmpImm(size: x64::Size.Qword, lhs: offset_index, imm: i32.fit(high - low)))
+    let default = self.position_of(self.destination(otherwise))
+    mut self.emit(x64::Inst.Jcc(cond: x64::Cond.Above, label: default))
+    var reached = mem::List[u32].empty(self.alloc)
+    mut reached.push(default)
+    var entries = filled(usize.widen(high - low) + 1, value: default, alloc: self.alloc)
+    for case in 0..<keys.len() {
+        let label = labels[case]
+        entries[usize.widen(keys[case] - low)] = label
+        if reached.position(fn(succ: u32) => succ == label).is_none() {
+            mut reached.push(label)
+        }
+    }
+    for label in reached {
+        mut self.code.succs.push(label)
+    }
+    let table = mut self.code.add_table(entries.view())
+    let base = mut self.temp(false)
+    let offset = mut self.temp(false)
+    mut self.emit(x64::Inst.JumpTable(index: offset_index, base: base, temp: offset, table: table))
+} Selector.jump_table

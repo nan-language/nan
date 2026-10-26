@@ -1,0 +1,224 @@
+//! Bodies taken in place: the small functions whose bodies their calls take; and the functions whose calls nothing reads the results of are left out, as they end, trap, call or write nothing their callers see.
+
+/// The most instructions a body taken in place holds.
+const BODY_INSTS: usize = 32
+
+/// The bodies calls take in place, by the indices of their functions' names: of the functions
+/// defined so far, those of at most `BODY_INSTS` instructions and no stack slot, each of whose
+/// instructions stays in place, with the hash of each body's text; and the functions compiled so
+/// far whose calls can be left out; and the function copying as `memmove` does, its arguments
+/// the destination, the source and the length, if declared.
+pkg struct Leaves {
+    bodies: mem::HashMap[u32, clif::Function]
+    digests: mem::HashMap[u32, hashing::HashValue]
+    removable: mem::HashMap[u32, bool]
+    copier: Option[u32]
+} Leaves
+
+pkg fn Leaves.empty(alloc: mem::Alloc) -> Leaves {
+    return Leaves(bodies: mem::HashMap[u32, clif::Function].empty(seed: 0, alloc), digests: mem::HashMap[u32, hashing::HashValue].empty(seed: 0, alloc), removable: mem::HashMap[u32, bool].empty(seed: 0, alloc), copier: None)
+} Leaves.empty
+
+/// Records the function copying as `memmove` does.
+pkg fn Leaves.note_copier(mut self, index: u32) {
+    self.copier = Some(index)
+} Leaves.note_copier
+
+/// Whether a function is the one copying as `memmove` does.
+fn Leaves.is_copier(self, index: u32) -> bool {
+    return match self.copier {
+        Some(copier) => copier == index
+        None => false
+    }
+} Leaves.is_copier
+
+/// Whether an instruction calls the function copying as `memmove` does.
+fn Leaves.copies(self, func: clif::Function, inst: clif::Inst) -> bool {
+    let clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) = func.inst_data(inst) else {
+        return false
+    }
+    let ext = func.ext_func(func_ref)
+    return ext.colocated and ext.name.namespace == 0 and self.is_copier(ext.name.index)
+} Leaves.copies
+
+/// Records a compiled function whose calls can be left out.
+pkg fn Leaves.note_removable(mut self, index: u32) {
+    discard mut self.removable.insert(index, value: true)
+} Leaves.note_removable
+
+/// Whether a call can be left out when nothing reads its results.
+fn Leaves.removes(self, func: clif::Function, inst: clif::Inst) -> bool {
+    let clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) = func.inst_data(inst) else {
+        return false
+    }
+    let ext = func.ext_func(func_ref)
+    return ext.colocated and ext.name.namespace == 0 and self.removable.get(ext.name.index).is_some()
+} Leaves.removes
+
+/// Whether calls of a compiled function can be left out: from its entry it reaches no block
+/// twice on a path, so it ends, and no instruction it reaches traps, calls a function whose calls
+/// cannot be left out, or writes memory other than its own stack slots.
+fn is_left_out_callee(func: clif::Function, leaves: Leaves, alloc: mem::Alloc) -> bool {
+    let Some(entry) = func.entry_block() else {
+        return false
+    }
+    let count = block_count(func, alloc)
+    var state = filled(count, value: 0u32, alloc)
+    var stack = mem::List[clif::Block].empty(alloc)
+    var next_arm = mem::List[u32].empty(alloc)
+    let slot_addresses = slot_addresses_of(func, alloc)
+    expect usize.widen(entry.index) < count
+    state[usize.widen(entry.index)] = 1
+    mut stack.push(entry)
+    mut next_arm.push(0)
+    loop {
+        let depth = stack.len()
+        if depth == 0 {
+            return true
+        }
+        expect next_arm.len() == depth
+        let block = stack[depth - 1]
+        let arm = next_arm[depth - 1]
+        if arm == 0 {
+            for inst in func.block_insts(block, alloc) {
+                if not leaves.leaves_unseen(func, inst, slot_addresses: slot_addresses.view()) {
+                    return false
+                }
+            }
+        }
+        let targets = targets_of(func, block, alloc)
+        if usize.widen(arm) >= targets.len() {
+            expect usize.widen(block.index) < state.len()
+            state[usize.widen(block.index)] = 2
+            discard mut stack.pop()
+            discard mut next_arm.pop()
+            continue
+        }
+        next_arm[depth - 1] = arm + 1
+        let at = usize.widen(targets[usize.widen(arm)].index)
+        expect at < state.len()
+        if state[at] == 1 {
+            return false
+        }
+        if state[at] == 0 {
+            state[at] = 1
+            mut stack.push(targets[usize.widen(arm)])
+            mut next_arm.push(0)
+        }
+    }
+} is_left_out_callee
+
+/// Whether each value of a function is a stack slot's address or a constant past one.
+fn slot_addresses_of(func: clif::Function, alloc: mem::Alloc) -> mem::List[bool] {
+    let count = usize.widen(func.value_count())
+    var constants = filled(count, value: false, alloc)
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            let clif::InstructionData.UnaryImm(opcode: _, imm: _) = func.inst_data(inst) else {
+                continue
+            }
+            for result in func.inst_results(inst, alloc) {
+                expect usize.widen(result.index) < constants.len()
+                constants[usize.widen(result.index)] = true
+            }
+        }
+    }
+    var addresses = filled(count, value: false, alloc)
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            let pointing = match func.inst_data(inst) {
+                clif::InstructionData.StackLoad(opcode: _, slot: _, offset: _) => true
+                clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) => (is_marked(func, marks: addresses.view(), value: x) and is_marked(func, marks: constants.view(), value: y)) or (is_marked(func, marks: addresses.view(), value: y) and is_marked(func, marks: constants.view(), value: x))
+                else => false
+            }
+            if pointing {
+                for result in func.inst_results(inst, alloc) {
+                    expect usize.widen(result.index) < addresses.len()
+                    addresses[usize.widen(result.index)] = true
+                }
+            }
+        }
+    }
+    return addresses
+} slot_addresses_of
+
+fn is_marked(func: clif::Function, marks: Slice[bool], value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    return at < marks.len() and marks[at]
+} is_marked
+
+/// Whether an instruction's effects stay unseen by its function's callers: it computes values,
+/// reads memory through a load marked as unable to fault, writes its function's stack slots,
+/// branches, returns or calls a function whose calls can be left out.
+fn Leaves.leaves_unseen(self, func: clif::Function, inst: clif::Inst, slot_addresses: Slice[bool]) -> bool {
+    return match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: _, imm: _) or clif::InstructionData.UnaryIeee32(opcode: _, bits: _) or clif::InstructionData.UnaryIeee64(opcode: _, bits: _) => true
+        clif::InstructionData.Unary(opcode: _, arg: _) or clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+        clif::InstructionData.Binary(opcode: opcode, x: _, y: _) => not (opcode == clif::Opcode.Udiv or opcode == clif::Opcode.Sdiv or opcode == clif::Opcode.Urem or opcode == clif::Opcode.Srem)
+        clif::InstructionData.Ternary(opcode: opcode, x: _, y: _, z: _) => opcode == clif::Opcode.Select
+        clif::InstructionData.Load(opcode: opcode, flags: flags, arg: _, offset: _) => opcode == clif::Opcode.Load and flags.notrap
+        clif::InstructionData.Store(opcode: opcode, flags: _, x: _, p: p, offset: _) => opcode == clif::Opcode.Store and is_marked(func, marks: slot_addresses, value: p)
+        clif::InstructionData.StackLoad(opcode: _, slot: _, offset: _) or clif::InstructionData.FuncAddr(opcode: _, func_ref: _) => true
+        clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: _) => opcode == clif::Opcode.SymbolValue
+        clif::InstructionData.Jump(opcode: _, destination: _) or clif::InstructionData.Brif(opcode: _, arg: _, then: _, otherwise: _) or clif::InstructionData.MultiAry(opcode: _, args: _) => true
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: _) => self.removes(func, inst)
+        else => false
+    }
+} Leaves.leaves_unseen
+
+/// Keeps a defined function's body for its calls to take in place when it qualifies.
+pkg fn Leaves.offer(mut self, take func: clif::Function, alloc: mem::Alloc) {
+    if not qualifies(func, alloc) {
+        return
+    }
+    let index = func.name.index
+    discard mut self.digests.insert(index, value: hashing::HashValue.of(func.display(alloc).as_bytes()))
+    discard mut self.bodies.insert(index, value: take func)
+} Leaves.offer
+
+/// The body a call takes in place, if any.
+proj fn Leaves.taken(self, func: clif::Function, inst: clif::Inst) -> Option[clif::Function] {
+    let clif::InstructionData.Call(opcode: _, func_ref: func_ref, args: _) = func.inst_data(inst) else {
+        return None
+    }
+    let ext = func.ext_func(func_ref)
+    if not ext.colocated or ext.name.namespace != 0 {
+        return None
+    }
+    return self.bodies.get(ext.name.index)
+} Leaves.taken
+
+fn qualifies(func: clif::Function, alloc: mem::Alloc) -> bool {
+    if func.name.namespace != 0 or func.signature.call_conv != clif::CallConv.SystemV or func.stack_slot_count() > 0 {
+        return false
+    }
+    let Some(entry) = func.entry_block() else {
+        return false
+    }
+    var count: usize = 0
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            count += 1
+            if count > BODY_INSTS or not stays_in_place(func.inst_data(inst), entry) {
+                return false
+            }
+        }
+    }
+    return true
+} qualifies
+
+/// Whether an instruction behaves alike in its caller's frame and in its caller's trap reports:
+/// it is no call, trap instruction, stack slot address or frame pointer read, and no branch to
+/// the entry.
+fn stays_in_place(data: clif::InstructionData, entry: clif::Block) -> bool {
+    return match data {
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: _) or clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => false
+        clif::InstructionData.Trap(opcode: _, code: _) or clif::InstructionData.StackLoad(opcode: _, slot: _, offset: _) => false
+        clif::InstructionData.NullAry(opcode: opcode) => opcode == clif::Opcode.Fence
+        clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: _) => opcode != clif::Opcode.TlsValue
+        clif::InstructionData.Ternary(opcode: opcode, x: _, y: _, z: _) => opcode == clif::Opcode.Select
+        clif::InstructionData.Jump(opcode: _, destination: destination) => destination.block != entry
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => then_call.block != entry and else_call.block != entry
+        else => true
+    }
+} stays_in_place

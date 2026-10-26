@@ -130,12 +130,45 @@ pub enum Brought {
     Charged,
 }
 
-/// The digests computed in one check, by item.
+/// The digests computed in one check, by item. The computations form Tarjan's search over the
+/// calls and function arguments of the code walked: a cycle's members get their digests once its
+/// outermost member's is computed, which joins theirs.
 #[derive(Default)]
 pub struct Digests {
     done: HashMap<ItemId, Rc<Digest>>,
-    /// The items whose digests are being computed, outermost first.
-    computing: Vec<ItemId>,
+    /// The functions whose digests are being computed, outermost first.
+    computing: Vec<Computing>,
+    /// The functions whose digests are computed while a member of their cycle's is still being
+    /// computed, in order of computation.
+    pending: Vec<Pending>,
+    /// How many digest computations started.
+    started: usize,
+}
+
+/// A digest being computed: its function, the number of its computation, and the lowest number
+/// of a computation of its cycle it read, as Tarjan's low link.
+struct Computing {
+    item: ItemId,
+    number: usize,
+    low: usize,
+}
+
+/// A digest computed before its cycle's: its function, the number of its computation, whether
+/// the function's head waits, and the digest its own computation gave.
+struct Pending {
+    item: ItemId,
+    number: usize,
+    wait: bool,
+    digest: Rc<Digest>,
+}
+
+impl Digests {
+    /// Records that the innermost computation read the computation numbered `number`.
+    fn read(&mut self, number: usize) {
+        if let Some(innermost) = self.computing.last_mut() {
+            innermost.low = innermost.low.min(number);
+        }
+    }
 }
 
 /// The state of Tarjan's algorithm: each function entered with its number and low link, the
@@ -190,9 +223,16 @@ impl Checker<'_> {
     /// without one, and otherwise declared.
     pub fn digest(&self, item: ItemId) -> Rc<Digest> {
         self.db.note(item);
-        if let Some(digest) = self.digests.borrow().done.get(&item) {
+        let mut digests = self.digests.borrow_mut();
+        if let Some(digest) = digests.done.get(&item) {
             return digest.clone();
         }
+        if let Some(pending) = digests.pending.iter().find(|pending| pending.item == item) {
+            let (number, digest) = (pending.number, pending.digest.clone());
+            digests.read(number);
+            return digest;
+        }
+        drop(digests);
         self.db.about(Some(item), || self.compute_digest(item))
     }
 
@@ -204,7 +244,11 @@ impl Checker<'_> {
                 |head| Digest::declared(head.wait, &head.limits),
             ))
         };
-        if self.digests.borrow().computing.contains(&item) {
+        let open = (self.digests.borrow().computing.iter())
+            .find(|computing| computing.item == item)
+            .map(|computing| computing.number);
+        if let Some(number) = open {
+            self.digests.borrow_mut().read(number);
             return Rc::new(self.cycle_digest(item));
         }
         let Some(body) = self.typed_body(item) else {
@@ -215,7 +259,17 @@ impl Checker<'_> {
             self.digests.borrow_mut().done.insert(item, digest.clone());
             return digest;
         };
-        self.digests.borrow_mut().computing.push(item);
+        let number = {
+            let mut digests = self.digests.borrow_mut();
+            let number = digests.started;
+            digests.started += 1;
+            digests.computing.push(Computing {
+                item,
+                number,
+                low: number,
+            });
+            number
+        };
         let mut digest = Digest::none();
         for site in self.sites(item, &body, None) {
             digest.join(&site.facts);
@@ -224,9 +278,32 @@ impl Checker<'_> {
         digest.wait = wait;
         let cyclic = self.in_cycle(item);
         digest.terminates &= !wait && (!cyclic || self.has_decreases(item));
-        self.digests.borrow_mut().computing.pop();
         let digest = Rc::new(digest);
-        self.digests.borrow_mut().done.insert(item, digest.clone());
+        let mut digests = self.digests.borrow_mut();
+        let low = digests
+            .computing
+            .pop()
+            .expect("the digest being computed")
+            .low;
+        digests.read(low);
+        if low < number {
+            digests.pending.push(Pending {
+                item,
+                number,
+                wait,
+                digest: digest.clone(),
+            });
+            return digest;
+        }
+        let first = (digests.pending.iter())
+            .position(|pending| pending.number > number)
+            .unwrap_or(digests.pending.len());
+        for member in digests.pending.split_off(first) {
+            let mut shared = (*digest).clone();
+            shared.wait = member.wait;
+            digests.done.insert(member.item, Rc::new(shared));
+        }
+        digests.done.insert(item, digest.clone());
         digest
     }
 
@@ -1050,3 +1127,6 @@ impl Checker<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

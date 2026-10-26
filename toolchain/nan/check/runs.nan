@@ -1,24 +1,21 @@
 //! The interpreter runs of check time: the const evaluation of consts, const asserts and contributions, and example runs, each reporting how it ended.
 
 /// The value of a const or contribution: its const evaluation's, none when that ends without
-/// one or needs the value it computes, as the evaluations then under way do.
+/// one or needs the value it computes, as the evaluations then under way do. The item is judged
+/// before its evaluation starts.
 pkg fn Checker.const_value(self, item: ty::ItemId) -> Option[mem::Shared[ConstValue]] {
     let db = self.db()
     let state = self.state.contents()
     db.note(item)
-    let stack = state.evaluating.get()
+    let stack = self.underway.contents().evaluating.get()
     if stack.len() > 0 {
         let need = Need(needing: stack[stack.len() - 1], needed: item)
-        if state.needed.get(need).is_none() {
-            state.needed.insert(need, value: Unit)
+        if state.needed.claim(need) {
             discard state.needs.push(need)
         }
     }
     match state.const_values.get(item) {
-        Some(known) => match known {
-            Some(shared) => return Some(shared.share())
-            None => return None
-        }
+        Some(known) => return shared_value(known)
         None => {}
     }
     match stack.position(fn(other: ty::ItemId) => other == item) {
@@ -32,21 +29,31 @@ pkg fn Checker.const_value(self, item: ty::ItemId) -> Option[mem::Shared[ConstVa
         }
         None => {}
     }
+    discard self.rejected(item)
+    match state.const_values.get(item) {
+        Some(known) => return shared_value(known)
+        None => {}
+    }
     var pushed = mem::List[ty::ItemId].empty(self.alloc())
     for held in stack {
         mut pushed.push(held)
     }
     mut pushed.push(item)
-    let restored = state.evaluating.replace(take pushed)
-    let muted = state.muted.swap(0)
-    let value = db.about(Some(item), compute: fn() => self.evaluate(item))
-    state.muted.store(muted)
-    state.evaluating.restore(restored)
-    match state.const_values.insert(item, value: take value) {
-        Some(shared) => return Some(shared.share())
-        None => return None
-    }
+    let restored = self.underway.contents().evaluating.replace(take pushed)
+    let muted = self.underway.contents().muted.swap(0)
+    let value = self.about(Some(item), compute: fn() => self.evaluate(item))
+    self.underway.contents().muted.store(muted)
+    self.underway.contents().evaluating.restore(restored)
+    return shared_value(state.const_values.insert(item, value: take value))
 } Checker.const_value
+
+/// Another handle of a const value, if any.
+fn shared_value(value: Option[mem::Shared[ConstValue]]) -> Option[mem::Shared[ConstValue]] {
+    let Some(held) = value else {
+        return None
+    }
+    return Some(held.share())
+} shared_value
 
 /// Runs the const evaluation of a const, const assert or contribution and reports its end,
 /// unless it needs its own value.
@@ -133,7 +140,6 @@ fn Checker.run_examples(self, item: ty::ItemId) {
     let Some(body) = self.typed(item) else {
         return
     }
-    let db = self.db()
     let alloc = self.alloc()
     let typed = body.contents()
     for index in 0..<typed.examples.len() {
@@ -142,7 +148,7 @@ fn Checker.run_examples(self, item: ty::ItemId) {
             continue
         }
         var interpreter = Interpreter.new(self.share())
-        let end = db.about(Some(item), compute: fn[mut interpreter]() -> End {
+        let end = self.about(Some(item), compute: fn[mut interpreter]() -> End {
             return mut interpreter.run(item, role: nir::Role.Example, index: u32.fit(index), args: mem::List[Val].empty(alloc), type_args: mem::List[ty::Arg].empty(alloc).view())
         })
         match end {

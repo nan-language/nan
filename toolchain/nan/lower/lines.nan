@@ -11,7 +11,8 @@ const LINES_HIDDEN: u32 = 1
 const LINES_CRITICAL: u32 = 2
 
 /// The size of a function record: its address, its size, its first entry, its entry count and
-/// its flags.
+/// its flags. On `x86_64-host` the address is the signed 32-bit distance from the record to the
+/// function, which the static link resolves, so that loading the image relocates none of them.
 const FUNCTION_RECORD: u64 = 24
 
 /// The size of an entry: a code offset and a location.
@@ -25,6 +26,8 @@ struct Lines {
     locations: mem::List[LinesLocation]
     known: mem::HashMap[LineKey, u32]
     functions: mem::List[Function]
+    /// The index of each defined function's record.
+    records: mem::HashMap[object::FuncId, usize]
     table_id: Option[object::DataId]
 } Lines
 
@@ -61,7 +64,7 @@ struct RecordFunction derives Copy {
 } RecordFunction
 
 fn Lines.empty(alloc: mem::Alloc) -> Lines {
-    return Lines(locations: mem::List[LinesLocation].empty(alloc), known: mem::HashMap[LineKey, u32].empty(seed: 0, alloc), functions: mem::List[Function].empty(alloc), table_id: None)
+    return Lines(locations: mem::List[LinesLocation].empty(alloc), known: mem::HashMap[LineKey, u32].empty(seed: 0, alloc), functions: mem::List[Function].empty(alloc), records: mem::HashMap[object::FuncId, usize].empty(seed: 0, alloc), table_id: None)
 } Lines.empty
 
 /// The number of a span's location, as source locations of lowered code carry it.
@@ -104,10 +107,24 @@ fn trimmed_start(written: Str, alloc: mem::Alloc) -> text::String {
     return text::String.of(rest, alloc)
 } trimmed_start
 
-/// Records a compiled function's size and the locations of its code.
-fn Lines.function(mut self, id: object::FuncId, flags: u32, size: u32, take entries: mem::List[LineEntry]) {
-    mut self.functions.push(Function(id: id, size: size, flags: flags, entries: take entries))
+/// Records a defined function, its size and the locations of its code known once it compiles.
+fn Lines.function(mut self, id: object::FuncId, flags: u32, alloc: mem::Alloc) {
+    discard mut self.records.insert(id, value: self.functions.len())
+    mut self.functions.push(Function(id: id, size: 0, flags: flags, entries: mem::List[LineEntry].empty(alloc)))
 } Lines.function
+
+/// Records a compiled function's size and the locations of its code, giving the index of its
+/// record.
+fn Lines.compiled(mut self, id: object::FuncId, size: u32, take entries: mem::List[LineEntry]) -> usize {
+    let Some(at) = self.records.get(id) else {
+        expect false
+        return 0
+    }
+    expect at < self.functions.len()
+    self.functions[at].size = size
+    self.functions[at].entries = entries
+    return at
+} Lines.compiled
 
 /// The data object of the line tables, declared once and defined when lowering finishes.
 fn Lines.table(mut self, mut module: object::Module) -> object::DataId {
@@ -228,7 +245,11 @@ fn lines_array(mut lo: Lowering, index: u32, take bytes: mem::Bytes, function_re
     if index == 0 {
         for reloc in function_relocs {
             let reference = mut description.import_function(reloc.function)
-            mut description.write_function_addr(reloc.offset, function: reference)
+            if lo.machine() {
+                mut description.write_function_addr(reloc.offset, function: reference)
+            } else {
+                mut description.write_function_offset(reloc.offset, function: reference)
+            }
         }
     }
     mut lo.module.define_data(id, take description)

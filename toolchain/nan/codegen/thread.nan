@@ -1,0 +1,827 @@
+//! Jump threading: an edge into a block whose conditional branch the values known on the edge decide goes on to the target the branch takes, through a copy of the block's few instructions, the block's jumps to blocks only it reaches followed. A value is known on an edge from the conditional branches and constant block arguments on the chain of single-predecessor blocks leading to it.
+
+/// The most instructions besides their jumps and branch the blocks an edge is threaded through
+/// hold.
+const THREADED_INSTS: usize = 12
+
+/// The most known values a block keeps from the edges leading to it.
+const FACTS: usize = 32
+
+/// The rounds of threading a function goes through, each over the function the previous gives.
+const THREAD_ROUNDS: u32 = 2
+
+/// An edge: the block whose terminator takes it and which of its targets, 0 for a jump's or a
+/// conditional branch's first, 1 for the second.
+struct Edge derives Copy, Eq, Hash {
+    block: u32
+    arm: u32
+} Edge
+
+/// What is known of values: that one holds a constant, by its bits zero-extended from its type,
+/// or that two compare as a condition says.
+enum Fact derives Copy, Eq {
+    Holds(value: u32, bits: u64)
+    Compares(cond: clif::IntCC, x: u32, y: u32)
+} Fact
+
+/// Whether a fact is about a value a block defines.
+fn Fact.within(self, homes: Slice[u32], block: u32) -> bool {
+    return match self {
+        Fact.Holds(value: value, bits: _) => homed(homes, value, block)
+        Fact.Compares(cond: _, x: x, y: y) => homed(homes, value: x, block) or homed(homes, value: y, block)
+    }
+} Fact.within
+
+fn homed(homes: Slice[u32], value: u32, block: u32) -> bool {
+    let at = usize.widen(value)
+    expect at < homes.len()
+    return homes[at] == block
+} homed
+
+/// The threading of a function: for each edge threaded, which target of the branch the blocks it
+/// goes through end in it goes on to; whether each block stays reached; whether each value,
+/// defined in a block an edge is threaded through, is read outside that block, so that its copies
+/// merge through a variable; the edges reaching each block; and the function's blocks.
+struct Plan {
+    threads: mem::HashMap[Edge, u32]
+    kept: mem::List[bool]
+    crossing: mem::List[bool]
+    incoming: mem::List[u32]
+    shape: Shape
+} Plan
+
+/// A function's blocks as threading reads them, by block index: the instructions of each and the
+/// targets of its terminator, by arm.
+struct Shape {
+    insts: mem::List[mem::List[clif::Inst]]
+    targets: mem::List[mem::List[clif::Block]]
+} Shape
+
+fn Shape.empty(alloc: mem::Alloc) -> Shape {
+    return Shape(insts: mem::List[mem::List[clif::Inst]].empty(alloc), targets: mem::List[mem::List[clif::Block]].empty(alloc))
+} Shape.empty
+
+fn Shape.of(func: clif::Function, count: usize, alloc: mem::Alloc) -> Shape {
+    var shape = Shape.empty(alloc)
+    for _ in 0..<count {
+        mut shape.insts.push(mem::List[clif::Inst].empty(alloc))
+        mut shape.targets.push(mem::List[clif::Block].empty(alloc))
+    }
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < shape.insts.len() and at < shape.targets.len()
+        shape.insts[at] = func.block_insts(block, alloc)
+        shape.targets[at] = targets_of(func, block, alloc)
+    }
+    return shape
+} Shape.of
+
+proj fn Shape.insts_of(self, block: clif::Block) -> Slice[clif::Inst] {
+    let at = usize.widen(block.index)
+    expect at < self.insts.len()
+    return self.insts[at].view()
+} Shape.insts_of
+
+proj fn Shape.targets_from(self, block: clif::Block) -> Slice[clif::Block] {
+    let at = usize.widen(block.index)
+    expect at < self.targets.len()
+    return self.targets[at].view()
+} Shape.targets_from
+
+/// The function with its edges threaded, round after round, or none when no edge is.
+fn threaded(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let Some(once) = thread_once(func, alloc) else {
+        return None
+    }
+    var current = once
+    for _ in 1u32..<THREAD_ROUNDS {
+        let Some(next) = thread_once(current, alloc) else {
+            break
+        }
+        current = next
+    }
+    return Some(take current)
+} threaded
+
+fn thread_once(func: clif::Function, alloc: mem::Alloc) -> Option[clif::Function] {
+    let plan = plan_of(func, alloc)
+    if plan.threads.len() == 0 {
+        return None
+    }
+    var copier = Copier.threading(func, take plan, alloc)
+    mut copier.copy_function(func, leaves: Leaves.empty(alloc))
+    return take copier.finish()
+} thread_once
+
+/// The targets of a block's terminator, by arm.
+fn targets_of(func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var found = mem::List[clif::Block].empty(alloc)
+    let insts = func.block_insts(block, alloc)
+    if insts.len() == 0 {
+        return found
+    }
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => mut found.push(destination.block)
+        clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+            mut found.push(then_call.block)
+            mut found.push(else_call.block)
+        }
+        else => {}
+    }
+    return found
+} targets_of
+
+/// The edges the plan leaves a block's terminator taking: each target, or for a threaded edge the
+/// target of the branch it goes on to.
+fn Plan.successors(self, func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var found = mem::List[clif::Block].empty(alloc)
+    let targets = self.shape.targets_from(block)
+    for arm in 0..<targets.len() {
+        let target = targets[arm]
+        match self.threads.get(Edge(block: block.index, arm: u32.fit(arm))) {
+            Some(onward) => mut found.push(self.onward_target(func, through: target, onward, alloc))
+            None => mut found.push(target)
+        }
+    }
+    return found
+} Plan.successors
+
+/// The target a threaded edge into `through` goes on to.
+fn Plan.onward_target(self, func: clif::Function, through: clif::Block, onward: u32, alloc: mem::Alloc) -> clif::Block {
+    let chain = self.chain(func, start: through, alloc)
+    expect chain.len() > 0
+    let beyond = self.shape.targets_from(chain[chain.len() - 1])
+    expect usize.widen(onward) < beyond.len()
+    return beyond[usize.widen(onward)]
+} Plan.onward_target
+
+/// The blocks an edge into `start` goes through: `start`, then, while the last ends in a jump to
+/// a block other than the entry that only that jump reaches and that the chain does not hold,
+/// that block.
+fn Plan.chain(self, func: clif::Function, start: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var chain = mem::List[clif::Block].empty(alloc)
+    mut chain.push(start)
+    loop {
+        let last = chain[chain.len() - 1]
+        let insts = self.shape.insts_of(last)
+        if insts.len() == 0 {
+            return chain
+        }
+        let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(insts[insts.len() - 1]) else {
+            return chain
+        }
+        let next = destination.block
+        let at = usize.widen(next.index)
+        if func.entry_block() == Some(next) or at >= self.incoming.len() or self.incoming[at] != 1 {
+            return chain
+        }
+        for held in chain {
+            if held == next {
+                return chain
+            }
+        }
+        mut chain.push(next)
+    }
+} Plan.chain
+
+fn plan_of(func: clif::Function, alloc: mem::Alloc) -> Plan {
+    let count = block_count(func, alloc)
+    var plan = Plan(threads: mem::HashMap[Edge, u32].empty(seed: 0, alloc), kept: filled(count, value: false, alloc), crossing: filled(usize.widen(func.value_count()), value: false, alloc), incoming: filled(count, value: 0u32, alloc), shape: Shape.of(func, count, alloc))
+    let Some(entry) = func.entry_block() else {
+        return plan
+    }
+    let order = reverse_postorder(plan.shape, entry, count, alloc)
+    var single = filled(count, value: Edge(block: NONE, arm: 0), alloc)
+    for block in order {
+        let targets = plan.shape.targets_from(block)
+        for arm in 0..<targets.len() {
+            let at = usize.widen(targets[arm].index)
+            expect at < count and at < plan.incoming.len()
+            plan.incoming[at] += 1
+            single[at] = Edge(block: block.index, arm: u32.fit(arm))
+        }
+    }
+    var decidable = filled(count, value: false, alloc)
+    var any = false
+    for block in order {
+        let at = usize.widen(block.index)
+        expect at < decidable.len()
+        decidable[at] = block != entry and ends_in_branch(func, shape: plan.shape, chain: plan.chain(func, start: block, alloc).view())
+        if decidable[at] {
+            any = true
+        }
+    }
+    if not any {
+        return plan
+    }
+    let values = Values.of(func, alloc)
+    var entry_facts = mem::List[mem::List[Fact]].empty(alloc)
+    for _ in 0..<count {
+        mut entry_facts.push(mem::List[Fact].empty(alloc))
+    }
+    for block in order {
+        let at = usize.widen(block.index)
+        expect at < count and at < plan.incoming.len() and at < single.len()
+        if block == entry or plan.incoming[at] != 1 {
+            continue
+        }
+        let edge = single[at]
+        expect usize.widen(edge.block) < entry_facts.len()
+        let known = edge_facts(func, values, shape: plan.shape, edge, from: entry_facts[usize.widen(edge.block)].view(), alloc)
+        entry_facts[at] = known
+    }
+    for block in order {
+        let targets = plan.shape.targets_from(block)
+        for arm in 0..<targets.len() {
+            let through = targets[arm]
+            expect usize.widen(through.index) < decidable.len()
+            if not decidable[usize.widen(through.index)] {
+                continue
+            }
+            let edge = Edge(block: block.index, arm: u32.fit(arm))
+            expect usize.widen(block.index) < entry_facts.len()
+            let known = edge_facts(func, values, shape: plan.shape, edge, from: entry_facts[usize.widen(block.index)].view(), alloc)
+            let chain = plan.chain(func, start: through, alloc)
+            match decided_arm(func, values, shape: plan.shape, chain: chain.view(), known: known.view(), alloc) {
+                Some(onward) => {
+                    if plan.onward_target(func, through, onward, alloc) != through {
+                        discard mut plan.threads.insert(edge, value: onward)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    if plan.threads.len() == 0 {
+        return plan
+    }
+    mut plan.mark_kept(func, entry, alloc)
+    mut plan.mark_crossing(func, alloc)
+    return plan
+} plan_of
+
+/// Whether the blocks of a chain end in a conditional branch, holding at most `THREADED_INSTS`
+/// instructions besides their terminators, none of them a call.
+fn ends_in_branch(func: clif::Function, shape: Shape, chain: Slice[clif::Block]) -> bool {
+    var held: usize = 0
+    for block in chain {
+        let insts = shape.insts_of(block)
+        if insts.len() == 0 {
+            return false
+        }
+        held += insts.len() - 1
+        if held > THREADED_INSTS {
+            return false
+        }
+        for inst in insts {
+            match func.inst_data(inst) {
+                clif::InstructionData.Call(opcode: _, func_ref: _, args: _) or clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => return false
+                else => {}
+            }
+        }
+    }
+    expect chain.len() > 0
+    let last = shape.insts_of(chain[chain.len() - 1])
+    expect last.len() > 0
+    return match func.inst_data(last[last.len() - 1]) {
+        clif::InstructionData.Brif(opcode: _, arg: _, then: _, otherwise: _) => true
+        else => false
+    }
+} ends_in_branch
+
+/// The blocks a path from the entry reaches, in reverse postorder.
+fn reverse_postorder(shape: Shape, entry: clif::Block, count: usize, alloc: mem::Alloc) -> mem::List[clif::Block] {
+    var seen = filled(count, value: false, alloc)
+    var postorder = mem::List[clif::Block].empty(alloc)
+    var stack = mem::List[clif::Block].empty(alloc)
+    var next_arm = mem::List[u32].empty(alloc)
+    expect usize.widen(entry.index) < count
+    seen[usize.widen(entry.index)] = true
+    mut stack.push(entry)
+    mut next_arm.push(0)
+    loop {
+        let depth = stack.len()
+        if depth == 0 {
+            break
+        }
+        expect next_arm.len() == depth
+        let block = stack[depth - 1]
+        let arm = next_arm[depth - 1]
+        let targets = shape.targets_from(block)
+        if usize.widen(arm) >= targets.len() {
+            mut postorder.push(block)
+            discard mut stack.pop()
+            discard mut next_arm.pop()
+            continue
+        }
+        next_arm[depth - 1] = arm + 1
+        let target = targets[usize.widen(arm)]
+        let at = usize.widen(target.index)
+        expect at < seen.len()
+        if not seen[at] {
+            seen[at] = true
+            mut stack.push(target)
+            mut next_arm.push(0)
+        }
+    }
+    var order = mem::List[clif::Block].empty(alloc)
+    for back in 0..<postorder.len() {
+        mut order.push(postorder[postorder.len() - 1 - back])
+    }
+    return order
+} reverse_postorder
+
+/// What is known on an edge: what is known in the block it leaves and the condition of its
+/// conditional branch, but for the values its target defines anew, and the parameters of its
+/// target that constants or known values reach.
+fn edge_facts(func: clif::Function, values: Values, shape: Shape, edge: Edge, from: Slice[Fact], alloc: mem::Alloc) -> mem::List[Fact] {
+    var known = mem::List[Fact].empty(alloc)
+    let skipped = if from.len() > FACTS {
+        from.len() - FACTS
+    } else {
+        0
+    }
+    for index in skipped..<from.len() {
+        mut known.push(from[index])
+    }
+    let insts = shape.insts_of(clif::Block(index: edge.block))
+    if insts.len() == 0 {
+        return known
+    }
+    match func.inst_data(insts[insts.len() - 1]) {
+        clif::InstructionData.Jump(opcode: _, destination: destination) => bind_params(func, values, call: destination, mut known, alloc)
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            let condition = func.resolve_aliases(arg)
+            let comparison = compared(func, defs: values.defs.view(), value: condition)
+            if edge.arm == 0 {
+                if is_flag(func, defs: values.defs.view(), value: condition) {
+                    mut known.push(Fact.Holds(value: condition.index, bits: 1))
+                }
+                match comparison {
+                    Some(relation) => mut known.push(relation)
+                    None => {}
+                }
+                bind_params(func, values, call: then_call, mut known, alloc)
+            } else {
+                mut known.push(Fact.Holds(value: condition.index, bits: 0))
+                match comparison {
+                    Some(relation) => match relation {
+                        Fact.Compares(cond: cond, x: x, y: y) => mut known.push(Fact.Compares(cond: negated(cond), x: x, y: y))
+                        else => {}
+                    }
+                    None => {}
+                }
+                bind_params(func, values, call: else_call, mut known, alloc)
+            }
+        }
+        else => {}
+    }
+    return known
+} edge_facts
+
+/// Makes what is known before a branch what is known in its target: the facts on the values the
+/// target defines dropped, as it defines them anew, and the parameters known arguments reach
+/// added.
+fn bind_params(func: clif::Function, values: Values, call: clif::BlockCall, mut known: mem::List[Fact], alloc: mem::Alloc) {
+    let params = func.block_params(call.block, alloc)
+    expect params.len() == call.args.len()
+    var bound = mem::List[Fact].empty(alloc)
+    for index in 0..<params.len() {
+        match known_bits(func, defs: values.defs.view(), value: call.args[index], known: known.view()) {
+            Some(bits) => mut bound.push(Fact.Holds(value: params[index].index, bits: bits))
+            None => {}
+        }
+    }
+    var kept = mem::List[Fact].empty(alloc)
+    for fact in known {
+        if not fact.within(homes: values.homes.view(), block: call.block.index) {
+            mut kept.push(fact)
+        }
+    }
+    for fact in bound {
+        mut kept.push(fact)
+    }
+    known = kept
+} bind_params
+
+/// What threading reads of a function's values: the index of the instruction defining each,
+/// `NONE` for a block parameter, and the index of the block defining each.
+struct Values {
+    defs: mem::List[u32]
+    homes: mem::List[u32]
+} Values
+
+fn Values.of(func: clif::Function, alloc: mem::Alloc) -> Values {
+    let count = usize.widen(func.value_count())
+    var values = Values(defs: filled(count, value: NONE, alloc), homes: filled(count, value: NONE, alloc))
+    for block in func.layout_blocks(alloc) {
+        for param in func.block_params(block, alloc) {
+            expect usize.widen(param.index) < values.homes.len()
+            values.homes[usize.widen(param.index)] = block.index
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                expect usize.widen(result.index) < values.defs.len() and usize.widen(result.index) < values.homes.len()
+                values.defs[usize.widen(result.index)] = inst.index
+                values.homes[usize.widen(result.index)] = block.index
+            }
+        }
+    }
+    return values
+} Values.of
+
+/// Whether a value is a comparison's result, which is 1 when not 0.
+fn is_flag(func: clif::Function, defs: Slice[u32], value: clif::Value) -> bool {
+    return match defining(func, defs, value) {
+        Some(inst) => match func.inst_data(inst) {
+            clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+            else => false
+        }
+        None => false
+    }
+} is_flag
+
+/// The instruction defining a value, by the index of the instruction defining each value, none
+/// for a block parameter.
+fn defining(func: clif::Function, defs: Slice[u32], value: clif::Value) -> Option[clif::Inst] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    if at >= defs.len() or defs[at] == NONE {
+        return None
+    }
+    return Some(clif::Inst(index: defs[at]))
+} defining
+
+/// The bits a value is known to hold: those of the constant defining it or of a fact.
+fn known_bits(func: clif::Function, defs: Slice[u32], value: clif::Value, known: Slice[Fact]) -> Option[u64] {
+    let resolved = func.resolve_aliases(value)
+    for back in 0..<known.len() {
+        match known[known.len() - 1 - back] {
+            Fact.Holds(value: held, bits: bits) => {
+                if held == resolved.index {
+                    return Some(bits)
+                }
+            }
+            else => {}
+        }
+    }
+    let Some(inst) = defining(func, defs, value: resolved) else {
+        return None
+    }
+    let clif::InstructionData.UnaryImm(opcode: clif::Opcode.Iconst, imm: imm) = func.inst_data(inst) else {
+        return None
+    }
+    return low_bits(imm.to_bits(), ty: func.value_type(resolved))
+} known_bits
+
+/// The low bits of a pattern a value of an integer type of at most 64 bits holds.
+fn low_bits(bits: u64, ty: clif::Type) -> Option[u64] {
+    if not ty.is_int() or ty.bits() > 64 {
+        return None
+    }
+    if ty.bits() == 64 {
+        return Some(bits)
+    }
+    return Some(bits & ((1u64 << ty.bits()) - 1))
+} low_bits
+
+/// The target the conditional branch ending a chain of blocks takes when values are known as
+/// `known` on entry to its first, for blocks of at most `THREADED_INSTS` other instructions
+/// together, none of them a call.
+fn decided_arm(func: clif::Function, values: Values, shape: Shape, chain: Slice[clif::Block], known: Slice[Fact], alloc: mem::Alloc) -> Option[u32] {
+    var budget: usize = THREADED_INSTS
+    var found = mem::List[Fact].empty(alloc)
+    for fact in known {
+        var redefined = false
+        for index in 1..<chain.len() {
+            if fact.within(homes: values.homes.view(), block: chain[index].index) {
+                redefined = true
+            }
+        }
+        if not redefined {
+            mut found.push(fact)
+        }
+    }
+    for index in 0..<chain.len() {
+        let insts = shape.insts_of(chain[index])
+        if insts.len() == 0 or insts.len() - 1 > budget {
+            return None
+        }
+        budget -= insts.len() - 1
+        for at in 0..<(insts.len() - 1) {
+            let inst = insts[at]
+            match func.inst_data(inst) {
+                clif::InstructionData.Call(opcode: _, func_ref: _, args: _) or clif::InstructionData.CallIndirect(opcode: _, sig_ref: _, callee: _, args: _) => return None
+                else => {}
+            }
+            match fold_inst(func, defs: values.defs.view(), inst, known: found.view(), alloc) {
+                Some(bits) => {
+                    let result = func.inst_results(inst, alloc)
+                    expect result.len() > 0
+                    mut found.push(Fact.Holds(value: result[0].index, bits: bits))
+                }
+                None => {}
+            }
+            match borrow_of(func, inst, known: found.view(), alloc) {
+                Some(fact) => mut found.push(fact)
+                None => {}
+            }
+        }
+        match func.inst_data(insts[insts.len() - 1]) {
+            clif::InstructionData.Jump(opcode: _, destination: destination) => bind_params(func, values, call: destination, known: mut found, alloc)
+            clif::InstructionData.Brif(opcode: _, arg: arg, then: _, otherwise: _) => {
+                let Some(bits) = known_bits(func, defs: values.defs.view(), value: arg, known: found.view()) else {
+                    return None
+                }
+                if bits != 0 {
+                    return Some(0)
+                }
+                return Some(1)
+            }
+            else => return None
+        }
+    }
+    return None
+} decided_arm
+
+/// The bits of an instruction's one result when the values it reads are known, for constants,
+/// comparisons, selects, bitwise operations, additions, subtractions and extensions of integers
+/// of at most 64 bits.
+fn fold_inst(func: clif::Function, defs: Slice[u32], inst: clif::Inst, known: Slice[Fact], alloc: mem::Alloc) -> Option[u64] {
+    let results = func.inst_results(inst, alloc)
+    if results.len() != 1 {
+        return None
+    }
+    let ty = func.value_type(results[0])
+    return match func.inst_data(inst) {
+        clif::InstructionData.UnaryImm(opcode: clif::Opcode.Iconst, imm: imm) => low_bits(imm.to_bits(), ty)
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            let left_known = known_bits(func, defs, value: x, known)
+            let right_known = known_bits(func, defs, value: y, known)
+            let Some(left) = left_known else {
+                return bit_of(decided_by_relation(func, cond, x, y, known))
+            }
+            let Some(right) = right_known else {
+                return bit_of(decided_by_relation(func, cond, x, y, known))
+            }
+            let width = func.value_type(x).bits()
+            return Some(if compares(cond, left: left, right: right, width: width) {
+                1
+            } else {
+                0
+            })
+        }
+        clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: c, y: chosen, z: other) => {
+            let Some(condition) = known_bits(func, defs, value: c, known) else {
+                return None
+            }
+            if condition != 0 {
+                return known_bits(func, defs, value: chosen, known)
+            }
+            return known_bits(func, defs, value: other, known)
+        }
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => {
+            let Some(left) = known_bits(func, defs, value: x, known) else {
+                return None
+            }
+            let Some(right) = known_bits(func, defs, value: y, known) else {
+                return None
+            }
+            return match opcode {
+                clif::Opcode.Band => low_bits(left & right, ty)
+                clif::Opcode.Bor => low_bits(left | right, ty)
+                clif::Opcode.Bxor => low_bits(left ^ right, ty)
+                clif::Opcode.Iadd => low_bits(left.wrapping_add(right), ty)
+                clif::Opcode.Isub => low_bits(left.wrapping_sub(right), ty)
+                else => None
+            }
+        }
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => {
+            let Some(bits) = known_bits(func, defs, value: arg, known) else {
+                return None
+            }
+            return match opcode {
+                clif::Opcode.Uextend or clif::Opcode.Ireduce => low_bits(bits, ty)
+                clif::Opcode.Sextend => low_bits(sign_extended(bits, width: func.value_type(arg).bits()), ty)
+                clif::Opcode.Bnot => low_bits(~bits, ty)
+                else => None
+            }
+        }
+        else => None
+    }
+} fold_inst
+
+/// The bits of a value of `width` bits sign-extended to 64.
+fn sign_extended(bits: u64, width: u32) -> u64 {
+    if width >= 64 or width == 0 {
+        return bits
+    }
+    let shift = 64 - width
+    return i64.from_bits(bits << shift).shr_arith(shift).to_bits()
+} sign_extended
+
+/// Whether two integers of `width` bits, zero-extended into their bits, compare as `cond` says.
+fn compares(cond: clif::IntCC, left: u64, right: u64, width: u32) -> bool {
+    let signed_left = i64.from_bits(sign_extended(left, width: width))
+    let signed_right = i64.from_bits(sign_extended(right, width: width))
+    return match cond {
+        clif::IntCC.Equal => left == right
+        clif::IntCC.NotEqual => left != right
+        clif::IntCC.SignedLessThan => signed_left < signed_right
+        clif::IntCC.SignedGreaterThanOrEqual => signed_left >= signed_right
+        clif::IntCC.SignedGreaterThan => signed_left > signed_right
+        clif::IntCC.SignedLessThanOrEqual => signed_left <= signed_right
+        clif::IntCC.UnsignedLessThan => left < right
+        clif::IntCC.UnsignedGreaterThanOrEqual => left >= right
+        clif::IntCC.UnsignedGreaterThan => left > right
+        clif::IntCC.UnsignedLessThanOrEqual => left <= right
+    }
+} compares
+
+/// Marks the blocks a path from the entry reaches once the edges are threaded.
+fn Plan.mark_kept(mut self, func: clif::Function, entry: clif::Block, alloc: mem::Alloc) {
+    var pending = mem::List[clif::Block].empty(alloc)
+    expect usize.widen(entry.index) < self.kept.len()
+    self.kept[usize.widen(entry.index)] = true
+    mut pending.push(entry)
+    loop {
+        let Some(block) = mut pending.pop() else {
+            break
+        }
+        for next in self.successors(func, block, alloc) {
+            let at = usize.widen(next.index)
+            expect at < self.kept.len()
+            if not self.kept[at] {
+                self.kept[at] = true
+                mut pending.push(next)
+            }
+        }
+    }
+} Plan.mark_kept
+
+/// Marks each value defined in a block a threaded edge goes through that a kept block other than
+/// it reads.
+fn Plan.mark_crossing(mut self, func: clif::Function, alloc: mem::Alloc) {
+    let count = self.kept.len()
+    var through = filled(count, value: false, alloc)
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < count
+        if not self.kept[at] {
+            continue
+        }
+        let targets = self.shape.targets_from(block)
+        for arm in 0..<targets.len() {
+            if self.threads.get(Edge(block: block.index, arm: u32.fit(arm))).is_some() {
+                for held in self.chain(func, start: targets[arm], alloc) {
+                    let target = usize.widen(held.index)
+                    expect target < count
+                    through[target] = true
+                }
+            }
+        }
+    }
+    var homes = filled(usize.widen(func.value_count()), value: NONE, alloc)
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < through.len()
+        if not through[at] {
+            continue
+        }
+        for param in func.block_params(block, alloc) {
+            expect usize.widen(param.index) < homes.len()
+            homes[usize.widen(param.index)] = block.index
+        }
+        for inst in func.block_insts(block, alloc) {
+            for result in func.inst_results(inst, alloc) {
+                expect usize.widen(result.index) < homes.len()
+                homes[usize.widen(result.index)] = block.index
+            }
+        }
+    }
+    for block in func.layout_blocks(alloc) {
+        let at = usize.widen(block.index)
+        expect at < count
+        if not self.kept[at] and not through[at] {
+            continue
+        }
+        for inst in func.block_insts(block, alloc) {
+            each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
+                let read = usize.widen(func.resolve_aliases(value).index)
+                expect read < homes.len() and read < self.crossing.len()
+                if homes[read] != NONE and homes[read] != block.index {
+                    self.crossing[read] = true
+                }
+            })
+        }
+    }
+} Plan.mark_crossing
+
+/// The comparison defining a value, as a fact.
+fn compared(func: clif::Function, defs: Slice[u32], value: clif::Value) -> Option[Fact] {
+    let Some(inst) = defining(func, defs, value) else {
+        return None
+    }
+    let clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) = func.inst_data(inst) else {
+        return None
+    }
+    return Some(Fact.Compares(cond: cond, x: func.resolve_aliases(x).index, y: func.resolve_aliases(y).index))
+} compared
+
+/// Whether `x cond y` holds, when a known comparison of the two values or their sameness decides
+/// it.
+fn decided_by_relation(func: clif::Function, cond: clif::IntCC, x: clif::Value, y: clif::Value, known: Slice[Fact]) -> Option[bool] {
+    let left = func.resolve_aliases(x).index
+    let right = func.resolve_aliases(y).index
+    if left == right {
+        return Some(implies(clif::IntCC.Equal, wanted: cond))
+    }
+    for fact in known {
+        let Fact.Compares(cond: held, x: a, y: b) = fact else {
+            continue
+        }
+        var relation = held
+        if a == right and b == left {
+            relation = swapped(held)
+        } else if a != left or b != right {
+            continue
+        }
+        if implies(relation, wanted: cond) {
+            return Some(true)
+        }
+        if implies(relation, wanted: negated(cond)) {
+            return Some(false)
+        }
+    }
+    return None
+} decided_by_relation
+
+/// What is known of whether an unsigned subtraction borrows, the second result of `usub_overflow`.
+fn borrow_of(func: clif::Function, inst: clif::Inst, known: Slice[Fact], alloc: mem::Alloc) -> Option[Fact] {
+    let clif::InstructionData.Binary(opcode: clif::Opcode.UsubOverflow, x: x, y: y) = func.inst_data(inst) else {
+        return None
+    }
+    let Some(borrows) = bit_of(decided_by_relation(func, cond: clif::IntCC.UnsignedLessThan, x, y, known)) else {
+        return None
+    }
+    let results = func.inst_results(inst, alloc)
+    expect results.len() > 1
+    return Some(Fact.Holds(value: results[1].index, bits: borrows))
+} borrow_of
+
+fn bit_of(decided: Option[bool]) -> Option[u64] {
+    return match decided {
+        Some(holds) => Some(if holds {
+            1
+        } else {
+            0
+        })
+        None => None
+    }
+} bit_of
+
+/// The outcomes of comparing two values a condition holds for: less (1), equal (2), greater (4).
+fn outcomes(cond: clif::IntCC) -> u32 {
+    return match cond {
+        clif::IntCC.Equal => 2
+        clif::IntCC.NotEqual => 5
+        clif::IntCC.SignedLessThan or clif::IntCC.UnsignedLessThan => 1
+        clif::IntCC.SignedGreaterThanOrEqual or clif::IntCC.UnsignedGreaterThanOrEqual => 6
+        clif::IntCC.SignedGreaterThan or clif::IntCC.UnsignedGreaterThan => 4
+        clif::IntCC.SignedLessThanOrEqual or clif::IntCC.UnsignedLessThanOrEqual => 3
+    }
+} outcomes
+
+/// The order a condition compares in: 0 for equality alone, 1 signed, 2 unsigned.
+fn order_of(cond: clif::IntCC) -> u32 {
+    return match cond {
+        clif::IntCC.Equal or clif::IntCC.NotEqual => 0
+        clif::IntCC.SignedLessThan or clif::IntCC.SignedGreaterThanOrEqual or clif::IntCC.SignedGreaterThan or clif::IntCC.SignedLessThanOrEqual => 1
+        else => 2
+    }
+} order_of
+
+/// Whether two values comparing as `held` says compare as `wanted` says.
+fn implies(held: clif::IntCC, wanted: clif::IntCC) -> bool {
+    let left = order_of(held)
+    let right = order_of(wanted)
+    if left != 0 and right != 0 and left != right {
+        return false
+    }
+    return (outcomes(held) & ~outcomes(wanted)) == 0
+} implies
+
+/// The condition holding exactly when `cond` does not.
+fn negated(cond: clif::IntCC) -> clif::IntCC {
+    return match cond {
+        clif::IntCC.Equal => clif::IntCC.NotEqual
+        clif::IntCC.NotEqual => clif::IntCC.Equal
+        clif::IntCC.SignedLessThan => clif::IntCC.SignedGreaterThanOrEqual
+        clif::IntCC.SignedGreaterThanOrEqual => clif::IntCC.SignedLessThan
+        clif::IntCC.SignedGreaterThan => clif::IntCC.SignedLessThanOrEqual
+        clif::IntCC.SignedLessThanOrEqual => clif::IntCC.SignedGreaterThan
+        clif::IntCC.UnsignedLessThan => clif::IntCC.UnsignedGreaterThanOrEqual
+        clif::IntCC.UnsignedGreaterThanOrEqual => clif::IntCC.UnsignedLessThan
+        clif::IntCC.UnsignedGreaterThan => clif::IntCC.UnsignedLessThanOrEqual
+        clif::IntCC.UnsignedLessThanOrEqual => clif::IntCC.UnsignedGreaterThan
+    }
+} negated

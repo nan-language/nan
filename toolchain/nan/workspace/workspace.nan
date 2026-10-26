@@ -55,17 +55,22 @@ pkg struct File {
     pkg module: Option[usize]
     pkg syntax: syntax::SourceFile
     /// Its items lowered, by index, once a check has read them; none for an item without one.
-    lowering: mem::OnceMap[u8, mem::List[Option[ast::Item]]]
+    lowering: mem::OnceMap[u8, mem::Shared[mem::List[Option[ast::Item]]]]
 } File
 
 fn File.new(take path: text::String, module: Option[usize], take parsed: syntax::SourceFile, alloc: mem::Alloc) -> File {
-    return File(path: take path, module: module, syntax: take parsed, lowering: mem::OnceMap[u8, mem::List[Option[ast::Item]]].empty(seed: 0, alloc))
+    return File(path: take path, module: module, syntax: take parsed, lowering: mem::OnceMap[u8, mem::Shared[mem::List[Option[ast::Item]]]].empty(seed: 0, alloc))
 } File.new
 
 /// Its items lowered, by index: none for an abandoned item or one that lowers to nothing.
 pkg proj fn File.lowered(self, alloc: mem::Alloc) -> Slice[Option[ast::Item]] {
+    return self.lowering_of(alloc).contents().view()
+} File.lowered
+
+/// Its items lowered, as `lowered` gives them, held for whoever keeps them.
+pkg proj fn File.lowering_of(self, alloc: mem::Alloc) -> mem::Shared[mem::List[Option[ast::Item]]] {
     match self.lowering.get(0) {
-        Some(items) => return items.view()
+        Some(items) => return items
         None => {}
     }
     var items = mem::List[Option[ast::Item]].empty(alloc)
@@ -81,9 +86,8 @@ pkg proj fn File.lowered(self, alloc: mem::Alloc) -> Slice[Option[ast::Item]] {
             None => mut items.push(None)
         }
     }
-    let stored = self.lowering.insert(0, value: take items)
-    return stored.view()
-} File.lowered
+    return self.lowering.insert(0, value: mem::Shared.of(take items, alloc))
+} File.lowering_of
 
 /// The workspace root of a command run in `current`: the parent of the outermost directory at or
 /// above it holding a `package.nan`, or else `current`.
@@ -181,24 +185,66 @@ pkg fn Workspace.load(
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Workspace fails platform::IoError {
-    var walked = mem::List[Found].empty(alloc)
+    let walked = try Walked.of(root, alloc)
+    return try take walked.loaded(root, read, given, syntaxes: Syntaxes.of(given, alloc), grammar, alloc)
+} Workspace.load
+
+/// The workspace at `root`, loaded as `load` does once the worker tasks of `parsing` beside this
+/// task have parsed the source files whose syntax the build cache does not hold.
+pkg fn Workspace.load_ahead(
+    root: Str,
+    read: mem::Arena[text::String],
+    given: Option[cache::HomeOverride],
+    grammar: mem::Shared[syntax::Grammar],
+    parsing: Parsing,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
+    let walked = try Walked.of(root, alloc)
+    let syntaxes = Syntaxes.of(given, alloc)
+    try syntaxes.ahead(walked.found.view(), root, grammar, parsing, alloc)
+    return try take walked.loaded(root, read, given, syntaxes, grammar: grammar.contents(), alloc)
+} Workspace.load_ahead
+
+/// What walking a workspace's directories found: its packages, and its source files no package
+/// holds.
+struct Walked {
+    found: mem::List[Found]
+    stray: mem::List[text::String]
+} Walked
+
+fn Walked.of(root: Str, alloc: mem::Alloc) -> Walked fails platform::IoError {
+    var found = mem::List[Found].empty(alloc)
     var stray = mem::List[text::String].empty(alloc)
-    try walk(root, dir: "", enclosing: None, found: mut walked, stray: mut stray, alloc)
+    try walk(root, dir: "", enclosing: None, found: mut found, stray: mut stray, alloc)
+    return Walked(found: take found, stray: take stray)
+} Walked.of
+
+/// The workspace of what the walk found, its files read from `root`, their paths recorded in
+/// `read`.
+fn Walked.loaded(
+    take self,
+    root: Str,
+    read: mem::Arena[text::String],
+    given: Option[cache::HomeOverride],
+    syntaxes: Syntaxes,
+    grammar: syntax::Grammar,
+    alloc: mem::Alloc,
+    ) -> Workspace fails platform::IoError {
     var user = UserStore(opened: None, alloc: alloc)
-    return try Workspace.build(text::String.of(root, alloc), walked: take walked, stray: take stray, source: fn(path: Str) -> mem::Bytes fails platform::IoError {
+    return try Workspace.build(text::String.of(root, alloc), walked: take self.found, stray: take self.stray, source: fn(path: Str) -> mem::Bytes fails platform::IoError {
         discard read.push(text::String.of(path, alloc))
         let absolute = platform::join(root, name: path, alloc)
         return try platform::read_file(absolute.as_str(), alloc)
-    }, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+    }, syntaxes, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
         return try mut user.entry(held, given)
     }, grammar, alloc)
-} Workspace.load
+} Walked.loaded
 
 /// The workspace with the files of `changed` holding their new sources, read from memory.
 pkg fn Workspace.overlaid(self, changed: mem::Map[text::String, mem::Bytes], grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
     let built = attempt Workspace.build(text::String.of(self.root.as_str(), alloc), walked: self.layout_with(changed, alloc), stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
         return self.changed_source(changed, path, alloc)
-    }, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+    }, syntaxes: Syntaxes.parsing(), store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
         return held_entry(self.releases.view(), confirmed: self.confirmed.view(), root: held, alloc)
     }, grammar, alloc)
     let Ok(workspace) = built else {
@@ -289,15 +335,20 @@ pkg fn Workspace.rebuilt(
     let walked = self.layout_with(changed, alloc)
     return try Workspace.build(text::String.of(self.root.as_str(), alloc), walked: take walked, stray: self.stray_paths(alloc), source: fn(path: Str) -> mem::Bytes {
         return self.changed_source(changed, path, alloc)
-    }, store_entry, grammar, alloc)
+    }, syntaxes: Syntaxes.parsing(), store_entry, grammar, alloc)
 } Workspace.rebuilt
 
 /// The workspace of in-memory files, each given by its path relative to `root`: each file
 /// belongs to the package of the nearest directory at or above it holding a `package.nan`.
 pkg fn Workspace.of_files(root: Str, files: Slice[artefact::SourceFile], grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
+    return Workspace.of_parsed_files(root, files, syntaxes: Syntaxes.parsing(), grammar, alloc)
+} Workspace.of_files
+
+/// The workspace of in-memory files as `of_files` places them, their syntax from `syntaxes`.
+fn Workspace.of_parsed_files(root: Str, files: Slice[artefact::SourceFile], syntaxes: Syntaxes, grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
     let releases = mem::List[Release].empty(alloc)
     let confirmed = mem::List[mem::Shared[store::Entry]].empty(alloc)
-    let built = attempt Workspace.from_files(root, files, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
+    let built = attempt Workspace.from_files(root, files, syntaxes, store_entry: fn(held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] {
         return held_entry(releases.view(), confirmed: confirmed.view(), root: held, alloc)
     }, grammar, alloc)
     let Ok(workspace) = built else {
@@ -305,7 +356,7 @@ pkg fn Workspace.of_files(root: Str, files: Slice[artefact::SourceFile], grammar
         return Workspace.empty(root, alloc)
     }
     return workspace
-} Workspace.of_files
+} Workspace.of_parsed_files
 
 /// The workspace of in-memory files as `of_files` places them, its locks reading releases
 /// from the local store of the user directory, the one `given` replaces when a harness gives one.
@@ -317,23 +368,138 @@ pkg fn Workspace.of_stored_files(
     alloc: mem::Alloc,
     ) -> Workspace fails platform::IoError {
     var user = UserStore(opened: None, alloc: alloc)
-    return try Workspace.from_files(root, files, store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
+    return try Workspace.from_files(root, files, syntaxes: Syntaxes.of(given, alloc), store_entry: fn[mut user](held: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError {
         return try mut user.entry(held, given)
     }, grammar, alloc)
 } Workspace.of_stored_files
 
+/// The std packages the toolchain carries, as a workspace of their own loaded when first read,
+/// its files parsed ahead by the worker tasks of `parsing`; the copies `share` makes share it.
+pkg struct CarriedStd {
+    held: mem::Shared[mem::OnceMap[u8, mem::Shared[Workspace]]]
+    parsing: mem::Shared[Parsing]
+} CarriedStd
+
+pkg fn CarriedStd.unloaded(take parsing: mem::Shared[Parsing], alloc: mem::Alloc) -> CarriedStd {
+    return CarriedStd(held: mem::Shared.of(mem::OnceMap[u8, mem::Shared[Workspace]].empty(seed: 0, alloc), alloc: alloc), parsing: take parsing)
+} CarriedStd.unloaded
+
+pkg fn CarriedStd.share(self) -> CarriedStd {
+    return CarriedStd(held: self.held.share(), parsing: self.parsing.share())
+} CarriedStd.share
+
+/// The std workspace, its source files' syntax from the `Syntaxes` of the user directory, the
+/// one `given` replaces, when it is first read.
+pkg proj fn CarriedStd.workspace(self, grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], alloc: mem::Alloc) -> Workspace {
+    let held = self.held.contents()
+    match held.get(0) {
+        Some(loaded) => return loaded.contents()
+        None => {}
+    }
+    return held.insert(0, value: mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), alloc), alloc: alloc)).contents()
+} CarriedStd.workspace
+
+/// A handle of the std workspace, as `workspace` reads it.
+pkg fn CarriedStd.shared(self, grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], alloc: mem::Alloc) -> mem::Shared[Workspace] {
+    discard self.workspace(grammar, given, alloc)
+    let Some(loaded) = self.held.contents().get(0) else {
+        expect false
+        return mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), alloc), alloc: alloc)
+    }
+    return loaded.share()
+} CarriedStd.shared
+
 /// The std packages as a workspace of their own, whose files the locations of std items name.
-pkg fn Workspace.of_std(grammar: syntax::Grammar, alloc: mem::Alloc) -> Workspace {
+fn Workspace.of_std(grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], parsing: Parsing, alloc: mem::Alloc) -> Workspace {
     var files = mem::List[artefact::SourceFile].empty(alloc)
     for file in stdlib::StdFile.all(alloc) {
         mut files.push(artefact::SourceFile(path: text::String.of(file.path(), alloc), content: copied_bytes(file.text().as_bytes(), alloc)))
     }
-    return Workspace.of_files("std", files: files.view(), grammar, alloc)
+    let syntaxes = Syntaxes.of(given, alloc)
+    syntaxes.ahead_carried(grammar, parsing, alloc)
+    return Workspace.of_parsed_files("std", files: files.view(), syntaxes, grammar: grammar.contents(), alloc)
 } Workspace.of_std
+
+/// Where the syntax of source files comes from: the build cache of the user directory, when the
+/// running image records its toolchain's source tree hash and the cache holds the syntax of a
+/// file's bytes under the toolchain hash, and otherwise parsing them, after which the cache
+/// receives it.
+pkg struct Syntaxes {
+    cache: Option[cache::Cache]
+    toolchain: Option[hashing::HashValue]
+    decoding: Option[syntax::Decoding]
+} Syntaxes
+
+/// Syntax from parsing alone.
+pkg fn Syntaxes.parsing() -> Syntaxes {
+    return Syntaxes(cache: None, toolchain: None, decoding: None)
+} Syntaxes.parsing
+
+/// Syntax from the build cache of the user directory, the one `given` replaces.
+pkg fn Syntaxes.of(given: Option[cache::HomeOverride], alloc: mem::Alloc) -> Syntaxes {
+    let Ok(Some(tree)) = attempt toolchain::recorded_tree(alloc) else {
+        return Syntaxes.parsing()
+    }
+    let Ok(opened) = attempt cache::Cache.open(cache::copied_override(given, alloc), alloc) else {
+        return Syntaxes.parsing()
+    }
+    let Ok(user) = opened else {
+        return Syntaxes.parsing()
+    }
+    return Syntaxes(cache: Some(take user), toolchain: Some(toolchain::hash(toolchain::LANGUAGES[0], tree, alloc)), decoding: Some(syntax::Decoding.new(alloc)))
+} Syntaxes.of
+
+/// The syntax of a source file's bytes, parsed as a std package's file when `std` holds.
+fn Syntaxes.parsed(self, take bytes: mem::Bytes, std: bool, grammar: syntax::Grammar, alloc: mem::Alloc) -> syntax::SourceFile {
+    let Some(user) = self.cache else {
+        return parsed_bytes(take bytes, std, grammar, alloc)
+    }
+    let Some(toolchain) = self.toolchain else {
+        return parsed_bytes(take bytes, std, grammar, alloc)
+    }
+    let Some(decoding) = self.decoding else {
+        return parsed_bytes(take bytes, std, grammar, alloc)
+    }
+    let key = syntax_key(toolchain, bytes: bytes.view(), std, alloc)
+    match attempt user.entry(key) {
+        Ok(Ok(Some(held))) => {
+            match decoding.file(held.view(), source: copied_bytes(bytes.view(), alloc), readable: syntax::source_text(bytes.view(), alloc), alloc) {
+                Some(file) => return file
+                None => {}
+            }
+        }
+        else => {}
+    }
+    let file = parsed_bytes(take bytes, std, grammar, alloc)
+    discard attempt user.put(key, contents: file.stored(alloc).view())
+    return file
+} Syntaxes.parsed
+
+/// The key of the cache entry holding the syntax of a source file's bytes under a toolchain hash.
+fn syntax_key(toolchain: hashing::HashValue, bytes: Slice[u8], std: bool, alloc: mem::Alloc) -> hashing::HashValue {
+    var keyed = mem::Bytes.empty(alloc)
+    mut keyed.append(b"syntax\n")
+    mut keyed.append(toolchain.bytes.view())
+    match std {
+        true => mut keyed.push(1)
+        false => mut keyed.push(0)
+    }
+    mut keyed.append(hashing::HashValue.of(bytes).bytes.view())
+    return hashing::HashValue.of(keyed.view())
+} syntax_key
+
+/// The syntax parsing a source file's bytes gives, as a std package's file when `std` holds.
+fn parsed_bytes(take bytes: mem::Bytes, std: bool, grammar: syntax::Grammar, alloc: mem::Alloc) -> syntax::SourceFile {
+    return match std {
+        true => syntax::parse_std(take bytes, grammar, alloc)
+        false => syntax::parse(take bytes, grammar, alloc)
+    }
+} parsed_bytes
 
 fn Workspace.from_files(
     root: Str,
     files: Slice[artefact::SourceFile],
+    syntaxes: Syntaxes,
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
@@ -373,7 +539,7 @@ fn Workspace.from_files(
         }
         expect false
         return mem::Bytes.empty(alloc)
-    }, store_entry, grammar, alloc)
+    }, syntaxes, store_entry, grammar, alloc)
 } Workspace.from_files
 
 fn Workspace.build(
@@ -381,13 +547,14 @@ fn Workspace.build(
     take walked: mem::List[Found],
     take stray: mem::List[text::String],
     source: fn(path: Str) -> mem::Bytes fails platform::IoError,
+    syntaxes: Syntaxes,
     store_entry: fn(root: hashing::HashValue) -> Option[mem::Shared[store::Entry]] fails platform::IoError,
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Workspace fails platform::IoError {
     var packages = mem::List[Package].empty(alloc)
     for found in walked {
-        let loaded = try Package.load(found.copied(alloc), source, grammar, alloc)
+        let loaded = try Package.load(found.copied(alloc), source, syntaxes, grammar, alloc)
         mut packages.push(take loaded)
     }
     let read = try read_closures(packages.view(), store_entry, grammar, alloc)
@@ -416,20 +583,12 @@ fn Workspace.build(
 pkg proj fn Workspace.member(self, member: Member) -> Package {
     match member {
         Member.Source(index) => {
-            let Some(source) = self.packages.get(index) else {
-                expect false
-                loop {
-                }
-            }
-            return source
+            expect index < self.packages.len()
+            return self.packages[index]
         }
         Member.Release(index) => {
-            let Some(release) = self.releases.get(index) else {
-                expect false
-                loop {
-                }
-            }
-            return release.pack
+            expect index < self.releases.len()
+            return self.releases[index].pack
         }
     }
 } Workspace.member
@@ -1148,6 +1307,7 @@ fn last_dot(name: Str) -> Option[usize] {
 fn Package.load(
     take found: Found,
     source: fn(path: Str) -> mem::Bytes fails platform::IoError,
+    syntaxes: Syntaxes,
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Package fails platform::IoError {
@@ -1155,7 +1315,7 @@ fn Package.load(
     mut sources.sort_by(fn(left: text::String, right: text::String) => left.cmp(right))
     var manifest_path = text::String.of(found.dir.as_str(), alloc)
     mut manifest_path.append("/package.nan")
-    let parsed = syntax::parse(try source(manifest_path.as_str()), grammar, alloc)
+    let parsed = syntaxes.parsed(try source(manifest_path.as_str()), std: false, grammar, alloc)
     var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
     let manifest = Manifest.read(parsed, path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
     var files = mem::List[File].empty(alloc)
@@ -1167,10 +1327,7 @@ fn Package.load(
     if language_supported(manifest) {
         for index in 0..<sources.len() {
             let bytes = try source(sources[index].as_str())
-            let parsed_source = match std {
-                true => syntax::parse_std(take bytes, grammar, alloc)
-                false => syntax::parse(take bytes, grammar, alloc)
-            }
+            let parsed_source = syntaxes.parsed(take bytes, std, grammar, alloc)
             mut files.push(File.new(text::String.of(sources[index].as_str(), alloc), module: Some(assigned[index]), parsed: take parsed_source, alloc))
         }
     }
@@ -1273,7 +1430,7 @@ fn Package.from_entry(entry: store::Entry, dir: Str, grammar: syntax::Grammar, a
             }
         }
         fail platform::IoError.Other(0)
-    }, grammar, alloc)
+    }, syntaxes: Syntaxes.parsing(), grammar, alloc)
 } Package.from_entry
 
 /// Reports every `package` item outside `package.nan`, and every item of `package.nan` but
@@ -1300,7 +1457,7 @@ fn Package.check_misplaced_manifests(mut self, alloc: mem::Alloc) {
             if manifest_file and manifest_item and not manifest_seen {
                 manifest_seen = true
             } else if manifest_file or manifest_item {
-                let Some(line) = tree.head_line(file.syntax, alloc) else {
+                let Some(line) = tree.head_line(file.syntax) else {
                     expect false
                     continue
                 }

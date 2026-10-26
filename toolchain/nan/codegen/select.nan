@@ -15,6 +15,11 @@ struct Selector {
     defs: mem::List[u32]
     /// Each block's index in the code, `NONE` for one no path from the entry reaches.
     positions: mem::List[u32]
+    /// The block a jump to each block lands in: past the blocks holding only a jump without
+    /// arguments.
+    destinations: mem::List[u32]
+    /// The chains of branches becoming jump tables.
+    switches: Switches
     /// For each block ending in a conditional branch, the index of the block each edge passing
     /// arguments goes through, `NONE` for an edge without arguments.
     then_edges: mem::List[u32]
@@ -68,6 +73,8 @@ fn Selector.new(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> Selector {
         use_counts: filled(values, value: 0u32, alloc),
         defs: filled(values, value: NONE, alloc),
         positions: filled(blocks, value: NONE, alloc),
+        destinations: destinations(func, count: blocks, alloc),
+        switches: find_switches(func, count: blocks, alloc),
         then_edges: filled(blocks, value: NONE, alloc),
         else_edges: filled(blocks, value: NONE, alloc),
         slot_offsets: mem::List[u32].empty(alloc),
@@ -91,26 +98,90 @@ fn block_count(func: clif::Function, alloc: mem::Alloc) -> usize {
     return count
 } block_count
 
-/// The blocks a block's terminator branches to.
-fn successors(func: clif::Function, block: clif::Block, alloc: mem::Alloc) -> mem::List[clif::Block] {
-    var found = mem::List[clif::Block].empty(alloc)
-    let insts = func.block_insts(block, alloc)
+/// The block a jump to each block lands in: the end of the chain of blocks other than the entry
+/// that hold only a jump without arguments, or a block of the chain when it loops.
+fn destinations(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List[u32] {
+    var next = filled(count, value: NONE, alloc)
+    let entry = func.entry_block()
+    for block in func.layout_blocks(alloc) {
+        if entry == Some(block) or func.block_params(block, alloc).len() > 0 {
+            continue
+        }
+        let insts = func.block_insts(block, alloc)
+        if insts.len() != 1 {
+            continue
+        }
+        let clif::InstructionData.Jump(opcode: _, destination: destination) = func.inst_data(insts[0]) else {
+            continue
+        }
+        expect usize.widen(block.index) < next.len()
+        if destination.args.len() == 0 and usize.widen(destination.block.index) < count {
+            next[usize.widen(block.index)] = destination.block.index
+        }
+    }
+    var found = filled(count, value: NONE, alloc)
+    for index in 0..<count {
+        invariant next.len() == count and found.len() == count
+        var walk = u32.fit(index)
+        var steps: usize = 0
+        while next[usize.widen(walk)] != NONE and found[usize.widen(walk)] == NONE and steps < count {
+            walk = next[usize.widen(walk)]
+            steps += 1
+        }
+        if found[usize.widen(walk)] != NONE {
+            found[index] = found[usize.widen(walk)]
+        } else if next[usize.widen(walk)] == NONE {
+            found[index] = walk
+        } else {
+            found[index] = u32.fit(index)
+        }
+    }
+    return found
+} destinations
+
+/// The block a jump to a block lands in.
+fn Selector.destination(self, block: clif::Block) -> clif::Block {
+    let at = usize.widen(block.index)
+    expect at < self.destinations.len()
+    return clif::Block(index: self.destinations[at])
+} Selector.destination
+
+/// Whether both edges of a conditional branch land in one block without arguments.
+fn Selector.merges(self, then_call: clif::BlockCall, else_call: clif::BlockCall) -> bool {
+    return then_call.args.len() == 0 and else_call.args.len() == 0 and self.destination(then_call.block) == self.destination(else_call.block)
+} Selector.merges
+
+/// The blocks a block's terminator lands in.
+fn Selector.successors(self, func: clif::Function, block: clif::Block) -> mem::List[clif::Block] {
+    var found = mem::List[clif::Block].empty(self.alloc)
+    let chain = self.switch_of(block)
+    if chain != NONE {
+        expect usize.widen(chain) < self.switches.chains.len()
+        for target in self.switches.chains[usize.widen(chain)].targets {
+            mut found.push(self.destination(target))
+        }
+        mut found.push(self.destination(self.switches.chains[usize.widen(chain)].default))
+        return found
+    }
+    let insts = func.block_insts(block, alloc: self.alloc)
     if insts.len() == 0 {
         return found
     }
     match func.inst_data(insts[insts.len() - 1]) {
-        clif::InstructionData.Jump(opcode: _, destination: destination) => mut found.push(destination.block)
+        clif::InstructionData.Jump(opcode: _, destination: destination) => mut found.push(self.destination(destination.block))
         clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
-            mut found.push(then_call.block)
-            mut found.push(else_call.block)
+            mut found.push(self.destination(then_call.block))
+            mut found.push(self.destination(else_call.block))
         }
         else => {}
     }
     return found
-} successors
+} Selector.successors
 
 /// Whether a path from the entry reaches each block.
-fn reachable(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List[bool] {
+fn Selector.reachable(self, func: clif::Function) -> mem::List[bool] {
+    let alloc = self.alloc
+    let count = self.positions.len()
     var seen = filled(count, value: false, alloc)
     var pending = mem::List[clif::Block].empty(alloc)
     let Some(entry) = func.entry_block() else {
@@ -123,7 +194,7 @@ fn reachable(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List
         let Some(block) = mut pending.pop() else {
             break
         }
-        for next in successors(func, block, alloc) {
+        for next in self.successors(func, block) {
             let at = usize.widen(next.index)
             expect at < seen.len()
             if not seen[at] {
@@ -133,7 +204,7 @@ fn reachable(func: clif::Function, count: usize, alloc: mem::Alloc) -> mem::List
         }
     }
     return seen
-} reachable
+} Selector.reachable
 
 /// The reachable blocks in the order emission lays them out: those not cold in layout order,
 /// then the cold ones.
@@ -163,7 +234,7 @@ fn Selector.position_of(self, block: clif::Block) -> u32 {
 /// Numbers the reachable blocks in emission order, each followed by the blocks its conditional
 /// branch's edges with arguments go through.
 fn Selector.place_blocks(mut self, func: clif::Function) {
-    let seen = reachable(func, count: self.positions.len(), alloc: self.alloc)
+    let seen = self.reachable(func)
     for index in 0..<seen.len() {
         if seen[index] {
             expect index < self.positions.len()
@@ -181,6 +252,9 @@ fn Selector.place_blocks(mut self, func: clif::Function) {
             continue
         }
         let clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) = func.inst_data(insts[insts.len() - 1]) else {
+            continue
+        }
+        if self.merges(then_call, else_call) {
             continue
         }
         if then_call.args.len() > 0 {
@@ -417,10 +491,23 @@ fn imm32(bits: u64, width: u32) -> Option[i32] {
     return Some(i32.truncate(i64.from_bits(bits << shift).shr_arith(shift)))
 } imm32
 
-/// The register holding a value for an instruction to read; a constant is written into a new
-/// register for each read.
+/// The register holding a value for an instruction to read; a constant or a stack slot's address
+/// is written into a new register for each read.
 fn Selector.src(mut self, value: clif::Value, func: clif::Function) -> x64::Reg {
     let Some(bits) = self.constant(value, func) else {
+        let at = usize.widen(func.resolve_aliases(value).index)
+        expect at < self.defs.len()
+        let def = self.defs[at]
+        if def != NONE {
+            match func.inst_data(clif::Inst(index: def)) {
+                clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => {
+                    let address = mut self.temp(false)
+                    mut self.emit(x64::Inst.Lea(dst: address, src: x64::Amode.at(x64::RSP, disp: self.slot_disp(slot, offset))))
+                    return address
+                }
+                else => {}
+            }
+        }
         return mut self.reg(value, func)
     }
     let ty = func.value_type(value)
@@ -600,7 +687,7 @@ fn Selector.jump(mut self, func: clif::Function, target: clif::Block, args: Slic
             mut self.code.args.push(high)
         }
     }
-    let position = self.position_of(target)
+    let position = self.position_of(self.destination(target))
     mut self.code.succs.push(position)
     mut self.emit(x64::Inst.Jmp(label: position))
 } Selector.jump

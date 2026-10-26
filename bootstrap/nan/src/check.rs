@@ -112,9 +112,9 @@ pub struct Checker<'a> {
     scope: RefCell<Vec<GenericDef>>,
     /// The item whose body or clauses are being typed.
     within: Cell<Option<ItemId>>,
-    /// The properties of struct and enum definitions, by whether a consumer sees them; none while
-    /// one is being decided.
-    definitions: RefCell<HashMap<(ItemId, bool), Option<props::Props>>>,
+    /// The properties of struct and enum definitions, by whether a consumer sees them.
+    definitions: RefCell<HashMap<(ItemId, bool), props::Props>>,
+    deciding: RefCell<props::Deciding>,
     /// The typed bodies of function items, from their checks or typed for their digests.
     bodies: RefCell<HashMap<ItemId, Rc<tir::TBody>>>,
     /// The functions each function calls directly or supplies as function arguments, in order;
@@ -231,6 +231,7 @@ impl<'a> Checker<'a> {
             scope: RefCell::new(Vec::new()),
             within: Cell::new(None),
             definitions: RefCell::new(HashMap::new()),
+            deciding: RefCell::new(props::Deciding::default()),
             bodies: RefCell::new(HashMap::new()),
             body_dependencies: RefCell::new(HashMap::new()),
             implemented: RefCell::new(HashMap::new()),

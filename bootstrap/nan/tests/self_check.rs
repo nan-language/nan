@@ -8,15 +8,18 @@
 //! what it writes; and for the toolchain workspace, which must check without a diagnostic and
 //! pass `nan verify` with both. The toolchain test then checks the self-built toolchain by diverse
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
-//! into the same bytes, and the bootstrap's stage comparison accepts it. The NaN toolchain runs on
-//! a copy of the workspace and local store the bootstrap has just used, on one processor under an
-//! address-space cap, with a user directory of its own.
+//! into the same bytes, and the bootstrap's stage comparison accepts it. The NaN toolchain runs
+//! beside the bootstrap on a copy of the workspace and local store the bootstrap runs in, on one
+//! processor under an address-space cap, with a user directory of its own.
 
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use datatest_stable::Utf8Path;
@@ -67,8 +70,7 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     let Ok(loaded) = attempt workspace::Workspace.load(root.as_str(), read, given: given.home, grammar, alloc) else {
         return 101
     }
-    let std = workspace::Workspace.of_std(grammar, alloc)
-    let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: mem::Shared.of(take std, alloc: alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(given.home, alloc), alloc)
+    let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: workspace::CarriedStd.unloaded(parsing: mem::Shared.of(workspace::Parsing.empty(served: false, alloc), alloc: alloc), alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(given.home, alloc), alloc)
     match given.nir {
         Some(wanted) => {
             discard attempt platform::write_stdout(session.nir_streams(wanted.as_str()).view())
@@ -235,11 +237,13 @@ fn image() -> Result<PathBuf, String> {
     Ok(image)
 }
 
-/// One processor of the harness's affinity set, picked by its process id. The runtime of an
-/// image sets up an executor thread and an io_uring instance per processor of its affinity set,
-/// and the kernel charges the instances' memory to the user's locked-memory limit, which
-/// concurrent toolchain runs with every processor would exhaust.
+/// One processor of the harness's affinity set, the next one for each run this process starts,
+/// from one its process id picks, so that runs beside each other do not share a processor. The
+/// runtime of an image sets up an executor thread and an io_uring instance per processor of its
+/// affinity set, and the kernel charges the instances' memory to the user's locked-memory limit,
+/// which concurrent toolchain runs with every processor would exhaust.
 fn processor() -> String {
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let allowed: Vec<u32> = status
         .lines()
@@ -252,7 +256,8 @@ fn processor() -> String {
             low.parse().unwrap_or(0)..=high.parse().unwrap_or(0)
         })
         .collect();
-    allowed[std::process::id() as usize % allowed.len()].to_string()
+    let run = std::process::id() as usize + STARTED.fetch_add(1, Ordering::Relaxed);
+    allowed[run % allowed.len()].to_string()
 }
 
 /// A NaN toolchain image and the bounds of each of its runs.
@@ -290,14 +295,9 @@ struct Given<'a> {
     asked: &'a [(&'a str, &'a str)],
 }
 
-/// What a run of a NaN toolchain in `dir` prints and the status it exits with, on one processor,
-/// under its bounds, killed after its time limit.
-fn front(
-    toolchain: &Toolchain,
-    dir: &Path,
-    given: &Given,
-    args: &[&str],
-) -> Result<(Vec<u8>, Option<i32>), String> {
+/// Starts a run of a NaN toolchain in `dir`, on one processor, under its bounds, killed after its
+/// time limit.
+fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Result<Front, String> {
     fs::create_dir_all(given.home).map_err(|error| error.to_string())?;
     let mut command = Command::new("sh");
     command
@@ -318,22 +318,39 @@ fn front(
     for (variable, value) in given.asked {
         command.env(variable, value);
     }
-    let ran = supervised(command, toolchain.limit)?;
-    let Some(status) = ran.status else {
-        return Err(format!(
-            "the NaN toolchain runs over {:?}: nan {}",
-            toolchain.limit,
-            args.join(" ")
-        ));
-    };
-    if !ran.stderr.is_empty() {
-        return Err(format!(
-            "the NaN toolchain exits with {status:?} on nan {} and reports\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&ran.stderr)
-        ));
+    Ok(Front {
+        run: Supervised::start(command, toolchain.limit)?,
+        limit: toolchain.limit,
+        command: args.join(" "),
+    })
+}
+
+/// A started run of a NaN toolchain, with its time limit and command line.
+struct Front {
+    run: Supervised,
+    limit: Duration,
+    command: String,
+}
+
+impl Front {
+    /// What the run prints and the status it exits with.
+    fn output(self) -> Result<(Vec<u8>, Option<i32>), String> {
+        let ran = self.run.finish()?;
+        let Some(status) = ran.status else {
+            return Err(format!(
+                "the NaN toolchain runs over {:?}: nan {}",
+                self.limit, self.command
+            ));
+        };
+        if !ran.stderr.is_empty() {
+            return Err(format!(
+                "the NaN toolchain exits with {status:?} on nan {} and reports\n{}",
+                self.command,
+                String::from_utf8_lossy(&ran.stderr)
+            ));
+        }
+        Ok((ran.stdout, status))
     }
-    Ok((ran.stdout, status))
 }
 
 /// What a supervised command writes to its standard output and error, and its exit status,
@@ -345,38 +362,71 @@ struct Ran {
     status: Option<Option<i32>>,
 }
 
-/// Runs a command to its end or until `limit` passes, then kills it.
-fn supervised(mut command: Command, limit: Duration) -> Result<Ran, String> {
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let mut stdout = child.stdout.take().expect("the child's output");
-    let mut stderr = child.stderr.take().expect("the child's diagnostics");
-    let printed = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        drop(stdout.read_to_end(&mut bytes));
-        bytes
-    });
-    let reported = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        drop(stderr.read_to_end(&mut bytes));
-        bytes
-    });
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break Some(status.code());
-        }
-        if Instant::now() >= deadline {
-            drop(child.kill());
-            drop(child.wait());
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Ok(Ran {
-        stdout: printed.join().expect("the child's output read"),
-        stderr: reported.join().expect("the child's diagnostics read"),
-        status,
-    })
+/// A started command, its standard output and error read as it runs, killed once its deadline
+/// passes or when dropped unfinished.
+struct Supervised {
+    child: Child,
+    printed: Option<JoinHandle<Vec<u8>>>,
+    reported: Option<JoinHandle<Vec<u8>>>,
+    deadline: Instant,
+}
+
+impl Supervised {
+    /// Starts a command that may run for `limit`.
+    fn start(mut command: Command, limit: Duration) -> Result<Supervised, String> {
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let mut stdout = child.stdout.take().expect("the child's output");
+        let mut stderr = child.stderr.take().expect("the child's diagnostics");
+        let printed = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            drop(stdout.read_to_end(&mut bytes));
+            bytes
+        });
+        let reported = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            drop(stderr.read_to_end(&mut bytes));
+            bytes
+        });
+        Ok(Supervised {
+            child,
+            printed: Some(printed),
+            reported: Some(reported),
+            deadline: Instant::now() + limit,
+        })
+    }
+
+    /// Waits for the command to end, or kills it once its deadline passes.
+    fn finish(mut self) -> Result<Ran, String> {
+        let status = loop {
+            if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
+                break Some(status.code());
+            }
+            if Instant::now() >= self.deadline {
+                drop(self.child.kill());
+                drop(self.child.wait());
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let read = |handle: Option<JoinHandle<Vec<u8>>>| {
+            handle
+                .expect("a stream read once")
+                .join()
+                .expect("the child's stream read")
+        };
+        Ok(Ran {
+            stdout: read(self.printed.take()),
+            stderr: read(self.reported.take()),
+            status,
+        })
+    }
+}
+
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        drop(self.child.kill());
+        drop(self.child.wait());
+    }
 }
 
 /// The workspace and local store directories of the NaN toolchain's runs beside the
@@ -396,13 +446,18 @@ fn front_home() -> PathBuf {
 
 /// Makes the NaN toolchain's workspace and local store copies of the bootstrap's.
 fn resync(bootstrap: &Path, store: &Path) -> Result<(), String> {
-    let fault = |error: std::io::Error| error.to_string();
     let (front_dir, front_store) = fronts(bootstrap, store);
-    copy_tree(bootstrap, &front_dir, true).map_err(fault)?;
-    match store.exists() {
-        true => copy_tree(store, &front_store, true).map_err(fault),
+    copy_state((bootstrap, store), (&front_dir, &front_store))
+}
+
+/// Makes a workspace and local store copies of others.
+fn copy_state(from: (&Path, &Path), to: (&Path, &Path)) -> Result<(), String> {
+    let fault = |error: std::io::Error| error.to_string();
+    copy_tree(from.0, to.0, true).map_err(fault)?;
+    match from.1.exists() {
+        true => copy_tree(from.1, to.1, true).map_err(fault),
         false => {
-            drop(fs::remove_dir_all(&front_store));
+            drop(fs::remove_dir_all(to.1));
             Ok(())
         }
     }
@@ -444,9 +499,10 @@ fn tree_difference(left: &Path, right: &Path) -> Result<Option<String>, String> 
     Ok(None)
 }
 
-/// Runs `nan <args>` with the bootstrap in its workspace and with the NaN toolchain in a copy of
-/// it and of its local store, then compares what both print, the statuses they exit with and the
-/// files they leave in the workspace and the local store. Gives what they print and the status.
+/// Runs `nan <args>` with the bootstrap in its workspace and, at the same time, with the NaN
+/// toolchain in a copy of it and of its local store, then compares what both print, the statuses
+/// they exit with and the files they leave in the workspace and the local store. Gives what they
+/// print and the status.
 fn compare(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -455,22 +511,42 @@ fn compare(
 ) -> Result<(String, Option<i32>), String> {
     resync(bootstrap, store)?;
     let (front_dir, front_store) = fronts(bootstrap, store);
-    let (expected, status) = nan(bootstrap, args)?;
     let home = front_home();
     let given = Given {
         home: &home,
         store: &front_store,
         asked: &[],
     };
-    let (printed, code) = front(toolchain, &front_dir, &given, args)?;
-    if printed != expected.as_bytes() || code != status {
-        return Err(format!(
-            "nan {} exits with {status:?} and prints\n{expected}the NaN toolchain exits with {code:?} and prints\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&printed)
-        ));
+    let run = front(toolchain, &front_dir, &given, args)?;
+    let (expected, status) = nan(bootstrap, args)?;
+    let (printed, code) = run.output()?;
+    agree(args, (expected.as_bytes(), status), (&printed, code))?;
+    same_files(args, (bootstrap, store), (&front_dir, &front_store))?;
+    Ok((expected, status))
+}
+
+/// Compares what the bootstrap and the NaN toolchain print on `nan <args>` and the statuses they
+/// exit with.
+fn agree(
+    args: &[&str],
+    (expected, status): (&[u8], Option<i32>),
+    (printed, code): (&[u8], Option<i32>),
+) -> Result<(), String> {
+    if printed == expected && code == status {
+        return Ok(());
     }
-    for (ours, theirs) in [(bootstrap, front_dir.as_path()), (store, &front_store)] {
+    Err(format!(
+        "nan {} exits with {status:?} and prints\n{}the NaN toolchain exits with {code:?} and prints\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(printed)
+    ))
+}
+
+/// Compares the workspace and local store the bootstrap leaves after `nan <args>` with those the
+/// NaN toolchain leaves.
+fn same_files(args: &[&str], ours: (&Path, &Path), theirs: (&Path, &Path)) -> Result<(), String> {
+    for (ours, theirs) in [(ours.0, theirs.0), (ours.1, theirs.1)] {
         if let Some(path) = tree_difference(ours, theirs)? {
             return Err(format!(
                 "after nan {}, {path} differs in {}",
@@ -479,26 +555,17 @@ fn compare(
             ));
         }
     }
-    Ok((expected, status))
+    Ok(())
 }
 
 /// Compares the canonical NIR stream of each package of the workspace, or of the one `package`
-/// names, with the NaN toolchain's, run on its copy of the workspace.
+/// names, with the NaN toolchain's, run on its copy of the workspace at the same time.
 fn compare_nir(
     toolchain: &Toolchain,
     bootstrap: &Path,
     store: &Path,
     package: Option<&str>,
 ) -> Result<(), String> {
-    let streams = nan::nir_streams(bootstrap).map_err(|error| error.to_string())?;
-    let mut expected = Vec::new();
-    for (name, stream) in &streams {
-        if package.is_some_and(|package| package != name) {
-            continue;
-        }
-        expected.extend(format!("{name} {}\n", stream.len()).bytes());
-        expected.extend(stream);
-    }
     resync(bootstrap, store)?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let home = front_home();
@@ -508,7 +575,17 @@ fn compare_nir(
         store: &front_store,
         asked: &asked,
     };
-    let (printed, code) = front(toolchain, &front_dir, &given, &[])?;
+    let run = front(toolchain, &front_dir, &given, &[])?;
+    let streams = nan::nir_streams(bootstrap).map_err(|error| error.to_string())?;
+    let mut expected = Vec::new();
+    for (name, stream) in &streams {
+        if package.is_some_and(|package| package != name) {
+            continue;
+        }
+        expected.extend(format!("{name} {}\n", stream.len()).bytes());
+        expected.extend(stream);
+    }
+    let (printed, code) = run.output()?;
     if printed != expected || code != Some(0) {
         return Err(format!(
             "the NaN toolchain exits with {code:?} and gives NIR differing from the bootstrap's at byte {}",
@@ -544,14 +621,37 @@ fn lowered(dump: &[u8]) -> Result<Vec<(String, String)>, String> {
     Ok(functions)
 }
 
-/// Compares the text of each function the final build of `program` lowers with the bootstrap's.
+/// The support routines the NaN toolchain lowers its own way on `x86_64-host`, whose programs
+/// the harness compares by what they write instead.
+const OWN_ROUTINES: [&str; 17] = [
+    "_NScap_table_alloc",
+    "_NScap_table_alloc_in",
+    "_NScap_table_alloc_large",
+    "_NScap_table_chunk_return",
+    "_NScap_table_free",
+    "_NScap_table_free_unpooled",
+    "_NScap_table_lift",
+    "_NScap_table_pool_add",
+    "_NScap_table_pool_draw",
+    "_NSstack_switch_init",
+    "_NSstack_switch_lock",
+    "_NSstack_switch_lock_wait",
+    "_NSstack_switch_thread_main",
+    "_NSstack_switch_unlock",
+    "_NStrap_overflow",
+    "_NStrap_preempt",
+    "_NStrap_raise",
+];
+
+/// Compares the text of each function the final build of `program` lowers with the bootstrap's,
+/// for an `x86_64-host` program those `comparable` keeps, as it gives them.
 fn compare_lowered(
     toolchain: &Toolchain,
     bootstrap: &Path,
     store: &Path,
     program: &str,
+    host: bool,
 ) -> Result<(), String> {
-    let expected = nan::lowered_functions(bootstrap, program).map_err(|error| error.to_string())?;
     resync(bootstrap, store)?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let home = front_home();
@@ -561,13 +661,20 @@ fn compare_lowered(
         store: &front_store,
         asked: &asked,
     };
-    let (printed, code) = front(toolchain, &front_dir, &given, &[])?;
+    let run = front(toolchain, &front_dir, &given, &[])?;
+    let mut expected =
+        nan::lowered_functions(bootstrap, program).map_err(|error| error.to_string())?;
+    let (printed, code) = run.output()?;
     if code != Some(0) {
         return Err(format!(
             "the NaN toolchain exits with {code:?} lowering {program}"
         ));
     }
-    let given = lowered(&printed)?;
+    let mut given = lowered(&printed)?;
+    if host {
+        expected = comparable(expected);
+        given = comparable(given);
+    }
     for index in 0..expected.len().max(given.len()) {
         match (expected.get(index), given.get(index)) {
             (Some(wanted), Some(found)) if wanted == found => {}
@@ -589,6 +696,65 @@ fn compare_lowered(
     Ok(())
 }
 
+/// The prefix of the symbols of std's `hw` package, whose synchronisation operations read the
+/// line tables the NaN toolchain lays out its own way on `x86_64-host`, so that the harness
+/// compares the programs calling them by what they write instead.
+const HW_FUNCTIONS: &str = "_N2hw_";
+
+/// The functions of a lowering but `OWN_ROUTINES` and `HW_FUNCTIONS`, in the order of their
+/// names: which routines and C library functions those call first, and so the numbers of the
+/// names lowering declares after, differ. Each external name a text holds is numbered by its
+/// first mention instead.
+fn comparable(functions: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut kept: Vec<(String, String)> = functions
+        .into_iter()
+        .filter(|(name, _)| {
+            !OWN_ROUTINES.contains(&name.as_str()) && !name.starts_with(HW_FUNCTIONS)
+        })
+        .collect();
+    kept.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut numbers = std::collections::HashMap::new();
+    kept.into_iter()
+        .map(|(name, text)| {
+            let text = renumbered(&text, &mut numbers);
+            (name, text)
+        })
+        .collect()
+}
+
+/// A function's text with each external name `uN:M` written `uN:` and the number of its first
+/// mention in `numbers`.
+fn renumbered(text: &str, numbers: &mut std::collections::HashMap<String, usize>) -> String {
+    let bytes = text.as_bytes();
+    let digits_from = |from: usize| {
+        from + bytes[from.min(bytes.len())..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let starts = bytes[at] == b'u'
+            && (at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_'));
+        let colon = digits_from(at + 1);
+        let end = digits_from(colon + 1);
+        if starts && colon > at + 1 && bytes.get(colon) == Some(&b':') && end > colon + 1 {
+            let next = numbers.len();
+            let number = *numbers.entry(text[at..end].to_owned()).or_insert(next);
+            out.push_str(&text[copied..=colon]);
+            out.push_str(&number.to_string());
+            copied = end;
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Runs the `x86_64-host` image of `program` that each toolchain built in its workspace and
 /// compares what both write to their standard streams and the statuses they exit with.
 fn compare_program(bootstrap: &Path, store: &Path, program: &str) -> Result<(), String> {
@@ -601,7 +767,7 @@ fn compare_program(bootstrap: &Path, store: &Path, program: &str) -> Result<(), 
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        runs.push(supervised(command, RUN_LIMIT)?);
+        runs.push(Supervised::start(command, RUN_LIMIT)?.finish()?);
     }
     if runs[0] != runs[1] {
         let written = |ran: &Ran| {
@@ -642,8 +808,9 @@ fn compare_example(
         for program in programs(example) {
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
-                compare_lowered(toolchain, dir, store, &program.0)?;
-                if program.1 == "x86_64-host" {
+                let host = program.1 == "x86_64-host";
+                compare_lowered(toolchain, dir, store, &program.0, host)?;
+                if host {
                     compare_program(dir, store, &program.0)?;
                 }
             }
@@ -738,16 +905,16 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
     fs::remove_file(dir.join(name).join("expected"))?;
     compare(&toolchain, &dir, &store, &["build", name])?;
-    compare_lowered(&toolchain, &dir, &store, name)?;
+    compare_lowered(&toolchain, &dir, &store, name, true)?;
     compare_program(&dir, &store, name)?;
     fs::remove_dir_all(&dir)?;
     fs::remove_dir_all(fronts(&dir, &store).0)?;
     Ok(())
 }
 
-/// Builds the toolchain workspace copied into `dir` with the NaN toolchain `builder`, with a user
-/// directory and local store of its own, and gives the toolchain it writes.
-fn self_build(builder: &Toolchain, dir: &Path) -> Result<Toolchain, String> {
+/// Starts building the toolchain workspace copied into `dir` with the NaN toolchain `builder`,
+/// with a user directory and local store of its own.
+fn self_build(builder: &Toolchain, dir: &Path) -> Result<SelfBuild, String> {
     driven_copy(dir)?;
     let home = dir.with_extension("home");
     let store = dir.with_extension("store");
@@ -757,56 +924,194 @@ fn self_build(builder: &Toolchain, dir: &Path) -> Result<Toolchain, String> {
         store: &store,
         asked: &[],
     };
-    let (printed, code) = front(builder, dir, &given, &["build", "nan"])?;
-    if code != Some(0) {
-        return Err(format!(
-            "{} does not build the toolchain:\n{}",
-            builder.image.display(),
-            String::from_utf8_lossy(&printed)
-        ));
-    }
-    Ok(Toolchain::over_itself(
-        dir.join(".nan/images/x86_64-host/nan"),
-    ))
+    Ok(SelfBuild {
+        run: front(builder, dir, &given, &["build", "nan"])?,
+        builder: builder.image.clone(),
+        image: dir.join(".nan/images/x86_64-host/nan"),
+    })
 }
 
-/// Checks the toolchain workspace with both, which must agree and report no diagnostic, and
-/// verifies it with both, in a copy outside every git working tree. Then the toolchain the
-/// bootstrap built builds the toolchain, the toolchain so built builds it again into the same
-/// bytes, and the bootstrap's stage comparison accepts the first self-built toolchain.
+/// A started build of the toolchain workspace by a NaN toolchain, and the image it writes.
+struct SelfBuild {
+    run: Front,
+    builder: PathBuf,
+    image: PathBuf,
+}
+
+impl SelfBuild {
+    /// The toolchain the build writes.
+    fn built(self) -> Result<Toolchain, String> {
+        let (printed, code) = self.run.output()?;
+        if code != Some(0) {
+            return Err(format!(
+                "{} does not build the toolchain:\n{}",
+                self.builder.display(),
+                String::from_utf8_lossy(&printed)
+            ));
+        }
+        Ok(Toolchain::over_itself(self.image))
+    }
+}
+
+/// The commands of the toolchain test, in order.
+const STEPS: [&[&str]; 2] = [&["check"], &["verify"]];
+
+/// What the bootstrap gave on a command of the toolchain test: what it printed, the status it
+/// exited with and copies of the workspace and local store it left.
+struct Taken {
+    expected: String,
+    status: Option<i32>,
+    left: (PathBuf, PathBuf),
+}
+
+/// The copies, named after `kind`, of the workspace and local store of a command of the toolchain
+/// test.
+fn step_copies(outside: &Path, kind: &str, step: usize) -> (PathBuf, PathBuf) {
+    let dir = outside.join(format!("{kind}-{step}"));
+    let store = dir.with_extension("store");
+    (dir, store)
+}
+
+/// Checks the toolchain workspace with both, which must agree and report no diagnostic, compares
+/// their NIR of the checked workspace and verifies it with both, in a copy outside every git
+/// working tree. The bootstrap runs `nan check` then `nan verify` from the start, and the
+/// toolchain it built runs each on a copy of the workspace and local store the bootstrap made
+/// before running it. Meanwhile the toolchain the bootstrap built builds the toolchain, the
+/// toolchain so built builds it again into the same bytes, and the bootstrap's stage comparison
+/// accepts the first self-built toolchain.
 fn toolchain(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let store = fresh_store("self-check-toolchain")?;
-    let first = Toolchain::over_itself(image()?);
     let outside = std::env::temp_dir().join(format!("nan-self-check-{}", std::process::id()));
     let dir = outside.join("toolchain");
     copy_tree(&repository().join("toolchain"), &dir, false)?;
-    let (output, _) = compare(&first, &dir, &store, &["check"])?;
-    if output.lines().any(|line| !line.starts_with("ok check ")) {
-        return Err(format!("the toolchain workspace checks with diagnostics:\n{output}").into());
+    let (copied_to, copied) = mpsc::channel();
+    let (taken_to, taken) = mpsc::channel();
+    let (bootstrapped, fronted) = std::thread::scope(|scope| {
+        let bootstrapped =
+            scope.spawn(|| bootstrap_steps((&dir, &store), &outside, copied_to, taken_to));
+        let fronted = front_side(&outside, copied, taken);
+        (
+            bootstrapped.join().expect("the bootstrap's commands end"),
+            fronted,
+        )
+    });
+    bootstrapped?;
+    fronted?;
+    fs::remove_dir_all(outside)?;
+    Ok(())
+}
+
+/// Runs each command of the toolchain test with the bootstrap in the workspace and local store
+/// `state`, which it copies for the NaN toolchain before the command and as it left them after.
+/// Stops once nothing waits for its commands.
+fn bootstrap_steps(
+    state: (&Path, &Path),
+    outside: &Path,
+    copied: Sender<()>,
+    taken: Sender<Taken>,
+) -> Result<(), String> {
+    for (step, args) in STEPS.iter().enumerate() {
+        let (front_dir, front_store) = step_copies(outside, "front", step);
+        copy_state(state, (&front_dir, &front_store))?;
+        if copied.send(()).is_err() {
+            return Ok(());
+        }
+        let (expected, status) = nan(state.0, args)?;
+        let (left_dir, left_store) = step_copies(outside, "left", step);
+        copy_state(state, (&left_dir, &left_store))?;
+        let given = Taken {
+            expected,
+            status,
+            left: (left_dir, left_store),
+        };
+        if taken.send(given).is_err() {
+            return Ok(());
+        }
     }
-    compare_nir(&first, &dir, &store, None)?;
-    let (output, _) = compare(&first, &dir, &store, &["verify"])?;
-    if !output.starts_with("ok ") {
-        return Err(format!("nan verify reports\n{output}").into());
-    }
+    Ok(())
+}
+
+/// Builds the toolchain image, then runs the double-compiling check beside the NaN toolchain's
+/// side of the toolchain test's commands.
+fn front_side(outside: &Path, copied: Receiver<()>, taken: Receiver<Taken>) -> Result<(), String> {
+    let first = Toolchain::over_itself(image()?);
     let second = self_build(&first, &outside.join("second"))?;
-    let third = self_build(&second, &outside.join("third"))?;
-    if fs::read(&second.image)? != fs::read(&third.image)? {
-        return Err("the toolchain it built builds a toolchain of other bytes".into());
+    std::thread::scope(|scope| {
+        let staged = scope.spawn(|| double_compiled(second, outside));
+        let compared = front_steps(&first, outside, copied, taken);
+        let staged = staged.join().expect("the double-compiling check ends");
+        compared.and(staged)
+    })
+}
+
+/// Runs each command of the toolchain test with the NaN toolchain, once the bootstrap has copied
+/// the workspace and local store for it, and compares it with the bootstrap's; after `nan check`,
+/// compares their NIR of the workspace the bootstrap's check left.
+fn front_steps(
+    first: &Toolchain,
+    outside: &Path,
+    copied: Receiver<()>,
+    taken: Receiver<Taken>,
+) -> Result<(), String> {
+    let home = front_home();
+    let ended = |_| "the bootstrap's side of the toolchain test ends early".to_owned();
+    for (step, args) in STEPS.iter().enumerate() {
+        copied.recv().map_err(ended)?;
+        let (front_dir, front_store) = step_copies(outside, "front", step);
+        let given = Given {
+            home: &home,
+            store: &front_store,
+            asked: &[],
+        };
+        let run = front(first, &front_dir, &given, args)?;
+        let bootstrap = taken.recv().map_err(ended)?;
+        let (printed, code) = run.output()?;
+        let (left_dir, left_store) = &bootstrap.left;
+        agree(
+            args,
+            (bootstrap.expected.as_bytes(), bootstrap.status),
+            (&printed, code),
+        )?;
+        same_files(args, (left_dir, left_store), (&front_dir, &front_store))?;
+        let output = &bootstrap.expected;
+        let accepted = match *args {
+            ["check"] => output.lines().all(|line| line.starts_with("ok check ")),
+            _ => output.starts_with("ok "),
+        };
+        if !accepted {
+            return Err(format!("nan {} reports\n{output}", args.join(" ")));
+        }
+        if *args == ["check"] {
+            compare_nir(first, left_dir, left_store, None)?;
+        }
     }
+    Ok(())
+}
+
+/// Waits for the first self-built toolchain, then builds the toolchain again with it, under
+/// `outside`, into the same bytes, while the bootstrap's stage comparison against it must report
+/// no error.
+fn double_compiled(second: SelfBuild, outside: &Path) -> Result<(), String> {
+    let fault = |error: std::io::Error| error.to_string();
+    let second = second.built()?;
+    let third = self_build(&second, &outside.join("third"))?;
     let compared = outside.join("compared");
     driven_copy(&compared)?;
     let second_path = second.image.to_str().expect("a UTF-8 path");
     let (output, status) = nan(&compared, &["build", "nan", "--compare-with", second_path])?;
     if status != Some(0) {
-        return Err(format!("the stage comparison reports\n{output}").into());
+        return Err(format!("the stage comparison reports\n{output}"));
     }
-    fs::remove_dir_all(outside)?;
+    let third = third.built()?;
+    if fs::read(&second.image).map_err(fault)? != fs::read(&third.image).map_err(fault)? {
+        return Err("the toolchain it built builds a toolchain of other bytes".to_owned());
+    }
     Ok(())
 }
 
-/// A trap of the NaN toolchain's own code is an internal error: checking its workspace in too
-/// little address space exhausts the memory of the domain the command runs in, which it reports
+/// A trap of the NaN toolchain's own code is an internal error: checking its workspace with an
+/// empty user directory in too little address space exhausts the memory of the domain the command
+/// runs in, which it reports
 /// as `internal.resource-exhausted` with a reproducer holding the command line and the files the
 /// command read, writing nothing to standard error.
 fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
@@ -819,13 +1124,13 @@ fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         std::env::temp_dir().join(format!("nan-self-check-starved-{}", std::process::id()));
     let dir = outside.join("toolchain");
     copy_tree(&repository().join("toolchain"), &dir, false)?;
-    let home = front_home();
+    let home = outside.join("home");
     let given = Given {
         home: &home,
         store: &store,
         asked: &[],
     };
-    let (printed, code) = front(&starved, &dir, &given, &["check"])?;
+    let (printed, code) = front(&starved, &dir, &given, &["check"])?.output()?;
     let expected = "internal-error check .: records 1\ninternal internal.resource-exhausted - -\n    reproducer .nan/repro/1\ninternal-error check .: records 1\n";
     if code != Some(3) || printed != expected.as_bytes() {
         return Err(format!(

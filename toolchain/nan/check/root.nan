@@ -18,6 +18,44 @@ struct Coded {
 /// the build cache, under the toolchain, the member's name and the states of the closure's
 /// members.
 pkg fn Session.build(self, closure: workspace::Closure, member: workspace::Member) -> Built {
+    return self.built(closure, member, checked: None)
+} Session.build
+
+/// The artefact `build` gives of the workspace package at an index, its code root, when not
+/// cached, from `checked`, a checker that `coding` gave.
+pkg fn Session.build_from(self, closure: workspace::Closure, package_index: usize, checked: Checker) -> Built {
+    return self.built(closure, member: workspace::Member.Source(package_index), checked: Some(checked.share()))
+} Session.build_from
+
+/// Whether the checker of a closure under a target that gives the workspace's diagnostics can
+/// also give the code root of the workspace package at an index: when the closure checks that
+/// package alone and the package declares that target alone.
+pkg fn Session.codes_in_check(self, closure: workspace::Closure, package_index: usize, target: workspace::Target) -> bool {
+    if closure.checked.len() != 1 or closure.checked[0] != package_index {
+        return false
+    }
+    let Some(source) = self.workspace.contents().packages.get(package_index) else {
+        return false
+    }
+    let targets = check_targets(source, alloc: self.alloc)
+    return targets.len() == 1 and targets[0] == target
+} Session.codes_in_check
+
+/// The checker of a closure under a target once it has checked each package the closure checks,
+/// recording the reads of the code root of the workspace package at an index.
+fn Session.coding(self, closure: workspace::Closure, package_index: usize, target: workspace::Target) -> Checker {
+    let checker = self.unchecked(closure, target)
+    match checker.db().package_of_member(workspace::Member.Source(package_index)) {
+        Some(id) => checker.db().record_foreign(id)
+        None => {
+            expect false
+        }
+    }
+    checker.check_all()
+    return checker
+} Session.coding
+
+fn Session.built(self, closure: workspace::Closure, member: workspace::Member, take checked: Option[Checker]) -> Built {
     let alloc = self.alloc
     let held = self.workspace.contents()
     let source = held.member(member)
@@ -33,7 +71,7 @@ pkg fn Session.build(self, closure: workspace::Closure, member: workspace::Membe
     mut key.push('\n')
     for entry in closure.members {
         let state = match entry.value() {
-            workspace::Member.Source(_) => coded_state(held.member(entry.value()), alloc)
+            workspace::Member.Source(index) => self.coded_state(index)
             workspace::Member.Release(at) => held.releases[at].root
         }
         mut key.append(entry.key().as_str())
@@ -45,7 +83,7 @@ pkg fn Session.build(self, closure: workspace::Closure, member: workspace::Membe
     let opened = open_proof_cache(self.home, alloc)
     var found = cached_coded(opened, key: keyed, alloc)
     if found.is_none() {
-        let computed = self.coded(closure, member)
+        let computed = self.coded(closure, member, take checked)
         match opened {
             Some(user_cache) => {
                 discard attempt user_cache.put(keyed, contents: computed.encoded(alloc).view())
@@ -59,10 +97,10 @@ pkg fn Session.build(self, closure: workspace::Closure, member: workspace::Membe
         return Built(artefact: mem::Bytes.empty(alloc), sources: package_files(source, alloc))
     }
     return assemble(source, coded, toolchain_hash, alloc)
-} Session.build
+} Session.built
 
 /// The toolchain hash of language version 1.
-fn Session.toolchain_hash(self) -> hashing::HashValue {
+pkg fn Session.toolchain_hash(self) -> hashing::HashValue {
     let Some(tree) = self.toolchain_tree() else {
         expect false
         return hashing::HashValue.of(b"")
@@ -70,13 +108,19 @@ fn Session.toolchain_hash(self) -> hashing::HashValue {
     return toolchain::hash(1, tree, alloc: self.alloc)
 } Session.toolchain_hash
 
-/// The state of a workspace package its code root and seals depend on: the hash of its files but
-/// its lock, which its closure's members stand for.
-fn coded_state(source: workspace::Package, alloc: mem::Alloc) -> hashing::HashValue {
-    var files = package_files(source, alloc)
+/// The state of the workspace package at an index that its code root and seals depend on: the
+/// hash of its files but its lock, which its closure's members stand for.
+fn Session.coded_state(self, index: usize) -> hashing::HashValue {
+    let computed = self.states.contents()
+    match computed.get(index) {
+        Some(held) => return held
+        None => {}
+    }
+    let alloc = self.alloc
+    var files = package_files(self.workspace.contents().member(workspace::Member.Source(index)), alloc)
     mut files.retain(fn(file: artefact::SourceFile) => file.path.as_str() != ".nan/lock.nan")
-    return artefact::source_tree_hash(files.view(), alloc)
-} coded_state
+    return computed.insert(index, value: artefact::source_tree_hash(files.view(), alloc))
+} Session.coded_state
 
 fn Coded.encoded(self, alloc: mem::Alloc) -> mem::Bytes {
     var out = mem::Bytes.empty(alloc)
@@ -120,8 +164,9 @@ fn assemble(source: workspace::Package, coded: Coded, toolchain_hash: hashing::H
     return Built(artefact: artefact::artefact(coded.code_root.view(), attested: attested.view(), alloc), sources: take sources)
 } assemble
 
-/// The code root and seals of the current state of a closure's member.
-fn Session.coded(self, closure: workspace::Closure, member: workspace::Member) -> Coded {
+/// The code root and seals of the current state of a closure's member, from `checked` when
+/// given.
+fn Session.coded(self, closure: workspace::Closure, member: workspace::Member, take checked: Option[Checker]) -> Coded {
     let alloc = self.alloc
     let held = self.workspace.contents()
     let source = held.member(member)
@@ -130,14 +175,9 @@ fn Session.coded(self, closure: workspace::Closure, member: workspace::Member) -
         None => ""
     }
     var checkers = mem::List[TargetChecker].empty(alloc)
-    for target in check_targets(source, alloc) {
-        let checker = self.unchecked(closure, target)
-        checker.db().record()
-        match checker.package_named(package_name) {
-            Some(id) => checker.check_whole(id)
-            None => {}
-        }
-        mut checkers.push(TargetChecker(target: target, checker: take checker))
+    match checked {
+        Some(checker) => mut checkers.push(TargetChecker(target: checker.db().target, checker: take checker))
+        None => self.add_coding_checkers(closure, source, package_name, mut checkers)
     }
     let items = Items.of(checkers.view(), package_name, alloc)
     let computed = match member {
@@ -168,6 +208,24 @@ fn Session.coded(self, closure: workspace::Closure, member: workspace::Member) -
     let code_root = artefact::code_root(parts, alloc)
     return Coded(code_root: take code_root, seals: artefact::seal_list(attested_seals(computed, alloc).view(), alloc))
 } Session.coded
+
+/// Adds a checker of a closure under each target its member `source` declares, recording the
+/// reads of its code root, once it has checked the member.
+fn Session.add_coding_checkers(self, closure: workspace::Closure, source: workspace::Package, package_name: Str, mut checkers: mem::List[TargetChecker]) {
+    for target in check_targets(source, alloc: self.alloc) {
+        let checker = self.unchecked(closure, target)
+        match checker.package_named(package_name) {
+            Some(id) => {
+                checker.db().record_foreign(id)
+                checker.check_whole(id)
+            }
+            None => {
+                expect false
+            }
+        }
+        mut checkers.push(TargetChecker(target: target, checker: take checker))
+    }
+} Session.add_coding_checkers
 
 /// The text of each module's API snapshot a code root's interface part holds, empty for a module
 /// without one: its entries' lines but seals, closures and signatures, of each entry holding more
@@ -412,7 +470,7 @@ fn Checker.state_schemas(self, package_id: ty::PackageId) -> mem::List[artefact:
             let SigKind.Impl(target: Some(TypeKey.Item(target)), target_ty: _, bound: Some(bound)) = sig.contents().kind else {
                 continue
             }
-            if db.canonical(bound.item).as_str() == "sys::Component" {
+            if db.canonical_text(bound.item) == "sys::Component" {
                 mut states.push(target)
             }
         }
@@ -432,7 +490,7 @@ fn Checker.state_schemas(self, package_id: ty::PackageId) -> mem::List[artefact:
 
 /// The order of component states by canonical path, then item.
 fn state_order(db: Db, left: ty::ItemId, right: ty::ItemId) -> core::Ordering {
-    let by_path = db.canonical(left).as_str().cmp(db.canonical(right).as_str())
+    let by_path = db.canonical_text(left).cmp(db.canonical_text(right))
     if by_path != core::Ordering.Equal {
         return by_path
     }
@@ -525,8 +583,7 @@ pkg fn Session.nir_streams(self, wanted: Str) -> mem::Bytes {
 
 /// Checks a package of the checker's closure, quiet or not, and the rules relating its items.
 fn Checker.check_whole(self, package_id: ty::PackageId) {
-    let state = self.state.contents()
-    state.checking.store(package_id.index)
+    self.underway.contents().checking.store(package_id.index)
     self.check_package(package_id)
     self.fix_misnamed()
     self.reject_items()

@@ -26,12 +26,20 @@ struct Class derives Copy, Eq {
 /// The class of any integer.
 const ANY_CLASS: Class = Class(low: None, high: None, residue: wide::Wide.zero(), modulus: wide::Wide.one())
 
-/// A clause of the state with its encoding, by which clauses are in term order.
+/// A clause of the state with its encoding, by which clauses are in term order, and the ids of
+/// its literals.
 struct StateClause {
     id: u32
     key: mem::Shared[mem::Bytes]
     literals: mem::List[Literal]
+    ids: mem::List[LiteralIds]
 } StateClause
+
+/// The ids a state gives a literal and its negation.
+struct LiteralIds derives Copy {
+    literal: u32
+    negation: u32
+} LiteralIds
 
 /// An asserted linear atom with its encoding, and whether it is an equality.
 struct AssertedAtom {
@@ -66,8 +74,16 @@ struct State {
     integers: mem::List[u32]
     /// The linear literal of each integer comparison term.
     comparisons: mem::HashMap[u32, Literal]
+    /// The form of each application given one, its function with its parts left out, by
+    /// term, `NO_FORM` for the others.
+    form_of: mem::List[u32]
+    /// The forms of applications, by number.
+    forms: mem::HashMap[Term, u32]
     clauses: mem::List[StateClause]
-    asserted: mem::HashMap[Literal, Unit]
+    /// The id of each literal of the clauses, of its negation, and of each literal asserted.
+    literal_ids: mem::HashMap[Literal, u32]
+    /// Whether the literal of each id is asserted.
+    asserted: mem::List[bool]
     /// The asserted linear atoms in term order.
     atoms: mem::List[AssertedAtom]
     disequalities: mem::List[Linear]
@@ -76,6 +92,11 @@ struct State {
     /// The difference graph: the bound w of each edge (from, to), meaning to − from ≤ w, over
     /// class roots and the zero node.
     graph: mem::HashMap[TermPair, wide::Wide]
+    /// Whether the graph is closed by shortest paths over the current classes: no class has
+    /// merged since it was closed.
+    graph_closed: bool
+    /// How many asserted atoms the graph holds the edges of.
+    graph_atoms: usize
     /// The clauses instantiated, with the term instantiated at.
     instances: mem::List[Instance]
     truth: u32
@@ -141,6 +162,15 @@ struct KeyedNode {
     key: mem::Shared[mem::Bytes]
     node: u32
 } KeyedNode
+
+/// An application as congruence closure compares it: its form and the roots of its parts.
+struct AppShape derives Eq, Hash {
+    form: u32
+    roots: mem::List[u32]
+} AppShape
+
+/// The number of an application's form not given yet.
+const NO_FORM: u32 = 0xFFFF_FFFF
 
 /// The condition and arms of an ite term.
 struct IteArms derives Copy {
@@ -238,16 +268,19 @@ fn Solver.step(mut self) fails Halt {
 
 fn Solver.decide(mut self, take query: CanonQuery) -> Decision {
     let alloc = self.ck.alloc()
-    let CanonQuery(terms: held, clauses: clauses, origins: _, hash: _) = query
-    var state = State.of(take held, alloc)
+    let CanonQuery(terms: held, encodings: encodings, clauses: clauses, origins: _, keys: keys, hash: _) = query
+    var state = State.of(take held, take encodings, alloc)
     state.truth = mut state.terms.boolean(true)
     state.falsity = mut state.terms.boolean(false)
     let truth = state.truth
     let falsity = state.falsity
     mut self.register(mut state, term: truth)
     mut self.register(mut state, term: falsity)
+    var position: usize = 0
     for clause in take clauses {
-        mut self.add_clause(mut state, take clause)
+        expect position < keys.len()
+        mut self.file_clause(mut state, sorted: take clause, key: keys[position].share())
+        position += 1
     }
     match attempt mut self.search(take state, depth: 0) {
         Ok(None) => return Decision.Proved
@@ -259,11 +292,12 @@ fn Solver.decide(mut self, take query: CanonQuery) -> Decision {
     }
 } Solver.decide
 
-/// A state of a query's store holding no class, clause or atom yet.
-fn State.of(take terms: Terms, alloc: mem::Alloc) -> State {
+/// A state of a query's store, with the keys of its terms known so far, holding no class,
+/// clause or atom yet.
+fn State.of(take terms: Terms, take encodings: Encodings, alloc: mem::Alloc) -> State {
     return State(
         terms: take terms,
-        encodings: Encodings.empty(alloc),
+        encodings: take encodings,
         parent: mem::List[u32].empty(alloc),
         size: mem::List[u32].empty(alloc),
         classes: mem::List[Class].empty(alloc),
@@ -273,12 +307,17 @@ fn State.of(take terms: Terms, alloc: mem::Alloc) -> State {
         muls: mem::List[u32].empty(alloc),
         integers: mem::List[u32].empty(alloc),
         comparisons: mem::HashMap[u32, Literal].empty(seed: 0, alloc),
+        form_of: mem::List[u32].empty(alloc),
+        forms: mem::HashMap[Term, u32].empty(seed: 0, alloc),
         clauses: mem::List[StateClause].empty(alloc),
-        asserted: mem::HashMap[Literal, Unit].empty(seed: 0, alloc),
+        literal_ids: mem::HashMap[Literal, u32].empty(seed: 0, alloc),
+        asserted: mem::List[bool].empty(alloc),
         atoms: mem::List[AssertedAtom].empty(alloc),
         disequalities: mem::List[Linear].empty(alloc),
         separated: mem::List[TermPair].empty(alloc),
         graph: mem::HashMap[TermPair, wide::Wide].empty(seed: 0, alloc),
+        graph_closed: true,
+        graph_atoms: 0,
         instances: mem::List[Instance].empty(alloc),
         truth: 0,
         falsity: 0,
@@ -351,29 +390,31 @@ fn Solver.split(mut self, mut state: State) -> Option[Split] fails Halt {
     }
     for index in 0..<state.clauses.len() {
         expect index < state.clauses.len()
-        let literals = copied_literals(state.clauses[index].literals.view(), alloc)
-        var open = mem::List[Literal].empty(alloc)
+        var open = mem::List[usize].empty(alloc)
         var satisfied = false
-        for literal in take literals {
-            match try mut self.evaluate(mut state, literal) {
+        for at in 0..<state.clauses[index].literals.len() {
+            match try mut self.evaluate(mut state, clause: index, at) {
                 Some(true) => {
                     satisfied = true
                 }
                 Some(false) => {}
-                None => mut open.push(take literal)
+                None => mut open.push(at)
             }
         }
         if satisfied or open.len() < 2 {
             continue
         }
-        for literal in take open {
-            if literal.all_atom().is_some() {
+        expect index < state.clauses.len()
+        let literals = state.clauses[index].literals
+        for at in open {
+            expect at < literals.len()
+            if literals[at].all_atom().is_some() {
                 continue
             }
-            if literal.negated {
-                return Some(Split.Literal(literal.negation(alloc)))
+            if literals[at].negated {
+                return Some(Split.Literal(literals[at].negation(alloc)))
             }
-            return Some(Split.Literal(take literal))
+            return Some(Split.Literal(literals[at].copy(alloc)))
         }
     }
     return None
@@ -400,7 +441,7 @@ fn Solver.propagate(mut self, mut state: State) fails Halt {
 fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
     let alloc = state.terms.alloc
     var changed = false
-    var seen = mem::HashMap[Term, u32].empty(seed: 0, alloc)
+    var seen = mem::HashMap[AppShape, u32].empty(seed: 0, alloc)
     for position in 0..<state.apps.len() {
         expect position < state.apps.len()
         let app = state.apps[position]
@@ -408,7 +449,7 @@ fn Solver.congruence(mut self, mut state: State) -> bool fails Halt {
         for part in state.terms.get(app).parts(alloc) {
             mut roots.push(state.find(part))
         }
-        let shape = state.terms.get(app).replacing_parts(roots.view(), alloc)
+        let shape = AppShape(form: mut state.form(app), roots: take roots)
         let known = seen.get(shape)
         match known {
             Some(other) => {
@@ -522,16 +563,16 @@ fn Solver.intervals(mut self, mut state: State) -> bool fails Halt {
 
 /// Each asserted atom's terms narrowed from the intervals of its others.
 fn Solver.atom_intervals(mut self, mut state: State) -> bool fails Halt {
-    let alloc = state.terms.alloc
     var changed = false
     for position in 0..<state.atoms.len() {
         expect position < state.atoms.len()
-        let sum = state.atoms[position].sum.copy(alloc)
+        let constant = state.atoms[position].sum.constant
         let equality = state.atoms[position].equality
-        for index in 0..<sum.terms.len() {
-            let summand = sum.terms[index]
-            let others = state.sum(sum, skip: Some(index))
-            let bounds = summand_bounds(sum.constant, others, equality, coefficient: summand.coefficient)
+        for index in 0..<state.atoms[position].sum.terms.len() {
+            expect position < state.atoms.len() and index < state.atoms[position].sum.terms.len()
+            let summand = state.atoms[position].sum.terms[index]
+            let others = state.sum(state.atoms[position].sum, skip: Some(index))
+            let bounds = summand_bounds(constant, others, equality, coefficient: summand.coefficient)
             let narrowed = try mut self.narrow(mut state, term: summand.term, low: bounds.low, high: bounds.high)
             changed = changed or narrowed
         }
@@ -569,6 +610,9 @@ fn summand_bounds(constant: wide::Wide, others: SumBounds, equality: bool, coeff
 fn divided_bound(bound: Option[wide::Wide], coefficient: wide::Wide, ceiling: bool) -> Option[wide::Wide] {
     let Some(value) = bound else {
         return None
+    }
+    if coefficient == wide::Wide.one() {
+        return Some(value)
     }
     if ceiling {
         return Some(ceil_div(value, divisor: coefficient))
@@ -732,36 +776,68 @@ fn State.implied_congruence(self, sum: Linear, index: usize) -> Option[Congruenc
 /// their classes, as edges of the difference graph, which is then closed by shortest paths.
 fn Solver.differences(mut self, mut state: State) -> bool fails Halt {
     let alloc = state.terms.alloc
+    if state.graph_closed and state.graph_atoms == state.atoms.len() {
+        return try mut self.closed_differences(mut state)
+    }
     var edges = state.difference_edges(alloc)
-    var nodes = mut self.edge_nodes(mut state, edges)
+    var nodes = state.edge_nodes(edges)
     if nodes.len() == 0 {
         return false
     }
     for node in nodes {
         expect usize.widen(node) < state.classes.len()
-        let class = state.classes[usize.widen(node)]
-        match class.high {
-            Some(high) => lower_edge(mut edges, from: ZERO_NODE, to: node, weight: high)
-            None => {}
-        }
-        let Some(low) = class.low else {
-            continue
-        }
-        let Some(weight) = low.checked_neg() else {
-            continue
-        }
-        lower_edge(mut edges, from: node, to: ZERO_NODE, weight)
+        discard lower_bound_edges(mut edges, node, class: state.classes[usize.widen(node)])
     }
     mut nodes.push(ZERO_NODE)
-    var changed = try mut self.closed_paths(mut edges, nodes: nodes.view())
+    var changed = false
+    if not state.graph_closed or not still_closed(edges, closed: state.graph, nodes: nodes.view()) {
+        changed = try mut self.closed_paths(mut edges, nodes: nodes.view())
+    }
     state.graph = copied_graph(edges, alloc)
+    state.graph_closed = true
+    state.graph_atoms = state.atoms.len()
+    let concluded = try mut self.concluded_differences(mut state, nodes: nodes.view())
+    return changed or concluded
+} Solver.differences
+
+/// Rule 5 over a graph closed over the current classes and holding the edges of every asserted
+/// atom: the graph with the edges the intervals lower, closed again unless it stays closed.
+fn Solver.closed_differences(mut self, mut state: State) -> bool fails Halt {
+    var nodes = state.edge_nodes(state.graph)
+    if nodes.len() == 0 {
+        return false
+    }
+    var lowered = mem::List[TermPair].empty(state.terms.alloc)
+    for node in nodes {
+        expect usize.widen(node) < state.classes.len()
+        let class = state.classes[usize.widen(node)]
+        let bounds = lower_bound_edges(mut state.graph, node, class)
+        if bounds.high {
+            mut lowered.push(TermPair(left: ZERO_NODE, right: node))
+        }
+        if bounds.low {
+            mut lowered.push(TermPair(left: node, right: ZERO_NODE))
+        }
+    }
+    mut nodes.push(ZERO_NODE)
+    var changed = false
+    if not lowered_closed(state.graph, lowered: lowered.view(), nodes: nodes.view()) {
+        changed = try mut self.closed_paths(mut state.graph, nodes: nodes.view())
+    }
+    let concluded = try mut self.concluded_differences(mut state, nodes: nodes.view())
+    return changed or concluded
+} Solver.closed_differences
+
+/// The intervals and merges the closed graph gives its nodes.
+fn Solver.concluded_differences(mut self, mut state: State, nodes: Slice[u32]) -> bool fails Halt {
+    var changed = false
     for node in nodes {
         if node == ZERO_NODE {
             continue
         }
-        let high = edges.get(TermPair(left: ZERO_NODE, right: node))
+        let high = state.graph.get(TermPair(left: ZERO_NODE, right: node))
         var low: Option[wide::Wide] = None
-        match edges.get(TermPair(left: node, right: ZERO_NODE)) {
+        match state.graph.get(TermPair(left: node, right: ZERO_NODE)) {
             Some(weight) => {
                 low = weight.checked_neg()
             }
@@ -777,14 +853,39 @@ fn Solver.differences(mut self, mut state: State) -> bool fails Halt {
             if a == ZERO_NODE or b == ZERO_NODE {
                 continue
             }
-            if at_most_zero(edges.get(TermPair(left: a, right: b))) and at_most_zero(edges.get(TermPair(left: b, right: a))) {
+            if at_most_zero(state.graph.get(TermPair(left: a, right: b))) and at_most_zero(state.graph.get(TermPair(left: b, right: a))) {
                 let merged = try mut self.merge(mut state, a, b)
                 changed = changed or merged
             }
         }
     }
     return changed
-} Solver.differences
+} Solver.concluded_differences
+
+/// Which of the edges between a node and the zero node its class's bounds lowered or added.
+struct BoundEdges derives Copy {
+    high: bool
+    low: bool
+} BoundEdges
+
+/// Lowers the edges between a node and the zero node to its class's bounds.
+fn lower_bound_edges(mut edges: mem::HashMap[TermPair, wide::Wide], node: u32, class: Class) -> BoundEdges {
+    var lowered = BoundEdges(high: false, low: false)
+    match class.high {
+        Some(high) => {
+            lowered.high = lower_edge(mut edges, from: ZERO_NODE, to: node, weight: high)
+        }
+        None => {}
+    }
+    let Some(low) = class.low else {
+        return lowered
+    }
+    let Some(weight) = low.checked_neg() else {
+        return lowered
+    }
+    lowered.low = lower_edge(mut edges, from: node, to: ZERO_NODE, weight)
+    return lowered
+} lower_bound_edges
 
 /// Whether an edge exists and its bound is at most 0.
 fn at_most_zero(weight: Option[wide::Wide]) -> bool {
@@ -808,7 +909,7 @@ fn State.difference_edges(self, alloc: mem::Alloc) -> mem::HashMap[TermPair, wid
         if pair.right != ZERO_NODE {
             to = self.find(pair.right)
         }
-        lower_edge(mut edges, from, to, weight: entry.value())
+        discard lower_edge(mut edges, from, to, weight: entry.value())
     }
     for atom in self.atoms {
         let Some(ends) = atom.sum.difference() else {
@@ -816,53 +917,54 @@ fn State.difference_edges(self, alloc: mem::Alloc) -> mem::HashMap[TermPair, wid
         }
         let p = self.find(ends.left)
         let n = self.find(ends.right)
-        lower_edge(mut edges, from: n, to: p, weight: atom.sum.constant)
+        discard lower_edge(mut edges, from: n, to: p, weight: atom.sum.constant)
         if atom.equality {
-            lower_edge(mut edges, from: p, to: n, weight: atom.sum.constant.wrapping_neg())
+            discard lower_edge(mut edges, from: p, to: n, weight: atom.sum.constant.wrapping_neg())
         }
     }
     return edges
 } State.difference_edges
 
-/// The nodes of edges other than the zero node, in term order, each once.
-fn Solver.edge_nodes(mut self, mut state: State, edges: mem::HashMap[TermPair, wide::Wide]) -> mem::List[u32] {
-    let alloc = state.terms.alloc
-    var keyed = mem::List[KeyedNode].empty(alloc)
+/// The nodes of edges other than the zero node, in term order, each once: the integer terms,
+/// in term order, that end an edge.
+fn State.edge_nodes(self, edges: mem::HashMap[TermPair, wide::Wide]) -> mem::List[u32] {
+    let alloc = self.terms.alloc
+    var ends = mem::HashMap[u32, Unit].empty(seed: 0, alloc)
     for entry in edges {
         let pair = entry.key()
         if pair.left != ZERO_NODE {
-            let key = mut state.encodings.term(self.ck, terms: state.terms, id: pair.left)
-            mut keyed.push(KeyedNode(key: take key, node: pair.left))
+            discard mut ends.insert(pair.left, value: Unit)
         }
         if pair.right != ZERO_NODE {
-            let key = mut state.encodings.term(self.ck, terms: state.terms, id: pair.right)
-            mut keyed.push(KeyedNode(key: take key, node: pair.right))
+            discard mut ends.insert(pair.right, value: Unit)
         }
     }
-    mut keyed.sort_by(fn(left: KeyedNode, right: KeyedNode) => left.key.contents().view().cmp(right.key.contents().view()))
     var nodes = mem::List[u32].empty(alloc)
-    for entry in keyed {
-        if nodes.len() > 0 and nodes[nodes.len() - 1] == entry.node {
-            continue
+    for term in self.integers {
+        if ends.contains(term) {
+            mut nodes.push(term)
         }
-        mut nodes.push(entry.node)
     }
+    expect nodes.len() == ends.len()
     return nodes
-} Solver.edge_nodes
+} State.edge_nodes
 
 /// Closes the difference graph by shortest paths through each node in turn, each shortened
 /// edge a step; a negative cycle is a contradiction.
 fn Solver.closed_paths(mut self, mut edges: mem::HashMap[TermPair, wide::Wide], nodes: Slice[u32]) -> bool fails Halt {
+    var bounds = edge_rows(edges, nodes, alloc: self.ck.alloc())
+    let count = nodes.len()
+    expect bounds.len() == count
     var changed = false
-    for k in nodes {
-        for i in nodes {
-            let incoming = edges.get(TermPair(left: i, right: k))
-            let Some(ik) = incoming else {
+    for k in 0..<count {
+        for i in 0..<count {
+            expect bounds[i].len() == count and bounds[k].len() == count
+            let Some(ik) = bounds[i][k] else {
                 continue
             }
-            for j in nodes {
-                let outgoing = edges.get(TermPair(left: k, right: j))
-                let Some(kj) = outgoing else {
+            for j in 0..<count {
+                expect bounds[i].len() == count and bounds[k].len() == count
+                let Some(kj) = bounds[k][j] else {
                     continue
                 }
                 let Some(through) = ik.checked_add(kj) else {
@@ -874,10 +976,10 @@ fn Solver.closed_paths(mut self, mut edges: mem::HashMap[TermPair, wide::Wide], 
                 if i == j {
                     continue
                 }
-                let direct = edges.get(TermPair(left: i, right: j))
-                if shorter_than(through, direct) {
+                if shorter_than(through, direct: bounds[i][j]) {
                     try mut self.step()
-                    discard mut edges.insert(TermPair(left: i, right: j), value: through)
+                    bounds[i][j] = Some(through)
+                    discard mut edges.insert(TermPair(left: nodes[i], right: nodes[j]), value: through)
                     changed = true
                 }
             }
@@ -885,6 +987,83 @@ fn Solver.closed_paths(mut self, mut edges: mem::HashMap[TermPair, wide::Wide], 
     }
     return changed
 } Solver.closed_paths
+
+/// The bound of the edge between each two nodes, by their positions, none where no edge is.
+fn edge_rows(edges: mem::HashMap[TermPair, wide::Wide], nodes: Slice[u32], alloc: mem::Alloc) -> mem::List[mem::List[Option[wide::Wide]]] {
+    var rows = mem::List[mem::List[Option[wide::Wide]]].empty(alloc)
+    for from in nodes {
+        var row = mem::List[Option[wide::Wide]].empty(alloc)
+        for to in nodes {
+            mut row.push(edges.get(TermPair(left: from, right: to)))
+        }
+        mut rows.push(take row)
+    }
+    return rows
+} edge_rows
+
+/// Whether a closed graph with some edges lowered or added is still closed, so that closing it
+/// by shortest paths changes nothing.
+fn still_closed(edges: mem::HashMap[TermPair, wide::Wide], closed: mem::HashMap[TermPair, wide::Wide], nodes: Slice[u32]) -> bool {
+    for entry in edges {
+        if closed.get(entry.key()) == Some(entry.value()) {
+            continue
+        }
+        if not stays_closed(edges, pair: entry.key(), nodes) {
+            return false
+        }
+    }
+    return true
+} still_closed
+
+/// Whether a closed graph with the listed edges lowered or added is still closed.
+fn lowered_closed(edges: mem::HashMap[TermPair, wide::Wide], lowered: Slice[TermPair], nodes: Slice[u32]) -> bool {
+    for pair in lowered {
+        if not stays_closed(edges, pair, nodes) {
+            return false
+        }
+    }
+    return true
+} lowered_closed
+
+/// Whether no path of two edges through a lowered or added edge is shorter than the direct
+/// edge, and no cycle of two edges through it is negative.
+fn stays_closed(edges: mem::HashMap[TermPair, wide::Wide], pair: TermPair, nodes: Slice[u32]) -> bool {
+    let Some(weight) = edges.get(pair) else {
+        return true
+    }
+    for node in nodes {
+        match edges.get(TermPair(left: pair.right, right: node)) {
+            Some(after) => {
+                if not holds_triangle(weight, second: after, direct: edges.get(TermPair(left: pair.left, right: node)), cycle: node == pair.left) {
+                    return false
+                }
+            }
+            None => {}
+        }
+        match edges.get(TermPair(left: node, right: pair.left)) {
+            Some(before) => {
+                if not holds_triangle(before, second: weight, direct: edges.get(TermPair(left: node, right: pair.right)), cycle: node == pair.right) {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    return true
+} stays_closed
+
+/// Whether the path of two edges leaves its ends' bound as it is: one leaving the integers
+/// the prover computes with, a cycle that is not negative, or one no shorter than the direct
+/// edge.
+fn holds_triangle(leading: wide::Wide, second: wide::Wide, direct: Option[wide::Wide], cycle: bool) -> bool {
+    let Some(through) = leading.checked_add(second) else {
+        return true
+    }
+    if cycle {
+        return not through.is_negative()
+    }
+    return not shorter_than(through, direct)
+} holds_triangle
 
 /// Whether a path's bound is below an edge's, or no edge exists.
 fn shorter_than(through: wide::Wide, direct: Option[wide::Wide]) -> bool {
@@ -894,20 +1073,21 @@ fn shorter_than(through: wide::Wide, direct: Option[wide::Wide]) -> bool {
     return through < held
 } shorter_than
 
-/// Lowers the bound of an edge to a weight, adding the edge when it is missing.
-fn lower_edge(mut edges: mem::HashMap[TermPair, wide::Wide], from: u32, to: u32, weight: wide::Wide) {
+/// Lowers the bound of an edge to a weight, adding the edge when it is missing; whether it
+/// did.
+fn lower_edge(mut edges: mem::HashMap[TermPair, wide::Wide], from: u32, to: u32, weight: wide::Wide) -> bool {
     let key = TermPair(left: from, right: to)
     let held = edges.get(key)
     match held {
         Some(known) => {
-            if weight < known {
-                discard mut edges.insert(key, value: weight)
+            if not (weight < known) {
+                return false
             }
         }
-        None => {
-            discard mut edges.insert(key, value: weight)
-        }
+        None => {}
     }
+    discard mut edges.insert(key, value: weight)
+    return true
 } lower_edge
 
 /// A copy of a difference graph.
@@ -924,30 +1104,33 @@ fn copied_graph(graph: mem::HashMap[TermPair, wide::Wide], alloc: mem::Alloc) ->
 fn Solver.clauses(mut self, mut state: State) -> bool fails Halt {
     let alloc = state.terms.alloc
     var changed = false
-    var index: usize = 0
-    while index < state.clauses.len() {
-        let literals = copied_literals(state.clauses[index].literals.view(), alloc)
-        index += 1
-        var open = mem::List[Literal].empty(alloc)
+    for index in 0..<state.clauses.len() {
+        var open: usize = 0
+        var first_open: usize = 0
         var satisfied = false
-        for literal in take literals {
-            let value = try mut self.evaluate(mut state, literal)
+        for at in 0..<state.clauses[index].literals.len() {
+            let value = try mut self.evaluate(mut state, clause: index, at)
             if value == Some(true) {
                 satisfied = true
                 break
             }
             if value.is_none() {
-                mut open.push(take literal)
+                if open == 0 {
+                    first_open = at
+                }
+                open += 1
             }
         }
         if satisfied {
             continue
         }
-        if open.len() == 0 {
+        if open == 0 {
             fail Halt.Contradiction
         }
-        if open.len() == 1 {
-            let asserted = try mut self.assert_literal(mut state, literal: open[0])
+        if open == 1 {
+            expect index < state.clauses.len() and first_open < state.clauses[index].literals.len()
+            let literal = state.clauses[index].literals[first_open].copy(alloc)
+            let asserted = try mut self.assert_literal(mut state, literal)
             changed = changed or asserted
         }
     }
@@ -1152,8 +1335,14 @@ fn Solver.instantiate(
 
 /// Adds a clause in term order, registering its terms.
 fn Solver.add_clause(mut self, mut state: State, take clause: mem::List[Literal]) {
+    let KeyedClause(key: key, literals: sorted) = self.ck.sorted_clause(state.terms, encodings: mut state.encodings, take clause)
+    mut self.file_clause(mut state, take sorted, key: mem::Shared.of(take key, alloc: state.terms.alloc))
+} Solver.add_clause
+
+/// Files a clause in term order by its encoding, registering its terms.
+fn Solver.file_clause(mut self, mut state: State, take sorted: mem::List[Literal], take key: mem::Shared[mem::Bytes]) {
     let alloc = state.terms.alloc
-    for literal in clause {
+    for literal in sorted {
         match literal.atom {
             Atom.All(forall) => {
                 mut self.register(mut state, term: forall.low)
@@ -1169,13 +1358,17 @@ fn Solver.add_clause(mut self, mut state: State, take clause: mem::List[Literal]
             }
         }
     }
-    let sorted = self.ck.sorted_clause(state.terms, encodings: mut state.encodings, take clause)
-    let key = mem::Shared.of(mut state.encodings.clause(self.ck, terms: state.terms, clause: sorted.view()), alloc)
+    var ids = mem::List[LiteralIds].empty(alloc)
+    for literal in sorted {
+        let id = mut state.literal_id(literal)
+        let negation = mut state.literal_id(literal.negation(alloc))
+        mut ids.push(LiteralIds(literal: id, negation: negation))
+    }
     let at = state.clause_position(key.contents().view())
-    mut state.clauses.insert(at, value: StateClause(id: state.next_clause, key: take key, literals: take sorted))
+    mut state.clauses.insert(at, value: StateClause(id: state.next_clause, key: take key, literals: take sorted, ids: take ids))
     expect state.next_clause < 0xFFFF_FFFF
     state.next_clause += 1
-} Solver.add_clause
+} Solver.file_clause
 
 /// The position of the first clause whose key is greater than a key.
 fn State.clause_position(self, key: Slice[u8]) -> usize {
@@ -1344,6 +1537,7 @@ fn Solver.merge(mut self, mut state: State, a: u32, b: u32) -> bool fails Halt {
     expect usize.widen(root) < state.size.len() and usize.widen(root) < state.classes.len()
     expect usize.widen(child) < state.parent.len() and usize.widen(child) < state.size.len() and usize.widen(child) < state.classes.len()
     state.parent[usize.widen(child)] = root
+    state.graph_closed = false
     let added = state.size[usize.widen(child)]
     let size = state.size[usize.widen(root)]
     expect size <= ~0u32 - added
@@ -1420,14 +1614,16 @@ fn Solver.congruent(mut self, mut state: State, term: u32, residue: wide::Wide, 
 /// the asserted atoms, and a negated equality records a disequality.
 fn Solver.assert_literal(mut self, mut state: State, literal: Literal) -> bool fails Halt {
     let alloc = state.terms.alloc
-    if state.asserted.contains(literal) {
+    let id = mut state.literal_id(literal)
+    expect usize.widen(id) < state.asserted.len()
+    if state.asserted[usize.widen(id)] {
         return false
     }
     if literal.negated and literal.atom.is_le() {
         return try mut self.assert_literal(mut state, literal: literal.negation(alloc))
     }
     try mut self.step()
-    discard mut state.asserted.insert(literal.copy(alloc), value: Unit)
+    state.asserted[usize.widen(id)] = true
     match literal.atom {
         Atom.Bool(term) => try mut self.assert_boolean(mut state, term, negated: literal.negated)
         Atom.Le(sum) => mut self.add_atom(mut state, literal, sum, equality: false)
@@ -1533,32 +1729,74 @@ fn Solver.decided(mut self, mut state: State, term: u32) -> Option[bool] fails H
     return value
 } Solver.decided
 
-/// Whether a literal is true or false in the state, if it decides it.
-fn Solver.evaluate(mut self, mut state: State, literal: Literal) -> Option[bool] fails Halt {
-    if state.asserted.contains(literal) {
+/// Whether a literal of a clause is true or false in the state, if it decides it.
+fn Solver.evaluate(mut self, mut state: State, clause: usize, at: usize) -> Option[bool] fails Halt {
+    expect clause < state.clauses.len() and at < state.clauses[clause].ids.len() and at < state.clauses[clause].literals.len()
+    let ids = state.clauses[clause].ids[at]
+    expect usize.widen(ids.literal) < state.asserted.len() and usize.widen(ids.negation) < state.asserted.len()
+    if state.asserted[usize.widen(ids.literal)] {
         return Some(true)
     }
-    if state.asserted.contains(literal.negation(state.terms.alloc)) {
+    if state.asserted[usize.widen(ids.negation)] {
         return Some(false)
     }
-    var value: Option[bool] = None
-    match literal.atom {
-        Atom.Bool(term) => {
-            value = try mut self.decided(mut state, term)
-        }
-        Atom.All(_) => {}
-        Atom.Le(sum) => {
-            value = state.entails_atom(sum, equality: false)
-        }
-        Atom.Eq(sum) => {
-            value = state.entails_atom(sum, equality: true)
-        }
+    let Some(term) = state.clauses[clause].literals[at].atom.boolean() else {
+        return state.entails(state.clauses[clause].literals[at])
     }
-    let Some(holds) = value else {
+    let negated = state.clauses[clause].literals[at].negated
+    let Some(holds) = try mut self.decided(mut state, term) else {
         return None
     }
-    return Some(holds != literal.negated)
+    return Some(holds != negated)
 } Solver.evaluate
+
+/// The term of a boolean atom.
+fn Atom.boolean(self) -> Option[u32] {
+    return match self {
+        Atom.Bool(term) => Some(term)
+        else => None
+    }
+} Atom.boolean
+
+/// The id of a literal, given it when it has none, not asserted.
+fn State.literal_id(mut self, literal: Literal) -> u32 {
+    match self.literal_ids.get(literal) {
+        Some(id) => return id
+        None => {}
+    }
+    let id = u32.fit(self.asserted.len())
+    discard mut self.literal_ids.insert(literal.copy(self.terms.alloc), value: id)
+    mut self.asserted.push(false)
+    return id
+} State.literal_id
+
+/// The number of an application's form: its function with its parts left out.
+fn State.form(mut self, app: u32) -> u32 {
+    let index = usize.widen(app)
+    while self.form_of.len() <= index {
+        mut self.form_of.push(NO_FORM)
+    }
+    if self.form_of[index] != NO_FORM {
+        return self.form_of[index]
+    }
+    let alloc = self.terms.alloc
+    var zeros = mem::List[u32].empty(alloc)
+    for _ in self.terms.get(app).parts(alloc) {
+        mut zeros.push(0)
+    }
+    let shape = self.terms.get(app).replacing_parts(zeros.view(), alloc)
+    var form = u32.fit(self.forms.len())
+    match self.forms.get(shape) {
+        Some(known) => {
+            form = known
+        }
+        None => {
+            discard mut self.forms.insert(take shape, value: form)
+        }
+    }
+    self.form_of[index] = form
+    return form
+} State.form
 
 /// A copy of the state, as a case split gives each branch.
 fn State.copy(self, alloc: mem::Alloc) -> State {
@@ -1568,11 +1806,15 @@ fn State.copy(self, alloc: mem::Alloc) -> State {
     }
     var clauses = mem::List[StateClause].empty(alloc)
     for entry in self.clauses {
-        mut clauses.push(StateClause(id: entry.id, key: entry.key.share(), literals: copied_literals(entry.literals.view(), alloc)))
+        mut clauses.push(StateClause(id: entry.id, key: entry.key.share(), literals: copied_literals(entry.literals.view(), alloc), ids: copied_ids(entry.ids.view(), alloc)))
     }
-    var asserted = mem::HashMap[Literal, Unit].empty(seed: 0, alloc)
-    for entry in self.asserted {
-        discard mut asserted.insert(entry.key().copy(alloc), value: Unit)
+    var forms = mem::HashMap[Term, u32].empty(seed: 0, alloc)
+    for entry in self.forms {
+        discard mut forms.insert(entry.key().copy(alloc), value: entry.value())
+    }
+    var literal_ids = mem::HashMap[Literal, u32].empty(seed: 0, alloc)
+    for entry in self.literal_ids {
+        discard mut literal_ids.insert(entry.key().copy(alloc), value: entry.value())
     }
     var atoms = mem::List[AssertedAtom].empty(alloc)
     for atom in self.atoms {
@@ -1594,12 +1836,17 @@ fn State.copy(self, alloc: mem::Alloc) -> State {
         muls: listed_terms(self.muls.view(), alloc),
         integers: listed_terms(self.integers.view(), alloc),
         comparisons: take comparisons,
+        form_of: listed_terms(self.form_of.view(), alloc),
+        forms: take forms,
         clauses: take clauses,
-        asserted: take asserted,
+        literal_ids: take literal_ids,
+        asserted: copied_flags(self.asserted.view(), alloc),
         atoms: take atoms,
         disequalities: take disequalities,
         separated: copied_pairs(self.separated.view(), alloc),
         graph: copied_graph(self.graph, alloc),
+        graph_closed: self.graph_closed,
+        graph_atoms: self.graph_atoms,
         instances: copied_instances(self.instances.view(), alloc),
         truth: self.truth,
         falsity: self.falsity,
@@ -1615,6 +1862,15 @@ fn copied_classes(classes: Slice[Class], alloc: mem::Alloc) -> mem::List[Class] 
     }
     return copied
 } copied_classes
+
+/// A list of the literal ids of a slice.
+fn copied_ids(ids: Slice[LiteralIds], alloc: mem::Alloc) -> mem::List[LiteralIds] {
+    var copied = mem::List[LiteralIds].empty(alloc)
+    for entry in ids {
+        mut copied.push(entry)
+    }
+    return copied
+} copied_ids
 
 /// A list of the flags of a slice.
 fn copied_flags(flags: Slice[bool], alloc: mem::Alloc) -> mem::List[bool] {
@@ -1787,7 +2043,7 @@ fn added_bound(total: Option[wide::Wide], value: Option[wide::Wide]) -> Option[w
     return held.checked_add(added)
 } added_bound
 
-/// Whether the state entails a positive linear literal or its negation.
+/// Whether the state entails a linear literal or its negation.
 fn State.entails(self, literal: Literal) -> Option[bool] {
     var value: Option[bool] = None
     match literal.atom {
@@ -1821,6 +2077,16 @@ fn State.entails_atom(self, linear_sum: Linear, equality: bool) -> Option[bool] 
 
 /// Whether the coefficients of a sum's terms add up to 0 in each class.
 fn State.cancels(self, linear_sum: Linear) -> bool {
+    let summands = linear_sum.terms
+    if summands.len() == 1 {
+        return summands[0].coefficient.is_zero()
+    }
+    if summands.len() == 2 {
+        if self.find(summands[0].term) == self.find(summands[1].term) {
+            return summands[0].coefficient.wrapping_add(summands[1].coefficient).is_zero()
+        }
+        return summands[0].coefficient.is_zero() and summands[1].coefficient.is_zero()
+    }
     var by_class = mem::List[LinearTerm].empty(self.terms.alloc)
     for summand in linear_sum.terms {
         let root = self.find(summand.term)

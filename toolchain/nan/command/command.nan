@@ -209,6 +209,11 @@ fn Name.writes(self) -> bool {
     }
 } Name.writes
 
+/// Whether the command checks or loads work its crew may share; `nan primer` only prints.
+fn Name.crewed(self) -> bool {
+    return self != Name.Primer
+} Name.crewed
+
 /// The names of the counts its summary gives, separated by spaces.
 proj fn Name.counts(self) -> Str {
     return match self {
@@ -538,7 +543,8 @@ fn usage(args: Slice[text::String], alloc: mem::Alloc) -> Ran {
     return Ran(output: written.render(output::Format(json: json, budget: None, skip: 0), alloc), status: output::Verdict.Invalid.status(), launch: None)
 } usage
 
-/// The stack a command runs on: the entry task stack of `x86_64-host`.
+/// The stack a command and each worker task of its crew run on: the entry task stack of
+/// `x86_64-host`.
 const COMMAND_STACK: usize = 67_108_864
 
 /// What a command has learnt by the time it may fail: its workspace root, its scope as the
@@ -589,7 +595,7 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 f
     let Ok(current) = attempt text::String.try_from_utf8(directory.view(), alloc) else {
         return 101
     }
-    let ran = try await run(take args, take current, home, exec: world.exec, alloc)
+    let ran = try await run(take args, take current, home, exec: world.exec, clock: world.clock, alloc)
     match ran.launch {
         Some(launch) => return launch.start(alloc)
         None => {}
@@ -600,8 +606,9 @@ pkg fn entry(take world: host::World, home: Option[cache::HomeOverride]) -> u8 f
 
 /// What a command line prints run in `current`, and the status it ends with, or the program it
 /// starts. The command runs in a domain of its own, so that a trap of its implementation is an
-/// internal error.
-fn run(take args: mem::List[text::String], take current: text::String, home: Option[cache::HomeOverride], exec: task::Executor, alloc: mem::Alloc) -> Ran fails task::Cancelled uses wait {
+/// internal error, beside a worker task per other processor, up to `CREW_WORKERS`, serving the
+/// crew of its checks and loads, each drawing on a cell of its own, when it has a crew.
+fn run(take args: mem::List[text::String], take current: text::String, home: Option[cache::HomeOverride], exec: task::Executor, clock: sys::Clock, alloc: mem::Alloc) -> Ran fails task::Cancelled uses wait {
     let Some(invocation) = read_command(args.view(), alloc) else {
         return usage(args.view(), alloc)
     }
@@ -609,12 +616,33 @@ fn run(take args: mem::List[text::String], take current: text::String, home: Opt
     let given = traced.share()
     let line = copied_lines(args.view(), alloc)
     let user = cache::copied_override(home, alloc)
-    let attempted = try await sys::Domain.run_sized(fn[take given, take line, take current, take user]() -> Result[Outcome, platform::IoError] {
+    let attempted = try await sys::Domain.run_sized(fn[take given, take line, take current, take user]() -> Result[Outcome, platform::IoError] fails task::Cancelled uses wait {
         let Some(read) = read_command(line.view(), alloc) else {
             expect false
             return Err(platform::IoError.Other(0))
         }
-        return attempt execute(read, current: current.as_str(), home: user, trace: given.contents(), alloc)
+        var workers = platform::processors() - 1
+        if workers > CREW_WORKERS {
+            workers = CREW_WORKERS
+        }
+        if not read.name.crewed() {
+            workers = 0
+        }
+        let crew = Crew(checks: mem::Shared.of(check::Crew.empty(alloc), alloc), parses: mem::Shared.of(workspace::Parsing.empty(served: workers > 0, alloc), alloc))
+        var outcome: Result[Outcome, platform::IoError] = Err(platform::IoError.Other(0))
+        try await task::scope(exec, body: fn[mut outcome](s: task::Scope) {
+            for _ in 0..<workers {
+                let served = crew.share()
+                discard s.spawn_sized(fn[take served]() fails task::Cancelled uses wait {
+                    let budget = alloc.split(~0usize)
+                    defer take budget.close()
+                    try await served.serve(clock, alloc: budget.alloc())
+                }, stack: COMMAND_STACK)
+            }
+            outcome = attempt execute(read, current: current.as_str(), home: user, trace: given.contents(), crew, alloc)
+            s.cancel()
+        })
+        return outcome
     }, stack: COMMAND_STACK, exec, alloc)
     let outcome = match attempted {
         Ok(Ok(done)) => done
@@ -627,6 +655,45 @@ fn run(take args: mem::List[text::String], take current: text::String, home: Opt
         Outcome.Ended(status) => Ran(output: text::String.empty(alloc), status: status, launch: None)
     }
 } run
+
+/// What the worker tasks of a command serve: the batches of its checks and of its workspace
+/// load.
+struct Crew {
+    checks: mem::Shared[check::Crew]
+    parses: mem::Shared[workspace::Parsing]
+} Crew
+
+fn Crew.share(self) -> Crew {
+    return Crew(checks: self.checks.share(), parses: self.parses.share())
+} Crew.share
+
+/// The most worker tasks a command runs: each costs memory of its own, and beyond one thread per
+/// core of a common machine they hardly speed checking up.
+const CREW_WORKERS: usize = 7
+
+/// The longest a worker task sleeps between looks for posted jobs, in milliseconds.
+const IDLE_MS: u64 = 16
+
+/// Runs the jobs posted to the crew, drawing on `alloc`, until its task is cancelled; while none
+/// is left it sleeps a millisecond, then twice as long after each look finding none, up to
+/// `IDLE_MS`.
+fn Crew.serve(self, clock: sys::Clock, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var checked: usize = 0
+    var parsed: usize = 0
+    var idle: u64 = 1
+    loop {
+        let seen = checked + parsed
+        self.parses.contents().help(mut parsed, alloc)
+        self.checks.contents().help(mut checked, alloc)
+        if checked + parsed != seen {
+            idle = 1
+        }
+        try await clock.sleep(idle)
+        if idle < IDLE_MS {
+            idle = idle * 2
+        }
+    }
+} Crew.serve
 
 /// The internal error a trap of a command's implementation is: one of a resource the command
 /// cannot obtain when it exhausted memory or its stack.
@@ -726,7 +793,7 @@ fn numbered(repro: Str, number: u32, alloc: mem::Alloc) -> text::String {
 
 /// Runs the command: `nan merge` and the workspace form of `nan diff` outside a workspace, every
 /// other command in the session of the workspace holding `current`, under the workspace lock.
-fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], trace: Trace, alloc: mem::Alloc) -> Outcome fails platform::IoError {
+fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverride], trace: Trace, crew: Crew, alloc: mem::Alloc) -> Outcome fails platform::IoError {
     if invocation.name == Name.Merge {
         return Outcome.Output(try merge_run(invocation, current, home, trace, alloc))
     }
@@ -740,10 +807,10 @@ fn execute(invocation: Invocation, current: Str, home: Option[cache::HomeOverrid
     trace.rooted(root.as_str(), alloc)
     let lock = try journal::Lock.acquire(root.as_str(), exclusive: invocation.name.writes(), alloc)
     defer take lock.release()
-    let grammar = syntax::Grammar.load(alloc)
-    let loaded = try workspace::Workspace.load(root.as_str(), read: trace.read, given: home, grammar, alloc)
-    let std = workspace::Workspace.of_std(grammar, alloc)
-    let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: mem::Shared.of(take std, alloc: alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(home, alloc), alloc)
+    let grammar = mem::Shared.of(syntax::Grammar.load(alloc), alloc: alloc)
+    let loaded = try workspace::Workspace.load_ahead(root.as_str(), read: trace.read, given: home, grammar, parsing: crew.parses.contents(), alloc)
+    var session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: workspace::CarriedStd.unloaded(parsing: crew.parses.share(), alloc), grammar: grammar.share(), home: cache::copied_override(home, alloc), alloc)
+    session.crew = crew.checks.share()
     if invocation.name == Name.Upgrade and invocation.value("--language").is_some() {
         return Outcome.Output(upgrade_language(invocation, session, current, trace, alloc))
     }

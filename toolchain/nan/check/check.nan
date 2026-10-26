@@ -2,38 +2,95 @@
 
 /// What the checkers of one command share: the workspace, the std packages the toolchain carries
 /// as a workspace of their own, the grammar their files are parsed with, the type interner, the
-/// home directory replacing the running user's, and the allocator checking draws on.
+/// home directory replacing the running user's, the crew running their batches and the
+/// allocator checking draws on.
 pkg struct Session {
     pkg workspace: mem::Shared[workspace::Workspace]
-    pkg std: mem::Shared[workspace::Workspace]
+    pkg carried: workspace::CarriedStd
     pkg grammar: mem::Shared[syntax::Grammar]
     pkg types: mem::Shared[ty::Types]
     pkg home: Option[cache::HomeOverride]
     /// The hash standing for the toolchain's source tree, under key 0 once computed.
     tree_hash: mem::Shared[mem::OnceMap[u8, Option[hashing::HashValue]]]
+    /// The states of the workspace's packages that code roots depend on, by package index, once
+    /// computed.
+    states: mem::Shared[mem::OnceMap[usize, hashing::HashValue]]
+    pkg crew: mem::Shared[Crew]
     pkg alloc: mem::Alloc
 } Session
 
-/// The session of a workspace, with a type interner of its own.
+/// The session of a workspace, with a type interner and a crew of its own, no worker serving it.
 pkg fn Session.of(
     take workspace: mem::Shared[workspace::Workspace],
-    take std: mem::Shared[workspace::Workspace],
+    take std: workspace::CarriedStd,
     take grammar: mem::Shared[syntax::Grammar],
     take home: Option[cache::HomeOverride],
     alloc: mem::Alloc,
     ) -> Session {
-    return Session(workspace: take workspace, std: take std, grammar: take grammar, types: mem::Shared.of(ty::Types.empty(alloc), alloc), home: take home, tree_hash: mem::Shared.of(mem::OnceMap[u8, Option[hashing::HashValue]].empty(seed: 0, alloc), alloc), alloc: alloc)
+    return Session(workspace: take workspace, carried: take std, grammar: take grammar, types: mem::Shared.of(ty::Types.empty(alloc), alloc), home: take home, tree_hash: mem::Shared.of(mem::OnceMap[u8, Option[hashing::HashValue]].empty(seed: 0, alloc), alloc), states: mem::Shared.of(mem::OnceMap[usize, hashing::HashValue].empty(seed: 0, alloc), alloc), crew: mem::Shared.of(Crew.empty(alloc), alloc), alloc: alloc)
 } Session.of
 
+/// The session of another workspace, with this one's std packages, grammar, home directory and
+/// crew.
+pkg fn Session.over(self, take workspace: mem::Shared[workspace::Workspace], alloc: mem::Alloc) -> Session {
+    var session = Session.of(take workspace, std: self.carried.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+    session.crew = self.crew.share()
+    return session
+} Session.over
+
+/// The std packages the toolchain carries, as a workspace of their own.
+pkg proj fn Session.std(self) -> workspace::Workspace {
+    return self.carried.workspace(self.grammar, given: self.home, alloc: self.alloc)
+} Session.std
+
 pkg fn Session.share(self) -> Session {
-    return Session(workspace: self.workspace.share(), std: self.std.share(), grammar: self.grammar.share(), types: self.types.share(), home: cache::copied_override(self.home, alloc: self.alloc), tree_hash: self.tree_hash.share(), alloc: self.alloc)
+    return Session(workspace: self.workspace.share(), carried: self.carried.share(), grammar: self.grammar.share(), types: self.types.share(), home: cache::copied_override(self.home, alloc: self.alloc), tree_hash: self.tree_hash.share(), states: self.states.share(), crew: self.crew.share(), alloc: self.alloc)
 } Session.share
 
 /// A handle of a checker: the database of one check under one target and what its queries
-/// computed. The copies `share` makes see the same checker.
+/// computed, with what the queries of the task holding it change as they run. The copies
+/// `share` makes see the same checker and the same work under way.
 pkg struct Checker {
     state: mem::Shared[CheckerState]
+    underway: mem::Shared[Underway]
 } Checker
+
+/// What the queries a task runs on a checker change as they run: where they report, the work
+/// under way and the item whose own work it is. Each task helping a batch runs its jobs with one
+/// of its own.
+struct Underway {
+    /// The sink the diagnostics reported go into.
+    sink: core::atomic::AtomicU32
+    /// While positive, typing reports nothing: a probe of what a construct is.
+    muted: core::atomic::AtomicU32
+    /// The probe listening, `NO_ID` for none.
+    listener: core::atomic::AtomicU32
+    /// The generic parameters of the body being checked, with the bounds that hold in it.
+    scope: cell::Swap[mem::List[GenericDef]]
+    /// The item whose body or clauses are being typed, `NO_ID` for none.
+    within: core::atomic::AtomicU32
+    /// The package being checked, `NO_ID` for none.
+    checking: core::atomic::AtomicU32
+    /// The consts and contributions being evaluated, innermost last.
+    evaluating: cell::Swap[mem::List[ty::ItemId]]
+    /// The tombstones whose replacements are being found, innermost last.
+    replacing: cell::Swap[mem::List[ty::ItemId]]
+    deciding: Deciding
+    computing: DigestSearch
+    /// Whether components are being found, during which a query searches the dependencies.
+    finding_cycles: core::atomic::AtomicBool
+    /// The item whose own work is being computed, recording or not, `NO_ID` for none; rules
+    /// relating several items within that work leave it in place.
+    traced: core::atomic::AtomicU32
+    /// The jobs of a batch it runs, if any.
+    job: Option[Job]
+    /// The allocator the task's checking draws on.
+    alloc: mem::Alloc
+} Underway
+
+fn Underway.empty(checking: u32, take job: Option[Job], alloc: mem::Alloc) -> Underway {
+    return Underway(sink: core::atomic::AtomicU32.of(0), muted: core::atomic::AtomicU32.of(0), listener: core::atomic::AtomicU32.of(NO_ID), scope: cell::Swap.of(mem::List[GenericDef].empty(alloc), alloc), within: core::atomic::AtomicU32.of(NO_ID), checking: core::atomic::AtomicU32.of(checking), evaluating: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), replacing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), deciding: Deciding.empty(alloc), computing: DigestSearch.empty(alloc), finding_cycles: core::atomic::AtomicBool.of(false), traced: core::atomic::AtomicU32.of(NO_ID), job: take job, alloc: alloc)
+} Underway.empty
 
 /// What a checker holds; its queries change it through read access.
 struct CheckerState {
@@ -45,33 +102,28 @@ struct CheckerState {
     found: mem::Arena[Found]
     /// Whether each sink is closed, by sink; sink 0, the checker's own, never is.
     sinks: mem::Arena[core::atomic::AtomicBool]
-    /// The sink the diagnostics reported go into.
-    sink: core::atomic::AtomicU32
     /// The fixes replacing those of found diagnostics, by the index their diagnostics hold.
     refixes: mem::Arena[mem::List[diagnostic::Fix]]
-    /// The package being checked, `NO_ID` for none.
-    checking: core::atomic::AtomicU32
     /// The impl lines, by the type they target, once indexed, under key 0.
     impls: mem::OnceMap[u8, mem::Shared[mem::HashMap[TypeKey, mem::List[ty::ItemId]]]]
-    /// While positive, typing reports nothing: a probe of what a construct is.
-    muted: core::atomic::AtomicU32
+    /// The derivable interfaces core declares, once found, under key 0, and its operator
+    /// interfaces under key 1.
+    builtin_interfaces: mem::OnceMap[u8, mem::List[ty::ItemId]]
+    /// The impl lines, by the items they name as impl target or interface, once indexed, under
+    /// key 0.
+    naming: mem::OnceMap[u8, mem::Shared[mem::HashMap[ty::ItemId, mem::List[ty::ItemId]]]]
     /// The probes of an item's typing that listened, each with the diagnostics found on its item.
     listeners: mem::Arena[Listener]
-    /// The probe listening, `NO_ID` for none.
-    listener: core::atomic::AtomicU32
-    /// The generic parameters of the body being checked, with the bounds that hold in it.
-    scope: cell::Swap[mem::List[GenericDef]]
-    /// The item whose body or clauses are being typed, `NO_ID` for none.
-    within: core::atomic::AtomicU32
     /// The properties of struct and enum definitions, by whether a consumer sees them.
     definitions: mem::OnceMap[DefinitionKey, Props]
-    /// The definitions whose properties are being decided or are decided.
-    deciding: mem::OnceMap[DefinitionKey, Unit]
     /// The typed bodies of function items, from their checks or typed for their digests.
     bodies: mem::OnceMap[ty::ItemId, mem::Shared[TBody]]
     /// The functions each function calls directly or supplies as function arguments, in order;
     /// none for an item without a typed body.
     body_dependencies: mem::OnceMap[ty::ItemId, Option[mem::Shared[mem::List[ty::ItemId]]]]
+    /// The functions each function's unit calls directly or supplies as function arguments, in
+    /// order; none for an item without a unit.
+    unit_dependencies: mem::OnceMap[ty::ItemId, mem::Shared[mem::List[ty::ItemId]]]
     /// The impl lines each function implements a method of, once found.
     implemented: mem::OnceMap[ty::ItemId, mem::List[ty::ItemId]]
     /// The strongly connected component of the dependencies holding each function, as found so
@@ -79,9 +131,13 @@ struct CheckerState {
     cycle_components: mem::OnceMap[ty::ItemId, u32]
     /// Whether each component holds a cycle: several functions, or one depending on itself.
     cycle_flags: mem::Arena[bool]
-    /// Whether components are being found, during which a query searches the dependencies.
-    finding_cycles: core::atomic::AtomicBool
-    digests: Digests
+    /// While only a code root's reads are recorded, the functions whose reads are recorded with
+    /// those of every function they reach through their body dependencies, and through their
+    /// unit dependencies.
+    bodies_read: mem::OnceMap[ty::ItemId, Unit]
+    units_read: mem::OnceMap[ty::ItemId, Unit]
+    /// The digests computed, by function.
+    digests: mem::OnceMap[ty::ItemId, mem::Shared[Digest]]
     /// The authorities each module performs directly, as far as checked.
     performed: mem::OnceMap[Performed, Unit]
     /// The typed holes of the bodies checked.
@@ -110,14 +166,10 @@ struct CheckerState {
     units: mem::OnceMap[ty::ItemId, Option[mem::Shared[nir::NirUnit]]]
     /// The values const evaluation computed, none for one that ends without a value.
     const_values: mem::OnceMap[ty::ItemId, Option[mem::Shared[ConstValue]]]
-    /// The consts and contributions being evaluated, innermost last.
-    evaluating: cell::Swap[mem::List[ty::ItemId]]
-    /// The tombstones whose replacements are being found, innermost last.
-    replacing: cell::Swap[mem::List[ty::ItemId]]
     /// The consts and contributions whose values each evaluation needs, by the one evaluated,
     /// in order of first need.
     needs: mem::Arena[Need]
-    needed: mem::OnceMap[Need, Unit]
+    needed: cell::Claims[Need]
     /// The consts and contributions whose evaluation needs their own values.
     cyclic: mem::OnceMap[ty::ItemId, Unit]
     /// The obligation sites of the units decided, with their statuses.
@@ -129,7 +181,7 @@ struct CheckerState {
     instantiations: mem::Arena[Instantiation]
     /// The diagnostics of unused code found under the target, reported once found under every
     /// target checking their file.
-    unused: mem::Arena[diagnostic::Diagnostic]
+    unused: mem::Arena[Found]
     /// The diagnostics found on the items of quiet packages, which no command reports.
     quiet: mem::Arena[diagnostic::Diagnostic]
     /// The fields of structs the bodies checked read.
@@ -138,12 +190,30 @@ struct CheckerState {
     member_functions: mem::OnceMap[u8, mem::Map[text::String, mem::List[ty::ItemId]]]
     /// The items each item names, once computed.
     named: mem::OnceMap[ty::ItemId, mem::Shared[mem::Set[ty::ItemId]]]
+    /// The interfaces each type mentioning no generic parameter implements, by the package
+    /// checking it.
+    implemented_interfaces: mem::OnceMap[ImplementedKey, mem::Shared[mem::List[ty::ItemId]]]
+    /// Whether each std type read is one with interior mutability.
+    interior_types: mem::OnceMap[ty::ItemId, bool]
+    /// The folded names of the values each module declares, once a local's name is checked
+    /// against them.
+    value_folds: mem::OnceMap[ty::ModuleId, mem::Set[text::String]]
     /// The `label: value` of each construction and struct pattern the bodies checked write, by
     /// the struct and the field it names.
     field_labels: mem::OnceMap[FieldKey, mem::Arena[FieldLabel]]
     /// The proof cache of the running user, opened at the first query decided, under key 0;
     /// none without a usable one.
     proof_cache: mem::OnceMap[u8, Option[cache::Cache]]
+    /// The result of each query decided, by its language and obligation hash: proved, out of
+    /// fuel or open.
+    outcomes: mem::OnceMap[QueryKey, u8]
+    /// Whether each type asked has interior mutability, by the reads it was asked under.
+    interior: mem::OnceMap[TypeAsked, bool]
+    /// Whether each type asked holds a struct with predicates, by the reads it was asked under.
+    predicated: mem::OnceMap[TypeAsked, bool]
+    /// What the prover reads from the canonical path of each function asked, by the reads it
+    /// was asked under.
+    path_roles: mem::OnceMap[ItemAsked, PathRole]
     /// The entries of the local store of the running user, once read, under key 0; none without
     /// a usable one.
     store_entries: mem::OnceMap[u8, Option[mem::List[store::Entry]]]
@@ -155,12 +225,15 @@ struct CheckerState {
     /// While the prover is compared with the proof cache, the obligation hashes whose held
     /// result differs from the procedure's.
     compared: mem::Arena[hashing::HashValue]
+    /// What the build cache keeps of the check and gives back to it.
+    kept: Kept
 } CheckerState
 
-/// A diagnostic reported into a sink, and the index of the fixes replacing those it holds,
-/// `NO_ID` while they stand.
+/// A diagnostic reported into a sink by the own work of an item, `NO_ID` for a rule relating
+/// items, and the index of the fixes replacing those it holds, `NO_ID` while they stand.
 struct Found {
     sink: u32
+    owner: u32
     diagnostic: diagnostic::Diagnostic
     refixed: core::atomic::AtomicU32
 } Found
@@ -297,15 +370,24 @@ pkg proj fn Words.next(mut self) -> Option[Str] {
     return self.list.slice_bytes(start, end: length)
 } Words.next
 
-/// Whether a list of words holds a word.
+/// Whether a list of words holds a word, as `Words` gives them.
 pkg fn is_listed(list: Str, word: Str) -> bool {
-    let Some(whole) = list.slice_bytes(0, end: list.byte_len()) else {
-        return false
-    }
-    for held in Words(list: take whole, at: 0) {
-        if held == word {
+    let bytes = list.as_bytes()
+    let wanted = word.byte_len()
+    var start: usize = 0
+    while start < bytes.len() {
+        var end = start
+        while end < bytes.len() and bytes[end] != b' ' {
+            invariant start <= end
+            end += 1
+        }
+        if end - start == wanted and list.slice_bytes(start, end: end) == Some(word) {
             return true
         }
+        if end == bytes.len() {
+            return false
+        }
+        start = end + 1
     }
     return false
 } is_listed
@@ -320,24 +402,21 @@ fn Checker.new(take db: Db) -> Checker {
         sigs: mem::OnceMap[ty::ItemId, mem::Shared[Sig]].empty(seed: 0, alloc),
         found: mem::Arena[Found].empty(alloc),
         sinks: mem::Arena[core::atomic::AtomicBool].empty(alloc),
-        sink: core::atomic::AtomicU32.of(0),
         refixes: mem::Arena[mem::List[diagnostic::Fix]].empty(alloc),
-        checking: core::atomic::AtomicU32.of(NO_ID),
         impls: mem::OnceMap[u8, mem::Shared[mem::HashMap[TypeKey, mem::List[ty::ItemId]]]].empty(seed: 0, alloc),
-        muted: core::atomic::AtomicU32.of(0),
+        builtin_interfaces: mem::OnceMap[u8, mem::List[ty::ItemId]].empty(seed: 0, alloc),
+        naming: mem::OnceMap[u8, mem::Shared[mem::HashMap[ty::ItemId, mem::List[ty::ItemId]]]].empty(seed: 0, alloc),
         listeners: mem::Arena[Listener].empty(alloc),
-        listener: core::atomic::AtomicU32.of(NO_ID),
-        scope: cell::Swap.of(mem::List[GenericDef].empty(alloc), alloc),
-        within: core::atomic::AtomicU32.of(NO_ID),
         definitions: mem::OnceMap[DefinitionKey, Props].empty(seed: 0, alloc),
-        deciding: mem::OnceMap[DefinitionKey, Unit].empty(seed: 0, alloc),
         bodies: mem::OnceMap[ty::ItemId, mem::Shared[TBody]].empty(seed: 0, alloc),
         body_dependencies: mem::OnceMap[ty::ItemId, Option[mem::Shared[mem::List[ty::ItemId]]]].empty(seed: 0, alloc),
+        unit_dependencies: mem::OnceMap[ty::ItemId, mem::Shared[mem::List[ty::ItemId]]].empty(seed: 0, alloc),
         implemented: mem::OnceMap[ty::ItemId, mem::List[ty::ItemId]].empty(seed: 0, alloc),
         cycle_components: mem::OnceMap[ty::ItemId, u32].empty(seed: 0, alloc),
         cycle_flags: mem::Arena[bool].empty(alloc),
-        finding_cycles: core::atomic::AtomicBool.of(false),
-        digests: Digests.empty(alloc),
+        bodies_read: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
+        units_read: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
+        digests: mem::OnceMap[ty::ItemId, mem::Shared[Digest]].empty(seed: 0, alloc),
         performed: mem::OnceMap[Performed, Unit].empty(seed: 0, alloc),
         holes: mem::Arena[Hole].empty(alloc),
         members_named: mem::Arena[MemberNamed].empty(alloc),
@@ -351,33 +430,117 @@ fn Checker.new(take db: Db) -> Checker {
         judged: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
         units: mem::OnceMap[ty::ItemId, Option[mem::Shared[nir::NirUnit]]].empty(seed: 0, alloc),
         const_values: mem::OnceMap[ty::ItemId, Option[mem::Shared[ConstValue]]].empty(seed: 0, alloc),
-        evaluating: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc),
-        replacing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc),
         needs: mem::Arena[Need].empty(alloc),
-        needed: mem::OnceMap[Need, Unit].empty(seed: 0, alloc),
+        needed: cell::Claims[Need].empty(alloc),
         cyclic: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
         obligations: mem::OnceMap[ty::ItemId, mem::Shared[mem::List[Obligated]]].empty(seed: 0, alloc),
         may_traps: mem::OnceMap[ty::ItemId, bool].empty(seed: 0, alloc),
         instantiations: mem::Arena[Instantiation].empty(alloc),
-        unused: mem::Arena[diagnostic::Diagnostic].empty(alloc),
+        unused: mem::Arena[Found].empty(alloc),
         quiet: mem::Arena[diagnostic::Diagnostic].empty(alloc),
         fields_read: mem::OnceMap[FieldKey, Unit].empty(seed: 0, alloc),
         member_functions: mem::OnceMap[u8, mem::Map[text::String, mem::List[ty::ItemId]]].empty(seed: 0, alloc),
         named: mem::OnceMap[ty::ItemId, mem::Shared[mem::Set[ty::ItemId]]].empty(seed: 0, alloc),
+        value_folds: mem::OnceMap[ty::ModuleId, mem::Set[text::String]].empty(seed: 0, alloc),
+        interior_types: mem::OnceMap[ty::ItemId, bool].empty(seed: 0, alloc),
+        implemented_interfaces: mem::OnceMap[ImplementedKey, mem::Shared[mem::List[ty::ItemId]]].empty(seed: 0, alloc),
         field_labels: mem::OnceMap[FieldKey, mem::Arena[FieldLabel]].empty(seed: 0, alloc),
         proof_cache: mem::OnceMap[u8, Option[cache::Cache]].empty(seed: 0, alloc),
+        outcomes: mem::OnceMap[QueryKey, u8].empty(seed: 0, alloc),
+        interior: mem::OnceMap[TypeAsked, bool].empty(seed: 0, alloc),
+        predicated: mem::OnceMap[TypeAsked, bool].empty(seed: 0, alloc),
+        path_roles: mem::OnceMap[ItemAsked, PathRole].empty(seed: 0, alloc),
         store_entries: mem::OnceMap[u8, Option[mem::List[store::Entry]]].empty(seed: 0, alloc),
         head_exports: mem::OnceMap[ty::PackageId, Option[mem::Shared[mem::Map[text::String, machine::ApiEntry]]]].empty(seed: 0, alloc),
         comparing: core::atomic::AtomicBool.of(false),
         compared: mem::Arena[hashing::HashValue].empty(alloc),
+        kept: Kept.empty(alloc),
     )
     discard state.sinks.push(core::atomic::AtomicBool.of(false))
-    return Checker(state: mem::Shared.of(take state, alloc))
+    return Checker(state: mem::Shared.of(take state, alloc), underway: mem::Shared.of(Underway.empty(checking: NO_ID, job: None, alloc), alloc))
 } Checker.new
 
 pkg fn Checker.share(self) -> Checker {
-    return Checker(state: self.state.share())
+    return Checker(state: self.state.share(), underway: self.underway.share())
 } Checker.share
+
+/// Computes a query about `subject`, or about no item: its reads recorded as that subject's,
+/// and the subject's own work.
+fn Checker.about[T](self, subject: Option[ty::ItemId], compute: fn() -> T) -> T {
+    return self.db().about(subject, compute: fn() -> T {
+        return match subject {
+            Some(item) => self.traced_as(item, compute)
+            None => compute()
+        }
+    })
+} Checker.about
+
+/// Computes part of an item's own work, as the item whose own work is traced.
+fn Checker.traced_as[T](self, item: ty::ItemId, compute: fn() -> T) -> T {
+    let traced = self.underway.contents().traced
+    let outer = traced.swap(item.index)
+    let computed = compute()
+    traced.store(outer)
+    return computed
+} Checker.traced_as
+
+/// The item whose own work is being computed, if any.
+fn Checker.traced(self) -> Option[ty::ItemId] {
+    return item_of_bits(self.underway.contents().traced.load())
+} Checker.traced
+
+/// The bits of the item whose own work logs what it finds, which within a job is the job's
+/// item.
+fn Checker.logging_owner(self) -> u32 {
+    let owner = item_bits(self.traced())
+    match self.underway.contents().job {
+        Some(job) => {
+            let current = job.current()
+            expect owner == current.index
+        }
+        None => {}
+    }
+    return owner
+} Checker.logging_owner
+
+/// The diagnostics found that the running work appends to: its job's, or the checker's.
+proj fn Checker.found_log(self) -> mem::Arena[Found] {
+    return match self.underway.contents().job {
+        Some(job) => job.found
+        None => self.state.contents().found
+    }
+} Checker.found_log
+
+/// The diagnostics found on the items of quiet packages that the running work appends to.
+proj fn Checker.quiet_log(self) -> mem::Arena[diagnostic::Diagnostic] {
+    return match self.underway.contents().job {
+        Some(job) => job.quiet
+        None => self.state.contents().quiet
+    }
+} Checker.quiet_log
+
+/// The diagnostics of unused code that the running work appends to.
+proj fn Checker.unused_log(self) -> mem::Arena[Found] {
+    return match self.underway.contents().job {
+        Some(job) => job.unused
+        None => self.state.contents().unused
+    }
+} Checker.unused_log
+
+/// Traps when a job logs, where entries keep the order of the work, for an item the check judged
+/// other than its own: the work of whichever job reaches them logs only the items the check did
+/// not judge, such as those of packages it checks under no target of its own, whose order no
+/// output reads.
+fn Checker.logged_freely(self, owner: ty::ItemId) {
+    match self.underway.contents().job {
+        Some(job) => {
+            let judged = self.state.contents().judged.get(owner).is_some()
+            let current = job.current()
+            expect owner == current or not judged
+        }
+        None => {}
+    }
+} Checker.logged_freely
 
 /// The item database of the check.
 pkg proj fn Checker.db(self) -> Db {
@@ -394,13 +557,13 @@ proj fn Checker.session(self) -> Session {
     return self.state.contents().session
 } Checker.session
 
-/// The allocator checking draws on.
+/// The allocator the checking of the task holding the checker draws on.
 pkg fn Checker.alloc(self) -> mem::Alloc {
-    return self.state.contents().session.alloc
+    return self.underway.contents().alloc
 } Checker.alloc
 
 fn Checker.current_package(self) -> Option[ty::PackageId] {
-    let bits = self.state.contents().checking.load()
+    let bits = self.underway.contents().checking.load()
     if bits == NO_ID {
         return None
     }
@@ -484,13 +647,14 @@ fn Checker.reason(self, item: ty::ItemId, token: u32, role: diagnostic::Role, ta
 /// on that item.
 fn Checker.heard[T](self, item: ty::ItemId, probe: fn() -> T) -> Probed[T] {
     let state = self.state.contents()
+    let underway = self.underway.contents()
     let alloc = state.session.alloc
     let listening = state.listeners.push(Listener(item: item, heard: mem::Arena[diagnostic::Diagnostic].empty(alloc)))
-    let outer = state.listener.swap(listening.index())
-    discard state.muted.fetch_add(1)
+    let outer = underway.listener.swap(listening.index())
+    discard underway.muted.fetch_add(1)
     let value = probe()
-    discard state.muted.fetch_sub(1)
-    state.listener.store(outer)
+    discard underway.muted.fetch_sub(1)
+    underway.listener.store(outer)
     var heard = mem::List[diagnostic::Diagnostic].empty(alloc)
     for reported in state.listeners.at(listening).heard.cursor() {
         mut heard.push(reported.copy(alloc))
@@ -532,16 +696,18 @@ fn read_store_entries(home: Option[cache::HomeOverride], alloc: mem::Alloc) -> O
 /// Runs a probe whose diagnostics are withheld, returning its result and those diagnostics.
 fn Checker.withheld[T](self, probe: fn() -> T) -> Probed[T] {
     let state = self.state.contents()
+    let underway = self.underway.contents()
     let alloc = state.session.alloc
+    let found = self.found_log()
     let opened = state.sinks.push(core::atomic::AtomicBool.of(false))
-    let outer = state.sink.swap(opened.index())
-    let before = state.found.len()
+    let outer = underway.sink.swap(opened.index())
+    let before = found.len()
     let value = probe()
-    state.sink.store(outer)
+    underway.sink.store(outer)
     state.sinks.at(opened).store(true)
     var withheld = mem::List[diagnostic::Diagnostic].empty(alloc)
-    for index in before..<state.found.len() {
-        let entry = state.found.at(mem::Id[Found].of(u32.fit(index)))
+    for index in before..<found.len() {
+        let entry = found.at(mem::Id[Found].of(u32.fit(index)))
         if entry.sink == opened.index() {
             mut withheld.push(state.current(entry))
         }
@@ -590,10 +756,16 @@ fn Checker.found_diagnostics(self) -> mem::List[diagnostic::Diagnostic] {
     return found
 } Checker.found_diagnostics
 
-/// Appends a diagnostic to those found, into the sink current.
+/// Appends a diagnostic to those found, into the sink current, owned by the item whose own work
+/// reports it; into the checker's own sink, one whose owner's outcome the build cache gives is
+/// dropped.
 fn Checker.push_found(self, take reported: diagnostic::Diagnostic) {
-    let state = self.state.contents()
-    discard state.found.push(Found(sink: state.sink.load(), diagnostic: take reported, refixed: core::atomic::AtomicU32.of(NO_ID)))
+    let owner = self.logging_owner()
+    let sink = self.underway.contents().sink.load()
+    if sink == 0 and self.is_restored(owner) {
+        return
+    }
+    discard self.found_log().push(Found(sink: sink, owner: owner, diagnostic: take reported, refixed: core::atomic::AtomicU32.of(NO_ID)))
 } Checker.push_found
 
 /// Replaces the fixes of each found diagnostic `matches` holds for.
@@ -619,22 +791,34 @@ fn Checker.reported_at(self, item: ty::ItemId, token: u32) -> bool {
     expect usize.widen(token) < file.syntax.tokens.len()
     let start = file.syntax.tokens[usize.widen(token)].start
     let state = self.state.contents()
-    for entry in state.found.cursor() {
-        if not state.is_open(entry.sink) {
+    if state.reports_at(state.found, path: file.path.as_str(), start) {
+        return true
+    }
+    return match self.underway.contents().job {
+        Some(job) => state.reports_at(job.found, path: file.path.as_str(), start)
+        None => false
+    }
+} Checker.reported_at
+
+/// Whether a diagnostic of an open sink among `found` is reported on the construct starting at
+/// a byte of a file.
+fn CheckerState.reports_at(self, found: mem::Arena[Found], path: Str, start: u32) -> bool {
+    for entry in found.cursor() {
+        if not self.is_open(entry.sink) {
             continue
         }
-        let Some(path) = entry.diagnostic.path else {
+        let Some(at) = entry.diagnostic.path else {
             continue
         }
         let Some(span) = entry.diagnostic.span else {
             continue
         }
-        if path.as_str() == file.path.as_str() and span.start == start {
+        if at.as_str() == path and span.start == start {
             return true
         }
     }
     return false
-} Checker.reported_at
+} CheckerState.reports_at
 
 fn Checker.report_diagnostic(self, item: ty::ItemId, take reported: diagnostic::Diagnostic) {
     let Some(located) = self.on_item(item, take reported) else {
@@ -644,7 +828,7 @@ fn Checker.report_diagnostic(self, item: ty::ItemId, take reported: diagnostic::
         self.push_found(take located)
         return
     }
-    discard self.state.contents().quiet.push(take located)
+    discard self.quiet_log().push(take located)
 } Checker.report_diagnostic
 
 /// Records a diagnostic of unused code on an item, reported once found under every target
@@ -654,9 +838,18 @@ fn Checker.report_unused(self, item: ty::ItemId, take reported: diagnostic::Diag
         return
     }
     if self.db().is_reported(item) {
-        discard self.state.contents().unused.push(take located)
+        self.push_unused(take located)
     }
 } Checker.report_unused
+
+/// Records a diagnostic of unused code as `push_found` records a found one.
+fn Checker.push_unused(self, take reported: diagnostic::Diagnostic) {
+    let owner = self.logging_owner()
+    if self.is_restored(owner) {
+        return
+    }
+    discard self.unused_log().push(Found(sink: 0, owner: owner, diagnostic: take reported, refixed: core::atomic::AtomicU32.of(NO_ID)))
+} Checker.push_unused
 
 /// A diagnostic located on an item's file and item; none for the carried std's items and in
 /// probes, which hear those on the item they listen to.
@@ -665,11 +858,11 @@ pkg fn Checker.on_item(self, item: ty::ItemId, take reported: diagnostic::Diagno
     if db.is_carried(item) {
         return None
     }
-    let state = self.state.contents()
-    if state.muted.load() > 0 {
-        let listening = state.listener.load()
+    let underway = self.underway.contents()
+    if underway.muted.load() > 0 {
+        let listening = underway.listener.load()
         if listening != NO_ID {
-            let listener = state.listeners.at(mem::Id[Listener].of(listening))
+            let listener = self.state.contents().listeners.at(mem::Id[Listener].of(listening))
             if listener.item == item {
                 discard listener.heard.push(take reported)
             }
@@ -713,10 +906,26 @@ fn Checker.report_file_fixed(self, path: Str, line: u32, code: diagnostic::Code,
 /// The diagnostics check time reports on lines of a scope, those of loading, lexing and parsing
 /// included, by path, line and code, each once, each located on its reported construct's bytes.
 pkg fn Session.reported(self, scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
+    return self.located(self.diagnostics(), scope)
+} Session.reported
+
+/// The diagnostics check time reports on lines of a scope, as `reported` gives them, from the
+/// checkers of the workspace's closures.
+pkg fn Session.reported_by(self, checked: Checked, scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
+    var gathered = Gathered.empty(self.alloc)
+    for entry in checked.checkers {
+        mut gathered.add(entry.checker)
+    }
+    return self.located(take gathered.finish(), scope)
+} Session.reported_by
+
+/// The diagnostics of loading, lexing and parsing joined to those checking found, on lines of a
+/// scope, by path, line and code, each once, each located on its reported construct's bytes.
+fn Session.located(self, take checking: mem::List[diagnostic::Diagnostic], scope: scope::Scope) -> mem::List[diagnostic::Diagnostic] {
     let alloc = self.alloc
     let held = self.workspace.contents()
     var found = held.diagnostics(alloc)
-    for reported in take self.diagnostics() {
+    for reported in take checking {
         mut found.push(take reported)
     }
     for at in held.files() {
@@ -759,7 +968,7 @@ pkg fn Session.reported(self, scope: scope::Scope) -> mem::List[diagnostic::Diag
         mut deduplicated.push(take reported)
     }
     return deduplicated
-} Session.reported
+} Session.located
 
 /// A syntax diagnostic of a file at a path.
 fn file_diagnostic(written: syntax::FileDiagnostic, path: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
@@ -925,26 +1134,29 @@ fn Checker.judge_alone(self, item: ty::ItemId) {
         return
     }
     state.judged.insert(item, value: Unit)
-    let found_before = state.found.len()
-    let quiet_before = state.quiet.len()
-    let muted = state.muted.swap(0)
-    let package_bits = state.checking.swap(self.db().package_of(item).index)
-    self.db().about(Some(item), compute: fn() => self.check_item(item))
-    state.muted.store(muted)
-    state.checking.store(package_bits)
+    let underway = self.underway.contents()
+    let found = self.found_log()
+    let quiet = self.quiet_log()
+    let found_before = found.len()
+    let quiet_before = quiet.len()
+    let muted = underway.muted.swap(0)
+    let package_bits = underway.checking.swap(self.db().package_of(item).index)
+    self.about(Some(item), compute: fn() => self.check_item(item))
+    underway.muted.store(muted)
+    underway.checking.store(package_bits)
     let file = self.db().item_file(item)
     let data = self.db().item(item)
     expect data.index < file.syntax.items.len()
     let lines = file.syntax.item_lines(file.syntax.items[data.index])
     var failed = false
-    for index in found_before..<state.found.len() {
-        let entry = state.found.at(mem::Id[Found].of(u32.fit(index)))
+    for index in found_before..<found.len() {
+        let entry = found.at(mem::Id[Found].of(u32.fit(index)))
         if state.is_open(entry.sink) and errs_within(entry.diagnostic, path: file.path.as_str(), lines) {
             failed = true
         }
     }
-    for index in quiet_before..<state.quiet.len() {
-        if errs_within(state.quiet.at(mem::Id[diagnostic::Diagnostic].of(u32.fit(index))), path: file.path.as_str(), lines) {
+    for index in quiet_before..<quiet.len() {
+        if errs_within(quiet.at(mem::Id[diagnostic::Diagnostic].of(u32.fit(index))), path: file.path.as_str(), lines) {
             failed = true
         }
     }
@@ -956,6 +1168,7 @@ fn Checker.judge_alone(self, item: ty::ItemId) {
     if failed {
         state.rejections.insert(item, value: Unit)
     }
+    state.kept.judged_alone(item, rejected: failed)
 } Checker.judge_alone
 
 /// Whether a diagnostic is an error on one of some lines of a file.
@@ -1126,22 +1339,37 @@ pkg fn Session.checked(self, closure: workspace::Closure, target: workspace::Tar
     return checker
 } Session.checked
 
-/// Checks each package the checker checks, then the rules relating its items.
+/// Checks each package the checker checks, then the rules relating its items. The rules of check
+/// time reading an item's NIR run for the consts and contributions of every package first, whose
+/// evaluations the other items' examples read, then per package as a batch for its other items.
 fn Checker.check_all(self) {
-    let state = self.state.contents()
     for package_id in self.packages_checked() {
-        state.checking.store(package_id.index)
+        self.underway.contents().checking.store(package_id.index)
         self.check_package(package_id)
     }
     self.fix_misnamed()
     self.reject_items()
     let db = self.db()
-    for package_id in self.packages_checked() {
+    let checked = self.packages_checked()
+    var batches = mem::List[mem::List[ty::ItemId]].empty(self.alloc())
+    for package_id in checked {
+        var batched = mem::List[ty::ItemId].empty(self.alloc())
         for module in db.package_data(package_id).modules {
             for item in db.module(module).items {
-                self.check_elaborated(item)
+                if self.is_restored(item.index) {
+                    continue
+                }
+                match db.ast(item).kind {
+                    ast::ItemKind.Const(_) or ast::ItemKind.ConstAssert(_) or ast::ItemKind.Contribute(_) => self.traced_as(item, compute: fn() => self.check_elaborated(item))
+                    else => mut batched.push(item)
+                }
             }
         }
+        mut batches.push(take batched)
+    }
+    for index in 0..<checked.len() {
+        let package_id = checked[index]
+        self.run_batch(Work.Elaborated, items: batches[index].view())
         self.check_tables(package_id)
         self.check_approvals(package_id)
     }
@@ -1158,15 +1386,29 @@ pkg fn Session.unchecked(self, closure: workspace::Closure, target: workspace::T
 
 /// A checked checker of each closure under each target its packages are checked for.
 fn Session.closures_checked(self) -> mem::List[TargetChecker] {
+    return self.closures_coding(coded: None)
+} Session.closures_checked
+
+/// The checkers `closures_checked` gives, the one from which the code root of the workspace
+/// package at `coded` can come, if any, recording that code root's reads.
+fn Session.closures_coding(self, coded: Option[usize]) -> mem::List[TargetChecker] {
     let held = self.workspace.contents()
     var checkers = mem::List[TargetChecker].empty(self.alloc)
     for closure in held.closures {
         for target in closure_targets(held, closure, alloc: self.alloc) {
-            mut checkers.push(TargetChecker(target: target, checker: self.checked(closure, target)))
+            let checker = match coded {
+                Some(package_index) => if self.codes_in_check(closure, package_index, target) {
+                    self.coding(closure, package_index, target)
+                } else {
+                    self.checked(closure, target)
+                }
+                None => self.checked(closure, target)
+            }
+            mut checkers.push(TargetChecker(target: target, checker: take checker))
         }
     }
     return checkers
-} Session.closures_checked
+} Session.closures_coding
 
 /// An unchecked checker of each closure under each target its packages are checked for.
 fn Session.checkers(self) -> mem::List[TargetChecker] {
@@ -1189,44 +1431,128 @@ struct UnusedCount {
 /// The diagnostics of the workspace's items under each target their packages are checked for,
 /// those of unused code once found under every target checking their file.
 fn Session.diagnostics(self) -> mem::List[diagnostic::Diagnostic] {
-    let alloc = self.alloc
     let held = self.workspace.contents()
-    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
-    var unused = mem::List[UnusedCount].empty(alloc)
-    var checking = mem::Map[text::String, usize].empty(alloc)
+    var gathered = Gathered.empty(self.alloc)
     for closure in held.closures {
-        for target in closure_targets(held, closure, alloc) {
-            let checker = self.checked(closure, target)
-            count_checking(checker, mut checking)
-            var emitted = mem::List[diagnostic::Diagnostic].empty(alloc)
-            for reported in checker.state.contents().unused.cursor() {
-                if emitted.position(fn(known: diagnostic::Diagnostic) => same_diagnostic(known, earlier: reported, spanned: true)).is_none() {
-                    mut emitted.push(reported.copy(alloc))
-                }
-            }
-            for reported in take emitted {
-                match unused.position(fn(known: UnusedCount) => same_diagnostic(known.reported, earlier: reported, spanned: true)) {
-                    Some(position) => {
-                        let count = unused[position].count
-                        expect count < ~0usize
-                        unused[position].count = count + 1
-                    }
-                    None => mut unused.push(UnusedCount(reported: take reported, count: 1))
-                }
-            }
-            for reported in take checker.found_diagnostics() {
-                mut found.push(take reported)
-            }
+        for target in closure_targets(held, closure, alloc: self.alloc) {
+            mut gathered.add(self.kept_checked(closure, target))
         }
     }
-    for counted in take unused {
-        if found_everywhere(counted, checking) {
-            let UnusedCount(reported: reported, count: _) = counted
-            mut found.push(take reported)
-        }
-    }
-    return found
+    return take gathered.finish()
 } Session.diagnostics
+
+/// The checkers of the workspace's closures, each under each target its packages are checked
+/// for, once checked.
+pkg struct Checked {
+    checkers: mem::List[TargetChecker]
+} Checked
+
+/// The checkers of the workspace's closures as `diagnostics` checks them.
+pkg fn Session.check_closures(self) -> Checked {
+    let held = self.workspace.contents()
+    var checkers = mem::List[TargetChecker].empty(self.alloc)
+    for closure in held.closures {
+        for target in closure_targets(held, closure, alloc: self.alloc) {
+            mut checkers.push(TargetChecker(target: target, checker: self.kept_checked(closure, target)))
+        }
+    }
+    return Checked(checkers: take checkers)
+} Session.check_closures
+
+/// Whether a checker of the closures rejects an item.
+pkg fn Checked.rejects(self) -> bool {
+    for entry in self.checkers {
+        if entry.checker.state.contents().rejections.len() > 0 {
+            return true
+        }
+    }
+    return false
+} Checked.rejects
+
+/// Other handles of the checkers.
+pkg fn Checked.share(self, alloc: mem::Alloc) -> Checked {
+    var checkers = mem::List[TargetChecker].empty(alloc)
+    for entry in self.checkers {
+        mut checkers.push(TargetChecker(target: entry.target, checker: entry.checker.share()))
+    }
+    return Checked(checkers: take checkers)
+} Checked.share
+
+/// The checked checkers of the workspace's closures, the code root of the workspace package at
+/// an index coming from its closure's checker under its target when `codes_in_check` holds.
+pkg fn Session.check_closures_coding(self, package_index: usize) -> Checked {
+    return Checked(checkers: self.closures_coding(coded: Some(package_index)))
+} Session.check_closures_coding
+
+/// The checker, among a workspace's checked checkers, of the closure checking the workspace
+/// package at an index under a target, the others released; none when no closure checks it
+/// under that target.
+pkg fn Session.checker_in(self, take checked: Checked, package_index: usize, target: workspace::Target) -> Option[Checker] {
+    let held = self.workspace.contents()
+    var position: usize = 0
+    for closure in held.closures {
+        let holding = closure.checked.position(fn(index: usize) => index == package_index).is_some()
+        for closure_target in closure_targets(held, closure, alloc: self.alloc) {
+            if holding and closure_target == target {
+                let Some(found) = checked.checkers.get(position) else {
+                    expect false
+                    return None
+                }
+                return Some(found.checker.share())
+            }
+            position += 1
+        }
+    }
+    return None
+} Session.checker_in
+
+/// The diagnostics of checkers gathered as `Session.diagnostics` gathers them: the diagnostics
+/// found, those of unused code with the number of checkers finding each, and how many checkers
+/// check each file.
+struct Gathered {
+    found: mem::List[diagnostic::Diagnostic]
+    unused: mem::List[UnusedCount]
+    checking: mem::Map[text::String, usize]
+} Gathered
+
+fn Gathered.empty(alloc: mem::Alloc) -> Gathered {
+    return Gathered(found: mem::List[diagnostic::Diagnostic].empty(alloc), unused: mem::List[UnusedCount].empty(alloc), checking: mem::Map[text::String, usize].empty(alloc))
+} Gathered.empty
+
+fn Gathered.add(mut self, checker: Checker) {
+    let alloc = checker.alloc()
+    count_checking(checker, checking: mut self.checking)
+    var emitted = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for entry in checker.state.contents().unused.cursor() {
+        let reported = entry.diagnostic
+        if emitted.position(fn(known: diagnostic::Diagnostic) => same_diagnostic(known, earlier: reported, spanned: true)).is_none() {
+            mut emitted.push(reported.copy(alloc))
+        }
+    }
+    for reported in take emitted {
+        match self.unused.position(fn(known: UnusedCount) => same_diagnostic(known.reported, earlier: reported, spanned: true)) {
+            Some(position) => {
+                let count = self.unused[position].count
+                expect count < ~0usize
+                self.unused[position].count = count + 1
+            }
+            None => mut self.unused.push(UnusedCount(reported: take reported, count: 1))
+        }
+    }
+    for reported in take checker.found_diagnostics() {
+        mut self.found.push(take reported)
+    }
+} Gathered.add
+
+fn Gathered.finish(take self) -> mem::List[diagnostic::Diagnostic] {
+    for counted in take self.unused {
+        if found_everywhere(counted, checking: self.checking) {
+            let UnusedCount(reported: reported, count: _) = counted
+            mut self.found.push(take reported)
+        }
+    }
+    return self.found
+} Gathered.finish
 
 /// Whether a diagnostic of unused code was found by every checker checking its file.
 fn found_everywhere(counted: UnusedCount, checking: mem::Map[text::String, usize]) -> bool {

@@ -1,0 +1,203 @@
+//! The allocation routines of `x86_64-host`, each pool taking a lock of its own: `Alloc` and `AllocIn` carve a small allocation and `Free` frees one under its pool's lock, calling routines that take the lock of allocations only to add a pool, to draw or return chunks, for an allocation larger than a chunk or to free in a run of chunks no pool carves; `Lift` takes the pool's lock, then the lock of allocations. A routine taking both takes the pool's first. Each placement and charge is the one the lock of allocations alone gives.
+
+/// How a routine carving or freeing draws and returns chunks: in place, holding the lock of
+/// allocations, or through the routines taking it.
+enum Draw derives Copy {
+    Held
+    Called
+} Draw
+
+/// A chunk drawn for a pool to carve, made the pool's chunk; zero on exhaustion.
+fn Draw.pool_chunk(self, mut lo: Lowering, mut fx: Fx, pool: clif::Value, handle: clif::Value, domain: clif::Value) -> clif::Value {
+    match self {
+        Draw.Held => return pool_chunk(mut lo, mut fx, pool, handle, domain)
+        Draw.Called => {
+            let drawn = mut lo.call_routine(mut fx, routine: Routine.PoolDraw, args: fx.list3(pool, b: handle, c: domain).view())
+            expect drawn.len() > 0
+            return drawn[0]
+        }
+    }
+} Draw.pool_chunk
+
+/// Returns a run of chunks by its record.
+fn Draw.chunk_return(self, mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    match self {
+        Draw.Held => return_chunk(mut lo, mut fx, record)
+        Draw.Called => {
+            discard mut lo.call_routine(mut fx, routine: Routine.ChunkReturn, args: fx.list1(record).view())
+        }
+    }
+} Draw.chunk_return
+
+/// `Alloc`, `AllocIn`, `Free`, `Lift` and the routines they call on `x86_64-host`.
+fn pools_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let params = mut fx.entry()
+    expect params.len() > 0
+    match routine {
+        Routine.PoolAdd => {
+            expect params.len() > 1
+            let lock = allocations_lock(mut lo, mut fx)
+            locks_acquire(mut lo, mut fx, lock)
+            let added = domain_pool(mut lo, mut fx, domain: params[0], handle: params[1])
+            locks_release(mut lo, mut fx, lock)
+            mut fx.b.ret(fx.list1(added).view())
+        }
+        Routine.PoolDraw => {
+            expect params.len() > 2
+            let lock = allocations_lock(mut lo, mut fx)
+            locks_acquire(mut lo, mut fx, lock)
+            let drawn = pool_chunk(mut lo, mut fx, pool: params[0], handle: params[1], domain: params[2])
+            locks_release(mut lo, mut fx, lock)
+            mut fx.b.ret(fx.list1(drawn).view())
+        }
+        Routine.AllocLarge => {
+            expect params.len() > 2
+            let lock = allocations_lock(mut lo, mut fx)
+            locks_acquire(mut lo, mut fx, lock)
+            let drawn = allocate_large(mut lo, mut fx, handle: params[0], size: params[1], domain: params[2])
+            locks_release(mut lo, mut fx, lock)
+            mut fx.b.ret(fx.list1(drawn).view())
+        }
+        Routine.ChunkReturn => {
+            let lock = allocations_lock(mut lo, mut fx)
+            locks_acquire(mut lo, mut fx, lock)
+            return_chunk(mut lo, mut fx, record: params[0])
+            locks_release(mut lo, mut fx, lock)
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.FreeUnpooled => {
+            expect params.len() > 1
+            let lock = allocations_lock(mut lo, mut fx)
+            locks_acquire(mut lo, mut fx, lock)
+            release_in_chunk(mut lo, mut fx, record: params[0], address: params[1], draw: Draw.Held)
+            locks_release(mut lo, mut fx, lock)
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.LockWait => {
+            wait_free(mut lo, mut fx, lock: params[0])
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.Alloc or Routine.AllocIn => {
+            expect params.len() > 2
+            let domain = match routine {
+                Routine.Alloc => running_domain(mut lo, mut fx)
+                else => params[3]
+            }
+            let address = pools_alloc(mut lo, mut fx, handle: params[0], size: params[1], align: params[2], domain)
+            mut fx.b.ret(fx.list1(address).view())
+        }
+        Routine.Free => {
+            pools_free(mut lo, mut fx, address: params[0])
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        else => {
+            expect params.len() > 1
+            let lock = allocations_lock(mut lo, mut fx)
+            let lifted = pools_lift(mut lo, mut fx, lock, address: params[0], to: params[1])
+            mut fx.b.ret(fx.list1(lifted).view())
+        }
+    }
+} pools_define
+
+/// The address of the lock of allocations.
+fn allocations_lock(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    return mut fx.offset(state_address, offset: STATE_LOCK)
+} allocations_lock
+
+/// `Alloc` and `AllocIn` on `x86_64-host`: an allocation larger than a chunk through
+/// `AllocLarge`, a smaller one under its pool's lock, the pool found without a lock and added
+/// through `PoolAdd`.
+fn pools_alloc(mut lo: Lowering, mut fx: Fx, handle: clif::Value, size: clif::Value, align: clif::Value, domain: clif::Value) -> clif::Value {
+    let large = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: size, y: i64.fit(MEMORY_CHUNK))
+    let allocated = mut fx.choose_in(mut lo, condition: large, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        return mut lo1.call_routine(mut fx1, routine: Routine.AllocLarge, args: fx1.list3(handle, b: size, c: domain).view())
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let found = pool_search(mut fx1, domain, handle)
+        let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: found, y: 0)
+        let pools = mut fx1.choose_in(mut lo1, condition: missing, results: fx1.types1(PTR).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return mut lo2.call_routine(mut fx2, routine: Routine.PoolAdd, args: fx2.list2(domain, b: handle).view())
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(found)
+        })
+        let pool = pools[0]
+        let pool_lock = mut fx1.offset(pool, offset: MEMORY_POOL_LOCK)
+        locks_acquire(mut lo1, fx: mut fx1, lock: pool_lock)
+        let carved = memory_carve(mut lo1, fx: mut fx1, pool, handle, size, align, domain, draw: Draw.Called)
+        locks_release(mut lo1, fx: mut fx1, lock: pool_lock)
+        return fx1.list1(carved)
+    })
+    return allocated[0]
+} pools_alloc
+
+/// `Free` on `x86_64-host`: under the lock of the pool carving the allocation's run of chunks,
+/// read without a lock and again under it, or through `FreeUnpooled` for a run no pool carves.
+fn pools_free(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: address, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let record = chunk_of(mut lo, fx: mut fx1, address)
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            let pool = mut fx2.load(PTR, addr: record, offset: CHUNK_POOL)
+            let pooled = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: pool, y: 0)
+            let moved = mut fx2.choose_in(mut lo, condition: pooled, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let pool_lock = mut fx3.offset(pool, offset: MEMORY_POOL_LOCK)
+                locks_acquire(mut lo3, fx: mut fx3, lock: pool_lock)
+                let held = mut fx3.load(PTR, addr: record, offset: CHUNK_POOL)
+                let same = mut fx3.b.icmp(clif::IntCC.Equal, x: held, y: pool)
+                discard mut fx3.choose_in(mut lo3, condition: same, results: mem::List[clif::Type].empty(fx3.alloc).view(), then: fn(mut lo4: Lowering, mut fx4: Fx) -> mem::List[clif::Value] {
+                    release_in_chunk(mut lo4, fx: mut fx4, record, address, draw: Draw.Called)
+                    return mem::List[clif::Value].empty(fx4.alloc)
+                }, otherwise: fn(mut lo4: Lowering, mut fx4: Fx) -> mem::List[clif::Value] {
+                    return mem::List[clif::Value].empty(fx4.alloc)
+                })
+                locks_release(mut lo3, fx: mut fx3, lock: pool_lock)
+                let changed = mut fx3.b.bxor_imm_s(same, y: 1)
+                return fx3.list1(changed)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                discard mut lo3.call_routine(mut fx3, routine: Routine.FreeUnpooled, args: fx3.list2(record, b: address).view())
+                let settled = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(settled)
+            })
+            return Pass(again: moved[0], next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+    })
+} pools_free
+
+/// `Lift` on `x86_64-host`: under the lock of the pool carving the allocation's run of chunks,
+/// when one does, then the lock of allocations at `lock`, the pool read again under both.
+fn pools_lift(mut lo: Lowering, mut fx: Fx, lock: clif::Value, address: clif::Value, to: clif::Value) -> clif::Value {
+    let record = chunk_of(mut lo, mut fx, address)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let lifted = mut fx.choose_in(mut lo, condition: present, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let unlifted = mut fx1.int(clif::Type.Int8, value: 0)
+        let passed = mut fx1.repeat(fx1.list1(unlifted).view(), body: fn[mut lo1](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            let pool = mut fx2.load(PTR, addr: record, offset: CHUNK_POOL)
+            let pooled = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: pool, y: 0)
+            let pool_lock = mut fx2.offset(pool, offset: MEMORY_POOL_LOCK)
+            mut fx2.if_true(pooled, then: fn[mut lo1](mut fx3: Fx) {
+                locks_acquire(mut lo1, fx: mut fx3, lock: pool_lock)
+            })
+            locks_acquire(mut lo1, fx: mut fx2, lock)
+            let held = mut fx2.load(PTR, addr: record, offset: CHUNK_POOL)
+            let same = mut fx2.b.icmp(clif::IntCC.Equal, x: held, y: pool)
+            let outcome = mut fx2.choose(same, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let inside = lift_record(mut fx3, record, to)
+                return fx3.list1(inside)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let none = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(none)
+            })
+            locks_release(mut lo1, fx: mut fx2, lock)
+            mut fx2.if_true(pooled, then: fn[mut lo1](mut fx3: Fx) {
+                locks_release(mut lo1, fx: mut fx3, lock: pool_lock)
+            })
+            let changed = mut fx2.b.bxor_imm_s(same, y: 1)
+            return Pass(again: changed, next: take outcome)
+        })
+        return fx1.list1(passed[0])
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let unlifted = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(unlifted)
+    })
+    return lifted[0]
+} pools_lift

@@ -18,6 +18,15 @@ use crate::check::ty::Ty;
 /// The largest stack the address space of an `x86_64` process holds.
 const MOST_STACK: i64 = 1 << 47;
 
+/// A stack size a call gives, trapping as exhausted when no address space holds it.
+pub fn sized_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value) -> Value {
+    let huge =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, stack, MOST_STACK);
+    fx.when(huge, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
+    stack
+}
+
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     match supply.path.as_str() {
         "sys::Domain.run" => run(lo, fx, supply, false),
@@ -86,14 +95,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool) {
     });
     let cell = fx.load(PTR, supply.param(2 + given).address(), 0);
     let caller_domain = tasks::current_domain(lo, fx);
-    let stack = sized.then(|| {
-        let stack = supply.param(1).scalar();
-        let huge =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::UnsignedGreaterThan, stack, MOST_STACK);
-        fx.when(huge, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
-        stack
-    });
+    let stack = sized.then(|| sized_stack(lo, fx, supply.param(1).scalar()));
     let Nested {
         record,
         first,

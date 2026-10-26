@@ -59,7 +59,18 @@ fn Selector.select_inst(mut self, func: clif::Function, block: clif::Block, inst
         clif::InstructionData.CallIndirect(opcode: _, sig_ref: sig_ref, callee: callee, args: args) => mut self.call_indirect(func, inst, sig_ref, callee, args: args.view())
         clif::InstructionData.MultiAry(opcode: _, args: args) => mut self.ret(func, args: args.view())
         clif::InstructionData.Jump(opcode: _, destination: destination) => mut self.jump(func, target: destination.block, args: destination.args.view())
-        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => mut self.brif(func, block, c: arg, then_block: then_call.block, else_block: else_call.block)
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            let chain = self.switch_of(block)
+            if chain != NONE {
+                mut self.jump_table(func, index: chain)
+                return
+            }
+            if self.merges(then_call, else_call) {
+                mut self.jump(func, target: then_call.block, args: then_call.args.view())
+            } else {
+                mut self.brif(func, block, c: arg, then_block: then_call.block, else_block: else_call.block)
+            }
+        }
         clif::InstructionData.Trap(opcode: _, code: _) => mut self.emit(x64::Inst.Ud2)
     }
 } Selector.select_inst
@@ -209,12 +220,12 @@ fn Selector.iadd(mut self, func: clif::Function, inst: clif::Inst, x: clif::Valu
     }
     let operands = self.commuted(func, x, y)
     let dst = mut self.dst_of(func, inst)
-    let base = mut self.src(operands.x, func)
     let Some(imm) = self.imm(operands.y, func) else {
-        let index = mut self.src(operands.y, func)
-        mut self.emit(x64::Inst.Lea(dst: dst, src: x64::Amode.Mem(base: base, index: Some(index), shift: 0, disp: 0)))
+        let sum = mut self.indexed(func, x: operands.x, y: operands.y, disp: 0)
+        mut self.emit(x64::Inst.Lea(dst: dst, src: sum))
         return
     }
+    let base = mut self.src(operands.x, func)
     prefer(mut self.code.hints, reg: dst, preferred: base)
     mut self.emit(x64::Inst.Lea(dst: dst, src: x64::Amode.at(base, disp: imm)))
 } Selector.iadd
@@ -251,7 +262,18 @@ fn Selector.imul(mut self, func: clif::Function, inst: clif::Inst, x: clif::Valu
     let src = mut self.src(operands.x, func)
     let size = op_size(ty)
     match self.imm(operands.y, func) {
-        Some(imm) => mut self.emit(x64::Inst.ImulImm(size: size, dst: dst, src: src, imm: imm))
+        Some(imm) => {
+            match power_of_two(imm) {
+                Some(shift) => {
+                    prefer(mut self.code.hints, reg: dst, preferred: src)
+                    mut self.mov(dst, src: src)
+                    if shift > 0 {
+                        mut self.emit(x64::Inst.Shift(op: x64::ShiftOp.Shl, size: size, dst: dst, amount: shift))
+                    }
+                }
+                None => mut self.emit(x64::Inst.ImulImm(size: size, dst: dst, src: src, imm: imm))
+            }
+        }
         None => {
             mut self.mov(dst, src: src)
             let reg = mut self.src(operands.y, func)
@@ -318,11 +340,85 @@ fn Selector.bitwise(mut self, func: clif::Function, inst: clif::Inst, op: x64::A
         mut self.wide_alu(func, inst, op, high_op: op, x, y)
         return
     }
+    if op == x64::AluOp.Or {
+        match self.rotation(func, x, y) {
+            Some(rotated) => {
+                let dst = mut self.dst_of(func, inst)
+                let src = mut self.src(rotated.value, func)
+                mut self.mov(dst, src: src)
+                mut self.emit(x64::Inst.Shift(op: x64::ShiftOp.Ror, size: exact_size(ty), dst: dst, amount: rotated.amount))
+                return
+            }
+            None => {}
+        }
+    }
     let operands = self.commuted(func, x, y)
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(operands.x, func)
     mut self.alu(func, op, size: op_size(ty), dst, src, y: operands.y)
 } Selector.bitwise
+
+/// The value and amount of a right rotation `x | y` computes of a 32- or 64-bit integer, when
+/// one operand shifts it right and the other left by the rest of the width, and only the `bor`
+/// reads either.
+fn Selector.rotation(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Option[Shifted] {
+    let width = func.value_type(x).bits()
+    if width != 32 and width != 64 {
+        return None
+    }
+    let Some(right) = self.shifted(func, value: x, opcode: clif::Opcode.Ushr) else {
+        let Some(left_first) = self.shifted(func, value: x, opcode: clif::Opcode.Ishl) else {
+            return None
+        }
+        let Some(right_second) = self.shifted(func, value: y, opcode: clif::Opcode.Ushr) else {
+            return None
+        }
+        return rotation_of(func, right: right_second, left: left_first, width: width)
+    }
+    let Some(left) = self.shifted(func, value: y, opcode: clif::Opcode.Ishl) else {
+        return None
+    }
+    return rotation_of(func, right, left, width: width)
+} Selector.rotation
+
+/// A right and a left shift of one value whose amounts add up to the width, as a right rotation.
+fn rotation_of(func: clif::Function, right: Shifted, left: Shifted, width: u32) -> Option[Shifted] {
+    if func.resolve_aliases(right.value) != func.resolve_aliases(left.value) or u32.widen(right.amount) + u32.widen(left.amount) != width {
+        return None
+    }
+    return Some(right)
+} rotation_of
+
+/// The value a single-use shift by a constant between 1 and 63 of an opcode defining `value`
+/// shifts, with the amount.
+fn Selector.shifted(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[Shifted] {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.defs.len() and at < self.use_counts.len()
+    let def = self.defs[at]
+    if def == NONE or self.use_counts[at] != 1 {
+        return None
+    }
+    let clif::InstructionData.Binary(opcode: found, x: shifted, y: amount) = func.inst_data(clif::Inst(index: def)) else {
+        return None
+    }
+    if found != opcode {
+        return None
+    }
+    let Some(bits) = self.constant(amount, func) else {
+        return None
+    }
+    if bits == 0 or bits > 63 {
+        return None
+    }
+    return Some(Shifted(value: shifted, amount: u8.truncate(bits)))
+} Selector.shifted
+
+/// A value and a constant amount it is shifted or rotated by.
+struct Shifted derives Copy, Eq {
+    value: clif::Value
+    amount: u8
+} Shifted
 
 /// A shift or rotation by the amount modulo the width: an immediate when constant, else `cl`,
 /// masked for a type narrower than 32 bits, whose shifts the processor masks to 5 bits.

@@ -19,7 +19,7 @@ use super::super::super::{Glue, Lowering};
 use super::super::Supply;
 use super::super::mem::lists::fn_param;
 use crate::check::ty::{FnTy, Ty};
-use crate::nir::{Callable, FnRef, Op, Operand, Role, Value as NirValue};
+use crate::nir::{Callable, FnRef, NTy, Op, Operand, Role, Value as NirValue};
 
 mod scope {
     pub const LOCK: u64 = 40;
@@ -60,11 +60,13 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, origin, 0);
             supply.ret(lo, fx, Held::Scalar(cancelled));
         }
-        "task::Scope.spawn" => {
+        "task::Scope.spawn" | "task::Scope.spawn_sized" => {
             let child_ty = fn_param(supply, 1);
             let scope_record = fx.load(PTR, supply.param(0).address(), 0);
             let child = supply.param(1).address();
-            let join = spawn_child(lo, fx, scope_record, child, &child_ty, None);
+            let stack = (supply.path == "task::Scope.spawn_sized")
+                .then(|| super::domains::sized_stack(lo, fx, supply.param(2).scalar()));
+            let join = spawn_child(lo, fx, scope_record, child, &child_ty, None, stack);
             let sret = supply.sret.expect("a join handle's address");
             fx.store(join, sret, 0);
             supply.done(lo, fx);
@@ -74,8 +76,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// A call of `task::Scope.spawn` lowered where it is written: at a lexical spawn, the child's
-/// failure converts to the failure type of its scope's body closure.
+/// A call of `task::Scope.spawn` or `spawn_sized` lowered where it is written: at a lexical
+/// spawn, the child's failure converts to the failure type of its scope's body closure.
 pub fn spawn_at(body: &mut Body, operands: &[Operand]) -> Held {
     let scope_fails = lexical_scope(body, &operands[0]);
     let (receiver, receiver_nty) = body.operand(&operands[0]);
@@ -86,6 +88,14 @@ pub fn spawn_at(body: &mut Body, operands: &[Operand]) -> Held {
         panic!("a spawned task fn value");
     };
     let child = super::address_of(body.lo, body.fx, child_nty.ty(), child);
+    let stack = operands.get(2).map(|operand| {
+        let (stack, stack_nty) = body.operand(operand);
+        let stack = match stack_nty {
+            NTy::Owned(_) => stack.scalar(),
+            _ => body.fx.load(PTR, stack.address(), 0),
+        };
+        super::domains::sized_stack(body.lo, body.fx, stack)
+    });
     let join = spawn_child(
         body.lo,
         body.fx,
@@ -93,16 +103,18 @@ pub fn spawn_at(body: &mut Body, operands: &[Operand]) -> Held {
         child,
         &child_ty,
         scope_fails,
+        stack,
     );
     let slot = body.fx.slot(8, 8);
     body.fx.store(join, slot, 0);
     Held::Address(slot)
 }
 
-/// Whether a call names `task::Scope.spawn`.
+/// Whether a call names `task::Scope.spawn` or `spawn_sized`.
 pub fn is_spawn(lo: &Lowering, fn_ref: &FnRef) -> bool {
     matches!(fn_ref.callable, Callable::Item { item, role: Role::Body, .. }
-        if lo.ck.db.is_std(item) && lo.ck.db.canonical(item) == "task::Scope.spawn")
+        if lo.ck.db.is_std(item)
+            && matches!(lo.ck.db.canonical(item).as_str(), "task::Scope.spawn" | "task::Scope.spawn_sized"))
 }
 
 /// The failure type of the body closure whose parameter a spawn's receiver is, reached through
@@ -496,6 +508,7 @@ fn spawn_child(
     child: Value,
     child_ty: &FnTy,
     scope_fails: Option<Ty>,
+    stack: Option<Value>,
 ) -> Value {
     let cell = fx.load(PTR, scope_record, scope::EXECUTOR);
     let domain = tasks::current_domain(lo, fx);
@@ -519,7 +532,7 @@ fn spawn_child(
         domain,
         scope_record,
         scope_record,
-        None,
+        stack,
         Some(end),
         done,
     );

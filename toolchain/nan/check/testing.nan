@@ -120,13 +120,14 @@ fn Checker.check_test_reach(self, item: ty::ItemId, tested: ast::TestItem) {
     let Some(target) = self.test_target(item, tested) else {
         return
     }
-    let reach = self.test_reach(item)
-    let reached = match target {
-        TestTarget.Function(function) => reach.contains(function)
-        TestTarget.Derived(owner) => reach.contains(owner)
+    let wanted = match target {
+        TestTarget.Function(function) => function
+        TestTarget.Derived(owner) => owner
     }
+    let db = self.db()
+    let reached = db.about(None, compute: fn() => self.searched_reach(item, target: Some(wanted)).found)
     if not reached {
-        self.report(item, token: self.db().ast(item).token, code: diagnostic::Code.TestTargetUnreachable)
+        self.report(item, token: db.ast(item).token, code: diagnostic::Code.TestTargetUnreachable)
     }
 } Checker.check_test_reach
 
@@ -137,26 +138,57 @@ pkg fn Checker.test_reach(self, item: ty::ItemId) -> mem::Set[ty::ItemId] {
     let db = self.db()
     return db.about(None, compute: fn() -> mem::Set[ty::ItemId] {
         let alloc = self.alloc()
+        let searched = self.searched_reach(item, target: None)
+        var listed = mem::List[ty::ItemId].empty(alloc)
+        for entry in searched.reached {
+            mut listed.push(entry.key())
+        }
+        mut listed.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => left.cmp(right))
         var reach = mem::Set[ty::ItemId].empty(alloc)
-        discard mut reach.insert(item)
-        var pending = mem::List[ty::ItemId].empty(alloc)
-        for named in self.names(item).contents() {
-            mut pending.push(named)
+        for held in listed {
+            discard mut reach.insert(held)
         }
-        loop {
-            let Some(next) = mut pending.pop() else {
-                return reach
-            }
-            if not mut reach.insert(next) or db.is_carried(next) {
-                continue
-            }
-            for named in self.names(next).contents() {
-                mut pending.push(named)
-            }
-            self.extend_reach(next, mut pending)
-        }
+        return reach
     })
 } Checker.test_reach
+
+/// The items of a search of a test's reach, and whether it found `target`, at which it stops.
+struct SearchedReach {
+    reached: mem::HashMap[ty::ItemId, Unit]
+    found: bool
+} SearchedReach
+
+fn Checker.searched_reach(self, item: ty::ItemId, target: Option[ty::ItemId]) -> SearchedReach {
+    let db = self.db()
+    let alloc = self.alloc()
+    var searched = SearchedReach(reached: mem::HashMap[ty::ItemId, Unit].empty(seed: 0, alloc), found: target == Some(item))
+    discard mut searched.reached.insert(item, value: Unit)
+    var pending = mem::List[ty::ItemId].empty(alloc)
+    for named in self.names(item).contents() {
+        mut pending.push(named)
+    }
+    var next_at: usize = 0
+    var scanned: usize = 0
+    loop {
+        while scanned < pending.len() {
+            searched.found = searched.found or target == Some(pending[scanned])
+            scanned += 1
+        }
+        if searched.found or next_at >= pending.len() {
+            return searched
+        }
+        let next = pending[next_at]
+        next_at += 1
+        let known = mut searched.reached.insert(next, value: Unit)
+        if known.is_some() or db.is_carried(next) {
+            continue
+        }
+        for named in self.names(next).contents() {
+            mut pending.push(named)
+        }
+        self.extend_reach(next, mut pending)
+    }
+} Checker.searched_reach
 
 /// Adds to a reach's pending items the impl lines of a type, or the contributions to a
 /// registry.
@@ -200,6 +232,9 @@ fn Checker.check_test_only(self, item: ty::ItemId) {
         }
         else => {}
     }
+    if not db.recording() and not self.names_test_only(item) {
+        return
+    }
     let module = db.module_of(item)
     for path in self.written_paths(item) {
         let head = path.token()
@@ -216,6 +251,17 @@ fn Checker.check_test_only(self, item: ty::ItemId) {
         }
     }
 } Checker.check_test_only
+
+/// Whether an item names an item of the std modules legal only in tests.
+fn Checker.names_test_only(self, item: ty::ItemId) -> bool {
+    let db = self.db()
+    for named in self.names(item).contents() {
+        if db.is_std(named) and is_listed(TEST_ONLY, word: db.module_path(db.module_of(named)).as_str()) {
+            return true
+        }
+    }
+    return false
+} Checker.names_test_only
 
 /// Adds the tokens each example clause spans, from its first token to its expression's last.
 fn example_spans(clauses: Slice[ast::Clause], mut found: mem::List[nir::Span]) {

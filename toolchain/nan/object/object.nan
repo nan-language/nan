@@ -46,10 +46,11 @@ pkg struct ModuleReloc derives Copy, Eq, Hash {
     pkg addend: i64
 } ModuleReloc
 
-/// What a compiled function gives lowering: its code size, its frame size from the return
-/// address down, and the code offset at which each run of code with one source location starts,
-/// with that location, in offset order.
+/// What a compiled function gives lowering: the function, its code size, its frame size from the
+/// return address down, and the code offset at which each run of code with one source location
+/// starts, with that location, in offset order.
 pkg struct Compiled {
+    pkg id: FuncId
     pkg size: u32
     pkg frame: u64
     pkg locations: mem::List[codegen::Located]
@@ -121,11 +122,13 @@ pkg struct DataDescription {
     functions: mem::List[FuncId]
     data_objects: mem::List[DataId]
     function_addresses: mem::List[Address]
+    /// The functions whose addresses the data holds as 32-bit distances from where it holds them.
+    function_offsets: mem::List[Address]
     data_addresses: mem::List[Address]
 } DataDescription
 
 pkg fn DataDescription.new(alloc: mem::Alloc) -> DataDescription {
-    return DataDescription(init: Init.Uninitialized, align: None, functions: mem::List[FuncId].empty(alloc), data_objects: mem::List[DataId].empty(alloc), function_addresses: mem::List[Address].empty(alloc), data_addresses: mem::List[Address].empty(alloc))
+    return DataDescription(init: Init.Uninitialized, align: None, functions: mem::List[FuncId].empty(alloc), data_objects: mem::List[DataId].empty(alloc), function_addresses: mem::List[Address].empty(alloc), function_offsets: mem::List[Address].empty(alloc), data_addresses: mem::List[Address].empty(alloc))
 } DataDescription.new
 
 pkg fn DataDescription.define(mut self, take bytes: mem::Bytes) {
@@ -160,6 +163,11 @@ pkg fn DataDescription.write_function_addr(mut self, offset: u32, function: u32)
     mut self.function_addresses.push(Address(offset: offset, reference: function, addend: 0))
 } DataDescription.write_function_addr
 
+/// Writes at `offset` the signed 32-bit distance from there to a function's address.
+pkg fn DataDescription.write_function_offset(mut self, offset: u32, function: u32) {
+    mut self.function_offsets.push(Address(offset: offset, reference: function, addend: 0))
+} DataDescription.write_function_offset
+
 pkg fn DataDescription.write_data_addr(mut self, offset: u32, data: u32, addend: i64) {
     mut self.data_addresses.push(Address(offset: offset, reference: data, addend: addend))
 } DataDescription.write_data_addr
@@ -171,6 +179,11 @@ fn DataDescription.records(self, alloc: mem::Alloc) -> mem::List[Record] {
         expect usize.widen(address.reference) < self.functions.len()
         let target = Target.Declared(RelocTarget.Function(self.functions[usize.widen(address.reference)]))
         mut records.push(Record(offset: address.offset, kind: R_X86_64_64, target: target, addend: address.addend))
+    }
+    for address in self.function_offsets {
+        expect usize.widen(address.reference) < self.functions.len()
+        let target = Target.Declared(RelocTarget.Function(self.functions[usize.widen(address.reference)]))
+        mut records.push(Record(offset: address.offset, kind: R_X86_64_PC32, target: target, addend: address.addend))
     }
     for address in self.data_addresses {
         expect usize.widen(address.reference) < self.data_objects.len()
@@ -209,19 +222,52 @@ pkg struct Module {
     pkg target: workspace::Target
     functions: mem::List[FunctionDeclaration]
     data_objects: mem::List[DataDeclaration]
-    names: mem::Map[text::String, Declared]
+    names: mem::HashMap[text::String, Declared]
     elf: Elf
     /// The relocations of each definition, in order of definition.
     relocations: mem::List[Relocations]
+    /// The bodies calls take in place, the defined functions waiting to compile, and the
+    /// functions compiled that lowering has not taken yet.
+    leaves: codegen::Leaves
+    schedule: Schedule
+    compiled: mem::List[Compiled]
+    /// The code an earlier lowering compiled, and the code of the functions this one compiles.
+    codes: Codes
     alloc: mem::Alloc
 } Module
 
 pkg fn Module.new(target: workspace::Target, alloc: mem::Alloc) -> Module {
-    return Module(target: target, functions: mem::List[FunctionDeclaration].empty(alloc), data_objects: mem::List[DataDeclaration].empty(alloc), names: mem::Map[text::String, Declared].empty(alloc), elf: Elf.new("nan", alloc), relocations: mem::List[Relocations].empty(alloc), alloc: alloc)
+    return Module(
+        target: target,
+        functions: mem::List[FunctionDeclaration].empty(alloc),
+        data_objects: mem::List[DataDeclaration].empty(alloc),
+        names: mem::HashMap[text::String, Declared].empty(seed: 0, alloc),
+        elf: Elf.new("nan", alloc),
+        relocations: mem::List[Relocations].empty(alloc),
+        leaves: codegen::Leaves.empty(alloc),
+        schedule: Schedule.empty(alloc),
+        compiled: mem::List[Compiled].empty(alloc),
+        codes: Codes.none(alloc),
+        alloc: alloc,
+    )
 } Module.new
 
+/// Makes the module take the code an earlier lowering's entry holds instead of compiling it
+/// again.
+pkg fn Module.hold_codes(mut self, held: Slice[u8]) {
+    var owned = mem::Bytes.empty(self.alloc)
+    mut owned.append(held)
+    self.codes = Codes.of(take owned, alloc: self.alloc)
+} Module.hold_codes
+
+/// An entry holding the code of every function the module compiled, none when it held all of
+/// it.
+pkg fn Module.codes_entry(self) -> Option[CodesEntry] {
+    return self.codes.entry(self.alloc)
+} Module.codes_entry
+
 fn Module.declared(self, name: Str) -> Option[Declared] {
-    return self.names.get_by(fn(key: text::String) => key.as_str().cmp(name))
+    return self.names.get(text::String.of(name, alloc: self.alloc))
 } Module.declared
 
 /// Declares a function, or declares a function declared before again, merging the linkages;
@@ -291,17 +337,91 @@ pkg fn Module.declare_data(mut self, name: Str, linkage: Linkage, writable: bool
     }
 } Module.declare_data
 
-/// Compiles a built function into the definition of a declared one.
-pkg fn Module.define_function(mut self, id: FuncId, take func: clif::Function) -> Compiled {
-    let code = codegen::compile(take func, isa: codegen::Isa.of(self.target), alloc: self.alloc)
+/// Defines a declared function as a built one, compiled once the colocated functions it calls
+/// are defined, so that calls of small ones take their bodies in place, or sooner when too much
+/// waits; a body is taken in place only from a function `inlinable` defines.
+pkg fn Module.define_function(mut self, id: FuncId, take func: clif::Function, inlinable: bool) {
+    mut self.mark_defined(id)
+    let callees = undefined_callees(func, functions: self.functions.view(), alloc: self.alloc)
+    if callees.len() == 0 {
+        mut self.compile(id, func: take func, inlinable)
+    } else {
+        mut self.schedule.hold(id, func: take func, callees: callees.view())
+    }
+    mut self.release(id)
+    loop {
+        let Some(waiting) = mut self.schedule.overflow() else {
+            break
+        }
+        let Waiting(id: held, func: held_func, missing: _) = waiting
+        mut self.compile(held, func: take held_func, inlinable: false)
+    }
+} Module.define_function
+
+/// Compiles the functions waiting for a function now defined that wait for nothing else.
+fn Module.release(mut self, id: FuncId) {
+    let ready = mut self.schedule.released(id)
+    for waiting in take ready {
+        let Waiting(id: held, func: held_func, missing: _) = waiting
+        mut self.compile(held, func: take held_func, inlinable: false)
+    }
+} Module.release
+
+/// Compiles every function still waiting, in the order they were defined.
+pkg fn Module.compile_waiting(mut self) {
+    loop {
+        let Some(waiting) = mut self.schedule.oldest() else {
+            return
+        }
+        let Waiting(id: held, func: held_func, missing: _) = waiting
+        mut self.compile(held, func: take held_func, inlinable: false)
+    }
+} Module.compile_waiting
+
+/// Records the declared function copying as `memmove` does, its arguments the destination, the
+/// source and the length.
+pkg fn Module.note_copier(mut self, id: FuncId) {
+    mut self.leaves.note_copier(id.index)
+} Module.note_copier
+
+/// The functions compiled since lowering last took them, in no particular order.
+pkg fn Module.take_compiled(mut self) -> mem::List[Compiled] {
+    var taken = mem::List[Compiled].empty(self.alloc)
+    loop {
+        let Some(compiled) = mut self.compiled.pop() else {
+            return taken
+        }
+        mut taken.push(take compiled)
+    }
+} Module.take_compiled
+
+/// Compiles a defined function into its code, or takes the code held under the key of what
+/// compiling it reads; keeps its body for calls to take in place when `inlinable` and it
+/// qualifies, and notes whether its calls can be left out.
+fn Module.compile(mut self, id: FuncId, take func: clif::Function, inlinable: bool) {
+    let isa = codegen::Isa.of(self.target)
+    let key = codegen::code_key(func, isa, leaves: self.leaves, alloc: self.alloc)
+    let held = self.codes.taken(key, alloc: self.alloc)
+    let compiled = held.is_none()
+    let code = match held {
+        Some(found) => found
+        None => codegen::compile(func, isa, leaves: self.leaves, alloc: self.alloc)
+    }
+    mut self.codes.made_one(key, code, compiled)
     var records = mem::List[Record].empty(self.alloc)
     for reloc in code.relocs {
         mut records.push(Record(offset: reloc.offset, kind: elf_type(reloc.kind), target: symbol_target(reloc.target), addend: reloc.addend))
     }
-    mut self.define_code(id, align: u64.widen(code.align), bytes: code.bytes.view(), take records)
-    let codegen::Code(bytes: bytes, align: _, relocs: _, frame: frame, locations: locations) = code
-    return Compiled(size: u32.fit(bytes.len()), frame: frame, locations: take locations)
-} Module.define_function
+    mut self.place_code(id, align: u64.widen(code.align), bytes: code.bytes.view(), take records)
+    let codegen::Code(bytes: bytes, align: _, relocs: _, frame: frame, locations: locations, removable: removable) = code
+    mut self.compiled.push(Compiled(id: id, size: u32.fit(bytes.len()), frame: frame, locations: take locations))
+    if removable {
+        mut self.leaves.note_removable(id.index)
+    }
+    if inlinable {
+        mut self.leaves.offer(take func, alloc: self.alloc)
+    }
+} Module.compile
 
 /// The target of a relocation of compiled code: a declared function or data object, named by
 /// namespace 0 or 1 and its index, or the C library's `__tls_get_addr`.
@@ -324,22 +444,30 @@ pkg fn Module.define_function_bytes(mut self, id: FuncId, align: u64, bytes: Sli
     for reloc in relocs {
         mut records.push(Record(offset: reloc.offset, kind: elf_type(reloc.kind), target: Target.Declared(reloc.target), addend: reloc.addend))
     }
-    mut self.define_code(id, align, bytes, take records)
+    mut self.mark_defined(id)
+    mut self.place_code(id, align, bytes, take records)
+    mut self.release(id)
 } Module.define_function_bytes
 
-/// Defines a declared function as code appended to the text section, at its alignment.
-fn Module.define_code(mut self, id: FuncId, align: u64, bytes: Slice[u8], take records: mem::List[Record]) {
+/// Records that a declared function is defined.
+fn Module.mark_defined(mut self, id: FuncId) {
     let at = usize.widen(id.index)
     expect at < self.functions.len()
     var declaration = mut self.functions.at_mut(at)
     expect declaration.linkage != Linkage.Import
     expect not declaration.defined
     declaration.defined = true
-    let symbol = declaration.symbol
+} Module.mark_defined
+
+/// Appends a defined function's code to the text section, at its alignment.
+fn Module.place_code(mut self, id: FuncId, align: u64, bytes: Slice[u8], take records: mem::List[Record]) {
+    let at = usize.widen(id.index)
+    expect at < self.functions.len()
+    let symbol = self.functions[at].symbol
     let section = mut self.elf.section(SectionKind.Text)
     let offset = mut self.elf.define(symbol, section, data: bytes, align: at_least_one(align))
     mut self.add_relocations(section, offset, take records)
-} Module.define_code
+} Module.place_code
 
 /// Defines a declared data object, in the section its contents, writability and thread-locality
 /// choose.
@@ -355,7 +483,7 @@ pkg fn Module.define_data(mut self, id: DataId, take description: DataDescriptio
     let writable = declaration.writable
     let records = description.records(self.alloc)
     let align = description.align.value_or(1)
-    let DataDescription(init: init, align: _, functions: _, data_objects: _, function_addresses: _, data_addresses: _) = description
+    let DataDescription(init: init, align: _, functions: _, data_objects: _, function_addresses: _, function_offsets: _, data_addresses: _) = description
     match init {
         Init.Zeros(size) => {
             var kind = SectionKind.Zeroed
@@ -427,16 +555,24 @@ pkg fn Module.function_linkage(self, id: FuncId) -> Linkage {
     return self.functions[usize.widen(id.index)].linkage
 } Module.function_linkage
 
-/// The ELF relocatable object of every definition, holding a `.nan` section with `section`
-/// when given.
-pkg fn Module.finish(take self, section: Option[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+/// The sections of an image that describe its final closure: its artefacts, as the `.nan`
+/// section holds them, and the hash of their code roots.
+pkg view struct ClosureSections {
+    pkg artefacts: Slice[u8]
+    pkg tree: Slice[u8]
+} ClosureSections
+
+/// The ELF relocatable object of every definition, holding the sections of `closure` when
+/// given.
+pkg fn Module.finish(take self, closure: Option[ClosureSections], alloc: mem::Alloc) -> mem::Bytes {
+    expect self.schedule.is_empty() and self.compiled.len() == 0
     for declaration in self.functions {
         expect declaration.linkage == Linkage.Import or declaration.defined
     }
     for declaration in self.data_objects {
         expect declaration.linkage == Linkage.Import or declaration.defined
     }
-    let Module(target: _, functions: functions, data_objects: data_objects, names: _, elf: elf, relocations: relocations, alloc: _) = self
+    let Module(target: _, functions: functions, data_objects: data_objects, names: _, elf: elf, relocations: relocations, leaves: _, schedule: _, compiled: _, codes: _, alloc: _) = self
     var written = elf
     for definition in relocations {
         for record in definition.records {
@@ -450,10 +586,12 @@ pkg fn Module.finish(take self, section: Option[Slice[u8]], alloc: mem::Alloc) -
         }
     }
     discard mut written.section(SectionKind.GnuStack)
-    match section {
-        Some(bytes) => {
+    match closure {
+        Some(held) => {
             let artefacts = mut written.section(SectionKind.Artefacts)
-            discard mut written.sections[usize.widen(artefacts)].append_data(bytes, align: 1)
+            discard mut written.sections[usize.widen(artefacts)].append_data(held.artefacts, align: 1)
+            let tree = mut written.section(SectionKind.Tree)
+            discard mut written.sections[usize.widen(tree)].append_data(held.tree, align: 1)
         }
         None => {}
     }

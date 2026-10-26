@@ -1,0 +1,222 @@
+//! Compiled code kept across builds: the key of everything compiling a function reads, and the encoding of the code it compiles to.
+
+/// The hash of everything compiling a function reads: how the target generates code, the
+/// function's text, and for each colocated function it calls, the hash of the body its calls take
+/// in place, if any, whether its calls can be left out and whether it copies as `memmove` does.
+pkg fn code_key(func: clif::Function, isa: Isa, leaves: Leaves, alloc: mem::Alloc) -> hashing::HashValue {
+    var keyed = mem::Bytes.empty(alloc)
+    encoding::bytes(mut keyed, value: b"code 1")
+    put_flag(mut keyed, held: isa.pic)
+    put_flag(mut keyed, held: isa.probes)
+    put_flag(mut keyed, held: isa.floats)
+    encoding::bytes(mut keyed, value: func.display(alloc).as_bytes())
+    for index in 0u32..<func.ext_func_count() {
+        let data = func.ext_func(clif::FuncRef(index: index))
+        if not data.colocated or data.name.namespace != 0 {
+            continue
+        }
+        encoding::uvar(mut keyed, value: u64.widen(data.name.index))
+        match leaves.digests.get(data.name.index) {
+            Some(digest) => encoding::bytes(mut keyed, value: digest.bytes.view())
+            None => encoding::uvar(mut keyed, value: 0)
+        }
+        put_flag(mut keyed, held: leaves.removable.get(data.name.index).is_some())
+        put_flag(mut keyed, held: leaves.is_copier(data.name.index))
+    }
+    return hashing::HashValue.of(keyed.view())
+} code_key
+
+fn put_flag(mut out: mem::Bytes, held: bool) {
+    encoding::uvar(mut out, value: if held {
+        1
+    } else {
+        0
+    })
+} put_flag
+
+/// Appends a compiled function's code to `out`.
+pkg fn Code.encode(self, mut out: mem::Bytes) {
+    encoding::bytes(mut out, value: self.bytes.view())
+    encoding::uvar(mut out, value: u64.widen(self.align))
+    encoding::uvar(mut out, value: u64.widen(self.relocs.len()))
+    for reloc in self.relocs {
+        encoding::uvar(mut out, value: u64.widen(reloc.offset))
+        encoding::uvar(mut out, value: kind_number(reloc.kind))
+        match reloc.target {
+            x64::Symbol.Name(name) => {
+                encoding::uvar(mut out, value: 1 + u64.widen(name.namespace))
+                encoding::uvar(mut out, value: u64.widen(name.index))
+            }
+            x64::Symbol.TlsGetAddr => encoding::uvar(mut out, value: 0)
+        }
+        encoding::svar(mut out, value: reloc.addend)
+    }
+    encoding::uvar(mut out, value: self.frame)
+    encoding::uvar(mut out, value: u64.widen(self.locations.len()))
+    for located in self.locations {
+        encoding::uvar(mut out, value: u64.widen(located.offset))
+        encoding::uvar(mut out, value: u64.widen(located.loc.bits))
+    }
+    put_flag(mut out, held: self.removable)
+} Code.encode
+
+fn kind_number(kind: x64::RelocKind) -> u64 {
+    return match kind {
+        x64::RelocKind.Absolute4 => 0
+        x64::RelocKind.Absolute8 => 1
+        x64::RelocKind.Relative4 => 2
+        x64::RelocKind.CallPlt4 => 3
+        x64::RelocKind.GotRelative4 => 4
+        x64::RelocKind.TlsGeneralDynamic => 5
+    }
+} kind_number
+
+fn kind_of(number: u64) -> Option[x64::RelocKind] {
+    return match number {
+        0 => Some(x64::RelocKind.Absolute4)
+        1 => Some(x64::RelocKind.Absolute8)
+        2 => Some(x64::RelocKind.Relative4)
+        3 => Some(x64::RelocKind.CallPlt4)
+        4 => Some(x64::RelocKind.GotRelative4)
+        5 => Some(x64::RelocKind.TlsGeneralDynamic)
+        else => None
+    }
+} kind_of
+
+/// A reader of encoded code, failing at the first malformed value.
+pkg view struct CodeReader {
+    pkg held: Slice[u8]
+    pkg at: usize
+    pkg failed: bool
+} CodeReader
+
+/// Whether every value read was well formed and none is left.
+pkg fn CodeReader.done(self) -> bool = not self.failed and self.at == self.held.len()
+
+/// Whether every value read so far was well formed.
+pkg fn CodeReader.ok(self) -> bool = not self.failed
+
+/// How many bytes the reader has read.
+pkg fn CodeReader.offset(self) -> usize = self.at
+
+pkg fn CodeReader.uvar(mut self) -> u64 {
+    var value: u64 = 0
+    var shift: u32 = 0
+    loop {
+        if self.failed or self.at >= self.held.len() or shift > 63 {
+            self.failed = true
+            return 0
+        }
+        let group = self.held[self.at]
+        self.at += 1
+        value = value | (u64.widen(group & 0x7F) << shift)
+        if (group & 0x80) == 0 {
+            return value
+        }
+        shift += 7
+    }
+} CodeReader.uvar
+
+fn CodeReader.svar(mut self) -> i64 {
+    let bits = mut self.uvar()
+    let half = i64.from_bits(bits >> 1)
+    if (bits & 1) == 0 {
+        return half
+    }
+    return -half - 1
+} CodeReader.svar
+
+fn CodeReader.number(mut self) -> u32 {
+    let Some(narrow) = u32.checked_fit(mut self.uvar()) else {
+        self.failed = true
+        return 0
+    }
+    return narrow
+} CodeReader.number
+
+/// The bytes of a length-prefixed run.
+pkg fn CodeReader.run(mut self, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    let length = mut self.uvar()
+    if self.failed or self.at > self.held.len() or length > u64.widen(self.held.len() - self.at) {
+        self.failed = true
+        return out
+    }
+    let count = usize.widen(length)
+    let Some(parts) = self.held.split_at(self.at) else {
+        self.failed = true
+        return out
+    }
+    let Some(run) = parts.tail.prefix(count) else {
+        self.failed = true
+        return out
+    }
+    mut out.append(run)
+    self.at += count
+    return out
+} CodeReader.run
+
+/// A compiled function's code, as `encode` wrote it.
+pkg fn CodeReader.code(mut self, alloc: mem::Alloc) -> Code {
+    let bytes = mut self.run(alloc)
+    let align = mut self.number()
+    var relocs = mem::List[x64::Reloc].empty(alloc)
+    let count = mut self.uvar()
+    var read: u64 = 0
+    while read < count and not self.failed {
+        let offset = mut self.number()
+        let kind = kind_of(mut self.uvar())
+        let namespace = mut self.uvar()
+        var target = x64::Symbol.TlsGetAddr
+        if namespace > 0 {
+            let index = mut self.number()
+            target = x64::Symbol.Name(clif::ExternalName(namespace: u32.truncate(namespace - 1), index: index))
+        }
+        let addend = mut self.svar()
+        match kind {
+            Some(known) => mut relocs.push(x64::Reloc(offset: offset, kind: known, target: target, addend: addend))
+            None => {
+                self.failed = true
+            }
+        }
+        read += 1
+    }
+    let frame = mut self.uvar()
+    var locations = mem::List[Located].empty(alloc)
+    let located_count = mut self.uvar()
+    var located_read: u64 = 0
+    while located_read < located_count and not self.failed {
+        let offset = mut self.number()
+        let bits = mut self.number()
+        mut locations.push(Located(offset: offset, loc: clif::SourceLoc(bits: bits)))
+        located_read += 1
+    }
+    let removable = mut self.uvar() == 1
+    return Code(bytes: take bytes, align: align, relocs: take relocs, frame: frame, locations: take locations, removable: removable)
+} CodeReader.code
+
+/// Reads past a compiled function's code, as `encode` wrote it.
+pkg fn CodeReader.skip_code(mut self, alloc: mem::Alloc) {
+    discard mut self.run(alloc)
+    discard mut self.uvar()
+    let count = mut self.uvar()
+    var read: u64 = 0
+    while read < count and not self.failed {
+        discard mut self.uvar()
+        discard mut self.uvar()
+        if mut self.uvar() > 0 {
+            discard mut self.uvar()
+        }
+        discard mut self.uvar()
+        read += 1
+    }
+    discard mut self.uvar()
+    let located_count = mut self.uvar()
+    var located_read: u64 = 0
+    while located_read < located_count and not self.failed {
+        discard mut self.uvar()
+        discard mut self.uvar()
+        located_read += 1
+    }
+    discard mut self.uvar()
+} CodeReader.skip_code

@@ -1,0 +1,635 @@
+//! The syntax of source files as the build cache holds it: what parsing a file gives but its source.
+
+/// The variants of the enums a stored syntax names by index, in index order.
+pkg struct Decoding {
+    keywords: mem::List[Keyword]
+    puncts: mem::List[Punct]
+    foreigns: mem::List[Foreign]
+    rules: mem::List[Rule]
+} Decoding
+
+pkg fn Decoding.new(alloc: mem::Alloc) -> Decoding {
+    var decoding = Decoding(keywords: mem::List[Keyword].empty(alloc), puncts: mem::List[Punct].empty(alloc), foreigns: mem::List[Foreign].empty(alloc), rules: mem::List[Rule].empty(alloc))
+    for index in 0..<KEYWORDS {
+        match Keyword.from_index(index) {
+            Some(keyword) => mut decoding.keywords.push(keyword)
+            None => {}
+        }
+    }
+    for index in 0..<PUNCTS {
+        match Punct.from_index(index) {
+            Some(punct) => mut decoding.puncts.push(punct)
+            None => {}
+        }
+    }
+    for index in 0..<FOREIGNS {
+        match Foreign.from_index(index) {
+            Some(spelt) => mut decoding.foreigns.push(spelt)
+            None => {}
+        }
+    }
+    var index: usize = 0
+    loop {
+        let Some(rule) = Rule.from_index(index) else {
+            return decoding
+        }
+        mut decoding.rules.push(rule)
+        index += 1
+    }
+} Decoding.new
+
+/// The syntax of a parsed file, as `Decoding.file` reads it.
+pkg fn SourceFile.stored(self, alloc: mem::Alloc) -> mem::Bytes {
+    var out = Writer(written: mem::Bytes.zeroed(64, alloc), at: 0, alloc: alloc)
+    self.store(mut out)
+    return take out.finished()
+} SourceFile.stored
+
+fn SourceFile.store(self, mut out: Writer) {
+    store_count(mut out, value: self.tokens.len())
+    var last = Token(kind: TokenKind.Eof, start: 0, end: 0, line: 0)
+    for token in self.tokens {
+        store_kind(mut out, kind: token.kind)
+        store_step(mut out, from: last.end, to: token.start)
+        store_step(mut out, from: token.start, to: token.end)
+        store_step(mut out, from: last.line, to: token.line)
+        last = token
+    }
+    store_count(mut out, value: self.lines.len())
+    var line_end: u32 = 0
+    for line in self.lines {
+        store_step(mut out, from: line_end, to: line.start)
+        store_step(mut out, from: line.start, to: line.end)
+        store_option(mut out, value: widened(line.comment))
+        store_flag(mut out, value: line.lexical_error)
+        line_end = line.end
+    }
+    match self.summary {
+        Some(at) => store_option(mut out, value: Some(u64.widen(at)))
+        None => store_option(mut out, value: None)
+    }
+    store_count(mut out, value: self.items.len())
+    for item in self.items {
+        store_count(mut out, value: item.head)
+        store_count(mut out, value: item.end)
+        match item.tree {
+            Some(tree) => {
+                store_flag(mut out, value: true)
+                tree.store(mut out)
+            }
+            None => store_flag(mut out, value: false)
+        }
+        store_flag(mut out, value: item.abandoned)
+    }
+    store_count(mut out, value: self.comment.len())
+    for read in self.comment {
+        store_flag(mut out, value: read)
+    }
+    store_count(mut out, value: self.diagnostics.len())
+    for reported in self.diagnostics {
+        reported.store(mut out)
+    }
+} SourceFile.store
+
+fn Tree.store(self, mut out: Writer) {
+    store_count(mut out, value: self.nodes.len())
+    var node_end: u32 = 0
+    for node in self.nodes {
+        store_count(mut out, value: node.rule.index())
+        store_step(mut out, from: node_end, to: node.start)
+        store_step(mut out, from: node.start, to: node.end)
+        node_end = node.end
+    }
+    store_count(mut out, value: self.child_list.len())
+    var last_token: u32 = 0
+    for child in self.child_list {
+        match child {
+            Child.Node(node) => mut out.uvar(u64.widen(node) << 1)
+            Child.Token(token) => {
+                mut out.uvar(1)
+                store_step(mut out, from: last_token, to: token)
+                last_token = token
+            }
+        }
+    }
+    mut out.uvar(u64.widen(self.root_node))
+} Tree.store
+
+fn FileDiagnostic.store(self, mut out: Writer) {
+    mut out.uvar(u64.widen(self.line))
+    mut out.bytes(self.code.name().as_bytes())
+    store_text(mut out, value: self.expected)
+    store_text(mut out, value: self.found)
+    match self.span {
+        Some(span) => {
+            store_flag(mut out, value: true)
+            mut out.uvar(u64.widen(span.start))
+            mut out.uvar(u64.widen(span.end))
+        }
+        None => store_flag(mut out, value: false)
+    }
+    store_option(mut out, value: widened(self.failing))
+    store_count(mut out, value: self.fixes.len())
+    for fix in self.fixes {
+        store_count(mut out, value: fix.len())
+        for replacement in fix {
+            mut out.uvar(u64.widen(replacement.start))
+            mut out.uvar(u64.widen(replacement.end))
+            mut out.bytes(replacement.text.as_bytes())
+        }
+    }
+    store_count(mut out, value: match self.offer {
+        diagnostic::Offer.Each => 0
+        diagnostic::Offer.First => 1
+        diagnostic::Offer.Unique => 2
+    })
+} FileDiagnostic.store
+
+fn store_kind(mut out: Writer, kind: TokenKind) {
+    match kind {
+        TokenKind.Ident => store_count(mut out, value: 0)
+        TokenKind.Int => store_count(mut out, value: 1)
+        TokenKind.Float => store_count(mut out, value: 2)
+        TokenKind.Text => store_count(mut out, value: 3)
+        TokenKind.Bytes => store_count(mut out, value: 4)
+        TokenKind.Char => store_count(mut out, value: 5)
+        TokenKind.Byte => store_count(mut out, value: 6)
+        TokenKind.TextLine => store_count(mut out, value: 7)
+        TokenKind.Doc => store_count(mut out, value: 8)
+        TokenKind.FileDoc => store_count(mut out, value: 9)
+        TokenKind.Keyword(keyword) => {
+            store_count(mut out, value: 10)
+            store_count(mut out, value: keyword.index())
+        }
+        TokenKind.Punct(punct) => {
+            store_count(mut out, value: 11)
+            store_count(mut out, value: punct.index())
+        }
+        TokenKind.Foreign(spelt) => {
+            store_count(mut out, value: 12)
+            store_count(mut out, value: spelt.index())
+        }
+        TokenKind.Nl => store_count(mut out, value: 13)
+        TokenKind.Col0 => store_count(mut out, value: 14)
+        TokenKind.Eof => store_count(mut out, value: 15)
+        TokenKind.LexError => store_count(mut out, value: 16)
+    }
+} store_kind
+
+/// A position as the step from the position before it.
+fn store_step(mut out: Writer, from: u32, to: u32) {
+    mut out.svar(i64.widen(to) - i64.widen(from))
+} store_step
+
+fn store_count(mut out: Writer, value: usize) {
+    mut out.uvar(u64.widen(value))
+} store_count
+
+fn store_flag(mut out: Writer, value: bool) {
+    match value {
+        true => mut out.byte(1)
+        false => mut out.byte(0)
+    }
+} store_flag
+
+fn store_option(mut out: Writer, value: Option[u64]) {
+    match value {
+        Some(held) => {
+            store_flag(mut out, value: true)
+            mut out.uvar(held)
+        }
+        None => store_flag(mut out, value: false)
+    }
+} store_option
+
+fn store_text(mut out: Writer, value: Option[text::String]) {
+    match value {
+        Some(held) => {
+            store_flag(mut out, value: true)
+            mut out.bytes(held.as_bytes())
+        }
+        None => store_flag(mut out, value: false)
+    }
+} store_text
+
+fn widened(value: Option[u32]) -> Option[u64] {
+    return match value {
+        Some(held) => Some(u64.widen(held))
+        None => None
+    }
+} widened
+
+/// Stored bytes being written: the first `at` of `written` are, the rest room for more.
+struct Writer {
+    written: mem::Bytes
+    at: usize
+    alloc: mem::Alloc
+} Writer
+
+/// Makes room for `count` more bytes.
+fn Writer.room(mut self, count: usize) {
+    expect self.at <= self.written.len()
+    if self.written.len() - self.at < count {
+        mut self.grow(count)
+    }
+} Writer.room
+
+/// Grows the room past the bytes written to at least `count` bytes.
+fn Writer.grow(mut self, count: usize) {
+    let size = 2 * self.written.len() + count
+    let Some(kept) = self.written.view().prefix(self.at) else {
+        expect false
+        return
+    }
+    var grown = mem::Bytes.empty(self.alloc)
+    mut grown.reserve(size)
+    mut grown.append(kept)
+    mut grown.append(mem::Bytes.zeroed(size - self.at, alloc: self.alloc).view())
+    self.written = grown
+} Writer.grow
+
+fn Writer.byte(mut self, value: u8) {
+    if self.at >= self.written.len() {
+        mut self.grow(1)
+    }
+    expect self.at < self.written.len()
+    self.written[self.at] = value
+    self.at += 1
+} Writer.byte
+
+/// An unsigned integer in LEB128, without redundant trailing groups.
+fn Writer.uvar(mut self, value: u64) {
+    if value < 0x80 and self.at < self.written.len() {
+        self.written[self.at] = u8.truncate(value)
+        self.at += 1
+        return
+    }
+    mut self.room(10)
+    var rest = value
+    loop {
+        expect self.at < self.written.len()
+        let group = u8.truncate(rest & 0x7F)
+        rest = rest >> 7
+        if rest == 0 {
+            self.written[self.at] = group
+            self.at += 1
+            return
+        }
+        self.written[self.at] = group | 0x80
+        self.at += 1
+    }
+} Writer.uvar
+
+/// A signed integer: the uvar 2n when n is at least 0, and −2n − 1 otherwise.
+fn Writer.svar(mut self, value: i64) {
+    if value >= 0 {
+        mut self.uvar(u64.fit(value) << 1)
+        return
+    }
+    mut self.uvar((u64.fit(-(value + 1)) << 1) | 1)
+} Writer.svar
+
+/// Bytes: their length as a uvar, then the bytes.
+fn Writer.bytes(mut self, value: Slice[u8]) {
+    mut self.uvar(u64.widen(value.len()))
+    mut self.room(value.len())
+    for byte in value {
+        expect self.at < self.written.len()
+        self.written[self.at] = byte
+        self.at += 1
+    }
+} Writer.bytes
+
+/// The bytes written.
+fn Writer.finished(take self) -> mem::Bytes {
+    var written = self.written
+    mut written.truncate(self.at)
+    return written
+} Writer.finished
+
+/// Stored bytes being read: where the next value starts, and whether every value read so far
+/// was well formed.
+view struct Reader {
+    stored: Slice[u8]
+    at: usize
+    failed: bool
+} Reader
+
+/// Whether every value read was well formed and none is left.
+fn Reader.done(self) -> bool {
+    return not self.failed and self.at == self.stored.len()
+} Reader.done
+
+/// The uvar at the reader, 0 once it failed.
+fn Reader.uvar(mut self) -> u64 {
+    if not self.failed and self.at < self.stored.len() and self.stored[self.at] < 0x80 {
+        self.at += 1
+        return u64.widen(self.stored[self.at - 1])
+    }
+    var value: u64 = 0
+    var shift: u32 = 0
+    while not self.failed {
+        if self.at >= self.stored.len() or shift > 63 {
+            self.failed = true
+            return 0
+        }
+        let byte = self.stored[self.at]
+        self.at += 1
+        value = value | (u64.widen(byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            return value
+        }
+        shift += 7
+    }
+    return 0
+} Reader.uvar
+
+/// A count at the reader, failing for one larger than the bytes left could hold.
+fn Reader.count(mut self) -> usize {
+    let value = mut self.uvar()
+    if self.at > self.stored.len() or value > u64.widen(self.stored.len() - self.at) {
+        self.failed = true
+        return 0
+    }
+    return usize.widen(value)
+} Reader.count
+
+/// The position a step at the reader leads to from `from`.
+fn Reader.step(mut self, from: u32) -> u32 {
+    let held = mut self.uvar()
+    var value = i64.widen(from)
+    if (held & 1) == 0 {
+        value = value + i64.fit(held >> 1)
+    } else {
+        value = value - i64.fit(held >> 1) - 1
+    }
+    if value < 0 or value > i64.widen(~0u32) {
+        self.failed = true
+        return 0
+    }
+    return u32.fit(value)
+} Reader.step
+
+fn Reader.number(mut self) -> u32 {
+    let value = mut self.uvar()
+    if value > u64.widen(~0u32) {
+        self.failed = true
+        return 0
+    }
+    return u32.truncate(value)
+} Reader.number
+
+fn Reader.flag(mut self) -> bool {
+    let value = mut self.uvar()
+    if value > 1 {
+        self.failed = true
+    }
+    return value == 1
+} Reader.flag
+
+fn Reader.option(mut self) -> Option[u32] {
+    if not mut self.flag() {
+        return None
+    }
+    return Some(mut self.number())
+} Reader.option
+
+/// The bytes at the reader, a length then the bytes.
+fn Reader.held(mut self, alloc: mem::Alloc) -> mem::Bytes {
+    let length = mut self.count()
+    var out = mem::Bytes.empty(alloc)
+    let Some(parts) = self.stored.split_at(self.at) else {
+        self.failed = true
+        return out
+    }
+    let Some(held) = parts.tail.prefix(length) else {
+        self.failed = true
+        return out
+    }
+    mut out.append(held)
+    self.at += length
+    return out
+} Reader.held
+
+fn Reader.text(mut self, alloc: mem::Alloc) -> text::String {
+    let held = mut self.held(alloc)
+    let Some(read) = output::text_of(held.view(), alloc) else {
+        self.failed = true
+        return text::String.empty(alloc)
+    }
+    return read
+} Reader.text
+
+/// The variant of index order at the reader.
+fn Reader.indexed[T: Copy](mut self, listed: Slice[T], fallback: T) -> T {
+    let index = mut self.uvar()
+    if index >= u64.widen(listed.len()) {
+        self.failed = true
+        return fallback
+    }
+    return listed[usize.widen(index)]
+} Reader.indexed
+
+/// The syntax of a file stored at the reader, `source` being its source and `readable` its
+/// source as `source_text` gives it; none when the reader holds no stored syntax there.
+fn Reader.source_file(mut self, take source: mem::Bytes, take readable: text::String, decoding: Decoding, alloc: mem::Alloc) -> Option[SourceFile] {
+    var tokens = mem::List[Token].empty(alloc)
+    var last = Token(kind: TokenKind.Eof, start: 0, end: 0, line: 0)
+    let token_count = mut self.count()
+    mut tokens.reserve(token_count)
+    for _ in 0..<token_count {
+        let kind = mut self.kind(decoding)
+        let start = mut self.step(from: last.end)
+        let end = mut self.step(from: start)
+        let line = mut self.step(from: last.line)
+        last = Token(kind: kind, start: start, end: end, line: line)
+        mut tokens.push(last)
+    }
+    var lines = mem::List[Line].empty(alloc)
+    var line_end: u32 = 0
+    let line_count = mut self.count()
+    mut lines.reserve(line_count)
+    for _ in 0..<line_count {
+        let start = mut self.step(from: line_end)
+        let end = mut self.step(from: start)
+        let comment = mut self.option()
+        let lexical_error = mut self.flag()
+        mut lines.push(Line(start: start, end: end, comment: comment, lexical_error: lexical_error))
+        line_end = end
+    }
+    var summary: Option[usize] = None
+    if mut self.flag() {
+        summary = Some(mut self.count())
+    }
+    var items = mem::List[ItemSyntax].empty(alloc)
+    for _ in 0..<mut self.count() {
+        let head = mut self.count()
+        let end = mut self.count()
+        var tree: Option[Tree] = None
+        if mut self.flag() {
+            tree = Some(mut self.tree(decoding, alloc))
+        }
+        let abandoned = mut self.flag()
+        mut items.push(ItemSyntax(head: head, end: end, tree: take tree, abandoned: abandoned))
+    }
+    var comment = mem::List[bool].empty(alloc)
+    let comment_count = mut self.count()
+    mut comment.reserve(comment_count)
+    for _ in 0..<comment_count {
+        mut comment.push(mut self.flag())
+    }
+    var diagnostics = mem::List[FileDiagnostic].empty(alloc)
+    for _ in 0..<mut self.count() {
+        mut diagnostics.push(mut self.diagnostic(alloc))
+    }
+    if self.failed {
+        return None
+    }
+    return Some(SourceFile(source: take source, readable: take readable, tokens: take tokens, lines: take lines, summary: summary, items: take items, comment: take comment, diagnostics: take diagnostics))
+} Reader.source_file
+
+fn Reader.kind(mut self, decoding: Decoding) -> TokenKind {
+    let tag = mut self.uvar()
+    if tag > 16 {
+        self.failed = true
+    }
+    return match tag {
+        0 => TokenKind.Ident
+        1 => TokenKind.Int
+        2 => TokenKind.Float
+        3 => TokenKind.Text
+        4 => TokenKind.Bytes
+        5 => TokenKind.Char
+        6 => TokenKind.Byte
+        7 => TokenKind.TextLine
+        8 => TokenKind.Doc
+        9 => TokenKind.FileDoc
+        10 => TokenKind.Keyword(mut self.indexed(decoding.keywords.view(), fallback: Keyword.Fn))
+        11 => TokenKind.Punct(mut self.indexed(decoding.puncts.view(), fallback: Punct.Comma))
+        12 => TokenKind.Foreign(mut self.indexed(decoding.foreigns.view(), fallback: Foreign.Semi))
+        13 => TokenKind.Nl
+        14 => TokenKind.Col0
+        15 => TokenKind.Eof
+        else => TokenKind.LexError
+    }
+} Reader.kind
+
+fn Reader.tree(mut self, decoding: Decoding, alloc: mem::Alloc) -> Tree {
+    var tree = Tree.empty(alloc)
+    var node_end: u32 = 0
+    let node_count = mut self.count()
+    mut tree.nodes.reserve(node_count)
+    for _ in 0..<node_count {
+        let rule = mut self.indexed(decoding.rules.view(), fallback: Rule.Item)
+        let start = mut self.step(from: node_end)
+        let end = mut self.step(from: start)
+        mut tree.nodes.push(Node(rule: rule, start: start, end: end))
+        node_end = end
+    }
+    var last_token: u32 = 0
+    let child_count = mut self.count()
+    mut tree.child_list.reserve(child_count)
+    for _ in 0..<child_count {
+        let held = mut self.uvar()
+        if (held & 1) == 1 {
+            if held != 1 {
+                self.failed = true
+            }
+            last_token = mut self.step(from: last_token)
+            mut tree.child_list.push(Child.Token(last_token))
+        } else {
+            if (held >> 1) > u64.widen(~0u32) {
+                self.failed = true
+            }
+            mut tree.child_list.push(Child.Node(u32.truncate(held >> 1)))
+        }
+    }
+    tree.root_node = mut self.number()
+    return tree
+} Reader.tree
+
+fn Reader.diagnostic(mut self, alloc: mem::Alloc) -> FileDiagnostic {
+    let line = mut self.number()
+    let name = mut self.text(alloc)
+    let Some(code) = diagnostic::Code.from_name(name.as_str()) else {
+        self.failed = true
+        return FileDiagnostic.new(line, code: diagnostic::Code.ToolUsage, alloc)
+    }
+    var reported = FileDiagnostic.new(line, code, alloc)
+    if mut self.flag() {
+        reported.expected = Some(mut self.text(alloc))
+    }
+    if mut self.flag() {
+        reported.found = Some(mut self.text(alloc))
+    }
+    if mut self.flag() {
+        let start = mut self.number()
+        let end = mut self.number()
+        reported.span = Some(diagnostic::Span(start: start, end: end))
+    }
+    reported.failing = mut self.option()
+    for _ in 0..<mut self.count() {
+        var fix = mem::List[diagnostic::Replacement].empty(alloc)
+        for _ in 0..<mut self.count() {
+            let start = mut self.number()
+            let end = mut self.number()
+            mut fix.push(diagnostic::Replacement(start: start, end: end, text: mut self.text(alloc)))
+        }
+        mut reported.fixes.push(take fix)
+    }
+    let offer = mut self.uvar()
+    if offer > 2 {
+        self.failed = true
+    }
+    reported.offer = match offer {
+        1 => diagnostic::Offer.First
+        2 => diagnostic::Offer.Unique
+        else => diagnostic::Offer.Each
+    }
+    return reported
+} Reader.diagnostic
+
+/// The syntax of a file that `held` stores, `source` being the file's bytes and `readable`
+/// their text as `source_text` gives it; none when `held` stores no syntax.
+pkg fn Decoding.file(self, held: Slice[u8], take source: mem::Bytes, take readable: text::String, alloc: mem::Alloc) -> Option[SourceFile] {
+    let Some(whole) = held.prefix(held.len()) else {
+        return None
+    }
+    var reader = Reader(stored: take whole, at: 0, failed: false)
+    let Some(file) = mut reader.source_file(take source, take readable, decoding: self, alloc) else {
+        return None
+    }
+    if not reader.done() {
+        return None
+    }
+    return Some(take file)
+} Decoding.file
+
+test a_stored_syntax_decodes_to_the_parse_it_stores for Decoding.file {
+    let alloc = testing::world().alloc
+    let parsed = parse(sample_bytes(alloc), grammar: Grammar.load(alloc), alloc)
+    expect parsed.diagnostics.len() > 0 and parsed.items.len() > 0
+    let stored = parsed.stored(alloc)
+    let decoding = Decoding.new(alloc)
+    let Some(decoded) = decoding.file(stored.view(), source: sample_bytes(alloc), readable: text::String.of(SAMPLE, alloc), alloc) else {
+        expect false
+        return
+    }
+    let again = decoded.stored(alloc)
+    expect again.view() == stored.view() and decoded.tokens.view() == parsed.tokens.view()
+    let Some(shortened) = stored.view().prefix(stored.len() - 1) else {
+        expect false
+        return
+    }
+    let truncated = decoding.file(shortened, source: sample_bytes(alloc), readable: text::String.of(SAMPLE, alloc), alloc)
+    expect truncated.is_none()
+} a_stored_syntax_decodes_to_the_parse_it_stores
+
+/// A file with doc comments, keywords, punctuation and a foreign idiom.
+const SAMPLE: Str = "//! A.\n\n/// The sum.\npub fn sum(left: u32, right: u32) -> u32 {\n    return left && right\n} sum\n\npub struct Pair {\n    pub low: Array[u8, 2]\n} Pair\n"
+
+fn sample_bytes(alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(SAMPLE.as_bytes())
+    return bytes
+} sample_bytes

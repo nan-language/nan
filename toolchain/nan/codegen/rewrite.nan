@@ -1,0 +1,1230 @@
+//! The function code generation compiles: the function lowering built, with the bodies of the leaves its calls take in place, its unread calls of functions that end and trap, call or write nothing their callers see left out, its loads of bytes a dominating load read since the last write taking that load's value, the fields of each stack slot held in values when only loads and stores at fixed offsets reach the slot, an access lying within a wider one reaching bits of the wider one's value, and the copies into a stack slot nothing else reaches left out.
+
+/// Where an address points: a stack slot and an offset in it; the slot is `NONE` for a value
+/// that points nowhere the copy follows.
+struct Address derives Copy, Eq {
+    slot: u32
+    offset: i64
+} Address
+
+const NOWHERE: Address = Address(slot: NONE, offset: 0)
+
+/// No value of the copy yet.
+const NO_VALUE: clif::Value = clif::Value(index: 0xFFFF_FFFF)
+
+/// An access of a stack slot held in values: its slot, its offset and the type it loads or
+/// stores.
+struct Field derives Copy, Eq, Hash {
+    slot: u32
+    offset: i64
+    ty: clif::Type
+} Field
+
+/// An access of a stack slot: its offset and the type it loads or stores.
+struct Access derives Copy, Eq {
+    offset: i64
+    ty: clif::Type
+} Access
+
+fn Access.end(self) -> i64 = self.offset.wrapping_add(i64.widen(self.ty.bytes()))
+
+/// Whether an access reaches every byte another reaches.
+fn Access.holds(self, other: Access) -> bool = self.offset <= other.offset and other.end() <= self.end()
+
+fn Access.meets(self, other: Access) -> bool = self.offset < other.end() and other.offset < self.end()
+
+/// Where the value of an access of a slot held in values lies: the bits from `shift` of a
+/// variable of type `wide`.
+struct Part derives Copy, Eq {
+    variable: clif::Variable
+    shift: i64
+    wide: clif::Type
+} Part
+
+/// How a function reaches its stack slots: whether each escapes, reached otherwise than by
+/// loads and stores at fixed offsets within it that stay apart or lie within a wider one, or
+/// than by copies of a fixed length into it alone; the distinct accesses of each; whether a copy
+/// reaches each; and whether a call takes a body in place or is left out.
+struct Slots {
+    sizes: mem::List[u32]
+    escaped: mem::List[bool]
+    accesses: mem::List[mem::List[Access]]
+    filled: mem::List[bool]
+    rewrites: bool
+} Slots
+
+/// What a function's values are known to be: the address each points to, and the constant each
+/// `iconst` gives.
+struct Known {
+    addresses: mem::List[Address]
+    constants: mem::List[Option[i64]]
+} Known
+
+/// The function with the bodies its calls take in place, its unread calls of functions whose
+/// calls can be left out left out and its slots that do not escape held in values, or none when
+/// it has none of these or holds a use before its definition in layout order.
+fn promoted(func: clif::Function, leaves: Leaves, alloc: mem::Alloc) -> Option[clif::Function] {
+    var slots = Slots(sizes: mem::List[u32].empty(alloc), escaped: mem::List[bool].empty(alloc), accesses: mem::List[mem::List[Access]].empty(alloc), filled: mem::List[bool].empty(alloc), rewrites: false)
+    for index in 0u32..<func.stack_slot_count() {
+        mut slots.sizes.push(func.stack_slot_data(clif::StackSlot(index: index)).size)
+        mut slots.escaped.push(false)
+        mut slots.accesses.push(mem::List[Access].empty(alloc))
+        mut slots.filled.push(false)
+    }
+    mut slots.walk(func, bound: mem::List[Address].empty(alloc).view(), leaves, alloc)
+    mut slots.settle(alloc)
+    var held = false
+    for escaped in slots.escaped {
+        if not escaped {
+            held = true
+        }
+    }
+    if not slots.rewrites and not held {
+        return None
+    }
+    var copier = Copier.new(func, slots, alloc)
+    mut copier.copy_function(func, leaves)
+    return take copier.finish()
+} promoted
+
+/// What a function's values are, its entry's parameters pointing where `bound` gives by
+/// position.
+fn known_of(func: clif::Function, bound: Slice[Address], alloc: mem::Alloc) -> Known {
+    let count = usize.widen(func.value_count())
+    let unknown: Option[i64] = None
+    var known = Known(addresses: filled(count, value: NOWHERE, alloc), constants: filled(count, value: unknown, alloc))
+    let blocks = func.layout_blocks(alloc)
+    match func.entry_block() {
+        Some(entry) => {
+            let params = func.block_params(entry, alloc)
+            for index in 0..<params.len() {
+                if index < bound.len() and usize.widen(params[index].index) < count {
+                    known.addresses[usize.widen(params[index].index)] = bound[index]
+                }
+            }
+        }
+        None => {}
+    }
+    for block in blocks {
+        for inst in func.block_insts(block, alloc) {
+            let clif::InstructionData.UnaryImm(opcode: _, imm: imm) = func.inst_data(inst) else {
+                continue
+            }
+            let result = result_of(func, inst, alloc)
+            expect usize.widen(result.index) < count
+            known.constants[usize.widen(result.index)] = Some(imm)
+        }
+    }
+    loop {
+        var changed = false
+        for block in blocks {
+            for inst in func.block_insts(block, alloc) {
+                let derived = known.derived(func, inst)
+                if derived == NOWHERE {
+                    continue
+                }
+                let at = usize.widen(result_of(func, inst, alloc).index)
+                expect at < count
+                if known.addresses[at] != derived {
+                    known.addresses[at] = derived
+                    changed = true
+                }
+            }
+        }
+        if not changed {
+            return known
+        }
+    }
+} known_of
+
+fn Known.address(self, func: clif::Function, value: clif::Value) -> Address {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.addresses.len()
+    return self.addresses[at]
+} Known.address
+
+fn Known.constant(self, func: clif::Function, value: clif::Value) -> Option[i64] {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.constants.len()
+    return self.constants[at]
+} Known.constant
+
+/// The address an instruction's result points to: a stack slot's, or a constant past another.
+fn Known.derived(self, func: clif::Function, inst: clif::Inst) -> Address {
+    match func.inst_data(inst) {
+        clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => return Address(slot: slot.index, offset: i64.widen(offset))
+        clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) => {
+            let base = self.address(func, value: x)
+            match self.constant(func, value: y) {
+                Some(step) => {
+                    if base != NOWHERE {
+                        return Address(slot: base.slot, offset: base.offset.wrapping_add(step))
+                    }
+                }
+                None => {}
+            }
+            let other = self.address(func, value: y)
+            match self.constant(func, value: x) {
+                Some(step) => {
+                    if other != NOWHERE {
+                        return Address(slot: other.slot, offset: other.offset.wrapping_add(step))
+                    }
+                }
+                None => {}
+            }
+            return NOWHERE
+        }
+        else => return NOWHERE
+    }
+} Known.derived
+
+/// Records how a function's instructions reach the slots, its parameters pointing where `bound`
+/// gives, the bodies its calls take in place walked with the addresses their arguments hold.
+fn Slots.walk(mut self, func: clif::Function, bound: Slice[Address], leaves: Leaves, alloc: mem::Alloc) {
+    let known = known_of(func, bound, alloc)
+    let reads = use_counts(func, alloc)
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            if leaves.removes(func, inst) and is_unread(func, reads: reads.view(), inst, alloc) {
+                self.rewrites = true
+                continue
+            }
+            mut self.visit(func, inst, known, leaves, alloc)
+        }
+    }
+} Slots.walk
+
+/// How many instructions read each value of a function.
+fn use_counts(func: clif::Function, alloc: mem::Alloc) -> mem::List[u32] {
+    var reads = filled(usize.widen(func.value_count()), value: 0u32, alloc)
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            each_operand(func.inst_data(inst), visit: fn[mut reads](value: clif::Value) {
+                let at = usize.widen(func.resolve_aliases(value).index)
+                expect at < reads.len()
+                reads[at] += 1
+            })
+        }
+    }
+    return reads
+} use_counts
+
+/// Whether nothing reads an instruction's results.
+fn is_unread(func: clif::Function, reads: Slice[u32], inst: clif::Inst, alloc: mem::Alloc) -> bool {
+    for result in func.inst_results(inst, alloc) {
+        let at = usize.widen(result.index)
+        expect at < reads.len()
+        if reads[at] != 0 {
+            return false
+        }
+    }
+    return true
+} is_unread
+
+/// Records how an instruction reaches the slots.
+fn Slots.visit(mut self, func: clif::Function, inst: clif::Inst, known: Known, leaves: Leaves, alloc: mem::Alloc) {
+    match func.inst_data(inst) {
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: offset) => {
+            let ty = func.value_type(result_of(func, inst, alloc))
+            mut self.access(known.address(func, value: arg), offset, ty)
+            return
+        }
+        clif::InstructionData.Store(opcode: clif::Opcode.Store, flags: _, x: x, p: p, offset: offset) => {
+            mut self.escape(known.address(func, value: x))
+            mut self.access(known.address(func, value: p), offset, ty: func.value_type(x))
+            return
+        }
+        clif::InstructionData.StackLoad(opcode: _, slot: _, offset: _) => return
+        clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: _, y: _) => {
+            if known.derived(func, inst) != NOWHERE {
+                return
+            }
+        }
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: args) => {
+            match leaves.taken(func, inst) {
+                Some(body) => {
+                    self.rewrites = true
+                    var bound = mem::List[Address].empty(alloc)
+                    for arg in args {
+                        mut bound.push(known.address(func, value: arg))
+                    }
+                    mut self.walk(body, bound: bound.view(), leaves, alloc)
+                    return
+                }
+                None => {}
+            }
+            if leaves.copies(func, inst) and args.len() == 3 {
+                mut self.fill(known.address(func, value: args[0]), length: known.constant(func, value: args[2]))
+                mut self.escape(known.address(func, value: args[1]))
+                return
+            }
+        }
+        else => {}
+    }
+    each_operand(func.inst_data(inst), visit: fn[mut self](value: clif::Value) {
+        mut self.escape(known.address(func, value))
+    })
+} Slots.visit
+
+/// Records a copy of `length` bytes to an address, letting its slot escape when the length is
+/// unknown or the copy leaves the slot.
+fn Slots.fill(mut self, address: Address, length: Option[i64]) {
+    if address == NOWHERE {
+        return
+    }
+    let at = usize.widen(address.slot)
+    expect at < self.escaped.len() and at < self.filled.len() and at < self.sizes.len()
+    let Some(bytes) = length else {
+        self.escaped[at] = true
+        return
+    }
+    if address.offset < 0 or bytes < 0 or bytes > i64.widen(self.sizes[at]) - address.offset {
+        self.escaped[at] = true
+        return
+    }
+    self.filled[at] = true
+} Slots.fill
+
+/// Lets the slot an address points into escape.
+fn Slots.escape(mut self, address: Address) {
+    if address == NOWHERE {
+        return
+    }
+    let at = usize.widen(address.slot)
+    expect at < self.escaped.len()
+    self.escaped[at] = true
+} Slots.escape
+
+/// Records an access of `ty` at `offset` past an address, letting its slot escape when the
+/// access leaves the slot.
+fn Slots.access(mut self, address: Address, offset: i32, ty: clif::Type) {
+    if address == NOWHERE {
+        return
+    }
+    let at = usize.widen(address.slot)
+    expect at < self.escaped.len() and at < self.accesses.len() and at < self.sizes.len()
+    let start = address.offset.wrapping_add(i64.widen(offset))
+    let size = i64.widen(ty.bytes())
+    if start < 0 or start > i64.widen(self.sizes[at]) - size {
+        self.escaped[at] = true
+        return
+    }
+    let added = Access(offset: start, ty: ty)
+    for access in self.accesses[at] {
+        if access == added {
+            return
+        }
+    }
+    var list = mut self.accesses.at_mut(at)
+    mut list.push(added)
+} Slots.access
+
+/// Lets each slot escape that a copy reaches and an access reads or writes, or whose accesses
+/// meet without lying within one widest access, or meet one of a type other than an integer of
+/// at most 64 bits.
+fn Slots.settle(mut self, alloc: mem::Alloc) {
+    for index in 0..<self.escaped.len() {
+        expect index < self.accesses.len()
+        if self.escaped[index] {
+            continue
+        }
+        let accesses = self.accesses[index].view()
+        expect index < self.filled.len()
+        if self.filled[index] and accesses.len() > 0 {
+            self.escaped[index] = true
+            continue
+        }
+        let widest = widest_of(accesses, alloc)
+        expect widest.len() == accesses.len()
+        for at in 0..<accesses.len() {
+            if not widest[at] {
+                continue
+            }
+            let wide = accesses[at]
+            for other_at in 0..<accesses.len() {
+                let other = accesses[other_at]
+                if other_at == at or not wide.meets(other) {
+                    continue
+                }
+                if widest[other_at] or not is_narrowable(wide.ty) or not is_narrowable(other.ty) {
+                    self.escaped[index] = true
+                }
+            }
+        }
+    }
+} Slots.settle
+
+/// Whether each access lies within no wider one.
+fn widest_of(accesses: Slice[Access], alloc: mem::Alloc) -> mem::List[bool] {
+    var widest = mem::List[bool].empty(alloc)
+    for access in accesses {
+        var within = false
+        for other in accesses {
+            if other.holds(access) and not access.holds(other) {
+                within = true
+            }
+        }
+        mut widest.push(not within)
+    }
+    return widest
+} widest_of
+
+/// Whether a value of a type can hold the bits of narrower accesses.
+fn is_narrowable(ty: clif::Type) -> bool = ty.is_int() and ty.bits() <= 64
+
+/// The copy being built: its builder, the variable of each field of the slots held in values,
+/// the slot of the copy each other slot becomes, the branches still to copy to each block of the
+/// copy, which it seals once none is left, and whether a use was met before its definition; the
+/// edges it threads, with the variable through which each value read outside the block an edge
+/// is threaded through merges, and the block being copied.
+struct Copier {
+    b: clif::Builder
+    parts: mem::HashMap[Field, Part]
+    slot_map: mem::List[u32]
+    remaining: mem::List[u32]
+    lost: bool
+    plan: Plan
+    merged: mem::HashMap[u32, clif::Variable]
+    current: clif::Block
+    loads: mem::List[Loaded]
+    alloc: mem::Alloc
+} Copier
+
+/// A load of the copy that later loads of the same bytes may take the value of: the address it
+/// reads, its offset and type, and the value it gives.
+struct Loaded derives Copy, Eq {
+    address: clif::Value
+    offset: i32
+    ty: clif::Type
+    value: clif::Value
+} Loaded
+
+/// How the copy names what one function copied names, the function compiled or a body taken in
+/// place: the value and block of each of its own, by index, what its values are known to be,
+/// and its signatures, functions and global values; the block a body's returns jump to when it
+/// has several blocks; and the values a body of one block returns.
+struct Scope {
+    values: mem::List[clif::Value]
+    known: Known
+    blocks: mem::List[clif::Block]
+    sigs: mem::List[clif::SigRef]
+    funcs: mem::List[clif::FuncRef]
+    globals: mem::List[clif::GlobalValue]
+    in_place: bool
+    resume: Option[clif::Block]
+    returned: mem::List[clif::Value]
+    single: mem::List[u32]
+    previous: u32
+    reads: mem::List[u32]
+} Scope
+
+fn Copier.new(func: clif::Function, slots: Slots, alloc: mem::Alloc) -> Copier {
+    var b = clif::Builder.new(clif::Function.new(func.name, signature: copied_signature(func.signature, alloc), alloc), alloc)
+    var slot_map = mem::List[u32].empty(alloc)
+    var parts = mem::HashMap[Field, Part].empty(seed: 0, alloc)
+    for index in 0..<slots.escaped.len() {
+        if slots.escaped[index] {
+            let slot = mut b.create_sized_stack_slot(func.stack_slot_data(clif::StackSlot(index: u32.fit(index))))
+            mut slot_map.push(slot.index)
+            continue
+        }
+        mut slot_map.push(NONE)
+        expect index < slots.accesses.len()
+        let accesses = slots.accesses[index].view()
+        let widest = widest_of(accesses, alloc)
+        expect widest.len() == accesses.len()
+        for at in 0..<accesses.len() {
+            if not widest[at] {
+                continue
+            }
+            let wide = accesses[at]
+            let variable = mut b.declare_var(wide.ty)
+            for access in accesses {
+                if wide.holds(access) {
+                    let part = Part(variable: variable, shift: 8 * (access.offset - wide.offset), wide: wide.ty)
+                    discard mut parts.insert(Field(slot: u32.fit(index), offset: access.offset, ty: access.ty), value: part)
+                }
+            }
+        }
+    }
+    let plan = Plan(threads: mem::HashMap[Edge, u32].empty(seed: 0, alloc), kept: mem::List[bool].empty(alloc), crossing: mem::List[bool].empty(alloc), incoming: mem::List[u32].empty(alloc), shape: Shape.empty(alloc))
+    return Copier(b: take b, parts: take parts, slot_map: take slot_map, remaining: mem::List[u32].empty(alloc), lost: false, plan: take plan, merged: mem::HashMap[u32, clif::Variable].empty(seed: 0, alloc), current: clif::Block(index: NONE), loads: mem::List[Loaded].empty(alloc), alloc: alloc)
+} Copier.new
+
+/// A copier threading a function's edges as a plan says, its stack slots kept.
+fn Copier.threading(func: clif::Function, take plan: Plan, alloc: mem::Alloc) -> Copier {
+    var slots = Slots(sizes: mem::List[u32].empty(alloc), escaped: mem::List[bool].empty(alloc), accesses: mem::List[mem::List[Access]].empty(alloc), filled: mem::List[bool].empty(alloc), rewrites: false)
+    for index in 0u32..<func.stack_slot_count() {
+        mut slots.sizes.push(func.stack_slot_data(clif::StackSlot(index: index)).size)
+        mut slots.escaped.push(true)
+        mut slots.accesses.push(mem::List[Access].empty(alloc))
+        mut slots.filled.push(false)
+    }
+    var copier = Copier.new(func, slots, alloc)
+    for index in 0..<plan.crossing.len() {
+        if plan.crossing[index] {
+            let variable = mut copier.b.declare_var(func.value_type(clif::Value(index: u32.fit(index))))
+            discard mut copier.merged.insert(u32.fit(index), value: variable)
+        }
+    }
+    copier.plan = plan
+    return copier
+} Copier.threading
+
+fn copied_signature(signature: clif::Signature, alloc: mem::Alloc) -> clif::Signature {
+    var copy = clif::Signature.new(signature.call_conv, alloc)
+    for param in signature.params {
+        mut copy.params.push(param)
+    }
+    for returned in signature.returns {
+        mut copy.returns.push(returned)
+    }
+    return copy
+} copied_signature
+
+/// The copy, once every block is sealed, when no use came before its definition.
+fn Copier.finish(take self) -> Option[clif::Function] {
+    let Copier(b: b, parts: _, slot_map: _, remaining: _, lost: lost, plan: _, merged: _, current: _, loads: _, alloc: _) = self
+    if lost {
+        return None
+    }
+    var built = b
+    mut built.seal_all_blocks()
+    return Some(take built.finalize())
+} Copier.finish
+
+/// A scope for a function copied, its entry's parameters pointing where `bound` gives: its
+/// signatures, functions and global values imported, and a block of the copy for each of its
+/// blocks with the parameters they have, the entry of a body taken in place left to the block
+/// its call is in.
+fn Copier.scope_of(mut self, func: clif::Function, bound: Slice[Address], in_place: bool) -> Scope {
+    let count = usize.widen(func.value_count())
+    var scope = Scope(
+        values: filled(count, value: NO_VALUE, alloc: self.alloc),
+        known: self.known_in(func, bound),
+        blocks: mem::List[clif::Block].empty(self.alloc),
+        sigs: mem::List[clif::SigRef].empty(self.alloc),
+        funcs: mem::List[clif::FuncRef].empty(self.alloc),
+        globals: mem::List[clif::GlobalValue].empty(self.alloc),
+        in_place: in_place,
+        resume: None,
+        returned: mem::List[clif::Value].empty(self.alloc),
+        single: single_predecessors(func, alloc: self.alloc),
+        previous: NONE,
+        reads: self.reads_in(func),
+    )
+    for index in 0u32..<func.signature_count() {
+        let sig_ref = mut self.b.import_signature(copied_signature(func.imported_signature(clif::SigRef(index: index)), alloc: self.alloc))
+        mut scope.sigs.push(sig_ref)
+    }
+    for index in 0u32..<func.ext_func_count() {
+        let data = func.ext_func(clif::FuncRef(index: index))
+        expect usize.widen(data.signature.index) < scope.sigs.len()
+        let func_ref = mut self.b.import_function(clif::ExtFuncData(name: data.name, signature: scope.sigs[usize.widen(data.signature.index)], colocated: data.colocated))
+        mut scope.funcs.push(func_ref)
+    }
+    for index in 0u32..<func.global_value_count() {
+        let global = mut self.b.create_global_value(func.global_value_data(clif::GlobalValue(index: index)))
+        mut scope.globals.push(global)
+    }
+    let entry = func.entry_block()
+    let predecessors = if self.plan.threads.len() == 0 {
+        predecessor_counts(func, alloc: self.alloc)
+    } else {
+        self.plan.branch_counts(func, alloc: self.alloc)
+    }
+    for block in func.layout_blocks(self.alloc) {
+        while scope.blocks.len() <= usize.widen(block.index) {
+            mut scope.blocks.push(clif::Block(index: NONE))
+        }
+        if (in_place and entry == Some(block)) or not self.plan.keeps(block) {
+            continue
+        }
+        expect usize.widen(block.index) < predecessors.len()
+        let copy = mut self.new_block(predecessors: predecessors[usize.widen(block.index)])
+        scope.blocks[usize.widen(block.index)] = copy
+        if func.is_cold(block) {
+            mut self.b.set_cold_block(copy)
+        }
+        if entry == Some(block) {
+            mut self.b.append_block_params_for_function_params(copy)
+        } else {
+            for param in func.block_params(block, alloc: self.alloc) {
+                discard mut self.b.append_block_param(copy, ty: func.value_type(param))
+            }
+        }
+        let copied_params = self.b.block_params(copy, alloc: self.alloc)
+        let params = func.block_params(block, alloc: self.alloc)
+        expect copied_params.len() == params.len()
+        for index in 0..<params.len() {
+            scope.values[usize.widen(params[index].index)] = copied_params[index]
+        }
+    }
+    return scope
+} Copier.scope_of
+
+/// What a function copied is known to hold: nothing when the copy threads edges, which keeps
+/// every stack slot.
+fn Copier.known_in(self, func: clif::Function, bound: Slice[Address]) -> Known {
+    if self.plan.threads.len() == 0 {
+        return known_of(func, bound, alloc: self.alloc)
+    }
+    let count = usize.widen(func.value_count())
+    let unknown: Option[i64] = None
+    return Known(addresses: filled(count, value: NOWHERE, alloc: self.alloc), constants: filled(count, value: unknown, alloc: self.alloc))
+} Copier.known_in
+
+/// How many instructions read each value of a function copied, which only a copy that may
+/// leave calls out reads.
+fn Copier.reads_in(self, func: clif::Function) -> mem::List[u32] {
+    if self.plan.threads.len() > 0 {
+        return mem::List[u32].empty(self.alloc)
+    }
+    return use_counts(func, alloc: self.alloc)
+} Copier.reads_in
+
+/// A block of the copy that `predecessors` branches reach, sealed once they are all copied.
+fn Copier.new_block(mut self, predecessors: u32) -> clif::Block {
+    let block = mut self.b.create_block()
+    while self.remaining.len() <= usize.widen(block.index) {
+        mut self.remaining.push(0)
+    }
+    self.remaining[usize.widen(block.index)] = predecessors
+    if predecessors == 0 {
+        mut self.b.seal_block(block)
+    }
+    return block
+} Copier.new_block
+
+/// Notes a branch to a block of the copy, sealing it after the last.
+fn Copier.reached(mut self, block: clif::Block) {
+    let at = usize.widen(block.index)
+    expect at < self.remaining.len()
+    if self.remaining[at] == 0 {
+        return
+    }
+    self.remaining[at] -= 1
+    if self.remaining[at] == 0 {
+        mut self.b.seal_block(block)
+    }
+} Copier.reached
+
+/// The branches to each block of a function, by block index, a conditional branch counting once
+/// for each distinct target.
+fn predecessor_counts(func: clif::Function, alloc: mem::Alloc) -> mem::List[u32] {
+    let count = block_count(func, alloc)
+    var counts = filled(count, value: 0u32, alloc)
+    for block in func.layout_blocks(alloc) {
+        let insts = func.block_insts(block, alloc)
+        if insts.len() == 0 {
+            continue
+        }
+        match func.inst_data(insts[insts.len() - 1]) {
+            clif::InstructionData.Jump(opcode: _, destination: destination) => {
+                expect usize.widen(destination.block.index) < counts.len()
+                counts[usize.widen(destination.block.index)] += 1
+            }
+            clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => {
+                expect usize.widen(then_call.block.index) < counts.len() and usize.widen(else_call.block.index) < counts.len()
+                counts[usize.widen(then_call.block.index)] += 1
+                if else_call.block != then_call.block {
+                    counts[usize.widen(else_call.block.index)] += 1
+                }
+            }
+            else => {}
+        }
+    }
+    return counts
+} predecessor_counts
+
+/// The branches the copy holds to each block of a function, by block index, from the blocks the
+/// plan keeps: a conditional branch counting once for each distinct target, and a threaded edge
+/// as a branch to the target it goes on to.
+fn Plan.branch_counts(self, func: clif::Function, alloc: mem::Alloc) -> mem::List[u32] {
+    let count = block_count(func, alloc)
+    var counts = filled(count, value: 0u32, alloc)
+    for block in func.layout_blocks(alloc) {
+        if not self.keeps(block) {
+            continue
+        }
+        let targets = targets_of(func, block, alloc)
+        let onward = self.successors(func, block, alloc)
+        expect onward.len() == targets.len()
+        for arm in 0..<targets.len() {
+            let rerouted = self.threads.get(Edge(block: block.index, arm: u32.fit(arm))).is_some()
+            if arm == 1 and not rerouted and targets[1] == targets[0] and self.threads.get(Edge(block: block.index, arm: 0)).is_none() {
+                continue
+            }
+            let at = usize.widen(onward[arm].index)
+            expect at < counts.len()
+            counts[at] += 1
+        }
+    }
+    return counts
+} Plan.branch_counts
+
+/// Whether the copy holds a block.
+fn Plan.keeps(self, block: clif::Block) -> bool {
+    let at = usize.widen(block.index)
+    return self.kept.len() == 0 or (at < self.kept.len() and self.kept[at])
+} Plan.keeps
+
+/// The block branching to each block of a function, by block index, when it is the only one;
+/// `NONE` otherwise.
+fn single_predecessors(func: clif::Function, alloc: mem::Alloc) -> mem::List[u32] {
+    let count = block_count(func, alloc)
+    var single = filled(count, value: NONE, alloc)
+    var seen = filled(count, value: 0u32, alloc)
+    for block in func.layout_blocks(alloc) {
+        for target in targets_of(func, block, alloc) {
+            let at = usize.widen(target.index)
+            expect at < count
+            seen[at] += 1
+            single[at] = block.index
+        }
+    }
+    for index in 0..<count {
+        if seen[index] != 1 {
+            single[index] = NONE
+        }
+    }
+    return single
+} single_predecessors
+
+/// The returns of a function.
+fn return_count(func: clif::Function, alloc: mem::Alloc) -> u32 {
+    var count: u32 = 0
+    for block in func.layout_blocks(alloc) {
+        for inst in func.block_insts(block, alloc) {
+            match func.inst_data(inst) {
+                clif::InstructionData.MultiAry(opcode: _, args: _) => {
+                    count += 1
+                }
+                else => {}
+            }
+        }
+    }
+    return count
+} return_count
+
+/// Copies the function compiled, block by block in layout order.
+fn Copier.copy_function(mut self, func: clif::Function, leaves: Leaves) {
+    var scope = mut self.scope_of(func, bound: mem::List[Address].empty(self.alloc).view(), in_place: false)
+    for block in func.layout_blocks(self.alloc) {
+        if not self.plan.keeps(block) {
+            continue
+        }
+        mut self.b.switch_to_block(scope.block(block))
+        mut self.copy_block(func, mut scope, block, leaves)
+        if self.lost {
+            return
+        }
+    }
+} Copier.copy_function
+
+fn Scope.block(self, block: clif::Block) -> clif::Block {
+    let at = usize.widen(block.index)
+    expect at < self.blocks.len()
+    return self.blocks[at]
+} Scope.block
+
+fn Copier.copy_block(mut self, func: clif::Function, mut scope: Scope, block: clif::Block, leaves: Leaves) {
+    self.current = block
+    let at = usize.widen(block.index)
+    expect at < scope.single.len()
+    let continued = (scope.in_place and func.entry_block() == Some(block)) or (scope.single[at] != NONE and scope.single[at] == scope.previous)
+    if not continued {
+        mut self.loads.truncate(0)
+    }
+    scope.previous = block.index
+    if self.plan.threads.len() > 0 {
+        let copied = self.b.block_params(scope.block(block), alloc: self.alloc)
+        let params = func.block_params(block, alloc: self.alloc)
+        expect copied.len() == params.len()
+        for index in 0..<params.len() {
+            mut self.bind_merged(mut scope, value: params[index], copy: copied[index])
+        }
+    }
+    for inst in func.block_insts(block, alloc: self.alloc) {
+        mut self.copy_inst(func, mut scope, inst, leaves)
+        if self.lost {
+            return
+        }
+    }
+} Copier.copy_block
+
+/// The copy of a value, `NO_VALUE` when it has none yet.
+fn Scope.copy(self, func: clif::Function, value: clif::Value) -> clif::Value {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.values.len()
+    return self.values[at]
+} Scope.copy
+
+fn Scope.copies(self, func: clif::Function, values: Slice[clif::Value], alloc: mem::Alloc) -> mem::List[clif::Value] {
+    var copies = mem::List[clif::Value].empty(alloc)
+    for value in values {
+        mut copies.push(self.copy(func, value))
+    }
+    return copies
+} Scope.copies
+
+/// The copy of a value, or `NO_VALUE` with the copy lost when it has none yet.
+fn Copier.value(mut self, scope: Scope, func: clif::Function, value: clif::Value) -> clif::Value {
+    let copy = scope.copy(func, value)
+    if copy == NO_VALUE {
+        self.lost = true
+    }
+    return copy
+} Copier.value
+
+fn Copier.values(mut self, scope: Scope, func: clif::Function, values: Slice[clif::Value]) -> mem::List[clif::Value] {
+    var copies = mem::List[clif::Value].empty(self.alloc)
+    for value in values {
+        let copy = mut self.value(scope, func, value)
+        mut copies.push(copy)
+    }
+    return copies
+} Copier.values
+
+/// The address a value points to in a slot held in values, `NOWHERE` for any other value.
+fn Copier.held(self, scope: Scope, func: clif::Function, value: clif::Value) -> Address {
+    let address = scope.known.address(func, value)
+    if address == NOWHERE {
+        return NOWHERE
+    }
+    expect usize.widen(address.slot) < self.slot_map.len()
+    if self.slot_map[usize.widen(address.slot)] != NONE {
+        return NOWHERE
+    }
+    return address
+} Copier.held
+
+/// Makes a value of the function copied stand for a value of the copy.
+fn Scope.bind(mut self, value: clif::Value, copy: clif::Value) {
+    let at = usize.widen(value.index)
+    expect at < self.values.len()
+    self.values[at] = copy
+} Scope.bind
+
+/// Where the value an access of `ty` at `offset` past an address reaches lies.
+fn Copier.part(self, address: Address, offset: i32, ty: clif::Type) -> Part {
+    let field = Field(slot: address.slot, offset: address.offset.wrapping_add(i64.widen(offset)), ty: ty)
+    let Some(part) = self.parts.get(field) else {
+        expect false
+        return Part(variable: clif::Variable(index: 0), shift: 0, wide: ty)
+    }
+    return part
+} Copier.part
+
+/// The value of type `ty` a part holds.
+fn Copier.use_part(mut self, part: Part, ty: clif::Type) -> clif::Value {
+    var value = mut self.b.use_var(part.variable)
+    if part.shift > 0 {
+        value = mut self.b.ushr_imm_s(value, y: part.shift)
+    }
+    if ty != part.wide {
+        value = mut self.b.ireduce(ty, x: value)
+    }
+    return value
+} Copier.use_part
+
+/// Makes a part hold a value of type `ty`, the other bits of its variable kept.
+fn Copier.def_part(mut self, part: Part, value: clif::Value, ty: clif::Type) {
+    if ty == part.wide {
+        mut self.b.def_var(part.variable, val: value)
+        return
+    }
+    let ones: u64 = match ty {
+        clif::Type.Int8 => 0xFF
+        clif::Type.Int16 => 0xFFFF
+        else => 0xFFFF_FFFF
+    }
+    expect part.shift >= 0 and part.shift < 64
+    let kept_bits = ~(ones << u32.fit(part.shift))
+    let old = mut self.b.use_var(part.variable)
+    let kept = mut self.b.band_imm_s(old, y: i64.from_bits(kept_bits))
+    var placed = mut self.b.uextend(part.wide, x: value)
+    if part.shift > 0 {
+        placed = mut self.b.ishl_imm_s(placed, y: part.shift)
+    }
+    let merged = mut self.b.bor(kept, y: placed)
+    mut self.b.def_var(part.variable, val: merged)
+} Copier.def_part
+
+/// Copies an instruction: an address into a slot held in values, a load or store through it,
+/// a call taking a body in place, a return of such a body, and any other instruction with its
+/// operands and references named as the copy names them.
+fn Copier.copy_inst(mut self, func: clif::Function, mut scope: Scope, inst: clif::Inst, leaves: Leaves)
+    waive length "one arm per instruction the copy changes"
+{
+    if not scope.in_place {
+        mut self.b.set_srcloc(func.srcloc(inst))
+    }
+    if self.merged.len() > 0 {
+        each_operand(func.inst_data(inst), visit: fn[mut self, mut scope](value: clif::Value) {
+            mut self.read_merged(mut scope, func, value)
+        })
+    }
+    match func.inst_data(inst) {
+        clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: offset) => {
+            expect usize.widen(slot.index) < self.slot_map.len()
+            let copied_slot = self.slot_map[usize.widen(slot.index)]
+            if copied_slot == NONE {
+                return
+            }
+            let result = result_of(func, inst, alloc: self.alloc)
+            let address = mut self.b.stack_addr(func.value_type(result), slot: clif::StackSlot(index: copied_slot), offset)
+            mut self.bind_merged(mut scope, value: result, copy: address)
+            return
+        }
+        clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: _, y: _) => {
+            if self.held(scope, func, value: result_of(func, inst, alloc: self.alloc)) != NOWHERE {
+                return
+            }
+        }
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: offset) => {
+            let result = result_of(func, inst, alloc: self.alloc)
+            let ty = func.value_type(result)
+            let address = self.held(scope, func, value: arg)
+            if address != NOWHERE {
+                let loaded = mut self.use_part(self.part(address, offset, ty), ty)
+                mut scope.bind(result, copy: loaded)
+                return
+            }
+            let base = scope.copy(func, value: arg)
+            for earlier in self.loads {
+                if earlier.address == base and earlier.offset == offset and earlier.ty == ty {
+                    mut self.bind_merged(mut scope, value: result, copy: earlier.value)
+                    return
+                }
+            }
+        }
+        clif::InstructionData.Store(opcode: clif::Opcode.Store, flags: _, x: x, p: p, offset: offset) => {
+            let address = self.held(scope, func, value: p)
+            if address != NOWHERE {
+                let stored = mut self.value(scope, func, value: x)
+                if not self.lost {
+                    let ty = func.value_type(x)
+                    mut self.def_part(self.part(address, offset, ty), value: stored, ty)
+                }
+                return
+            }
+        }
+        clif::InstructionData.Call(opcode: _, func_ref: _, args: args) => {
+            if leaves.removes(func, inst) and is_unread(func, reads: scope.reads.view(), inst, alloc: self.alloc) {
+                return
+            }
+            match leaves.taken(func, inst) {
+                Some(body) => {
+                    mut self.take_in_place(func, mut scope, call: inst, args: args.view(), body, leaves)
+                    return
+                }
+                None => {
+                    if leaves.copies(func, inst) and args.len() == 3 and self.held(scope, func, value: args[0]) != NOWHERE {
+                        return
+                    }
+                }
+            }
+        }
+        clif::InstructionData.Jump(opcode: _, destination: destination) => {
+            let passed = mut self.values(scope, func, values: destination.args.view())
+            if self.lost {
+                return
+            }
+            match self.plan.threads.get(Edge(block: self.current.index, arm: 0)) {
+                Some(onward) => mut self.thread_through(func, mut scope, through: destination.block, args: passed.view(), onward, leaves)
+                None => {
+                    let target = scope.block(destination.block)
+                    mut self.b.jump(target, args: passed.view())
+                    mut self.reached(target)
+                }
+            }
+            return
+        }
+        clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
+            let c = mut self.value(scope, func, value: arg)
+            let then_args = mut self.values(scope, func, values: then_call.args.view())
+            let else_args = mut self.values(scope, func, values: else_call.args.view())
+            if self.lost {
+                return
+            }
+            let then_onward = self.plan.threads.get(Edge(block: self.current.index, arm: 0))
+            let else_onward = self.plan.threads.get(Edge(block: self.current.index, arm: 1))
+            let taken = mut self.edge_target(func, scope, block: then_call.block, onward: then_onward)
+            let other = mut self.edge_target(func, scope, block: else_call.block, onward: else_onward)
+            let no_args = mem::List[clif::Value].empty(self.alloc)
+            let passed_then = if then_onward.is_some() {
+                no_args.view()
+            } else {
+                then_args.view()
+            }
+            let passed_else = if else_onward.is_some() {
+                no_args.view()
+            } else {
+                else_args.view()
+            }
+            mut self.b.brif(c, then: taken, then_args: passed_then, otherwise: other, otherwise_args: passed_else)
+            mut self.reached(taken)
+            if other != taken {
+                mut self.reached(other)
+            }
+            match then_onward {
+                Some(onward) => {
+                    mut self.b.switch_to_block(taken)
+                    mut self.thread_through(func, mut scope, through: then_call.block, args: then_args.view(), onward, leaves)
+                }
+                None => {}
+            }
+            match else_onward {
+                Some(onward) => {
+                    mut self.b.switch_to_block(other)
+                    mut self.thread_through(func, mut scope, through: else_call.block, args: else_args.view(), onward, leaves)
+                }
+                None => {}
+            }
+            return
+        }
+        clif::InstructionData.MultiAry(opcode: _, args: args) => {
+            let returned = mut self.values(scope, func, values: args.view())
+            if self.lost {
+                return
+            }
+            match scope.resume {
+                Some(resume) => {
+                    mut self.b.jump(resume, args: returned.view())
+                    mut self.reached(resume)
+                }
+                None => {
+                    if scope.in_place {
+                        scope.returned = returned
+                    } else {
+                        mut self.b.ret(returned.view())
+                    }
+                }
+            }
+            return
+        }
+        else => {}
+    }
+    var complete = true
+    each_operand(func.inst_data(inst), visit: fn[mut complete](value: clif::Value) {
+        if scope.copy(func, value) == NO_VALUE {
+            complete = false
+        }
+    })
+    if not complete {
+        self.lost = true
+        return
+    }
+    let copied = mut self.b.copy(scope.mapped(func, data: func.inst_data(inst), alloc: self.alloc), ctrl_typevar: func.ctrl_typevar(inst))
+    let results = func.inst_results(inst, alloc: self.alloc)
+    let copies = self.b.inst_results(copied, alloc: self.alloc)
+    expect results.len() == copies.len()
+    for index in 0..<results.len() {
+        mut self.bind_merged(mut scope, value: results[index], copy: copies[index])
+    }
+    match func.inst_data(inst) {
+        clif::InstructionData.Load(opcode: clif::Opcode.Load, flags: _, arg: arg, offset: offset) => {
+            expect copies.len() > 0
+            mut self.loads.push(Loaded(address: scope.copy(func, value: arg), offset: offset, ty: func.value_type(results[0]), value: copies[0]))
+        }
+        else => {
+            if writes_memory(func.inst_data(inst)) {
+                mut self.loads.truncate(0)
+            }
+        }
+    }
+} Copier.copy_inst
+
+/// Makes a value stand for a copy, and a value read outside the block a threaded edge goes
+/// through take the copy as its variable's value.
+fn Copier.bind_merged(mut self, mut scope: Scope, value: clif::Value, copy: clif::Value) {
+    mut scope.bind(value, copy)
+    if self.merged.len() == 0 {
+        return
+    }
+    match self.merged.get(value.index) {
+        Some(variable) => mut self.b.def_var(variable, val: copy)
+        None => {}
+    }
+} Copier.bind_merged
+
+/// Makes a value merging through a variable stand for the variable's value where the copy is.
+fn Copier.read_merged(mut self, mut scope: Scope, func: clif::Function, value: clif::Value) {
+    let resolved = func.resolve_aliases(value)
+    match self.merged.get(resolved.index) {
+        Some(variable) => {
+            let merged = mut self.b.use_var(variable)
+            mut scope.bind(resolved, copy: merged)
+        }
+        None => {}
+    }
+} Copier.read_merged
+
+/// The block of the copy an edge of a conditional branch goes to: a new block for a threaded
+/// edge, cold when the block it goes through is.
+fn Copier.edge_target(mut self, func: clif::Function, scope: Scope, block: clif::Block, onward: Option[u32]) -> clif::Block {
+    if onward.is_none() {
+        return scope.block(block)
+    }
+    let edge_block = mut self.new_block(predecessors: 1)
+    if func.is_cold(block) {
+        mut self.b.set_cold_block(edge_block)
+    }
+    return edge_block
+} Copier.edge_target
+
+/// Copies the instructions of the blocks a threaded edge goes through, the first's parameters
+/// taking `args`, then jumps to the target of the branch ending them that the edge goes on to.
+fn Copier.thread_through(mut self, func: clif::Function, mut scope: Scope, through: clif::Block, args: Slice[clif::Value], onward: u32, leaves: Leaves) {
+    let chain = self.plan.chain(func, start: through, alloc: self.alloc)
+    mut self.loads.truncate(0)
+    var passed = mem::List[clif::Value].empty(self.alloc)
+    for arg in args {
+        mut passed.push(arg)
+    }
+    for block in chain {
+        let params = func.block_params(block, alloc: self.alloc)
+        expect params.len() == passed.len()
+        for index in 0..<params.len() {
+            mut self.bind_merged(mut scope, value: params[index], copy: passed[index])
+        }
+        let insts = func.block_insts(block, alloc: self.alloc)
+        expect insts.len() > 0
+        for index in 0..<(insts.len() - 1) {
+            mut self.copy_inst(func, mut scope, inst: insts[index], leaves)
+            if self.lost {
+                return
+            }
+        }
+        let last = insts[insts.len() - 1]
+        mut self.b.set_srcloc(func.srcloc(last))
+        let call = match func.inst_data(last) {
+            clif::InstructionData.Jump(opcode: _, destination: destination) => destination
+            clif::InstructionData.Brif(opcode: _, arg: _, then: then_call, otherwise: else_call) => if onward == 0 {
+                then_call
+            } else {
+                else_call
+            }
+            else => {
+                expect false
+                return
+            }
+        }
+        for arg in call.args {
+            mut self.read_merged(mut scope, func, value: arg)
+        }
+        passed = mut self.values(scope, func, values: call.args.view())
+        if self.lost {
+            return
+        }
+        if block == chain[chain.len() - 1] {
+            let target = scope.block(call.block)
+            mut self.b.jump(target, args: passed.view())
+            mut self.reached(target)
+        }
+    }
+    mut self.loads.truncate(0)
+} Copier.thread_through
+
+/// A call taking a leaf's body in place: the body's instructions, its parameters standing for
+/// the arguments and its returned values for the call's results, through the parameters of a
+/// block its returns jump to when it has several blocks.
+fn Copier.take_in_place(mut self, func: clif::Function, mut scope: Scope, call: clif::Inst, args: Slice[clif::Value], body: clif::Function, leaves: Leaves) {
+    var bound = mem::List[Address].empty(self.alloc)
+    for arg in args {
+        mut bound.push(scope.known.address(func, value: arg))
+    }
+    var inner = mut self.scope_of(body, bound: bound.view(), in_place: true)
+    let Some(entry) = body.entry_block() else {
+        expect false
+        return
+    }
+    let params = body.block_params(entry, alloc: self.alloc)
+    expect params.len() == args.len()
+    for index in 0..<params.len() {
+        let at = usize.widen(func.resolve_aliases(args[index]).index)
+        expect at < scope.values.len()
+        mut inner.bind(params[index], copy: scope.values[at])
+    }
+    let results = func.inst_results(call, alloc: self.alloc)
+    let laid_out = body.layout_blocks(self.alloc)
+    if laid_out.len() > 1 {
+        let resume = mut self.new_block(predecessors: return_count(body, alloc: self.alloc))
+        for result in results {
+            discard mut self.b.append_block_param(resume, ty: func.value_type(result))
+        }
+        inner.resume = Some(resume)
+    }
+    for block in laid_out {
+        if block != entry {
+            mut self.b.switch_to_block(inner.block(block))
+        }
+        mut self.copy_block(body, scope: mut inner, block, leaves)
+        if self.lost {
+            return
+        }
+    }
+    var returned = inner.returned
+    match inner.resume {
+        Some(resume) => {
+            mut self.b.switch_to_block(resume)
+            mut self.loads.truncate(0)
+            returned = self.b.block_params(resume, alloc: self.alloc)
+        }
+        None => {}
+    }
+    expect returned.len() == results.len()
+    for index in 0..<results.len() {
+        mut scope.bind(results[index], copy: returned[index])
+    }
+} Copier.take_in_place
+
+/// An instruction's data with its operands, each with a copy, and its references named as the
+/// copy names them.
+fn Scope.mapped(self, func: clif::Function, data: clif::InstructionData, alloc: mem::Alloc) -> clif::InstructionData {
+    return match data {
+        clif::InstructionData.UnaryImm(opcode: opcode, imm: imm) => clif::InstructionData.UnaryImm(opcode: opcode, imm: imm)
+        clif::InstructionData.UnaryIeee32(opcode: opcode, bits: bits) => clif::InstructionData.UnaryIeee32(opcode: opcode, bits: bits)
+        clif::InstructionData.UnaryIeee64(opcode: opcode, bits: bits) => clif::InstructionData.UnaryIeee64(opcode: opcode, bits: bits)
+        clif::InstructionData.Unary(opcode: opcode, arg: arg) => clif::InstructionData.Unary(opcode: opcode, arg: self.copy(func, value: arg))
+        clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => clif::InstructionData.Binary(opcode: opcode, x: self.copy(func, value: x), y: self.copy(func, value: y))
+        clif::InstructionData.Ternary(opcode: opcode, x: x, y: y, z: z) => clif::InstructionData.Ternary(opcode: opcode, x: self.copy(func, value: x), y: self.copy(func, value: y), z: self.copy(func, value: z))
+        clif::InstructionData.IntCompare(opcode: opcode, cond: cond, x: x, y: y) => clif::InstructionData.IntCompare(opcode: opcode, cond: cond, x: self.copy(func, value: x), y: self.copy(func, value: y))
+        clif::InstructionData.FloatCompare(opcode: opcode, cond: cond, x: x, y: y) => clif::InstructionData.FloatCompare(opcode: opcode, cond: cond, x: self.copy(func, value: x), y: self.copy(func, value: y))
+        clif::InstructionData.Load(opcode: opcode, flags: flags, arg: arg, offset: offset) => clif::InstructionData.Load(opcode: opcode, flags: flags, arg: self.copy(func, value: arg), offset: offset)
+        clif::InstructionData.Store(opcode: opcode, flags: flags, x: x, p: p, offset: offset) => clif::InstructionData.Store(opcode: opcode, flags: flags, x: self.copy(func, value: x), p: self.copy(func, value: p), offset: offset)
+        clif::InstructionData.LoadNoOffset(opcode: opcode, flags: flags, arg: arg) => clif::InstructionData.LoadNoOffset(opcode: opcode, flags: flags, arg: self.copy(func, value: arg))
+        clif::InstructionData.StoreNoOffset(opcode: opcode, flags: flags, x: x, p: p) => clif::InstructionData.StoreNoOffset(opcode: opcode, flags: flags, x: self.copy(func, value: x), p: self.copy(func, value: p))
+        clif::InstructionData.AtomicRmw(opcode: opcode, flags: flags, op: op, p: p, x: x) => clif::InstructionData.AtomicRmw(opcode: opcode, flags: flags, op: op, p: self.copy(func, value: p), x: self.copy(func, value: x))
+        clif::InstructionData.AtomicCas(opcode: opcode, flags: flags, p: p, e: e, x: x) => clif::InstructionData.AtomicCas(opcode: opcode, flags: flags, p: self.copy(func, value: p), e: self.copy(func, value: e), x: self.copy(func, value: x))
+        clif::InstructionData.NullAry(opcode: opcode) => clif::InstructionData.NullAry(opcode: opcode)
+        clif::InstructionData.StackLoad(opcode: opcode, slot: slot, offset: offset) => clif::InstructionData.StackLoad(opcode: opcode, slot: slot, offset: offset)
+        clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: global_value) => clif::InstructionData.UnaryGlobalValue(opcode: opcode, global_value: self.global(global_value))
+        clif::InstructionData.FuncAddr(opcode: opcode, func_ref: func_ref) => clif::InstructionData.FuncAddr(opcode: opcode, func_ref: self.function(func_ref))
+        clif::InstructionData.Call(opcode: opcode, func_ref: func_ref, args: args) => clif::InstructionData.Call(opcode: opcode, func_ref: self.function(func_ref), args: self.copies(func, values: args.view(), alloc))
+        clif::InstructionData.CallIndirect(opcode: opcode, sig_ref: sig_ref, callee: callee, args: args) => clif::InstructionData.CallIndirect(opcode: opcode, sig_ref: self.signature(sig_ref), callee: self.copy(func, value: callee), args: self.copies(func, values: args.view(), alloc))
+        clif::InstructionData.MultiAry(opcode: opcode, args: args) => clif::InstructionData.MultiAry(opcode: opcode, args: self.copies(func, values: args.view(), alloc))
+        clif::InstructionData.Jump(opcode: opcode, destination: destination) => clif::InstructionData.Jump(opcode: opcode, destination: clif::BlockCall(block: destination.block, args: self.copies(func, values: destination.args.view(), alloc)))
+        clif::InstructionData.Brif(opcode: opcode, arg: arg, then: then_call, otherwise: else_call) => clif::InstructionData.Brif(opcode: opcode, arg: self.copy(func, value: arg), then: clif::BlockCall(block: then_call.block, args: self.copies(func, values: then_call.args.view(), alloc)), otherwise: clif::BlockCall(block: else_call.block, args: self.copies(func, values: else_call.args.view(), alloc)))
+        clif::InstructionData.Trap(opcode: opcode, code: code) => clif::InstructionData.Trap(opcode: opcode, code: code)
+    }
+} Scope.mapped
+
+fn Scope.global(self, global_value: clif::GlobalValue) -> clif::GlobalValue {
+    let at = usize.widen(global_value.index)
+    expect at < self.globals.len()
+    return self.globals[at]
+} Scope.global
+
+fn Scope.function(self, func_ref: clif::FuncRef) -> clif::FuncRef {
+    let at = usize.widen(func_ref.index)
+    expect at < self.funcs.len()
+    return self.funcs[at]
+} Scope.function
+
+fn Scope.signature(self, sig_ref: clif::SigRef) -> clif::SigRef {
+    let at = usize.widen(sig_ref.index)
+    expect at < self.sigs.len()
+    return self.sigs[at]
+} Scope.signature

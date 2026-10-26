@@ -1,19 +1,67 @@
 //! The grammar of language 1, built from `docs/spec/41-grammar.md`, and its LL(1) analysis.
 
-/// The grammar's tables: the choice each syntactic rule expands, each choice's alternatives and
-/// each alternative's elements, the code points the lexer rejects, and the LL(1) analysis.
+/// The grammar: the lexer's tables, and the parser's, built when a parse first needs them.
 pkg struct Grammar {
+    lexicon: mem::Shared[Lexicon]
+    /// The syntactic tables once built, under key 0.
+    syntactic: mem::OnceMap[u8, mem::Shared[Tables]]
+} Grammar
+
+/// The tables of the lexer: the code points it rejects and the spellings of tokens.
+struct Lexicon {
+    /// The ranges `REJECTED` matches, sorted.
+    rejected: mem::List[CodeRange]
+    /// The ranges `REJECTED_SPACE` matches, sorted.
+    rejected_space: mem::List[CodeRange]
+    /// The punctuation tokens by the first byte of their spelling, below 128, each byte's
+    /// longest first.
+    punctuation: mem::List[mem::List[PunctSpelling]]
+    /// The hard keywords and the context words by the first byte of their spelling, below 128.
+    keywords: mem::List[mem::List[Spelled[Keyword]]]
+    context_words: mem::List[mem::List[Spelled[ContextWord]]]
+} Lexicon
+
+/// The tables of the parser: the choice each syntactic rule expands, each choice's alternatives
+/// and each alternative's elements, and the LL(1) analysis, beside the lexer's.
+struct Tables {
+    lexicon: mem::Shared[Lexicon]
     /// The choice of each rule, by rule index.
     rule_choices: mem::List[usize]
     /// The alternatives of each choice, as sequence ids.
     choices: mem::List[mem::List[usize]]
     seqs: mem::List[SeqDef]
-    /// The ranges `REJECTED` matches, sorted.
-    rejected: mem::List[CodeRange]
-    /// The ranges `REJECTED_SPACE` matches, sorted.
-    rejected_space: mem::List[CodeRange]
     analysis: Analysis
-} Grammar
+    /// The alternatives each choice offers a lookahead, a row of `CHOOSING_ROW` little-endian
+    /// u16 entries by choice: for each terminal index the first alternative whose `ok` set holds
+    /// it, then the first whose `rejected` set holds it, then the first nullable alternative,
+    /// each as its sequence id plus one, 0 for none.
+    choosing: mem::Bytes
+} Tables
+
+/// A word and its spelling.
+struct Spelled[T] {
+    spelling: mem::Bytes
+    word: T
+} Spelled
+
+/// The word of a list by first byte of spelling that `text` spells, if any.
+fn word_of[T: Copy](by_byte: Slice[mem::List[Spelled[T]]], text: Slice[u8]) -> Option[T] {
+    if text.len() == 0 or usize.widen(text[0]) >= by_byte.len() {
+        return None
+    }
+    for spelled in by_byte[usize.widen(text[0])] {
+        if spelled.spelling.len() == text.len() and spelled.spelling.view() == text {
+            return Some(spelled.word)
+        }
+    }
+    return None
+} word_of
+
+/// A punctuation token and its spelling.
+struct PunctSpelling {
+    kind: TokenKind
+    spelling: mem::Bytes
+} PunctSpelling
 
 /// The code points from `low` to `high`, both included.
 struct CodeRange derives Copy, Eq, Ord {
@@ -30,6 +78,12 @@ struct SeqDef {
 struct ElemDef derives Copy, Eq {
     atom: Atom
     repeat: Repeat
+    /// The choice a rule or group atom expands.
+    choice: usize
+    /// What can start the atom.
+    starts: First
+    /// The terminals that start the atom, through a rejected alternative or not.
+    opens: TermSet
 } ElemDef
 
 enum Atom derives Copy, Eq {
@@ -68,7 +122,10 @@ const TERMS: usize = KEYWORDS + PUNCTS + CONTEXTS + CLASSES
 
 const WORDS: usize = (TERMS + 63) / 64
 
-fn Rule.choice(self, grammar: Grammar) -> usize {
+/// The entries of a choice's row of `Tables.choosing`.
+const CHOOSING_ROW: usize = 2 * TERMS + 1
+
+fn Rule.choice(self, grammar: Tables) -> usize {
     let index = self.index()
     expect index < grammar.rule_choices.len()
     return grammar.rule_choices[index]
@@ -155,9 +212,43 @@ fn TermSet.insert(mut self, term: Term) {
 } TermSet.insert
 
 fn TermSet.contains(self, term: Term) -> bool {
-    let index = term.index()
-    return (self.words[index / 64] & (1u64 << u32.truncate(index % 64))) != 0
+    return self.holds(TermBit.of(term.index()))
 } TermSet.contains
+
+/// Whether the set holds a terminal.
+fn TermSet.holds(self, bit: TermBit) -> bool {
+    if bit.word >= WORDS {
+        return false
+    }
+    return (self.words[bit.word] & bit.mask) != 0
+} TermSet.holds
+
+/// Sets `entry` at `offset` plus the index of each terminal of the set in `row`, where no entry is
+/// set yet.
+fn TermSet.mark_first(self, mut table: SliceMut[u8], offset: usize, entry: u16) {
+    for word in 0..<WORDS {
+        var bits = self.words[word]
+        while bits != 0 {
+            let at = 2 * (offset + word * 64 + usize.widen(bits.trailing_zeros()))
+            if at < table.len() and table.len() - at >= 2 and table.u16_le(at) == 0 {
+                mut table.write_u16_le(at, value: entry)
+            }
+            bits = bits & (bits - 1)
+        }
+    }
+} TermSet.mark_first
+
+/// Where a set holds the terminal of an index: its word and its bit there.
+struct TermBit derives Copy {
+    /// The terminal's index.
+    index: usize
+    word: usize
+    mask: u64
+} TermBit
+
+fn TermBit.of(index: usize) -> TermBit {
+    return TermBit(index: index, word: index / 64, mask: 1u64 << u32.truncate(index % 64))
+} TermBit.of
 
 fn TermSet.union(mut self, other: TermSet) {
     for index in 0..<WORDS {
@@ -201,7 +292,7 @@ struct Analysis {
 
 fn Analysis.empty(alloc: mem::Alloc) -> Analysis = Analysis(choices: mem::List[First].empty(alloc), seqs: mem::List[First].empty(alloc))
 
-fn Analysis.compute(grammar: Grammar, alloc: mem::Alloc) -> Analysis {
+fn Analysis.compute(grammar: Tables, alloc: mem::Alloc) -> Analysis {
     var analysis = Analysis.empty(alloc)
     for _ in 0..<grammar.choices.len() {
         mut analysis.choices.push(First.default())
@@ -211,28 +302,26 @@ fn Analysis.compute(grammar: Grammar, alloc: mem::Alloc) -> Analysis {
     }
     loop {
         var changed = false
-        for id in 0..<grammar.seqs.len() {
-            invariant analysis.seqs.len() == grammar.seqs.len()
-            let seq = grammar.seqs[id]
-            var reached = analysis.elems(seq.elems, grammar)
-            if seq.rejection.is_some() {
-                mut reached.rejected.union(reached.ok)
-                reached.ok = TermSet.default()
-            }
-            changed = changed or analysis.seqs[id] != reached
-            analysis.seqs[id] = reached
-        }
-        for id in 0..<grammar.choices.len() {
-            invariant analysis.choices.len() == grammar.choices.len()
-            var reached = First.default()
+        for back in 0..<grammar.choices.len() {
+            invariant analysis.choices.len() == grammar.choices.len() and analysis.seqs.len() == grammar.seqs.len()
+            let id = grammar.choices.len() - 1 - back
+            var reached_choice = First.default()
             for alt in grammar.choices[id] {
-                let alternative = analysis.seq(alt)
-                mut reached.ok.union(alternative.ok)
-                mut reached.rejected.union(alternative.rejected)
-                reached.nullable = reached.nullable or alternative.nullable
+                expect alt < analysis.seqs.len()
+                let seq = grammar.seqs[alt]
+                var reached = analysis.elems(seq.elems, grammar)
+                if seq.rejection.is_some() {
+                    mut reached.rejected.union(reached.ok)
+                    reached.ok = TermSet.default()
+                }
+                changed = changed or analysis.seqs[alt] != reached
+                analysis.seqs[alt] = reached
+                mut reached_choice.ok.union(reached.ok)
+                mut reached_choice.rejected.union(reached.rejected)
+                reached_choice.nullable = reached_choice.nullable or reached.nullable
             }
-            changed = changed or analysis.choices[id] != reached
-            analysis.choices[id] = reached
+            changed = changed or analysis.choices[id] != reached_choice
+            analysis.choices[id] = reached_choice
         }
         if not changed {
             return analysis
@@ -250,7 +339,7 @@ fn Analysis.seq(self, seq: usize) -> First {
     return self.seqs[seq]
 } Analysis.seq
 
-fn Analysis.atom(self, atom: Atom, grammar: Grammar) -> First {
+fn Analysis.atom(self, atom: Atom, grammar: Tables) -> First {
     return match atom {
         Atom.Term(term) => First(ok: TermSet.single(term), rejected: TermSet.default(), nullable: false)
         Atom.Rule(rule) => self.choice(rule.choice(grammar))
@@ -259,7 +348,7 @@ fn Analysis.atom(self, atom: Atom, grammar: Grammar) -> First {
 } Analysis.atom
 
 /// What can start a run of elements, through every element that may derive no token.
-fn Analysis.elems(self, elems: mem::List[ElemDef], grammar: Grammar) -> First {
+fn Analysis.elems(self, elems: mem::List[ElemDef], grammar: Tables) -> First {
     var reached = First(ok: TermSet.default(), rejected: TermSet.default(), nullable: true)
     for elem in elems {
         let atom = self.atom(elem.atom, grammar)
@@ -277,9 +366,11 @@ fn Analysis.elems(self, elems: mem::List[ElemDef], grammar: Grammar) -> First {
     return reached
 } Analysis.elems
 
-test choices_are_ll1_under_the_published_resolutions for Grammar.load {
+test choices_are_ll1_under_the_published_resolutions for Tables.load {
     let alloc = testing::world().alloc
-    let grammar = Grammar.load(alloc)
+    let loaded = Grammar.load(alloc)
+    let tables = loaded.tables(alloc)
+    let grammar = tables.contents()
     for alts in grammar.choices {
         for left in 0..<alts.len() {
             for right in (left + 1)..<alts.len() {
@@ -296,9 +387,8 @@ test choices_are_ll1_under_the_published_resolutions for Grammar.load {
     }
 } choices_are_ll1_under_the_published_resolutions
 
-test rejected_code_points_leave_printable_ascii_alone for Grammar.load {
-    let grammar = Grammar.load(testing::world().alloc)
-    for range in grammar.rejected {
+test rejected_code_points_leave_printable_ascii_alone for Lexicon.load {
+    for range in Lexicon.load(testing::world().alloc).rejected {
         expect range.high < 0x20 or range.low >= 0x7F
     }
 } rejected_code_points_leave_printable_ascii_alone

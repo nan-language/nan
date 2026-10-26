@@ -7,6 +7,15 @@ enum FlagTest derives Copy, Eq {
     Either(left: x64::Cond, right: x64::Cond)
 } FlagTest
 
+/// The flag test holding exactly when this one does not.
+fn FlagTest.inverse(self) -> FlagTest {
+    return match self {
+        FlagTest.One(cond) => FlagTest.One(cond.invert())
+        FlagTest.Both(left: left, right: right) => FlagTest.Either(left: left.invert(), right: right.invert())
+        FlagTest.Either(left: left, right: right) => FlagTest.Both(left: left.invert(), right: right.invert())
+    }
+} FlagTest.inverse
+
 fn int_cond(cond: clif::IntCC) -> x64::Cond {
     return match cond {
         clif::IntCC.Equal => x64::Cond.Equal
@@ -161,25 +170,100 @@ fn Selector.combine(mut self, dst: x64::Reg, left: x64::Cond, right: x64::Cond, 
     mut self.emit(x64::Inst.Alu(op: op, size: x64::Size.Dword, dst: dst, src: other))
 } Selector.combine
 
-/// The flags deciding a branch or a select on `c`: those of the comparison defining it when
-/// nothing else reads it, else those of testing it against zero.
+/// The flags deciding a branch or a select on `c`: those of the comparison deciding the flag
+/// `c` is or tests against zero, made again for each reader, else those of testing `c` against
+/// zero.
 fn Selector.condition(mut self, func: clif::Function, c: clif::Value) -> FlagTest {
-    let resolved = func.resolve_aliases(c)
-    let at = usize.widen(resolved.index)
-    expect at < self.defs.len() and at < self.use_counts.len()
-    let def = self.defs[at]
-    if def != NONE and self.use_counts[at] == 1 {
-        match func.inst_data(clif::Inst(index: def)) {
-            clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => return mut self.int_compare(func, cond, x, y)
-            clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => return mut self.float_compare(func, cond, x, y)
-            else => {}
+    let Some(decided) = self.decider(func, value: c) else {
+        let reg = mut self.src(c, func)
+        let size = exact_size(func.value_type(c))
+        mut self.emit(x64::Inst.Test(size: size, lhs: reg, rhs: reg))
+        return FlagTest.One(x64::Cond.NotEqual)
+    }
+    var outcome = FlagTest.One(x64::Cond.NotEqual)
+    match func.inst_data(decided.compare) {
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            outcome = mut self.int_compare(func, cond, x, y)
+        }
+        clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            outcome = mut self.float_compare(func, cond, x, y)
+        }
+        else => {
+            expect false
         }
     }
-    let reg = mut self.src(c, func)
-    let size = exact_size(func.value_type(c))
-    mut self.emit(x64::Inst.Test(size: size, lhs: reg, rhs: reg))
-    return FlagTest.One(x64::Cond.NotEqual)
+    if decided.inverted {
+        return outcome.inverse()
+    }
+    return outcome
 } Selector.condition
+
+/// A comparison deciding whether a value is not zero, holding exactly then or, when
+/// `inverted`, exactly otherwise.
+struct Decider derives Copy, Eq {
+    compare: clif::Inst
+    inverted: bool
+} Decider
+
+/// The comparison deciding whether a value is not zero: the one defining it, the one deciding a
+/// value it extends or tests against zero, or the one deciding the condition of a select of 1 and
+/// 0 defining it.
+fn Selector.decider(self, func: clif::Function, value: clif::Value) -> Option[Decider] {
+    var current = value
+    var inverted = false
+    loop {
+        let at = usize.widen(func.resolve_aliases(current).index)
+        expect at < self.defs.len()
+        let def = self.defs[at]
+        if def == NONE {
+            return None
+        }
+        let inst = clif::Inst(index: def)
+        match func.inst_data(inst) {
+            clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+                if (cond == clif::IntCC.Equal or cond == clif::IntCC.NotEqual) and self.constant(y, func) == Some(0) and self.constant(x, func).is_none() and self.is_flag(func, value: x) {
+                    current = x
+                    inverted = inverted != (cond == clif::IntCC.Equal)
+                    continue
+                }
+                return Some(Decider(compare: inst, inverted: inverted))
+            }
+            clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => return Some(Decider(compare: inst, inverted: inverted))
+            clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => {
+                current = arg
+            }
+            clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: c, y: chosen, z: other) => {
+                let picked = self.constant(chosen, func)
+                let left = self.constant(other, func)
+                if picked == Some(1) and left == Some(0) {
+                    current = c
+                } else if picked == Some(0) and left == Some(1) {
+                    current = c
+                    inverted = not inverted
+                } else {
+                    return None
+                }
+            }
+            else => return None
+        }
+    }
+} Selector.decider
+
+/// Whether a value is a comparison's flag or one extended or chosen from 1 and 0 by a select.
+fn Selector.is_flag(self, func: clif::Function, value: clif::Value) -> bool {
+    let at = usize.widen(func.resolve_aliases(value).index)
+    expect at < self.defs.len()
+    let def = self.defs[at]
+    if def == NONE {
+        return false
+    }
+    return match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.IntCompare(opcode: _, cond: _, x: _, y: _) or clif::InstructionData.FloatCompare(opcode: _, cond: _, x: _, y: _) => true
+        clif::InstructionData.Unary(opcode: clif::Opcode.Uextend, arg: arg) => self.is_flag(func, value: arg)
+        clif::InstructionData.Ternary(opcode: clif::Opcode.Select, x: _, y: chosen, z: other) => (self.constant(chosen, func) == Some(1) and self.constant(other, func) == Some(0)) or (self.constant(chosen, func) == Some(0) and self.constant(other, func) == Some(1))
+        else => false
+    }
+} Selector.is_flag
 
 /// The one condition a flag test reads, combining a test of two into a flag tested again.
 fn Selector.single(mut self, outcome: FlagTest) -> x64::Cond {
@@ -192,8 +276,43 @@ fn Selector.single(mut self, outcome: FlagTest) -> x64::Cond {
     return cond
 } Selector.single
 
+/// A select: the condition's flag, or its inverse, when it chooses between 1 and 0, else a
+/// conditional move.
 fn Selector.select_value(mut self, func: clif::Function, inst: clif::Inst, c: clif::Value, x: clif::Value, y: clif::Value) {
     let outcome = mut self.condition(func, c)
+    let ty = func.value_type(x)
+    let Some(flag_test) = flag_choice(outcome, chosen: self.constant(x, func), other: self.constant(y, func)) else {
+        mut self.select_move(func, inst, outcome, x, y)
+        return
+    }
+    if ty.is_int() and ty.bits() <= 64 {
+        let flag = mut self.dst_of(func, inst)
+        mut self.write_flag(flag, outcome: flag_test)
+        if ty.bits() > 8 {
+            mut self.emit(x64::Inst.Extend(kind: x64::ExtendKind.Zx8, dst: flag, src: flag))
+        }
+        return
+    }
+    mut self.select_move(func, inst, outcome, x, y)
+} Selector.select_value
+
+/// The flag test a select writes as its result when it chooses 1 over 0, or 0 over 1 on one
+/// condition.
+fn flag_choice(outcome: FlagTest, chosen: Option[u64], other: Option[u64]) -> Option[FlagTest] {
+    if chosen == Some(1) and other == Some(0) {
+        return Some(outcome)
+    }
+    if chosen == Some(0) and other == Some(1) {
+        match outcome {
+            FlagTest.One(cond) => return Some(FlagTest.One(cond.invert()))
+            else => return None
+        }
+    }
+    return None
+} flag_choice
+
+/// A select as a conditional move of the chosen value over the other.
+fn Selector.select_move(mut self, func: clif::Function, inst: clif::Inst, outcome: FlagTest, x: clif::Value, y: clif::Value) {
     let cond = mut self.single(outcome)
     let ty = func.value_type(x)
     let dst = mut self.dst_of(func, inst)
@@ -212,7 +331,7 @@ fn Selector.select_value(mut self, func: clif::Function, inst: clif::Inst, c: cl
         mut self.mov(dst_high, src: other_high)
         mut self.emit(x64::Inst.Cmov(cond: cond, size: x64::Size.Qword, dst: dst_high, src: chosen_high))
     }
-} Selector.select_value
+} Selector.select_move
 
 /// A conditional branch: a jump on the condition to the first target, or to the block passing
 /// its arguments, then a jump to the second.
@@ -243,5 +362,5 @@ fn Selector.target_of(self, edge: u32, block: clif::Block) -> u32 {
     if edge != NONE {
         return edge
     }
-    return self.position_of(block)
+    return self.position_of(self.destination(block))
 } Selector.target_of

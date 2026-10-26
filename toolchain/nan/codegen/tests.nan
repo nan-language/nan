@@ -11,13 +11,18 @@ fn int_signature(count: u32, alloc: mem::Alloc) -> clif::Signature {
 
 /// A builder of a function named `u0:0` of 64-bit integers, its entry block current.
 fn builder_of(params: u32, alloc: mem::Alloc) -> clif::Builder {
-    var b = clif::Builder.new(clif::Function.new(clif::ExternalName(namespace: 0, index: 0), signature: int_signature(params, alloc), alloc), alloc)
+    return named_builder(0, params, alloc)
+} builder_of
+
+/// A builder of a function named `u0:<index>` of 64-bit integers, its entry block current.
+fn named_builder(index: u32, params: u32, alloc: mem::Alloc) -> clif::Builder {
+    var b = clif::Builder.new(clif::Function.new(clif::ExternalName(namespace: 0, index: index), signature: int_signature(params, alloc), alloc), alloc)
     let entry = mut b.create_block()
     mut b.append_block_params_for_function_params(entry)
     mut b.switch_to_block(entry)
     mut b.seal_block(entry)
     return b
-} builder_of
+} named_builder
 
 fn params_of(b: clif::Builder, alloc: mem::Alloc) -> mem::List[clif::Value] {
     let Some(entry) = b.current_block() else {
@@ -52,7 +57,7 @@ test compiles_an_addition_without_moves for compile {
     expect params.len() == 2
     let sum = mut b.iadd(params[0], y: params[1])
     mut b.ret(one(sum, alloc).view())
-    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x8d\x04\x37\x5d\xc3"
     expect code.frame == 16
     expect code.relocs.len() == 0
@@ -89,9 +94,164 @@ test carries_loop_values_in_the_registers_of_their_parameters for compile {
     mut b.switch_to_block(exit)
     mut b.ret(one(total, alloc).view())
     mut b.seal_all_blocks()
-    let code = compile(take b.finalize(), isa: host_isa(), alloc)
-    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\x48\x39\xf8\x0f\x82\x08\x00\x00\x00\x48\x89\xc8\xe9\x0d\x00\x00\x00\x48\x8d\x0c\x01\x48\x8d\x40\x01\xe9\xe2\xff\xff\xff\x5d\xc3"
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x00\x00\x00\x00\xb9\x00\x00\x00\x00\x48\x39\xf8\x72\x05\x48\x89\xc8\xeb\x0a\x48\x8d\x0c\x01\x48\x8d\x40\x01\xeb\xec\x5d\xc3"
 } carries_loop_values_in_the_registers_of_their_parameters
+
+/// The parameter, after branches on it to blocks that only jump on to where the other edge
+/// goes, as a derived equality of a fieldless enum branches.
+test drops_branches_whose_edges_land_in_one_block for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    for k in 0i64..<3 {
+        let tag = mut b.iconst(clif::Type.Int64, imm: k)
+        let hit = mut b.icmp(clif::IntCC.Equal, x: params[0], y: tag)
+        let forward = mut b.create_block()
+        let next = mut b.create_block()
+        mut b.brif(hit, then: forward, then_args: no_values(alloc).view(), otherwise: next, otherwise_args: no_values(alloc).view())
+        mut b.switch_to_block(forward)
+        mut b.jump(next, args: no_values(alloc).view())
+        mut b.switch_to_block(next)
+    }
+    mut b.ret(one(params[0], alloc).view())
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x89\xf8\x5d\xc3"
+} drops_branches_whose_edges_land_in_one_block
+
+/// `u0:1(x, y) = x - y` and `u0:2(x, y)`, the larger of `x` and `y` through a branch, as leaves
+/// whose calls take their bodies in place.
+fn two_leaves(alloc: mem::Alloc) -> Leaves {
+    var held = Leaves.empty(alloc)
+    var sub_body = named_builder(1, params: 2, alloc)
+    let pair = params_of(sub_body, alloc)
+    expect pair.len() == 2
+    let less = mut sub_body.isub(pair[0], y: pair[1])
+    mut sub_body.ret(one(less, alloc).view())
+    mut held.offer(take sub_body.finalize(), alloc)
+    var max_body = named_builder(2, params: 2, alloc)
+    let both = params_of(max_body, alloc)
+    expect both.len() == 2
+    let keep = mut max_body.create_block()
+    let replace = mut max_body.create_block()
+    let below = mut max_body.icmp(clif::IntCC.UnsignedLessThan, x: both[0], y: both[1])
+    mut max_body.brif(below, then: replace, then_args: no_values(alloc).view(), otherwise: keep, otherwise_args: no_values(alloc).view())
+    mut max_body.switch_to_block(keep)
+    mut max_body.ret(one(both[0], alloc).view())
+    mut max_body.switch_to_block(replace)
+    mut max_body.ret(one(both[1], alloc).view())
+    mut max_body.seal_all_blocks()
+    mut held.offer(take max_body.finalize(), alloc)
+    return held
+} two_leaves
+
+/// `u0:2(u0:1(b, a), a)`: both calls take their callees' bodies in place.
+test takes_the_bodies_of_leaves_in_place_of_their_calls for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let sig_ref = mut b.import_signature(int_signature(2, alloc))
+    let subtract = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 1), signature: sig_ref, colocated: true))
+    let maximum = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 2), signature: sig_ref, colocated: true))
+    var reversed = one(params[1], alloc)
+    mut reversed.push(params[0])
+    let first_call = mut b.call(subtract, args: reversed.view())
+    var pair = one(call_result(b, call: first_call, alloc), alloc)
+    mut pair.push(params[0])
+    let second_call = mut b.call(maximum, args: pair.view())
+    mut b.ret(one(call_result(b, call: second_call, alloc), alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: two_leaves(alloc), alloc)
+    expect code.relocs.len() == 0
+    expect code.frame == 16
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x29\xfe\x48\x39\xfe\x72\x05\x48\x89\xf0\xeb\x03\x48\x89\xf8\x5d\xc3"
+} takes_the_bodies_of_leaves_in_place_of_their_calls
+
+/// A parameter stored into a stack slot through a leaf, `u0:3(p, x)` storing `x` 8 bytes past
+/// `p` and giving 0, then read back: the slot is held in a value once the leaf's body takes the
+/// call's place.
+test holds_slots_only_loads_and_stores_reach_in_values for compile {
+    let alloc = testing::world().alloc
+    let flags = clif::MemFlags.owned()
+    var held = Leaves.empty(alloc)
+    var store_body = named_builder(3, params: 2, alloc)
+    let pair = params_of(store_body, alloc)
+    expect pair.len() == 2
+    mut store_body.store(flags, x: pair[1], p: pair[0], offset: 8)
+    let zero = mut store_body.iconst(clif::Type.Int64, imm: 0)
+    mut store_body.ret(one(zero, alloc).view())
+    mut held.offer(take store_body.finalize(), alloc)
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let sig_ref = mut b.import_signature(int_signature(2, alloc))
+    let keep = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 3), signature: sig_ref, colocated: true))
+    let slot = mut b.create_sized_stack_slot(clif::StackSlotData(size: 16, align_shift: 3))
+    let place = mut b.stack_addr(clif::Type.Int64, slot, offset: 0)
+    var args = one(place, alloc)
+    mut args.push(params[0])
+    discard mut b.call(keep, args: args.view())
+    let back = mut b.load(clif::Type.Int64, flags, p: place, offset: 8)
+    mut b.ret(one(back, alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: held, alloc)
+    expect code.frame == 16
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x89\xf8\x5d\xc3"
+} holds_slots_only_loads_and_stores_reach_in_values
+
+/// `b` when `a < b`, else `a`, branching on whether the tag a select of 0 and 1 gives on that
+/// comparison is 0, as an `Option` returned through a slot is tested: one comparison decides.
+test branches_on_the_comparison_deciding_a_tested_flag for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(2, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 2
+    let below = mut b.icmp(clif::IntCC.UnsignedLessThan, x: params[0], y: params[1])
+    let empty_tag = mut b.iconst(clif::Type.Int8, imm: 0)
+    let full_tag = mut b.iconst(clif::Type.Int8, imm: 1)
+    let tag = mut b.select(below, x: empty_tag, y: full_tag)
+    let absent = mut b.icmp_imm_s(clif::IntCC.Equal, x: tag, y: 0)
+    let take_second = mut b.create_block()
+    let take_first = mut b.create_block()
+    mut b.brif(absent, then: take_second, then_args: no_values(alloc).view(), otherwise: take_first, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(take_second)
+    mut b.ret(one(params[1], alloc).view())
+    mut b.switch_to_block(take_first)
+    mut b.ret(one(params[0], alloc).view())
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x39\xf7\x73\x05\x48\x89\xf0\x5d\xc3\x48\x89\xf8\x5d\xc3"
+} branches_on_the_comparison_deciding_a_tested_flag
+
+/// `10k` for a parameter `k` below 8, else 99, through a chain of tests of the parameter: a jump
+/// through a table of the returning blocks.
+test jumps_through_a_table_for_a_chain_of_tests_of_one_value for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    var returning = mem::List[clif::Block].empty(alloc)
+    for k in 0i64..<8 {
+        let key = mut b.iconst(clif::Type.Int64, imm: k)
+        let hit = mut b.icmp(clif::IntCC.Equal, x: params[0], y: key)
+        let found = mut b.create_block()
+        let next = mut b.create_block()
+        mut b.brif(hit, then: found, then_args: no_values(alloc).view(), otherwise: next, otherwise_args: no_values(alloc).view())
+        mut returning.push(found)
+        mut b.switch_to_block(next)
+    }
+    let missing = mut b.iconst(clif::Type.Int64, imm: 99)
+    mut b.ret(one(missing, alloc).view())
+    for k in 0..<returning.len() {
+        mut b.switch_to_block(returning[k])
+        let result = mut b.iconst(clif::Type.Int64, imm: 10 * i64.fit(k))
+        mut b.ret(one(result, alloc).view())
+    }
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x83\xff\x07\x77\x10\x48\x8d\x05\x4b\x00\x00\x00\x48\x63\x0c\xb8\x48\x01\xc8\xff\xe0\xb8\x63\x00\x00\x00\x5d\xc3\xb8\x00\x00\x00\x00\x5d\xc3\xb8\x0a\x00\x00\x00\x5d\xc3\xb8\x14\x00\x00\x00\x5d\xc3\xb8\x1e\x00\x00\x00\x5d\xc3\xb8\x28\x00\x00\x00\x5d\xc3\xb8\x32\x00\x00\x00\x5d\xc3\xb8\x3c\x00\x00\x00\x5d\xc3\xb8\x46\x00\x00\x00\x5d\xc3\xcc\xcc\xcc\xc5\xff\xff\xff\xcc\xff\xff\xff\xd3\xff\xff\xff\xda\xff\xff\xff\xe1\xff\xff\xff\xe8\xff\xff\xff\xef\xff\xff\xff\xf6\xff\xff\xff"
+} jumps_through_a_table_for_a_chain_of_tests_of_one_value
 
 /// `3x + 5f(x) + f(f(x) + x)` through a function pointer, `x`, `f` and `f(x)` live across calls.
 test keeps_values_across_calls_in_callee_saved_registers for compile {
@@ -110,7 +270,7 @@ test keeps_values_across_calls_in_callee_saved_registers for compile {
     let partial = mut b.iadd(x3, y: y5)
     let total = mut b.iadd(partial, y: twice)
     mut b.ret(one(total, alloc).view())
-    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     expect code.bytes.view() == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x48\x83\xec\x08\x48\x89\xfb\x49\x89\xf4\x4c\x89\xe7\xff\xd3\x49\x89\xc5\x4b\x8d\x7c\x25\x00\xff\xd3\x49\x6b\xcc\x03\x49\x6b\xd5\x05\x48\x8d\x0c\x11\x48\x8d\x04\x01\x48\x83\xc4\x08\x41\x5d\x41\x5c\x5b\x5d\xc3"
     expect code.frame == 48
 } keeps_values_across_calls_in_callee_saved_registers
@@ -134,7 +294,7 @@ test spills_what_the_registers_cannot_hold_into_the_frame for compile {
         sum = mut b.iadd(times, y: value)
     }
     mut b.ret(one(sum, alloc).view())
-    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     expect code.frame == 160
 } spills_what_the_registers_cannot_hold_into_the_frame
 
@@ -173,7 +333,7 @@ fn named(namespace: u32, index: u32) -> x64::Symbol = x64::Symbol.Name(clif::Ext
 
 test relocates_symbols_by_where_they_are_defined_and_locates_calls for compile {
     let alloc = testing::world().alloc
-    let code = compile(symbols(alloc), isa: host_isa(), alloc)
+    let code = compile(symbols(alloc), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     expect code.relocs.len() == 7
     expect code.relocs[0] == x64::Reloc(offset: 12, kind: x64::RelocKind.Relative4, target: named(0, index: 3), addend: -4)
     expect code.relocs[1] == x64::Reloc(offset: 20, kind: x64::RelocKind.CallPlt4, target: named(0, index: 4), addend: -4)
@@ -185,14 +345,14 @@ test relocates_symbols_by_where_they_are_defined_and_locates_calls for compile {
     expect code.locations.len() == 2
     expect code.locations[0] == Located(offset: 11, loc: clif::SourceLoc(bits: 7))
     expect code.locations[1] == Located(offset: 19, loc: clif::SourceLoc(bits: 9))
-    let fixed = compile(symbols(alloc), isa: machine_isa(), alloc)
+    let fixed = compile(symbols(alloc), isa: machine_isa(), leaves: Leaves.empty(alloc), alloc)
     expect fixed.relocs.len() == 7
     expect fixed.relocs[3] == x64::Reloc(offset: 36, kind: x64::RelocKind.Absolute8, target: named(1, index: 6), addend: 0)
     expect fixed.relocs[6] == x64::Reloc(offset: 62, kind: x64::RelocKind.Absolute8, target: named(0, index: 4), addend: 0)
 } relocates_symbols_by_where_they_are_defined_and_locates_calls
 
 /// A 20000-byte slot and an 8-byte one aligned to 64, the result mixing a word of the first with
-/// the second's address.
+/// both slots' addresses.
 fn large_frame(alloc: mem::Alloc) -> clif::Function {
     var b = builder_of(1, alloc)
     let params = params_of(b, alloc)
@@ -206,19 +366,20 @@ fn large_frame(alloc: mem::Alloc) -> clif::Function {
     let word = mut b.load(clif::Type.Int64, flags, p: start, offset: 19992)
     let place = mut b.stack_addr(clif::Type.Int64, slot: aligned, offset: 0)
     let mixed = mut b.bxor(word, y: place)
-    mut b.ret(one(mixed, alloc).view())
+    let both = mut b.bxor(mixed, y: start)
+    mut b.ret(one(both, alloc).view())
     return take b.finalize()
 } large_frame
 
 test probes_frames_reaching_the_guard_page_on_the_host_and_aligns_slots for compile {
     let alloc = testing::world().alloc
-    let probed = compile(large_frame(alloc), isa: host_isa(), alloc)
+    let probed = compile(large_frame(alloc), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     let Some(head) = probed.bytes.view().prefix(18) else {
         expect false
         return
     }
     expect head == b"\x55\x48\x89\xe5\x48\x81\xec\x00\x10\x00\x00\xc7\x04\x24\x00\x00\x00\x00"
-    let unprobed = compile(large_frame(alloc), isa: machine_isa(), alloc)
+    let unprobed = compile(large_frame(alloc), isa: machine_isa(), leaves: Leaves.empty(alloc), alloc)
     let Some(start) = unprobed.bytes.view().prefix(15) else {
         expect false
         return
@@ -244,7 +405,7 @@ test moves_floats_through_general_registers_without_sse for compile {
     let bits = mut b.bitcast(clif::Type.Int32, flags: clif::MemFlags.new(), x: single)
     let wide = mut b.uextend(clif::Type.Int64, x: bits)
     mut b.ret(one(wide, alloc).view())
-    let code = compile(take b.finalize(), isa: machine_isa(), alloc)
+    let code = compile(take b.finalize(), isa: machine_isa(), leaves: Leaves.empty(alloc), alloc)
     expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x8b\x07\x48\x85\xd2\x48\xb9\x00\x00\x00\x00\x00\x00\xf8\x3f\x48\x0f\x45\xc8\x48\x89\x0e\x8b\x47\x08\x89\xc0\x5d\xc3"
 } moves_floats_through_general_registers_without_sse
 
@@ -259,7 +420,7 @@ test saves_every_callee_saved_register_around_a_stack_switch for compile {
     let doubled = mut b.iadd(params[2], y: params[2])
     let total = mut b.iadd(received, y: doubled)
     mut b.ret(one(total, alloc).view())
-    let code = compile(take b.finalize(), isa: host_isa(), alloc)
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
     let Some(head) = code.bytes.view().prefix(17) else {
         expect false
         return
@@ -267,3 +428,137 @@ test saves_every_callee_saved_register_around_a_stack_switch for compile {
     expect head == b"\x55\x48\x89\xe5\x53\x41\x54\x41\x55\x41\x56\x41\x57\x48\x83\xec\x08"
     expect code.frame == 64
 } saves_every_callee_saved_register_around_a_stack_switch
+
+/// `9`, through a block testing whether its parameter is 0 that the entry reaches with 1: the
+/// edge goes straight to the block returning 9.
+test threads_an_edge_whose_argument_decides_the_branch for compile {
+    let alloc = testing::world().alloc
+    var b = builder_of(0, alloc)
+    let test_block = mut b.create_block()
+    let flag = mut b.append_block_param(test_block, ty: clif::Type.Int64)
+    let zero_block = mut b.create_block()
+    let other_block = mut b.create_block()
+    let one_value = mut b.iconst(clif::Type.Int64, imm: 1)
+    mut b.jump(test_block, args: one(one_value, alloc).view())
+    mut b.switch_to_block(test_block)
+    let empty = mut b.icmp_imm_s(clif::IntCC.Equal, x: flag, y: 0)
+    mut b.brif(empty, then: zero_block, then_args: no_values(alloc).view(), otherwise: other_block, otherwise_args: no_values(alloc).view())
+    mut b.switch_to_block(zero_block)
+    let seven = mut b.iconst(clif::Type.Int64, imm: 7)
+    mut b.ret(one(seven, alloc).view())
+    mut b.switch_to_block(other_block)
+    let nine = mut b.iconst(clif::Type.Int64, imm: 9)
+    mut b.ret(one(nine, alloc).view())
+    mut b.seal_all_blocks()
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: Leaves.empty(alloc), alloc)
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\xb8\x09\x00\x00\x00\x5d\xc3"
+} threads_an_edge_whose_argument_decides_the_branch
+
+/// The parameter, after a copy by `u0:1`, noted as copying, into a slot nothing else reaches;
+/// the copy stays when a load reads the slot.
+test leaves_out_copies_into_slots_nothing_reads for compile {
+    let alloc = testing::world().alloc
+    var noted = Leaves.empty(alloc)
+    mut noted.note_copier(1)
+    let unread = compile(copy_into_slot(read: false, alloc), isa: host_isa(), leaves: noted, alloc)
+    expect unread.relocs.len() == 0 and unread.frame == 16
+    expect unread.bytes.view() == b"\x55\x48\x89\xe5\x48\x89\xf8\x5d\xc3"
+    let read = compile(copy_into_slot(read: true, alloc), isa: host_isa(), leaves: noted, alloc)
+    expect read.relocs.len() == 1
+} leaves_out_copies_into_slots_nothing_reads
+
+/// A function copying 16 bytes from its parameter into a slot by calling `u0:1`, returning the
+/// slot's first word when `read`, else the parameter.
+fn copy_into_slot(read: bool, alloc: mem::Alloc) -> clif::Function {
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let sig_ref = mut b.import_signature(int_signature(3, alloc))
+    let copier = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 1), signature: sig_ref, colocated: true))
+    let slot = mut b.create_sized_stack_slot(clif::StackSlotData(size: 16, align_shift: 3))
+    let place = mut b.stack_addr(clif::Type.Int64, slot, offset: 0)
+    let length = mut b.iconst(clif::Type.Int64, imm: 16)
+    var args = one(place, alloc)
+    mut args.push(params[0])
+    mut args.push(length)
+    discard mut b.call(copier, args: args.view())
+    var returned = params[0]
+    if read {
+        returned = mut b.load(clif::Type.Int64, flags: clif::MemFlags.owned(), p: place, offset: 0)
+    }
+    mut b.ret(one(returned, alloc).view())
+    return take b.finalize()
+} copy_into_slot
+
+/// The parameter, after a call of `u0:1` whose result nothing reads, `u0:1` being noted as a
+/// function whose calls can be left out.
+test leaves_out_unread_calls_of_functions_noted_removable for compile {
+    let alloc = testing::world().alloc
+    var noted = Leaves.empty(alloc)
+    mut noted.note_removable(1)
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let sig_ref = mut b.import_signature(int_signature(1, alloc))
+    let callee = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 1), signature: sig_ref, colocated: true))
+    discard mut b.call(callee, args: one(params[0], alloc).view())
+    mut b.ret(one(params[0], alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: noted, alloc)
+    expect code.relocs.len() == 0
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x89\xf8\x5d\xc3"
+} leaves_out_unread_calls_of_functions_noted_removable
+
+/// The parameter, after a copy of it into a slot and an unread call of a leaf `u0:2` reading
+/// the slot, `u0:2` being noted removable: the call is left out, not taken in place, and so is
+/// the copy nothing else reads.
+test leaves_out_unread_calls_of_removable_leaves for compile {
+    let alloc = testing::world().alloc
+    var noted = Leaves.empty(alloc)
+    mut noted.note_copier(1)
+    mut noted.note_removable(2)
+    var read_body = named_builder(2, params: 1, alloc)
+    let read_params = params_of(read_body, alloc)
+    expect read_params.len() == 1
+    let word = mut read_body.load(clif::Type.Int64, flags: clif::MemFlags.owned(), p: read_params[0], offset: 8)
+    mut read_body.ret(one(word, alloc).view())
+    mut noted.offer(take read_body.finalize(), alloc)
+    var b = builder_of(1, alloc)
+    let params = params_of(b, alloc)
+    expect params.len() == 1
+    let copy_sig = mut b.import_signature(int_signature(3, alloc))
+    let copier = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 1), signature: copy_sig, colocated: true))
+    let read_sig = mut b.import_signature(int_signature(1, alloc))
+    let reader = mut b.import_function(clif::ExtFuncData(name: clif::ExternalName(namespace: 0, index: 2), signature: read_sig, colocated: true))
+    let slot = mut b.create_sized_stack_slot(clif::StackSlotData(size: 16, align_shift: 3))
+    let place = mut b.stack_addr(clif::Type.Int64, slot, offset: 0)
+    let length = mut b.iconst(clif::Type.Int64, imm: 16)
+    var args = one(place, alloc)
+    mut args.push(params[0])
+    mut args.push(length)
+    discard mut b.call(copier, args: args.view())
+    discard mut b.call(reader, args: one(place, alloc).view())
+    mut b.ret(one(params[0], alloc).view())
+    let code = compile(take b.finalize(), isa: host_isa(), leaves: noted, alloc)
+    expect code.relocs.len() == 0
+    expect code.bytes.view() == b"\x55\x48\x89\xe5\x48\x89\xf8\x5d\xc3"
+} leaves_out_unread_calls_of_removable_leaves
+
+/// A function looping on itself is not noted removable, and one computing a value is.
+test notes_as_removable_only_functions_that_end_and_hide_their_effects for is_left_out_callee {
+    let alloc = testing::world().alloc
+    var looping = builder_of(1, alloc)
+    let spin = mut looping.create_block()
+    mut looping.jump(spin, args: no_values(alloc).view())
+    mut looping.switch_to_block(spin)
+    mut looping.jump(spin, args: no_values(alloc).view())
+    mut looping.seal_all_blocks()
+    let loops = is_left_out_callee(take looping.finalize(), leaves: Leaves.empty(alloc), alloc)
+    expect not loops
+    var adding = builder_of(2, alloc)
+    let pair = params_of(adding, alloc)
+    expect pair.len() == 2
+    let sum = mut adding.iadd(pair[0], y: pair[1])
+    mut adding.ret(one(sum, alloc).view())
+    let adds = is_left_out_callee(take adding.finalize(), leaves: Leaves.empty(alloc), alloc)
+    expect adds
+} notes_as_removable_only_functions_that_end_and_hide_their_effects

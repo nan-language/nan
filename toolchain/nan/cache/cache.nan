@@ -1,4 +1,4 @@
-//! The user directory and its build cache, whose files hold their contents, then their digest.
+//! The user directory and its build cache, whose files hold their contents, then their checksum.
 
 /// The home directory a process uses in place of the one the user database gives, and the
 /// directory of its local store in place of the user directory's `store`, as a harness gives
@@ -131,7 +131,7 @@ pkg fn Cache.store(self) -> StoreDir {
     return StoreDir(dir: copied(self.store_path, alloc: self.alloc), home: text::String.of(self.home.as_str(), alloc: self.alloc), uid: self.uid, alloc: self.alloc)
 } Cache.store
 
-/// The contents of a cache entry, none when it is missing or its digest does not match.
+/// The contents of a cache entry, none when it is missing or its checksum does not match.
 pkg fn Cache.entry(self, key: hashing::HashValue) -> Result[Option[mem::Bytes], Exposed] fails platform::IoError {
     let name = entry_name(key, alloc: self.alloc)
     return try self.record(name.as_str())
@@ -149,6 +149,38 @@ pkg fn Cache.put(self, key: hashing::HashValue, contents: Slice[u8]) fails platf
     try self.replace(name.as_str(), contents)
 } Cache.put
 
+/// Whether the cache holds an entry under a key.
+pkg fn Cache.holds(self, key: hashing::HashValue) -> bool {
+    let Some(dir) = self.dir else {
+        return false
+    }
+    return platform::exists(platform::join(dir.as_str(), name: entry_name(key, alloc: self.alloc).as_str(), alloc: self.alloc).as_str())
+} Cache.holds
+
+/// Another handle of the cache.
+pkg fn Cache.copied(self, alloc: mem::Alloc) -> Cache {
+    return Cache(dir: copied_text(self.dir, alloc), store_path: copied_text(self.store_path, alloc), home: text::String.of(self.home.as_str(), alloc), uid: self.uid, alloc: alloc)
+} Cache.copied
+
+fn copied_text(held: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(written) = held else {
+        return None
+    }
+    return Some(text::String.of(written.as_str(), alloc))
+} copied_text
+
+/// Deletes the cache entry under a key, if there.
+pkg fn Cache.remove(self, key: hashing::HashValue) fails platform::IoError {
+    let Some(dir) = self.dir else {
+        return
+    }
+    let name = entry_name(key, alloc: self.alloc)
+    match first attempt platform::remove_file(platform::join(dir.as_str(), name: name.as_str(), alloc: self.alloc).as_str()) {
+        Ok(_) or Err(platform::IoError.NotFound) => {}
+        Err(error) => fail error
+    }
+} Cache.remove
+
 /// The name of a cache entry's file: `entry-` and its key in full form.
 fn entry_name(key: hashing::HashValue, alloc: mem::Alloc) -> text::String {
     var name = text::String.of("entry-", alloc)
@@ -156,7 +188,7 @@ fn entry_name(key: hashing::HashValue, alloc: mem::Alloc) -> text::String {
     return name
 } entry_name
 
-/// The contents of a cache record, none when it is missing or its digest does not match.
+/// The contents of a cache record, none when it is missing or its checksum does not match.
 pkg fn Cache.record(self, name: Str) -> Result[Option[mem::Bytes], Exposed] fails platform::IoError {
     let Some(dir) = self.dir else {
         return Ok(None)
@@ -174,23 +206,78 @@ pkg fn Cache.record(self, name: Str) -> Result[Option[mem::Bytes], Exposed] fail
     return Ok(checked_contents(file.view(), alloc: self.alloc))
 } Cache.record
 
-/// The contents of a file holding contents followed by their digest, none when the digest does
-/// not match or the file is shorter than one.
+/// The contents of a file holding contents followed by their checksum, none when the checksum
+/// does not match or the file is shorter than one.
 fn checked_contents(file: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
-    if file.len() < 32 {
+    if file.len() < CHECKSUM_LEN {
         return None
     }
-    let Some(parts) = file.split_at(file.len() - 32) else {
+    let Some(parts) = file.split_at(file.len() - CHECKSUM_LEN) else {
         return None
     }
-    let digest = hashing::blake3(parts.head)
-    if digest.view() != parts.tail {
+    if checksum(parts.head).view() != parts.tail {
         return None
     }
     var contents = mem::Bytes.empty(alloc)
     mut contents.append(parts.head)
     return Some(take contents)
 } checked_contents
+
+const CHECKSUM_LEN: usize = 16
+
+/// The multipliers of the two lanes of `checksum`, odd constants of the golden ratio and of
+/// xxHash.
+const LANE_A: u64 = 0x9E37_79B9_7F4A_7C15
+
+const LANE_B: u64 = 0xC2B2_AE3D_27D4_EB4F
+
+/// The checksum of a cache file's contents, which tells a file cut short or altered from the
+/// one written: two lanes of 64 bits, folding in each little-endian word of eight bytes, the
+/// last one zero-padded, by an exclusive or or a sum, a multiplication and a rotation, then the
+/// length, each finished by the avalanche of MurmurHash3.
+fn checksum(data: Slice[u8]) -> Array[u8, 16] {
+    var a = LANE_A
+    var b = LANE_B
+    var at: usize = 0
+    while at <= data.len() and data.len() - at >= 8 {
+        let word = data.u64_le(at)
+        a = rotated((a ^ word).wrapping_mul(LANE_A), by: 31)
+        b = rotated(b.wrapping_add(word).wrapping_mul(LANE_B), by: 27)
+        at += 8
+    }
+    var last: u64 = 0
+    var shift: u32 = 0
+    while at < data.len() {
+        last = last | (u64.widen(data[at]) << shift)
+        shift += 8
+        at += 1
+    }
+    a = rotated((a ^ last).wrapping_mul(LANE_A), by: 31) ^ u64.widen(data.len())
+    b = rotated(b.wrapping_add(last).wrapping_mul(LANE_B), by: 27) ^ u64.widen(data.len())
+    var sum = Array[u8, 16].filled(0)
+    let low = avalanche(a ^ b)
+    let high = avalanche(b.wrapping_add(a))
+    for index in 0..<8usize {
+        sum[index] = u8.truncate(low >> u32.truncate(8 * index))
+        sum[8 + index] = u8.truncate(high >> u32.truncate(8 * index))
+    }
+    return sum
+} checksum
+
+fn rotated(value: u64, by: u32) -> u64
+    requires by > 0 and by < 64
+{
+    return (value << by) | (value >> (64 - by))
+} rotated
+
+/// The finalisation of MurmurHash3's 64-bit hash.
+fn avalanche(value: u64) -> u64 {
+    var mixed = value ^ (value >> 33)
+    mixed = mixed.wrapping_mul(0xFF51_AFD7_ED55_8CCD)
+    mixed = mixed ^ (mixed >> 33)
+    mixed = mixed.wrapping_mul(0xC4CE_B9FE_1A85_EC53)
+    return mixed ^ (mixed >> 33)
+} avalanche
 
 /// Replaces a cache record, writing it whole under a new name and renaming it into place.
 pkg fn Cache.replace(self, name: Str, contents: Slice[u8]) fails platform::IoError {
@@ -204,8 +291,7 @@ pkg fn Cache.replace(self, name: Str, contents: Slice[u8]) fails platform::IoErr
     let file = try platform::File.create(fresh.as_str(), mode: 0b110_000_000)
     defer take file.close()
     try file.write_all(contents)
-    let digest = hashing::blake3(contents)
-    try file.write_all(digest.view())
+    try file.write_all(checksum(contents).view())
     try platform::rename_path(fresh.as_str(), to: platform::join(dir.as_str(), name, alloc: self.alloc).as_str())
 } Cache.replace
 

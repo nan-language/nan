@@ -1,0 +1,116 @@
+//! The tests of the snapshots the build cache keeps of checks.
+
+const SHAPED_FILE: Str = "//! S.\n\nfn rise(x: u32) -> u32 {\n    return x + 1\n} rise\n\nfn rest() {\n    return\n} rest\n"
+
+fn shape_of(source: Str, grammar: syntax::Grammar, alloc: mem::Alloc) -> FileShape {
+    return file_shape(syntax::parse(text::String.of(source, alloc).into_bytes(), grammar, alloc), alloc)
+} shape_of
+
+test a_body_edit_changes_its_body_alone for file_shape {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let before = bodies_of(shape_of(SHAPED_FILE, grammar, alloc), alloc)
+    expect before.len() == 2
+    let original = shape_of(SHAPED_FILE, grammar, alloc)
+    let edited = shape_of("//! S.\n\nfn rise(x: u32) -> u32 {\n    return x + 2\n} rise\n\nfn rest() {\n    return\n} rest\n", grammar, alloc)
+    expect edited.skeleton == original.skeleton
+    let edited_bodies = bodies_of(edited, alloc)
+    expect edited_bodies[0].hash != before[0].hash and edited_bodies[1] == before[1]
+    let headed = shape_of("//! S.\n\nfn rise(x: u64) -> u32 {\n    return x + 1\n} rise\n\nfn rest() {\n    return\n} rest\n", grammar, alloc)
+    expect headed.skeleton != edited.skeleton
+    let shifted = shape_of("//! S.\n\nfn rise(x: u32) -> u32 {\n    let y = x\n    return y + 1\n} rise\n\nfn rest() {\n    return\n} rest\n", grammar, alloc)
+    expect shifted.skeleton == edited.skeleton
+    let shifted_bodies = bodies_of(shifted, alloc)
+    expect shifted_bodies[1].hash == before[1].hash and shifted_bodies[1].lines.start == before[1].lines.start + 1
+} a_body_edit_changes_its_body_alone
+
+/// The bodies of a shape, in order.
+fn bodies_of(shape: FileShape, alloc: mem::Alloc) -> mem::List[BodyAt] {
+    var bodies = mem::List[BodyAt].empty(alloc)
+    for body in shape.bodies {
+        match body {
+            Some(at) => mut bodies.push(at)
+            None => {}
+        }
+    }
+    return bodies
+} bodies_of
+
+/// The graph `written` writes: each node's targets, as digits, nodes separated by `|`.
+fn written_graph(written: Str, alloc: mem::Alloc) -> mem::List[mem::List[u32]] {
+    var edges = mem::List[mem::List[u32]].empty(alloc)
+    var targets = mem::List[u32].empty(alloc)
+    for byte in written.as_bytes() {
+        if byte == b'|' {
+            mut edges.push(take targets)
+            targets = mem::List[u32].empty(alloc)
+        } else if byte >= b'0' and byte <= b'9' {
+            mut targets.push(u32.widen(byte - b'0'))
+        }
+    }
+    mut edges.push(take targets)
+    return edges
+} written_graph
+
+test cycles_join_and_self_calls_count for components {
+    let alloc = testing::world().alloc
+    let edges = written_graph("1|23|1|3|", alloc)
+    let found = components(edges.view(), alloc)
+    expect found.least[1] == 1 and found.least[2] == 1 and found.cyclic[1] and found.cyclic[2]
+    expect found.least[0] == 0 and not found.cyclic[0]
+    expect found.least[3] == 3 and found.cyclic[3]
+    expect found.least[4] == 4 and not found.cyclic[4]
+} cycles_join_and_self_calls_count
+
+test readers_and_cycle_members_are_checked_again for rechecked {
+    let alloc = testing::world().alloc
+    var reads = mem::List[TracedRead].empty(alloc)
+    mut reads.push(TracedRead(reader: ty::ItemId(index: 0), read: ty::ItemId(index: 4)))
+    mut reads.push(TracedRead(reader: ty::ItemId(index: 5), read: ty::ItemId(index: 0)))
+    let snapshot = Snapshot(context: hashing::HashValue.of(b""), items: 6, files: mem::List[SnapshotFile].empty(alloc), seeds: mem::List[Seed].empty(alloc), reads: take reads, greens: mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc), outcomes: mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc))
+    let edges = written_graph("|2|1|1||", alloc)
+    let old = components(edges.view(), alloc)
+    var changed = mem::List[ty::ItemId].empty(alloc)
+    mut changed.push(ty::ItemId(index: 4))
+    mut changed.push(ty::ItemId(index: 2))
+    let marked = rechecked(snapshot, changed: changed.view(), old, alloc)
+    expect marked[4] and marked[0] and marked[5]
+    expect marked[2] and marked[1]
+    expect not marked[3]
+} readers_and_cycle_members_are_checked_again
+
+test diagnostics_read_back_whole for Cursor.diagnostic {
+    let alloc = testing::world().alloc
+    var reported = diagnostic::Diagnostic.at(diagnostic::Code.TypeMismatch, path: "a/a.nan", line: 3, alloc)
+    reported.item = Some(text::String.of("a::f", alloc))
+    reported.expected = Some(text::String.of("u32", alloc))
+    reported.span = Some(diagnostic::Span(start: 10, end: 14))
+    mut reported.because.push(diagnostic::Reason(role: diagnostic::Role.Called, subject: text::String.of("a::g", alloc), at: Some(diagnostic::At(path: text::String.of("a/b.nan", alloc), line: 9))))
+    var edits = mem::List[diagnostic::Edit].empty(alloc)
+    mut edits.push(diagnostic::Edit(path: text::String.of("a/a.nan", alloc), replacement: diagnostic::Replacement(start: 10, end: 14, text: text::String.of("u64", alloc))))
+    mut reported.fixes.push(diagnostic::Fix(edits: take edits))
+    reported.offer = diagnostic::Offer.Unique
+    var out = mem::Bytes.empty(alloc)
+    put_diagnostic(mut out, reported)
+    var cursor = Cursor(bytes: out.view(), at: 0, failed: false)
+    let read = mut cursor.diagnostic(alloc)
+    expect not cursor.failed and cursor.at == out.len()
+    expect same_diagnostic(read, earlier: reported, spanned: true)
+} diagnostics_read_back_whole
+
+test positions_move_past_changed_bodies_and_not_into_them for FileMoves.moved {
+    let alloc = testing::world().alloc
+    let grammar = syntax::Grammar.load(alloc)
+    let shifted = "//! S.\n\nfn rise(x: u32) -> u32 {\n    let y = x\n    return y + 1\n} rise\n\nfn rest() {\n    return\n} rest\n"
+    let Some(moves) = file_moves(path: "a.nan", old: shape_of(SHAPED_FILE, grammar, alloc), new: shape_of(shifted, grammar, alloc), alloc) else {
+        expect false
+        return
+    }
+    expect moves.moved(3, kind: Position.Line) == Some(3)
+    expect moves.moved(4, kind: Position.Line).is_none()
+    expect moves.moved(5, kind: Position.Line) == Some(6)
+    expect moves.moved(8, kind: Position.Line) == Some(9)
+    let other = file_moves(path: "a.nan", old: shape_of(SHAPED_FILE, grammar, alloc), new: shape_of("//! T.\n", grammar, alloc), alloc)
+    expect other.is_none()
+} positions_move_past_changed_bodies_and_not_into_them
+

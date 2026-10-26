@@ -39,43 +39,140 @@ pkg fn Forms.of(
     resolve: fn(segments: Slice[text::String]) -> Option[text::String],
     alloc: mem::Alloc,
     ) -> Forms {
+    let Some(reading) = ItemReading.of(file, item, alloc) else {
+        expect false
+        return Forms(normalised: text::String.empty(alloc), interface_form: None)
+    }
+    return Forms.read(file, item, take reading, known, resolve, alloc)
+} Forms.of
+
+/// The normalised and interface forms of a parsed item, from what reading it gave, as `Forms.of`
+/// gives them.
+pkg fn Forms.read(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    take reading: ItemReading,
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    alloc: mem::Alloc,
+    ) -> Forms {
     let Some(tree) = item.tree else {
         expect false
         return Forms(normalised: text::String.empty(alloc), interface_form: None)
     }
-    let normal = Normal(facts: Facts.collect(file, tree, alloc), bindings: Bindings.collect(file, tree, alloc))
-    let punned = Punning.collect(file, tree, bindings: normal.bindings, alloc)
-    var toks = flat_tokens(file, item, facts: normal.facts, punned: punned.labels, alloc)
-    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, alloc)
+    let normal = NormalTokens.read(file, tree, take reading, known, resolve, unseen: TokenMarks.none(alloc), alloc)
+    let normalised = text_of_lines(normal.normal.render(normal.toks.view(), alloc), alloc)
+    let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Form, alloc) else {
+        return Forms(normalised: take normalised, interface_form: None)
+    }
+    return Forms(normalised: take normalised, interface_form: Some(take normal.interface_form(reduction, known, alloc)))
+} Forms.read
+
+/// The interface form of a parsed item, from what reading it gave, as `Forms.read` gives it.
+pkg fn read_interface_form(
+    file: syntax::SourceFile,
+    item: syntax::ItemSyntax,
+    take reading: ItemReading,
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    alloc: mem::Alloc,
+    ) -> Option[text::String] {
+    let Some(tree) = item.tree else {
+        expect false
+        return None
+    }
+    let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Form, alloc) else {
+        return None
+    }
+    let normal = NormalTokens.read(file, tree, take reading, known, resolve, unseen: reduction.dropped, alloc)
+    return Some(take normal.interface_form(reduction, known, alloc))
+} read_interface_form
+
+/// An item's tokens in normal form, with the facts and bindings that order and number them.
+struct NormalTokens {
+    normal: Normal
+    toks: mem::List[Tok]
+} NormalTokens
+
+/// The tokens in normal form; the paths of `unseen` tokens, which the form read drops, stay
+/// unresolved.
+fn NormalTokens.read(
+    file: syntax::SourceFile,
+    tree: syntax::Tree,
+    take reading: ItemReading,
+    known: Known,
+    resolve: fn(segments: Slice[text::String]) -> Option[text::String],
+    unseen: TokenMarks,
+    alloc: mem::Alloc,
+    ) -> NormalTokens {
+    let ItemReading(facts: facts, bindings: bindings, punned: punned, toks: read) = reading
+    var toks = read
+    for tok in mut toks {
+        tok.newline = false
+    }
+    discard trailing_commas(mut toks, facts, flat: true, alloc)
+    let normal = Normal(facts: take facts, bindings: take bindings)
+    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, unseen, alloc)
     for run in normal.runs(file, tree, alloc) {
         normal.sort(mut toks, run, alloc)
     }
     normal.number(mut toks, renamed, alloc)
-    let normalised = text_of_lines(normal.render(toks.view(), alloc), alloc)
-    let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Form, alloc) else {
-        return Forms(normalised: take normalised, interface_form: None)
-    }
-    let reduced = reduction.apply(take toks, alloc)
-    var lines = normal.render(reduced.view(), alloc)
+    return NormalTokens(normal: take normal, toks: take toks)
+} NormalTokens.read
+
+/// The interface form the tokens give under the reduction of the form.
+fn NormalTokens.interface_form(take self, reduction: Reduction, known: Known, alloc: mem::Alloc) -> text::String {
+    let reduced = reduction.apply(take self.toks, alloc)
+    var lines = self.normal.render(reduced.view(), alloc)
     match known.facts {
-        Some(facts) => mut lines.push(text::String.of(facts.as_str(), alloc))
+        Some(facts_line) => mut lines.push(text::String.of(facts_line.as_str(), alloc))
         None => {
         }
     }
-    return Forms(normalised: take normalised, interface_form: Some(text_of_lines(lines, alloc)))
-} Forms.of
+    return text_of_lines(lines, alloc)
+} NormalTokens.interface_form
+
+/// What the forms and the interface text of a parsed item read from its syntax alone: its facts,
+/// bindings and punned labels, and its tokens in canonical order without comments.
+pkg struct ItemReading {
+    facts: Facts
+    bindings: Bindings
+    punned: Punning
+    toks: mem::List[Tok]
+} ItemReading
+
+pkg fn ItemReading.of(file: syntax::SourceFile, item: syntax::ItemSyntax, alloc: mem::Alloc) -> Option[ItemReading] {
+    let Some(tree) = item.tree else {
+        return None
+    }
+    let facts = Facts.collect(file, tree, alloc)
+    let bindings = Bindings.collect(file, tree, alloc)
+    let punned = Punning.collect(file, tree, bindings, alloc)
+    let toks = uncommented(item_tokens(file, item, facts, punned: punned.labels, alloc), alloc)
+    return Some(ItemReading(facts: take facts, bindings: take bindings, punned: take punned, toks: take toks))
+} ItemReading.of
 
 /// The interface text of a parsed item: the lines of its canonical format, without comments,
 /// that hold its interface form.
 pkg fn interface_text(file: syntax::SourceFile, item: syntax::ItemSyntax, known: Known, alloc: mem::Alloc) -> mem::List[text::String] {
+    let Some(reading) = ItemReading.of(file, item, alloc) else {
+        expect false
+        return mem::List[text::String].empty(alloc)
+    }
+    return read_interface_text(file, item, reading, known, alloc)
+} interface_text
+
+/// The interface text of a parsed item, from what reading it gave, as `interface_text` gives it.
+pkg fn read_interface_text(file: syntax::SourceFile, item: syntax::ItemSyntax, reading: ItemReading, known: Known, alloc: mem::Alloc) -> mem::List[text::String] {
     let Some(tree) = item.tree else {
         expect false
         return mem::List[text::String].empty(alloc)
     }
-    let facts = Facts.collect(file, tree, alloc)
-    let punned = Punning.collect(file, tree, bindings: Bindings.collect(file, tree, alloc), alloc)
-    var toks = uncommented(item_tokens(file, item, facts, punned: punned.labels, alloc), alloc)
-    let roles = trailing_commas(mut toks, facts, flat: false, alloc)
+    var toks = mem::List[Tok].empty(alloc)
+    for tok in reading.toks {
+        mut toks.push(tok.duplicate(alloc))
+    }
+    let roles = trailing_commas(mut toks, facts: reading.facts, flat: false, alloc)
     let Some(reduction) = Reduction.of(file, tree, known, reading: Reading.Text, alloc) else {
         expect false
         return mem::List[text::String].empty(alloc)
@@ -94,8 +191,8 @@ pkg fn interface_text(file: syntax::SourceFile, item: syntax::ItemSyntax, known:
     }
     let kept_roles = roles.kept(kept, alloc)
     let reduced = reduction.apply(take toks, alloc)
-    return facts.render_lines(reduced.view(), roles: kept_roles, alloc)
-} interface_text
+    return reading.facts.render_lines(reduced.view(), roles: kept_roles, alloc)
+} read_interface_text
 
 /// Which bindings a fragment's normalised text numbers.
 pkg enum Numbering derives Copy, Eq {
@@ -124,7 +221,7 @@ pkg fn normalised_fragment(
     let normal = Normal(facts: Facts.collect(file, tree, alloc), bindings: Bindings.collect(file, tree, alloc))
     let punned = Punning.collect(file, tree, bindings: normal.bindings, alloc)
     var toks = flat_tokens(file, item, facts: normal.facts, punned: punned.labels, alloc)
-    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, alloc)
+    let renamed = normal.substitute(file, tree, mut toks, known, resolve, punned, unseen: TokenMarks.none(alloc), alloc)
     for run in normal.runs(file, tree, alloc) {
         normal.sort(mut toks, run, alloc)
     }
@@ -298,7 +395,8 @@ fn Normal.render(self, toks: Slice[Tok], alloc: mem::Alloc) -> mem::List[text::S
 } Normal.render
 
 /// Writes the item's declared names, paths and literals canonically and its bindings as
-/// `$`; returns the binding each renamed token belongs to.
+/// `$`, but for the paths starting at `unseen` tokens; returns the binding each renamed token
+/// belongs to.
 fn Normal.substitute(
     self,
     file: syntax::SourceFile,
@@ -307,6 +405,7 @@ fn Normal.substitute(
     known: Known,
     resolve: fn(segments: Slice[text::String]) -> Option[text::String],
     punned: Punning,
+    unseen: TokenMarks,
     alloc: mem::Alloc,
     ) -> mem::HashMap[u32, u32] {
     var written = mem::HashMap[u32, Option[text::String]].empty(seed: 0, alloc)
@@ -320,6 +419,9 @@ fn Normal.substitute(
         }
     }
     for path in self.paths(file, tree, alloc) {
+        if unseen.contains(path.span.head) {
+            continue
+        }
         match resolve(path.segments.view()) {
             Some(resolved) => replace(mut written, span: path.span, by: take resolved)
             None => {
@@ -390,12 +492,12 @@ fn replace(mut written: mem::HashMap[u32, Option[text::String]], span: syntax::T
 /// The spans of the item's declared name and closing label, and of a tombstone's old form.
 fn Normal.declared(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[syntax::TokenSpan] {
     var spans = mem::List[syntax::TokenSpan].empty(alloc)
-    for node in tree.descendants(tree.root(), alloc) {
+    for node in declaration_nodes(tree, alloc) {
         match tree.rule(node) {
-            syntax::Rule.FnHead or syntax::Rule.FnBody => label_span(tree, node, mut spans, alloc)
+            syntax::Rule.FnHead or syntax::Rule.FnBody => label_span(tree, node, mut spans)
             syntax::Rule.StructItem or syntax::Rule.EnumItem or syntax::Rule.InterfaceItem or syntax::Rule.LayoutItem or syntax::Rule.RegistersItem or syntax::Rule.PackageItem => {
                 name_span(file, tree, node, mut spans)
-                label_span(tree, node, mut spans, alloc)
+                label_span(tree, node, mut spans)
             }
             syntax::Rule.RegistryItem or syntax::Rule.TestItem or syntax::Rule.ConstItem or syntax::Rule.ContributeItem => name_span(file, tree, node, mut spans)
             syntax::Rule.RetiredOld => {
@@ -407,7 +509,7 @@ fn Normal.declared(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: me
                 }
                 match find_in(tree, node: Some(node), rule: syntax::Rule.Path) {
                     Some(path) => {
-                        match tree.span(path, alloc) {
+                        match tree.span(path) {
                             Some(span) => mut spans.push(syntax::TokenSpan(head: span.head, last: member.value_or(span.last)))
                             None => {
                             }
@@ -425,11 +527,11 @@ fn Normal.declared(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: me
 } Normal.declared
 
 /// Adds the span of a node's closing label, if it has one holding tokens.
-fn label_span(tree: syntax::Tree, node: u32, mut spans: mem::List[syntax::TokenSpan], alloc: mem::Alloc) {
+fn label_span(tree: syntax::Tree, node: u32, mut spans: mem::List[syntax::TokenSpan]) {
     let Some(label) = tree.find(node, rule: syntax::Rule.ItemLabel) else {
         return
     }
-    match tree.span(label, alloc) {
+    match tree.span(label) {
         Some(span) => mut spans.push(span)
         None => {
         }
@@ -466,15 +568,19 @@ struct PathUse {
 fn Normal.paths(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[PathUse] {
     var local = mem::HashMap[text::String, Unit].empty(seed: 0, alloc)
     discard mut local.insert(text::String.of("Self", alloc), value: Unit)
-    for node in tree.descendants(tree.root(), alloc) {
-        let rule = tree.rule(node)
-        if rule == syntax::Rule.GenericParam or rule == syntax::Rule.ImplParam or rule == syntax::Rule.Field {
-            match first_ident(file, tree, node) {
-                Some(token) => {
-                    discard mut local.insert(text::String.of(file.text(usize.widen(token)), alloc), value: Unit)
-                }
-                None => {
-                }
+    for node in declaration_nodes(tree, alloc) {
+        let declares = match tree.rule(node) {
+            syntax::Rule.GenericParam or syntax::Rule.ImplParam or syntax::Rule.Field => true
+            else => false
+        }
+        if not declares {
+            continue
+        }
+        match first_ident(file, tree, node) {
+            Some(token) => {
+                discard mut local.insert(text::String.of(file.text(usize.widen(token)), alloc), value: Unit)
+            }
+            None => {
             }
         }
     }
@@ -490,8 +596,9 @@ fn Normal.paths(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::
             syntax::Rule.Arg or syntax::Rule.FieldPattern or syntax::Rule.PayloadField if children.len() == 2 => mut pending.push(children[1])
             syntax::Rule.RetiredOld => {
                 for child in children {
-                    if tree.rule(child) != syntax::Rule.Path {
-                        mut pending.push(child)
+                    match tree.rule(child) {
+                        syntax::Rule.Path => {}
+                        else => mut pending.push(child)
                     }
                 }
             }
@@ -530,7 +637,7 @@ struct DepthNode derives Copy {
 /// `match` that is not `match first`; innermost first.
 fn Normal.runs(self, file: syntax::SourceFile, tree: syntax::Tree, alloc: mem::Alloc) -> mem::List[Run] {
     var ordered = false
-    for node in tree.descendants(tree.root(), alloc) {
+    for node in declaration_nodes(tree, alloc) {
         if tree.rule(node) != syntax::Rule.DerivesClause {
             continue
         }
@@ -581,9 +688,9 @@ fn add_runs(
                     continue
                 }
                 if tree.find(child, rule: syntax::Rule.Field).is_some() {
-                    mut fields.push(member_span(tree, node: child, alloc))
+                    mut fields.push(member_span(tree, node: child))
                 } else {
-                    mut invariants.push(member_span(tree, node: child, alloc))
+                    mut invariants.push(member_span(tree, node: child))
                 }
             }
             if not ordered {
@@ -613,7 +720,7 @@ fn add_runs(
         syntax::Rule.LimitsClause => {
             var entries = mem::List[syntax::TokenSpan].empty(alloc)
             for child in children {
-                mut entries.push(member_span(tree, node: child, alloc))
+                mut entries.push(member_span(tree, node: child))
             }
             mut runs.push(Run(elements: take entries, depth: depth))
         }
@@ -646,8 +753,8 @@ fn holds_keyword(file: syntax::SourceFile, tree: syntax::Tree, node: u32, keywor
 } holds_keyword
 
 /// The span of a member, which holds tokens.
-fn member_span(tree: syntax::Tree, node: u32, alloc: mem::Alloc) -> syntax::TokenSpan {
-    let Some(span) = tree.span(node, alloc) else {
+fn member_span(tree: syntax::Tree, node: u32) -> syntax::TokenSpan {
+    let Some(span) = tree.span(node) else {
         expect false
         return syntax::TokenSpan(head: 0, last: 0)
     }
@@ -659,7 +766,7 @@ fn member_spans(tree: syntax::Tree, children: mem::List[u32], rule: syntax::Rule
     var spans = mem::List[syntax::TokenSpan].empty(alloc)
     for child in children {
         if tree.rule(child) == rule {
-            mut spans.push(member_span(tree, node: child, alloc))
+            mut spans.push(member_span(tree, node: child))
         }
     }
     return spans
@@ -810,9 +917,46 @@ enum Reading derives Copy, Eq {
 /// The tokens an interface form or text leaves out of an item, and the default bodies it
 /// writes `default`.
 struct Reduction {
-    dropped: mem::HashMap[u32, Unit]
+    dropped: TokenMarks
     defaults: mem::HashMap[u32, Unit]
 } Reduction
+
+/// Tokens of an item marked, by their offset from the first token of its tree.
+struct TokenMarks {
+    base: u32
+    marked: mem::List[bool]
+} TokenMarks
+
+/// No token marked.
+fn TokenMarks.none(alloc: mem::Alloc) -> TokenMarks {
+    return TokenMarks(base: 0, marked: mem::List[bool].empty(alloc))
+} TokenMarks.none
+
+/// No token of a tree marked yet.
+fn TokenMarks.over(tree: syntax::Tree, alloc: mem::Alloc) -> TokenMarks {
+    var marked = mem::List[bool].empty(alloc)
+    let Some(span) = tree.span(tree.root()) else {
+        return TokenMarks(base: 0, marked: take marked)
+    }
+    for _ in span.head..=span.last {
+        mut marked.push(false)
+    }
+    return TokenMarks(base: span.head, marked: take marked)
+} TokenMarks.over
+
+/// Marks a token of the tree.
+fn TokenMarks.mark(mut self, token: u32) {
+    expect token >= self.base and usize.widen(token - self.base) < self.marked.len()
+    self.marked[usize.widen(token - self.base)] = true
+} TokenMarks.mark
+
+fn TokenMarks.contains(self, token: u32) -> bool {
+    if token < self.base {
+        return false
+    }
+    let at = usize.widen(token - self.base)
+    return at < self.marked.len() and self.marked[at]
+} TokenMarks.contains
 
 fn Reduction.apply(self, take toks: mem::List[Tok], alloc: mem::Alloc) -> mem::List[Tok] {
     var kept = mem::List[Tok].empty(alloc)
@@ -845,7 +989,7 @@ fn Reduction.of(
     reading: Reading,
     alloc: mem::Alloc,
     ) -> Option[Reduction] {
-    var reduction = Reduction(dropped: mem::HashMap[u32, Unit].empty(seed: 0, alloc), defaults: mem::HashMap[u32, Unit].empty(seed: 0, alloc))
+    var reduction = Reduction(dropped: TokenMarks.over(tree, alloc), defaults: mem::HashMap[u32, Unit].empty(seed: 0, alloc))
     let Some(kind) = tree.kind() else {
         return Some(take reduction)
     }
@@ -853,9 +997,9 @@ fn Reduction.of(
     match first kind.rule {
         syntax::Rule.FnItem => mut reduction.drop_body(file, tree, item: kind.node, known, mut regions, alloc)
         syntax::Rule.StructItem => mut reduction.drop_hidden_fields(file, tree, item: kind.node, known, alloc)
-        syntax::Rule.InterfaceItem => mut reduction.default_methods(file, tree, item: kind.node, mut regions, alloc)
+        syntax::Rule.InterfaceItem => mut reduction.default_methods(file, tree, item: kind.node, mut regions)
         syntax::Rule.TestItem if reading == Reading.Form => mut reduction.keep_test_head(file, tree, item: kind.node, alloc)
-        syntax::Rule.PackageItem if reading == Reading.Form => mut reduction.keep_package_head(tree, item: kind.node, alloc)
+        syntax::Rule.PackageItem if reading == Reading.Form => mut reduction.keep_package_head(tree, item: kind.node)
         syntax::Rule.ConstItem if reading == Reading.Form => return None
         else => {
         }
@@ -872,7 +1016,7 @@ fn Reduction.of(
                 else => false
             }
             if not kept {
-                mut reduction.drop_node(tree, node: line, alloc)
+                mut reduction.drop_node(tree, node: line)
             }
         }
     }
@@ -880,13 +1024,13 @@ fn Reduction.of(
 } Reduction.of
 
 /// Drops the tokens of a node.
-fn Reduction.drop_node(mut self, tree: syntax::Tree, node: u32, alloc: mem::Alloc) {
-    let Some(span) = tree.span(node, alloc) else {
+fn Reduction.drop_node(mut self, tree: syntax::Tree, node: u32) {
+    let Some(span) = tree.span(node) else {
         expect false
         return
     }
     for token in span.head..=span.last {
-        mark(mut self.dropped, token)
+        mut self.dropped.mark(token)
     }
 } Reduction.drop_node
 
@@ -909,18 +1053,18 @@ fn Reduction.drop_body(
         match child {
             syntax::Child.Token(token) => {
                 if is_punct(file, token, punct: syntax::Punct.LBrace) {
-                    mark(mut self.dropped, token)
+                    mut self.dropped.mark(token)
                 } else if is_punct(file, token, punct: syntax::Punct.Eq) and not known.transparent {
-                    mark(mut self.dropped, token)
+                    mut self.dropped.mark(token)
                 }
             }
             syntax::Child.Node(node) => {
                 let rule = tree.rule(node)
                 if rule == syntax::Rule.FnBody {
-                    mut self.drop_node(tree, node, alloc)
+                    mut self.drop_node(tree, node)
                 } else if transparent and rule == syntax::Rule.Expr {
                     if not known.transparent {
-                        mut self.drop_node(tree, node, alloc)
+                        mut self.drop_node(tree, node)
                     }
                 } else if rule == syntax::Rule.ClauseRegion {
                     mut regions.push(node)
@@ -978,11 +1122,11 @@ fn Reduction.drop_hidden_fields(
             None => {
             }
         }
-        mut self.drop_node(tree, node: member, alloc)
+        mut self.drop_node(tree, node: member)
     }
     for line in invariants {
         if names_hidden(file, tree, node: line, hidden, alloc) {
-            mut self.drop_node(tree, node: line, alloc)
+            mut self.drop_node(tree, node: line)
         }
     }
 } Reduction.drop_hidden_fields
@@ -1020,7 +1164,6 @@ fn Reduction.default_methods(
     tree: syntax::Tree,
     item: u32,
     mut regions: mem::List[u32],
-    alloc: mem::Alloc,
     ) {
     for member in tree.child_nodes(item) {
         let Some(end) = tree.find(member, rule: syntax::Rule.MethodEnd) else {
@@ -1034,14 +1177,14 @@ fn Reduction.default_methods(
         let Some(body) = tree.find(end, rule: syntax::Rule.MethodBody) else {
             continue
         }
-        let Some(span) = tree.span(body, alloc) else {
+        let Some(span) = tree.span(body) else {
             expect false
             return
         }
         mark(mut self.defaults, token: span.head)
         for token in span.head..=span.last {
             if token > span.head and token_kind(file, token) != syntax::TokenKind.Nl {
-                mark(mut self.dropped, token)
+                mut self.dropped.mark(token)
             }
         }
     }
@@ -1075,7 +1218,7 @@ fn Reduction.keep_test_head(
     }
     match tree.find(item, rule: syntax::Rule.TestTarget) {
         Some(target) => {
-            let Some(span) = tree.span(target, alloc) else {
+            let Some(span) = tree.span(target) else {
                 expect false
                 return
             }
@@ -1086,19 +1229,19 @@ fn Reduction.keep_test_head(
         None => {
         }
     }
-    let Some(whole_span) = tree.span(item, alloc) else {
+    let Some(whole_span) = tree.span(item) else {
         expect false
         return
     }
     for token in whole_span.head..=whole_span.last {
         if not kept.contains(token) {
-            mark(mut self.dropped, token)
+            mut self.dropped.mark(token)
         }
     }
 } Reduction.keep_test_head
 
 /// Keeps of a package item its `language` and `targets` directives.
-fn Reduction.keep_package_head(mut self, tree: syntax::Tree, item: u32, alloc: mem::Alloc) {
+fn Reduction.keep_package_head(mut self, tree: syntax::Tree, item: u32) {
     for directive in tree.child_nodes(item) {
         var nodes = tree.child_nodes(directive)
         var kept = false
@@ -1111,7 +1254,7 @@ fn Reduction.keep_package_head(mut self, tree: syntax::Tree, item: u32, alloc: m
             }
         }
         if tree.rule(directive) == syntax::Rule.Directive and not kept {
-            mut self.drop_node(tree, node: directive, alloc)
+            mut self.drop_node(tree, node: directive)
         }
     }
 } Reduction.keep_package_head

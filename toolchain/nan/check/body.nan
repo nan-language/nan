@@ -155,9 +155,6 @@ struct Body {
     /// The view bindings of what a read parameter holds, which `Some`, `Ok` and `Err` wrap
     /// unmarked.
     read_views: mem::Set[LocalId]
-    /// The folded names of the values the module declares, once a local's name is checked
-    /// against them, under key 0.
-    folded_values: mem::OnceMap[u8, mem::Set[text::String]]
     /// The generic scope and the item being typed that the body replaced in the checker, which
     /// closing the body restores.
     enclosing: Enclosing
@@ -278,9 +275,8 @@ fn Clauses.written(
 
 /// Restores the generic scope and the item being typed that the body replaced in the checker.
 fn Body.close(self) {
-    let state = self.ck.state.contents()
-    state.scope.restore(self.enclosing.scope)
-    state.within.store(self.enclosing.within)
+    self.ck.underway.contents().scope.restore(self.enclosing.scope)
+    self.ck.underway.contents().within.store(self.enclosing.within)
 } Body.close
 
 fn Body.new(ck: Checker, item: ty::ItemId, take generics: mem::List[GenericDef]) -> Body {
@@ -292,9 +288,8 @@ fn Body.new(ck: Checker, item: ty::ItemId, take generics: mem::List[GenericDef])
             break
         }
     }
-    let state = ck.state.contents()
-    let scope = state.scope.replace(GenericDef.copies(generics.view(), alloc))
-    let within = state.within.swap(item.index)
+    let scope = ck.underway.contents().scope.replace(GenericDef.copies(generics.view(), alloc))
+    let within = ck.underway.contents().within.swap(item.index)
     var scopes = mem::List[mem::List[LocalId]].empty(alloc)
     mut scopes.push(mem::List[LocalId].empty(alloc))
     return Body(
@@ -323,7 +318,6 @@ fn Body.new(ck: Checker, item: ty::ItemId, take generics: mem::List[GenericDef])
         part_bindings: mem::Set[LocalId].empty(alloc),
         wrapped_bindings: mem::Set[LocalId].empty(alloc),
         read_views: mem::Set[LocalId].empty(alloc),
-        folded_values: mem::OnceMap[u8, mem::Set[text::String]].empty(seed: 0, alloc),
         enclosing: Enclosing(scope: scope, within: within),
     )
 } Body.new
@@ -562,7 +556,7 @@ fn Body.check_local_name(self, name: ast::Name, kind: LocalKind) {
     }
     let folded = fold(spelt, alloc)
     let clashes_local = self.local_folds_to(folded.as_str())
-    let clashes_value = self.value_folds().contains(folded)
+    let clashes_value = self.ck.value_folds(self.module).contains(folded)
     let clashes_scalar = db.package_of(self.item) != db.core() and ty::Scalar.from_name(folded.as_str()).is_some()
     if clashes_scalar {
         self.report(name.token, code: diagnostic::Code.NameCoreRedefined)
@@ -596,20 +590,21 @@ fn Body.local_folds_to(self, folded: Str) -> bool {
     return false
 } Body.local_folds_to
 
-/// The folded names of the values the body's module declares.
-proj fn Body.value_folds(self) -> mem::Set[text::String] {
-    let held = match self.folded_values.get(0) {
+/// The folded names of the values a module declares.
+proj fn Checker.value_folds(self, module: ty::ModuleId) -> mem::Set[text::String] {
+    let state = self.state.contents()
+    let held = match state.value_folds.get(module) {
         Some(known) => known
-        None => self.folded_values.insert(0, value: self.module_value_folds())
+        None => state.value_folds.insert(module, value: self.module_value_folds(module))
     }
     return held
-} Body.value_folds
+} Checker.value_folds
 
-fn Body.module_value_folds(self) -> mem::Set[text::String] {
-    let alloc = self.ck.alloc()
-    let db = self.ck.db()
+fn Checker.module_value_folds(self, module: ty::ModuleId) -> mem::Set[text::String] {
+    let alloc = self.alloc()
+    let db = self.db()
     var folds = mem::Set[text::String].empty(alloc)
-    for item in db.module(self.module).items {
+    for item in db.module(module).items {
         let declared = db.declaration(item)
         if not in_values_namespace(declared) {
             continue
@@ -620,7 +615,7 @@ fn Body.module_value_folds(self) -> mem::Set[text::String] {
         discard mut folds.insert(fold(name.text.as_str(), alloc))
     }
     return folds
-} Body.module_value_folds
+} Checker.module_value_folds
 
 fn Body.push_scope(mut self) {
     mut self.scopes.push(mem::List[LocalId].empty(self.ck.alloc()))
@@ -1056,7 +1051,7 @@ fn Body.let_stmt(
             None => {}
         }
     }
-    return Diverging(value: TStmtKind.Let(pattern: take typed_pattern, value: take typed, otherwise: take typed_otherwise), diverges: diverges)
+    return Diverging(value: TStmtKind.Let(pattern: mem::Heap.of(self.ck.alloc()).boxed(take typed_pattern), value: take typed, otherwise: take typed_otherwise), diverges: diverges)
 } Body.let_stmt
 
 /// Reports a `let _ =` binding, with the fix writing `discard` in place of `let _ =`, or
@@ -1259,8 +1254,9 @@ fn Body.type_expr(mut self, ty: ast::TypeExpr) -> ty::Ty {
 } Body.type_expr
 
 /// Types every body an item holds and reports their rules; returns the typed form of its
-/// function, test, const or contribution body.
-fn Checker.check_bodies(self, item: ty::ItemId) -> Option[TBody] {
+/// function, test, const or contribution body. A function's block body comes `lowered` when its
+/// abstract syntax is at hand.
+fn Checker.check_bodies(self, item: ty::ItemId, take lowered: Option[ast::Block]) -> Option[TBody] {
     let alloc = self.alloc()
     let sig = self.sig(item)
     match self.db().ast(item).kind {
@@ -1268,7 +1264,7 @@ fn Checker.check_bodies(self, item: ty::ItemId) -> Option[TBody] {
             let SigKind.Fn(fn_sig) = sig.contents().kind else {
                 return None
             }
-            return Some(self.function_body(item, function, sig: fn_sig))
+            return Some(self.function_body(item, function, sig: fn_sig, take lowered))
         }
         ast::ItemKind.Test(tested) => return Some(self.test_body(item, tested))
         ast::ItemKind.Retired(tombstone) => {
@@ -1336,7 +1332,7 @@ fn Checker.method_bodies_of(self, item: ty::ItemId, declaring: ast::InterfaceIte
     }
 } Checker.method_bodies_of
 
-fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnSig) -> TBody {
+fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnSig, take lowered: Option[ast::Block]) -> TBody {
     let alloc = self.alloc()
     var body = Body.new(self, item, generics: GenericDef.copies(sig.generics.view(), alloc))
     mut body.push_frame(Body.function_frame(sig.result, failure: sig.failure, alloc))
@@ -1345,7 +1341,11 @@ fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnS
     var root: Option[TExpr] = None
     var bodiless = false
     match function.body {
-        ast::FnBody.Block(block) => {
+        ast::FnBody.Block(written) => {
+            let block = match lowered {
+                Some(given) => given
+                None => self.lowered_body(item, body: written)
+            }
             let typed = mut body.result_block(block, result: sig.result)
             root = Some(TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed)))
         }
@@ -1366,6 +1366,20 @@ fn Checker.function_body(self, item: ty::ItemId, function: ast::FnItem, sig: FnS
     }
     return take body.finish(take root)
 } Checker.function_body
+
+/// The abstract syntax of a function's or a test's block body.
+pkg fn Checker.lowered_body(self, item: ty::ItemId, body: ast::BodySyntax) -> ast::Block {
+    self.trace_read(item)
+    let db = self.db()
+    let data = db.item(item)
+    let syntax = db.syntax(item)
+    expect data.index < syntax.items.len()
+    let Some(tree) = syntax.items[data.index].tree else {
+        expect false
+        return ast::Block(token: body.opener, end: body.opener, stmts: mem::List[ast::Stmt].empty(self.alloc()))
+    }
+    return ast::lower_body(syntax, tree, body, alloc: self.alloc())
+} Checker.lowered_body
 
 /// Whether a function is the root module's function that its package's `entry` directive
 /// names, whose head forms are fixed.
@@ -1436,9 +1450,10 @@ fn Checker.test_body(self, item: ty::ItemId, tested: ast::TestItem) -> TBody {
         Some(params) => mut body.declare_test_params(params.view())
         None => {}
     }
-    let checked = mut body.block(tested.body)
+    let block = self.lowered_body(item, body: tested.body)
+    let checked = mut body.block(block)
     let Diverging(value: typed, diverges: _) = checked
-    return take body.finish(Some(TExpr(token: tested.body.token, last: tested.body.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed))))
+    return take body.finish(Some(TExpr(token: block.token, last: block.end, ty: ty::Ty.unit(), kind: TKind.Block(take typed))))
 } Checker.test_body
 
 /// Declares a test's parameters, the inputs a property test generates.
@@ -1645,7 +1660,7 @@ fn Body.for_stmt(mut self, pattern: ast::Pattern, iterated: ast::Expr, body: ast
     mut self.pop_scope()
     discard mut self.loops.pop()
     let TypedLoop(invariants: invariants, block: block) = looped
-    return TStmtKind.For(pattern: take typed_pattern, mode: mode, iterated: take typed, cursor: found.cursor, invariants: take invariants, body: take block)
+    return TStmtKind.For(pattern: mem::Heap.of(self.ck.alloc()).boxed(take typed_pattern), mode: mode, iterated: take typed, cursor: found.cursor, invariants: take invariants, body: take block)
 } Body.for_stmt
 
 /// The iterated expression of a `for` form, a place reached by `mut` for `for x in mut xs`.
@@ -1794,9 +1809,9 @@ fn Body.deferred(mut self, call: ast::Expr, postfix: ast::Expr, mode: Option[ast
     var markers = Markers.none()
     markers.mode = mode
     let ck = self.ck.share()
-    discard ck.state.contents().muted.fetch_add(1)
+    discard ck.underway.contents().muted.fetch_add(1)
     let probe = mut self.call(postfix, expected: None, markers: Some(markers))
-    discard ck.state.contents().muted.fetch_sub(1)
+    discard ck.underway.contents().muted.fetch_sub(1)
     let called = match probe.kind {
         TKind.Call(_) => true
         else => false
@@ -1832,7 +1847,7 @@ fn Body.deferred_code(self, probe: TExpr) -> Option[diagnostic::Code] {
     let types = self.ck.types()
     var waits = called.head.wait
     for arg in called.args {
-        match types.kind(arg.expr.ty) {
+        match types.kind(arg.expr.contents().ty) {
             ty::TyKind.Fn(id) => {
                 if types.fn_of(id).wait {
                     waits = true
@@ -1873,7 +1888,7 @@ fn Body.abandoned(self, call: ast::Expr, postfix: ast::Expr, probed: Call) -> Op
         return None
     }
     let receiver = probed.args[0]
-    if receiver.mode != ast::Mode.Take or self.ck.method_candidates(receiver.expr.ty, name: "abandon").len() == 0 {
+    if receiver.mode != ast::Mode.Take or self.ck.method_candidates(receiver.expr.contents().ty, name: "abandon").len() == 0 {
         return None
     }
     let ast::ExprKind.Call(callee: callee, args: _) = postfix.kind else {
@@ -1958,7 +1973,7 @@ fn TExpr.root_local(self) -> Option[LocalId] {
             if held.args.len() == 0 {
                 return None
             }
-            return held.args[0].expr.root_local()
+            return held.args[0].expr.contents().root_local()
         }
         else => return None
     }

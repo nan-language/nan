@@ -288,13 +288,14 @@ struct CaptureAt derives Copy {
 pkg fn Checker.unit(self, item: ty::ItemId) -> Option[mem::Shared[nir::NirUnit]] {
     let state = self.state.contents()
     state.db.note(item)
+    self.trace_read(item)
     match state.units.get(item) {
         Some(known) => return shared_unit(known)
         None => {}
     }
     var unit: Option[mem::Shared[nir::NirUnit]] = None
     if not self.rejected(item) {
-        let elaborated = state.db.about(Some(item), compute: fn() => attempt self.elaborate(item))
+        let elaborated = self.about(Some(item), compute: fn() => attempt self.elaborate(item))
         match elaborated {
             Ok(Some(built)) => {
                 unit = Some(mem::Shared.of(take built, alloc: self.alloc()))
@@ -436,9 +437,9 @@ fn Checker.type_parts(self, item: ty::ItemId) {
     if state.typed_wheres.get(item).is_some() {
         return
     }
-    discard state.muted.fetch_add(1)
+    discard self.underway.contents().muted.fetch_add(1)
     self.where_conditions(item, generics)
-    discard state.muted.fetch_sub(1)
+    discard self.underway.contents().muted.fetch_sub(1)
 } Checker.type_parts
 
 /// The typed body of an item, its clauses included: the one its check produced, or one typed
@@ -446,13 +447,14 @@ fn Checker.type_parts(self, item: ty::ItemId) {
 pkg fn Checker.typed(self, item: ty::ItemId) -> Option[mem::Shared[TBody]] {
     let state = self.state.contents()
     state.db.note(item)
+    self.trace_read(item)
     match state.bodies.get(item) {
         Some(body) => return Some(body.share())
         None => {}
     }
-    discard state.muted.fetch_add(1)
-    let checked = state.db.about(Some(item), compute: fn() => self.check_bodies(item))
-    discard state.muted.fetch_sub(1)
+    discard self.underway.contents().muted.fetch_add(1)
+    let checked = self.about(Some(item), compute: fn() => self.check_bodies(item, lowered: None))
+    discard self.underway.contents().muted.fetch_sub(1)
     let Some(body) = checked else {
         return None
     }
@@ -1310,10 +1312,18 @@ pkg fn Checker.predicate_count(self, item: ty::ItemId) -> u32 {
     return count
 } Checker.predicate_count
 
-/// Whether a value of the type reaches a struct with predicates through its fields.
+/// Whether a value of the type reaches a struct with predicates through its fields, kept for
+/// the reads it is asked under.
 fn Checker.has_predicates_within(self, ty: ty::Ty) -> bool {
+    let asked = self.asked(ty)
+    let state = self.state.contents()
+    match state.predicated.get(asked) {
+        Some(known) => return known
+        None => {}
+    }
     var seen = mem::List[ty::ItemId].empty(self.alloc())
-    return self.reaches_predicates(ty, seen: mut seen)
+    let reached = self.reaches_predicates(ty, seen: mut seen)
+    return state.predicated.insert(asked, value: reached)
 } Checker.has_predicates_within
 
 fn Checker.reaches_predicates(self, ty: ty::Ty, mut seen: mem::List[ty::ItemId]) -> bool {
@@ -1501,9 +1511,7 @@ fn UnitDraft.finish(take self, alloc: mem::Alloc) -> nir::NirUnit {
         }
     }
     for function in mut functions {
-        for block in mut function.blocks {
-            renumber_premises(mut block, renumbered: renumbered.view())
-        }
+        renumber_premises(mut function, renumbered: renumbered.view())
     }
     return nir::NirUnit(item: self.item, functions: take functions, premises: take premises)
 } UnitDraft.finish
@@ -1517,9 +1525,9 @@ fn function_order(left: nir::Function, right: nir::Function) -> core::Ordering {
     return left.index.cmp(right.index)
 } function_order
 
-/// Replaces the premise index of each instruction of a block by its rank in source order.
-fn renumber_premises(mut block: nir::Block, renumbered: Slice[u32]) {
-    for inst in mut block.insts {
+/// Replaces the premise index of each instruction of a function by its rank in source order.
+fn renumber_premises(mut function: nir::Function, renumbered: Slice[u32]) {
+    for inst in mut function.insts {
         match inst.premise {
             Some(premise) => {
                 expect usize.widen(premise) < renumbered.len()
@@ -1878,7 +1886,7 @@ fn Elab.finish(
         mut params.push(nir::Param(mode: param.mode, value: built.params[position], name: take param.name, span: param.span))
         position += 1
     }
-    let function = nir::Function(role: self.role, index: 0, params: take params, result: result, failure: failure, wait: wait, closure: closure, blocks: take built.blocks, types: take built.types, span: span)
+    let function = nir::Function(role: self.role, index: 0, params: take params, result: result, failure: failure, wait: wait, closure: closure, blocks: take built.blocks, insts: take built.insts, types: take built.types, span: span)
     return FinishedFunction(function: take function, unit: take self.unit)
 } Elab.finish
 
@@ -2214,10 +2222,10 @@ proj fn Call.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExp
         else => {}
     }
     for arg in self.args {
-        if matches(arg.expr) {
-            return Some(arg.expr)
+        if matches(arg.expr.contents()) {
+            return Some(arg.expr.contents())
         }
-        let found = arg.expr.found_within(matches)
+        let found = arg.expr.contents().found_within(matches)
         if found.is_some() {
             return found
         }
@@ -2229,7 +2237,8 @@ proj fn Call.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExp
 /// visits them, that matches.
 proj fn TArm.found_within(self, matches: fn(expr: TExpr) -> bool) -> Option[TExpr] {
     match self.guard {
-        Some(guard) => {
+        Some(boxed) => {
+            let guard = boxed.contents()
             if matches(guard) {
                 return Some(guard)
             }

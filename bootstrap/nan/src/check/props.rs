@@ -18,6 +18,63 @@ pub struct Props {
     pub any_bits: bool,
 }
 
+/// The definitions whose properties are being decided, as Tarjan's search over their
+/// constituents. Properties decided through a constituent that reaches a definition still being
+/// decided hold only until that one's are decided, and are decided again when next read.
+#[derive(Default)]
+pub struct Deciding {
+    /// The definitions being decided, outermost first, each with the number of its decision and
+    /// the lowest number of a decision it read, as Tarjan's low link.
+    open: Vec<((ItemId, bool), usize, usize)>,
+    /// The properties decided while a definition they read is still being decided, each with the
+    /// number of its decision.
+    provisional: Vec<((ItemId, bool), usize, Props)>,
+    /// How many decisions started.
+    started: usize,
+}
+
+impl Deciding {
+    /// Records that the innermost decision read the decision numbered `number`.
+    fn read(&mut self, number: usize) {
+        if let Some((_, _, low)) = self.open.last_mut() {
+            *low = (*low).min(number);
+        }
+    }
+
+    /// For a definition being decided, none; for one decided provisionally, its properties.
+    fn reread(&mut self, key: (ItemId, bool)) -> Option<Option<Props>> {
+        if let Some(&(_, number, _)) = self.open.iter().find(|(open, _, _)| *open == key) {
+            self.read(number);
+            return Some(None);
+        }
+        let &(_, number, props) = self.provisional.iter().find(|(held, _, _)| *held == key)?;
+        self.read(number);
+        Some(Some(props))
+    }
+
+    /// Starts deciding a definition, giving the number of the decision.
+    fn start(&mut self, key: (ItemId, bool)) -> usize {
+        let number = self.started;
+        self.started += 1;
+        self.open.push((key, number, number));
+        number
+    }
+
+    /// Ends the innermost decision with its properties, giving whether they are decided: no
+    /// definition it read is still being decided. The properties decided provisionally through
+    /// one decided so are dropped.
+    fn finish(&mut self, key: (ItemId, bool), number: usize, props: Props) -> bool {
+        let (_, _, low) = self.open.pop().expect("a decision");
+        self.read(low);
+        if low < number {
+            self.provisional.push((key, number, props));
+            return false;
+        }
+        self.provisional.retain(|(_, decided, _)| *decided < number);
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Property {
     Linear,
@@ -356,13 +413,21 @@ impl Checker<'_> {
         self.db.note(item);
         let key = (item, self.consumer_view(item));
         if let Some(known) = self.definitions.borrow().get(&key) {
-            return known.unwrap_or_else(|| self.assumed_props(item));
+            return *known;
         }
-        self.definitions.borrow_mut().insert(key, None);
+        let reread = self.deciding.borrow_mut().reread(key);
+        match reread {
+            Some(Some(provisional)) => return provisional,
+            Some(None) => return self.assumed_props(item),
+            None => {}
+        }
+        let number = self.deciding.borrow_mut().start(key);
         let props = self
             .db
             .about(Some(item), || self.compute_definition_props(item));
-        self.definitions.borrow_mut().insert(key, Some(props));
+        if self.deciding.borrow_mut().finish(key, number, props) {
+            self.definitions.borrow_mut().insert(key, props);
+        }
         props
     }
 
@@ -682,3 +747,6 @@ fn fn_props(fn_ty: &FnTy) -> Props {
         },
     }
 }
+
+#[cfg(test)]
+mod tests;

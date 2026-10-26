@@ -1,0 +1,2531 @@
+//! The snapshots of checks the build cache keeps: for a closure under a target, what checking a state gave each workspace item and the facts it derived of every item. A check of a state differing from a snapshot's in function bodies alone checks the items whose bodies changed and those whose own work read them, takes every other item's outcome from the snapshot, and keeps that result only when the items it checked give the facts the snapshot holds; otherwise it checks the state whole.
+
+/// A read of another item's body, typed, lowered, elaborated or with its obligations decided, or
+/// of the items it names, by an item's own work.
+struct TracedRead derives Copy, Eq, Hash {
+    reader: ty::ItemId
+    read: ty::ItemId
+} TracedRead
+
+/// A field of a struct that an item's own work reads.
+struct FieldRead derives Eq, Hash {
+    reader: ty::ItemId
+    owner: ty::ItemId
+    name: text::String
+} FieldRead
+
+/// A `label: value` naming a field of a struct.
+struct LabelOf derives Eq, Hash {
+    owner: ty::ItemId
+    name: text::String
+    label: FieldLabel
+} LabelOf
+
+/// An authority an item's module performs through the item.
+struct PerformedBy derives Eq, Hash {
+    item: ty::ItemId
+    authority: workspace::Authority
+} PerformedBy
+
+/// What the build cache keeps of a check and gives back to it.
+struct Kept {
+    /// The items whose outcomes a snapshot gives, by index: their own work reports nothing.
+    restored: mem::OnceMap[u32, Unit]
+    reads: mem::Arena[TracedRead]
+    read_once: cell::Claims[TracedRead]
+    fields: mem::Arena[FieldRead]
+    field_once: cell::Claims[FieldRead]
+    labels: mem::Arena[LabelOf]
+    label_once: cell::Claims[LabelOf]
+    performs: mem::Arena[PerformedBy]
+    perform_once: cell::Claims[PerformedBy]
+    /// Whether judging each item alone rejected it.
+    alone: mem::OnceMap[ty::ItemId, bool]
+    /// The green entries the check computed, as a snapshot encodes them, one after another in
+    /// the part of each task that computed them, and where each item's lies there.
+    green_parts: mem::Arena[mem::Arena[u8]]
+    greens: mem::OnceMap[ty::ItemId, GreenSpan]
+    /// The state checked and the snapshot restored from, under key 0 once planned.
+    plan: mem::OnceMap[u8, mem::Shared[Plan]]
+} Kept
+
+fn Kept.empty(alloc: mem::Alloc) -> Kept {
+    return Kept(
+        restored: mem::OnceMap[u32, Unit].empty(seed: 0, alloc),
+        reads: mem::Arena[TracedRead].empty(alloc),
+        read_once: cell::Claims[TracedRead].empty(alloc),
+        fields: mem::Arena[FieldRead].empty(alloc),
+        field_once: cell::Claims[FieldRead].empty(alloc),
+        labels: mem::Arena[LabelOf].empty(alloc),
+        label_once: cell::Claims[LabelOf].empty(alloc),
+        performs: mem::Arena[PerformedBy].empty(alloc),
+        perform_once: cell::Claims[PerformedBy].empty(alloc),
+        alone: mem::OnceMap[ty::ItemId, bool].empty(seed: 0, alloc),
+        green_parts: mem::Arena[mem::Arena[u8]].empty(alloc),
+        greens: mem::OnceMap[ty::ItemId, GreenSpan].empty(seed: 0, alloc),
+        plan: mem::OnceMap[u8, mem::Shared[Plan]].empty(seed: 0, alloc),
+    )
+} Kept.empty
+
+/// Whether a snapshot gives the outcome of the item with these bits, `NO_ID` for none.
+fn Checker.is_restored(self, bits: u32) -> bool {
+    return bits != NO_ID and self.state.contents().kept.restored.get(bits).is_some()
+} Checker.is_restored
+
+/// Records that the item whose own work is computed reads another item's body or names.
+fn Checker.trace_read(self, item: ty::ItemId) {
+    let Some(reader) = self.traced() else {
+        return
+    }
+    if reader == item {
+        return
+    }
+    let kept = self.state.contents().kept
+    let read = TracedRead(reader: reader, read: item)
+    if kept.read_once.claim(read) {
+        discard kept.reads.push(read)
+    }
+} Checker.trace_read
+
+/// Records that the item whose own work is computed reads a struct's field.
+fn Checker.kept_field_read(self, owner: ty::ItemId, field: Str) {
+    let Some(reader) = self.traced() else {
+        return
+    }
+    let kept = self.state.contents().kept
+    if kept.field_once.claim(FieldRead(reader: reader, owner: owner, name: text::String.of(field, alloc: self.alloc()))) {
+        discard kept.fields.push(FieldRead(reader: reader, owner: owner, name: text::String.of(field, alloc: self.alloc())))
+    }
+} Checker.kept_field_read
+
+/// Records a `label: value` naming a struct's field, once, giving whether it was new.
+fn Kept.labelled(self, owner: ty::ItemId, field: Str, label: FieldLabel, alloc: mem::Alloc) -> bool {
+    if not self.label_once.claim(LabelOf(owner: owner, name: text::String.of(field, alloc), label: label)) {
+        return false
+    }
+    discard self.labels.push(LabelOf(owner: owner, name: text::String.of(field, alloc), label: label))
+    return true
+} Kept.labelled
+
+/// Records an authority an item's module performs through it.
+fn Kept.performed(self, item: ty::ItemId, authority: workspace::Authority, alloc: mem::Alloc) {
+    if self.perform_once.claim(PerformedBy(item: item, authority: copied_authority(authority, alloc))) {
+        discard self.performs.push(PerformedBy(item: item, authority: copied_authority(authority, alloc)))
+    }
+} Kept.performed
+
+/// Records whether judging an item alone rejected it.
+fn Kept.judged_alone(self, item: ty::ItemId, rejected: bool) {
+    if self.alone.get(item).is_none() {
+        discard self.alone.insert(item, value: rejected)
+    }
+} Kept.judged_alone
+
+/// Where an item's green entry lies: the part holding it, and its bytes there.
+struct GreenSpan derives Copy {
+    part: u32
+    start: usize
+    end: usize
+} GreenSpan
+
+/// Keeps an item's green entry for the next snapshot, in the part of the running task's jobs.
+fn Checker.keep_green(self, item: ty::ItemId, entry: Greened) {
+    let alloc = self.alloc()
+    let kept = self.state.contents().kept
+    var encoded = mem::Bytes.empty(alloc)
+    put_green(mut encoded, entry)
+    let Some(job) = self.underway.contents().job else {
+        expect false
+        return
+    }
+    if job.part.load() == NO_ID {
+        job.part.store(kept.green_parts.push(mem::Arena[u8].empty(alloc)).index())
+    }
+    let part = job.part.load()
+    let bytes = kept.green_parts.at(mem::Id[mem::Arena[u8]].of(part))
+    let start = bytes.len()
+    for byte in encoded {
+        discard bytes.push(byte)
+    }
+    discard kept.greens.insert(item, value: GreenSpan(part: part, start: start, end: bytes.len()))
+} Checker.keep_green
+
+/// The bytes of the green entry kept of an item, if any.
+fn Checker.kept_green_bytes(self, item: ty::ItemId) -> Option[mem::Bytes] {
+    let kept = self.state.contents().kept
+    let Some(span) = kept.greens.get(item) else {
+        return None
+    }
+    let part = kept.green_parts.at(mem::Id[mem::Arena[u8]].of(span.part))
+    var bytes = mem::Bytes.empty(self.alloc())
+    for at in span.start..<span.end {
+        mut bytes.push(part.at(mem::Id[u8].of(u32.fit(at))))
+    }
+    return Some(take bytes)
+} Checker.kept_green_bytes
+
+/// An item's api lines and interface hash, as its last-green entry holds them: those the snapshot
+/// restored from holds, or those kept for the next snapshot.
+fn Checker.kept_green(self, item: ty::ItemId) -> Greened {
+    match self.restored_green(item) {
+        Some(entry) => return entry
+        None => {}
+    }
+    let Some(bytes) = self.kept_green_bytes(item) else {
+        expect false
+        return Greened(api: mem::List[text::String].empty(self.alloc()), interface_hash: None)
+    }
+    let Some(entry) = read_green(bytes.view(), alloc: self.alloc()) else {
+        expect false
+        return Greened(api: mem::List[text::String].empty(self.alloc()), interface_hash: None)
+    }
+    return entry
+} Checker.kept_green
+
+fn put_green(mut out: mem::Bytes, entry: Greened) {
+    encoding::uvar(mut out, value: u64.widen(entry.api.len()))
+    for line in entry.api {
+        put_text(mut out, value: line.as_str())
+    }
+    match entry.interface_hash {
+        Some(hash) => {
+            put_flag(mut out, value: true)
+            put_hash(mut out, value: hash)
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_green
+
+/// The green entry of an item the snapshot restored from holds, if any.
+fn Checker.restored_green(self, item: ty::ItemId) -> Option[Greened] {
+    let Some(bytes) = self.restored_green_bytes(item) else {
+        return None
+    }
+    return read_green(bytes.view(), alloc: self.alloc())
+} Checker.restored_green
+
+/// The state of a closure under a target as its snapshot names it.
+struct CheckState {
+    /// The hash of every input of the check, which names its snapshot.
+    key: hashing::HashValue
+    /// The name of the cache record holding the key of the latest snapshot of the closure under
+    /// the target in this workspace.
+    latest: text::String
+    /// The hash of every input but the source files of the packages checked.
+    context: hashing::HashValue
+    files: mem::List[StateFile]
+} CheckState
+
+/// A source file of a package checked, with the hash of its contents.
+struct StateFile {
+    path: text::String
+    content: hashing::HashValue
+    /// Its file in the workspace.
+    at: workspace::FileAt
+} StateFile
+
+/// The state a check checks, and the snapshot it restores from.
+struct Plan {
+    state: mem::Shared[CheckState]
+    restored: Option[Restoring]
+} Plan
+
+/// A snapshot a check restores from: its key, the outcomes it restores, at the positions of the
+/// state checked, with their spans by item index, the reads it keeps, its files, and its bytes
+/// with the spans there of the green entries of the items it restores.
+struct Restoring {
+    key: hashing::HashValue
+    bytes: mem::Bytes
+    outcomes: mem::HashMap[u32, ByteSpan]
+    reads: mem::List[TracedRead]
+    files: mem::List[SnapshotFile]
+    source: mem::Bytes
+    greens: mem::HashMap[u32, ByteSpan]
+} Restoring
+
+/// The bytes `start..end` of a snapshot.
+struct ByteSpan derives Copy {
+    start: usize
+    end: usize
+} ByteSpan
+
+/// The shape of a source file: the hash of its text outside function bodies, and each item's
+/// body, by its index among the file's items.
+struct FileShape {
+    skeleton: hashing::HashValue
+    bodies: mem::List[Option[BodyAt]]
+} FileShape
+
+/// The body of an item of a file.
+fn item_body(file: syntax::SourceFile, item: syntax::ItemSyntax) -> Option[BodyAt] {
+    if item.abandoned {
+        return None
+    }
+    let Some(tree) = item.tree else {
+        return None
+    }
+    let Some(kind) = tree.kind() else {
+        return None
+    }
+    var holder = kind.node
+    if kind.rule == syntax::Rule.FnItem {
+        let Some(end) = tree.find(kind.node, rule: syntax::Rule.FnEnd) else {
+            return None
+        }
+        holder = end
+    } else if kind.rule != syntax::Rule.TestItem {
+        return None
+    }
+    let Some(body) = tree.find(holder, rule: syntax::Rule.FnBody) else {
+        return None
+    }
+    let Some(span) = tree.span(body) else {
+        return None
+    }
+    var closing: Option[u32] = None
+    for token in tree.child_tokens(body) {
+        expect usize.widen(token) < file.tokens.len()
+        if file.tokens[usize.widen(token)].kind == syntax::TokenKind.Punct(syntax::Punct.RBrace) {
+            closing = Some(token)
+            break
+        }
+    }
+    let Some(close) = closing else {
+        return None
+    }
+    if usize.widen(span.head) <= item.head or close < span.head {
+        return None
+    }
+    let before = file.tokens[usize.widen(span.head) - 1]
+    let closer = file.tokens[usize.widen(close)]
+    if closer.start < before.end {
+        return None
+    }
+    let Some(upto) = file.source.view().prefix(usize.widen(closer.start)) else {
+        return None
+    }
+    let Some(parts) = upto.split_at(usize.widen(before.end)) else {
+        return None
+    }
+    return Some(BodyAt(hash: hashing::HashValue.of(parts.tail), bytes: Stretch(start: before.end, end: closer.start), lines: Stretch(start: before.line, end: closer.line), tokens: Stretch(start: span.head - 1, end: close)))
+} item_body
+
+/// A source file's shape.
+fn file_shape(file: syntax::SourceFile, alloc: mem::Alloc) -> FileShape {
+    let source = file.source.view()
+    var skeleton = mem::Bytes.empty(alloc)
+    var bodies = mem::List[Option[BodyAt]].empty(alloc)
+    var from: usize = 0
+    for item in file.items {
+        let found = item_body(file, item)
+        mut bodies.push(found)
+        let Some(body) = found else {
+            continue
+        }
+        let start = usize.widen(body.bytes.start)
+        expect from <= start and start <= source.len()
+        let Some(upto) = source.prefix(start) else {
+            continue
+        }
+        let Some(parts) = upto.split_at(from) else {
+            continue
+        }
+        encoding::bytes(mut skeleton, value: parts.tail)
+        from = usize.widen(body.bytes.end)
+    }
+    let Some(rest) = source.split_at(from) else {
+        expect false
+        return FileShape(skeleton: hashing::HashValue.of(skeleton.view()), bodies: take bodies)
+    }
+    encoding::bytes(mut skeleton, value: rest.tail)
+    return FileShape(skeleton: hashing::HashValue.of(skeleton.view()), bodies: take bodies)
+} file_shape
+
+/// The state of the checker's closure under its target: its source files with their hashes, and
+/// the hash of its other inputs, the toolchain's, the target, its other packages' files and
+/// releases, the local store's index and the database's items.
+fn Checker.check_state(self, closure: workspace::Closure) -> CheckState {
+    let db = self.db()
+    let session = self.session()
+    let alloc = self.alloc()
+    let held = session.workspace.contents()
+    let toolchain_hash = session.toolchain_hash()
+    let checked = self.packages_checked()
+    var context = mem::Bytes.empty(alloc)
+    encoding::bytes(mut context, value: b"kept 1")
+    encoding::bytes(mut context, value: toolchain_hash.bytes.view())
+    encoding::bytes(mut context, value: db.target.name().as_bytes())
+    encoding::uvar(mut context, value: u64.widen(db.items.len()))
+    var latest = mem::Bytes.empty(alloc)
+    encoding::bytes(mut latest, value: toolchain_hash.bytes.view())
+    encoding::bytes(mut latest, value: db.target.name().as_bytes())
+    encoding::bytes(mut latest, value: held.root.as_bytes())
+    var files = mem::List[StateFile].empty(alloc)
+    for entry in closure.members {
+        encoding::bytes(mut context, value: entry.key().as_bytes())
+        encoding::bytes(mut latest, value: entry.key().as_bytes())
+        match entry.value() {
+            workspace::Member.Release(at) => {
+                expect at < held.releases.len()
+                encoding::bytes(mut context, value: held.releases[at].root.bytes.view())
+            }
+            workspace::Member.Source(index) => {
+                let source = held.member(entry.value())
+                let is_checked = match db.package_of_member(entry.value()) {
+                    Some(id) => checked.position(fn(value: ty::PackageId) => value == id).is_some()
+                    None => false
+                }
+                if not is_checked {
+                    for file in package_files(source, alloc) {
+                        put_file(mut context, path: file.path.as_str(), content: file.content.view())
+                    }
+                    continue
+                }
+                put_machine_files(mut context, machine: source.machine)
+                for position in 0..<source.files.len() {
+                    let file = source.files[position]
+                    mut files.push(StateFile(path: text::String.of(file.path.as_str(), alloc), content: hashing::HashValue.of(file.syntax.source.view()), at: workspace::FileAt(package_index: index, file_index: position)))
+                }
+            }
+        }
+    }
+    for published in self.store_index() {
+        encoding::uvar(mut context, value: published.index)
+        encoding::bytes(mut context, value: published.root.bytes.view())
+    }
+    let context_hash = hashing::HashValue.of(context.view())
+    var keyed = mem::Bytes.empty(alloc)
+    encoding::bytes(mut keyed, value: context_hash.bytes.view())
+    for file in files {
+        encoding::bytes(mut keyed, value: file.path.as_bytes())
+        encoding::bytes(mut keyed, value: file.content.bytes.view())
+    }
+    var name = text::String.of("latest-", alloc)
+    mut name.append(hashing::HashValue.of(latest.view()).full(alloc).as_str())
+    return CheckState(key: hashing::HashValue.of(keyed.view()), latest: take name, context: context_hash, files: take files)
+} Checker.check_state
+
+/// A file's path and the hash of its contents.
+fn put_file(mut out: mem::Bytes, path: Str, content: Slice[u8]) {
+    put_text(mut out, value: path)
+    put_hash(mut out, value: hashing::HashValue.of(content))
+} put_file
+
+/// The paths and hashes of a package's machine files.
+fn put_machine_files(mut out: mem::Bytes, machine: workspace::Machine) {
+    match machine.lock_file {
+        Some(loaded) => put_file(mut out, path: loaded.path.as_str(), content: loaded.bytes.view())
+        None => {}
+    }
+    match machine.history_file {
+        Some(loaded) => put_file(mut out, path: loaded.path.as_str(), content: loaded.bytes.view())
+        None => {}
+    }
+    for snapshot in machine.snapshots {
+        put_file(mut out, path: snapshot.loaded.path.as_str(), content: snapshot.loaded.bytes.view())
+    }
+} put_machine_files
+
+/// The publication index and code root of each entry of the local store, none without a usable
+/// one.
+fn Checker.store_index(self) -> mem::List[store::Published] {
+    let session = self.session()
+    let alloc = self.alloc()
+    let Ok(opened) = attempt cache::Cache.open(cache::copied_override(session.home, alloc), alloc) else {
+        return mem::List[store::Published].empty(alloc)
+    }
+    let Ok(user) = opened else {
+        return mem::List[store::Published].empty(alloc)
+    }
+    let Ok(found) = attempt store::Store.new(user.store()).index() else {
+        return mem::List[store::Published].empty(alloc)
+    }
+    let Ok(index) = found else {
+        return mem::List[store::Published].empty(alloc)
+    }
+    return index
+} Checker.store_index
+
+fn put_flag(mut out: mem::Bytes, value: bool) {
+    var number: u64 = 0
+    if value {
+        number = 1
+    }
+    encoding::uvar(mut out, value: number)
+} put_flag
+
+fn put_text(mut out: mem::Bytes, value: Str) {
+    encoding::bytes(mut out, value: value.as_bytes())
+} put_text
+
+fn put_hash(mut out: mem::Bytes, value: hashing::HashValue) {
+    encoding::bytes(mut out, value: value.bytes.view())
+} put_hash
+
+fn put_item(mut out: mem::Bytes, item: ty::ItemId) {
+    encoding::uvar(mut out, value: u64.widen(item.index))
+} put_item
+
+fn put_items(mut out: mem::Bytes, items: Slice[ty::ItemId]) {
+    encoding::uvar(mut out, value: u64.widen(items.len()))
+    for item in items {
+        put_item(mut out, item)
+    }
+} put_items
+
+fn put_optional_text(mut out: mem::Bytes, value: Option[text::String]) {
+    match value {
+        Some(held) => {
+            put_flag(mut out, value: true)
+            put_text(mut out, value: held.as_str())
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_optional_text
+
+fn put_optional_number(mut out: mem::Bytes, value: Option[u32]) {
+    match value {
+        Some(held) => {
+            put_flag(mut out, value: true)
+            encoding::uvar(mut out, value: u64.widen(held))
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_optional_number
+
+fn put_span(mut out: mem::Bytes, value: Option[diagnostic::Span]) {
+    match value {
+        Some(span) => {
+            put_flag(mut out, value: true)
+            encoding::uvar(mut out, value: u64.widen(span.start))
+            encoding::uvar(mut out, value: u64.widen(span.end))
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_span
+
+/// A diagnostic, every part of it.
+fn put_diagnostic(mut out: mem::Bytes, reported: diagnostic::Diagnostic) {
+    put_text(mut out, value: reported.code.name())
+    put_optional_text(mut out, value: reported.path)
+    put_optional_number(mut out, value: reported.line)
+    put_optional_text(mut out, value: reported.item)
+    put_optional_text(mut out, value: reported.expected)
+    put_optional_text(mut out, value: reported.found)
+    encoding::uvar(mut out, value: u64.widen(reported.because.len()))
+    for reason in reported.because {
+        encoding::uvar(mut out, value: reason_role_number(reason.role))
+        put_text(mut out, value: reason.subject.as_str())
+        match reason.at {
+            Some(at) => {
+                put_flag(mut out, value: true)
+                put_text(mut out, value: at.path.as_str())
+                encoding::uvar(mut out, value: u64.widen(at.line))
+            }
+            None => put_flag(mut out, value: false)
+        }
+    }
+    put_span(mut out, value: reported.span)
+    put_span(mut out, value: reported.judged)
+    put_optional_number(mut out, value: reported.failing)
+    encoding::uvar(mut out, value: u64.widen(reported.fixes.len()))
+    for fix in reported.fixes {
+        encoding::uvar(mut out, value: u64.widen(fix.edits.len()))
+        for edit in fix.edits {
+            put_text(mut out, value: edit.path.as_str())
+            encoding::uvar(mut out, value: u64.widen(edit.replacement.start))
+            encoding::uvar(mut out, value: u64.widen(edit.replacement.end))
+            put_text(mut out, value: edit.replacement.text.as_str())
+        }
+    }
+    encoding::uvar(mut out, value: match reported.offer {
+        diagnostic::Offer.Each => 0
+        diagnostic::Offer.First => 1
+        diagnostic::Offer.Unique => 2
+    })
+    match reported.envelope {
+        Some(held) => {
+            put_flag(mut out, value: true)
+            put_text(mut out, value: held.origin.as_str())
+            encoding::uvar(mut out, value: u64.widen(held.lines.len()))
+            for line in held.lines {
+                put_text(mut out, value: line.as_str())
+            }
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_diagnostic
+
+fn put_authority(mut out: mem::Bytes, authority: workspace::Authority) {
+    match authority {
+        workspace::Authority.Device => encoding::uvar(mut out, value: 0)
+        workspace::Authority.Priv => encoding::uvar(mut out, value: 1)
+        workspace::Authority.Trusted => encoding::uvar(mut out, value: 2)
+        workspace::Authority.Validate => encoding::uvar(mut out, value: 3)
+        workspace::Authority.Contribute(path) => {
+            encoding::uvar(mut out, value: 4)
+            put_text(mut out, value: path.as_str())
+        }
+    }
+} put_authority
+
+fn put_item_set(mut out: mem::Bytes, set: Option[mem::Set[ty::ItemId]]) {
+    match set {
+        Some(held) => {
+            put_flag(mut out, value: true)
+            encoding::uvar(mut out, value: u64.widen(held.len()))
+            for item in held {
+                put_item(mut out, item)
+            }
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_item_set
+
+fn put_digest(mut out: mem::Bytes, digest: Digest) {
+    put_flag(mut out, value: digest.wait)
+    put_flag(mut out, value: digest.alloc)
+    put_flag(mut out, value: digest.device)
+    put_flag(mut out, value: digest.privileged)
+    put_flag(mut out, value: digest.sync)
+    put_flag(mut out, value: digest.terminates)
+    put_flag(mut out, value: digest.float)
+    put_item_set(mut out, set: digest.capabilities)
+    put_item_set(mut out, set: digest.validators)
+} put_digest
+
+/// The bytes of a snapshot and the position read to; a read past their end, or of a part
+/// malformed, fails the whole read.
+view struct Cursor {
+    bytes: Slice[u8]
+    at: usize
+    failed: bool
+} Cursor
+
+fn Cursor.number(mut self) -> u64 {
+    var value: u64 = 0
+    var shift: u32 = 0
+    loop {
+        if self.at >= self.bytes.len() or shift > 56 {
+            self.failed = true
+            return 0
+        }
+        let byte = self.bytes[self.at]
+        self.at += 1
+        value = value | (u64.widen(byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            return value
+        }
+        shift += 7
+    }
+} Cursor.number
+
+fn Cursor.small(mut self) -> u32 {
+    let value = mut self.number()
+    if value > 0xFFFF_FFFF {
+        self.failed = true
+        return 0
+    }
+    return u32.fit(value)
+} Cursor.small
+
+fn Cursor.count(mut self) -> usize {
+    let value = mut self.number()
+    if value > u64.widen(self.bytes.len()) {
+        self.failed = true
+        return 0
+    }
+    return usize.widen(value)
+} Cursor.count
+
+fn Cursor.flag(mut self) -> bool {
+    return mut self.number() == 1
+} Cursor.flag
+
+/// The bytes of a part; once the read fails, any bytes.
+proj fn Cursor.chunk(mut self) -> Slice[u8] {
+    let length = mut self.count()
+    let start = self.at
+    if self.failed or start + length > self.bytes.len() {
+        self.failed = true
+        return self.bytes
+    }
+    self.at = start + length
+    let Some(upto) = self.bytes.prefix(start + length) else {
+        self.failed = true
+        return self.bytes
+    }
+    let Some(parts) = upto.split_at(start) else {
+        self.failed = true
+        return self.bytes
+    }
+    return parts.tail
+} Cursor.chunk
+
+fn Cursor.text(mut self, alloc: mem::Alloc) -> text::String {
+    let bytes = mut self.chunk()
+    let Some(written) = output::text_of(bytes, alloc) else {
+        self.failed = true
+        return text::String.empty(alloc)
+    }
+    return written
+} Cursor.text
+
+fn Cursor.optional_text(mut self, alloc: mem::Alloc) -> Option[text::String] {
+    if not mut self.flag() {
+        return None
+    }
+    return Some(mut self.text(alloc))
+} Cursor.optional_text
+
+fn Cursor.optional_number(mut self) -> Option[u32] {
+    if not mut self.flag() {
+        return None
+    }
+    return Some(mut self.small())
+} Cursor.optional_number
+
+fn Cursor.hash(mut self) -> hashing::HashValue {
+    let bytes = mut self.chunk()
+    var held = Array[u8, 33].filled(0)
+    if bytes.len() != 33 {
+        self.failed = true
+        return hashing::HashValue(bytes: held)
+    }
+    for index in 0..<33usize {
+        held[index] = bytes[index]
+    }
+    return hashing::HashValue(bytes: held)
+} Cursor.hash
+
+fn Cursor.item(mut self) -> ty::ItemId {
+    return ty::ItemId(index: mut self.small())
+} Cursor.item
+
+fn Cursor.items(mut self, alloc: mem::Alloc) -> mem::List[ty::ItemId] {
+    var items = mem::List[ty::ItemId].empty(alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        mut items.push(mut self.item())
+    }
+    return items
+} Cursor.items
+
+fn Cursor.span(mut self) -> Option[diagnostic::Span] {
+    if not mut self.flag() {
+        return None
+    }
+    let start = mut self.small()
+    let end = mut self.small()
+    return Some(diagnostic::Span(start: start, end: end))
+} Cursor.span
+
+fn Cursor.diagnostic(mut self, alloc: mem::Alloc) -> diagnostic::Diagnostic {
+    let name = mut self.text(alloc)
+    var code = diagnostic::Code.ToolUsage
+    match diagnostic::Code.from_name(name.as_str()) {
+        Some(found) => {
+            code = found
+        }
+        None => {
+            self.failed = true
+        }
+    }
+    var reported = diagnostic::Diagnostic.new(code, alloc)
+    reported.path = mut self.optional_text(alloc)
+    reported.line = mut self.optional_number()
+    reported.item = mut self.optional_text(alloc)
+    reported.expected = mut self.optional_text(alloc)
+    reported.found = mut self.optional_text(alloc)
+    let reasons = mut self.count()
+    for _ in 0..<reasons {
+        var role = diagnostic::Role.Note
+        match reason_role(mut self.number()) {
+            Some(found) => {
+                role = found
+            }
+            None => {
+                self.failed = true
+            }
+        }
+        let subject = mut self.text(alloc)
+        var at: Option[diagnostic::At] = None
+        if mut self.flag() {
+            let path = mut self.text(alloc)
+            at = Some(diagnostic::At(path: take path, line: mut self.small()))
+        }
+        mut reported.because.push(diagnostic::Reason(role: role, subject: take subject, at: take at))
+    }
+    reported.span = mut self.span()
+    reported.judged = mut self.span()
+    reported.failing = mut self.optional_number()
+    let fixes = mut self.count()
+    for _ in 0..<fixes {
+        var edits = mem::List[diagnostic::Edit].empty(alloc)
+        let count = mut self.count()
+        for _ in 0..<count {
+            let path = mut self.text(alloc)
+            let start = mut self.small()
+            let end = mut self.small()
+            let replaced = mut self.text(alloc)
+            mut edits.push(diagnostic::Edit(path: take path, replacement: diagnostic::Replacement(start: start, end: end, text: take replaced)))
+        }
+        mut reported.fixes.push(diagnostic::Fix(edits: take edits))
+    }
+    reported.offer = match mut self.number() {
+        0 => diagnostic::Offer.Each
+        1 => diagnostic::Offer.First
+        else => diagnostic::Offer.Unique
+    }
+    if mut self.flag() {
+        let origin = mut self.text(alloc)
+        var lines = mem::List[text::String].empty(alloc)
+        let count = mut self.count()
+        for _ in 0..<count {
+            mut lines.push(mut self.text(alloc))
+        }
+        reported.envelope = Some(diagnostic::Envelope(origin: take origin, lines: take lines))
+    }
+    return reported
+} Cursor.diagnostic
+
+fn Cursor.authority(mut self, alloc: mem::Alloc) -> workspace::Authority {
+    return match mut self.number() {
+        0 => workspace::Authority.Device
+        1 => workspace::Authority.Priv
+        2 => workspace::Authority.Trusted
+        3 => workspace::Authority.Validate
+        else => workspace::Authority.Contribute(mut self.text(alloc))
+    }
+} Cursor.authority
+
+fn Cursor.item_set(mut self, alloc: mem::Alloc) -> Option[mem::Set[ty::ItemId]] {
+    if not mut self.flag() {
+        return None
+    }
+    var set = mem::Set[ty::ItemId].empty(alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        discard mut set.insert(mut self.item())
+    }
+    return Some(take set)
+} Cursor.item_set
+
+fn Cursor.digest(mut self, alloc: mem::Alloc) -> Digest {
+    let wait = mut self.flag()
+    let allocates = mut self.flag()
+    let device = mut self.flag()
+    let privileged = mut self.flag()
+    let sync = mut self.flag()
+    let terminates = mut self.flag()
+    let float = mut self.flag()
+    let capabilities = mut self.item_set(alloc)
+    let validators = mut self.item_set(alloc)
+    return Digest(wait: wait, alloc: allocates, device: device, privileged: privileged, sync: sync, terminates: terminates, float: float, capabilities: take capabilities, validators: take validators)
+} Cursor.digest
+
+/// The positions in the checker's arenas of what each item's own work found, read and
+/// performed, by item index.
+struct Grouped {
+    found: mem::HashMap[u32, mem::List[u32]]
+    unused: mem::HashMap[u32, mem::List[u32]]
+    fields: mem::HashMap[u32, mem::List[u32]]
+    labels: mem::HashMap[u32, mem::List[u32]]
+    performs: mem::HashMap[u32, mem::List[u32]]
+    needs: mem::HashMap[u32, mem::List[u32]]
+} Grouped
+
+fn add_grouped(mut groups: mem::HashMap[u32, mem::List[u32]], owner: u32, position: usize, alloc: mem::Alloc) {
+    if owner == NO_ID {
+        return
+    }
+    if groups.contains(owner) {
+        var listed = mut groups.at_mut(owner)
+        mut listed.push(u32.fit(position))
+        return
+    }
+    var listed = mem::List[u32].empty(alloc)
+    mut listed.push(u32.fit(position))
+    discard mut groups.insert(owner, value: take listed)
+} add_grouped
+
+fn group_of(groups: mem::HashMap[u32, mem::List[u32]], item: ty::ItemId, alloc: mem::Alloc) -> mem::List[u32] {
+    let Some(listed) = groups.get(item.index) else {
+        return mem::List[u32].empty(alloc)
+    }
+    var copied = mem::List[u32].empty(alloc)
+    for position in listed {
+        mut copied.push(position)
+    }
+    return copied
+} group_of
+
+fn Checker.grouped(self) -> Grouped {
+    let state = self.state.contents()
+    let kept = state.kept
+    let alloc = self.alloc()
+    var grouped = Grouped(found: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), unused: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), fields: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), labels: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), performs: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc), needs: mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc))
+    for position in 0..<state.found.len() {
+        let entry = state.found.at(mem::Id[Found].of(u32.fit(position)))
+        if entry.sink == 0 {
+            add_grouped(mut grouped.found, owner: entry.owner, position, alloc)
+        }
+    }
+    for position in 0..<state.unused.len() {
+        add_grouped(mut grouped.unused, owner: state.unused.at(mem::Id[Found].of(u32.fit(position))).owner, position, alloc)
+    }
+    for position in 0..<kept.fields.len() {
+        add_grouped(mut grouped.fields, owner: kept.fields.at(mem::Id[FieldRead].of(u32.fit(position))).reader.index, position, alloc)
+    }
+    for position in 0..<kept.labels.len() {
+        add_grouped(mut grouped.labels, owner: kept.labels.at(mem::Id[LabelOf].of(u32.fit(position))).label.item.index, position, alloc)
+    }
+    for position in 0..<kept.performs.len() {
+        add_grouped(mut grouped.performs, owner: kept.performs.at(mem::Id[PerformedBy].of(u32.fit(position))).item.index, position, alloc)
+    }
+    for position in 0..<state.needs.len() {
+        add_grouped(mut grouped.needs, owner: state.needs.at(mem::Id[Need].of(u32.fit(position))).needing.index, position, alloc)
+    }
+    return grouped
+} Checker.grouped
+
+/// The interface hash of a const whose value is known, which holds that value.
+fn Checker.const_hash(self, item: ty::ItemId) -> Option[hashing::HashValue] {
+    let ast::ItemKind.Const(_) = self.db().declaration(item).kind else {
+        return None
+    }
+    if self.state.contents().const_values.get(item).is_none() {
+        return None
+    }
+    return self.hashes(item).interface_hash
+} Checker.const_hash
+
+/// The facts of an item a snapshot seeds a later check with: its digest, its dependencies through
+/// its typed body and through its unit, and its may-trap fact, each once computed.
+fn Checker.put_seed(self, mut out: mem::Bytes, item: ty::ItemId) {
+    let state = self.state.contents()
+    let digest = state.digests.get(item)
+    let body = state.body_dependencies.get(item)
+    let unit = state.unit_dependencies.get(item)
+    let traps = state.may_traps.get(item)
+    put_item(mut out, item)
+    match digest {
+        Some(held) => {
+            put_flag(mut out, value: true)
+            put_digest(mut out, digest: held.contents())
+        }
+        None => put_flag(mut out, value: false)
+    }
+    match body {
+        Some(found) => {
+            put_flag(mut out, value: true)
+            match found {
+                Some(listed) => {
+                    put_flag(mut out, value: true)
+                    put_items(mut out, items: listed.contents().view())
+                }
+                None => put_flag(mut out, value: false)
+            }
+        }
+        None => put_flag(mut out, value: false)
+    }
+    match unit {
+        Some(listed) => {
+            put_flag(mut out, value: true)
+            put_items(mut out, items: listed.contents().view())
+        }
+        None => put_flag(mut out, value: false)
+    }
+    match traps {
+        Some(flag) => {
+            put_flag(mut out, value: true)
+            put_flag(mut out, value: flag)
+        }
+        None => put_flag(mut out, value: false)
+    }
+} Checker.put_seed
+
+/// Whether the check computed one of the facts of an item a snapshot seeds a check with.
+fn Checker.seeded(self, item: ty::ItemId) -> bool {
+    let state = self.state.contents()
+    return state.digests.get(item).is_some() or state.body_dependencies.get(item).is_some() or state.unit_dependencies.get(item).is_some() or state.may_traps.get(item).is_some()
+} Checker.seeded
+
+/// The items whose outcomes a snapshot keeps: those of the packages the checker checks.
+fn Checker.outcome_items(self) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var items = mem::List[ty::ItemId].empty(self.alloc())
+    for package_id in self.packages_checked() {
+        for module in db.package_data(package_id).modules {
+            for item in db.module(module).items {
+                mut items.push(item)
+            }
+        }
+    }
+    return items
+} Checker.outcome_items
+
+const SNAPSHOT_HEADER: Str = "nan kept 1"
+
+/// The snapshot of the state the checker checked.
+fn Checker.snapshot(self, plan: Plan) -> mem::Bytes {
+    let state = self.state.contents()
+    let db = self.db()
+    let alloc = self.alloc()
+    let held = state.session.workspace.contents()
+    let checked = plan.state.contents()
+    var out = mem::Bytes.empty(alloc)
+    match plan.restored {
+        Some(restoring) => mut out.reserve(restoring.source.len())
+        None => {}
+    }
+    put_text(mut out, value: SNAPSHOT_HEADER)
+    put_hash(mut out, value: checked.context)
+    encoding::uvar(mut out, value: u64.widen(db.items.len()))
+    encoding::uvar(mut out, value: u64.widen(checked.files.len()))
+    for index in 0..<checked.files.len() {
+        let file = checked.files[index]
+        put_text(mut out, value: file.path.as_str())
+        put_hash(mut out, value: file.content)
+        match plan.restored {
+            Some(restoring) => if index < restoring.files.len() and restoring.files[index].content == file.content and restoring.files[index].path.as_str() == file.path.as_str() {
+                put_shape(mut out, shape: restoring.files[index].shape)
+                continue
+            }
+            None => {}
+        }
+        put_shape(mut out, shape: file_shape(held.file_at(file.at).syntax, alloc))
+    }
+    var seeded: usize = 0
+    for index in 0..<db.items.len() {
+        if self.seeded(ty::ItemId(index: u32.fit(index))) {
+            seeded += 1
+        }
+    }
+    encoding::uvar(mut out, value: u64.widen(seeded))
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if self.seeded(item) {
+            self.put_seed(mut out, item)
+        }
+    }
+    self.put_reads(mut out, plan)
+    self.put_greens(mut out)
+    self.put_outcomes(mut out, plan)
+    return out
+} Checker.snapshot
+
+/// A snapshot as read: the parts before the outcomes, and the span of each item's green entry
+/// and outcome.
+struct Snapshot {
+    context: hashing::HashValue
+    items: usize
+    files: mem::List[SnapshotFile]
+    seeds: mem::List[Seed]
+    reads: mem::List[TracedRead]
+    greens: mem::HashMap[u32, ByteSpan]
+    outcomes: mem::HashMap[u32, ByteSpan]
+} Snapshot
+
+/// A file a snapshot's state checked, with its contents' hash and its shape.
+struct SnapshotFile {
+    path: text::String
+    content: hashing::HashValue
+    shape: FileShape
+} SnapshotFile
+
+/// The facts of an item a snapshot seeds a check with.
+struct Seed {
+    item: ty::ItemId
+    digest: Option[Digest]
+    body: Option[Option[mem::List[ty::ItemId]]]
+    unit: Option[mem::List[ty::ItemId]]
+    traps: Option[bool]
+} Seed
+
+/// The snapshot `bytes` hold, none for bytes that do not hold one.
+fn read_snapshot(bytes: Slice[u8], alloc: mem::Alloc) -> Option[Snapshot] {
+    let Some(whole) = bytes.prefix(bytes.len()) else {
+        return None
+    }
+    var cursor = Cursor(bytes: take whole, at: 0, failed: false)
+    let header = mut cursor.text(alloc)
+    if cursor.failed or header.as_str() != SNAPSHOT_HEADER {
+        return None
+    }
+    let context = mut cursor.hash()
+    let items = mut cursor.count()
+    var files = mem::List[SnapshotFile].empty(alloc)
+    let file_count = mut cursor.count()
+    for _ in 0..<file_count {
+        let path = mut cursor.text(alloc)
+        let content = mut cursor.hash()
+        mut files.push(SnapshotFile(path: take path, content: content, shape: mut cursor.shape(alloc)))
+    }
+    var seeds = mem::List[Seed].empty(alloc)
+    let seed_count = mut cursor.count()
+    for _ in 0..<seed_count {
+        let seed = mut cursor.seed(alloc)
+        if usize.widen(seed.item.index) >= items {
+            return None
+        }
+        mut seeds.push(take seed)
+    }
+    var reads = mem::List[TracedRead].empty(alloc)
+    let read_count = mut cursor.count()
+    for _ in 0..<read_count {
+        let reader = mut cursor.item()
+        let read = mut cursor.item()
+        mut reads.push(TracedRead(reader: reader, read: read))
+    }
+    let greens = mut cursor.green_spans(alloc)
+    let outcomes = mut cursor.outcome_spans(alloc)
+    if cursor.failed or cursor.at != bytes.len() {
+        return None
+    }
+    return Some(Snapshot(context: context, items: items, files: take files, seeds: take seeds, reads: take reads, greens: take greens, outcomes: take outcomes))
+} read_snapshot
+
+/// A file of a package and an item's index among its items.
+struct ItemAt derives Copy, Eq, Hash {
+    package_index: usize
+    file_index: usize
+    index: usize
+} ItemAt
+
+fn Checker.changed_bodies(self, snapshot: Snapshot, state: CheckState) -> Option[Changes] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let held = self.session().workspace.contents()
+    if snapshot.context != state.context or snapshot.items != db.items.len() or snapshot.files.len() != state.files.len() {
+        return None
+    }
+    var changed = mem::List[ItemAt].empty(alloc)
+    var moves = mem::List[FileMoves].empty(alloc)
+    for index in 0..<state.files.len() {
+        let file = state.files[index]
+        let old = snapshot.files[index]
+        if old.path.as_str() != file.path.as_str() {
+            return None
+        }
+        if old.content == file.content {
+            continue
+        }
+        let shape = file_shape(held.file_at(file.at).syntax, alloc)
+        let Some(moved) = file_moves(path: file.path.as_str(), old: old.shape, new: shape, alloc) else {
+            return None
+        }
+        for position in 0..<shape.bodies.len() {
+            if body_hash(shape.bodies[position]) != body_hash(old.shape.bodies[position]) {
+                mut changed.push(ItemAt(package_index: file.at.package_index, file_index: file.at.file_index, index: position))
+            }
+        }
+        mut moves.push(take moved)
+    }
+    let Some(items) = self.items_at(changed.view()) else {
+        return None
+    }
+    return Some(Changes(items: take items, moves: Moves(files: take moves)))
+} Checker.changed_bodies
+
+/// The strongly connected components of a graph over item indexes: for each node the least node
+/// of its component, and whether its component holds a cycle.
+struct Components {
+    least: mem::List[u32]
+    cyclic: mem::List[bool]
+} Components
+
+/// A node whose edges Tarjan's search walks, with the next to walk.
+struct Walking derives Copy {
+    node: u32
+    next: usize
+} Walking
+
+fn components(edges: Slice[mem::List[u32]], alloc: mem::Alloc) -> Components {
+    let count = edges.len()
+    var search = Tarjan(number: mem::List[u32].empty(alloc), low: mem::List[u32].empty(alloc), on_stack: mem::List[bool].empty(alloc), stack: mem::List[u32].empty(alloc), counter: 0, found: Components(least: mem::List[u32].empty(alloc), cyclic: mem::List[bool].empty(alloc)))
+    for _ in 0..<count {
+        mut search.number.push(NO_ID)
+        mut search.low.push(NO_ID)
+        mut search.on_stack.push(false)
+        mut search.found.least.push(NO_ID)
+        mut search.found.cyclic.push(false)
+    }
+    var frames = mem::List[Walking].empty(alloc)
+    for root in 0..<count {
+        if search.number[root] != NO_ID {
+            continue
+        }
+        mut search.enter(node: root, mut frames)
+        while frames.len() > 0 {
+            let top = frames.len() - 1
+            let node = usize.widen(frames[top].node)
+            let next = frames[top].next
+            if next < edges[node].len() {
+                frames[top].next = next + 1
+                let target = usize.widen(edges[node][next])
+                if target >= count {
+                    continue
+                }
+                if search.number[target] == NO_ID {
+                    mut search.enter(node: target, mut frames)
+                } else if search.on_stack[target] and search.number[target] < search.low[node] {
+                    search.low[node] = search.number[target]
+                }
+                continue
+            }
+            discard mut frames.pop()
+            if frames.len() > 0 {
+                let parent = usize.widen(frames[frames.len() - 1].node)
+                if search.low[node] < search.low[parent] {
+                    search.low[parent] = search.low[node]
+                }
+            }
+            if search.low[node] == search.number[node] {
+                mut search.close(node, looping: edges[node].position(fn(value: u32) => usize.widen(value) == node).is_some(), alloc)
+            }
+        }
+    }
+    return search.found
+} components
+
+/// The dependencies through typed bodies a snapshot holds, by item index.
+fn snapshot_edges(snapshot: Snapshot, alloc: mem::Alloc) -> mem::List[mem::List[u32]] {
+    var edges = mem::List[mem::List[u32]].empty(alloc)
+    for _ in 0..<snapshot.items {
+        mut edges.push(mem::List[u32].empty(alloc))
+    }
+    for seed in snapshot.seeds {
+        let Some(Some(listed)) = seed.body else {
+            continue
+        }
+        var targets = mem::List[u32].empty(alloc)
+        for item in listed {
+            mut targets.push(item.index)
+        }
+        edges[usize.widen(seed.item.index)] = targets
+    }
+    return edges
+} snapshot_edges
+
+/// The items a check of a snapshot's state checks again beside those whose bodies changed:
+/// those whose own work read one of them, closed under that relation and under the cycles of the
+/// snapshot's dependencies; by item index.
+fn rechecked(snapshot: Snapshot, changed: Slice[ty::ItemId], old: Components, alloc: mem::Alloc) -> mem::List[bool] {
+    var readers = mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc)
+    for read in snapshot.reads {
+        add_grouped(mut readers, owner: read.read.index, position: usize.widen(read.reader.index), alloc)
+    }
+    var cycles = mem::HashMap[u32, mem::List[u32]].empty(seed: 0, alloc)
+    for index in 0..<snapshot.items {
+        if old.cyclic[index] {
+            add_grouped(mut cycles, owner: old.least[index], position: index, alloc)
+        }
+    }
+    var marked = mem::List[bool].empty(alloc)
+    for _ in 0..<snapshot.items {
+        mut marked.push(false)
+    }
+    var pending = mem::List[u32].empty(alloc)
+    for item in changed {
+        if not marked[usize.widen(item.index)] {
+            marked[usize.widen(item.index)] = true
+            mut pending.push(item.index)
+        }
+    }
+    while pending.len() > 0 {
+        let Some(node) = mut pending.pop() else {
+            break
+        }
+        var next = mem::List[u32].empty(alloc)
+        match readers.get(node) {
+            Some(listed) => {
+                for reader in listed {
+                    mut next.push(reader)
+                }
+            }
+            None => {}
+        }
+        if old.cyclic[usize.widen(node)] {
+            match cycles.get(old.least[usize.widen(node)]) {
+                Some(listed) => {
+                    for member in listed {
+                        mut next.push(member)
+                    }
+                }
+                None => {}
+            }
+        }
+        for reached in next {
+            if usize.widen(reached) < marked.len() and not marked[usize.widen(reached)] {
+                marked[usize.widen(reached)] = true
+                mut pending.push(reached)
+            }
+        }
+    }
+    return marked
+} rechecked
+
+/// Gives the checker an item's outcome in place of the item's own work.
+fn Checker.restore_outcome(self, item: ty::ItemId, take outcome: Outcome) {
+    let state = self.state.contents()
+    let kept = state.kept
+    let db = self.db()
+    let alloc = self.alloc()
+    kept.restored.insert(item.index, value: Unit)
+    state.judged.insert(item, value: Unit)
+    kept.judged_alone(item, rejected: outcome.alone)
+    if outcome.alone {
+        state.rejections.insert(item, value: Unit)
+    }
+    for reported in take outcome.found {
+        discard state.found.push(Found(sink: 0, owner: item.index, diagnostic: take reported, refixed: core::atomic::AtomicU32.of(NO_ID)))
+    }
+    for reported in take outcome.unused {
+        discard state.unused.push(Found(sink: 0, owner: item.index, diagnostic: take reported, refixed: core::atomic::AtomicU32.of(NO_ID)))
+    }
+    for read in take outcome.fields {
+        state.fields_read.insert(FieldKey(owner: read.owner, name: take read.name), value: Unit)
+    }
+    for labelled in take outcome.labels {
+        let key = FieldKey(owner: labelled.owner, name: take labelled.name)
+        let listed = match state.field_labels.get(key) {
+            Some(known) => known
+            None => state.field_labels.insert(take key, value: mem::Arena[FieldLabel].empty(alloc))
+        }
+        discard listed.push(labelled.label)
+    }
+    for authority in take outcome.performs {
+        state.performed.insert(Performed(module: db.module_of(item), authority: take authority), value: Unit)
+    }
+    for needed in outcome.needs {
+        let need = Need(needing: item, needed: needed)
+        if state.needed.claim(need) {
+            discard state.needs.push(need)
+        }
+    }
+    match outcome.names {
+        Some(listed) => if state.named.get(item).is_none() {
+            var named = mem::Set[ty::ItemId].empty(alloc)
+            for held in listed {
+                discard mut named.insert(held)
+            }
+            discard state.named.insert(item, value: mem::Shared.of(take named, alloc))
+        }
+        None => {}
+    }
+} Checker.restore_outcome
+
+/// Whether judging an item alone rejected it, whether the check did, and a const's interface
+/// hash, as a snapshot's outcome holds them.
+struct OutcomeFacts derives Copy {
+    alone: bool
+    rejected: bool
+    value: Option[hashing::HashValue]
+} OutcomeFacts
+
+/// An item's green entry as a snapshot holds it.
+fn read_green(bytes: Slice[u8], alloc: mem::Alloc) -> Option[Greened] {
+    let Some(whole) = bytes.prefix(bytes.len()) else {
+        return None
+    }
+    var cursor = Cursor(bytes: take whole, at: 0, failed: false)
+    var api = mem::List[text::String].empty(alloc)
+    let count = mut cursor.count()
+    for _ in 0..<count {
+        mut api.push(mut cursor.text(alloc))
+    }
+    var interface_hash: Option[hashing::HashValue] = None
+    if mut cursor.flag() {
+        interface_hash = Some(mut cursor.hash())
+    }
+    if cursor.failed {
+        return None
+    }
+    return Some(Greened(api: take api, interface_hash: interface_hash))
+} read_green
+
+/// A copy of the bytes `span` of a snapshot's, none past its end.
+fn copied_span(bytes: Slice[u8], span: ByteSpan, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Some(upto) = bytes.prefix(span.end) else {
+        return None
+    }
+    let Some(parts) = upto.split_at(span.start) else {
+        return None
+    }
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(parts.tail)
+    return Some(take copied)
+} copied_span
+
+/// Seeds the checker with a snapshot's facts of the items not checked again.
+fn Checker.seed(self, snapshot: Snapshot, marked: Slice[bool]) {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    for seed in snapshot.seeds {
+        let item = seed.item
+        if marked[usize.widen(item.index)] {
+            continue
+        }
+        match seed.digest {
+            Some(digest) => if state.digests.get(item).is_none() {
+                discard state.digests.insert(item, value: mem::Shared.of(digest.copy(alloc), alloc))
+            }
+            None => {}
+        }
+        match seed.body {
+            Some(found) => if state.body_dependencies.get(item).is_none() {
+                let listed = match found {
+                    Some(items) => Some(mem::Shared.of(copied_items(items.view(), alloc), alloc))
+                    None => None
+                }
+                discard state.body_dependencies.insert(item, value: take listed)
+            }
+            None => {}
+        }
+        match seed.unit {
+            Some(items) => if state.unit_dependencies.get(item).is_none() {
+                discard state.unit_dependencies.insert(item, value: mem::Shared.of(copied_items(items.view(), alloc), alloc))
+            }
+            None => {}
+        }
+        match seed.traps {
+            Some(flag) => if state.may_traps.get(item).is_none() {
+                discard state.may_traps.insert(item, value: flag)
+            }
+            None => {}
+        }
+    }
+} Checker.seed
+
+/// Checks the state of a closure from the snapshot of an earlier state: restores the outcomes of
+/// the items whose bodies, and whose own work's reads, are unchanged, checks the others, and
+/// tells whether that gives what a full check of the state gives.
+fn Checker.check_restored(self, state: mem::Shared[CheckState], key: hashing::HashValue, take bytes: mem::Bytes) -> bool {
+    let alloc = self.alloc()
+    let Some(snapshot) = read_snapshot(bytes.view(), alloc) else {
+        return false
+    }
+    let Some(differences) = self.changed_bodies(snapshot, state: state.contents()) else {
+        return false
+    }
+    var changed = differences.items
+    let items = self.outcome_items()
+    for item in items {
+        if snapshot.outcomes.get(item.index).is_none() {
+            mut changed.push(item)
+        }
+    }
+    let old = components(snapshot_edges(snapshot, alloc).view(), alloc)
+    let marked = rechecked(snapshot, changed: changed.view(), old, alloc)
+    let Some(restored) = self.restore(snapshot, bytes: bytes.view(), marked: marked.view(), moves: differences.moves) else {
+        return false
+    }
+    var facts = mem::HashMap[u32, OutcomeFacts].empty(seed: 0, alloc)
+    for item in items {
+        if not marked[usize.widen(item.index)] {
+            continue
+        }
+        match snapshot.outcomes.get(item.index) {
+            Some(span) => {
+                let Some(held) = copied_span(bytes.view(), span, alloc) else {
+                    return false
+                }
+                let Some(outcome) = read_outcome(held.view(), item, alloc) else {
+                    return false
+                }
+                discard mut facts.insert(item.index, value: OutcomeFacts(alone: outcome.alone, rejected: outcome.rejected, value: outcome.value))
+            }
+            None => {}
+        }
+    }
+    var reads = mem::List[TracedRead].empty(alloc)
+    for read in snapshot.reads {
+        if not marked[usize.widen(read.reader.index)] {
+            mut reads.push(read)
+        }
+    }
+    let Restored(bytes: kept_bytes, outcomes: outcomes, greens: greens) = restored
+    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: state.share(), restored: Some(Restoring(key: key, bytes: take kept_bytes, outcomes: take outcomes, reads: take reads, files: copied_files(snapshot.files.view(), alloc), source: take bytes, greens: take greens))), alloc))
+    self.check_all()
+    return self.accepts(snapshot, facts, marked: marked.view(), old)
+} Checker.check_restored
+
+/// A diagnostic's file, line and code, by which reported diagnostics are ordered.
+struct DiagnosticKey derives Eq, Hash {
+    path: text::String
+    line: u32
+    code: diagnostic::Code
+} DiagnosticKey
+
+fn diagnostic_key(reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> DiagnosticKey {
+    let path = match reported.path {
+        Some(held) => text::String.of(held.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    let line = match reported.line {
+        Some(held) => held
+        None => NO_ID
+    }
+    return DiagnosticKey(path: take path, line: line, code: reported.code)
+} diagnostic_key
+
+/// Whether diagnostics of an arena that the reported ones order alike come from the own work of
+/// one item, or rules relating items, each: then their order does not depend on when that work
+/// ran.
+fn owned_apart(entries: mem::Arena[Found], own_sink: bool, alloc: mem::Alloc) -> bool {
+    var owners = mem::HashMap[DiagnosticKey, u32].empty(seed: 0, alloc)
+    for entry in entries.cursor() {
+        if own_sink and entry.sink != 0 {
+            continue
+        }
+        let key = diagnostic_key(entry.diagnostic, alloc)
+        match owners.get(key) {
+            Some(owner) => if owner != entry.owner {
+                return false
+            }
+            None => {
+                discard mut owners.insert(take key, value: entry.owner)
+            }
+        }
+    }
+    return true
+} owned_apart
+
+/// Whether a check that restored from a snapshot gives what a full check gives: nothing it
+/// reports depends on when the restored work ran, the items it checked again give the facts the
+/// snapshot holds of them, and the cycles of the dependencies are the snapshot's.
+fn Checker.accepts(self, snapshot: Snapshot, facts: mem::HashMap[u32, OutcomeFacts], marked: Slice[bool], old: Components) -> bool {
+    if not self.reports_apart() {
+        return false
+    }
+    let state = self.state.contents()
+    for item in self.outcome_items() {
+        let Some(held) = facts.get(item.index) else {
+            continue
+        }
+        let alone = match state.kept.alone.get(item) {
+            Some(rejected) => rejected
+            None => return false
+        }
+        if alone != held.alone or state.rejections.get(item).is_some() != held.rejected {
+            return false
+        }
+        match held.value {
+            Some(hash) => {
+                discard self.const_value(item)
+                if self.const_hash(item) != Some(hash) {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    let Some(reshaped) = self.seeds_agree(snapshot, marked) else {
+        return false
+    }
+    if not reshaped {
+        return true
+    }
+    return self.cycles_agree(snapshot, old)
+} Checker.accepts
+
+fn same_items(left: Slice[ty::ItemId], right: Slice[ty::ItemId]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for index in 0..<left.len() {
+        if left[index] != right[index] {
+            return false
+        }
+    }
+    return true
+} same_items
+
+/// The key and bytes of the snapshot of a state, or else of the latest state checked of its
+/// closure under its target in its workspace; none when the build cache holds neither.
+fn latest_snapshot(opened: Option[cache::Cache], state: CheckState, alloc: mem::Alloc) -> Option[KeyedBytes] {
+    let Some(user_cache) = opened else {
+        return None
+    }
+    match cached_entry(user_cache, key: state.key) {
+        Some(bytes) => return Some(KeyedBytes(key: state.key, bytes: take bytes))
+        None => {}
+    }
+    let Ok(found) = attempt user_cache.record(state.latest.as_str()) else {
+        return None
+    }
+    let Ok(Some(held)) = found else {
+        return None
+    }
+    var cursor = Cursor(bytes: held.view(), at: 0, failed: false)
+    let key = mut cursor.hash()
+    if cursor.failed {
+        return None
+    }
+    let Some(bytes) = cached_entry(user_cache, key) else {
+        return None
+    }
+    return Some(KeyedBytes(key: key, bytes: take bytes))
+} latest_snapshot
+
+/// A cache entry's key and contents.
+struct KeyedBytes {
+    key: hashing::HashValue
+    bytes: mem::Bytes
+} KeyedBytes
+
+fn cached_entry(user_cache: cache::Cache, key: hashing::HashValue) -> Option[mem::Bytes] {
+    let Ok(found) = attempt user_cache.entry(key) else {
+        return None
+    }
+    let Ok(Some(held)) = found else {
+        return None
+    }
+    return Some(take held)
+} cached_entry
+
+/// The checker of a closure under a target once checked: from the build cache's snapshot of the
+/// state, or of the latest state checked when the two differ in function bodies alone and
+/// checking what those reach gives the facts that snapshot holds; otherwise by a full check.
+pkg fn Session.kept_checked(self, closure: workspace::Closure, target: workspace::Target) -> Checker {
+    let alloc = self.alloc
+    let checker = self.unchecked(closure, target)
+    let state = mem::Shared.of(checker.check_state(closure), alloc)
+    match latest_snapshot(open_proof_cache(self.home, alloc), state: state.contents(), alloc) {
+        Some(found) => {
+            let KeyedBytes(key: key, bytes: bytes) = found
+            match take checker.restored(state.share(), key, take bytes) {
+                Some(done) => return done
+                None => {}
+            }
+        }
+        None => return take checker.wholly_checked(take state)
+    }
+    return self.unchecked(closure, target).wholly_checked(take state)
+} Session.kept_checked
+
+/// The checker once it has checked the state from a snapshot, as `check_restored` does; none,
+/// the checker dropped, when that does not give what a full check gives.
+fn Checker.restored(take self, state: mem::Shared[CheckState], key: hashing::HashValue, take bytes: mem::Bytes) -> Option[Checker] {
+    if self.check_restored(state, key, take bytes) {
+        return Some(take self)
+    }
+    return None
+} Checker.restored
+
+/// The checker once it has checked its state whole.
+fn Checker.wholly_checked(take self, take state: mem::Shared[CheckState]) -> Checker {
+    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: take state, restored: None), alloc: self.alloc()))
+    self.check_all()
+    return self
+} Checker.wholly_checked
+
+/// Writes the snapshot of the state the checker checked to the build cache, unless it holds it,
+/// makes it the latest of its closure under its target in its workspace, and deletes the one it
+/// restored from.
+fn Checker.keep(self) {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    let Some(held) = state.kept.plan.get(0) else {
+        return
+    }
+    let plan = held.contents()
+    for reported in state.quiet.cursor() {
+        if reported.code.class() == diagnostic::Class.Error {
+            return
+        }
+    }
+    let Some(user_cache) = open_proof_cache(state.session.home, alloc) else {
+        return
+    }
+    let checked = plan.state.contents()
+    if cached_entry(user_cache, key: checked.key).is_none() {
+        let Ok(_) = attempt user_cache.put(checked.key, contents: self.snapshot(plan).view()) else {
+            return
+        }
+    }
+    var named = mem::Bytes.empty(alloc)
+    put_hash(mut named, value: checked.key)
+    let Ok(_) = attempt user_cache.replace(checked.latest.as_str(), contents: named.view()) else {
+        return
+    }
+    match plan.restored {
+        Some(restoring) => if restoring.key != checked.key {
+            discard attempt user_cache.remove(restoring.key)
+        }
+        None => {}
+    }
+} Checker.keep
+
+/// Keeps the snapshot of each checker's state.
+pkg fn Checked.keep(self) {
+    for entry in self.checkers {
+        entry.checker.keep()
+    }
+} Checked.keep
+
+/// A function or test body, its statements up to the `}` closing it: the hash of its bytes and
+/// where it lies in bytes, lines and tokens, each from the end of what precedes it to the start
+/// of the `}`.
+struct BodyAt derives Copy, Eq {
+    hash: hashing::HashValue
+    bytes: Stretch
+    lines: Stretch
+    tokens: Stretch
+} BodyAt
+
+/// The positions `start..end` of one kind in a file.
+struct Stretch derives Copy, Eq {
+    start: u32
+    end: u32
+} Stretch
+
+/// How the positions of a file outside its changed bodies moved between two states of it: its
+/// bodies in both, in order, each with whether it changed.
+struct FileMoves {
+    path: text::String
+    old: mem::List[BodyAt]
+    new: mem::List[BodyAt]
+} FileMoves
+
+/// How the positions of the files whose bodies changed moved.
+struct Moves {
+    files: mem::List[FileMoves]
+} Moves
+
+/// The kinds of positions in a file.
+enum Position derives Copy, Eq {
+    Byte
+    Line
+    Token
+} Position
+
+fn Stretch.of(body: BodyAt, kind: Position) -> Stretch {
+    return match kind {
+        Position.Byte => body.bytes
+        Position.Line => body.lines
+        Position.Token => body.tokens
+    }
+} Stretch.of
+
+/// Where a position of the earlier state of a file lies in the later one; none for one inside a
+/// changed body.
+fn FileMoves.moved(self, value: u32, kind: Position) -> Option[u32] {
+    var offset: i64 = 0
+    for index in 0..<self.old.len() {
+        expect index < self.new.len()
+        let old = Stretch.of(self.old[index], kind)
+        let new = Stretch.of(self.new[index], kind)
+        if value <= old.start {
+            break
+        }
+        if value < old.end {
+            if self.old[index].hash != self.new[index].hash {
+                return None
+            }
+            offset = i64.widen(new.start) - i64.widen(old.start)
+            break
+        }
+        offset = i64.widen(new.end) - i64.widen(old.end)
+    }
+    let moved = i64.widen(value) + offset
+    if moved < 0 or moved > 0xFFFF_FFFF {
+        return None
+    }
+    return Some(u32.fit(moved))
+} FileMoves.moved
+
+/// Where a position of a file of the earlier state lies in the later one; none for one inside a
+/// changed body.
+fn Moves.moved(self, path: Str, value: u32, kind: Position) -> Option[u32] {
+    for file in self.files {
+        if file.path.as_str() == path {
+            return file.moved(value, kind)
+        }
+    }
+    return Some(value)
+} Moves.moved
+
+/// A reason's role, by its position among the roles.
+fn reason_role_number(role: diagnostic::Role) -> u64 {
+    return match role {
+        diagnostic::Role.Declared => 0
+        diagnostic::Role.Bound => 1
+        diagnostic::Role.Frozen => 2
+        diagnostic::Role.Held => 3
+        diagnostic::Role.Moved => 4
+        diagnostic::Role.Used => 5
+        diagnostic::Role.Accessed => 6
+        diagnostic::Role.Called => 7
+        diagnostic::Role.Raised => 8
+        diagnostic::Role.Command => 9
+        diagnostic::Role.Note => 10
+    }
+} reason_role_number
+
+fn reason_role(number: u64) -> Option[diagnostic::Role] {
+    return match number {
+        0 => Some(diagnostic::Role.Declared)
+        1 => Some(diagnostic::Role.Bound)
+        2 => Some(diagnostic::Role.Frozen)
+        3 => Some(diagnostic::Role.Held)
+        4 => Some(diagnostic::Role.Moved)
+        5 => Some(diagnostic::Role.Used)
+        6 => Some(diagnostic::Role.Accessed)
+        7 => Some(diagnostic::Role.Called)
+        8 => Some(diagnostic::Role.Raised)
+        9 => Some(diagnostic::Role.Command)
+        10 => Some(diagnostic::Role.Note)
+        else => None
+    }
+} reason_role
+
+fn put_extent(mut out: mem::Bytes, extent: Stretch) {
+    encoding::uvar(mut out, value: u64.widen(extent.start))
+    encoding::uvar(mut out, value: u64.widen(extent.end))
+} put_extent
+
+fn put_shape(mut out: mem::Bytes, shape: FileShape) {
+    put_hash(mut out, value: shape.skeleton)
+    encoding::uvar(mut out, value: u64.widen(shape.bodies.len()))
+    for body in shape.bodies {
+        match body {
+            Some(at) => {
+                put_flag(mut out, value: true)
+                put_hash(mut out, value: at.hash)
+                put_extent(mut out, extent: at.bytes)
+                put_extent(mut out, extent: at.lines)
+                put_extent(mut out, extent: at.tokens)
+            }
+            None => put_flag(mut out, value: false)
+        }
+    }
+} put_shape
+
+/// The reads of other items the work of the items whose outcomes a snapshot keeps made.
+fn Checker.put_reads(self, mut out: mem::Bytes, plan: Plan) {
+    let db = self.db()
+    var reads = mem::List[TracedRead].empty(self.alloc())
+    match plan.restored {
+        Some(restoring) => {
+            for read in restoring.reads {
+                mut reads.push(read)
+            }
+        }
+        None => {}
+    }
+    for read in self.state.contents().kept.reads.cursor() {
+        if not self.is_restored(read.reader.index) and db.is_reported(read.reader) and db.is_reported(read.read) {
+            mut reads.push(read)
+        }
+    }
+    mut reads.sort_by(fn(left: TracedRead, right: TracedRead) -> core::Ordering {
+        let readers = left.reader.cmp(right.reader)
+        if readers != core::Ordering.Equal {
+            return readers
+        }
+        return left.read.cmp(right.read)
+    })
+    encoding::uvar(mut out, value: u64.widen(reads.len()))
+    for read in reads {
+        put_item(mut out, item: read.reader)
+        put_item(mut out, item: read.read)
+    }
+} Checker.put_reads
+
+/// The green entries the check gave or restored.
+fn Checker.put_greens(self, mut out: mem::Bytes) {
+    let kept = self.state.contents().kept
+    var greened: usize = 0
+    for index in 0..<self.db().items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if kept.greens.get(item).is_some() or self.restored_green_span(item).is_some() {
+            greened += 1
+        }
+    }
+    encoding::uvar(mut out, value: u64.widen(greened))
+    for index in 0..<self.db().items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        match self.kept_green_bytes(item) {
+            Some(bytes) => {
+                put_item(mut out, item)
+                mut out.append(bytes.view())
+                continue
+            }
+            None => {}
+        }
+        match self.restored_green_bytes(item) {
+            Some(bytes) => {
+                put_item(mut out, item)
+                mut out.append(bytes.view())
+            }
+            None => {}
+        }
+    }
+} Checker.put_greens
+
+/// The span, in the snapshot restored from, of the green entry it holds for an item, if any.
+fn Checker.restored_green_span(self, item: ty::ItemId) -> Option[ByteSpan] {
+    let Some(plan) = self.state.contents().kept.plan.get(0) else {
+        return None
+    }
+    let Some(restoring) = plan.contents().restored else {
+        return None
+    }
+    return restoring.greens.get(item.index)
+} Checker.restored_green_span
+
+/// The bytes of the green entry of an item the snapshot restored from holds, if any.
+fn Checker.restored_green_bytes(self, item: ty::ItemId) -> Option[mem::Bytes] {
+    let Some(span) = self.restored_green_span(item) else {
+        return None
+    }
+    let Some(plan) = self.state.contents().kept.plan.get(0) else {
+        return None
+    }
+    let Some(restoring) = plan.contents().restored else {
+        return None
+    }
+    return copied_span(restoring.source.view(), span, alloc: self.alloc())
+} Checker.restored_green_bytes
+
+/// The outcome of each item a snapshot keeps: the one it restored, or the one its work gave.
+fn Checker.put_outcomes(self, mut out: mem::Bytes, plan: Plan) {
+    let items = self.outcome_items()
+    let grouped = self.grouped()
+    encoding::uvar(mut out, value: u64.widen(items.len()))
+    for item in items {
+        put_item(mut out, item)
+        match plan.restored {
+            Some(restoring) => match restoring.outcomes.get(item.index) {
+                Some(span) => match copied_span(restoring.bytes.view(), span, alloc: self.alloc()) {
+                    Some(kept) => {
+                        encoding::bytes(mut out, value: kept.view())
+                        continue
+                    }
+                    None => {}
+                }
+                None => {}
+            }
+            None => {}
+        }
+        var fresh = mem::Bytes.empty(self.alloc())
+        put_outcome(mut fresh, outcome: self.outcome(item, grouped))
+        encoding::bytes(mut out, value: fresh.view())
+    }
+} Checker.put_outcomes
+
+fn Cursor.extent(mut self) -> Stretch {
+    let start = mut self.small()
+    let end = mut self.small()
+    return Stretch(start: start, end: end)
+} Cursor.extent
+
+fn Cursor.shape(mut self, alloc: mem::Alloc) -> FileShape {
+    let skeleton = mut self.hash()
+    var bodies = mem::List[Option[BodyAt]].empty(alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        if not mut self.flag() {
+            mut bodies.push(None)
+            continue
+        }
+        let hash = mut self.hash()
+        let bytes = mut self.extent()
+        let lines = mut self.extent()
+        let tokens = mut self.extent()
+        mut bodies.push(Some(BodyAt(hash: hash, bytes: bytes, lines: lines, tokens: tokens)))
+    }
+    return FileShape(skeleton: skeleton, bodies: take bodies)
+} Cursor.shape
+
+fn Cursor.seed(mut self, alloc: mem::Alloc) -> Seed {
+    let item = mut self.item()
+    var digest: Option[Digest] = None
+    if mut self.flag() {
+        digest = Some(mut self.digest(alloc))
+    }
+    var body: Option[Option[mem::List[ty::ItemId]]] = None
+    if mut self.flag() {
+        if mut self.flag() {
+            body = Some(Some(mut self.items(alloc)))
+        } else {
+            body = Some(None)
+        }
+    }
+    var unit: Option[mem::List[ty::ItemId]] = None
+    if mut self.flag() {
+        unit = Some(mut self.items(alloc))
+    }
+    var traps: Option[bool] = None
+    if mut self.flag() {
+        traps = Some(mut self.flag())
+    }
+    return Seed(item: item, digest: take digest, body: take body, unit: take unit, traps: traps)
+} Cursor.seed
+
+fn Cursor.green_spans(mut self, alloc: mem::Alloc) -> mem::HashMap[u32, ByteSpan] {
+    var greens = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        let item = mut self.item()
+        let start = self.at
+        let lines = mut self.count()
+        for _ in 0..<lines {
+            discard mut self.chunk()
+        }
+        if mut self.flag() {
+            discard mut self.hash()
+        }
+        discard mut greens.insert(item.index, value: ByteSpan(start: start, end: self.at))
+    }
+    return greens
+} Cursor.green_spans
+
+fn Cursor.outcome_spans(mut self, alloc: mem::Alloc) -> mem::HashMap[u32, ByteSpan] {
+    var outcomes = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        let item = mut self.item()
+        let length = mut self.count()
+        let start = self.at
+        if start + length > self.bytes.len() {
+            self.failed = true
+            return outcomes
+        }
+        self.at = start + length
+        discard mut outcomes.insert(item.index, value: ByteSpan(start: start, end: start + length))
+    }
+    return outcomes
+} Cursor.outcome_spans
+
+/// What differs between a snapshot's state and the state checked: the items whose bodies
+/// changed, and how positions moved; none when the states differ elsewhere, in any other input,
+/// outside the bodies of a file, or in a body the database holds no item of.
+struct Changes {
+    items: mem::List[ty::ItemId]
+    moves: Moves
+} Changes
+
+fn body_hash(body: Option[BodyAt]) -> Option[hashing::HashValue] {
+    return match body {
+        Some(at) => Some(at.hash)
+        None => None
+    }
+} body_hash
+
+/// How positions moved between two shapes of a file with the same text outside bodies; none
+/// for shapes that differ there.
+fn file_moves(path: Str, old: FileShape, new: FileShape, alloc: mem::Alloc) -> Option[FileMoves] {
+    if new.skeleton != old.skeleton or new.bodies.len() != old.bodies.len() {
+        return None
+    }
+    var olds = mem::List[BodyAt].empty(alloc)
+    var news = mem::List[BodyAt].empty(alloc)
+    for position in 0..<new.bodies.len() {
+        match old.bodies[position] {
+            Some(before) => match new.bodies[position] {
+                Some(after) => {
+                    mut olds.push(before)
+                    mut news.push(after)
+                }
+                None => return None
+            }
+            None => if new.bodies[position].is_some() {
+                return None
+            }
+        }
+    }
+    return Some(FileMoves(path: text::String.of(path, alloc), old: take olds, new: take news))
+} file_moves
+
+/// The items of the database at these positions; none when one is not there.
+fn Checker.items_at(self, wanted: Slice[ItemAt]) -> Option[mem::List[ty::ItemId]] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var items = mem::List[ty::ItemId].empty(alloc)
+    if wanted.len() == 0 {
+        return Some(take items)
+    }
+    var located = mem::HashMap[ItemAt, ty::ItemId].empty(seed: 0, alloc)
+    for index in 0..<db.items.len() {
+        let data = db.items[index]
+        if data.file.history {
+            continue
+        }
+        match data.file.source {
+            PackageSource.Member(workspace::Member.Source(package_index)) => {
+                discard mut located.insert(ItemAt(package_index: package_index, file_index: data.file.index, index: data.index), value: ty::ItemId(index: u32.fit(index)))
+            }
+            else => {}
+        }
+    }
+    for at in wanted {
+        let Some(item) = located.get(at) else {
+            return None
+        }
+        mut items.push(item)
+    }
+    return Some(take items)
+} Checker.items_at
+
+/// The state of Tarjan's search over item indexes.
+struct Tarjan {
+    number: mem::List[u32]
+    low: mem::List[u32]
+    on_stack: mem::List[bool]
+    stack: mem::List[u32]
+    counter: u32
+    found: Components
+} Tarjan
+
+fn Tarjan.enter(mut self, node: usize, mut frames: mem::List[Walking]) {
+    self.number[node] = self.counter
+    self.low[node] = self.counter
+    self.counter += 1
+    mut self.stack.push(u32.fit(node))
+    self.on_stack[node] = true
+    mut frames.push(Walking(node: u32.fit(node), next: 0))
+} Tarjan.enter
+
+/// Pops the component whose root is `node`, cyclic when it has several members or `looping`, its
+/// root calling itself.
+fn Tarjan.close(mut self, node: usize, looping: bool, alloc: mem::Alloc) {
+    var members = mem::List[u32].empty(alloc)
+    var smallest = u32.fit(node)
+    loop {
+        let Some(member) = mut self.stack.pop() else {
+            break
+        }
+        self.on_stack[usize.widen(member)] = false
+        mut members.push(member)
+        if member < smallest {
+            smallest = member
+        }
+        if usize.widen(member) == node {
+            break
+        }
+    }
+    let cyclic = members.len() > 1 or looping
+    for member in members {
+        self.found.least[usize.widen(member)] = smallest
+        self.found.cyclic[usize.widen(member)] = cyclic
+    }
+} Tarjan.close
+
+/// What a snapshot keeps of an item's own work: whether judging it alone, and the check, rejected
+/// it; the diagnostics and those of unused code it found; the fields it read and labelled, the
+/// authorities it performed and the consts it needed; the items it names; a const's interface
+/// hash.
+struct Outcome {
+    alone: bool
+    rejected: bool
+    found: mem::List[diagnostic::Diagnostic]
+    unused: mem::List[diagnostic::Diagnostic]
+    fields: mem::List[FieldRead]
+    labels: mem::List[LabelOf]
+    performs: mem::List[workspace::Authority]
+    needs: mem::List[ty::ItemId]
+    names: Option[mem::List[ty::ItemId]]
+    value: Option[hashing::HashValue]
+} Outcome
+
+fn put_outcome(mut out: mem::Bytes, outcome: Outcome) {
+    put_flag(mut out, value: outcome.alone)
+    put_flag(mut out, value: outcome.rejected)
+    put_diagnostics(mut out, diagnostics: outcome.found.view())
+    put_diagnostics(mut out, diagnostics: outcome.unused.view())
+    encoding::uvar(mut out, value: u64.widen(outcome.fields.len()))
+    for read in outcome.fields {
+        put_item(mut out, item: read.owner)
+        put_text(mut out, value: read.name.as_str())
+    }
+    encoding::uvar(mut out, value: u64.widen(outcome.labels.len()))
+    for labelled in outcome.labels {
+        put_item(mut out, item: labelled.owner)
+        put_text(mut out, value: labelled.name.as_str())
+        encoding::uvar(mut out, value: u64.widen(labelled.label.head))
+        encoding::uvar(mut out, value: u64.widen(labelled.label.last))
+        put_flag(mut out, value: labelled.label.simple)
+    }
+    encoding::uvar(mut out, value: u64.widen(outcome.performs.len()))
+    for authority in outcome.performs {
+        put_authority(mut out, authority)
+    }
+    put_items(mut out, items: outcome.needs.view())
+    match outcome.names {
+        Some(named) => {
+            put_flag(mut out, value: true)
+            put_items(mut out, items: named.view())
+        }
+        None => put_flag(mut out, value: false)
+    }
+    match outcome.value {
+        Some(hash) => {
+            put_flag(mut out, value: true)
+            put_hash(mut out, value: hash)
+        }
+        None => put_flag(mut out, value: false)
+    }
+} put_outcome
+
+fn put_diagnostics(mut out: mem::Bytes, diagnostics: Slice[diagnostic::Diagnostic]) {
+    encoding::uvar(mut out, value: u64.widen(diagnostics.len()))
+    for reported in diagnostics {
+        put_diagnostic(mut out, reported)
+    }
+} put_diagnostics
+
+/// The outcome of an item's own work the cursor holds.
+fn Cursor.outcome(mut self, item: ty::ItemId, alloc: mem::Alloc) -> Outcome {
+    let alone = mut self.flag()
+    let rejected = mut self.flag()
+    let found = mut self.diagnostics(alloc)
+    let unused = mut self.diagnostics(alloc)
+    var fields = mem::List[FieldRead].empty(alloc)
+    let field_count = mut self.count()
+    for _ in 0..<field_count {
+        let owner = mut self.item()
+        mut fields.push(FieldRead(reader: item, owner: owner, name: mut self.text(alloc)))
+    }
+    var labels = mem::List[LabelOf].empty(alloc)
+    let label_count = mut self.count()
+    for _ in 0..<label_count {
+        let owner = mut self.item()
+        let name = mut self.text(alloc)
+        let head = mut self.small()
+        let last = mut self.small()
+        mut labels.push(LabelOf(owner: owner, name: take name, label: FieldLabel(item: item, head: head, last: last, simple: mut self.flag())))
+    }
+    var performs = mem::List[workspace::Authority].empty(alloc)
+    let perform_count = mut self.count()
+    for _ in 0..<perform_count {
+        mut performs.push(mut self.authority(alloc))
+    }
+    let needs = mut self.items(alloc)
+    var names: Option[mem::List[ty::ItemId]] = None
+    if mut self.flag() {
+        names = Some(mut self.items(alloc))
+    }
+    var value: Option[hashing::HashValue] = None
+    if mut self.flag() {
+        value = Some(mut self.hash())
+    }
+    return Outcome(alone: alone, rejected: rejected, found: take found, unused: take unused, fields: take fields, labels: take labels, performs: take performs, needs: take needs, names: take names, value: value)
+} Cursor.outcome
+
+fn Cursor.diagnostics(mut self, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let count = mut self.count()
+    for _ in 0..<count {
+        mut found.push(mut self.diagnostic(alloc))
+    }
+    return found
+} Cursor.diagnostics
+
+/// The outcome a snapshot holds for an item, none for bytes that do not hold one.
+fn read_outcome(bytes: Slice[u8], item: ty::ItemId, alloc: mem::Alloc) -> Option[Outcome] {
+    let Some(whole) = bytes.prefix(bytes.len()) else {
+        return None
+    }
+    var cursor = Cursor(bytes: take whole, at: 0, failed: false)
+    let outcome = mut cursor.outcome(item, alloc)
+    if cursor.failed or cursor.at != bytes.len() {
+        return None
+    }
+    return Some(take outcome)
+} read_outcome
+
+/// The outcome of an item's own work in the checker.
+fn Checker.outcome(self, item: ty::ItemId, grouped: Grouped) -> Outcome {
+    let state = self.state.contents()
+    let kept = state.kept
+    let alloc = self.alloc()
+    var found = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for position in group_of(grouped.found, item, alloc) {
+        mut found.push(state.current(state.found.at(mem::Id[Found].of(position))))
+    }
+    var unused = mem::List[diagnostic::Diagnostic].empty(alloc)
+    for position in group_of(grouped.unused, item, alloc) {
+        mut unused.push(state.unused.at(mem::Id[Found].of(position)).diagnostic.copy(alloc))
+    }
+    var fields = mem::List[FieldRead].empty(alloc)
+    for position in group_of(grouped.fields, item, alloc) {
+        let read = kept.fields.at(mem::Id[FieldRead].of(position))
+        mut fields.push(FieldRead(reader: item, owner: read.owner, name: text::String.of(read.name.as_str(), alloc)))
+    }
+    var labels = mem::List[LabelOf].empty(alloc)
+    for position in group_of(grouped.labels, item, alloc) {
+        let labelled = kept.labels.at(mem::Id[LabelOf].of(position))
+        mut labels.push(LabelOf(owner: labelled.owner, name: text::String.of(labelled.name.as_str(), alloc), label: labelled.label))
+    }
+    var performs = mem::List[workspace::Authority].empty(alloc)
+    for position in group_of(grouped.performs, item, alloc) {
+        mut performs.push(copied_authority(kept.performs.at(mem::Id[PerformedBy].of(position)).authority, alloc))
+    }
+    var needs = mem::List[ty::ItemId].empty(alloc)
+    for position in group_of(grouped.needs, item, alloc) {
+        mut needs.push(state.needs.at(mem::Id[Need].of(position)).needed)
+    }
+    var names: Option[mem::List[ty::ItemId]] = None
+    match state.named.get(item) {
+        Some(named) => {
+            var listed = mem::List[ty::ItemId].empty(alloc)
+            for held in named.contents() {
+                mut listed.push(held)
+            }
+            names = Some(take listed)
+        }
+        None => {}
+    }
+    let alone = match kept.alone.get(item) {
+        Some(rejected) => rejected
+        None => false
+    }
+    return Outcome(alone: alone, rejected: state.rejections.get(item).is_some(), found: take found, unused: take unused, fields: take fields, labels: take labels, performs: take performs, needs: take needs, names: take names, value: self.const_hash(item))
+} Checker.outcome
+
+/// An outcome of the snapshot's state at the positions of the state checked; none when one of its
+/// positions lies in a changed body.
+fn Outcome.moved(take self, path: Str, moves: Moves, alloc: mem::Alloc) -> Option[Outcome] {
+    if moves.files.len() == 0 {
+        return Some(take self)
+    }
+    for reported in mut self.found {
+        if not moves.move_diagnostic(mut reported, alloc) {
+            return None
+        }
+    }
+    for reported in mut self.unused {
+        if not moves.move_diagnostic(mut reported, alloc) {
+            return None
+        }
+    }
+    for labelled in mut self.labels {
+        let Some(head) = moves.moved(path, value: labelled.label.head, kind: Position.Token) else {
+            return None
+        }
+        let Some(last) = moves.moved(path, value: labelled.label.last, kind: Position.Token) else {
+            return None
+        }
+        labelled.label = FieldLabel(item: labelled.label.item, head: head, last: last, simple: labelled.label.simple)
+    }
+    return Some(take self)
+} Outcome.moved
+
+/// Moves a diagnostic's positions to the state checked; whether none lies in a changed body.
+fn Moves.move_diagnostic(self, mut reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> bool {
+    let path = match reported.path {
+        Some(held) => text::String.of(held.as_str(), alloc)
+        None => return true
+    }
+    match reported.line {
+        Some(line) => match self.moved(path.as_str(), value: line, kind: Position.Line) {
+            Some(moved) => {
+                reported.line = Some(moved)
+            }
+            None => return false
+        }
+        None => {}
+    }
+    if not self.move_span(path.as_str(), span: mut reported.span) or not self.move_span(path.as_str(), span: mut reported.judged) {
+        return false
+    }
+    match reported.failing {
+        Some(at) => match self.moved(path.as_str(), value: at, kind: Position.Byte) {
+            Some(moved) => {
+                reported.failing = Some(moved)
+            }
+            None => return false
+        }
+        None => {}
+    }
+    for reason in mut reported.because {
+        let Some(at) = reason.at else {
+            continue
+        }
+        let Some(moved) = self.moved(at.path.as_str(), value: at.line, kind: Position.Line) else {
+            return false
+        }
+        reason.at = Some(diagnostic::At(path: text::String.of(at.path.as_str(), alloc), line: moved))
+    }
+    for fix in mut reported.fixes {
+        for edit in mut fix.edits {
+            let Some(start) = self.moved(edit.path.as_str(), value: edit.replacement.start, kind: Position.Byte) else {
+                return false
+            }
+            let Some(end) = self.moved(edit.path.as_str(), value: edit.replacement.end, kind: Position.Byte) else {
+                return false
+            }
+            edit.replacement.start = start
+            edit.replacement.end = end
+        }
+    }
+    return true
+} Moves.move_diagnostic
+
+fn Moves.move_span(self, path: Str, mut span: Option[diagnostic::Span]) -> bool {
+    let Some(held) = span else {
+        return true
+    }
+    let Some(start) = self.moved(path, value: held.start, kind: Position.Byte) else {
+        return false
+    }
+    let Some(end) = self.moved(path, value: held.end, kind: Position.Byte) else {
+        return false
+    }
+    span = Some(diagnostic::Span(start: start, end: end))
+    return true
+} Moves.move_span
+
+/// The outcomes a check restored, as the state checked holds them, and their spans there, with
+/// the spans of their green entries in the snapshot.
+struct Restored {
+    bytes: mem::Bytes
+    outcomes: mem::HashMap[u32, ByteSpan]
+    greens: mem::HashMap[u32, ByteSpan]
+} Restored
+
+/// Seeds the checker with a snapshot's facts and gives it the outcomes and green entries of the
+/// items not checked again; none when one does not read or lies in a changed body.
+fn Checker.restore(self, snapshot: Snapshot, bytes: Slice[u8], marked: Slice[bool], moves: Moves) -> Option[Restored] {
+    let alloc = self.alloc()
+    let db = self.db()
+    self.seed(snapshot, marked)
+    var out = mem::Bytes.empty(alloc)
+    var outcomes = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    var greens = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    for item in self.outcome_items() {
+        if marked[usize.widen(item.index)] {
+            continue
+        }
+        let Some(span) = snapshot.outcomes.get(item.index) else {
+            return None
+        }
+        let Some(held) = copied_span(bytes, span, alloc) else {
+            return None
+        }
+        let Some(read) = read_outcome(held.view(), item, alloc) else {
+            return None
+        }
+        let Some(outcome) = take read.moved(path: db.item_file(item).path.as_str(), moves, alloc) else {
+            return None
+        }
+        let start = out.len()
+        put_outcome(mut out, outcome)
+        discard mut outcomes.insert(item.index, value: ByteSpan(start: start, end: out.len()))
+        self.restore_outcome(item, take outcome)
+        match snapshot.greens.get(item.index) {
+            Some(green) => {
+                discard mut greens.insert(item.index, value: green)
+            }
+            None => {}
+        }
+    }
+    return Some(Restored(bytes: take out, outcomes: take outcomes, greens: take greens))
+} Checker.restore
+
+/// Whether nothing the check reports depends on when restored work ran: no `name.case` fix, no
+/// `unused.field` fix joining labels, no error of a quiet package, and the diagnostics that
+/// order alike coming from one item's work or rules relating items each.
+fn Checker.reports_apart(self) -> bool {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    for entry in state.found.cursor() {
+        if entry.sink == 0 and entry.diagnostic.code == diagnostic::Code.NameCase {
+            return false
+        }
+    }
+    for entry in state.unused.cursor() {
+        if entry.diagnostic.code == diagnostic::Code.UnusedField {
+            return false
+        }
+    }
+    for reported in state.quiet.cursor() {
+        if reported.code.class() == diagnostic::Class.Error {
+            return false
+        }
+    }
+    return owned_apart(state.found, own_sink: true, alloc) and owned_apart(state.unused, own_sink: false, alloc)
+} Checker.reports_apart
+
+/// Whether the items checked again give the digests and may-trap facts the snapshot holds of
+/// them, and whether their dependencies differ from the snapshot's; none when a fact differs.
+fn Checker.seeds_agree(self, snapshot: Snapshot, marked: Slice[bool]) -> Option[bool] {
+    var reshaped = false
+    for seed in snapshot.seeds {
+        let item = seed.item
+        if not marked[usize.widen(item.index)] {
+            continue
+        }
+        match seed.digest {
+            Some(digest) => if self.digest(item).contents() != digest {
+                return None
+            }
+            None => {}
+        }
+        match seed.body {
+            Some(found) => {
+                let now = self.body_dependencies(item)
+                let same = match found {
+                    Some(items) => match now {
+                        Some(listed) => same_items(listed.contents().view(), right: items.view())
+                        None => false
+                    }
+                    None => now.is_none()
+                }
+                reshaped = reshaped or not same
+            }
+            None => {}
+        }
+        match seed.traps {
+            Some(flag) => if self.may_trap(item) != flag {
+                return None
+            }
+            None => {}
+        }
+    }
+    return Some(reshaped)
+} Checker.seeds_agree
+
+/// Whether the cycles of the dependencies the check computed are the snapshot's.
+fn Checker.cycles_agree(self, snapshot: Snapshot, old: Components) -> bool {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    var edges = snapshot_edges(snapshot, alloc)
+    for index in 0..<edges.len() {
+        let Some(found) = state.body_dependencies.get(ty::ItemId(index: u32.fit(index))) else {
+            continue
+        }
+        var targets = mem::List[u32].empty(alloc)
+        match found {
+            Some(listed) => {
+                for item in listed.contents() {
+                    mut targets.push(item.index)
+                }
+            }
+            None => {}
+        }
+        edges[index] = targets
+    }
+    let now = components(edges.view(), alloc)
+    for index in 0..<edges.len() {
+        if now.least[index] != old.least[index] or now.cyclic[index] != old.cyclic[index] {
+            return false
+        }
+    }
+    return true
+} Checker.cycles_agree
+
+fn copied_files(files: Slice[SnapshotFile], alloc: mem::Alloc) -> mem::List[SnapshotFile] {
+    var copied = mem::List[SnapshotFile].empty(alloc)
+    for file in files {
+        var bodies = mem::List[Option[BodyAt]].empty(alloc)
+        for body in file.shape.bodies {
+            mut bodies.push(body)
+        }
+        mut copied.push(SnapshotFile(path: text::String.of(file.path.as_str(), alloc), content: file.content, shape: FileShape(skeleton: file.shape.skeleton, bodies: take bodies)))
+    }
+    return copied
+} copied_files

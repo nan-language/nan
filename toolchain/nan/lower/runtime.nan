@@ -37,6 +37,22 @@ enum Routine derives Copy, Eq, Hash {
     /// `(address, domain) -> lifted`: passes the chunks an allocation lies in to a domain when
     /// a domain nested in it owns them; nonzero when they passed.
     Lift
+    /// `(domain, cell) -> pool`: on `x86_64-host`, the pool of a domain for a cell, added when
+    /// missing.
+    PoolAdd
+    /// `(pool, cell, domain) -> record`: on `x86_64-host`, a chunk drawn for a pool to carve,
+    /// zero on exhaustion.
+    PoolDraw
+    /// `(cell, size, domain) -> address`: on `x86_64-host`, an allocation larger than a chunk,
+    /// zero on exhaustion.
+    AllocLarge
+    /// `(record)`: on `x86_64-host`, returns a run of chunks by its record.
+    ChunkReturn
+    /// `(record, address)`: on `x86_64-host`, frees an allocation in a run of chunks no pool
+    /// carves.
+    FreeUnpooled
+    /// `(lock)`: on `x86_64-host`, waits until a lock word another thread holds reads free.
+    LockWait
     /// `(kind, payload) -> holding`: a new holding the running task's domain owns.
     Hold
     /// `(holding)`: ends a holding released.
@@ -151,6 +167,12 @@ proj fn Routine.name(self) -> Str {
         Routine.TaskEnv => "_NScap_table_task_env"
         Routine.TaskEnvFree => "_NScap_table_task_env_free"
         Routine.Lift => "_NScap_table_lift"
+        Routine.PoolAdd => "_NScap_table_pool_add"
+        Routine.PoolDraw => "_NScap_table_pool_draw"
+        Routine.AllocLarge => "_NScap_table_alloc_large"
+        Routine.ChunkReturn => "_NScap_table_chunk_return"
+        Routine.FreeUnpooled => "_NScap_table_free_unpooled"
+        Routine.LockWait => "_NSstack_switch_lock_wait"
         Routine.Hold => "_NScap_table_hold"
         Routine.Unhold => "_NScap_table_unhold"
         Routine.Rehome => "_NScap_table_rehome"
@@ -206,6 +228,10 @@ fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
         Routine.AllocIn => RoutineTypes(params: type_list(None, count: 4, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Split or Routine.Derive or Routine.Hold => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.Lift => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: None, alloc))
+        Routine.PoolAdd => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.PoolDraw or Routine.AllocLarge => RoutineTypes(params: type_list(None, count: 3, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
+        Routine.FreeUnpooled => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
+        Routine.ChunkReturn or Routine.LockWait => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Rehome => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 0, trailing: None, alloc))
         Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.Check or Routine.OutboxClaim or Routine.RegionOpen or Routine.RecordAlloc => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.RecordResize => RoutineTypes(params: type_list(None, count: 2, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
@@ -381,6 +407,9 @@ fn Lowering.routine(mut self, routine: Routine) -> object::FuncId {
     }
     let id = mut self.module.declare_function(routine.name(), linkage: object::Linkage.Local, signature: routine.signature(self.alloc))
     discard mut self.routines.insert(routine, value: id)
+    if routine == Routine.Copy {
+        mut self.module.note_copier(id)
+    }
     mut self.queue.push(Pending.Routine(routine: routine, id: id))
     return id
 } Lowering.routine
@@ -469,6 +498,17 @@ fn Lowering.thread(mut self, mut fx: Fx) -> clif::Value {
     return results[0]
 } Lowering.thread
 
+/// The record of the running executor thread, as `thread` gives it, read in place rather than
+/// through the `Thread` routine on `x86_64-host`: only code with no suspension point between the
+/// read and its uses reads it so.
+fn Lowering.thread_inline(mut self, mut fx: Fx) -> clif::Value {
+    if self.machine() {
+        return mut self.thread(mut fx)
+    }
+    let slot = mut self.thread_slot(mut fx)
+    return mut fx.load(PTR, addr: slot, offset: 0)
+} Lowering.thread_inline
+
 /// A C library function, by name, which only an `x86_64-host` image links.
 fn Lowering.libc(mut self, name: Str, params: Slice[clif::Type], returns: Slice[clif::Type]) -> object::FuncId {
     expect not self.machine()
@@ -539,7 +579,15 @@ fn Lowering.views_equal(mut self, mut fx: Fx, left: Held, right: Held) -> clif::
 fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     match routine {
         Routine.Copy or Routine.Fill or Routine.Compare => memory_bytes(mut lo, mut fx, routine)
-        Routine.Alloc or Routine.AllocIn or Routine.Free or Routine.Split or Routine.Close or Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.TaskEnvFree or Routine.Lift => memory_define(mut lo, mut fx, routine)
+        Routine.Alloc or Routine.AllocIn or Routine.Free or Routine.Lift => {
+            if lo.machine() {
+                memory_define(mut lo, mut fx, routine)
+            } else {
+                pools_define(mut lo, mut fx, routine)
+            }
+        }
+        Routine.PoolAdd or Routine.PoolDraw or Routine.AllocLarge or Routine.ChunkReturn or Routine.FreeUnpooled or Routine.LockWait => pools_define(mut lo, mut fx, routine)
+        Routine.Split or Routine.Close or Routine.Charged or Routine.Limit or Routine.TaskEnv or Routine.TaskEnvFree => memory_define(mut lo, mut fx, routine)
         Routine.Hold or Routine.Unhold or Routine.Rehome => holdings_define(mut lo, mut fx, routine)
         Routine.MintRoot or Routine.Check or Routine.Derive or Routine.Revoke or Routine.OutboxMint or Routine.OutboxRetire or Routine.OutboxClaim => tables_define(mut lo, mut fx, routine)
         Routine.TrapRaise or Routine.Reacquired or Routine.ReportScalar or Routine.ReportText or Routine.WriteErr or Routine.OverflowRaise => report_define(mut lo, mut fx, routine)

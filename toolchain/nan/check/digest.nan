@@ -32,16 +32,82 @@ enum Brought derives Copy, Eq {
     Charged
 } Brought
 
-/// The digests computed in one check, by item.
-struct Digests {
-    done: mem::OnceMap[ty::ItemId, mem::Shared[Digest]]
-    /// The items whose digests are being computed, outermost first.
-    computing: cell::Swap[mem::List[ty::ItemId]]
-} Digests
+/// The digest computations a task has under way. They form Tarjan's search over the calls and
+/// function arguments of the code walked: a cycle's members get their digests once its
+/// outermost member's is computed, which joins theirs.
+struct DigestSearch {
+    /// The numbers of the digest computations under way, outermost first.
+    computing: cell::Swap[mem::List[u32]]
+    /// Each digest computation, by number.
+    computations: mem::Arena[DigestComputation]
+    /// The digests computed while a member of their cycle's is still being computed.
+    pending: mem::OnceMap[ty::ItemId, PendingDigest]
+    /// The numbers of the computations of those still pending, in order of computation.
+    pending_order: cell::Swap[mem::List[u32]]
+} DigestSearch
 
-fn Digests.empty(alloc: mem::Alloc) -> Digests {
-    return Digests(done: mem::OnceMap[ty::ItemId, mem::Shared[Digest]].empty(seed: 0, alloc), computing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc))
-} Digests.empty
+/// A digest computation: its function, and the lowest number of a computation of its cycle it
+/// read, as Tarjan's low link.
+struct DigestComputation {
+    item: ty::ItemId
+    low: core::atomic::AtomicU32
+} DigestComputation
+
+/// A digest computed before its cycle's: the number of its computation, whether the function's
+/// head waits, and the digest its own computation gave.
+struct PendingDigest {
+    number: u32
+    wait: bool
+    digest: mem::Shared[Digest]
+} PendingDigest
+
+fn DigestSearch.empty(alloc: mem::Alloc) -> DigestSearch {
+    return DigestSearch(computing: cell::Swap.of(mem::List[u32].empty(alloc), alloc), computations: mem::Arena[DigestComputation].empty(alloc), pending: mem::OnceMap[ty::ItemId, PendingDigest].empty(seed: 0, alloc), pending_order: cell::Swap.of(mem::List[u32].empty(alloc), alloc))
+} DigestSearch.empty
+
+/// Records that the innermost computation read the computation numbered `number`.
+fn DigestSearch.read(self, number: u32) {
+    let open = self.computing.get()
+    let count = open.len()
+    if count == 0 {
+        return
+    }
+    let innermost = self.computations.at(mem::Id[DigestComputation].of(open[count - 1]))
+    if number < innermost.low.load() {
+        innermost.low.store(number)
+    }
+} DigestSearch.read
+
+/// The number of the computation under way of a function's digest, if any.
+fn DigestSearch.open_number(self, item: ty::ItemId) -> Option[u32] {
+    for number in self.computing.get() {
+        if self.computations.at(mem::Id[DigestComputation].of(number)).item == item {
+            return Some(number)
+        }
+    }
+    return None
+} DigestSearch.open_number
+
+/// Gives each function whose digest is pending since after the computation numbered `number`
+/// the digest of its cycle, waiting as its head states.
+fn DigestSearch.close_cycle(self, number: u32, digest: Digest, done: mem::OnceMap[ty::ItemId, mem::Shared[Digest]], alloc: mem::Alloc) {
+    var kept = mem::List[u32].empty(alloc)
+    for pending_number in self.pending_order.get() {
+        if pending_number < number {
+            mut kept.push(pending_number)
+            continue
+        }
+        let member = self.computations.at(mem::Id[DigestComputation].of(pending_number)).item
+        let Some(pending) = self.pending.get(member) else {
+            expect false
+            continue
+        }
+        var shared = digest.copy(alloc)
+        shared.wait = pending.wait
+        discard done.insert(member, value: mem::Shared.of(take shared, alloc))
+    }
+    discard self.pending_order.replace(take kept)
+} DigestSearch.close_cycle
 
 /// The sites of an `expect` condition, by the condition's first token.
 struct ExpectSites {
@@ -171,11 +237,19 @@ fn extended_set(set: Option[mem::Set[ty::ItemId]], item: ty::ItemId, alloc: mem:
 fn Checker.digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let db = self.db()
     db.note(item)
-    match self.state.contents().digests.done.get(item) {
+    let search = self.underway.contents().computing
+    match self.state.contents().digests.get(item) {
         Some(digest) => return digest.share()
         None => {}
     }
-    return db.about(Some(item), compute: fn() => self.compute_digest(item))
+    match search.pending.get(item) {
+        Some(pending) => {
+            search.read(pending.number)
+            return pending.digest.share()
+        }
+        None => {}
+    }
+    return self.about(Some(item), compute: fn() => self.compute_digest(item))
 } Checker.digest
 
 fn Checker.compute_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
@@ -190,23 +264,31 @@ fn Checker.compute_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
         }
         None => {}
     }
-    let digests = self.state.contents().digests
-    if digests.computing.get().position(fn(value: ty::ItemId) => value == item).is_some() {
-        return mem::Shared.of(self.cycle_digest(item), alloc)
+    let done = self.state.contents().digests
+    let search = self.underway.contents().computing
+    match search.open_number(item) {
+        Some(open) => {
+            search.read(open)
+            return mem::Shared.of(self.cycle_digest(item), alloc)
+        }
+        None => {}
     }
     let Some(body) = self.typed_body(item) else {
         let found = match self.db().is_std(item) {
             true => self.supplied(item)
             false => Digest.declared(wait, limit_set, alloc)
         }
-        return digests.done.insert(item, value: mem::Shared.of(take found, alloc)).share()
+        return done.insert(item, value: mem::Shared.of(take found, alloc)).share()
     }
-    var computing = mem::List[ty::ItemId].empty(alloc)
-    for held in digests.computing.get() {
+    let started = search.computations.push(DigestComputation(item: item, low: core::atomic::AtomicU32.of(0)))
+    let number = started.index()
+    search.computations.at(started).low.store(number)
+    var computing = mem::List[u32].empty(alloc)
+    for held in search.computing.get() {
         mut computing.push(held)
     }
-    mut computing.push(item)
-    let outer = digests.computing.replace(take computing)
+    mut computing.push(number)
+    let outer = search.computing.replace(take computing)
     var digest = Digest.none(alloc)
     let sites = self.sites(item, body, closure: 0)
     for site in sites {
@@ -216,8 +298,22 @@ fn Checker.compute_digest(self, item: ty::ItemId) -> mem::Shared[Digest] {
     let cyclic = self.in_cycle(item)
     let terminates = not wait and (not cyclic or self.has_decreases(item))
     digest.terminates = digest.terminates and terminates
-    digests.computing.restore(outer)
-    return digests.done.insert(item, value: mem::Shared.of(take digest, alloc)).share()
+    search.computing.restore(outer)
+    let low = search.computations.at(started).low.load()
+    search.read(low)
+    if low < number {
+        let shared = mem::Shared.of(take digest, alloc)
+        discard search.pending.insert(item, value: PendingDigest(number: number, wait: wait, digest: shared.share()))
+        var order = mem::List[u32].empty(alloc)
+        for held in search.pending_order.get() {
+            mut order.push(held)
+        }
+        mut order.push(number)
+        discard search.pending_order.replace(take order)
+        return shared
+    }
+    search.close_cycle(number, digest, done, alloc)
+    return done.insert(item, value: mem::Shared.of(take digest, alloc)).share()
 } Checker.compute_digest
 
 /// The digest of a body, closure or default function of an item's unit: the item's own for
@@ -298,13 +394,12 @@ fn Checker.cycle_digest(self, item: ty::ItemId) -> Digest {
 /// Whether two functions belong to one cycle: each reaches the other through dependencies.
 /// While reads are recorded, the search reads each function it reaches.
 fn Checker.same_cycle(self, item: ty::ItemId, other: ty::ItemId) -> bool {
-    if self.db().recording() or self.state.contents().finding_cycles.load() {
-        let alloc = self.alloc()
-        var seen = mem::Set[ty::ItemId].empty(alloc)
+    if self.db().recording() or self.underway.contents().finding_cycles.load() {
+        var seen = ItemMarks.empty(self.alloc())
         if not self.reaches(item, target: other, mut seen) {
             return false
         }
-        var seen_back = mem::Set[ty::ItemId].empty(alloc)
+        var seen_back = ItemMarks.empty(self.alloc())
         return self.reaches(other, target: item, seen: mut seen_back)
     }
     if item == other {
@@ -314,11 +409,24 @@ fn Checker.same_cycle(self, item: ty::ItemId, other: ty::ItemId) -> bool {
 } Checker.same_cycle
 
 /// Whether a function belongs to a cycle: it reaches itself through its dependencies.
-/// While reads are recorded, the search reads each function it reaches.
+/// While reads are recorded, the search reads each function it reaches; while only a code
+/// root's are, a function whose reach is read through is answered from the components.
 fn Checker.in_cycle(self, item: ty::ItemId) -> bool {
     let state = self.state.contents()
-    if self.db().recording() or state.finding_cycles.load() {
-        var seen = mem::Set[ty::ItemId].empty(self.alloc())
+    let db = self.db()
+    if db.recording() and db.records_code_root() and not self.underway.contents().finding_cycles.load() {
+        if state.bodies_read.get(item).is_some() {
+            return db.about(None, compute: fn() => self.in_cycle(item))
+        }
+        var searched = ItemMarks.empty(self.alloc())
+        if self.returns_to(item, root: item, seen: mut searched) {
+            return true
+        }
+        self.read_through(state.bodies_read, functions: searched)
+        return false
+    }
+    if db.recording() or self.underway.contents().finding_cycles.load() {
+        var seen = ItemMarks.empty(self.alloc())
         return self.reaches(item, target: item, mut seen)
     }
     let component = self.cycle_component(item)
@@ -340,12 +448,12 @@ fn Checker.recorded_cycle(self, item: ty::ItemId, take reachable: mem::List[ty::
     let db = self.db()
     let alloc = self.alloc()
     var search = FullSearch(visited: mem::List[ty::ItemId].empty(alloc), checked: mem::HashMap[ty::ItemId, usize].empty(seed: 0, alloc))
-    var seen = mem::Set[ty::ItemId].empty(alloc)
+    var seen = ItemMarks.empty(self.alloc())
     db.about(None, compute: fn[mut search, mut seen]() {
         self.search_from(item, mut seen, mut search)
     })
     var noted: usize = 0
-    var closed = mem::Set[ty::ItemId].empty(alloc)
+    var closed = ItemMarks.empty(self.alloc())
     var members = mem::List[ty::ItemId].empty(alloc)
     for member in reachable {
         if member == item {
@@ -374,14 +482,14 @@ fn Checker.recorded_cycle(self, item: ty::ItemId, take reachable: mem::List[ty::
             return self.cycle_component(member) == self.cycle_component(item)
         })
         if together {
-            var fresh = mem::Set[ty::ItemId].empty(alloc)
+            var fresh = ItemMarks.empty(self.alloc())
             if self.reaches(member, target: item, seen: mut fresh) {
                 mut members.push(member)
             }
             continue
         }
         var visited = mem::List[ty::ItemId].empty(alloc)
-        var member_seen = mem::Set[ty::ItemId].empty(alloc)
+        var member_seen = ItemMarks.empty(self.alloc())
         self.note_reached(member, closed, seen: mut member_seen, visited: mut visited)
         for done in visited {
             discard mut closed.insert(done)
@@ -391,7 +499,7 @@ fn Checker.recorded_cycle(self, item: ty::ItemId, take reachable: mem::List[ty::
 } Checker.recorded_cycle
 
 /// Visits the functions a function reaches as `reaches` does with no target, in order.
-fn Checker.search_from(self, from: ty::ItemId, mut seen: mem::Set[ty::ItemId], mut search: FullSearch) {
+fn Checker.search_from(self, from: ty::ItemId, mut seen: ItemMarks, mut search: FullSearch) {
     if not mut seen.insert(from) {
         return
     }
@@ -411,7 +519,7 @@ fn Checker.search_from(self, from: ty::ItemId, mut seen: mem::Set[ty::ItemId], m
 /// Reads the functions a function reaches as `reaches` does with a target it never finds,
 /// skipping the `closed` functions, whose reachable functions are all read, and lists those it
 /// visits.
-fn Checker.note_reached(self, from: ty::ItemId, closed: mem::Set[ty::ItemId], mut seen: mem::Set[ty::ItemId], mut visited: mem::List[ty::ItemId]) {
+fn Checker.note_reached(self, from: ty::ItemId, closed: ItemMarks, mut seen: ItemMarks, mut visited: mem::List[ty::ItemId]) {
     if closed.contains(from) {
         return
     }
@@ -434,9 +542,9 @@ fn Checker.cycle_component(self, item: ty::ItemId) -> u32 {
         Some(found) => return found
         None => {}
     }
-    state.finding_cycles.store(true)
+    self.underway.contents().finding_cycles.store(true)
     self.find_components(item)
-    state.finding_cycles.store(false)
+    self.underway.contents().finding_cycles.store(false)
     let Some(found) = state.cycle_components.get(item) else {
         expect false
         return 0
@@ -550,7 +658,7 @@ fn TarjanSearch.lower(mut self, item: ty::ItemId, number: u32) {
 
 /// Whether a function reaches `target` through its dependencies: the functions it calls
 /// directly and those it supplies as function arguments.
-fn Checker.reaches(self, from: ty::ItemId, target: ty::ItemId, mut seen: mem::Set[ty::ItemId]) -> bool {
+fn Checker.reaches(self, from: ty::ItemId, target: ty::ItemId, mut seen: ItemMarks) -> bool {
     if not mut seen.insert(from) {
         return false
     }
@@ -564,6 +672,108 @@ fn Checker.reaches(self, from: ty::ItemId, target: ty::ItemId, mut seen: mem::Se
     }
     return false
 } Checker.reaches
+
+/// A set of items, open addressed by their indices.
+struct ItemMarks {
+    /// The indices of the items held, `NO_ID` in each free slot; a power of two of slots, at
+    /// most half of them held.
+    slots: mem::List[u32]
+    held: usize
+    alloc: mem::Alloc
+} ItemMarks
+
+fn ItemMarks.empty(alloc: mem::Alloc) -> ItemMarks {
+    return ItemMarks(slots: free_slots(16, alloc), held: 0, alloc: alloc)
+} ItemMarks.empty
+
+fn free_slots(count: usize, alloc: mem::Alloc) -> mem::List[u32] {
+    var slots = mem::List[u32].empty(alloc)
+    mut slots.reserve(count)
+    for _ in 0..<count {
+        mut slots.push(NO_ID)
+    }
+    return slots
+} free_slots
+
+/// The slot holding an item's index among `slots`, or the free slot where it belongs.
+fn mark_slot(slots: Slice[u32], index: u32) -> usize {
+    let mask = slots.len() - 1
+    var at = usize.widen(index.wrapping_mul(0x9E37_79B1)) & mask
+    loop {
+        expect at < slots.len()
+        let found = slots[at]
+        if found == index or found == NO_ID {
+            return at
+        }
+        at = (at + 1) & mask
+    }
+} mark_slot
+
+/// Adds an item, giving whether it was absent.
+fn ItemMarks.insert(mut self, item: ty::ItemId) -> bool {
+    let at = mark_slot(self.slots.view(), index: item.index)
+    expect at < self.slots.len()
+    if self.slots[at] == item.index {
+        return false
+    }
+    self.slots[at] = item.index
+    self.held += 1
+    if self.held > self.slots.len() / 2 {
+        expect self.slots.len() < ~0usize / 2
+        var grown = free_slots(self.slots.len() * 2, alloc: self.alloc)
+        for index in self.slots {
+            if index != NO_ID {
+                let free = mark_slot(grown.view(), index)
+                expect free < grown.len()
+                grown[free] = index
+            }
+        }
+        self.slots = grown
+    }
+    return true
+} ItemMarks.insert
+
+fn ItemMarks.contains(self, item: ty::ItemId) -> bool {
+    let at = mark_slot(self.slots.view(), index: item.index)
+    expect at < self.slots.len()
+    return self.slots[at] == item.index
+} ItemMarks.contains
+
+/// Whether a function the search from `root` reached reaches `root` through its dependencies,
+/// searching as `reaches` does while a code root's reads are recorded. A function whose reads
+/// are recorded with those of all it reaches, and that lies outside `root`'s cycle, is not
+/// searched further: it does not reach `root`, and searching it reads nothing new.
+fn Checker.returns_to(self, from: ty::ItemId, root: ty::ItemId, mut seen: ItemMarks) -> bool {
+    if not mut seen.insert(from) {
+        return false
+    }
+    if from != root and self.state.contents().bodies_read.get(from).is_some() {
+        let together = self.db().about(None, compute: fn() -> bool {
+            return self.cycle_component(from) == self.cycle_component(root)
+        })
+        if not together {
+            return false
+        }
+    }
+    let Some(dependencies) = self.body_dependencies(from) else {
+        return false
+    }
+    for dependency in dependencies.contents() {
+        if dependency == root or self.returns_to(dependency, root, mut seen) {
+            return true
+        }
+    }
+    return false
+} Checker.returns_to
+
+/// Records that the reads of each function of a set, and of all it reaches, are recorded.
+fn Checker.read_through(self, read: mem::OnceMap[ty::ItemId, Unit], functions: ItemMarks) {
+    for index in functions.slots {
+        if index != NO_ID and read.get(ty::ItemId(index: index)).is_none() {
+            read.insert(ty::ItemId(index: index), value: Unit)
+        }
+    }
+} Checker.read_through
 
 /// The dependencies of a function with a body, in order of occurrence; reading them reads the
 /// function as `typed_body` does.
@@ -772,7 +982,7 @@ fn Checker.check_fit_call(self, item: ty::ItemId, body: TBody, call: Call) {
             continue
         }
         let wanted = types.fn_of(wanted_id).limit_set
-        let arg = call.args[position].expr
+        let arg = call.args[position].expr.contents()
         let broken = match first arg.kind {
             TKind.FnValue(item: function, type_args: _) => self.digest(function).contents().broken(wanted)
             TKind.Local(local) if not is_param(body.local(local).kind) => match types.kind(arg.ty) {
@@ -798,7 +1008,8 @@ fn is_param(kind: LocalKind) -> bool {
 
 /// Judges the sites of a body, or of the closure of it numbered `closure`, against limits; the
 /// closures it holds are judged against their own limits first, each site reported once, for
-/// the innermost.
+/// the innermost. Limits demanding no fact are judged without walking the sites while reads are
+/// not recorded.
 fn Checker.judge(
     self,
     item: ty::ItemId,
@@ -825,6 +1036,10 @@ fn Checker.judge(
         if limit_set.pure or limit_set.terminates or limit_set.noalloc {
             self.judge(item, body, closure: nested, limit_set, mut reported)
         }
+    }
+    let demanding = limit_set.pure or limit_set.terminates or limit_set.noalloc
+    if not demanding and not self.db().recording() {
+        return
     }
     let sites = self.sites(item, body, closure)
     for site in sites {
@@ -1095,7 +1310,7 @@ fn DigestWalk.call(mut self, call: Call) {
         Callee.Builtin(builtin) => mut self.builtin_sites(token, builtin, call)
     }
     for arg in call.args {
-        mut self.argument(token, arg: arg.expr)
+        mut self.argument(token, arg: arg.expr.contents())
     }
 } DigestWalk.call
 
@@ -1122,7 +1337,7 @@ fn DigestWalk.builtin_sites(mut self, token: u32, builtin: Builtin, call: Call) 
     let alloc = self.ck.alloc()
     match builtin {
         Builtin.Conversion(_) => {
-            var floats = call.args.len() > 0 and self.is_float(call.args[0].expr.ty)
+            var floats = call.args.len() > 0 and self.is_float(call.args[0].expr.contents().ty)
             floats = floats or self.is_float(call.head.result)
             if floats {
                 var facts = Digest.none(alloc)

@@ -24,14 +24,23 @@ const OPCODE_OR: u64 = 58
 const UVAR_REST_MASK: wide::Wide = wide::Wide.max().shift_right(6)
 
 /// The keys of a store's terms, each computed once: the BLAKE3-256 digest of the term's
-/// encoding, in which each argument term is written as its key.
+/// encoding, in which each argument term is written as its key; with whether each term whose
+/// key is known holds no fresh, skolem or bound symbol, so that its key does not depend on
+/// the store.
 struct Encodings {
     keys: mem::List[Option[mem::Shared[mem::Bytes]]]
+    unnumbered: mem::List[bool]
 } Encodings
+
+/// The keys of the terms of a walk's store that hold no fresh, skolem or bound symbol, by
+/// term, as the canonical queries over the store gave them.
+struct KeyCache {
+    keys: mem::List[Option[mem::Shared[mem::Bytes]]]
+} KeyCache
 
 /// No keys yet.
 fn Encodings.empty(alloc: mem::Alloc) -> Encodings {
-    return Encodings(keys: mem::List[Option[mem::Shared[mem::Bytes]]].empty(alloc))
+    return Encodings(keys: mem::List[Option[mem::Shared[mem::Bytes]]].empty(alloc), unnumbered: mem::List[bool].empty(alloc))
 } Encodings.empty
 
 /// A copy of the keys, as the solver's states copy them at a case split.
@@ -43,8 +52,79 @@ fn Encodings.copy(self, alloc: mem::Alloc) -> Encodings {
             None => mut keys.push(None)
         }
     }
-    return Encodings(keys: take keys)
+    var unnumbered = mem::List[bool].empty(alloc)
+    for flag in self.unnumbered {
+        mut unnumbered.push(flag)
+    }
+    return Encodings(keys: take keys, unnumbered: take unnumbered)
 } Encodings.copy
+
+fn KeyCache.empty(alloc: mem::Alloc) -> KeyCache {
+    return KeyCache(keys: mem::List[Option[mem::Shared[mem::Bytes]]].empty(alloc))
+} KeyCache.empty
+
+/// The keys a cache holds for the terms a store was copied from, by the copied terms' ids.
+fn KeyCache.seeded(self, copied: mem::HashMap[u32, u32], alloc: mem::Alloc) -> Encodings {
+    var encodings = Encodings.empty(alloc)
+    for entry in copied {
+        let from = usize.widen(entry.key())
+        if from >= self.keys.len() {
+            continue
+        }
+        match self.keys[from] {
+            Some(key) => mut encodings.set(id: entry.value(), key: key.share(), unnumbered: true)
+            None => {}
+        }
+    }
+    return encodings
+} KeyCache.seeded
+
+/// Keeps the keys a store's encodings give the terms it was copied from that hold no fresh,
+/// skolem or bound symbol.
+fn KeyCache.keep(mut self, encodings: Encodings, copied: mem::HashMap[u32, u32]) {
+    for entry in copied {
+        let to = usize.widen(entry.value())
+        if to >= encodings.keys.len() or to >= encodings.unnumbered.len() or not encodings.unnumbered[to] {
+            continue
+        }
+        let Some(key) = encodings.keys[to] else {
+            continue
+        }
+        let from = usize.widen(entry.key())
+        while self.keys.len() <= from {
+            mut self.keys.push(None)
+        }
+        self.keys[from] = Some(key.share())
+    }
+} KeyCache.keep
+
+/// Records a term's key, and whether the term holds no fresh, skolem or bound symbol.
+fn Encodings.set(mut self, id: u32, take key: mem::Shared[mem::Bytes], unnumbered: bool) {
+    let index = usize.widen(id)
+    while self.keys.len() <= index {
+        mut self.keys.push(None)
+    }
+    while self.unnumbered.len() <= index {
+        mut self.unnumbered.push(false)
+    }
+    self.keys[index] = Some(take key)
+    self.unnumbered[index] = unnumbered
+} Encodings.set
+
+/// Whether a term whose parts' keys are known holds no fresh, skolem or bound symbol.
+fn Encodings.holds_no_numbered(self, terms: Terms, id: u32) -> bool {
+    match terms.get(id) {
+        Term.Fresh(_) or Term.Skolem(_) or Term.Bound(_) => return false
+        else => {}
+    }
+    for part in terms.get(id).parts(terms.alloc) {
+        let index = usize.widen(part)
+        if index >= self.unnumbered.len() or not self.unnumbered[index] {
+            return false
+        }
+    }
+    return true
+} Encodings.holds_no_numbered
 
 fn Encodings.term(mut self, ck: Checker, terms: Terms, id: u32) -> mem::Shared[mem::Bytes] {
     let index = usize.widen(id)
@@ -61,10 +141,8 @@ fn Encodings.term(mut self, ck: Checker, terms: Terms, id: u32) -> mem::Shared[m
     var key = mem::Bytes.empty(alloc)
     mut key.append(digest.view())
     let done = mem::Shared.of(take key, alloc)
-    while self.keys.len() <= index {
-        mut self.keys.push(None)
-    }
-    self.keys[index] = Some(done.share())
+    let unnumbered = self.holds_no_numbered(terms, id)
+    mut self.set(id, key: done.share(), unnumbered)
     return done
 } Encodings.term
 
@@ -100,16 +178,6 @@ fn Encodings.literal(mut self, ck: Checker, terms: Terms, literal: Literal) -> m
     }
     return out
 } Encodings.literal
-
-fn Encodings.clause(mut self, ck: Checker, terms: Terms, clause: Slice[Literal]) -> mem::Bytes {
-    var out = mem::Bytes.empty(ck.alloc())
-    encoding::uvar(mut out, value: u64.widen(clause.len()))
-    for literal in clause {
-        let encoded = mut self.literal(ck, terms, literal)
-        mut out.append(encoded.view())
-    }
-    return out
-} Encodings.clause
 
 fn Encodings.write_term(mut self, ck: Checker, terms: Terms, id: u32, mut out: mem::Bytes) {
     match terms.get(id) {

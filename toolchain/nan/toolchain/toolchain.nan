@@ -5,22 +5,71 @@ pkg const LANGUAGES: Array[u64, 1] = Array[u64, 1].filled(1)
 
 /// The hash standing for the toolchain's source tree: the hash of the canonical encoding of the
 /// list of the code roots of the artefacts the running image's `.nan` section holds, in order;
-/// `InvalidData` when the image holds no such section or an artefact that does not decode.
+/// `InvalidData` when the image holds no such section, an artefact that does not decode, or a
+/// `.nan.tree` section holding no hash.
 pkg fn source_tree(alloc: mem::Alloc) -> hashing::HashValue fails platform::IoError {
-    let executable = try platform::read_file("/proc/self/exe", alloc)
+    match try recorded_tree(alloc) {
+        Some(tree) => return tree
+        None => {}
+    }
+    let executable = try platform::read_file(IMAGE, alloc)
     let Some(artefacts) = artefact::image_section(executable.view(), alloc) else {
         fail platform::IoError.InvalidData
     }
-    var encoded = mem::Bytes.empty(alloc)
-    encoding::uvar(mut encoded, value: u64.widen(artefacts.len()))
+    let Some(tree) = tree_of(artefacts.view(), alloc) else {
+        fail platform::IoError.InvalidData
+    }
+    return tree
+} source_tree
+
+/// The source tree hash the running image's `.nan.tree` section records; none when it holds no
+/// such section, and `InvalidData` when the section holds no hash.
+pkg fn recorded_tree(alloc: mem::Alloc) -> Option[hashing::HashValue] fails platform::IoError {
+    let recorded = try artefact::section_contents(read: fn(at: usize, length: usize) -> mem::Bytes fails platform::IoError {
+        return try platform::read_at(IMAGE, at, length, alloc)
+    }, name: TREE_SECTION)
+    let Some(held) = recorded else {
+        return None
+    }
+    let Some(tree) = hashing::HashValue.read(held.view()) else {
+        fail platform::IoError.InvalidData
+    }
+    return Some(tree)
+} recorded_tree
+
+/// The running image.
+const IMAGE: Str = "/proc/self/exe"
+
+/// The section of an image that records its source tree hash.
+const TREE_SECTION: Slice[u8] = b".nan.tree"
+
+/// The hash of the canonical encoding of the list of the code roots of artefacts, in order; none
+/// when one does not decode.
+fn tree_of(artefacts: Slice[mem::Bytes], alloc: mem::Alloc) -> Option[hashing::HashValue] {
+    var roots = mem::List[Option[mem::Bytes]].empty(alloc)
     for held in artefacts {
         let Ok(decoded) = artefact::decode(held.view(), alloc) else {
-            fail platform::IoError.InvalidData
+            return None
         }
-        encoding::bytes(mut encoded, value: decoded.code_root.view())
+        let artefact::Decoded(code_root: code_root) = decoded
+        mut roots.push(Some(take code_root))
     }
-    return hashing::HashValue.of(encoded.view())
-} source_tree
+    return roots_tree(roots.view(), alloc)
+} tree_of
+
+/// The hash of the canonical encoding of a list of code roots, in order; none when one is
+/// missing.
+pkg fn roots_tree(roots: Slice[Option[mem::Bytes]], alloc: mem::Alloc) -> Option[hashing::HashValue] {
+    var encoded = mem::Bytes.empty(alloc)
+    encoding::uvar(mut encoded, value: u64.widen(roots.len()))
+    for held in roots {
+        let Some(code_root) = held else {
+            return None
+        }
+        encoding::bytes(mut encoded, value: code_root.view())
+    }
+    return Some(hashing::HashValue.of(encoded.view()))
+} roots_tree
 
 /// The hash of the canonical encoding of the record of a language version and the toolchain
 /// source tree hash.

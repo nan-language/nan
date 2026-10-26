@@ -1502,7 +1502,7 @@ fn Body.unqualified(self, ty: ty::Ty, name: Str) -> mem::List[ty::ItemId] {
     let Some(key) = ck.type_key(ty) else {
         return interfaces
     }
-    for interface_item in ck.implemented_interfaces(ty, key) {
+    for interface_item in ck.implemented_interfaces(ty, key).contents() {
         if ck.interface_method(interface_item, name).is_some() {
             mut interfaces.push(interface_item)
         }
@@ -1977,14 +1977,14 @@ fn Body.apply_with(
             if not markers.chained {
                 self.check_mode(construct: nir::Span(head: given.token, last: markers.receiver.value_or(given.token)), arg: given, mode: param.mode, marker: markers.mode, chain_mut: markers.chain_mut, receiver: true)
             }
-            mut typed_args.push(TArg(expr: take given, mode: param.mode))
+            mut typed_args.push(TArg.of(take given, mode: param.mode, alloc))
         }
         None => {}
     }
     for index in 0..<args.len() {
         let param = params[index]
         let typed = mut self.typed_arg(args[index], param, infer: mut callable.infer, callee: callable.callee, typed_args: typed_args.view(), mut waits)
-        mut typed_args.push(TArg(expr: take typed, mode: param.mode))
+        mut typed_args.push(TArg.of(take typed, mode: param.mode, alloc))
     }
     return mut self.finish_call(token, take callable, take typed_args, markers, own_param, waits)
 } Body.apply_with
@@ -2438,10 +2438,11 @@ fn Body.written_as(self, callee: Callee, receiver: Slice[TArg], param: Str) -> W
     if path.as_str() == "task::scope" and param == "body" {
         return Written.ScopeBody
     }
-    if path.as_str() != "task::Scope.spawn" or receiver.len() == 0 {
+    let spawning = path.as_str() == "task::Scope.spawn" or path.as_str() == "task::Scope.spawn_sized"
+    if not spawning or receiver.len() == 0 {
         return Written.Other
     }
-    return match self.lexical_scope(receiver[0].expr) {
+    return match self.lexical_scope(receiver[0].expr.contents()) {
         Some(scope) => Written.Lent(scope)
         None => Written.Other
     }
@@ -2480,7 +2481,11 @@ fn Body.check_spawn(mut self, token: u32, callable: Callable, args: Slice[TArg])
     let Callee.Function(item: item) = callable.callee else {
         return
     }
-    if not ck.db().is_std(item) or ck.db().canonical(item).as_str() != "task::Scope.spawn" {
+    if not ck.db().is_std(item) {
+        return
+    }
+    let path = ck.db().canonical(item)
+    if path.as_str() != "task::Scope.spawn" and path.as_str() != "task::Scope.spawn_sized" {
         return
     }
     let own = callable.head.own_generics()
@@ -2492,7 +2497,7 @@ fn Body.check_spawn(mut self, token: u32, callable: Callable, args: Slice[TArg])
     }
     var scope: Option[u32] = None
     if args.len() > 0 {
-        scope = self.lexical_scope(args[0].expr)
+        scope = self.lexical_scope(args[0].expr.contents())
     }
     match scope {
         Some(scope_body) => mut self.lexical_spawns.push(LexicalSpawn(body: scope_body, failure: failure, token: token))
@@ -2517,7 +2522,7 @@ fn Body.check_lexical_spawns(mut self, callable: Callable, args: Slice[TArg]) {
     if args.len() < 2 {
         return
     }
-    let TKind.Closure(closure) = args[1].expr.kind else {
+    let TKind.Closure(closure) = args[1].expr.contents().kind else {
         return
     }
     let own = callable.head.own_generics()
@@ -2574,7 +2579,7 @@ fn Body.check_volatile(self, token: u32, callable: Callable, args: Slice[TArg]) 
     if args.len() < 2 {
         return
     }
-    let operand = args[1].expr
+    let operand = args[1].expr.contents()
     if ck.types().has_error(operand.ty) {
         return
     }
@@ -3308,8 +3313,8 @@ fn Body.index(mut self, token: u32, base: ast::Expr, index: ast::Expr, write: bo
     let result = head.result
     let type_args = found.callee.type_args(head: found.head, subst: found.infer.subst, types)
     var call_args = mem::List[TArg].empty(alloc)
-    mut call_args.push(TArg(expr: take base_typed, mode: found.head.params[0].mode))
-    mut call_args.push(TArg(expr: take index_typed, mode: ast::Mode.Read))
+    mut call_args.push(TArg.of(take base_typed, mode: found.head.params[0].mode, alloc))
+    mut call_args.push(TArg.of(take index_typed, mode: ast::Mode.Read, alloc))
     let made = Call(token: token, callee: take found.callee, type_args: type_args, args: take call_args, head: take head, projection: true, failure: None, awaited: false)
     return TExpr(token: token, last: token, ty: result, kind: TKind.Index(mem::Heap.of(alloc).boxed(take made)))
 } Body.index
@@ -3605,7 +3610,7 @@ fn Body.dyn_view(
     self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode, marker, chain_mut: false, receiver: false)
     let ty = types.intern(ty::TyKind.Dyn(bound))
     var call_args = mem::List[TArg].empty(alloc)
-    mut call_args.push(TArg(expr: take typed, mode: mode))
+    mut call_args.push(TArg.of(take typed, mode: mode, alloc))
     let made = Call(token: token, callee: Callee.Builtin(Builtin.DynView), type_args: ty::Args.none(), args: take call_args, head: plain_head(ty, alloc), projection: true, failure: None, awaited: false)
     return TExpr(token: token, last: token, ty: ty, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
 } Body.dyn_view
@@ -3664,7 +3669,7 @@ fn Body.boxed_dyn_call(
     }
     self.check_mode(construct: nir::Span(head: value.token, last: value.last), arg: typed, mode: ast::Mode.Take, marker, chain_mut: false, receiver: false)
     var call_args = mem::List[TArg].empty(alloc)
-    mut call_args.push(TArg(expr: take typed, mode: ast::Mode.Take))
+    mut call_args.push(TArg.of(take typed, mode: ast::Mode.Take, alloc))
     let made = Call(token: token, callee: Callee.Builtin(Builtin.DynView), type_args: ty::Args.none(), args: take call_args, head: plain_head(boxed, alloc), projection: false, failure: None, awaited: false)
     return TExpr(token: token, last: token, ty: boxed, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
 } Body.boxed_dyn_call
@@ -3694,7 +3699,7 @@ fn Body.template(mut self, token: u32, args: Slice[ast::Arg]) -> TExpr {
     }
     var names = mem::List[text::String].empty(alloc)
     var typed_args = mem::List[TArg].empty(alloc)
-    mut typed_args.push(text_arg(template.token, written: take value, str_ty: ck.str_ty()))
+    mut typed_args.push(text_arg(template.token, written: take value, str_ty: ck.str_ty(), alloc))
     let render = ck.db().core_item("Render")
     for index in 1..<args.len() {
         let arg = args[index]
@@ -3709,9 +3714,9 @@ fn Body.template(mut self, token: u32, args: Slice[ast::Arg]) -> TExpr {
             self.report(arg.token, code: diagnostic::Code.TextArgumentUnused)
         }
         mut names.push(text::String.of(name.as_str(), alloc))
-        mut typed_args.push(text_arg(arg.token, written: take name, str_ty: ck.str_ty()))
+        mut typed_args.push(text_arg(arg.token, written: take name, str_ty: ck.str_ty(), alloc))
         let typed = mut self.hole_argument(arg, render)
-        mut typed_args.push(TArg(expr: take typed, mode: ast::Mode.Read))
+        mut typed_args.push(TArg.of(take typed, mode: ast::Mode.Read, alloc))
     }
     for hole in holes {
         if not holds_text(names.view(), text: hole.as_str()) {
@@ -3774,8 +3779,8 @@ fn Body.hole_argument(mut self, arg: ast::Arg, render: Option[ty::ItemId]) -> TE
 } Body.hole_argument
 
 /// A text literal argument of a template call.
-fn text_arg(token: u32, take written: text::String, str_ty: ty::Ty) -> TArg {
-    return TArg(expr: TExpr(token: token, last: token, ty: str_ty, kind: TKind.Literal(Lit.Text(take written))), mode: ast::Mode.Read)
+fn text_arg(token: u32, take written: text::String, str_ty: ty::Ty, alloc: mem::Alloc) -> TArg {
+    return TArg.of(TExpr(token: token, last: token, ty: str_ty, kind: TKind.Literal(Lit.Text(take written))), mode: ast::Mode.Read, alloc)
 } text_arg
 
 /// The head of a DMA access call on an `hw::DmaShared`.
@@ -3839,13 +3844,13 @@ fn Body.apply_dma(
     mut carried.push(ty::Arg.Const(ty::Const.Bool(write)))
     mut carried.push(ty::Arg.Const(ty::Const.Bool(indexed)))
     var call_args = mem::List[TArg].empty(alloc)
-    mut call_args.push(TArg(expr: take receiver, mode: ast::Mode.Mut))
+    mut call_args.push(TArg.of(take receiver, mode: ast::Mode.Mut, alloc))
     match operands.index {
-        Some(indexing) => mut call_args.push(TArg(expr: take indexing, mode: ast::Mode.Read))
+        Some(indexing) => mut call_args.push(TArg.of(take indexing, mode: ast::Mode.Read, alloc))
         None => {}
     }
     match operands.value {
-        Some(written) => mut call_args.push(TArg(expr: take written, mode: ast::Mode.Take))
+        Some(written) => mut call_args.push(TArg.of(take written, mode: ast::Mode.Take, alloc))
         None => {}
     }
     let made = Call(token: token, callee: Callee.Builtin(Builtin.DmaAccess), type_args: types.args(take carried), args: take call_args, head: plain_head(result, alloc), projection: false, failure: markers.failure, awaited: markers.awaited.is_some())
@@ -3977,7 +3982,7 @@ fn builtin_call(
     alloc: mem::Alloc,
     ) -> TExpr {
     var args = mem::List[TArg].empty(alloc)
-    mut args.push(TArg(expr: take source, mode: ast::Mode.Read))
+    mut args.push(TArg.of(take source, mode: ast::Mode.Read, alloc))
     let made = Call(token: token, callee: Callee.Builtin(take builtin), type_args: ty::Args.none(), args: take args, head: plain_head(result, alloc), projection: false, failure: None, awaited: false)
     return TExpr(token: token, last: token, ty: result, kind: TKind.Call(mem::Heap.of(alloc).boxed(take made)))
 } builtin_call
@@ -3997,7 +4002,7 @@ fn TExpr.is_place(self) -> bool {
     return match self.kind {
         TKind.Local(_) => true
         TKind.Field(base: base, name: _) => base.contents().is_place()
-        TKind.Index(held) => held.contents().args.len() > 0 and held.contents().args[0].expr.is_place()
+        TKind.Index(held) => held.contents().args.len() > 0 and held.contents().args[0].expr.contents().is_place()
         else => false
     }
 } TExpr.is_place

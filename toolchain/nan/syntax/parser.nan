@@ -76,40 +76,35 @@ fn Discard.token(mut self, at: usize) {
 fn Discard.close(mut self) {
 } Discard.close
 
-/// How well a lookahead matches what can start a symbol; lower ranks win. A context word beats
-/// `IDENT`, and an alternative outside every rejection beats a rejected one.
-fn rank(reached: First, look: Look) -> Option[u8] {
-    match look.context {
-        Some(word) => {
-            if reached.ok.contains(Term.Context(word)) {
-                return Some(0)
-            }
-            if reached.rejected.contains(Term.Context(word)) {
-                return Some(1)
-            }
-        }
-        None => {}
-    }
-    match look.term {
-        Some(term) => {
-            if reached.ok.contains(term) {
-                return Some(2)
-            }
-            if reached.rejected.contains(term) {
-                return Some(3)
-            }
-        }
-        None => {}
-    }
-    return None
-} rank
+/// Whether a lookahead can start what `reached` describes, through a rejected alternative or not.
+fn Look.starts(self, reached: First) -> bool {
+    return self.opens(reached.ok) or self.opens(reached.rejected)
+} Look.starts
 
+/// Whether a set holds a terminal a lookahead token can be.
+fn Look.opens(self, set: TermSet) -> bool {
+    match self.context {
+        Some(word) => {
+            if set.holds(word) {
+                return true
+            }
+        }
+        None => {}
+    }
+    return match self.term {
+        Some(term) => set.holds(term)
+        None => false
+    }
+} Look.opens
+
+/// The terminals a lookahead token can be: the terminal its kind is, and the context word it
+/// reads as.
 struct Look derives Copy {
-    term: Option[Term]
-    context: Option[ContextWord]
+    term: Option[TermBit]
+    context: Option[TermBit]
 } Look
 
-fn Look.of(lookahead: Lookahead, source: Slice[u8]) -> Look {
+fn Look.of(lookahead: Lookahead, source: Slice[u8], grammar: Tables) -> Look {
     var next_kind: Option[TokenKind] = None
     match lookahead.next {
         Some(next) => {
@@ -117,7 +112,7 @@ fn Look.of(lookahead: Lookahead, source: Slice[u8]) -> Look {
         }
         None => {}
     }
-    var context = lookahead.token.context_word(source)
+    var context = lookahead.token.context_word(source, grammar)
     match context {
         Some(ContextWord.Task) => {
             if next_kind != Some(TokenKind.Keyword(Keyword.Fn)) {
@@ -136,12 +131,26 @@ fn Look.of(lookahead: Lookahead, source: Slice[u8]) -> Look {
         }
         else => {}
     }
-    return Look(term: lookahead.token.kind.term(), context: context)
+    var term: Option[TermBit] = None
+    match lookahead.token.kind.term() {
+        Some(held) => {
+            term = Some(TermBit.of(held.index()))
+        }
+        None => {}
+    }
+    var word: Option[TermBit] = None
+    match context {
+        Some(read) => {
+            word = Some(TermBit.of(Term.Context(read).index()))
+        }
+        None => {}
+    }
+    return Look(term: term, context: word)
 } Look.of
 
 /// Whether the lookahead can start `rule`, through a rejected alternative or not.
-fn starts(rule: Rule, lookahead: Lookahead, source: Slice[u8], grammar: Grammar) -> bool {
-    return rank(grammar.analysis.choice(rule.choice(grammar)), look: Look.of(lookahead, source)).is_some()
+fn starts(rule: Rule, lookahead: Lookahead, source: Slice[u8], grammar: Tables) -> bool {
+    return Look.of(lookahead, source, grammar).starts(grammar.analysis.choice(rule.choice(grammar)))
 } starts
 
 /// Whether an identifier has the PascalCase shape: an uppercase letter, then letters and digits
@@ -175,55 +184,91 @@ fn State.clone(self, alloc: mem::Alloc) -> State {
     return State(start: self.start, frames: take frames, single_line: self.single_line, braces: self.braces, pascal_path: self.pascal_path, last_operand: self.last_operand)
 } State.clone
 
-fn State.push_rule[S: Sink](mut self, rule: Rule, seq: usize, at: usize, mut sink: S, grammar: Grammar) {
+/// Notes a rule's node closed over the tokens `start..end`: a prefix expression is the last
+/// operand.
+fn State.closed(mut self, rule: Rule, start: usize, end: usize) {
+    match rule {
+        Rule.PrefixExpr => {
+            self.last_operand = Some(Operand(start: start, end: end))
+        }
+        else => {}
+    }
+} State.closed
+
+fn State.push_rule[S: Sink](mut self, rule: Rule, seq: usize, at: usize, mut sink: S, grammar: Tables) {
     mut sink.open(rule)
     let single_line_kind = match rule {
         Rule.ImplItem or Rule.ConstItem or Rule.ConstAssertItem or Rule.RegistryItem or Rule.ContributeItem or Rule.RetiredItem => true
         else => false
     }
     var single_line_fn = false
-    if rule == Rule.FnEnd {
-        expect seq < grammar.seqs.len() and grammar.seqs[seq].elems.len() > 0
-        single_line_fn = match grammar.seqs[seq].elems[0].atom {
-            Atom.Term(Term.Punct(Punct.Eq)) or Atom.Rule(Rule.ConventionClause) => true
-            else => false
+    match rule {
+        Rule.FnEnd => {
+            expect seq < grammar.seqs.len() and grammar.seqs[seq].elems.len() > 0
+            single_line_fn = match grammar.seqs[seq].elems[0].atom {
+                Atom.Term(Term.Punct(Punct.Eq)) or Atom.Rule(Rule.ConventionClause) => true
+                else => false
+            }
         }
+        else => {}
     }
     self.single_line = self.single_line or single_line_kind or single_line_fn
     mut self.frames.push(Frame(seq: seq, elem: 0, count: 0, rule: Some(rule), start: at))
 } State.push_rule
 
-/// The alternative of a choice the lookahead selects, if any.
-fn State.choose(choice: usize, look: Look, grammar: Grammar) -> Option[usize] {
-    var best: Option[usize] = None
-    var best_rank: u8 = 0
-    expect choice < grammar.choices.len()
-    for alt in grammar.choices[choice] {
-        let Some(ranked) = rank(grammar.analysis.seq(alt), look) else {
-            continue
+/// The alternative of a choice the lookahead selects, if any: the first that a context word
+/// starts outside every rejection, else through one, else the first the terminal starts the same
+/// way, else the first nullable one.
+fn State.choose(choice: usize, look: Look, grammar: Tables) -> Option[usize] {
+    let row = choice * CHOOSING_ROW
+    let table = grammar.choosing.view()
+    match look.context {
+        Some(word) => {
+            match chosen(table, at: row + word.index) {
+                Some(alt) => return Some(alt)
+                None => {}
+            }
+            match chosen(table, at: row + TERMS + word.index) {
+                Some(alt) => return Some(alt)
+                None => {}
+            }
         }
-        if best.is_none() or ranked < best_rank {
-            best = Some(alt)
-            best_rank = ranked
+        None => {}
+    }
+    match look.term {
+        Some(term) => {
+            match chosen(table, at: row + term.index) {
+                Some(alt) => return Some(alt)
+                None => {}
+            }
+            match chosen(table, at: row + TERMS + term.index) {
+                Some(alt) => return Some(alt)
+                None => {}
+            }
         }
+        None => {}
     }
-    if best.is_some() {
-        return best
-    }
-    for alt in grammar.choices[choice] {
-        if grammar.analysis.seq(alt).nullable {
-            return Some(alt)
-        }
-    }
-    return None
+    return chosen(table, at: row + 2 * TERMS)
 } State.choose
+
+/// The alternative the entry at an index of `Grammar.choosing` names, if any.
+fn chosen(table: Slice[u8], at: usize) -> Option[usize] {
+    if at >= table.len() / 2 {
+        return None
+    }
+    let entry = table.u16_le(2 * at)
+    if entry == 0 {
+        return None
+    }
+    return Some(usize.widen(entry - 1))
+} chosen
 
 /// Advances the parse to the lookahead token: expands and completes rules until the token is
 /// consumed, the start rule completes before it, or the parse fails at it.
-fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut sink: S, grammar: Grammar) -> Fed fails Failure
+fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut sink: S, grammar: Tables) -> Fed fails Failure
     waive length "one loop over the frames, as the Rust parse"
 {
-    let look = Look.of(lookahead, source)
+    let look = Look.of(lookahead, source, grammar)
     let at = lookahead.at
     var expected = TermSet.default()
     match mut self.start.extract() {
@@ -254,9 +299,7 @@ fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut si
             match frame.rule {
                 Some(rule) => {
                     mut sink.close()
-                    if rule == Rule.PrefixExpr {
-                        self.last_operand = Some(Operand(start: frame.start, end: at))
-                    }
+                    mut self.closed(rule, start: frame.start, end: at)
                 }
                 None => {}
             }
@@ -267,30 +310,31 @@ fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut si
             }
             continue
         }
-        let elem = elems[frame.elem]
-        let may = match elem.repeat {
+        let repeat = elems[frame.elem].repeat
+        let may = match repeat {
             Repeat.One or Repeat.Opt => frame.count == 0
             Repeat.Star or Repeat.Plus => true
         }
-        let must = match elem.repeat {
+        let must = match repeat {
             Repeat.One or Repeat.Plus => frame.count == 0
             Repeat.Opt or Repeat.Star => false
         }
         if not may {
-            self.frames[top] = Frame(seq: frame.seq, elem: frame.elem + 1, count: 0, rule: frame.rule, start: frame.start)
+            self.frames[top].elem = frame.elem + 1
+            self.frames[top].count = 0
             continue
         }
-        let atom_first = grammar.analysis.atom(elem.atom, grammar)
-        let can_start = rank(atom_first, look).is_some()
-        let resolved = self.resolves(frame, atom: elem.atom, lookahead, source, grammar)
-        if not must and not (can_start and resolved) {
+        let atom = elems[frame.elem].atom
+        let can_start = look.opens(elems[frame.elem].opens)
+        if not must and not (can_start and self.resolves(frame, atom, lookahead, source, grammar)) {
             if not can_start {
-                mut expected.union(atom_first.ok)
+                mut expected.union(elems[frame.elem].starts.ok)
             }
-            self.frames[top] = Frame(seq: frame.seq, elem: frame.elem + 1, count: 0, rule: frame.rule, start: frame.start)
+            self.frames[top].elem = frame.elem + 1
+            self.frames[top].count = 0
             continue
         }
-        match elem.atom {
+        match atom {
             Atom.Term(term) => {
                 if not can_start {
                     mut expected.insert(term)
@@ -303,15 +347,15 @@ fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut si
                 return Fed.Consumed
             }
             Atom.Rule(rule) => {
-                let Some(alt) = State.choose(rule.choice(grammar), look, grammar) else {
-                    mut expected.union(atom_first.ok)
+                let Some(alt) = State.choose(elems[frame.elem].choice, look, grammar) else {
+                    mut expected.union(elems[frame.elem].starts.ok)
                     fail Failure.Token(at: at, expected: expected)
                 }
                 mut self.push_rule(rule, seq: alt, at, mut sink, grammar)
             }
             Atom.Group(choice) => {
                 let Some(alt) = State.choose(choice, look, grammar) else {
-                    mut expected.union(atom_first.ok)
+                    mut expected.union(elems[frame.elem].starts.ok)
                     fail Failure.Token(at: at, expected: expected)
                 }
                 mut self.frames.push(Frame(seq: alt, elem: 0, count: 0, rule: None, start: at))
@@ -322,20 +366,23 @@ fn State.feed[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut si
 
 /// Whether the resolutions the grammar publishes let an element the lookahead can start begin
 /// there: generic arguments after a PascalCase path segment, and a `limits` comma before a limit.
-fn State.resolves(self, frame: Frame, atom: Atom, lookahead: Lookahead, source: Slice[u8], grammar: Grammar) -> bool {
-    if frame.rule == Some(Rule.PathExpr) and atom == Atom.Rule(Rule.GenericArgs) {
-        return self.pascal_path
-    }
-    let group = match atom {
-        Atom.Group(_) => true
-        else => false
-    }
-    if frame.rule == Some(Rule.LimitsClause) and group {
-        let Some(next) = lookahead.next else {
-            return false
+fn State.resolves(self, frame: Frame, atom: Atom, lookahead: Lookahead, source: Slice[u8], grammar: Tables) -> bool {
+    match frame.rule {
+        Some(Rule.PathExpr) => match atom {
+            Atom.Rule(Rule.GenericArgs) => return self.pascal_path
+            else => {}
         }
-        let after = Lookahead(token: next, next: None, at: lookahead.at)
-        return rank(grammar.analysis.choice(Rule.Limit.choice(grammar)), look: Look.of(after, source)).is_some()
+        Some(Rule.LimitsClause) => match atom {
+            Atom.Group(_) => {
+                let Some(next) = lookahead.next else {
+                    return false
+                }
+                let after = Lookahead(token: next, next: None, at: lookahead.at)
+                return Look.of(after, source, grammar).starts(grammar.analysis.choice(Rule.Limit.choice(grammar)))
+            }
+            else => {}
+        }
+        else => {}
     }
     return true
 } State.resolves
@@ -354,16 +401,19 @@ fn State.consume[S: Sink](mut self, lookahead: Lookahead, source: Slice[u8], mut
         }
         else => {}
     }
-    if token.kind == TokenKind.Ident {
-        let Some(head) = source.prefix(usize.widen(token.end)) else {
-            expect false
-            return
+    match token.kind {
+        TokenKind.Ident => {
+            let Some(head) = source.prefix(usize.widen(token.end)) else {
+                expect false
+                return
+            }
+            let Some(parts) = head.split_at(usize.widen(token.start)) else {
+                expect false
+                return
+            }
+            self.pascal_path = is_pascal(parts.tail)
         }
-        let Some(parts) = head.split_at(usize.widen(token.start)) else {
-            expect false
-            return
-        }
-        self.pascal_path = is_pascal(parts.tail)
+        else => {}
     }
     mut sink.token(lookahead.at)
 } State.consume
@@ -380,7 +430,7 @@ fn State.innermost_rule(self) -> Option[Rule] {
 } State.innermost_rule
 
 /// The atom the innermost frame stands at, if it has not passed its end.
-fn State.current_atom(self, grammar: Grammar) -> Option[Atom] {
+fn State.current_atom(self, grammar: Tables) -> Option[Atom] {
     let depth = self.frames.len()
     if depth == 0 {
         return None
@@ -395,7 +445,7 @@ fn State.current_atom(self, grammar: Grammar) -> Option[Atom] {
 } State.current_atom
 
 /// Whether the parse accepts these tokens in order, each read with the next as lookahead.
-fn State.accepts(self, tokens: Slice[Token], source: Slice[u8], grammar: Grammar, alloc: mem::Alloc) -> bool {
+fn State.accepts(self, tokens: Slice[Token], source: Slice[u8], grammar: Tables, alloc: mem::Alloc) -> bool {
     var state = self.clone(alloc)
     var dry = Discard()
     for index in 0..<tokens.len() {

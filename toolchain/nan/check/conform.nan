@@ -120,15 +120,12 @@ fn Checker.impl_lines(self, key: TypeKey) -> mem::List[ty::ItemId] {
 } Checker.impl_lines
 
 /// The canonical path of an interface without its package, for the core interfaces.
-fn Checker.core_interface(self, interface_item: ty::ItemId) -> Option[text::String] {
-    let path = self.db().canonical(interface_item)
+proj fn Checker.core_interface(self, interface_item: ty::ItemId) -> Option[Str] {
+    let path = self.db().canonical_text(interface_item)
     if not path.starts_with("core::") {
         return None
     }
-    let Some(rest) = path.slice_bytes(6, end: path.byte_len()) else {
-        return None
-    }
-    return Some(text::String.of(rest, alloc: self.alloc()))
+    return path.slice_bytes(6, end: path.byte_len())
 } Checker.core_interface
 
 /// Whether an interface is the core interface of a name.
@@ -136,7 +133,7 @@ fn Checker.is_core_interface(self, interface_item: ty::ItemId, name: Str) -> boo
     let Some(core) = self.core_interface(interface_item) else {
         return false
     }
-    return core.as_str() == name
+    return core == name
 } Checker.is_core_interface
 
 /// The arguments of `interface_item` through which `ty` implements it, and how.
@@ -309,7 +306,7 @@ fn Checker.property_interface(self, interface_item: ty::ItemId) -> Option[Proper
     let Some(name) = self.core_interface(interface_item) else {
         return None
     }
-    return match name.as_str() {
+    return match name {
         "Copy" => Some(Property.Copy)
         "Send" => Some(Property.Send)
         "Inert" => Some(Property.Inert)
@@ -323,10 +320,12 @@ pkg fn Checker.derives_interface(self, item: ty::ItemId, interface_item: ty::Ite
     let Some(name) = self.core_interface(interface_item) else {
         return false
     }
-    if not is_listed(DERIVABLE_INTERFACES, word: name.as_str()) {
-        return false
+    for listed in self.derivable_interfaces() {
+        if listed == interface_item {
+            return self.derived_by(item, name)
+        }
     }
-    return self.derived_by(item, name: name.as_str())
+    return false
 } Checker.derives_interface
 
 /// Whether an impl line applies to an instantiation as far as droppable parameters go: a
@@ -403,10 +402,9 @@ fn Checker.droppable_for_line(self, line: ty::ItemId) -> mem::List[bool] {
 
 /// The conformances the owning chapters declare for scalars, `Unit` and std types.
 fn Checker.builtin_conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> Option[ty::Args] {
-    let Some(core) = self.core_interface(interface_item) else {
+    let Some(name) = self.core_interface(interface_item) else {
         return None
     }
-    let name = core.as_str()
     let types = self.types()
     match types.kind(ty) {
         ty::TyKind.Scalar(scalar) => return scalar_conformance(ty, scalar, name, types)
@@ -421,7 +419,7 @@ fn Checker.builtin_conformance(self, ty: ty::Ty, interface_item: ty::ItemId) -> 
             if not db.is_std(item) {
                 return None
             }
-            return self.std_conformance(ty, path: db.canonical(item).as_str(), name, interface_item)
+            return self.std_conformance(ty, path: db.canonical_text(item), name, interface_item)
         }
         else => return None
     }
@@ -623,7 +621,7 @@ fn Checker.conform_candidates(self, ty: ty::Ty, key: TypeKey, name: Str, mut can
         TypeKey.Item(item) => db.package_of(item)
         else => db.core()
     }
-    for interface_item in self.implemented_interfaces(ty, key) {
+    for interface_item in self.implemented_interfaces(ty, key).contents() {
         let interface_package = db.package_of(interface_item)
         if interface_package != package_id and interface_package != db.core() {
             continue
@@ -678,7 +676,7 @@ fn Checker.boxed_dyn(self, ty: ty::Ty) -> Option[ty::Ty] {
         return None
     }
     let db = self.db()
-    if not db.is_std(item) or db.canonical(item).as_str() != "mem::Box" {
+    if not db.is_std(item) or db.canonical_text(item) != "mem::Box" {
         return None
     }
     let listed = types.arg_list(args)
@@ -705,9 +703,30 @@ fn Checker.type_subst(self, key: TypeKey, ty: ty::Ty) -> ty::Subst {
     return ty::Subst.of(params.view(), args: types.arg_list(types.args_of(ty)), alloc)
 } Checker.type_subst
 
-/// The interfaces a type implements through impl lines, derives and std conformances.
-fn Checker.implemented_interfaces(self, ty: ty::Ty, key: TypeKey) -> mem::List[ty::ItemId] {
-    let db = self.db()
+/// The interfaces a type implements through impl lines, derives and std conformances. Those of
+/// a type mentioning no generic parameter are found once per package checking them, while reads
+/// are not recorded.
+fn Checker.implemented_interfaces(self, ty: ty::Ty, key: TypeKey) -> mem::Shared[mem::List[ty::ItemId]] {
+    let alloc = self.alloc()
+    let state = self.state.contents()
+    if self.db().recording() or self.types().mentions(ty, params: fn(param: ty::Param) => true) {
+        return mem::Shared.of(self.found_implemented(ty, key), alloc)
+    }
+    let memo = ImplementedKey(ty: ty, checking: self.underway.contents().checking.load())
+    match state.implemented_interfaces.get(memo) {
+        Some(known) => return known.share()
+        None => {}
+    }
+    return state.implemented_interfaces.insert(memo, value: mem::Shared.of(self.found_implemented(ty, key), alloc)).share()
+} Checker.implemented_interfaces
+
+/// A type and the package checking it, `NO_ID` for none.
+struct ImplementedKey derives Copy, Eq, Hash {
+    ty: ty::Ty
+    checking: u32
+} ImplementedKey
+
+fn Checker.found_implemented(self, ty: ty::Ty, key: TypeKey) -> mem::List[ty::ItemId] {
     let alloc = self.alloc()
     var interfaces = mem::List[ty::ItemId].empty(alloc)
     for line in self.impl_lines(key) {
@@ -717,17 +736,11 @@ fn Checker.implemented_interfaces(self, ty: ty::Ty, key: TypeKey) -> mem::List[t
             else => {}
         }
     }
-    for name in Words(list: DERIVABLE_INTERFACES, at: 0) {
-        match db.core_item(name) {
-            Some(interface_item) => mut interfaces.push(interface_item)
-            None => {}
-        }
+    for interface_item in self.derivable_interfaces() {
+        mut interfaces.push(interface_item)
     }
-    for name in Words(list: OPERATOR_INTERFACES, at: 0) {
-        match db.std_item("core", name) {
-            Some(interface_item) => mut interfaces.push(interface_item)
-            None => {}
-        }
+    for interface_item in self.listed_interfaces(1) {
+        mut interfaces.push(interface_item)
     }
     mut interfaces.sort_by(fn(left: ty::ItemId, right: ty::ItemId) => left.cmp(right))
     var implemented = mem::List[ty::ItemId].empty(alloc)
@@ -742,7 +755,43 @@ fn Checker.implemented_interfaces(self, ty: ty::Ty, key: TypeKey) -> mem::List[t
         }
     }
     return implemented
-} Checker.implemented_interfaces
+} Checker.found_implemented
+
+/// The derivable interfaces core declares.
+proj fn Checker.derivable_interfaces(self) -> Slice[ty::ItemId] {
+    return self.listed_interfaces(0)
+} Checker.derivable_interfaces
+
+/// The derivable interfaces core declares under key 0, its operator interfaces under key 1.
+proj fn Checker.listed_interfaces(self, key: u8) -> Slice[ty::ItemId] {
+    let state = self.state.contents()
+    let held = match state.builtin_interfaces.get(key) {
+        Some(known) => known
+        None => state.builtin_interfaces.insert(key, value: self.found_interfaces(key))
+    }
+    return held.view()
+} Checker.listed_interfaces
+
+fn Checker.found_interfaces(self, key: u8) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var interfaces = mem::List[ty::ItemId].empty(self.alloc())
+    if key == 0 {
+        for name in Words(list: DERIVABLE_INTERFACES, at: 0) {
+            match db.core_item(name) {
+                Some(interface_item) => mut interfaces.push(interface_item)
+                None => {}
+            }
+        }
+        return interfaces
+    }
+    for name in Words(list: OPERATOR_INTERFACES, at: 0) {
+        match db.std_item("core", name) {
+            Some(interface_item) => mut interfaces.push(interface_item)
+            None => {}
+        }
+    }
+    return interfaces
+} Checker.found_interfaces
 
 /// The index of an interface's method of that name.
 pkg fn Checker.interface_method(self, interface_item: ty::ItemId, name: Str) -> Option[usize] {
@@ -865,7 +914,7 @@ fn Checker.typed_member_of(self, element: Option[ty::Ty]) -> Option[ty::ItemId] 
     let ty::TyKind.Param(param) = self.types().kind(element_ty) else {
         return None
     }
-    let Some(within) = item_of_bits(self.state.contents().within.load()) else {
+    let Some(within) = item_of_bits(self.underway.contents().within.load()) else {
         return None
     }
     if self.db().owners.get(within) != Some(TypeKey.Item(param.owner)) {
@@ -964,7 +1013,7 @@ fn Checker.argument_problem(self, def: GenericDef, arg: ty::Ty, subst: ty::Subst
     }
     var any = false
     for bound in def.bounds {
-        if db.canonical(bound.item).as_str() == "core::Any" {
+        if db.canonical_text(bound.item) == "core::Any" {
             any = true
             break
         }
@@ -974,7 +1023,7 @@ fn Checker.argument_problem(self, def: GenericDef, arg: ty::Ty, subst: ty::Subst
     }
     let accepts = self.accepts_views(def.param)
     let boxed_dyn = match types.kind(arg) {
-        ty::TyKind.Dyn(_) => db.canonical(def.param.owner).as_str() == "mem::Box"
+        ty::TyKind.Dyn(_) => db.canonical_text(def.param.owner) == "mem::Box"
         else => false
     }
     let std_function = db.is_std(def.param.owner) and is_fn_item(db.ast(def.param.owner))
@@ -1137,7 +1186,8 @@ fn Db.canonical_line_droppable(self, line: ty::ItemId) -> bool {
 /// whose `where` conditions are judged once the items are elaborated.
 fn Checker.instantiated(self, holder: ty::ItemId, token: u32, target: ty::ItemId, args: ty::Args) {
     let state = self.state.contents()
-    if state.muted.load() == 0 and not self.db().is_std(holder) {
+    if self.underway.contents().muted.load() == 0 and not self.db().is_std(holder) {
+        self.logged_freely(holder)
         discard state.instantiations.push(Instantiation(item: holder, token: token, instantiated: target, args: args))
     }
 } Checker.instantiated
@@ -1159,13 +1209,15 @@ fn Checker.check_wheres(self) {
     for position in 0..<count {
         let written = state.instantiations.at(mem::Id[Instantiation].of(u32.fit(position)))
         let at = HolderToken(holder: written.item, token: written.token)
-        if judged.contains(at) or self.rejected(written.item) {
+        if judged.contains(at) or self.is_restored(written.item.index) or self.rejected(written.item) {
             continue
         }
         discard mut judged.insert(at, value: Unit)
-        if not self.where_met(written) {
-            self.report(written.item, token: written.token, code: diagnostic::Code.GenericWhereUnmet)
-        }
+        self.traced_as(written.item, compute: fn() {
+            if not self.where_met(written) {
+                self.report(written.item, token: written.token, code: diagnostic::Code.GenericWhereUnmet)
+            }
+        })
     }
 } Checker.check_wheres
 

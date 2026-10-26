@@ -604,7 +604,9 @@ fn host_overflow(mut lo: Lowering, mut fx: Fx, info: clif::Value, context: clif:
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
 /// calling thread being the first, and the reading of termination requests; returns 1 from
-/// `Init` when the system refuses one.
+/// `Init` when the system refuses the first thread's ring or the second thread. Each other
+/// thread sets up its own ring and starts the next, as `ThreadMain` does, so that starting
+/// costs the calling thread one ring and one thread whatever the processors.
 fn start_threads(mut lo: Lowering, mut fx: Fx) {
     let state_address = mut lo.state(mut fx)
     if lo.seeded() {
@@ -628,14 +630,14 @@ fn start_threads(mut lo: Lowering, mut fx: Fx) {
         let record = first_result(mut lo.call_libc(mut pass_fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
         unavailable_unless(mut pass_fx, address: record)
         mut pass_fx.store(index, addr: record, offset: THREAD_INDEX)
-        let ring = setup_ring(mut lo, fx: mut pass_fx)
-        unavailable_unless(mut pass_fx, address: ring)
-        mut pass_fx.store(ring, addr: record, offset: THREAD_RING)
         let slot_offset = mut pass_fx.b.imul_imm_s(index, y: 8)
         let slot = mut pass_fx.b.iadd(threads, y: slot_offset)
         mut pass_fx.store(record, addr: slot, offset: 0)
     })
     let first_thread = mut fx.load(PTR, addr: threads, offset: 0)
+    let ring = setup_ring(mut lo, mut fx)
+    unavailable_unless(mut fx, address: ring)
+    mut fx.store(ring, addr: first_thread, offset: THREAD_RING)
     let thread_slot = mut lo.thread_slot(mut fx)
     mut fx.store(first_thread, addr: thread_slot, offset: 0)
     let refused = thread_signals(mut lo, mut fx, record: first_thread)
@@ -651,28 +653,68 @@ fn start_threads(mut lo: Lowering, mut fx: Fx) {
     pipe_args[1] = ignore
     discard mut lo.call_libc(mut fx, name: "signal", args: pipe_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
     read_signals(mut lo, mut fx)
+    let failed = start_next_thread(mut lo, mut fx, record: first_thread)
+    mut fx.if_true(failed, then: fn(mut then_fx: Fx) {
+        let refusal = mut then_fx.ptr(1)
+        mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
+    })
+} start_threads
+
+/// Starts the executor thread after the one whose record is `record`, if there is one; gives
+/// whether the system refused it.
+fn start_next_thread(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let threads = mut fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let index = mut fx.load(PTR, addr: record, offset: THREAD_INDEX)
+    let next = mut fx.b.iadd_imm_s(index, y: 1)
+    let more = mut fx.b.icmp(clif::IntCC.UnsignedLessThan, x: next, y: count)
     let thread_main_id = mut lo.routine(Routine.ThreadMain)
     let thread_main_ref = mut lo.func_ref(mut fx, id: thread_main_id)
     let thread_main = mut fx.b.func_addr(PTR, func_ref: thread_main_ref)
-    let one = mut fx.ptr(1)
-    mut fx.each(one, end: count, body: fn[mut lo](mut pass_fx: Fx, index: clif::Value) {
-        let slot_offset = mut pass_fx.b.imul_imm_s(index, y: 8)
-        let slot = mut pass_fx.b.iadd(threads, y: slot_offset)
-        let record = mut pass_fx.load(PTR, addr: slot, offset: 0)
-        let thread_id = mut pass_fx.slot(8, align: 8)
-        let null = mut pass_fx.ptr(0)
+    let outcome = mut fx.choose_in(mut lo, condition: more, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let slot_offset = mut yes_fx.b.imul_imm_s(next, y: 8)
+        let slot = mut yes_fx.b.iadd(threads, y: slot_offset)
+        let next_record = mut yes_fx.load(PTR, addr: slot, offset: 0)
+        let thread_id = mut yes_fx.slot(8, align: 8)
+        let null = mut yes_fx.ptr(0)
         var create_args = Array[clif::Value, 4].filled(thread_id)
         create_args[1] = null
         create_args[2] = thread_main
-        create_args[3] = record
-        let started = first_result(mut lo.call_libc(mut pass_fx, name: "pthread_create", args: create_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view()))
-        let failed = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: started, y: 0)
-        mut pass_fx.if_true(failed, then: fn(mut then_fx: Fx) {
-            let refusal = mut then_fx.ptr(1)
-            mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
-        })
+        create_args[3] = next_record
+        let started = first_result(mut cx.call_libc(mut yes_fx, name: "pthread_create", args: create_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view()))
+        var refused = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut refused.push(mut yes_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: started, y: 0))
+        return refused
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        var none = mem::List[clif::Value].empty(no_fx.alloc)
+        mut none.push(mut no_fx.int(clif::Type.Int8, value: 0))
+        return none
     })
-} start_threads
+    return outcome[0]
+} start_next_thread
+
+/// The start of an executor thread other than the first, whose record is `record`: sets up its
+/// ring and starts the next thread, ending the process as unavailable when the system refuses
+/// either.
+fn thread_start(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let ring = setup_ring(mut lo, mut fx)
+    mut fx.store(ring, addr: record, offset: THREAD_RING)
+    let no_ring = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: ring, y: 0)
+    let no_thread = mut fx.choose_in(mut lo, condition: no_ring, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        var skipped = mem::List[clif::Value].empty(yes_fx.alloc)
+        mut skipped.push(mut yes_fx.int(clif::Type.Int8, value: 0))
+        return skipped
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        var started = mem::List[clif::Value].empty(no_fx.alloc)
+        mut started.push(start_next_thread(mut cx, fx: mut no_fx, record))
+        return started
+    })
+    let refused = mut fx.b.bor(no_ring, y: no_thread[0])
+    mut fx.if_true(refused, then: fn[mut lo](mut then_fx: Fx) {
+        system_unavailable(mut lo, fx: mut then_fx)
+    })
+} thread_start
 
 /// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
 /// thread, without a ring; a fault reports a stack overflow, and the run ends with status

@@ -265,10 +265,11 @@ fn run_target(session: check::Session, checker: check::Checker, scope: scope::Sc
         }
     }
     mut by_package.sort_by(fn(left: Planned, right: Planned) => left.package_id.index.cmp(right.package_id.index))
+    let hashes = ItemHashes(held: mem::OnceMap[ty::ItemId, hashing::HashValue].empty(seed: 0, alloc))
     var planned = mem::List[Planned].empty(alloc)
     for group in take by_package {
         let Planned(package_id: package_id, tests: tests) = group
-        match try kept_tests(checker, package_id, take tests, runs, user_cache, alloc) {
+        match try kept_tests(checker, hashes, package_id, take tests, runs, user_cache, alloc) {
             Ok(kept) => mut planned.push(Planned(package_id: package_id, tests: take kept))
             Err(exposed) => return Err(take exposed)
         }
@@ -276,14 +277,14 @@ fn run_target(session: check::Session, checker: check::Checker, scope: scope::Sc
     for group in planned {
         expect report.tests <= ~0usize - group.tests.len()
         report.tests += group.tests.len()
-        try run_package(session, checker, package_id: group.package_id, tests: group.tests.view(), runs, user_cache, report: mut report)
+        try run_package(session, checker, hashes, package_id: group.package_id, tests: group.tests.view(), runs, user_cache, report: mut report)
     }
     return Ok(Unit)
 } run_target
 
 /// The tests of a package that `runs` keeps on a checker's target; a part of the build cache that
 /// is exposed when it reads a pass record.
-fn kept_tests(checker: check::Checker, package_id: ty::PackageId, take tests: mem::List[Selected], runs: Runs, user_cache: cache::Cache, alloc: mem::Alloc) -> Result[mem::List[Selected], cache::Exposed] fails platform::IoError {
+fn kept_tests(checker: check::Checker, hashes: ItemHashes, package_id: ty::PackageId, take tests: mem::List[Selected], runs: Runs, user_cache: cache::Cache, alloc: mem::Alloc) -> Result[mem::List[Selected], cache::Exposed] fails platform::IoError {
     var kept = mem::List[Selected].empty(alloc)
     let target = checker.db().target
     match runs {
@@ -295,7 +296,7 @@ fn kept_tests(checker: check::Checker, package_id: ty::PackageId, take tests: me
                     Ok(found) => found
                     Err(exposed) => return Err(take exposed)
                 }
-                let Some(passed) = pass_record(checker, test_item: selected_test.item, alloc) else {
+                let Some(passed) = pass_record(checker, hashes, test_item: selected_test.item, alloc) else {
                     mut kept.push(take selected_test)
                     continue
                 }
@@ -368,6 +369,19 @@ fn record_name(checker: check::Checker, test_item: ty::ItemId, alloc: mem::Alloc
     return name
 } record_name
 
+/// The item hashes of a checker's items that the runs of its tests read, each computed once.
+struct ItemHashes {
+    held: mem::OnceMap[ty::ItemId, hashing::HashValue]
+} ItemHashes
+
+fn ItemHashes.item(self, checker: check::Checker, item: ty::ItemId) -> hashing::HashValue {
+    match self.held.get(item) {
+        Some(hash) => return hash
+        None => {}
+    }
+    return self.held.insert(item, value: checker.hashes(item).item)
+} ItemHashes.item
+
 /// A canonical path and an item hash of a test's reach.
 struct Reached {
     path: text::String
@@ -377,14 +391,14 @@ struct Reached {
 /// The record of a test passing on a checker's target: the toolchain hash, the target's name,
 /// then the canonical path and item hash of each item of the test's reach, in path order; none
 /// when the toolchain hash cannot be known.
-fn pass_record(checker: check::Checker, test_item: ty::ItemId, alloc: mem::Alloc) -> Option[mem::Bytes] {
+fn pass_record(checker: check::Checker, hashes: ItemHashes, test_item: ty::ItemId, alloc: mem::Alloc) -> Option[mem::Bytes] {
     let db = checker.db()
     let Some(tree) = db.session.toolchain_tree() else {
         return None
     }
     var reach = mem::List[Reached].empty(alloc)
     for item in checker.test_reach(test_item) {
-        mut reach.push(Reached(path: db.canonical(item), hash: checker.hashes(item).item))
+        mut reach.push(Reached(path: db.canonical(item), hash: hashes.item(checker, item)))
     }
     mut reach.sort_by(fn(left: Reached, right: Reached) => reached_order(left, right))
     var record = mem::Bytes.empty(alloc)
@@ -528,7 +542,7 @@ fn run_targets(source: workspace::Package, alloc: mem::Alloc) -> mem::List[works
 /// Runs a package's tests on a checker's target, each run a process of the package's test image
 /// or a boot of the emulator on it, and records in the cache each test whose every run passes,
 /// unless replaying; every run fails on a machine target whose emulator cannot start.
-fn run_package(session: check::Session, checker: check::Checker, package_id: ty::PackageId, tests: Slice[Selected], runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
+fn run_package(session: check::Session, checker: check::Checker, hashes: ItemHashes, package_id: ty::PackageId, tests: Slice[Selected], runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
     let alloc = session.alloc
     if tests.len() == 0 {
         return
@@ -549,14 +563,14 @@ fn run_package(session: check::Session, checker: check::Checker, package_id: ty:
         return
     }
     for number in 0..<tests.len() {
-        try run_test_runs(checker, test_image, number, selected_test: tests[number], runs, user_cache, report: mut report)
+        try run_test_runs(checker, hashes, test_image, number, selected_test: tests[number], runs, user_cache, report: mut report)
     }
     try test_image.remove(alloc)
 } run_package
 
 /// Runs the runs of the numbered test of a test image, the first failing one recording the test's
 /// failure, and records the test's passes in the cache when none fails, unless replaying.
-fn run_test_runs(checker: check::Checker, test_image: Image, number: usize, selected_test: Selected, runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
+fn run_test_runs(checker: check::Checker, hashes: ItemHashes, test_image: Image, number: usize, selected_test: Selected, runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
     let db = checker.db()
     let alloc = checker.alloc()
     let target = db.target
@@ -565,7 +579,7 @@ fn run_test_runs(checker: check::Checker, test_image: Image, number: usize, sele
     match runs {
         Runs.Replay(token) => mut indexed.push(Indexed(index: token.index, seed: token.seed))
         else => {
-            let hash = checker.hashes(selected_test.item).item
+            let hash = hashes.item(checker, item: selected_test.item)
             var count = SCHEDULES
             if selected_test.property {
                 count = CASES
@@ -596,7 +610,7 @@ fn run_test_runs(checker: check::Checker, test_image: Image, number: usize, sele
     }
     if report.failures.len() == failures and not replaying {
         let name = record_name(checker, test_item: selected_test.item, alloc)
-        let Some(passed) = pass_record(checker, test_item: selected_test.item, alloc) else {
+        let Some(passed) = pass_record(checker, hashes, test_item: selected_test.item, alloc) else {
             return
         }
         try user_cache.replace(name.as_str(), contents: passed.view())
@@ -681,8 +695,12 @@ fn lower_tests(session: check::Session, checker: check::Checker, package_id: ty:
     }
     var roots = mem::List[ty::PackageId].empty(alloc)
     mut roots.push(package_id)
-    let prefixes = final_build::prefixes(final_build::artefacts_of(session, checker, root: package_id, alloc), alloc)
-    return lower::test_image_lower(checker, tests: lower::Tests(tests: take lowered, roots: take roots, prefixes: take prefixes))
+    let prefixes = final_build::prefixes(final_build::artefacts_of(session, checker, root: package_id, coding: false, alloc), alloc)
+    let record = final_build::codes_record(session, checker, root: package_id, kind: "test", alloc)
+    let kept = final_build::kept_codes(session, record: record.as_str(), alloc)
+    let image = lower::test_image_lower(checker, tests: lower::Tests(tests: take lowered, roots: take roots, prefixes: take prefixes, kept: take kept))
+    final_build::keep_codes(session, record: record.as_str(), lowered: image, alloc)
+    return image
 } lower_tests
 
 /// The seed of a run: the first 8 bytes, little-endian, of the BLAKE3-256 hash of the test's item
@@ -786,7 +804,7 @@ fn regression(checker: check::Checker, test_item: ty::ItemId, shrunk: Run) -> me
     }
     let count = u32.fit(final_build::lines_of(edit.replacement.text.as_str(), alloc).len())
     let after = fix::fixed_by(held, fix: regression_fix, grammar: session.grammar.contents(), alloc)
-    let rechecking = check::Session.of(mem::Shared.of(take after, alloc: alloc), std: session.std.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
+    let rechecking = check::Session.of(mem::Shared.of(take after, alloc: alloc), std: session.carried.share(), grammar: session.grammar.share(), home: cache::copied_override(session.home, alloc), alloc)
     for reported in rechecking.reported(scope::Scope.Workspace) {
         if reported.code.class() != diagnostic::Class.Error or reported.path != Some(text::String.of(edit.path.as_str(), alloc)) {
             continue

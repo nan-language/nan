@@ -1,0 +1,202 @@
+//! Batches: per-item work a checker posts to its session's crew, the worker tasks that run the jobs of each batch beside the task posting it. Each job runs with its own state of the work under way and keeps what its work logs apart, and the poster appends that in item order, so a batch gives what running its jobs one after another gives, whichever task ran each.
+
+/// The batches posted to the worker tasks of a session, in order.
+pkg struct Crew {
+    batches: mem::Arena[mem::Shared[Batch]]
+} Crew
+
+pkg fn Crew.empty(alloc: mem::Alloc) -> Crew {
+    return Crew(batches: mem::Arena[mem::Shared[Batch]].empty(alloc))
+} Crew.empty
+
+/// Runs the jobs of the batches posted from the one at `next`, drawing on `alloc`, and moves
+/// `next` past them.
+pkg fn Crew.help(self, mut next: usize, alloc: mem::Alloc) {
+    while next < self.batches.len() {
+        self.batches.at(mem::Id[mem::Shared[Batch]].of(u32.fit(next))).contents().help(alloc)
+        next += 1
+    }
+} Crew.help
+
+/// Per-item work of a checker: its kind, the package being checked when it was posted, its
+/// items, how many of its jobs are taken and ended, and the jobs each task helping it ran.
+struct Batch {
+    checker: Checker
+    work: Work
+    checking: u32
+    items: mem::List[ty::ItemId]
+    taken: core::atomic::AtomicU32
+    ended: core::atomic::AtomicU32
+    helpers: mem::Arena[mem::Shared[Underway]]
+} Batch
+
+/// A kind of per-item work.
+enum Work derives Copy, Eq {
+    /// The rules of check time that read an item's NIR.
+    Elaborated
+    /// The last-green entry of an item the snapshot restored from does not hold, kept for the
+    /// next.
+    Greened
+    /// The items an item names.
+    Named
+} Work
+
+/// The jobs a task runs of a batch, one after another: the item of the job running, and what
+/// their work logs, kept apart until the batch appends it, with where each job's logs start.
+struct Job {
+    item: core::atomic::AtomicU32
+    /// The part of the green entries kept that holds those of its jobs, `NO_ID` before the
+    /// first.
+    part: core::atomic::AtomicU32
+    found: mem::Arena[Found]
+    quiet: mem::Arena[diagnostic::Diagnostic]
+    unused: mem::Arena[Found]
+    starts: mem::Arena[JobStart]
+} Job
+
+/// A job of a task, by its index in the batch, and how much its task had logged when it started.
+struct JobStart derives Copy {
+    index: u32
+    found: u32
+    quiet: u32
+    unused: u32
+} JobStart
+
+fn Job.empty(alloc: mem::Alloc) -> Job {
+    return Job(item: core::atomic::AtomicU32.of(NO_ID), part: core::atomic::AtomicU32.of(NO_ID), found: mem::Arena[Found].empty(alloc), quiet: mem::Arena[diagnostic::Diagnostic].empty(alloc), unused: mem::Arena[Found].empty(alloc), starts: mem::Arena[JobStart].empty(alloc))
+} Job.empty
+
+/// The item of the job running.
+fn Job.current(self) -> ty::ItemId {
+    return ty::ItemId(index: self.item.load())
+} Job.current
+
+/// Runs the jobs of the batch not yet taken, as this task's, with a state of the work under way
+/// of their own, drawing on `alloc`.
+fn Batch.help(self, alloc: mem::Alloc) {
+    let Some(start) = self.claim() else {
+        return
+    }
+    let checker = self.helper(alloc)
+    var index = start
+    loop {
+        self.run(checker, index)
+        discard self.ended.fetch_add(1)
+        let Some(next) = self.claim() else {
+            return
+        }
+        index = next
+    }
+} Batch.help
+
+/// The index of a job no task has taken yet, taking it; none once every job is taken.
+fn Batch.claim(self) -> Option[u32] {
+    let Some(taken) = self.taken.fetch_add(1) else {
+        return None
+    }
+    if usize.widen(taken) >= self.items.len() {
+        return None
+    }
+    return Some(taken)
+} Batch.claim
+
+/// The checker of a task helping the batch, the state of its work under way listed among the
+/// batch's helpers.
+fn Batch.helper(self, alloc: mem::Alloc) -> Checker {
+    let underway = mem::Shared.of(Underway.empty(checking: self.checking, job: Some(Job.empty(alloc)), alloc), alloc)
+    discard self.helpers.push(underway.share())
+    return Checker(state: self.checker.state.share(), underway: take underway)
+} Batch.helper
+
+/// Runs the job at an index: for `Work.Elaborated` as the item's own work.
+fn Batch.run(self, checker: Checker, index: u32) {
+    let item = self.items[usize.widen(index)]
+    let Some(job) = checker.underway.contents().job else {
+        expect false
+        return
+    }
+    job.item.store(item.index)
+    discard job.starts.push(JobStart(index: index, found: u32.fit(job.found.len()), quiet: u32.fit(job.quiet.len()), unused: u32.fit(job.unused.len())))
+    match self.work {
+        Work.Elaborated => checker.traced_as(item, compute: fn() => checker.check_elaborated(item))
+        Work.Greened => {
+            if checker.restored_green(item).is_none() {
+                checker.keep_green(item, entry: checker.greened(item))
+            }
+        }
+        Work.Named => {
+            discard checker.names(item)
+        }
+    }
+} Batch.run
+
+/// A job's part of what a task logged: the task, by its place among the batch's helpers, and the
+/// job's start there and its end.
+struct JobSpan derives Copy {
+    index: u32
+    helper: u32
+    start: JobStart
+    end: JobStart
+} JobSpan
+
+/// Runs a job of `work` for each item, on the session's worker tasks beside this task unless
+/// reads are recorded or the prover is compared with the proof cache, then appends what each
+/// logged, in item order.
+fn Checker.run_batch(self, work: Work, items: Slice[ty::ItemId]) {
+    let state = self.state.contents()
+    let alloc = self.alloc()
+    let count = items.len()
+    var listed = mem::List[ty::ItemId].empty(alloc)
+    for item in items {
+        mut listed.push(item)
+    }
+    let batch = mem::Shared.of(Batch(checker: self.share(), work: work, checking: self.underway.contents().checking.load(), items: take listed, taken: core::atomic::AtomicU32.of(0), ended: core::atomic::AtomicU32.of(0), helpers: mem::Arena[mem::Shared[Underway]].empty(alloc)), alloc)
+    if not self.db().records_any() and not state.comparing.load() {
+        discard state.session.crew.contents().batches.push(batch.share())
+    }
+    let posted = batch.contents()
+    posted.help(alloc)
+    while usize.widen(posted.ended.load()) < count {
+    }
+    for span in posted.spans(alloc) {
+        let Some(job) = posted.helpers.at(mem::Id[mem::Shared[Underway]].of(span.helper)).contents().job else {
+            expect false
+            continue
+        }
+        for position in span.start.found..<span.end.found {
+            discard state.found.push(job.found.at(mem::Id[Found].of(position)).copied(alloc))
+        }
+        for position in span.start.quiet..<span.end.quiet {
+            discard state.quiet.push(job.quiet.at(mem::Id[diagnostic::Diagnostic].of(position)).copy(alloc))
+        }
+        for position in span.start.unused..<span.end.unused {
+            discard state.unused.push(job.unused.at(mem::Id[Found].of(position)).copied(alloc))
+        }
+    }
+} Checker.run_batch
+
+/// The part of each job of an ended batch in what its task logged, in job order.
+fn Batch.spans(self, alloc: mem::Alloc) -> mem::List[JobSpan] {
+    var spans = mem::List[JobSpan].empty(alloc)
+    for helper in 0..<self.helpers.len() {
+        let Some(job) = self.helpers.at(mem::Id[mem::Shared[Underway]].of(u32.fit(helper))).contents().job else {
+            expect false
+            continue
+        }
+        let count = job.starts.len()
+        for position in 0..<count {
+            let start = job.starts.at(mem::Id[JobStart].of(u32.fit(position)))
+            var end = JobStart(index: start.index, found: u32.fit(job.found.len()), quiet: u32.fit(job.quiet.len()), unused: u32.fit(job.unused.len()))
+            if position + 1 < count {
+                end = job.starts.at(mem::Id[JobStart].of(u32.fit(position + 1)))
+            }
+            mut spans.push(JobSpan(index: start.index, helper: u32.fit(helper), start: start, end: end))
+        }
+    }
+    mut spans.sort_by(fn(left: JobSpan, right: JobSpan) => left.index.cmp(right.index))
+    return spans
+} Batch.spans
+
+fn Found.copied(self, alloc: mem::Alloc) -> Found {
+    return Found(sink: self.sink, owner: self.owner, diagnostic: self.diagnostic.copy(alloc), refixed: core::atomic::AtomicU32.of(self.refixed.load()))
+} Found.copied

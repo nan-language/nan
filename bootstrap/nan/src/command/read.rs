@@ -58,8 +58,9 @@ pub fn holes(
 
 /// `nan show <scope>`: a `module` record holding the summary of a module or package scope, then a
 /// record per item of the scope holding its text, with its item and interface hashes; with
-/// `--api`, a record per item of the scope that consumers see. `nan read <location>`: the record
-/// of the item holding that line.
+/// `--api`, a record per item of the scope that consumers see; a canonical path naming nothing in
+/// the workspace names a std item. `nan read <location>`: the record of the item holding that
+/// line.
 pub fn show(
     invocation: &Invocation,
     workspace: &Workspace,
@@ -71,7 +72,11 @@ pub fn show(
         [operand] if invocation.name != Name::Read || is_location(operand) => operand,
         _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
     };
-    let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
+    let std = crate::stdlib::workspace();
+    let shown_in = Scope::resolve(workspace, current, Some(operand))
+        .map(|resolved| (workspace, resolved))
+        .or_else(|| Some((std, (Scope::canonical(std, operand)?, operand.to_owned()))));
+    let Some((workspace, (scope, written))) = shown_in else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
     trace.scope = Some(written.clone());

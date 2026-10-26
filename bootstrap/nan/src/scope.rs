@@ -61,6 +61,11 @@ impl Scope {
         scope.map(|scope| (scope, text.to_owned()))
     }
 
+    /// The package, module, item or member a canonical path names.
+    pub fn canonical(workspace: &Workspace, text: &str) -> Option<Scope> {
+        named(workspace, text, None)
+    }
+
     /// Whether the scope covers a line of a file, or the file as a whole when `line` is absent.
     pub fn holds(&self, workspace: &Workspace, path: &str, line: Option<u32>) -> bool {
         let file = workspace.file(path);

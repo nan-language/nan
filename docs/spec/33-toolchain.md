@@ -49,7 +49,7 @@ The commands are:
 
 ### Reading commands
 
-- `nan show <scope>` prints per item a record `item <item> <location> <item hash> <interface hash>`, hashes in [short form](29-identity-versioning.md#hash-values), holding its text. A module or package first prints its [module summary](32-docs.md#module-summaries) as a `module <path>` record, then its items in path and line order. `nan read <location>` prints the record of the item holding that line, and a line outside every item is `tool.unknown-scope`.
+- `nan show <scope>` prints per item a record `item <item> <location> <item hash> <interface hash>`, hashes in [short form](29-identity-versioning.md#hash-values), holding its text. A module or package first prints its [module summary](32-docs.md#module-summaries) as a `module <path>` record, then its items in path and line order. `nan read <location>` prints the record of the item holding that line, and a line outside every item is `tool.unknown-scope`. In `nan show`, a canonical path that names nothing in the workspace names the std package, module, item or member it names among the std packages.
 - `nan show <scope> --api` prints an `api <item> <location>` record per item of the scope that consumers see, and for a type per such function named after it, holding: its doc comments; its [interface text](35-format.md#api-snapshots), each ensures line followed by ` [<status>]` ([statuses](18-contracts.md#statuses)); the impl lines naming it that consumers see; for a struct or enum, `properties: ` with the [structural properties](05-properties.md#structural-properties) consumers see in the order linear, view, Copy, Send, Inert, AnyBits, separated by `, `, or `none`; for a function, its [digest line](10-effects-digests.md#digests) per declared target in byte order, followed by ` (<target>)` when there are several.
 - The [named conversions](09-numbers.md#conversions) and the bit conversions of [bit patterns](09-numbers.md#bit-patterns) are built-in members, not items: no command prints an `item` or `api` record for one, and a context pack shows none.
 - `nan find <name>` prints a record `found <item> <location>`, holding the declaration's first line, per item or member of the workspace and of its packages' dependency closures whose [folded](03-packages-modules.md#naming-conventions) name equals the folded argument, workspace items first, then by path. `nan find --contributors <registry>` prints a record `contribution <registry> <entry> <location>`, followed by `admitted` or `not-admitted`, per contribution in the dependency closure of the given package, by default the current directory's, judged with it as [judging root](25-registries.md#contributors).
@@ -77,6 +77,13 @@ api example::clamp_level example/example.nan:2
         ensures result <= 100 [proven]
     digest: effects none | authority none | may-trap no | terminates
 ok show example::clamp_level --api: records 1
+$ nan show core::Option.is_some --api
+ok show core::Option.is_some --api: records 1
+api core::Option.is_some core/core.nan:8
+    pub fn Option.is_some(self) -> bool limits pure, notrap, terminates
+        example Some(3u8).is_some()
+    digest: effects none | authority none | may-trap no | terminates
+ok show core::Option.is_some --api: records 1
 ```
 
 ### Writing commands

@@ -35,9 +35,9 @@ const KEPT: u64 = 64;
 pub const CELLS: u64 = 65_536;
 pub const CELL_RECORD: u64 = 40;
 
-/// The chunk map: a table of 2^15 pointers, indexed by bits 47 to 32 of a chunk's address, to
+/// The chunk map: a table of 2^16 pointers, indexed by bits 47 to 32 of a chunk's address, to
 /// tables of 2^16 chunk records, indexed by bits 31 to 16.
-pub const MAP_ROOTS: u64 = 32_768;
+pub const MAP_ROOTS: u64 = 65_536;
 const MAP_LEAVES: u64 = 65_536;
 
 mod cell {

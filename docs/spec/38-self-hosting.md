@@ -14,7 +14,7 @@ The **bootstrap** is the [implementation](00-charter.md#conformance) written in 
 
 ### NaN toolchain
 
-The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. It targets `x86_64-host`, and its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
+The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. Its workspace declares `x86_64-host`, and a copy of it declaring `aarch64-host` instead builds it for that target; its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
 
 - For every workspace and command line, the NaN toolchain prints what the bootstrap prints, exits with the same status and writes the same source and machine files; each image it writes behaves as the bootstrap's image of that build does.
 
@@ -27,7 +27,7 @@ The **NaN front end** is the part of the NaN toolchain that implements `nan chec
 
 ### Self-hosting
 
-The NaN toolchain built by the bootstrap builds the NaN toolchain: the image it writes is the **first self-built toolchain**. The first self-built toolchain is checked against the bootstrap by two checks:
+For each host target, the NaN toolchain the bootstrap built for that target builds the NaN toolchain for it: the image it writes is the target's **first self-built toolchain**. Each first self-built toolchain is checked against the bootstrap by two checks:
 
 - **Diverse double-compiling:** the first self-built toolchain builds the NaN toolchain into an image equal, byte for byte, to itself.
 - **Stage comparison:** the bootstrap's `nan build --compare-with` against the first self-built toolchain reports no error ([stage comparison](36-builds.md#stage-comparison)).

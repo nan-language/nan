@@ -1,16 +1,16 @@
 # NaN
 
-NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It compiles itself and will build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64, stays frozen and serves only to verify the self-hosted compiler.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. It compiles itself and will build NaN OS, an operating system for AI, from bootloader to user interface; its Rust bootstrap compiler, targeting Linux on x86_64 and AArch64, stays frozen and serves only to verify the self-hosted compiler.
 
 ## Installation
 
-On Linux x86_64:
+On Linux, on x86_64 or AArch64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | sh
 ```
 
-The script installs `nan`, the NaN toolchain built by itself, as `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory and `NAN_VERSION` another release, such as `v0.1.0`. Building programs for `x86_64-host` requires a C compiler available as `cc`, which links them, and for `aarch64-host` off an AArch64 machine the GNU cross compiler `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`), and the `uefi` targets their firmware, OVMF and AAVMF.
+The script installs `nan`, the NaN toolchain built by itself, as `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory and `NAN_VERSION` another release, such as `v0.1.0`. Building programs for the host target of the machine's architecture requires a C compiler available as `cc`, which links them, and for the other host target the GNU cross compiler, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`; running and testing programs for the `uefi` and `bare` targets also requires QEMU 10.2 or later (`qemu-system-x86_64` or `qemu-system-aarch64`), and the `uefi` targets their firmware, OVMF and AAVMF.
 
 ## Specification
 
@@ -31,7 +31,7 @@ nan test
 
 Packages name their dependencies with `dep` directives, by relative path or by a store name of the local store in `~/.nan/store`. `nan dep sync` locks a package's dependencies, `nan api update` records its API snapshots, `nan seal <item> --as <principal>` seals an item holding a trust escape, and `nan verify`, the release gate, accepts a package ready to publish; `nan publish --local <dir> --name <store name>` then appends its release to the local store, and `nan upgrade` moves a package to newer releases. `nan diff <old> <new>` compares two versions of a workspace, and `nan merge <base> <ours> <theirs>` merges three, also usable as a git merge driver with `--path`.
 
-The NaN toolchain is the workspace in `toolchain/`, written in NaN; `nan build nan` run there builds it into `toolchain/.nan/images/x86_64-host/nan`.
+The NaN toolchain is the workspace in `toolchain/`, written in NaN; `nan build nan` run there builds it into `toolchain/.nan/images/x86_64-host/nan`, or, with `targets aarch64-host` in its manifest, for AArch64.
 
 ## Bootstrap
 

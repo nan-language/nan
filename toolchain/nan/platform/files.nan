@@ -10,10 +10,6 @@ const O_EXCL: i32 = 0x80
 
 const O_TRUNC: i32 = 0x200
 
-const O_DIRECTORY: i32 = 0x1_0000
-
-const O_NOFOLLOW: i32 = 0x2_0000
-
 const O_CLOEXEC: i32 = 0x8_0000
 
 /// The directory `openat` and `unlinkat` resolve relative paths in when given no descriptor.
@@ -22,6 +18,11 @@ const AT_FDCWD: i32 = -100
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100
 
 const AT_REMOVEDIR: i32 = 0x200
+
+const AT_EMPTY_PATH: i32 = 0x1000
+
+/// The fields `statx` is asked for: the file's type and mode, its owner and its size.
+const STATX_FIELDS: u32 = 0x20B
 
 const LOCK_SH: i32 = 1
 
@@ -52,24 +53,27 @@ const STDOUT: i32 = 1
 /// The bytes a read asks for at least, before the file's size is known.
 const READ_CHUNK: usize = 8_192
 
-/// glibc's `struct stat` on x86_64.
-layout Stat: bytes 144 le {
-    dev: u64 at 0
-    ino: u64 at 8
-    nlink: u64 at 16
-    mode: u32 at 24
-    uid: u32 at 28
-    gid: u32 at 32
-    pad: u32 at 36
-    rdev: u64 at 40
-    size: i64 at 48
-    blksize: i64 at 56
-    blocks: i64 at 64
-    times: Array[u64, 6] at 72
-    reserved: Array[u64, 3] at 120
-} Stat
+/// Linux's `struct statx`, the same on every architecture.
+layout Statx: bytes 256 le {
+    mask: u32 at 0
+    blksize: u32 at 4
+    attributes: u64 at 8
+    nlink: u32 at 16
+    uid: u32 at 20
+    gid: u32 at 24
+    mode: u16 at 28
+    spare: u16 at 30
+    ino: u64 at 32
+    size: u64 at 40
+    blocks: u64 at 48
+    attributes_mask: u64 at 56
+    times: Array[u64, 8] at 64
+    devices: Array[u32, 4] at 128
+    reserved: Array[u64, 14] at 144
+} Statx
 
-/// The fixed part of glibc's `struct dirent` on x86_64, which its NUL-terminated name follows.
+/// The fixed part of glibc's `struct dirent` on 64-bit Linux, which its NUL-terminated name
+/// follows.
 layout Dirent: bytes 19 le {
     ino: u64 at 0
     off: u64 at 8
@@ -95,13 +99,7 @@ foreign fn fsync(fd: i32) -> i32 convention "sysv"
 
 foreign fn flock(fd: i32, operation: i32) -> i32 convention "sysv"
 
-foreign fn fstat(fd: i32, buf: hw::Ptr[Stat]) -> i32 convention "sysv"
-
-foreign fn stat(path: hw::Ptr[u8], buf: hw::Ptr[Stat]) -> i32 convention "sysv"
-
-foreign fn lstat(path: hw::Ptr[u8], buf: hw::Ptr[Stat]) -> i32 convention "sysv"
-
-foreign fn fstatat(dir: i32, path: hw::Ptr[u8], buf: hw::Ptr[Stat], flags: i32) -> i32 convention "sysv"
+foreign fn statx(dir: i32, path: hw::Ptr[u8], flags: i32, mask: u32, buf: hw::Ptr[Statx]) -> i32 convention "sysv"
 
 foreign fn rename(from: hw::Ptr[u8], to: hw::Ptr[u8]) -> i32 convention "sysv"
 
@@ -245,7 +243,7 @@ fn read_all(fd: i32, alloc: mem::Alloc) -> mem::Bytes fails IoError {
     var room = READ_CHUNK
     let held = fd_status(fd)
     if held.size > 0 {
-        room = usize.fit(held.size) + 1
+        room = usize.widen(held.size).saturating_add(1)
     }
     var data = mem::Bytes.zeroed(room, alloc)
     var filled: usize = 0
@@ -272,14 +270,15 @@ fn read_all(fd: i32, alloc: mem::Alloc) -> mem::Bytes fails IoError {
 } read_all
 
 /// The status of an open file, all zero when the system gives none.
-fn fd_status(fd: i32) -> Stat {
-    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+fn fd_status(fd: i32) -> Statx {
+    var raw = Statx.from_bits(Array[u8, 256].filled(0))
     let buffer = hw::Ptr.of_mut(mut raw)
-    let done = trusted "buffer addresses a struct stat" { fstat(fd, buf: buffer) }
+    let empty = Array[u8, 1].filled(0)
+    let done = trusted "empty holds a NUL-terminated empty path and buffer addresses a struct statx" { statx(fd, path: hw::Ptr.of_view(empty.view()), flags: AT_EMPTY_PATH, mask: STATX_FIELDS, buf: buffer) }
     if done != 0 {
         return raw
     }
-    return trusted "fstat wrote a struct stat at buffer" { buffer.read() }
+    return trusted "statx wrote a struct statx at buffer" { buffer.read() }
 } fd_status
 
 /// Writes all of `data` to an open descriptor.
@@ -412,30 +411,32 @@ pkg fn create_dir_all(path: Str, alloc: mem::Alloc) fails IoError {
 
 /// The metadata of what a path names, a symbolic link followed.
 pkg fn metadata(path: Str) -> Metadata fails IoError {
-    let name = try c_text(path.as_bytes())
-    var raw = Stat.from_bits(Array[u8, 144].filled(0))
-    let buffer = hw::Ptr.of_mut(mut raw)
-    try checked(trusted "name holds a NUL-terminated path and buffer addresses a struct stat" { stat(hw::Ptr.of_view(name.bytes.view()), buf: buffer) })
-    return metadata_of(trusted "stat wrote a struct stat at buffer" { buffer.read() })
+    return try metadata_with(path, flags: 0)
 } metadata
 
 /// The metadata of what a path names, a symbolic link itself.
 pkg fn symlink_metadata(path: Str) -> Metadata fails IoError {
-    let name = try c_text(path.as_bytes())
-    var raw = Stat.from_bits(Array[u8, 144].filled(0))
-    let buffer = hw::Ptr.of_mut(mut raw)
-    try checked(trusted "name holds a NUL-terminated path and buffer addresses a struct stat" { lstat(hw::Ptr.of_view(name.bytes.view()), buf: buffer) })
-    return metadata_of(trusted "lstat wrote a struct stat at buffer" { buffer.read() })
+    return try metadata_with(path, flags: AT_SYMLINK_NOFOLLOW)
 } symlink_metadata
 
-fn metadata_of(held: Stat) -> Metadata {
-    let kind = match held.mode & S_IFMT {
+/// The metadata `statx` gives with `flags` of what a path names.
+fn metadata_with(path: Str, flags: i32) -> Metadata fails IoError {
+    let name = try c_text(path.as_bytes())
+    var raw = Statx.from_bits(Array[u8, 256].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    try checked(trusted "name holds a NUL-terminated path and buffer addresses a struct statx" { statx(AT_FDCWD, path: hw::Ptr.of_view(name.bytes.view()), flags, mask: STATX_FIELDS, buf: buffer) })
+    return metadata_of(trusted "statx wrote a struct statx at buffer" { buffer.read() })
+} metadata_with
+
+fn metadata_of(held: Statx) -> Metadata {
+    let mode = u32.widen(held.mode)
+    let kind = match mode & S_IFMT {
         S_IFREG => FileKind.Regular
         S_IFDIR => FileKind.Directory
         S_IFLNK => FileKind.Symlink
         else => FileKind.Other
     }
-    return Metadata(kind: kind, uid: held.uid, mode: held.mode)
+    return Metadata(kind: kind, uid: held.uid, mode: mode)
 } metadata_of
 
 /// Whether a path names something, a symbolic link followed.
@@ -470,7 +471,7 @@ fn close_stream(stream: hw::Ptr[u8]) {
 } close_stream
 
 /// The entries a directory stream gives but `.` and `..`, each entry whose type the stream does
-/// not give read with `fstatat`.
+/// not give read with `statx`.
 fn stream_entries(stream: hw::Ptr[u8], alloc: mem::Alloc) -> mem::List[DirEntry] fails IoError {
     var found = mem::List[DirEntry].empty(alloc)
     loop {
@@ -505,10 +506,10 @@ fn stream_entries(stream: hw::Ptr[u8], alloc: mem::Alloc) -> mem::List[DirEntry]
 /// The kind of the file a directory stream's entry names, its name at `start`.
 fn entry_kind(stream: hw::Ptr[u8], start: hw::Ptr[u8]) -> FileKind fails IoError {
     let dir = trusted "stream is an open directory stream" { dirfd(stream) }
-    var raw = Stat.from_bits(Array[u8, 144].filled(0))
+    var raw = Statx.from_bits(Array[u8, 256].filled(0))
     let buffer = hw::Ptr.of_mut(mut raw)
-    try checked(trusted "start addresses the NUL-terminated name of an entry of dir and buffer a struct stat" { fstatat(dir, path: start, buf: buffer, flags: AT_SYMLINK_NOFOLLOW) })
-    return metadata_of(trusted "fstatat wrote a struct stat at buffer" { buffer.read() }).kind
+    try checked(trusted "start addresses the NUL-terminated name of an entry of dir and buffer a struct statx" { statx(dir, path: start, flags: AT_SYMLINK_NOFOLLOW, mask: STATX_FIELDS, buf: buffer) })
+    return metadata_of(trusted "statx wrote a struct statx at buffer" { buffer.read() }).kind
 } entry_kind
 
 /// Removes a directory with everything in it, or a symbolic link itself; a symbolic link inside
@@ -523,10 +524,18 @@ pkg fn remove_dir_all(path: Str, alloc: mem::Alloc) fails IoError {
     try remove_tree(AT_FDCWD, name, alloc)
 } remove_dir_all
 
+/// The `open` flags `O_DIRECTORY | O_NOFOLLOW`, whose values differ between architectures.
+fn directory_nofollow() -> i32 {
+    if on_aarch64() {
+        return 0x4000 | 0x8000
+    }
+    return 0x1_0000 | 0x2_0000
+} directory_nofollow
+
 /// Removes the directory `name` of the directory open as `dir`, after what it holds; `name`
 /// itself when it is not a directory and lies in a removed directory.
 fn remove_tree(dir: i32, name: CText, alloc: mem::Alloc) fails IoError {
-    let fd = trusted "name holds a NUL-terminated path" { openat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC, mode: 0) }
+    let fd = trusted "name holds a NUL-terminated path" { openat(dir, path: hw::Ptr.of_view(name.bytes.view()), flags: O_RDONLY | directory_nofollow() | O_CLOEXEC, mode: 0) }
     if fd < 0 {
         let code = last_code()
         if (code == ENOTDIR or code == ELOOP) and dir != AT_FDCWD {

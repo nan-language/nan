@@ -7,9 +7,10 @@ repository=https://github.com/nan-language/nan
 dir=${NAN_INSTALL_DIR:-$HOME/.local/bin}
 
 case "$(uname -s) $(uname -m)" in
-    "Linux x86_64") ;;
+    "Linux x86_64") arch=x86_64 ;;
+    "Linux aarch64") arch=aarch64 ;;
     *)
-        echo "nan: releases are built for Linux on x86_64 only" >&2
+        echo "nan: releases are built for Linux on x86_64 and AArch64 only" >&2
         exit 1
         ;;
 esac
@@ -23,7 +24,7 @@ case "$version" in
         ;;
 esac
 
-asset="nan-$version-x86_64-linux"
+asset="nan-$version-$arch-linux"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 curl -fsSL -o "$work/$asset" "$repository/releases/download/$version/$asset"

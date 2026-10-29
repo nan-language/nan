@@ -1,6 +1,7 @@
-//! The self-check harness: builds the NaN toolchain of `toolchain/` once per state of its files
-//! and of this harness, with a root file of its own, then runs it beside the bootstrap and
-//! compares what both print, their exit statuses and the files they write: for every `nan`
+//! The self-check harness: builds the NaN toolchain of `toolchain/` for the host target of this
+//! machine's architecture, which its copies of the toolchain workspace declare, once per state of
+//! its files and of this harness, with a root file of its own, then runs it beside the bootstrap
+//! and compares what both print, their exit statuses and the files they write: for every `nan`
 //! example of each specification chapter, the commands the conformance harness runs and those of
 //! its section's `text` blocks, with the canonical NIR, the text of each function a final build
 //! lowers and what each host program of this machine's architecture writes; for every std
@@ -119,6 +120,10 @@ validator fn harness(raw: Untrusted[mem::Map[mem::Bytes, mem::Bytes]], alloc: me
 /// The grant of the toolchain's manifest that the driver widens to its root module.
 const GRANT: &str = "allow validate in platform, command\n";
 
+/// The targets directive of the toolchain's manifest, which its copies replace with the host
+/// target of this machine's architecture.
+const DECLARED_TARGET: &str = "targets x86_64-host\n";
+
 /// How long one run of a program or of the NaN toolchain may take, and one of the NaN toolchain
 /// over its own workspace, which checks, tests or builds the whole toolchain.
 const RUN_LIMIT: Duration = Duration::from_secs(900);
@@ -197,17 +202,40 @@ fn hash_tree(dir: &Path, prefix: &str, hasher: &mut DefaultHasher) -> std::io::R
     Ok(())
 }
 
-/// Copies the toolchain workspace into `dir`, its root file replaced by the driver.
-fn driven_copy(dir: &Path) -> Result<(), String> {
+/// The host target of this machine's architecture.
+fn host_target() -> String {
+    format!("{}-host", std::env::consts::ARCH)
+}
+
+/// The image of the toolchain that `nan build nan` writes in the workspace `dir`.
+fn built_image(dir: &Path) -> PathBuf {
+    dir.join(".nan/images").join(host_target()).join("nan")
+}
+
+/// Replaces a line of the manifest of the toolchain workspace copied into `dir`.
+fn rewrite_manifest(dir: &Path, line: &str, with: &str) -> Result<(), String> {
     let fault = |error: std::io::Error| error.to_string();
-    copy_tree(&repository().join("toolchain"), dir, false).map_err(fault)?;
-    let manifest = fs::read_to_string(dir.join("nan/package.nan")).map_err(fault)?;
-    if !manifest.contains(GRANT) {
-        return Err(format!("the toolchain's manifest lacks `{}`", GRANT.trim()));
+    let path = dir.join("nan/package.nan");
+    let manifest = fs::read_to_string(&path).map_err(fault)?;
+    if !manifest.contains(line) {
+        return Err(format!("the toolchain's manifest lacks `{}`", line.trim()));
     }
-    let widened = manifest.replace(GRANT, "allow validate in platform, command, nan\n");
-    fs::write(dir.join("nan/package.nan"), widened).map_err(fault)?;
-    fs::write(dir.join("nan/nan.nan"), DRIVER).map_err(fault)
+    fs::write(path, manifest.replace(line, with)).map_err(fault)
+}
+
+/// Copies the toolchain workspace into `dir`, its manifest declaring the host target of this
+/// machine's architecture.
+fn machine_copy(dir: &Path) -> Result<(), String> {
+    copy_tree(&repository().join("toolchain"), dir, false).map_err(|error| error.to_string())?;
+    rewrite_manifest(dir, DECLARED_TARGET, &format!("targets {}\n", host_target()))
+}
+
+/// Copies the toolchain workspace into `dir` as `machine_copy` does, its root file replaced by
+/// the driver.
+fn driven_copy(dir: &Path) -> Result<(), String> {
+    machine_copy(dir)?;
+    rewrite_manifest(dir, GRANT, "allow validate in platform, command, nan\n")?;
+    fs::write(dir.join("nan/nan.nan"), DRIVER).map_err(|error| error.to_string())
 }
 
 /// The toolchain image the bootstrap builds for the current state of `toolchain/`, this harness
@@ -235,7 +263,7 @@ fn image() -> Result<PathBuf, String> {
     if status != Some(0) {
         return Err(format!("the toolchain does not build:\n{output}"));
     }
-    fs::copy(build.join(".nan/images/x86_64-host/nan"), &image).map_err(fault)?;
+    fs::copy(built_image(&build), &image).map_err(fault)?;
     Ok(image)
 }
 
@@ -1005,7 +1033,7 @@ fn self_build(builder: &Toolchain, dir: &Path) -> Result<SelfBuild, String> {
     Ok(SelfBuild {
         run: front(builder, dir, &given, &["build", "nan"])?,
         builder: builder.image.clone(),
-        image: dir.join(".nan/images/x86_64-host/nan"),
+        image: built_image(dir),
     })
 }
 
@@ -1061,7 +1089,7 @@ fn toolchain(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let store = fresh_store("self-check-toolchain")?;
     let outside = std::env::temp_dir().join(format!("nan-self-check-{}", std::process::id()));
     let dir = outside.join("toolchain");
-    copy_tree(&repository().join("toolchain"), &dir, false)?;
+    machine_copy(&dir)?;
     let (copied_to, copied) = mpsc::channel();
     let (taken_to, taken) = mpsc::channel();
     let (bootstrapped, fronted) = std::thread::scope(|scope| {
@@ -1201,7 +1229,7 @@ fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let outside =
         std::env::temp_dir().join(format!("nan-self-check-starved-{}", std::process::id()));
     let dir = outside.join("toolchain");
-    copy_tree(&repository().join("toolchain"), &dir, false)?;
+    machine_copy(&dir)?;
     let home = outside.join("home");
     let given = Given {
         home: &home,

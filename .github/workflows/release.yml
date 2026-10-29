@@ -8,10 +8,19 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-26.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
     env:
       TAG: ${{ github.ref_name }}
+      TARGET: ${{ matrix.arch }}-host
+      IMAGE: nan-${{ github.ref_name }}-${{ matrix.arch }}-linux
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,10 +38,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bootstrap/target
-          key: release-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}
+          key: release-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}
       - name: Build the bootstrap
         working-directory: bootstrap
         run: cargo build --release -q -p nan
+      - name: Declare the host target of the runner's architecture
+        run: |
+          sed -i "s/^    targets x86_64-host\$/    targets $TARGET/" toolchain/nan/package.nan
+          grep -q "^    targets $TARGET\$" toolchain/nan/package.nan
       # Each stage builds a fresh copy of toolchain/ with an empty user directory, so that no
       # stage reuses another's proofs; the second and third stages must be equal byte for byte,
       # and the bootstrap's stage comparison must accept the second.
@@ -42,7 +55,7 @@ jobs:
             rm -rf ~/.nan "$RUNNER_TEMP/$2"
             cp -r toolchain "$RUNNER_TEMP/$2"
             (cd "$RUNNER_TEMP/$2" && "$1" build nan)
-            cp "$RUNNER_TEMP/$2/.nan/images/x86_64-host/nan" "$RUNNER_TEMP/$2.image"
+            cp "$RUNNER_TEMP/$2/.nan/images/$TARGET/nan" "$RUNNER_TEMP/$2.image"
           }
           stage "$PWD/bootstrap/target/release/nan" first
           stage "$RUNNER_TEMP/first.image" second
@@ -51,18 +64,42 @@ jobs:
           rm -rf ~/.nan "$RUNNER_TEMP/compared"
           cp -r toolchain "$RUNNER_TEMP/compared"
           (cd "$RUNNER_TEMP/compared" && "$GITHUB_WORKSPACE/bootstrap/target/release/nan" build nan --compare-with "$RUNNER_TEMP/second.image")
+      - name: Identify the image
+        run: |
+          cp "$RUNNER_TEMP/second.image" "$IMAGE"
+          sha256sum "$IMAGE" > "$IMAGE.sha256"
+          objcopy --dump-section .nan.tree="$RUNNER_TEMP/tree" "$IMAGE"
+          od -An -tx1 -v "$RUNNER_TEMP/tree" | tr -d ' \n' > "$IMAGE.tree"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.IMAGE }}
+          path: ${{ env.IMAGE }}*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
       - name: Write the release notes
         run: |
-          image="nan-$TAG-x86_64-linux"
-          cp "$RUNNER_TEMP/second.image" "$image"
-          sha256sum "$image" > "$image.sha256"
-          objcopy --dump-section .nan.tree="$RUNNER_TEMP/tree" "$image"
           previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
           {
-            echo "The NaN toolchain built by itself, for Linux on x86_64 (it links the system C library)."
-            echo
-            echo "- SHA-256: \`$(cut -d' ' -f1 "$image.sha256")\`"
-            echo "- Source tree hash (\`.nan.tree\`, hexadecimal): \`$(od -An -tx1 -v "$RUNNER_TEMP/tree" | tr -d ' \n')\`"
+            echo "The NaN toolchain built by itself, for Linux on x86_64 and on AArch64 (each image links the system C library)."
+            for image in "nan-$TAG-x86_64-linux" "nan-$TAG-aarch64-linux"; do
+              echo
+              echo "## $image"
+              echo
+              echo "- SHA-256: \`$(cut -d' ' -f1 "$image.sha256")\`"
+              echo "- Source tree hash (\`.nan.tree\`, hexadecimal): \`$(cat "$image.tree")\`"
+            done
             echo
             echo "## Changes"
             echo
@@ -71,6 +108,4 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          image="nan-$TAG-x86_64-linux"
-          gh release create "$TAG" "$image" "$image.sha256" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
+        run: gh release create "$TAG" nan-"$TAG"-*-linux nan-"$TAG"-*-linux.sha256 --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag

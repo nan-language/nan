@@ -227,7 +227,11 @@ fn rewrite_manifest(dir: &Path, line: &str, with: &str) -> Result<(), String> {
 /// machine's architecture.
 fn machine_copy(dir: &Path) -> Result<(), String> {
     copy_tree(&repository().join("toolchain"), dir, false).map_err(|error| error.to_string())?;
-    rewrite_manifest(dir, DECLARED_TARGET, &format!("targets {}\n", host_target()))
+    rewrite_manifest(
+        dir,
+        DECLARED_TARGET,
+        &format!("targets {}\n", host_target()),
+    )
 }
 
 /// Copies the toolchain workspace into `dir` as `machine_copy` does, its root file replaced by

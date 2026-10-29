@@ -12,7 +12,7 @@ A **waiting primitive** is a std function whose head states `uses wait`. A task 
 - A frame never moves while its task lives. While the task is suspended, its frames change only through the views it passed to the waiting primitive, through places it [lent](16-concurrency.md#lending) and through values with [interior mutability](12-memory.md#interior-mutability).
 - An awaited call that reaches no waiting primitive returns or fails without suspending.
 
-[Kernel execution model](24-kernel.md#kernel-suspension) states how suspension is lowered on `x86_64-uefi` and `x86_64-bare`.
+[Kernel execution model](24-kernel.md#kernel-suspension) states how suspension is lowered on the machine targets.
 
 ```nan
 pub fn pause_steps(clock: sys::Clock, steps: u32) fails task::Cancelled uses wait {
@@ -37,12 +37,12 @@ test sleeps_in_nested_frames for pause_twice {
 
 ## Task stacks
 
-The **entry** of a task is the code it starts with: the [task closure](16-concurrency.md#task-closures) or named function whose `task fn` value starts it, the body of a [test](22-testing.md#test-items) for the task of that test, or, on `x86_64-host`, the [entry function](27-program-model.md#entry) for the first task of a program.
+The **entry** of a task is the code it starts with: the [task closure](16-concurrency.md#task-closures) or named function whose `task fn` value starts it, the body of a [test](22-testing.md#test-items) for the task of that test, or, on the host targets, the [entry function](27-program-model.md#entry) for the first task of a program.
 
 - When the entry's own head states `limits stack N`, the task's stack holds at least N bytes, and every final build lowering the entry checks that its stack use is at most N ([stack limits](10-effects-digests.md#stack-limits)).
 - The stack of the first task of a domain that `sys::Domain.run_sized` runs holds at least the `stack` bytes the call gives ([domain run](11-errors-domains.md#domain-run)), and so does the stack of a child that `task::Scope.spawn_sized` starts ([joins](16-concurrency.md#joins)).
-- Otherwise, on `x86_64-host`, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
-- On `x86_64-host`, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
+- Otherwise, on the host targets, the stack of a program's [entry task](27-program-model.md#host-runs) holds the entry task stack of that target's [descriptor](27-program-model.md#descriptors), and every other stack its default task stack.
+- On the host targets, an inaccessible guard region of at least 4 KiB lies beyond the end of every task stack toward which the stack grows.
 
 ```nan
 pub closed enum JobError derives Render {
@@ -70,7 +70,7 @@ pub fn contained_triangle(n: u64, exec: task::Executor, alloc: mem::Alloc) -> Op
 
 ### Static bounds
 
-On `x86_64-uefi` and `x86_64-bare`, every stack has a static bound. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
+On the machine targets, every stack has a static bound. The code of each context in this table starts at an entry whose head states `limits stack N`, every final build checks the entry's stack use against N ([stack limits](10-effects-digests.md#stack-limits)), and the section in the Stack column fixes how much the context's stack holds.
 
 | Context | Entry | Stack |
 | --- | --- | --- |
@@ -79,7 +79,7 @@ On `x86_64-uefi` and `x86_64-bare`, every stack has a static bound. The code of 
 | interrupt | each [interrupt fn](24-kernel.md#interrupt-functions) | the processor's interrupt stack ([interrupt functions](24-kernel.md#interrupt-functions)) |
 | landing | each [landing fn](23-low-level.md#landing-functions) | the stack its seam switches to ([user exceptions and syscalls](24-kernel.md#user-exceptions-and-syscalls), [machine runs](27-program-model.md#machine-runs)) |
 
-- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for `x86_64-uefi` or `x86_64-bare` or within the reach of a final build for one of them ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.
+- An entry of these contexts other than a test body whose own head states no `limits stack N`, in code checked for a machine target or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`suspend.stack-missing`), reported on the line of its head.
 - A test body states no limits. On these targets, the build of a test image ([emulator runs](22-testing.md#emulator-runs)) computes the body's stack use as [stack limits](10-effects-digests.md#stack-limits) does for a function demanding `stack N`, reporting each unbounded call site of the body (`limit.stack-unbounded`), and the test's task runs on a stack holding that stack use.
 
 ```nan
@@ -126,9 +126,9 @@ fn main(take m: boot::Machine) -> Never { // error: suspend.stack-missing
 
 ### Stack overflow
 
-On `x86_64-host`, an access to a task's guard region traps (`trap.stack-overflow`). Before using a frame larger than 4 KiB, lowered code accesses that frame once per 4 KiB, starting at the end nearest the caller's frame, so a task whose stack use exceeds its stack accesses the guard region before writing outside the stack.
+On the host targets, an access to a task's guard region traps (`trap.stack-overflow`). Before using a frame larger than 4 KiB, lowered code accesses that frame once per 4 KiB, starting at the end nearest the caller's frame, so a task whose stack use exceeds its stack accesses the guard region before writing outside the stack.
 
-On `x86_64-uefi` and `x86_64-bare`, each stack holds at least the stack use of the code running on it, counting a [foreign fn](23-low-level.md#foreign-functions) at the `stack N` it declares, so `trap.stack-overflow` never occurs there.
+On the machine targets, each stack holds at least the stack use of the code running on it, counting a [foreign fn](23-low-level.md#foreign-functions) at the `stack N` it declares, so `trap.stack-overflow` never occurs there.
 
 ## Completion I/O
 

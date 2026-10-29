@@ -1,0 +1,322 @@
+//! Instruction selection for AArch64 of comparisons, the conditional branches and selects that read them, the 128-bit comparisons, and jump tables.
+
+/// How the flags a comparison sets answer it: one condition, both of two, or either of two.
+enum ArmTest derives Copy, Eq {
+    One(aarch64::Cond)
+    Both(left: aarch64::Cond, right: aarch64::Cond)
+    Either(left: aarch64::Cond, right: aarch64::Cond)
+} ArmTest
+
+/// The test holding exactly when this one does not.
+fn ArmTest.inverse(self) -> ArmTest {
+    return match self {
+        ArmTest.One(cond) => ArmTest.One(cond.invert())
+        ArmTest.Both(left: left, right: right) => ArmTest.Either(left: left.invert(), right: right.invert())
+        ArmTest.Either(left: left, right: right) => ArmTest.Both(left: left.invert(), right: right.invert())
+    }
+} ArmTest.inverse
+
+fn arm_int_cond(cond: clif::IntCC) -> aarch64::Cond {
+    return match cond {
+        clif::IntCC.Equal => aarch64::Cond.Eq
+        clif::IntCC.NotEqual => aarch64::Cond.Ne
+        clif::IntCC.SignedLessThan => aarch64::Cond.Lt
+        clif::IntCC.SignedGreaterThanOrEqual => aarch64::Cond.Ge
+        clif::IntCC.SignedGreaterThan => aarch64::Cond.Gt
+        clif::IntCC.SignedLessThanOrEqual => aarch64::Cond.Le
+        clif::IntCC.UnsignedLessThan => aarch64::Cond.Lo
+        clif::IntCC.UnsignedGreaterThanOrEqual => aarch64::Cond.Hs
+        clif::IntCC.UnsignedGreaterThan => aarch64::Cond.Hi
+        clif::IntCC.UnsignedLessThanOrEqual => aarch64::Cond.Ls
+    }
+} arm_int_cond
+
+/// Whether a comparison orders its operands as signed integers.
+fn is_signed(cond: clif::IntCC) -> bool {
+    return match cond {
+        clif::IntCC.SignedLessThan or clif::IntCC.SignedGreaterThanOrEqual or clif::IntCC.SignedGreaterThan or clif::IntCC.SignedLessThanOrEqual => true
+        else => false
+    }
+} is_signed
+
+/// Sets the flags comparing two integers at their type's width, a narrow one extended as the
+/// comparison orders it: `cmp` or `cmn` with an immediate when one side is a constant that fits,
+/// else `cmp`.
+fn ArmSelector.int_compare(mut self, func: clif::Function, cond: clif::IntCC, x: clif::Value, y: clif::Value) -> ArmTest {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        return mut self.wide_compare(func, cond, x, y)
+    }
+    var lhs = x
+    var rhs = y
+    var tested = cond
+    if self.facts.constant(x, func).is_some() and self.facts.constant(y, func).is_none() {
+        lhs = y
+        rhs = x
+        tested = swapped(cond)
+    }
+    let signed = is_signed(tested)
+    let width = width_of(ty)
+    let lhs_reg = mut self.src(lhs, func)
+    let lhs_value = mut self.full(lhs_reg, ty, signed: signed)
+    match self.signed_constant(rhs, func) {
+        Some(imm) => {
+            var value = imm
+            if not signed and ty.bits() < 32 {
+                value = imm & ((1i64 << ty.bits()) - 1)
+            }
+            if value >= 0 and value < 0x100_0000 and aarch64::is_arith_imm(u64.fit(value)) {
+                mut self.emit(aarch64::Inst.CmpImm(width: width, lhs: lhs_value, imm: u32.fit(value)))
+                return ArmTest.One(arm_int_cond(tested))
+            }
+            if value < 0 and value > -0x100_0000 and aarch64::is_arith_imm(u64.fit(-value)) {
+                mut self.emit(aarch64::Inst.CmnImm(width: width, lhs: lhs_value, imm: u32.fit(-value)))
+                return ArmTest.One(arm_int_cond(tested))
+            }
+        }
+        None => {}
+    }
+    let rhs_reg = mut self.src(rhs, func)
+    let other = mut self.full(rhs_reg, ty, signed: signed)
+    mut self.emit(aarch64::Inst.Cmp(width: width, lhs: lhs_value, rhs: other))
+    return ArmTest.One(arm_int_cond(tested))
+} ArmSelector.int_compare
+
+/// Sets the flags comparing two 128-bit integers: equality from the halves' differences, an
+/// order from the borrow and sign of subtracting them, the operands swapped for the orders the
+/// subtraction's flags do not answer.
+fn ArmSelector.wide_compare(mut self, func: clif::Function, cond: clif::IntCC, x: clif::Value, y: clif::Value) -> ArmTest {
+    let wide = aarch64::Width.Bits64
+    if cond == clif::IntCC.Equal or cond == clif::IntCC.NotEqual {
+        let x_low = mut self.src(x, func)
+        let x_high = mut self.src_high(x, func)
+        let y_low = mut self.src(y, func)
+        let y_high = mut self.src_high(y, func)
+        let low = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Eor, width: wide, dst: low, lhs: x_low, rhs: y_low))
+        let high = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Eor, width: wide, dst: high, lhs: x_high, rhs: y_high))
+        let differences = mut self.temp(false)
+        mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: wide, dst: differences, lhs: low, rhs: high))
+        mut self.emit(aarch64::Inst.CmpImm(width: wide, lhs: differences, imm: 0))
+        return ArmTest.One(arm_int_cond(cond))
+    }
+    var lhs = x
+    var rhs = y
+    var tested = cond
+    match cond {
+        clif::IntCC.SignedGreaterThan or clif::IntCC.SignedLessThanOrEqual or clif::IntCC.UnsignedGreaterThan or clif::IntCC.UnsignedLessThanOrEqual => {
+            lhs = y
+            rhs = x
+            tested = swapped(cond)
+        }
+        else => {}
+    }
+    let lhs_low = mut self.src(lhs, func)
+    let lhs_high = mut self.src_high(lhs, func)
+    let rhs_low = mut self.src(rhs, func)
+    let rhs_high = mut self.src_high(rhs, func)
+    mut self.emit(aarch64::Inst.Cmp(width: wide, lhs: lhs_low, rhs: rhs_low))
+    mut self.emit(aarch64::Inst.Sbcs(width: wide, dst: aarch64::SP, lhs: lhs_high, rhs: rhs_high))
+    return ArmTest.One(arm_int_cond(tested))
+} ArmSelector.wide_compare
+
+/// Sets the flags comparing two floats with `fcmp`, which sets them as for a signed comparison
+/// and both carry and overflow when unordered; an ordered inequality and an unordered equality
+/// each read two conditions.
+fn ArmSelector.float_compare(mut self, func: clif::Function, cond: clif::FloatCC, x: clif::Value, y: clif::Value) -> ArmTest {
+    expect self.isa.floats
+    let a = mut self.src(x, func)
+    let b = mut self.src(y, func)
+    mut self.emit(aarch64::Inst.FloatCmp(prec: precision(func.value_type(x)), lhs: a, rhs: b))
+    return match cond {
+        clif::FloatCC.Ordered => ArmTest.One(aarch64::Cond.Vc)
+        clif::FloatCC.Unordered => ArmTest.One(aarch64::Cond.Vs)
+        clif::FloatCC.Equal => ArmTest.One(aarch64::Cond.Eq)
+        clif::FloatCC.NotEqual => ArmTest.One(aarch64::Cond.Ne)
+        clif::FloatCC.OrderedNotEqual => ArmTest.Either(left: aarch64::Cond.Mi, right: aarch64::Cond.Gt)
+        clif::FloatCC.UnorderedOrEqual => ArmTest.Either(left: aarch64::Cond.Eq, right: aarch64::Cond.Vs)
+        clif::FloatCC.LessThan => ArmTest.One(aarch64::Cond.Mi)
+        clif::FloatCC.LessThanOrEqual => ArmTest.One(aarch64::Cond.Ls)
+        clif::FloatCC.GreaterThan => ArmTest.One(aarch64::Cond.Gt)
+        clif::FloatCC.GreaterThanOrEqual => ArmTest.One(aarch64::Cond.Ge)
+        clif::FloatCC.UnorderedOrLessThan => ArmTest.One(aarch64::Cond.Lt)
+        clif::FloatCC.UnorderedOrLessThanOrEqual => ArmTest.One(aarch64::Cond.Le)
+        clif::FloatCC.UnorderedOrGreaterThan => ArmTest.One(aarch64::Cond.Hi)
+        clif::FloatCC.UnorderedOrGreaterThanOrEqual => ArmTest.One(aarch64::Cond.Pl)
+    }
+} ArmSelector.float_compare
+
+/// Writes a comparison's answer as 0 or 1 into its result.
+fn ArmSelector.set_flag(mut self, func: clif::Function, inst: clif::Inst, outcome: ArmTest) {
+    let dst = mut self.dst_of(func, inst)
+    mut self.write_flag(dst, outcome)
+} ArmSelector.set_flag
+
+fn ArmSelector.write_flag(mut self, dst: machinst::Reg, outcome: ArmTest) {
+    match outcome {
+        ArmTest.One(cond) => mut self.emit(aarch64::Inst.Cset(cond: cond, width: aarch64::Width.Bits32, dst: dst))
+        ArmTest.Both(left: left, right: right) => mut self.combine(dst, left, right, op: aarch64::LogicOp.And)
+        ArmTest.Either(left: left, right: right) => mut self.combine(dst, left, right, op: aarch64::LogicOp.Orr)
+    }
+} ArmSelector.write_flag
+
+fn ArmSelector.combine(mut self, dst: machinst::Reg, left: aarch64::Cond, right: aarch64::Cond, op: aarch64::LogicOp) {
+    let left_flag = mut self.temp(false)
+    let right_flag = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Cset(cond: left, width: aarch64::Width.Bits32, dst: left_flag))
+    mut self.emit(aarch64::Inst.Cset(cond: right, width: aarch64::Width.Bits32, dst: right_flag))
+    mut self.emit(aarch64::Inst.Logic(op: op, width: aarch64::Width.Bits32, dst: dst, lhs: left_flag, rhs: right_flag))
+} ArmSelector.combine
+
+/// The flags deciding a branch or a select on `c`: those of the comparison deciding the flag `c`
+/// is or tests against zero, made again for each reader, else those of testing `c`'s bits against
+/// zero.
+fn ArmSelector.condition(mut self, func: clif::Function, c: clif::Value) -> ArmTest {
+    let Some(decided) = self.facts.decider(func, value: c) else {
+        mut self.test_zero(func, c)
+        return ArmTest.One(aarch64::Cond.Ne)
+    }
+    var outcome = ArmTest.One(aarch64::Cond.Ne)
+    match func.inst_data(decided.compare) {
+        clif::InstructionData.IntCompare(opcode: _, cond: cond, x: x, y: y) => {
+            outcome = mut self.int_compare(func, cond, x, y)
+        }
+        clif::InstructionData.FloatCompare(opcode: _, cond: cond, x: x, y: y) => {
+            outcome = mut self.float_compare(func, cond, x, y)
+        }
+        else => {
+            expect false
+        }
+    }
+    if decided.inverted {
+        return outcome.inverse()
+    }
+    return outcome
+} ArmSelector.condition
+
+/// Sets the flags testing a value's bits against zero: those of its type's width.
+fn ArmSelector.test_zero(mut self, func: clif::Function, c: clif::Value) {
+    let ty = func.value_type(c)
+    let reg = mut self.src(c, func)
+    if ty.bits() < 32 {
+        let mask = (1u64 << ty.bits()) - 1
+        mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.Ands, width: aarch64::Width.Bits32, dst: aarch64::SP, src: reg, imm: mask))
+        return
+    }
+    mut self.emit(aarch64::Inst.CmpImm(width: width_of(ty), lhs: reg, imm: 0))
+} ArmSelector.test_zero
+
+/// The one condition a test reads, combining a test of two into a flag tested again.
+fn ArmSelector.single(mut self, outcome: ArmTest) -> aarch64::Cond {
+    let ArmTest.One(cond) = outcome else {
+        let flag = mut self.temp(false)
+        mut self.write_flag(flag, outcome)
+        mut self.emit(aarch64::Inst.CmpImm(width: aarch64::Width.Bits32, lhs: flag, imm: 0))
+        return aarch64::Cond.Ne
+    }
+    return cond
+} ArmSelector.single
+
+/// A select: the condition's flag, or its inverse, when it chooses between 1 and 0, else a
+/// conditional select.
+fn ArmSelector.select_value(mut self, func: clif::Function, inst: clif::Inst, c: clif::Value, x: clif::Value, y: clif::Value) {
+    let outcome = mut self.condition(func, c)
+    let ty = func.value_type(x)
+    if ty.is_int() and ty.bits() <= 64 {
+        match arm_flag_choice(outcome, chosen: self.facts.constant(x, func), other: self.facts.constant(y, func)) {
+            Some(flag_test) => {
+                let flag = mut self.dst_of(func, inst)
+                mut self.write_flag(flag, outcome: flag_test)
+                return
+            }
+            None => {}
+        }
+    }
+    let cond = mut self.single(outcome)
+    let chosen = mut self.src(x, func)
+    let other = mut self.src(y, func)
+    let dst = mut self.dst_of(func, inst)
+    if self.code.is_float(dst) {
+        mut self.emit(aarch64::Inst.FloatCsel(cond: cond, prec: precision(ty), dst: dst, a: chosen, b: other))
+        return
+    }
+    mut self.emit(aarch64::Inst.Csel(cond: cond, width: width_of(ty), dst: dst, a: chosen, b: other))
+    if ty == clif::Type.Int128 {
+        let chosen_high = mut self.src_high(x, func)
+        let other_high = mut self.src_high(y, func)
+        let dst_high = mut self.dst_high_of(func, inst)
+        mut self.emit(aarch64::Inst.Csel(cond: cond, width: aarch64::Width.Bits64, dst: dst_high, a: chosen_high, b: other_high))
+    }
+} ArmSelector.select_value
+
+/// The test a select writes as its result when it chooses 1 over 0, or 0 over 1 on one
+/// condition.
+fn arm_flag_choice(outcome: ArmTest, chosen: Option[u64], other: Option[u64]) -> Option[ArmTest] {
+    if chosen == Some(1) and other == Some(0) {
+        return Some(outcome)
+    }
+    if chosen == Some(0) and other == Some(1) {
+        match outcome {
+            ArmTest.One(cond) => return Some(ArmTest.One(cond.invert()))
+            else => return None
+        }
+    }
+    return None
+} arm_flag_choice
+
+/// A conditional branch: on the condition to the first target, or to the block passing its
+/// arguments, then a branch to the second; a value no comparison decides is tested by `cbnz`.
+fn ArmSelector.brif(mut self, func: clif::Function, block: clif::Block, c: clif::Value, then_block: clif::Block, else_block: clif::Block) {
+    let at = usize.widen(block.index)
+    expect at < self.facts.then_edges.len() and at < self.facts.else_edges.len()
+    let taken = self.facts.target_of(self.facts.then_edges[at], block: then_block)
+    let other = self.facts.target_of(self.facts.else_edges[at], block: else_block)
+    let ty = func.value_type(c)
+    if self.facts.decider(func, value: c).is_none() and ty.bits() >= 32 {
+        let reg = mut self.src(c, func)
+        mut self.emit(aarch64::Inst.Cbnz(width: width_of(ty), reg: reg, label: taken))
+    } else {
+        match mut self.condition(func, c) {
+            ArmTest.One(cond) => mut self.emit(aarch64::Inst.Bcond(cond: cond, label: taken))
+            ArmTest.Both(left: left, right: right) => {
+                mut self.emit(aarch64::Inst.Bcond(cond: left.invert(), label: other))
+                mut self.emit(aarch64::Inst.Bcond(cond: right, label: taken))
+            }
+            ArmTest.Either(left: left, right: right) => {
+                mut self.emit(aarch64::Inst.Bcond(cond: left, label: taken))
+                mut self.emit(aarch64::Inst.Bcond(cond: right, label: taken))
+            }
+        }
+    }
+    mut self.emit(aarch64::Inst.B(label: other))
+    mut self.code.succs.push(taken)
+    mut self.code.succs.push(other)
+} ArmSelector.brif
+
+/// A chain's branches: its value, zero-extended and less the smallest constant, indexing a table
+/// of the targets when within the constants' span, else a branch to the default.
+fn ArmSelector.jump_table(mut self, func: clif::Function, index: u32) {
+    let JumpTable(value: tested, low: low, span: span, default: default, entries: entries, reached: reached) = self.facts.jump_table(index)
+    let value = mut self.src(tested, func)
+    var offset_index = mut self.extended(value, ty: func.value_type(tested), signed: false)
+    if low != 0 {
+        let rebased = mut self.temp(false)
+        if aarch64::is_arith_imm(low) {
+            mut self.emit(aarch64::Inst.SubImm(width: aarch64::Width.Bits64, dst: rebased, src: offset_index, imm: u32.fit(low)))
+        } else {
+            let lowest = mut self.int_constant(low)
+            mut self.emit(aarch64::Inst.SubReg(width: aarch64::Width.Bits64, dst: rebased, lhs: offset_index, rhs: lowest))
+        }
+        offset_index = rebased
+    }
+    mut self.emit(aarch64::Inst.CmpImm(width: aarch64::Width.Bits64, lhs: offset_index, imm: u32.fit(span)))
+    mut self.emit(aarch64::Inst.Bcond(cond: aarch64::Cond.Hi, label: default))
+    for label in reached {
+        mut self.code.succs.push(label)
+    }
+    let table = mut self.code.add_table(entries.view())
+    let base = mut self.temp(false)
+    let offset = mut self.temp(false)
+    mut self.emit(aarch64::Inst.JumpTable(index: offset_index, base: base, temp: offset, table: table))
+} ArmSelector.jump_table

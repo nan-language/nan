@@ -234,7 +234,7 @@ fn Checker.check_contribution(self, item: ty::ItemId, contribution: ast::Contrib
     }
     let seams = match path.as_str() {
         "hw::vectors" or "hw::preempt" => vectors
-        "hw::syscall_entry" => db.target == workspace::Target.Bare
+        "hw::syscall_entry" => db.target.kind() == Some(workspace::Kind.Bare)
         else => true
     }
     if not seams {
@@ -615,22 +615,24 @@ fn Checker.check_platform_entry(self, item: ty::ItemId) {
 } Checker.check_platform_entry
 
 /// Whether the fields of a contribution to `hw::vectors` break the target's vector classes:
-/// a handler of another class, an NMI, double fault or machine check without its own stack, or
-/// a user landing fn on an interrupt vector or naming a function that is not a landing fn.
+/// a handler of another class, an `ist` the descriptor does not allow for the vector, or a user
+/// landing fn on an interrupt vector or naming a function that is not a landing fn.
 fn Checker.vectors_entry_broken(self, fields: Slice[Val]) -> bool {
     expect fields.len() > 2
+    let Some(arch) = self.db().target.arch() else {
+        return false
+    }
     let vector = fields[0].int_value()
     let Val.Variant(item: _, index: handler, fields: _) = fields[2] else {
         return false
     }
-    let class = vector_class(vector)
+    let class = vector_class(arch, vector)
     expect fields.len() > 3
     let user_landing = match fields[3] {
         Val.Variant(item: _, index: 0, fields: _) => true
         else => false
     }
-    let stackless = vector == wide::Wide.of_u64(2) or vector == wide::Wide.of_u64(8) or vector == wide::Wide.of_u64(18)
-    return class != Some(handler) or (fields[1].int_value().is_zero() and stackless) or (user_landing and class == Some(0)) or self.landing_broken(fields[3])
+    return class != Some(handler) or not ist_allowed(arch, vector, ist: fields[1].int_value()) or (user_landing and class == Some(0)) or self.landing_broken(fields[3])
 } Checker.vectors_entry_broken
 
 /// Whether the field of a contribution to `hw::syscall_entry` names a function that is not a
@@ -688,17 +690,38 @@ fn Checker.dependency_closure(self, package_id: ty::PackageId) -> mem::List[ty::
     return closure
 } Checker.dependency_closure
 
-/// The class the descriptors of `x86_64-uefi` and `x86_64-bare` give a vector, as the index of
+/// The class the descriptors of an architecture's machine targets give a vector, as the index of
 /// the `hw::VectorHandler` variant it names: `Irq`, `Trap`, `TrapWithCode`, `PageFault`.
-fn vector_class(vector: wide::Wide) -> Option[u32] {
+fn vector_class(arch: workspace::Arch, vector: wide::Wide) -> Option[u32] {
     let Some(small) = vector.to_u64() else {
         return None
     }
-    return match small {
-        0..=7 or 16 or 18..=20 or 28 => Some(1)
-        8 or 10..=13 or 17 or 21 or 29 or 30 => Some(2)
-        14 => Some(3)
-        32..=255 => Some(0)
-        else => None
+    return match arch {
+        workspace::Arch.Amd64 => match small {
+            0..=7 or 16 or 18..=20 or 28 => Some(1)
+            8 or 10..=13 or 17 or 21 or 29 or 30 => Some(2)
+            14 => Some(3)
+            32..=255 => Some(0)
+            else => None
+        }
+        workspace::Arch.Aarch64 => match small {
+            0 or 2 => Some(2)
+            1 => Some(3)
+            16..=255 => Some(0)
+            else => None
+        }
     }
 } vector_class
+
+/// Whether the descriptors of an architecture's machine targets allow an `ist` for a vector: on
+/// x86_64 a nonzero one for each vector that needs one, and on AArch64, whose vector seams run on
+/// the CPU's one interrupt stack, 0 for every vector.
+fn ist_allowed(arch: workspace::Arch, vector: wide::Wide, ist: wide::Wide) -> bool {
+    if arch == workspace::Arch.Aarch64 {
+        return ist.is_zero()
+    }
+    let Some(small) = vector.to_u64() else {
+        return true
+    }
+    return not ist.is_zero() or not (small == 2 or small == 8 or small == 18)
+} ist_allowed

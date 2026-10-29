@@ -23,7 +23,7 @@ fn an_exceeded_bound_names_each_call_of_the_deepest_path_in_source() {
         &workspace,
         &workspace.closures[0],
         crate::stdlib::packages(),
-        Target::Host,
+        Target::X64Host,
     );
     let item = |canonical: &str| {
         (0..checker.db.items.len())

@@ -1,0 +1,627 @@
+//! The encoder: instructions of physical registers assembled into 32-bit little-endian words, with the labels it binds, the displacements that wait for them and the relocations of the symbols the code names.
+
+/// Assembled code: its bytes and the relocations of symbols it names.
+pkg struct Encoded {
+    pkg bytes: mem::Bytes
+    pkg relocs: mem::List[machinst::Reloc]
+} Encoded
+
+/// What a pending displacement to a label fills: the 26-bit field of an unconditional branch, the
+/// 19-bit field of a conditional one, the split 21-bit field of an `adr`, or a table entry holding
+/// the label's offset from the table's start.
+enum FixupKind derives Copy, Eq {
+    Branch26
+    Branch19
+    Adr
+    Entry(start: u32)
+} FixupKind
+
+/// A pending displacement: the code offset of its word, the word with the field empty, and the
+/// label it reaches.
+struct Fixup derives Copy {
+    at: u32
+    base: u32
+    label: u32
+    kind: FixupKind
+} Fixup
+
+/// An assembler gathering encoded instructions. Displacements to labels are left empty and filled
+/// once every label is bound.
+pkg struct Assembler {
+    code: mem::Bytes
+    relocs: mem::List[machinst::Reloc]
+    labels: mem::List[u32]
+    fixups: mem::List[Fixup]
+} Assembler
+
+/// The offset a label has until it is bound.
+const UNBOUND: u32 = 0xFFFF_FFFF
+
+/// The word of `udf #0xc11f`, the trap Cranelift's AArch64 backend encodes.
+const UDF: u32 = 0x0000_C11F
+
+pkg fn Assembler.new(alloc: mem::Alloc) -> Assembler = Assembler(code: mem::Bytes.empty(alloc), relocs: mem::List[machinst::Reloc].empty(alloc), labels: mem::List[u32].empty(alloc), fixups: mem::List[Fixup].empty(alloc))
+
+/// The number of bytes emitted so far.
+pkg fn Assembler.offset(self) -> u32 {
+    return u32.fit(self.code.len())
+} Assembler.offset
+
+/// A fresh label, bound later with `bind`.
+pkg fn Assembler.new_label(mut self) -> u32 {
+    let label = u32.fit(self.labels.len())
+    mut self.labels.push(UNBOUND)
+    return label
+} Assembler.new_label
+
+/// Binds a label to the current offset.
+pkg fn Assembler.bind(mut self, label: u32) {
+    expect usize.widen(label) < self.labels.len()
+    self.labels[usize.widen(label)] = self.offset()
+} Assembler.bind
+
+/// The code with every displacement filled, each within its field's reach.
+pkg fn Assembler.finish(take self) -> Encoded {
+    for fixup in self.fixups {
+        expect usize.widen(fixup.label) < self.labels.len()
+        let target = self.labels[usize.widen(fixup.label)]
+        expect target != UNBOUND
+        let delta = i64.widen(target) - i64.widen(fixup.at)
+        var word = fixup.base
+        match fixup.kind {
+            FixupKind.Branch26 => {
+                expect delta >= -0x800_0000 and delta < 0x800_0000
+                word = word | (u32.truncate(delta.shr_arith(2).to_bits()) & 0x03FF_FFFF)
+            }
+            FixupKind.Branch19 => {
+                expect delta >= -0x10_0000 and delta < 0x10_0000
+                word = word | ((u32.truncate(delta.shr_arith(2).to_bits()) & 0x7_FFFF) << 5)
+            }
+            FixupKind.Adr => {
+                expect delta >= -0x10_0000 and delta < 0x10_0000
+                let bits = u32.truncate(delta.to_bits())
+                word = word | ((bits & 3) << 29) | (((bits >> 2) & 0x7_FFFF) << 5)
+            }
+            FixupKind.Entry(start: start) => {
+                word = u32.truncate((i64.widen(target) - i64.widen(start)).to_bits())
+            }
+        }
+        var writable = mut self.code.view_mut()
+        mut writable.write_u32_le(usize.widen(fixup.at), value: word)
+    }
+    return Encoded(bytes: take self.code, relocs: take self.relocs)
+} Assembler.finish
+
+/// Appends an instruction word, little-endian.
+fn Assembler.word(mut self, value: u32) {
+    mut self.code.push(u8.truncate(value))
+    mut self.code.push(u8.truncate(value >> 8))
+    mut self.code.push(u8.truncate(value >> 16))
+    mut self.code.push(u8.truncate(value >> 24))
+} Assembler.word
+
+/// Appends a word whose displacement to a label waits for `finish`.
+fn Assembler.label_word(mut self, base: u32, label: u32, kind: FixupKind) {
+    mut self.fixups.push(Fixup(at: self.offset(), base: base, label: label, kind: kind))
+    mut self.word(base)
+} Assembler.label_word
+
+/// Appends a word the linker or image writer completes with a symbol's address.
+fn Assembler.relocated(mut self, word: u32, kind: machinst::RelocKind, symbol: machinst::Symbol) {
+    mut self.relocs.push(machinst::Reloc(offset: self.offset(), kind: kind, target: symbol, addend: 0))
+    mut self.word(word)
+} Assembler.relocated
+
+/// Appends a jump table entry: the offset of a label from the table's start.
+pkg fn Assembler.table_entry(mut self, label: u32, start: u32) {
+    mut self.label_word(0, label: label, kind: FixupKind.Entry(start: start))
+} Assembler.table_entry
+
+/// Whether an add or subtract immediate encodes a value: below 4096, or below 2^24 with its low
+/// 12 bits clear.
+pkg fn is_arith_imm(value: u64) -> bool = value < 0x1000 or (value < 0x100_0000 and (value & 0xFFF) == 0)
+
+/// The `sh:imm12` fields of an add or subtract immediate, placed in the word.
+fn imm12(value: u32) -> u32 {
+    if value < 0x1000 {
+        return value << 10
+    }
+    expect (value & 0xFFF) == 0 and value < 0x100_0000
+    return (1u32 << 22) | ((value >> 12) << 10)
+} imm12
+
+/// Whether a displacement reaches the memory of an access of `1 << scale` bytes: a multiple of its
+/// size below 4096 times it, or any displacement from -256 to 255.
+pkg fn reaches(disp: i64, scale: u32) -> bool {
+    return scaled_offset(disp, scale).is_some() or (disp >= -256 and disp <= 255)
+} reaches
+
+/// A displacement as the unsigned 12-bit offset of an access of `1 << scale` bytes, in units of
+/// its size, when it is a multiple of the size below 4096 times it.
+fn scaled_offset(disp: i64, scale: u32) -> Option[u32] {
+    if disp < 0 {
+        return None
+    }
+    let bytes = u64.fit(disp)
+    if (bytes & ((1u64 << scale) - 1)) != 0 or (bytes >> scale) > 0xFFF {
+        return None
+    }
+    return Some(u32.fit(bytes >> scale))
+} scaled_offset
+
+/// The signed 7-bit scaled offset of a load or store pair of 64-bit registers, placed in its
+/// field: the byte offset divided by 8.
+fn pair_imm7(imm: i32) -> u32 {
+    let scaled = i64.widen(imm).div_trunc(8)
+    expect scaled * 8 == i64.widen(imm) and imm >= -512 and imm <= 504
+    return (u32.truncate(scaled.to_bits()) & 0x7F) << 15
+} pair_imm7
+
+/// The `N:immr:imms` fields of the bitmask immediate encoding a value for a logical operation of
+/// a width: a run of ones, rotated, within an element of 2, 4, 8, 16, 32 or 64 bits repeated across
+/// the width. None encodes 0, all ones or a value the width cannot hold.
+pkg fn bitmask(imm: u64, width: Width) -> Option[u32] {
+    var bits: u32 = 64
+    if width == Width.Bits32 {
+        bits = 32
+    }
+    if imm == 0 or imm == 0xFFFF_FFFF_FFFF_FFFF or (bits == 32 and ((imm >> 32) != 0 or imm == 0xFFFF_FFFF)) {
+        return None
+    }
+    var size = bits
+    loop {
+        size = size / 2
+        let half = (1u64 << size) - 1
+        if (imm & half) != ((imm >> size) & half) {
+            size = size * 2
+            break
+        }
+        if size <= 2 {
+            break
+        }
+    }
+    let mask = 0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - size)
+    var element = imm & mask
+    var rotation: u32 = 0
+    var ones: u32 = 0
+    if is_shifted_mask(element) {
+        rotation = element.trailing_zeros()
+        ones = (~(element >> rotation)).trailing_zeros()
+    } else {
+        element = element | ~mask
+        if not is_shifted_mask(~element) {
+            return None
+        }
+        let leading = (~element).leading_zeros()
+        rotation = 64 - leading
+        ones = leading + (~element).trailing_zeros() - (64 - size)
+    }
+    let immr = (size - rotation) & (size - 1)
+    let nimms = (~((size - 1) << 1) & 0x7E) | (ones - 1)
+    let n = ((nimms >> 6) & 1) ^ 1
+    return Some((n << 12) | (immr << 6) | (nimms & 0x3F))
+} bitmask
+
+/// Whether a value's set bits are one contiguous run.
+fn is_shifted_mask(value: u64) -> bool {
+    if value == 0 {
+        return false
+    }
+    let filled = (value - 1) | value
+    if filled == 0xFFFF_FFFF_FFFF_FFFF {
+        return true
+    }
+    return (filled & (filled + 1)) == 0
+} is_shifted_mask
+
+/// The bitmask immediate fields placed in a logical immediate's word.
+fn placed_bitmask(fields: u32) -> u32 = (((fields >> 12) & 1) << 22) | (((fields >> 6) & 0x3F) << 16) | ((fields & 0x3F) << 10)
+
+/// Encodes an instruction into the assembler's code.
+pkg fn Assembler.emit(mut self, inst: Inst)
+    waive length "one arm per instruction, its fields in encoding order"
+{
+    match inst {
+        Inst.Mov(width: width, dst: dst, src: src) => {
+            let sf = width.sf() << 31
+            if dst == SP or src == SP {
+                mut self.word(sf | 0x1100_0000 | (hw(src) << 5) | hw(dst))
+            } else {
+                mut self.word(sf | 0x2A00_03E0 | (hw(src) << 16) | hw(dst))
+            }
+        }
+        Inst.MovImm(dst: dst, imm: imm) => mut self.mov_imm(dst, imm)
+        Inst.AddReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x0B00_0000, dst, lhs, rhs)
+        Inst.SubReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x4B00_0000, dst, lhs, rhs)
+        Inst.AddsReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x2B00_0000, dst, lhs, rhs)
+        Inst.SubsReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x6B00_0000, dst, lhs, rhs)
+        Inst.Adc(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x1A00_0000, dst, lhs, rhs)
+        Inst.Sbc(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x5A00_0000, dst, lhs, rhs)
+        Inst.Sbcs(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x7A00_0000, dst, lhs, rhs)
+        Inst.AddImm(width: width, dst: dst, src: src, imm: imm) => {
+            mut self.word((width.sf() << 31) | 0x1100_0000 | imm12(imm) | (hw(src) << 5) | hw(dst))
+        }
+        Inst.SubImm(width: width, dst: dst, src: src, imm: imm) => {
+            mut self.word((width.sf() << 31) | 0x5100_0000 | imm12(imm) | (hw(src) << 5) | hw(dst))
+        }
+        Inst.Cmp(width: width, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x6B00_0000, dst: SP, lhs, rhs)
+        Inst.CmpImm(width: width, lhs: lhs, imm: imm) => {
+            mut self.word((width.sf() << 31) | 0x7100_001F | imm12(imm) | (hw(lhs) << 5))
+        }
+        Inst.CmnImm(width: width, lhs: lhs, imm: imm) => {
+            mut self.word((width.sf() << 31) | 0x3100_001F | imm12(imm) | (hw(lhs) << 5))
+        }
+        Inst.Tst(width: width, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x6A00_0000, dst: SP, lhs, rhs)
+        Inst.Logic(op: op, width: width, dst: dst, lhs: lhs, rhs: rhs) => {
+            let base = match op {
+                LogicOp.And => 0x0A00_0000u32
+                LogicOp.Orr => 0x2A00_0000u32
+                LogicOp.Eor => 0x4A00_0000u32
+                LogicOp.Ands => 0x6A00_0000u32
+            }
+            mut self.three(width, base: base, dst, lhs, rhs)
+        }
+        Inst.LogicImm(op: op, width: width, dst: dst, src: src, imm: imm) => {
+            let Some(fields) = bitmask(imm, width) else {
+                expect false
+                return
+            }
+            let base = match op {
+                LogicOp.And => 0x1200_0000u32
+                LogicOp.Orr => 0x3200_0000u32
+                LogicOp.Eor => 0x5200_0000u32
+                LogicOp.Ands => 0x7200_0000u32
+            }
+            mut self.word((width.sf() << 31) | base | placed_bitmask(fields) | (hw(src) << 5) | hw(dst))
+        }
+        Inst.Shift(kind: kind, width: width, dst: dst, lhs: lhs, rhs: rhs) => {
+            mut self.three(width, base: 0x1AC0_2000 | (kind.op() << 10), dst, lhs, rhs)
+        }
+        Inst.ShiftImm(kind: kind, width: width, dst: dst, src: src, amount: amount) => mut self.shift_imm(kind, width, dst, src, amount)
+        Inst.Madd(width: width, dst: dst, lhs: lhs, rhs: rhs, addend: addend) => {
+            mut self.three(width, base: 0x1B00_0000 | (hw(addend) << 10), dst, lhs, rhs)
+        }
+        Inst.Msub(width: width, dst: dst, lhs: lhs, rhs: rhs, minuend: minuend) => {
+            mut self.three(width, base: 0x1B00_8000 | (hw(minuend) << 10), dst, lhs, rhs)
+        }
+        Inst.Sdiv(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x1AC0_0C00, dst, lhs, rhs)
+        Inst.Udiv(width: width, dst: dst, lhs: lhs, rhs: rhs) => mut self.three(width, base: 0x1AC0_0800, dst, lhs, rhs)
+        Inst.Smulh(dst: dst, lhs: lhs, rhs: rhs) => mut self.three(Width.Bits32, base: 0x9B40_7C00, dst, lhs, rhs)
+        Inst.Umulh(dst: dst, lhs: lhs, rhs: rhs) => mut self.three(Width.Bits32, base: 0x9BC0_7C00, dst, lhs, rhs)
+        Inst.Csel(cond: cond, width: width, dst: dst, a: a, b: b) => {
+            mut self.three(width, base: 0x1A80_0000 | (cond.code() << 12), dst, lhs: a, rhs: b)
+        }
+        Inst.Cset(cond: cond, width: width, dst: dst) => {
+            mut self.word((width.sf() << 31) | 0x1A9F_07E0 | (cond.invert().code() << 12) | hw(dst))
+        }
+        Inst.Extend(kind: kind, dst: dst, src: src) => mut self.word(kind.base() | (hw(src) << 5) | hw(dst))
+        Inst.Mvn(width: width, dst: dst, src: src) => mut self.three(width, base: 0x2A20_0000, dst, lhs: SP, rhs: src)
+        Inst.Neg(width: width, dst: dst, src: src) => mut self.three(width, base: 0x4B00_0000, dst, lhs: SP, rhs: src)
+        Inst.Clz(width: width, dst: dst, src: src) => mut self.word((width.sf() << 31) | 0x5AC0_1000 | (hw(src) << 5) | hw(dst))
+        Inst.Rbit(width: width, dst: dst, src: src) => mut self.word((width.sf() << 31) | 0x5AC0_0000 | (hw(src) << 5) | hw(dst))
+        Inst.Rev(width: width, dst: dst, src: src) => {
+            let base = match width {
+                Width.Bits32 => 0x5AC0_0800u32
+                Width.Bits64 => 0xDAC0_0C00u32
+            }
+            mut self.word(base | (hw(src) << 5) | hw(dst))
+        }
+        Inst.Cnt(dst: dst, src: src) => mut self.word(0x0E20_5800 | (vhw(src) << 5) | vhw(dst))
+        Inst.Addv(dst: dst, src: src) => mut self.word(0x0E31_B800 | (vhw(src) << 5) | vhw(dst))
+        Inst.Ldr(width: width, dst: dst, src: src) => {
+            let scale = 2 + width.sf()
+            mut self.word(self.access((scale << 30) | 0x0040_0000, scale: scale, reg: hw(dst), mem: src))
+        }
+        Inst.Str(width: width, src: src, dst: dst) => {
+            let scale = 2 + width.sf()
+            mut self.word(self.access(scale << 30, scale: scale, reg: hw(src), mem: dst))
+        }
+        Inst.LdrSized(kind: kind, dst: dst, src: src) => mut self.word(self.access(kind.fields(), scale: kind.scale(), reg: hw(dst), mem: src))
+        Inst.StrSized(kind: kind, src: src, dst: dst) => {
+            let scale = match kind {
+                StoreKind.Byte => 0u32
+                StoreKind.Half => 1u32
+            }
+            mut self.word(self.access(scale << 30, scale: scale, reg: hw(src), mem: dst))
+        }
+        Inst.LdrFloat(prec: prec, dst: dst, src: src) => {
+            let scale = float_scale(prec)
+            mut self.word(self.access((scale << 30) | 0x0440_0000, scale: scale, reg: vhw(dst), mem: src))
+        }
+        Inst.StrFloat(prec: prec, src: src, dst: dst) => {
+            let scale = float_scale(prec)
+            mut self.word(self.access((scale << 30) | 0x0400_0000, scale: scale, reg: vhw(src), mem: dst))
+        }
+        Inst.Ldp(mode: mode, dst1: dst1, dst2: dst2, base: base, imm: imm) => {
+            let op = match mode {
+                PairMode.Signed => 0xA940_0000u32
+                PairMode.Pre => 0xA9C0_0000u32
+                PairMode.Post => 0xA8C0_0000u32
+            }
+            mut self.word(op | pair_imm7(imm) | (hw(dst2) << 10) | (hw(base) << 5) | hw(dst1))
+        }
+        Inst.Stp(mode: mode, src1: src1, src2: src2, base: base, imm: imm) => {
+            let op = match mode {
+                PairMode.Signed => 0xA900_0000u32
+                PairMode.Pre => 0xA980_0000u32
+                PairMode.Post => 0xA880_0000u32
+            }
+            mut self.word(op | pair_imm7(imm) | (hw(src2) << 10) | (hw(base) << 5) | hw(src1))
+        }
+        Inst.FloatMov(prec: prec, dst: dst, src: src) => mut self.word(0x1E20_4000 | prec.ptype() | (vhw(src) << 5) | vhw(dst))
+        Inst.FloatFromInt(prec: prec, dst: dst, src: src) => {
+            let base = match prec {
+                Precision.Single => 0x1E27_0000u32
+                Precision.Double => 0x9E67_0000u32
+            }
+            mut self.word(base | (hw(src) << 5) | vhw(dst))
+        }
+        Inst.IntFromFloat(prec: prec, dst: dst, src: src) => {
+            let base = match prec {
+                Precision.Single => 0x1E26_0000u32
+                Precision.Double => 0x9E66_0000u32
+            }
+            mut self.word(base | (vhw(src) << 5) | hw(dst))
+        }
+        Inst.FloatArith(op: op, prec: prec, dst: dst, lhs: lhs, rhs: rhs) => {
+            let base = match op {
+                FloatOp.Add => 0x1E20_2800u32
+                FloatOp.Sub => 0x1E20_3800u32
+                FloatOp.Mul => 0x1E20_0800u32
+                FloatOp.Div => 0x1E20_1800u32
+            }
+            mut self.word(base | prec.ptype() | (vhw(rhs) << 16) | (vhw(lhs) << 5) | vhw(dst))
+        }
+        Inst.FloatSqrt(prec: prec, dst: dst, src: src) => mut self.word(0x1E21_C000 | prec.ptype() | (vhw(src) << 5) | vhw(dst))
+        Inst.FloatNeg(prec: prec, dst: dst, src: src) => mut self.word(0x1E21_4000 | prec.ptype() | (vhw(src) << 5) | vhw(dst))
+        Inst.FloatAbs(prec: prec, dst: dst, src: src) => mut self.word(0x1E20_C000 | prec.ptype() | (vhw(src) << 5) | vhw(dst))
+        Inst.FloatCmp(prec: prec, lhs: lhs, rhs: rhs) => mut self.word(0x1E20_2000 | prec.ptype() | (vhw(rhs) << 16) | (vhw(lhs) << 5))
+        Inst.FloatConvert(to: to, dst: dst, src: src) => {
+            let base = match to {
+                Precision.Single => 0x1E62_4000u32
+                Precision.Double => 0x1E22_C000u32
+            }
+            mut self.word(base | (vhw(src) << 5) | vhw(dst))
+        }
+        Inst.IntToFloat(signed: signed, width: width, prec: prec, dst: dst, src: src) => {
+            var base = 0x1E22_0000u32
+            if not signed {
+                base = 0x1E23_0000
+            }
+            mut self.word((width.sf() << 31) | base | prec.ptype() | (hw(src) << 5) | vhw(dst))
+        }
+        Inst.FloatToInt(signed: signed, width: width, prec: prec, dst: dst, src: src) => {
+            var base = 0x1E38_0000u32
+            if not signed {
+                base = 0x1E39_0000
+            }
+            mut self.word((width.sf() << 31) | base | prec.ptype() | (vhw(src) << 5) | hw(dst))
+        }
+        Inst.FloatCsel(cond: cond, prec: prec, dst: dst, a: a, b: b) => {
+            mut self.word(0x1E20_0C00 | prec.ptype() | (vhw(b) << 16) | (cond.code() << 12) | (vhw(a) << 5) | vhw(dst))
+        }
+        Inst.CanonNan(prec: prec, reg: reg, temp: temp) => mut self.canon_nan(prec, reg, temp)
+        Inst.Ldar(size: size, dst: dst, base: base) => mut self.word((size.scale() << 30) | 0x08DF_FC00 | (hw(base) << 5) | hw(dst))
+        Inst.Stlr(size: size, src: src, base: base) => mut self.word((size.scale() << 30) | 0x089F_FC00 | (hw(base) << 5) | hw(src))
+        Inst.AtomicRmwLoop(op: op, size: size, addr: addr, operand: operand, old: old, temp: temp, status: status) => mut self.atomic_rmw_loop(op, size, addr, operand, old, temp, status)
+        Inst.AtomicCasLoop(size: size, addr: addr, expected: expected, replacement: replacement, old: old, status: status) => mut self.atomic_cas_loop(size, addr, expected, replacement, old, status)
+        Inst.Dmb => mut self.word(0xD503_3BBF)
+        Inst.Address(dst: dst, symbol: symbol, mode: mode) => mut self.address(dst, symbol, mode)
+        Inst.TlsDesc(symbol: symbol, temp: temp) => mut self.tls_desc(symbol, temp)
+        Inst.Call(target: target, args: _, results: _, clobbers: _) => {
+            match target {
+                CallTarget.Direct(symbol) => mut self.relocated(0x9400_0000, kind: machinst::RelocKind.Arm64Call, symbol: symbol)
+                CallTarget.Indirect(reg) => mut self.word(0xD63F_0000 | (hw(reg) << 5))
+            }
+        }
+        Inst.B(label: label) => mut self.label_word(0x1400_0000, label: label, kind: FixupKind.Branch26)
+        Inst.Bcond(cond: cond, label: label) => mut self.label_word(0x5400_0000 | cond.code(), label: label, kind: FixupKind.Branch19)
+        Inst.Cbz(width: width, reg: reg, label: label) => mut self.label_word((width.sf() << 31) | 0x3400_0000 | hw(reg), label: label, kind: FixupKind.Branch19)
+        Inst.Cbnz(width: width, reg: reg, label: label) => mut self.label_word((width.sf() << 31) | 0x3500_0000 | hw(reg), label: label, kind: FixupKind.Branch19)
+        Inst.JumpTable(index: index, base: base, temp: temp, table: table) => {
+            mut self.label_word(0x1000_0000 | hw(base), label: table, kind: FixupKind.Adr)
+            mut self.word(0xB8A0_7800 | (hw(index) << 16) | (hw(base) << 5) | hw(temp))
+            mut self.word(0x8B00_0000 | (hw(temp) << 16) | (hw(base) << 5) | hw(base))
+            mut self.word(0xD61F_0000 | (hw(base) << 5))
+        }
+        Inst.TrapIfZero(width: width, reg: reg) => {
+            mut self.word((width.sf() << 31) | 0x3500_0040 | hw(reg))
+            mut self.word(UDF)
+        }
+        Inst.TrapIfOverflow(width: width, lhs: lhs, rhs: rhs) => {
+            let sf = width.sf() << 31
+            mut self.word(sf | 0x3100_041F | (hw(rhs) << 5))
+            mut self.word(sf | 0x7A41_0800 | (hw(lhs) << 5))
+            mut self.word(0x5400_0047)
+            mut self.word(UDF)
+        }
+        Inst.Udf => mut self.word(UDF)
+        Inst.Ret(reg: reg) => mut self.word(0xD65F_0000 | (hw(reg) << 5))
+        Inst.Return(results: _) or Inst.Args(params: _) => {
+            expect false
+        }
+    }
+} Assembler.emit
+
+/// The word of a three-register operation: its base word with the width's `sf` bit and the
+/// registers in the `Rd`, `Rn` and `Rm` fields.
+fn Assembler.three(mut self, width: Width, base: u32, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg) {
+    mut self.word((width.sf() << 31) | base | (hw(rhs) << 16) | (hw(lhs) << 5) | hw(dst))
+} Assembler.three
+
+/// The access scale of a float's loads and stores.
+fn float_scale(prec: Precision) -> u32 {
+    return match prec {
+        Precision.Single => 2
+        Precision.Double => 3
+    }
+} float_scale
+
+/// The word of a load or store of `1 << scale` bytes, `fields` holding its `size`, `V` and `opc`
+/// bits: the scaled unsigned offset when it reaches the displacement, else the unscaled signed
+/// one, or the register offset.
+fn Assembler.access(self, fields: u32, scale: u32, reg: u32, mem: Amode) -> u32 {
+    match mem {
+        Amode.Imm(base: base, disp: disp) => {
+            let wide = i64.widen(disp)
+            match scaled_offset(wide, scale) {
+                Some(offset) => return fields | 0x3900_0000 | (offset << 10) | (hw(base) << 5) | reg
+                None => {}
+            }
+            expect wide >= -256 and wide <= 255
+            return fields | 0x3800_0000 | ((u32.truncate(wide.to_bits()) & 0x1FF) << 12) | (hw(base) << 5) | reg
+        }
+        Amode.Reg(base: base, index: index, scaled: scaled) => {
+            var s = 0u32
+            if scaled {
+                s = 1u32 << 12
+            }
+            return fields | 0x3820_6800 | (hw(index) << 16) | s | (hw(base) << 5) | reg
+        }
+    }
+} Assembler.access
+
+/// A shift or rotation by an immediate: `lsl`, `lsr` and `asr` as the bitfield moves they alias,
+/// `ror` as an extract of the register with itself.
+fn Assembler.shift_imm(mut self, kind: ShiftKind, width: Width, dst: machinst::Reg, src: machinst::Reg, amount: u8) {
+    let sf = width.sf()
+    let bits = 32u32 << sf
+    let shift = u32.widen(amount)
+    expect shift < bits
+    let top = bits - 1
+    let wide = (sf << 31) | (sf << 22)
+    match kind {
+        ShiftKind.Lsl => mut self.word(wide | 0x5300_0000 | (((bits - shift) & top) << 16) | ((top - shift) << 10) | (hw(src) << 5) | hw(dst))
+        ShiftKind.Lsr => mut self.word(wide | 0x5300_0000 | (shift << 16) | (top << 10) | (hw(src) << 5) | hw(dst))
+        ShiftKind.Asr => mut self.word(wide | 0x1300_0000 | (shift << 16) | (top << 10) | (hw(src) << 5) | hw(dst))
+        ShiftKind.Ror => mut self.word(wide | 0x1380_0000 | (hw(src) << 16) | (shift << 10) | (hw(src) << 5) | hw(dst))
+    }
+} Assembler.shift_imm
+
+/// A 64-bit constant: one `orr` of a bitmask immediate when the moves would take more, else
+/// `movn` and `movk` when more halfwords are all ones than zero, or `movz` and `movk`.
+fn Assembler.mov_imm(mut self, dst: machinst::Reg, imm: u64) {
+    var zeros: u32 = 0
+    var ones: u32 = 0
+    for index in 0u32..<4 {
+        let half = (imm >> (16 * index)) & 0xFFFF
+        if half == 0 {
+            zeros += 1
+        } else if half == 0xFFFF {
+            ones += 1
+        }
+    }
+    if zeros < 3 and ones < 3 {
+        match bitmask(imm, width: Width.Bits64) {
+            Some(fields) => {
+                mut self.word(0xB200_03E0 | placed_bitmask(fields) | hw(dst))
+                return
+            }
+            None => {}
+        }
+    }
+    let inverted = ones > zeros
+    var opened = false
+    for index in 0u32..<4 {
+        let half = u32.truncate((imm >> (16 * index)) & 0xFFFF)
+        if (inverted and half == 0xFFFF) or (not inverted and half == 0) {
+            continue
+        }
+        if opened {
+            mut self.word(0xF280_0000 | (index << 21) | (half << 5) | hw(dst))
+        } else if inverted {
+            mut self.word(0x9280_0000 | (index << 21) | ((~half & 0xFFFF) << 5) | hw(dst))
+        } else {
+            mut self.word(0xD280_0000 | (index << 21) | (half << 5) | hw(dst))
+        }
+        opened = true
+    }
+    if not opened and inverted {
+        mut self.word(0x9280_0000 | hw(dst))
+    } else if not opened {
+        mut self.word(0xD280_0000 | hw(dst))
+    }
+} Assembler.mov_imm
+
+/// Replaces a NaN by the canonical quiet NaN: a compare of the register with itself, unordered
+/// for a NaN alone, and otherwise a branch over the move of the canonical NaN's bits into it.
+fn Assembler.canon_nan(mut self, prec: Precision, reg: machinst::Reg, temp: machinst::Reg) {
+    mut self.word(0x1E20_2000 | prec.ptype() | (vhw(reg) << 16) | (vhw(reg) << 5))
+    mut self.word(0x5400_0067)
+    match prec {
+        Precision.Single => {
+            mut self.word(0x52AF_F800 | hw(temp))
+            mut self.word(0x1E27_0000 | (hw(temp) << 5) | vhw(reg))
+        }
+        Precision.Double => {
+            mut self.word(0xD2EF_FF00 | hw(temp))
+            mut self.word(0x9E67_0000 | (hw(temp) << 5) | vhw(reg))
+        }
+    }
+} Assembler.canon_nan
+
+/// `ldaxr`, then the operation into `temp`, `stlxr` of it, and a branch back while the store
+/// fails; an exchange stores the operand itself.
+fn Assembler.atomic_rmw_loop(mut self, op: AtomicOp, size: Size, addr: machinst::Reg, operand: machinst::Reg, old: machinst::Reg, temp: machinst::Reg, status: machinst::Reg) {
+    let sized = size.scale() << 30
+    let width = size.width()
+    mut self.word(sized | 0x085F_FC00 | (hw(addr) << 5) | hw(old))
+    var stored = temp
+    var back: u32 = 3
+    match op {
+        AtomicOp.Add => mut self.three(width, base: 0x0B00_0000, dst: temp, lhs: old, rhs: operand)
+        AtomicOp.And => mut self.three(width, base: 0x0A00_0000, dst: temp, lhs: old, rhs: operand)
+        AtomicOp.Orr => mut self.three(width, base: 0x2A00_0000, dst: temp, lhs: old, rhs: operand)
+        AtomicOp.Eor => mut self.three(width, base: 0x4A00_0000, dst: temp, lhs: old, rhs: operand)
+        AtomicOp.Xchg => {
+            stored = operand
+            back = 2
+        }
+    }
+    mut self.word(sized | 0x0800_FC00 | (hw(status) << 16) | (hw(addr) << 5) | hw(stored))
+    mut self.word(0x3500_0000 | (((0x8_0000 - back) & 0x7_FFFF) << 5) | hw(status))
+} Assembler.atomic_rmw_loop
+
+/// `ldaxr`, a compare with the expected value and a branch past the loop when it differs, then
+/// `stlxr` of the replacement and a branch back while the store fails.
+fn Assembler.atomic_cas_loop(mut self, size: Size, addr: machinst::Reg, expected: machinst::Reg, replacement: machinst::Reg, old: machinst::Reg, status: machinst::Reg) {
+    let sized = size.scale() << 30
+    mut self.word(sized | 0x085F_FC00 | (hw(addr) << 5) | hw(old))
+    mut self.three(size.width(), base: 0x6B00_0000, dst: SP, lhs: old, rhs: expected)
+    mut self.word(0x5400_0061)
+    mut self.word(sized | 0x0800_FC00 | (hw(status) << 16) | (hw(addr) << 5) | hw(replacement))
+    mut self.word(0x3500_0000 | (((0x8_0000u32 - 4) & 0x7_FFFF) << 5) | hw(status))
+} Assembler.atomic_cas_loop
+
+/// A symbol's address: `adrp` and `add` of its low 12 bits, `adrp` of its global offset table
+/// entry's page and `ldr` of the entry, or `ldr` of the literal word after a branch over it.
+fn Assembler.address(mut self, dst: machinst::Reg, symbol: machinst::Symbol, mode: AddressMode) {
+    match mode {
+        AddressMode.Near => {
+            mut self.relocated(0x9000_0000 | hw(dst), kind: machinst::RelocKind.Arm64AdrPrel, symbol: symbol)
+            mut self.relocated(0x9100_0000 | (hw(dst) << 5) | hw(dst), kind: machinst::RelocKind.Arm64AddLo12, symbol: symbol)
+        }
+        AddressMode.Got => {
+            mut self.relocated(0x9000_0000 | hw(dst), kind: machinst::RelocKind.Arm64AdrGotPage, symbol: symbol)
+            mut self.relocated(0xF940_0000 | (hw(dst) << 5) | hw(dst), kind: machinst::RelocKind.Arm64Ld64GotLo12, symbol: symbol)
+        }
+        AddressMode.Far => {
+            mut self.word(0x5800_0040 | hw(dst))
+            mut self.word(0x1400_0003)
+            mut self.relocated(0, kind: machinst::RelocKind.Arm64Abs64, symbol: symbol)
+            mut self.word(0)
+        }
+    }
+} Assembler.address
+
+/// The thread-local descriptor sequence: `adrp` of the descriptor's page into `x0`, `ldr` of its
+/// resolver, `add` of its low 12 bits, a call of the resolver giving the variable's offset from the
+/// thread pointer, and the thread pointer added to it.
+fn Assembler.tls_desc(mut self, symbol: machinst::Symbol, temp: machinst::Reg) {
+    mut self.relocated(0x9000_0000, kind: machinst::RelocKind.Arm64TlsDescAdrPage, symbol: symbol)
+    mut self.relocated(0xF940_0000 | hw(temp), kind: machinst::RelocKind.Arm64TlsDescLd64Lo12, symbol: symbol)
+    mut self.relocated(0x9100_0000, kind: machinst::RelocKind.Arm64TlsDescAddLo12, symbol: symbol)
+    mut self.relocated(0xD63F_0000 | (hw(temp) << 5), kind: machinst::RelocKind.Arm64TlsDescCall, symbol: symbol)
+    mut self.word(0xD53B_D040 | hw(temp))
+    mut self.word(0x8B00_0000 | (hw(temp) << 16))
+} Assembler.tls_desc

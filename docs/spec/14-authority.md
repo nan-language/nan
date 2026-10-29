@@ -310,9 +310,9 @@ A **root grant** is the capability a platform [landing fn](23-low-level.md#landi
 
 | Target | Root grant |
 | --- | --- |
-| `x86_64-host` | `host::World` |
-| `x86_64-uefi` | `boot::Machine` |
-| `x86_64-bare` | `boot::Kernel` |
+| `x86_64-host`, `aarch64-host` | `host::World` |
+| `x86_64-uefi`, `aarch64-uefi` | `boot::Machine` |
+| `x86_64-bare`, `aarch64-bare` | `boot::Kernel` |
 
 ```nan-api
 // module: host

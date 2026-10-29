@@ -1,4 +1,4 @@
-//! Instruction selection of integer arithmetic, bit operations, extensions and comparisons, and the dispatch of every instruction to its family.
+//! Instruction selection for x86-64 of integer arithmetic, bit operations, extensions and comparisons, and the dispatch of every instruction to its family.
 
 /// The machine instructions of one instruction of `block`.
 fn Selector.select_inst(mut self, func: clif::Function, block: clif::Block, inst: clif::Inst) {
@@ -60,12 +60,12 @@ fn Selector.select_inst(mut self, func: clif::Function, block: clif::Block, inst
         clif::InstructionData.MultiAry(opcode: _, args: args) => mut self.ret(func, args: args.view())
         clif::InstructionData.Jump(opcode: _, destination: destination) => mut self.jump(func, target: destination.block, args: destination.args.view())
         clif::InstructionData.Brif(opcode: _, arg: arg, then: then_call, otherwise: else_call) => {
-            let chain = self.switch_of(block)
+            let chain = self.facts.switch_of(block)
             if chain != NONE {
                 mut self.jump_table(func, index: chain)
                 return
             }
-            if self.merges(then_call, else_call) {
+            if self.facts.merges(then_call, else_call) {
                 mut self.jump(func, target: then_call.block, args: then_call.args.view())
             } else {
                 mut self.brif(func, block, c: arg, then_block: then_call.block, else_block: else_call.block)
@@ -164,17 +164,17 @@ fn Selector.binary(mut self, func: clif::Function, inst: clif::Inst, opcode: cli
 } Selector.binary
 
 /// The register of an instruction's first result.
-fn Selector.dst_of(mut self, func: clif::Function, inst: clif::Inst) -> x64::Reg {
+fn Selector.dst_of(mut self, func: clif::Function, inst: clif::Inst) -> machinst::Reg {
     return mut self.reg(result_of(func, inst, alloc: self.alloc), func)
 } Selector.dst_of
 
 /// The register of the high half of an instruction's 128-bit first result.
-fn Selector.dst_high_of(mut self, func: clif::Function, inst: clif::Inst) -> x64::Reg {
+fn Selector.dst_high_of(mut self, func: clif::Function, inst: clif::Inst) -> machinst::Reg {
     return mut self.high(result_of(func, inst, alloc: self.alloc), func)
 } Selector.dst_high_of
 
 /// `dst = src op y`, `y` an immediate when it is a constant that fits.
-fn Selector.alu(mut self, func: clif::Function, op: x64::AluOp, size: x64::Size, dst: x64::Reg, src: x64::Reg, y: clif::Value) {
+fn Selector.alu(mut self, func: clif::Function, op: x64::AluOp, size: x64::Size, dst: machinst::Reg, src: machinst::Reg, y: clif::Value) {
     mut self.mov(dst, src: src)
     let Some(imm) = self.imm(y, func) else {
         let reg = mut self.src(y, func)
@@ -183,19 +183,6 @@ fn Selector.alu(mut self, func: clif::Function, op: x64::AluOp, size: x64::Size,
     }
     mut self.emit(x64::Inst.AluImm(op: op, size: size, dst: dst, imm: imm))
 } Selector.alu
-
-/// The operands of a commutative operation with a constant one last.
-fn Selector.commuted(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Operands {
-    if self.constant(x, func).is_some() and self.constant(y, func).is_none() {
-        return Operands(x: y, y: x)
-    }
-    return Operands(x: x, y: y)
-} Selector.commuted
-
-struct Operands derives Copy, Eq {
-    x: clif::Value
-    y: clif::Value
-} Operands
 
 /// `dst = (low, high) op (y's halves)` for a 128-bit integer: `op` on the low halves, then
 /// `high_op` on the high ones.
@@ -218,7 +205,7 @@ fn Selector.iadd(mut self, func: clif::Function, inst: clif::Inst, x: clif::Valu
         mut self.wide_alu(func, inst, op: x64::AluOp.Add, high_op: x64::AluOp.Adc, x, y)
         return
     }
-    let operands = self.commuted(func, x, y)
+    let operands = self.facts.commuted(func, x, y)
     let dst = mut self.dst_of(func, inst)
     let Some(imm) = self.imm(operands.y, func) else {
         let sum = mut self.indexed(func, x: operands.x, y: operands.y, disp: 0)
@@ -257,7 +244,7 @@ fn Selector.imul(mut self, func: clif::Function, inst: clif::Inst, x: clif::Valu
         mut self.wide_mul(func, inst, x, y)
         return
     }
-    let operands = self.commuted(func, x, y)
+    let operands = self.facts.commuted(func, x, y)
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(operands.x, func)
     let size = op_size(ty)
@@ -341,7 +328,7 @@ fn Selector.bitwise(mut self, func: clif::Function, inst: clif::Inst, op: x64::A
         return
     }
     if op == x64::AluOp.Or {
-        match self.rotation(func, x, y) {
+        match self.facts.rotation(func, x, y) {
             Some(rotated) => {
                 let dst = mut self.dst_of(func, inst)
                 let src = mut self.src(rotated.value, func)
@@ -352,73 +339,11 @@ fn Selector.bitwise(mut self, func: clif::Function, inst: clif::Inst, op: x64::A
             None => {}
         }
     }
-    let operands = self.commuted(func, x, y)
+    let operands = self.facts.commuted(func, x, y)
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(operands.x, func)
     mut self.alu(func, op, size: op_size(ty), dst, src, y: operands.y)
 } Selector.bitwise
-
-/// The value and amount of a right rotation `x | y` computes of a 32- or 64-bit integer, when
-/// one operand shifts it right and the other left by the rest of the width, and only the `bor`
-/// reads either.
-fn Selector.rotation(self, func: clif::Function, x: clif::Value, y: clif::Value) -> Option[Shifted] {
-    let width = func.value_type(x).bits()
-    if width != 32 and width != 64 {
-        return None
-    }
-    let Some(right) = self.shifted(func, value: x, opcode: clif::Opcode.Ushr) else {
-        let Some(left_first) = self.shifted(func, value: x, opcode: clif::Opcode.Ishl) else {
-            return None
-        }
-        let Some(right_second) = self.shifted(func, value: y, opcode: clif::Opcode.Ushr) else {
-            return None
-        }
-        return rotation_of(func, right: right_second, left: left_first, width: width)
-    }
-    let Some(left) = self.shifted(func, value: y, opcode: clif::Opcode.Ishl) else {
-        return None
-    }
-    return rotation_of(func, right, left, width: width)
-} Selector.rotation
-
-/// A right and a left shift of one value whose amounts add up to the width, as a right rotation.
-fn rotation_of(func: clif::Function, right: Shifted, left: Shifted, width: u32) -> Option[Shifted] {
-    if func.resolve_aliases(right.value) != func.resolve_aliases(left.value) or u32.widen(right.amount) + u32.widen(left.amount) != width {
-        return None
-    }
-    return Some(right)
-} rotation_of
-
-/// The value a single-use shift by a constant between 1 and 63 of an opcode defining `value`
-/// shifts, with the amount.
-fn Selector.shifted(self, func: clif::Function, value: clif::Value, opcode: clif::Opcode) -> Option[Shifted] {
-    let resolved = func.resolve_aliases(value)
-    let at = usize.widen(resolved.index)
-    expect at < self.defs.len() and at < self.use_counts.len()
-    let def = self.defs[at]
-    if def == NONE or self.use_counts[at] != 1 {
-        return None
-    }
-    let clif::InstructionData.Binary(opcode: found, x: shifted, y: amount) = func.inst_data(clif::Inst(index: def)) else {
-        return None
-    }
-    if found != opcode {
-        return None
-    }
-    let Some(bits) = self.constant(amount, func) else {
-        return None
-    }
-    if bits == 0 or bits > 63 {
-        return None
-    }
-    return Some(Shifted(value: shifted, amount: u8.truncate(bits)))
-} Selector.shifted
-
-/// A value and a constant amount it is shifted or rotated by.
-struct Shifted derives Copy, Eq {
-    value: clif::Value
-    amount: u8
-} Shifted
 
 /// A shift or rotation by the amount modulo the width: an immediate when constant, else `cl`,
 /// masked for a type narrower than 32 bits, whose shifts the processor masks to 5 bits.
@@ -428,7 +353,7 @@ fn Selector.shift(mut self, func: clif::Function, inst: clif::Inst, op: x64::Shi
     let size = exact_size(ty)
     let dst = mut self.dst_of(func, inst)
     let src = mut self.src(x, func)
-    match self.constant(y, func) {
+    match self.facts.constant(y, func) {
         Some(bits) => {
             mut self.mov(dst, src: src)
             let amount = u8.truncate(bits & u64.widen(ty.bits() - 1))
@@ -575,7 +500,7 @@ fn sign_extension(ty: clif::Type) -> x64::ExtendKind {
 
 /// A register holding a narrow integer extended to 64 bits, or the register itself for a 64-bit
 /// one.
-fn Selector.extended(mut self, src: x64::Reg, ty: clif::Type, signed: bool) -> x64::Reg {
+fn Selector.extended(mut self, src: machinst::Reg, ty: clif::Type, signed: bool) -> machinst::Reg {
     if ty.bits() == 64 {
         return src
     }

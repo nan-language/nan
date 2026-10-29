@@ -65,7 +65,7 @@ fn pointer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "read" => {
             let address = supply.param(0).scalar();
-            let held = lo.held_at(fx, &element, address);
+            let held = lo.device_held_at(fx, &element, address);
             supply.ret(lo, fx, held);
         }
         "write" => {

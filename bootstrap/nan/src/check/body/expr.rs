@@ -21,7 +21,7 @@ use crate::syntax::ast::{
     self, BinaryOp, ExprKind, FnKind, ItemKind, LiteralKind, Mode, Tok, UnaryOp,
 };
 use crate::syntax::literal::text_value;
-use crate::workspace::{Authority, Target};
+use crate::workspace::Authority;
 
 impl Checker<'_> {
     /// A core type item applied to its arguments, or a failed type when std lacks it.
@@ -1814,10 +1814,7 @@ impl Body<'_, '_> {
         if let Some(code) = self.ck.fn_type_problem(&closure_ty) {
             self.report(token, code);
         }
-        if task
-            && matches!(self.ck.db.target, Target::Uefi | Target::Bare)
-            && closure_ty.limits.stack.is_none()
-        {
+        if task && self.ck.db.target.is_machine() && closure_ty.limits.stack.is_none() {
             self.report(token, Code::SuspendStackMissing);
         }
         if let (Some(fails), Some(written)) = (&closure_ty.fails, &closure.fails)

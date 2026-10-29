@@ -1,15 +1,29 @@
-//! The out-of-line compiler stubs of the machine targets: fixed machine code each image emits once for the operations Cranelift cannot express.
+//! The out-of-line compiler stubs of the machine targets: fixed machine code each image emits once for the operations Cranelift cannot express, in the bytes of its architecture.
 
-/// The compiler stubs. Each takes its arguments in `rdi`, `rsi` and `rdx`, gives its result in `rax`
-/// and returns, but `Halt`, which stops the processor with maskable interrupts disabled. A port
-/// stub takes the port and, for `Out`, the value; a memory-mapped stub takes the address and,
-/// for a write, the value; `Copy` and `Fill` take the target, the source or byte, and the length,
-/// a copy between overlapping ranges running backwards when its target lies above its source.
-/// `Thread` reads the first word of the running CPU's record, which the GS base addresses;
-/// `Wrmsr` and `Rdmsr` write and read a model-specific register; `LoadTables` loads a CPU's
-/// descriptor tables through their pseudo-descriptor, reloading its segments and task register;
-/// `EnableAvx` enables AVX and its state saving when the CPU has both, giving whether it did;
-/// `IdleWait` halts until an interrupt with maskable interrupts enabled.
+/// The compiler stubs. Each takes its integer arguments and gives its integer result in the
+/// registers its architecture's convention names, and returns, but `Halt`, which stops the
+/// processor with maskable interrupts disabled. A port stub, on x86_64 alone, takes the port
+/// and, for `Out`, the value; a memory-mapped stub takes the address and, for a write, the
+/// value; `Copy` and `Fill` take the target, the source or byte, and the length, a copy between
+/// overlapping ranges running backwards when its target lies above its source. `Thread` reads
+/// the first word of the running CPU's record, which the GS base addresses on x86_64 and
+/// `TPIDR_EL1` on AArch64; `SetCpu` points that register at a record. `Cli` and `Sti` disable
+/// and enable maskable interrupts; `IrqSave` gives their state and disables them, `IrqRestore`
+/// restores it. `IdleWait` halts until an interrupt with maskable interrupts enabled.
+///
+/// The x86_64 stubs are `Lidt`, which loads an interrupt descriptor table; `Wrmsr` and `Rdmsr`,
+/// which write and read a model-specific register; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
+/// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
+/// their pseudo-descriptor; and `EnableAvx`. The AArch64 stubs are `ReadSysReg` and
+/// `WriteSysReg`, each naming a system register by its 15-bit encoding, which the instruction
+/// holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base register; `TlbiPage`,
+/// which invalidates a page's translations; `EnterRoot`, which installs the entry root with the
+/// memory attributes and translation control the entry seams program; `InterruptStack`, which
+/// makes a stack top the one exceptions switch to and leaves the caller on its stack through
+/// `SP_EL0`; `Switch`, the task-stack switch; `SemiExit`, the exit port; `Hvc`, which makes a
+/// PSCI call through the hypervisor conduit, taking the function identifier and three arguments
+/// and giving the result; and `FiqOn` and `FiqOff`, which unmask and mask fast interrupts,
+/// through which a halting CPU stops the others.
 enum Stub derives Copy, Eq, Hash {
     Out1
     Out2
@@ -45,6 +59,19 @@ enum Stub derives Copy, Eq, Hash {
     LoadTables
     EnableAvx
     Halt
+    SetCpu
+    ReadSysReg(u16)
+    WriteSysReg(u16)
+    ReadTtbr0
+    WriteTtbr0
+    TlbiPage
+    EnterRoot
+    InterruptStack
+    Switch
+    SemiExit
+    Hvc
+    FiqOn
+    FiqOff
 } Stub
 
 /// A compiler stub's code: the words it takes and gives, and its machine code.
@@ -54,9 +81,12 @@ view struct StubCode {
     bytes: Slice[u8]
 } StubCode
 
-/// The words the stub takes and gives, and its machine code.
-proj fn Stub.code(self) -> StubCode {
-    return match self {
+/// The words the stub takes and gives, and its machine code in the architecture's instruction
+/// set. `ReadSysReg` and `WriteSysReg`, whose code the running CPU's register field builds, are
+/// emitted by `call_stub` instead and never reach here.
+proj fn Stub.code(self, arch: workspace::Arch) -> StubCode {
+    return match arch {
+        workspace::Arch.Amd64 => match self {
         Stub.Out1 => StubCode(params: 2, returns: 0, bytes: b"\x89\xfa\x89\xf0\xee\xc3")
         Stub.Out2 => StubCode(params: 2, returns: 0, bytes: b"\x89\xfa\x89\xf0\x66\xef\xc3")
         Stub.Out4 => StubCode(params: 2, returns: 0, bytes: b"\x89\xfa\x89\xf0\xef\xc3")
@@ -91,6 +121,47 @@ proj fn Stub.code(self) -> StubCode {
         Stub.LoadTables => StubCode(params: 1, returns: 0, bytes: b"\x0f\x01\x17\x6a\x08\x48\x8d\x05\x03\x00\x00\x00\x50\x48\xcb\xb8\x10\x00\x00\x00\x8e\xd8\x8e\xc0\x8e\xd0\xb8\x28\x00\x00\x00\x0f\x00\xd8\xc3")
         Stub.EnableAvx => StubCode(params: 0, returns: 1, bytes: b"\x53\xb8\x01\x00\x00\x00\x0f\xa2\x5b\x81\xe1\x00\x00\x00\x14\x81\xf9\x00\x00\x00\x14\x75\x1d\x0f\x20\xe0\x48\x0d\x00\x00\x04\x00\x0f\x22\xe0\x31\xc9\x0f\x01\xd0\x83\xc8\x07\x0f\x01\xd1\xb8\x01\x00\x00\x00\xc3\x31\xc0\xc3")
         Stub.Halt => StubCode(params: 0, returns: 0, bytes: b"\xfa\xf4\xeb\xfd")
+        else => {
+            expect false
+            return StubCode(params: 0, returns: 0, bytes: b"")
+        }
+        }
+        workspace::Arch.Aarch64 => match self {
+        Stub.MmioRead1 => StubCode(params: 1, returns: 1, bytes: b"\xbf\x33\x03\xd5\x00\x00\x40\x39\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioRead2 => StubCode(params: 1, returns: 1, bytes: b"\xbf\x33\x03\xd5\x00\x00\x40\x79\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioRead4 => StubCode(params: 1, returns: 1, bytes: b"\xbf\x33\x03\xd5\x00\x00\x40\xb9\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioRead8 => StubCode(params: 1, returns: 1, bytes: b"\xbf\x33\x03\xd5\x00\x00\x40\xf9\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioWrite1 => StubCode(params: 2, returns: 0, bytes: b"\xbf\x33\x03\xd5\x01\x00\x00\x39\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioWrite2 => StubCode(params: 2, returns: 0, bytes: b"\xbf\x33\x03\xd5\x01\x00\x00\x79\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioWrite4 => StubCode(params: 2, returns: 0, bytes: b"\xbf\x33\x03\xd5\x01\x00\x00\xb9\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.MmioWrite8 => StubCode(params: 2, returns: 0, bytes: b"\xbf\x33\x03\xd5\x01\x00\x00\xf9\xbf\x33\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.Fill => StubCode(params: 3, returns: 0, bytes: b"\x82\x00\x00\xb4\x01\x14\x00\x38\x42\x04\x00\xf1\xc1\xff\xff\x54\xc0\x03\x5f\xd6")
+        Stub.Copy => StubCode(params: 3, returns: 0, bytes: b"\x22\x02\x00\xb4\x1f\x00\x01\xeb\x69\x01\x00\x54\x29\x00\x02\x8b\x1f\x00\x09\xeb\x02\x01\x00\x54\x00\x00\x02\x8b\x21\x00\x02\x8b\x29\xfc\x5f\x38\x09\xfc\x1f\x38\x42\x04\x00\xf1\xa1\xff\xff\x54\xc0\x03\x5f\xd6\x29\x14\x40\x38\x09\x14\x00\x38\x42\x04\x00\xf1\xa1\xff\xff\x54\xc0\x03\x5f\xd6")
+        Stub.Pause => StubCode(params: 0, returns: 0, bytes: b"\x3f\x20\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.Mfence => StubCode(params: 0, returns: 0, bytes: b"\xbf\x3b\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.IdleWait => StubCode(params: 0, returns: 0, bytes: b"\x7f\x20\x03\xd5\xff\x42\x03\xd5\xdf\x3f\x03\xd5\xdf\x42\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.Sti => StubCode(params: 0, returns: 0, bytes: b"\xff\x42\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.Cli => StubCode(params: 0, returns: 0, bytes: b"\xdf\x42\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.IrqSave => StubCode(params: 0, returns: 1, bytes: b"\x20\x42\x3b\xd5\xdf\x42\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.IrqRestore => StubCode(params: 1, returns: 0, bytes: b"\x20\x42\x1b\xd5\xc0\x03\x5f\xd6")
+        Stub.Thread => StubCode(params: 0, returns: 1, bytes: b"\x80\xd0\x38\xd5\x00\x00\x40\xf9\xc0\x03\x5f\xd6")
+        Stub.SetCpu => StubCode(params: 1, returns: 0, bytes: b"\x80\xd0\x18\xd5\xc0\x03\x5f\xd6")
+        Stub.Halt => StubCode(params: 0, returns: 0, bytes: b"\xdf\x4f\x03\xd5\x7f\x20\x03\xd5\xff\xff\xff\x17")
+        Stub.ReadTtbr0 => StubCode(params: 0, returns: 1, bytes: b"\x00\x20\x38\xd5\xc0\x03\x5f\xd6")
+        Stub.WriteTtbr0 => StubCode(params: 1, returns: 0, bytes: b"\x29\x42\x3b\xd5\xdf\x42\x03\xd5\x9f\x3b\x03\xd5\x00\x20\x18\xd5\x9f\x3b\x03\xd5\x1f\x87\x08\xd5\x9f\x3b\x03\xd5\xdf\x3f\x03\xd5\x29\x42\x1b\xd5\xc0\x03\x5f\xd6")
+        Stub.TlbiPage => StubCode(params: 1, returns: 0, bytes: b"\x09\xfc\x4c\xd3\x9f\x3a\x03\xd5\xa9\x87\x08\xd5\x9f\x3b\x03\xd5\xdf\x3f\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.SemiExit => StubCode(params: 1, returns: 0, bytes: b"\xff\x43\x00\xd1\xc9\x04\x80\xd2\x49\x00\xa0\xf2\xe9\x03\x00\xf9\xe0\x07\x00\xf9\xe1\x03\x00\x91\x00\x03\x80\xd2\x00\x00\x5e\xd4\xdf\x4f\x03\xd5\x7f\x20\x03\xd5\xff\xff\xff\x17")
+        Stub.Switch => StubCode(params: 3, returns: 0, bytes: b"\xff\x83\x02\xd1\xf3\x53\x00\xa9\xf5\x5b\x01\xa9\xf7\x63\x02\xa9\xf9\x6b\x03\xa9\xfb\x73\x04\xa9\xfd\x7b\x05\xa9\xe8\x27\x06\x6d\xea\x2f\x07\x6d\xec\x37\x08\x6d\xee\x3f\x09\x6d\xe9\x03\x00\x91\x09\x00\x00\xf9\x1d\x04\x00\xf9\x2a\x01\x00\x10\x0a\x08\x00\xf9\x29\x00\x40\xf9\x3f\x01\x00\x91\x3d\x04\x40\xf9\x2b\x08\x40\xf9\xe0\x03\x02\xaa\xfe\x03\x1f\xaa\x60\x01\x1f\xd6\xf3\x53\x40\xa9\xf5\x5b\x41\xa9\xf7\x63\x42\xa9\xf9\x6b\x43\xa9\xfb\x73\x44\xa9\xfd\x7b\x45\xa9\xe8\x27\x46\x6d\xea\x2f\x47\x6d\xec\x37\x48\x6d\xee\x3f\x49\x6d\xff\x83\x02\x91\xc0\x03\x5f\xd6")
+        Stub.Hvc => StubCode(params: 4, returns: 1, bytes: b"\x02\x00\x00\xd4\xc0\x03\x5f\xd6")
+        Stub.EnterRoot => StubCode(params: 1, returns: 0, bytes: b"\x01\x80\x88\xd2\xe1\x1f\xa0\xf2\x02\xa2\x86\xd2\x02\x10\xa0\xf2\x42\x00\xc0\xf2\x03\x10\x38\xd5\x64\xf8\x7f\x92\x9f\x3f\x03\xd5\x04\x10\x18\xd5\xdf\x3f\x03\xd5\x01\xa2\x18\xd5\x42\x20\x18\xd5\x00\x20\x18\xd5\xdf\x3f\x03\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x03\x10\x18\xd5\xdf\x3f\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.InterruptStack => StubCode(params: 1, returns: 0, bytes: b"\xe1\x03\x00\x91\xbf\x41\x00\xd5\x1f\x00\x00\x91\xbf\x40\x00\xd5\x3f\x00\x00\x91\xc0\x03\x5f\xd6")
+        Stub.FiqOn => StubCode(params: 0, returns: 0, bytes: b"\xff\x41\x03\xd5\xc0\x03\x5f\xd6")
+        Stub.FiqOff => StubCode(params: 0, returns: 0, bytes: b"\xdf\x41\x03\xd5\xc0\x03\x5f\xd6")
+        else => {
+            expect false
+            return StubCode(params: 0, returns: 0, bytes: b"")
+        }
+        }
     }
 } Stub.code
 
@@ -131,13 +202,66 @@ proj fn Stub.name(self) -> Str {
         Stub.LoadTables => "LoadTables"
         Stub.EnableAvx => "EnableAvx"
         Stub.Halt => "Halt"
+        Stub.SetCpu => "SetCpu"
+        Stub.ReadSysReg(_) => "ReadSysReg"
+        Stub.WriteSysReg(_) => "WriteSysReg"
+        Stub.ReadTtbr0 => "ReadTtbr0"
+        Stub.WriteTtbr0 => "WriteTtbr0"
+        Stub.TlbiPage => "TlbiPage"
+        Stub.EnterRoot => "EnterRoot"
+        Stub.InterruptStack => "InterruptStack"
+        Stub.Switch => "Switch"
+        Stub.SemiExit => "SemiExit"
+        Stub.Hvc => "Hvc"
+        Stub.FiqOn => "FiqOn"
+        Stub.FiqOff => "FiqOff"
     }
 } Stub.name
 
-/// Calls a compiler stub, emitted once per image, giving its results.
+/// Calls a compiler stub, emitted once per image at its architecture's instruction alignment,
+/// giving its results.
 fn Lowering.call_stub(mut self, mut fx: Fx, stub: Stub, args: Slice[clif::Value]) -> mem::List[clif::Value] {
     if self.machine_stubs.get(stub).is_none() {
-        let code = stub.code()
+        let arch = match self.ck.db().target.arch() {
+            Some(found) => found
+            None => workspace::Arch.Amd64
+        }
+        // A system-register stub's `mrs`/`msr` for `x0` is built from the register field; every
+        // other stub has fixed code for its architecture.
+        var word: u32 = 0
+        var sys_params: usize = 0
+        var sys_returns: usize = 0
+        var sys_field: u16 = 0
+        var sysreg = false
+        match stub {
+            Stub.ReadSysReg(field) => {
+                word = 0xD530_0000u32 | (u32.widen(field) << 5)
+                sys_returns = 1
+                sys_field = field
+                sysreg = true
+            }
+            Stub.WriteSysReg(field) => {
+                word = 0xD510_0000u32 | (u32.widen(field) << 5)
+                sys_params = 1
+                sys_field = field
+                sysreg = true
+            }
+            else => {}
+        }
+        var sys_bytes = Array[u8, 8].filled(0)
+        sys_bytes[0] = u8.truncate(word)
+        sys_bytes[1] = u8.truncate(word >> 8)
+        sys_bytes[2] = u8.truncate(word >> 16)
+        sys_bytes[3] = u8.truncate(word >> 24)
+        sys_bytes[4] = 0xc0
+        sys_bytes[5] = 0x03
+        sys_bytes[6] = 0x5f
+        sys_bytes[7] = 0xd6
+        let code = if sysreg {
+            StubCode(params: sys_params, returns: sys_returns, bytes: sys_bytes.view())
+        } else {
+            stub.code(arch)
+        }
         var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
         for _ in 0..<code.params {
             mut signature.params.push(clif::AbiParam(value_type: PTR))
@@ -147,8 +271,15 @@ fn Lowering.call_stub(mut self, mut fx: Fx, stub: Stub, args: Slice[clif::Value]
         }
         var symbol_name = text::String.of("_NSstub_", alloc: self.alloc)
         mut symbol_name.append(stub.name())
+        if sysreg {
+            mut symbol_name.write(text::fmt("_{sys_field}", sys_field), budget: 32)
+        }
+        let align: u64 = match arch {
+            workspace::Arch.Amd64 => 1
+            workspace::Arch.Aarch64 => 4
+        }
         let stub_id = mut self.module.declare_function(symbol_name.as_str(), linkage: object::Linkage.Local, signature)
-        mut self.module.define_function_bytes(stub_id, align: 1, bytes: code.bytes, relocs: mem::List[object::ModuleReloc].empty(self.alloc).view())
+        mut self.module.define_function_bytes(stub_id, align: align, bytes: code.bytes, relocs: mem::List[object::ModuleReloc].empty(self.alloc).view())
         discard mut self.machine_stubs.insert(stub, value: stub_id)
     }
     let id = self.machine_stubs.at(stub)

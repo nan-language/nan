@@ -12,7 +12,6 @@ use crate::diagnostic::{Code, Fix, Offer};
 use crate::syntax::ast::ItemKind;
 use crate::syntax::grammar::Punct;
 use crate::syntax::token::TokenKind;
-use crate::workspace::Target;
 
 /// The order of the entries of a `derives` clause in canonical format.
 const DERIVES_ORDER: [&str; 11] = [
@@ -115,6 +114,9 @@ impl Checker<'_> {
                 return Some(Code::ComponentNotComponent);
             }
         }
-        matches!(self.db.target, Target::Uefi | Target::Bare).then_some(Code::ComponentUnavailable)
+        self.db
+            .target
+            .is_machine()
+            .then_some(Code::ComponentUnavailable)
     }
 }

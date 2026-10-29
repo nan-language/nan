@@ -1,0 +1,405 @@
+//! Instruction selection for AArch64 of memory accesses with their address computations folded into the operand, atomics, symbol and thread-local addresses, calls and returns.
+
+/// The memory operand of an access of `1 << scale` bytes to `p + offset`: a stack slot's address
+/// folded into a displacement from the stack pointer, an addition only this access reads folded
+/// as a constant into the displacement or, without a displacement, as an index register, scaled
+/// when a shift by the access's scale defines it; else the address in a register, the
+/// displacement added to it when the access cannot reach it.
+fn ArmSelector.amode(mut self, p: clif::Value, func: clif::Function, offset: i64, scale: u32) -> aarch64::Amode {
+    let resolved = func.resolve_aliases(p)
+    let at = usize.widen(resolved.index)
+    expect at < self.facts.defs.len() and at < self.facts.use_counts.len()
+    let def = self.facts.defs[at]
+    if def != NONE {
+        match func.inst_data(clif::Inst(index: def)) {
+            clif::InstructionData.StackLoad(opcode: _, slot: slot, offset: slot_offset) => {
+                let disp = self.slot_disp(slot, offset: slot_offset) + offset
+                if aarch64::reaches(disp, scale) {
+                    return aarch64::Amode.at(aarch64::SP, disp: i32.fit(disp))
+                }
+            }
+            clif::InstructionData.Binary(opcode: clif::Opcode.Iadd, x: x, y: y) => {
+                if self.facts.use_counts[at] == 1 and func.value_type(resolved) == clif::POINTER {
+                    match mut self.folded_sum(func, x, y, offset, scale) {
+                        Some(mem) => return mem
+                        None => {}
+                    }
+                }
+            }
+            else => {}
+        }
+    }
+    let base = mut self.src(p, func)
+    if aarch64::reaches(offset, scale) {
+        return aarch64::Amode.at(base, disp: i32.fit(offset))
+    }
+    return aarch64::Amode.at(mut self.added(base, imm: offset), disp: 0)
+} ArmSelector.amode
+
+/// The memory operand of `x + y + offset` folding the addition: a constant addend into the
+/// displacement or, without a displacement, the operands as base and index registers.
+fn ArmSelector.folded_sum(mut self, func: clif::Function, x: clif::Value, y: clif::Value, offset: i64, scale: u32) -> Option[aarch64::Amode] {
+    let operands = self.facts.commuted(func, x, y)
+    match self.signed_constant(operands.y, func) {
+        Some(imm) => {
+            if imm <= -0x1_0000_0000 or imm >= 0x1_0000_0000 {
+                return None
+            }
+            return Some(mut self.amode(operands.x, func, offset: offset + imm, scale: scale))
+        }
+        None => {}
+    }
+    if offset != 0 {
+        return None
+    }
+    return Some(mut self.indexed(func, x: operands.x, y: operands.y, scale: scale))
+} ArmSelector.folded_sum
+
+/// A new register holding `base + imm`.
+fn ArmSelector.added(mut self, base: machinst::Reg, imm: i64) -> machinst::Reg {
+    let sum = mut self.temp(false)
+    var magnitude = imm
+    if imm < 0 {
+        magnitude = -imm
+    }
+    if aarch64::is_arith_imm(u64.fit(magnitude)) {
+        mut self.add_imm(aarch64::Width.Bits64, dst: sum, src: base, imm: imm)
+        return sum
+    }
+    let addend = mut self.int_constant(imm.to_bits())
+    mut self.emit(aarch64::Inst.AddReg(width: aarch64::Width.Bits64, dst: sum, lhs: base, rhs: addend))
+    return sum
+} ArmSelector.added
+
+/// The memory operand of `x + y` with base and index registers, a left shift of one operand by
+/// the access's scale, or its multiplication by the access size, folded into a scaled index when
+/// only this sum reads it.
+fn ArmSelector.indexed(mut self, func: clif::Function, x: clif::Value, y: clif::Value, scale: u32) -> aarch64::Amode {
+    match self.scaled_by(func, value: y, scale: scale) {
+        Some(index) => {
+            let base = mut self.src(x, func)
+            let scaled = mut self.src(index, func)
+            return aarch64::Amode.Reg(base: base, index: scaled, scaled: true)
+        }
+        None => {}
+    }
+    match self.scaled_by(func, value: x, scale: scale) {
+        Some(index) => {
+            let base = mut self.src(y, func)
+            let scaled = mut self.src(index, func)
+            return aarch64::Amode.Reg(base: base, index: scaled, scaled: true)
+        }
+        None => {}
+    }
+    let base = mut self.src(x, func)
+    let index = mut self.src(y, func)
+    return aarch64::Amode.Reg(base: base, index: index, scaled: false)
+} ArmSelector.indexed
+
+/// The value a pointer-sized value scales by `1 << scale`, when only one instruction reads it and
+/// a left shift by `scale` or a multiplication by `1 << scale` defines it; a scale of 0 folds
+/// nothing.
+fn ArmSelector.scaled_by(self, func: clif::Function, value: clif::Value, scale: u32) -> Option[clif::Value] {
+    let resolved = func.resolve_aliases(value)
+    let at = usize.widen(resolved.index)
+    expect at < self.facts.defs.len() and at < self.facts.use_counts.len()
+    let def = self.facts.defs[at]
+    if scale == 0 or def == NONE or self.facts.use_counts[at] != 1 or func.value_type(resolved) != clif::POINTER {
+        return None
+    }
+    match func.inst_data(clif::Inst(index: def)) {
+        clif::InstructionData.Binary(opcode: clif::Opcode.Ishl, x: shifted, y: amount) => {
+            if self.facts.constant(amount, func) == Some(u64.widen(scale)) {
+                return Some(shifted)
+            }
+            return None
+        }
+        clif::InstructionData.Binary(opcode: clif::Opcode.Imul, x: a, y: b) => {
+            let operands = self.facts.commuted(func, x: a, y: b)
+            if self.facts.constant(operands.y, func) == Some(1u64 << scale) {
+                return Some(operands.x)
+            }
+            return None
+        }
+        else => return None
+    }
+} ArmSelector.scaled_by
+
+/// The base-2 logarithm of a type's size in bytes, the scale of its accesses.
+fn scale_of(ty: clif::Type) -> u32 {
+    return match ty.bits() {
+        8 => 0
+        16 => 1
+        32 => 2
+        else => 3
+    }
+} scale_of
+
+/// A new register holding `p + offset`.
+fn ArmSelector.address(mut self, p: clif::Value, func: clif::Function, offset: i64) -> machinst::Reg {
+    let base = mut self.src(p, func)
+    if offset == 0 {
+        return base
+    }
+    return mut self.added(base, imm: offset)
+} ArmSelector.address
+
+/// A load, zero-extending a narrow integer; a 128-bit one in two halves.
+fn ArmSelector.load(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value, offset: i32) {
+    let result = result_of(func, inst, alloc: self.alloc)
+    let ty = func.value_type(result)
+    let dst = mut self.reg(result, func)
+    if ty == clif::Type.Int128 {
+        let base = mut self.address(p, func, offset: i64.widen(offset))
+        let dst_high = mut self.high(result, func)
+        mut self.emit(aarch64::Inst.Ldr(width: aarch64::Width.Bits64, dst: dst, src: aarch64::Amode.at(base, disp: 0)))
+        mut self.emit(aarch64::Inst.Ldr(width: aarch64::Width.Bits64, dst: dst_high, src: aarch64::Amode.at(base, disp: 8)))
+        return
+    }
+    let mem = mut self.amode(p, func, offset: i64.widen(offset), scale: scale_of(ty))
+    if self.code.is_float(dst) {
+        mut self.emit(aarch64::Inst.LdrFloat(prec: precision(ty), dst: dst, src: mem))
+        return
+    }
+    match ty.bits() {
+        8 => mut self.emit(aarch64::Inst.LdrSized(kind: aarch64::LoadKind.Byte, dst: dst, src: mem))
+        16 => mut self.emit(aarch64::Inst.LdrSized(kind: aarch64::LoadKind.Half, dst: dst, src: mem))
+        else => mut self.emit(aarch64::Inst.Ldr(width: width_of(ty), dst: dst, src: mem))
+    }
+} ArmSelector.load
+
+/// A store, of the zero register for a zero constant; a 128-bit one in two halves.
+fn ArmSelector.store(mut self, func: clif::Function, x: clif::Value, p: clif::Value, offset: i32) {
+    let ty = func.value_type(x)
+    if ty == clif::Type.Int128 {
+        let low = mut self.src(x, func)
+        let high = mut self.src_high(x, func)
+        let base = mut self.address(p, func, offset: i64.widen(offset))
+        mut self.emit(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: low, dst: aarch64::Amode.at(base, disp: 0)))
+        mut self.emit(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: high, dst: aarch64::Amode.at(base, disp: 8)))
+        return
+    }
+    var reg = aarch64::SP
+    if self.facts.constant(x, func) != Some(0) {
+        reg = mut self.src(x, func)
+    }
+    let mem = mut self.amode(p, func, offset: i64.widen(offset), scale: scale_of(ty))
+    if reg != aarch64::SP and self.code.is_float(reg) {
+        mut self.emit(aarch64::Inst.StrFloat(prec: precision(ty), src: reg, dst: mem))
+        return
+    }
+    match ty.bits() {
+        8 => mut self.emit(aarch64::Inst.StrSized(kind: aarch64::StoreKind.Byte, src: reg, dst: mem))
+        16 => mut self.emit(aarch64::Inst.StrSized(kind: aarch64::StoreKind.Half, src: reg, dst: mem))
+        else => mut self.emit(aarch64::Inst.Str(width: width_of(ty), src: reg, dst: mem))
+    }
+} ArmSelector.store
+
+/// The size of an atomic access to a type.
+fn atomic_size(ty: clif::Type) -> aarch64::Size {
+    return match ty.bits() {
+        8 => aarch64::Size.Byte
+        16 => aarch64::Size.Half
+        32 => aarch64::Size.Word
+        else => aarch64::Size.Double
+    }
+} atomic_size
+
+/// A load-acquire, zero-extending a narrow integer.
+fn ArmSelector.atomic_load(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value) {
+    let ty = func.value_type(result_of(func, inst, alloc: self.alloc))
+    let base = mut self.src(p, func)
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.Ldar(size: atomic_size(ty), dst: dst, base: base))
+} ArmSelector.atomic_load
+
+/// A store-release.
+fn ArmSelector.atomic_store(mut self, func: clif::Function, x: clif::Value, p: clif::Value) {
+    let ty = func.value_type(x)
+    let value = mut self.src(x, func)
+    let base = mut self.src(p, func)
+    mut self.emit(aarch64::Inst.Stlr(size: atomic_size(ty), src: value, base: base))
+} ArmSelector.atomic_store
+
+/// An atomic read-modify-write giving the previous value, through an exclusive loop.
+fn ArmSelector.atomic_rmw(mut self, func: clif::Function, inst: clif::Inst, op: clif::AtomicRmwOp, p: clif::Value, x: clif::Value) {
+    let ty = func.value_type(x)
+    let addr = mut self.src(p, func)
+    let operand = mut self.src(x, func)
+    let dst = mut self.dst_of(func, inst)
+    let temp = mut self.temp(false)
+    let status = mut self.temp(false)
+    let applied = match op {
+        clif::AtomicRmwOp.Add => aarch64::AtomicOp.Add
+        clif::AtomicRmwOp.And => aarch64::AtomicOp.And
+        clif::AtomicRmwOp.Or => aarch64::AtomicOp.Orr
+        clif::AtomicRmwOp.Xor => aarch64::AtomicOp.Eor
+        clif::AtomicRmwOp.Xchg => aarch64::AtomicOp.Xchg
+    }
+    mut self.emit(aarch64::Inst.AtomicRmwLoop(op: applied, size: atomic_size(ty), addr: addr, operand: operand, old: dst, temp: temp, status: status))
+} ArmSelector.atomic_rmw
+
+/// An atomic compare-and-swap giving the value memory held, through an exclusive loop comparing
+/// it with the expected value zero-extended as the exclusive load extends it.
+fn ArmSelector.atomic_cas(mut self, func: clif::Function, inst: clif::Inst, p: clif::Value, e: clif::Value, x: clif::Value) {
+    let ty = func.value_type(x)
+    let addr = mut self.src(p, func)
+    let given = mut self.src(e, func)
+    let expected = mut self.full(given, ty, signed: false)
+    let replacement = mut self.src(x, func)
+    let dst = mut self.dst_of(func, inst)
+    let status = mut self.temp(false)
+    mut self.emit(aarch64::Inst.AtomicCasLoop(size: atomic_size(ty), addr: addr, expected: expected, replacement: replacement, old: dst, status: status))
+} ArmSelector.atomic_cas
+
+/// A symbol's address, or a thread-local variable's through its descriptor.
+fn ArmSelector.global_value(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, global_value: clif::GlobalValue) {
+    let data = func.global_value_data(global_value)
+    let dst = mut self.dst_of(func, inst)
+    if opcode == clif::Opcode.TlsValue {
+        let temp = mut self.temp(false)
+        mut self.emit(aarch64::Inst.TlsDesc(symbol: machinst::Symbol.Name(data.name), temp: temp))
+        mut self.mov(dst, src: aarch64::X0)
+        return
+    }
+    mut self.symbol_address(dst, name: data.name, colocated: data.colocated)
+} ArmSelector.global_value
+
+/// How code takes a symbol's address: relative to the code when the symbol is in this object,
+/// from its global offset table entry in position-independent code, else from a literal word.
+fn ArmSelector.address_mode(self, colocated: bool) -> aarch64::AddressMode {
+    if colocated {
+        return aarch64::AddressMode.Near
+    }
+    if self.isa.pic {
+        return aarch64::AddressMode.Got
+    }
+    return aarch64::AddressMode.Far
+} ArmSelector.address_mode
+
+fn ArmSelector.symbol_address(mut self, dst: machinst::Reg, name: clif::ExternalName, colocated: bool) {
+    mut self.emit(aarch64::Inst.Address(dst: dst, symbol: machinst::Symbol.Name(name), mode: self.address_mode(colocated)))
+} ArmSelector.symbol_address
+
+/// A direct call: a `bl` when the callee is in this object, else a call through its address.
+fn ArmSelector.call(mut self, func: clif::Function, inst: clif::Inst, func_ref: clif::FuncRef, args: Slice[clif::Value]) {
+    let ext = func.ext_func(func_ref)
+    var target = aarch64::CallTarget.Direct(machinst::Symbol.Name(ext.name))
+    if not ext.colocated {
+        let callee = mut self.temp(false)
+        mut self.symbol_address(callee, name: ext.name, colocated: false)
+        target = aarch64::CallTarget.Indirect(callee)
+    }
+    mut self.call_with(func, inst, sig: func.imported_signature(ext.signature), target, args)
+} ArmSelector.call
+
+fn ArmSelector.call_indirect(mut self, func: clif::Function, inst: clif::Inst, sig_ref: clif::SigRef, callee: clif::Value, args: Slice[clif::Value]) {
+    let reg = mut self.src(callee, func)
+    mut self.call_with(func, inst, sig: func.imported_signature(sig_ref), target: aarch64::CallTarget.Indirect(reg), args)
+} ArmSelector.call_indirect
+
+/// A call: the arguments moved where the signature places them, then the results taken from
+/// where it returns them.
+fn ArmSelector.call_with(mut self, func: clif::Function, inst: clif::Inst, sig: clif::Signature, target: aarch64::CallTarget, args: Slice[clif::Value]) {
+    let placed = aarch64::places(sig, floats: self.isa.floats, alloc: self.alloc)
+    let passed = mut self.pass_all(func, values: args, placed: placed.params.view())
+    var returned = machinst::RegSet.empty()
+    for place in placed.returns {
+        match place {
+            aarch64::Place.Reg(reg) => {
+                returned = returned.plus(reg)
+            }
+            aarch64::Place.Stack(_) => {
+                expect false
+            }
+        }
+    }
+    mut self.emit(aarch64::Inst.Call(target: target, args: passed, results: returned, clobbers: aarch64::caller_saved()))
+    var index: usize = 0
+    for result in func.inst_results(inst, alloc: self.alloc) {
+        let low = mut self.reg(result, func)
+        expect index < placed.returns.len()
+        mut self.take_result(low, place: placed.returns[index])
+        index += 1
+        if func.value_type(result) == clif::Type.Int128 {
+            let high = mut self.high(result, func)
+            expect index < placed.returns.len()
+            mut self.take_result(high, place: placed.returns[index])
+            index += 1
+        }
+    }
+} ArmSelector.call_with
+
+/// Moves values where places pass them, two places for a 128-bit one, giving the registers they
+/// pass in.
+fn ArmSelector.pass_all(mut self, func: clif::Function, values: Slice[clif::Value], placed: Slice[aarch64::Place]) -> machinst::RegSet {
+    var passed = machinst::RegSet.empty()
+    var at: usize = 0
+    for value in values {
+        expect at < placed.len()
+        passed = passed.union(mut self.pass(value, func, high: false, place: placed[at]))
+        at += 1
+        if func.value_type(value) == clif::Type.Int128 {
+            expect at < placed.len()
+            passed = passed.union(mut self.pass(value, func, high: true, place: placed[at]))
+            at += 1
+        }
+    }
+    return passed
+} ArmSelector.pass_all
+
+/// Moves an argument, or a 128-bit one's high half, where a call takes it, giving the register
+/// it passes in.
+fn ArmSelector.pass(mut self, arg: clif::Value, func: clif::Function, high: bool, place: aarch64::Place) -> machinst::RegSet {
+    var reg = NO_REG
+    if high {
+        reg = mut self.src_high(arg, func)
+    } else {
+        match self.facts.constant(arg, func) {
+            Some(bits) => {
+                match place {
+                    aarch64::Place.Reg(target) => {
+                        if not aarch64::is_vector(target) {
+                            mut self.emit(aarch64::Inst.MovImm(dst: target, imm: bits))
+                            return machinst::RegSet.of(target)
+                        }
+                    }
+                    aarch64::Place.Stack(_) => {}
+                }
+            }
+            None => {}
+        }
+        reg = mut self.src(arg, func)
+    }
+    match place {
+        aarch64::Place.Reg(target) => {
+            mut self.mov(target, src: reg)
+            return machinst::RegSet.of(target)
+        }
+        aarch64::Place.Stack(offset) => {
+            let dst = aarch64::Amode.at(aarch64::SP, disp: i32.fit(offset))
+            if self.code.is_float(reg) {
+                mut self.emit(aarch64::Inst.StrFloat(prec: precision(func.value_type(arg)), src: reg, dst: dst))
+            } else {
+                mut self.emit(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: reg, dst: dst))
+            }
+            return machinst::RegSet.empty()
+        }
+    }
+} ArmSelector.pass
+
+fn ArmSelector.take_result(mut self, reg: machinst::Reg, place: aarch64::Place) {
+    match place {
+        aarch64::Place.Reg(returned) => mut self.mov(reg, src: returned)
+        aarch64::Place.Stack(_) => {
+            expect false
+        }
+    }
+} ArmSelector.take_result
+
+/// A return: the results moved where the function's signature returns them.
+fn ArmSelector.ret(mut self, func: clif::Function, args: Slice[clif::Value]) {
+    let placed = aarch64::places(func.signature, floats: self.isa.floats, alloc: self.alloc)
+    let passed = mut self.pass_all(func, values: args, placed: placed.returns.view())
+    mut self.emit(aarch64::Inst.Return(results: passed))
+} ArmSelector.ret

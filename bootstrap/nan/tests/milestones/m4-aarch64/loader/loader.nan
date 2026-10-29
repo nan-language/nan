@@ -1,0 +1,103 @@
+//! Entry of the loader and its reports on the serial port.
+
+/// The polls of the flags before a byte is written whatever they say.
+const TRANSMIT_POLLS: u32 = 100_000
+
+/// The base of the virt board's first PL011.
+const PL011_BASE: u64 = 0x0900_0000
+
+layout Flags: u32 le {
+    reserved_low: bit 0..=3
+    receive_empty: bit 4
+    transmit_full: bit 5
+    reserved: rest
+} Flags
+
+registers Pl011 {
+    data: u8 at 0x0 write
+    flags: Flags at 0x18 read
+} Pl011
+
+fn main(take m: boot::Machine) -> Never limits stack 16_384 {
+    let alloc = m.alloc()
+    let read = attempt mut m.with_services(fn(services: boot::Services) -> Untrusted[mem::Bytes] fails boot::ServiceError {
+        return try services.read_file("kernel.elf", alloc)
+    })
+    let k = take m.exit_services()
+    var uart = trusted "the virt board maps its first PL011 at 0x0900_0000 and nothing else maps it" { hw::Mmio[Pl011].map(PL011_BASE) }
+    match read {
+        Ok(image) => {
+            let outcome = attempt place_all(image.view())
+            match outcome {
+                Ok(count) => {
+                    say(mut uart, text: "loader: copied ")
+                    say_number(mut uart, value: u64.widen(count))
+                    say(mut uart, text: " loadable segments of kernel.elf to their physical addresses\n")
+                }
+                Err(error) => {
+                    say(mut uart, text: "loader: kernel.elf is not a loadable image: ")
+                    say_reason(mut uart, error)
+                    say(mut uart, text: "\n")
+                }
+            }
+        }
+        Err(error) => {
+            say(mut uart, text: "loader: kernel.elf unreadable\n")
+            discard error
+        }
+    }
+    var spins: u64 = 0
+    loop {
+        spins = spins.wrapping_add(1)
+    }
+} main
+
+/// Writes why an image cannot be placed.
+fn say_reason(mut uart: hw::Mmio[Pl011], error: ImageError) {
+    match error {
+        ImageError.NotElf => say(mut uart, text: "not an aarch64 ELF executable")
+        ImageError.Truncated => say(mut uart, text: "truncated")
+        ImageError.Inverted => say(mut uart, text: "a segment holds more bytes than its memory")
+        ImageError.Unmapped => say(mut uart, text: "a segment lies outside the mapped memory")
+        ImageError.Misplaced => say(mut uart, text: "a segment's memory differs from its bytes")
+    }
+} say_reason
+
+/// Writes text to the serial port.
+fn say(mut uart: hw::Mmio[Pl011], text: Str) {
+    for byte in text.as_bytes() {
+        put(mut uart, byte)
+    }
+} say
+
+/// Writes a byte once the transmitter has room, or after `TRANSMIT_POLLS` polls.
+fn put(mut uart: hw::Mmio[Pl011], byte: u8) {
+    for _ in 0..<TRANSMIT_POLLS {
+        let flags = mut uart.read(Pl011.flags)
+        if not flags.transmit_full {
+            break
+        }
+    }
+    mut uart.write(Pl011.data, value: byte)
+} put
+
+/// Writes a number in decimal to the serial port.
+fn say_number(mut uart: hw::Mmio[Pl011], value: u64) {
+    var digits = Array[u8, 20].filled(b'0')
+    var rest = value
+    var leading: usize = 19
+    for position in 0usize..<20 {
+        let at = 19 - position
+        digits[at] = b'0' + u8.fit(rest % 10)
+        rest = rest / 10
+        if digits[at] != b'0' {
+            leading = at
+        }
+    }
+    let Some(parts) = digits.view().split_at(leading) else {
+        return
+    }
+    for byte in parts.tail {
+        put(mut uart, byte)
+    }
+} say_number

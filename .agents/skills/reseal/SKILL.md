@@ -1,9 +1,9 @@
 ---
 name: reseal
-description: Update the API snapshots and seals of a sealed workspace (toolchain/, the M4 scenario) when nan verify or the self-check reports trust.unsealed, api.stale or api.weakening-pending
+description: Update the API snapshots and seals of a sealed workspace (toolchain/, the M4 scenarios) when nan verify or the self-check reports trust.unsealed, api.stale or api.weakening-pending
 ---
 
-A seal states that its principal reviewed the item. The sealed workspaces are `toolchain/` (principal `m5-review`) and `bootstrap/nan/tests/milestones/m4/` (principal `m4-review`).
+A seal states that its principal reviewed the item. The sealed workspaces are `toolchain/` (principal `m5-review`) and the M4 scenarios `bootstrap/nan/tests/milestones/m4/` and `bootstrap/nan/tests/milestones/m4-aarch64/` (principal `m4-review`).
 
 1. Run `nan verify` in the workspace and read each item it lists. For a lapsed seal it names what changed: the item hash or the closure entries. Review that change in the item and in each named item before sealing it.
 2. Copy the workspace outside every git working tree, so that the author rule does not apply, and run every step below in the copy.

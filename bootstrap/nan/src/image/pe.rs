@@ -1,7 +1,8 @@
-//! Writes `x86_64-uefi` images: PE32+ EFI applications with one section per segment and the base
+//! Writes UEFI-target images: PE32+ EFI applications with one section per segment and the base
 //! relocations of every 64-bit absolute address, so the firmware may load them anywhere.
 
 use super::{Access, Linked, PAGE};
+use crate::workspace::Arch;
 
 /// The address an image is linked for; its headers occupy its first page.
 const IMAGE_BASE: u64 = 0x0040_0000;
@@ -23,6 +24,7 @@ const HEADERS: u64 = DOS_HEADER + SIGNATURE.len() as u64 + FILE_HEADER + OPTIONA
 const SECTION_HEADER: u64 = 40;
 
 const MACHINE_X86_64: u16 = 0x8664;
+const MACHINE_AARCH64: u16 = 0xAA64;
 const EXECUTABLE_LARGE_ADDRESS_AWARE: u16 = 0x0022;
 const PE32_PLUS: u16 = 0x020B;
 const SUBSYSTEM_EFI_APPLICATION: u16 = 10;
@@ -72,7 +74,7 @@ pub fn base_relocations(rvas: &[u64]) -> Vec<u8> {
 
 /// The bytes of a PE32+ EFI application holding the linked object's segments, linked at
 /// `IMAGE_BASE` and entered at the address `entry`.
-pub fn write(linked: &Linked, entry: u64) -> Vec<u8> {
+pub fn write(linked: &Linked, entry: u64, arch: Arch) -> Vec<u8> {
     let mut sections: Vec<Section> = linked
         .segments
         .iter()
@@ -129,7 +131,11 @@ pub fn write(linked: &Linked, entry: u64) -> Vec<u8> {
     out.resize(E_LFANEW, 0);
     out.extend_from_slice(&(DOS_HEADER as u32).to_le_bytes());
     out.extend_from_slice(SIGNATURE);
-    out.extend_from_slice(&MACHINE_X86_64.to_le_bytes());
+    let machine = match arch {
+        Arch::Amd64 => MACHINE_X86_64,
+        Arch::Aarch64 => MACHINE_AARCH64,
+    };
+    out.extend_from_slice(&machine.to_le_bytes());
     out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
     out.extend_from_slice(&[0; 12]);
     out.extend_from_slice(&(OPTIONAL_HEADER as u16).to_le_bytes());

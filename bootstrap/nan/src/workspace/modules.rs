@@ -61,13 +61,10 @@ pub fn assign(
 
 /// The concrete targets a variant selector matches.
 fn matches(selector: &str) -> Vec<Target> {
-    match selector {
-        "x86_64-host" | "host" => vec![Target::Host],
-        "x86_64-uefi" | "uefi" => vec![Target::Uefi],
-        "x86_64-bare" | "bare" => vec![Target::Bare],
-        "x86_64" => vec![Target::Host, Target::Uefi, Target::Bare],
-        _ => Vec::new(),
-    }
+    Target::CONCRETE
+        .into_iter()
+        .filter(|target| target.selected_by(selector))
+        .collect()
 }
 
 /// Checks the variants of each module and that each module directory holds its summary file.

@@ -1,4 +1,4 @@
-//! The `x86_64-host` target, everything Linux-specific: the program entry seam `main`, the executor threads with their io_uring rings, termination requests, which a thread of their own reads from a `signalfd`, the support routines' calls into the system, and linking the image with `cc`. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
+//! The host targets, everything Linux-specific: the program entry seam `main`, the executor threads with their io_uring rings, termination requests, which a thread of their own reads from a `signalfd`, the support routines' calls into the system, and linking the image with the host target's linker. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
 
 const MMAP_READ_WRITE: i64 = 3
 
@@ -78,17 +78,32 @@ const SIGACTION: u64 = 152
 
 const SIGACTION_FLAGS: u64 = 136
 
-/// The offsets in a `ucontext_t` of the registers a handler reads and redirects, and of the
-/// fault address in a `siginfo_t`.
-const CONTEXT_RDI: u64 = 40 + 8 * 8u64
+/// The offset of the fault address in a `siginfo_t`.
+const FAULT_ADDRESS: u64 = 16
 
-const CONTEXT_RBP: u64 = 40 + 10 * 8u64
+/// The offsets in a `ucontext_t` of the registers a stop or fault handler reads and redirects:
+/// the register a redirected call passes its argument in, the frame and stack pointers, the
+/// instruction pointer, and the link register a leaf's return address lives in where the
+/// architecture has one.
+struct Context derives Copy {
+    arg: u64
+    fp: u64
+    sp: u64
+    ip: u64
+    link: Option[u64]
+} Context
 
-const CONTEXT_RSP: u64 = 40 + 15 * 8u64
-
-const CONTEXT_RIP: u64 = 40 + 16 * 8u64
-
-const CONTEXT_FAULT_ADDRESS: u64 = 16
+/// The register offsets of a host target's architecture.
+fn Context.of(target: workspace::Target) -> Context {
+    let Some(arch) = target.arch() else {
+        expect false
+        return Context(arg: 0, fp: 0, sp: 0, ip: 0, link: None)
+    }
+    return match arch {
+        workspace::Arch.Amd64 => Context(arg: 40 + 8 * 8u64, fp: 40 + 10 * 8u64, sp: 40 + 15 * 8u64, ip: 40 + 16 * 8u64, link: None)
+        workspace::Arch.Aarch64 => Context(arg: 184, fp: 416, sp: 432, ip: 440, link: Some(424u64))
+    }
+} Context.of
 
 /// The size of each thread's signal stack and of its stack for stack overflow reports.
 const HOST_SIGNAL_STACK: u64 = 65_536
@@ -426,11 +441,10 @@ fn critical_at(mut lo: Lowering, mut fx: Fx, address: clif::Value, unknown: bool
 
 /// `Preempt(signal, info, context)`: the handler of the stop signal. When the task the thread
 /// runs is asked to stop, holds no lock and has no frame of a function it does not stop inside,
-/// the handler makes it resume in `Stop` on its own stack, below the interrupted frame and its
-/// red zone; otherwise the task runs on and the stop signal comes again. The two words at the
-/// stack pointer stand for the return address of a function interrupted in its prologue or
-/// epilogue, before its frame pointer is set or after it is restored.
+/// the handler makes it resume in `Stop` on its own stack, below the interrupted frame; otherwise
+/// the task runs on and the stop signal comes again.
 fn host_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
+    let ctx = Context.of(lo.ck.db().target)
     let thread = mut lo.thread(mut fx)
     let outside = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: thread, y: 0)
     mut fx.if_true(outside, then: fn(mut then_fx: Fx) {
@@ -445,40 +459,53 @@ fn host_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
     let locks = mut fx.load(PTR, addr: thread, offset: THREAD_LOCKS)
     let unlocked = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: locks, y: 0)
     let asked_unlocked = mut fx.b.band(asked, y: unlocked)
-    let rip = mut fx.load(PTR, addr: context, offset: CONTEXT_RIP)
-    let rsp = mut fx.load(PTR, addr: context, offset: CONTEXT_RSP)
-    let rbp = mut fx.load(PTR, addr: context, offset: CONTEXT_RBP)
+    let ip = mut fx.load(PTR, addr: context, offset: ctx.ip)
+    let sp = mut fx.load(PTR, addr: context, offset: ctx.sp)
+    let fp = mut fx.load(PTR, addr: context, offset: ctx.fp)
     let low = mut fx.load(PTR, addr: record, offset: TASK_GUARD)
     let base = mut fx.load(PTR, addr: record, offset: TASK_STACK)
     let size = mut fx.load(PTR, addr: record, offset: TASK_STACK_SIZE)
     let high = mut fx.b.iadd(base, y: size)
-    let above = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: rsp, y: low)
-    let room = mut fx.b.iadd_imm_s(rsp, y: 16)
+    let above = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: sp, y: low)
+    let room = mut fx.b.iadd_imm_s(sp, y: 16)
     let below = mut fx.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: room, y: high)
     let on_stack = mut fx.b.band(above, y: below)
     let stopping = mut fx.b.band(asked_unlocked, y: on_stack)
     mut fx.if_true(stopping, then: fn[mut lo](mut stop_fx: Fx) {
-        let in_rip = critical_at(mut lo, fx: mut stop_fx, address: rip, unknown: true)
-        let top = mut stop_fx.load(PTR, addr: rsp, offset: 0)
-        let in_top = critical_at(mut lo, fx: mut stop_fx, address: top, unknown: false)
-        let next = mut stop_fx.load(PTR, addr: rsp, offset: 8)
-        let in_next = critical_at(mut lo, fx: mut stop_fx, address: next, unknown: false)
-        let busy_top = mut stop_fx.b.bor(in_rip, y: in_top)
-        let busy = mut stop_fx.b.bor(busy_top, y: in_next)
+        let in_ip = critical_at(mut lo, fx: mut stop_fx, address: ip, unknown: true)
+        // The return address of a function interrupted in its prologue or epilogue, before its
+        // frame pointer is set or after it is restored, lives in the link register where the
+        // architecture has one, and otherwise in the two words at the stack pointer.
+        var busy = in_ip
+        match ctx.link {
+            Some(link) => {
+                let address = mut stop_fx.load(PTR, addr: context, offset: link)
+                let in_link = critical_at(mut lo, fx: mut stop_fx, address, unknown: false)
+                busy = mut stop_fx.b.bor(in_ip, y: in_link)
+            }
+            None => {
+                let top = mut stop_fx.load(PTR, addr: sp, offset: 0)
+                let in_top = critical_at(mut lo, fx: mut stop_fx, address: top, unknown: false)
+                let next = mut stop_fx.load(PTR, addr: sp, offset: 8)
+                let in_next = critical_at(mut lo, fx: mut stop_fx, address: next, unknown: false)
+                let busy_top = mut stop_fx.b.bor(in_ip, y: in_top)
+                busy = mut stop_fx.b.bor(busy_top, y: in_next)
+            }
+        }
         let free = mut stop_fx.b.bxor_imm_s(busy, y: 1)
         mut stop_fx.if_true(free, then: fn[mut lo](mut free_fx: Fx) {
-            preempt_frames(mut lo, fx: mut free_fx, context, record, rsp, rbp, low, high, free)
+            preempt_frames(mut lo, fx: mut free_fx, ctx, context, record, sp, fp, low, high, free)
         })
     })
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } host_preempt
 
-/// The rest of `Preempt` once neither the interrupted code nor the return addresses at the stack
-/// pointer forbid stopping, `free` holding: walks the frame pointers from `rbp` down the task's
-/// stack, between `low` and `high`, and when no frame forbids it, makes the task resume in
-/// `Stop`.
-fn preempt_frames(mut lo: Lowering, mut fx: Fx, context: clif::Value, record: clif::Value, rsp: clif::Value, rbp: clif::Value, low: clif::Value, high: clif::Value, free: clif::Value) {
-    var walk_start = Array[clif::Value, 2].filled(rbp)
+/// The rest of `Preempt` once neither the interrupted code nor the return address of a function
+/// interrupted in its prologue or epilogue forbids stopping, `free` holding: walks the frame
+/// pointers from `fp` down the task's stack, between `low` and `high`, and when no frame forbids
+/// it, makes the task resume in `Stop`.
+fn preempt_frames(mut lo: Lowering, mut fx: Fx, ctx: Context, context: clif::Value, record: clif::Value, sp: clif::Value, fp: clif::Value, low: clif::Value, high: clif::Value, free: clif::Value) {
+    var walk_start = Array[clif::Value, 2].filled(fp)
     walk_start[1] = free
     let walked = mut fx.repeat(walk_start.view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
         expect current.len() > 1
@@ -511,17 +538,30 @@ fn preempt_frames(mut lo: Lowering, mut fx: Fx, context: clif::Value, record: cl
     })
     let walked_free = walked[1]
     mut fx.if_true(walked_free, then: fn[mut lo](mut then_fx: Fx) {
-        let lowered = mut then_fx.b.iadd_imm_s(rsp, y: -128)
-        let aligned = mut then_fx.b.band_imm_s(lowered, y: -16)
-        let entry_slot = mut then_fx.b.iadd_imm_s(aligned, y: -8)
-        let zero_word = mut then_fx.ptr(0)
-        mut then_fx.store(zero_word, addr: entry_slot, offset: 0)
-        mut then_fx.store(entry_slot, addr: context, offset: CONTEXT_RSP)
+        // Resume in `Stop` below the interrupted frame: where the return address lives on the
+        // stack, past the red zone and behind a null return; where it lives in the link register,
+        // at the aligned stack pointer with that register cleared.
+        var resumed = sp
+        match ctx.link {
+            Some(link) => {
+                resumed = mut then_fx.b.band_imm_s(sp, y: -16)
+                let zero_word = mut then_fx.ptr(0)
+                mut then_fx.store(zero_word, addr: context, offset: link)
+            }
+            None => {
+                let lowered = mut then_fx.b.iadd_imm_s(sp, y: -128)
+                let aligned = mut then_fx.b.band_imm_s(lowered, y: -16)
+                resumed = mut then_fx.b.iadd_imm_s(aligned, y: -8)
+                let zero_word = mut then_fx.ptr(0)
+                mut then_fx.store(zero_word, addr: resumed, offset: 0)
+            }
+        }
+        mut then_fx.store(resumed, addr: context, offset: ctx.sp)
         let stop_id = mut lo.routine(Routine.Stop)
         let stop_ref = mut lo.func_ref(mut then_fx, id: stop_id)
         let stop_address = mut then_fx.b.func_addr(PTR, func_ref: stop_ref)
-        mut then_fx.store(stop_address, addr: context, offset: CONTEXT_RIP)
-        mut then_fx.store(record, addr: context, offset: CONTEXT_RDI)
+        mut then_fx.store(stop_address, addr: context, offset: ctx.ip)
+        mut then_fx.store(record, addr: context, offset: ctx.arg)
     })
 } preempt_frames
 
@@ -530,7 +570,8 @@ fn preempt_frames(mut lo: Lowering, mut fx: Fx, context: clif::Value, record: cl
 /// called at the call whose frame does not fit; any other fault restores the default action
 /// and faults again.
 fn host_overflow(mut lo: Lowering, mut fx: Fx, info: clif::Value, context: clif::Value) {
-    let fault = mut fx.load(PTR, addr: info, offset: CONTEXT_FAULT_ADDRESS)
+    let ctx = Context.of(lo.ck.db().target)
+    let fault = mut fx.load(PTR, addr: info, offset: FAULT_ADDRESS)
     let thread = mut lo.thread(mut fx)
     let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
     let current = mut fx.choose(inside, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
@@ -566,43 +607,72 @@ fn host_overflow(mut lo: Lowering, mut fx: Fx, info: clif::Value, context: clif:
         discard mut lo.call_libc(mut then_fx, name: "signal", args: signal_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
         mut then_fx.b.ret(mem::List[clif::Value].empty(then_fx.alloc).view())
     })
-    let rip = mut fx.load(PTR, addr: context, offset: CONTEXT_RIP)
-    let rsp = mut fx.load(PTR, addr: context, offset: CONTEXT_RSP)
-    let rbp = mut fx.load(PTR, addr: context, offset: CONTEXT_RBP)
-    let holding = function_at(mut lo, mut fx, address: rip)
-    let entering = mut fx.b.icmp(clif::IntCC.Equal, x: holding.start, y: rip)
-    let pushed = mut fx.b.iadd_imm_s(rsp, y: -8)
-    let calling = mut fx.b.icmp(clif::IntCC.Equal, x: fault, y: pushed)
-    let caller_types = Array[clif::Type, 2].filled(PTR)
-    let caller = mut fx.choose(entering, results: caller_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
-        var entered = mem::List[clif::Value].empty(yes_fx.alloc)
-        mut entered.push(mut yes_fx.load(PTR, addr: rsp, offset: 0))
-        mut entered.push(rbp)
-        return entered
-    }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
-        return mut no_fx.choose(calling, results: caller_types.view(), then: fn(mut call_fx: Fx) -> mem::List[clif::Value] {
-            var called = mem::List[clif::Value].empty(call_fx.alloc)
-            mut called.push(mut call_fx.b.iadd_imm_s(rip, y: 1))
-            mut called.push(rbp)
-            return called
-        }, otherwise: fn(mut body_fx: Fx) -> mem::List[clif::Value] {
-            var framed = mem::List[clif::Value].empty(body_fx.alloc)
-            mut framed.push(mut body_fx.load(PTR, addr: rbp, offset: 8))
-            mut framed.push(mut body_fx.load(PTR, addr: rbp, offset: 0))
-            return framed
-        })
-    })
+    let ip = mut fx.load(PTR, addr: context, offset: ctx.ip)
+    let sp = mut fx.load(PTR, addr: context, offset: ctx.sp)
+    let fp = mut fx.load(PTR, addr: context, offset: ctx.fp)
+    let holding = function_at(mut lo, mut fx, address: ip)
+    let entering = mut fx.b.icmp(clif::IntCC.Equal, x: holding.start, y: ip)
+    let caller = overflow_caller(mut fx, ctx, context, entering, fault, ip, sp, fp)
     let top = mut fx.load(PTR, addr: thread, offset: THREAD_TRAP_STACK)
-    let entry_slot = mut fx.b.iadd_imm_s(top, y: -8)
-    mut fx.store(caller[0], addr: entry_slot, offset: 0)
-    mut fx.store(entry_slot, addr: context, offset: CONTEXT_RSP)
-    mut fx.store(caller[1], addr: context, offset: CONTEXT_RBP)
+    // Resume in `OverflowRaise` on the trap stack as if the faulting site had called it: with the
+    // return address where a call leaves it — behind the stack pointer, or in the link register.
+    match ctx.link {
+        Some(link) => {
+            let aligned = mut fx.b.band_imm_s(top, y: -16)
+            mut fx.store(aligned, addr: context, offset: ctx.sp)
+            mut fx.store(caller[0], addr: context, offset: link)
+        }
+        None => {
+            let entry_slot = mut fx.b.iadd_imm_s(top, y: -8)
+            mut fx.store(caller[0], addr: entry_slot, offset: 0)
+            mut fx.store(entry_slot, addr: context, offset: ctx.sp)
+        }
+    }
+    mut fx.store(caller[1], addr: context, offset: ctx.fp)
     let raise_id = mut lo.routine(Routine.OverflowRaise)
     let raise_ref = mut lo.func_ref(mut fx, id: raise_id)
     let raise_address = mut fx.b.func_addr(PTR, func_ref: raise_ref)
-    mut fx.store(raise_address, addr: context, offset: CONTEXT_RIP)
+    mut fx.store(raise_address, addr: context, offset: ctx.ip)
     mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
 } host_overflow
+
+/// The caller the faulting call returns to, and that caller's frame pointer: a function faulting
+/// as it is entered has not built its frame, so its return address is the one the call left — in
+/// the link register where the architecture has one, and otherwise at the stack pointer, unless
+/// the push growing the frame is what faulted; a function faulting deeper has its caller in its
+/// frame record.
+fn overflow_caller(mut fx: Fx, ctx: Context, context: clif::Value, entering: clif::Value, fault: clif::Value, ip: clif::Value, sp: clif::Value, fp: clif::Value) -> mem::List[clif::Value] {
+    let caller_types = Array[clif::Type, 2].filled(PTR)
+    match ctx.link {
+        Some(link) => {
+            let address = mut fx.load(PTR, addr: context, offset: link)
+            return mut fx.choose(entering, results: caller_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+                return yes_fx.list2(address, b: fp)
+            }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+                let returns_to = mut no_fx.load(PTR, addr: fp, offset: 8)
+                let frame = mut no_fx.load(PTR, addr: fp, offset: 0)
+                return no_fx.list2(returns_to, b: frame)
+            })
+        }
+        None => {
+            let pushed = mut fx.b.iadd_imm_s(sp, y: -8)
+            let calling = mut fx.b.icmp(clif::IntCC.Equal, x: fault, y: pushed)
+            return mut fx.choose(entering, results: caller_types.view(), then: fn(mut yes_fx: Fx) -> mem::List[clif::Value] {
+                let returns_to = mut yes_fx.load(PTR, addr: sp, offset: 0)
+                return yes_fx.list2(returns_to, b: fp)
+            }, otherwise: fn(mut no_fx: Fx) -> mem::List[clif::Value] {
+                return mut no_fx.choose(calling, results: caller_types.view(), then: fn(mut call_fx: Fx) -> mem::List[clif::Value] {
+                    let returns_to = mut call_fx.b.iadd_imm_s(ip, y: 1)
+                    return call_fx.list2(returns_to, b: fp)
+                }, otherwise: fn(mut body_fx: Fx) -> mem::List[clif::Value] {
+                    let returns_to = mut body_fx.load(PTR, addr: fp, offset: 8)
+                    let frame = mut body_fx.load(PTR, addr: fp, offset: 0)
+                    return body_fx.list2(returns_to, b: frame)
+                })
+            })
+        }
+    }
+} overflow_caller
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
 /// calling thread being the first, and the reading of termination requests; returns 1 from
@@ -1446,15 +1516,28 @@ fn syscall(mut lo: Lowering, mut fx: Fx, call_number: clif::Value, args: Slice[c
     return first_result(mut lo.call_libc(mut fx, name: "syscall", args: call_words.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
 } syscall
 
-/// Links an object into a position-independent executable at `image` with the `cc` of the
-/// `PATH`; the linker's output when it fails.
-pkg fn host_link(object: Str, image: Str, alloc: mem::Alloc) -> Result[Unit, text::String] {
+/// The linker of a host target: `cc` from the `PATH` when the machine running the toolchain has
+/// the target's architecture, and the GNU cross compiler for that architecture otherwise.
+pkg fn host_linker(target: workspace::Target, alloc: mem::Alloc) -> text::String {
+    if target.arch() == Some(workspace::Arch.running()) {
+        return text::String.of("cc", alloc)
+    }
+    let linker = match target.arch() {
+        Some(workspace::Arch.Aarch64) => "aarch64-linux-gnu-gcc"
+        else => "x86_64-linux-gnu-gcc"
+    }
+    return text::String.of(linker, alloc)
+} host_linker
+
+/// Links an object into a position-independent executable at `image` with the host target's
+/// linker; the linker's output when it fails.
+pkg fn host_link(target: workspace::Target, object: Str, image: Str, alloc: mem::Alloc) -> Result[Unit, text::String] {
     var args = mem::List[text::String].empty(alloc)
     mut args.push(text::String.of("-pie", alloc))
     mut args.push(text::String.of("-o", alloc))
     mut args.push(text::String.of(image, alloc))
     mut args.push(text::String.of(object, alloc))
-    let ran = attempt platform::run_output("cc", args: args.view(), input: None, capture_errors: true, alloc)
+    let ran = attempt platform::run_output(host_linker(target, alloc).as_str(), args: args.view(), input: None, capture_errors: true, alloc)
     match ran {
         Ok(output) => {
             if output.status.is_success() {

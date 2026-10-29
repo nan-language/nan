@@ -53,12 +53,12 @@ test triple_of_two for double { // error: test.target-unreachable
 
 ### Test runs
 
-A **run** is one execution of a test body on one [run target](#emulator-runs). On `x86_64-host` the body is the first task of a new test [domain](11-errors-domains.md#domains), on a new [simulated world](#simulated-capabilities)'s executor, and the run ends once every task of the domain has ended. The target runs when a call of it begins, through any chain of calls, function values, registry fields or `Dyn`, whatever lowering inlines or folds. A run passes when the body returns and the target ran; otherwise it fails with the first of:
+A **run** is one execution of a test body on one [run target](#emulator-runs). On a host target the body is the first task of a new test [domain](11-errors-domains.md#domains), on a new [simulated world](#simulated-capabilities)'s executor, and the run ends once every task of the domain has ended. The target runs when a call of it begins, through any chain of calls, function values, registry fields or `Dyn`, whatever lowering inlines or folds. A run passes when the body returns and the target ran; otherwise it fails with the first of:
 
 - a trap abandons the domain, reported by its [trap report](11-errors-domains.md#trap-reports);
 - a failure escapes the body (`test.escaped-failure`), reported with its variant's path and, when its type implements `Render`, its rendering within a render budget of 4,096 bytes; a trap while rendering it fails the run with that trap's report;
 - the target did not run (`test.target-not-run`);
-- on `x86_64-host`, no task of the domain is ready and no deadline is pending (`test.stalled`);
+- on a host target, no task of the domain is ready and no deadline is pending (`test.stalled`);
 - the run uses more than 10 seconds of host processor time, its process's or its emulator's (`test.timeout`), its domain then being [abandoned](11-errors-domains.md#abandoning-a-domain) without a trap report.
 
 These codes and `test.emulator-unavailable` are the **test-run codes**. `nan test` reports a failing test as [checking commands](33-toolchain.md#checking-commands) state, its cause being its test-run code or trap kind; a test-run code is never a diagnostic. A test passes when every run passes, and reports only its failing run of lowest index. Runs share no state, and their outcomes never depend on how many execute at once.
@@ -395,11 +395,11 @@ A test is affected on a run target when it has no recorded pass there under the 
 
 ## Emulator runs
 
-A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for `x86_64-host`, which is the **run target** of their runs. On `x86_64-host` each run is a host process.
+A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for `x86_64-host`, which is the **run target** of their runs. On a host target each run is a host process.
 
-- On `x86_64-uefi` and `x86_64-bare`, each run boots, under the emulator of the target's [descriptor](27-program-model.md#descriptors), a [test image](30-artefacts.md#lowering) of the test's reach and the support routines. It starts the seeded scheduler on one processor, runs the body as its first task, writes the outcome, test trace and any trap report to the descriptor's serial port, then writes the byte 0 to its [exit port](27-program-model.md#descriptors), which ends the run. The image holds the registry tables that the tested package admits ([contributors](25-registries.md#contributors)).
+- On the machine targets, each run boots, under the emulator of the target's [descriptor](27-program-model.md#descriptors), a [test image](30-artefacts.md#lowering) of the test's reach and the support routines. It starts the seeded scheduler on one processor, runs the body as its first task, writes the outcome, test trace and any trap report to the descriptor's serial port, then writes the byte 0 to its [exit port](27-program-model.md#descriptors), which ends the run. The image holds the registry tables that the tested package admits ([contributors](25-registries.md#contributors)).
 - The run's domain is that boot's kernel domain: a trap halts it, and the report on serial is the run's failure. When no task is ready and no deadline is pending, the processor waits for an interrupt.
-- When the emulator cannot be started, every run on that target fails (`test.emulator-unavailable`).
+- When the emulator cannot be started, or for a host target when the machine running the toolchain has another architecture, every run on that target fails (`test.emulator-unavailable`).
 
 ```nan
 // file: checksum/package.nan

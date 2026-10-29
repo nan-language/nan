@@ -1,4 +1,4 @@
-//! Interrupt delivery on the machine targets: the vector seam, which saves the interrupted state and preempts the interrupted kernel task when told to; the dispatcher, which calls the interrupt fn bound to the fired vector by an `hw::vectors` contribution or by `hw::IrqShared.install`; each CPU's local APIC and timer; and the stopping of the CPUs in a kernel halt.
+//! Interrupt delivery on the machine targets: the x86_64 vector seam, which saves the interrupted state and preempts the interrupted kernel task when told to; the dispatcher both architectures' seams reach, which calls the interrupt fn bound to the fired vector by an `hw::vectors` contribution or by `hw::IrqShared.install`; each CPU's local APIC and timer; and the stopping of the CPUs in a kernel halt.
 
 /// The vectors whose exception pushes an error code the CPU leaves on the stack; every other
 /// vector's stub pushes a zero so each interrupt frame has the same shape.
@@ -74,8 +74,41 @@ const FRAME_RFLAGS: u64 = 152
 
 const FRAME_RSP: u64 = 160
 
-/// The vector of page faults, whose trap frame holds the faulting address.
-const PAGE_FAULT: i64 = 14
+/// The offsets in the frame an architecture's vector seam saves of what the dispatcher,
+/// `hw::TrapFrame` and halt reports read: the error code or syndrome, the interrupted
+/// instruction's address, the processor state holding whether maskable interrupts were enabled,
+/// and the interrupted stack pointer.
+struct SavedFrame derives Copy {
+    code: u64
+    ip: u64
+    state: u64
+    sp: u64
+} SavedFrame
+
+/// The layout of the frame the x86_64 vector seam saves.
+fn x64_frame() -> SavedFrame = SavedFrame(code: FRAME_CODE, ip: FRAME_RIP, state: FRAME_RFLAGS, sp: FRAME_RSP)
+
+/// What the dispatcher knows of an architecture's vectors: the vector of the interrupt a halting
+/// CPU stops the others with, where the dispatcher receives it as a vector; the vector the timer
+/// pacing the kernel fires; the vector of the interrupt controller's spurious interrupts, where
+/// it delivers them as one; the vectors whose interrupt fn's return halts the kernel, as a mask of
+/// the first 64; the vector of page faults, whose trap frame holds the faulting address; and,
+/// where the interrupt controller numbers interrupts past the last vector, the end of the vectors
+/// an `hw::IrqShared` installs on.
+struct Vectors derives Copy {
+    stop: Option[i64]
+    timer: i64
+    spurious: Option[i64]
+    abort_mask: u64
+    page_fault: i64
+    installable_end: Option[i64]
+} Vectors
+
+/// Whether an interrupt fn's return for a vector halts the kernel.
+fn Vectors.aborts(self, vector: i64) -> bool = vector >= 0 and vector < 64 and ((self.abort_mask >> u32.fit(vector)) & 1) == 1
+
+/// What the dispatcher knows of the x86_64 vectors.
+fn x64_vectors() -> Vectors = Vectors(stop: Some(NMI_VECTOR), timer: TIMER_VECTOR, spurious: Some(SPURIOUS_VECTOR), abort_mask: (1u64 << 8) | (1u64 << 18), page_fault: 14, installable_end: None)
 
 /// The interrupt flag of the saved flags.
 const INTERRUPTS_ENABLED: i64 = 0x200
@@ -133,17 +166,8 @@ const TIMER_COUNT: u64 = 0x10_0000
 
 const SPURIOUS_VECTOR: i64 = 0xFF
 
-/// The vector of non-maskable interrupts, and those whose interrupt fn's return halts the
-/// kernel.
+/// The vector of non-maskable interrupts.
 const NMI_VECTOR: i64 = 2
-
-const ABORT_VECTORS: Array[i64, 2] = listed_abort_vectors()
-
-fn listed_abort_vectors() -> Array[i64, 2] {
-    var listed = Array[i64, 2].filled(8)
-    listed[1] = 18
-    return listed
-} listed_abort_vectors
 
 /// The stack the dispatcher and its glue use beside the interrupt fns they call, a halt report
 /// included.
@@ -257,11 +281,63 @@ fn Lowering.preempt_handler(mut self) -> Option[Instance] {
     return Some(take handler)
 } Lowering.preempt_handler
 
-/// Sets up interrupt delivery for a kernel's executor: builds the interrupt descriptor table,
-/// masks the legacy interrupt controller, and gives the glue each CPU runs to take
-/// interrupts: it draws its interrupt stacks, loads the table and starts its local APIC and
-/// timer. Maskable interrupts stay disabled until the executor enables them.
+/// The architecture of the machine target being lowered for.
+fn Lowering.machine_arch(self) -> workspace::Arch {
+    let Some(arch) = self.ck.db().target.arch() else {
+        expect false
+        return workspace::Arch.Amd64
+    }
+    return arch
+} Lowering.machine_arch
+
+/// What the dispatcher knows of the target's vectors.
+fn Lowering.vectors(self) -> Vectors {
+    return match self.machine_arch() {
+        workspace::Arch.Amd64 => x64_vectors()
+        workspace::Arch.Aarch64 => aarch64_vectors()
+    }
+} Lowering.vectors
+
+/// The layout of the frame the target's vector seam saves.
+fn Lowering.saved_frame(self) -> SavedFrame {
+    return match self.machine_arch() {
+        workspace::Arch.Amd64 => x64_frame()
+        workspace::Arch.Aarch64 => aarch64_frame()
+    }
+} Lowering.saved_frame
+
+/// Whether the code a saved frame interrupted ran with maskable interrupts enabled: the
+/// interrupt flag of the saved flags is set on x86_64, the IRQ mask of the saved processor state
+/// clear on AArch64.
+fn Lowering.interrupts_were_enabled(mut self, mut fx: Fx, saved: clif::Value) -> clif::Value {
+    let state = mut fx.load(PTR, addr: saved, offset: self.saved_frame().state)
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        let masked = mut fx.b.band_imm_s(state, y: AARCH64_IRQ_MASKED)
+        return mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: masked, y: 0)
+    }
+    let enabled = mut fx.b.band_imm_s(state, y: INTERRUPTS_ENABLED)
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: enabled, y: 0)
+} Lowering.interrupts_were_enabled
+
+/// The address a page fault faulted at: `cr2` on x86_64, the fault address register the
+/// AArch64 seam saved in the frame.
+fn Lowering.fault_address(mut self, mut fx: Fx, saved: clif::Value) -> clif::Value {
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        return mut fx.load(PTR, addr: saved, offset: AARCH64_FRAME_FAR)
+    }
+    let results = mut self.call_stub(mut fx, stub: Stub.ReadCr2, args: mem::List[clif::Value].empty(fx.alloc).view())
+    expect results.len() > 0
+    return results[0]
+} Lowering.fault_address
+
+/// Sets up interrupt delivery for a kernel's executor and gives the glue each CPU runs to take
+/// interrupts. On x86_64 it builds the interrupt descriptor table, masks the legacy interrupt
+/// controller, and the glue draws the CPU's interrupt stacks, loads the table and starts its
+/// local APIC and timer. Maskable interrupts stay disabled until the executor enables them.
 fn Lowering.interrupt_setup(mut self, mut fx: Fx) -> object::FuncId {
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        return mut self.aarch64_interrupt_setup(mut fx)
+    }
     let idt = mut self.reserved(mut fx, data_name: "_NSidt", size: IDT_BYTES, align: 16)
     mut self.fill_idt(mut fx, table: idt)
     let masked = mut fx.ptr(0xFF)
@@ -448,8 +524,8 @@ fn Lowering.vector_seam(mut self, dispatch: object::FuncId, preemption: object::
     mut seam_bytes.append(SEAM_COMMON)
     let seam = mut self.module.declare_function("_NSseam", linkage: object::Linkage.Local, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
     var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
-    mut relocs.push(object::ModuleReloc(offset: common + SEAM_DISPATCH, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(dispatch), addend: -4))
-    mut relocs.push(object::ModuleReloc(offset: common + SEAM_PREEMPT, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(preemption), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: common + SEAM_DISPATCH, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(dispatch), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: common + SEAM_PREEMPT, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(preemption), addend: -4))
     mut self.module.define_function_bytes(seam, align: 16, bytes: seam_bytes.view(), relocs: relocs.view())
     return seam
 } Lowering.vector_seam
@@ -475,17 +551,21 @@ fn Lowering.preempt_glue(mut self) -> object::FuncId {
     return id
 } Lowering.preempt_glue
 
-/// The interrupt dispatcher the vector seam calls with the fired vector and the saved frame;
-/// it gives nonzero when the seam is to preempt the interrupted task. It records both in the
-/// running CPU's record while it dispatches the vector, then restores those of the interrupt
-/// it nested in.
+/// The interrupt dispatcher the vector seam calls with what fired and the saved frame; it gives
+/// nonzero when the seam is to preempt the interrupted task. The x86_64 seam passes the fired
+/// vector, the AArch64 one the kind of exception, from which the dispatcher finds the vector. It
+/// records the vector and the frame in the running CPU's record while it dispatches the vector,
+/// then restores those of the interrupt it nested in.
 fn Lowering.dispatcher(mut self, bound: Slice[Bound]) -> object::FuncId {
     let signature = dispatch_signature(self.alloc)
     let id = mut self.module.declare_function("_NSseam_dispatch", linkage: object::Linkage.Local, signature)
     let dispatch = mut self.dispatch_vector(bound, signature: dispatch_signature(self.alloc))
     mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
-        let param_values = mut fx1.entry()
+        var param_values = mut fx1.entry()
         expect param_values.len() > 1
+        if lo1.machine_arch() == workspace::Arch.Aarch64 {
+            param_values[0] = mut lo1.aarch64_vector(mut fx1, kind: param_values[0], saved: param_values[1])
+        }
         let record = mut lo1.running_cpu(mut fx1)
         let outer_vector = mut fx1.load(PTR, addr: record, offset: CPU_VECTOR)
         let outer_frame = mut fx1.load(PTR, addr: record, offset: CPU_FRAME)
@@ -529,9 +609,9 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
     let saved = mut fx.load(PTR, addr: record, offset: CPU_FRAME)
     let serving = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: saved, y: 0)
     let located = mut fx.choose_in(mut self, condition: serving, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let rip = mut fx1.load(PTR, addr: saved, offset: FRAME_RIP)
+        let ip = mut fx1.load(PTR, addr: saved, offset: lo1.saved_frame().ip)
         var produced = mem::List[clif::Value].empty(fx1.alloc)
-        mut produced.push(location_at(mut lo1, fx: mut fx1, address: rip))
+        mut produced.push(location_at(mut lo1, fx: mut fx1, address: ip))
         return produced
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         var produced = mem::List[clif::Value].empty(fx1.alloc)
@@ -545,36 +625,36 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
 /// binds to the vector, an interrupt vector's with a new `hw::IrqContext` and an exception
 /// vector's with the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared`
 /// binds. When the fn gives `hw::IrqExit.Reschedule` while a kernel task ran with maskable
-/// interrupts enabled and the anchor is installed, the task is preempted. After an interrupt
-/// fn for vector 8 or 18 returns, and on an unbound vector, the kernel halts at the
-/// interrupted instruction.
+/// interrupts enabled and the anchor is installed, the task is preempted. An unbound timer
+/// interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
+/// unbound vector, the kernel halts at the interrupted instruction.
 fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif::Signature) -> object::FuncId {
     let id = mut self.module.declare_function("_NSseam_dispatch_vector", linkage: object::Linkage.Local, signature)
     let handler = mut self.preempt_handler()
     let preempting = handler.is_some()
+    let known = self.vectors()
     mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo1: Lowering, mut fx1: Fx) {
         let param_values = mut fx1.entry()
         expect param_values.len() > 1
         let vector = param_values[0]
         let saved = param_values[1]
-        let nmi = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: NMI_VECTOR)
-        mut fx1.if_true(nmi, then: fn[mut lo1](mut fx2: Fx) {
-            mut lo1.stop_if_halting(mut fx2)
-        })
+        match known.stop {
+            Some(stop) => {
+                let stopping = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: stop)
+                mut fx1.if_true(stopping, then: fn[mut lo1](mut fx2: Fx) {
+                    mut lo1.stop_if_halting(mut fx2)
+                })
+            }
+            None => {}
+        }
         let zero_value = mut fx1.ptr(0)
         for bound_entry in bound {
             let this = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: bound_entry.vector)
             mut fx1.if_true(this, then: fn[mut lo1](mut fx2: Fx) {
                 let reschedule = mut lo1.dispatch_bound(mut fx2, bound_entry, saved)
-                var aborts = false
-                for abort_vector in ABORT_VECTORS {
-                    if abort_vector == bound_entry.vector {
-                        aborts = true
-                    }
-                }
-                if aborts {
-                    let rip = mut fx2.load(PTR, addr: saved, offset: FRAME_RIP)
-                    let location = location_at(mut lo1, fx: mut fx2, address: rip)
+                if known.aborts(bound_entry.vector) {
+                    let ip = mut fx2.load(PTR, addr: saved, offset: lo1.saved_frame().ip)
+                    let location = location_at(mut lo1, fx: mut fx2, address: ip)
                     halt(mut lo1, fx: mut fx2, cause: "abort-exception", location, operand: None)
                     return
                 }
@@ -582,48 +662,37 @@ fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif:
                 mut fx2.b.ret(Array[clif::Value, 1].filled(preempt_flag).view())
             })
         }
-        let installable = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: 32)
+        var installable = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: vector, y: 32)
+        match known.installable_end {
+            Some(end) => {
+                let below = mut fx1.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: vector, y: end)
+                installable = mut fx1.b.band(installable, y: below)
+            }
+            None => {}
+        }
         mut fx1.if_true(installable, then: fn[mut lo1](mut fx2: Fx) {
-            let slot = mut lo1.irq_binding(mut fx2, vector)
-            let running = mut fx2.offset(slot, offset: BINDING_RUNNING)
-            let one = mut fx2.ptr(1)
-            discard fetch_add(mut fx2, address: running, amount: one)
-            let device = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
-            let present = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: device, y: 0)
-            let rescheduled = mut fx2.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
-                let glue = mut fx3.load(PTR, addr: device, offset: DEVICE_RECORD_GLUE)
-                var call_signature = clif::Signature.new(CALL_CONV, alloc: fx3.alloc)
-                mut call_signature.params.push(clif::AbiParam(value_type: PTR))
-                mut call_signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
-                let sig_ref = mut fx3.b.import_signature(take call_signature)
-                let inst = mut fx3.b.call_indirect(sig_ref, callee: glue, args: Array[clif::Value, 1].filled(device).view())
-                let results = fx3.b.inst_results(inst, alloc: fx3.alloc)
-                expect results.len() > 0
-                return fx3.list1(results[0])
-            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
-                var produced = mem::List[clif::Value].empty(fx3.alloc)
-                mut produced.push(mut fx3.int(clif::Type.Int8, value: 0))
-                return produced
-            })
-            let reschedule = rescheduled[0]
-            let minus = mut fx2.int(PTR, value: -1)
-            discard fetch_add(mut fx2, address: running, amount: minus)
-            mut fx2.if_true(present, then: fn[mut lo1](mut fx3: Fx) {
-                let preempt_flag = mut lo1.preempts(mut fx3, reschedule, saved, preempting)
+            let installed = mut lo1.installed_reschedule(mut fx2, vector)
+            mut fx2.if_true(installed[0], then: fn[mut lo1](mut fx3: Fx) {
+                let preempt_flag = mut lo1.preempts(mut fx3, reschedule: installed[1], saved, preempting)
                 mut fx3.b.ret(Array[clif::Value, 1].filled(preempt_flag).view())
             })
         })
-        let timer = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: TIMER_VECTOR)
+        let timer = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: known.timer)
         mut fx1.if_true(timer, then: fn[mut lo1](mut fx2: Fx) {
-            mut lo1.apic_eoi(mut fx2)
+            mut lo1.end_of_interrupt(mut fx2)
             mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
         })
-        let spurious = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: SPURIOUS_VECTOR)
-        mut fx1.if_true(spurious, then: fn(mut fx2: Fx) {
-            mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
-        })
-        let rip = mut fx1.load(PTR, addr: saved, offset: FRAME_RIP)
-        let location = location_at(mut lo1, fx: mut fx1, address: rip)
+        match known.spurious {
+            Some(ignored) => {
+                let spurious = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: ignored)
+                mut fx1.if_true(spurious, then: fn(mut fx2: Fx) {
+                    mut fx2.b.ret(Array[clif::Value, 1].filled(zero_value).view())
+                })
+            }
+            None => {}
+        }
+        let ip = mut fx1.load(PTR, addr: saved, offset: lo1.saved_frame().ip)
+        let location = location_at(mut lo1, fx: mut fx1, address: ip)
         halt(mut lo1, fx: mut fx1, cause: "unbound-vector", location, operand: Some(HaltOperand(name: "vector", value: vector)))
     })
     return id
@@ -644,21 +713,51 @@ fn Lowering.dispatch_bound(mut self, mut fx: Fx, bound_entry: Bound, saved: clif
         let trap_frame = mut fx.slot(laid.contents().size, align: laid.contents().align)
         let saved_field = mut self.layouts.field(self.ck, ty: frame_ty, variant: None, label: "saved")
         mut fx.store(saved, addr: trap_frame, offset: saved_field.offset)
-        var faults = mem::List[clif::Value].empty(fx.alloc)
-        if bound_entry.vector == PAGE_FAULT {
-            faults = mut self.call_stub(mut fx, stub: Stub.ReadCr2, args: mem::List[clif::Value].empty(fx.alloc).view())
-        } else {
-            mut faults.push(mut fx.ptr(0))
+        let fault = match bound_entry.vector == self.vectors().page_fault {
+            true => mut self.fault_address(mut fx, saved)
+            false => mut fx.ptr(0)
         }
         let fault_field = mut self.layouts.field(self.ck, ty: frame_ty, variant: None, label: "fault")
-        expect faults.len() > 0
-        mut fx.store(faults[0], addr: trap_frame, offset: fault_field.offset)
+        mut fx.store(fault, addr: trap_frame, offset: fault_field.offset)
         arg = Held.Address(trap_frame)
     }
     let called = mut self.invoke(mut fx, invoked: Invoked.Direct(id), abi, args: Array[Held, 1].filled(arg).view())
     let exit_ty = abi.result
     return mut self.reschedules(mut fx, exit_ty, exit: called.result)
 } Lowering.dispatch_bound
+
+/// Calls the device an `hw::IrqShared` installed on a vector of 32 or more, counting the call
+/// so an uninstall waits for it. Gives whether a device was installed, at index 0, and, when
+/// one was, whether its `hw::IrqExit` is `Reschedule`, at index 1.
+fn Lowering.installed_reschedule(mut self, mut fx: Fx, vector: clif::Value) -> Array[clif::Value, 2] {
+    let slot = mut self.irq_binding(mut fx, vector)
+    let running = mut fx.offset(slot, offset: BINDING_RUNNING)
+    let one = mut fx.ptr(1)
+    discard fetch_add(mut fx, address: running, amount: one)
+    let device = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: slot)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: device, y: 0)
+    let rescheduled = mut fx.choose(present, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let glue = mut fx1.load(PTR, addr: device, offset: DEVICE_RECORD_GLUE)
+        var call_signature = clif::Signature.new(CALL_CONV, alloc: fx1.alloc)
+        mut call_signature.params.push(clif::AbiParam(value_type: PTR))
+        mut call_signature.returns.push(clif::AbiParam(value_type: clif::Type.Int8))
+        let sig_ref = mut fx1.b.import_signature(take call_signature)
+        let inst = mut fx1.b.call_indirect(sig_ref, callee: glue, args: Array[clif::Value, 1].filled(device).view())
+        let results = fx1.b.inst_results(inst, alloc: fx1.alloc)
+        expect results.len() > 0
+        return fx1.list1(results[0])
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        var produced = mem::List[clif::Value].empty(fx1.alloc)
+        mut produced.push(mut fx1.int(clif::Type.Int8, value: 0))
+        return produced
+    })
+    let reschedule = rescheduled[0]
+    let minus = mut fx.int(PTR, value: -1)
+    discard fetch_add(mut fx, address: running, amount: minus)
+    var out = Array[clif::Value, 2].filled(present)
+    out[1] = reschedule
+    return out
+} Lowering.installed_reschedule
 
 /// Whether an `hw::IrqExit` an interrupt fn gave is `Reschedule`.
 fn Lowering.reschedules(mut self, mut fx: Fx, exit_ty: ty::Ty, exit: Held) -> clif::Value {
@@ -686,21 +785,20 @@ fn Lowering.preempts(mut self, mut fx: Fx, reschedule: clif::Value, saved: clif:
     if not preempting {
         return mut fx.ptr(0)
     }
-    let flags = mut fx.load(PTR, addr: saved, offset: FRAME_RFLAGS)
-    let enabled_bit = mut fx.b.band_imm_s(flags, y: INTERRUPTS_ENABLED)
-    let enabled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: enabled_bit, y: 0)
+    let enabled = mut self.interrupts_were_enabled(mut fx, saved)
     let state_address = mut self.state(mut fx)
     let anchor = mut fx.load(PTR, addr: state_address, offset: STATE_ANCHOR)
     let installed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: anchor, y: 0)
     let record = current_task(mut self, mut fx)
     let running = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: record, y: 0)
+    let sp_at = self.saved_frame().sp
     let on_stack_values = mut fx.choose(running, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let rsp = mut fx1.load(PTR, addr: saved, offset: FRAME_RSP)
+        let sp = mut fx1.load(PTR, addr: saved, offset: sp_at)
         let base = mut fx1.load(PTR, addr: record, offset: TASK_STACK)
         let size = mut fx1.load(PTR, addr: record, offset: TASK_STACK_SIZE)
         let top = mut fx1.b.iadd(base, y: size)
-        let above = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: rsp, y: base)
-        let below = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: rsp, y: top)
+        let above = mut fx1.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: sp, y: base)
+        let below = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: sp, y: top)
         var produced = mem::List[clif::Value].empty(fx1.alloc)
         mut produced.push(mut fx1.b.band(above, y: below))
         return produced
@@ -748,10 +846,14 @@ fn Lowering.apic_write(mut self, mut fx: Fx, register: u64, value: u64)
     mut self.mmio_write(mut fx, width: 4, address: at, value: value_word)
 } Lowering.apic_write
 
-/// Writes the local APIC's end-of-interrupt register, ending the interrupt in service.
-fn Lowering.apic_eoi(mut self, mut fx: Fx) {
-    mut self.apic_write(mut fx, register: APIC_EOI, value: 0)
-} Lowering.apic_eoi
+/// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the
+/// local APIC's end-of-interrupt register on x86_64, and the GIC CPU interface's on AArch64.
+fn Lowering.end_of_interrupt(mut self, mut fx: Fx) {
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => mut self.apic_write(mut fx, register: APIC_EOI, value: 0)
+        workspace::Arch.Aarch64 => mut self.aarch64_eoi(mut fx)
+    }
+} Lowering.end_of_interrupt
 
 /// The running CPU's local APIC id.
 fn Lowering.local_apic_id(mut self, mut fx: Fx) -> clif::Value {
@@ -780,9 +882,8 @@ fn Lowering.send_ipi(mut self, mut fx: Fx, destination: clif::Value, command: u6
 } Lowering.send_ipi
 
 /// The first step of a kernel halt, with maskable interrupts disabled so that nothing else
-/// runs on the halting CPU: the first CPU to begin one sends every other started CPU a
-/// non-maskable interrupt and waits until each has stopped; a CPU beginning a halt after it
-/// stops instead.
+/// runs on the halting CPU: the first CPU to begin one sends every other started CPU the stop
+/// interrupt and waits until each has stopped; a CPU beginning a halt after it stops instead.
 fn Lowering.stop_other_cpus(mut self, mut fx: Fx) {
     discard mut self.call_stub(mut fx, stub: Stub.Cli, args: mem::List[clif::Value].empty(fx.alloc).view())
     let state_address = mut self.state(mut fx)
@@ -792,14 +893,20 @@ fn Lowering.stop_other_cpus(mut self, mut fx: Fx) {
     let seen = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero_value, x: one)
     let later = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: seen, y: 0)
     mut fx.if_true(later, then: fn[mut self](mut fx1: Fx) {
-        discard mut self.call_stub(mut fx1, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        // The non-maskable interrupt reaches a halted x86_64 CPU, which then counts itself; an
+        // AArch64 CPU halts with the stop interrupt masked, so it counts itself first.
+        match self.machine_arch() {
+            workspace::Arch.Amd64 => {
+                discard mut self.call_stub(mut fx1, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx1.alloc).view())
+            }
+            workspace::Arch.Aarch64 => mut self.stop_cpu(mut fx1)
+        }
     })
     let started = mut fx.load(PTR, addr: state_address, offset: STATE_STARTED_CPUS)
     let others = mut fx.b.iadd_imm_s(started, y: -1)
     let running = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: others, y: 0)
     mut fx.if_true(running, then: fn[mut self](mut fx1: Fx) {
-        let all = mut fx1.ptr(0)
-        mut self.send_ipi(mut fx1, destination: all, command: IPI_NMI_OTHERS)
+        mut self.send_stop(mut fx1)
         let stopped = mut fx1.offset(state_address, offset: STATE_STOPPED_CPUS)
         discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut self](mut fx2: Fx, current: Slice[clif::Value]) -> Pass {
             let count = mut fx2.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: stopped)
@@ -812,18 +919,42 @@ fn Lowering.stop_other_cpus(mut self, mut fx: Fx) {
     })
 } Lowering.stop_other_cpus
 
-/// On a non-maskable interrupt during a kernel halt, stops the running CPU, counting it.
+/// Sends every other CPU the interrupt that stops it in a halt, which disabled maskable
+/// interrupts do not hold back: a non-maskable interrupt on x86_64, and on AArch64 the software
+/// interrupt the interrupt controller delivers as a fast interrupt.
+fn Lowering.send_stop(mut self, mut fx: Fx) {
+    match self.machine_arch() {
+        workspace::Arch.Amd64 => {
+            let all = mut fx.ptr(0)
+            mut self.send_ipi(mut fx, destination: all, command: IPI_NMI_OTHERS)
+        }
+        workspace::Arch.Aarch64 => mut self.aarch64_send_stop(mut fx)
+    }
+} Lowering.send_stop
+
+/// On a non-maskable interrupt during a kernel halt, stops the running CPU, counting it; the
+/// interrupt has other causes outside one.
 fn Lowering.stop_if_halting(mut self, mut fx: Fx) {
     let state_address = mut self.state(mut fx)
     let halting_word = mut fx.load(PTR, addr: state_address, offset: STATE_HALTING)
     let halting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: halting_word, y: 0)
     mut fx.if_true(halting, then: fn[mut self](mut fx1: Fx) {
-        let stopped = mut fx1.offset(state_address, offset: STATE_STOPPED_CPUS)
-        let one = mut fx1.ptr(1)
-        discard fetch_add(mut fx1, address: stopped, amount: one)
-        discard mut self.call_stub(mut fx1, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        mut self.stop_cpu(mut fx1)
     })
 } Lowering.stop_if_halting
+
+/// Counts the running CPU among the stopped and halts it. An AArch64 CPU masks fast interrupts
+/// first, so that a stop interrupt arriving meanwhile cannot count it twice.
+fn Lowering.stop_cpu(mut self, mut fx: Fx) {
+    if self.machine_arch() == workspace::Arch.Aarch64 {
+        discard mut self.call_stub(mut fx, stub: Stub.FiqOff, args: mem::List[clif::Value].empty(fx.alloc).view())
+    }
+    let state_address = mut self.state(mut fx)
+    let stopped = mut fx.offset(state_address, offset: STATE_STOPPED_CPUS)
+    let one = mut fx.ptr(1)
+    discard fetch_add(mut fx, address: stopped, amount: one)
+    discard mut self.call_stub(mut fx, stub: Stub.Halt, args: mem::List[clif::Value].empty(fx.alloc).view())
+} Lowering.stop_cpu
 
 /// The signature of the dispatcher and of the vector dispatch it calls: the fired vector and
 /// the saved frame, giving whether to preempt.

@@ -1,4 +1,4 @@
-//! The code generator: instruction selection, register allocation and emission of x86-64 machine code for the functions lowering builds.
+//! The code generator: instruction selection, register allocation and emission of x86-64 and AArch64 machine code for the functions lowering builds.
 
 /// The start of a run of code with one source location.
 pkg struct Located derives Copy, Eq {
@@ -6,21 +6,30 @@ pkg struct Located derives Copy, Eq {
     pkg loc: clif::SourceLoc
 } Located
 
-/// What code generation takes from the target: whether code is position-independent, reaching
-/// the symbols other objects define through the global offset table and calling them through
-/// the procedure linkage table; whether a frame reaching the guard page size probes the pages it
-/// spans; and whether code may use the SSE registers, which then hold float values.
+/// What code generation takes from the target: its architecture; whether code is
+/// position-independent, reaching the symbols other objects define through the global offset table
+/// and calling them through the procedure linkage table; whether a frame reaching the guard page
+/// size probes the pages it spans; and whether code may use the floating-point registers, which
+/// then hold float values.
 pkg struct Isa derives Copy, Eq {
+    pkg arch: workspace::Arch
     pkg pic: bool
     pkg probes: bool
     pkg floats: bool
 } Isa
 
+/// The guard page size, which a frame must not step over without touching.
+const GUARD: u32 = 4096
+
 pkg fn Isa.of(target: workspace::Target) -> Isa {
-    if target.is_machine() {
-        return Isa(pic: false, probes: false, floats: false)
+    let arch = match target.arch() {
+        Some(found) => found
+        None => workspace::Arch.Amd64
     }
-    return Isa(pic: true, probes: true, floats: true)
+    if target.is_machine() {
+        return Isa(arch: arch, pic: false, probes: false, floats: false)
+    }
+    return Isa(arch: arch, pic: true, probes: true, floats: true)
 } Isa.of
 
 /// A compiled function: its machine code, the alignment its start needs, the relocations of the
@@ -30,16 +39,16 @@ pkg fn Isa.of(target: workspace::Target) -> Isa {
 pkg struct Code {
     pkg bytes: mem::Bytes
     pkg align: u32
-    pkg relocs: mem::List[x64::Reloc]
+    pkg relocs: mem::List[machinst::Reloc]
     pkg frame: u64
     pkg locations: mem::List[Located]
     pkg removable: bool
 } Code
 
-/// Compiles a function built by lowering into x86-64 machine code, its calls of the functions
-/// whose bodies `leaves` holds taking those bodies in place, its calls of the functions whose
-/// calls can be left out left out when nothing reads their results, its stack slots held in
-/// values where they can be and its edges threaded.
+/// Compiles a function built by lowering into machine code for the target's architecture, its
+/// calls of the functions whose bodies `leaves` holds taking those bodies in place, its calls of
+/// the functions whose calls can be left out left out when nothing reads their results, its stack
+/// slots held in values where they can be and its edges threaded.
 pkg fn compile(func: clif::Function, isa: Isa, leaves: Leaves, alloc: mem::Alloc) -> Code {
     return match promoted(func, leaves, alloc) {
         Some(simpler) => match threaded(simpler, alloc) {
@@ -54,10 +63,24 @@ pkg fn compile(func: clif::Function, isa: Isa, leaves: Leaves, alloc: mem::Alloc
 } compile
 
 fn code_of(func: clif::Function, isa: Isa, leaves: Leaves, alloc: mem::Alloc) -> Code {
-    var vcode = select(func, isa, alloc)
-    mut vcode.remove_dead(alloc)
-    let allocation = allocate(vcode, alloc)
-    var code = emit(vcode, allocation, isa, alloc)
+    var code = match isa.arch {
+        workspace::Arch.Amd64 => x64_code(func, isa, alloc)
+        workspace::Arch.Aarch64 => arm_code(func, isa, alloc)
+    }
     code.removable = is_left_out_callee(func, leaves, alloc)
     return code
 } code_of
+
+fn x64_code(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> Code {
+    var vcode = select(func, isa, alloc)
+    mut vcode.remove_dead(alloc)
+    let allocation = allocate(vcode, alloc)
+    return emit(vcode, allocation, isa, alloc)
+} x64_code
+
+fn arm_code(func: clif::Function, isa: Isa, alloc: mem::Alloc) -> Code {
+    var vcode = arm_select(func, isa, alloc)
+    mut vcode.remove_dead(alloc)
+    let allocation = allocate(vcode, alloc)
+    return arm_emit(vcode, allocation, isa, alloc)
+} arm_code

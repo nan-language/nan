@@ -1,13 +1,13 @@
 //! The CPU-facing operations of `hw`: the context of an interrupt fn, the privileged intrinsics of `hw::Ring0`, the interrupt descriptor table `hw::Idt.of_vectors` builds, the interrupted state an exception's `hw::TrapFrame` names, and copies from user memory through `hw::UserAddr`. Only an interrupt fn's context exists on the host, where no interrupt fires.
 
 /// `hw::IrqContext`: on the host completing one does nothing and its vector reads as zero; on a
-/// machine target completing one writes the local APIC's end-of-interrupt register, and its
-/// vector is the one the running CPU serves.
+/// machine target completing one ends the interrupt the running CPU serves, whose vector is its
+/// vector.
 fn irq_context(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "complete" => {
             if lo.machine() {
-                mut lo.apic_eoi(mut fx)
+                mut lo.end_of_interrupt(mut fx)
             }
             supply.done(mut lo, mut fx)
         }
@@ -25,10 +25,19 @@ fn irq_context(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } irq_context
 
-/// The privileged intrinsics, each one compiler stub on the running CPU. `load_idt` loads the
-/// table the box holds and keeps the box in its token; `write_cr3` installs a root and gives the
-/// one it replaces, which the CPU's record keeps, none for the entry root.
+/// The privileged intrinsics of `hw::Ring0`, each one compiler stub on the running CPU, by target.
 fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    if lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        cpu_ring0_aarch64(mut lo, mut fx, supply)
+        return
+    }
+    cpu_ring0_x64(mut lo, mut fx, supply)
+} cpu_ring0
+
+/// The x86_64 privileged intrinsics. `load_idt` loads the table the box holds and keeps the box
+/// in its token; `write_cr3` installs a root and gives the one it replaces, which the CPU's
+/// record keeps, none for the entry root.
+fn cpu_ring0_x64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     match supply.member() {
         "load_idt" => {
             let table = cpu_word(mut fx, held: supply.param(1))
@@ -74,7 +83,72 @@ fn cpu_ring0(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             expect false
         }
     }
-} cpu_ring0
+} cpu_ring0_x64
+
+/// The AArch64 privileged intrinsics. `write_ttbr0` installs a low translation-table root and
+/// gives the one it replaces, as `write_cr3` does; `read_sysreg` and `write_sysreg` read and
+/// write the system register their `hw::SysReg` names, each built as the instruction holding its
+/// encoding; `invalidate_page` removes a page's cached translations.
+fn cpu_ring0_aarch64(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    match supply.member() {
+        "write_ttbr0" => {
+            let root = cpu_word(mut fx, held: supply.param(1))
+            let replaced = mut lo.swap_root(mut fx, root)
+            let option = supply.abi.result
+            let entry_root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: replaced, y: 0)
+            mut fx.if_true(entry_root, then: fn[mut lo](mut fx1: Fx) {
+                let none = mut lo.none_value(mut fx1, option)
+                supply.ret(mut lo, fx: mut fx1, held: none)
+            })
+            let held = mut fx.slot(8, align: 8)
+            mut fx.store(replaced, addr: held, offset: 0)
+            let some = mut lo.variant_value(mut fx, ty: option, variant: "Some", payload_values: Array[Held, 1].filled(Held.Address(held)).view(), wrapped: None)
+            supply.ret(mut lo, mut fx, held: some)
+        }
+        "invalidate_page" => {
+            let page = cpu_word(mut fx, held: supply.param(1))
+            discard mut lo.call_stub(mut fx, stub: Stub.TlbiPage, args: Array[clif::Value, 1].filled(page).view())
+            supply.done(mut lo, mut fx)
+        }
+        "read_sysreg" => {
+            let index = sysreg_index(mut lo, mut fx, supply)
+            for position in 0..<SYS_REG_FIELDS.len() {
+                let field = SYS_REG_FIELDS[position]
+                let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+                mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+                    let read = mut lo.call_stub(mut fx1, stub: Stub.ReadSysReg(field), args: mem::List[clif::Value].empty(fx1.alloc).view())
+                    expect read.len() > 0
+                    supply.ret(mut lo, fx: mut fx1, held: Held.Scalar(read[0]))
+                })
+            }
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        "write_sysreg" => {
+            let index = sysreg_index(mut lo, mut fx, supply)
+            let value = supply.param(2).scalar_value()
+            for position in 0..<WRITABLE_SYS_REGS {
+                let field = SYS_REG_FIELDS[position]
+                let is = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: index, y: i64.fit(position))
+                mut fx.if_true(is, then: fn[mut lo](mut fx1: Fx) {
+                    discard mut lo.call_stub(mut fx1, stub: Stub.WriteSysReg(field), args: Array[clif::Value, 1].filled(value).view())
+                    supply.done(mut lo, fx: mut fx1)
+                })
+            }
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        else => {
+            expect false
+        }
+    }
+} cpu_ring0_aarch64
+
+/// The index of the `hw::SysReg` an intrinsic's register parameter holds, in variant order.
+fn sysreg_index(mut lo: Lowering, mut fx: Fx, supply: Supply) -> clif::Value {
+    let register_ty = supply.abi.params[1].nty.ty()
+    let slot = mut fx.slot(8, align: 8)
+    mut lo.store_held(mut fx, address: slot, held: supply.param(1), ty: register_ty)
+    return mut lo.variant_index(mut fx, ty: register_ty, address: slot)
+} sysreg_index
 
 /// `hw::Idt.of_vectors()`: the table whose gate n enters the vector seam's stub for n.
 fn cpu_idt(mut lo: Lowering, mut fx: Fx, supply: Supply) {
@@ -87,8 +161,8 @@ fn cpu_idt(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 } cpu_idt
 
 /// `hw::TrapFrame[V]`, which names the state the seam saved for an exception: `info` holds the
-/// error code the CPU pushed and, for a page fault, the faulting address; `ip` and `set_ip` read
-/// and replace the interrupted instruction pointer.
+/// error code the CPU pushed on x86_64 or the syndrome on AArch64 and, for a page fault, the
+/// faulting address; `ip` and `set_ip` read and replace the interrupted instruction's address.
 fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let trap_frame = supply.param(0).address_value()
     let Some(owner) = supply.owner else {
@@ -111,7 +185,7 @@ fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
                 else => {}
             }
             if canonical.as_str() != "hw::NoCode" {
-                let code = mut fx.load(PTR, addr: saved, offset: FRAME_CODE)
+                let code = mut fx.load(PTR, addr: saved, offset: lo.saved_frame().code)
                 let code_field = mut lo.layouts.field(lo.ck, ty: info_ty, variant: None, label: "code")
                 mut fx.store(code, addr: info, offset: code_field.offset)
             }
@@ -124,12 +198,12 @@ fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
             supply.ret(mut lo, mut fx, held)
         }
         "ip" => {
-            let ip = mut fx.load(PTR, addr: saved, offset: FRAME_RIP)
+            let ip = mut fx.load(PTR, addr: saved, offset: lo.saved_frame().ip)
             supply.ret(mut lo, mut fx, held: Held.Scalar(ip))
         }
         "set_ip" => {
             let ip = supply.param(1).scalar_value()
-            mut fx.store(ip, addr: saved, offset: FRAME_RIP)
+            mut fx.store(ip, addr: saved, offset: lo.saved_frame().ip)
             supply.done(mut lo, mut fx)
         }
         "irqs_disabled" => supply.ret(mut lo, mut fx, held: Held.Empty)
@@ -139,13 +213,64 @@ fn cpu_trap_frame(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     }
 } cpu_trap_frame
 
-/// The user address space's upper end, the bit of a page-table entry granting user mode access,
-/// and the mask of an entry's frame address.
-const USER_END: i64 = 0x0000_8000_0000_0000
+/// The upper end of each architecture's user address space, below which `copy_in` reads: the
+/// x86_64 canonical lower half and the AArch64 `TTBR0_EL1` range.
+const USER_END_X64: i64 = 0x0000_8000_0000_0000
 
+const USER_END_AARCH64: i64 = 0x0001_0000_0000_0000
+
+/// The x86_64 bit of a page-table entry granting user mode access, and the mask of an entry's
+/// frame address.
 const CPU_USER: i64 = 0x4
 
 const FRAME_ADDRESS: i64 = 0x000F_FFFF_FFFF_F000
+
+/// The AArch64 descriptor bits `copy_in` reads beside the valid, table and access bits:
+/// unprivileged access, whose `AP[1]` bit is set for an EL0-readable mapping, and `APTable[0]`,
+/// set in a table descriptor to forbid EL0 access to everything below it; and the mask of a
+/// descriptor's output address, which leaves out the `TTBR0_EL1` address space identifier.
+const A64_EL0: u64 = 0x40
+
+const A64_TABLE_NO_EL0: i64 = 1 << 61
+
+const A64_ADDRESS: i64 = 0x0000_FFFF_FFFF_F000
+
+/// The AArch64 system register each `hw::SysReg` variant names, by the variant's index, as the
+/// 15-bit field the `mrs` and `msr` instructions hold.
+const SYS_REG_FIELDS: Array[u16, 24] = listed_sys_reg_fields()
+
+fn listed_sys_reg_fields() -> Array[u16, 24] {
+    var listed = Array[u16, 24].filled(0)
+    listed[0] = 0x4080 // SctlrEl1
+    listed[1] = 0x4102 // TcrEl1
+    listed[2] = 0x4510 // MairEl1
+    listed[3] = 0x4101 // Ttbr1El1
+    listed[4] = 0x4681 // ContextidrEl1
+    listed[5] = 0x4082 // CpacrEl1
+    listed[6] = 0x4708 // CntkctlEl1
+    listed[7] = 0x5E82 // TpidrEl0
+    listed[8] = 0x5E83 // TpidrroEl0
+    listed[9] = 0x5F11 // CntpCtlEl0
+    listed[10] = 0x5F12 // CntpCvalEl0
+    listed[11] = 0x5F10 // CntpTvalEl0
+    listed[12] = 0x5F19 // CntvCtlEl0
+    listed[13] = 0x5F1A // CntvCvalEl0
+    listed[14] = 0x5F18 // CntvTvalEl0
+    listed[15] = 0x4000 // MidrEl1
+    listed[16] = 0x4005 // MpidrEl1
+    listed[17] = 0x5F00 // CntfrqEl0
+    listed[18] = 0x5F01 // CntpctEl0
+    listed[19] = 0x5F02 // CntvctEl0
+    listed[20] = 0x5801 // CtrEl0
+    listed[21] = 0x4020 // IdAa64pfr0El1
+    listed[22] = 0x4030 // IdAa64isar0El1
+    listed[23] = 0x4038 // IdAa64mmfr0El1
+    return listed
+} listed_sys_reg_fields
+
+/// How many of `SYS_REG_FIELDS`, from the first, `hw::SysReg.is_writable` holds for, which
+/// `write_sysreg` alone reaches.
+const WRITABLE_SYS_REGS: usize = 15
 
 /// `hw::UserAddr[T]`, one word: `copy_in` fails with `OutsideUser` when the `T` at the address
 /// does not lie below the user address space's end, and with `Unmapped` when a page of it is not
@@ -166,6 +291,7 @@ fn user_addr(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 } user_addr
 
 fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let aarch64 = lo.ck.db().target.arch() == Some(workspace::Arch.Aarch64)
     let start = cpu_word(mut fx, held: supply.param(0))
     let value_ty = supply.type_arg(lo, index: 0)
     let value_layout = mut lo.layout_of(value_ty)
@@ -173,7 +299,12 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let size_value = mut fx.ptr(size)
     let summed = mut fx.b.uadd_overflow(start, y: size_value)
     let end = summed.value
-    let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: end, y: USER_END)
+    let user_end = if aarch64 {
+        USER_END_AARCH64
+    } else {
+        USER_END_X64
+    }
+    let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThan, x: end, y: user_end)
     let outside = mut fx.b.bor(beyond, y: summed.flag)
     mut fx.if_true(outside, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "OutsideUser")
@@ -185,7 +316,12 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let laid = mut lo.layout_of(value_ty)
     let copied = mut fx.slot(at_least_one(size), align: at_least_one(laid.contents().align))
     let saved = mut lo.call_stub(mut fx, stub: Stub.IrqSave, args: mem::List[clif::Value].empty(fx.alloc).view())
-    let roots = mut lo.call_stub(mut fx, stub: Stub.ReadCr3, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let read_root = if aarch64 {
+        Stub.ReadTtbr0
+    } else {
+        Stub.ReadCr3
+    }
+    let roots = mut lo.call_stub(mut fx, stub: read_root, args: mem::List[clif::Value].empty(fx.alloc).view())
     expect saved.len() > 0 and roots.len() > 0
     let root = roots[0]
     let yes = mut fx.int(clif::Type.Int8, value: 1)
@@ -194,7 +330,10 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.each(zero_value, end: pages, body: fn(mut fx1: Fx, index: clif::Value) {
         let offset = mut fx1.b.ishl_imm_s(index, y: 12)
         let page = mut fx1.b.iadd(head, y: offset)
-        let readable = user_readable(mut fx1, root, page)
+        let readable = match aarch64 {
+            true => user_readable_aarch64(mut fx1, root, page)
+            false => user_readable_x64(mut fx1, root, page)
+        }
         let so_far = mut fx1.b.use_var(mapped_var)
         let still = mut fx1.b.band(so_far, y: readable)
         mut fx1.b.def_var(mapped_var, val: still)
@@ -212,9 +351,9 @@ fn copy_in(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     supply.ret(mut lo, mut fx, held)
 } copy_in
 
-/// Whether the page tables from `root` map the page at `page` present and user-accessible at
-/// every level, a large page ending the walk; the tables lie at their physical addresses.
-fn user_readable(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
+/// Whether the x86_64 page tables from `root` map the page at `page` present and user-accessible
+/// at every level, a large page ending the walk; the tables lie at their physical addresses.
+fn user_readable_x64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
     let table = mut fx.b.band_imm_s(root, y: FRAME_ADDRESS)
     let top = mut fx.ptr(1)
     let readable = mut fx.int(clif::Type.Int8, value: 1)
@@ -252,7 +391,67 @@ fn user_readable(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Valu
         return Pass(again: more, next: take state)
     })
     return walked[2]
-} user_readable
+} user_readable_x64
+
+/// Whether the AArch64 page tables from `root` map the page at `page` EL0-readable: each table
+/// descriptor on the way valid without `APTable[0]`, and the descriptor ending the walk a valid,
+/// accessed and EL0-readable block at level 1 or 2 or page at level 3. The 4 KiB-granule walk
+/// reads levels 0 to 3, each indexed by nine bits of the address from bit 39 down, the tables
+/// lying at their physical addresses.
+fn user_readable_aarch64(mut fx: Fx, root: clif::Value, page: clif::Value) -> clif::Value {
+    let table = mut fx.b.band_imm_s(root, y: A64_ADDRESS)
+    let top = mut fx.ptr(0)
+    let readable = mut fx.int(clif::Type.Int8, value: 1)
+    var initial = Array[clif::Value, 3].filled(table)
+    initial[1] = top
+    initial[2] = readable
+    let walked = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 2
+        let level_table = current[0]
+        let level = current[1]
+        let readable_so_far = current[2]
+        let scaled = mut fx1.b.imul_imm_s(level, y: -9)
+        let shift = mut fx1.b.iadd_imm_s(scaled, y: 39)
+        let shifted = mut fx1.b.ushr(page, y: shift)
+        let index = mut fx1.b.band_imm_s(shifted, y: 0x1FF)
+        let slot_offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(level_table, y: slot_offset)
+        let entry = mut fx1.load(PTR, addr: slot, offset: 0)
+        let valid_bit = mut fx1.b.band_imm_s(entry, y: i64.fit(A64_VALID))
+        let valid = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: valid_bit, y: 0)
+        let table_bit_set = mut fx1.b.band_imm_s(entry, y: i64.fit(A64_TABLE))
+        let table_bit = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: table_bit_set, y: 0)
+        let first_level = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: 0)
+        let bottom = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: level, y: 3)
+        // At levels 0 to 2 a table descriptor continues the walk. A block, whose table bit is
+        // clear, ends it at level 1 or 2, and a page, whose table bit is set, at level 3; any
+        // other descriptor maps nothing.
+        let walks_table = mut fx1.b.band(valid, y: table_bit)
+        let walks = mut fx1.b.band_not(walks_table, y: bottom)
+        let edge = mut fx1.b.bor(first_level, y: bottom)
+        let not_block = mut fx1.b.bor(table_bit, y: edge)
+        let block = mut fx1.b.bxor_imm_s(not_block, y: 1)
+        let page_leaf = mut fx1.b.band(table_bit, y: bottom)
+        let leaf = mut fx1.b.bor(block, y: page_leaf)
+        let el0_bits = mut fx1.b.band_imm_s(entry, y: i64.fit(A64_EL0 | A64_ACCESS))
+        let el0 = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: el0_bits, y: i64.fit(A64_EL0 | A64_ACCESS))
+        let valid_leaf = mut fx1.b.band(valid, y: leaf)
+        let leaf_allowed = mut fx1.b.band(valid_leaf, y: el0)
+        let forbidding = mut fx1.b.band_imm_s(entry, y: A64_TABLE_NO_EL0)
+        let open = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: forbidding, y: 0)
+        let more = mut fx1.b.band(walks, y: open)
+        let allowed = mut fx1.b.bor(more, y: leaf_allowed)
+        let still_readable = mut fx1.b.band(readable_so_far, y: allowed)
+        let next = mut fx1.b.band_imm_s(entry, y: A64_ADDRESS)
+        let next_level = mut fx1.b.iadd_imm_s(level, y: 1)
+        var state = mem::List[clif::Value].empty(fx1.alloc)
+        mut state.push(next)
+        mut state.push(next_level)
+        mut state.push(still_readable)
+        return Pass(again: more, next: take state)
+    })
+    return walked[2]
+} user_readable_aarch64
 
 /// The word a one-word value holds, whether held by address or as a scalar.
 fn cpu_word(mut fx: Fx, held: Held) -> clif::Value {

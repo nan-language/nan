@@ -1,22 +1,37 @@
 //! The out-of-line compiler stubs of the machine targets: fixed machine code each image emits
-//! once for the operations Cranelift cannot express.
+//! once for the operations Cranelift cannot express, in the bytes of its architecture.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
 use cranelift_module::{Linkage, Module};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
+use crate::workspace::Arch;
 
-/// The compiler stubs. Each takes its arguments in `rdi`, `rsi` and `rdx`, gives its result in `rax`
-/// and returns, but `Halt`, which stops the processor with maskable interrupts disabled. A port
-/// stub takes the port and, for `Out`, the value; a memory-mapped stub takes the address and,
-/// for a write, the value; `Copy` and `Fill` take the target, the source or byte, and the length,
-/// a copy between overlapping ranges running backwards when its target lies above its source.
-/// `Thread` reads the first word of the running CPU's record, which the GS base addresses;
-/// `Wrmsr` and `Rdmsr` write and read a model-specific register; `LoadTables` loads a CPU's
-/// descriptor tables through their pseudo-descriptor, reloading its segments and task register;
-/// `EnableAvx` enables AVX and its state saving when the CPU has both, giving whether it did;
-/// `IdleWait` halts until an interrupt with maskable interrupts enabled.
+/// The compiler stubs. Each takes its integer arguments and gives its integer result in the
+/// registers its architecture's convention names, and returns, but `Halt`, which stops the
+/// processor with maskable interrupts disabled. A port stub, on x86_64 alone, takes the port
+/// and, for `Out`, the value; a memory-mapped stub takes the address and, for a write, the
+/// value; `Copy` and `Fill` take the target, the source or byte, and the length, a copy between
+/// overlapping ranges running backwards when its target lies above its source. `Thread` reads
+/// the first word of the running CPU's record, which the GS base addresses on x86_64 and
+/// `TPIDR_EL1` on AArch64; `SetCpu` points that register at a record. `Cli` and `Sti` disable
+/// and enable maskable interrupts; `IrqSave` gives their state and disables them, `IrqRestore`
+/// restores it. `IdleWait` halts until an interrupt with maskable interrupts enabled.
+///
+/// The x86_64 stubs are `Lidt`, which loads an interrupt descriptor table; `Wrmsr` and `Rdmsr`,
+/// which write and read a model-specific register; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
+/// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
+/// their pseudo-descriptor; and `EnableAvx`. The AArch64 stubs are `ReadSysReg` and
+/// `WriteSysReg`, each naming a system register by its 15-bit encoding, which the instruction
+/// holds; `ReadTtbr0` and `WriteTtbr0`, the low translation-table base register; `TlbiPage`,
+/// which invalidates a page's translations; `EnterRoot`, which installs the entry root with the
+/// memory attributes and translation control the entry seams program; `InterruptStack`, which
+/// makes a stack top the one exceptions switch to and leaves the caller on its stack through
+/// `SP_EL0`; `Switch`, the task-stack switch; `SemiExit`, the exit port; `Hvc`, which makes a
+/// PSCI call through the hypervisor conduit, taking the function identifier and three arguments
+/// and giving the result; and `FiqOn` and `FiqOff`, which unmask and mask fast interrupts,
+/// through which a halting CPU stops the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stub {
     Out1,
@@ -38,12 +53,14 @@ pub enum Stub {
     Pause,
     Mfence,
     IdleWait,
-    Lidt,
     Sti,
     Cli,
     IrqSave,
     IrqRestore,
     Thread,
+    SetCpu,
+    Halt,
+    Lidt,
     Wrmsr,
     Rdmsr,
     ReadCr2,
@@ -52,12 +69,50 @@ pub enum Stub {
     Invlpg,
     LoadTables,
     EnableAvx,
-    Halt,
+    ReadSysReg(u16),
+    WriteSysReg(u16),
+    ReadTtbr0,
+    WriteTtbr0,
+    TlbiPage,
+    EnterRoot,
+    InterruptStack,
+    Switch,
+    SemiExit,
+    Hvc,
+    FiqOn,
+    FiqOff,
 }
 
+/// The base encodings of the AArch64 `mrs` and `msr` instructions reading and writing `x0`, into
+/// which a system register's 15-bit field is placed from bit 5, and the `ret` that follows them.
+const MRS_X0: u32 = 0xD530_0000;
+const MSR_X0: u32 = 0xD510_0000;
+const A64_RET: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
+
 impl Stub {
-    /// The words the stub takes and gives, and its machine code.
-    fn code(self) -> (usize, usize, &'static [u8]) {
+    /// The words the stub takes and gives, and its machine code in the architecture's
+    /// instruction set.
+    fn code(self, arch: Arch) -> (usize, usize, Vec<u8>) {
+        if let Stub::ReadSysReg(field) = self {
+            let mut bytes = (MRS_X0 | u32::from(field) << 5).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&A64_RET);
+            return (0, 1, bytes);
+        }
+        if let Stub::WriteSysReg(field) = self {
+            let mut bytes = (MSR_X0 | u32::from(field) << 5).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&A64_RET);
+            return (1, 0, bytes);
+        }
+        let (params, returns, bytes): (usize, usize, &[u8]) = match arch {
+            Arch::Amd64 => self.x64(),
+            Arch::Aarch64 => self.aarch64(),
+        };
+        (params, returns, bytes.to_vec())
+    }
+
+    /// The x86_64 machine code of a stub, taking its arguments in `rdi`, `rsi` and `rdx` and
+    /// giving its result in `rax`.
+    fn x64(self) -> (usize, usize, &'static [u8]) {
         match self {
             Stub::Out1 => (2, 0, &[0x89, 0xfa, 0x89, 0xf0, 0xee, 0xc3]),
             Stub::Out2 => (2, 0, &[0x89, 0xfa, 0x89, 0xf0, 0x66, 0xef, 0xc3]),
@@ -140,17 +195,267 @@ impl Stub {
                 ],
             ),
             Stub::Halt => (0, 0, &[0xfa, 0xf4, 0xeb, 0xfd]),
+            Stub::SetCpu
+            | Stub::ReadSysReg(_)
+            | Stub::WriteSysReg(_)
+            | Stub::ReadTtbr0
+            | Stub::WriteTtbr0
+            | Stub::TlbiPage
+            | Stub::EnterRoot
+            | Stub::InterruptStack
+            | Stub::Switch
+            | Stub::SemiExit
+            | Stub::Hvc
+            | Stub::FiqOn
+            | Stub::FiqOff => panic!("no x86_64 code for the AArch64 stub {self:?}"),
+        }
+    }
+
+    /// The AArch64 machine code of a stub, taking its arguments in `x0`, `x1` and `x2` and giving
+    /// its result in `x0`. A memory-mapped access is fenced on both sides so devices observe it
+    /// in program order; `WriteTtbr0` and `TlbiPage` order their translation changes and keep
+    /// maskable interrupts disabled across them; `EnterRoot` makes its changes with the MMU off,
+    /// so that no translation mixes the firmware's settings with the entry root's.
+    fn aarch64(self) -> (usize, usize, &'static [u8]) {
+        match self {
+            Stub::MmioRead1 => (
+                1,
+                1,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x00, 0x00, 0x40, 0x39, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioRead2 => (
+                1,
+                1,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x00, 0x00, 0x40, 0x79, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioRead4 => (
+                1,
+                1,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x00, 0x00, 0x40, 0xb9, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioRead8 => (
+                1,
+                1,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x00, 0x00, 0x40, 0xf9, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioWrite1 => (
+                2,
+                0,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x01, 0x00, 0x00, 0x39, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioWrite2 => (
+                2,
+                0,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x01, 0x00, 0x00, 0x79, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioWrite4 => (
+                2,
+                0,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x01, 0x00, 0x00, 0xb9, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::MmioWrite8 => (
+                2,
+                0,
+                &[
+                    0xbf, 0x33, 0x03, 0xd5, 0x01, 0x00, 0x00, 0xf9, 0xbf, 0x33, 0x03, 0xd5, 0xc0,
+                    0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::Fill => (
+                3,
+                0,
+                &[
+                    0x82, 0x00, 0x00, 0xb4, 0x01, 0x14, 0x00, 0x38, 0x42, 0x04, 0x00, 0xf1, 0xc1,
+                    0xff, 0xff, 0x54, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::Copy => (
+                3,
+                0,
+                &[
+                    0x22, 0x02, 0x00, 0xb4, 0x1f, 0x00, 0x01, 0xeb, 0x69, 0x01, 0x00, 0x54, 0x29,
+                    0x00, 0x02, 0x8b, 0x1f, 0x00, 0x09, 0xeb, 0x02, 0x01, 0x00, 0x54, 0x00, 0x00,
+                    0x02, 0x8b, 0x21, 0x00, 0x02, 0x8b, 0x29, 0xfc, 0x5f, 0x38, 0x09, 0xfc, 0x1f,
+                    0x38, 0x42, 0x04, 0x00, 0xf1, 0xa1, 0xff, 0xff, 0x54, 0xc0, 0x03, 0x5f, 0xd6,
+                    0x29, 0x14, 0x40, 0x38, 0x09, 0x14, 0x00, 0x38, 0x42, 0x04, 0x00, 0xf1, 0xa1,
+                    0xff, 0xff, 0x54, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::Pause => (0, 0, &[0x3f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Mfence => (0, 0, &[0xbf, 0x3b, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::IdleWait => (
+                0,
+                0,
+                &[
+                    0x7f, 0x20, 0x03, 0xd5, 0xff, 0x42, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0xdf,
+                    0x42, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::Sti => (0, 0, &[0xff, 0x42, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Cli => (0, 0, &[0xdf, 0x42, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::IrqSave => (
+                0,
+                1,
+                &[
+                    0x20, 0x42, 0x3b, 0xd5, 0xdf, 0x42, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::IrqRestore => (1, 0, &[0x20, 0x42, 0x1b, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Thread => (
+                0,
+                1,
+                &[
+                    0x80, 0xd0, 0x38, 0xd5, 0x00, 0x00, 0x40, 0xf9, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::SetCpu => (1, 0, &[0x80, 0xd0, 0x18, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Halt => (
+                0,
+                0,
+                &[
+                    0xdf, 0x4f, 0x03, 0xd5, 0x7f, 0x20, 0x03, 0xd5, 0xff, 0xff, 0xff, 0x17,
+                ],
+            ),
+            Stub::ReadTtbr0 => (0, 1, &[0x00, 0x20, 0x38, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::WriteTtbr0 => (
+                1,
+                0,
+                &[
+                    0x29, 0x42, 0x3b, 0xd5, 0xdf, 0x42, 0x03, 0xd5, 0x9f, 0x3b, 0x03, 0xd5, 0x00,
+                    0x20, 0x18, 0xd5, 0x9f, 0x3b, 0x03, 0xd5, 0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x3b,
+                    0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0x29, 0x42, 0x1b, 0xd5, 0xc0, 0x03, 0x5f,
+                    0xd6,
+                ],
+            ),
+            Stub::TlbiPage => (
+                1,
+                0,
+                &[
+                    0x09, 0xfc, 0x4c, 0xd3, 0x9f, 0x3a, 0x03, 0xd5, 0xa9, 0x87, 0x08, 0xd5, 0x9f,
+                    0x3b, 0x03, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::EnterRoot => (
+                1,
+                0,
+                &[
+                    0x01, 0x80, 0x88, 0xd2, 0xe1, 0x1f, 0xa0, 0xf2, 0x02, 0xa2, 0x86, 0xd2, 0x02,
+                    0x10, 0xa0, 0xf2, 0x42, 0x00, 0xc0, 0xf2, 0x03, 0x10, 0x38, 0xd5, 0x64, 0xf8,
+                    0x7f, 0x92, 0x9f, 0x3f, 0x03, 0xd5, 0x04, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03,
+                    0xd5, 0x01, 0xa2, 0x18, 0xd5, 0x42, 0x20, 0x18, 0xd5, 0x00, 0x20, 0x18, 0xd5,
+                    0xdf, 0x3f, 0x03, 0xd5, 0x1f, 0x87, 0x08, 0xd5, 0x9f, 0x37, 0x03, 0xd5, 0xdf,
+                    0x3f, 0x03, 0xd5, 0x03, 0x10, 0x18, 0xd5, 0xdf, 0x3f, 0x03, 0xd5, 0xc0, 0x03,
+                    0x5f, 0xd6,
+                ],
+            ),
+            Stub::InterruptStack => (
+                1,
+                0,
+                &[
+                    0xe1, 0x03, 0x00, 0x91, 0xbf, 0x41, 0x00, 0xd5, 0x1f, 0x00, 0x00, 0x91, 0xbf,
+                    0x40, 0x00, 0xd5, 0x3f, 0x00, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            // Ends the machine through a semihosting `SYS_EXIT` call, its subcode `x0` the exit
+            // status; on a machine without a debugger it stops the CPU with interrupts disabled.
+            Stub::SemiExit => (
+                1,
+                0,
+                &[
+                    0xff, 0x43, 0x00, 0xd1, 0xc9, 0x04, 0x80, 0xd2, 0x49, 0x00, 0xa0, 0xf2, 0xe9,
+                    0x03, 0x00, 0xf9, 0xe0, 0x07, 0x00, 0xf9, 0xe1, 0x03, 0x00, 0x91, 0x00, 0x03,
+                    0x80, 0xd2, 0x00, 0x00, 0x5e, 0xd4, 0xdf, 0x4f, 0x03, 0xd5, 0x7f, 0x20, 0x03,
+                    0xd5, 0xff, 0xff, 0xff, 0x17,
+                ],
+            ),
+            // The task-stack switch, which Cranelift's `stack_switch` lowers on x86_64: it saves
+            // the callee-saved registers on the outgoing stack and `x0`'s context's sp, fp and
+            // resume address, loads `x1`'s context and resumes it with `x2` in `x0`. It clears the
+            // link register before the branch, so a fresh task's first frame records a null return
+            // that ends a stack walk, as the zeroed return address does on x86_64.
+            Stub::Switch => (
+                3,
+                0,
+                &[
+                    0xff, 0x83, 0x02, 0xd1, 0xf3, 0x53, 0x00, 0xa9, 0xf5, 0x5b, 0x01, 0xa9, 0xf7,
+                    0x63, 0x02, 0xa9, 0xf9, 0x6b, 0x03, 0xa9, 0xfb, 0x73, 0x04, 0xa9, 0xfd, 0x7b,
+                    0x05, 0xa9, 0xe8, 0x27, 0x06, 0x6d, 0xea, 0x2f, 0x07, 0x6d, 0xec, 0x37, 0x08,
+                    0x6d, 0xee, 0x3f, 0x09, 0x6d, 0xe9, 0x03, 0x00, 0x91, 0x09, 0x00, 0x00, 0xf9,
+                    0x1d, 0x04, 0x00, 0xf9, 0x2a, 0x01, 0x00, 0x10, 0x0a, 0x08, 0x00, 0xf9, 0x29,
+                    0x00, 0x40, 0xf9, 0x3f, 0x01, 0x00, 0x91, 0x3d, 0x04, 0x40, 0xf9, 0x2b, 0x08,
+                    0x40, 0xf9, 0xe0, 0x03, 0x02, 0xaa, 0xfe, 0x03, 0x1f, 0xaa, 0x60, 0x01, 0x1f,
+                    0xd6, 0xf3, 0x53, 0x40, 0xa9, 0xf5, 0x5b, 0x41, 0xa9, 0xf7, 0x63, 0x42, 0xa9,
+                    0xf9, 0x6b, 0x43, 0xa9, 0xfb, 0x73, 0x44, 0xa9, 0xfd, 0x7b, 0x45, 0xa9, 0xe8,
+                    0x27, 0x46, 0x6d, 0xea, 0x2f, 0x47, 0x6d, 0xec, 0x37, 0x48, 0x6d, 0xee, 0x3f,
+                    0x49, 0x6d, 0xff, 0x83, 0x02, 0x91, 0xc0, 0x03, 0x5f, 0xd6,
+                ],
+            ),
+            Stub::Hvc => (4, 1, &[0x02, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::FiqOn => (0, 0, &[0xff, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::FiqOff => (0, 0, &[0xdf, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::Out1
+            | Stub::Out2
+            | Stub::Out4
+            | Stub::In1
+            | Stub::In2
+            | Stub::In4
+            | Stub::Lidt
+            | Stub::Wrmsr
+            | Stub::Rdmsr
+            | Stub::ReadCr2
+            | Stub::ReadCr3
+            | Stub::WriteCr3
+            | Stub::Invlpg
+            | Stub::LoadTables
+            | Stub::EnableAvx => panic!("no AArch64 code for the x86_64 stub {self:?}"),
+            Stub::ReadSysReg(_) | Stub::WriteSysReg(_) => unreachable!("handled before the match"),
+        }
+    }
+
+    /// The stub's symbol: its name, and for a system-register stub the register's encoding.
+    fn symbol(self) -> String {
+        match self {
+            Stub::ReadSysReg(field) => format!("_NSstub_ReadSysReg_{field}"),
+            Stub::WriteSysReg(field) => format!("_NSstub_WriteSysReg_{field}"),
+            other => format!("_NSstub_{other:?}"),
         }
     }
 }
 
 impl Lowering<'_, '_> {
-    /// Calls a compiler stub, emitted once per image, giving its results.
+    /// Calls a compiler stub, emitted once per image at its architecture's instruction alignment,
+    /// giving its results.
     pub fn call_stub(&mut self, fx: &mut Fx, stub: Stub, args: &[Value]) -> Vec<Value> {
         let id = match self.machine_stubs.get(&stub) {
             Some(id) => *id,
             None => {
-                let (params, returns, bytes) = stub.code();
+                let arch = self.ck.db.target.arch().unwrap_or(Arch::Amd64);
+                let align = match arch {
+                    Arch::Amd64 => 1,
+                    Arch::Aarch64 => 4,
+                };
+                let (params, returns, bytes) = stub.code(arch);
                 let mut signature = Signature::new(super::super::CALL_CONV);
                 signature
                     .params
@@ -160,10 +465,10 @@ impl Lowering<'_, '_> {
                     .extend((0..returns).map(|_| AbiParam::new(PTR)));
                 let id = self
                     .module
-                    .declare_function(&format!("_NSstub_{stub:?}"), Linkage::Local, &signature)
+                    .declare_function(&stub.symbol(), Linkage::Local, &signature)
                     .expect("a compiler stub");
                 self.module
-                    .define_function_bytes(id, 1, bytes, &[])
+                    .define_function_bytes(id, align, &bytes, &[])
                     .expect("a compiler stub");
                 self.machine_stubs.insert(stub, id);
                 id

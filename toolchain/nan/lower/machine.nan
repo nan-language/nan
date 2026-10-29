@@ -1,4 +1,4 @@
-//! Machine targets: the `x86_64-uefi` and `x86_64-bare` program entry seams, which Cranelift cannot express, and the boot glue the seams call. Each seam is fixed machine code the implementation emits, with relocations the image writer resolves into the image's own addresses.
+//! Machine targets: the program entry seams of the UEFI and bare targets, which Cranelift cannot express, and the boot glue the seams call. Each seam is fixed machine code the implementation emits, with relocations the image writer resolves into the image's own addresses.
 
 /// The program entry seam's symbol, which the image writer enters.
 pkg const MACHINE_ENTRY: Str = "_NSentry"
@@ -39,9 +39,78 @@ const LARGE_PAGE: u64 = 2u64 * 1024 * 1024
 
 const DEVICES: u64 = 3 << 30
 
+/// The memory the AArch64 entry root maps at its physical addresses, the first 4 GiB, and the
+/// bytes a 1 GiB block descriptor maps, the first of which holds the `virt` board's devices.
+const AARCH64_MAPPED: u64 = 1 << 32
+
+const AARCH64_BLOCK: u64 = 1 << 30
+
+/// The bits of an AArch64 descriptor: a valid descriptor, a table rather than a block, the access
+/// flag, inner-shareable, and the memory-attribute indices into `MAIR_EL1` of device memory and of
+/// normal write-back memory, as the entry seam programs them.
+const A64_VALID: u64 = 0x1
+
+const A64_TABLE: u64 = 0x2
+
+const A64_ACCESS: u64 = 0x400
+
+const A64_INNER: u64 = 0x300
+
+const A64_ATTR_DEVICE: u64 = 0 << 2
+
+const A64_ATTR_NORMAL: u64 = 2 << 2
+
 /// The `x86_64-uefi` entry seam's machine code: already in long mode, it sets the boot stack and
 /// calls the boot glue with the image handle and system table the firmware passed.
 const UEFI_SEAM: Slice[u8] = b"\x48\xbc\x00\x00\x00\x00\x00\x00\x00\x00\x48\x89\xcf\x48\x89\xd6\xe8\x00\x00\x00\x00\xf4\xeb\xfd"
+
+/// The `aarch64-bare` entry seam's machine code, entered at EL1 with the MMU off: it enables
+/// floating point and Advanced SIMD, loads the entry root, the memory attributes and the
+/// translation control, which walks the entry root for the low addresses and no table for the
+/// high ones, turns the MMU and caches on, sets the boot stack, and calls the boot glue with the
+/// device tree's address `0x4000_0000` and zero. Its literal pool, after the code, holds
+/// the entry root's address, the memory attributes, the translation control, the boot stack's top
+/// and the boot glue's address; the image writer patches the first, fourth and fifth.
+const AARCH64_BARE_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x02\x00\x58\x09\x20\x18\xd5\xc9\x02\x00\x58\x09\xa2\x18\xd5\xc9\x02\x00\x58\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x01\x00\x58\x3f\x01\x00\x91\x00\x00\xa8\xd2\x01\x00\x80\xd2\x89\x01\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\xff\x00\x00\x00\x00\x00\x10\x35\x80\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+/// The offsets within `AARCH64_BARE_SEAM` of the literal-pool entries the image writer patches:
+/// the entry root's address, the boot stack's top and the boot glue's address.
+const AARCH64_SEAM_ROOT: u32 = 0x68
+
+const AARCH64_SEAM_STACK: u32 = 0x80
+
+const AARCH64_SEAM_BOOT: u32 = 0x88
+
+/// The `aarch64-uefi` entry seam's machine code: the firmware calls it in the Procedure Call
+/// Standard with the image handle in `x0` and the system table in `x1`, under the MMU it set up; it
+/// enables floating point and Advanced SIMD, sets the boot stack, and calls the boot glue with the
+/// two values. Its literal pool holds the boot stack's top and the boot glue's address.
+const AARCH64_UEFI_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\xc9\x00\x00\x58\x3f\x01\x00\x91\xc9\x00\x00\x58\x20\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+/// The offsets within `AARCH64_UEFI_SEAM` of the boot stack's top and the boot glue's address.
+const AARCH64_UEFI_STACK: u32 = 0x28
+
+const AARCH64_UEFI_BOOT: u32 = 0x30
+
+/// The AArch64 secondary entry seam's machine code, which `PSCI CPU_ON` enters at EL1 with the
+/// MMU off, the start record's address in `x0`. It enables floating point and Advanced SIMD,
+/// installs the entry root and turns the MMU and caches on as the boot seam does, sets the stack the
+/// record names, and calls the record's glue with the record's CPU record. The record holds the
+/// entry root, the stack's top, the glue's address and the CPU record, which it reads before the
+/// MMU is on, from identity-mapped memory.
+const AARCH64_SECONDARY_SEAM: Slice[u8] = b"\x49\x10\x38\xd5\x29\x05\x6c\xb2\x49\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x00\x40\xf9\x09\x20\x18\xd5\x09\x80\x88\xd2\xe9\x1f\xa0\xf2\x09\xa2\x18\xd5\x09\xa2\x86\xd2\x09\x10\xa0\xf2\x49\x00\xc0\xf2\x49\x20\x18\xd5\x1f\x87\x08\xd5\x9f\x37\x03\xd5\xdf\x3f\x03\xd5\x09\x10\x38\xd5\xaa\x00\x82\xd2\x29\x01\x0a\xaa\x09\x10\x18\xd5\xdf\x3f\x03\xd5\x09\x04\x40\xf9\x3f\x01\x00\x91\x0a\x08\x40\xf9\x00\x0c\x40\xf9\x40\x01\x3f\xd6\x7f\x20\x03\xd5\xff\xff\xff\x17"
+
+/// The offsets of a secondary start record's fields: the entry root, the stack's top, the glue's
+/// address and the CPU record, as `AARCH64_SECONDARY_SEAM` reads them.
+const SECONDARY_ROOT: u64 = 0
+
+const SECONDARY_STACK: u64 = 8
+
+const SECONDARY_GLUE: u64 = 16
+
+const SECONDARY_CPU: u64 = 24
+
+const SECONDARY_SIZE: u64 = 32
 
 /// The addresses an image spans: its first address and its last address plus one.
 struct Extent derives Copy {
@@ -74,11 +143,27 @@ fn Lowering.boot_stack(self, program: Program) -> u64 {
     return next_multiple_of(framed, multiple: 16)
 } Lowering.boot_stack
 
+/// Switches task stacks: saves the running stack's execution to the context at `store`, restores
+/// the one at `load` and resumes it with `payload`. The x86-64 code generator lowers the switch;
+/// on AArch64, which it cannot, the `Switch` compiler stub does.
+fn Lowering.switch_stacks(mut self, mut fx: Fx, store: clif::Value, load: clif::Value, payload: clif::Value) {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        var args = Array[clif::Value, 3].filled(store)
+        args[1] = load
+        args[2] = payload
+        discard mut self.call_stub(mut fx, stub: Stub.Switch, args: args.view())
+        return
+    }
+    discard mut fx.b.stack_switch(store, load_context_ptr: load, in_payload0: payload)
+} Lowering.switch_stacks
+
 /// Emits the program entry seam of the target, which calls `boot` on a boot stack of
 /// `stack_bytes` bytes.
 fn Lowering.entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
     match self.ck.db().target {
-        workspace::Target.Bare => mut self.bare_entry_seam(boot, stack_bytes)
+        workspace::Target.X64Bare => mut self.bare_entry_seam(boot, stack_bytes)
+        workspace::Target.Aarch64Bare => mut self.aarch64_bare_entry_seam(boot, stack_bytes)
+        workspace::Target.Aarch64Uefi => mut self.aarch64_uefi_entry_seam(boot, stack_bytes)
         else => mut self.uefi_entry_seam(boot, stack_bytes)
     }
 } Lowering.entry_seam
@@ -93,9 +178,9 @@ fn Lowering.bare_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
     var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
     mut relocs.push(machine_abs4(0x05, data: gdtr, addend: 0))
     mut relocs.push(machine_abs4(0x0a, data: root, addend: 0))
-    mut relocs.push(object::ModuleReloc(offset: 0x39, kind: x64::RelocKind.Absolute4, target: object::RelocTarget.Function(seam), addend: BARE_LONG_MODE))
-    mut relocs.push(object::ModuleReloc(offset: 0x51, kind: x64::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
-    mut relocs.push(object::ModuleReloc(offset: 0x5e, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: 0x39, kind: machinst::RelocKind.Absolute4, target: object::RelocTarget.Function(seam), addend: BARE_LONG_MODE))
+    mut relocs.push(object::ModuleReloc(offset: 0x51, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: 0x5e, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
     mut self.module.define_function_bytes(seam, align: 16, bytes: BARE_SEAM, relocs: relocs.view())
 } Lowering.bare_entry_seam
 
@@ -106,10 +191,50 @@ fn Lowering.uefi_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
     let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
     let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
     var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
-    mut relocs.push(object::ModuleReloc(offset: 0x02, kind: x64::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
-    mut relocs.push(object::ModuleReloc(offset: 0x11, kind: x64::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
+    mut relocs.push(object::ModuleReloc(offset: 0x02, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: 0x11, kind: machinst::RelocKind.Relative4, target: object::RelocTarget.Function(boot), addend: -4))
     mut self.module.define_function_bytes(seam, align: 16, bytes: UEFI_SEAM, relocs: relocs.view())
 } Lowering.uefi_entry_seam
+
+/// Reserves an `aarch64-bare` image's boot stack and emits the program entry seam, which the
+/// platform enters with the MMU off and which calls `boot` with the device tree's address and
+/// zero.
+fn Lowering.aarch64_bare_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
+    let root = mut self.aarch64_entry_root()
+    let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
+    let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_ROOT, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(root), addend: 0))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_STACK, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_SEAM_BOOT, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Function(boot), addend: 0))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: AARCH64_BARE_SEAM, relocs: relocs.view())
+} Lowering.aarch64_bare_entry_seam
+
+/// Reserves an `aarch64-uefi` image's boot stack and emits the program entry seam, which the
+/// firmware calls with the image handle and system table and which calls `boot`.
+fn Lowering.aarch64_uefi_entry_seam(mut self, boot: object::FuncId, stack_bytes: u64) {
+    let stack_data = mut self.reserved_data("_NSboot_stack", size: stack_bytes, align: 16)
+    let seam = mut self.module.declare_function(MACHINE_ENTRY, linkage: object::Linkage.Export, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    var relocs = mem::List[object::ModuleReloc].empty(self.alloc)
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_UEFI_STACK, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Data(stack_data), addend: i64.fit(stack_bytes)))
+    mut relocs.push(object::ModuleReloc(offset: AARCH64_UEFI_BOOT, kind: machinst::RelocKind.Absolute8, target: object::RelocTarget.Function(boot), addend: 0))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: AARCH64_UEFI_SEAM, relocs: relocs.view())
+} Lowering.aarch64_uefi_entry_seam
+
+/// Emits the AArch64 secondary entry seam, which `PSCI CPU_ON` enters, and gives its symbol
+/// so the starting of the other CPUs may name its address. It reads everything from the start
+/// record passed in `x0`, so it needs no relocations.
+fn Lowering.aarch64_secondary_seam(mut self) -> object::FuncId {
+    let seam = mut self.module.declare_function("_NSsecondary", linkage: object::Linkage.Local, signature: clif::Signature.new(CALL_CONV, alloc: self.alloc))
+    mut self.module.define_function_bytes(seam, align: 16, bytes: AARCH64_SECONDARY_SEAM, relocs: mem::List[object::ModuleReloc].empty(self.alloc).view())
+    return seam
+} Lowering.aarch64_secondary_seam
+
+/// The address of a machine image's single secondary start record, which the boot CPU fills before
+/// it starts each other CPU.
+fn Lowering.secondary_record(mut self, mut fx: Fx) -> clif::Value {
+    return mut self.reserved(mut fx, data_name: "_NSsecondary_record", size: SECONDARY_SIZE, align: 16)
+} Lowering.secondary_record
 
 /// The boot glue a final build's entry seam calls with the two values the platform entered
 /// the image with: it records them, sets up the runtime, mints the root grant through the
@@ -152,10 +277,20 @@ fn Lowering.boot_glue(mut self, program: Program) -> object::FuncId {
     return id
 } Lowering.boot_glue
 
-/// The entry root, whose tables the image holds: a top-level table, a page-directory-pointer
-/// table and four page directories of 2 MiB pages mapping the first 4 GiB writable at their
-/// physical addresses, the last gigabyte uncached.
+/// The entry root, the page tables the image holds mapping the first 4 GiB writable at their
+/// physical addresses, which the entry seam or `exit_services` installs, in the format of the
+/// target's architecture.
 fn Lowering.entry_root(mut self) -> object::DataId {
+    if self.ck.db().target.arch() == Some(workspace::Arch.Aarch64) {
+        return mut self.aarch64_entry_root()
+    }
+    return mut self.x64_entry_root()
+} Lowering.entry_root
+
+/// The x86_64 entry root: a top-level table, a page-directory-pointer table and four page
+/// directories of 2 MiB pages mapping the first 4 GiB writable at their physical addresses, the
+/// last gigabyte uncached.
+fn Lowering.x64_entry_root(mut self) -> object::DataId {
     let root_name = "_NSentry_root"
     match self.reservations.get(text::String.of(root_name, alloc: self.alloc)) {
         Some(reserved) => return reserved
@@ -187,7 +322,43 @@ fn Lowering.entry_root(mut self) -> object::DataId {
     mut self.module.define_data(id, take description)
     discard mut self.reservations.insert(text::String.of(root_name, alloc: self.alloc), value: id)
     return id
-} Lowering.entry_root
+} Lowering.x64_entry_root
+
+/// The AArch64 entry root, a 4 KiB-granule level-0 table pointing at a level-1 table of four
+/// 1 GiB block descriptors mapping the first 4 GiB: the first gigabyte, which holds the `virt`
+/// board's devices, as device memory, and the rest as normal write-back inner-shareable memory,
+/// at their physical addresses. Its attribute indices are those the `aarch64-bare` entry seam
+/// programs into `MAIR_EL1`.
+fn Lowering.aarch64_entry_root(mut self) -> object::DataId {
+    let root_name = "_NSentry_root"
+    match self.reservations.get(text::String.of(root_name, alloc: self.alloc)) {
+        Some(reserved) => return reserved
+        None => {}
+    }
+    let id = mut self.module.declare_data(root_name, linkage: object::Linkage.Local, writable: true, tls: false)
+    // The level-0 table is zeroed; the level-1 table follows it a page later.
+    var table_bytes = mem::Bytes.zeroed(2 * 4_096, alloc: self.alloc)
+    for gigabyte in 0..<(AARCH64_MAPPED / AARCH64_BLOCK) {
+        let address = gigabyte * AARCH64_BLOCK
+        let memory = if address < AARCH64_BLOCK {
+            A64_VALID | A64_ACCESS | A64_ATTR_DEVICE
+        } else {
+            A64_VALID | A64_ACCESS | A64_INNER | A64_ATTR_NORMAL
+        }
+        let block_entry = address | memory
+        let at = usize.widen(4_096 + 8 * gigabyte)
+        var writable = mut table_bytes.view_mut()
+        mut writable.write_u64_le(at, value: block_entry)
+    }
+    var description = object::DataDescription.new(self.alloc)
+    mut description.define(take table_bytes)
+    mut description.set_align(4_096)
+    let own = mut description.import_data(id)
+    mut description.write_data_addr(0, data: own, addend: i64.fit(4_096 + A64_VALID + A64_TABLE))
+    mut self.module.define_data(id, take description)
+    discard mut self.reservations.insert(text::String.of(root_name, alloc: self.alloc), value: id)
+    return id
+} Lowering.aarch64_entry_root
 
 /// The image's first address and last address plus one, which the image writer records.
 fn Lowering.image_extent(mut self, mut fx: Fx) -> Extent {
@@ -233,7 +404,7 @@ fn Lowering.define_gdt(mut self) -> object::DataId {
 
 /// An absolute 4-byte relocation of a data object's address plus `addend` at `offset`.
 fn machine_abs4(offset: u32, data: object::DataId, addend: i64) -> object::ModuleReloc {
-    return object::ModuleReloc(offset: offset, kind: x64::RelocKind.Absolute4, target: object::RelocTarget.Data(data), addend: addend)
+    return object::ModuleReloc(offset: offset, kind: machinst::RelocKind.Absolute4, target: object::RelocTarget.Data(data), addend: addend)
 } machine_abs4
 
 /// A size or alignment, 1 when it is 0.

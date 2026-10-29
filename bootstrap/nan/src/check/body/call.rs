@@ -21,7 +21,20 @@ use crate::nir::{self, BitConversion, BitsOwner, Conversion};
 use crate::syntax::ast::{
     self, ExprKind, FailureMarker, FnKind, ItemKind, Mode, Tok, TypeModifier,
 };
-use crate::workspace::{Authority, Target};
+use crate::workspace::{Arch, Authority};
+
+/// The std functions that belong to one architecture's machine targets: its privileged
+/// intrinsics other than `invalidate_page`, and the x86_64 interrupt descriptor table.
+const INTRINSIC_ARCHS: [(&str, Arch); 8] = [
+    ("hw::Ring0.load_idt", Arch::Amd64),
+    ("hw::Ring0.write_cr3", Arch::Amd64),
+    ("hw::Ring0.read_msr", Arch::Amd64),
+    ("hw::Ring0.write_msr", Arch::Amd64),
+    ("hw::Idt.of_vectors", Arch::Amd64),
+    ("hw::Ring0.write_ttbr0", Arch::Aarch64),
+    ("hw::Ring0.read_sysreg", Arch::Aarch64),
+    ("hw::Ring0.write_sysreg", Arch::Aarch64),
+];
 
 /// The named conversions.
 const CONVERSIONS: [&str; 6] = [
@@ -1709,9 +1722,18 @@ impl Body<'_, '_> {
                         self.report(token, Code::KernelAnchorOutsideEntry);
                     }
                     "sys::Domain.run" | "sys::Domain.run_sized"
-                        if matches!(self.ck.db.target, Target::Uefi | Target::Bare) =>
+                        if self.ck.db.target.is_machine() =>
                     {
                         self.report(token, Code::DomainUnavailable);
+                    }
+                    "hw::Ports.map" if self.ck.db.target.arch() == Some(Arch::Aarch64) => {
+                        self.report(token, Code::RegisterPortTarget);
+                    }
+                    _ if INTRINSIC_ARCHS.iter().any(|(intrinsic, arch)| {
+                        *intrinsic == path && self.ck.db.target.arch().is_some_and(|of| of != *arch)
+                    }) =>
+                    {
+                        self.report(token, Code::HwIntrinsicTarget);
                     }
                     "host::Runner.run" => {
                         if let Some(code) = self.ck.runner_problem(&callable.head, subst) {

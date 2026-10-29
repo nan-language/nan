@@ -14,7 +14,7 @@ use super::ty::{Subst, Ty};
 use crate::diagnostic::{Code, Offer};
 use crate::interp::{ConstValue, FnVal, Interpreter, Val};
 use crate::syntax::ast::{self, ItemKind};
-use crate::workspace::{Authority, Target};
+use crate::workspace::{Arch, Authority, Kind};
 
 /// A contribution as a judging root sees it.
 pub struct Contribution {
@@ -154,7 +154,7 @@ impl Checker<'_> {
         if !self.db.is_std(registry) {
             return;
         }
-        let vectors = matches!(self.db.target, Target::Uefi | Target::Bare);
+        let vectors = self.db.target.is_machine();
         let seams = match self.db.canonical(registry).as_str() {
             "hw::vectors" => vectors,
             "hw::preempt" => {
@@ -168,7 +168,7 @@ impl Checker<'_> {
                 }
                 vectors
             }
-            "hw::syscall_entry" => self.db.target == Target::Bare,
+            "hw::syscall_entry" => self.db.target.kind() == Some(Kind::Bare),
             _ => true,
         };
         if !seams {
@@ -410,19 +410,22 @@ impl Checker<'_> {
             .map(|registry| self.db.canonical(registry));
         let broken = match registry.as_deref() {
             Some("hw::vectors") => {
+                let Some(arch) = self.db.target.arch() else {
+                    return;
+                };
                 let vector = fields[0].int();
                 let handler = match &fields[2] {
                     Val::Variant(_, index, _) => *index,
                     _ => return,
                 };
                 let user = &fields[3];
-                let class = vector_class(vector);
+                let class = vector_class(arch, vector);
                 let landing = match user {
                     Val::Variant(_, 0, payload) => Some(&payload[0]),
                     _ => None,
                 };
                 class != Some(handler)
-                    || fields[1].int() == 0 && matches!(vector, 2 | 8 | 18)
+                    || !ist_allowed(arch, vector, fields[1].int())
                     || landing.is_some() && class == Some(0)
                     || landing.is_some_and(|function| !self.is_landing(function))
             }
@@ -467,14 +470,32 @@ impl Checker<'_> {
     }
 }
 
-/// The class the descriptors of `x86_64-uefi` and `x86_64-bare` give a vector, as the index of
+/// The class the descriptors of an architecture's machine targets give a vector, as the index of
 /// the `hw::VectorHandler` variant it names: `Irq`, `Trap`, `TrapWithCode`, `PageFault`.
-fn vector_class(vector: i128) -> Option<u32> {
-    match vector {
-        0..=7 | 16 | 18..=20 | 28 => Some(1),
-        8 | 10..=13 | 17 | 21 | 29 | 30 => Some(2),
-        14 => Some(3),
-        32..=255 => Some(0),
-        _ => None,
+fn vector_class(arch: Arch, vector: i128) -> Option<u32> {
+    match arch {
+        Arch::Amd64 => match vector {
+            0..=7 | 16 | 18..=20 | 28 => Some(1),
+            8 | 10..=13 | 17 | 21 | 29 | 30 => Some(2),
+            14 => Some(3),
+            32..=255 => Some(0),
+            _ => None,
+        },
+        Arch::Aarch64 => match vector {
+            0 | 2 => Some(2),
+            1 => Some(3),
+            16..=255 => Some(0),
+            _ => None,
+        },
+    }
+}
+
+/// Whether the descriptors of an architecture's machine targets allow an `ist` for a vector: on
+/// x86_64 a nonzero one for each vector that needs one, and on AArch64, whose vector seams run on
+/// the CPU's one interrupt stack, 0 for every vector.
+fn ist_allowed(arch: Arch, vector: i128, ist: i128) -> bool {
+    match arch {
+        Arch::Amd64 => ist != 0 || !matches!(vector, 2 | 8 | 18),
+        Arch::Aarch64 => ist == 0,
     }
 }

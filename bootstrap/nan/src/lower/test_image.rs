@@ -1,5 +1,5 @@
 //! Test images: a package's tests lowered for their runs on a run target, each run a process on
-//! `x86_64-host` and a boot of the emulator on a machine target. The seam reads which test and
+//! a host target and a boot of the emulator on a machine target. The seam reads which test and
 //! run to perform and starts the entry task, which mints the run's simulated world, runs the test
 //! as the first task of a new test domain on the seeded scheduler, then writes the run's outcome
 //! as a frame on standard output, or the serial port of a machine, and ends the run.

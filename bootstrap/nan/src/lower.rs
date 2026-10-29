@@ -45,7 +45,7 @@ use crate::check::Checker;
 use crate::check::db::{ItemId, PackageId, TypeKey};
 use crate::check::ty::{self as ty, Args, Ty};
 use crate::nir::{Role, Span};
-use crate::workspace::Target;
+use crate::workspace::{Arch, Target};
 pub use abi::Abi;
 use fx::Fx;
 use layout::Layouts;
@@ -276,24 +276,29 @@ enum Pending {
     Routine(runtime::Routine, FuncId),
 }
 
-/// The settings an image's code is generated with: the x86-64 base set with SSE2, frame
-/// pointers in every function, stack switching, and the canonical NaN as the NaN every float
-/// operation returns. An `x86_64-host` image is position-independent and links against glibc
-/// with inline stack probes for its guard pages; a machine image loads at a fixed address and
-/// is not position-independent, so its code reaches its own functions and data directly, with no
-/// global offset table and no stack probes.
+/// The settings an image's code is generated with: the base set of its architecture, the x86-64
+/// one with SSE2 or the A64 one of Armv8.0-A, frame pointers in every function, Cranelift's stack
+/// switching where it has it, and the canonical NaN as the NaN every float operation returns. A
+/// host image is position-independent and links against glibc with inline stack probes for its
+/// guard pages; a machine image loads at a fixed address and is not position-independent, so its
+/// code reaches its own functions and data directly, with no global offset table and no stack
+/// probes.
 fn isa(target: Target) -> OwnedTargetIsa {
     let mut flags = settings::builder();
-    let (triple, pic, probes) = match target {
-        Target::Host => ("x86_64-unknown-linux-gnu", "true", "true"),
-        _ => ("x86_64-unknown-none-elf", "false", "false"),
+    let host = target.is_host();
+    let triple = match (target.arch(), host) {
+        (Some(Arch::Aarch64), true) => "aarch64-unknown-linux-gnu",
+        (Some(Arch::Aarch64), false) => "aarch64-unknown-none-elf",
+        (_, true) => "x86_64-unknown-linux-gnu",
+        (_, false) => "x86_64-unknown-none-elf",
     };
+    let on_host = if host { "true" } else { "false" };
     for (name, value) in [
         ("opt_level", "speed"),
-        ("is_pic", pic),
+        ("is_pic", on_host),
         ("preserve_frame_pointers", "true"),
         ("stack_switch_model", "basic"),
-        ("enable_probestack", probes),
+        ("enable_probestack", on_host),
         ("probestack_strategy", "inline"),
         ("unwind_info", "false"),
         ("tls_model", "elf_gd"),
@@ -302,9 +307,9 @@ fn isa(target: Target) -> OwnedTargetIsa {
         flags.set(name, value).expect("a Cranelift setting");
     }
     cranelift_codegen::isa::lookup_by_name(triple)
-        .expect("the x86-64 backend")
+        .expect("the target's backend")
         .finish(settings::Flags::new(flags))
-        .expect("the x86-64 settings")
+        .expect("the target's settings")
 }
 
 /// Lowers the reach of a program's final build.
@@ -315,9 +320,9 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
     lowering.finish(Some(&program.section))
 }
 
-/// Lowers the reach of an `x86_64-uefi` or `x86_64-bare` program's final build: the entry
-/// function and the target's entry landing fn behind the machine entry seam, into an object the
-/// image writer turns into an image.
+/// Lowers the reach of a final build for a machine target: the entry function and the target's
+/// entry landing fn behind the machine entry seam, into an object the image writer turns into an
+/// image.
 pub fn lower_machine(ck: &Checker, program: &Program) -> Lowered {
     let mut lowering = Lowering::new(ck, program.prefixes.clone(), program.roots.clone(), None);
     let boot = lowering.boot_glue(program);
@@ -376,7 +381,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
         }
     }
 
-    /// Whether the image runs on a machine target, `x86_64-uefi` or `x86_64-bare`.
+    /// Whether the image runs on a machine target, a UEFI or bare one.
     pub fn machine(&self) -> bool {
         self.ck.db.target.is_machine()
     }

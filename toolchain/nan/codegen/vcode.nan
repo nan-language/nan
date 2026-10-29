@@ -1,7 +1,7 @@
 //! A function's machine code before register allocation: instructions over virtual registers, in blocks laid out in emission order, and the removal of the instructions whose results nothing reads.
 
 /// No register.
-const NO_REG: x64::Reg = x64::Reg(index: 0xFFFF_FFFF)
+const NO_REG: machinst::Reg = machinst::Reg(index: 0xFFFF_FFFF)
 
 /// No index.
 const NONE: u32 = 0xFFFF_FFFF
@@ -11,8 +11,8 @@ const NONE: u32 = 0xFFFF_FFFF
 const MAX_INSTS: u32 = 0x8000_0000
 
 /// A machine instruction with the source location of the instruction it was selected for.
-struct VInst derives Copy, Eq {
-    inst: x64::Inst
+struct VInst[I: Copy] derives Copy {
+    inst: I
     loc: clif::SourceLoc
 } VInst
 
@@ -31,17 +31,17 @@ struct VBlock derives Copy, Eq {
 } VBlock
 
 /// A function's machine code before register allocation, with what its frame needs.
-struct VCode {
-    insts: mem::List[VInst]
+struct VCode[I: machinst::MachInst and Copy] {
+    insts: mem::List[VInst[I]]
     blocks: mem::List[VBlock]
-    params: mem::List[x64::Reg]
-    args: mem::List[x64::Reg]
+    params: mem::List[machinst::Reg]
+    args: mem::List[machinst::Reg]
     succs: mem::List[u32]
-    /// Whether each virtual register is an SSE register.
+    /// Whether each virtual register is a floating-point register.
     floats: mem::List[bool]
     /// The register each virtual register would rather share: a physical one, a virtual one, or
     /// `NO_REG`.
-    hints: mem::List[x64::Reg]
+    hints: mem::List[machinst::Reg]
     /// The offset from the stack pointer at which the outgoing argument area and the stack slots
     /// above it end.
     slots_end: u32
@@ -59,7 +59,7 @@ struct VCode {
 /// fewer than `MAX_INSTS`.
 fn VCode.holds(self, block: VBlock) -> bool = block.begin < block.end and usize.widen(block.end) <= self.insts.len() and self.insts.len() < usize.widen(MAX_INSTS)
 
-proj fn VCode.block_params(self, block: VBlock) -> Slice[x64::Reg] {
+proj fn VCode.block_params(self, block: VBlock) -> Slice[machinst::Reg] {
     let Some(parts) = self.params.view().split_at(usize.widen(block.param_start)) else {
         expect false
         return self.params.view()
@@ -72,7 +72,7 @@ proj fn VCode.block_params(self, block: VBlock) -> Slice[x64::Reg] {
 } VCode.block_params
 
 /// The registers a block's final jump passes to its target's parameters.
-proj fn VCode.block_args(self, block: VBlock) -> Slice[x64::Reg] {
+proj fn VCode.block_args(self, block: VBlock) -> Slice[machinst::Reg] {
     let Some(parts) = self.args.view().split_at(usize.widen(block.arg_start)) else {
         expect false
         return self.args.view()
@@ -98,8 +98,8 @@ proj fn VCode.block_succs(self, block: VBlock) -> Slice[u32] {
 
 /// The code's hints with each argument a jump passes and the parameter receiving it preferring
 /// each other's register.
-fn VCode.edge_hints(self, alloc: mem::Alloc) -> mem::List[x64::Reg] {
-    var hints = mem::List[x64::Reg].empty(alloc)
+fn VCode.edge_hints(self, alloc: mem::Alloc) -> mem::List[machinst::Reg] {
+    var hints = mem::List[machinst::Reg].empty(alloc)
     for hint in self.hints {
         mut hints.push(hint)
     }
@@ -120,15 +120,15 @@ fn VCode.edge_hints(self, alloc: mem::Alloc) -> mem::List[x64::Reg] {
     return hints
 } VCode.edge_hints
 
-fn VCode.empty(alloc: mem::Alloc) -> VCode {
+fn VCode.empty(alloc: mem::Alloc) -> VCode[I] {
     return VCode(
-        insts: mem::List[VInst].empty(alloc),
+        insts: mem::List[VInst[I]].empty(alloc),
         blocks: mem::List[VBlock].empty(alloc),
-        params: mem::List[x64::Reg].empty(alloc),
-        args: mem::List[x64::Reg].empty(alloc),
+        params: mem::List[machinst::Reg].empty(alloc),
+        args: mem::List[machinst::Reg].empty(alloc),
         succs: mem::List[u32].empty(alloc),
         floats: mem::List[bool].empty(alloc),
-        hints: mem::List[x64::Reg].empty(alloc),
+        hints: mem::List[machinst::Reg].empty(alloc),
         slots_end: 0,
         align: 16,
         calls: false,
@@ -151,8 +151,8 @@ fn VCode.table_count(self) -> usize {
     return self.table_starts.len() - 1
 } VCode.table_count
 
-fn VCode.new_vreg(mut self, float: bool) -> x64::Reg {
-    let reg = x64::Reg.virtual_number(u32.fit(self.floats.len()))
+fn VCode.new_vreg(mut self, float: bool) -> machinst::Reg {
+    let reg = machinst::Reg.virtual_number(u32.fit(self.floats.len()))
     mut self.floats.push(float)
     mut self.hints.push(NO_REG)
     return reg
@@ -162,19 +162,31 @@ fn VCode.vreg_count(self) -> u32 {
     return u32.fit(self.floats.len())
 } VCode.vreg_count
 
-/// Whether a register is an SSE one, physical or virtual.
-fn VCode.is_float(self, reg: x64::Reg) -> bool {
+/// Whether a register is a floating-point one, physical or virtual.
+fn VCode.is_float(self, reg: machinst::Reg) -> bool {
     if reg.is_virtual() {
         let at = usize.widen(reg.vreg())
         expect at < self.floats.len()
         return self.floats[at]
     }
-    return reg.is_xmm()
+    return I.is_float(reg)
 } VCode.is_float
+
+/// The registers allocation hands out.
+fn VCode.allocatable(self) -> machinst::RegSet {
+    var regs = machinst::RegSet.empty()
+    for index in 0u32..<I.class_size(false) {
+        regs = regs.plus(I.class_reg(false, index: index))
+    }
+    for index in 0u32..<I.class_size(true) {
+        regs = regs.plus(I.class_reg(true, index: index))
+    }
+    return regs
+} VCode.allocatable
 
 /// Records in the code's hints that a virtual register would rather share `preferred`'s
 /// register, unless it already prefers one.
-fn prefer(mut hints: mem::List[x64::Reg], reg: x64::Reg, preferred: x64::Reg) {
+fn prefer(mut hints: mem::List[machinst::Reg], reg: machinst::Reg, preferred: machinst::Reg) {
     if not reg.is_virtual() or preferred == NO_REG {
         return
     }
@@ -228,9 +240,9 @@ fn VCode.remove_dead(mut self, alloc: mem::Alloc) {
 
 /// Adds 1 to the use count of each virtual register an instruction reads when `adding`, or takes
 /// 1 away.
-fn count_uses(inst: x64::Inst, mut counts: mem::List[u32], adding: bool) {
-    discard inst.map_regs(fn[mut counts](reg: x64::Reg, role: x64::Role) -> x64::Reg {
-        if reg.is_virtual() and (role == x64::Role.Use or role == x64::Role.Mod) {
+fn count_uses[I: machinst::MachInst](inst: I, mut counts: mem::List[u32], adding: bool) {
+    discard inst.map_regs(fn[mut counts](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+        if reg.is_virtual() and (role == machinst::Role.Use or role == machinst::Role.Mod) {
             let at = usize.widen(reg.vreg())
             expect at < counts.len()
             if adding {
@@ -246,13 +258,13 @@ fn count_uses(inst: x64::Inst, mut counts: mem::List[u32], adding: bool) {
 
 /// Whether an instruction without memory or control effects writes only virtual registers that
 /// no other instruction reads.
-fn is_removable(inst: x64::Inst, counts: mem::List[u32]) -> bool {
-    if not is_pure(inst) {
+fn is_removable[I: machinst::MachInst](inst: I, counts: mem::List[u32]) -> bool {
+    if not inst.is_pure() {
         return false
     }
     var removable = true
-    discard inst.map_regs(fn[mut removable](reg: x64::Reg, role: x64::Role) -> x64::Reg {
-        if role == x64::Role.Use {
+    discard inst.map_regs(fn[mut removable](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+        if role == machinst::Role.Use {
             return reg
         }
         if not reg.is_virtual() {
@@ -260,7 +272,7 @@ fn is_removable(inst: x64::Inst, counts: mem::List[u32]) -> bool {
             return reg
         }
         var own: u32 = 0
-        if role == x64::Role.Mod {
+        if role == machinst::Role.Mod {
             own = 1
         }
         let at = usize.widen(reg.vreg())
@@ -272,43 +284,6 @@ fn is_removable(inst: x64::Inst, counts: mem::List[u32]) -> bool {
     })
     return removable
 } is_removable
-
-/// Whether an instruction only computes registers and flags.
-fn is_pure(inst: x64::Inst) -> bool {
-    return match inst {
-        x64::Inst.Mov(dst: _, src: _) or x64::Inst.MovImm(dst: _, imm: _) or x64::Inst.MovSymbol(dst: _, symbol: _, addend: _) or x64::Inst.Lea(dst: _, src: _) => true
-        x64::Inst.Alu(op: _, size: _, dst: _, src: _) or x64::Inst.AluImm(op: _, size: _, dst: _, imm: _) or x64::Inst.Cmp(size: _, lhs: _, rhs: _) or x64::Inst.CmpImm(size: _, lhs: _, imm: _) or x64::Inst.Test(size: _, lhs: _, rhs: _) => true
-        x64::Inst.Unary(op: _, size: _, reg: _) or x64::Inst.Imul(size: _, dst: _, src: _) or x64::Inst.ImulImm(size: _, dst: _, src: _, imm: _) or x64::Inst.Shift(op: _, size: _, dst: _, amount: _) => true
-        x64::Inst.Setcc(cond: _, dst: _) or x64::Inst.Cmov(cond: _, size: _, dst: _, src: _) or x64::Inst.Extend(kind: _, dst: _, src: _) or x64::Inst.BitScan(reverse: _, size: _, dst: _, src: _) or x64::Inst.Bswap(size: _, reg: _) => true
-        x64::Inst.FloatArith(op: _, size: _, dst: _, src: _) or x64::Inst.FloatSqrt(size: _, dst: _, src: _) or x64::Inst.FloatConvert(source: _, dst: _, src: _) or x64::Inst.FloatBits(op: _, dst: _, src: _) or x64::Inst.Ucomis(size: _, lhs: _, rhs: _) => true
-        x64::Inst.CvtIntToFloat(int_size: _, size: _, dst: _, src: _) or x64::Inst.CvtFloatToInt(size: _, int_size: _, dst: _, src: _) or x64::Inst.MovToXmm(size: _, dst: _, src: _) or x64::Inst.MovFromXmm(size: _, dst: _, src: _) => true
-        x64::Inst.FloatToIntSat(signed: _, size: _, dst: _, src: _, temp: _) or x64::Inst.UintToFloat(size: _, dst: _, src: _, temp: _) or x64::Inst.CanonNan(size: _, reg: _, temp: _) or x64::Inst.XmmCmov(cond: _, dst: _, src: _) => true
-        else => false
-    }
-} is_pure
-
-/// Whether an instruction reads the flags.
-fn reads_flags(inst: x64::Inst) -> bool {
-    return match inst {
-        x64::Inst.Setcc(cond: _, dst: _) or x64::Inst.Cmov(cond: _, size: _, dst: _, src: _) or x64::Inst.Jcc(cond: _, label: _) or x64::Inst.XmmCmov(cond: _, dst: _, src: _) => true
-        x64::Inst.Alu(op: op, size: _, dst: _, src: _) => op == x64::AluOp.Adc or op == x64::AluOp.Sbb
-        x64::Inst.AluImm(op: op, size: _, dst: _, imm: _) => op == x64::AluOp.Adc or op == x64::AluOp.Sbb
-        else => false
-    }
-} reads_flags
-
-/// Whether an instruction leaves the flags other than it found them.
-fn writes_flags(inst: x64::Inst) -> bool {
-    return match inst {
-        x64::Inst.Mov(dst: _, src: _) or x64::Inst.MovImm(dst: _, imm: _) or x64::Inst.MovSymbol(dst: _, symbol: _, addend: _) or x64::Inst.Load(kind: _, dst: _, src: _) or x64::Inst.Lea(dst: _, src: _) => false
-        x64::Inst.Store(size: _, src: _, dst: _) or x64::Inst.StoreImm(size: _, imm: _, dst: _) or x64::Inst.Setcc(cond: _, dst: _) or x64::Inst.Cmov(cond: _, size: _, dst: _, src: _) or x64::Inst.Extend(kind: _, dst: _, src: _) => false
-        x64::Inst.Bswap(size: _, reg: _) or x64::Inst.Jmp(label: _) or x64::Inst.Jcc(cond: _, label: _) or x64::Inst.Args(params: _) or x64::Inst.SignExtendData(size: _) or x64::Inst.Xchg(size: _, reg: _, mem: _) => false
-        x64::Inst.FloatArith(op: _, size: _, dst: _, src: _) or x64::Inst.FloatSqrt(size: _, dst: _, src: _) or x64::Inst.FloatConvert(source: _, dst: _, src: _) or x64::Inst.FloatBits(op: _, dst: _, src: _) => false
-        x64::Inst.CvtIntToFloat(int_size: _, size: _, dst: _, src: _) or x64::Inst.CvtFloatToInt(size: _, int_size: _, dst: _, src: _) or x64::Inst.MovToXmm(size: _, dst: _, src: _) or x64::Inst.MovFromXmm(size: _, dst: _, src: _) or x64::Inst.XmmCmov(cond: _, dst: _, src: _) => false
-        x64::Inst.Unary(op: op, size: _, reg: _) => op == x64::UnaryOp.Neg
-        else => true
-    }
-} writes_flags
 
 /// Whether each instruction writes flags a later one of its block reads.
 fn VCode.flags_consumed(self, dead: mem::List[bool], alloc: mem::Alloc) -> mem::List[bool]
@@ -327,11 +302,11 @@ fn VCode.flags_consumed(self, dead: mem::List[bool], alloc: mem::Alloc) -> mem::
                 continue
             }
             let inst = self.insts[index].inst
-            if reads_flags(inst) and writer != NONE {
+            if inst.reads_flags() and writer != NONE {
                 expect usize.widen(writer) < consumed.len()
                 consumed[usize.widen(writer)] = true
             }
-            if writes_flags(inst) {
+            if inst.writes_flags() {
                 writer = at
             }
         }
@@ -343,7 +318,7 @@ fn VCode.flags_consumed(self, dead: mem::List[bool], alloc: mem::Alloc) -> mem::
 fn VCode.compact(mut self, dead: mem::List[bool], alloc: mem::Alloc)
     requires dead.len() == self.insts.len()
 {
-    var kept = mem::List[VInst].empty(alloc)
+    var kept = mem::List[VInst[I]].empty(alloc)
     var blocks = mem::List[VBlock].empty(alloc)
     for block in self.blocks {
         expect self.holds(block)

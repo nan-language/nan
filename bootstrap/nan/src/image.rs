@@ -1,7 +1,7 @@
 //! The image writer: links the relocatable object of a machine target's lowering into its image,
-//! a PE32+ EFI application on `x86_64-uefi` or a static ELF64 executable entered by the PVH boot
-//! protocol on `x86_64-bare`. It lays the object's sections out in segments, one per access
-//! kind, resolves its symbols and applies its relocations.
+//! a PE32+ EFI application on a UEFI target or a static ELF64 executable on a bare target. It
+//! lays the object's sections out in segments, one per access kind, resolves its symbols and
+//! applies its relocations.
 
 mod elf;
 mod object;
@@ -9,7 +9,7 @@ mod pe;
 
 use std::collections::HashMap;
 
-use crate::workspace::Target;
+use crate::workspace::{self, Target};
 use object::Kind;
 
 /// The size of a page, to which every segment is aligned.
@@ -21,16 +21,17 @@ pub const IMAGE_EXTENT: &str = "_NSimage";
 
 /// The image of a machine target linking an object lowering wrote, entered at the symbol `entry`.
 pub fn write(target: Target, object: &[u8], entry: &str) -> Vec<u8> {
-    match target {
-        Target::Uefi => {
+    let arch = target.arch().expect("a machine target's architecture");
+    match target.kind() {
+        Some(workspace::Kind::Uefi) => {
             let linked = link(object, pe::BASE);
-            pe::write(&linked, linked.symbol(entry))
+            pe::write(&linked, linked.symbol(entry), arch)
         }
-        Target::Bare => {
-            let linked = link(object, elf::BASE);
-            elf::write(&linked, linked.symbol(entry))
+        Some(workspace::Kind::Bare) => {
+            let linked = link(object, elf::base(arch));
+            elf::write(&linked, linked.symbol(entry), arch)
         }
-        Target::Host | Target::Any => panic!("the image writer builds no {} image", target.name()),
+        _ => panic!("the image writer builds no {} image", target.name()),
     }
 }
 
@@ -95,12 +96,26 @@ impl Linked {
     }
 }
 
-/// The relocation types the objects lowering writes hold.
+/// The relocation types the objects lowering writes hold: the x86_64 ones and `A64_ABS64`, which
+/// patch a byte range with an absolute or program-counter-relative address, and the other AArch64
+/// ones, which patch an instruction's immediate field.
 mod reloc {
-    pub const ABS64: u32 = 1;
-    pub const PC32: u32 = 2;
-    pub const PLT32: u32 = 4;
-    pub const ABS32: u32 = 10;
+    pub const X64_ABS64: u32 = 1;
+    pub const X64_PC32: u32 = 2;
+    pub const X64_PLT32: u32 = 4;
+    pub const X64_ABS32: u32 = 10;
+    pub const A64_ABS64: u32 = 257;
+    pub const A64_ADR_PREL_PG_HI21: u32 = 275;
+    pub const A64_ADD_ABS_LO12_NC: u32 = 277;
+    pub const A64_CALL26: u32 = 283;
+}
+
+/// Patches the 32-bit AArch64 instruction at `at` in `bytes`, replacing the bits `field` covers
+/// with `value`.
+fn patch_a64(bytes: &mut [u8], at: usize, field: u32, value: u32) {
+    let instruction = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+    let patched = (instruction & !field) | (value & field);
+    bytes[at..at + 4].copy_from_slice(&patched.to_le_bytes());
 }
 
 /// Links an object with its first segment at `base`.
@@ -171,22 +186,48 @@ fn link(object: &[u8], base: u64) -> Linked {
             let target = address_of(&object.symbols[relocation.symbol]) as i64 + relocation.addend;
             let at = (place - segment.address) as usize;
             let relative = target - place as i64;
-            let bytes: Vec<u8> = match relocation.kind {
-                reloc::ABS64 => target.to_le_bytes().to_vec(),
-                reloc::ABS32 => u32::try_from(target)
-                    .expect("an absolute address below 4 GiB")
-                    .to_le_bytes()
-                    .to_vec(),
-                reloc::PC32 | reloc::PLT32 => i32::try_from(relative)
-                    .expect("a relative address within 2 GiB")
-                    .to_le_bytes()
-                    .to_vec(),
+            match relocation.kind {
+                reloc::X64_ABS64 | reloc::A64_ABS64 => {
+                    segment.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
+                    absolute.push((place, 8));
+                }
+                reloc::X64_ABS32 => {
+                    let value = u32::try_from(target).expect("an absolute address below 4 GiB");
+                    segment.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                    absolute.push((place, 4));
+                }
+                reloc::X64_PC32 | reloc::X64_PLT32 => {
+                    let value = i32::try_from(relative).expect("a relative address within 2 GiB");
+                    segment.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                // The branch's 26-bit field holds the instruction count to the target.
+                reloc::A64_CALL26 => {
+                    let count = relative >> 2;
+                    assert!(
+                        (-(1 << 25)..1 << 25).contains(&count),
+                        "a branch target within 128 MiB"
+                    );
+                    patch_a64(&mut segment.bytes, at, 0x03FF_FFFF, count as u32);
+                }
+                // The address of the 4 KiB page the target lies in, relative to the page the
+                // instruction lies in, in units of pages, held in the split immediate.
+                reloc::A64_ADR_PREL_PG_HI21 => {
+                    let pages = ((target & !0xFFF) - (place & !0xFFF) as i64) >> 12;
+                    assert!(
+                        (-(1 << 20)..1 << 20).contains(&pages),
+                        "a page within 4 GiB"
+                    );
+                    let pages = pages as u32;
+                    patch_a64(&mut segment.bytes, at, 0x6000_0000, pages << 29);
+                    patch_a64(&mut segment.bytes, at, 0x00FF_FFE0, (pages >> 2) << 5);
+                }
+                // The target's low 12 bits, added to the page the previous instruction formed.
+                reloc::A64_ADD_ABS_LO12_NC => {
+                    let low = (target & 0xFFF) as u32;
+                    patch_a64(&mut segment.bytes, at, 0x003F_FC00, low << 10);
+                }
                 other => panic!("relocation type {other} in a machine image"),
-            };
-            if matches!(relocation.kind, reloc::ABS64 | reloc::ABS32) {
-                absolute.push((place, bytes.len()));
             }
-            segment.bytes[at..at + bytes.len()].copy_from_slice(&bytes);
         }
     }
     let mut linked = Linked {

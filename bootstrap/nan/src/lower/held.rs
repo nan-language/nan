@@ -23,6 +23,14 @@ impl Lowering<'_, '_> {
         }
     }
 
+    /// The value of a type a hardware pointer addresses, held as its type is: a scalar loaded.
+    pub fn device_held_at(&mut self, fx: &mut Fx, ty: &Ty, address: Value) -> Held {
+        match self.layout(ty).shape {
+            Shape::Scalar { ty: scalar, big } => Held::Scalar(fx.load_device(scalar, address, big)),
+            _ => self.held_at(fx, ty, address),
+        }
+    }
+
     /// Stores a value of a type at an address.
     pub fn store_held(&mut self, fx: &mut Fx, address: Value, held: Held, ty: &Ty) {
         let layout = self.layout(ty);

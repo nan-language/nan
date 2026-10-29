@@ -1,6 +1,6 @@
 //! A test image as its runs start it, and one run of a test, given the test's number, the run's
-//! index and seed, its replay token and the draws a rerun forces: a process of the image on
-//! `x86_64-host`, a boot of the emulator on it on a machine target, whose standard output or
+//! index and seed, its replay token and the draws a rerun forces: a process of the image on a
+//! host target, a boot of the emulator on it on a machine target, whose standard output or
 //! serial port carries frames, and how it ended.
 
 use std::fs;
@@ -14,7 +14,7 @@ use crate::emulator::{self, Writes};
 use crate::lower::test_image::{RUN_FILE, RUN_START, TIMED_OUT, frame, outcome};
 use crate::workspace::Target;
 
-/// A test image as its runs start it: an `x86_64-host` executable, or a machine image and the
+/// A test image as its runs start it: a host target's executable, or a machine image and the
 /// emulator invocation booting it.
 pub enum Image {
     Host(PathBuf),

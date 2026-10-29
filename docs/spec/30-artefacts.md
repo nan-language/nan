@@ -87,9 +87,9 @@ The reserved sections record of an artefact reserves keys 1 signature, 2 native 
 
 ## Host ELF section
 
-Every image of an `x86_64-host` [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state. An image a toolchain written in NaN writes also holds exactly one ELF section named `.nan.tree`, of the same type, flags and alignment, holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order.
+Every image of a host target's [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state. An image a toolchain written in NaN writes also holds exactly one ELF section named `.nan.tree`, of the same type, flags and alignment, holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order.
 
-The runtime never reads these sections; a toolchain written in NaN reads its own image's for its [toolchain hash](36-builds.md#toolchain-hash). `x86_64-uefi` and `x86_64-bare` images hold no artefact.
+The runtime never reads these sections; a toolchain written in NaN reads its own image's for its [toolchain hash](36-builds.md#toolchain-hash). Images of the machine targets hold no artefact.
 
 ## Reuse
 
@@ -185,7 +185,7 @@ Between code of different final closures, the only defined representations are t
 
 ## Host symbol names
 
-In machine code lowered for `x86_64-host`, each lowered function, each const item placed in memory and each registry table has a **host symbol name** in the symbol table of the object holding it. The name is the concatenation of:
+In machine code lowered for a host target, each lowered function, each const item placed in memory and each registry table has a **host symbol name** in the symbol table of the object holding it. The name is the concatenation of:
 
 1. `_N`;
 2. the package name, preceded by its length in decimal;

@@ -526,8 +526,8 @@ impl Lowering<'_, '_> {
         self.invoke(fx, Invoked::Direct(id), &abi, args)
     }
 
-    /// The instance of the function of the host platform package named `name`, which only an
-    /// `x86_64-host` image holds.
+    /// The instance of the function of the host platform package named `name`, which only a host
+    /// image holds.
     fn platform_instance(&mut self, name: &str) -> Instance {
         assert!(
             !self.machine(),

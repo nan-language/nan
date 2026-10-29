@@ -4,9 +4,10 @@ This chapter defines targets and the dependencies they allow, target descriptors
 
 ## Targets
 
-A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets; `x86_64-nanos` is reserved there.
+A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets; `x86_64-nanos` and `aarch64-nanos` are reserved there.
 
-- `x86_64-host`, `x86_64-uefi` and `x86_64-bare` are the **concrete targets**, each fixed by its [descriptor](#descriptors). A package declaring `any` is valid on every concrete target and is checked once, under the `any` descriptor.
+- The targets other than `any` are the **concrete targets**, each fixed by its [descriptor](#descriptors). A package declaring `any` is valid on every concrete target and is checked once, under the `any` descriptor.
+- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-host` and `aarch64-host` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**; the UEFI and bare targets are the **machine targets**.
 - A package **covers** a target when it declares that target or `any`. A `dep` directive naming a package that does not cover every target the declaring package declares, `any` included, is an error (`target.dependency-uncovered`).
 
 ```nan
@@ -82,7 +83,7 @@ pub fn pages(bytes: usize) -> usize {
 
 ## Descriptors
 
-A **descriptor** is the fixed definition of a target. The language version fixes every descriptor; no option, file or variable changes one. A concrete target's descriptor fixes its [environment](#environments), [root grant](14-authority.md#root-grants), [platform package](28-stdlib.md#platform-packages) (whose entry [landing fn](23-low-level.md#landing-functions) mints the root grant), [calling conventions](23-low-level.md#calling-conventions), [compiler stubs](23-low-level.md#compiler-stubs), codegen, [image](#images) format, [support routine](#runtime-support) names and these values:
+A **descriptor** is the fixed definition of a target. The language version fixes every descriptor; no option, file or variable changes one. A concrete target's descriptor fixes its [environment](#environments), [root grant](14-authority.md#root-grants), [platform package](28-stdlib.md#platform-packages) (whose entry [landing fn](23-low-level.md#landing-functions) mints the root grant), [calling conventions](23-low-level.md#calling-conventions), [privileged intrinsics](23-low-level.md#privileged-intrinsics), [compiler stubs](23-low-level.md#compiler-stubs), codegen, [image](#images) format, [support routine](#runtime-support) names and these values:
 
 | Field | `x86_64-host` | `x86_64-uefi` | `x86_64-bare` |
 | --- | --- | --- | --- |
@@ -94,13 +95,32 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 | Boot heap ([anchor](24-kernel.md#anchor)) | none | 16 MiB | 16 MiB |
 | Serial port | none | the 16550 UART at I/O port `0x3F8` | the 16550 UART at I/O port `0x3F8` |
 | Exit port | none | I/O port `0xF4` | I/O port `0xF4` |
+| Interrupt controller | none | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC at `0xFEE0_0000` and the I/O APIC at `0xFEC0_0000` |
+| Timer | none | each CPU's local APIC timer, firing vector `0x20` periodically | each CPU's local APIC timer, firing vector `0x20` periodically |
 | Emulator | none | QEMU with OVMF firmware | QEMU |
 
-- Codegen uses the x86-64 base instruction set with SSE2 and no later extension. On `x86_64-uefi` and `x86_64-bare`, lowered code never stores below the stack pointer. The codegen field has exactly this one value; other values are reserved.
+| Field | `aarch64-host` | `aarch64-uefi` | `aarch64-bare` |
+| --- | --- | --- | --- |
+| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | UEFI firmware with boot services, on AArch64 at EL1, with PSCI reached by `hvc` | an AArch64 machine whose memory starts at `0x4000_0000`, with PSCI reached by `hvc`, entering the image at EL1 with a flattened device tree at the start of memory |
+| Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
+| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | none | none |
+| Stub call bound | 256 bytes | 256 bytes | 256 bytes |
+| Seam frame | none | 4 KiB | 4 KiB |
+| Boot heap ([anchor](24-kernel.md#anchor)) | none | 16 MiB | 16 MiB |
+| Serial port | none | the PL011 UART at `0x0900_0000` | the PL011 UART at `0x0900_0000` |
+| Exit port | none | the semihosting exit call | the semihosting exit call |
+| Interrupt controller | none | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` | a GICv3, its distributor at `0x0800_0000` and its redistributors from `0x080A_0000` |
+| Timer | none | each CPU's virtual timer, firing vector 27 periodically | each CPU's virtual timer, firing vector 27 periodically |
+| Emulator | none | QEMU with AAVMF firmware | QEMU |
+
+- Codegen uses, on x86_64, the x86-64 base instruction set with SSE2 and, on AArch64, the A64 instruction set of Armv8.0-A with floating point and Advanced SIMD, and no later extension. On the machine targets, lowered code never stores below the stack pointer. The codegen field has exactly this one value per architecture; other values are reserved.
 - A call of a compiler stub or a support routine uses at most the stub call bound of its caller's stack, switching to a stack the image reserves when it needs more. A **seam frame** is the most stack a vector seam uses for the state it saves.
-- The emulator is `qemu-system-x86_64` emulating a `q35` machine with 4 processors, 512 MiB of memory, a `virtio-rng-pci` device, an `isa-debug-exit` device of width 1 byte at I/O port `0xF4`, no display, no reboot on reset and its serial port connected to the toolchain. OVMF loads a `x86_64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTX64.EFI`; under `nan run` the volume also holds, at `/` followed by its file name, each other image file in the workspace's `.nan/images/x86_64-uefi/` and `.nan/images/x86_64-bare/` directories ([commands](33-toolchain.md#commands)); QEMU boots a `x86_64-bare` image directly by the PVH boot protocol.
-- On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on other machines of the platform, writing to it has no effect.
-- On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 2, 8 and 18 need a nonzero `ist`.
+- The emulator of the x86_64 machine targets is `qemu-system-x86_64` emulating a `q35` machine with 4 processors, 512 MiB of memory, a `virtio-rng-pci` device, an `isa-debug-exit` device of width 1 byte at I/O port `0xF4`, no display, no reboot on reset and its serial port connected to the toolchain. OVMF loads a `x86_64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTX64.EFI`; QEMU boots a `x86_64-bare` image directly by the PVH boot protocol.
+- The emulator of the AArch64 machine targets is `qemu-system-aarch64` emulating a `virt` machine with a GICv3, 4 Cortex-A72 processors, 512 MiB of memory, a `virtio-rng-device` on its virtio-mmio transports, semihosting, no display, no reboot on reset and its serial port connected to the toolchain. AAVMF loads an `aarch64-uefi` image from a FAT volume holding it as `/EFI/BOOT/BOOTAA64.EFI`; QEMU boots an `aarch64-bare` image by loading its segments and entering it with the device tree it generates at `0x4000_0000`.
+- Under `nan run` the volume of a UEFI target's image also holds, at `/` followed by its file name, each other image file in the workspace's `.nan/images/` directories of the machine targets of its architecture ([commands](33-toolchain.md#commands)).
+- On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
+- On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`.
+- On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, and vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
 - The `any` descriptor fixes only its environment, which restricts nothing.
 
 ```nan
@@ -142,9 +162,66 @@ interrupt fn on_double_fault(mut frame: hw::TrapFrame[hw::ErrorCode]) -> hw::Irq
 contribute hw::vectors double_fault = hw::Vector(vector: 8, ist: 0, handler: hw::VectorHandler.TrapWithCode(on_double_fault), user: None) // error: registry.platform-entry
 ```
 
+```nan
+// file: kernel/package.nan
+//! Instruction and data aborts for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+} kernel
+
+// file: kernel/kernel.nan
+//! Binds vector 1, instruction and data aborts, whose frame holds the syndrome and the faulting address.
+
+interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit limits stack 1_024 {
+    return hw::IrqExit.Resume
+} on_abort
+
+contribute hw::vectors abort = hw::Vector(vector: 1, ist: 0, handler: hw::VectorHandler.PageFault(on_abort), user: None)
+```
+
+```nan
+// file: kernel/package.nan
+//! Instruction and data aborts for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+} kernel
+
+// file: kernel/kernel.nan
+//! Binds the abort handler to the x86_64 page-fault vector.
+
+interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit limits stack 1_024 {
+    return hw::IrqExit.Resume
+} on_abort
+
+contribute hw::vectors abort = hw::Vector(vector: 14, ist: 0, handler: hw::VectorHandler.PageFault(on_abort), user: None) // error: registry.platform-entry
+```
+
+```nan
+// file: kernel/package.nan
+//! Instruction and data aborts for an AArch64 bare kernel.
+
+package kernel {
+    language 1
+    targets aarch64-bare
+} kernel
+
+// file: kernel/kernel.nan
+//! Asks an interrupt stack of its own for the abort handler.
+
+interrupt fn on_abort(mut frame: hw::TrapFrame[hw::PageFault]) -> hw::IrqExit limits stack 1_024 {
+    return hw::IrqExit.Resume
+} on_abort
+
+contribute hw::vectors abort = hw::Vector(vector: 1, ist: 1, handler: hw::VectorHandler.PageFault(on_abort), user: None) // error: registry.platform-entry
+```
+
 ### Environments
 
-An **environment** is the set of restrictions a target places on programs: the rules that name the target, such as [floating point](24-kernel.md#floating-point) on `x86_64-uefi` and `x86_64-bare`. An environment only rejects programs: a program valid on several targets has the same meaning on each, and every type, operation, trap and rendering behaves alike on all of them.
+An **environment** is the set of restrictions a target places on programs: the rules that name the target, such as [floating point](24-kernel.md#floating-point) on the machine targets. An environment only rejects programs: a program valid on several targets has the same meaning on each, and every type, operation, trap and rendering behaves alike on all of them.
 
 A rule judging reachable code judges all code of a package declaring its target, and code of a package declaring `any` only within the reach of each [final build](#final-builds) for that target.
 
@@ -154,13 +231,13 @@ The `entry main` directive names the **entry function**: the function item `main
 
 | Target | Head |
 | --- | --- |
-| `x86_64-host` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
-| `x86_64-uefi` | `fn main(take P: boot::Machine) -> Never` |
-| `x86_64-bare` | `fn main(take P: boot::Kernel) -> Never` |
+| `x86_64-host`, `aarch64-host` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
+| `x86_64-uefi`, `aarch64-uefi` | `fn main(take P: boot::Machine) -> Never` |
+| `x86_64-bare`, `aarch64-bare` | `fn main(take P: boot::Kernel) -> Never` |
 
 The head is one of its target's forms, P being any parameter name and E either an enum implementing `Render` or `task::Cancelled`; it may add a `limits` clause and a clause region. Any other head, including one with a visibility, a modifier, a generic parameter or another parameter, is an error (`target.entry-head`), whose diagnostic quotes the expected forms. Whether the body may fail or wait is judged by [heads](02-items.md#heads); `target.entry-head` judges only the head's shape.
 
-An `x86_64-bare` entry function starts kernel tasks only by ending in `take k.anchor(take state, run: f)` ([anchor](24-kernel.md#anchor)); one whose body diverges otherwise runs no task.
+The entry function of a bare target starts kernel tasks only by ending in `take k.anchor(take state, run: f)` ([anchor](24-kernel.md#anchor)); one whose body diverges otherwise runs no task.
 
 ```nan
 // file: status/package.nan
@@ -201,7 +278,7 @@ fn main(take world: host::World) fails task::Cancelled { // error: target.entry-
 
 ### Host runs
 
-A program run on `x86_64-host` is one Linux process:
+A program run on a host target is one Linux process:
 
 1. glibc's start-up code calls the program entry seam, whose symbol is `main`. The seam calls the host entry landing fn, which mints `host::World`.
 2. The executor runs tasks on one thread per processor in the process's affinity set at start. The seam starts the entry function, given the `host::World`, as the **entry task**: the first task of the process [domain](11-errors-domains.md#domains).
@@ -221,7 +298,7 @@ A program run on `x86_64-host` is one Linux process:
 
 ### Machine runs
 
-A program run on `x86_64-uefi` or `x86_64-bare` is one boot of one machine. The program entry seam switches to the **boot stack**, which the image reserves, on `x86_64-bare` installs the [entry root](24-kernel.md#physical-memory) and loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
+A program run on a machine target is one boot of one machine. The program entry seam switches to the **boot stack**, which the image reserves, on a bare target installs the [entry root](24-kernel.md#physical-memory) and, on `x86_64-bare`, loads the boot CPU's [CPU tables](24-kernel.md#anchor), calls the descriptor's entry landing fn, and calls the entry function with the root grant that landing fn returns. The boot stack holds the larger of the two functions' `stack N` limits plus one seam frame. The entry function never returns; [Kernel execution model](24-kernel.md) defines the run from there.
 
 ## Programs and libraries
 
@@ -344,25 +421,25 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
 
 ## Runtime support
 
-No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on `x86_64-host` by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
+No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the host targets by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
 
 A **support routine** is one of these fixed routines of the implementation, each with the name its descriptor gives it:
 
 | Name | Does | Targets |
 | --- | --- | --- |
 | `stack_switch` | creates, switches and frees task stacks, and runs each executor's choice of ready tasks | every concrete target |
-| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on `x86_64-host` it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack and reports `trap.stack-overflow` | every concrete target |
-| `settle` | performs [settlement](11-errors-domains.md#settlement) | `x86_64-host` |
+| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the host targets it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack and reports `trap.stack-overflow` | every concrete target |
+| `settle` | performs [settlement](11-errors-domains.md#settlement) | the host targets |
 | `cap_table` | mints capabilities, checks generations, revokes, keeps cells, chunk draws and the outbox table, and dispatches each target-dependent operation to the platform function its table entry records ([platform packages](28-stdlib.md#platform-packages)) | every concrete target |
 | `mem_op` | copies, fills and compares byte ranges for lowering | every concrete target |
 | `replay` | runs the seeded scheduler and records [replay tokens](22-testing.md#replay), in test runs only | every concrete target |
-| `anchor` | installs and reaches the [anchor](24-kernel.md#anchor) | `x86_64-uefi`, `x86_64-bare` |
+| `anchor` | installs and reaches the [anchor](24-kernel.md#anchor) | the machine targets |
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
 
 ### Host I/O backend
 
-On `x86_64-host` every waiting primitive of the platform package performs its operation through io_uring:
+On the host targets every waiting primitive of the platform package performs its operation through io_uring:
 
 - Each executor thread owns one io_uring instance. A primitive submits its operation as submission queue entries on the ring of the thread running its task, and suspends the task until the matching completion queue entries arrive on that ring.
 - Cancelling an in-flight operation submits `IORING_OP_ASYNC_CANCEL` for it on the ring holding it; the operation's own completion entry, whatever its result, is the acknowledgement.
@@ -374,11 +451,13 @@ On `x86_64-host` every waiting primitive of the platform package performs its op
 
 An **image** is the output of a final build:
 
-- On `x86_64-host`, a position-independent ELF64 executable for Linux, dynamically linked against `libc.so.6` alone and named after the package. `cc` from the `PATH` links it from the objects lowering produced. It carries the [host ELF section](30-artefacts.md#host-elf-section). A failing `cc` run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting `cc`'s output in an [envelope](33-toolchain.md#envelopes).
+- On a host target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-host` and `aarch64-linux-gnu-gcc` for `aarch64-host`, from the `PATH`. It carries the [host ELF section](30-artefacts.md#host-elf-section). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
 - On `x86_64-uefi`, a PE32+ image for machine type `0x8664`, subsystem EFI application, with base relocations, named after the package with `.efi`. The firmware calls its entry point, the program entry seam, with the image handle and system table under `"win64"`, and the seam passes both to the entry landing fn.
+- On `aarch64-uefi`, the same with machine type `0xAA64`, its entry point called under `"aapcs64"`.
 - On `x86_64-bare`, a statically linked ELF64 executable with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x0010_0000`, named after the package with `.elf`. A `XEN_ELFNOTE_PHYS32_ENTRY` note names the program entry seam, which a PVH loader enters in 32-bit protected mode with paging disabled and `ebx` holding the physical address of the start information. The seam maps all physical memory the start information lists at its physical addresses, in page tables the image reserves, enables long mode and passes the `ebx` value to the entry landing fn.
+- On `aarch64-bare`, a statically linked ELF64 executable for AArch64 with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x4020_0000`, named after the package with `.elf`. Its entry point is the program entry seam, which the platform enters at EL1 with the MMU off. The seam enables floating point, installs the entry root, turns the MMU and caches on and passes the device tree's address, `0x4000_0000`, to the entry landing fn.
 
-The implementation's own image writer builds `x86_64-uefi` and `x86_64-bare` images.
+The implementation's own image writer builds the images of the machine targets.
 
 Every image keeps frame pointers in every function, stubs and support routines included, and holds line tables mapping each instruction of lowered code to its source path, line and item. The trap routine reads both to write [trap reports](11-errors-domains.md#trap-reports); their encoding belongs to the ABI inside the final closure, which is unspecified.
 

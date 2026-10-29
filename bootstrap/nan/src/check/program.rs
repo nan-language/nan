@@ -7,7 +7,7 @@ use super::db::{ItemId, PackageId};
 use super::ty::{Scalar, Ty};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{ItemKind, Mode, Visibility};
-use crate::workspace::Target;
+use crate::workspace::{Kind, Target};
 
 impl Checker<'_> {
     /// The rules of a package's `targets`, `entry` and `dep` directives: a program declares one
@@ -76,15 +76,17 @@ impl Checker<'_> {
         if failed || self.reported_at(item, ast.token) {
             return;
         }
-        let (grant, forms) = match self.db.target {
-            Target::Host => (
+        let Some(kind) = self.db.target.kind() else {
+            return;
+        };
+        let (grant, forms) = match kind {
+            Kind::Host => (
                 "host::World",
                 "fn main(take P: host::World) fails E uses wait or fn main(take P: host::World) -> \
                  u8 fails E uses wait",
             ),
-            Target::Uefi => ("boot::Machine", "fn main(take P: boot::Machine) -> Never"),
-            Target::Bare => ("boot::Kernel", "fn main(take P: boot::Kernel) -> Never"),
-            Target::Any => return,
+            Kind::Uefi => ("boot::Machine", "fn main(take P: boot::Machine) -> Never"),
+            Kind::Bare => ("boot::Kernel", "fn main(take P: boot::Kernel) -> Never"),
         };
         let parameter = matches!(&sig.params[..], [param]
             if param.mode == Mode::Take && !param.is_self && self.is_std(&param.ty, grant));
@@ -97,8 +99,8 @@ impl Checker<'_> {
                     .is_some_and(|render| self.implements(fails, render));
             rendered_enum || self.is_std(fails, "task::Cancelled")
         };
-        let rest = match self.db.target {
-            Target::Host => {
+        let rest = match kind {
+            Kind::Host => {
                 matches!(sig.result, Ty::Unit | Ty::Scalar(Scalar::U8))
                     && sig.fails.as_ref().is_some_and(failure)
                     && sig.wait

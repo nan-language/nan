@@ -1,0 +1,147 @@
+//! Instruction selection for AArch64 of float arithmetic, with NaN results canonicalized as Cranelift's pass does, float sign operations, and the conversions between floats and integers.
+
+/// A float arithmetic operation, its NaN result made the canonical NaN.
+fn ArmSelector.float_arith(mut self, func: clif::Function, inst: clif::Inst, op: aarch64::FloatOp, x: clif::Value, y: clif::Value) {
+    expect self.isa.floats
+    let prec = precision(func.value_type(x))
+    let a = mut self.src(x, func)
+    let b = mut self.src(y, func)
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.FloatArith(op: op, prec: prec, dst: dst, lhs: a, rhs: b))
+    mut self.canonicalize(prec, reg: dst)
+} ArmSelector.float_arith
+
+fn ArmSelector.canonicalize(mut self, prec: aarch64::Precision, reg: machinst::Reg) {
+    let temp = mut self.temp(false)
+    mut self.emit(aarch64::Inst.CanonNan(prec: prec, reg: reg, temp: temp))
+} ArmSelector.canonicalize
+
+/// `sqrt`, `fpromote` and `fdemote`, each canonicalizing a NaN result.
+fn ArmSelector.float_unary(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) {
+    expect self.isa.floats
+    let source = precision(func.value_type(arg))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    match opcode {
+        clif::Opcode.Sqrt => {
+            mut self.emit(aarch64::Inst.FloatSqrt(prec: source, dst: dst, src: src))
+            mut self.canonicalize(source, reg: dst)
+        }
+        else => {
+            let target = precision(func.value_type(result_of(func, inst, alloc: self.alloc)))
+            mut self.emit(aarch64::Inst.FloatConvert(to: target, dst: dst, src: src))
+            mut self.canonicalize(target, reg: dst)
+        }
+    }
+} ArmSelector.float_unary
+
+/// `fabs` or `fneg`.
+fn ArmSelector.float_sign(mut self, func: clif::Function, inst: clif::Inst, opcode: clif::Opcode, arg: clif::Value) {
+    expect self.isa.floats
+    let prec = precision(func.value_type(arg))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if opcode == clif::Opcode.Fabs {
+        mut self.emit(aarch64::Inst.FloatAbs(prec: prec, dst: dst, src: src))
+    } else {
+        mut self.emit(aarch64::Inst.FloatNeg(prec: prec, dst: dst, src: src))
+    }
+} ArmSelector.float_sign
+
+/// `x`'s magnitude with `y`'s sign, combined in general-purpose registers.
+fn ArmSelector.fcopysign(mut self, func: clif::Function, inst: clif::Inst, x: clif::Value, y: clif::Value) {
+    expect self.isa.floats
+    let ty = func.value_type(x)
+    let prec = precision(ty)
+    var width = aarch64::Width.Bits64
+    var sign = 0x8000_0000_0000_0000u64
+    if prec == aarch64::Precision.Single {
+        width = aarch64::Width.Bits32
+        sign = 0x8000_0000
+    }
+    let magnitude_src = mut self.src(x, func)
+    let sign_src = mut self.src(y, func)
+    let magnitude_bits = mut self.temp(false)
+    mut self.emit(aarch64::Inst.IntFromFloat(prec: prec, dst: magnitude_bits, src: magnitude_src))
+    let sign_bits = mut self.temp(false)
+    mut self.emit(aarch64::Inst.IntFromFloat(prec: prec, dst: sign_bits, src: sign_src))
+    let magnitude = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: width, dst: magnitude, src: magnitude_bits, imm: sign - 1))
+    let signed = mut self.temp(false)
+    mut self.emit(aarch64::Inst.LogicImm(op: aarch64::LogicOp.And, width: width, dst: signed, src: sign_bits, imm: sign))
+    let combined = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Logic(op: aarch64::LogicOp.Orr, width: width, dst: combined, lhs: magnitude, rhs: signed))
+    let dst = mut self.dst_of(func, inst)
+    mut self.emit(aarch64::Inst.FloatFromInt(prec: prec, dst: dst, src: combined))
+} ArmSelector.fcopysign
+
+/// A float converted to an integer, truncating and saturating, NaN giving 0: `fcvtzs` or `fcvtzu`
+/// to 32 or 64 bits, a narrower result through a signed 32-bit conversion clamped to its bounds.
+fn ArmSelector.float_to_int(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
+    expect self.isa.floats
+    let prec = precision(func.value_type(arg))
+    let ty = func.value_type(result_of(func, inst, alloc: self.alloc))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if ty.bits() >= 32 {
+        mut self.emit(aarch64::Inst.FloatToInt(signed: signed, width: width_of(ty), prec: prec, dst: dst, src: src))
+        return
+    }
+    let wide = mut self.temp(false)
+    mut self.emit(aarch64::Inst.FloatToInt(signed: true, width: aarch64::Width.Bits32, prec: prec, dst: wide, src: src))
+    var low: i64 = 0
+    var high = i64.fit(0xFFFF_FFFF_FFFF_FFFFu64 >> (64 - ty.bits()))
+    if signed {
+        high = i64.fit(0xFFFF_FFFF_FFFF_FFFFu64 >> (65 - ty.bits()))
+        low = -high - 1
+    }
+    let capped = mut self.clamp(wide, bound: high, cond: aarch64::Cond.Gt)
+    let floored = mut self.clamp(capped, bound: low, cond: aarch64::Cond.Lt)
+    mut self.mov(dst, src: floored)
+} ArmSelector.float_to_int
+
+/// A new register holding a signed 32-bit value, or `bound` when the value compares to it as
+/// `cond` says.
+fn ArmSelector.clamp(mut self, reg: machinst::Reg, bound: i64, cond: aarch64::Cond) -> machinst::Reg {
+    let limit = mut self.int_constant(bound.to_bits())
+    mut self.emit(aarch64::Inst.Cmp(width: aarch64::Width.Bits32, lhs: reg, rhs: limit))
+    let clamped = mut self.temp(false)
+    mut self.emit(aarch64::Inst.Csel(cond: cond, width: aarch64::Width.Bits32, dst: clamped, a: limit, b: reg))
+    return clamped
+} ArmSelector.clamp
+
+/// An integer converted to a float, rounding to nearest: `scvtf` or `ucvtf` of 32 or 64 bits, a
+/// narrower integer extended to 64 bits first.
+fn ArmSelector.int_to_float(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value, signed: bool) {
+    expect self.isa.floats
+    let source = func.value_type(arg)
+    let prec = precision(func.value_type(result_of(func, inst, alloc: self.alloc)))
+    let src = mut self.src(arg, func)
+    let dst = mut self.dst_of(func, inst)
+    if source.bits() >= 32 {
+        mut self.emit(aarch64::Inst.IntToFloat(signed: signed, width: width_of(source), prec: prec, dst: dst, src: src))
+        return
+    }
+    let wide = mut self.extended(src, ty: source, signed: signed)
+    mut self.emit(aarch64::Inst.IntToFloat(signed: signed, width: aarch64::Width.Bits64, prec: prec, dst: dst, src: wide))
+} ArmSelector.int_to_float
+
+/// A bit pattern taken as another type: no code between registers of one class, else a move
+/// between a vector and a general-purpose register.
+fn ArmSelector.bitcast(mut self, func: clif::Function, inst: clif::Inst, arg: clif::Value) {
+    let result = result_of(func, inst, alloc: self.alloc)
+    let to = func.value_type(result)
+    let source = func.value_type(arg)
+    let src = mut self.src(arg, func)
+    let to_vector = aarch64::in_vector(to, floats: self.isa.floats)
+    if to_vector == aarch64::in_vector(source, floats: self.isa.floats) {
+        mut self.alias(result, func, low: src, high: NO_REG)
+        return
+    }
+    let dst = mut self.reg(result, func)
+    if to_vector {
+        mut self.emit(aarch64::Inst.FloatFromInt(prec: precision(to), dst: dst, src: src))
+    } else {
+        mut self.emit(aarch64::Inst.IntFromFloat(prec: precision(source), dst: dst, src: src))
+    }
+} ArmSelector.bitcast

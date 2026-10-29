@@ -22,7 +22,7 @@ fn distinct_instances_with_one_symbol_name_collide() {
     ]);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    let checker = checked(&workspace, &workspace.closures[0], std, Target::Host);
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
     let item = (0..checker.db.items.len())
         .map(|index| ItemId(index as u32))
         .find(|item| checker.db.canonical(*item) == "example::scale")

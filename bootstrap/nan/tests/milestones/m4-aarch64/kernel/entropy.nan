@@ -1,0 +1,207 @@
+//! A driver of the virtio entropy device over virtio-mmio, receiving bytes through a DMA-shared virtqueue.
+
+/// The virt board's virtio-mmio devices: their first register bank, the stride between banks, and
+/// how many the board decodes.
+const VIRTIO_MMIO_BASE: u64 = 0x0A00_0000
+
+const VIRTIO_MMIO_STRIDE: u64 = 0x200
+
+const VIRTIO_MMIO_SLOTS: u32 = 32
+
+/// The magic value a virtio-mmio register bank starts with, the modern version, and the entropy
+/// device's id.
+const VIRTIO_MAGIC: u32 = 0x7472_6976
+
+const VIRTIO_VERSION: u32 = 2
+
+const RNG_DEVICE: u32 = 4
+
+/// The device-status bits set in order, and the second feature word, of virtio 1.
+const ACKNOWLEDGE: u32 = 1
+
+const DRIVER: u32 = 2
+
+const DRIVER_OK: u32 = 4
+
+const FEATURES_OK: u32 = 8
+
+const VERSION_1: u32 = 1
+
+/// The entries of the driver's virtqueue, the flag of a descriptor the device writes, and the
+/// polls of the used ring before the request is abandoned.
+const QUEUE_SIZE: u32 = 4
+
+const DEVICE_WRITES: u16 = 2
+
+const USED_POLLS: u32 = 50_000_000
+
+/// The bytes the driver asks the device for.
+const SAMPLE_BYTES: u32 = 16
+
+/// A virtio-mmio device's register bank, version 2.
+registers VirtioMmio {
+    magic: u32 at 0x000 read
+    version: u32 at 0x004 read
+    device_id: u32 at 0x008 read
+    device_feature: u32 at 0x010 read
+    device_feature_select: u32 at 0x014 write
+    driver_feature: u32 at 0x020 write
+    driver_feature_select: u32 at 0x024 write
+    queue_select: u32 at 0x030 write
+    queue_size_max: u32 at 0x034 read
+    queue_size: u32 at 0x038 write
+    queue_ready: u32 at 0x044 write
+    queue_notify: u32 at 0x050 write
+    status: u32 at 0x070 read write
+    queue_desc_low: u32 at 0x080 write
+    queue_desc_high: u32 at 0x084 write
+    queue_driver_low: u32 at 0x090 write
+    queue_driver_high: u32 at 0x094 write
+    queue_device_low: u32 at 0x0A0 write
+    queue_device_high: u32 at 0x0A4 write
+} VirtioMmio
+
+layout Descriptor: bytes 16 le {
+    address: u64 at 0
+    length: u32 at 8
+    flags: u16 at 12
+    next: u16 at 14
+} Descriptor
+
+layout UsedEntry: bytes 8 le {
+    id: u32 at 0
+    length: u32 at 4
+} UsedEntry
+
+/// The virtqueue and the bytes its one request receives: the descriptor table, the driver area
+/// and the device area at the alignments virtio requires of them, then the receive buffer.
+layout Queue: bytes 160 le {
+    descriptors: Array[Descriptor, 4] at 0
+    avail_flags: u16 at 64
+    avail_index: u16 at 66
+    avail_ring: Array[u16, 4] at 68
+    avail_pad: Array[u8, 4] at 76
+    used_flags: u16 at 80
+    used_index: u16 at 82
+    used_ring: Array[UsedEntry, 4] at 84
+    used_pad: Array[u8, 12] at 116
+    data: Array[u8, 16] at 128
+    data_pad: Array[u8, 16] at 144
+} Queue
+
+/// The offsets of the driver and device areas and of the receive buffer in a `Queue`, and its
+/// size.
+const DRIVER_AREA: u64 = 64
+
+const DEVICE_AREA: u64 = 80
+
+const BUFFER: u64 = 128
+
+const QUEUE_BYTES: u64 = 160
+
+pub closed enum EntropyError derives Render {
+    NoDevice
+    Unsupported
+    Misaligned
+    NoResponse
+} EntropyError
+
+/// Asks the entropy device for bytes and reports how many it gave, or why it gave none.
+fn sample_entropy(console: hw::IrqShared[Console], alloc: mem::Alloc) {
+    let outcome = attempt receive(alloc)
+    match outcome {
+        Ok(count) => say_number(console, before: "virtio-rng: received ", value: u64.widen(count), after: " bytes\n")
+        Err(error) => {
+            say(console, text: "virtio-rng: failed\n")
+            discard error
+        }
+    }
+} sample_entropy
+
+/// Finds the device, sets up its virtqueue in DMA-shared memory, makes one request and gives the
+/// number of bytes the device wrote.
+fn receive(alloc: mem::Alloc) -> u32 fails EntropyError {
+    let Some(base) = locate() else {
+        fail EntropyError.NoDevice
+    }
+    let heap = mem::Heap.of(alloc)
+    var queue = hw::DmaShared.of(heap.boxed(Queue.from_bits(Array[u8, 160].filled(0))))
+    let outcome = attempt exchange(base, mut queue)
+    discard take queue.into_box()
+    return match outcome {
+        Ok(count) => count
+        Err(error) => fail error
+    }
+} receive
+
+/// The register bank of the first entropy device the board decodes.
+fn locate() -> Option[u64] {
+    for slot in 0u32..<VIRTIO_MMIO_SLOTS {
+        let base = VIRTIO_MMIO_BASE + u64.widen(slot) * VIRTIO_MMIO_STRIDE
+        var device = trusted "the virt board decodes a virtio-mmio register bank at base and nothing else maps it" { hw::Mmio[VirtioMmio].map(base) }
+        let magic = mut device.read(VirtioMmio.magic)
+        let version = mut device.read(VirtioMmio.version)
+        let id = mut device.read(VirtioMmio.device_id)
+        take device.unmap()
+        if magic == VIRTIO_MAGIC and version == VIRTIO_VERSION and id == RNG_DEVICE {
+            return Some(base)
+        }
+    }
+    return None
+} locate
+
+/// Initialises the device at `base` with its virtqueue in `queue`, makes one request for
+/// `SAMPLE_BYTES` bytes into the queue's receive buffer, and gives the number it wrote.
+fn exchange(base: u64, mut queue: hw::DmaShared[Queue]) -> u32 fails EntropyError {
+    let bus = queue.bus_addr().value
+    if bus % 16 != 0 or bus > ~0u64 - QUEUE_BYTES {
+        fail EntropyError.Misaligned
+    }
+    var device = trusted "the device's register bank lies at base, uncached in the entry root, and nothing else maps it" { hw::Mmio[VirtioMmio].map(base) }
+    defer take device.unmap()
+    try start(mut device, table: bus, avail: bus + DRIVER_AREA, used: bus + DEVICE_AREA)
+    mut queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(address: bus + BUFFER, length: SAMPLE_BYTES, flags: DEVICE_WRITES, next: 0))
+    mut queue.write_release_at(Queue.avail_ring, index: 0, value: 0)
+    mut queue.write_release(Queue.avail_index, value: 1)
+    mut device.write(VirtioMmio.queue_notify, value: 0)
+    for _ in 0..<USED_POLLS {
+        if mut queue.read_acquire(Queue.used_index) != 0 {
+            let used = mut queue.read_acquire_at(Queue.used_ring, index: 0)
+            return used.length
+        }
+    }
+    fail EntropyError.NoResponse
+} exchange
+
+/// Resets the device, negotiates virtio 1 alone, and sets up queue 0 of `QUEUE_SIZE` entries with
+/// its descriptor table, driver area and device area at the bus addresses `table`, `avail` and
+/// `used`, leaving the device running.
+fn start(mut device: hw::Mmio[VirtioMmio], table: u64, avail: u64, used: u64) fails EntropyError {
+    mut device.write(VirtioMmio.status, value: 0)
+    mut device.write(VirtioMmio.status, value: ACKNOWLEDGE | DRIVER)
+    mut device.write(VirtioMmio.device_feature_select, value: 1)
+    if (mut device.read(VirtioMmio.device_feature) & VERSION_1) == 0 {
+        fail EntropyError.Unsupported
+    }
+    mut device.write(VirtioMmio.driver_feature_select, value: 0)
+    mut device.write(VirtioMmio.driver_feature, value: 0)
+    mut device.write(VirtioMmio.driver_feature_select, value: 1)
+    mut device.write(VirtioMmio.driver_feature, value: VERSION_1)
+    mut device.write(VirtioMmio.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK)
+    if (mut device.read(VirtioMmio.status) & FEATURES_OK) == 0 {
+        fail EntropyError.Unsupported
+    }
+    mut device.write(VirtioMmio.queue_select, value: 0)
+    if mut device.read(VirtioMmio.queue_size_max) < QUEUE_SIZE {
+        fail EntropyError.Unsupported
+    }
+    mut device.write(VirtioMmio.queue_size, value: QUEUE_SIZE)
+    mut device.write(VirtioMmio.queue_desc_low, value: u32.truncate(table))
+    mut device.write(VirtioMmio.queue_desc_high, value: u32.truncate(table >> 32))
+    mut device.write(VirtioMmio.queue_driver_low, value: u32.truncate(avail))
+    mut device.write(VirtioMmio.queue_driver_high, value: u32.truncate(avail >> 32))
+    mut device.write(VirtioMmio.queue_device_low, value: u32.truncate(used))
+    mut device.write(VirtioMmio.queue_device_high, value: u32.truncate(used >> 32))
+    mut device.write(VirtioMmio.queue_ready, value: 1)
+    mut device.write(VirtioMmio.status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+} start

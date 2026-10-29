@@ -1,0 +1,141 @@
+//! Boot, the anchor, the timer and the kernel's first task.
+
+/// What interrupt fns reach: the tick count and the signal posting it to the first task.
+struct State {
+    ticks: core::atomic::AtomicU64
+    tick: mem::Shared[hw::Signal[u64]]
+} State
+
+/// What the kernel's tasks observe: the number of each CPU, the CPUs that ran a spinning task
+/// and each spinning task's passes.
+struct Probe {
+    cpus: hw::PerCpu[u32]
+    ran: core::atomic::AtomicU64
+    passes: mem::List[core::atomic::AtomicU64]
+} Probe
+
+pub interrupt fn on_timer(take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    let t = irq.irqs_disabled()
+    discard hw::Anchor[State].with(fn(state: State) {
+        let Some(count) = state.ticks.fetch_add(1) else {
+            return
+        }
+        state.tick.contents().post(t, value: count)
+    })
+    take irq.complete()
+    return hw::IrqExit.Reschedule
+} on_timer
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    let tick = mem::Shared.of(hw::Signal[u64].empty(), alloc)
+    let ticks = tick.share()
+    let state = State(ticks: core::atomic::AtomicU64.of(0), tick: take tick)
+    take k.anchor(take state, run: fn[take ticks](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+        try await run(exec, take ticks, alloc)
+    })
+} main
+
+/// The kernel's first task: attaches the console, then in one scope wakes a reader through the
+/// UART's loopback, starts the spinning tasks and the entropy driver, and reports what the
+/// spinning tasks show once each tick.
+fn run(exec: task::Executor, take ticks: mem::Shared[hw::Signal[u64]], alloc: mem::Alloc) fails task::Cancelled uses wait limits stack 24_576 {
+    let received = mem::Shared.of(hw::Signal[u8].empty(), alloc)
+    let console = attach(received.share())
+    defer detach(take console)
+    say_number(console, before: "kernel: running on ", value: u64.widen(hw::cpu_count()), after: " cpus\n")
+    let spinners = usize.widen(hw::cpu_count()) + 1
+    var passes = mem::List[core::atomic::AtomicU64].empty(alloc)
+    for _ in 0..<spinners {
+        mut passes.push(core::atomic::AtomicU64.of(0))
+    }
+    let cpus = hw::PerCpu.of(fn(cpu: u32) => cpu, alloc)
+    let probe = Probe(cpus: take cpus, ran: core::atomic::AtomicU64.of(0), passes: take passes)
+    try await task::scope(exec, body: fn(s: task::Scope) fails task::Cancelled uses wait limits stack 16_384 {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+            let byte = try await received.contents().wait()
+            say_number(console, before: "uart: reader woke on byte ", value: u64.widen(byte), after: "\n")
+        })
+        discard try await ticks.contents().wait()
+        discard try await ticks.contents().wait()
+        loop_back(console, byte: 78)
+        for index in 0..<spinners {
+            discard s.spawn(fn() limits stack 8_192 {
+                spin(probe, index)
+            })
+        }
+        discard s.spawn(fn() limits stack 16_384 {
+            sample_entropy(console, alloc)
+        })
+        try await watch(console, probe, ticks, spinners)
+    })
+} run
+
+/// Counts a spinning task's passes and marks each CPU it runs on, never awaiting.
+fn spin(probe: Probe, index: usize) -> Never {
+    let passes = probe.passes[index]
+    loop {
+        discard passes.fetch_add(1)
+        let cpu = current_cpu(probe.cpus)
+        discard probe.ran.fetch_or(1u64 << cpu)
+    }
+} spin
+
+/// The number of the CPU running the caller.
+fn current_cpu(cpus: hw::PerCpu[u32]) -> u32 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u32 limits notrap {
+        return cpus.with(t, body: fn(mut cpu: u32) -> u32 limits notrap, terminates, noalloc {
+            return cpu
+        })
+    })
+} current_cpu
+
+/// Reports, at the first tick showing each, that the spinning tasks ran on every CPU and that
+/// every one of them ran though none awaits.
+fn watch(console: hw::IrqShared[Console], probe: Probe, ticks: mem::Shared[hw::Signal[u64]], spinners: usize) fails task::Cancelled uses wait {
+    var every: u64 = 0
+    for cpu in 0..<hw::cpu_count() {
+        every = every | (1u64 << cpu)
+    }
+    var spread = false
+    var preempted = false
+    while not spread or not preempted {
+        discard try await ticks.contents().wait()
+        if not spread and probe.ran.load() == every {
+            say_number(console, before: "smp: tasks ran on every one of ", value: u64.widen(hw::cpu_count()), after: " cpus\n")
+            spread = true
+        }
+        if not preempted and all_passed(probe) {
+            say_number(console, before: "preempt: ", value: u64.widen(spinners), after: " tasks that never await all ran\n")
+            preempted = true
+        }
+    }
+} watch
+
+/// Whether each spinning task has run.
+fn all_passed(probe: Probe) -> bool {
+    for passes in probe.passes {
+        if passes.load() == 0 {
+            return false
+        }
+    }
+    return true
+} all_passed
+
+contribute hw::vectors timer = hw::Vector(vector: 27, ist: 0, handler: hw::VectorHandler.Irq(on_timer), user: None)
+
+test all_passed_waits_for_every_spinner for all_passed {
+    let alloc = testing::world().alloc
+    var passes = mem::List[core::atomic::AtomicU64].empty(alloc)
+    mut passes.push(core::atomic::AtomicU64.of(1))
+    mut passes.push(core::atomic::AtomicU64.of(0))
+    let cpus = hw::PerCpu.of(fn(cpu: u32) => cpu, alloc)
+    let probe = Probe(cpus: take cpus, ran: core::atomic::AtomicU64.of(0), passes: take passes)
+    let before = all_passed(probe)
+    for counter in probe.passes {
+        discard counter.fetch_add(1)
+    }
+    let after = all_passed(probe)
+    expect not before
+    expect after
+} all_passed_waits_for_every_spinner

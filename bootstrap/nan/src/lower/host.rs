@@ -1,8 +1,8 @@
-//! The `x86_64-host` target: everything Linux-specific. The program entry seam `main`, which the
-//! C library's start-up code calls; the executor threads, one per processor of the process's
+//! The host targets: everything Linux-specific. The program entry seam `main`, which the C
+//! library's start-up code calls; the executor threads, one per processor of the process's
 //! affinity set, each with its io_uring; termination requests, which a thread of their own reads
-//! from a `signalfd`; the support routines' calls into the system; and linking the image with
-//! `cc`.
+//! from a `signalfd`; the support routines' calls into the system; and linking the image with the
+//! host target's linker.
 //!
 //! An operation record is what a completion reaches: the task waiting on it, its result, how far its completion has been delivered, the
 //! thread whose ring holds it, how far its cancellation has gone, its kind and its links in its
@@ -26,6 +26,7 @@ use super::runtime::tasks::{self, kind, operation, task, thread};
 use super::runtime::{Routine, memory, state};
 use super::{CALL_CONV, Instance, Lowering, Program, lines};
 use crate::nir::{Role, Span};
+use crate::workspace::{Arch, Target};
 
 mod mmap {
     pub const READ_WRITE: i64 = 3;
@@ -83,14 +84,41 @@ const SA_RESTART: i64 = 0x1000_0000;
 const SIGACTION: u64 = 152;
 const SIGACTION_FLAGS: u64 = 136;
 
-/// The offsets in a `ucontext_t` of the registers a handler reads and redirects, and of the
-/// fault address in a `siginfo_t`.
-mod context {
-    pub const RDI: u64 = 40 + 8 * 8;
-    pub const RBP: u64 = 40 + 10 * 8;
-    pub const RSP: u64 = 40 + 15 * 8;
-    pub const RIP: u64 = 40 + 16 * 8;
-    pub const FAULT_ADDRESS: u64 = 16;
+/// The offset of the fault address in a `siginfo_t`.
+const FAULT_ADDRESS: u64 = 16;
+
+/// The offsets in a `ucontext_t` of the registers a stop or fault handler reads and redirects:
+/// the register a redirected call passes its argument in, the frame and stack pointers, the
+/// instruction pointer, and the link register a leaf's return address lives in where the
+/// architecture has one.
+#[derive(Clone, Copy)]
+struct Context {
+    arg: u64,
+    fp: u64,
+    sp: u64,
+    ip: u64,
+    link: Option<u64>,
+}
+
+impl Context {
+    fn of(target: Target) -> Context {
+        match target.arch().expect("a host target's architecture") {
+            Arch::Amd64 => Context {
+                arg: 40 + 8 * 8,
+                fp: 40 + 10 * 8,
+                sp: 40 + 15 * 8,
+                ip: 40 + 16 * 8,
+                link: None,
+            },
+            Arch::Aarch64 => Context {
+                arg: 184,
+                fp: 416,
+                sp: 432,
+                ip: 440,
+                link: Some(424),
+            },
+        }
+    }
 }
 
 /// The size of each thread's signal stack and of its stack for stack overflow reports.
@@ -355,11 +383,10 @@ fn critical_at(lo: &mut Lowering, fx: &mut Fx, address: Value, unknown: bool) ->
 
 /// `Preempt(signal, info, context)`: the handler of the stop signal. When the task the thread
 /// runs is asked to stop, holds no lock and has no frame of a function it does not stop inside,
-/// the handler makes it resume in `Stop` on its own stack, below the interrupted frame and its
-/// red zone; otherwise the task runs on and the stop signal comes again. The two words at the
-/// stack pointer stand for the return address of a function interrupted in its prologue or
-/// epilogue, before its frame pointer is set or after it is restored.
+/// the handler makes it resume in `Stop` on its own stack, below the interrupted frame; otherwise
+/// the task runs on and the stop signal comes again.
 fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
+    let ctx = Context::of(lo.ck.db.target);
     let thread = lo.thread(fx);
     let outside = fx.b.ins().icmp_imm_s(IntCC::Equal, thread, 0);
     fx.when(outside, |fx| {
@@ -374,29 +401,41 @@ fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
     let locks = fx.load(PTR, thread, thread::LOCKS);
     let unlocked = fx.b.ins().icmp_imm_s(IntCC::Equal, locks, 0);
     let stopping = fx.b.ins().band(asked, unlocked);
-    let rip = fx.load(PTR, context, context::RIP);
-    let rsp = fx.load(PTR, context, context::RSP);
-    let rbp = fx.load(PTR, context, context::RBP);
+    let ip = fx.load(PTR, context, ctx.ip);
+    let sp = fx.load(PTR, context, ctx.sp);
+    let fp = fx.load(PTR, context, ctx.fp);
     let low = fx.load(PTR, record, task::GUARD);
     let base = fx.load(PTR, record, task::STACK);
     let size = fx.load(PTR, record, task::STACK_SIZE);
     let high = fx.b.ins().iadd(base, size);
-    let above = fx.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, rsp, low);
-    let room = fx.b.ins().iadd_imm_s(rsp, 16);
+    let above = fx.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sp, low);
+    let room = fx.b.ins().iadd_imm_s(sp, 16);
     let below = fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, room, high);
     let on_stack = fx.b.ins().band(above, below);
     let stopping = fx.b.ins().band(stopping, on_stack);
     fx.when(stopping, |fx| {
-        let in_rip = critical_at(lo, fx, rip, true);
-        let top = fx.load(PTR, rsp, 0);
-        let in_top = critical_at(lo, fx, top, false);
-        let next = fx.load(PTR, rsp, 8);
-        let in_next = critical_at(lo, fx, next, false);
-        let busy = fx.b.ins().bor(in_rip, in_top);
-        let busy = fx.b.ins().bor(busy, in_next);
+        let in_ip = critical_at(lo, fx, ip, true);
+        // The return address of a function interrupted in its prologue or epilogue, before its
+        // frame pointer is set or after it is restored, lives in the link register where the
+        // architecture has one, and otherwise in the two words at the stack pointer.
+        let busy = match ctx.link {
+            Some(link) => {
+                let address = fx.load(PTR, context, link);
+                let in_link = critical_at(lo, fx, address, false);
+                fx.b.ins().bor(in_ip, in_link)
+            }
+            None => {
+                let top = fx.load(PTR, sp, 0);
+                let in_top = critical_at(lo, fx, top, false);
+                let next = fx.load(PTR, sp, 8);
+                let in_next = critical_at(lo, fx, next, false);
+                let busy = fx.b.ins().bor(in_ip, in_top);
+                fx.b.ins().bor(busy, in_next)
+            }
+        };
         let free = fx.b.ins().bxor_imm_s(busy, 1);
         fx.when(free, |fx| {
-            let walked = fx.repeat(&[rbp, free], |fx, state| {
+            let walked = fx.repeat(&[fp, free], |fx, state| {
                 let (frame, free) = (state[0], state[1]);
                 let above =
                     fx.b.ins()
@@ -423,17 +462,31 @@ fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
             });
             let free = walked[1];
             fx.when(free, |fx| {
-                let lowered = fx.b.ins().iadd_imm_s(rsp, -128);
-                let aligned = fx.b.ins().band_imm_s(lowered, -16);
-                let entry = fx.b.ins().iadd_imm_s(aligned, -8);
-                let zero = fx.ptr(0);
-                fx.store(zero, entry, 0);
-                fx.store(entry, context, context::RSP);
+                // Resume in `Stop` below the interrupted frame: where the return address lives on
+                // the stack, past the red zone and behind a null return; where it lives in the
+                // link register, at the aligned stack pointer with that register cleared.
+                let resumed = match ctx.link {
+                    Some(link) => {
+                        let aligned = fx.b.ins().band_imm_s(sp, -16);
+                        let zero = fx.ptr(0);
+                        fx.store(zero, context, link);
+                        aligned
+                    }
+                    None => {
+                        let lowered = fx.b.ins().iadd_imm_s(sp, -128);
+                        let aligned = fx.b.ins().band_imm_s(lowered, -16);
+                        let entry = fx.b.ins().iadd_imm_s(aligned, -8);
+                        let zero = fx.ptr(0);
+                        fx.store(zero, entry, 0);
+                        entry
+                    }
+                };
+                fx.store(resumed, context, ctx.sp);
                 let stop = lo.routine(Routine::Stop);
                 let stop = lo.func_ref(fx, stop);
                 let stop = fx.b.ins().func_addr(PTR, stop);
-                fx.store(stop, context, context::RIP);
-                fx.store(record, context, context::RDI);
+                fx.store(stop, context, ctx.ip);
+                fx.store(record, context, ctx.arg);
             });
         });
     });
@@ -445,7 +498,8 @@ fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
 /// called at the call whose frame does not fit; any other fault restores the default action
 /// and faults again.
 fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
-    let fault = fx.load(PTR, info, context::FAULT_ADDRESS);
+    let ctx = Context::of(lo.ck.db.target);
+    let fault = fx.load(PTR, info, FAULT_ADDRESS);
     let thread = lo.thread(fx);
     let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
     let record = fx.choose(
@@ -476,35 +530,64 @@ fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
         lo.call_libc(fx, "signal", &[signal, default], &[PTR]);
         fx.b.ins().return_(&[]);
     });
-    let rip = fx.load(PTR, context, context::RIP);
-    let rsp = fx.load(PTR, context, context::RSP);
-    let rbp = fx.load(PTR, context, context::RBP);
-    let (start, _) = super::runtime::report::function_at(lo, fx, rip);
-    let entering = fx.b.ins().icmp(IntCC::Equal, start, rip);
-    let pushed = fx.b.ins().iadd_imm_s(rsp, -8);
-    let calling = fx.b.ins().icmp(IntCC::Equal, fault, pushed);
-    let caller = fx.choose(
-        entering,
-        &[PTR, PTR],
-        |fx| vec![fx.load(PTR, rsp, 0), rbp],
-        |fx| {
+    let ip = fx.load(PTR, context, ctx.ip);
+    let sp = fx.load(PTR, context, ctx.sp);
+    let fp = fx.load(PTR, context, ctx.fp);
+    let (start, _) = super::runtime::report::function_at(lo, fx, ip);
+    let entering = fx.b.ins().icmp(IntCC::Equal, start, ip);
+    // The caller the faulting call returns to, and that caller's frame pointer: a function
+    // faulting as it is entered has not built its frame, so its return address is the one the call
+    // left — in the link register where the architecture has one, and otherwise at the stack
+    // pointer, unless the push growing the frame is what faulted; a function faulting deeper has
+    // its caller in its frame record.
+    let caller = match ctx.link {
+        Some(link) => {
+            let address = fx.load(PTR, context, link);
             fx.choose(
-                calling,
+                entering,
                 &[PTR, PTR],
-                |fx| vec![fx.b.ins().iadd_imm_s(rip, 1), rbp],
-                |fx| vec![fx.load(PTR, rbp, 8), fx.load(PTR, rbp, 0)],
+                |_fx| vec![address, fp],
+                |fx| vec![fx.load(PTR, fp, 8), fx.load(PTR, fp, 0)],
             )
-        },
-    );
+        }
+        None => {
+            let pushed = fx.b.ins().iadd_imm_s(sp, -8);
+            let calling = fx.b.ins().icmp(IntCC::Equal, fault, pushed);
+            fx.choose(
+                entering,
+                &[PTR, PTR],
+                |fx| vec![fx.load(PTR, sp, 0), fp],
+                |fx| {
+                    fx.choose(
+                        calling,
+                        &[PTR, PTR],
+                        |fx| vec![fx.b.ins().iadd_imm_s(ip, 1), fp],
+                        |fx| vec![fx.load(PTR, fp, 8), fx.load(PTR, fp, 0)],
+                    )
+                },
+            )
+        }
+    };
     let top = fx.load(PTR, thread, thread::TRAP_STACK);
-    let entry = fx.b.ins().iadd_imm_s(top, -8);
-    fx.store(caller[0], entry, 0);
-    fx.store(entry, context, context::RSP);
-    fx.store(caller[1], context, context::RBP);
+    // Resume in `OverflowRaise` on the trap stack as if the faulting site had called it: with the
+    // return address where a call leaves it — behind the stack pointer, or in the link register.
+    match ctx.link {
+        Some(link) => {
+            let aligned = fx.b.ins().band_imm_s(top, -16);
+            fx.store(aligned, context, ctx.sp);
+            fx.store(caller[0], context, link);
+        }
+        None => {
+            let entry = fx.b.ins().iadd_imm_s(top, -8);
+            fx.store(caller[0], entry, 0);
+            fx.store(entry, context, ctx.sp);
+        }
+    }
+    fx.store(caller[1], context, ctx.fp);
     let raise = lo.routine(Routine::OverflowRaise);
     let raise = lo.func_ref(fx, raise);
     let raise = fx.b.ins().func_addr(PTR, raise);
-    fx.store(raise, context, context::RIP);
+    fx.store(raise, context, ctx.ip);
     fx.b.ins().return_(&[]);
 }
 
@@ -1216,10 +1299,22 @@ fn syscall(lo: &mut Lowering, fx: &mut Fx, number: Value, args: &[Value]) -> Val
     lo.call_libc(fx, "syscall", &words, &[PTR])[0]
 }
 
-/// Links an object into a position-independent executable at `image` with the `cc` of the
-/// `PATH`; the linker's output when it fails.
-pub fn link(object: &Path, image: &Path) -> Result<(), String> {
-    let output = Command::new("cc")
+/// The linker of a host target: `cc` from the `PATH` when the machine running the toolchain has
+/// the target's architecture, and the GNU cross compiler for that architecture otherwise.
+pub fn linker(target: Target) -> &'static str {
+    if target.arch() == Some(Arch::running()) {
+        return "cc";
+    }
+    match target.arch() {
+        Some(Arch::Aarch64) => "aarch64-linux-gnu-gcc",
+        _ => "x86_64-linux-gnu-gcc",
+    }
+}
+
+/// Links an object into a position-independent executable at `image` with the host target's
+/// linker; the linker's output when it fails.
+pub fn link(target: Target, object: &Path, image: &Path) -> Result<(), String> {
+    let output = Command::new(linker(target))
         .arg("-pie")
         .arg("-o")
         .arg(image)

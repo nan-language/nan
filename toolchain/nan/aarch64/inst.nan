@@ -1,0 +1,559 @@
+//! The instructions: their operands, how each accesses its registers, the registers calls clobber, and the registers allocation hands out.
+
+/// The width of an integer operation, 32 or 64 bits.
+pkg enum Width derives Copy, Eq {
+    Bits32
+    Bits64
+} Width
+
+/// The `sf` bit the instruction encodings set for a 64-bit operation.
+pkg fn Width.sf(self) -> u32 {
+    return match self {
+        Width.Bits32 => 0
+        Width.Bits64 => 1
+    }
+} Width.sf
+
+/// The size of an atomic access: 1, 2, 4 or 8 bytes.
+pkg enum Size derives Copy, Eq {
+    Byte
+    Half
+    Word
+    Double
+} Size
+
+/// The `size` field of an access, the base-2 logarithm of its bytes.
+pkg fn Size.scale(self) -> u32 {
+    return match self {
+        Size.Byte => 0
+        Size.Half => 1
+        Size.Word => 2
+        Size.Double => 3
+    }
+} Size.scale
+
+/// The width of the register operations on a value of the size.
+pkg fn Size.width(self) -> Width {
+    return match self {
+        Size.Double => Width.Bits64
+        else => Width.Bits32
+    }
+} Size.width
+
+/// A bitwise logical operation; `Ands` also sets the flags.
+pkg enum LogicOp derives Copy, Eq {
+    And
+    Orr
+    Eor
+    Ands
+} LogicOp
+
+/// A shift, the rotate included.
+pkg enum ShiftKind derives Copy, Eq {
+    Lsl
+    Lsr
+    Asr
+    Ror
+} ShiftKind
+
+pkg fn ShiftKind.op(self) -> u32 {
+    return match self {
+        ShiftKind.Lsl => 0
+        ShiftKind.Lsr => 1
+        ShiftKind.Asr => 2
+        ShiftKind.Ror => 3
+    }
+} ShiftKind.op
+
+/// A register-to-register extension, each a fixed bitfield move: sign- or zero-extending a byte,
+/// a halfword, or (signed, to 64 bits) a word.
+pkg enum ExtendKind derives Copy, Eq {
+    Sxtb
+    Sxth
+    Sxtw
+    Uxtb
+    Uxth
+} ExtendKind
+
+/// The word of an extension, taking its source in `Rn` field position and destination in `Rd`.
+pkg fn ExtendKind.base(self) -> u32 {
+    return match self {
+        ExtendKind.Sxtb => 0x9340_1C00
+        ExtendKind.Sxth => 0x9340_3C00
+        ExtendKind.Sxtw => 0x9340_7C00
+        ExtendKind.Uxtb => 0x5300_1C00
+        ExtendKind.Uxth => 0x5300_3C00
+    }
+} ExtendKind.base
+
+/// How a load or store pair addresses memory: a signed offset left in the base, a pre-indexed
+/// offset written back before the access, or a post-indexed offset written back after.
+pkg enum PairMode derives Copy, Eq {
+    Signed
+    Pre
+    Post
+} PairMode
+
+/// What a sized integer load reads and how it extends it: a byte or halfword zero-extended, a
+/// byte, halfword or word sign-extended to 64 bits.
+pkg enum LoadKind derives Copy, Eq {
+    Byte
+    Half
+    SignByte
+    SignHalf
+    SignWord
+} LoadKind
+
+/// The `size` and `opc` fields of a sized integer load, and its access scale.
+pkg fn LoadKind.fields(self) -> u32 {
+    return match self {
+        LoadKind.Byte => 0x0040_0000
+        LoadKind.Half => 0x4040_0000
+        LoadKind.SignByte => 0x0080_0000
+        LoadKind.SignHalf => 0x4080_0000
+        LoadKind.SignWord => 0x8080_0000
+    }
+} LoadKind.fields
+
+pkg fn LoadKind.scale(self) -> u32 {
+    return match self {
+        LoadKind.Byte => 0
+        LoadKind.SignByte => 0
+        LoadKind.Half => 1
+        LoadKind.SignHalf => 1
+        LoadKind.SignWord => 2
+    }
+} LoadKind.scale
+
+/// The size of a sized integer store: a byte or a halfword. Word and doubleword stores use `Str`.
+pkg enum StoreKind derives Copy, Eq {
+    Byte
+    Half
+} StoreKind
+
+/// A scalar floating-point operation of two operands.
+pkg enum FloatOp derives Copy, Eq {
+    Add
+    Sub
+    Mul
+    Div
+} FloatOp
+
+/// The precision of a scalar floating-point operation.
+pkg enum Precision derives Copy, Eq {
+    Single
+    Double
+} Precision
+
+/// The `ftype` bit a double-precision operation sets.
+pkg fn Precision.ptype(self) -> u32 {
+    return match self {
+        Precision.Single => 0
+        Precision.Double => 0x0040_0000
+    }
+} Precision.ptype
+
+/// The operation of an atomic read-modify-write; `Xchg` stores the operand itself.
+pkg enum AtomicOp derives Copy, Eq {
+    Add
+    And
+    Orr
+    Eor
+    Xchg
+} AtomicOp
+
+/// Where a call goes: a symbol a `bl` reaches, or the address in a register.
+pkg enum CallTarget derives Copy, Eq {
+    Direct(machinst::Symbol)
+    Indirect(machinst::Reg)
+} CallTarget
+
+/// How code takes a symbol's address: `adrp` and `add` for a symbol within 4 GiB, `adrp` and
+/// `ldr` of its global offset table entry, or a load of the address from a literal word the code
+/// branches over.
+pkg enum AddressMode derives Copy, Eq {
+    Near
+    Got
+    Far
+} AddressMode
+
+/// An instruction, or a short sequence of them that register allocation treats as one. Sizes
+/// name the operation's width; a 32-bit result zeroes the register's upper bits.
+pkg enum Inst derives Copy, Eq {
+    /// `mov xd, xm`, which is `orr xd, xzr, xm`, or `mov xd, sp` / `mov sp, xd`, which is
+    /// `add xd, xn, #0`, when either register is the stack pointer.
+    Mov(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// A 64-bit constant: an `orr` of a bitmask immediate, or the shortest run of `movz` or
+    /// `movn` and `movk`.
+    MovImm(dst: machinst::Reg, imm: u64)
+    AddReg(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    SubReg(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `adds`, an add that sets the flags.
+    AddsReg(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `subs`, a subtract that sets the flags.
+    SubsReg(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `adc`, an add of the carry flag too.
+    Adc(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `sbc`, a subtract of the carry flag's complement too.
+    Sbc(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `sbcs`, an `sbc` that sets the flags.
+    Sbcs(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// An add of an immediate below 4096, or below 2^24 with its low 12 bits clear.
+    AddImm(width: Width, dst: machinst::Reg, src: machinst::Reg, imm: u32)
+    SubImm(width: Width, dst: machinst::Reg, src: machinst::Reg, imm: u32)
+    /// A compare, `subs xzr, lhs, rhs`, setting the flags.
+    Cmp(width: Width, lhs: machinst::Reg, rhs: machinst::Reg)
+    CmpImm(width: Width, lhs: machinst::Reg, imm: u32)
+    /// `cmn`, a compare with an immediate's negation.
+    CmnImm(width: Width, lhs: machinst::Reg, imm: u32)
+    /// `tst`, the flags of a bitwise and.
+    Tst(width: Width, lhs: machinst::Reg, rhs: machinst::Reg)
+    Logic(op: LogicOp, width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// A logical operation with a bitmask immediate, one `bitmask` encodes.
+    LogicImm(op: LogicOp, width: Width, dst: machinst::Reg, src: machinst::Reg, imm: u64)
+    /// A shift by the low bits of a register.
+    Shift(kind: ShiftKind, width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// A shift by an amount below the width.
+    ShiftImm(kind: ShiftKind, width: Width, dst: machinst::Reg, src: machinst::Reg, amount: u8)
+    /// `madd dst, lhs, rhs, addend`: `dst = addend + lhs * rhs`. `mul` is `addend` the zero register.
+    Madd(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg, addend: machinst::Reg)
+    /// `msub dst, lhs, rhs, minuend`: `dst = minuend - lhs * rhs`.
+    Msub(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg, minuend: machinst::Reg)
+    /// A division, which gives 0 for a zero divisor and the dividend for an overflow.
+    Sdiv(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    Udiv(width: Width, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// The high 64 bits of a 64-by-64-bit product.
+    Smulh(dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    Umulh(dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `csel dst, a, b, cond`: `dst = cond ? a : b`.
+    Csel(cond: Cond, width: Width, dst: machinst::Reg, a: machinst::Reg, b: machinst::Reg)
+    /// `cset dst, cond`: `dst = cond ? 1 : 0`.
+    Cset(cond: Cond, width: Width, dst: machinst::Reg)
+    Extend(kind: ExtendKind, dst: machinst::Reg, src: machinst::Reg)
+    /// `mvn dst, src`, the bitwise negation.
+    Mvn(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// `neg dst, src`, the two's-complement negation.
+    Neg(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// `clz`, the count of leading zero bits.
+    Clz(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// `rbit`, the bit reversal.
+    Rbit(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// `rev`, the byte reversal.
+    Rev(width: Width, dst: machinst::Reg, src: machinst::Reg)
+    /// `cnt vd.8b, vn.8b`, each byte of a vector register replaced by its population count.
+    Cnt(dst: machinst::Reg, src: machinst::Reg)
+    /// `addv bd, vn.8b`, a vector register's eight bytes summed into its low byte.
+    Addv(dst: machinst::Reg, src: machinst::Reg)
+    Ldr(width: Width, dst: machinst::Reg, src: Amode)
+    Str(width: Width, src: machinst::Reg, dst: Amode)
+    /// A sized integer load, extended as its kind names.
+    LdrSized(kind: LoadKind, dst: machinst::Reg, src: Amode)
+    /// A sized integer store of the low bits of a register.
+    StrSized(kind: StoreKind, src: machinst::Reg, dst: Amode)
+    /// A floating-point load into a vector register.
+    LdrFloat(prec: Precision, dst: machinst::Reg, src: Amode)
+    /// A floating-point store from a vector register.
+    StrFloat(prec: Precision, src: machinst::Reg, dst: Amode)
+    /// A load pair of two 64-bit registers from `[base]` with an offset in the index mode.
+    Ldp(mode: PairMode, dst1: machinst::Reg, dst2: machinst::Reg, base: machinst::Reg, imm: i32)
+    /// A store pair of two 64-bit registers to `[base]` with an offset in the index mode.
+    Stp(mode: PairMode, src1: machinst::Reg, src2: machinst::Reg, base: machinst::Reg, imm: i32)
+    /// `fmov` between two vector registers.
+    FloatMov(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// `fmov` of a general-purpose register's bits into a vector register.
+    FloatFromInt(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// `fmov` of a vector register's bits into a general-purpose register.
+    IntFromFloat(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    FloatArith(op: FloatOp, prec: Precision, dst: machinst::Reg, lhs: machinst::Reg, rhs: machinst::Reg)
+    FloatSqrt(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    FloatNeg(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    FloatAbs(prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// `fcmp`, setting the flags.
+    FloatCmp(prec: Precision, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `fcvt` between single and double precision; `to` is the destination precision.
+    FloatConvert(to: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// A signed or unsigned integer of a width converted to a float.
+    IntToFloat(signed: bool, width: Width, prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// A float truncated to a signed or unsigned integer of a width, saturating, NaN giving 0.
+    FloatToInt(signed: bool, width: Width, prec: Precision, dst: machinst::Reg, src: machinst::Reg)
+    /// `fcsel dst, a, b, cond`: `dst = cond ? a : b`.
+    FloatCsel(cond: Cond, prec: Precision, dst: machinst::Reg, a: machinst::Reg, b: machinst::Reg)
+    /// Replaces a NaN by the canonical quiet NaN, made in a general-purpose register.
+    CanonNan(prec: Precision, reg: machinst::Reg, temp: machinst::Reg)
+    /// `ldar`, a load-acquire.
+    Ldar(size: Size, dst: machinst::Reg, base: machinst::Reg)
+    /// `stlr`, a store-release.
+    Stlr(size: Size, src: machinst::Reg, base: machinst::Reg)
+    /// A load-exclusive, store-exclusive loop applying `op` with `operand` to memory, leaving the
+    /// previous value in `old`; `temp` holds the value stored and `status` the store's outcome.
+    AtomicRmwLoop(op: AtomicOp, size: Size, addr: machinst::Reg, operand: machinst::Reg, old: machinst::Reg, temp: machinst::Reg, status: machinst::Reg)
+    /// A load-exclusive, store-exclusive loop storing `replacement` when memory holds `expected`,
+    /// zero-extended to the size, leaving the previous value in `old`.
+    AtomicCasLoop(size: Size, addr: machinst::Reg, expected: machinst::Reg, replacement: machinst::Reg, old: machinst::Reg, status: machinst::Reg)
+    /// `dmb ish`, a data memory barrier over the inner-shareable domain.
+    Dmb
+    /// A symbol's address.
+    Address(dst: machinst::Reg, symbol: machinst::Symbol, mode: AddressMode)
+    /// The thread-local descriptor sequence for a thread-local symbol, its address in `x0`.
+    TlsDesc(symbol: machinst::Symbol, temp: machinst::Reg)
+    /// A call reading its arguments from the registers `args`, writing its results to `results`
+    /// and changing `clobbers`.
+    Call(target: CallTarget, args: machinst::RegSet, results: machinst::RegSet, clobbers: machinst::RegSet)
+    /// The return, the function's results in `results`.
+    Return(results: machinst::RegSet)
+    /// No code: the function's parameters arriving in `params`.
+    Args(params: machinst::RegSet)
+    /// An unconditional branch to a label.
+    B(label: u32)
+    /// A conditional branch to a label.
+    Bcond(cond: Cond, label: u32)
+    /// A branch to a label taken when the register is zero.
+    Cbz(width: Width, reg: machinst::Reg, label: u32)
+    /// A branch to a label taken when the register is not zero.
+    Cbnz(width: Width, reg: machinst::Reg, label: u32)
+    /// A branch through the table at label `table`, `index` selecting the 4-byte offset of its
+    /// target from the table's start; `base` and `temp` hold the table's address and the offset.
+    JumpTable(index: machinst::Reg, base: machinst::Reg, temp: machinst::Reg, table: u32)
+    /// A trap when a register is zero.
+    TrapIfZero(width: Width, reg: machinst::Reg)
+    /// A trap when a signed division of `lhs` by `rhs` overflows: `rhs` is -1 and `lhs` the
+    /// least integer of the width.
+    TrapIfOverflow(width: Width, lhs: machinst::Reg, rhs: machinst::Reg)
+    /// `udf`, a trap.
+    Udf
+    /// `ret xn`, the return address in `reg`.
+    Ret(reg: machinst::Reg)
+} Inst
+
+/// The memory operand with its registers replaced by what `visit` gives for them.
+fn mapped(mem: Amode, visit: fn(reg: machinst::Reg, role: machinst::Role) -> machinst::Reg) -> Amode {
+    match mem {
+        Amode.Imm(base: base, disp: disp) => return Amode.Imm(base: visit(base, role: machinst::Role.Use), disp: disp)
+        Amode.Reg(base: base, index: index, scaled: scaled) => {
+            let new_base = visit(base, role: machinst::Role.Use)
+            return Amode.Reg(base: new_base, index: visit(index, role: machinst::Role.Use), scaled: scaled)
+        }
+    }
+} mapped
+
+/// Shows `visit` each register of a set.
+fn each_reg(set: machinst::RegSet, role: machinst::Role, visit: fn(reg: machinst::Reg, role: machinst::Role) -> machinst::Reg) {
+    for index in 0u32..<machinst::PHYSICAL {
+        if set.contains(machinst::Reg(index: index)) {
+            discard visit(machinst::Reg(index: index), role)
+        }
+    }
+} each_reg
+
+/// The instruction with each register operand replaced by what `visit` gives for it, visited
+/// in a fixed order. `visit` also sees the registers the instruction accesses implicitly; their
+/// replacements are ignored.
+pkg fn Inst.map_regs(self, visit: fn(reg: machinst::Reg, role: machinst::Role) -> machinst::Reg) -> Inst
+    waive length "one arm per instruction, its operands in field order"
+{
+    let def = machinst::Role.Def
+    let used = machinst::Role.Use
+    match self {
+        Inst.Mov(width: width, dst: dst, src: src) => return Inst.Mov(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.MovImm(dst: dst, imm: imm) => return Inst.MovImm(dst: visit(dst, role: def), imm: imm)
+        Inst.AddReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.AddReg(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.SubReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.SubReg(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.AddsReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.AddsReg(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.SubsReg(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.SubsReg(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Adc(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Adc(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Sbc(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Sbc(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Sbcs(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Sbcs(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.AddImm(width: width, dst: dst, src: src, imm: imm) => return Inst.AddImm(width: width, dst: visit(dst, role: def), src: visit(src, role: used), imm: imm)
+        Inst.SubImm(width: width, dst: dst, src: src, imm: imm) => return Inst.SubImm(width: width, dst: visit(dst, role: def), src: visit(src, role: used), imm: imm)
+        Inst.Cmp(width: width, lhs: lhs, rhs: rhs) => return Inst.Cmp(width: width, lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.CmpImm(width: width, lhs: lhs, imm: imm) => return Inst.CmpImm(width: width, lhs: visit(lhs, role: used), imm: imm)
+        Inst.CmnImm(width: width, lhs: lhs, imm: imm) => return Inst.CmnImm(width: width, lhs: visit(lhs, role: used), imm: imm)
+        Inst.Tst(width: width, lhs: lhs, rhs: rhs) => return Inst.Tst(width: width, lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Logic(op: op, width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Logic(op: op, width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.LogicImm(op: op, width: width, dst: dst, src: src, imm: imm) => return Inst.LogicImm(op: op, width: width, dst: visit(dst, role: def), src: visit(src, role: used), imm: imm)
+        Inst.Shift(kind: kind, width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Shift(kind: kind, width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.ShiftImm(kind: kind, width: width, dst: dst, src: src, amount: amount) => return Inst.ShiftImm(kind: kind, width: width, dst: visit(dst, role: def), src: visit(src, role: used), amount: amount)
+        Inst.Madd(width: width, dst: dst, lhs: lhs, rhs: rhs, addend: addend) => return Inst.Madd(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used), addend: visit(addend, role: used))
+        Inst.Msub(width: width, dst: dst, lhs: lhs, rhs: rhs, minuend: minuend) => return Inst.Msub(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used), minuend: visit(minuend, role: used))
+        Inst.Sdiv(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Sdiv(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Udiv(width: width, dst: dst, lhs: lhs, rhs: rhs) => return Inst.Udiv(width: width, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Smulh(dst: dst, lhs: lhs, rhs: rhs) => return Inst.Smulh(dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Umulh(dst: dst, lhs: lhs, rhs: rhs) => return Inst.Umulh(dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Csel(cond: cond, width: width, dst: dst, a: a, b: b) => return Inst.Csel(cond: cond, width: width, dst: visit(dst, role: def), a: visit(a, role: used), b: visit(b, role: used))
+        Inst.Cset(cond: cond, width: width, dst: dst) => return Inst.Cset(cond: cond, width: width, dst: visit(dst, role: def))
+        Inst.Extend(kind: kind, dst: dst, src: src) => return Inst.Extend(kind: kind, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Mvn(width: width, dst: dst, src: src) => return Inst.Mvn(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Neg(width: width, dst: dst, src: src) => return Inst.Neg(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Clz(width: width, dst: dst, src: src) => return Inst.Clz(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Rbit(width: width, dst: dst, src: src) => return Inst.Rbit(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Rev(width: width, dst: dst, src: src) => return Inst.Rev(width: width, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Cnt(dst: dst, src: src) => return Inst.Cnt(dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Addv(dst: dst, src: src) => return Inst.Addv(dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.Ldr(width: width, dst: dst, src: src) => return Inst.Ldr(width: width, dst: visit(dst, role: def), src: mapped(src, visit))
+        Inst.Str(width: width, src: src, dst: dst) => return Inst.Str(width: width, src: visit(src, role: used), dst: mapped(dst, visit))
+        Inst.LdrSized(kind: kind, dst: dst, src: src) => return Inst.LdrSized(kind: kind, dst: visit(dst, role: def), src: mapped(src, visit))
+        Inst.StrSized(kind: kind, src: src, dst: dst) => return Inst.StrSized(kind: kind, src: visit(src, role: used), dst: mapped(dst, visit))
+        Inst.LdrFloat(prec: prec, dst: dst, src: src) => return Inst.LdrFloat(prec: prec, dst: visit(dst, role: def), src: mapped(src, visit))
+        Inst.StrFloat(prec: prec, src: src, dst: dst) => return Inst.StrFloat(prec: prec, src: visit(src, role: used), dst: mapped(dst, visit))
+        Inst.Ldp(mode: mode, dst1: dst1, dst2: dst2, base: base, imm: imm) => return Inst.Ldp(mode: mode, dst1: visit(dst1, role: def), dst2: visit(dst2, role: def), base: visit(base, role: machinst::Role.Mod), imm: imm)
+        Inst.Stp(mode: mode, src1: src1, src2: src2, base: base, imm: imm) => return Inst.Stp(mode: mode, src1: visit(src1, role: used), src2: visit(src2, role: used), base: visit(base, role: machinst::Role.Mod), imm: imm)
+        Inst.FloatMov(prec: prec, dst: dst, src: src) => return Inst.FloatMov(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatFromInt(prec: prec, dst: dst, src: src) => return Inst.FloatFromInt(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.IntFromFloat(prec: prec, dst: dst, src: src) => return Inst.IntFromFloat(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatArith(op: op, prec: prec, dst: dst, lhs: lhs, rhs: rhs) => return Inst.FloatArith(op: op, prec: prec, dst: visit(dst, role: def), lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.FloatSqrt(prec: prec, dst: dst, src: src) => return Inst.FloatSqrt(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatNeg(prec: prec, dst: dst, src: src) => return Inst.FloatNeg(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatAbs(prec: prec, dst: dst, src: src) => return Inst.FloatAbs(prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatCmp(prec: prec, lhs: lhs, rhs: rhs) => return Inst.FloatCmp(prec: prec, lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.FloatConvert(to: to, dst: dst, src: src) => return Inst.FloatConvert(to: to, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.IntToFloat(signed: signed, width: width, prec: prec, dst: dst, src: src) => return Inst.IntToFloat(signed: signed, width: width, prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatToInt(signed: signed, width: width, prec: prec, dst: dst, src: src) => return Inst.FloatToInt(signed: signed, width: width, prec: prec, dst: visit(dst, role: def), src: visit(src, role: used))
+        Inst.FloatCsel(cond: cond, prec: prec, dst: dst, a: a, b: b) => return Inst.FloatCsel(cond: cond, prec: prec, dst: visit(dst, role: def), a: visit(a, role: used), b: visit(b, role: used))
+        Inst.CanonNan(prec: prec, reg: reg, temp: temp) => return Inst.CanonNan(prec: prec, reg: visit(reg, role: machinst::Role.Mod), temp: visit(temp, role: machinst::Role.Temp))
+        Inst.Ldar(size: size, dst: dst, base: base) => return Inst.Ldar(size: size, dst: visit(dst, role: def), base: visit(base, role: used))
+        Inst.Stlr(size: size, src: src, base: base) => return Inst.Stlr(size: size, src: visit(src, role: used), base: visit(base, role: used))
+        Inst.AtomicRmwLoop(op: op, size: size, addr: addr, operand: operand, old: old, temp: temp, status: status) => {
+            let mapped_addr = visit(addr, role: used)
+            let mapped_operand = visit(operand, role: used)
+            let mapped_old = visit(old, role: machinst::Role.EarlyDef)
+            let mapped_temp = visit(temp, role: machinst::Role.Temp)
+            return Inst.AtomicRmwLoop(op: op, size: size, addr: mapped_addr, operand: mapped_operand, old: mapped_old, temp: mapped_temp, status: visit(status, role: machinst::Role.Temp))
+        }
+        Inst.AtomicCasLoop(size: size, addr: addr, expected: expected, replacement: replacement, old: old, status: status) => {
+            let mapped_addr = visit(addr, role: used)
+            let mapped_expected = visit(expected, role: used)
+            let mapped_replacement = visit(replacement, role: used)
+            let mapped_old = visit(old, role: machinst::Role.EarlyDef)
+            return Inst.AtomicCasLoop(size: size, addr: mapped_addr, expected: mapped_expected, replacement: mapped_replacement, old: mapped_old, status: visit(status, role: machinst::Role.Temp))
+        }
+        Inst.Address(dst: dst, symbol: symbol, mode: mode) => return Inst.Address(dst: visit(dst, role: def), symbol: symbol, mode: mode)
+        Inst.TlsDesc(symbol: symbol, temp: temp) => {
+            let mapped_temp = visit(temp, role: machinst::Role.Temp)
+            discard visit(X0, role: def)
+            return Inst.TlsDesc(symbol: symbol, temp: mapped_temp)
+        }
+        Inst.Call(target: target, args: args, results: results, clobbers: clobbers) => {
+            var mapped_target = target
+            match target {
+                CallTarget.Indirect(reg) => {
+                    mapped_target = CallTarget.Indirect(visit(reg, role: used))
+                }
+                CallTarget.Direct(_) => {}
+            }
+            each_reg(args, role: used, visit)
+            each_reg(results, role: def, visit)
+            return Inst.Call(target: mapped_target, args: args, results: results, clobbers: clobbers)
+        }
+        Inst.Return(results: results) => {
+            each_reg(results, role: used, visit)
+            return self
+        }
+        Inst.Args(params: params) => {
+            each_reg(params, role: def, visit)
+            return self
+        }
+        Inst.Cbz(width: width, reg: reg, label: label) => return Inst.Cbz(width: width, reg: visit(reg, role: used), label: label)
+        Inst.Cbnz(width: width, reg: reg, label: label) => return Inst.Cbnz(width: width, reg: visit(reg, role: used), label: label)
+        Inst.JumpTable(index: index, base: base, temp: temp, table: table) => return Inst.JumpTable(index: visit(index, role: used), base: visit(base, role: machinst::Role.Temp), temp: visit(temp, role: machinst::Role.Temp), table: table)
+        Inst.TrapIfZero(width: width, reg: reg) => return Inst.TrapIfZero(width: width, reg: visit(reg, role: used))
+        Inst.TrapIfOverflow(width: width, lhs: lhs, rhs: rhs) => return Inst.TrapIfOverflow(width: width, lhs: visit(lhs, role: used), rhs: visit(rhs, role: used))
+        Inst.Ret(reg: reg) => return Inst.Ret(reg: visit(reg, role: used))
+        Inst.Dmb or Inst.B(label: _) or Inst.Bcond(cond: _, label: _) or Inst.Udf => return self
+    }
+} Inst.map_regs
+
+/// The registers a call may change: `x0` to `x17`, and the vector registers but for `v8` to
+/// `v15`, whose low halves, all scalar code holds in them, the callee restores.
+pkg fn caller_saved() -> machinst::RegSet = machinst::RegSet(bits: 0xFFFF_00FF_0003_FFFF)
+
+/// The registers the instruction changes beyond its operands.
+pkg fn Inst.clobbers(self) -> machinst::RegSet {
+    return match self {
+        Inst.Call(target: _, args: _, results: _, clobbers: clobbers) => clobbers
+        else => machinst::RegSet.empty()
+    }
+} Inst.clobbers
+
+/// Whether the instruction is a call, the only kind across which allocation saves registers.
+pkg fn Inst.is_call(self) -> bool {
+    return match self {
+        Inst.Call(target: _, args: _, results: _, clobbers: _) => true
+        else => false
+    }
+} Inst.is_call
+
+/// Whether the instruction only computes registers and flags.
+pkg fn Inst.is_pure(self) -> bool {
+    return match self {
+        Inst.Mov(width: _, dst: _, src: _) or Inst.MovImm(dst: _, imm: _) or Inst.Address(dst: _, symbol: _, mode: _) => true
+        Inst.AddReg(width: _, dst: _, lhs: _, rhs: _) or Inst.SubReg(width: _, dst: _, lhs: _, rhs: _) or Inst.AddsReg(width: _, dst: _, lhs: _, rhs: _) or Inst.SubsReg(width: _, dst: _, lhs: _, rhs: _) => true
+        Inst.Adc(width: _, dst: _, lhs: _, rhs: _) or Inst.Sbc(width: _, dst: _, lhs: _, rhs: _) or Inst.Sbcs(width: _, dst: _, lhs: _, rhs: _) or Inst.AddImm(width: _, dst: _, src: _, imm: _) or Inst.SubImm(width: _, dst: _, src: _, imm: _) => true
+        Inst.Cmp(width: _, lhs: _, rhs: _) or Inst.CmpImm(width: _, lhs: _, imm: _) or Inst.CmnImm(width: _, lhs: _, imm: _) or Inst.Tst(width: _, lhs: _, rhs: _) => true
+        Inst.Logic(op: _, width: _, dst: _, lhs: _, rhs: _) or Inst.LogicImm(op: _, width: _, dst: _, src: _, imm: _) or Inst.Shift(kind: _, width: _, dst: _, lhs: _, rhs: _) or Inst.ShiftImm(kind: _, width: _, dst: _, src: _, amount: _) => true
+        Inst.Madd(width: _, dst: _, lhs: _, rhs: _, addend: _) or Inst.Msub(width: _, dst: _, lhs: _, rhs: _, minuend: _) or Inst.Sdiv(width: _, dst: _, lhs: _, rhs: _) or Inst.Udiv(width: _, dst: _, lhs: _, rhs: _) => true
+        Inst.Smulh(dst: _, lhs: _, rhs: _) or Inst.Umulh(dst: _, lhs: _, rhs: _) or Inst.Csel(cond: _, width: _, dst: _, a: _, b: _) or Inst.Cset(cond: _, width: _, dst: _) or Inst.Extend(kind: _, dst: _, src: _) => true
+        Inst.Mvn(width: _, dst: _, src: _) or Inst.Neg(width: _, dst: _, src: _) or Inst.Clz(width: _, dst: _, src: _) or Inst.Rbit(width: _, dst: _, src: _) or Inst.Rev(width: _, dst: _, src: _) or Inst.Cnt(dst: _, src: _) or Inst.Addv(dst: _, src: _) => true
+        Inst.FloatMov(prec: _, dst: _, src: _) or Inst.FloatFromInt(prec: _, dst: _, src: _) or Inst.IntFromFloat(prec: _, dst: _, src: _) or Inst.FloatArith(op: _, prec: _, dst: _, lhs: _, rhs: _) or Inst.FloatSqrt(prec: _, dst: _, src: _) => true
+        Inst.FloatNeg(prec: _, dst: _, src: _) or Inst.FloatAbs(prec: _, dst: _, src: _) or Inst.FloatCmp(prec: _, lhs: _, rhs: _) or Inst.FloatConvert(to: _, dst: _, src: _) or Inst.FloatCsel(cond: _, prec: _, dst: _, a: _, b: _) => true
+        Inst.IntToFloat(signed: _, width: _, prec: _, dst: _, src: _) or Inst.FloatToInt(signed: _, width: _, prec: _, dst: _, src: _) or Inst.CanonNan(prec: _, reg: _, temp: _) => true
+        else => false
+    }
+} Inst.is_pure
+
+pkg fn Inst.reads_flags(self) -> bool {
+    return match self {
+        Inst.Adc(width: _, dst: _, lhs: _, rhs: _) or Inst.Sbc(width: _, dst: _, lhs: _, rhs: _) or Inst.Sbcs(width: _, dst: _, lhs: _, rhs: _) => true
+        Inst.Csel(cond: _, width: _, dst: _, a: _, b: _) or Inst.Cset(cond: _, width: _, dst: _) or Inst.FloatCsel(cond: _, prec: _, dst: _, a: _, b: _) or Inst.Bcond(cond: _, label: _) => true
+        else => false
+    }
+} Inst.reads_flags
+
+/// Whether the instruction leaves the flags other than it found them.
+pkg fn Inst.writes_flags(self) -> bool {
+    return match self {
+        Inst.AddsReg(width: _, dst: _, lhs: _, rhs: _) or Inst.SubsReg(width: _, dst: _, lhs: _, rhs: _) or Inst.Sbcs(width: _, dst: _, lhs: _, rhs: _) => true
+        Inst.Cmp(width: _, lhs: _, rhs: _) or Inst.CmpImm(width: _, lhs: _, imm: _) or Inst.CmnImm(width: _, lhs: _, imm: _) or Inst.Tst(width: _, lhs: _, rhs: _) or Inst.FloatCmp(prec: _, lhs: _, rhs: _) => true
+        Inst.Logic(op: op, width: _, dst: _, lhs: _, rhs: _) => op == LogicOp.Ands
+        Inst.LogicImm(op: op, width: _, dst: _, src: _, imm: _) => op == LogicOp.Ands
+        Inst.CanonNan(prec: _, reg: _, temp: _) or Inst.AtomicCasLoop(size: _, addr: _, expected: _, replacement: _, old: _, status: _) or Inst.TrapIfOverflow(width: _, lhs: _, rhs: _) => true
+        Inst.Call(target: _, args: _, results: _, clobbers: _) or Inst.TlsDesc(symbol: _, temp: _) => true
+        else => false
+    }
+} Inst.writes_flags
+
+/// Whether a physical register is a vector one.
+pkg fn Inst.is_float(reg: machinst::Reg) -> bool = is_vector(reg)
+
+/// How many registers of a class allocation hands out.
+pkg fn Inst.class_size(float: bool) -> u32 {
+    if float {
+        return 30
+    }
+    return 26
+} Inst.class_size
+
+/// The registers allocation hands out, by class in order of preference: those a call changes
+/// first, as they need no saving, then the callee-saved ones. Neither `x16` and `x17`, which hold
+/// spilled operands, nor `x18`, which a platform may reserve, is handed out, nor `v30` and `v31`,
+/// which hold spilled vector operands.
+pkg fn Inst.class_reg(float: bool, index: u32) -> machinst::Reg {
+    if float {
+        if index < 8 {
+            return vreg(index)
+        }
+        if index < 22 {
+            return vreg(index + 8)
+        }
+        return vreg(index - 14)
+    }
+    if index < 16 {
+        return xreg(index)
+    }
+    return xreg(index + 3)
+} Inst.class_reg
+
+/// The registers a function must restore before it returns: `x19` to `x28` and the low 64 bits of
+/// `v8` to `v15`. The frame pointer and link register are saved by the prologue instead.
+pkg fn Inst.callee_saved() -> machinst::RegSet = machinst::RegSet(bits: (0x3FFu64 << 19) | (0xFFu64 << 40))
+
+impl Inst: machinst::MachInst

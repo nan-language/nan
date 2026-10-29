@@ -8,7 +8,6 @@ use super::tir::TBody;
 use super::ty::{Arg, FnParam, FnTy, Ty};
 use crate::diagnostic::Code;
 use crate::syntax::ast::{FnModifier, ItemKind, Mode};
-use crate::workspace::Target;
 
 /// The types of the information a trap frame carries.
 const FRAME_INFOS: [&str; 3] = ["hw::NoCode", "hw::ErrorCode", "hw::PageFault"];
@@ -47,7 +46,7 @@ impl Checker<'_> {
     /// Each float operation of a function's or const's text, closures included, under a kernel
     /// target.
     pub fn check_float_use(&self, item: ItemId, body: &TBody) {
-        if !matches!(self.db.target, Target::Uefi | Target::Bare) {
+        if !self.db.target.is_machine() {
             return;
         }
         for site in self.text_sites(item, body) {

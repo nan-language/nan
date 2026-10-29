@@ -349,7 +349,7 @@ pub fn Runner.run[Env: Send, M: Send, E](take env: Env, exec: task::Executor, al
 
 - `host::Runner[S]` has no values; it names `run`. The runner's executor and allocator are the `exec` and `alloc` of the call.
 - A use of `host::Runner[S].run` where S does not implement `sys::Component[Env, M]` for the Env and M fixed at that use ([inference](08-generics-interfaces.md#inference)) is an error (`component.not-component`).
-- A use of `host::Runner.run` in code checked for `x86_64-uefi` or `x86_64-bare`, or within the reach of a final build for one of them ([environments](27-program-model.md#environments)), is an error (`component.unavailable`).
+- A use of `host::Runner.run` in code checked for a machine target, or within the reach of a final build for one ([environments](27-program-model.md#environments)), is an error (`component.unavailable`).
 
 A call `host::Runner[S].run(env, exec, alloc, body: b)` runs these steps:
 

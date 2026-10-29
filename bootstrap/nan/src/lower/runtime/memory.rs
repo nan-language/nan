@@ -94,7 +94,7 @@ const CLASSES: u64 = 44;
 const UNSHARED: i64 = 0x7F;
 const FREED: i64 = 0x80;
 
-/// The byte routines of `mem_op`: the C library's on `x86_64-host`; on a machine target, which
+/// The byte routines of `mem_op`: the C library's on a host target; on a machine target, which
 /// has no C library, the copy and fill compiler stubs and a comparison loop.
 pub fn bytes(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();

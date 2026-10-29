@@ -3,10 +3,11 @@
 //! compares what both print, their exit statuses and the files they write: for every `nan`
 //! example of each specification chapter, the commands the conformance harness runs and those of
 //! its section's `text` blocks, with the canonical NIR, the text of each function a final build
-//! lowers and what each `x86_64-host` program writes; for every std package, `nan check` with its
-//! NIR and `nan test`; for every program of `tests/programs`, its final build and lowering and
-//! what it writes; and for the toolchain workspace, which must check without a diagnostic and
-//! pass `nan verify` with both. The toolchain test then checks the self-built toolchain by diverse
+//! lowers and what each host program of this machine's architecture writes; for every std
+//! package, `nan check` with its NIR and `nan test`; for every program of `tests/programs`, its
+//! final build and lowering and what it writes, a machine program's under its emulator; and for
+//! the toolchain workspace, which must check without a diagnostic and pass `nan verify` with
+//! both. The toolchain test then checks the self-built toolchain by diverse
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
 //! into the same bytes, and the bootstrap's stage comparison accepts it. The NaN toolchain runs
 //! beside the bootstrap on a copy of the workspace and local store the bootstrap runs in, on one
@@ -25,13 +26,14 @@ use std::time::{Duration, Instant};
 use datatest_stable::Utf8Path;
 
 mod common;
+mod machine;
 
 use common::{Example, examples, nan, unmark};
 
 datatest_stable::harness! {
     { test = chapter, root = "../../docs/spec", pattern = r"^\d\d-[a-z-]+\.md$" },
     { test = std_package, root = "../../std", pattern = r"^[a-z_]+/package\.nan$" },
-    { test = program, root = "tests/programs", pattern = r"^[a-z-]+/expected$" },
+    { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
     { test = toolchain, root = "../../toolchain", pattern = r"^nan/package\.nan$" },
     { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
 }
@@ -755,13 +757,35 @@ fn renumbered(text: &str, numbers: &mut std::collections::HashMap<String, usize>
     out
 }
 
-/// Runs the `x86_64-host` image of `program` that each toolchain built in its workspace and
+/// Runs the images of `program` for `target` that each toolchain built in its workspace and
+/// compares what both write and the statuses they end with: a host program's standard streams
+/// when this machine has its architecture, a machine program's serial port under its emulator.
+fn compare_program(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+    target: &str,
+) -> Result<(), String> {
+    match target.strip_suffix("-host") {
+        Some(arch) if arch != std::env::consts::ARCH => Ok(()),
+        Some(_) => compare_processes(bootstrap, store, program, target),
+        None => compare_boots(toolchain, bootstrap, store, program),
+    }
+}
+
+/// Runs the host image of `program` for `target` that each toolchain built in its workspace and
 /// compares what both write to their standard streams and the statuses they exit with.
-fn compare_program(bootstrap: &Path, store: &Path, program: &str) -> Result<(), String> {
+fn compare_processes(
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+    target: &str,
+) -> Result<(), String> {
     let (front_dir, _) = fronts(bootstrap, store);
     let mut runs = Vec::new();
     for dir in [bootstrap, front_dir.as_path()] {
-        let mut command = Command::new(dir.join(".nan/images/x86_64-host").join(program));
+        let mut command = Command::new(dir.join(".nan/images").join(target).join(program));
         command
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -787,10 +811,48 @@ fn compare_program(bootstrap: &Path, store: &Path, program: &str) -> Result<(), 
     Ok(())
 }
 
+/// Boots the machine image of `program` that each toolchain builds in its workspace with
+/// `nan run` and compares what both write to the serial port and the statuses their runs end
+/// with.
+fn compare_boots(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+) -> Result<(), String> {
+    let run = nan::run(&["run".to_owned(), program.to_owned()], bootstrap);
+    let launch = run
+        .launch
+        .ok_or_else(|| format!("nan run {program} reports\n{}", run.output))?;
+    let booted = machine::boot(&launch, bootstrap)?;
+    let (front_dir, front_store) = fronts(bootstrap, store);
+    let mut command = Command::new(&toolchain.image);
+    command
+        .args(["run", program])
+        .current_dir(&front_dir)
+        .env("NAN_SELF_CHECK_HOME", front_home())
+        .env("NAN_SELF_CHECK_STORE", &front_store)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let ran = Supervised::start(command, RUN_LIMIT)?.finish()?;
+    let written = String::from_utf8_lossy(&ran.stdout);
+    if ran.status != Some(Some(booted.status)) || written != booted.written {
+        return Err(format!(
+            "{program} built by the bootstrap writes\n{}exiting with {:?}\nbuilt by the NaN toolchain\n{written}exiting with {:?}{}",
+            booted.written,
+            Some(Some(booted.status)),
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// Compares, for an example, every command the conformance harness runs: checking, NIR, tests,
-/// the final build and lowering of each program with what each `x86_64-host` one writes,
-/// `nan verify`, the commands of its section's `text` blocks and `nan fmt` of its files without
-/// their marker comments.
+/// the final build and lowering of each program with what each host one of this machine's
+/// architecture writes, `nan verify`, the commands of its section's `text` blocks and `nan fmt`
+/// of its files without their marker comments.
 fn compare_example(
     toolchain: &Toolchain,
     example: &Example,
@@ -808,10 +870,10 @@ fn compare_example(
         for program in programs(example) {
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
-                let host = program.1 == "x86_64-host";
-                compare_lowered(toolchain, dir, store, &program.0, host)?;
-                if host {
-                    compare_program(dir, store, &program.0)?;
+                let host = program.1.strip_suffix("-host");
+                compare_lowered(toolchain, dir, store, &program.0, host.is_some())?;
+                if host == Some(std::env::consts::ARCH) {
+                    compare_processes(dir, store, &program.0, &program.1)?;
                 }
             }
         }
@@ -830,6 +892,16 @@ fn compare_example(
     Ok(())
 }
 
+/// The concrete targets.
+const TARGETS: [&str; 6] = [
+    "x86_64-host",
+    "x86_64-uefi",
+    "x86_64-bare",
+    "aarch64-host",
+    "aarch64-uefi",
+    "aarch64-bare",
+];
+
 /// The programs of an example: each package declaring an entry and a concrete target, by name and
 /// target.
 fn programs(example: &Example) -> Vec<(String, String)> {
@@ -841,7 +913,7 @@ fn programs(example: &Example) -> Vec<(String, String)> {
             let entry = lines.iter().any(|line| unmark(line).trim() == "entry main");
             let target = lines.iter().find_map(|line| {
                 let target = line.trim().strip_prefix("targets ")?;
-                ["x86_64-host", "x86_64-uefi", "x86_64-bare"]
+                TARGETS
                     .into_iter()
                     .find(|known| target.split(", ").any(|one| one == *known))
             })?;
@@ -905,8 +977,14 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
     fs::remove_file(dir.join(name).join("expected"))?;
     compare(&toolchain, &dir, &store, &["build", name])?;
-    compare_lowered(&toolchain, &dir, &store, name, true)?;
-    compare_program(&dir, &store, name)?;
+    let manifest = fs::read_to_string(dir.join(name).join("package.nan"))?;
+    let target = manifest
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("targets "))
+        .expect("a program's targets directive")
+        .to_owned();
+    compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-host"))?;
+    compare_program(&toolchain, &dir, &store, name, &target)?;
     fs::remove_dir_all(&dir)?;
     fs::remove_dir_all(fronts(&dir, &store).0)?;
     Ok(())

@@ -1,21 +1,26 @@
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_module::{DataDescription, Linkage, Module, ModuleReloc};
+use cranelift_module::{DataDescription, Linkage, Module, ModuleReloc, ModuleRelocTarget};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use super::*;
 
+/// An object module as lowering makes it for a machine target of the architecture of `triple`.
+fn module(triple: &str) -> ObjectModule {
+    let mut flags = settings::builder();
+    flags.set("is_pic", "false").expect("a Cranelift setting");
+    let isa = cranelift_codegen::isa::lookup_by_name(triple)
+        .expect("the architecture's backend")
+        .finish(settings::Flags::new(flags))
+        .expect("the architecture's settings");
+    let names = cranelift_module::default_libcall_names();
+    ObjectModule::new(ObjectBuilder::new(isa, "test", names).expect("a builder"))
+}
+
 /// An object as lowering writes it for a machine target: `entry` calling `callee` through a
 /// relocation of the kind given, `table` holding the address of `callee`, then 64 zeroed bytes.
 fn object(call: Reloc) -> Vec<u8> {
-    let mut flags = settings::builder();
-    flags.set("is_pic", "false").expect("a Cranelift setting");
-    let isa = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-none-elf")
-        .expect("the x86-64 backend")
-        .finish(settings::Flags::new(flags))
-        .expect("the x86-64 settings");
-    let names = cranelift_module::default_libcall_names();
-    let mut module = ObjectModule::new(ObjectBuilder::new(isa, "test", names).expect("a builder"));
+    let mut module = module("x86_64-unknown-none-elf");
     let signature = module.make_signature();
     let mut function = |name: &str| {
         module
@@ -51,6 +56,60 @@ fn object(call: Reloc) -> Vec<u8> {
     module.finish().emit().expect("an object")
 }
 
+/// The A64 instructions `aarch64_object` holds, their immediates 0: `adrp x0`, `add x0, x0`,
+/// `bl` and `ret`.
+const ADRP_X0: u32 = 0x9000_0000;
+const ADD_X0: u32 = 0x9100_0000;
+const BL: u32 = 0x9400_0000;
+const RET: u32 = 0xD65F_03C0;
+
+/// The bytes of A64 instructions.
+fn code(instructions: &[u32]) -> Vec<u8> {
+    instructions
+        .iter()
+        .flat_map(|instruction| instruction.to_le_bytes())
+        .collect()
+}
+
+/// The AArch64 twin of `object`: `entry` forming the address of `table` plus 0x4008 with `adrp`
+/// and `add`, `callee` calling `entry` with `bl`, and `table` holding the address of `callee`.
+fn aarch64_object() -> Vec<u8> {
+    let mut module = module("aarch64-unknown-none-elf");
+    let signature = module.make_signature();
+    let mut function = |name: &str| {
+        module
+            .declare_function(name, Linkage::Local, &signature)
+            .expect("a function")
+    };
+    let (entry, callee) = (function("entry"), function("callee"));
+    let table = module
+        .declare_data("table", Linkage::Local, true, false)
+        .expect("a data object");
+    let relocation = |offset, kind, name: ModuleRelocTarget, addend| ModuleReloc {
+        offset,
+        kind,
+        name,
+        addend,
+    };
+    let page = relocation(0, Reloc::Aarch64AdrPrelPgHi21, table.into(), 0x4008);
+    let low = relocation(4, Reloc::Aarch64AddAbsLo12Nc, table.into(), 0x4008);
+    module
+        .define_function_bytes(entry, 16, &code(&[ADRP_X0, ADD_X0, RET]), &[page, low])
+        .expect("the entry");
+    let call = relocation(0, Reloc::Arm64Call, entry.into(), 0);
+    module
+        .define_function_bytes(callee, 16, &code(&[BL, RET]), &[call])
+        .expect("the callee");
+    let mut description = DataDescription::new();
+    description.define(vec![0; 8].into_boxed_slice());
+    let address = module.declare_func_in_data(callee, &mut description);
+    description.write_function_addr(0, address);
+    module
+        .define_data(table, &description)
+        .expect("a data object");
+    module.finish().emit().expect("an object")
+}
+
 #[test]
 fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memory_only() {
     let base = 0x0010_0000;
@@ -67,6 +126,21 @@ fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memor
         (data.address, data.access, data.size),
         (base + 0x1000, Access::Write, 128)
     );
+    assert_eq!(data.bytes, (base + 16).to_le_bytes());
+    assert_eq!(linked.absolute, [(base + 0x1000, 8)]);
+}
+
+#[test]
+fn link_patches_aarch64_branches_pages_and_page_offsets() {
+    let base = elf::base(workspace::Arch::Aarch64);
+    let linked = link(&aarch64_object(), base);
+    let [text, data] = &linked.segments[..] else {
+        panic!("{} segments", linked.segments.len());
+    };
+    let five_pages = ADRP_X0 | 1 << 29 | 1 << 5;
+    let back_four = BL | 0x03FF_FFFC;
+    let patched = code(&[five_pages, ADD_X0 | 8 << 10, RET, 0, back_four, RET]);
+    assert_eq!(text.bytes, patched);
     assert_eq!(data.bytes, (base + 16).to_le_bytes());
     assert_eq!(linked.absolute, [(base + 0x1000, 8)]);
 }
@@ -89,5 +163,5 @@ fn base_relocations_group_addresses_by_page_and_pad_odd_blocks() {
 #[test]
 #[should_panic(expected = "32-bit absolute address")]
 fn uefi_images_reject_32_bit_absolute_addresses() {
-    write(Target::Uefi, &object(Reloc::Abs4), "entry");
+    write(Target::X64Uefi, &object(Reloc::Abs4), "entry");
 }

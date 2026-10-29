@@ -382,12 +382,12 @@ fn run_targets(package: &Package) -> Vec<Target> {
         .iter()
         .flat_map(|manifest| &manifest.targets)
         .map(|target| match target {
-            Target::Any => Target::Host,
+            Target::Any => Target::X64Host,
             other => *other,
         })
         .collect();
     if targets.is_empty() {
-        targets.push(Target::Host);
+        targets.push(Target::X64Host);
     }
     targets.sort();
     targets.dedup();
@@ -396,7 +396,7 @@ fn run_targets(package: &Package) -> Vec<Target> {
 
 /// Runs a package's tests on a checker's target, each run a process of the package's test image
 /// or a boot of the emulator on it, and records in the cache each test whose every run passes,
-/// unless replaying; every run fails on a machine target whose emulator cannot start.
+/// unless replaying; every run fails on a target whose images cannot run on this machine.
 fn run_package(
     checker: &Checker,
     hashes: &ItemHashes,
@@ -410,7 +410,7 @@ fn run_package(
         return Ok(());
     }
     let target = checker.db.target;
-    if target.is_machine() && !emulator::available(target) {
+    if !emulator::available(target) {
         for test in tests {
             let cause = "test.emulator-unavailable";
             report

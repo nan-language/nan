@@ -14,7 +14,7 @@ use super::ty::{Scalar, Ty};
 use crate::diagnostic::{Code, Offer};
 use crate::syntax::ast::{self, FnModifier, ItemKind, Mode};
 use crate::syntax::parser::is_pascal;
-use crate::workspace::{Authority, Target};
+use crate::workspace::Authority;
 
 /// The naming convention a declared name follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -739,7 +739,7 @@ impl Checker<'_> {
     /// The `limits stack N` an entry of a boot, task, interrupt or landing context states when
     /// checked for a machine target, reported on the entry's head.
     pub fn check_stack_bound(&self, item: ItemId, limits: &super::ty::LimitSet) {
-        if matches!(self.db.target, Target::Uefi | Target::Bare) && limits.stack.is_none() {
+        if self.db.target.is_machine() && limits.stack.is_none() {
             self.report(item, self.db.ast(item).token, Code::SuspendStackMissing);
         }
     }

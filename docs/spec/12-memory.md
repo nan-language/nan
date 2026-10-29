@@ -32,7 +32,7 @@ pub fn readings_list(values: Slice[u16], alloc: mem::Alloc) -> mem::List[u16] {
 
 A **budget** is a linear `mem::Budget` owning a cell. A **cell** is a slot of a cell table holding a limit in bytes, a charge in bytes, a parent cell and an open or closed state; cell tables are memory of the support routines, charged to no cell. A **chunk** is 64 KiB of memory aligned to 64 KiB; cells are charged in whole chunks.
 
-- A **root cell** is a cell without a parent; its **supply** is the memory its chunks come from. The allocator of a [root grant](14-authority.md#root-grants) names a root cell with a limit of 2^64 − 1 bytes, whose supply is the process's memory on `x86_64-host` and the boot heap ([anchor](24-kernel.md#anchor)) on `x86_64-uefi` and `x86_64-bare`. A store over a region names a root cell whose supply is that region ([regions](#regions)).
+- A **root cell** is a cell without a parent; its **supply** is the memory its chunks come from. The allocator of a [root grant](14-authority.md#root-grants) names a root cell with a limit of 2^64 − 1 bytes, whose supply is the process's memory on the host targets and the boot heap ([anchor](24-kernel.md#anchor)) on the machine targets. A store over a region names a root cell whose supply is that region ([regions](#regions)).
 - Every other cell is a budget's or a revoker's, and its parent is the cell of the allocator it was made from. The **chain** of a cell is the cell, its parent, the parent's parent and so on to a root cell.
 
 ```nan-api
@@ -55,7 +55,7 @@ pub fn Budget.close(take self)
 - `budget.alloc()` returns the allocator naming the budget's cell; every call returns the same handle. `limit()` is the cell's limit.
 - A **draw** of n chunks through an allocator succeeds exactly when every cell on the chain of the cell it names is open and has a charge that, with n × 65,536 bytes added, is at most its limit, and the root cell's supply yields n chunks. It then adds n × 65,536 bytes to the charge of every cell on that chain. Otherwise it charges nothing; a failed draw is **exhaustion**.
 - Draws, returns and closes are atomic: concurrent draws through cells sharing an ancestor never take that ancestor past its limit, and a draw either completes before the close of a cell on its chain or fails.
-- A return has no [digest fact](10-effects-digests.md#digests), so code under `noalloc` may release values. On `x86_64-uefi` and `x86_64-bare`, each draw and return runs with maskable interrupts disabled on its CPU.
+- A return has no [digest fact](10-effects-digests.md#digests), so code under `noalloc` may release values. On the machine targets, each draw and return runs with maskable interrupts disabled on its CPU.
 - `take budget.close()` closes the budget's cell, making its allocator stale, so no draw succeeds through an allocator whose cell's chain holds that cell. Memory already drawn stays usable.
 - A chunk **returns** to its root cell's supply once no allocation in it is live, or when its domain is freed ([chunk ownership](#chunk-ownership)). A return subtracts 65,536 bytes from the charge of every open cell on the chain of the cell it was drawn through.
 - `charged()` is the cell's charge: 65,536 bytes for each chunk not yet returned that was drawn through the cell or through a cell whose chain holds it.

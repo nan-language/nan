@@ -1,0 +1,151 @@
+//! What both emitters read of an allocation: where each virtual register lives, the parallel moves of block arguments between such places, and the scratch registers spilled operands take.
+
+/// Where a value lives: a physical register or a spill slot.
+enum Loc derives Copy, Eq {
+    Reg(machinst::Reg)
+    Slot(u32)
+} Loc
+
+/// Where allocation put a register: itself when physical.
+fn location(allocation: Allocation, reg: machinst::Reg) -> Loc {
+    if not reg.is_virtual() {
+        return Loc.Reg(reg)
+    }
+    let at = usize.widen(reg.vreg())
+    expect at < allocation.regs.len() and at < allocation.slots.len()
+    let assigned = allocation.regs[at]
+    if assigned == NO_REG {
+        return Loc.Slot(allocation.slots[at])
+    }
+    return Loc.Reg(assigned)
+} location
+
+/// The slot of a virtual register spilled or saved across calls.
+fn slot_of(allocation: Allocation, vreg: u32) -> u32 {
+    let at = usize.widen(vreg)
+    expect at < allocation.slots.len()
+    return allocation.slots[at]
+} slot_of
+
+fn is_spilled(allocation: Allocation, reg: machinst::Reg) -> bool {
+    if not reg.is_virtual() {
+        return false
+    }
+    let at = usize.widen(reg.vreg())
+    expect at < allocation.regs.len()
+    return allocation.regs[at] == NO_REG
+} is_spilled
+
+/// A pending copy of a parallel move.
+struct Move derives Copy, Eq {
+    dst: Loc
+    src: Loc
+    float: bool
+} Move
+
+/// Whether a move other than the one at `except` still reads a location.
+fn is_read(moves: mem::List[Move], at: Loc, except: usize) -> bool {
+    for index in 0..<moves.len() {
+        if index != except and moves[index].src == at {
+            return true
+        }
+    }
+    return false
+} is_read
+
+/// An operand of an instruction being emitted, with the register it gets.
+struct Operand derives Copy, Eq {
+    reg: machinst::Reg
+    role: machinst::Role
+    assigned: machinst::Reg
+} Operand
+
+fn is_read_role(role: machinst::Role) -> bool = role == machinst::Role.Use or role == machinst::Role.Mod
+
+fn is_written_role(role: machinst::Role) -> bool = role == machinst::Role.Def or role == machinst::Role.Mod or role == machinst::Role.EarlyDef
+
+/// Whether the operand at `at` reads its register when `read`, or writes it otherwise, and is the
+/// first such operand naming the register.
+fn is_first(operands: mem::List[Operand], at: usize, read: bool) -> bool
+    requires at < operands.len()
+{
+    let operand = operands[at]
+    if read and not is_read_role(operand.role) {
+        return false
+    }
+    if not read and not is_written_role(operand.role) {
+        return false
+    }
+    for index in 0..<at {
+        let earlier = operands[index]
+        if earlier.reg == operand.reg and ((read and is_read_role(earlier.role)) or (not read and is_written_role(earlier.role))) {
+            return false
+        }
+    }
+    return true
+} is_first
+
+/// The scratch register an earlier operand naming the same register got, or `NO_REG`.
+fn same_reg(operands: mem::List[Operand], at: usize) -> machinst::Reg
+    requires at < operands.len()
+{
+    for index in 0..<operands.len() {
+        if index != at and operands[index].reg == operands[at].reg and operands[index].assigned != operands[at].reg {
+            return operands[index].assigned
+        }
+    }
+    return NO_REG
+} same_reg
+
+/// Gives each operand its register: a physical one stays, an allocated one takes its register,
+/// and a spilled one a scratch register of its class, two of each class in `scratches` by the
+/// index `held` follows them at, the operands read first; an operand only written takes a scratch
+/// register holding one read when no other is left and the instruction reads all its operands
+/// before it writes.
+fn assign_scratch[I: machinst::MachInst and Copy](mut operands: mem::List[Operand], code: VCode[I], allocation: Allocation, sequence: bool, scratches: Array[machinst::Reg, SCRATCH_COUNT]) {
+    let count = operands.len()
+    var used_int: u32 = 0
+    var used_float: u32 = 0
+    for pass in 0u32..<2 {
+        for index in 0..<count {
+            invariant operands.len() == count
+            let operand = operands[index]
+            if not operand.reg.is_virtual() or is_read_role(operand.role) != (pass == 0) {
+                continue
+            }
+            let at = usize.widen(operand.reg.vreg())
+            expect at < allocation.regs.len()
+            let assigned = allocation.regs[at]
+            if assigned != NO_REG {
+                operands[index].assigned = assigned
+                continue
+            }
+            let earlier = same_reg(operands, at: index)
+            if earlier != NO_REG {
+                operands[index].assigned = earlier
+                continue
+            }
+            let float = code.is_float(operand.reg)
+            var used = used_int
+            if float {
+                used = used_float
+            }
+            if used >= 2 {
+                expect pass == 1 and not sequence
+                used = 0
+            } else if float {
+                used_float += 1
+            } else {
+                used_int += 1
+            }
+            var at_scratch = usize.widen(used)
+            if float {
+                at_scratch += 2
+            }
+            operands[index].assigned = scratches[at_scratch]
+        }
+    }
+} assign_scratch
+
+/// The scratch registers an emitter keeps, two of each class.
+const SCRATCH_COUNT: usize = 4

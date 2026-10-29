@@ -121,17 +121,6 @@ struct Reads {
     noted_on_lines: HashSet<(ItemId, u32, ItemId)>,
 }
 
-/// Whether a variant selector matches a target.
-fn selects(selector: &str, target: Target) -> bool {
-    match selector {
-        "x86_64-host" | "host" => target == Target::Host,
-        "x86_64-uefi" | "uefi" => target == Target::Uefi,
-        "x86_64-bare" | "bare" => target == Target::Bare,
-        "x86_64" => target != Target::Any,
-        _ => false,
-    }
-}
-
 impl<'a> Db<'a> {
     /// The database of a closure's packages and std under `target`: the workspace packages it
     /// checks, its other members quiet, and each std package no member is named like, carried.
@@ -228,7 +217,7 @@ impl<'a> Db<'a> {
                 let matching = module.dirs.iter().find(|dir| {
                     dir.selector
                         .as_deref()
-                        .is_some_and(|selector| selects(selector, self.target))
+                        .is_some_and(|selector| self.target.selected_by(selector))
                 });
                 let chosen = matching.or_else(|| module.dirs.iter().min_by_key(|dir| &dir.path));
                 chosen.map(|dir| dir.path.as_str()).into_iter().collect()
